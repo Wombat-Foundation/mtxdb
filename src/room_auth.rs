@@ -25,11 +25,13 @@ pub enum RoomAuthError {
         event_id: String,
     },
     /// A snapshot pinned a generation that a later publish has since retired.
+    /// Take a fresh snapshot; retrying the same read cannot succeed.
     StaleGeneration {
         /// Generation the handle was pinned to.
         pinned: u64,
-        /// Current published generation.
-        current: u64,
+        /// Generation published now, or `None` if nothing is (for example the
+        /// room was purged).
+        current: Option<u64>,
     },
     /// A closure record belongs to a different room or scope than the one
     /// addressed.
@@ -53,10 +55,16 @@ impl fmt::Display for RoomAuthError {
             Self::MissingParent { event_id } => {
                 write!(f, "auth chain references unrecorded event {event_id}")
             }
-            Self::StaleGeneration { pinned, current } => write!(
-                f,
-                "pinned closure generation {pinned} is stale; current generation is {current}"
-            ),
+            Self::StaleGeneration { pinned, current } => match current {
+                Some(current) => write!(
+                    f,
+                    "pinned closure generation {pinned} is stale; current generation is {current}"
+                ),
+                None => write!(
+                    f,
+                    "pinned closure generation {pinned} is stale; no generation is published"
+                ),
+            },
             Self::WrongDomain => write!(f, "closure record belongs to a different domain"),
             Self::Corruption(message) => write!(f, "closure data is corrupt: {message}"),
             Self::IncompleteClosure { missing } => {
@@ -80,6 +88,13 @@ impl From<StorageError> for RoomAuthError {
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::Corrupt(message) => Self::Corruption(message),
+            StorageError::StaleGeneration {
+                generation,
+                current,
+            } => Self::StaleGeneration {
+                pinned: generation,
+                current,
+            },
             other => Self::Storage(other),
         }
     }

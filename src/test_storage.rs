@@ -383,6 +383,29 @@ fn test_io_error_from_storage_error_preserves_kinds() {
 
     let collision: std::io::Error = StorageError::Collision("dup".into()).into();
     assert_eq!(collision.kind(), std::io::ErrorKind::AlreadyExists);
+
+    // An expired pinned snapshot is neither "absent" nor "retry", and keeps its
+    // typed error so a caller can still recover the generations.
+    let stale: std::io::Error = StorageError::StaleGeneration {
+        generation: 1,
+        current: Some(3),
+    }
+    .into();
+    assert_eq!(stale.kind(), std::io::ErrorKind::Other);
+    assert!(matches!(
+        stale
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<StorageError>()),
+        Some(StorageError::StaleGeneration {
+            generation: 1,
+            current: Some(3)
+        })
+    ));
+    assert!(StorageError::StaleGeneration {
+        generation: 1,
+        current: None
+    }
+    .is_stale_generation());
 }
 
 #[test]

@@ -64,13 +64,13 @@ fn rebuild_publishes_per_event_and_reports_the_skipped_one() {
         !report.is_complete(),
         "a generation with skipped events is explicitly not complete"
     );
-    assert_eq!(
-        report.skipped,
-        vec!["$orphan".to_owned(), "$never-recorded".to_owned()],
-        "the event that depends on the gap and the never-recorded parent are both \
-         named in short-id order, not merely counted"
-    );
     assert_eq!(report.skipped_count, 2);
+    assert_eq!(
+        u64::try_from(report.skipped_ids().count()).unwrap(),
+        u64::from(report.skipped_count),
+        "the expanded ids agree with the count"
+    );
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     assert_eq!(
         report.missing,
         vec!["$never-recorded".to_owned()],
@@ -103,6 +103,11 @@ fn rebuild_publishes_per_event_and_reports_the_skipped_one() {
         snapshot.skipped.runs(),
         report.runs,
         "the report's runs are the ones the generation actually stored"
+    );
+    assert_eq!(
+        report.skipped_ids().collect::<Vec<_>>(),
+        vec![first, last],
+        "skipped_ids walks the runs in ascending order"
     );
 
     drop(db);

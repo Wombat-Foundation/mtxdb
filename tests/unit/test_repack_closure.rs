@@ -114,9 +114,9 @@ fn repack_preserves_short_ids_adjacency_and_published_closures() {
     let closure = AuthClosure::new(POOL, ROOM);
     let report = closure.rebuild(&db).unwrap();
     assert!(
-        report.skipped.is_empty(),
+        report.is_complete(),
         "every event is recorded, but rebuild skipped {:?}",
-        report.skipped
+        report.runs
     );
     assert_eq!(
         report.count as usize,

@@ -29,3 +29,5 @@ mod test_packfile_layout;
 mod test_redo;
 #[cfg(all(feature = "multi-reader", feature = "bitmaps"))]
 mod test_repack_closure;
+#[cfg(all(feature = "multi-reader", feature = "bitmaps"))]
+mod test_room_auth;

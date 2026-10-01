@@ -741,11 +741,14 @@ impl From<StorageError> for std::io::Error {
             StorageError::Unsupported(message) => {
                 std::io::Error::new(std::io::ErrorKind::Unsupported, message)
             }
-            // `StaleGeneration` maps here too: the pinned generation is gone, so the
-            // caller needs a new snapshot rather than another attempt.
-            StorageError::NotFound(_) | StorageError::StaleGeneration { .. } => {
+            StorageError::NotFound(_) => {
                 std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string())
             }
+            // Neither "absent" (`NotFound` is how callers probe for a missing pool
+            // or record) nor "retry" (`WouldBlock`): the pinned generation is gone,
+            // so the caller needs a new snapshot. The typed error is kept as the
+            // source so a caller can still `downcast_ref::<StorageError>()`.
+            StorageError::StaleGeneration { .. } => std::io::Error::other(error),
             StorageError::VerificationFailed(_) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             }

@@ -342,21 +342,24 @@ pub struct RebuildReport {
     pub source_next: u32,
     /// Number of closure records written.
     pub count: u32,
-    /// Every covered event left without a closure record because a reachable
-    /// `auth` parent was absent, in short-id order. One entry per event, not one
-    /// per coverage run, so a skipped run of three events lists all three.
-    /// Empty means the generation is complete.
-    pub skipped: Vec<String>,
-    /// Number of events in `skipped`, mirroring the head field it reports.
+    /// Number of covered events left without a closure record because a
+    /// reachable `auth` parent was absent, mirroring the head field it reports.
+    /// Zero means the generation is complete.
     pub skipped_count: u32,
     /// The root causes: events that were never recorded, so they have no `auth`
-    /// of their own and cannot be walked. Every event in `skipped` reaches one of
-    /// these, directly or through a dependent.
+    /// of their own and cannot be walked. Every skipped event reaches one of
+    /// these, directly or through a dependent. Bounded by the number of absent
+    /// parents, not by the size of the room, so these are the ids worth naming.
     pub missing: Vec<String>,
     /// The skipped ids as canonical inclusive `(start, end)` short-id runs, which
     /// is how the generation's coverage record encodes them. Adjacent skipped ids
-    /// collapse into one run.
+    /// collapse into one run, so this stays compact however holey the room is.
+    /// Use [`Self::skipped_ids`] to walk the ids and resolve the ones you need
+    /// through the short-id index.
     pub runs: Vec<(u32, u32)>,
+    /// Non-fatal problems met while rebuilding, such as a failed cleanup of a
+    /// generation after an error. Empty on a clean rebuild.
+    pub warnings: Vec<String>,
 }
 
 #[cfg(feature = "multi-reader")]
@@ -367,6 +370,12 @@ impl RebuildReport {
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.skipped_count == 0
+    }
+
+    /// The skipped short ids in ascending order, expanded lazily from the runs so
+    /// nothing is allocated per event.
+    pub fn skipped_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.runs.iter().flat_map(|&(start, end)| start..=end)
     }
 }
 
@@ -579,12 +588,9 @@ impl AuthClosure {
         let mut builder = self.store.begin(db)?;
         let mut walk = Walk::new(&graph);
         let mut batch: Vec<(u32, Vec<u8>)> = Vec::new();
-        // Skipped ids are accumulated twice, on purpose: the runs, which are what
-        // the coverage record stores and stay compact however holey the room is,
-        // and the ids themselves, which only the report needs and only one label
-        // per event. A room with a single hole near the end costs one run plus one
-        // id, not one id per covered event.
-        let mut skipped_ids: Vec<u32> = Vec::new();
+        // Skipped ids are kept only as runs, which is how the coverage record
+        // stores them, so a room that skips most of its events costs a handful of
+        // runs, not one allocation per event.
         let mut coverage = ClosureCoverageBuilder::new();
         // A walk error (a cycle) is corruption, not a publishable gap, so release
         // the reserved generation rather than leaving it orphaned for retire.
@@ -597,10 +603,7 @@ impl AuthClosure {
                             flush(&mut builder, db, &mut batch)?;
                         }
                     }
-                    WalkOutcome::Incomplete => {
-                        skipped_ids.push(short_id);
-                        coverage.push(short_id);
-                    }
+                    WalkOutcome::Incomplete => coverage.push(short_id),
                 }
             }
             flush(&mut builder, db, &mut batch)
@@ -608,6 +611,7 @@ impl AuthClosure {
         if let Err(error) = walked {
             // The walk error is the real failure; a failed cleanup must not
             // replace it, or the caller loses the corrupt cycle that caused it.
+            // There is no report to carry it on this path, so it is logged.
             if let Err(cleanup) = builder.abandon(db) {
                 eprintln!("closure rebuild: could not abandon the reserved generation: {cleanup}");
             }
@@ -621,10 +625,10 @@ impl AuthClosure {
             generation: head.generation,
             source_next: head.source_next,
             count: head.count,
-            skipped: skipped_ids.iter().map(|&id| graph.label(id)).collect(),
             skipped_count: head.skipped_count,
             missing: walk.missing_ids(),
             runs: coverage.runs().to_vec(),
+            warnings: Vec::new(),
         })
     }
 
