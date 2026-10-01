@@ -12,28 +12,49 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(clippy::module_name_repetitions)]
 
+// On disk the source is grouped by layer, with each module's tests beside it:
+//   engine/  the storage engine: packfiles, shards, journal, database, layout,
+//            the hash index, templates and record classes;
+//   graph/   ordered, adjacency and closure primitives built on the engine:
+//            short ids, closure generations, logical heads, bitmap sets, the
+//            timeline, auxiliary indexes and the graph helpers;
+//   matrix/  the Matrix-specific adapters: event adjacency, room-version
+//            policy, state groups, auth closures and the room auth facade.
+// The module tree stays flat: each module below names its file with `#[path]`,
+// so every `crate::journal::...` and `mtxdb::journal::...` path is unchanged.
+
 /// Transitive auth closures: pure in-memory computation plus the persisted
 /// generation layer, both under `bitmaps`.
 #[cfg(feature = "bitmaps")]
+#[path = "matrix/auth_closure.rs"]
 pub mod auth_closure;
 /// Named application-owned lookup indexes sharing the normal packfile engine.
+#[path = "graph/auxiliary.rs"]
 pub mod auxiliary;
 /// Domain-tagged `u32` bitmap sets with generic set algebra.
 #[cfg(feature = "bitmaps")]
+#[path = "graph/bitmap_set.rs"]
 pub mod bitmap_set;
 /// Verify-once decoded-node cache with O(1) LRU eviction, plus a pinned-node set.
+#[path = "engine/cache/mod.rs"]
 pub mod cache;
 /// Persisted closure generations published through a logical head.
+#[path = "graph/closure_store.rs"]
 pub mod closure_store;
 /// Compressed sparse row graph for deterministic topological ordering.
+#[path = "graph/csr/mod.rs"]
 pub mod csr;
 /// In-memory dependency DAG used to track unresolved node references.
+#[path = "graph/dag/mod.rs"]
 pub mod dag;
 /// Root-level handle that opens every pool behind one shared WAL fence.
+#[path = "engine/database.rs"]
 pub mod database;
 /// Frontier tracking for nodes awaiting their dependencies before being writable.
+#[path = "graph/frontier.rs"]
 pub mod frontier;
 /// Lossy, append-only index mapping content hashes to packfile locations.
+#[path = "engine/index/mod.rs"]
 pub mod index;
 /// Checksummed append-only journal primitives for durable group commits.
 ///
@@ -43,48 +64,69 @@ pub mod index;
 /// *read-committed overlay* built on top of it — letting a separate OS process
 /// observe a live writer's committed-but-not-yet-checkpointed data — is always
 /// available too; see `packfile::storage::read_journal`.
+#[path = "engine/journal.rs"]
 pub mod journal;
 /// Database-root layout and named independent packfile pools.
+#[path = "engine/layout.rs"]
 pub mod layout;
 /// Stable logical-ID to current physical-record pointers.
+#[path = "graph/logical_head.rs"]
 pub mod logical_head;
 /// Matrix event adjacency (`prev`, `auth`, relations) over the short-id primitives.
+#[path = "matrix/matrix_adjacency.rs"]
 pub mod matrix_adjacency;
 /// Matrix-specific room-version policy.
+#[path = "matrix/matrix_policy.rs"]
 pub mod matrix_policy;
 /// On-disk packfile format and the storage engine built on top of it.
+#[path = "engine/packfile/mod.rs"]
 pub mod packfile;
 /// Per-record retention, durability, and ordering policy.
+#[path = "engine/record_class.rs"]
 pub mod record_class;
 /// Public façade and error surface over a room's auth closures.
 #[cfg(feature = "bitmaps")]
+#[path = "matrix/room_auth.rs"]
 pub mod room_auth;
 /// Fixed-size shard file pool that packfiles are written into.
+#[path = "engine/shard.rs"]
 pub mod shard;
 /// Room-scoped dense `u32` short ids and compact adjacency lists.
+#[path = "graph/short_id.rs"]
 pub mod short_id;
 /// Matrix state-group instance identity and record layout.
+#[path = "matrix/state_group.rs"]
 pub mod state_group;
 /// Core node/storage types and the top-level `StorageEngine`.
+#[path = "engine/storage.rs"]
 pub mod storage;
 /// Executable policy primitives for application collection templates.
+#[path = "engine/template.rs"]
 pub mod template;
 /// Persisted, ordered timeline index with copy-on-write roots.
+#[path = "graph/timeline.rs"]
 pub mod timeline;
 
 #[cfg(all(test, feature = "bitmaps"))]
+#[path = "matrix/test_auth_closure.rs"]
 mod test_auth_closure;
 #[cfg(all(test, feature = "bitmaps"))]
+#[path = "graph/test_bitmap_set.rs"]
 mod test_bitmap_set;
 #[cfg(test)]
+#[path = "graph/test_closure_store.rs"]
 mod test_closure_store;
 #[cfg(test)]
+#[path = "graph/test_logical_head.rs"]
 mod test_logical_head;
 #[cfg(test)]
+#[path = "matrix/test_matrix_adjacency.rs"]
 mod test_matrix_adjacency;
 #[cfg(all(test, feature = "bitmaps"))]
+#[path = "matrix/test_room_auth.rs"]
 mod test_room_auth;
 #[cfg(test)]
+#[path = "graph/test_short_id.rs"]
 mod test_short_id;
 
 pub use auxiliary::{
