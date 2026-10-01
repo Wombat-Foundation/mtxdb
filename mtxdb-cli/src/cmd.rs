@@ -8750,11 +8750,11 @@ fn cmd_import_file(
         .is_some_and(|extension| extension == "jsonl");
 
     if is_jsonl {
-        let (events, detected_collection) =
+        let (events, detected_collection, raw_adjacency) =
             parse_jsonl_events(&content).or_else(|jsonl_error| {
                 // Some existing DAG exports carry a `.jsonl` suffix despite
                 // being a pretty-printed federation JSON document.
-                parse_federation_events(&content).map_err(|federation_error| {
+                parse_federation_events(&content).map(|(events, collection)| (events, collection, Vec::new())).map_err(|federation_error| {
                     anyhow!(
                         "{jsonl_error}; also not a valid Matrix federation document: {federation_error}"
                     )
@@ -8763,13 +8763,14 @@ fn cmd_import_file(
         if events.is_empty() {
             bail!("no events found in {}", path.display());
         }
-        import_pdu_events(
+        import_pdu_events_with_raw(
             db,
             store,
             state_store,
             path,
             &events,
             &[],
+            Some(&raw_adjacency),
             detected_collection.as_deref(),
             collection_override,
             template,
@@ -9038,6 +9039,34 @@ fn import_pdu_events(
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
 ) -> anyhow::Result<()> {
+    import_pdu_events_with_raw(
+        db,
+        store,
+        state_store,
+        path,
+        events,
+        auth_chain,
+        None,
+        detected_collection,
+        collection_override,
+        template,
+        established_collections,
+    )
+}
+
+fn import_pdu_events_with_raw(
+    db: &Database,
+    store: &PackfileStorage,
+    state_store: &PackfileStorage,
+    path: &Path,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+    raw_adjacency: Option<&[rezzy::OwnedMatrixEvent]>,
+    detected_collection: Option<&str>,
+    collection_override: Option<&str>,
+    template: &CollectionTemplate,
+    established_collections: &mut HashSet<[u8; 16]>,
+) -> anyhow::Result<()> {
     if events.is_empty() {
         bail!("no events found in {}", path.display());
     }
@@ -9127,7 +9156,7 @@ fn import_pdu_events(
     // per room, so a structural conflict (the same event with a different prev or
     // auth) rejects the import before any primary write and leaves no partial
     // adjacency; a later re-import repairs adjacency for events written without it.
-    record_matrix_adjacency(db, template, events)?;
+    record_matrix_adjacency_with_raw(db, template, events, raw_adjacency)?;
 
     // Keep physical event order causal even when the input is newest-first.
     // This is especially important for establishment batches: the metadata
@@ -9485,9 +9514,16 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
     Ok(established)
 }
 
-fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
+fn parse_jsonl_events(
+    content: &[u8],
+) -> anyhow::Result<(
+    Vec<OwnedValue>,
+    Option<String>,
+    Vec<rezzy::OwnedMatrixEvent>,
+)> {
     let text = std::str::from_utf8(content).context("input is not valid UTF-8 JSONL")?;
     let mut events = Vec::new();
+    let mut raw_lines = Vec::new();
     let mut raw_detected_collection = None;
     // Reusable scratch for zero-alloc room_id extraction from raw bytes.
     // Allocated once here, grows to fit the largest event, then zero-alloc
@@ -9510,10 +9546,13 @@ fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option
         let event = simd_json::to_owned_value(&mut bytes)
             .with_context(|| format!("invalid JSONL event on line {line_number}"))?;
         events.push(event);
+        raw_lines.push(line.as_bytes());
     }
     let detected_collection = raw_detected_collection
         .or_else(|| events.iter().find_map(event_room_id).map(str::to_owned));
-    Ok((events, detected_collection))
+    let raw_adjacency = rezzy::OwnedMatrixEvent::extract_batch(&raw_lines)
+        .map_err(|error| anyhow!("extracting raw Matrix adjacency metadata: {error:?}"))?;
+    Ok((events, detected_collection, raw_adjacency))
 }
 
 fn parse_federation_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
@@ -11271,6 +11310,15 @@ struct MatrixEventFields {
 }
 
 impl MatrixEventFields {
+    fn from_owned(event: &rezzy::OwnedMatrixEvent) -> Self {
+        Self {
+            event_id: event.event_id.clone().unwrap_or_default(),
+            prev: event.prev_events.clone(),
+            auth: event.auth_events.clone(),
+            relation: event.relates_to.clone(),
+        }
+    }
+
     fn from_event(event_id: &str, event: &OwnedValue) -> Self {
         let mut fields = Self {
             event_id: event_id.to_owned(),
@@ -11350,6 +11398,15 @@ fn record_matrix_adjacency(
     template: &CollectionTemplate,
     events: &[OwnedValue],
 ) -> anyhow::Result<()> {
+    record_matrix_adjacency_with_raw(db, template, events, None)
+}
+
+fn record_matrix_adjacency_with_raw(
+    db: &Database,
+    template: &CollectionTemplate,
+    events: &[OwnedValue],
+    raw_adjacency: Option<&[rezzy::OwnedMatrixEvent]>,
+) -> anyhow::Result<()> {
     if !matches!(
         &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
@@ -11358,14 +11415,15 @@ fn record_matrix_adjacency(
     }
     // Ordered, so the order adjacency is recorded in is the same on every run.
     let mut rooms: BTreeMap<&str, Vec<MatrixEventFields>> = BTreeMap::new();
-    for event in events {
+    for (index, event) in events.iter().enumerate() {
         let (Some(room_id), Some(event_id)) = (event_room_id(event), event_id(event)) else {
             continue;
         };
-        rooms
-            .entry(room_id)
-            .or_default()
-            .push(MatrixEventFields::from_event(event_id, event));
+        let fields = raw_adjacency
+            .and_then(|raw| raw.get(index))
+            .map(MatrixEventFields::from_owned)
+            .unwrap_or_else(|| MatrixEventFields::from_event(event_id, event));
+        rooms.entry(room_id).or_default().push(fields);
     }
     for (room_id, fields) in rooms {
         let room = RoomAuth::new(ShardType::Edges, room_id);
