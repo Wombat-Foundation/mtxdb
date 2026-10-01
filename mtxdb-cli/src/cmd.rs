@@ -9488,6 +9488,11 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
 fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
     let text = std::str::from_utf8(content).context("input is not valid UTF-8 JSONL")?;
     let mut events = Vec::new();
+    let mut raw_detected_collection = None;
+    // Reusable scratch for zero-alloc room_id extraction from raw bytes.
+    // Allocated once here, grows to fit the largest event, then zero-alloc
+    // on every subsequent call (steady-state: 0 heap allocations per event).
+    let mut scratch = rezzy::MatrixEventScratch::with_capacity(16, 16, 64);
     for (line_number, line) in text.lines().enumerate() {
         let line_number = line_number
             .checked_add(1)
@@ -9496,12 +9501,18 @@ fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option
         if line.is_empty() {
             continue;
         }
+        if raw_detected_collection.is_none() {
+            if let Ok(view) = rezzy::extract_matrix_event_into(line.as_bytes(), &mut scratch) {
+                raw_detected_collection = view.room_id.map(str::to_owned);
+            }
+        }
         let mut bytes = line.as_bytes().to_vec();
         let event = simd_json::to_owned_value(&mut bytes)
             .with_context(|| format!("invalid JSONL event on line {line_number}"))?;
         events.push(event);
     }
-    let detected_collection = events.iter().find_map(event_room_id).map(str::to_owned);
+    let detected_collection = raw_detected_collection
+        .or_else(|| events.iter().find_map(event_room_id).map(str::to_owned));
     Ok((events, detected_collection))
 }
 
