@@ -445,3 +445,208 @@ fn a_lowered_max_id_refuses_inside_the_transaction() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+fn plain_edges<'a>(targets: &[&'a [u8]]) -> Vec<EdgeKey<'a>> {
+    targets
+        .iter()
+        .map(|target| EdgeKey::plain(target))
+        .collect()
+}
+
+/// Events that reference each other share ids, and the whole batch is one
+/// transaction.
+#[test]
+fn a_batch_allocates_once_and_events_may_reference_each_other() {
+    let root = test_root("batch-shared");
+    let db = Database::open(root.clone()).unwrap();
+    let a_edges = plain_edges(&[b"$b"]);
+    let b_edges = plain_edges(&[b"$c"]);
+    let a_families = [FamilyEdges {
+        family: PLAIN,
+        edges: &a_edges,
+    }];
+    let b_families = [FamilyEdges {
+        family: PLAIN,
+        edges: &b_edges,
+    }];
+    let recorded = index()
+        .record_events(
+            &db,
+            &[
+                BatchEvent {
+                    owner: b"$a",
+                    families: &a_families,
+                },
+                BatchEvent {
+                    owner: b"$b",
+                    families: &b_families,
+                },
+            ],
+        )
+        .unwrap();
+    // First-appearance order: $a, $b (a's target), $c (b's target).
+    assert_eq!(recorded[0].id, 1);
+    assert_eq!(recorded[1].id, 2);
+    assert_eq!(index().counter(&db).unwrap(), 4);
+    let first = index().edges(&db, 1, PLAIN).unwrap().unwrap();
+    let second = index().edges(&db, 2, PLAIN).unwrap().unwrap();
+    assert_eq!(first.iter().map(|e| e.target).collect::<Vec<_>>(), vec![2]);
+    assert_eq!(second.iter().map(|e| e.target).collect::<Vec<_>>(), vec![3]);
+    assert!(
+        index().edges(&db, 3, PLAIN).unwrap().is_none(),
+        "$c was only referenced, so it has no edge record"
+    );
+    assert!(index().verify(&db, &[PLAIN]).unwrap().is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A batch whose later event conflicts with stored data publishes nothing, not
+/// even the earlier events that were fine.
+#[test]
+fn a_failed_batch_publishes_nothing() {
+    let root = test_root("batch-atomic");
+    let db = Database::open(root.clone()).unwrap();
+    index()
+        .record_edges(&db, b"$stored", PLAIN, &[b"$p"])
+        .unwrap();
+    let counter = index().counter(&db).unwrap();
+
+    let ok_edges = plain_edges(&[b"$x"]);
+    let conflict_edges = plain_edges(&[b"$different"]);
+    let ok = [FamilyEdges {
+        family: PLAIN,
+        edges: &ok_edges,
+    }];
+    let conflict = [FamilyEdges {
+        family: PLAIN,
+        edges: &conflict_edges,
+    }];
+    let error = index()
+        .record_events(
+            &db,
+            &[
+                BatchEvent {
+                    owner: b"$fine",
+                    families: &ok,
+                },
+                BatchEvent {
+                    owner: b"$stored",
+                    families: &conflict,
+                },
+            ],
+        )
+        .unwrap_err();
+    assert!(matches!(error, StorageError::Collision(_)), "{error}");
+    assert_eq!(
+        index().counter(&db).unwrap(),
+        counter,
+        "no id was allocated"
+    );
+    assert_eq!(index().lookup(&db, b"$fine").unwrap(), None);
+    assert_eq!(index().lookup(&db, b"$x").unwrap(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The same owner twice in a batch matches or collides; it never stages two
+/// writes of one record.
+#[test]
+fn a_duplicate_owner_in_a_batch_matches_or_collides() {
+    let root = test_root("batch-duplicate");
+    let db = Database::open(root.clone()).unwrap();
+    let edges = plain_edges(&[b"$p"]);
+    let other = plain_edges(&[b"$q"]);
+    let same = [FamilyEdges {
+        family: PLAIN,
+        edges: &edges,
+    }];
+    let different = [FamilyEdges {
+        family: PLAIN,
+        edges: &other,
+    }];
+    let twice = index()
+        .record_events(
+            &db,
+            &[
+                BatchEvent {
+                    owner: b"$e",
+                    families: &same,
+                },
+                BatchEvent {
+                    owner: b"$e",
+                    families: &same,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(twice[0].id, twice[1].id);
+
+    let error = index()
+        .record_events(
+            &db,
+            &[
+                BatchEvent {
+                    owner: b"$fresh",
+                    families: &same,
+                },
+                BatchEvent {
+                    owner: b"$fresh",
+                    families: &different,
+                },
+            ],
+        )
+        .unwrap_err();
+    assert!(matches!(error, StorageError::Collision(_)), "{error}");
+    assert_eq!(index().lookup(&db, b"$fresh").unwrap(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Running out of ids part-way through a batch publishes none of it.
+#[test]
+fn exhaustion_mid_batch_publishes_nothing() {
+    let root = test_root("batch-exhausted");
+    let db = Database::open(root.clone()).unwrap();
+    index().get_or_create(&db, &[b"$seed"]).unwrap();
+    index()
+        .set_counter_for_test(&db, SHORT_ID_MAX.saturating_sub(1))
+        .unwrap();
+
+    let first_edges = plain_edges(&[b"$t1"]);
+    let second_edges = plain_edges(&[b"$t2"]);
+    let first = [FamilyEdges {
+        family: PLAIN,
+        edges: &first_edges,
+    }];
+    let second = [FamilyEdges {
+        family: PLAIN,
+        edges: &second_edges,
+    }];
+    // Two ids remain; the batch needs four ($e1, $t1, $e2, $t2).
+    let error = index()
+        .record_events(
+            &db,
+            &[
+                BatchEvent {
+                    owner: b"$e1",
+                    families: &first,
+                },
+                BatchEvent {
+                    owner: b"$e2",
+                    families: &second,
+                },
+            ],
+        )
+        .unwrap_err();
+    assert!(error.is_exhausted(), "{error}");
+    assert_eq!(
+        index().lookup(&db, b"$e1").unwrap(),
+        None,
+        "nothing published"
+    );
+    assert_eq!(index().lookup(&db, b"$t1").unwrap(), None);
+    assert!(index().record_events(&db, &[]).unwrap().is_empty());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}

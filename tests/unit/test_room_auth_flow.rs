@@ -41,22 +41,30 @@ fn expected_chain(index: usize) -> Vec<String> {
     (0..index).map(id).collect()
 }
 
+/// Import the whole room as one atomic batch.
 fn import(room: &RoomAuth, db: &Database) {
-    for index in 0..EVENTS {
-        let event_id = id(index);
-        let auth = auth_of(index);
-        let auth_refs: Vec<&str> = auth.iter().map(String::as_str).collect();
-        room.record_event(
-            db,
-            &NewEvent {
-                event_id: &event_id,
-                prev: &[],
-                auth: &auth_refs,
-                relation: None,
-            },
-        )
-        .unwrap();
-    }
+    let ids: Vec<String> = (0..EVENTS).map(id).collect();
+    let auth: Vec<Vec<String>> = (0..EVENTS).map(auth_of).collect();
+    let auth_refs: Vec<Vec<&str>> = auth
+        .iter()
+        .map(|list| list.iter().map(String::as_str).collect())
+        .collect();
+    let events: Vec<NewEvent<'_>> = ids
+        .iter()
+        .zip(&auth_refs)
+        .map(|(event_id, auth)| NewEvent {
+            event_id,
+            prev: &[],
+            auth,
+            relation: None,
+        })
+        .collect();
+    let recorded = room.record_events(db, &events).unwrap();
+    assert_eq!(
+        recorded.len(),
+        EVENTS,
+        "every event of the batch was recorded"
+    );
 }
 
 fn sorted(mut ids: Vec<String>) -> Vec<String> {

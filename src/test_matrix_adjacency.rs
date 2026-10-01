@@ -299,3 +299,104 @@ fn purge_removes_events_and_the_kind_dictionary_together() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A batch with relations stores exactly what recording one event at a time
+/// would, including the relation-kind dictionary shared across the batch.
+#[test]
+fn a_batch_matches_recording_events_one_at_a_time() {
+    let batched_root = test_root("batch-vs-single-a");
+    let single_root = test_root("batch-vs-single-b");
+    let batched_db = Database::open(batched_root.clone()).unwrap();
+    let single_db = Database::open(single_root.clone()).unwrap();
+    let batched = adjacency();
+    let single = adjacency();
+
+    let events = [
+        EventRecord {
+            event_id: "$create",
+            prev: &[],
+            auth: &[],
+            relation: None,
+        },
+        EventRecord {
+            event_id: "$msg",
+            prev: &["$create"],
+            auth: &["$create"],
+            relation: None,
+        },
+        EventRecord {
+            event_id: "$react1",
+            prev: &["$msg"],
+            auth: &["$create"],
+            relation: Some(RelationRef {
+                target: "$msg",
+                rel_type: "m.annotation",
+            }),
+        },
+        EventRecord {
+            event_id: "$react2",
+            prev: &["$react1"],
+            auth: &["$create"],
+            relation: Some(RelationRef {
+                target: "$msg",
+                rel_type: "m.annotation",
+            }),
+        },
+        EventRecord {
+            event_id: "$edit",
+            prev: &["$react2"],
+            auth: &["$create"],
+            relation: Some(RelationRef {
+                target: "$msg",
+                rel_type: "org.example.custom",
+            }),
+        },
+    ];
+
+    let ids = batched.record_events(&batched_db, &events).unwrap();
+    for event in &events {
+        single
+            .record_event(
+                &single_db,
+                event.event_id,
+                event.prev,
+                event.auth,
+                event.relation,
+            )
+            .unwrap();
+    }
+    assert_eq!(ids.len(), events.len());
+    for event in &events {
+        assert_eq!(
+            batched.prev_of(&batched_db, event.event_id).unwrap(),
+            single.prev_of(&single_db, event.event_id).unwrap(),
+            "{}",
+            event.event_id
+        );
+        assert_eq!(
+            batched.auth_of(&batched_db, event.event_id).unwrap(),
+            single.auth_of(&single_db, event.event_id).unwrap(),
+            "{}",
+            event.event_id
+        );
+        assert_eq!(
+            batched
+                .relation_of(&batched_db, event.event_id, &AlwaysVisible)
+                .unwrap(),
+            single
+                .relation_of(&single_db, event.event_id, &AlwaysVisible)
+                .unwrap(),
+            "{}",
+            event.event_id
+        );
+    }
+    assert_eq!(
+        batched.kind_id(&batched_db, "m.annotation").unwrap(),
+        single.kind_id(&single_db, "m.annotation").unwrap()
+    );
+    assert!(batched.verify(&batched_db).unwrap().is_consistent());
+    drop(batched_db);
+    drop(single_db);
+    let _ = std::fs::remove_dir_all(&batched_root);
+    let _ = std::fs::remove_dir_all(&single_root);
+}

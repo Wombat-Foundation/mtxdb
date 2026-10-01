@@ -316,26 +316,68 @@ fn a_lost_publish_race_is_a_rebuild_conflict() {
 }
 
 #[test]
-fn a_failed_batch_reports_what_was_recorded_and_is_safe_to_retry() {
+fn a_batch_is_one_transaction_and_a_failed_one_records_nothing() {
     let dir = root("batch");
     let db = Database::open(dir.clone()).unwrap();
     let room = RoomAuth::new(POOL, ROOM);
     room.record_event(&db, &event("$x", &["$p1"])).unwrap();
-    let events = [
+
+    // Events in one batch may reference each other.
+    let good = [
         event("$a", &[]),
         event("$b", &["$a"]),
-        // Same id, different auth: refused, because an event never changes.
-        event("$x", &["$p2"]),
-        event("$c", &["$b"]),
+        event("$c", &["$b", "$a"]),
     ];
-    let failure = room.record_events(&db, &events).unwrap_err();
-    assert_eq!(failure.recorded.len(), 2, "$a and $b committed before $x");
-    assert!(failure.to_string().contains("2 recorded"));
+    let recorded = room.record_events(&db, &good).unwrap();
+    assert_eq!(recorded.len(), 3);
+    assert_eq!(room.auth_chain(&db, "$c").unwrap().len(), 2);
 
-    // The committed events are there, and re-running the prefix is a no-op.
-    assert_eq!(room.auth_edges(&db, "$b").unwrap(), vec!["$a"]);
-    let again = room.record_events(&db, &events[..2]).unwrap();
-    assert_eq!(again, failure.recorded);
+    // A batch with a conflicting event (same id, different auth) records none of
+    // it, including the events before it.
+    let bad = [
+        event("$d", &["$c"]),
+        event("$x", &["$p2"]),
+        event("$e", &["$d"]),
+    ];
+    let error = room.record_events(&db, &bad).unwrap_err();
+    assert!(
+        matches!(&error, RoomAuthError::Storage(StorageError::Collision(_))),
+        "{error}"
+    );
+    assert!(matches!(
+        room.auth_edges(&db, "$d").unwrap_err(),
+        RoomAuthError::UnknownEvent { .. }
+    ));
+    assert!(matches!(
+        room.auth_edges(&db, "$e").unwrap_err(),
+        RoomAuthError::UnknownEvent { .. }
+    ));
+
+    // Re-running a batch that already succeeded is a no-op.
+    let again = room.record_events(&db, &good).unwrap();
+    assert_eq!(again, recorded);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_oversized_batch_is_refused_whole() {
+    let dir = root("batch-limit");
+    let db = Database::open(dir.clone()).unwrap();
+    let room = RoomAuth::new(POOL, ROOM);
+    let ids: Vec<String> = (0..=crate::room_auth::MAX_BATCH_EVENTS)
+        .map(|index| format!("$e{index}"))
+        .collect();
+    let events: Vec<NewEvent<'_>> = ids.iter().map(|id| event(id, &[])).collect();
+    let error = room.record_events(&db, &events).unwrap_err();
+    assert!(
+        matches!(&error, RoomAuthError::BatchTooLarge { limit } if *limit == crate::room_auth::MAX_BATCH_EVENTS),
+        "{error}"
+    );
+    assert!(matches!(
+        room.auth_edges(&db, "$e0").unwrap_err(),
+        RoomAuthError::UnknownEvent { .. }
+    ));
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }

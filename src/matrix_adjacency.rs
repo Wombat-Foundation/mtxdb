@@ -34,9 +34,10 @@
 
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
-use crate::short_id::{EdgeFamily, EdgeKey, FamilyEdges, ShortIdIndex};
+use crate::short_id::{BatchEvent, EdgeFamily, EdgeKey, FamilyEdges, ShortIdIndex};
 use crate::storage::StorageError;
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
+use std::collections::HashMap;
 
 /// Family of an event's `prev_events`.
 pub const PREV: EdgeFamily = EdgeFamily::plain(1);
@@ -93,6 +94,20 @@ pub struct RelationRef<'a> {
     pub target: &'a str,
     /// The relation type string.
     pub rel_type: &'a str,
+}
+
+/// An event to record: its `prev` and `auth` events and, optionally, its
+/// relation to another event.
+#[derive(Debug, Clone, Copy)]
+pub struct EventRecord<'a> {
+    /// The event id.
+    pub event_id: &'a str,
+    /// The event's `prev_events`.
+    pub prev: &'a [&'a str],
+    /// The event's `auth_events`.
+    pub auth: &'a [&'a str],
+    /// The event's relation, if it has one.
+    pub relation: Option<RelationRef<'a>>,
 }
 
 /// Result of [`MatrixAdjacency::verify`].
@@ -206,6 +221,96 @@ impl MatrixAdjacency {
             ],
         )?;
         Ok(recorded.id)
+    }
+
+    /// Record several events in **one** transaction, returning each event's
+    /// short id in order.
+    ///
+    /// Either every event is recorded or none is. Events may reference each
+    /// other, and the same event twice with the same data is a no-op. Relation
+    /// kinds are allocated first, each in its own idempotent and permanent
+    /// transaction, so a failure leaves at most unused dictionary entries.
+    ///
+    /// # Errors
+    /// As [`Self::record_event`], applied to the whole batch.
+    pub fn record_events(
+        &self,
+        db: &Database,
+        events: &[EventRecord<'_>],
+    ) -> Result<Vec<u32>, StorageError> {
+        struct Prepared<'a> {
+            owner: &'a [u8],
+            prev: Vec<EdgeKey<'a>>,
+            auth: Vec<EdgeKey<'a>>,
+            relation: Vec<EdgeKey<'a>>,
+        }
+        let mut kinds: HashMap<&str, u16> = HashMap::new();
+        let mut prepared: Vec<Prepared<'_>> = Vec::with_capacity(events.len());
+        for event in events {
+            let relation = match event.relation {
+                Some(relation) => {
+                    let kind = if let Some(kind) = kinds.get(relation.rel_type) {
+                        *kind
+                    } else {
+                        let kind = self.kind_id(db, relation.rel_type)?;
+                        kinds.insert(relation.rel_type, kind);
+                        kind
+                    };
+                    vec![EdgeKey {
+                        target: relation.target.as_bytes(),
+                        kind,
+                    }]
+                }
+                None => Vec::new(),
+            };
+            prepared.push(Prepared {
+                owner: event.event_id.as_bytes(),
+                prev: event
+                    .prev
+                    .iter()
+                    .map(|id| EdgeKey::plain(id.as_bytes()))
+                    .collect(),
+                auth: event
+                    .auth
+                    .iter()
+                    .map(|id| EdgeKey::plain(id.as_bytes()))
+                    .collect(),
+                relation,
+            });
+        }
+        let families: Vec<[FamilyEdges<'_>; 3]> = prepared
+            .iter()
+            .map(|event| {
+                [
+                    FamilyEdges {
+                        family: PREV,
+                        edges: &event.prev,
+                    },
+                    FamilyEdges {
+                        family: AUTH,
+                        edges: &event.auth,
+                    },
+                    FamilyEdges {
+                        family: RELATIONS,
+                        edges: &event.relation,
+                    },
+                ]
+            })
+            .collect();
+        let batch: Vec<BatchEvent<'_>> = prepared
+            .iter()
+            .zip(&families)
+            .map(|(event, families)| BatchEvent {
+                owner: event.owner,
+                families,
+            })
+            .collect();
+        Ok(self
+            .events
+            .record_events(db, &batch)?
+            .into_iter()
+            .map(|recorded| recorded.id)
+            .collect())
     }
 
     /// The room-local short id of `event_id`, if it has been recorded or

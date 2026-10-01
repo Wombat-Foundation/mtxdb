@@ -141,6 +141,16 @@ pub struct FamilyEdges<'a> {
     pub edges: &'a [EdgeKey<'a>],
 }
 
+/// One event of a [`ShortIdIndex::record_events`](crate::short_id::ShortIdIndex::record_events)
+/// batch: an owner key and its edge lists.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchEvent<'a> {
+    /// The owner's key.
+    pub owner: &'a [u8],
+    /// The owner's edge lists, one per family.
+    pub families: &'a [FamilyEdges<'a>],
+}
+
 /// Outcome of [`ShortIdIndex::record_event`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedEvent {
@@ -398,6 +408,66 @@ impl ShortIdIndex {
         }
         self.write_with_retry(db, &keys, Some(families))
             .map(|(_, recorded)| recorded)
+    }
+
+    /// Record several events' edge lists in **one** transaction.
+    ///
+    /// Ids are allocated once for every owner and target across the whole batch,
+    /// so events that reference each other share ids, and either every event is
+    /// recorded or none is. The same owner twice with the same lists is a no-op;
+    /// with different lists it is a collision error and nothing is published.
+    /// Returns one [`RecordedEvent`] per input, in order.
+    ///
+    /// The transaction layer bounds how much one transaction may stage, so a
+    /// caller with a very large import should split it into batches.
+    ///
+    /// # Errors
+    /// As [`Self::record_event`], applied to the whole batch.
+    pub fn record_events(
+        &self,
+        db: &Database,
+        events: &[BatchEvent<'_>],
+    ) -> Result<Vec<RecordedEvent>, StorageError> {
+        for event in events {
+            for family in event.families {
+                if !family.family.typed && family.edges.iter().any(|edge| edge.kind != 0) {
+                    return Err(StorageError::Internal(
+                        "untyped edge family given a non-zero kind".to_owned(),
+                    ));
+                }
+            }
+        }
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut keys: Vec<&[u8]> = Vec::new();
+        let mut starts: Vec<usize> = Vec::with_capacity(events.len());
+        for event in events {
+            starts.push(keys.len());
+            keys.push(event.owner);
+            for family in event.families {
+                keys.extend(family.edges.iter().map(|edge| edge.target));
+            }
+        }
+        let mut last = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let txn = db.begin_transaction();
+            match self.attempt_batch(&txn, &keys, &starts, events) {
+                Ok((recorded, commit_needed)) => {
+                    if !commit_needed {
+                        return Ok(recorded);
+                    }
+                    match txn.commit() {
+                        Ok(()) => return Ok(recorded),
+                        Err(error) if error.is_stale_read() => last = Some(error),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if error.is_stale_read() => last = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| StorageError::Internal("short-id retry budget".to_owned())))
     }
 
     /// Convenience for one untyped family: record `owner`'s edges to `targets`
@@ -677,13 +747,20 @@ impl ShortIdIndex {
     }
 
     /// Merge the requested edge lists with what is stored and stage the changes.
+    ///
+    /// The owner is `allocation.ids[start]` and its targets follow it. `claimed`
+    /// holds the lists already staged by earlier events of the same batch, so the
+    /// same owner and family twice either matches or collides rather than staging
+    /// two writes of one record.
     fn stage_edges(
         &self,
         txn: &DatabaseTransaction<'_>,
         allocation: &mut Allocation,
+        start: usize,
         families: &[FamilyEdges<'_>],
+        claimed: &mut HashMap<NodeId, Vec<Edge>>,
     ) -> Result<Vec<Vec<Edge>>, StorageError> {
-        let owner = allocation.ids[0];
+        let owner = allocation.ids[start];
         // Read every existing edge record of the owner in one call, before
         // staging, so each token matches the data it guards. A freshly
         // allocated owner has none.
@@ -699,7 +776,7 @@ impl ShortIdIndex {
             records.into_iter().zip(tokens).map(Some).collect()
         };
         let mut lists = Vec::with_capacity(families.len());
-        let mut cursor = 1usize;
+        let mut cursor = start.saturating_add(1);
         for (family, existing) in families.iter().zip(existing) {
             let mut wanted: BTreeSet<Edge> = BTreeSet::new();
             for edge in family.edges {
@@ -725,38 +802,59 @@ impl ShortIdIndex {
                     ));
                 }
             }
-            if stored.is_none() {
-                allocation.staged.push((
-                    edges_record_id(owner, family.family.id),
-                    encode_edges(family.family, &list)?,
-                    token,
-                ));
+            let record = edges_record_id(owner, family.family.id);
+            if let Some(earlier) = claimed.get(&record) {
+                // Already staged by an earlier event of this batch.
+                if *earlier != list {
+                    return Err(StorageError::Collision(
+                        "short-id edge list differs from one already in this batch".to_owned(),
+                    ));
+                }
+            } else if stored.is_none() {
+                allocation
+                    .staged
+                    .push((record, encode_edges(family.family, &list)?, token));
+                claimed.insert(record, list.clone());
             }
             lists.push(list);
         }
         Ok(lists)
     }
 
-    fn attempt(
+    /// One attempt at a whole batch: allocate every key once, stage each event's
+    /// edges, then stage the counter and records. Returns the recorded events and
+    /// whether anything needs committing.
+    fn attempt_batch(
         &self,
         txn: &DatabaseTransaction<'_>,
         keys: &[&[u8]],
-        families: Option<&[FamilyEdges<'_>]>,
-    ) -> Result<Attempt, StorageError> {
+        starts: &[usize],
+        events: &[BatchEvent<'_>],
+    ) -> Result<(Vec<RecordedEvent>, bool), StorageError> {
         let mut allocation = self.allocate(txn, keys)?;
-        let edges = match families {
-            Some(families) => self.stage_edges(txn, &mut allocation, families)?,
-            None => Vec::new(),
-        };
-        let ids = allocation.ids.clone();
-        let recorded = RecordedEvent { id: ids[0], edges };
-        if allocation.staged.is_empty() {
-            return Ok(Attempt {
-                recorded,
-                ids,
-                commit_needed: false,
+        let mut claimed: HashMap<NodeId, Vec<Edge>> = HashMap::new();
+        let mut recorded = Vec::with_capacity(events.len());
+        for (event, &start) in events.iter().zip(starts) {
+            let edges =
+                self.stage_edges(txn, &mut allocation, start, event.families, &mut claimed)?;
+            recorded.push(RecordedEvent {
+                id: allocation.ids[start],
+                edges,
             });
         }
+        if allocation.staged.is_empty() {
+            return Ok((recorded, false));
+        }
+        self.stage_allocation(txn, allocation)?;
+        Ok((recorded, true))
+    }
+
+    /// Stage the counter bump (if ids were allocated) and every record.
+    fn stage_allocation(
+        &self,
+        txn: &DatabaseTransaction<'_>,
+        allocation: Allocation,
+    ) -> Result<(), StorageError> {
         if !allocation.fresh.is_empty() {
             let (token, next) = allocation.counter;
             txn.expect_record_version(self.pool, self.collection_id, COUNTER_ID, token)?;
@@ -778,6 +876,32 @@ impl ShortIdIndex {
                 &NodeData::new(Bytes::from(payload)),
             )?;
         }
+        Ok(())
+    }
+
+    fn attempt(
+        &self,
+        txn: &DatabaseTransaction<'_>,
+        keys: &[&[u8]],
+        families: Option<&[FamilyEdges<'_>]>,
+    ) -> Result<Attempt, StorageError> {
+        let mut allocation = self.allocate(txn, keys)?;
+        let edges = match families {
+            Some(families) => {
+                self.stage_edges(txn, &mut allocation, 0, families, &mut HashMap::new())?
+            }
+            None => Vec::new(),
+        };
+        let ids = allocation.ids.clone();
+        let recorded = RecordedEvent { id: ids[0], edges };
+        if allocation.staged.is_empty() {
+            return Ok(Attempt {
+                recorded,
+                ids,
+                commit_needed: false,
+            });
+        }
+        self.stage_allocation(txn, allocation)?;
         Ok(Attempt {
             recorded,
             ids,

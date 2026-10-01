@@ -39,13 +39,18 @@ use crate::bitmap_set::BitmapSet;
 use crate::closure_store::{ClosureCoverage, ClosureSnapshot};
 use crate::database::Database;
 use crate::layout::ShardType;
-use crate::matrix_adjacency::{EventVisibility, Relation, RelationRef, AUTH};
+use crate::matrix_adjacency::{EventRecord, EventVisibility, Relation, AUTH};
 use crate::storage::StorageError;
 
 /// A room auth operation failed.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RoomAuthError {
+    /// A batch had more events than one transaction takes. Nothing was recorded.
+    BatchTooLarge {
+        /// The most events one batch may hold.
+        limit: usize,
+    },
     /// The room's `u32` short-id space or its `u16` relation-kind dictionary is
     /// full. Ids are never reused, so no further event or relation type can be
     /// assigned one, and the operation published nothing.
@@ -99,6 +104,9 @@ pub enum RoomAuthError {
 impl fmt::Display for RoomAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BatchTooLarge { limit } => {
+                write!(f, "a batch holds at most {limit} events")
+            }
             Self::OrdinalExhausted => write!(f, "room id space is exhausted"),
             Self::UnknownEvent { event_id } => write!(f, "unknown event {event_id}"),
             Self::EventNotRecorded { event_id } => {
@@ -156,50 +164,13 @@ impl From<StorageError> for RoomAuthError {
 
 /// An event to record: its `prev` and `auth` events and, optionally, its
 /// relation to another event.
-#[derive(Debug, Clone, Copy)]
-pub struct NewEvent<'a> {
-    /// The event id.
-    pub event_id: &'a str,
-    /// The event's `prev_events`.
-    pub prev: &'a [&'a str],
-    /// The event's `auth_events`.
-    pub auth: &'a [&'a str],
-    /// The event's relation, if it has one.
-    pub relation: Option<RelationRef<'a>>,
-}
+pub type NewEvent<'a> = EventRecord<'a>;
 
 /// A recorded event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordedEvent {
     /// The event's room-local short id.
     pub short_id: u32,
-}
-
-/// A batch that stopped part-way. Events before the failing one remain
-/// recorded; recording is idempotent, so re-running the whole batch is safe.
-#[derive(Debug)]
-pub struct BatchFailure {
-    /// The events that were recorded before the failure, in order.
-    pub recorded: Vec<RecordedEvent>,
-    /// What stopped the batch.
-    pub error: RoomAuthError,
-}
-
-impl fmt::Display for BatchFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "batch stopped after {} recorded event(s): {}",
-            self.recorded.len(),
-            self.error
-        )
-    }
-}
-
-impl std::error::Error for BatchFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
 }
 
 /// What [`RoomAuth::verify`] found.
@@ -241,6 +212,10 @@ impl RoomAuthVerifyReport {
         self.uncovered_events > 0
     }
 }
+
+/// The most events [`RoomAuth::record_events`] takes in one call. One
+/// transaction can only stage a bounded amount, so larger imports are split.
+pub const MAX_BATCH_EVENTS: usize = 1000;
 
 /// How many times a convenience query retries after its fresh snapshot was
 /// retired by a concurrent rebuild and retire.
@@ -288,28 +263,35 @@ impl RoomAuth {
         Ok(RecordedEvent { short_id })
     }
 
-    /// Record several events in order.
+    /// Record several events in **one** transaction, returning them in order.
     ///
-    /// This is **not atomic across the batch**: each event is its own
-    /// transaction (a single transaction across events is deferred). On failure
-    /// the events before the failing one stay recorded and the error says how
-    /// many; recording is idempotent, so the same batch can simply be run again.
+    /// Either every event is recorded or none is, so a failed batch leaves the
+    /// room as it was and can simply be run again. Events in the batch may
+    /// reference each other. A batch is limited to [`MAX_BATCH_EVENTS`] events,
+    /// because one transaction can only stage so much; split a larger import into
+    /// batches.
     ///
     /// # Errors
-    /// A [`BatchFailure`] naming the events recorded before the first error.
+    /// [`RoomAuthError::BatchTooLarge`] over the limit,
+    /// [`RoomAuthError::OrdinalExhausted`] if an id space is full, otherwise as
+    /// [`Self::record_event`]. In every case nothing from the batch is recorded.
     pub fn record_events(
         &self,
         db: &Database,
         events: &[NewEvent<'_>],
-    ) -> Result<Vec<RecordedEvent>, BatchFailure> {
-        let mut recorded = Vec::with_capacity(events.len());
-        for event in events {
-            match self.record_event(db, event) {
-                Ok(done) => recorded.push(done),
-                Err(error) => return Err(BatchFailure { recorded, error }),
-            }
+    ) -> Result<Vec<RecordedEvent>, RoomAuthError> {
+        if events.len() > MAX_BATCH_EVENTS {
+            return Err(RoomAuthError::BatchTooLarge {
+                limit: MAX_BATCH_EVENTS,
+            });
         }
-        Ok(recorded)
+        Ok(self
+            .closure
+            .adjacency()
+            .record_events(db, events)?
+            .into_iter()
+            .map(|short_id| RecordedEvent { short_id })
+            .collect())
     }
 
     /// The event's `auth_events`.
