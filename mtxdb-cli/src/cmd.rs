@@ -9,16 +9,18 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context};
 
 use mtxdb::auxiliary::AuxiliaryIndex;
+use mtxdb::matrix_adjacency::EventRecord;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
+use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
     derive_collection_id, frame_digest, record_logical_id, state_group_instance_id,
-    CollectionKeyRule, CollectionMetadata, CollectionTemplate, DatabaseLayout, DigestAlgorithm,
-    EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion, PackfileStorage,
-    PayloadPolicy, RecordIdentityRule, ShardType,
+    CollectionKeyRule, CollectionMetadata, CollectionTemplate, Database, DatabaseLayout,
+    DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion,
+    PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -784,11 +786,6 @@ fn existing_pool_dir(
 ) -> anyhow::Result<Option<PathBuf>> {
     let path = layout.pool_path(shard_type);
     Ok(path.is_dir().then_some(path))
-}
-
-/// The directory of a specific pool, regardless of `--shard-type`.
-fn pool_dir_for(cli: &Cli, shard_type: ShardType) -> anyhow::Result<PathBuf> {
-    pool_dir(&open_layout(cli)?, shard_type)
 }
 
 fn selected_pool_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
@@ -7794,35 +7791,33 @@ fn cmd_import(
     // Admission is based on the actual pack contents rather than a sidecar:
     // a stale summary must not make an unestablished room look established.
     let mut established_collections = matrix_create_collections_on_disk(&pool_dir)?;
-    // Import buffers appends (one positioned write per ~1 MiB of frames
-    // instead of one per record) and ends with a single `sync_all`, which
-    // flushes and fsyncs everything below — the explicit durability schedule
-    // the buffered append policy is meant for. A `put` command that syncs
-    // per record stays on the default eager path.
-    let store = open_store(cli)?.with_append_policy(mtxdb::shard::AppendPolicy::buffered());
+    // One `Database` owns every pool for the whole import, so the event, state and
+    // edges pools share one write-ahead log and the root's single-writer lock: no
+    // other writer can interleave halfway through a shell glob, and the per-room
+    // auth adjacency is recorded through the same database as the records it
+    // describes. Every pool the import touches is synced once at the end.
+    let layout = open_layout(cli)?;
+    let shard = cli.require_shard_type()?;
+    let db = Database::open(layout.root().to_path_buf()).with_context(|| {
+        format!(
+            "failed to open the database at `{}` for writing",
+            layout.root().display()
+        )
+    })?;
+    let store: &PackfileStorage = db.pool(shard);
+    store.set_read_plan_policy(cli.read_plan);
     // State-group mappings belong in the State pool, not the event pool.
-    let state_dir = pool_dir_for(cli, ShardType::State)?;
-    let separate_state_store = if state_dir == pool_dir {
-        None
-    } else {
-        Some({
-            let state_store = PackfileStorage::open(state_dir)
-                .context("failed to open the state pool")?
-                .with_append_policy(mtxdb::shard::AppendPolicy::buffered());
-            state_store.set_read_plan_policy(cli.read_plan);
-            state_store
-        })
-    };
-    let state_store = separate_state_store.as_ref().unwrap_or(&store);
+    let state_store: &PackfileStorage = db.pool(ShardType::State);
+    state_store.set_read_plan_policy(cli.read_plan);
     let mut failures = 0_usize;
     for (index, path) in paths.iter().enumerate() {
         if index != 0 {
             eprintln!();
         }
         if let Err(error) = cmd_import_file(
-            &store,
+            &db,
+            store,
             state_store,
-            &pool_dir,
             path,
             collection_override,
             &import_template,
@@ -7835,10 +7830,15 @@ fn cmd_import(
     store
         .sync_all()
         .context("persisting import shard and collection summaries")?;
-    if separate_state_store.is_some() {
+    if shard != ShardType::State {
         state_store
             .sync_all()
             .context("persisting state-group summaries")?;
+    }
+    if shard != ShardType::Edges {
+        db.pool(ShardType::Edges)
+            .sync_all()
+            .context("persisting auth adjacency and edges summaries")?;
     }
     if failures != 0 {
         bail!("import completed with {failures} failed input file(s)");
@@ -8736,9 +8736,9 @@ fn pack_dump_line(
     reason = "the file-level import orchestration intentionally handles several import phases"
 )]
 fn cmd_import_file(
+    db: &Database,
     store: &PackfileStorage,
     state_store: &PackfileStorage,
-    dir: &Path,
     path: &Path,
     collection_override: Option<&str>,
     template: &CollectionTemplate,
@@ -8764,9 +8764,9 @@ fn cmd_import_file(
             bail!("no events found in {}", path.display());
         }
         import_pdu_events(
+            db,
             store,
             state_store,
-            dir,
             path,
             &events,
             &[],
@@ -8803,9 +8803,9 @@ fn cmd_import_file(
             0
         } else {
             import_pdu_events(
+                db,
                 store,
                 state_store,
-                dir,
                 path,
                 &federation.pdus,
                 &federation.auth_chain,
@@ -8825,22 +8825,15 @@ fn cmd_import_file(
 
         // Import auth chain events into the edges shard pool.
         if !federation.auth_chain.is_empty() {
-            // Derive the edges pool dir from the event pool dir.
-            // pool_dir is {root}/pools/mtpl-event; edges is {root}/pools/mtpl-edges.
-            let edges_dir = dir
-                .parent()
-                .map(|p| p.join("mtpl-edges"))
-                .context("deriving edges pool path")?;
-            fs::create_dir_all(&edges_dir)?;
-            let auth_store = PackfileStorage::open(edges_dir).context("opening edges store")?;
-            // This open bypasses `open_store`, so carry the caller's
-            // `--read-plan` choice over from the event store instead of
-            // silently running the default.
+            // The auth chain's event records go to the edges pool, through the same
+            // database as the rest of the import.
+            let auth_store: &PackfileStorage = db.edges();
+            // Carry the caller's `--read-plan` choice over from the event store.
             auth_store.set_read_plan_policy(store.read_plan_policy());
-            // Resolve the derived adjacency records before writing any auth
-            // events, so a structural conflict rejects the import before the
-            // edges pool is mutated.
-            let edge_plan = plan_matrix_edges(&auth_store, template, &federation.auth_chain)?;
+            // Record the derived adjacency before writing any auth events, so a
+            // structural conflict rejects the import before the edges pool is
+            // mutated.
+            record_matrix_adjacency(db, template, &federation.auth_chain)?;
             let mut auth_count = 0u64;
             let mut auth_skipped = 0u64;
             // Auth-chain events may span multiple rooms (collections). Group
@@ -8944,7 +8937,6 @@ fn cmd_import_file(
                     auth_count = auth_count.saturating_add(to_write.len() as u64);
                 }
             }
-            write_matrix_edges(&auth_store, edge_plan)?;
             auth_store.sync_all()?;
             eprintln!(
                 "imported {auth_count} edges events ({} dangling references)",
@@ -9035,9 +9027,9 @@ fn import_room_version(
     reason = "the PDU import phase intentionally owns validation, batching, and state-group work"
 )]
 fn import_pdu_events(
+    db: &Database,
     store: &PackfileStorage,
     state_store: &PackfileStorage,
-    dir: &Path,
     path: &Path,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
@@ -9131,19 +9123,11 @@ fn import_pdu_events(
             to_write.push((id_bytes, data));
         }
     }
-    // Resolve the derived adjacency records before touching the event pool. A
-    // structural conflict (same source key, different prev/auth) is thus
-    // rejected before any primary write, keeping the event and edges pools in
-    // step; a later re-import repairs any missing derived records.
-    let edge_dir = dir
-        .parent()
-        .map(|parent| parent.join("mtpl-edges"))
-        .context("deriving edges pool path")?;
-    fs::create_dir_all(&edge_dir)?;
-    let edge_store = PackfileStorage::open(edge_dir)
-        .context("opening edges store")?
-        .with_append_policy(mtxdb::shard::AppendPolicy::buffered());
-    let edge_plan = plan_matrix_edges(&edge_store, template, events)?;
+    // Record the auth adjacency before touching the event pool. The batch is atomic
+    // per room, so a structural conflict (the same event with a different prev or
+    // auth) rejects the import before any primary write and leaves no partial
+    // adjacency; a later re-import repairs adjacency for events written without it.
+    record_matrix_adjacency(db, template, events)?;
 
     // Keep physical event order causal even when the input is newest-first.
     // This is especially important for establishment batches: the metadata
@@ -9177,9 +9161,6 @@ fn import_pdu_events(
         store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
-
-    write_matrix_edges(&edge_store, edge_plan)?;
-    edge_store.sync_all()?;
 
     // Replayed batches still need state-group repair when the derived index is
     // incomplete, but a complete replay should not rebuild the whole DAG.
@@ -11261,352 +11242,123 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
     edges
 }
 
-const EDGE_MAGIC: &[u8] = b"EDG1";
-const EDGE_ID_BYTES: usize = 16;
-const EDGE_COUNT_BYTES: usize = 4;
+/// The longest `rel_type` the importer records. Longer values are not real
+/// relation types and are dropped, not errors.
+const MAX_RELATION_TYPE_BYTES: usize = 255;
 
-/// Adjacency records an import would append, grouped by collection.
-type MatrixEdgePlan = Vec<([u8; 16], Vec<(NodeId, NodeData)>)>;
+/// One Matrix event's auth-index fields, borrowed from the parsed event.
+struct MatrixEventFields<'a> {
+    event_id: &'a str,
+    prev: Vec<&'a str>,
+    auth: Vec<&'a str>,
+    /// `(target event id, relation type)` from `content.m.relates_to`.
+    relation: Option<(&'a str, &'a str)>,
+}
 
-/// Resolve the compact adjacency records an import would append for each
-/// Matrix event. The source's 128-bit logical ID is the pack record key; the
-/// payload stores typed target IDs, not repeated source/target event-ID
-/// strings.
+impl<'a> MatrixEventFields<'a> {
+    fn from_event(event_id: &'a str, event: &'a OwnedValue) -> Self {
+        let mut fields = Self {
+            event_id,
+            prev: Vec::new(),
+            auth: Vec::new(),
+            relation: None,
+        };
+        let OwnedValue::Object(object) = event else {
+            return fields;
+        };
+        for (field, targets) in [
+            ("prev_events", &mut fields.prev),
+            ("auth_events", &mut fields.auth),
+        ] {
+            if let Some(OwnedValue::Array(values)) = object.get(field) {
+                for value in values.iter() {
+                    // Room versions 1 and 2 reference `[event_id, hashes]`.
+                    let target = match value {
+                        OwnedValue::String(id) => Some(id.as_str()),
+                        OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        targets.push(target);
+                    }
+                }
+            }
+        }
+        // One relation per event, from `rel_type` and `event_id`, as Synapse's
+        // `event_relations` stores it. A bare `m.in_reply_to` reply fallback has no
+        // `rel_type` and is not a relation there either.
+        if let Some(OwnedValue::Object(content)) = object.get("content") {
+            if let Some(OwnedValue::Object(relates_to)) = content.get("m.relates_to") {
+                if let (Some(OwnedValue::String(rel_type)), Some(OwnedValue::String(target))) =
+                    (relates_to.get("rel_type"), relates_to.get("event_id"))
+                {
+                    // `rel_type` is user-supplied and becomes a dictionary entry, so
+                    // one too long to be a real identifier is dropped rather than
+                    // failing the whole import. Relations are best-effort here.
+                    if rel_type.len() <= MAX_RELATION_TYPE_BYTES {
+                        fields.relation = Some((target.as_str(), rel_type.as_str()));
+                    }
+                }
+            }
+        }
+        fields
+    }
+
+    fn as_record(&self) -> EventRecord<'_> {
+        EventRecord {
+            event_id: self.event_id,
+            prev: &self.prev,
+            auth: &self.auth,
+            relation: self.relation.map(|(target, rel_type)| {
+                mtxdb::matrix_adjacency::RelationRef { target, rel_type }
+            }),
+        }
+    }
+}
+
+/// Record each Matrix event's `prev_events`, `auth_events` and relation in its
+/// room's auth index, one atomic batch per room.
 ///
-/// Decodes and reconciles against the store without mutating it. Splitting the
-/// read/reconcile pass from the write lets an importer reject a structural
-/// conflict *before* it appends the primary event records, so a conflicting
-/// input cannot leave the event and edges pools out of step.
-fn plan_matrix_edges(
-    store: &PackfileStorage,
+/// Parent references are Matrix event IDs, so a record identity other than
+/// `/event_id` cannot name a referenced event; those templates record nothing.
+///
+/// Call this before writing the primary event records: a structural conflict (the
+/// same event with different `prev` or `auth`) is rejected as a unit before any
+/// event is written, and the batch is atomic, so a failure leaves no partial
+/// adjacency. Recording is idempotent, so a later re-import repairs adjacency for
+/// events that were written but not recorded.
+fn record_matrix_adjacency(
+    db: &Database,
     template: &CollectionTemplate,
     events: &[OwnedValue],
-) -> anyhow::Result<MatrixEdgePlan> {
-    // Parent references contain Matrix event IDs, so a custom record identity
-    // such as /sender cannot be derived for a referenced event. The checked-in
-    // Matrix importer profile requires /event_id; generic templates that use
-    // another identity do not publish MtxAdjacency records.
+) -> anyhow::Result<()> {
     if !matches!(
         &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
     ) {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    // Ordered maps so the written record order is deterministic across runs
-    // (`put_many` preserves caller order); a `HashMap` would randomize it.
-    let mut by_collection: BTreeMap<[u8; 16], BTreeMap<NodeId, MtxAdjacency>> = BTreeMap::new();
+    // Ordered, so the order adjacency is recorded in is the same on every run.
+    let mut rooms: BTreeMap<&str, Vec<MatrixEventFields<'_>>> = BTreeMap::new();
     for event in events {
-        let Some(source_id) = template_node_id(template, event)? else {
+        let (Some(room_id), Some(event_id)) = (event_room_id(event), event_id(event)) else {
             continue;
         };
-        let Some(room_id) = event_room_id(event) else {
-            continue;
-        };
-        let adjacency = mtx_relationships(template, event)?;
-        // EDG1 is the initial adjacency format; it has not shipped, so no
-        // deployed legacy collection needs migration or versioned separation.
-        let collection_id = template_collection_id(template, room_id);
-        let records = by_collection.entry(collection_id).or_default();
-        if let Some(previous) = records.get_mut(&source_id) {
-            reconcile_mtx_adjacency(previous, &adjacency).with_context(|| {
-                format!(
-                    "event {} has conflicting prev/auth edges in one import",
-                    hex::encode(source_id)
-                )
-            })?;
-        } else {
-            records.insert(source_id, adjacency);
-        }
+        rooms
+            .entry(room_id)
+            .or_default()
+            .push(MatrixEventFields::from_event(event_id, event));
     }
-
-    let mut plan = Vec::new();
-    for (collection_id, records) in by_collection {
-        let ids: Vec<NodeId> = records.keys().copied().collect();
-        let existing = store.get_many(&collection_id, &ids)?;
-        let mut to_write = Vec::new();
-        for (id, old) in ids.into_iter().zip(existing) {
-            let adjacency = records
-                .get(&id)
-                .expect("each requested source ID came from records");
-            if let Some(old) = old {
-                let mut merged = decode_mtx_adjacency(&old.bytes).with_context(|| {
-                    format!(
-                        "decoding stored edge adjacency for event {}",
-                        hex::encode(id)
-                    )
-                })?;
-                if reconcile_mtx_adjacency(&mut merged, adjacency).with_context(|| {
-                    format!(
-                        "stored edge adjacency for event {} has conflicting prev/auth edges",
-                        hex::encode(id)
-                    )
-                })? {
-                    let data = encode_mtx_adjacency(&merged)?;
-                    to_write.push((id, NodeData::new(bytes::Bytes::from(data))));
-                }
-            } else {
-                let data = encode_mtx_adjacency(adjacency)?;
-                to_write.push((id, NodeData::new(bytes::Bytes::from(data))));
-            }
+    for (room_id, fields) in rooms {
+        let room = RoomAuth::new(ShardType::Edges, room_id);
+        for chunk in fields.chunks(MAX_BATCH_EVENTS) {
+            let records: Vec<EventRecord<'_>> =
+                chunk.iter().map(MatrixEventFields::as_record).collect();
+            room.record_events(db, &records)
+                .with_context(|| format!("recording auth adjacency for room {room_id}"))?;
         }
-        if !to_write.is_empty() {
-            plan.push((collection_id, to_write));
-        }
-    }
-    Ok(plan)
-}
-
-/// Append a plan from [`plan_matrix_edges`] to the edges pool.
-fn write_matrix_edges(store: &PackfileStorage, plan: MatrixEdgePlan) -> anyhow::Result<()> {
-    for (collection_id, to_write) in plan {
-        store.put_many(&collection_id, &to_write)?;
     }
     Ok(())
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct MtxAdjacency {
-    prev: Vec<NodeId>,
-    auth: Vec<NodeId>,
-    related: Vec<(NodeId, String)>,
-}
-
-/// Require the structural event edges to agree, while monotonically unioning
-/// related edges that may arrive in a later import or duplicate batch record.
-/// Returns true only when the destination adjacency changed.
-fn reconcile_mtx_adjacency(
-    existing: &mut MtxAdjacency,
-    incoming: &MtxAdjacency,
-) -> anyhow::Result<bool> {
-    anyhow::ensure!(existing.prev == incoming.prev, "prev edges differ");
-    anyhow::ensure!(existing.auth == incoming.auth, "auth edges differ");
-    let mut changed = false;
-    for edge in &incoming.related {
-        if !existing.related.contains(edge) {
-            existing.related.push(edge.clone());
-            changed = true;
-        }
-    }
-    Ok(changed)
-}
-
-fn encode_mtx_adjacency(adjacency: &MtxAdjacency) -> anyhow::Result<Vec<u8>> {
-    let prev_count = u32::try_from(adjacency.prev.len()).context("too many prev edges")?;
-    let auth_count = u32::try_from(adjacency.auth.len()).context("too many auth edges")?;
-    let related_count = u32::try_from(adjacency.related.len()).context("too many related edges")?;
-    let related_bytes = adjacency
-        .related
-        .iter()
-        .try_fold(0usize, |sum, (_, kind)| {
-            let kind_len = u16::try_from(kind.len()).context("edge kind is too long")?;
-            sum.checked_add(EDGE_ID_BYTES)
-                .and_then(|n| n.checked_add(std::mem::size_of::<u16>()))
-                .and_then(|n| n.checked_add(usize::from(kind_len)))
-                .context("edge adjacency length overflow")
-        })?;
-    let ids_bytes = adjacency
-        .prev
-        .len()
-        .checked_add(adjacency.auth.len())
-        .and_then(|count| count.checked_mul(EDGE_ID_BYTES))
-        .context("edge adjacency length overflow")?;
-    let capacity = EDGE_MAGIC
-        .len()
-        .checked_add(3 * EDGE_COUNT_BYTES)
-        .and_then(|n| n.checked_add(ids_bytes))
-        .and_then(|n| n.checked_add(related_bytes))
-        .context("edge adjacency length overflow")?;
-    let mut out = Vec::with_capacity(capacity);
-    out.extend_from_slice(EDGE_MAGIC);
-    out.extend_from_slice(&prev_count.to_le_bytes());
-    for id in &adjacency.prev {
-        out.extend_from_slice(id);
-    }
-    out.extend_from_slice(&auth_count.to_le_bytes());
-    for id in &adjacency.auth {
-        out.extend_from_slice(id);
-    }
-    out.extend_from_slice(&related_count.to_le_bytes());
-    for (id, kind) in &adjacency.related {
-        let kind_len = u16::try_from(kind.len()).context("edge kind is too long")?;
-        out.extend_from_slice(id);
-        out.extend_from_slice(&kind_len.to_le_bytes());
-        out.extend_from_slice(kind.as_bytes());
-    }
-    debug_assert_eq!(
-        out.len(),
-        capacity,
-        "encoded adjacency must match its computed size"
-    );
-    Ok(out)
-}
-
-fn decode_mtx_adjacency(bytes: &[u8]) -> anyhow::Result<MtxAdjacency> {
-    anyhow::ensure!(
-        bytes.len() >= EDGE_MAGIC.len(),
-        "truncated edge adjacency magic"
-    );
-    anyhow::ensure!(
-        &bytes[..EDGE_MAGIC.len()] == EDGE_MAGIC,
-        "unknown edge adjacency version"
-    );
-    let mut offset = EDGE_MAGIC.len();
-    let read_count = |bytes: &[u8], offset: &mut usize| -> anyhow::Result<usize> {
-        let end = offset
-            .checked_add(EDGE_COUNT_BYTES)
-            .context("edge offset overflow")?;
-        let raw: [u8; EDGE_COUNT_BYTES] = bytes
-            .get(*offset..end)
-            .context("truncated edge adjacency count")?
-            .try_into()
-            .expect("slice length checked");
-        *offset = end;
-        Ok(u32::from_le_bytes(raw) as usize)
-    };
-    let read_ids =
-        |bytes: &[u8], offset: &mut usize, count: usize| -> anyhow::Result<Vec<NodeId>> {
-            let total = count
-                .checked_mul(EDGE_ID_BYTES)
-                .context("edge ID count overflow")?;
-            let end = offset.checked_add(total).context("edge offset overflow")?;
-            let raw = bytes.get(*offset..end).context("truncated edge IDs")?;
-            *offset = end;
-            let (ids, remainder) = raw.as_chunks::<EDGE_ID_BYTES>();
-            debug_assert!(remainder.is_empty(), "ID byte length is a multiple of 16");
-            Ok(ids.to_vec())
-        };
-    let prev_count = read_count(bytes, &mut offset)?;
-    let prev = read_ids(bytes, &mut offset, prev_count)?;
-    let auth_count = read_count(bytes, &mut offset)?;
-    let auth = read_ids(bytes, &mut offset, auth_count)?;
-    let related_count = read_count(bytes, &mut offset)?;
-    // Each related edge occupies at least an ID plus its kind length, so the
-    // count cannot exceed the remaining bytes divided by that minimum. Reject
-    // an oversized count before `Vec::with_capacity` acts on it.
-    let min_related_bytes = EDGE_ID_BYTES
-        .checked_add(std::mem::size_of::<u16>())
-        .context("edge adjacency length overflow")?;
-    let remaining = bytes
-        .len()
-        .checked_sub(offset)
-        .context("edge offset underflow")?;
-    let max_related = remaining
-        .checked_div(min_related_bytes)
-        .context("edge adjacency length overflow")?;
-    anyhow::ensure!(
-        related_count <= max_related,
-        "truncated related-edge entries"
-    );
-    let mut related = Vec::with_capacity(related_count);
-    for _ in 0..related_count {
-        let id_end = offset
-            .checked_add(EDGE_ID_BYTES)
-            .context("edge offset overflow")?;
-        let id: NodeId = bytes
-            .get(offset..id_end)
-            .context("truncated related-edge ID")?
-            .try_into()
-            .expect("slice length checked");
-        offset = id_end;
-        let kind_len_end = offset.checked_add(2).context("edge offset overflow")?;
-        let kind_len_raw: [u8; 2] = bytes
-            .get(offset..kind_len_end)
-            .context("truncated related-edge kind length")?
-            .try_into()
-            .expect("slice length checked");
-        offset = kind_len_end;
-        let kind_end = offset
-            .checked_add(usize::from(u16::from_le_bytes(kind_len_raw)))
-            .context("edge offset overflow")?;
-        let kind = std::str::from_utf8(
-            bytes
-                .get(offset..kind_end)
-                .context("truncated related-edge kind")?,
-        )?
-        .to_owned();
-        offset = kind_end;
-        related.push((id, kind));
-    }
-    anyhow::ensure!(offset == bytes.len(), "trailing bytes in edge adjacency");
-    Ok(MtxAdjacency {
-        prev,
-        auth,
-        related,
-    })
-}
-
-fn matrix_event_id_for_template(
-    template: &CollectionTemplate,
-    event_id: &str,
-) -> anyhow::Result<NodeId> {
-    let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
-        bail!("Matrix edge IDs require a pointer-based template record identity");
-    };
-    anyhow::ensure!(
-        pointer == "/event_id",
-        "Matrix edge IDs require record identity /event_id"
-    );
-    let algorithm = match template.record_id_rule.digest_algorithm {
-        DigestAlgorithm::Blake3 => "blake3-128",
-        DigestAlgorithm::Sha256 => "sha2-256",
-        DigestAlgorithm::Unknown(id) => bail!("unsupported template digest algorithm id {id}"),
-    };
-    derive_template_key(algorithm, event_id)
-}
-
-fn mtx_relationships(
-    template: &CollectionTemplate,
-    event: &OwnedValue,
-) -> anyhow::Result<MtxAdjacency> {
-    let mut adjacency = MtxAdjacency::default();
-    let OwnedValue::Object(fields) = event else {
-        return Ok(adjacency);
-    };
-    for (field, targets) in [
-        ("prev_events", &mut adjacency.prev),
-        ("auth_events", &mut adjacency.auth),
-    ] {
-        if let Some(OwnedValue::Array(values)) = fields.get(field) {
-            for value in values.iter() {
-                let target = match value {
-                    OwnedValue::String(id) => Some(id.as_str()),
-                    OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
-                    _ => None,
-                };
-                if let Some(target) = target {
-                    targets.push(matrix_event_id_for_template(template, target)?);
-                }
-            }
-        }
-    }
-    let Some(OwnedValue::Object(content)) = fields.get("content") else {
-        return Ok(adjacency);
-    };
-    let Some(OwnedValue::Object(relates_to)) = content.get("m.relates_to") else {
-        return Ok(adjacency);
-    };
-    if let (Some(OwnedValue::String(rel_type)), Some(OwnedValue::String(target))) =
-        (relates_to.get("rel_type"), relates_to.get("event_id"))
-    {
-        let kind = format!("relates_to:{rel_type}");
-        // Related edges are best-effort and EDG1 stores the kind length as a
-        // `u16`; a user-supplied `rel_type` too long to encode is dropped
-        // rather than failing the whole import.
-        if u16::try_from(kind.len()).is_ok() {
-            adjacency
-                .related
-                .push((matrix_event_id_for_template(template, target)?, kind));
-        }
-    }
-    if let Some(OwnedValue::Object(reply)) = relates_to.get("m.in_reply_to") {
-        if let Some(OwnedValue::String(target)) = reply.get("event_id") {
-            adjacency.related.push((
-                matrix_event_id_for_template(template, target)?,
-                "relates_to:m.in_reply_to".to_owned(),
-            ));
-        }
-    }
-    Ok(adjacency)
 }
 
 fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {

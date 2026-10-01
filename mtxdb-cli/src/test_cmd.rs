@@ -1,35 +1,34 @@
 use super::{
-    build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import_file, cmd_info,
-    cmd_import, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
-    collection_canonical_id,
-    compile_import_template, compute_state_groups_partial, decode_event_json_record,
-    decode_hamt_node, decode_hamt_root, decode_mtx_adjacency, default_matrix_import_template,
-    derive_template_key, display_collection_role, encode_mtx_adjacency, event_id, event_room_id,
-    event_short_id, export_envelope_line, extract_pointer_string, fmt_disk_megabytes,
-    fmt_megabytes, format_canonical_display, format_id, glob_pack_files, import_pdu_events,
+    build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import, cmd_import_file,
+    cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
+    collection_canonical_id, compile_import_template, compute_state_groups_partial,
+    decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
+    derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
+    export_envelope_line, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
+    format_canonical_display, format_id, glob_pack_files, import_pdu_events,
     interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
-    matrix_event_id_for_template, matrix_event_node_id, matrix_room_collection_id,
-    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
-    mtx_relationships, pack_identity, parse_federation_input, parse_pack_id_selector,
-    parse_pack_selectors, plan_matrix_edges, pretty_print_payload, redacted_event_bytes,
+    matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
+    meta_pools, meta_raw, pack_identity, parse_federation_input, parse_pack_id_selector,
+    parse_pack_selectors, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
     resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
     template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-    verify_auth_chain_edges, write_matrix_edges, CollectionTemplate, MatrixRoomExtension,
-    MetaReport, MtxAdjacency, PackIdentity, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
-    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, MetaReport, PackIdentity,
+    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    STATE_GROUP_NAMESPACE,
 };
 use crate::{Cli, Commands};
 use bytes::Bytes;
 use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::packfile::PackId;
+use mtxdb::room_auth::RoomAuth;
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::template::{
     CollectionKeyRule, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
 };
 use mtxdb::{
-    content_digest, derive_collection_id, DatabaseLayout, DigestAlgorithm, MatrixRoomVersion,
-    ShardType,
+    content_digest, derive_collection_id, Database, DatabaseLayout, DigestAlgorithm,
+    MatrixRoomVersion, ShardType,
 };
 use simd_json::prelude::{ValueAsScalar, ValueObjectAccess, Writable};
 use simd_json::OwnedValue;
@@ -38,17 +37,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine;
-
-/// Plan and append in one step, mirroring the production import paths that
-/// keep the two phases separate for preflight.
-fn persist_matrix_edges(
-    store: &PackfileStorage,
-    template: &CollectionTemplate,
-    events: &[OwnedValue],
-) -> anyhow::Result<()> {
-    let plan = plan_matrix_edges(store, template, events)?;
-    write_matrix_edges(store, plan)
-}
 
 fn owned_value(json: &str) -> OwnedValue {
     let mut bytes = json.as_bytes().to_vec();
@@ -1585,22 +1573,13 @@ fn sender_identity_template() -> CollectionTemplate {
 }
 
 #[allow(clippy::type_complexity)]
-fn import_fixture(
-    name: &str,
-) -> (
-    PackfileStorage,
-    PathBuf,
-    PathBuf,
-    CollectionTemplate,
-    [u8; 16],
-) {
+fn import_fixture(name: &str) -> (Database, PathBuf, PathBuf, CollectionTemplate, [u8; 16]) {
     let dir = unique_temp_dir().join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
     let template = sender_identity_template();
     let collection_id = template_collection_id(&template, "!room");
     let path = dir.join("fixture.json");
-    (store, dir, path, template, collection_id)
+    (db, dir, path, template, collection_id)
 }
 
 fn import_event(event_id_: &str, sender: &str, room: &str) -> OwnedValue {
@@ -1640,7 +1619,8 @@ fn imported_event_payload_uses_rezzy_redaction() {
 
 #[test]
 fn import_dedups_repeated_event_id_within_one_input() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_dedup");
+    let (db, _dir, path, template, collection_id) = import_fixture("import_dedup");
+    let store = db.event_dag();
     let mut established = HashSet::new();
     established.insert(collection_id);
     let events = vec![
@@ -1648,9 +1628,9 @@ fn import_dedups_repeated_event_id_within_one_input() {
         import_event("$a", "@alice", "!room"),
     ];
     import_pdu_events(
-        &store,
-        &store,
-        &dir,
+        &db,
+        store,
+        store,
         &path,
         &events,
         &[],
@@ -1678,7 +1658,8 @@ fn import_dedups_repeated_event_id_within_one_input() {
 
 #[test]
 fn import_rejects_two_event_ids_mapping_to_one_node_id() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_input_collision");
+    let (db, _dir, path, template, collection_id) = import_fixture("import_input_collision");
+    let store = db.event_dag();
     let mut established = HashSet::new();
     established.insert(collection_id);
     let events = vec![
@@ -1686,9 +1667,9 @@ fn import_rejects_two_event_ids_mapping_to_one_node_id() {
         import_event("$b", "@alice", "!room"),
     ];
     let error = import_pdu_events(
-        &store,
-        &store,
-        &dir,
+        &db,
+        store,
+        store,
         &path,
         &events,
         &[],
@@ -1711,8 +1692,8 @@ fn import_rejects_two_event_ids_mapping_to_one_node_id() {
 
 #[test]
 fn import_rejects_cross_record_event_id_collision() {
-    let (store, dir, path, template, collection_id) =
-        import_fixture("import_cross_record_collision");
+    let (db, _dir, path, template, collection_id) = import_fixture("import_cross_record_collision");
+    let store = db.event_dag();
     let existing = import_event("$c", "@alice", "!room");
     let node_id = template_node_id(&template, &existing).unwrap().unwrap();
     store
@@ -1727,9 +1708,9 @@ fn import_rejects_cross_record_event_id_collision() {
     let mut established = HashSet::new();
     established.insert(collection_id);
     let error = import_pdu_events(
-        &store,
-        &store,
-        &dir,
+        &db,
+        store,
+        store,
         &path,
         &[incoming],
         &[],
@@ -1754,7 +1735,8 @@ fn import_rejects_cross_record_event_id_collision() {
 
 #[test]
 fn import_keeps_existing_record_when_event_id_matches() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_keep_same_event");
+    let (db, dir, path, template, collection_id) = import_fixture("import_keep_same_event");
+    let store = db.event_dag();
     // Keep the derived state-group index separate from the event store so
     // this assertion measures whether the existing event record was
     // rewritten.  Replaying the event may legitimately populate a
@@ -1773,9 +1755,9 @@ fn import_keeps_existing_record_when_event_id_matches() {
     let mut established = HashSet::new();
     established.insert(collection_id);
     import_pdu_events(
-        &store,
+        &db,
+        store,
         &state_store,
-        &dir,
         &path,
         &[event],
         &[],
@@ -1794,7 +1776,8 @@ fn import_keeps_existing_record_when_event_id_matches() {
 
 #[test]
 fn importer_loads_complete_cached_state_groups_without_recomputing() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_cached_state_groups");
+    let (db, dir, path, template, collection_id) = import_fixture("import_cached_state_groups");
+    let store = db.event_dag();
     let state_store = PackfileStorage::open(dir.join("state")).unwrap();
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
@@ -1805,9 +1788,9 @@ fn importer_loads_complete_cached_state_groups_without_recomputing() {
     let mut established = HashSet::new();
     established.insert(collection_id);
     import_pdu_events(
-        &store,
+        &db,
+        store,
         &state_store,
-        &dir,
         &path,
         std::slice::from_ref(&event),
         &[],
@@ -1833,8 +1816,9 @@ fn importer_loads_complete_cached_state_groups_without_recomputing() {
 #[test]
 fn importer_ignores_the_previous_unversioned_state_group_cache() {
     const OLD_NAMESPACE: &str = "sys:matrix-state-groups";
-    let (store, dir, path, template, collection_id) =
+    let (db, dir, path, template, collection_id) =
         import_fixture("import_old_namespace_state_groups");
+    let store = db.event_dag();
     let state_store = PackfileStorage::open(dir.join("state")).unwrap();
     let old_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, OLD_NAMESPACE);
     old_aux.ensure_metadata().unwrap();
@@ -1846,9 +1830,9 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
     let mut established = HashSet::new();
     established.insert(collection_id);
     import_pdu_events(
-        &store,
+        &db,
+        store,
         &state_store,
-        &dir,
         &path,
         std::slice::from_ref(&event),
         &[],
@@ -1869,7 +1853,8 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
 
 #[test]
 fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_state_group_repair");
+    let (db, dir, path, template, collection_id) = import_fixture("import_state_group_repair");
+    let store = db.event_dag();
     let state_store = PackfileStorage::open(dir.join("state")).unwrap();
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
@@ -1879,9 +1864,9 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     let mut established = HashSet::new();
     established.insert(collection_id);
     import_pdu_events(
-        &store,
+        &db,
+        store,
         &state_store,
-        &dir,
         &path,
         std::slice::from_ref(&child),
         &[],
@@ -1897,9 +1882,9 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
         r#"{"event_id":"$parent","sender":"@server","room_id":"!room","type":"m.room.create","content":{"room_version":"11"}}"#,
     );
     import_pdu_events(
-        &store,
+        &db,
+        store,
         &state_store,
-        &dir,
         &path,
         &[repaired_parent, child],
         &[],
@@ -1938,8 +1923,8 @@ fn count_pack_records(pool_dir: &Path) -> u64 {
 fn auth_chain_reimport_writes_nothing_new() {
     let root = unique_temp_dir();
     let pool_dir = root.join("pools").join("mtpl-event");
-    std::fs::create_dir_all(&pool_dir).unwrap();
-    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
     let input = root.join("export.json");
     std::fs::write(
         &input,
@@ -1960,29 +1945,11 @@ fn auth_chain_reimport_writes_nothing_new() {
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
 
-    cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
-        &input,
-        None,
-        &template,
-        &mut established,
-    )
-    .unwrap();
+    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
     let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
     let first_import_records = count_pack_records(&auth_dir);
     // Declares the create so batch_has_create resolves for any follow-up.
-    cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
-        &input,
-        None,
-        &template,
-        &mut established,
-    )
-    .unwrap();
+    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
 
     assert_eq!(
         count_pack_records(&auth_dir),
@@ -2003,9 +1970,8 @@ fn auth_chain_reimport_writes_nothing_new() {
 #[test]
 fn import_establishment_persists_the_matrix_extension() {
     let root = unique_temp_dir();
-    let pool_dir = root.join("pools").join("mtpl-event");
-    std::fs::create_dir_all(&pool_dir).unwrap();
-    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
     let input = root.join("export.json");
     // The create and a user record share one batch, so the import writes
     // metadata and records together. The genesis record must be written
@@ -2028,16 +1994,7 @@ fn import_establishment_persists_the_matrix_extension() {
     .unwrap();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
-    cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
-        &input,
-        None,
-        &template,
-        &mut established,
-    )
-    .unwrap();
+    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
 
     let collection_id = template_collection_id(&template, "!room");
     let metadata = store
@@ -2050,7 +2007,7 @@ fn import_establishment_persists_the_matrix_extension() {
 
     // The self-describing blob is readable back through the same path
     // `info` uses, and carries the room version without touching a payload.
-    let extension = matrix_room_extension_from_store(&store, &collection_id)
+    let extension = matrix_room_extension_from_store(store, &collection_id)
         .expect("extension read back from the header");
     assert_eq!(extension.room_id.as_deref(), Some("!room"));
     assert_eq!(extension.create_event_id.as_deref(), Some("$c"));
@@ -2369,9 +2326,8 @@ fn v12_reference_event_id(event: &OwnedValue) -> String {
 #[test]
 fn import_v12_followup_batch_lands_in_the_create_collection() {
     let root = unique_temp_dir();
-    let pool_dir = root.join("pools").join("mtpl-event");
-    std::fs::create_dir_all(&pool_dir).unwrap();
-    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
 
@@ -2397,9 +2353,9 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
     )
     .unwrap();
     cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
+        &db,
+        store,
+        store,
         &create_path,
         None,
         &template,
@@ -2431,9 +2387,9 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
     )
     .unwrap();
     cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
+        &db,
+        store,
+        store,
         &message_path,
         None,
         &template,
@@ -2453,9 +2409,8 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
 #[test]
 fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
     let root = unique_temp_dir();
-    let pool_dir = root.join("pools").join("mtpl-event");
-    std::fs::create_dir_all(&pool_dir).unwrap();
-    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
 
@@ -2468,9 +2423,9 @@ fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/v12-room-slice.jsonl");
     cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
+        &db,
+        store,
+        store,
         &fixture,
         None,
         &template,
@@ -3031,317 +2986,325 @@ fn build_event_dag_resolves_prev_and_auth_edges() {
     assert_eq!(msg_node.auth.1, 2); // 2 auth_events
 }
 
+/// A database root and its (lazily created) pools, for the adjacency tests.
+fn adjacency_db(name: &str) -> (Database, PathBuf) {
+    let root = unique_temp_dir().join(name);
+    (Database::open(root.clone()).unwrap(), root)
+}
+
+fn room_adjacency(room: &str) -> mtxdb::matrix_adjacency::MatrixAdjacency {
+    mtxdb::matrix_adjacency::MatrixAdjacency::new(ShardType::Edges, room)
+}
+
 #[test]
-fn matrix_edges_persist_as_one_compact_record_per_source_event() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
-    let mut template = default_matrix_import_template();
-    template.record_id_rule.digest_algorithm = DigestAlgorithm::Sha256;
+fn matrix_adjacency_records_prev_auth_and_relation() {
+    let (db, root) = adjacency_db("adjacency_basic");
+    let template = default_matrix_import_template();
     let event = owned_value(
         r#"{"event_id":"$source","room_id":"!r:x","type":"m.room.message","prev_events":["$prev1",["$prev2",{}]],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$related"}}}"#,
     );
-    let source = template_node_id(&template, &event).unwrap().unwrap();
-    let adjacency = mtx_relationships(&template, &event).unwrap();
-    assert_eq!(adjacency.prev.len(), 2);
-    assert_eq!(adjacency.auth.len(), 1);
-    assert_eq!(adjacency.related.len(), 1);
-    let expected = encode_mtx_adjacency(&MtxAdjacency {
-        prev: vec![
-            matrix_event_id_for_template(&template, "$prev1").unwrap(),
-            matrix_event_id_for_template(&template, "$prev2").unwrap(),
-        ],
-        auth: vec![matrix_event_id_for_template(&template, "$auth").unwrap()],
-        related: vec![(
-            matrix_event_id_for_template(&template, "$related").unwrap(),
-            "relates_to:m.reference".to_owned(),
-        )],
-    })
-    .unwrap();
-    assert_eq!(&expected[..4], b"EDG1");
-    assert_eq!(decode_mtx_adjacency(&expected).unwrap(), adjacency);
+    record_matrix_adjacency(&db, &template, std::slice::from_ref(&event)).unwrap();
 
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&event)).unwrap();
-    let collection = template_collection_id(&template, "!r:x");
-    let stored = store
-        .get(&collection, &source)
+    let adjacency = room_adjacency("!r:x");
+    assert_eq!(
+        adjacency.prev_of(&db, "$source").unwrap(),
+        Some(vec!["$prev1".to_owned(), "$prev2".to_owned()]),
+        "both the plain and the [id, hashes] reference forms are recorded"
+    );
+    assert_eq!(
+        adjacency.auth_of(&db, "$source").unwrap(),
+        Some(vec!["$auth".to_owned()])
+    );
+    let relation = adjacency
+        .relation_of(&db, "$source", &mtxdb::matrix_adjacency::AlwaysVisible)
         .unwrap()
-        .expect("source event adjacency record");
-    assert_eq!(stored.bytes.as_ref(), expected.as_slice());
-    assert_eq!(count_pack_records(&root), 1);
+        .expect("the relation is recorded");
+    assert_eq!(
+        (relation.target.as_str(), relation.rel_type.as_str()),
+        ("$related", "m.reference")
+    );
 
-    // Reimport is idempotent and verifies that a source key never silently
-    // accepts a different adjacency value.
-    persist_matrix_edges(&store, &template, &[event]).unwrap();
-    assert_eq!(count_pack_records(&root), 1);
-    drop(store);
+    // Recording again is a no-op.
+    record_matrix_adjacency(&db, &template, &[event]).unwrap();
+    assert!(adjacency.verify(&db).unwrap().is_consistent());
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn mtx_adjacency_round_trip_and_rejects_malformed_records() {
-    let adjacency = MtxAdjacency {
-        prev: vec![[1; 16], [2; 16]],
-        auth: vec![[3; 16]],
-        related: vec![([4; 16], "relates_to:m.reference".to_owned())],
-    };
-    let encoded = encode_mtx_adjacency(&adjacency).unwrap();
-    assert_eq!(decode_mtx_adjacency(&encoded).unwrap(), adjacency);
-    assert!(decode_mtx_adjacency(&encoded[..encoded.len() - 1]).is_err());
-    let mut trailing = encoded;
-    trailing.push(0);
-    assert!(decode_mtx_adjacency(&trailing).is_err());
-    assert!(decode_mtx_adjacency(b"EDG9").is_err());
-    let oversized_related_count = [
-        b"EDG1".as_slice(),
-        &0u32.to_le_bytes(),
-        &0u32.to_le_bytes(),
-        &u32::MAX.to_le_bytes(),
-    ]
-    .concat();
-    assert!(decode_mtx_adjacency(&oversized_related_count).is_err());
-}
-
-#[test]
-fn mtx_edges_preserve_empty_adjacencies_and_reject_conflicts() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
+fn matrix_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
+    let (db, root) = adjacency_db("adjacency_leaf");
     let template = default_matrix_import_template();
-    let event = owned_value(
+    let leaf = owned_value(
         r#"{"event_id":"$leaf","room_id":"!r:x","type":"m.room.message","content":{"body":"leaf"}}"#,
     );
-    let source = template_node_id(&template, &event).unwrap().unwrap();
-    let collection = template_collection_id(&template, "!r:x");
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&event)).unwrap();
-    let stored = store
-        .get(&collection, &source)
-        .unwrap()
-        .expect("leaf marker");
-    assert_eq!(
-        decode_mtx_adjacency(&stored.bytes).unwrap(),
-        MtxAdjacency::default()
+    let child = owned_value(
+        r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","prev_events":["$ghost"],"auth_events":["$leaf"]}"#,
     );
+    record_matrix_adjacency(&db, &template, &[leaf, child]).unwrap();
 
-    let conflicting = encode_mtx_adjacency(&MtxAdjacency {
-        prev: vec![[8; 16]],
-        ..MtxAdjacency::default()
-    })
-    .unwrap();
-    store
-        .put(
-            &collection,
-            &source,
-            &NodeData::new(Bytes::from(conflicting)),
-        )
-        .unwrap();
-    assert!(persist_matrix_edges(&store, &template, &[event]).is_err());
-    drop(store);
+    let adjacency = room_adjacency("!r:x");
+    assert_eq!(adjacency.auth_of(&db, "$leaf").unwrap(), Some(Vec::new()));
+    assert_eq!(adjacency.prev_of(&db, "$leaf").unwrap(), Some(Vec::new()));
+    assert_eq!(
+        adjacency.auth_of(&db, "$ghost").unwrap(),
+        None,
+        "an event only referenced by another has no recorded adjacency"
+    );
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_edges_group_duplicates_per_source_and_separate_rooms() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
+fn matrix_adjacency_groups_duplicates_and_separates_rooms() {
+    let (db, root) = adjacency_db("adjacency_rooms");
     let template = default_matrix_import_template();
     let event_a = owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
     let event_a_duplicate =
         owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
     let event_b = owned_value(r#"{"event_id":"$same","room_id":"!b:x","prev_events":["$q"]}"#);
-    persist_matrix_edges(&store, &template, &[event_a, event_a_duplicate, event_b]).unwrap();
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection_a = template_collection_id(&template, "!a:x");
-    let collection_b = template_collection_id(&template, "!b:x");
-    let a = store.get(&collection_a, &source).unwrap().unwrap();
-    let b = store.get(&collection_b, &source).unwrap().unwrap();
+    record_matrix_adjacency(&db, &template, &[event_a, event_a_duplicate, event_b]).unwrap();
+
     assert_eq!(
-        decode_mtx_adjacency(&a.bytes).unwrap().prev,
-        vec![matrix_event_node_id("$p").unwrap()]
+        room_adjacency("!a:x").prev_of(&db, "$same").unwrap(),
+        Some(vec!["$p".to_owned()])
     );
     assert_eq!(
-        decode_mtx_adjacency(&b.bytes).unwrap().prev,
-        vec![matrix_event_node_id("$q").unwrap()]
+        room_adjacency("!b:x").prev_of(&db, "$same").unwrap(),
+        Some(vec!["$q".to_owned()])
     );
-    assert_eq!(count_pack_records(&root), 2);
-    drop(store);
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_edges_union_related_edges_across_batch_and_reimports() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
+fn matrix_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
+    let (db, root) = adjacency_db("adjacency_conflict");
     let template = default_matrix_import_template();
-    let event_a = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$first"}}}"#,
-    );
-    let event_b = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$second"}}}"#,
-    );
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
-
-    persist_matrix_edges(&store, &template, &[event_a.clone(), event_b.clone()]).unwrap();
-    let stored = store.get(&collection, &source).unwrap().unwrap();
-    let adjacency = decode_mtx_adjacency(&stored.bytes).unwrap();
-    assert_eq!(adjacency.prev, vec![matrix_event_node_id("$p").unwrap()]);
-    assert_eq!(adjacency.auth, vec![matrix_event_node_id("$auth").unwrap()]);
-    assert_eq!(
-        adjacency.related,
-        vec![
-            (
-                matrix_event_node_id("$first").unwrap(),
-                "relates_to:m.reference".to_owned()
-            ),
-            (
-                matrix_event_node_id("$second").unwrap(),
-                "relates_to:m.annotation".to_owned()
-            ),
-        ]
-    );
-
-    // A later import adds another related edge without changing prev/auth.
-    let event_c = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$third"}}}"#,
-    );
-    persist_matrix_edges(&store, &template, &[event_c]).unwrap();
-    let updated = store.get(&collection, &source).unwrap().unwrap();
-    assert_eq!(
-        decode_mtx_adjacency(&updated.bytes).unwrap().related.len(),
-        3
-    );
-
-    // A repeated import is a no-op, and structural-edge conflicts remain errors.
-    let records_before = count_pack_records(&root);
-    persist_matrix_edges(&store, &template, &[event_a, event_b]).unwrap();
-    assert_eq!(count_pack_records(&root), records_before);
-    let conflict = owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"]}"#);
-    assert!(persist_matrix_edges(&store, &template, &[conflict]).is_err());
-
-    drop(store);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn matrix_edges_redacted_reimport_preserves_related_edges() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
-    let template = default_matrix_import_template();
-    let unredacted = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
-    );
-    // Redaction keeps event_id, prev_events and auth_events but empties content.
-    let redacted = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
-    );
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
-
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&unredacted)).unwrap();
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&redacted))
-        .expect("a redacted re-import must not be rejected");
-
-    let stored = store.get(&collection, &source).unwrap().unwrap();
-    assert_eq!(
-        decode_mtx_adjacency(&stored.bytes).unwrap().related,
-        vec![(
-            matrix_event_node_id("$target").unwrap(),
-            "relates_to:m.reference".to_owned()
-        )],
-        "the stored related edge must survive a redacted re-import"
-    );
-
-    drop(store);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn matrix_edges_mixed_redacted_and_unredacted_duplicates_union_related() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
-    let template = default_matrix_import_template();
-    let redacted = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
-    );
-    let unredacted = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
-    );
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
-
-    // The redacted copy is seen first; the later unredacted duplicate must
-    // union its related edge rather than be rejected as a conflict.
-    persist_matrix_edges(&store, &template, &[redacted, unredacted]).unwrap();
-
-    let stored = store.get(&collection, &source).unwrap().unwrap();
-    assert_eq!(
-        decode_mtx_adjacency(&stored.bytes).unwrap().related,
-        vec![(
-            matrix_event_node_id("$target").unwrap(),
-            "relates_to:m.reference".to_owned()
-        )],
-    );
-
-    drop(store);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn matrix_edge_preflight_rejects_conflict_without_writing() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
-    let template = default_matrix_import_template();
+    let adjacency = room_adjacency("!a:x");
     let original = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
+        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"]}"#,
     );
+    record_matrix_adjacency(&db, &template, std::slice::from_ref(&original)).unwrap();
+
+    // A later import whose event differs from the recorded one fails as a unit:
+    // the good event before it is not recorded either.
+    let fine = owned_value(r#"{"event_id":"$fine","room_id":"!a:x","prev_events":["$p"]}"#);
     let conflicting = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"],"auth_events":["$auth"],"content":{}}"#,
+        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"],"auth_events":["$auth"]}"#,
     );
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
-
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&original)).unwrap();
-    let before = store.get(&collection, &source).unwrap().unwrap();
-
-    let error = plan_matrix_edges(&store, &template, &[conflicting])
-        .expect_err("a differing prev edge must be rejected during planning");
+    let error = record_matrix_adjacency(&db, &template, &[fine, conflicting])
+        .expect_err("a differing prev edge must be rejected");
     assert!(
-        error.to_string().contains("conflicting prev/auth"),
-        "saw: {error}"
+        format!("{error:#}").contains("recording auth adjacency for room !a:x"),
+        "saw: {error:#}"
     );
-
-    let after = store.get(&collection, &source).unwrap().unwrap();
+    assert_eq!(adjacency.short_id(&db, "$fine").unwrap(), None);
     assert_eq!(
-        after.bytes, before.bytes,
-        "planning must not mutate the store when it rejects a conflict"
+        adjacency.prev_of(&db, "$same").unwrap(),
+        Some(vec!["$p".to_owned()]),
+        "the recorded adjacency is untouched"
     );
 
-    drop(store);
+    // Two conflicting copies inside one batch fail the same way.
+    let first = owned_value(r#"{"event_id":"$dup","room_id":"!a:x","prev_events":["$p"]}"#);
+    let second = owned_value(r#"{"event_id":"$dup","room_id":"!a:x","prev_events":["$q"]}"#);
+    assert!(record_matrix_adjacency(&db, &template, &[first, second]).is_err());
+    assert_eq!(adjacency.short_id(&db, "$dup").unwrap(), None);
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_edges_drop_unrepresentable_relation_kind() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
+fn matrix_adjacency_keeps_a_relation_across_redacted_copies() {
+    let (db, root) = adjacency_db("adjacency_redaction");
     let template = default_matrix_import_template();
-    // A `rel_type` long enough that `relates_to:<rel_type>` cannot fit the
-    // `u16` kind length EDG1 stores.
-    let long_rel_type = "x".repeat(usize::from(u16::MAX));
-    let event = owned_value(&format!(
-        r#"{{"event_id":"$same","room_id":"!a:x","content":{{"m.relates_to":{{"rel_type":"{long_rel_type}","event_id":"$target"}}}}}}"#
+    let adjacency = room_adjacency("!a:x");
+    let visible = mtxdb::matrix_adjacency::AlwaysVisible;
+    // Redaction keeps event_id, prev_events and auth_events but empties content.
+    let unredacted = owned_value(
+        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
+    );
+    let redacted = owned_value(
+        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
+    );
+    let target = |db: &Database| {
+        adjacency
+            .relation_of(db, "$same", &visible)
+            .unwrap()
+            .map(|relation| relation.target)
+    };
+
+    record_matrix_adjacency(&db, &template, std::slice::from_ref(&unredacted)).unwrap();
+    record_matrix_adjacency(&db, &template, std::slice::from_ref(&redacted))
+        .expect("a redacted re-import must not be rejected");
+    assert_eq!(
+        target(&db).as_deref(),
+        Some("$target"),
+        "the stored relation survives a redacted re-import"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+
+    // Seen redacted first, then unredacted in the same input: the relation is added.
+    let (db, root) = adjacency_db("adjacency_redaction_order");
+    record_matrix_adjacency(&db, &template, &[redacted, unredacted]).unwrap();
+    assert_eq!(target(&db).as_deref(), Some("$target"));
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
+    let (db, root) = adjacency_db("adjacency_relation_edges");
+    let template = default_matrix_import_template();
+    let adjacency = room_adjacency("!a:x");
+    let visible = mtxdb::matrix_adjacency::AlwaysVisible;
+    // A rich-reply fallback has no `rel_type`, so it is not a relation.
+    let reply = owned_value(
+        r#"{"event_id":"$reply","room_id":"!a:x","prev_events":["$p"],"content":{"m.relates_to":{"m.in_reply_to":{"event_id":"$target"}}}}"#,
+    );
+    // A `rel_type` too long to be a real identifier is dropped, not an error.
+    let long_rel_type = "x".repeat(300);
+    let long = owned_value(&format!(
+        r#"{{"event_id":"$long","room_id":"!a:x","prev_events":["$p"],"content":{{"m.relates_to":{{"rel_type":"{long_rel_type}","event_id":"$target"}}}}}}"#
     ));
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
+    record_matrix_adjacency(&db, &template, &[reply, long])
+        .expect("an unrepresentable relation must not fail the import");
 
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&event))
-        .expect("an unrepresentable related edge must be dropped, not fail the import");
-    let stored = store.get(&collection, &source).unwrap().unwrap();
-    assert!(decode_mtx_adjacency(&stored.bytes)
-        .unwrap()
-        .related
-        .is_empty());
+    for event in ["$reply", "$long"] {
+        assert!(adjacency
+            .relation_of(&db, event, &visible)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            adjacency.prev_of(&db, event).unwrap(),
+            Some(vec!["$p".to_owned()]),
+            "the event's own adjacency is still recorded"
+        );
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
 
-    drop(store);
+#[test]
+fn matrix_adjacency_is_not_recorded_for_templates_without_event_id_identity() {
+    let (db, root) = adjacency_db("adjacency_other_identity");
+    // A record identity other than /event_id cannot name a referenced event.
+    let template = sender_identity_template();
+    let event =
+        owned_value(r#"{"event_id":"$e","room_id":"!r:x","sender":"@alice","prev_events":["$p"]}"#);
+    record_matrix_adjacency(&db, &template, &[event]).unwrap();
+    assert_eq!(room_adjacency("!r:x").short_id(&db, "$e").unwrap(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn matrix_adjacency_skips_events_without_a_room_or_event_id() {
+    let (db, root) = adjacency_db("adjacency_skips");
+    let template = default_matrix_import_template();
+    let no_room = owned_value(r#"{"event_id":"$orphan","prev_events":["$p"]}"#);
+    let no_id = owned_value(r#"{"room_id":"!r:x","prev_events":["$p"]}"#);
+    let fine = owned_value(r#"{"event_id":"$fine","room_id":"!r:x"}"#);
+    record_matrix_adjacency(&db, &template, &[no_room, no_id, fine]).unwrap();
+    let adjacency = room_adjacency("!r:x");
+    assert!(adjacency.short_id(&db, "$fine").unwrap().is_some());
+    assert_eq!(adjacency.short_id(&db, "$orphan").unwrap(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn matrix_adjacency_splits_a_large_room_into_batches() {
+    let (db, root) = adjacency_db("adjacency_large");
+    let template = default_matrix_import_template();
+    // One more than a batch holds, so the room is recorded in two transactions.
+    let count = mtxdb::room_auth::MAX_BATCH_EVENTS + 1;
+    let events: Vec<OwnedValue> = (0..count)
+        .map(|index| {
+            let auth = if index == 0 {
+                String::new()
+            } else {
+                format!(r#""$e{}""#, index - 1)
+            };
+            owned_value(&format!(
+                r#"{{"event_id":"$e{index}","room_id":"!big:x","auth_events":[{auth}]}}"#
+            ))
+        })
+        .collect();
+    record_matrix_adjacency(&db, &template, &events).unwrap();
+
+    let auth = RoomAuth::new(ShardType::Edges, "!big:x");
+    let last = format!("$e{}", count - 1);
+    assert_eq!(
+        auth.auth_chain(&db, &last).unwrap().len(),
+        count - 1,
+        "every event of both batches is recorded and chained"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_import_records_auth_adjacency_that_survives_a_reopen() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let input = root.join("export.json");
+    std::fs::write(
+        &input,
+        r#"{
+            "pdus": [
+                {"event_id":"$c","room_id":"!room","sender":"@server",
+                 "type":"m.room.create","state_key":"",
+                 "content":{"creator":"@server","room_version":"10"},
+                 "auth_events":[],"prev_events":[]},
+                {"event_id":"$m","room_id":"!room","sender":"@server",
+                 "type":"m.room.message","content":{},
+                 "auth_events":["$c","$member"],"prev_events":["$c"]},
+                {"event_id":"$x","room_id":"!room","sender":"@server",
+                 "type":"m.room.message","content":{},
+                 "auth_events":["$c","$member","$m"],"prev_events":["$m"]}
+            ],
+            "auth_chain": [
+                {"event_id":"$member","room_id":"!room","sender":"@server",
+                 "type":"m.room.member","state_key":"@server",
+                 "content":{"membership":"join"},"auth_events":["$c"]}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let template = default_matrix_import_template();
+    let mut established = HashSet::new();
+    cmd_import_file(
+        &db,
+        db.event_dag(),
+        db.event_dag(),
+        &input,
+        None,
+        &template,
+        &mut established,
+    )
+    .unwrap();
+    db.edges().sync_all().unwrap();
+    drop(db);
+
+    let db = Database::open(root.clone()).unwrap();
+    let auth = RoomAuth::new(ShardType::Edges, "!room");
+    let mut edges = auth.auth_edges(&db, "$x").unwrap();
+    edges.sort();
+    assert_eq!(
+        edges,
+        vec!["$c", "$m", "$member"],
+        "order is not part of the contract"
+    );
+    let mut chain = auth.auth_chain(&db, "$x").unwrap();
+    chain.sort();
+    assert_eq!(chain, vec!["$c", "$m", "$member"]);
+    // The auth-chain event was recorded through the same path as the PDUs.
+    assert_eq!(auth.auth_edges(&db, "$member").unwrap(), vec!["$c"]);
+    assert!(auth.auth_edges(&db, "$c").unwrap().is_empty());
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
