@@ -34,3 +34,7 @@ The default target is `overview`. Use `--limit` and `--offset` for pagination,
 Corrupt headers, truncated tails, stale checkpoints, orphaned delta epochs, and
 lock-marker anomalies are reported as diagnostics while inspection continues
 where possible.
+
+The process-safety policy for read-only tools and the `multi-reader` feature is
+documented in
+[`docs/docs/2026-09-30-process-safety-and-reader-builds.md`](docs/docs/2026-09-30-process-safety-and-reader-builds.md).
