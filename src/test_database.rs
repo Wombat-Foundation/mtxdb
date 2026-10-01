@@ -2585,8 +2585,9 @@ fn open_uses_default_pool_policies_enabling_compression() {
 fn open_with_policies_applies_per_pool_settings() {
     let root = test_root("explicit_policies");
     let mut policies = super::PoolPolicies::default();
-    policies.state.compress = false;
-    policies.edges.checksum_policy = crate::packfile::ChecksumPolicy::WriteOnly;
+    policies.for_shard_mut(ShardType::State).compress = false;
+    policies.for_shard_mut(ShardType::Edges).checksum_policy =
+        crate::packfile::ChecksumPolicy::WriteOnly;
 
     let db = Database::open_with_policies(root.clone(), policies).unwrap();
     assert!(!db.state().is_compression_enabled());
@@ -3280,16 +3281,29 @@ fn a_reader_opened_before_a_pool_exists_sees_its_first_writes() {
     );
 }
 
-/// Every pool must have its own policy slot. Adding a `ShardType` without
-/// wiring a field into `PoolPolicies` would make two pools share one.
+/// Setting one pool's policy changes that pool and no other, for every pool in
+/// `ShardType::ALL`, so a new pool cannot silently share another's slot.
 #[test]
 fn every_pool_has_its_own_policy_slot() {
-    let policies = super::PoolPolicies::default();
-    let mut addresses: Vec<*const super::PoolPolicy> = ShardType::ALL
-        .iter()
-        .map(|shard| std::ptr::from_ref(policies.for_shard(*shard)))
-        .collect();
-    addresses.sort_unstable();
-    addresses.dedup();
-    assert_eq!(addresses.len(), ShardType::ALL.len());
+    use super::{PoolPolicies, PoolPolicy};
+    let baseline = PoolPolicy::default();
+    let changed = PoolPolicy {
+        compress: !baseline.compress,
+        ..baseline
+    };
+    for shard in ShardType::ALL {
+        let policies = PoolPolicies::default().with(shard, changed);
+        for other in ShardType::ALL {
+            let expected = if other == shard { changed } else { baseline };
+            assert_eq!(
+                *policies.for_shard(other),
+                expected,
+                "{shard:?} -> {other:?}"
+            );
+        }
+    }
+    assert_eq!(
+        *PoolPolicies::uniform(changed).for_shard(ShardType::ALL[0]),
+        changed
+    );
 }

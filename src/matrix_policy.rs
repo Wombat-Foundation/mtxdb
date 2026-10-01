@@ -330,18 +330,15 @@ pub struct RoomMetadata {
 /// - `Edges`: Edge records retain standard defaults.
 #[must_use]
 pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
-    crate::database::PoolPolicies {
-        state: crate::database::PoolPolicy {
-            compress: false,
-            checksum_policy: crate::packfile::ChecksumPolicy::Full,
-        },
-        event_dag: crate::database::PoolPolicy::default(),
-        edges: crate::database::PoolPolicy::default(),
-        server_info: crate::database::PoolPolicy {
-            compress: false,
-            checksum_policy: crate::packfile::ChecksumPolicy::Full,
-        },
-    }
+    use crate::database::{PoolPolicies, PoolPolicy};
+    use crate::layout::ShardType;
+    let uncompressed = PoolPolicy {
+        compress: false,
+        checksum_policy: crate::packfile::ChecksumPolicy::Full,
+    };
+    PoolPolicies::default()
+        .with(ShardType::State, uncompressed)
+        .with(ShardType::ServerInfo, uncompressed)
 }
 
 /// A Matrix storage workload with its own retention/durability/ordering policy.

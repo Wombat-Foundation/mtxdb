@@ -218,12 +218,7 @@ fn open_db(dir: PathBuf, compress: bool) -> Database {
         compress,
         checksum_policy: ChecksumPolicy::Full,
     };
-    let policies = PoolPolicies {
-        state: policy,
-        event_dag: policy,
-        edges: policy,
-        server_info: policy,
-    };
+    let policies = PoolPolicies::uniform(policy);
     Database::open_with_policies(dir, policies).expect("open shared database")
 }
 

@@ -46,33 +46,45 @@ impl Default for PoolPolicy {
     }
 }
 
-/// Policies for every named pool in a shared-WAL database.
+const POOL_COUNT: usize = ShardType::ALL.len();
+
+/// Policies for every named pool in a database.
+///
+/// One slot per [`ShardType`], indexed by [`ShardType::index`], so adding a pool
+/// adds a slot here without any other change. Start from the defaults and set
+/// the pools that differ with [`Self::with`] or [`Self::for_shard_mut`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PoolPolicies {
-    /// Policy for the state pool (`ShardType::State`).
-    pub state: PoolPolicy,
-    /// Policy for the event DAG pool (`ShardType::EventDag`).
-    pub event_dag: PoolPolicy,
-    /// Policy for the edges pool (`ShardType::Edges`).
-    pub edges: PoolPolicy,
-    /// Policy for server metadata and federation key records.
-    pub server_info: PoolPolicy,
+    policies: [PoolPolicy; POOL_COUNT],
 }
 
 impl PoolPolicies {
+    /// Every pool set to `policy`.
+    #[must_use]
+    pub const fn uniform(policy: PoolPolicy) -> Self {
+        Self {
+            policies: [policy; POOL_COUNT],
+        }
+    }
+
     /// Return the policy associated with `shard`.
     #[must_use]
     pub fn for_shard(&self, shard: ShardType) -> &PoolPolicy {
-        match shard {
-            ShardType::State => &self.state,
-            ShardType::EventDag => &self.event_dag,
-            ShardType::Edges => &self.edges,
-            ShardType::ServerInfo => &self.server_info,
-        }
+        &self.policies[shard.index()]
+    }
+
+    /// Mutable access to the policy associated with `shard`.
+    pub fn for_shard_mut(&mut self, shard: ShardType) -> &mut PoolPolicy {
+        &mut self.policies[shard.index()]
+    }
+
+    /// These policies with `shard` set to `policy`.
+    #[must_use]
+    pub fn with(mut self, shard: ShardType, policy: PoolPolicy) -> Self {
+        *self.for_shard_mut(shard) = policy;
+        self
     }
 }
-
-const POOL_COUNT: usize = ShardType::ALL.len();
 
 /// A database root open for writing: every pool behind one write-ahead log,
 /// with atomic cross-pool transactions and record-version compare-and-set.
