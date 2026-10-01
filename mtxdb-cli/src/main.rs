@@ -350,8 +350,7 @@ fn sub_memory() -> Command {
     Command::new("memory")
         .about("Inspect or evict mtxdb's in-process decoded-node caches")
         .long_about(
-            "Inspect or evict mtxdb's in-process decoded-node caches.\n\n"
-                .to_owned()
+            "Inspect or evict mtxdb's in-process decoded-node caches.\n\n".to_owned()
                 + "This reports heap objects decoded by the current mtxdb process only. "
                 + "It does not include durable records, indexes, memory-mapped files, or "
                 + "the operating system's filesystem page cache. A one-shot CLI process "
