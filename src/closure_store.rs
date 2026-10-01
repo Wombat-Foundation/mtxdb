@@ -29,9 +29,16 @@
 //! generation collection that [`ClosureStore::retire_superseded`] reclaims.
 //!
 //! The head also records the short-id counter the generation was built against
-//! (`source_next`): closures cover ids `1..source_next`. Verifying a closure's
-//! *content* against the direct edges is the adapter's job; [`ClosureStore::verify`]
-//! checks the storage invariants (head resolves, every covered id has a record,
+//! (`source_next`) and the coverage it achieved: ids in `1..source_next` that
+//! are deliberately left without a record because their walk was incomplete are
+//! listed in the head's `skipped` set, run-encoded. That makes the three states
+//! a reader can observe explicit and distinguishable — [`ClosureCoverage::Complete`]
+//! (record present), [`ClosureCoverage::Incomplete`] (covered, record absent by
+//! design), and [`ClosureCoverage::Absent`] (outside `1..source_next`) — instead
+//! of "no record" being ambiguous between incomplete and out of range.
+//! Verifying a closure's *content* against the direct edges is the adapter's
+//! job; [`ClosureStore::verify`] checks the storage invariants (head resolves,
+//! every non-skipped covered id has a record, every skipped id has none,
 //! counts match).
 //!
 //! Gated on `multi-reader` with the transaction layer and engine CAS it uses.
@@ -41,19 +48,151 @@ use bytes::Bytes;
 use crate::database::{DatabaseTransaction, SharedDatabase};
 use crate::layout::ShardType;
 use crate::logical_head::{LogicalHead, LogicalHeadValue};
+use crate::packfile;
 use crate::storage::{NodeData, NodeId, StorageError};
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
-/// Wire version of closure records and the generation counter.
-pub const CLOSURE_FORMAT_VERSION: u8 = 1;
+/// Wire version of closure records, the generation counter and the coverage
+/// record.
+pub const CLOSURE_FORMAT_VERSION: u8 = 3;
 
 const HEAD_LOGICAL_ID: NodeId = *b"MTXD-CLS-HEAD-v1";
 const COUNTER_ID: NodeId = *b"MTXD-CLS-NEXTG-1";
 const RECORD_MAGIC: [u8; 4] = *b"CLSR";
 const COUNTER_MAGIC: [u8; 4] = *b"CLSG";
+const COVERAGE_MAGIC: [u8; 4] = *b"CLCG";
 const RECORD_PREFIX: [u8; 8] = *b"MTXCLSR\0";
-const HEAD_METADATA_LEN: usize = 8 + 8 + 4 + 4;
+const COVERAGE_PREFIX: [u8; 8] = *b"MTXCLSC\0";
+/// Head metadata length: `generation`, `previous`, `source_next`, `count`,
+/// `skipped_count`. Fixed width, so reading a head never scales with the size of
+/// the generation.
+const HEAD_METADATA_LEN: usize = 8 + 8 + 4 + 4 + 4;
+/// Bytes per encoded skipped run: `(start, span)`, where `span` is `end - start`,
+/// so the stored span is one less than the run's length.
+const RUN_LEN: usize = 8;
 const MAX_ATTEMPTS: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Test-only instrumentation: head reads are counted so tests can assert the
+// read-side work a call actually does, and a hook can republish or retire at an
+// exact point to make a race deterministic instead of timing-dependent.
+//
+// Both are thread-local. Cargo runs tests in parallel threads, so a process-wide
+// atomic would let one test observe another's reads, and a process-wide hook slot
+// would let one test's `snapshot` consume another's hook and publish a generation
+// into the wrong database.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    static HEAD_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bump this thread's head-read counter.
+#[cfg(test)]
+pub(crate) fn head_reads() {
+    HEAD_READS.with(|reads| {
+        let bumped = reads.get().saturating_add(1);
+        reads.set(bumped);
+    });
+}
+
+/// Reset and return this thread's head-read count.
+#[cfg(test)]
+pub(crate) fn take_head_reads() -> u64 {
+    HEAD_READS.with(std::cell::Cell::take)
+}
+
+/// Runs once, inside `snapshot`, after the coverage record has been read and
+/// before it is checked against the head's count.
+#[cfg(test)]
+type SnapshotHook = Box<dyn Fn(&SharedDatabase)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Thread-local because cargo runs tests in parallel: a process-global hook
+    /// could be consumed by another test's `snapshot`, which would then publish a
+    /// generation into the wrong database. Thread-local also means a panic
+    /// before `disarm_snapshot_hook` cannot leak into an unrelated test.
+    static SNAPSHOT_HOOK: std::cell::RefCell<Option<SnapshotHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm a hook that runs inside [`ClosureStore::snapshot`] after the coverage
+/// read. The hook gets the database so it can republish or retire, which is how
+/// tests make the head-moved-mid-snapshot case deterministic.
+///
+/// # Panics
+/// Panics if called outside a test build.
+#[cfg(test)]
+pub(crate) fn arm_snapshot_hook<F>(hook: F)
+where
+    F: Fn(&SharedDatabase) + 'static,
+{
+    SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Clear any armed [`arm_snapshot_hook`].
+///
+/// # Panics
+/// Panics if called outside a test build.
+#[cfg(test)]
+pub(crate) fn disarm_snapshot_hook() {
+    SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Take the armed hook, if any, so it fires at most once.
+#[cfg(test)]
+fn take_snapshot_hook() -> Option<SnapshotHook> {
+    SNAPSHOT_HOOK.with(|slot| slot.borrow_mut().take())
+}
+
+/// Test hook namespace, so tests reach these without importing every item.
+#[cfg(test)]
+pub(crate) mod test {
+    pub(crate) use super::{arm_snapshot_hook, disarm_snapshot_hook, take_head_reads};
+
+    /// The coverage record's node id, so a test can corrupt it directly.
+    pub(crate) fn coverage_id() -> super::NodeId {
+        super::coverage_id()
+    }
+
+    /// The collection a generation's records live in, so a test can write into
+    /// it directly.
+    pub(crate) fn generation_collection(store: &super::ClosureStore, generation: u64) -> [u8; 16] {
+        store.generation_collection(generation)
+    }
+
+    /// Encode a coverage set exactly as `publish` would, so a test can write a
+    /// record that disagrees with its head.
+    pub(crate) fn encode_coverage_for_test(set: &super::ClosureCoverageSet) -> Vec<u8> {
+        super::encode_coverage(set)
+    }
+
+    /// Whether `generation`'s collection still holds anything, checking both its
+    /// coverage record and its closures for `short_ids`.
+    ///
+    /// A refused or failed publish must leave no records behind, and a reader
+    /// cannot see that: the head never named the generation. This reads the
+    /// collection directly.
+    pub(crate) fn generation_exists(
+        store: &super::ClosureStore,
+        db: &super::SharedDatabase,
+        generation: u64,
+        short_ids: &[u32],
+    ) -> Result<bool, super::StorageError> {
+        let txn = db.begin_transaction();
+        let mut ids: Vec<super::NodeId> =
+            short_ids.iter().map(|id| super::record_id(*id)).collect();
+        ids.push(super::coverage_id());
+        let (records, _) = txn.get_with_record_versions(
+            store.pool,
+            &store.generation_collection(generation),
+            &ids,
+        )?;
+        Ok(records.into_iter().any(|record| record.is_some()))
+    }
+}
 
 /// Test-only crash injection: abort the process (no destructors, no flush) when
 /// `MTXDB_CRASH_AT` names this point, so recovery tests can kill a real child
@@ -69,7 +208,24 @@ fn crash_point(name: &str) {
 #[inline(always)]
 fn crash_point(_name: &str) {}
 
-/// The published generation and what it covers.
+/// Whether a published generation holds a closure for an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureCoverage {
+    /// Covered and complete: a closure record exists.
+    Complete,
+    /// Covered but incomplete: no record, by design, because a reachable `auth`
+    /// parent was absent when the generation was built.
+    Incomplete,
+    /// Not covered by this generation: short id `0`, or at/after `source_next`.
+    Absent,
+}
+
+/// The published generation, what it covers, and where it fell short.
+///
+/// Fixed width on purpose: the head is read on every `get`, `get_many`, `begin`,
+/// `verify` and `publish`, so it must not grow with the size of a generation.
+/// The skipped ids themselves live in one record inside the generation
+/// collection (see [`ClosureCoverageSet`]), fetched once per reader snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClosureHead {
     /// Active generation number.
@@ -81,6 +237,273 @@ pub struct ClosureHead {
     pub source_next: u32,
     /// Number of closure records in the generation.
     pub count: u32,
+    /// How many covered ids are incomplete. The ids themselves need
+    /// [`ClosureStore::coverage`] to resolve.
+    pub skipped_count: u32,
+}
+
+impl ClosureHead {
+    /// Whether this generation claims to cover every id in `1..source_next`.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.skipped_count == 0
+    }
+}
+
+/// The skipped ids of one generation, as runs of consecutive short ids.
+///
+/// Kept run-encoded rather than expanded, so a room whose early event is missing
+/// costs a single `(1, len)` run instead of one `u32` per event. A hole near the
+/// start of a large room would otherwise allocate proportional to the room on
+/// every head read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClosureCoverageSet {
+    runs: Box<[(u32, u32)]>,
+}
+
+/// A pinned generation: its head plus the ids it skipped.
+///
+/// Everything a reader derives from this belongs to one generation, so a
+/// multi-step auth query can hold it and never mix generations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureSnapshot {
+    /// The generation this snapshot is pinned to.
+    pub head: ClosureHead,
+    /// Which covered ids that generation deliberately left unrecorded.
+    pub skipped: ClosureCoverageSet,
+}
+
+impl ClosureSnapshot {
+    /// What a reader will find for `short_id`.
+    #[must_use]
+    pub fn coverage(&self, short_id: u32) -> ClosureCoverage {
+        self.skipped.coverage(&self.head, short_id)
+    }
+
+    /// Whether this generation covers every id in `1..source_next`.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.head.is_complete()
+    }
+}
+
+impl ClosureCoverageSet {
+    /// Build from an ascending, deduplicated id list, collapsing consecutive ids
+    /// into runs.
+    #[must_use]
+    pub fn from_ids(ids: &[u32]) -> Self {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for &id in ids {
+            match runs.last_mut() {
+                // `checked_add` keeps a run from wrapping past u32::MAX.
+                Some((_, end)) if end.checked_add(1) == Some(id) => *end = id,
+                _ => runs.push((id, id)),
+            }
+        }
+        Self {
+            runs: runs.into_boxed_slice(),
+        }
+    }
+
+    /// The runs, each `(start, end)` inclusive and ascending.
+    #[must_use]
+    pub fn runs(&self) -> &[(u32, u32)] {
+        &self.runs
+    }
+
+    /// How many ids are skipped in total.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|&(start, end)| u64::from(end.saturating_sub(start)).saturating_add(1))
+            .sum()
+    }
+
+    /// Whether no ids are skipped.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// Whether `short_id` is one of the skipped ids. `O(log runs)`.
+    #[must_use]
+    pub fn contains(&self, short_id: u32) -> bool {
+        self.runs
+            .binary_search_by(|&(start, end)| {
+                if short_id < start {
+                    std::cmp::Ordering::Greater
+                } else if short_id > end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+
+    /// What a reader will find for `short_id` in `head`.
+    #[must_use]
+    pub fn coverage(&self, head: &ClosureHead, short_id: u32) -> ClosureCoverage {
+        if short_id == 0 || short_id >= head.source_next {
+            ClosureCoverage::Absent
+        } else if self.contains(short_id) {
+            ClosureCoverage::Incomplete
+        } else {
+            ClosureCoverage::Complete
+        }
+    }
+}
+
+/// Accumulates skipped ids into a [`ClosureCoverageSet`] as they are
+/// discovered, without holding every id and sorting afterwards.
+///
+/// [`ClosureCoverageSet::from_ids`] needs ascending, deduplicated input, so a
+/// caller that discovers ids one at a time would otherwise keep a second
+/// `Vec<u32>` and sort it, on top of the runs the set already stores. This keeps
+/// only runs: an id that follows the open run extends it, anything else starts a
+/// new run. A caller that pushes in ascending order, as the rebuild walk does,
+/// gets the same set with one copy and no sort.
+///
+/// Out-of-order pushes are still correct: [`Self::build`] sorts and merges once,
+/// so only the run-collapsing fast path depends on ascending input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClosureCoverageBuilder {
+    runs: Vec<(u32, u32)>,
+}
+
+impl ClosureCoverageBuilder {
+    /// An empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { runs: Vec::new() }
+    }
+
+    /// Record `id` as skipped, extending the open run when it is the next id.
+    pub fn push(&mut self, id: u32) {
+        match self.runs.last_mut() {
+            // `checked_add` keeps a run from wrapping past u32::MAX.
+            Some((_, end)) if end.checked_add(1) == Some(id) => *end = id,
+            _ => self.runs.push((id, id)),
+        }
+    }
+
+    /// How many ids have been pushed.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.runs
+            .iter()
+            .map(|&(start, end)| u64::from(end.saturating_sub(start)).saturating_add(1))
+            .sum()
+    }
+
+    /// Whether no id has been pushed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// Finish the set, merging runs that were pushed out of order.
+    #[must_use]
+    pub fn build(mut self) -> ClosureCoverageSet {
+        self.runs.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(self.runs.len());
+        for &(start, end) in &self.runs {
+            match merged.last_mut() {
+                // `<=`, so overlapping or adjacent runs coalesce. Duplicate ids
+                // arrive here as `(id, id)` twice.
+                Some((_, last)) if last.saturating_add(1) >= start => {
+                    if end > *last {
+                        *last = end;
+                    }
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        ClosureCoverageSet {
+            runs: merged.into_boxed_slice(),
+        }
+    }
+}
+
+/// The counts and coverage payload a publish would commit, or the reason it must
+/// not.
+///
+/// Kept separate from the write path so every check is known to run before the
+/// first byte is written, which is what lets a rejected publish roll its records
+/// back without a partially staged generation.
+fn validate_publish(
+    stored: &[u32],
+    set: &ClosureCoverageSet,
+    source_next: u32,
+) -> Result<(u32, u32, Vec<u8>), StorageError> {
+    // Every check runs over the runs themselves, not an expanded id list: a
+    // skipped run can cover thousands of ids, and the point of the run encoding
+    // is to not touch them.
+    let runs = set.runs();
+    // The runs are ascending and merged, so the first start and the last end
+    // bound every id in between.
+    if let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) {
+        if first == 0 || last >= source_next {
+            return Err(StorageError::Internal(format!(
+                "skipped closure ids {first}..={last} lie outside 1..{source_next}"
+            )));
+        }
+    }
+    // Stored ids must themselves be covered. `stored` is sorted, so the ends bound
+    // the whole vector. Without this, storing id 10 and publishing `source_next =
+    // 5` yields a head that decodes fine but names a count no generation can
+    // satisfy: the record is unreachable and `verify` reports the mismatch. Reject
+    // it at the write path instead.
+    if let (Some(&first), Some(&last)) = (stored.first(), stored.last()) {
+        if first == 0 || last >= source_next {
+            return Err(StorageError::Internal(format!(
+                "stored closure ids {first}..={last} lie outside 1..{source_next}"
+            )));
+        }
+    }
+    // An id cannot be both stored and skipped: readers resolve coverage from the
+    // skipped set first, so a stored closure for a skipped id would be unreachable
+    // and `verify` would flag it. `stored` is sorted, so one binary search per run
+    // finds any overlap.
+    for &(start, end) in runs {
+        let index = stored.partition_point(|&id| id < start);
+        if let Some(&clash) = stored.get(index) {
+            if clash <= end {
+                return Err(StorageError::Internal(format!(
+                    "closure id {clash} is stored and claimed as skipped"
+                )));
+            }
+        }
+    }
+    let stored_count = u32::try_from(stored.len())
+        .map_err(|_| StorageError::Internal("too many stored closures".to_owned()))?;
+    let skipped_count = u32::try_from(set.len())
+        .map_err(|_| StorageError::Internal("too many skipped closure ids".to_owned()))?;
+    // Belt and braces: the two checks above already imply this, but the head
+    // decoder enforces the partition, so reject it here too rather than committing
+    // a generation that `decode_head` would refuse to read back.
+    let covered = u64::from(source_next.saturating_sub(1));
+    if u64::from(stored_count)
+        .checked_add(set.len())
+        .map_or(true, |total| total > covered)
+    {
+        return Err(StorageError::Internal(format!(
+            "{stored_count} stored and {} skipped closures exceed the {covered} covered ids",
+            set.len()
+        )));
+    }
+    // The encoded coverage record must fit one engine record; a pathological
+    // interleaving of skipped and stored ids yields one run per skipped id.
+    let payload = encode_coverage(set);
+    if payload.len() > usize::try_from(packfile::MAX_DATA_LEN).unwrap_or(usize::MAX) {
+        return Err(StorageError::Internal(format!(
+            "closure coverage needs {} bytes, above the {}-byte record limit",
+            payload.len(),
+            packfile::MAX_DATA_LEN
+        )));
+    }
+    Ok((stored_count, skipped_count, payload))
 }
 
 /// Result of [`ClosureStore::verify`].
@@ -104,6 +527,15 @@ fn record_id(short_id: u32) -> NodeId {
     let mut id = [0u8; 16];
     id[..8].copy_from_slice(&RECORD_PREFIX);
     id[8..12].copy_from_slice(&short_id.to_be_bytes());
+    id
+}
+
+/// The one coverage record inside a generation collection. It sits beside the
+/// closure records but under a distinct prefix, so it is never mistaken for a
+/// closure for short id `0`.
+fn coverage_id() -> NodeId {
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&COVERAGE_PREFIX);
     id
 }
 
@@ -147,6 +579,7 @@ fn encode_head_metadata(head: &ClosureHead) -> Vec<u8> {
     out.extend_from_slice(&head.previous.to_be_bytes());
     out.extend_from_slice(&head.source_next.to_be_bytes());
     out.extend_from_slice(&head.count.to_be_bytes());
+    out.extend_from_slice(&head.skipped_count.to_be_bytes());
     out
 }
 
@@ -154,26 +587,121 @@ fn decode_head(
     value: &LogicalHeadValue,
     store: &ClosureStore,
 ) -> Result<ClosureHead, StorageError> {
+    fn corrupt() -> StorageError {
+        StorageError::Corrupt("closure head metadata".to_owned())
+    }
     let bytes = &value.metadata;
     if bytes.len() != HEAD_METADATA_LEN {
-        return Err(StorageError::Corrupt("closure head metadata".to_owned()));
+        return Err(corrupt());
     }
-    let word = |range: std::ops::Range<usize>| -> Result<[u8; 8], StorageError> {
-        <[u8; 8]>::try_from(&bytes[range])
-            .map_err(|_| StorageError::Corrupt("closure head metadata".to_owned()))
+    let word = |at: usize| -> Result<u64, StorageError> {
+        let raw: [u8; 8] = bytes
+            .get(at..)
+            .and_then(|b| b.get(..8))
+            .ok_or_else(corrupt)?
+            .try_into()
+            .map_err(|_| corrupt())?;
+        Ok(u64::from_be_bytes(raw))
     };
-    let head = ClosureHead {
-        generation: u64::from_be_bytes(word(0..8)?),
-        previous: u64::from_be_bytes(word(8..16)?),
-        source_next: u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
-        count: u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
+    let short = |at: usize| -> Result<u32, StorageError> {
+        let raw: [u8; 4] = bytes
+            .get(at..)
+            .and_then(|b| b.get(..4))
+            .ok_or_else(corrupt)?
+            .try_into()
+            .map_err(|_| corrupt())?;
+        Ok(u32::from_be_bytes(raw))
     };
-    if value.target != store.generation_collection(head.generation) {
+    let generation = word(0)?;
+    let previous = word(8)?;
+    let source_next = short(16)?;
+    let count = short(20)?;
+    let skipped_count = short(24)?;
+
+    // The head only counts skipped ids; it does not list them, so it cannot
+    // under-claim the exact set. It can over-claim, which
+    // `ClosureStore::verify` and the `get_many` corruption path both catch.
+    if u64::from(skipped_count).saturating_add(u64::from(count))
+        > u64::from(source_next.saturating_sub(1))
+    {
+        return Err(corrupt());
+    }
+
+    if value.target != store.generation_collection(generation) {
         return Err(StorageError::Corrupt(
             "closure head target does not name its generation".to_owned(),
         ));
     }
-    Ok(head)
+    Ok(ClosureHead {
+        generation,
+        previous,
+        source_next,
+        count,
+        skipped_count,
+    })
+}
+
+/// Whether an error describes on-disk inconsistency, which `verify` should
+/// report as a finding, rather than a read failure it should propagate.
+///
+/// A stale generation is included: a head that moved under a verify run is not
+/// a storage defect, and `verify` retries internally before giving up, so
+/// reaching this arm means the head is genuinely thrashing.
+fn is_malformed(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Corrupt(_) | StorageError::StaleGeneration { .. }
+    )
+}
+
+/// Coverage records hold one run per gap, `(start, span)`, ascending.
+fn encode_coverage(set: &ClosureCoverageSet) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RUN_LEN.saturating_mul(set.runs().len()));
+    out.extend_from_slice(&COVERAGE_MAGIC);
+    out.push(CLOSURE_FORMAT_VERSION);
+    for &(start, end) in set.runs() {
+        out.extend_from_slice(&start.to_be_bytes());
+        out.extend_from_slice(&end.saturating_sub(start).to_be_bytes());
+    }
+    out
+}
+
+fn decode_coverage(bytes: &[u8]) -> Result<ClosureCoverageSet, StorageError> {
+    let corrupt = || StorageError::Corrupt("closure coverage record".to_owned());
+    let Some(body) = bytes.get(5..) else {
+        return Err(corrupt());
+    };
+    if bytes.len() < 5 || bytes[..4] != COVERAGE_MAGIC || bytes[4] != CLOSURE_FORMAT_VERSION {
+        return Err(corrupt());
+    }
+    if body.len() % RUN_LEN != 0 {
+        return Err(corrupt());
+    }
+    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(body.len() / RUN_LEN);
+    for chunk in body.chunks_exact(RUN_LEN) {
+        let start = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let stored = u32::from_be_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        let Some(end) = start.checked_add(stored) else {
+            return Err(corrupt());
+        };
+        // Runs must be strictly ascending and non-adjacent, so the encoding is
+        // canonical. Adjacent runs would decode to the same set as one merged
+        // run, so accepting them would let two encodings mean the same thing.
+        // Runs are not bounds-checked against `source_next` here because that
+        // needs the head; `ClosureCoverageSet::coverage` checks `source_next`
+        // first, and `verify` reports out-of-range runs.
+        if start == 0
+            || runs.last().is_some_and(|&(_, prev_end)| {
+                start <= prev_end || start == prev_end.saturating_add(1)
+            })
+        {
+            return Err(corrupt());
+        }
+        runs.push((start, end));
+    }
+    Ok(ClosureCoverageSet {
+        runs: runs.into_boxed_slice(),
+    })
 }
 
 /// Closure generations for one scope.
@@ -212,6 +740,8 @@ impl ClosureStore {
         &self,
         txn: &DatabaseTransaction<'_>,
     ) -> Result<(Option<ClosureHead>, u64), StorageError> {
+        #[cfg(test)]
+        head_reads();
         let read = self.heads().read(txn, &HEAD_LOGICAL_ID)?;
         let head = read
             .value
@@ -229,6 +759,83 @@ impl ClosureStore {
             .map(|(head, _)| head)
     }
 
+    /// The published head plus the ids it skipped, as one consistent snapshot.
+    ///
+    /// One transaction is **not** enough on its own: the head and its coverage
+    /// record are separate records, so a concurrent republish and retire can land
+    /// between the two reads. Consistency comes from the count check instead. The
+    /// head states how many ids are skipped; the coverage record is fetched and
+    /// checked against that count, so a generation retired mid-read arrives as a
+    /// mismatch rather than as a silently short skipped set. A mismatch means
+    /// either a corrupt record or a moved head, and re-reading the head
+    /// distinguishes the two: only an unmoved head is corruption.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure, a corrupt head or coverage record, a
+    /// head whose skipped count disagrees with its coverage record, or a head
+    /// that keeps moving for every attempt.
+    pub fn snapshot(&self, db: &SharedDatabase) -> Result<Option<ClosureSnapshot>, StorageError> {
+        for _ in 0..MAX_ATTEMPTS {
+            let txn = db.begin_transaction();
+            let (Some(head), _) = self.read_head(&txn)? else {
+                return Ok(None);
+            };
+            // Fires before the coverage read, which is the window a concurrent
+            // republish and retire can invalidate.
+            #[cfg(test)]
+            if let Some(hook) = take_snapshot_hook() {
+                hook(db);
+            }
+            // A complete generation writes no coverage record, so the common case
+            // costs the head read alone.
+            let set = if head.skipped_count == 0 {
+                ClosureCoverageSet::default()
+            } else {
+                self.read_coverage(&txn, head.generation)?
+            };
+            if set.len() != u64::from(head.skipped_count) {
+                // The count disagrees, so either the record is corrupt or this
+                // generation was retired and replaced while we read. Re-reading
+                // the head distinguishes the two.
+                let (again, _) = self.read_head(&db.begin_transaction())?;
+                if again.map(|fresh| fresh.generation) != Some(head.generation) {
+                    continue;
+                }
+                return Err(StorageError::Corrupt(format!(
+                    "closure generation {} head counts {} skipped ids but its coverage record \
+                     has {}",
+                    head.generation,
+                    head.skipped_count,
+                    set.len()
+                )));
+            }
+            return Ok(Some(ClosureSnapshot { head, skipped: set }));
+        }
+        Err(StorageError::Internal(
+            "closure head kept moving during a read".to_owned(),
+        ))
+    }
+
+    /// Read the coverage record of `generation` inside an existing transaction.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt coverage record.
+    fn read_coverage(
+        &self,
+        txn: &DatabaseTransaction<'_>,
+        generation: u64,
+    ) -> Result<ClosureCoverageSet, StorageError> {
+        let (records, _) = txn.get_with_record_versions(
+            self.pool,
+            &self.generation_collection(generation),
+            &[coverage_id()],
+        )?;
+        match records.into_iter().next().flatten() {
+            Some(record) => decode_coverage(&record.bytes),
+            None => Ok(ClosureCoverageSet::default()),
+        }
+    }
+
     /// The closure blob of `short_id` in the published generation.
     ///
     /// # Errors
@@ -243,15 +850,26 @@ impl ClosureStore {
     }
 
     /// Closure blobs for several ids, all read from **one** generation: the head
-    /// is resolved once, so the result can never mix two generations. Returns the
-    /// generation read (`None` if nothing is published) and the blobs in order.
+    /// and its coverage record are resolved once, so the result can never mix two
+    /// generations. Returns the generation read (`None` if nothing is published)
+    /// and the blobs in order.
     ///
-    /// If the generation is retired between reading the head and its records,
-    /// the head is re-read and the read retried, so a concurrent republish never
-    /// surfaces as a false miss.
+    /// Coverage is consulted first, so an id the generation records as
+    /// [`ClosureCoverage::Incomplete`] or [`ClosureCoverage::Absent`] costs no
+    /// record read and no re-check — those `None`s are final answers, not races.
+    /// Only ids classified [`ClosureCoverage::Complete`] are fetched, and a
+    /// missing one means the generation was retired mid-read: the head is
+    /// re-read, and if it moved the whole call retries against the new
+    /// generation. If it did not move, a complete id with no record is
+    /// corruption, and is reported as such rather than as a silent miss.
+    ///
+    /// Prefer [`Self::snapshot`] plus [`Self::get_many_pinned`] when a caller
+    /// makes several reads and wants them all from one generation.
     ///
     /// # Errors
-    /// Returns an error on a read failure or a corrupt record.
+    /// Returns an error on a read failure, a corrupt record, a corrupt head or
+    /// coverage record, or a complete id whose record is missing from an
+    /// unmoved head.
     #[allow(clippy::type_complexity, reason = "generation plus ordered blobs")]
     pub fn get_many(
         &self,
@@ -259,32 +877,117 @@ impl ClosureStore {
         short_ids: &[u32],
     ) -> Result<(Option<u64>, Vec<Option<Vec<u8>>>), StorageError> {
         for _ in 0..MAX_ATTEMPTS {
-            let txn = db.begin_transaction();
-            let (Some(head), _) = self.read_head(&txn)? else {
+            let Some(snapshot) = self.snapshot(db)? else {
                 return Ok((None, vec![None; short_ids.len()]));
             };
-            let ids: Vec<NodeId> = short_ids.iter().map(|id| record_id(*id)).collect();
+            let head = &snapshot.head;
+            let wanted: Vec<(usize, u32)> = short_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, id)| snapshot.coverage(*id) == ClosureCoverage::Complete)
+                .collect();
+            let mut blobs: Vec<Option<Vec<u8>>> = vec![None; short_ids.len()];
+            if wanted.is_empty() {
+                return Ok((Some(head.generation), blobs));
+            }
+            let txn = db.begin_transaction();
+            let ids: Vec<NodeId> = wanted.iter().map(|(_, id)| record_id(*id)).collect();
             let (records, _) = txn.get_with_record_versions(
                 self.pool,
                 &self.generation_collection(head.generation),
                 &ids,
             )?;
-            let blobs = records
-                .into_iter()
-                .map(|record| record.map(|data| decode_record(&data.bytes)).transpose())
-                .collect::<Result<Vec<_>, _>>()?;
-            if blobs.iter().all(Option::is_some) {
+            for ((slot, _short_id), record) in wanted.iter().zip(records) {
+                if let Some(record) = record {
+                    blobs[*slot] = Some(decode_record(&record.bytes)?);
+                }
+            }
+            if wanted.iter().all(|(slot, _)| blobs[*slot].is_some()) {
                 return Ok((Some(head.generation), blobs));
             }
-            // Some absent: only a true miss if the head did not move underneath us.
+            // A complete id with no record: either this generation was retired
+            // after the head read, or the head is lying about its own coverage.
             let (again, _) = self.read_head(&db.begin_transaction())?;
             if again.map(|h| h.generation) == Some(head.generation) {
-                return Ok((Some(head.generation), blobs));
+                let absent: Vec<String> = wanted
+                    .iter()
+                    .filter(|(slot, _)| blobs[*slot].is_none())
+                    .map(|(_, id)| id.to_string())
+                    .collect();
+                return Err(StorageError::Corrupt(format!(
+                    "closure generation {} records ids {absent:?} as complete but stores no \
+                     closure for them",
+                    head.generation
+                )));
             }
         }
         Err(StorageError::Internal(
             "closure head kept moving during a read".to_owned(),
         ))
+    }
+
+    /// Read closure blobs for several ids from the generation a [`ClosureSnapshot`]
+    /// is pinned to, taking the coverage classification from that same snapshot.
+    ///
+    /// This is the fast path for a reader that has already resolved a snapshot:
+    /// it performs no head re-check and no retry, because absent is a legitimate
+    /// answer and the snapshot already says which ids are absent by design.
+    ///
+    /// A blob missing for an id the snapshot calls
+    /// [`ClosureCoverage::Complete`] is the one case that is not an answer but a
+    /// fault. The store keeps only the published generation and its predecessor,
+    /// so a snapshot held across two republishes reaches a generation that was
+    /// retired out from under it. That is not corruption: it is reported as
+    /// [`StorageError::StaleGeneration`], which tells the caller the right
+    /// response is a fresh snapshot rather than a retry of this read. Corruption
+    /// is reserved for a head that has not moved, where no such explanation
+    /// exists.
+    ///
+    /// # Errors
+    /// [`StorageError::StaleGeneration`] if the pinned generation is no longer
+    /// retained, [`StorageError::Corrupt`] for a complete id with no record under
+    /// an unmoved head or an undecodable record, otherwise a read failure.
+    pub fn get_many_pinned(
+        &self,
+        db: &SharedDatabase,
+        snapshot: &ClosureSnapshot,
+        short_ids: &[u32],
+    ) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
+        let generation = snapshot.head.generation;
+        let txn = db.begin_transaction();
+        let ids: Vec<NodeId> = short_ids.iter().map(|id| record_id(*id)).collect();
+        let (records, _) =
+            txn.get_with_record_versions(self.pool, &self.generation_collection(generation), &ids)?;
+        let mut blobs = Vec::with_capacity(records.len());
+        for (short_id, record) in short_ids.iter().copied().zip(records) {
+            match record {
+                Some(data) => blobs.push(Some(decode_record(&data.bytes)?)),
+                None if snapshot.coverage(short_id) != ClosureCoverage::Complete => {
+                    blobs.push(None);
+                }
+                None => {
+                    // Complete but unrecorded. Re-read the head: if it moved, this
+                    // generation was retired out from under the reader, which is a
+                    // stale generation rather than corruption. `StaleGeneration` is
+                    // distinct from the record-level `StaleRead` on purpose: the
+                    // response is a fresh snapshot, not a retry of this read.
+                    let (again, _) = self.read_head(&db.begin_transaction())?;
+                    let current = again.map(|fresh| fresh.generation);
+                    if current != Some(generation) {
+                        return Err(StorageError::StaleGeneration {
+                            generation,
+                            current,
+                        });
+                    }
+                    return Err(StorageError::Corrupt(format!(
+                        "closure generation {generation} records id {short_id} as complete but \
+                         stores no closure for it"
+                    )));
+                }
+            }
+        }
+        Ok(blobs)
     }
 
     /// Start building a new generation. Reserves its number so two builders
@@ -322,7 +1025,7 @@ impl ClosureStore {
                         generation,
                         base,
                         head_token,
-                        count: 0,
+                        stored: Vec::new(),
                     });
                 }
                 Err(error) if error.is_stale_read() => last = Some(error),
@@ -334,26 +1037,60 @@ impl ClosureStore {
 
     /// Check the storage invariants of the published generation.
     ///
+    /// The head's skipped count must match its coverage record, every skipped id
+    /// must fall inside `1..source_next`, and every id in that range the coverage
+    /// record does not list as skipped must have a decodable record. The reverse
+    /// holds too: a skipped id must have no record. A head that under-claims, by
+    /// listing fewer skipped ids than it counts or by omitting a real gap, shows
+    /// up as a covered id with no record.
+    ///
     /// # Errors
     /// Returns an error only when a record cannot be read.
     pub fn verify(&self, db: &SharedDatabase) -> Result<ClosureVerifyReport, StorageError> {
         let mut report = ClosureVerifyReport::default();
-        let Some(head) = self.head(db)? else {
+        // A corrupt head or coverage record is a finding, not an abort: `verify`
+        // exists to report exactly that, and callers want the structured report
+        // rather than an error they would have to unwrap.
+        let snapshot = match self.snapshot(db) {
+            Ok(snapshot) => snapshot,
+            Err(error) if is_malformed(&error) => {
+                report.problems.push(format!("closure snapshot: {error}"));
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(snapshot) = snapshot else {
             return Ok(report);
         };
+        let head = &snapshot.head;
         let txn = db.begin_transaction();
         let collection = self.generation_collection(head.generation);
+        for &(start, end) in snapshot.skipped.runs() {
+            if start == 0 || end < start || end >= head.source_next {
+                report.problems.push(format!(
+                    "skipped run {start}..={end} falls outside 1..{}",
+                    head.source_next
+                ));
+            }
+        }
         for short_id in 1..head.source_next {
             let (records, _) =
                 txn.get_with_record_versions(self.pool, &collection, &[record_id(short_id)])?;
-            match records.into_iter().next().flatten() {
-                Some(record) => {
+            match (
+                snapshot.skipped.contains(short_id),
+                records.into_iter().next().flatten(),
+            ) {
+                (false, Some(record)) => {
                     decode_record(&record.bytes)?;
                     report.records_checked = report.records_checked.saturating_add(1);
                 }
-                None => report
+                (false, None) => report
                     .problems
                     .push(format!("covered id {short_id} has no closure record")),
+                (true, Some(_)) => report.problems.push(format!(
+                    "id {short_id} is recorded as skipped but has a closure record"
+                )),
+                (true, None) => {}
             }
         }
         if report.records_checked != head.count {
@@ -381,7 +1118,8 @@ impl ClosureStore {
         };
         let next = decode_counter(&record.bytes)?;
         let keep = |generation: u64| {
-            head.is_some_and(|head| generation == head.generation || generation == head.previous)
+            head.as_ref()
+                .is_some_and(|head| generation == head.generation || generation == head.previous)
         };
         let mut removed = 0u64;
         for generation in 1..next {
@@ -398,6 +1136,29 @@ impl ClosureStore {
 
     /// Read one record straight from a generation's collection, bypassing the
     /// head, so tests can prove exactly how far a crashed step got.
+    /// The raw coverage record of `generation`, bypassing the head, so tests can
+    /// assert whether one was written at all.
+    #[cfg(test)]
+    pub(crate) fn raw_coverage_record(
+        &self,
+        db: &SharedDatabase,
+        generation: u64,
+    ) -> Option<Vec<u8>> {
+        let txn = db.begin_transaction();
+        let (records, _) = txn
+            .get_with_record_versions(
+                self.pool,
+                &self.generation_collection(generation),
+                &[coverage_id()],
+            )
+            .unwrap();
+        records
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|record| record.bytes.to_vec())
+    }
+
     #[cfg(test)]
     pub(crate) fn raw_generation_record(
         &self,
@@ -446,7 +1207,10 @@ pub struct GenerationBuilder {
     generation: u64,
     base: Option<ClosureHead>,
     head_token: u64,
-    count: u32,
+    /// Ids a closure was written for, ascending. Kept so [`Self::publish`] can
+    /// reject an id that is claimed as both stored and skipped; a builder is
+    /// short-lived, so this costs one `u32` per event only while publishing.
+    stored: Vec<u32>,
 }
 
 impl GenerationBuilder {
@@ -485,38 +1249,110 @@ impl GenerationBuilder {
         }
         txn.commit()?;
         crash_point("after-add");
-        let added = u32::try_from(closures.len())
-            .map_err(|_| StorageError::Internal("closure batch too large".to_owned()))?;
-        self.count = self
-            .count
-            .checked_add(added)
-            .ok_or_else(|| StorageError::Internal("closure count overflow".to_owned()))?;
+        for (short_id, _) in closures {
+            let at = self.stored.partition_point(|&seen| seen < *short_id);
+            if self.stored.get(at) != Some(short_id) {
+                self.stored.insert(at, *short_id);
+            }
+        }
         Ok(())
     }
 
+    /// Number of closure records written so far.
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        u32::try_from(self.stored.len()).unwrap_or(u32::MAX)
+    }
+
     /// Atomically publish this generation as the head, covering ids
-    /// `1..source_next`. Fails with `StorageError::StaleRead` if the head moved
-    /// since [`ClosureStore::begin`].
+    /// `1..source_next`.
+    ///
+    /// `skipped` names the covered ids left without a record because their walk
+    /// was incomplete. It is sorted, deduplicated and stored run-encoded as one
+    /// coverage record inside the generation collection, in the same transaction
+    /// that swaps the head. A reader therefore never sees a head that points at
+    /// a generation whose coverage record is absent or stale, and the head
+    /// itself stays a fixed 28 bytes however holey the room is.
+    ///
+    /// Fails with `StorageError::StaleRead` if the head moved since
+    /// [`ClosureStore::begin`].
     ///
     /// # Errors
-    /// `StaleRead` on a lost race; otherwise a commit failure.
+    /// `StaleRead` on a lost race, `Internal` if `skipped` is out of range or
+    /// overlaps a stored closure, otherwise a commit failure.
     pub fn publish(
         self,
         db: &SharedDatabase,
         source_next: u32,
+        skipped: &[u32],
+    ) -> Result<ClosureHead, StorageError> {
+        let mut sorted = skipped.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        self.publish_with_coverage(db, source_next, &ClosureCoverageSet::from_ids(&sorted))
+    }
+
+    /// As [`Self::publish`], but taking the coverage set directly.
+    ///
+    /// A caller that discovers skipped ids one at a time should push them into a
+    /// [`ClosureCoverageBuilder`] as it goes and pass the finished set here,
+    /// rather than collecting a `Vec<u32>` for [`Self::publish`] to copy and sort
+    /// on top of the runs the set already stores. The set must already be sorted
+    /// and merged, which [`ClosureCoverageBuilder::build`] guarantees.
+    ///
+    /// # Errors
+    /// As [`Self::publish`].
+    pub fn publish_with_coverage(
+        self,
+        db: &SharedDatabase,
+        source_next: u32,
+        set: &ClosureCoverageSet,
     ) -> Result<ClosureHead, StorageError> {
         crash_point("before-publish");
+        // Every validation runs over the runs themselves, not an expanded id list:
+        // a skipped run can cover thousands of ids, and the point of the run
+        // encoding is to not touch them.
+        //
+        // All of it happens before the first write, and any failure deletes the
+        // records already staged by `add`. A refused publish would otherwise leave
+        // a generation collection that no head names, holding the failed attempt
+        // until `retire_superseded` happened to reclaim it.
+        let validated = validate_publish(&self.stored, set, source_next);
+        let (stored_count, skipped_count, payload) = match validated {
+            Ok(validated) => validated,
+            Err(error) => {
+                if let Err(cleanup) = self.discard_generation(db) {
+                    eprintln!(
+                        "closure publish: could not discard the rejected generation: {cleanup}"
+                    );
+                }
+                return Err(error);
+            }
+        };
         let head = ClosureHead {
             generation: self.generation,
             previous: self.base.map_or(0, |base| base.generation),
             source_next,
-            count: self.count,
+            count: stored_count,
+            skipped_count,
         };
-        let value = LogicalHeadValue::new(
-            self.store.generation_collection(self.generation),
-            encode_head_metadata(&head),
-        );
+        let metadata = encode_head_metadata(&head);
+        let value =
+            LogicalHeadValue::new(self.store.generation_collection(self.generation), metadata);
         let txn = db.begin_transaction();
+        let collection = self.store.generation_collection(self.generation);
+        // Written before the head swap and committed with it, so the coverage
+        // record and the head that names it become visible together. A
+        // generation with no skipped ids writes no record at all; a head that
+        // then claims `skipped_count > 0` is a mismatch `verify` reports.
+        if !set.is_empty() {
+            txn.put(
+                self.store.pool,
+                collection,
+                coverage_id(),
+                &NodeData::new(Bytes::from(payload)),
+            )?;
+        }
         self.store
             .heads()
             .stage_replace(&txn, &HEAD_LOGICAL_ID, self.head_token, &value)?;
@@ -526,16 +1362,21 @@ impl GenerationBuilder {
         Ok(head)
     }
 
-    /// Discard an unpublished generation.
-    ///
-    /// # Errors
-    /// Returns an error if the delete cannot be committed.
-    pub fn abandon(self, db: &SharedDatabase) -> Result<(), StorageError> {
+    /// Delete this generation's collection, whether or not anything was staged.
+    fn discard_generation(&self, db: &SharedDatabase) -> Result<(), StorageError> {
         let txn = db.begin_transaction();
         txn.delete_collection(
             self.store.pool,
             self.store.generation_collection(self.generation),
         )?;
         txn.commit()
+    }
+
+    /// Discard an unpublished generation.
+    ///
+    /// # Errors
+    /// Returns an error if the delete cannot be committed.
+    pub fn abandon(self, db: &SharedDatabase) -> Result<(), StorageError> {
+        self.discard_generation(db)
     }
 }

@@ -16,6 +16,8 @@
 //! is test code by construction rather than a `#[cfg(test)] mod tests`.
 
 mod index_checkpoint;
+#[cfg(feature = "bitmaps")]
+mod test_auth_graph;
 mod test_cache;
 mod test_csr;
 mod test_dag;

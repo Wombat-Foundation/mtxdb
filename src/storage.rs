@@ -587,6 +587,18 @@ pub enum StorageError {
         /// Logical version observed when the commit was validated.
         actual: u64,
     },
+    /// A pinned reader is holding a generation that has since been superseded and
+    /// reclaimed. Distinct from [`Self::StaleRead`]: that one is a record-level
+    /// compare-and-set conflict where re-applying the same update succeeds,
+    /// whereas an expired generation cannot be re-read at all. The response is to
+    /// take a fresh snapshot, not to retry.
+    StaleGeneration {
+        /// Generation the reader was pinned to.
+        generation: u64,
+        /// Generation published at the time the failure was detected, or `None`
+        /// if nothing is published.
+        current: Option<u64>,
+    },
 }
 
 impl StorageError {
@@ -609,6 +621,13 @@ impl StorageError {
     #[must_use]
     pub fn is_stale_read(&self) -> bool {
         matches!(self, Self::StaleRead { .. })
+    }
+
+    /// Whether this error means a pinned reader's generation has been superseded
+    /// and reclaimed, so the reader must take a fresh snapshot rather than retry.
+    #[must_use]
+    pub fn is_stale_generation(&self) -> bool {
+        matches!(self, Self::StaleGeneration { .. })
     }
 }
 
@@ -683,6 +702,16 @@ impl std::fmt::Display for StorageError {
                 f,
                 "stale read on {pool:?} collection {collection_id:?}: expected version {expected}, found {actual}"
             ),
+            Self::StaleGeneration { generation, current } => match current {
+                Some(current) => write!(
+                    f,
+                    "pinned generation {generation} has been superseded by generation {current}"
+                ),
+                None => write!(
+                    f,
+                    "pinned generation {generation} has been superseded by an empty head"
+                ),
+            },
         }
     }
 }
@@ -712,7 +741,9 @@ impl From<StorageError> for std::io::Error {
             StorageError::Unsupported(message) => {
                 std::io::Error::new(std::io::ErrorKind::Unsupported, message)
             }
-            StorageError::NotFound(_) => {
+            // `StaleGeneration` maps here too: the pinned generation is gone, so the
+            // caller needs a new snapshot rather than another attempt.
+            StorageError::NotFound(_) | StorageError::StaleGeneration { .. } => {
                 std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string())
             }
             StorageError::VerificationFailed(_) => {

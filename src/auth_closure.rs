@@ -38,7 +38,9 @@ use crate::bitmap_set::{BitmapSet, DomainTag};
 use crate::storage::StorageError;
 
 #[cfg(feature = "multi-reader")]
-use crate::closure_store::{ClosureHead, ClosureStore, GenerationBuilder};
+use crate::closure_store::{
+    ClosureCoverageBuilder, ClosureHead, ClosureSnapshot, ClosureStore, GenerationBuilder,
+};
 #[cfg(feature = "multi-reader")]
 use crate::database::SharedDatabase;
 #[cfg(feature = "multi-reader")]
@@ -110,6 +112,15 @@ impl AuthGraph {
     #[must_use]
     pub fn short_id(&self, event_id: &str) -> Option<u32> {
         self.forward.get(event_id).copied()
+    }
+
+    /// The event id registered for `short_id`, or a placeholder naming the id.
+    #[must_use]
+    pub fn label(&self, short_id: u32) -> String {
+        self.labels
+            .get(&short_id)
+            .cloned()
+            .unwrap_or_else(|| format!("<unresolved short id {short_id}>"))
     }
 
     /// The ancestors-only closure of `event_id`.
@@ -307,30 +318,56 @@ impl<'a> Walk<'a> {
 #[cfg(feature = "multi-reader")]
 const BATCH_SIZE: usize = 256;
 
-/// What [`AuthClosure::rebuild`] did.
+/// Whether an error is a finding about the stored data rather than a failure to
+/// read it.
+///
+/// Corruption is the answer, not the fault: a hand-truncated coverage record or a
+/// generation whose head and coverage record disagree are both things verify
+/// exists to notice. Everything else is a read that did not happen.
 #[cfg(feature = "multi-reader")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RebuildOutcome {
-    /// A new generation was published.
-    Published(RebuildReport),
-    /// At least one covered event had an incomplete walk; nothing was published
-    /// and any partial generation was abandoned.
-    Incomplete {
-        /// Event ids whose `auth` adjacency is absent.
-        missing: Vec<String>,
-    },
+fn is_malformed(error: &StorageError) -> bool {
+    matches!(error, StorageError::Corrupt(_))
 }
 
 /// A published closure generation.
 #[cfg(feature = "multi-reader")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuildReport {
     /// Generation number.
     pub generation: u64,
-    /// Number of event ids covered (ids `1..covered`).
-    pub covered: u32,
+    /// Exclusive upper bound of the covered range: the generation covers short
+    /// ids `1..source_next`. Named for the event counter this generation was
+    /// built against, not for a count of events, so it reads the same as the
+    /// head field it mirrors.
+    pub source_next: u32,
     /// Number of closure records written.
     pub count: u32,
+    /// Every covered event left without a closure record because a reachable
+    /// `auth` parent was absent, in short-id order. One entry per event, not one
+    /// per coverage run, so a skipped run of three events lists all three.
+    /// Empty means the generation is complete.
+    pub skipped: Vec<String>,
+    /// Number of events in `skipped`, mirroring the head field it reports.
+    pub skipped_count: u32,
+    /// The root causes: events that were never recorded, so they have no `auth`
+    /// of their own and cannot be walked. Every event in `skipped` reaches one of
+    /// these, directly or through a dependent.
+    pub missing: Vec<String>,
+    /// The skipped ids as canonical inclusive `(start, end)` short-id runs, which
+    /// is how the generation's coverage record encodes them. Adjacent skipped ids
+    /// collapse into one run.
+    pub runs: Vec<(u32, u32)>,
+}
+
+#[cfg(feature = "multi-reader")]
+impl RebuildReport {
+    /// Whether the generation covers every id in `1..source_next` with a real
+    /// closure record. A strict caller that cannot tolerate an absent-by-design
+    /// answer checks this and fails the rebuild instead of publishing.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.skipped_count == 0
+    }
 }
 
 /// Result of [`AuthClosure::verify`].
@@ -339,6 +376,8 @@ pub struct RebuildReport {
 pub struct AuthClosureVerifyReport {
     /// Closures recomputed from direct auth edges.
     pub closures_checked: u32,
+    /// Covered events confirmed incomplete and absent by design.
+    pub skipped_checked: u32,
     /// Violations; empty means consistent.
     pub problems: Vec<String>,
 }
@@ -431,6 +470,14 @@ impl AuthClosure {
         self.store.head(db)
     }
 
+    /// The published head plus the ids it skipped, as one consistent snapshot.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt head or coverage record.
+    pub fn snapshot(&self, db: &SharedDatabase) -> Result<Option<ClosureSnapshot>, StorageError> {
+        self.store.snapshot(db)
+    }
+
     /// The ancestors-only closure of `event_id`.
     ///
     /// Materializes the room graph (see [`Self::graph`]).
@@ -513,43 +560,80 @@ impl AuthClosure {
     /// Recompute and publish a fresh generation covering every assigned event
     /// id.
     ///
-    /// Publishes only when every covered walk is complete; otherwise abandons
-    /// the partial generation and reports the missing event ids.
+    /// If the walk for a covered event is incomplete because some reachable `auth`
+    /// parent is unknown, the event is recorded as `skipped` in the published
+    /// generation and no closure record is written for it; no error is raised and
+    /// the generation is still published. This makes "absent by design" explicit
+    /// for readers (via [`crate::closure_store::ClosureSnapshot::coverage`]).
+    ///
+    /// An `auth` cycle is not a gap: the reserved generation is abandoned and the
+    /// error propagates, leaving the previously published head in place.
     ///
     /// # Errors
     /// Returns an error on a read/stage/commit failure, a corrupt record, an
     /// `auth` cycle, or a lost publish race (`StorageError::StaleRead`).
-    pub fn rebuild(&self, db: &SharedDatabase) -> Result<RebuildOutcome, StorageError> {
+    pub fn rebuild(&self, db: &SharedDatabase) -> Result<RebuildReport, StorageError> {
         let events = self.adjacency.events_index();
         let next = events.counter(db)?;
         let graph = self.graph(db)?;
         let mut builder = self.store.begin(db)?;
         let mut walk = Walk::new(&graph);
         let mut batch: Vec<(u32, Vec<u8>)> = Vec::new();
-        for short_id in 1..next {
-            if let WalkOutcome::Complete(set) = walk.closure(short_id)? {
-                batch.push((short_id, set.encode()?));
-                if batch.len() >= BATCH_SIZE {
-                    flush(&mut builder, db, &mut batch)?;
+        // Skipped ids are accumulated twice, on purpose: the runs, which are what
+        // the coverage record stores and stay compact however holey the room is,
+        // and the ids themselves, which only the report needs and only one label
+        // per event. A room with a single hole near the end costs one run plus one
+        // id, not one id per covered event.
+        let mut skipped_ids: Vec<u32> = Vec::new();
+        let mut coverage = ClosureCoverageBuilder::new();
+        // A walk error (a cycle) is corruption, not a publishable gap, so release
+        // the reserved generation rather than leaving it orphaned for retire.
+        let walked = (|| -> Result<(), StorageError> {
+            for short_id in 1..next {
+                match walk.closure(short_id)? {
+                    WalkOutcome::Complete(set) => {
+                        batch.push((short_id, set.encode()?));
+                        if batch.len() >= BATCH_SIZE {
+                            flush(&mut builder, db, &mut batch)?;
+                        }
+                    }
+                    WalkOutcome::Incomplete => {
+                        skipped_ids.push(short_id);
+                        coverage.push(short_id);
+                    }
                 }
             }
+            flush(&mut builder, db, &mut batch)
+        })();
+        if let Err(error) = walked {
+            // The walk error is the real failure; a failed cleanup must not
+            // replace it, or the caller loses the corrupt cycle that caused it.
+            if let Err(cleanup) = builder.abandon(db) {
+                eprintln!("closure rebuild: could not abandon the reserved generation: {cleanup}");
+            }
+            return Err(error);
         }
-        let missing = walk.missing_ids();
-        if !missing.is_empty() {
-            builder.abandon(db)?;
-            return Ok(RebuildOutcome::Incomplete { missing });
-        }
-        flush(&mut builder, db, &mut batch)?;
-        let head = builder.publish(db, next)?;
-        Ok(RebuildOutcome::Published(RebuildReport {
+        // The walk accumulated the root causes across every closure, so a skipped
+        // run and the never-recorded parent that caused it are both reportable.
+        let coverage = coverage.build();
+        let head = builder.publish_with_coverage(db, next, &coverage)?;
+        Ok(RebuildReport {
             generation: head.generation,
-            covered: head.source_next,
+            source_next: head.source_next,
             count: head.count,
-        }))
+            skipped: skipped_ids.iter().map(|&id| graph.label(id)).collect(),
+            skipped_count: head.skipped_count,
+            missing: walk.missing_ids(),
+            runs: coverage.runs().to_vec(),
+        })
     }
 
     /// Recompute every covered closure from the direct `auth` edges and compare
     /// it with the published generation.
+    ///
+    /// A walk that comes out incomplete must be one the coverage record lists as
+    /// skipped, and a walk that comes out complete must have a record; coverage is
+    /// checked against the walk both ways.
     ///
     /// # Errors
     /// Returns an error only when a record cannot be read; disagreements are
@@ -563,32 +647,72 @@ impl AuthClosure {
                 .into_iter()
                 .map(|problem| format!("closure store: {problem}")),
         );
-        let Some(head) = self.store.head(db)? else {
-            return Ok(report);
+        // A malformed head or coverage record is exactly what verify exists to report,
+        // so it becomes a problem rather than an error. Only a genuine read
+        // failure aborts.
+        let snapshot = match self.store.snapshot(db) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return Ok(report),
+            Err(error) if is_malformed(&error) => {
+                report.problems.push(format!("closure store: {error}"));
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
         };
         let graph = self.graph(db)?;
         let mut walk = Walk::new(&graph);
-        for short_id in 1..head.source_next {
+        for short_id in 1..snapshot.head.source_next {
             match walk.closure(short_id)? {
                 WalkOutcome::Complete(expected) => {
+                    if snapshot.skipped.contains(short_id) {
+                        report.problems.push(format!(
+                            "short id {short_id}: generation marks it skipped but its walk is \
+                             complete"
+                        ));
+                        continue;
+                    }
                     report.closures_checked = report.closures_checked.saturating_add(1);
-                    match self.store.get(db, short_id)? {
-                        Some(blob) => {
-                            if BitmapSet::decode_in_domain(&blob, self.domain)? != expected {
-                                report.problems.push(format!(
-                                    "short id {short_id}: stored closure disagrees with its direct \
-                                     auth edges"
-                                ));
-                            }
+                    let blob = match self.store.get_many_pinned(db, &snapshot, &[short_id]) {
+                        Ok(blobs) => blobs.into_iter().next().flatten(),
+                        // A lost generation or an undecodable record is a finding
+                        // about the data, not a failure to check it.
+                        Err(error) if is_malformed(&error) => {
+                            report
+                                .problems
+                                .push(format!("short id {short_id}: {error}"));
+                            continue;
                         }
+                        Err(error) => return Err(error),
+                    };
+                    match blob {
+                        Some(blob) => match BitmapSet::decode_in_domain(&blob, self.domain) {
+                            Ok(actual) => {
+                                if actual != expected {
+                                    report.problems.push(format!(
+                                        "short id {short_id}: stored closure disagrees with its \
+                                         direct auth edges"
+                                    ));
+                                }
+                            }
+                            Err(error) => report
+                                .problems
+                                .push(format!("short id {short_id}: undecodable closure: {error}")),
+                        },
                         None => report.problems.push(format!(
                             "short id {short_id}: covered by the head but has no closure record"
                         )),
                     }
                 }
-                WalkOutcome::Incomplete => report
-                    .problems
-                    .push(format!("short id {short_id}: closure walk is incomplete")),
+                WalkOutcome::Incomplete => {
+                    if snapshot.skipped.contains(short_id) {
+                        report.skipped_checked = report.skipped_checked.saturating_add(1);
+                    } else {
+                        report.problems.push(format!(
+                            "short id {short_id}: closure walk is incomplete but the generation \
+                             does not mark it skipped"
+                        ));
+                    }
+                }
             }
         }
         Ok(report)

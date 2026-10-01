@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use mtxdb::auth_closure::{AuthClosure, RebuildOutcome};
+use mtxdb::auth_closure::AuthClosure;
 use mtxdb::matrix_adjacency::MatrixAdjacency;
 use mtxdb::{BitmapSet, ShardType, SharedDatabase};
 
@@ -112,18 +112,17 @@ fn repack_preserves_short_ids_adjacency_and_published_closures() {
     }
 
     let closure = AuthClosure::new(POOL, ROOM);
-    match closure.rebuild(&db).unwrap() {
-        RebuildOutcome::Published(report) => {
-            assert_eq!(
-                report.count as usize,
-                EVENTS.len(),
-                "one closure record per recorded event"
-            );
-        }
-        RebuildOutcome::Incomplete { missing } => {
-            panic!("every event is recorded, but rebuild was incomplete: {missing:?}");
-        }
-    }
+    let report = closure.rebuild(&db).unwrap();
+    assert!(
+        report.skipped.is_empty(),
+        "every event is recorded, but rebuild skipped {:?}",
+        report.skipped
+    );
+    assert_eq!(
+        report.count as usize,
+        EVENTS.len(),
+        "one closure record per recorded event"
+    );
     assert!(
         closure.verify(&db).unwrap().is_consistent(),
         "closures verify against direct auth edges before repack"

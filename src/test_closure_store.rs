@@ -1,11 +1,15 @@
 #![cfg(test)]
 
+use bytes::Bytes;
+
+use super::closure_store;
 use super::closure_store::*;
 use super::short_id::{EdgeFamily, ShortIdIndex};
 use crate::database::SharedDatabase;
 use crate::layout::ShardType;
-use crate::storage::StorageError;
+use crate::storage::{NodeData, StorageError};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 const POOL: ShardType = ShardType::Edges;
 const SCOPE: [u8; 16] = [0xC1; 16];
@@ -37,7 +41,7 @@ fn build(db: &SharedDatabase, tag: u8, ids: std::ops::Range<u32>) -> ClosureHead
         .collect();
     let refs: Vec<(u32, &[u8])> = blobs.iter().map(|(i, b)| (*i, b.as_slice())).collect();
     builder.add(db, &refs).unwrap();
-    builder.publish(db, ids.end).unwrap()
+    builder.publish(db, ids.end, &[]).unwrap()
 }
 
 #[test]
@@ -54,7 +58,7 @@ fn unpublished_generation_is_invisible_then_published_atomically() {
         None,
         "not visible before publish"
     );
-    let head = builder.publish(&db, 2).unwrap();
+    let head = builder.publish(&db, 2, &[]).unwrap();
     assert_eq!((head.generation, head.previous, head.count), (1, 0, 1));
     assert_eq!(store().get(&db, 1).unwrap(), Some(b"one".to_vec()));
     assert!(store().verify(&db).unwrap().is_consistent());
@@ -96,7 +100,7 @@ fn stale_builder_loses_the_race_and_can_abandon() {
     slow.add(&db, &[(1, b"slow".as_slice())]).unwrap();
     // A faster builder publishes first.
     build(&db, 9, 1..3);
-    let error = slow.publish(&db, 2).unwrap_err();
+    let error = slow.publish(&db, 2, &[]).unwrap_err();
     assert!(matches!(error, StorageError::StaleRead { .. }), "{error}");
     assert_eq!(
         store.get(&db, 1).unwrap(),
@@ -153,11 +157,527 @@ fn verify_reports_gaps_and_empty_blobs_are_rejected() {
     assert!(builder.add(&db, &[(1, b"".as_slice())]).is_err());
     builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
     // Claims to cover ids 1..4 but only one closure was written.
-    builder.publish(&db, 4).unwrap();
+    builder.publish(&db, 4, &[]).unwrap();
     let report = store().verify(&db).unwrap();
     assert!(!report.is_consistent());
     assert_eq!(report.records_checked, 1);
     assert!(report.problems.len() >= 2, "{:?}", report.problems);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn skipped_coverage_round_trips_and_separates_the_three_states() {
+    let root = test_root("coverage");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let mut builder = store().begin(&db).unwrap();
+    // Cover 1..8, store closures for all but 3 and 4.
+    let blobs: Vec<(u32, Vec<u8>)> = [1u32, 2, 5, 6, 7]
+        .iter()
+        .map(|id| {
+            let byte = u8::try_from(*id).expect("test closure id must fit in a byte");
+            (*id, vec![byte])
+        })
+        .collect();
+    let refs: Vec<(u32, &[u8])> = blobs.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+    builder.add(&db, &refs).unwrap();
+    builder.publish(&db, 8, &[4, 3]).unwrap();
+
+    let snapshot = store().snapshot(&db).unwrap().unwrap();
+    assert_eq!(
+        snapshot.skipped.runs(),
+        &[(3, 4)],
+        "consecutive ids collapse into one run"
+    );
+    assert_eq!(snapshot.skipped.len(), 2);
+    assert_eq!(snapshot.head.skipped_count, 2);
+    assert_eq!(
+        snapshot.coverage(2),
+        ClosureCoverage::Complete,
+        "covered with a record"
+    );
+    assert_eq!(
+        snapshot.coverage(3),
+        ClosureCoverage::Incomplete,
+        "covered but deliberately has no record"
+    );
+    assert_eq!(
+        snapshot.coverage(8),
+        ClosureCoverage::Absent,
+        "outside 1..source_next"
+    );
+    assert_eq!(
+        snapshot.coverage(0),
+        ClosureCoverage::Absent,
+        "id 0 is never covered"
+    );
+    // The head itself carries only the count, so it cannot scale with the room.
+    let head = store().head(&db).unwrap().unwrap();
+    assert!(!head.is_complete());
+    assert!(store().verify(&db).unwrap().is_consistent());
+    assert_eq!(
+        store().get(&db, 3).unwrap(),
+        None,
+        "skipped ids have no record"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn publish_rejects_an_id_that_is_both_stored_and_skipped() {
+    let root = test_root("coverage-stray");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let mut builder = store().begin(&db).unwrap();
+    builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
+    // Id 1 is both stored and claimed skipped. Coverage resolves first, so a
+    // stored record there would be unreachable; publish rejects the overlap
+    // rather than producing a generation `verify` would later flag.
+    let error = builder.publish(&db, 2, &[1]).unwrap_err();
+    assert!(
+        matches!(&error, StorageError::Internal(msg) if msg.contains("stored and claimed as skipped")),
+        "{error}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn publish_rejects_skipped_ids_outside_the_covered_range() {
+    let root = test_root("coverage-range");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let mut builder = store().begin(&db).unwrap();
+    builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
+    for bad in [0u32, 4, 9] {
+        let error = builder.publish(&db, 4, &[bad]).unwrap_err();
+        assert!(matches!(error, StorageError::Internal(_)), "{error}");
+        // A lost generation is unusable, so re-begin for each attempt.
+        builder = store().begin(&db).unwrap();
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn get_many_serves_skipped_and_absent_without_retrying() {
+    let root = test_root("get-many-coverage");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let mut builder = store().begin(&db).unwrap();
+    // Cover 1..6, store 1, 3 and 5, skip 2 and 4.
+    let blobs: Vec<(u32, Vec<u8>)> = [1u32, 3, 5]
+        .iter()
+        .map(|id| {
+            let byte = u8::try_from(*id).expect("test closure id must fit in a byte");
+            (*id, vec![byte])
+        })
+        .collect();
+    let refs: Vec<(u32, &[u8])> = blobs.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+    builder.add(&db, &refs).unwrap();
+    builder.publish(&db, 6, &[4, 2]).unwrap();
+
+    // 2 and 4 are skipped, 6 is absent, 0 is absent; 1, 3, 5 are complete.
+    let (generation, out) = store().get_many(&db, &[1, 2, 3, 4, 5, 6, 0]).unwrap();
+    assert_eq!(generation, Some(1));
+    assert_eq!(out.len(), 7);
+    assert_eq!(out[0], Some(vec![1]));
+    assert_eq!(out[1], None, "skipped");
+    assert_eq!(out[2], Some(vec![3]));
+    assert_eq!(out[3], None, "skipped");
+    assert_eq!(out[4], Some(vec![5]));
+    assert_eq!(out[5], None, "absent");
+    assert_eq!(out[6], None, "id 0 is absent");
+
+    // get_many and the pinned read agree, including on the None cases.
+    let snapshot = store().snapshot(&db).unwrap().unwrap();
+    let pinned = store().get_many_pinned(&db, &snapshot, &[1, 2, 6]).unwrap();
+    assert_eq!(pinned[0], Some(vec![1]));
+    assert_eq!(pinned[1], None);
+    assert_eq!(pinned[2], None);
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn get_many_all_skipped_needs_no_record_read() {
+    let root = test_root("get-many-all-skipped");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let mut builder = store().begin(&db).unwrap();
+    builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
+    builder.publish(&db, 4, &[2, 3]).unwrap();
+    // Nothing here is complete, so the answer comes from coverage alone.
+    let (generation, out) = store().get_many(&db, &[2, 3]).unwrap();
+    assert_eq!(generation, Some(1));
+    assert_eq!(out, vec![None, None]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn get_many_reports_a_missing_record_for_a_complete_id() {
+    let root = test_root("get-many-corrupt");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let mut builder = store().begin(&db).unwrap();
+    builder
+        .add(&db, &[(1, b"a".as_slice()), (2, b"b".as_slice())])
+        .unwrap();
+    // Claims full coverage of 1..4 but only wrote two records, so the head lies
+    // about id 3 rather than recording it skipped.
+    builder.publish(&db, 4, &[]).unwrap();
+
+    let (generation, out) = store().get_many(&db, &[1, 2]).unwrap();
+    assert_eq!(generation, Some(1), "the two stored ids still read back");
+    assert_eq!(out, vec![Some(vec![0x61]), Some(vec![0x62])]);
+
+    // Id 3 is covered and complete per the head, but has no record: that is
+    // corruption, and it must surface as an error rather than a silent None.
+    let error = store().get_many(&db, &[3]).unwrap_err();
+    assert!(
+        matches!(&error, StorageError::Corrupt(msg) if msg.contains("as complete")),
+        "{error}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn get_many_retries_when_the_head_moves_under_it() {
+    let root = test_root("get-many-moved");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    build(&db, 7, 1..3);
+
+    // Republish *between* the head read and the record read. Without the hook
+    // this test would pass even if `get_many` mixed generations, because the
+    // publish would simply win the race before the read even started.
+    // Publish a new generation from inside the read, after it resolved the old
+    // head. Without this the test would pass even if `get_many` mixed
+    // generations, because the publish would win the race before the read began.
+    // Publishing once is not enough: generation 1 is still retained as the
+    // predecessor, so its records read back fine and `get_many` is entitled to
+    // return generation 1 as a stable snapshot. Publishing twice and retiring
+    // deletes generation 1's collection, which is what forces the retry.
+    let published = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&published);
+    closure_store::test::arm_snapshot_hook(move |db| {
+        for tag in [9u8, 10] {
+            let mut builder = store().begin(db).unwrap();
+            let blobs: Vec<(u32, Vec<u8>)> = (1..4u32)
+                .map(|id| (id, vec![tag, u8::try_from(id).unwrap()]))
+                .collect();
+            let refs: Vec<(u32, &[u8])> = blobs.iter().map(|(i, b)| (*i, b.as_slice())).collect();
+            builder.add(db, &refs).unwrap();
+            let head = builder.publish(db, 4, &[]).unwrap();
+            *slot.lock().unwrap() = Some(head);
+        }
+        store().retire_superseded(db).unwrap();
+    });
+    let (generation, out) = store().get_many(&db, &[1, 2, 3]).unwrap();
+    closure_store::test::disarm_snapshot_hook();
+    assert_eq!(
+        generation,
+        Some(published.lock().unwrap().unwrap().generation),
+        "retried against the surviving generation"
+    );
+    assert_eq!(
+        out,
+        vec![Some(vec![10, 1]), Some(vec![10, 2]), Some(vec![10, 3])],
+        "answered entirely from the new generation, never a mix"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pinned_reads_skip_the_head_reresolve_loop() {
+    let root = test_root("coverage-pinned");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    build(&db, 7, 1..4);
+    // 4 is not covered at all, so it is absent without any head retry.
+    let snapshot = store().snapshot(&db).unwrap().unwrap();
+    let _ = closure_store::test::take_head_reads();
+    let blobs = store().get_many_pinned(&db, &snapshot, &[1, 2, 4]).unwrap();
+    assert_eq!(
+        closure_store::test::take_head_reads(),
+        0,
+        "a pinned read performs no head read of its own"
+    );
+    assert_eq!(blobs.len(), 3);
+    assert!(blobs[0].is_some() && blobs[1].is_some());
+    assert!(blobs[2].is_none());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_pinned_read_of_a_retired_generation_is_stale_not_corrupt() {
+    let root = test_root("pinned-retired");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    build(&db, 7, 1..4);
+    let pinned = store().snapshot(&db).unwrap().unwrap();
+    assert_eq!(pinned.head.generation, 1);
+
+    // Two more publishes push the pinned generation out of the retained pair.
+    build(&db, 8, 1..4);
+    build(&db, 9, 1..4);
+    store().retire_superseded(&db).unwrap();
+
+    // Id 1 is Complete in the pinned snapshot, but its generation is gone. That
+    // is a stale reader, not corruption: the head moved.
+    let error = store().get_many_pinned(&db, &pinned, &[1]).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            StorageError::StaleGeneration {
+                generation,
+                current: Some(3)
+            } if *generation == 1
+        ),
+        "{error}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_pinned_read_of_an_unmoved_generation_with_no_record_is_corrupt() {
+    let root = test_root("pinned-corrupt");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    // Claims full coverage of 1..4 but stores only 1 and 2.
+    let mut builder = store().begin(&db).unwrap();
+    builder
+        .add(&db, &[(1, b"a".as_slice()), (2, b"b".as_slice())])
+        .unwrap();
+    builder.publish(&db, 4, &[]).unwrap();
+    let snapshot = store().snapshot(&db).unwrap().unwrap();
+
+    // Id 3 is Complete and the head has not moved, so this is corruption.
+    let error = store().get_many_pinned(&db, &snapshot, &[3]).unwrap_err();
+    assert!(
+        matches!(&error, StorageError::Corrupt(msg) if msg.contains("as complete")),
+        "{error}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn publish_rejects_a_stored_id_outside_the_covered_range() {
+    let root = test_root("stored-range");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let first = build(&db, 7, 1..4);
+
+    // Id 10 is stored but the generation claims to cover only 1..5, so the
+    // record would be unreachable: its count fits, so the head decodes, and only
+    // verify would notice. Reject at publish instead.
+    let mut builder = store().begin(&db).unwrap();
+    let reserved = builder.generation();
+    builder.add(&db, &[(10, b"j".as_slice())]).unwrap();
+    let error = builder.publish(&db, 5, &[]).unwrap_err();
+    assert!(
+        matches!(&error, StorageError::Internal(msg) if msg.contains("lie outside")),
+        "{error}"
+    );
+
+    // The refused publish left the previous head readable and untouched.
+    let head = store().head(&db).unwrap().unwrap();
+    assert_eq!(head.generation, first.generation);
+    assert_eq!(store().get(&db, 1).unwrap(), Some(vec![7, 1]));
+    assert!(
+        !closure_store::test::generation_exists(&store(), &db, reserved, &[10]).unwrap(),
+        "the rejected generation discarded the record it had already staged, \
+         rather than leaving an orphan no head names"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn every_published_head_partitions_its_covered_range() {
+    let root = test_root("partition");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let first = build(&db, 7, 1..4);
+
+    // Stored ids outside the range and stored/skipped overlap are both rejected,
+    // and together they make the count-partition check unreachable through
+    // `publish`. So assert the invariant the check defends: for every generation
+    // `publish` accepts, stored plus skipped covers exactly `1..source_next`,
+    // which is what `decode_head` requires and what `verify` counts against.
+    for (source_next, stored, skipped) in [
+        (4u32, vec![1u32, 2, 3], Vec::new()),
+        (8, vec![1, 6], vec![2, 3, 4, 5, 7]),
+        (5, vec![1, 2], vec![3, 4]),
+        (3, vec![1, 2], Vec::new()),
+    ] {
+        let mut builder = store().begin(&db).unwrap();
+        let blobs: Vec<(u32, Vec<u8>)> = stored
+            .iter()
+            .map(|&id| {
+                let byte = u8::try_from(id).expect("test closure id must fit in a byte");
+                (id, vec![byte])
+            })
+            .collect();
+        let refs: Vec<(u32, &[u8])> = blobs.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+        builder.add(&db, &refs).unwrap();
+        let head = builder.publish(&db, source_next, &skipped).unwrap();
+        assert_eq!(
+            u64::from(head.count).saturating_add(u64::from(head.skipped_count)),
+            u64::from(source_next).saturating_sub(1),
+            "stored plus skipped must partition 1..{source_next}"
+        );
+        assert!(store().verify(&db).unwrap().is_consistent());
+    }
+
+    // The refused out-of-range publish earlier in this file left the first head
+    // intact; nothing above disturbed it beyond superseding it.
+    assert!(store().head(&db).unwrap().unwrap().generation > first.generation);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_coverage_record_round_trips_and_a_zero_count_writes_none() {
+    let root = test_root("coverage-record");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+
+    // No skipped ids: publish must not write a coverage record at all, and the
+    // snapshot must still resolve to the empty set.
+    let mut builder = store().begin(&db).unwrap();
+    builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
+    let complete = builder.publish(&db, 2, &[]).unwrap();
+    assert_eq!(complete.skipped_count, 0);
+    assert!(complete.is_complete());
+    let snapshot = store().snapshot(&db).unwrap().unwrap();
+    assert!(snapshot.skipped.is_empty());
+    assert_eq!(snapshot.skipped.runs(), &[]);
+    assert!(store()
+        .raw_coverage_record(&db, complete.generation)
+        .is_none());
+
+    // Now a real gap: the runs round trip through the record. Stored and skipped
+    // must partition 1..8 exactly, so id 5 is skipped too.
+    let mut builder = store().begin(&db).unwrap();
+    builder
+        .add(&db, &[(1, b"a".as_slice()), (6, b"f".as_slice())])
+        .unwrap();
+    let gapped = builder.publish(&db, 8, &[2, 3, 4, 5, 7]).unwrap();
+    assert_eq!(gapped.skipped_count, 5);
+    assert!(store()
+        .raw_coverage_record(&db, gapped.generation)
+        .is_some());
+    let snapshot = store().snapshot(&db).unwrap().unwrap();
+    assert_eq!(snapshot.skipped.runs(), &[(2, 5), (7, 7)]);
+    assert_eq!(snapshot.skipped.len(), 5);
+    assert_eq!(snapshot.head.skipped_count, 5);
+    assert!(store().verify(&db).unwrap().is_consistent());
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn verify_reports_a_head_count_that_disagrees_with_the_coverage_record() {
+    let root = test_root("coverage-mismatch");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    let mut builder = store().begin(&db).unwrap();
+    builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
+    let head = builder.publish(&db, 5, &[2, 3]).unwrap();
+    assert_eq!(head.skipped_count, 2);
+
+    // Rewrite the coverage record so it no longer matches the head's count. This
+    // is exactly what a partially applied publish would leave behind.
+    let txn = db.begin_transaction();
+    txn.put(
+        POOL,
+        closure_store::test::generation_collection(&store(), head.generation),
+        closure_store::test::coverage_id(),
+        &NodeData::new(Bytes::from(closure_store::test::encode_coverage_for_test(
+            &ClosureCoverageSet::from_ids(&[2]),
+        ))),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    // verify reports the mismatch as a problem; it does not abort.
+    let report = store().verify(&db).unwrap();
+    assert!(!report.is_consistent(), "{:?}", report.problems);
+    assert!(
+        report.problems.iter().any(|p| p.contains("snapshot")),
+        "{:?}",
+        report.problems
+    );
+
+    // A reader cannot build a snapshot at all, which is the right answer: the
+    // generation's own accounting is inconsistent.
+    let error = store().snapshot(&db).unwrap_err();
+    assert!(matches!(&error, StorageError::Corrupt(_)), "{error}");
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn snapshot_retries_when_the_head_moves_under_it() {
+    let root = test_root("snapshot-race");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+
+    // Generation 1 must have skipped ids, so `snapshot` actually reads a coverage
+    // record. With `skipped_count == 0` there is no coverage read to race, and a
+    // superseded-but-consistent generation is a legitimate answer, not a retry.
+    let mut first = store().begin(&db).unwrap();
+    first
+        .add(&db, &[(1, b"a".as_slice()), (4, b"d".as_slice())])
+        .unwrap();
+    let first_head = first.publish(&db, 5, &[2, 3]).unwrap();
+    assert_eq!(first_head.skipped_count, 2);
+
+    // Publish two replacements and retire from inside the snapshot, after it read
+    // the head and the coverage record. Publishing once is not enough: generation
+    // 1 would survive as the predecessor and stay readable. Retiring is what
+    // deletes its coverage record and produces the count mismatch.
+    let published = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&published);
+    closure_store::test::arm_snapshot_hook(move |db| {
+        for tag in [9u8, 10] {
+            let mut builder = store().begin(db).unwrap();
+            let blobs: Vec<(u32, Vec<u8>)> = (1..4u32)
+                .map(|id| (id, vec![tag, u8::try_from(id).unwrap()]))
+                .collect();
+            let refs: Vec<(u32, &[u8])> = blobs.iter().map(|(i, b)| (*i, b.as_slice())).collect();
+            builder.add(db, &refs).unwrap();
+            *slot.lock().unwrap() = Some(builder.publish(db, 4, &[]).unwrap());
+        }
+        store().retire_superseded(db).unwrap();
+    });
+    let snapshot = store().snapshot(&db).unwrap().unwrap();
+    closure_store::test::disarm_snapshot_hook();
+
+    // Before this changed, a generation retired between the head read and the
+    // coverage read produced a false Corrupt. Now the count mismatch is
+    // recognized as a move and the snapshot comes from the new generation.
+    let fresh = published.lock().unwrap().unwrap();
+    assert_eq!(snapshot.head.generation, fresh.generation);
+    assert_eq!(snapshot.head.count, 3);
+    assert!(snapshot.skipped.is_empty());
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_complete_generation_costs_one_head_read_and_no_coverage_read() {
+    let root = test_root("read-count");
+    let db = SharedDatabase::open(root.clone()).unwrap();
+    build(&db, 7, 1..4);
+
+    let _ = closure_store::test::take_head_reads();
+    let snapshot = store().snapshot(&db).unwrap().unwrap();
+    assert_eq!(
+        closure_store::test::take_head_reads(),
+        1,
+        "a complete generation reads the head once and skips the coverage record"
+    );
+    assert!(snapshot.skipped.is_empty());
+
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -209,7 +729,7 @@ fn publish_full(db: &SharedDatabase) -> ClosureHead {
         let refs: Vec<(u32, &[u8])> = blobs.iter().map(|(i, b)| (*i, b.as_slice())).collect();
         builder.add(db, &refs).unwrap();
     }
-    builder.publish(db, CRASH_IDS).unwrap()
+    builder.publish(db, CRASH_IDS, &[]).unwrap()
 }
 
 /// Child-process body. A no-op unless the parent set `MTXDB_CRASH_SCENARIO`.
