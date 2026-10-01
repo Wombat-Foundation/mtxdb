@@ -11257,19 +11257,23 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
 /// relation types and are dropped, not errors.
 const MAX_RELATION_TYPE_BYTES: usize = 255;
 
-/// One Matrix event's auth-index fields, borrowed from the parsed event.
-struct MatrixEventFields<'a> {
-    event_id: &'a str,
-    prev: Vec<&'a str>,
-    auth: Vec<&'a str>,
+/// One Matrix event's auth-index fields, owned for safe batch retention.
+///
+/// The batch must outlive the reusable parsing scratch used by raw extraction;
+/// therefore these fields deliberately do not borrow from a `MatrixEventView`
+/// or from the source `OwnedValue`.
+struct MatrixEventFields {
+    event_id: String,
+    prev: Vec<String>,
+    auth: Vec<String>,
     /// `(target event id, relation type)` from `content.m.relates_to`.
-    relation: Option<(&'a str, &'a str)>,
+    relation: Option<(String, String)>,
 }
 
-impl<'a> MatrixEventFields<'a> {
-    fn from_event(event_id: &'a str, event: &'a OwnedValue) -> Self {
+impl MatrixEventFields {
+    fn from_event(event_id: &str, event: &OwnedValue) -> Self {
         let mut fields = Self {
-            event_id,
+            event_id: event_id.to_owned(),
             prev: Vec::new(),
             auth: Vec::new(),
             relation: None,
@@ -11290,7 +11294,7 @@ impl<'a> MatrixEventFields<'a> {
                         _ => None,
                     };
                     if let Some(target) = target {
-                        targets.push(target);
+                        targets.push(target.to_owned());
                     }
                 }
             }
@@ -11307,7 +11311,7 @@ impl<'a> MatrixEventFields<'a> {
                     // one too long to be a real identifier is dropped rather than
                     // failing the whole import. Relations are best-effort here.
                     if rel_type.len() <= MAX_RELATION_TYPE_BYTES {
-                        fields.relation = Some((target.as_str(), rel_type.as_str()));
+                        fields.relation = Some((target.to_owned(), rel_type.to_owned()));
                     }
                 }
             }
@@ -11315,13 +11319,16 @@ impl<'a> MatrixEventFields<'a> {
         fields
     }
 
-    fn as_record(&self) -> EventRecord<'_> {
+    fn as_record<'a>(&'a self, prev: &'a [&'a str], auth: &'a [&'a str]) -> EventRecord<'a> {
         EventRecord {
-            event_id: self.event_id,
-            prev: &self.prev,
-            auth: &self.auth,
-            relation: self.relation.map(|(target, rel_type)| {
-                mtxdb::matrix_adjacency::RelationRef { target, rel_type }
+            event_id: self.event_id.as_str(),
+            prev,
+            auth,
+            relation: self.relation.as_ref().map(|(target, rel_type)| {
+                mtxdb::matrix_adjacency::RelationRef {
+                    target: target.as_str(),
+                    rel_type: rel_type.as_str(),
+                }
             }),
         }
     }
@@ -11350,7 +11357,7 @@ fn record_matrix_adjacency(
         return Ok(());
     }
     // Ordered, so the order adjacency is recorded in is the same on every run.
-    let mut rooms: BTreeMap<&str, Vec<MatrixEventFields<'_>>> = BTreeMap::new();
+    let mut rooms: BTreeMap<&str, Vec<MatrixEventFields>> = BTreeMap::new();
     for event in events {
         let (Some(room_id), Some(event_id)) = (event_room_id(event), event_id(event)) else {
             continue;
@@ -11363,8 +11370,20 @@ fn record_matrix_adjacency(
     for (room_id, fields) in rooms {
         let room = RoomAuth::new(ShardType::Edges, room_id);
         for chunk in fields.chunks(MAX_BATCH_EVENTS) {
+            let prev: Vec<Vec<&str>> = chunk
+                .iter()
+                .map(|field| field.prev.iter().map(String::as_str).collect())
+                .collect();
+            let auth: Vec<Vec<&str>> = chunk
+                .iter()
+                .map(|field| field.auth.iter().map(String::as_str).collect())
+                .collect();
             let records: Vec<EventRecord<'_>> =
-                chunk.iter().map(MatrixEventFields::as_record).collect();
+                chunk
+                    .iter()
+                    .zip(prev.iter().zip(auth.iter()))
+                    .map(|(field, (prev, auth))| field.as_record(prev, auth))
+                    .collect();
             room.record_events(db, &records)
                 .with_context(|| format!("recording auth adjacency for room {room_id}"))?;
         }
