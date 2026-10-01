@@ -48,7 +48,7 @@ use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
 
 /// Wire version shared by every short-id record.
-pub const SHORT_ID_FORMAT_VERSION: u8 = 2;
+pub const SHORT_ID_FORMAT_VERSION: u8 = 3;
 /// Largest id that may be allocated.
 pub const SHORT_ID_MAX: u32 = u32::MAX - 1;
 
@@ -167,17 +167,44 @@ fn forward_id(key: &[u8]) -> NodeId {
     id
 }
 
-fn indexed_id(prefix: [u8; 8], short_id: u32) -> NodeId {
+/// A record id derived from a prefix, a short id and a discriminator.
+///
+/// The id is a hash, not a layout. The engine's hash index picks a record's
+/// bucket from the first 8 bytes of its id and its tag from the next 4, and
+/// assumes ids are uniformly distributed. An id with a constant prefix there
+/// puts every such record in one bucket and gives them all one tag, which turns
+/// each insert into a scan of the whole chain: ingesting a 60,000-event room took
+/// about a minute that way. Hashing spreads both fields.
+fn derived_id(prefix: [u8; 8], short_id: u32, discriminator: u16) -> NodeId {
+    let mut input = [0u8; 14];
+    input[..8].copy_from_slice(&prefix);
+    input[8..12].copy_from_slice(&short_id.to_be_bytes());
+    input[12..14].copy_from_slice(&discriminator.to_be_bytes());
+    let digest = DigestAlgorithm::Blake3.digest(&input);
     let mut id = [0u8; 16];
-    id[..8].copy_from_slice(&prefix);
-    id[8..12].copy_from_slice(&short_id.to_be_bytes());
+    id.copy_from_slice(&digest[..16]);
     id
 }
 
+fn indexed_id(prefix: [u8; 8], short_id: u32) -> NodeId {
+    derived_id(prefix, short_id, 0)
+}
+
 fn edges_record_id(short_id: u32, family: u16) -> NodeId {
-    let mut id = indexed_id(EDGES_PREFIX, short_id);
-    id[12..14].copy_from_slice(&family.to_be_bytes());
-    id
+    derived_id(EDGES_PREFIX, short_id, family)
+}
+
+/// The id of the reverse record for `short_id`, exposed so a test can check the
+/// ids the index will see are spread.
+#[cfg(test)]
+pub(crate) fn reverse_record_id_for_test(short_id: u32) -> NodeId {
+    indexed_id(REVERSE_PREFIX, short_id)
+}
+
+/// The id of an edges record, exposed for the same reason.
+#[cfg(test)]
+pub(crate) fn edges_record_id_for_test(short_id: u32, family: u16) -> NodeId {
+    edges_record_id(short_id, family)
 }
 
 fn header(magic: [u8; 4]) -> Vec<u8> {

@@ -573,3 +573,57 @@ fn a_power_cut_never_leaves_a_half_published_room() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&image);
 }
+
+/// The engine's hash index buckets a record by the first 8 bytes of its id and
+/// assumes ids are spread. Records whose ids share a long constant prefix (the
+/// short-id reverse and edges records, and closure records, were once laid out
+/// that way) all land in one bucket and make every insert scan the whole chain:
+/// 60,000 events took about a minute. Ingest and rebuild enough events to expose
+/// that, and check the longest probe chain any index saw stayed short.
+#[test]
+fn ingesting_and_rebuilding_many_events_keeps_index_probe_chains_short() {
+    const EVENTS: usize = 3000;
+    const BATCH: usize = 500;
+    let dir = root("probe-chains");
+    let db = Database::open(dir.clone()).unwrap();
+    let room = RoomAuth::new(POOL, ROOM);
+
+    let ids: Vec<String> = (0..EVENTS).map(|index| format!("$e{index:0>40}")).collect();
+    let auth: Vec<Vec<&str>> = (0..EVENTS)
+        .map(|index| {
+            let mut list = Vec::new();
+            if index > 0 {
+                list.push(ids[index - 1].as_str());
+            }
+            if index > 1 {
+                list.push(ids[index / 2].as_str());
+            }
+            list
+        })
+        .collect();
+    let events: Vec<NewEvent<'_>> = ids
+        .iter()
+        .zip(&auth)
+        .map(|(event_id, auth)| NewEvent {
+            event_id,
+            prev: &[],
+            auth,
+            relation: None,
+        })
+        .collect();
+    for chunk in events.chunks(BATCH) {
+        room.record_events(&db, chunk).unwrap();
+    }
+    room.rebuild(&db).unwrap();
+
+    // Measured for 3000 events: 92 with spread ids, 13,185 when the ids shared a
+    // constant prefix. Linear probing on a well-spread, fairly full table reaches
+    // double digits, so the bound only has to separate those two by a wide margin.
+    let probe = db.pool(POOL).stats().max_index_probe_len;
+    assert!(
+        probe <= 600,
+        "an index probe chain reached {probe} for {EVENTS} events: record ids are clustering"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

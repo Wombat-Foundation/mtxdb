@@ -993,3 +993,25 @@ fn concurrent_readers_never_see_a_mixed_generation() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Closure record ids must be spread in the bytes the engine's hash index uses
+/// (see `short_id`'s test of the same property): a constant prefix put every
+/// closure of a room into one bucket.
+#[test]
+fn closure_record_ids_vary_in_the_bytes_the_index_uses() {
+    const IDS: u32 = 10_000;
+    let mut buckets = std::collections::HashSet::new();
+    let mut tags = std::collections::HashSet::new();
+    for short_id in 1..=IDS {
+        let id = record_id_for_test(short_id);
+        buckets.insert(<[u8; 8]>::try_from(&id[..8]).unwrap());
+        tags.insert(<[u8; 4]>::try_from(&id[8..12]).unwrap());
+    }
+    let total = usize::try_from(IDS).unwrap();
+    assert!(
+        buckets.len() >= total - 1,
+        "bucket bytes collide: {}",
+        buckets.len()
+    );
+    assert!(tags.len() >= total - 1, "tag bytes collide: {}", tags.len());
+}

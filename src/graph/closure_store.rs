@@ -49,12 +49,12 @@ use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::logical_head::{LogicalHead, LogicalHeadValue};
 use crate::packfile;
-use crate::storage::{NodeData, NodeId, StorageError};
+use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
 /// Wire version of closure records, the generation counter and the coverage
 /// record.
-pub const CLOSURE_FORMAT_VERSION: u8 = 3;
+pub const CLOSURE_FORMAT_VERSION: u8 = 4;
 
 const HEAD_LOGICAL_ID: NodeId = *b"MTXD-CLS-HEAD-v1";
 const COUNTER_ID: NodeId = *b"MTXD-CLS-NEXTG-1";
@@ -523,11 +523,25 @@ impl ClosureVerifyReport {
     }
 }
 
+/// The id of a closure record. Hashed rather than laid out as prefix plus short
+/// id: the engine's hash index buckets by the first 8 bytes of an id, so a
+/// constant prefix there would put every closure record in one bucket (see
+/// `short_id::derived_id`).
 fn record_id(short_id: u32) -> NodeId {
+    let mut input = [0u8; 12];
+    input[..8].copy_from_slice(&RECORD_PREFIX);
+    input[8..12].copy_from_slice(&short_id.to_be_bytes());
+    let digest = DigestAlgorithm::Blake3.digest(&input);
     let mut id = [0u8; 16];
-    id[..8].copy_from_slice(&RECORD_PREFIX);
-    id[8..12].copy_from_slice(&short_id.to_be_bytes());
+    id.copy_from_slice(&digest[..16]);
     id
+}
+
+/// The id of a closure record, exposed so a test can check the ids the index
+/// will see are spread.
+#[cfg(test)]
+pub(crate) fn record_id_for_test(short_id: u32) -> NodeId {
+    record_id(short_id)
 }
 
 /// The one coverage record inside a generation collection. It sits beside the

@@ -650,3 +650,35 @@ fn exhaustion_mid_batch_publishes_nothing() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The engine's hash index buckets a record by id bytes 0..8 and tags it with
+/// bytes 8..12, assuming ids are spread. Every record id this layer builds must
+/// vary in both fields across sequential short ids; a constant prefix there put
+/// every reverse and edges record into one bucket.
+#[test]
+fn record_ids_vary_in_the_bytes_the_index_uses() {
+    const IDS: u32 = 10_000;
+    let mut buckets = std::collections::HashSet::new();
+    let mut tags = std::collections::HashSet::new();
+    for short_id in 1..=IDS {
+        for id in [
+            reverse_record_id_for_test(short_id),
+            edges_record_id_for_test(short_id, 1),
+            edges_record_id_for_test(short_id, 2),
+        ] {
+            buckets.insert(<[u8; 8]>::try_from(&id[..8]).unwrap());
+            tags.insert(<[u8; 4]>::try_from(&id[8..12]).unwrap());
+        }
+    }
+    let total = usize::try_from(IDS).unwrap() * 3;
+    assert!(
+        buckets.len() >= total - 3,
+        "the first 8 bytes (the index bucket) collide: {} distinct of {total}",
+        buckets.len()
+    );
+    assert!(
+        tags.len() >= total - 3,
+        "bytes 8..12 (the index tag) collide: {} distinct of {total}",
+        tags.len()
+    );
+}
