@@ -627,3 +627,104 @@ fn ingesting_and_rebuilding_many_events_keeps_index_probe_chains_short() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A full batch of realistic events must commit as one transaction. Matrix
+/// events carry up to about ten `auth_events` and a handful of `prev_events` by
+/// 44-character ids, and some carry a relation, so this is the fan-out one
+/// transaction has to stage at the batch limit.
+#[test]
+fn a_full_batch_of_realistic_events_fits_one_transaction() {
+    let dir = root("full-batch");
+    let db = Database::open(dir.clone()).unwrap();
+    let room = RoomAuth::new(POOL, ROOM);
+    let count = crate::room_auth::MAX_BATCH_EVENTS;
+
+    let ids: Vec<String> = (0..count).map(|index| format!("${index:0>43}")).collect();
+    let auth: Vec<Vec<&str>> = (0..count)
+        .map(|index| {
+            (1..=10)
+                .filter_map(|back| index.checked_sub(back))
+                .map(|i| ids[i].as_str())
+                .collect()
+        })
+        .collect();
+    let prev: Vec<Vec<&str>> = (0..count)
+        .map(|index| {
+            (1..=3)
+                .filter_map(|back| index.checked_sub(back))
+                .map(|i| ids[i].as_str())
+                .collect()
+        })
+        .collect();
+    let events: Vec<NewEvent<'_>> = (0..count)
+        .map(|index| NewEvent {
+            event_id: &ids[index],
+            prev: &prev[index],
+            auth: &auth[index],
+            relation: (index % 5 == 4).then(|| RelationRef {
+                target: ids[index - 1].as_str(),
+                rel_type: "m.annotation",
+            }),
+        })
+        .collect();
+
+    let recorded = room.record_events(&db, &events).unwrap();
+    assert_eq!(recorded.len(), count, "the whole batch is one commit");
+    let last = &ids[count - 1];
+    assert_eq!(room.auth_edges(&db, last).unwrap().len(), 10);
+    assert!(room.verify(&db).unwrap().is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Events with absurd fan-out can exceed what one transaction may stage even
+/// under the event-count limit. That must be a typed, recoverable error, and a
+/// failed batch records nothing.
+#[test]
+fn a_batch_over_the_transaction_stage_limit_is_a_typed_error_and_records_nothing() {
+    let dir = root("stage-limit");
+    let db = Database::open(dir.clone()).unwrap();
+    let room = RoomAuth::new(POOL, ROOM);
+    // Staged size scales with key length, and every new key is stored twice (its
+    // forward and reverse records), so long ids reach the 64 MiB limit with few
+    // keys: 8 events x 1500 references x 4 KB ids is about 96 MiB.
+    let count = 8usize;
+    let padding = "x".repeat(3950);
+    let refs: Vec<Vec<String>> = (0..count)
+        .map(|event| {
+            (0..1500)
+                .map(|r| format!("${event:0>20}-{r:0>22}{padding}"))
+                .collect()
+        })
+        .collect();
+    let auth: Vec<Vec<&str>> = refs
+        .iter()
+        .map(|list| list.iter().map(String::as_str).collect())
+        .collect();
+    let ids: Vec<String> = (0..count).map(|index| format!("$ev{index:0>41}")).collect();
+    let events: Vec<NewEvent<'_>> = (0..count)
+        .map(|index| NewEvent {
+            event_id: &ids[index],
+            prev: &[],
+            auth: &auth[index],
+            relation: None,
+        })
+        .collect();
+
+    let error = room.record_events(&db, &events).unwrap_err();
+    assert!(
+        matches!(error, RoomAuthError::BatchExceedsTransactionLimit),
+        "{error}"
+    );
+    assert!(matches!(
+        room.auth_edges(&db, &ids[0]).unwrap_err(),
+        RoomAuthError::UnknownEvent { .. }
+    ));
+    // Splitting the same events into smaller batches works.
+    for chunk in events.chunks(1) {
+        room.record_events(&db, chunk).unwrap();
+    }
+    assert_eq!(room.auth_edges(&db, &ids[count - 1]).unwrap().len(), 1500);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

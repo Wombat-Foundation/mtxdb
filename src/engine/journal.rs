@@ -210,6 +210,27 @@ pub struct RecordExpectation {
 /// other transactions sharing the process.
 pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
 
+/// A transaction staged more than [`MAX_TXN_STAGE_BYTES`].
+///
+/// Carried inside an [`io::Error`] of kind `InvalidInput`, so a caller can tell
+/// "this transaction is too big, split it" from any other I/O failure without
+/// matching on message text. See
+/// [`crate::storage::StorageError::is_stage_too_large`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageTooLarge;
+
+impl std::fmt::Display for StageTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "transaction journal stage exceeds its 64 MiB limit")
+    }
+}
+
+impl std::error::Error for StageTooLarge {}
+
+fn stage_too_large() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, StageTooLarge)
+}
+
 /// Lifecycle of a transaction's staged journal mutations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnStageState {
@@ -582,10 +603,7 @@ impl TxnStage {
             )
         })?;
         if total > MAX_TXN_STAGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transaction journal stage exceeds its 64 MiB limit",
-            ));
+            return Err(stage_too_large());
         }
         Ok(())
     }
@@ -615,10 +633,7 @@ impl TxnStage {
             )
         })?;
         if total > MAX_TXN_STAGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transaction journal stage exceeds its 64 MiB limit",
-            ));
+            return Err(stage_too_large());
         }
         data.pools[pool_index(pool)].push(Mutation::Put {
             collection_id,
@@ -663,10 +678,7 @@ impl TxnStage {
             )
         })?;
         if total > MAX_TXN_STAGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transaction journal stage exceeds its 64 MiB limit",
-            ));
+            return Err(stage_too_large());
         }
         let pool_mutations = &mut data.pools[pool_index(pool)];
         pool_mutations.extend(entries.iter().map(|(node_id, payload)| Mutation::Put {
@@ -702,10 +714,7 @@ impl TxnStage {
             )
         })?;
         if total > MAX_TXN_STAGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transaction journal stage exceeds its 64 MiB limit",
-            ));
+            return Err(stage_too_large());
         }
         data.pools[pool_index(pool)].push(Mutation::DeleteCollection { collection_id });
         data.applied[pool_index(pool)].push(false);

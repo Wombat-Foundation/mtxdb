@@ -634,6 +634,18 @@ impl StorageError {
         matches!(self, Self::StaleGeneration { .. })
     }
 
+    /// Whether a transaction staged more than the transaction layer allows
+    /// (64 MiB). Split the work into smaller transactions; retrying the same one
+    /// cannot succeed.
+    #[must_use]
+    pub fn is_stage_too_large(&self) -> bool {
+        matches!(self, Self::Io(error)
+            if error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<crate::journal::StageTooLarge>())
+                .is_some())
+    }
+
     /// Whether a fixed-capacity id space is full. Ids are never reused, so
     /// retrying cannot succeed.
     #[must_use]
