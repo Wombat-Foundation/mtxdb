@@ -100,7 +100,8 @@ pub use bitmap_set::{BitmapSet, DomainTag, BITMAP_SET_FORMAT_VERSION, BITMAP_SET
 pub use cache::NodeCache;
 #[cfg(feature = "multi-reader")]
 pub use database::{
-    CommitPhaseStats, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy, SharedDatabase,
+    CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
+    SharedDatabase,
 };
 pub use index::LossyIndex;
 #[cfg(feature = "multi-reader")]

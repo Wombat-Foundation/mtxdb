@@ -1,6 +1,6 @@
 //! Root-level handle for a shared-WAL database.
 //!
-//! [`SharedDatabase`] is the safe end-to-end entry point for the shared
+//! [`Database`] is the safe end-to-end entry point for the shared
 //! durability fence: it opens a database root, acquires the single root writer
 //! lock, opens the root's pool-tagged `wal.bin` as one
 //! [`crate::journal::JournalCoordinator`], opens every named pool, attaches each to that one
@@ -75,7 +75,7 @@ impl PoolPolicies {
 /// A database root open for writing through one shared durability fence.
 ///
 /// Dropping it releases the root writer lock and the pools it opened.
-pub struct SharedDatabase {
+pub struct Database {
     layout: DatabaseLayout,
     coordinator: Arc<JournalCoordinator>,
     pools: [Arc<PackfileStorage>; 4],
@@ -91,6 +91,10 @@ pub struct SharedDatabase {
     /// Held for the lifetime of the handle: one writer per database root.
     _lock: SharedWalLock,
 }
+
+/// Compatibility alias for the pre-`Database` name.
+#[deprecated(note = "use Database instead")]
+pub type SharedDatabase = Database;
 
 /// Total time and call count for one commit phase.
 #[derive(Default)]
@@ -174,12 +178,12 @@ impl Drop for TransactionOverlayGuard {
 /// case, or owned so the transaction can outlive the caller's borrow (held
 /// across an FFI boundary or moved between threads).
 enum DatabaseRef<'a> {
-    Borrowed(&'a SharedDatabase),
-    Owned(Arc<SharedDatabase>),
+    Borrowed(&'a Database),
+    Owned(Arc<Database>),
 }
 
 impl std::ops::Deref for DatabaseRef<'_> {
-    type Target = SharedDatabase;
+    type Target = Database;
 
     fn deref(&self) -> &SharedDatabase {
         match self {
@@ -577,7 +581,7 @@ impl DatabaseTransaction<'_> {
     }
 }
 
-impl SharedDatabase {
+impl Database {
     /// Open `root` for writing through one shared WAL using default pool policies.
     ///
     /// The root is initialized with the shared layout if it does not yet
