@@ -3274,3 +3274,53 @@ fn a_read_only_open_of_an_absent_pool_is_empty_and_creates_nothing() {
     }
     assert!(pool_dirs(&root).is_empty(), "{:?}", pool_dirs(&root));
 }
+
+/// A read-committed reader opened while a pool does not exist yet must see the
+/// pool's data once the writer creates it: first through the shared WAL, then
+/// after the writer's sync has made packs and a checkpoint.
+#[test]
+fn a_reader_opened_before_a_pool_exists_sees_its_first_writes() {
+    let root = test_root("reader-before-pool");
+    let database = SharedDatabase::open(root.clone()).unwrap();
+    let pool_dir = database.layout().pool_path(ShardType::State);
+    assert!(!pool_dir.exists());
+    let reader = PackfileStorage::open_read_committed_shared(
+        pool_dir.clone(),
+        database.layout().shared_wal_path(),
+        ShardType::State,
+    )
+    .unwrap();
+    assert!(!pool_dir.exists(), "a reader must not create the pool");
+    let collection = [4u8; 16];
+    assert!(reader.get_read_committed(&collection, &[node(1)]).unwrap()[0].is_none());
+
+    database
+        .pool(ShardType::State)
+        .put(&collection, &node(1), &data(b"first"))
+        .unwrap();
+    let seen = |label: &str| {
+        let got = reader.get_read_committed(&collection, &[node(1)]).unwrap();
+        assert_eq!(
+            got[0].as_ref().map(|d| d.bytes.to_vec()),
+            Some(b"first".to_vec()),
+            "{label}"
+        );
+    };
+    seen("after publish, before sync");
+    database.coordinator().sync().unwrap();
+    database.pool(ShardType::State).sync_all().unwrap();
+    seen("after the writer synced and created the pool");
+    database
+        .pool(ShardType::State)
+        .force_index_checkpoint()
+        .unwrap();
+    seen("after a full checkpoint");
+    assert_eq!(
+        reader
+            .get(&collection, &node(1))
+            .unwrap()
+            .map(|d| d.bytes.to_vec()),
+        Some(b"first".to_vec()),
+        "the durable read path must also see the new pool"
+    );
+}

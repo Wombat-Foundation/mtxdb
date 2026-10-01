@@ -1684,6 +1684,11 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on write or rename failure.
     fn persist_stats(&self) -> io::Result<()> {
+        // A pool of a shared database has no directory until its first write;
+        // there is nothing to record before then.
+        if !self.base_dir.is_dir() {
+            return Ok(());
+        }
         let mut buf = Vec::new();
         buf.extend_from_slice(STATS_MAGIC);
         buf.push(STATS_VERSION);
