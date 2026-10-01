@@ -1494,9 +1494,15 @@ pub(crate) fn crash_image(db: &Database, source: &std::path::Path, dest: &std::p
 }
 
 /// Discriminating check for `checkpoint_covered_lsn`: after any mix of
-/// writes and syncs, the disk a power cut would leave (packs cut to their
-/// fsynced length, WAL as it is) must still hold every record that was
+/// writes and syncs, the disk image a power loss would leave (packs cut to
+/// their fsynced length, WAL as it is) must still hold every record that was
 /// acknowledged and made durable by a full sync of its pool.
+//
+// This is deliberately a crash-image test, not a claim about a physical
+// device losing power. It models loss of dirty page-cache bytes by truncating
+// packfiles to their last known synced length; filesystem/controller write
+// reordering and lying hardware caches are outside what a portable Rust test
+// can establish.
 #[test]
 fn a_power_cut_image_never_loses_a_record_a_claim_covered() {
     let root = test_root("cut_image_source");
@@ -3308,10 +3314,13 @@ fn every_pool_has_its_own_policy_slot() {
     );
 }
 
-/// The worst case of a power cut: packs cut to their fsynced length and the WAL
-/// cut to its durable mark, so every frame written since the last fsync is lost.
-/// Whatever a full sync made durable must survive, and nothing half-applied may
-/// appear: a transaction is whole or absent.
+/// The worst case of a power loss: packs cut to their fsynced length and the
+/// WAL cut to its durable mark, so every frame written since the last fsync is
+/// lost. Whatever a full sync made durable must survive, and nothing
+/// half-applied may appear: a transaction is whole or absent.
+//
+// Like the test above, this validates the database's recovery contract against
+// a portable crash image. It does not simulate device-level cache reordering.
 #[test]
 fn a_worst_case_power_cut_keeps_what_was_synced_and_never_half_applies() {
     let root = test_root("worst_cut_source");
