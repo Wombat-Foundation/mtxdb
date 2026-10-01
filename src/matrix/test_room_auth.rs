@@ -333,27 +333,51 @@ fn a_lost_publish_race_leaves_the_winner_readable_and_the_loser_reclaimable() {
     let winner = first.publish(&db, 2, &[1]).unwrap();
     assert_eq!(winner.generation, first_generation);
     let error = second.publish(&db, 2, &[1]).unwrap_err();
-    assert!(matches!(error, StorageError::StaleRead { .. }), "{error}");
+    assert!(
+        matches!(
+            &error,
+            StorageError::StaleRead {
+                pool: actual_pool,
+                expected,
+                actual,
+                ..
+            } if *actual_pool == POOL && expected < actual
+        ),
+        "stale publish must report the winning version transition: {error}"
+    );
 
     let head = room.snapshot(&db).unwrap();
     assert_eq!(head.generation(), Some(first_generation));
     assert_eq!(room.auth_chain(&db, "$root").unwrap(), Vec::<String>::new());
-    assert!(!crate::closure_store::test::generation_exists(
-        room.closure_for_test().store(),
-        &db,
-        second_generation,
-        &[],
-    )
-    .unwrap(), "the losing generation must be discarded on a stale publish");
+    assert!(
+        !crate::closure_store::test::generation_exists(
+            room.closure_for_test().store(),
+            &db,
+            second_generation,
+            &[],
+        )
+        .unwrap(),
+        "the losing generation must be discarded on a stale publish"
+    );
 
-    room.retire_old_generations(&db).unwrap();
-    assert!(!crate::closure_store::test::generation_exists(
+    assert!(crate::closure_store::test::generation_exists(
         room.closure_for_test().store(),
         &db,
-        second_generation,
+        first_generation,
         &[],
     )
     .unwrap());
+    room.retire_old_generations(&db).unwrap();
+    assert!(
+        crate::closure_store::test::generation_exists(
+            room.closure_for_test().store(),
+            &db,
+            first_generation,
+            &[],
+        )
+        .unwrap(),
+        "retirement must preserve the winning generation"
+    );
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
