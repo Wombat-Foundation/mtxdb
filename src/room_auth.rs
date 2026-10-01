@@ -3,7 +3,7 @@
 //! The façade wraps the lower-level closure primitives — the pure
 //! [`AuthGraph`](crate::auth_closure::AuthGraph) computation and the persisted
 //! generation layer — behind one operation-level error type,
-//! [`RoomAuthError`], so callers do not have to interpret the storage layer's
+//! [`RoomAuthError`](crate::room_auth::RoomAuthError), so callers do not have to interpret the storage layer's
 //! taxonomy. The façade operations themselves land separately; this module
 //! defines their shared error surface first.
 

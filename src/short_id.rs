@@ -14,12 +14,12 @@
 //!   truncated hash, so the stored key is compared on every hit and a mismatch
 //!   is reported as a collision, never silently list;
 //! - **reverse** (`SIDR`): `id -> key bytes`;
-//! - **edges** (`SIDE`): `(family, id) -> sorted [Edge]`, where an [`Edge`] is a
+//! - **edges** (`SIDE`): `(family, id) -> sorted [Edge]`, where an [`Edge`](crate::short_id::Edge) is a
 //!   `u32` target plus, for typed families, a `u16` kind. A record is never
 //!   empty (it has a header), so a known owner with zero edges is distinguishable
 //!   from an absent record.
 //!
-//! An [`EdgeFamily`] fixes whether edges are typed. Edge lists are **immutable
+//! An [`EdgeFamily`](crate::short_id::EdgeFamily) fixes whether edges are typed. Edge lists are **immutable
 //! once written**: writing the same list again is a no-op and a different list
 //! for an existing owner is a collision. Mutable visibility (for example
 //! redaction or rejection of the owning record) is not modelled here; callers

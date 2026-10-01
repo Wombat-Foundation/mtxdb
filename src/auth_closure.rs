@@ -4,21 +4,21 @@
 //! transitive **ancestors** through `auth_events`: every direct auth target, and
 //! everything those target in turn. `E` itself is **not** included; a caller
 //! that needs Synapse's `include_given` semantics uses
-//! [`AuthGraph::union_of_with_given`] (or adds `E`'s own id). The only input is
+//! [`AuthGraph::union_of_with_given`](crate::auth_closure::AuthGraph::union_of_with_given) (or adds `E`'s own id). The only input is
 //! the immutable `auth` adjacency ([`crate::matrix_adjacency::AUTH`]); `prev` and
 //! relations are never read, so a redaction, rejection or relation change can
 //! never move a closure.
 //!
 //! # Layers
 //!
-//! - [`AuthGraph`] and [`ClosureOutcome`] are **in-memory and pure**: they need
+//! - [`AuthGraph`](crate::auth_closure::AuthGraph) and [`ClosureOutcome`](crate::auth_closure::ClosureOutcome) are **in-memory and pure**: they need
 //!   only the `bitmaps` feature and no transaction engine. A caller with its own
-//!   adjacency can compute [`AuthGraph::compute`], [`AuthGraph::union_of`] and
-//!   [`AuthGraph::union_of_with_given`] in a default build.
-//! - The persisted generation layer ([`AuthClosure`]) reads a room through
+//!   adjacency can compute [`AuthGraph::compute`](crate::auth_closure::AuthGraph::compute), [`AuthGraph::union_of`](crate::auth_closure::AuthGraph::union_of) and
+//!   [`AuthGraph::union_of_with_given`](crate::auth_closure::AuthGraph::union_of_with_given) in a default build.
+//! - The persisted generation layer ([`AuthClosure`](crate::auth_closure::AuthClosure)) reads a room through
 //!   [`MatrixAdjacency`](crate::matrix_adjacency::MatrixAdjacency), materializes
-//!   an [`AuthGraph`], and publishes closure generations through a
-//!   [`ClosureStore`] and its [`LogicalHead`](crate::logical_head::LogicalHead).
+//!   an [`AuthGraph`](crate::auth_closure::AuthGraph), and publishes closure generations through a
+//!   [`ClosureStore`](crate::closure_store::ClosureStore) and its [`LogicalHead`](crate::logical_head::LogicalHead).
 //!
 //! Closures are sets of the room's event short ids, so they use the room's event
 //! scope as their [`BitmapSet`] domain ([`DomainTag::for_scope`] over that

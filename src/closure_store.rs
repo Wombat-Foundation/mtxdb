@@ -18,26 +18,26 @@
 //! generation collection, staged into the caller's transaction so it is atomic
 //! with purging the short-id scope.
 //!
-//! Rebuild protocol: [`ClosureStore::begin`] reserves a never-reused generation
+//! Rebuild protocol: [`ClosureStore::begin`](crate::closure_store::ClosureStore::begin) reserves a never-reused generation
 //! number (a CAS on the counter) and records the head token it started from;
-//! [`GenerationBuilder::add`] writes closures in bounded batches under the new,
-//! still unpublished generation; [`GenerationBuilder::publish`] swaps the head
+//! [`GenerationBuilder::add`](crate::closure_store::GenerationBuilder::add) writes closures in bounded batches under the new,
+//! still unpublished generation; [`GenerationBuilder::publish`](crate::closure_store::GenerationBuilder::publish) swaps the head
 //! by CAS. Readers never see a partial generation: until the swap they read the
 //! old one. If another builder published first, `publish` fails with
 //! `StorageError::StaleRead` and the caller discards its work with
-//! [`GenerationBuilder::abandon`]. A crash before the swap leaves an orphan
-//! generation collection that [`ClosureStore::retire_superseded`] reclaims.
+//! [`GenerationBuilder::abandon`](crate::closure_store::GenerationBuilder::abandon). A crash before the swap leaves an orphan
+//! generation collection that [`ClosureStore::retire_superseded`](crate::closure_store::ClosureStore::retire_superseded) reclaims.
 //!
 //! The head also records the short-id counter the generation was built against
 //! (`source_next`) and the coverage it achieved: ids in `1..source_next` that
 //! are deliberately left without a record because their walk was incomplete are
 //! listed in the head's `skipped` set, run-encoded. That makes the three states
-//! a reader can observe explicit and distinguishable — [`ClosureCoverage::Complete`]
-//! (record present), [`ClosureCoverage::Incomplete`] (covered, record absent by
-//! design), and [`ClosureCoverage::Absent`] (outside `1..source_next`) — instead
+//! a reader can observe explicit and distinguishable — [`ClosureCoverage::Complete`](crate::closure_store::ClosureCoverage::Complete)
+//! (record present), [`ClosureCoverage::Incomplete`](crate::closure_store::ClosureCoverage::Incomplete) (covered, record absent by
+//! design), and [`ClosureCoverage::Absent`](crate::closure_store::ClosureCoverage::Absent) (outside `1..source_next`) — instead
 //! of "no record" being ambiguous between incomplete and out of range.
 //! Verifying a closure's *content* against the direct edges is the adapter's
-//! job; [`ClosureStore::verify`] checks the storage invariants (head resolves,
+//! job; [`ClosureStore::verify`](crate::closure_store::ClosureStore::verify) checks the storage invariants (head resolves,
 //! every non-skipped covered id has a record, every skipped id has none,
 //! counts match).
 //!
@@ -238,7 +238,7 @@ pub struct ClosureHead {
     /// Number of closure records in the generation.
     pub count: u32,
     /// How many covered ids are incomplete. The ids themselves need
-    /// [`ClosureStore::coverage`] to resolve.
+    /// [`ClosureSnapshot::coverage`] to resolve.
     pub skipped_count: u32,
 }
 

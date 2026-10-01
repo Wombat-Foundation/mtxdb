@@ -3190,7 +3190,7 @@ impl JournalCoordinator {
 
     /// Like [`Self::publish_group_tagged`], validating `expectations` inside the
     /// publication critical section. A mismatch rejects the commit with an
-    /// [`io::ErrorKind::WouldBlock`] error wrapping a [`StaleVersion`] instead
+    /// [`io::ErrorKind::WouldBlock`] error wrapping a `StaleVersion` instead
     /// of appending, so no group is published.
     ///
     /// # Errors

@@ -1,6 +1,6 @@
 //! Matrix event adjacency over the generic short-id primitives.
 //!
-//! One room maps to two [`ShortIdIndex`] scopes:
+//! One room maps to two [`ShortIdIndex`](crate::short_id::ShortIdIndex) scopes:
 //!
 //! - **events**: event id -> room-local `u32` short id, with three immutable
 //!   adjacency families keyed by the event: `prev` (plain), `auth` (plain) and
@@ -12,17 +12,17 @@
 //! Kind ids are persisted in the dictionary and never regenerated: once a type
 //! has an id it keeps it for the life of the room's data, so stored relation
 //! edges stay meaningful. The four relation types defined by the spec get fixed
-//! ids ([`KNOWN_RELATION_TYPES`]); any other type string is preserved (never
+//! ids ([`KNOWN_RELATION_TYPES`](crate::matrix_adjacency::KNOWN_RELATION_TYPES)); any other type string is preserved (never
 //! dropped) and gets the next free id on first sight. Ids above `u16::MAX` are a
 //! hard error.
 //!
 //! What is *not* stored here: whether an event is still visible. A relation
 //! disappears when its source event is redacted, rejected or soft-failed, but
 //! those are facts about the source event held elsewhere (and rejection is
-//! reversible). Reads therefore take an [`EventVisibility`] filter and apply it
+//! reversible). Reads therefore take an [`EventVisibility`](crate::matrix_adjacency::EventVisibility) filter and apply it
 //! to the relation at query time; `prev` and `auth` are signed event-core fields
 //! that redaction never changes, so they are not filtered. The transitive
-//! auth-closure layer must read only [`MatrixAdjacency::auth_of`], never
+//! auth-closure layer must read only [`MatrixAdjacency::auth_of`](crate::matrix_adjacency::MatrixAdjacency::auth_of), never
 //! relations.
 //!
 //! Reverse lookups (who relates to this event) are not provided: fan-in is
