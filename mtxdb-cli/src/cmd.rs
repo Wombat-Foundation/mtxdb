@@ -11370,20 +11370,28 @@ fn record_matrix_adjacency(
     for (room_id, fields) in rooms {
         let room = RoomAuth::new(ShardType::Edges, room_id);
         for chunk in fields.chunks(MAX_BATCH_EVENTS) {
-            let prev: Vec<Vec<&str>> = chunk
+            // One contiguous reference buffer per edge kind avoids a nested
+            // Vec allocation for every event while preserving EventRecord's
+            // borrowed-slice API.
+            let prev_capacity = chunk.iter().map(|field| field.prev.len()).sum();
+            let auth_capacity = chunk.iter().map(|field| field.auth.len()).sum();
+            let mut prev = Vec::with_capacity(prev_capacity);
+            let mut auth = Vec::with_capacity(auth_capacity);
+            let mut ranges = Vec::with_capacity(chunk.len());
+            for field in chunk {
+                let prev_start = prev.len();
+                prev.extend(field.prev.iter().map(String::as_str));
+                let auth_start = auth.len();
+                auth.extend(field.auth.iter().map(String::as_str));
+                ranges.push((prev_start, prev.len(), auth_start, auth.len()));
+            }
+            let records: Vec<EventRecord<'_>> = chunk
                 .iter()
-                .map(|field| field.prev.iter().map(String::as_str).collect())
+                .zip(ranges.iter())
+                .map(|(field, &(prev_start, prev_end, auth_start, auth_end))| {
+                    field.as_record(&prev[prev_start..prev_end], &auth[auth_start..auth_end])
+                })
                 .collect();
-            let auth: Vec<Vec<&str>> = chunk
-                .iter()
-                .map(|field| field.auth.iter().map(String::as_str).collect())
-                .collect();
-            let records: Vec<EventRecord<'_>> =
-                chunk
-                    .iter()
-                    .zip(prev.iter().zip(auth.iter()))
-                    .map(|(field, (prev, auth))| field.as_record(prev, auth))
-                    .collect();
             room.record_events(db, &records)
                 .with_context(|| format!("recording auth adjacency for room {room_id}"))?;
         }
