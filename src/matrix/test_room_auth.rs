@@ -780,7 +780,13 @@ fn a_batch_over_the_transaction_stage_limit_is_a_typed_error_and_records_nothing
 
     let error = room.record_events(&db, &events).unwrap_err();
     assert!(
-        matches!(error, RoomAuthError::BatchExceedsTransactionLimit),
+        matches!(
+            &error,
+            RoomAuthError::BatchExceedsTransactionLimit {
+                staged_bytes,
+                limit_bytes,
+            } if staged_bytes > limit_bytes && *limit_bytes == crate::journal::MAX_TXN_STAGE_BYTES
+        ),
         "{error}"
     );
     assert!(matches!(

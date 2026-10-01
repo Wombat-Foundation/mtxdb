@@ -217,7 +217,12 @@ pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
 /// matching on message text. See
 /// [`crate::storage::StorageError::is_stage_too_large`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StageTooLarge;
+pub struct StageTooLarge {
+    /// Estimated staged bytes after the rejected mutation or batch.
+    pub staged_bytes: usize,
+    /// Maximum permitted staged bytes.
+    pub limit_bytes: usize,
+}
 
 impl std::fmt::Display for StageTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -227,8 +232,14 @@ impl std::fmt::Display for StageTooLarge {
 
 impl std::error::Error for StageTooLarge {}
 
-fn stage_too_large() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, StageTooLarge)
+fn stage_too_large(staged_bytes: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        StageTooLarge {
+            staged_bytes,
+            limit_bytes: MAX_TXN_STAGE_BYTES,
+        },
+    )
 }
 
 /// Lifecycle of a transaction's staged journal mutations.
@@ -603,7 +614,7 @@ impl TxnStage {
             )
         })?;
         if total > MAX_TXN_STAGE_BYTES {
-            return Err(stage_too_large());
+            return Err(stage_too_large(total));
         }
         Ok(())
     }
@@ -633,7 +644,7 @@ impl TxnStage {
             )
         })?;
         if total > MAX_TXN_STAGE_BYTES {
-            return Err(stage_too_large());
+            return Err(stage_too_large(total));
         }
         data.pools[pool_index(pool)].push(Mutation::Put {
             collection_id,
@@ -678,7 +689,7 @@ impl TxnStage {
             )
         })?;
         if total > MAX_TXN_STAGE_BYTES {
-            return Err(stage_too_large());
+            return Err(stage_too_large(total));
         }
         let pool_mutations = &mut data.pools[pool_index(pool)];
         pool_mutations.extend(entries.iter().map(|(node_id, payload)| Mutation::Put {
@@ -714,7 +725,7 @@ impl TxnStage {
             )
         })?;
         if total > MAX_TXN_STAGE_BYTES {
-            return Err(stage_too_large());
+            return Err(stage_too_large(total));
         }
         data.pools[pool_index(pool)].push(Mutation::DeleteCollection { collection_id });
         data.applied[pool_index(pool)].push(false);

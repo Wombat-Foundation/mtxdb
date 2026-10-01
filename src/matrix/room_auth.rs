@@ -55,7 +55,12 @@ pub enum RoomAuthError {
     /// example events with extreme fan-out. Nothing was recorded; split it into
     /// smaller batches. Distinct from [`Self::BatchTooLarge`], which is the event
     /// count limit.
-    BatchExceedsTransactionLimit,
+    BatchExceedsTransactionLimit {
+        /// Estimated staged bytes after the rejected mutation or batch.
+        staged_bytes: usize,
+        /// Maximum permitted staged bytes.
+        limit_bytes: usize,
+    },
     /// The room's `u32` short-id space or its `u16` relation-kind dictionary is
     /// full. Ids are never reused, so no further event or relation type can be
     /// assigned one, and the operation published nothing.
@@ -112,9 +117,12 @@ impl fmt::Display for RoomAuthError {
             Self::BatchTooLarge { limit } => {
                 write!(f, "a batch holds at most {limit} events")
             }
-            Self::BatchExceedsTransactionLimit => write!(
+            Self::BatchExceedsTransactionLimit {
+                staged_bytes,
+                limit_bytes,
+            } => write!(
                 f,
-                "the batch needs more than one transaction can stage; split it into smaller batches"
+                "the batch would stage {staged_bytes} bytes, exceeding the {limit_bytes}-byte transaction limit; split it into smaller batches"
             ),
             Self::OrdinalExhausted => write!(f, "room id space is exhausted"),
             Self::UnknownEvent { event_id } => write!(f, "unknown event {event_id}"),
@@ -156,8 +164,11 @@ impl std::error::Error for RoomAuthError {
 
 impl From<StorageError> for RoomAuthError {
     fn from(error: StorageError) -> Self {
-        if error.is_stage_too_large() {
-            return Self::BatchExceedsTransactionLimit;
+        if let Some(stage) = error.stage_too_large() {
+            return Self::BatchExceedsTransactionLimit {
+                staged_bytes: stage.staged_bytes,
+                limit_bytes: stage.limit_bytes,
+            };
         }
         match error {
             StorageError::Corrupt(message) => Self::Corruption(message),

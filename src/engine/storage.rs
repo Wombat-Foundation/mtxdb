@@ -639,11 +639,20 @@ impl StorageError {
     /// cannot succeed.
     #[must_use]
     pub fn is_stage_too_large(&self) -> bool {
-        matches!(self, Self::Io(error)
-            if error
+        self.stage_too_large().is_some()
+    }
+
+    /// Return the staged-byte diagnostics when this is a transaction-size
+    /// failure.
+    #[must_use]
+    pub fn stage_too_large(&self) -> Option<crate::journal::StageTooLarge> {
+        match self {
+            Self::Io(error) => error
                 .get_ref()
                 .and_then(|source| source.downcast_ref::<crate::journal::StageTooLarge>())
-                .is_some())
+                .copied(),
+            _ => None,
+        }
     }
 
     /// Whether a fixed-capacity id space is full. Ids are never reused, so
