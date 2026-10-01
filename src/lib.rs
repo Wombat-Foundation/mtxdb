@@ -24,14 +24,12 @@ pub mod bitmap_set;
 /// Verify-once decoded-node cache with O(1) LRU eviction, plus a pinned-node set.
 pub mod cache;
 /// Persisted closure generations published through a logical head.
-#[cfg(feature = "multi-reader")]
 pub mod closure_store;
 /// Compressed sparse row graph for deterministic topological ordering.
 pub mod csr;
 /// In-memory dependency DAG used to track unresolved node references.
 pub mod dag;
 /// Root-level handle that opens every pool behind one shared WAL fence.
-#[cfg(feature = "multi-reader")]
 pub mod database;
 /// Frontier tracking for nodes awaiting their dependencies before being writable.
 pub mod frontier;
@@ -51,10 +49,8 @@ pub mod journal;
 /// Database-root layout and named independent packfile pools.
 pub mod layout;
 /// Stable logical-ID to current physical-record pointers.
-#[cfg(feature = "multi-reader")]
 pub mod logical_head;
 /// Matrix event adjacency (`prev`, `auth`, relations) over the short-id primitives.
-#[cfg(feature = "multi-reader")]
 pub mod matrix_adjacency;
 /// Matrix-specific room-version policy.
 pub mod matrix_policy;
@@ -68,7 +64,6 @@ pub mod room_auth;
 /// Fixed-size shard file pool that packfiles are written into.
 pub mod shard;
 /// Room-scoped dense `u32` short ids and compact adjacency lists.
-#[cfg(feature = "multi-reader")]
 pub mod short_id;
 /// Matrix state-group instance identity and record layout.
 pub mod state_group;
@@ -98,7 +93,6 @@ pub use auxiliary::{
 #[cfg(feature = "bitmaps")]
 pub use bitmap_set::{BitmapSet, DomainTag, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
 pub use cache::NodeCache;
-#[cfg(feature = "multi-reader")]
 pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
     SharedDatabase,
@@ -112,12 +106,10 @@ pub use journal::{
     DurabilityStats, DurabilityToken, DurableWaitLatency, GroupCommitConfig, GroupDirectoryStats,
 };
 pub use layout::{enclosing_root, is_database_root, DatabaseLayout, ShardType};
-#[cfg(feature = "multi-reader")]
 pub use logical_head::{
     decode_logical_head, encode_logical_head, LogicalHead, LogicalHeadRead, LogicalHeadValue,
     LOGICAL_HEAD_MAGIC, LOGICAL_HEAD_VERSION,
 };
-#[cfg(feature = "multi-reader")]
 pub use matrix_policy::matrix_pool_policies;
 pub use matrix_policy::{
     EventIdPolicy, MatrixRecordClass, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,

@@ -233,7 +233,6 @@ pub(super) struct ReadJournal {
     pub(super) delete_lsn: HashMap<[u8; 16], u64>,
     /// Whether this is the writer's transaction overlay, which is parked when
     /// no transaction uses it, and not a read-only worker's overlay.
-    #[cfg(feature = "multi-reader")]
     pub(super) transaction: bool,
 }
 
@@ -311,7 +310,6 @@ impl ReadJournal {
             tail_scratch: Vec::new(),
             puts: HashMap::new(),
             delete_lsn: HashMap::new(),
-            #[cfg(feature = "multi-reader")]
             transaction: false,
         }
     }
@@ -962,7 +960,6 @@ impl PackfileStorage {
     /// # Errors
     /// Returns [`StorageError`] if the segment is unreadable or a committed
     /// group fails validation.
-    #[cfg(feature = "multi-reader")]
     pub(super) fn enable_transaction_read_journal(
         &self,
         path: &std::path::Path,
@@ -1019,7 +1016,6 @@ impl PackfileStorage {
     /// it installed would make every read-committed read refresh and consult a
     /// journal that can only repeat what the index holds. Its scan position is
     /// kept for the next activation.
-    #[cfg(feature = "multi-reader")]
     pub(super) fn park_transaction_overlay(&self) {
         let mut installed = self.read_journal.lock();
         if installed

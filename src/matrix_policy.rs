@@ -328,7 +328,6 @@ pub struct RoomMetadata {
 ///   do not benefit from zstd; compression is disabled to save CPU cycles on write and replay.
 /// - `EventDag`: Event JSON benefits significantly from zstd; compression is enabled.
 /// - `Edges`: Edge records retain standard defaults.
-#[cfg(feature = "multi-reader")]
 #[must_use]
 pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
     crate::database::PoolPolicies {

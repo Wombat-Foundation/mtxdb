@@ -3279,6 +3279,7 @@ fn a_read_only_open_of_an_absent_pool_is_empty_and_creates_nothing() {
 /// pool's data once the writer creates it: first through the shared WAL, then
 /// after the writer's sync has made packs and a checkpoint.
 #[test]
+#[cfg(feature = "multi-reader")]
 fn a_reader_opened_before_a_pool_exists_sees_its_first_writes() {
     let root = test_root("reader-before-pool");
     let database = SharedDatabase::open(root.clone()).unwrap();

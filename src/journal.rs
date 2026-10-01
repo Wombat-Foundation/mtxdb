@@ -6,7 +6,6 @@
 //! target LSN and releases it only after a durable group covers that target.
 
 use std::collections::HashMap;
-#[cfg(feature = "multi-reader")]
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -48,7 +47,6 @@ impl JournalVersion {
     }
 
     /// Version a freshly created shared (multi-pool) segment uses.
-    #[cfg(feature = "multi-reader")]
     const fn shared() -> Self {
         Self::V5PoolTagged
     }
@@ -179,7 +177,6 @@ pub enum Mutation {
 /// that delete has no entry, but still resolves to a version (the delete LSN)
 /// so an "absent at version N" observation cannot be mistaken for a match
 /// after a concurrent delete/recreate.
-#[cfg(feature = "multi-reader")]
 #[derive(Debug, Default)]
 struct RecordVersions {
     nodes: HashMap<[u8; 16], u64>,
@@ -188,7 +185,6 @@ struct RecordVersions {
 
 /// Version trackers seeded from a retained WAL segment: each collection's
 /// logical version and each record's write LSN.
-#[cfg(feature = "multi-reader")]
 type SeededVersions = (
     HashMap<(ShardType, [u8; 16]), u64>,
     HashMap<(ShardType, [u8; 16]), RecordVersions>,
@@ -215,7 +211,6 @@ pub struct RecordExpectation {
 pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
 
 /// Lifecycle of a transaction's staged journal mutations.
-#[cfg(feature = "multi-reader")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnStageState {
     /// The SQL transaction attempt is active and may add mutations.
@@ -233,7 +228,6 @@ pub enum TxnStageState {
 }
 
 #[derive(Debug)]
-#[cfg(feature = "multi-reader")]
 struct TxnStageData {
     pools: [Vec<Mutation>; ShardType::ALL.len()],
     applied: [Vec<bool>; ShardType::ALL.len()],
@@ -250,7 +244,6 @@ struct TxnStageData {
 }
 
 /// What a transaction's staged mutations say about one record.
-#[cfg(feature = "multi-reader")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StagedLookup {
     /// The newest staged mutation for the record is a put of this payload.
@@ -283,7 +276,6 @@ pub struct CollectionExpectation {
 /// A failed collection-version precondition, carried inside the publish path's
 /// [`std::io::Error`] so the transaction layer can surface it as
 /// [`crate::storage::StorageError::StaleRead`].
-#[cfg(feature = "multi-reader")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StaleVersion {
     pub(crate) pool: ShardType,
@@ -292,7 +284,6 @@ pub(crate) struct StaleVersion {
     pub(crate) actual: u64,
 }
 
-#[cfg(feature = "multi-reader")]
 impl std::fmt::Display for StaleVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -303,7 +294,6 @@ impl std::fmt::Display for StaleVersion {
     }
 }
 
-#[cfg(feature = "multi-reader")]
 impl std::error::Error for StaleVersion {}
 
 /// Transaction-local mutation buffer used by
@@ -319,7 +309,6 @@ impl std::error::Error for StaleVersion {}
 /// [`Self::discard`] drops only buffered mutations. The database transaction
 /// applies them to packs and indexes only after its caller declares commit,
 /// then publishes the resulting shared-WAL group.
-#[cfg(feature = "multi-reader")]
 pub struct TxnStage {
     state: std::sync::atomic::AtomicU8,
     data: Mutex<TxnStageData>,
@@ -327,14 +316,12 @@ pub struct TxnStage {
     lookup_many_calls: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(feature = "multi-reader")]
 impl Default for TxnStage {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "multi-reader")]
 impl TxnStage {
     const ACTIVE: u8 = 0;
     const DISCARDED: u8 = 1;
@@ -473,33 +460,28 @@ impl TxnStage {
     }
 
     /// Snapshot staged mutations for application to storage at commit time.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn snapshot_mutations(&self) -> [Vec<Mutation>; ShardType::ALL.len()] {
         self.data.lock().pools.clone()
     }
 
     /// Receipt identifying this stage's published journal group.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn published_receipt(&self) -> Option<CommitReceipt> {
         self.data.lock().receipt
     }
 
     /// Which pools (in [`ShardType::ALL`] order) have at least one staged
     /// mutation.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn touched_pools(&self) -> [bool; ShardType::ALL.len()] {
         let data = self.data.lock();
         std::array::from_fn(|index| data.pools.get(index).is_some_and(|pool| !pool.is_empty()))
     }
 
     /// Whether this stage has no mutations to publish or materialize.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn is_empty(&self) -> bool {
         self.data.lock().pools.iter().all(Vec::is_empty)
     }
 
     /// Return whether one staged mutation has already been applied to storage.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn mutation_applied(&self, pool: ShardType, index: usize) -> bool {
         self.data.lock().applied[pool_index(pool)]
             .get(index)
@@ -509,7 +491,6 @@ impl TxnStage {
 
     /// Record successful application of one staged mutation. This makes a
     /// retry after a later mutation fails resume at the failed mutation.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn mark_mutation_applied(&self, pool: ShardType, index: usize) -> io::Result<()> {
         let mut data = self.data.lock();
         let applied = data.applied[pool_index(pool)]
@@ -525,7 +506,6 @@ impl TxnStage {
     }
 
     /// Begin pack/index materialization after the journal group is published.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn begin_materialization(&self) -> io::Result<()> {
         let state = self.state.load(Ordering::Acquire);
         match state {
@@ -554,7 +534,6 @@ impl TxnStage {
     }
 
     /// Complete an active no-op transaction without creating a journal group.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn mark_empty_published(&self) -> io::Result<()> {
         let data = self.data.lock();
         if data.pools.iter().any(|pool| !pool.is_empty()) {
@@ -576,7 +555,6 @@ impl TxnStage {
     }
 
     /// Mark both journal publication and storage application complete.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn mark_published(&self) -> io::Result<()> {
         match self.state.load(Ordering::Acquire) {
             Self::MATERIALIZING | Self::PUBLISHED => {
@@ -911,7 +889,6 @@ impl TxnStage {
     }
 }
 
-#[cfg(feature = "multi-reader")]
 const fn pool_index(pool: ShardType) -> usize {
     match pool {
         ShardType::State => 0,
@@ -1166,7 +1143,6 @@ struct SyncCapture {
 const UNATTRIBUTED_POOL_BIT: u8 = 0x80;
 
 /// What the group directory says about reclaiming a shared segment.
-#[cfg(feature = "multi-reader")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SharedBoundary {
     /// The directory does not match the file, so it cannot decide.
@@ -1207,7 +1183,6 @@ struct GroupMark {
 /// A pool's reclaim coverage on a shared segment is stuck: the segment is over
 /// the reclaim trigger and a reclaim could not shrink it. Remembered so forced
 /// checkpoints back off until something can change the outcome.
-#[cfg(feature = "multi-reader")]
 #[derive(Clone, Copy, Debug)]
 struct ReclaimStall {
     /// Segment length when the reclaim failed to shrink it.
@@ -1226,10 +1201,8 @@ struct ReclaimStall {
 
 /// Something that makes a named pool checkpoint so it reports coverage, given
 /// to a coordinator by whatever owns the pools.
-#[cfg(feature = "multi-reader")]
 type BlockerRemediation = Arc<dyn Fn(ShardType) + Send + Sync>;
 
-#[cfg(feature = "multi-reader")]
 thread_local! {
     /// Set while this thread is checkpointing lagging pools, so their syncs do
     /// not start another round.
@@ -1301,7 +1274,6 @@ fn marks_from_scan(scan: &Scan) -> Vec<GroupMark> {
 ///
 /// The one place this rule lives: the directory and the scan fallback both call
 /// it, so they cannot disagree.
-#[cfg(feature = "multi-reader")]
 fn boundary_through(
     groups: &[GroupMark],
     covered: &HashMap<ShardType, u64>,
@@ -1465,7 +1437,6 @@ pub struct Journal {
 const SLOW_FSYNC_WARN: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Cross-pool coverage bookkeeping for reclaiming a shared segment.
-#[cfg(feature = "multi-reader")]
 #[derive(Default)]
 struct CoverageState {
     /// Highest durable checkpoint coverage reported per pool. A group is
@@ -1775,20 +1746,15 @@ pub struct JournalCoordinator {
     /// [`RECLAIM_TRIGGER_LEN`].
     reclaim_trigger_len: AtomicU64,
     /// Set while a reclaim over the trigger cannot shrink the segment.
-    #[cfg(feature = "multi-reader")]
     reclaim_stall: Mutex<Option<ReclaimStall>>,
     /// Advances whenever any pool's reported coverage does.
-    #[cfg(feature = "multi-reader")]
     coverage_epoch: AtomicU64,
     /// Times a reclaim over the trigger has been found unable to shrink the
     /// segment.
-    #[cfg(feature = "multi-reader")]
     reclaim_stalls: AtomicU64,
     /// Checkpoints the pools that hold a stalled reclaim back.
-    #[cfg(feature = "multi-reader")]
     blocker_remediation: Mutex<Option<BlockerRemediation>>,
     /// `(segment length, coverage epoch)` at the last remediation attempt.
-    #[cfg(feature = "multi-reader")]
     last_remediation: Mutex<Option<(u64, u64)>>,
     /// Optional shared, cross-pool group-sequence allocator. When present,
     /// each committed group draws its sequence from here instead of the
@@ -1798,7 +1764,6 @@ pub struct JournalCoordinator {
     /// Per-pool durable coverage, used to reclaim a shared segment only up to
     /// the point every pool present in it has materialized. See
     /// [`Self::report_pool_coverage`] and [`Self::reclaim_shared`].
-    #[cfg(feature = "multi-reader")]
     coverage: Mutex<CoverageState>,
     /// Highest committed group `last_lsn` that carried a frame for each pool.
     ///
@@ -1817,11 +1782,9 @@ pub struct JournalCoordinator {
     /// reclaim drops the WAL history a version was derived from, so a collection
     /// whose last write is reclaimed reads `0` after a reopen until its next
     /// write (checkpoint persistence is the follow-up that closes this).
-    #[cfg(feature = "multi-reader")]
     collection_versions: Mutex<HashMap<(ShardType, [u8; 16]), u64>>,
     /// Per-record write LSNs for the live published suffix, keyed by
     /// `(pool, collection)`. See [`RecordVersions`].
-    #[cfg(feature = "multi-reader")]
     record_versions: Mutex<HashMap<(ShardType, [u8; 16]), RecordVersions>>,
     /// First LSNs of transaction groups that are published but whose writes are
     /// not yet all in the packs. See [`Self::publish_groups`].
@@ -1830,9 +1793,8 @@ pub struct JournalCoordinator {
     /// A read that cannot certify its boundary waits here instead of polling;
     /// `transaction_materialized` and each pool's materialized watermark
     /// advance notify it.
-    #[cfg(feature = "multi-reader")]
     materialized_cv: Condvar,
-    #[cfg(feature = "multi-reader")]
+    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     materialized_lock: Mutex<()>,
     /// Appended-but-not-yet-committed groups, with the highest LSN each carried
     /// per pool. Appending a transaction group makes it visible before it is
@@ -1973,7 +1935,6 @@ impl JournalCoordinator {
     /// Seed logical collection versions and per-record write LSNs from the
     /// retained segment. Records whose group was reclaimed are absent and fall
     /// back to their frame's `last_write_lsn` on first read.
-    #[cfg(feature = "multi-reader")]
     fn seed_versions(scan: &Scan) -> SeededVersions {
         let mut collection_versions: HashMap<(ShardType, [u8; 16]), u64> = HashMap::new();
         let mut record_versions: HashMap<(ShardType, [u8; 16]), RecordVersions> = HashMap::new();
@@ -2018,7 +1979,6 @@ impl JournalCoordinator {
     pub fn new(journal: Journal, scan: &Scan) -> Self {
         let committed_lsn = scan.groups.last().map_or(0, |group| group.last_lsn);
         let path = journal.path.clone();
-        #[cfg(feature = "multi-reader")]
         let coverage = CoverageState::default();
         // Seed each pool's committed watermark from the recovered groups, so a
         // fresh coordinator over a pre-existing segment reports the same
@@ -2035,7 +1995,6 @@ impl JournalCoordinator {
         // Seed each collection's logical version and each record's write LSN
         // from the retained segment. A version whose group was already
         // reclaimed is not recoverable here and reads as 0 until written again.
-        #[cfg(feature = "multi-reader")]
         let (collection_versions, record_versions) = Self::seed_versions(scan);
         Self {
             journal: Mutex::new(journal),
@@ -2045,28 +2004,18 @@ impl JournalCoordinator {
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
             reclaim_trigger_len: AtomicU64::new(RECLAIM_TRIGGER_LEN),
-            #[cfg(feature = "multi-reader")]
             reclaim_stall: Mutex::new(None),
-            #[cfg(feature = "multi-reader")]
             coverage_epoch: AtomicU64::new(0),
-            #[cfg(feature = "multi-reader")]
             reclaim_stalls: AtomicU64::new(0),
-            #[cfg(feature = "multi-reader")]
             blocker_remediation: Mutex::new(None),
-            #[cfg(feature = "multi-reader")]
             last_remediation: Mutex::new(None),
             sequence: None,
-            #[cfg(feature = "multi-reader")]
             coverage: Mutex::new(coverage),
             pool_committed: Mutex::new(pool_committed),
-            #[cfg(feature = "multi-reader")]
             collection_versions: Mutex::new(collection_versions),
-            #[cfg(feature = "multi-reader")]
             record_versions: Mutex::new(record_versions),
             unmaterialized: Mutex::new(std::collections::BTreeSet::new()),
-            #[cfg(feature = "multi-reader")]
             materialized_cv: Condvar::new(),
-            #[cfg(feature = "multi-reader")]
             materialized_lock: Mutex::new(()),
             pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
@@ -2169,7 +2118,6 @@ impl JournalCoordinator {
     /// Record that `pool`'s durable checkpoint has materialized every frame it
     /// owns through `lsn`. Coverage only advances. A pool with no reported
     /// coverage never blocks a group that does not carry its frames.
-    #[cfg(feature = "multi-reader")]
     pub fn report_pool_coverage(&self, pool: ShardType, lsn: u64) {
         let mut coverage = self.coverage.lock();
         let entry = coverage.covered.entry(pool).or_insert(0);
@@ -2184,7 +2132,6 @@ impl JournalCoordinator {
     /// written, or its last write predates the retained segment). See the
     /// tracker field docs for the reclaim/reopen caveat.
     #[must_use]
-    #[cfg(feature = "multi-reader")]
     pub fn collection_version(&self, pool: ShardType, collection_id: &[u8; 16]) -> u64 {
         self.collection_versions
             .lock()
@@ -2198,7 +2145,6 @@ impl JournalCoordinator {
     /// has no entry, so the caller must seed it from durable state (the
     /// record's frame metadata) before validating a conditional write.
     #[must_use]
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn record_version(
         &self,
         pool: ShardType,
@@ -2213,7 +2159,7 @@ impl JournalCoordinator {
     /// Seed a cold record's version from durable state (its frame metadata).
     /// Never overwrites a live entry, and a collection that was deleted
     /// resolves an absent record to its delete LSN rather than the seed.
-    #[cfg(feature = "multi-reader")]
+    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn seed_record_version(
         &self,
         pool: ShardType,
@@ -2236,7 +2182,7 @@ impl JournalCoordinator {
     /// Snapshot the logical versions this pool's checkpoint can safely claim.
     /// Versions above `covered_lsn` remain represented by retained WAL and
     /// must not be folded into the checkpoint baseline.
-    #[cfg(feature = "multi-reader")]
+    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn collection_versions_through(
         &self,
         pool: ShardType,
@@ -2257,7 +2203,6 @@ impl JournalCoordinator {
     /// Merge a durable pool-checkpoint baseline with versions recovered from
     /// the retained WAL. Newer WAL versions win; deleted collection IDs are
     /// retained as tombstone versions too.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn restore_collection_versions(
         &self,
         pool: ShardType,
@@ -2279,7 +2224,6 @@ impl JournalCoordinator {
     /// recording it would claim coverage the checkpoint does not have and let
     /// reclaim drop another pool's uncovered frames.
     #[must_use]
-    #[cfg(feature = "multi-reader")]
     pub fn committed_lsn_for_pool(&self, pool: ShardType) -> u64 {
         let committed = self.pool_committed.lock().get(&pool).copied().unwrap_or(0);
         // A published transaction whose writes are not all in the packs yet
@@ -2292,7 +2236,6 @@ impl JournalCoordinator {
 
     /// Record that the transaction group whose first frame is `first_lsn` has
     /// been fully written to the packs, so coverage may pass it.
-    #[cfg(feature = "multi-reader")]
     pub fn transaction_materialized(&self, first_lsn: u64) {
         self.unmaterialized.lock().remove(&first_lsn);
         self.notify_materialized();
@@ -2301,7 +2244,6 @@ impl JournalCoordinator {
     /// Wake versioned reads waiting for a pending group to lift the read
     /// boundary. Called when a pool's materialized watermark or the pending
     /// set changes.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn notify_materialized(&self) {
         self.materialized_cv.notify_all();
     }
@@ -2309,7 +2251,7 @@ impl JournalCoordinator {
     /// Block until a materialization may have advanced the read boundary, or
     /// `timeout` elapses. A spurious wake is fine: callers re-check the
     /// boundary and wait again.
-    #[cfg(feature = "multi-reader")]
+    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn wait_for_materialized(&self, timeout: std::time::Duration) {
         let mut guard = self.materialized_lock.lock();
         self.materialized_cv.wait_for(&mut guard, timeout);
@@ -2325,7 +2267,7 @@ impl JournalCoordinator {
     /// predates a publication with the version that publication already
     /// advanced.
     #[must_use]
-    #[cfg(feature = "multi-reader")]
+    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn unmaterialized_floor(&self) -> u64 {
         self.unmaterialized
             .lock()
@@ -2380,7 +2322,6 @@ impl JournalCoordinator {
     ///
     /// # Errors
     /// Propagates a scan or segment-rewrite failure from [`Self::reclaim_through`].
-    #[cfg(feature = "multi-reader")]
     pub fn reclaim_shared(&self) -> io::Result<Option<Reclaim>> {
         // The group directory answers this without reading the segment. The
         // lock order matches `reclaim_through`: the sync lock, then the journal,
@@ -2443,7 +2384,6 @@ impl JournalCoordinator {
 
     /// The pools whose missing coverage holds reclaim back right now, oldest
     /// needed group first. Empty when nothing is blocked or it cannot be told.
-    #[cfg(feature = "multi-reader")]
     #[must_use]
     pub fn reclaim_blockers(&self) -> Vec<ShardType> {
         let journal = self.journal.lock();
@@ -2452,7 +2392,6 @@ impl JournalCoordinator {
     }
 
     /// Whether the last reclaim left the segment over the trigger.
-    #[cfg(feature = "multi-reader")]
     #[must_use]
     pub fn is_reclaim_stalled(&self) -> bool {
         self.reclaim_stall.lock().is_some()
@@ -2460,7 +2399,6 @@ impl JournalCoordinator {
 
     /// Times a reclaim has been found unable to shrink a segment over the
     /// trigger (each stall counts once, until a reclaim clears it).
-    #[cfg(feature = "multi-reader")]
     #[must_use]
     pub fn reclaim_stalls(&self) -> u64 {
         self.reclaim_stalls.load(Ordering::Relaxed)
@@ -2469,7 +2407,6 @@ impl JournalCoordinator {
     /// Give the coordinator a way to make one named pool checkpoint (and so
     /// report coverage). It is used only in the emergency zone, to un-stall a
     /// reclaim held back by a pool nobody is syncing.
-    #[cfg(feature = "multi-reader")]
     pub fn set_blocker_remediation(&self, remediate: impl Fn(ShardType) + Send + Sync + 'static) {
         *self.blocker_remediation.lock() = Some(Arc::new(remediate));
     }
@@ -2477,7 +2414,6 @@ impl JournalCoordinator {
     /// Note how a reclaim ended, with the journal and sync locks held. A
     /// segment still over the trigger means the reclaim is stalled: remember
     /// it, and say so once, naming the pools it is waiting on.
-    #[cfg(feature = "multi-reader")]
     fn record_reclaim_outcome(&self, journal: &Journal, covered: &HashMap<ShardType, u64>) {
         let len = journal.file_len;
         if len <= self.reclaim_trigger_len() {
@@ -2529,7 +2465,6 @@ impl JournalCoordinator {
     /// with no journal or persistence lock held, at most once per further
     /// eighth of the trigger of growth unless coverage moved, and never from
     /// inside another remediation.
-    #[cfg(feature = "multi-reader")]
     pub fn remediate_blockers(&self, caller: Option<ShardType>) {
         if REMEDIATING.with(std::cell::Cell::get) {
             return;
@@ -2588,7 +2523,6 @@ impl JournalCoordinator {
     /// in a single segment's group sequence are then expected; recovery
     /// permits them.
     #[must_use]
-    #[cfg(feature = "multi-reader")]
     pub fn with_shared_sequence(journal: Journal, scan: &Scan, sequence: Arc<AtomicU64>) -> Self {
         let mut coordinator = Self::new(journal, scan);
         coordinator.sequence = Some(sequence);
@@ -3251,7 +3185,6 @@ impl JournalCoordinator {
     ///
     /// # Errors
     /// Same as [`Self::publish_group`].
-    #[cfg(feature = "multi-reader")]
     pub fn publish_group_tagged(
         &self,
         pool: ShardType,
@@ -3271,7 +3204,6 @@ impl JournalCoordinator {
     /// # Errors
     /// Returns a stale-version error if a collection's logical version differs
     /// from its expectation, or the usual publication errors.
-    #[cfg(feature = "multi-reader")]
     pub fn publish_group_tagged_checked(
         &self,
         pool: ShardType,
@@ -3294,7 +3226,6 @@ impl JournalCoordinator {
     /// # Errors
     /// Returns an error if the journal is poisoned or the group cannot be
     /// appended.
-    #[cfg(feature = "multi-reader")]
     pub fn publish_tagged_groups(
         &self,
         batches: &[(ShardType, &[Mutation])],
@@ -3308,7 +3239,6 @@ impl JournalCoordinator {
     /// # Errors
     /// Returns a stale-version error if a collection's logical version differs
     /// from its expectation, or the usual publication errors.
-    #[cfg(feature = "multi-reader")]
     pub fn publish_tagged_groups_checked(
         &self,
         batches: &[(ShardType, &[Mutation])],
@@ -3331,7 +3261,6 @@ impl JournalCoordinator {
     /// Validate `expectations` against the live collection versions. The caller
     /// must hold the publication lock, which also serializes the version bumps,
     /// so a passing check cannot race a competing publish.
-    #[cfg(feature = "multi-reader")]
     fn validate_expectations(
         &self,
         expectations: &[CollectionExpectation],
@@ -3391,7 +3320,6 @@ impl JournalCoordinator {
     /// # Errors
     /// Returns a stale-version error if any collection's logical version
     /// differs from its expectation.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn check_expectations(
         &self,
         expectations: &[CollectionExpectation],
@@ -3404,7 +3332,6 @@ impl JournalCoordinator {
     /// Advance the collection and per-record version trackers for a published
     /// group, under the publication lock, so a later conditional commit
     /// validates against the version this group published.
-    #[cfg(feature = "multi-reader")]
     fn note_published_versions(&self, staged: &[(Option<ShardType>, &[Mutation])], last_lsn: u64) {
         let mut versions = self.collection_versions.lock();
         let mut records = self.record_versions.lock();
@@ -3457,7 +3384,6 @@ impl JournalCoordinator {
         record_expectations: &[RecordExpectation],
     ) -> io::Result<Option<CommitReceipt>> {
         let _publication = self.publication.lock();
-        #[cfg(feature = "multi-reader")]
         self.validate_expectations(expectations, record_expectations)?;
         #[cfg(not(feature = "multi-reader"))]
         {
@@ -3532,7 +3458,6 @@ impl JournalCoordinator {
         // Advance every mutated collection's logical version to this group's
         // LSN, still under the publication lock, so a later conditional commit
         // validates against the version this group published.
-        #[cfg(feature = "multi-reader")]
         self.note_published_versions(staged, receipt.last_lsn);
         // Publish the read-committed change boundary for cross-process workers
         // at the exact point the group becomes visible, before any fsync: a
@@ -3609,7 +3534,6 @@ impl JournalCoordinator {
 
     /// How much a stalled segment must grow before the next forced checkpoint
     /// is worth trying: an eighth of the trigger.
-    #[cfg(feature = "multi-reader")]
     fn reclaim_retry_growth(&self) -> u64 {
         self.reclaim_trigger_len() / 8
     }
@@ -3634,7 +3558,6 @@ impl JournalCoordinator {
 
     /// Whether a stalled reclaim (if there is one) still lets `pool`'s sync
     /// force a checkpoint at segment length `len`.
-    #[cfg(feature = "multi-reader")]
     fn stall_permits_forcing(&self, len: u64, pool: Option<ShardType>) -> bool {
         let Some(stall) = *self.reclaim_stall.lock() else {
             return true;
@@ -3642,13 +3565,6 @@ impl JournalCoordinator {
         self.coverage_epoch.load(Ordering::Acquire) != stall.coverage_epoch
             || len >= stall.at_len.saturating_add(self.reclaim_retry_growth())
             || pool.is_some_and(|pool| self.reclaim_blockers().contains(&pool))
-    }
-
-    /// Per-pool journals have no other pool to wait on, so nothing stalls.
-    #[cfg(not(feature = "multi-reader"))]
-    fn stall_permits_forcing(&self, _len: u64, _pool: Option<ShardType>) -> bool {
-        let _ = self;
-        true
     }
 
     /// What the journal's in-memory group directory holds: its entry count and
@@ -4131,7 +4047,6 @@ impl JournalCoordinator {
 
     /// [`Self::reclaim_through`] recording the pool whose missing coverage
     /// stopped the cut on the returned [`Reclaim`]. Diagnostics only.
-    #[cfg(feature = "multi-reader")]
     fn reclaim_through_with_blocker(
         &self,
         covered_lsn: u64,
@@ -4334,7 +4249,6 @@ impl Journal {
     /// # Errors
     /// Same as [`Self::open`], plus `InvalidData` if an existing segment is not
     /// the pool-tagged version.
-    #[cfg(feature = "multi-reader")]
     pub fn open_shared(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
         Self::open_versioned(path, JournalVersion::shared(), 1)
     }
@@ -4352,7 +4266,6 @@ impl Journal {
     ///
     /// # Errors
     /// Same as [`Self::open_shared`].
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn open_shared_with_base(
         path: impl AsRef<Path>,
         base_lsn: u64,
@@ -4506,7 +4419,6 @@ impl Journal {
     /// # Errors
     /// Same as [`Self::append_group_with_sequence`], plus `InvalidInput` if
     /// this segment is not pool-tagged.
-    #[cfg(feature = "multi-reader")]
     pub fn append_group_tagged_with_sequence(
         &mut self,
         mutations: &[(Option<ShardType>, Mutation)],
@@ -4520,12 +4432,9 @@ impl Journal {
         mutations: &[(Option<ShardType>, Mutation)],
         sequence: Option<u64>,
     ) -> io::Result<CommitReceipt> {
-        #[cfg(feature = "multi-reader")]
-        {
+        if self.version.is_pool_tagged() {
             self.append_group_tagged_with_sequence(mutations, sequence)
-        }
-        #[cfg(not(feature = "multi-reader"))]
-        {
+        } else {
             let untagged = mutations
                 .iter()
                 .cloned()
@@ -4816,7 +4725,6 @@ impl Journal {
     /// still needed that have not reported coverage through it. Empty when the
     /// directory cannot be trusted, or the oldest needed group holds a frame no
     /// pool can be asked to cover (an untagged one).
-    #[cfg(feature = "multi-reader")]
     fn blocking_pools(&self, covered: &HashMap<ShardType, u64>) -> Vec<ShardType> {
         if !self.directory_matches_file() {
             return Vec::new();
@@ -4881,7 +4789,6 @@ impl Journal {
     /// which every pool with a frame has covered the group. The directory being
     /// stale is reported apart from nothing being covered, so the caller can
     /// scan the file in that case.
-    #[cfg(feature = "multi-reader")]
     fn shared_reclaim_boundary(&self, covered: &HashMap<ShardType, u64>) -> SharedBoundary {
         if !self.directory_matches_file() {
             return SharedBoundary::Untrusted;
@@ -5753,12 +5660,10 @@ fn invalid_data(message: &'static str) -> io::Error {
 /// holder opens the segment with [`Journal::open_shared`], builds one
 /// [`JournalCoordinator`], and attaches each pool with
 /// `PackfileStorage::enable_shared_journal`.
-#[cfg(feature = "multi-reader")]
 pub struct SharedWalLock {
     _lock: crate::shard::WriterLock,
 }
 
-#[cfg(feature = "multi-reader")]
 impl SharedWalLock {
     /// Acquire the root shared-WAL writer lock.
     ///

@@ -72,13 +72,15 @@ impl PoolPolicies {
     }
 }
 
+const POOL_COUNT: usize = ShardType::ALL.len();
+
 /// A database root open for writing through one shared durability fence.
 ///
 /// Dropping it releases the root writer lock and the pools it opened.
 pub struct Database {
     layout: DatabaseLayout,
     coordinator: Arc<JournalCoordinator>,
-    pools: [Arc<PackfileStorage>; 4],
+    pools: [Arc<PackfileStorage>; POOL_COUNT],
     /// Published transactions whose materialization still needs to be
     /// completed. The queue owns the transaction stage, so dropping a caller's
     /// handle cannot orphan the visibility overlay.
@@ -93,7 +95,6 @@ pub struct Database {
 }
 
 /// Compatibility alias for the pre-`Database` name.
-#[deprecated(note = "use Database instead")]
 pub type SharedDatabase = Database;
 
 /// Total time and call count for one commit phase.
@@ -622,8 +623,10 @@ impl Database {
             store.replay_journal()?;
             pools.push(Arc::new(store));
         }
-        let pools: [Arc<PackfileStorage>; 4] = pools.try_into().map_err(|_| {
-            StorageError::Internal("a shared database must open exactly four pools".into())
+        let pools: [Arc<PackfileStorage>; POOL_COUNT] = pools.try_into().map_err(|_| {
+            StorageError::Internal(format!(
+                "a shared database must open exactly {POOL_COUNT} pools"
+            ))
         })?;
 
         // This process owns every pool, so it can make a lagging one checkpoint
@@ -945,7 +948,7 @@ fn stale_read_from_publish(error: std::io::Error) -> StorageError {
     StorageError::Io(error)
 }
 
-/// Index of `shard` in the fixed `[State, EventDag, Edges, ServerInfo]` pool array.
+/// Index of `shard` in the canonical pool array.
 const fn shard_index(shard: ShardType) -> usize {
     match shard {
         ShardType::State => 0,

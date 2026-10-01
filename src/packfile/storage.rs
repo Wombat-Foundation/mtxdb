@@ -15,7 +15,6 @@ use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELT
 use crate::index::format::DeltaFrame;
 use crate::index::redo::{RedoOp, RedoRecord};
 use crate::index::{EntryUndo, InsertError, LossyIndex};
-#[cfg(feature = "multi-reader")]
 use crate::journal::pool_tag;
 use crate::journal::{
     pool_from_tag, DurabilityToken, GroupCommitConfig, Journal, JournalCoordinator, JournalCursor,
@@ -1948,16 +1947,14 @@ pub struct PackfileStorage {
     /// `read_journal` so read-committed reads on the writer skip the journal
     /// refresh, and kept at all so the next activation resumes its scan
     /// position instead of rescanning the segment.
-    #[cfg(feature = "multi-reader")]
     parked_transaction_overlay: parking_lot::Mutex<Option<ReadJournal>>,
     /// Serializes overlay activation and deactivation, so the overlay moves
     /// between `read_journal` and the parking slot exactly once per 0 <-> 1
     /// transition of `transaction_overlay_users`.
-    #[cfg(feature = "multi-reader")]
     transaction_overlay_lifecycle: parking_lot::Mutex<()>,
     /// Test-only total of segment bytes the transaction overlay has scanned,
     /// across activations, whether the overlay was retained or rebuilt.
-    #[cfg(all(test, feature = "multi-reader"))]
+    #[cfg(test)]
     transaction_overlay_scanned: AtomicU64,
     /// Journal LSN covered by the durable index this handle actually loaded.
     ///
@@ -2830,12 +2827,10 @@ impl PackfileStorage {
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
             read_journal: Arc::new(parking_lot::Mutex::new(None)),
-            #[cfg(feature = "multi-reader")]
             parked_transaction_overlay: parking_lot::Mutex::new(None),
-            #[cfg(feature = "multi-reader")]
             transaction_overlay_lifecycle: parking_lot::Mutex::new(()),
             transaction_overlay_users: AtomicU64::new(0),
-            #[cfg(all(test, feature = "multi-reader"))]
+            #[cfg(test)]
             transaction_overlay_scanned: AtomicU64::new(0),
             read_covered_lsn,
             materialized_lsn: AtomicU64::new(read_covered),
@@ -9823,7 +9818,6 @@ impl PackfileStorage {
     /// Returns [`StorageError::Internal`] if a journal is already enabled, or
     /// [`StorageError::Io`] if publish-signal setup fails, including OS entropy
     /// failures.
-    #[cfg(feature = "multi-reader")]
     pub fn enable_shared_journal(
         &self,
         journal: Arc<JournalCoordinator>,
@@ -10017,7 +10011,6 @@ impl PackfileStorage {
     /// still being materialized. The overlay is shared with the existing
     /// read-committed implementation, but ordinary reads consult it only
     /// while at least one transaction is in this state.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn activate_transaction_overlay(
         &self,
         wal_path: &Path,
@@ -10074,7 +10067,6 @@ impl PackfileStorage {
     /// Stop consulting the in-process transaction overlay after all staged
     /// mutations have been materialized or the transaction was abandoned
     /// before journal publication.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn deactivate_transaction_overlay(&self) {
         let _lifecycle = self.transaction_overlay_lifecycle.lock();
         let mut users = self.transaction_overlay_users.load(Ordering::Acquire);
@@ -10099,7 +10091,6 @@ impl PackfileStorage {
 
     /// Record that this handle's in-memory index now includes a published
     /// mutation or transaction group through `lsn`.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn note_materialized_lsn(&self, lsn: u64) {
         self.materialized_lsn.fetch_max(lsn, Ordering::Release);
         if let Some(journal) = self.journal() {
@@ -10134,7 +10125,6 @@ impl PackfileStorage {
         // durability remains separate so the background committer can batch
         // several such groups into one fsync. On a shared journal, tag the
         // frame with this store's pool so recovery can route it.
-        #[cfg(feature = "multi-reader")]
         let result = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
             Some(pool) => journal
                 .publish_group_tagged(pool, &[mutation()])
@@ -10145,12 +10135,6 @@ impl PackfileStorage {
         }
         .map(Some)
         .map_err(StorageError::Io);
-        #[cfg(not(feature = "multi-reader"))]
-        let result = journal
-            .publish_group(&[mutation()])
-            .map(|receipt| receipt.last_lsn)
-            .map(Some)
-            .map_err(StorageError::Io);
         if let Ok(Some(_)) = &result {
             self.record_published_mutation(started);
         }
@@ -10160,26 +10144,15 @@ impl PackfileStorage {
     /// Record that this store's index now holds the mutation published at
     /// `lsn`, so versioned reads may certify it. Called by each write path only
     /// after the frame or deletion is applied, never at publication time.
-    #[cfg_attr(
-        not(feature = "multi-reader"),
-        allow(
-            clippy::unused_self,
-            reason = "the materialized LSN is only recorded on the multi-reader path"
-        )
-    )]
     fn note_published_materialized(&self, lsn: Option<u64>) {
-        #[cfg(feature = "multi-reader")]
         if let Some(lsn) = lsn {
             self.note_materialized_lsn(lsn);
         }
-        #[cfg(not(feature = "multi-reader"))]
-        let _ = lsn;
     }
 
     /// Apply a mutation staged by a database transaction without publishing
     /// it to the legacy per-write journal queue. The transaction coordinator
     /// publishes the complete batch after every pool has applied successfully.
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn apply_transaction_mutation(
         &self,
         mutation: &JournalMutation,
@@ -10421,12 +10394,9 @@ impl PackfileStorage {
     /// emergency zone, make the pools holding it back checkpoint. Which pools,
     /// and how, is decided by the coordinator and whoever owns the pools.
     fn remediate_lagging_pools(&self) {
-        #[cfg(feature = "multi-reader")]
         if let Some(journal) = self.journal() {
             journal.remediate_blockers(pool_from_tag(self.journal_pool.load(Ordering::Acquire)));
         }
-        #[cfg(not(feature = "multi-reader"))]
-        let _ = self;
     }
 
     /// Whether this sync must take a full checkpoint so the journal can be
@@ -10438,7 +10408,6 @@ impl PackfileStorage {
         let Some(journal) = self.journal() else {
             return false;
         };
-        #[cfg(feature = "multi-reader")]
         {
             let this_pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
             if !journal.should_force_reclaim_checkpoint(this_pool) {
@@ -10448,10 +10417,6 @@ impl PackfileStorage {
                 Some(pool) => journal.committed_lsn_for_pool(pool) > self.durable_coverage(),
                 None => true,
             }
-        }
-        #[cfg(not(feature = "multi-reader"))]
-        {
-            journal.should_force_reclaim_checkpoint(None)
         }
     }
 
@@ -11414,7 +11379,6 @@ fn report_coverage_and_reclaim_via(
         },
         // A shared segment also holds other pools' frames. Record this pool's
         // coverage and reclaim only what every contributing pool has covered.
-        #[cfg(feature = "multi-reader")]
         Some(pool) => {
             journal.report_pool_coverage(pool, lsn);
             match journal.reclaim_shared() {
@@ -11425,8 +11389,6 @@ fn report_coverage_and_reclaim_via(
                 }
             }
         }
-        #[cfg(not(feature = "multi-reader"))]
-        Some(_) => unreachable!("shared journal state requires multi-reader"),
     }
 }
 
