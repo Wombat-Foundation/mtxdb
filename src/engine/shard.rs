@@ -1194,7 +1194,10 @@ impl ShardPool {
         // pack; an absent rooted pool is simply empty, for readers too.
         let rooted_member =
             !take_writer_lock || crate::layout::enclosing_pool_seed(&base_dir)?.is_some();
-        if writable && !rooted_member {
+        // A writer that takes its own lock needs the directory for the lock file,
+        // so it creates it, even for a pool inside a root. Only a member opened
+        // under the root's lock defers creation to its first pack.
+        if writable && take_writer_lock {
             fs::create_dir_all(&base_dir)?;
         } else if !writable && !rooted_member && !base_dir.is_dir() {
             return Err(io::Error::new(

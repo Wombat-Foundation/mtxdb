@@ -1364,3 +1364,23 @@ fn a_read_only_open_of_an_empty_pool_succeeds_and_a_missing_pool_fails() {
     assert!(reader.try_active_shard().is_err());
     assert!(ShardPool::open_read_only(dir.join("absent")).is_err());
 }
+
+/// A standalone writer on a pool inside a database root that was never written
+/// must create the directory itself: it needs it for its lock file. (Pools opened
+/// under the root's lock defer creation to their first pack instead.)
+#[test]
+fn a_standalone_writer_creates_an_absent_rooted_pool_directory() {
+    let root = test_dir("rooted_standalone_writer");
+    let layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
+    let pool = layout.pool_path(crate::layout::ShardType::State);
+    assert!(!pool.exists(), "lazy init leaves the pool absent");
+
+    let store = ShardPool::open(pool.clone()).expect("a standalone writer opens an absent pool");
+    assert!(pool.is_dir());
+    let record = test_record(1, 1, b"first");
+    store.put_record_with_len(&record).unwrap();
+    store.sync_all().unwrap();
+    assert_eq!(pack_count(&pool), 1);
+    drop(store);
+    let _ = fs::remove_dir_all(&root);
+}

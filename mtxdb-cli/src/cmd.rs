@@ -500,9 +500,10 @@ fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         println!("mtxdb database already initialized at `{}`", root.display());
     } else {
         println!("initialized mtxdb database at `{}`", root.display());
-        for shard_type in ShardType::ALL {
-            println!("  pools/{}", shard_type.as_str());
-        }
+        // Only the root descriptor exists yet: each pool is created by its first
+        // write, so list the pools it will hold rather than directories.
+        let pools: Vec<&str> = ShardType::ALL.iter().map(|shard| shard.as_str()).collect();
+        println!("  pools (created on first write): {}", pools.join(", "));
     }
     Ok(())
 }
@@ -758,26 +759,31 @@ where
     Ok(())
 }
 
+/// A pool's directory. A pool is created by its first write, so a pool that was
+/// never written has no directory yet and is simply empty: the path is returned
+/// either way, and opening it read-only yields an empty store.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "about thirty call sites are written against the fallible form, \
+              several as `let Ok(..) = .. else { continue }`"
+)]
 fn pool_dir(layout: &DatabaseLayout, shard_type: ShardType) -> anyhow::Result<PathBuf> {
-    layout
-        .pool_dir_read_only(shard_type)
-        .with_context(|| format!("failed to open {} shard pool", shard_type.as_str()))
+    Ok(layout.pool_path(shard_type))
 }
 
-/// Return an existing pool without treating a missing optional pool as an
-/// error.  This matters for `-t all` when a database predates a newer pool
-/// such as `mtpl-server-info`; read-only inspection must not create it.
+/// Return a pool that exists on disk, or `None` for one never written (or one a
+/// database predates, such as `mtpl-server-info`). `-t all` skips those, and
+/// read-only inspection must not create them.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "kept fallible to match `pool_dir` at its call sites"
+)]
 fn existing_pool_dir(
     layout: &DatabaseLayout,
     shard_type: ShardType,
 ) -> anyhow::Result<Option<PathBuf>> {
-    match layout.pool_dir_read_only(shard_type) {
-        Ok(path) => Ok(Some(path)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to open {} shard pool", shard_type.as_str()))
-        }
-    }
+    let path = layout.pool_path(shard_type);
+    Ok(path.is_dir().then_some(path))
 }
 
 /// The directory of a specific pool, regardless of `--shard-type`.
@@ -2535,7 +2541,13 @@ fn cmd_collections_in_dir(
 /// Confirm that every packfile in `dir` uses the format this CLI can read.
 /// This reads only the fixed 4 KiB shard descriptors; it never scans frames.
 fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
-    for entry in fs::read_dir(dir)? {
+    // A pool never written has no directory and no shard headers to validate.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let path = entry?.path();
         if path.extension().is_none_or(|extension| extension != "pack") {
             continue;
@@ -3843,7 +3855,14 @@ fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<PackId, us
 fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(PackId, u64, u8)>> {
     let mut packs = Vec::new();
     let mut seen = HashSet::new();
-    for entry in fs::read_dir(dir)? {
+    // A pool is created by its first write, so a pool directory that does not
+    // exist holds no packs.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(packs),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "pack") {

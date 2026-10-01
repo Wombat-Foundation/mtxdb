@@ -459,7 +459,8 @@ fn sort_arg(help: &'static str) -> Arg {
 }
 
 fn sub_init() -> Command {
-    Command::new("init").about("Create a new mtxdb database root (db.meta + pools).")
+    Command::new("init")
+        .about("Create a new mtxdb database root (db.meta); pools are created on first write.")
 }
 
 fn sub_subprocess_writer() -> Command {

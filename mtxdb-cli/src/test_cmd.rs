@@ -1,6 +1,7 @@
 use super::{
     build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import_file, cmd_info,
-    cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync, collection_canonical_id,
+    cmd_import, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
+    collection_canonical_id,
     compile_import_template, compute_state_groups_partial, decode_event_json_record,
     decode_hamt_node, decode_hamt_root, decode_mtx_adjacency, default_matrix_import_template,
     derive_template_key, display_collection_role, encode_mtx_adjacency, event_id, event_room_id,
@@ -418,7 +419,9 @@ fn sync_all_does_not_materialize_empty_pools() {
     cmd_sync(&cli, true).unwrap();
 
     for shard_type in ShardType::ALL {
-        let pool = layout.pool_dir_read_only(shard_type).unwrap();
+        // Pools are created by their first write, so a pool nothing wrote to has
+        // no directory at all; either way it must hold no pack.
+        let pool = layout.pool_path(shard_type);
         assert!(
             glob_pack_files(&pool).unwrap().is_empty(),
             "sync --all must not create a pack in the empty {} pool",
@@ -785,8 +788,8 @@ fn info_pack_flag_reports_same_id_in_multiple_pools() {
     let dir2 = unique_temp_dir();
     let l1 = DatabaseLayout::open(dir1.clone()).unwrap();
     let l2 = DatabaseLayout::open(dir2.clone()).unwrap();
-    let p1 = l1.pool_dir_read_only(ShardType::EventDag).unwrap();
-    let p2 = l2.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let p1 = l1.pool_dir(ShardType::EventDag).unwrap();
+    let p2 = l2.pool_dir(ShardType::EventDag).unwrap();
 
     let s1 = PackfileStorage::open(p1.clone()).unwrap();
     s1.put(
@@ -986,7 +989,7 @@ fn export_envelope_base64_encodes_non_json_payloads() {
 fn packs_dump_writes_decoded_jsonl_for_a_pack() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let pool = layout.pool_dir(ShardType::EventDag).unwrap();
     let store = PackfileStorage::open(pool).unwrap();
     let collection_id = [0x11; 16];
     let node_id = [0x22; 16];
@@ -1053,7 +1056,7 @@ fn packs_dump_rejects_a_pack_selector_present_in_multiple_pools() {
     // Deterministic addresses sharing the leading hex digits `ab` in two
     // pools: a `0xab` prefix selector is ambiguous across them.
     for (shard_type, tail) in [(ShardType::EventDag, 1u8), (ShardType::State, 2u8)] {
-        let pool = layout.pool_dir_read_only(shard_type).unwrap();
+        let pool = layout.pool_dir(shard_type).unwrap();
         let mut bytes = [0u8; mtxdb::packfile::PACK_ID_LEN];
         bytes[0] = 0xAB;
         bytes[mtxdb::packfile::PACK_ID_LEN - 1] = tail;
@@ -1097,7 +1100,7 @@ fn packs_dump_errors_when_the_pack_is_absent() {
 fn packs_extract_slices_target_collection_into_valid_pack() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let pool = layout.pool_dir(ShardType::EventDag).unwrap();
     let store = PackfileStorage::open(pool).unwrap();
 
     let room1_selector = "!room1:example.org";
@@ -1187,7 +1190,7 @@ fn packs_extract_slices_target_collection_into_valid_pack() {
 fn one_record_pack_fixture() -> (PathBuf, Cli, PackId) {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let pool = layout.pool_dir(ShardType::EventDag).unwrap();
     let store = PackfileStorage::open(pool).unwrap();
     store
         .put(
@@ -1218,7 +1221,7 @@ fn packs_extract_rejects_same_source_and_dest() {
 
     let source_path = DatabaseLayout::open(dir.clone())
         .unwrap()
-        .pool_dir_read_only(ShardType::EventDag)
+        .pool_dir(ShardType::EventDag)
         .unwrap()
         .join(pack_id.filename());
 
@@ -1241,7 +1244,7 @@ fn packs_extract_rejects_same_source_and_dest() {
 fn export_envelope_resolves_the_winning_frame_after_an_overwrite() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let pool_dir = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let pool_dir = layout.pool_dir(ShardType::EventDag).unwrap();
 
     let collection_id = [0x11; 16];
     let node_id = [0x22; 16];
@@ -1344,7 +1347,7 @@ fn get_event_selector_matches_the_imported_record_id() {
 fn get_dash_t_all_finds_record_across_pools() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
     let store = PackfileStorage::open(state_dir).unwrap();
     let col_id = [0x01; 16];
     let node_id = [0x02; 16];
@@ -1380,7 +1383,7 @@ fn get_dash_t_all_finds_record_across_pools() {
 fn get_and_scan_with_header_and_decode() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
     let store = PackfileStorage::open(state_dir).unwrap();
 
     let canonical_id = b"sys:flat-kv";
@@ -1492,7 +1495,7 @@ fn get_and_scan_with_header_and_decode() {
 fn info_dash_t_all_finds_collection_across_pools() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
     let store = PackfileStorage::open(state_dir).unwrap();
     let col_id = [0x01; 16];
     let node_id = [0x02; 16];
@@ -1522,7 +1525,7 @@ fn info_dash_t_all_finds_collection_across_pools() {
 fn scan_dash_t_all_finds_collection_across_pools() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
     let store = PackfileStorage::open(state_dir).unwrap();
     let col_id = [0x01; 16];
     let node_id = [0x02; 16];
@@ -3994,14 +3997,14 @@ fn coalesced_shards_and_collections_and_stats() {
     let l1 = DatabaseLayout::open(dir1.clone()).unwrap();
     let l2 = DatabaseLayout::open(dir2.clone()).unwrap();
 
-    let s1 = PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s1 = PackfileStorage::open(l1.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     let col = [0x11; 16];
     let n1 = [0x22; 16];
     let d1 = NodeData::new(Bytes::from_static(b"payload 1"));
     s1.put(&col, &n1, &d1).unwrap();
     s1.sync().unwrap();
 
-    let s2 = PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s2 = PackfileStorage::open(l2.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     let n2 = [0x33; 16];
     let d2 = NodeData::new(Bytes::from_static(b"payload 2"));
     s2.put(&col, &n2, &d2).unwrap();
@@ -4076,14 +4079,14 @@ fn coalesced_get_resolves_conflict_by_origin_server_ts() {
     let hex_id = format_id(&node);
 
     // dir1 has older ts
-    let s1 = PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s1 = PackfileStorage::open(l1.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     let old_json = br#"{"origin_server_ts": 1000, "body": "old"}"#;
     s1.put(&col, &node, &NodeData::new(Bytes::from_static(old_json)))
         .unwrap();
     s1.sync().unwrap();
 
     // dir2 has newer ts
-    let s2 = PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s2 = PackfileStorage::open(l2.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     let new_json = br#"{"origin_server_ts": 2000, "body": "new"}"#;
     s2.put(&col, &node, &NodeData::new(Bytes::from_static(new_json)))
         .unwrap();
@@ -4177,7 +4180,7 @@ fn coalesced_repack_materializes_canonical_database() {
     let node1 = [0x22; 16];
     let node2 = [0x33; 16];
 
-    let s1 = PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s1 = PackfileStorage::open(l1.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     s1.put(
         &col,
         &node1,
@@ -4188,7 +4191,7 @@ fn coalesced_repack_materializes_canonical_database() {
     .unwrap();
     s1.sync().unwrap();
 
-    let s2 = PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s2 = PackfileStorage::open(l2.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     s2.put(
         &col,
         &node2,
@@ -4220,7 +4223,7 @@ fn coalesced_repack_materializes_canonical_database() {
 
     // Target directory must be a valid canonical database
     let out_layout = DatabaseLayout::open_read_only(out_dir.clone()).unwrap();
-    let out_pool = out_layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let out_pool = out_layout.pool_dir(ShardType::EventDag).unwrap();
     let out_store = PackfileStorage::open_read_only(out_pool).unwrap();
 
     // Both nodes must be present in the newly materialized database
@@ -4247,8 +4250,7 @@ fn coalesced_repack_accepts_matrix_room_selectors() {
     let collection_id = matrix_room_collection_id(room);
     let node_id = [0x44; 16];
 
-    let store =
-        PackfileStorage::open(layout.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let store = PackfileStorage::open(layout.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     store
         .put(
             &collection_id,
@@ -4277,7 +4279,7 @@ fn coalesced_repack_accepts_matrix_room_selectors() {
     cmd_repack_coalesced(&cli, &out_dir, Some(room), &[], false, &[], false, true).unwrap();
 
     let out_layout = DatabaseLayout::open_read_only(out_dir.clone()).unwrap();
-    let out_pool = out_layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let out_pool = out_layout.pool_dir(ShardType::EventDag).unwrap();
     let out_store = PackfileStorage::open_read_only(out_pool).unwrap();
     assert!(out_store.get(&collection_id, &node_id).unwrap().is_some());
 
@@ -4298,7 +4300,7 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
     let node1 = [0x33; 16];
     let node2 = [0x44; 16];
 
-    let s1 = PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s1 = PackfileStorage::open(l1.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     s1.put(
         &col1,
         &node1,
@@ -4307,7 +4309,7 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
     .unwrap();
     s1.sync().unwrap();
 
-    let s2 = PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s2 = PackfileStorage::open(l2.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     s2.put(
         &col2,
         &node2,
@@ -4371,4 +4373,108 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
 
     std::fs::remove_dir_all(&dir1).ok();
     std::fs::remove_dir_all(&dir2).ok();
+}
+
+/// Importing into a root that was only initialized must work: `init` creates just
+/// `db.meta`, so the pools do not exist yet and the first write creates them.
+#[test]
+fn import_into_a_freshly_initialized_root_creates_pools_on_first_write() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    for shard_type in ShardType::ALL {
+        assert!(
+            !layout.pool_path(shard_type).exists(),
+            "a fresh root has no pool directories"
+        );
+    }
+    let input = dir.join("export.json");
+    std::fs::write(
+        &input,
+        r#"{
+            "pdus": [
+                {"event_id":"$c","room_id":"!room","sender":"@server",
+                 "type":"m.room.create","state_key":"",
+                 "content":{"creator":"@server","room_version":"10"},
+                 "auth_events":[],"prev_events":[]},
+                {"event_id":"$m","room_id":"!room","sender":"@server",
+                 "type":"m.room.message","content":{},
+                 "auth_events":["$c"],"prev_events":["$c"]}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let cli = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: Some(ShardType::EventDag),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Import {
+            paths: vec![input.clone()],
+            collection: None,
+            template: None,
+        },
+    };
+
+    cmd_import(&cli, &[input], None, None).expect("import into a fresh root");
+
+    assert!(
+        layout.pool_path(ShardType::EventDag).is_dir(),
+        "the event pool exists once it was written"
+    );
+    assert!(
+        !glob_pack_files(&layout.pool_path(ShardType::EventDag))
+            .unwrap()
+            .is_empty(),
+        "the import wrote a pack"
+    );
+    // Read-only inspection of the pools that were never written still works.
+    let inspect = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: None,
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Shards {
+            all: false,
+            layout: false,
+            sort: None,
+        },
+    };
+    cmd_shards(&inspect, false, false, None).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A missing database root is an error that says so; a valid root whose pool was
+/// never written is just empty, and inspecting it creates nothing.
+#[test]
+fn a_missing_root_is_an_error_but_an_unwritten_pool_is_empty() {
+    let missing = unique_temp_dir();
+    let cli = |dir: &Path| Cli {
+        dirs: vec![dir.to_path_buf()],
+        shard_type: Some(ShardType::State),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Collections {
+            all: false,
+            layout: false,
+            canonical: false,
+            sort: None,
+            limit: 0,
+        },
+    };
+    let error = cmd_collections(&cli(&missing), false, false, false, None, 0).unwrap_err();
+    assert!(
+        error.to_string().contains("no mtxdb database"),
+        "a missing root must be diagnosed as such: {error}"
+    );
+    assert!(!missing.exists(), "inspection must not create the root");
+
+    let root = unique_temp_dir();
+    let layout = DatabaseLayout::open(root.clone()).unwrap();
+    cmd_collections(&cli(&root), false, false, false, None, 0)
+        .expect("an unwritten pool is empty, not an error");
+    assert!(
+        !layout.pool_path(ShardType::State).exists(),
+        "read-only inspection must not create the pool"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
 }
