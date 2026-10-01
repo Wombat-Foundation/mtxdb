@@ -969,4 +969,4 @@ fn stale_read_from_publish(error: std::io::Error) -> StorageError {
 
 #[cfg(test)]
 #[path = "test_database.rs"]
-mod tests;
+pub(crate) mod tests;

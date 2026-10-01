@@ -5109,6 +5109,28 @@ fn newest_mark(bytes: &[u8]) -> Option<MarkSlot> {
         .max_by_key(|slot| slot.generation)
 }
 
+/// Test-only: cut a **copy** of a journal segment back to its embedded
+/// durability mark, keeping the header. That is the worst case of a power cut:
+/// every frame written after the last fsync is lost. A per-pool segment keeps no
+/// mark and counts every byte durable, so it is left whole.
+///
+/// # Errors
+/// Returns an error if the copy cannot be read, has an invalid header, or cannot
+/// be truncated.
+#[cfg(test)]
+pub(crate) fn cut_segment_image_to_durable_mark(path: &Path) -> io::Result<()> {
+    let bytes = fs::read(path)?;
+    if bytes.len() < FILE_HEADER_LEN {
+        return Ok(());
+    }
+    let (version, _, _) = validate_file_header(&bytes)?;
+    let file_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let mark = read_durable_len_from_header(&bytes, version, file_len);
+    let header = u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX);
+    let keep = mark.max(header).min(file_len);
+    OpenOptions::new().write(true).open(path)?.set_len(keep)
+}
+
 /// How many leading bytes of the segment are known durable. Per-pool segments
 /// keep no mark and count every byte durable, so an invalid group fails closed.
 /// A missing or unreadable mark, or one claiming more than the file holds,

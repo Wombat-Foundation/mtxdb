@@ -1463,7 +1463,7 @@ fn emergency_zone_cost_with_a_pool_that_never_reports() {
 
 /// Copy `source` to `dest`, then cut every pool's packs in the copy back to
 /// what an fsync had covered when the copy was taken.
-fn crash_image(db: &Database, source: &std::path::Path, dest: &std::path::Path) {
+pub(crate) fn crash_image(db: &Database, source: &std::path::Path, dest: &std::path::Path) {
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
@@ -3306,4 +3306,77 @@ fn every_pool_has_its_own_policy_slot() {
         *PoolPolicies::uniform(changed).for_shard(ShardType::ALL[0]),
         changed
     );
+}
+
+/// The worst case of a power cut: packs cut to their fsynced length and the WAL
+/// cut to its durable mark, so every frame written since the last fsync is lost.
+/// Whatever a full sync made durable must survive, and nothing half-applied may
+/// appear: a transaction is whole or absent.
+#[test]
+fn a_worst_case_power_cut_keeps_what_was_synced_and_never_half_applies() {
+    let root = test_root("worst_cut_source");
+    let image = test_root("worst_cut_image");
+    let collection = [0x6f; 16];
+    let db = Database::open(root.clone()).unwrap();
+    let pools = [ShardType::State, ShardType::EventDag];
+    let mut durable: Vec<(ShardType, [u8; 16])> = Vec::new();
+    let mut unsynced: Vec<Vec<(ShardType, [u8; 16])>> = Vec::new();
+    let mut next = 0u64;
+    for round in 0..30u32 {
+        // One transaction touching two pools: both writes or neither.
+        let txn = db.begin_transaction();
+        let mut written = Vec::new();
+        for pool in pools {
+            let mut node = [0u8; 16];
+            node[..8].copy_from_slice(&next.to_le_bytes());
+            next += 1;
+            txn.put(pool, collection, node, &NodeData::from_slice(&[0x33; 64]))
+                .unwrap();
+            written.push((pool, node));
+        }
+        txn.commit().unwrap();
+        unsynced.push(written);
+        if round % 4 == 0 {
+            for pool in pools {
+                db.pool(pool).sync_all().unwrap();
+            }
+            for batch in unsynced.drain(..) {
+                durable.extend(batch);
+            }
+        }
+
+        crash_image(&db, &root, &image);
+        crate::journal::cut_segment_image_to_durable_mark(&image.join("wal.bin")).unwrap();
+        let recovered = Database::open(image.clone()).unwrap();
+        for (pool, node) in &durable {
+            assert!(
+                recovered
+                    .pool(*pool)
+                    .get(&collection, node)
+                    .unwrap()
+                    .is_some(),
+                "round {round}: a durably synced record in {pool:?} is gone after a worst-case cut"
+            );
+        }
+        for batch in &unsynced {
+            let present: Vec<bool> = batch
+                .iter()
+                .map(|(pool, node)| {
+                    recovered
+                        .pool(*pool)
+                        .get(&collection, node)
+                        .unwrap()
+                        .is_some()
+                })
+                .collect();
+            assert!(
+                present.iter().all(|p| *p) || present.iter().all(|p| !*p),
+                "round {round}: a transaction was half applied: {present:?}"
+            );
+        }
+        drop(recovered);
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(image);
 }
