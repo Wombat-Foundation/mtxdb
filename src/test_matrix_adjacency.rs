@@ -252,7 +252,7 @@ fn relation_kind_space_is_a_hard_u16_limit() {
     // The last valid id is allocatable; the next type is refused, not wrapped.
     assert_eq!(adj.kind_id(&db, "org.example.last").unwrap(), u16::MAX);
     let error = adj.kind_id(&db, "org.example.one-too-many").unwrap_err();
-    assert!(matches!(error, StorageError::Internal(_)), "{error}");
+    assert!(error.is_exhausted(), "{error}");
     assert_eq!(adj.kind_id(&db, "org.example.last").unwrap(), u16::MAX);
     // Nothing was published past the limit: the refused type has no id at all.
     assert_eq!(

@@ -154,7 +154,7 @@ fn exhaustion_is_a_hard_error_and_publishes_nothing() {
     let error = index()
         .record_edges(&db, b"$over", PLAIN, &[b"$last", b"$also-new"])
         .unwrap_err();
-    assert!(matches!(error, StorageError::Internal(_)), "{error}");
+    assert!(error.is_exhausted(), "{error}");
     assert_eq!(
         index().resolve(&db, &[SHORT_ID_MAX]).unwrap(),
         vec![Some(b"$last".to_vec())]
@@ -429,7 +429,7 @@ fn a_lowered_max_id_refuses_inside_the_transaction() {
     // A batch that would cross the limit is refused whole: the new key past the
     // limit is not published, and neither is the key before it in the batch.
     let error = small.get_or_create(&db, &[b"$d", b"$e"]).unwrap_err();
-    assert!(matches!(error, StorageError::Internal(_)), "{error}");
+    assert!(error.is_exhausted(), "{error}");
     assert_eq!(small.lookup(&db, b"$d").unwrap(), None);
     assert_eq!(small.lookup(&db, b"$e").unwrap(), None);
     // Existing ids still resolve and re-asking for them still works.

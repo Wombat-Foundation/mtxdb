@@ -651,7 +651,7 @@ impl ShortIdIndex {
                 allocation.ids.push(*short_id);
             } else {
                 if next > self.max_id {
-                    return Err(StorageError::Internal(
+                    return Err(StorageError::Exhausted(
                         "short-id space exhausted for this scope".to_owned(),
                     ));
                 }

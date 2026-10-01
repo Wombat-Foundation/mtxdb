@@ -30,3 +30,5 @@ mod test_redo;
 mod test_repack_closure;
 #[cfg(feature = "bitmaps")]
 mod test_room_auth;
+#[cfg(feature = "bitmaps")]
+mod test_room_auth_flow;

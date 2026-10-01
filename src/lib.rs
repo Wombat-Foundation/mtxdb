@@ -82,6 +82,8 @@ mod test_closure_store;
 mod test_logical_head;
 #[cfg(test)]
 mod test_matrix_adjacency;
+#[cfg(all(test, feature = "bitmaps"))]
+mod test_room_auth;
 #[cfg(test)]
 mod test_short_id;
 

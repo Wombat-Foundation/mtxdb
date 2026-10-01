@@ -39,7 +39,7 @@ use crate::storage::StorageError;
 use crate::closure_store::{
     ClosureCoverageBuilder, ClosureHead, ClosureSnapshot, ClosureStore, GenerationBuilder,
 };
-use crate::database::Database;
+use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::matrix_adjacency::{MatrixAdjacency, AUTH};
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
@@ -632,10 +632,31 @@ impl AuthClosure {
             }
             Err(error) => return Err(error),
         };
-        let graph = self.graph(db)?;
+        // An id that is not UTF-8 or an `auth` cycle is corruption of the stored
+        // adjacency: a finding for `verify` to report, not a reason to abort it.
+        let graph = match self.graph(db) {
+            Ok(graph) => graph,
+            Err(error) if is_malformed(&error) => {
+                report.problems.push(format!("auth adjacency: {error}"));
+                return Ok(report);
+            }
+            Err(error) => return Err(error),
+        };
         let mut walk = Walk::new(&graph);
         for short_id in 1..snapshot.head.source_next {
-            match walk.closure(short_id)? {
+            let outcome = match walk.closure(short_id) {
+                Ok(outcome) => outcome,
+                Err(error) if is_malformed(&error) => {
+                    // The walk's path state is unreliable after a cycle, so stop
+                    // here rather than report follow-on noise.
+                    report
+                        .problems
+                        .push(format!("short id {short_id}: {error}"));
+                    return Ok(report);
+                }
+                Err(error) => return Err(error),
+            };
+            match outcome {
                 WalkOutcome::Complete(expected) => {
                     if snapshot.skipped.contains(short_id) {
                         report.problems.push(format!(
@@ -698,6 +719,26 @@ impl AuthClosure {
     )]
     pub(crate) fn store_for_test(&self) -> ClosureStore {
         self.store
+    }
+
+    /// The room adjacency this closure layer reads.
+    #[must_use]
+    pub(crate) const fn adjacency(&self) -> &MatrixAdjacency {
+        &self.adjacency
+    }
+
+    /// The closure generation store.
+    #[must_use]
+    pub(crate) const fn store(&self) -> &ClosureStore {
+        &self.store
+    }
+
+    /// Stage removal of this room's closure generations into `txn`.
+    ///
+    /// # Errors
+    /// Returns an error if a delete cannot be staged.
+    pub fn stage_purge(&self, txn: &DatabaseTransaction<'_>) -> Result<(), StorageError> {
+        self.store.stage_purge(txn)
     }
 }
 

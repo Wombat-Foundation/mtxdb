@@ -317,3 +317,36 @@ fn a_cycle_abandons_its_generation_instead_of_leaving_an_orphan() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn verify_reports_an_auth_cycle_as_a_finding_not_an_error() {
+    let root = test_root("verify-cycle");
+    let db = Database::open(root.clone()).unwrap();
+    let adjacency = MatrixAdjacency::new(POOL, ROOM);
+    adjacency
+        .record_event(&db, "$a", &[], &["$b"], None)
+        .unwrap();
+    adjacency
+        .record_event(&db, "$b", &[], &["$a"], None)
+        .unwrap();
+    let closure = AuthClosure::from_adjacency(adjacency);
+
+    // `rebuild` refuses a cycle, so publish a generation by hand that claims to
+    // cover both events, then verify it against the cyclic adjacency.
+    let store = closure.store_for_test();
+    let builder = store.begin(&db).unwrap();
+    builder.publish(&db, 3, &[]).unwrap();
+
+    let report = closure.verify(&db).unwrap();
+    assert!(!report.is_consistent(), "{report:?}");
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("cycle")),
+        "{:?}",
+        report.problems
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -599,6 +599,10 @@ pub enum StorageError {
         /// if nothing is published.
         current: Option<u64>,
     },
+    /// A fixed-capacity id space has no room left (for example a room's `u32`
+    /// short ids, or its `u16` relation-kind dictionary). Ids are never reused,
+    /// so this does not clear; the operation published nothing.
+    Exhausted(String),
 }
 
 impl StorageError {
@@ -628,6 +632,13 @@ impl StorageError {
     #[must_use]
     pub fn is_stale_generation(&self) -> bool {
         matches!(self, Self::StaleGeneration { .. })
+    }
+
+    /// Whether a fixed-capacity id space is full. Ids are never reused, so
+    /// retrying cannot succeed.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        matches!(self, Self::Exhausted(_))
     }
 }
 
@@ -702,6 +713,7 @@ impl std::fmt::Display for StorageError {
                 f,
                 "stale read on {pool:?} collection {collection_id:?}: expected version {expected}, found {actual}"
             ),
+            Self::Exhausted(what) => write!(f, "capacity exhausted: {what}"),
             Self::StaleGeneration { generation, current } => match current {
                 Some(current) => write!(
                     f,
@@ -748,7 +760,9 @@ impl From<StorageError> for std::io::Error {
             // or record) nor "retry" (`WouldBlock`): the pinned generation is gone,
             // so the caller needs a new snapshot. The typed error is kept as the
             // source so a caller can still `downcast_ref::<StorageError>()`.
-            StorageError::StaleGeneration { .. } => std::io::Error::other(error),
+            StorageError::StaleGeneration { .. } | StorageError::Exhausted(_) => {
+                std::io::Error::other(error)
+            }
             StorageError::VerificationFailed(_) => {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             }
