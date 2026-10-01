@@ -164,9 +164,16 @@ impl MatrixAdjacency {
     /// transaction, allocating short ids for the event and every referenced
     /// event. Returns the event's short id.
     ///
-    /// Re-recording identical data is a no-op; different `prev`, `auth` or
-    /// relation for an already-recorded event is a collision error (an event's
-    /// core fields and relation never change).
+    /// Re-recording identical data is a no-op; different `prev` or `auth` for an
+    /// already-recorded event is a collision error (an event's core fields never
+    /// change).
+    ///
+    /// A relation can be added but never changed or removed. An event recorded
+    /// without one may be recorded again with one, which stores it. An event
+    /// recorded with one may be recorded again without (a redacted copy has no
+    /// `m.relates_to`), which leaves the stored relation as it was; recording a
+    /// *different* relation is a collision. Passing `None` therefore means "no
+    /// relation known", not "no relation", so redaction never has to be stored.
     ///
     /// The relation kind is allocated first in its own transaction. That step
     /// is idempotent and permanent, so a failure after it leaves only an unused
@@ -202,24 +209,27 @@ impl MatrixAdjacency {
             }],
             _ => Vec::new(),
         };
-        let recorded = self.events.record_event(
-            db,
-            event_id.as_bytes(),
-            &[
-                FamilyEdges {
-                    family: PREV,
-                    edges: &prev_edges,
-                },
-                FamilyEdges {
-                    family: AUTH,
-                    edges: &auth_edges,
-                },
-                FamilyEdges {
-                    family: RELATIONS,
-                    edges: &relation_edges,
-                },
-            ],
-        )?;
+        let mut families = vec![
+            FamilyEdges {
+                family: PREV,
+                edges: &prev_edges,
+            },
+            FamilyEdges {
+                family: AUTH,
+                edges: &auth_edges,
+            },
+        ];
+        // No relation known means no relations record at all, so a relation can
+        // be added later and a stored one is never contradicted by its absence.
+        if !relation_edges.is_empty() {
+            families.push(FamilyEdges {
+                family: RELATIONS,
+                edges: &relation_edges,
+            });
+        }
+        let recorded = self
+            .events
+            .record_event(db, event_id.as_bytes(), &families)?;
         Ok(recorded.id)
     }
 
@@ -278,10 +288,10 @@ impl MatrixAdjacency {
                 relation,
             });
         }
-        let families: Vec<[FamilyEdges<'_>; 3]> = prepared
+        let families: Vec<Vec<FamilyEdges<'_>>> = prepared
             .iter()
             .map(|event| {
-                [
+                let mut list = vec![
                     FamilyEdges {
                         family: PREV,
                         edges: &event.prev,
@@ -290,11 +300,15 @@ impl MatrixAdjacency {
                         family: AUTH,
                         edges: &event.auth,
                     },
-                    FamilyEdges {
+                ];
+                // As in `record_event`: no relation known, no relations record.
+                if !event.relation.is_empty() {
+                    list.push(FamilyEdges {
                         family: RELATIONS,
                         edges: &event.relation,
-                    },
-                ]
+                    });
+                }
+                list
             })
             .collect();
         let batch: Vec<BatchEvent<'_>> = prepared

@@ -93,13 +93,18 @@ fn recording_is_idempotent_but_an_event_never_changes() {
                 rel_type: "m.replace",
             }),
         ),
-        (vec!["$p"], vec!["$a"], None),
     ] {
         let error = adj
             .record_event(&db, "$e", &prev, &auth, relation)
             .unwrap_err();
         assert!(matches!(error, StorageError::Collision(_)), "{error}");
     }
+    // Recording again with no relation is not a change: no relation known leaves
+    // the stored one alone (see `a_relation_can_be_added_later_but_never_changed_or_removed`).
+    assert_eq!(
+        adj.record_event(&db, "$e", &["$p"], &["$a"], None).unwrap(),
+        id
+    );
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -399,4 +404,79 @@ fn a_batch_matches_recording_events_one_at_a_time() {
     drop(single_db);
     let _ = std::fs::remove_dir_all(&batched_root);
     let _ = std::fs::remove_dir_all(&single_root);
+}
+
+/// A relation can be added to an event recorded without one, is never removed by
+/// recording the event again without it (a redacted copy has no `m.relates_to`),
+/// and is never replaced by a different one.
+#[test]
+fn a_relation_can_be_added_later_but_never_changed_or_removed() {
+    let root = test_root("relation-late");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    let reaction = RelationRef {
+        target: "$msg",
+        rel_type: "m.annotation",
+    };
+    let relation = |db: &Database| {
+        adj.relation_of(db, "$react", &AlwaysVisible)
+            .unwrap()
+            .map(|r| (r.target, r.rel_type))
+    };
+
+    // First seen redacted: no relation known.
+    adj.record_event(&db, "$react", &["$msg"], &["$create"], None)
+        .unwrap();
+    assert_eq!(relation(&db), None);
+
+    // The unredacted copy arrives: the relation is added, nothing else changes.
+    adj.record_event(&db, "$react", &["$msg"], &["$create"], Some(reaction))
+        .unwrap();
+    assert_eq!(
+        relation(&db),
+        Some(("$msg".to_owned(), "m.annotation".to_owned()))
+    );
+
+    // The redacted copy again: the stored relation is not removed.
+    adj.record_event(&db, "$react", &["$msg"], &["$create"], None)
+        .unwrap();
+    assert_eq!(
+        relation(&db),
+        Some(("$msg".to_owned(), "m.annotation".to_owned()))
+    );
+
+    // A different relation is a collision, and leaves the stored one intact.
+    let error = adj
+        .record_event(
+            &db,
+            "$react",
+            &["$msg"],
+            &["$create"],
+            Some(RelationRef {
+                target: "$other",
+                rel_type: "m.annotation",
+            }),
+        )
+        .unwrap_err();
+    assert!(matches!(error, StorageError::Collision(_)), "{error}");
+    assert_eq!(
+        relation(&db),
+        Some(("$msg".to_owned(), "m.annotation".to_owned()))
+    );
+
+    // The batch path follows the same rule.
+    let batch = [EventRecord {
+        event_id: "$react",
+        prev: &["$msg"],
+        auth: &["$create"],
+        relation: None,
+    }];
+    adj.record_events(&db, &batch).unwrap();
+    assert_eq!(
+        relation(&db),
+        Some(("$msg".to_owned(), "m.annotation".to_owned()))
+    );
+    assert!(adj.verify(&db).unwrap().is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
 }
