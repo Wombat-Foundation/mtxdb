@@ -7617,6 +7617,7 @@ fn shared_reclaim_waits_for_every_pool_then_truncates() {
     );
 }
 
+#[cfg(feature = "multi-reader")]
 /// End-to-end: three interleaved pool groups, independent per-pool
 /// checkpoints, shared reclaim, then a read-only reopen. The state reader's
 /// index boundary is state's own watermark, so a base advanced by the
@@ -7714,6 +7715,7 @@ fn shared_interleaved_checkpoints_reclaim_then_read_only_reopen() {
     );
 }
 
+#[cfg(feature = "multi-reader")]
 /// A shared reader whose own frame was committed by another pool's sync
 /// (so its checkpoint has not advanced) must tolerate a base LSN gap opened
 /// entirely by the other pools and read its own frame, instead of failing
@@ -7800,6 +7802,7 @@ fn shared_read_committed_accepts_another_pools_reclaimed_prefix() {
     );
 }
 
+#[cfg(feature = "multi-reader")]
 /// A read-only worker on a shared WAL must observe only its own pool's
 /// tagged frames, not the other pools' interleaved in the same segment.
 #[test]

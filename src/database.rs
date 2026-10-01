@@ -78,9 +78,10 @@ const POOL_COUNT: usize = ShardType::ALL.len();
 /// with atomic cross-pool transactions and record-version compare-and-set.
 ///
 /// Available in every build; no feature flag is needed to open or write a
-/// database, or for another process to read a live one through
-/// [`PackfileStorage::open_read_committed_shared`]. Dropping the handle releases
-/// the root writer lock and the pools it opened.
+/// database. Attaching *another process* to a live database as a read-committed
+/// reader (`PackfileStorage::open_read_committed_shared`) needs the
+/// `multi-reader` feature. Dropping the handle releases the root writer lock and
+/// the pools it opened.
 pub struct Database {
     layout: DatabaseLayout,
     coordinator: Arc<JournalCoordinator>,

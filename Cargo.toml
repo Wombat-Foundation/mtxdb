@@ -106,12 +106,15 @@ default = ["zstd"]
 # writes raw frames and refuses to read compressed ones.
 zstd = ["dep:zstd", "dep:zstd-sys"]
 
-# Deprecated no-op. Everything this feature once gated is now always
-# available: `Database`, its shared write-ahead log, transactions and
-# record-version compare-and-set, the read-committed overlay, and
-# `PackfileStorage::open_read_committed_shared` for readers in other processes.
-# The feature is kept only so existing manifests that enable it still resolve;
-# it can be removed once nothing depends on it.
+# Cross-process read-committed workers. Always available: `Database`, the
+# shared WAL, transactions, record-version compare-and-set and recovery, the
+# in-process read journal and `open_read_committed` for read-only use, and the
+# writer's publish signal and replay cursors (single-process repack uses them).
+# This feature adds only the API for attaching another OS process to a live
+# shared WAL (`PackfileStorage::open_read_committed_shared` and
+# `enable_read_journal_shared`) and the process-level tests. It never swaps in
+# different behavior: without it those APIs are simply absent, and there are no
+# alternate CAS or version paths.
 multi-reader = []
 
 # Roaring-backed `u32` bitmap sets (`bitmap_set`): generic set algebra over
@@ -165,6 +168,7 @@ path = "tests/unit/main.rs"
 [[test]]
 name = "shared_wal_processes"
 path = "tests/shared_wal_processes.rs"
+required-features = ["multi-reader"]
 
 [lints]
 workspace = true

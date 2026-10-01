@@ -2332,6 +2332,7 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Same as [`Self::open_read_committed`].
+    #[cfg(feature = "multi-reader")]
     pub fn open_read_committed_shared(
         base_dir: PathBuf,
         wal_path: impl AsRef<Path>,
@@ -4067,7 +4068,7 @@ impl PackfileStorage {
     /// until dropped, preventing either per-pool or shared-WAL reclaim from
     /// expiring the cursor while the caller catches up.
     ///
-    /// In multi-reader mode, a transaction publishes its journal group before
+    /// In a shared-WAL `Database`, a transaction publishes its journal group before
     /// materializing its pack records. The lifecycle lock covers the active
     /// transaction check and WAL-boundary capture, then is released before the
     /// pack walk. A transaction that starts later cannot materialize this
@@ -9706,7 +9707,7 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns [`StorageError::Internal`] for a pool inside a database root;
-    /// such pools must use `enable_shared_journal` (with `multi-reader`).
+    /// such pools must use `enable_shared_journal`.
     /// Propagates root-inspection, journal-open, recovery, and publish-signal
     /// setup errors, including OS entropy failures, as [`StorageError::Io`].
     pub fn enable_journal(&self, path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {

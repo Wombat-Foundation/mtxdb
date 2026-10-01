@@ -1,9 +1,10 @@
-//! Cross-process read-committed overlay, gated behind the `multi-reader`
-//! feature (see `Cargo.toml` and `docs/TODO.txt`'s extraction plan).
-//!
-//! Lets a separate OS process observe a live writer's committed-but-not-yet-
-//! checkpointed data by scanning the writer's journal segment read-only. A
-//! single-process embedded deployment never calls any of this.
+//! Read-committed overlay over a journal segment. It serves two callers: a
+//! `Database` transaction reading its own published-but-not-yet-materialized
+//! writes (always available), and a separate OS process observing a live
+//! writer's committed-but-not-yet-checkpointed data by scanning the segment
+//! read-only. Only the API that attaches another process to a *shared* WAL
+//! (`enable_read_journal_shared` / `open_read_committed_shared`) is gated behind
+//! the `multi-reader` feature (see `Cargo.toml`); the overlay itself is not.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -922,6 +923,7 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Same as [`Self::enable_read_journal`].
+    #[cfg(feature = "multi-reader")]
     pub fn enable_read_journal_shared(
         &self,
         path: impl AsRef<std::path::Path>,

@@ -4386,7 +4386,7 @@ impl Journal {
     /// # Errors
     /// Same as [`Self::append_group`], plus `InvalidInput` if `sequence` is
     /// behind this segment's next sequence, or if this is a pool-tagged segment
-    /// (which requires the multi-reader-only
+    /// (which requires the
     /// `append_group_tagged_with_sequence` method).
     pub fn append_group_with_sequence(
         &mut self,
