@@ -88,6 +88,9 @@ pub mod record_class;
 #[cfg(feature = "bitmaps")]
 #[path = "matrix/room_auth.rs"]
 pub mod room_auth;
+/// Rebuildable full-text and field secondary indexes.
+#[path = "search.rs"]
+pub mod search;
 /// Fixed-size shard file pool that packfiles are written into.
 #[path = "engine/shard.rs"]
 pub mod shard;
@@ -161,6 +164,7 @@ pub use packfile::{
     FrameMetadata, Record,
 };
 pub use record_class::{Durability, OrderingPolicy, RecordClass, Retention};
+pub use search::{SearchDocument, SearchIndexes, SearchQuery};
 pub use shard::{LockHolderInfo, ShardPool};
 pub use state_group::{
     decode_state_group_record, encode_state_group_record, state_group_collection_id,
