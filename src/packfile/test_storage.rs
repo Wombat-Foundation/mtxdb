@@ -28,7 +28,6 @@ fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_sees_a_committed_but_unflushed_group() {
     let dir = test_dir("read_committed_unflushed");
@@ -81,7 +80,6 @@ fn read_committed_overlay_sees_a_committed_but_unflushed_group() {
 /// is visible but never reached the disk. Returns the segment length that
 /// covers only LSN 1, so a test can cut the file back to what a crash would
 /// have kept.
-#[cfg(feature = "multi-reader")]
 fn journal_with_a_visible_but_undurable_group(
     wal: &std::path::Path,
     collection: [u8; 16],
@@ -111,7 +109,6 @@ fn journal_with_a_visible_but_undurable_group(
 /// visible-but-undurable group (`stale-` at the `reused` id, collection
 /// `0x42`), for the restarted-writer tests. Returns the
 /// journal path, the store and the journal's durable length.
-#[cfg(feature = "multi-reader")]
 fn reader_over_an_undurable_group(name: &str) -> (PathBuf, PackfileStorage, u64) {
     let dir = test_dir(name);
     let wal = dir.join("wal.bin");
@@ -142,7 +139,6 @@ fn reader_over_an_undurable_group(name: &str) -> (PathBuf, PackfileStorage, u64)
 /// restarted writer reuses those LSNs. A live reader that already applied
 /// the lost group must not keep serving it. The reissued group has the same
 /// length, so the file is exactly as long as when the reader last scanned.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_drops_a_group_the_restarted_writer_discarded() {
     let (wal, store, durable_len) =
@@ -179,7 +175,6 @@ fn read_committed_overlay_drops_a_group_the_restarted_writer_discarded() {
 
 /// Same restart, but the reissued LSN 2 is followed by an LSN 3, so the file
 /// has grown and the reader takes its incremental-scan path.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_drops_a_discarded_group_when_the_file_grew() {
     let (wal, store, durable_len) =
@@ -220,7 +215,6 @@ fn read_committed_overlay_drops_a_discarded_group_when_the_file_grew() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_shadows_durable_with_a_committed_delete() {
     let dir = test_dir("read_committed_delete");
@@ -256,7 +250,6 @@ fn read_committed_overlay_shadows_durable_with_a_committed_delete() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_preserves_a_delete_boundary_across_recreate() {
     let dir = test_dir("read_committed_recreate");
@@ -306,7 +299,6 @@ fn read_committed_overlay_preserves_a_delete_boundary_across_recreate() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_ignores_entries_the_checkpoint_covers() {
     let dir = test_dir("read_committed_covered");
@@ -351,7 +343,6 @@ fn read_committed_overlay_ignores_entries_the_checkpoint_covers() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_keeps_entries_a_newer_checkpoint_covers() {
     let dir = test_dir("read_committed_stale_index");
@@ -406,7 +397,6 @@ fn read_committed_overlay_keeps_entries_a_newer_checkpoint_covers() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_fails_closed_when_reclaim_skips_its_covered_lsn() {
     let dir = test_dir("read_committed_reclaim_gap");
@@ -460,7 +450,6 @@ fn read_committed_overlay_fails_closed_when_reclaim_skips_its_covered_lsn() {
 /// A genuine coverage gap that reloads cannot close — the checkpoint
 /// exists and matches, but never covers the reclaimed LSNs — is a
 /// persistent corruption, not a transient condition.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_gap_with_matching_checkpoint_is_corrupt() {
     let dir = test_dir("read_committed_gap_corrupt");
@@ -507,7 +496,6 @@ fn read_committed_gap_with_matching_checkpoint_is_corrupt() {
 /// The same gap, but with no usable checkpoint to reload: every reload
 /// attempt fails, so the read is retryable once the writer publishes a
 /// checkpoint instead of being reported as permanent corruption.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_gap_without_checkpoint_is_retryable() {
     let dir = test_dir("read_committed_gap_retry");
@@ -555,7 +543,6 @@ fn read_committed_gap_without_checkpoint_is_retryable() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_reloads_after_reclaim_advances_coverage() {
     let dir = test_dir("read_committed_reclaim_reload");
@@ -640,7 +627,6 @@ fn read_committed_overlay_reloads_after_reclaim_advances_coverage() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_reload_skips_the_exact_pack_gate() {
     let dir = test_dir("read_committed_reload_skip_gate");
@@ -736,7 +722,6 @@ fn read_committed_reload_skips_the_exact_pack_gate() {
     }
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn repack_persists_checkpoint_so_read_journal_reload_survives_retirement() {
     // Repack moves a collection's records into a fresh destination shard
@@ -806,7 +791,6 @@ fn repack_persists_checkpoint_so_read_journal_reload_survives_retirement() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn repack_persisted_checkpoint_reload_resolves_record_by_post_repack_offset() {
     let dir = test_dir("repack_persists_checkpoint_read");
@@ -861,7 +845,6 @@ fn repack_persisted_checkpoint_reload_resolves_record_by_post_repack_offset() {
 /// Out of scope: a delta frame referencing a pack created *after* C1 (a
 /// pack absent from C1's pack table), and any claim that a delta-side
 /// `SlotBinding` is unnecessary.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn post_repack_delta_epoch_replays_for_a_cold_reader() {
     let dir = test_dir("delta_across_retirement");
@@ -1002,7 +985,6 @@ fn repack_persists_checkpoint_so_fresh_cold_open_survives_retirement() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn open_read_committed_serves_the_overlay_in_one_call() {
     let dir = test_dir("open_read_committed");
@@ -1169,7 +1151,6 @@ fn persist_index_checkpoint_reports_whether_it_wrote() {
     assert!(!store.persist_index_checkpoint().unwrap());
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn reset_has_coverage_gap_is_a_pure_base_jump() {
     // A fully reclaimed segment carries no groups, only a moved base LSN.
@@ -1208,7 +1189,6 @@ fn reset_has_coverage_gap_is_a_pure_base_jump() {
     );
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_overlay_picks_up_groups_appended_after_the_first_scan() {
     let dir = test_dir("read_committed_tail");
@@ -1262,7 +1242,6 @@ fn read_committed_overlay_picks_up_groups_appended_after_the_first_scan() {
 /// the last refresh must skip the `fs::metadata` refresh entirely, and must
 /// still observe the next published group. This is the zero-staleness fast
 /// path that replaces the per-call stat.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_committed_publish_signal_skips_the_stat_until_a_group_is_published() {
     let dir = test_dir("read_committed_publish_signal");
@@ -3683,7 +3662,6 @@ fn a_failed_background_checkpoint_keeps_the_wal_and_is_retried() {
     assert_all_present(&reopened, &[1, 2]);
 }
 
-#[cfg(feature = "multi-reader")]
 /// Near the WAL cap a sync waits for the tail instead of letting it run on
 /// with reclaim suppressed.
 #[test]
@@ -7343,7 +7321,6 @@ fn checkpoint_growth_recovers_metadata_bearing_frames() {
 /// commits both pools' published mutations in one durability barrier, and
 /// a later reopen replays only each pool's own tagged frames.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_journal_fences_all_pools_and_routes_replay_by_pool() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -7438,7 +7415,6 @@ fn shared_journal_fences_all_pools_and_routes_replay_by_pool() {
 /// pool checkpoints: a reopen replays only the surviving frames, and LSNs
 /// continue past the reclaimed prefix without being reused.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -7526,7 +7502,6 @@ fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
 /// Collection logical versions remain stable after their WAL group is covered,
 /// reclaimed, and the writer is reopened from its pool checkpoint.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_checkpoint_preserves_collection_versions_after_reclaim() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -7589,7 +7564,6 @@ fn shared_checkpoint_preserves_collection_versions_after_reclaim() {
 /// A shared segment may only be reclaimed up to the minimum durable
 /// coverage across every pool that has frames in it.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_reclaim_waits_for_every_pool_then_truncates() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -7648,7 +7622,6 @@ fn shared_reclaim_waits_for_every_pool_then_truncates() {
 /// index boundary is state's own watermark, so a base advanced by the
 /// event-DAG pool must not be mistaken for a lost state frame.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_interleaved_checkpoints_reclaim_then_read_only_reopen() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -7746,7 +7719,6 @@ fn shared_interleaved_checkpoints_reclaim_then_read_only_reopen() {
 /// entirely by the other pools and read its own frame, instead of failing
 /// closed on the reclaim.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_read_committed_accepts_another_pools_reclaimed_prefix() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -7831,7 +7803,6 @@ fn shared_read_committed_accepts_another_pools_reclaimed_prefix() {
 /// A read-only worker on a shared WAL must observe only its own pool's
 /// tagged frames, not the other pools' interleaved in the same segment.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_read_committed_filters_by_pool() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -7920,7 +7891,6 @@ fn shared_read_committed_filters_by_pool() {
 /// The root shared-WAL lock is exclusive while held and reacquirable after
 /// the holder drops it.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_wal_lock_is_exclusive() {
     let root = test_dir("shared_wal_lock_exclusive");
     // A shared-WAL lock is gated on a shared-layout database descriptor.
@@ -8293,7 +8263,6 @@ fn a_checkpoint_leaves_no_pack_bytes_unsynced_whatever_the_budget() {
 /// is now only covered there: the reader loads the checkpoint, applies the
 /// delta operations the coverage claim describes, and binds its coverage to
 /// the claim, so nothing falls into the gap the reclaim left.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_reader_sees_records_covered_only_by_a_delta_coverage_batch() {
     let dir = test_dir("reader_delta_coverage");
@@ -8365,7 +8334,6 @@ fn a_reader_sees_records_covered_only_by_a_delta_coverage_batch() {
 /// index: the reload applies the delta operations up to the last coverage
 /// claim, records after it still come from the overlay, and a record the
 /// writer overwrote in a covered batch is served at its newest value.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_reader_attached_earlier_reloads_through_the_delta_coverage_prefix() {
     let dir = test_dir("reader_delta_coverage_reload");
@@ -8431,7 +8399,6 @@ fn a_reader_attached_earlier_reloads_through_the_delta_coverage_prefix() {
 /// redo records with the same rules as an open, growing its own copy of the
 /// table, and finds every record. The burst reaches the log as redo records
 /// only, no snapshot.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_reader_reloads_through_a_burst_that_grows_the_table() {
     let dir = test_dir("reader_reload_growth");
@@ -8514,7 +8481,6 @@ fn a_reader_reloads_through_a_burst_that_grows_the_table() {
 
 /// A writer with a journal that syncs under the size trigger: every sync
 /// past the first is a delta coverage step. Returns the store and the keys.
-#[cfg(feature = "multi-reader")]
 fn writer_with_coverage_steps(
     dir: &std::path::Path,
     wal: &std::path::Path,
@@ -8537,7 +8503,6 @@ fn writer_with_coverage_steps(
 }
 
 /// Reopen a store with a journal and check every record is served.
-#[cfg(feature = "multi-reader")]
 fn reopen_and_read_all(
     dir: &std::path::Path,
     wal: &std::path::Path,
@@ -8560,7 +8525,6 @@ fn reopen_and_read_all(
 /// Crash after coverage steps and a reclaim that went past the checkpoint:
 /// the reopened writer takes its coverage from the delta claim, replays only
 /// what is uncovered, and loses nothing.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_writer_recovers_from_a_reclaim_licensed_by_a_delta_coverage_batch() {
     let dir = test_dir("recover_delta_coverage");
@@ -8596,7 +8560,6 @@ fn a_writer_recovers_from_a_reclaim_licensed_by_a_delta_coverage_batch() {
 /// nothing. The journal was reclaimed on the strength of it and cannot help,
 /// but the packs it described are durable, so the reopen rebuilds the index
 /// from them and every record is still there.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_torn_or_damaged_coverage_batch_loses_no_records() {
     let dir = test_dir("torn_delta_coverage");
@@ -8642,7 +8605,6 @@ fn a_torn_or_damaged_coverage_batch_loses_no_records() {
 /// Without a coverage step (the journal is not over its trigger) nothing is
 /// claimed beyond the checkpoint, the journal keeps its groups, and a crash
 /// replays them: the behaviour before coverage batches existed.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_sync_under_the_trigger_claims_no_coverage() {
     let dir = test_dir("no_coverage_under_trigger");
@@ -8686,7 +8648,6 @@ fn a_sync_under_the_trigger_claims_no_coverage() {
 /// coverage `read_journal_lsn` reports and the fingerprint
 /// `read_durable_fingerprint` reports, with and without a coverage claim in
 /// the delta log.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn the_one_pass_durable_state_matches_the_separate_readers() {
     let dir = test_dir("one_pass_durable_state");
@@ -8719,7 +8680,6 @@ fn the_one_pass_durable_state_matches_the_separate_readers() {
 
 /// The one-pass state also matches the separate readers when the log names
 /// another checkpoint, and when its tail is torn.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn the_one_pass_durable_state_matches_for_a_foreign_or_torn_log() {
     let dir = test_dir("one_pass_foreign_torn");
@@ -9246,7 +9206,6 @@ fn logical_replay_across_several_packs_keeps_counts_and_records() {
 
 /// The coverage step obeys the same rotation: with the log at the rotation
 /// length, a sync over the trigger takes the checkpoint rather than a batch.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_coverage_step_is_replaced_by_a_checkpoint_at_the_rotation_length() {
     let dir = test_dir("coverage_rotation");
@@ -9274,7 +9233,6 @@ fn a_coverage_step_is_replaced_by_a_checkpoint_at_the_rotation_length() {
 /// checkpoint's pack table, since a reader translates the delta operations'
 /// slots through it. A pack created since forces a full checkpoint, which
 /// records the new table and starts a new epoch.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_pack_missing_from_the_checkpoint_table_forces_a_full_checkpoint() {
     let dir = test_dir("coverage_pack_gate");
@@ -9728,7 +9686,6 @@ fn scan_collection_at_snapshot_excludes_the_read_journal_overlay() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn replayable_scan_does_not_hold_transaction_lifecycle_lock_during_pack_walk() {
     use crate::layout::ShardType;
@@ -9823,7 +9780,6 @@ fn replayable_scan_does_not_hold_transaction_lifecycle_lock_during_pack_walk() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn scan_collection_at_snapshot_rejects_an_active_transaction_overlay() {
     let dir = test_dir("scan_collection_replay_transaction");
@@ -9845,7 +9801,6 @@ fn scan_collection_at_snapshot_rejects_an_active_transaction_overlay() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn read_only_handles_cannot_take_replayable_snapshots() {
     let dir = test_dir("scan_collection_replay_read_only");
     let wal = dir.join("wal.bin");
@@ -9869,7 +9824,6 @@ fn read_only_handles_cannot_take_replayable_snapshots() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn scan_collection_merges_the_read_committed_overlay() {
     let dir = test_dir("scan_collection_overlay");
@@ -9943,7 +9897,6 @@ fn scan_collection_merges_the_read_committed_overlay() {
 
 /// A snapshot pins one boundary across several collections: a publication
 /// that lands after capture is invisible to it, and a fresh read sees it.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_snapshot_pins_a_boundary_across_collections() {
     let dir = test_dir("read_snapshot_pins");
@@ -10010,7 +9963,6 @@ fn read_snapshot_pins_a_boundary_across_collections() {
 }
 
 /// A snapshot must not resurrect records a later collection delete removes.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_snapshot_does_not_resurrect_a_later_delete() {
     let dir = test_dir("read_snapshot_delete");
@@ -10080,7 +10032,6 @@ fn read_snapshot_does_not_resurrect_a_later_delete() {
 /// A writer restart changes the publish-signal epoch; a held snapshot must
 /// fail closed rather than serve a stale view, and a fresh snapshot must
 /// resync.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_snapshot_rejects_a_writer_restart() {
     let dir = test_dir("read_snapshot_incarnation");
@@ -10154,7 +10105,6 @@ fn read_snapshot_rejects_a_writer_restart() {
 
 /// A snapshot taken on a writer handle with no read overlay reads the live
 /// index.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_snapshot_reads_the_live_index_without_an_overlay() {
     let dir = test_dir("read_snapshot_no_overlay");
@@ -10188,7 +10138,6 @@ fn read_snapshot_reads_the_live_index_without_an_overlay() {
 /// A pinned snapshot survives reclamation of the journal groups it applied:
 /// the overlay entry is in memory, so materializing and checkpointing the
 /// group underneath it must not change what the snapshot reads.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_snapshot_survives_reclaiming_the_group_it_applied() {
     let dir = test_dir("read_snapshot_reclaim");
@@ -10247,7 +10196,6 @@ fn read_snapshot_survives_reclaiming_the_group_it_applied() {
 
 /// `with_read_snapshot` scopes the pin to the callback: reads inside see one
 /// boundary, and the pin is released before the call returns.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn with_read_snapshot_scopes_the_pin_to_the_callback() {
     let dir = test_dir("with_read_snapshot");
@@ -10333,7 +10281,6 @@ fn with_read_snapshot_scopes_the_pin_to_the_callback() {
 
 /// The snapshot pin-hold and overlay lock-wait histograms are opt-in and move
 /// when a snapshot is taken and dropped.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_snapshot_pin_and_lock_wait_are_timed() {
     let dir = test_dir("read_snapshot_timings");
@@ -10383,7 +10330,6 @@ fn read_snapshot_pin_and_lock_wait_are_timed() {
 
 /// A snapshot reports each record's durable group token: records written in the
 /// same journal group share it, and a later group advances it.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn read_snapshot_reports_the_durable_group_token() {
     let dir = test_dir("read_snapshot_record_versions");

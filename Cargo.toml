@@ -106,24 +106,21 @@ default = ["zstd"]
 # writes raw frames and refuses to read compressed ones.
 zstd = ["dep:zstd", "dep:zstd-sys"]
 
-# Cross-process write-ahead journal + read-committed overlay, for a
-# single-writer/multi-reader deployment where separate OS processes need to
-# read a live writer's committed-but-not-yet-checkpointed data (e.g. a
-# Synapse worker deployment). Off by default: a genuinely single-process
-# embedded deployment never needs this, and it costs real code (journal.rs,
-# the read-journal overlay, the refresh-on-miss read path) that a
-# single-process build shouldn't have to carry. See docs/TODO.txt's
-# "process model" entries for the deployment-shape reasoning.
+# Deprecated no-op. Everything this feature once gated is now always
+# available: `Database`, its shared write-ahead log, transactions and
+# record-version compare-and-set, the read-committed overlay, and
+# `PackfileStorage::open_read_committed_shared` for readers in other processes.
+# The feature is kept only so existing manifests that enable it still resolve;
+# it can be removed once nothing depends on it.
 multi-reader = []
 
 # Roaring-backed `u32` bitmap sets (`bitmap_set`): generic set algebra over
 # domain-tagged ordinal spaces, for auth-chain closures and other large or
 # frequently-intersected index sets (membership intersections, relation
 # fan-out, candidate sets, query AND/OR/NOT). Off by default; carries the
-# `roaring` dependency. Set algebra is pure computation needing no
-# transactions, so this is independent of `multi-reader`; only persistence
-# (the auth-closure builder) needs both features. See
-# docs/docs/auth-chain-closures-plan.md.
+# `roaring` dependency. Enables the bitmap sets and everything built on them:
+# the auth-closure walk and its persisted generations, and the room auth
+# façade. See docs/docs/auth-chain-closures-plan.md.
 bitmaps = ["dep:roaring"]
 
 [dependencies]
@@ -159,8 +156,8 @@ jobserver = "=0.1.32"
 
 # INTEGRATION TESTS. Ungated files are folded into one `tests/unit/main.rs`
 # target so `cargo test` links a single binary for them (see that file's
-# header). Feature-gated suites keep their own target with `required-features`,
-# so the default build neither compiles nor links them.
+# header). A suite that needs a feature keeps its own target with
+# `required-features`, so a build without it neither compiles nor links it.
 [[test]]
 name = "unit"
 path = "tests/unit/main.rs"
@@ -168,7 +165,6 @@ path = "tests/unit/main.rs"
 [[test]]
 name = "shared_wal_processes"
 path = "tests/shared_wal_processes.rs"
-required-features = ["multi-reader"]
 
 [lints]
 workspace = true

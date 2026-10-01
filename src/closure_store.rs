@@ -41,11 +41,11 @@
 //! every non-skipped covered id has a record, every skipped id has none,
 //! counts match).
 //!
-//! Gated on `multi-reader` with the transaction layer and engine CAS it uses.
+//! Built on the transaction layer and engine CAS in [`crate::database`].
 
 use bytes::Bytes;
 
-use crate::database::{DatabaseTransaction, SharedDatabase};
+use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::logical_head::{LogicalHead, LogicalHeadValue};
 use crate::packfile;
@@ -106,7 +106,7 @@ pub(crate) fn take_head_reads() -> u64 {
 /// Runs once, inside `snapshot`, after the coverage record has been read and
 /// before it is checked against the head's count.
 #[cfg(test)]
-type SnapshotHook = Box<dyn Fn(&SharedDatabase)>;
+type SnapshotHook = Box<dyn Fn(&Database)>;
 
 #[cfg(test)]
 thread_local! {
@@ -127,7 +127,7 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn arm_snapshot_hook<F>(hook: F)
 where
-    F: Fn(&SharedDatabase) + 'static,
+    F: Fn(&Database) + 'static,
 {
     SNAPSHOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -177,7 +177,7 @@ pub(crate) mod test {
     /// collection directly.
     pub(crate) fn generation_exists(
         store: &super::ClosureStore,
-        db: &super::SharedDatabase,
+        db: &super::Database,
         generation: u64,
         short_ids: &[u32],
     ) -> Result<bool, super::StorageError> {
@@ -754,7 +754,7 @@ impl ClosureStore {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt head.
-    pub fn head(&self, db: &SharedDatabase) -> Result<Option<ClosureHead>, StorageError> {
+    pub fn head(&self, db: &Database) -> Result<Option<ClosureHead>, StorageError> {
         self.read_head(&db.begin_transaction())
             .map(|(head, _)| head)
     }
@@ -774,7 +774,7 @@ impl ClosureStore {
     /// Returns an error on a read failure, a corrupt head or coverage record, a
     /// head whose skipped count disagrees with its coverage record, or a head
     /// that keeps moving for every attempt.
-    pub fn snapshot(&self, db: &SharedDatabase) -> Result<Option<ClosureSnapshot>, StorageError> {
+    pub fn snapshot(&self, db: &Database) -> Result<Option<ClosureSnapshot>, StorageError> {
         for _ in 0..MAX_ATTEMPTS {
             let txn = db.begin_transaction();
             let (Some(head), _) = self.read_head(&txn)? else {
@@ -840,7 +840,7 @@ impl ClosureStore {
     ///
     /// # Errors
     /// As [`Self::get_many`].
-    pub fn get(&self, db: &SharedDatabase, short_id: u32) -> Result<Option<Vec<u8>>, StorageError> {
+    pub fn get(&self, db: &Database, short_id: u32) -> Result<Option<Vec<u8>>, StorageError> {
         Ok(self
             .get_many(db, &[short_id])?
             .1
@@ -873,7 +873,7 @@ impl ClosureStore {
     #[allow(clippy::type_complexity, reason = "generation plus ordered blobs")]
     pub fn get_many(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         short_ids: &[u32],
     ) -> Result<(Option<u64>, Vec<Option<Vec<u8>>>), StorageError> {
         for _ in 0..MAX_ATTEMPTS {
@@ -950,7 +950,7 @@ impl ClosureStore {
     /// an unmoved head or an undecodable record, otherwise a read failure.
     pub fn get_many_pinned(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         snapshot: &ClosureSnapshot,
         short_ids: &[u32],
     ) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
@@ -995,7 +995,7 @@ impl ClosureStore {
     ///
     /// # Errors
     /// Returns an error on a read or commit failure, or a corrupt counter.
-    pub fn begin(&self, db: &SharedDatabase) -> Result<GenerationBuilder, StorageError> {
+    pub fn begin(&self, db: &Database) -> Result<GenerationBuilder, StorageError> {
         let mut last = None;
         for _ in 0..MAX_ATTEMPTS {
             let txn = db.begin_transaction();
@@ -1046,7 +1046,7 @@ impl ClosureStore {
     ///
     /// # Errors
     /// Returns an error only when a record cannot be read.
-    pub fn verify(&self, db: &SharedDatabase) -> Result<ClosureVerifyReport, StorageError> {
+    pub fn verify(&self, db: &Database) -> Result<ClosureVerifyReport, StorageError> {
         let mut report = ClosureVerifyReport::default();
         // A corrupt head or coverage record is a finding, not an abort: `verify`
         // exists to report exactly that, and callers want the structured report
@@ -1108,7 +1108,7 @@ impl ClosureStore {
     ///
     /// # Errors
     /// Returns an error on a read or commit failure.
-    pub fn retire_superseded(&self, db: &SharedDatabase) -> Result<u64, StorageError> {
+    pub fn retire_superseded(&self, db: &Database) -> Result<u64, StorageError> {
         let txn = db.begin_transaction();
         let (head, _) = self.read_head(&txn)?;
         let (records, _) =
@@ -1139,11 +1139,7 @@ impl ClosureStore {
     /// The raw coverage record of `generation`, bypassing the head, so tests can
     /// assert whether one was written at all.
     #[cfg(test)]
-    pub(crate) fn raw_coverage_record(
-        &self,
-        db: &SharedDatabase,
-        generation: u64,
-    ) -> Option<Vec<u8>> {
+    pub(crate) fn raw_coverage_record(&self, db: &Database, generation: u64) -> Option<Vec<u8>> {
         let txn = db.begin_transaction();
         let (records, _) = txn
             .get_with_record_versions(
@@ -1162,7 +1158,7 @@ impl ClosureStore {
     #[cfg(test)]
     pub(crate) fn raw_generation_record(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         generation: u64,
         short_id: u32,
     ) -> Option<Vec<u8>> {
@@ -1227,11 +1223,7 @@ impl GenerationBuilder {
     /// # Errors
     /// Returns an error on a stage or commit failure, or an empty blob (an
     /// empty value would be a tombstone).
-    pub fn add(
-        &mut self,
-        db: &SharedDatabase,
-        closures: &[(u32, &[u8])],
-    ) -> Result<(), StorageError> {
+    pub fn add(&mut self, db: &Database, closures: &[(u32, &[u8])]) -> Result<(), StorageError> {
         let txn = db.begin_transaction();
         let collection = self.store.generation_collection(self.generation);
         for (short_id, blob) in closures {
@@ -1282,7 +1274,7 @@ impl GenerationBuilder {
     /// overlaps a stored closure, otherwise a commit failure.
     pub fn publish(
         self,
-        db: &SharedDatabase,
+        db: &Database,
         source_next: u32,
         skipped: &[u32],
     ) -> Result<ClosureHead, StorageError> {
@@ -1304,7 +1296,7 @@ impl GenerationBuilder {
     /// As [`Self::publish`].
     pub fn publish_with_coverage(
         self,
-        db: &SharedDatabase,
+        db: &Database,
         source_next: u32,
         set: &ClosureCoverageSet,
     ) -> Result<ClosureHead, StorageError> {
@@ -1363,7 +1355,7 @@ impl GenerationBuilder {
     }
 
     /// Delete this generation's collection, whether or not anything was staged.
-    fn discard_generation(&self, db: &SharedDatabase) -> Result<(), StorageError> {
+    fn discard_generation(&self, db: &Database) -> Result<(), StorageError> {
         let txn = db.begin_transaction();
         txn.delete_collection(
             self.store.pool,
@@ -1376,7 +1368,7 @@ impl GenerationBuilder {
     ///
     /// # Errors
     /// Returns an error if the delete cannot be committed.
-    pub fn abandon(self, db: &SharedDatabase) -> Result<(), StorageError> {
+    pub fn abandon(self, db: &Database) -> Result<(), StorageError> {
         self.discard_generation(db)
     }
 }

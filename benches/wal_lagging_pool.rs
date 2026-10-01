@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use mtxdb::layout::ShardType;
 use mtxdb::storage::{NodeData, NodeId};
-use mtxdb::SharedDatabase;
+use mtxdb::Database;
 
 const COLLECTION: [u8; 16] = [9; 16];
 
@@ -83,7 +83,7 @@ fn print_phases(timings: &mtxdb::packfile::storage::SyncTimings) {
 
 /// Where the time of every full checkpoint not yet printed went. A
 /// remediation checkpoint runs inside the sync, so `State` can appear too.
-fn print_checkpoint_breakdowns(db: &SharedDatabase, seen: &mut [String]) {
+fn print_checkpoint_breakdowns(db: &Database, seen: &mut [String]) {
     for (pool, seen) in ShardType::ALL.iter().zip(seen.iter_mut()) {
         let Some(b) = db.pool(*pool).checkpoint_breakdown() else {
             continue;
@@ -130,7 +130,7 @@ fn print_header(
     );
 }
 
-fn print_pool_stats(db: &SharedDatabase) {
+fn print_pool_stats(db: &Database) {
     for (name, pool) in [
         ("EventDag", ShardType::EventDag),
         ("State", ShardType::State),
@@ -164,7 +164,7 @@ fn main() {
     let root = base.join(format!("mtxdb_bench_wal_lagging_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
-    let db = SharedDatabase::open(root.clone()).expect("open shared database");
+    let db = Database::open(root.clone()).expect("open shared database");
     let coordinator = db.coordinator();
     if !remediate {
         coordinator.set_blocker_remediation(|_| {});

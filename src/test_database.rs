@@ -1,4 +1,4 @@
-use super::{shard_index, DatabaseTransaction, SharedDatabase, TransactionOverlayGuard};
+use super::{Database, DatabaseTransaction, TransactionOverlayGuard};
 use crate::journal::Journal;
 use crate::layout::ShardType;
 use crate::packfile::storage::PackfileStorage;
@@ -13,7 +13,7 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn prepare_partial_materialization(
-    database: &SharedDatabase,
+    database: &Database,
     transaction: &DatabaseTransaction<'_>,
     overlay: &mut Option<TransactionOverlayGuard>,
     state_collection: [u8; 16],
@@ -42,7 +42,7 @@ fn prepare_partial_materialization(
     database
         .register_new_recovery_stage(Arc::clone(&transaction.stage), receipt, overlay)
         .unwrap();
-    let mutation = transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
+    let mutation = transaction.stage.snapshot_mutations()[ShardType::State.index()][0].clone();
     database
         .pool(ShardType::State)
         .apply_transaction_mutation(&mutation, 0)
@@ -62,7 +62,7 @@ fn data(bytes: &'static [u8]) -> NodeData {
 }
 
 fn live_get(
-    database: &SharedDatabase,
+    database: &Database,
     pool: ShardType,
     collection: [u8; 16],
     id: NodeId,
@@ -72,10 +72,7 @@ fn live_get(
 
 /// Activate the overlay for exactly the pools `stage` has writes for, as
 /// commit does.
-fn activate_for(
-    database: &SharedDatabase,
-    stage: &crate::journal::TxnStage,
-) -> TransactionOverlayGuard {
+fn activate_for(database: &Database, stage: &crate::journal::TxnStage) -> TransactionOverlayGuard {
     database
         .activate_transaction_overlay(stage.touched_pools())
         .unwrap()
@@ -96,7 +93,7 @@ fn own_get(
 #[test]
 fn a_transaction_reads_its_own_writes_and_others_do_not() {
     let root = test_root("transaction_reads_own_writes");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let collection = [7u8; 16];
     let transaction = database.begin_transaction();
     transaction
@@ -133,7 +130,7 @@ fn a_transaction_reads_its_own_writes_and_others_do_not() {
 #[test]
 fn transaction_reads_prefer_the_newest_write_then_the_live_pool() {
     let root = test_root("transaction_reads_layering");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let collection = [7u8; 16];
     database
         .pool(ShardType::State)
@@ -174,7 +171,7 @@ fn transaction_reads_prefer_the_newest_write_then_the_live_pool() {
 #[test]
 fn a_staged_collection_delete_hides_older_data_but_not_newer_puts() {
     let root = test_root("transaction_reads_delete");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let doomed = [7u8; 16];
     let other = [8u8; 16];
     for collection in [doomed, other] {
@@ -225,7 +222,7 @@ fn a_staged_collection_delete_hides_older_data_but_not_newer_puts() {
 #[test]
 fn an_aborted_transaction_leaves_no_trace() {
     let root = test_root("transaction_reads_abort");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let collection = [7u8; 16];
     let transaction = database.begin_transaction();
     transaction
@@ -254,7 +251,7 @@ fn an_aborted_transaction_leaves_no_trace() {
 #[test]
 fn open_transactions_are_isolated_from_each_other() {
     let root = test_root("transaction_isolation");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let collection = [7u8; 16];
     let first = database.begin_transaction();
     let second = database.begin_transaction();
@@ -292,7 +289,7 @@ fn open_transactions_are_isolated_from_each_other() {
 #[test]
 fn a_transaction_still_reads_its_writes_while_its_commit_is_part_way() {
     let root = test_root("transaction_reads_mid_commit");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let state_collection = [0x61; 16];
     let event_collection = [0x62; 16];
     let transaction = database.begin_transaction();
@@ -328,7 +325,7 @@ fn a_transaction_still_reads_its_writes_while_its_commit_is_part_way() {
 fn a_large_batch_read_preserves_order_and_values() {
     const RECORDS: u16 = 4000;
     let root = test_root("transaction_reads_large_batch");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let collection = [7u8; 16];
     let id_of = |index: u16| -> NodeId {
         let mut id = [0u8; 16];
@@ -371,7 +368,7 @@ fn a_large_batch_read_preserves_order_and_values() {
 #[test]
 fn an_owned_transaction_moves_across_threads_and_commits() {
     let root = test_root("owned_transaction");
-    let database = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+    let database = Arc::new(Database::open(root.clone()).unwrap());
     let collection = [7u8; 16];
     let transaction = database.begin_owned_transaction();
     transaction
@@ -399,7 +396,7 @@ fn an_owned_transaction_moves_across_threads_and_commits() {
 #[test]
 fn staged_reads_are_scoped_to_their_pool() {
     let root = test_root("transaction_reads_pool_scope");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let collection = [7u8; 16];
     let transaction = database.begin_transaction();
     transaction
@@ -422,7 +419,7 @@ fn staged_reads_are_scoped_to_their_pool() {
 #[test]
 fn a_transaction_commits_after_a_checkpoint_has_reclaimed_the_wal() {
     let root = test_root("commit_after_checkpoint");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let collection = [7u8; 16];
     database
         .pool(ShardType::State)
@@ -471,7 +468,7 @@ fn node(id: u8) -> NodeId {
 #[test]
 fn opens_a_root_with_all_pools_behind_one_coordinator() {
     let root = test_root("one_coordinator");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     for shard in ShardType::ALL {
         let pool = db.pool(shard);
         assert!(
@@ -487,7 +484,7 @@ fn opens_a_root_with_all_pools_behind_one_coordinator() {
 fn server_info_is_a_shared_wal_transaction_pool() {
     let root = test_root("server_info_shared_wal");
     let collection = [0x64; 16];
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let transaction = db.begin_transaction();
     transaction
         .put(
@@ -518,7 +515,7 @@ fn server_info_is_a_shared_wal_transaction_pool() {
 
     drop(transaction);
     drop(db);
-    let reopened = SharedDatabase::open(root.clone()).unwrap();
+    let reopened = Database::open(root.clone()).unwrap();
     assert_eq!(
         reopened
             .pool(ShardType::ServerInfo)
@@ -536,7 +533,7 @@ fn server_info_is_a_shared_wal_transaction_pool() {
 #[test]
 fn transaction_abort_keeps_staged_mutations_invisible() {
     let root = test_root("transaction_abort");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x51; 16];
     let node_id = node(1);
     let transaction = db.begin_transaction();
@@ -567,7 +564,7 @@ fn transaction_abort_keeps_staged_mutations_invisible() {
 #[test]
 fn transaction_rejects_mutations_after_completion() {
     let root = test_root("transaction_terminal_mutations");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let collection = [0x5A; 16];
     let node_id = node(1);
     let data = NodeData::new(bytes::Bytes::from_static(b"late"));
@@ -600,7 +597,7 @@ fn transaction_rejects_mutations_after_completion() {
 #[test]
 fn reused_overlay_does_not_shadow_a_later_direct_write() {
     let root = test_root("overlay_reuse_shadow");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x71; 16];
     let first = db.begin_transaction();
     first
@@ -633,7 +630,7 @@ fn reused_overlay_does_not_shadow_a_later_direct_write() {
 #[test]
 fn reused_overlay_keeps_a_collection_delete_from_resurrecting_records() {
     let root = test_root("overlay_reuse_delete");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x72; 16];
     let put = |id: u8, value: &'static [u8]| {
         let txn = db.begin_transaction();
@@ -666,7 +663,7 @@ fn reused_overlay_keeps_a_collection_delete_from_resurrecting_records() {
 #[test]
 fn reused_overlay_survives_reclaim_with_interleaved_pools() {
     let root = test_root("overlay_reuse_reclaim");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let state = [0x73; 16];
     let events = [0x74; 16];
     let commit_pair = |round: u8| {
@@ -704,11 +701,10 @@ fn reused_overlay_survives_reclaim_with_interleaved_pools() {
 
 /// Commit cost must not grow with the unreclaimed WAL: a lone commit
 /// scans only the group it appended, however long the segment already is.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn lone_commits_scan_only_the_appended_suffix() {
     let root = test_root("overlay_scan_bounded");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x75; 16];
     let pool = db.pool(ShardType::EventDag);
     let commit = |seq: u16| {
@@ -747,11 +743,10 @@ fn lone_commits_scan_only_the_appended_suffix() {
 /// shared segment keeps what the held pool has not covered (and names it as
 /// the blocker), a crash at that instant loses nothing, and once the tail
 /// installs its image the segment is reclaimed.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_pool_in_a_background_checkpoint_holds_only_its_own_coverage() {
     let root = test_root("shared_wal_background_checkpoint");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x5B; 16];
     let state = db.pool(ShardType::State);
     let events = db.pool(ShardType::EventDag);
@@ -795,7 +790,7 @@ fn a_pool_in_a_background_checkpoint_holds_only_its_own_coverage() {
     // with every committed record.
     let crashed = test_root("shared_wal_background_checkpoint_crash");
     crash_image(&db, &root, &crashed);
-    let after_crash = SharedDatabase::open(crashed.clone()).unwrap();
+    let after_crash = Database::open(crashed.clone()).unwrap();
     for pool in [ShardType::State, ShardType::EventDag] {
         for seq in [1, 2] {
             assert!(
@@ -832,7 +827,7 @@ fn a_pool_in_a_background_checkpoint_holds_only_its_own_coverage() {
         "once State covers commit 2 it no longer holds the segment"
     );
     drop(db);
-    let reopened = SharedDatabase::open(root.clone()).unwrap();
+    let reopened = Database::open(root.clone()).unwrap();
     for pool in [ShardType::State, ShardType::EventDag] {
         for seq in [1, 2] {
             assert!(live_get(&reopened, pool, collection, node(seq)).is_some());
@@ -846,11 +841,10 @@ fn a_pool_in_a_background_checkpoint_holds_only_its_own_coverage() {
 /// second tail (it would rotate the epoch again and race the first tail on
 /// the same checkpoint file); remediation of the other pool starts its own
 /// and leaves the held pool's coverage alone. Every record survives.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn remediating_a_pool_with_a_tail_running_starts_no_second_tail() {
     let root = test_root("shared_wal_remediation_with_tail");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x5C; 16];
     let state = db.pool(ShardType::State);
     let events = db.pool(ShardType::EventDag);
@@ -893,7 +887,7 @@ fn remediating_a_pool_with_a_tail_running_starts_no_second_tail() {
     // record of both pools.
     let crashed = test_root("shared_wal_remediation_with_tail_crash");
     crash_image(&db, &root, &crashed);
-    let after_crash = SharedDatabase::open(crashed.clone()).unwrap();
+    let after_crash = Database::open(crashed.clone()).unwrap();
     for pool in [ShardType::State, ShardType::EventDag] {
         for seq in [1, 2] {
             assert!(
@@ -909,7 +903,7 @@ fn remediating_a_pool_with_a_tail_running_starts_no_second_tail() {
     state.wait_for_checkpoint();
     assert!(state.durable_coverage() > state_before);
     drop(db);
-    let reopened = SharedDatabase::open(root.clone()).unwrap();
+    let reopened = Database::open(root.clone()).unwrap();
     for pool in [ShardType::State, ShardType::EventDag] {
         for seq in [1, 2] {
             assert!(
@@ -926,11 +920,10 @@ fn remediating_a_pool_with_a_tail_running_starts_no_second_tail() {
 /// staged group is visible before materialization; once the last user
 /// releases it, the overlay leaves the read path, and writer reads stop
 /// refreshing a journal that only repeats the index.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn transaction_overlay_is_on_the_read_path_only_while_a_transaction_uses_it() {
     let root = test_root("overlay_read_path");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x76; 16];
     let pool = db.pool(ShardType::EventDag);
     assert!(!pool.read_journal_installed());
@@ -951,11 +944,10 @@ fn transaction_overlay_is_on_the_read_path_only_while_a_transaction_uses_it() {
 /// After many lone commits and a checkpoint, a writer's read-committed reads
 /// must not have a journal overlay installed, and must still return every
 /// committed record.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn writer_reads_leave_the_overlay_off_after_commits_and_sync() {
     let root = test_root("overlay_writer_reads");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x77; 16];
     let pool = db.pool(ShardType::EventDag);
     for seq in 0..200u8 {
@@ -978,12 +970,11 @@ fn writer_reads_leave_the_overlay_off_after_commits_and_sync() {
 /// One thread commits while another reads: a reader must see every commit
 /// the writer has finished, whether or not the overlay is installed at that
 /// moment.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn concurrent_reads_see_every_finished_commit() {
     use std::sync::atomic::{AtomicU8, Ordering};
     let root = test_root("overlay_concurrent");
-    let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+    let db = Arc::new(Database::open(root.clone()).unwrap());
     let collection = [0x78; 16];
     let finished = Arc::new(AtomicU8::new(0));
     let writer = {
@@ -1022,11 +1013,10 @@ fn concurrent_reads_see_every_finished_commit() {
 /// While a transaction overlay is active, a read of a key the overlay does
 /// not hold must fall through to the live index once, not bounce between
 /// the overlay path and the durable path until the stack overflows.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn reading_an_unstaged_key_during_an_active_overlay_reaches_the_index() {
     let root = test_root("overlay_unstaged_read");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x79; 16];
     let pool = db.pool(ShardType::EventDag);
     pool.put(&collection, &node(1), &data(b"durable")).unwrap();
@@ -1046,7 +1036,6 @@ fn reading_an_unstaged_key_during_an_active_overlay_reaches_the_index() {
 }
 
 /// Small enough that a few hundred KiB of commits cross it.
-#[cfg(feature = "multi-reader")]
 const TEST_RECLAIM_TRIGGER_LEN: u64 = 256 << 10;
 
 /// Write committed transactions that stage into each of the `active` pools
@@ -1056,7 +1045,6 @@ const TEST_RECLAIM_TRIGGER_LEN: u64 = 256 << 10;
 /// `journal.lsn` after its first checkpoint, while every active pool does
 /// checkpoint once the segment is large. The segment can only be reclaimed
 /// once all the active pools have reported coverage.
-#[cfg(feature = "multi-reader")]
 fn run_bounded_wal_rounds(name: &str, active: &[ShardType], defer_rewrites: bool) -> u64 {
     use crate::PackfileStorage;
     assert!(!active.is_empty(), "at least one pool must be active");
@@ -1067,7 +1055,7 @@ fn run_bounded_wal_rounds(name: &str, active: &[ShardType], defer_rewrites: bool
         );
     }
     let root = test_root(name);
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     db.coordinator()
         .set_reclaim_trigger_len(TEST_RECLAIM_TRIGGER_LEN);
     if defer_rewrites {
@@ -1151,12 +1139,10 @@ fn run_bounded_wal_rounds(name: &str, active: &[ShardType], defer_rewrites: bool
 }
 
 /// The WAL must stay below the reclaim trigger after each round's syncs.
-#[cfg(feature = "multi-reader")]
 fn assert_wal_bounded(name: &str, active: &[ShardType]) {
     assert_wal_bounded_with(name, active, false);
 }
 
-#[cfg(feature = "multi-reader")]
 fn assert_wal_bounded_with(name: &str, active: &[ShardType], defer_rewrites: bool) {
     let largest = run_bounded_wal_rounds(name, active, defer_rewrites);
     assert!(
@@ -1172,19 +1158,16 @@ fn assert_wal_bounded_with(name: &str, active: &[ShardType], defer_rewrites: boo
 /// segment must force a full checkpoint so the WAL stays bounded, whichever
 /// pool carries the frames: each pool must be compared with its own
 /// committed LSN and its own `journal.lsn`.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn repeated_syncs_keep_the_shared_wal_bounded_with_only_state_active() {
     assert_wal_bounded("wal_bounded_state", &[ShardType::State]);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn repeated_syncs_keep_the_shared_wal_bounded_with_only_event_dag_active() {
     assert_wal_bounded("wal_bounded_event", &[ShardType::EventDag]);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn repeated_syncs_keep_the_shared_wal_bounded_with_only_edges_active() {
     assert_wal_bounded("wal_bounded_edges", &[ShardType::Edges]);
@@ -1192,7 +1175,6 @@ fn repeated_syncs_keep_the_shared_wal_bounded_with_only_edges_active() {
 
 /// With two contributing pools the segment is only reclaimable once both
 /// have reported coverage, and the third stays idle throughout.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn repeated_syncs_keep_the_shared_wal_bounded_with_two_pools_active() {
     assert_wal_bounded("wal_bounded_two", &[ShardType::State, ShardType::EventDag]);
@@ -1201,7 +1183,6 @@ fn repeated_syncs_keep_the_shared_wal_bounded_with_two_pools_active() {
 /// A configured checkpoint-rewrite deferral budget must not postpone the
 /// checkpoint the size trigger forces: the segment would fill and commits
 /// would fail.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_deferral_budget_does_not_hold_back_the_forced_reclaim() {
     assert_wal_bounded_with("wal_bounded_deferred", &[ShardType::EventDag], true);
@@ -1209,11 +1190,10 @@ fn a_deferral_budget_does_not_hold_back_the_forced_reclaim() {
 
 /// A transaction that stages writes for one pool must not activate (and so
 /// rescan the journal for) the overlay on the others.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn overlay_is_activated_only_on_the_pools_a_transaction_stages() {
     let root = test_root("overlay_touched_pools");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let collection = [0x7b; 16];
     let txn = db.begin_transaction();
     txn.put(ShardType::EventDag, collection, node(1), &data(b"staged"))
@@ -1240,9 +1220,8 @@ fn overlay_is_activated_only_on_the_pools_a_transaction_stages() {
 
 /// Commit `count` transactions, each staging 20 records into every pool in
 /// `pools`. Stops at the first error.
-#[cfg(feature = "multi-reader")]
 fn commit_batch(
-    db: &SharedDatabase,
+    db: &Database,
     pools: &[ShardType],
     next: &mut u64,
     count: usize,
@@ -1267,10 +1246,9 @@ fn commit_batch(
 
 /// A small database whose segment cap is 1 MiB, so its trigger is 256 KiB
 /// and its emergency line 768 KiB.
-#[cfg(feature = "multi-reader")]
-fn small_segment_database(name: &str) -> (SharedDatabase, PathBuf) {
+fn small_segment_database(name: &str) -> (Database, PathBuf) {
     let root = test_root(name);
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     db.coordinator().set_segment_cap(1 << 20);
     (db, root)
 }
@@ -1280,7 +1258,6 @@ fn small_segment_database(name: &str) -> (SharedDatabase, PathBuf) {
 /// reported with the pool named, `EventDag` must stop repeating a checkpoint
 /// that cannot help, and a commit that finally hits the hard limit must say
 /// which pool it is waiting on instead of failing silently.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
     let (db, root) = small_segment_database("lagging_no_remediation");
@@ -1347,7 +1324,6 @@ fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
 /// yet reclaim what the others have not reported. That is normal: it must
 /// neither be counted nor logged as a stall, and the later pool's coverage
 /// clears the pending state.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_healthy_sequential_sync_is_not_reported_as_a_stall() {
     let (db, root) = small_segment_database("healthy_sequential");
@@ -1382,7 +1358,6 @@ fn a_healthy_sequential_sync_is_not_reported_as_a_stall() {
 
 /// A pool that stays silent is reported, but only after the segment has
 /// grown by an eighth of the trigger past the first failed reclaim.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_silent_contributor_is_reported_after_the_grace_period() {
     let (db, root) = small_segment_database("stall_grace");
@@ -1422,7 +1397,6 @@ fn a_silent_contributor_is_reported_after_the_grace_period() {
 /// emergency zone costs. Every sync there may force a checkpoint; this
 /// records how many did, whether any reclaimed anything, and how much
 /// headroom the commits had left.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn emergency_zone_cost_with_a_pool_that_never_reports() {
     let (db, root) = small_segment_database("emergency_cost");
@@ -1489,8 +1463,7 @@ fn emergency_zone_cost_with_a_pool_that_never_reports() {
 
 /// Copy `source` to `dest`, then cut every pool's packs in the copy back to
 /// what an fsync had covered when the copy was taken.
-#[cfg(feature = "multi-reader")]
-fn crash_image(db: &SharedDatabase, source: &std::path::Path, dest: &std::path::Path) {
+fn crash_image(db: &Database, source: &std::path::Path, dest: &std::path::Path) {
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
@@ -1524,14 +1497,13 @@ fn crash_image(db: &SharedDatabase, source: &std::path::Path, dest: &std::path::
 /// writes and syncs, the disk a power cut would leave (packs cut to their
 /// fsynced length, WAL as it is) must still hold every record that was
 /// acknowledged and made durable by a full sync of its pool.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_power_cut_image_never_loses_a_record_a_claim_covered() {
     let root = test_root("cut_image_source");
     let image = test_root("cut_image_copy");
     let collection = [0x6e; 16];
     let pools = [ShardType::State, ShardType::EventDag];
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     db.coordinator().set_reclaim_trigger_len(1);
     let mut durable: Vec<(ShardType, [u8; 16])> = Vec::new();
     let mut pending: Vec<(ShardType, [u8; 16])> = Vec::new();
@@ -1569,7 +1541,7 @@ fn a_power_cut_image_never_loses_a_record_a_claim_covered() {
             _ => {}
         }
         crash_image(&db, &root, &image);
-        let recovered = SharedDatabase::open(image.clone()).unwrap();
+        let recovered = Database::open(image.clone()).unwrap();
         for (pool, node) in &durable {
             assert!(
                     recovered
@@ -1590,7 +1562,6 @@ fn a_power_cut_image_never_loses_a_record_a_claim_covered() {
 /// The same lag, but the database can make the silent pool checkpoint. Once
 /// the segment reaches the emergency zone it does, reclaim succeeds, and no
 /// commit ever fails.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_lagging_pool_is_checkpointed_for_the_caller_before_the_segment_fills() {
     use crate::PackfileStorage;
@@ -1620,7 +1591,6 @@ fn a_lagging_pool_is_checkpointed_for_the_caller_before_the_segment_fills() {
 /// A burst of commits between syncs can outrun the headroom the trigger
 /// leaves: the segment fills, commits are refused with a clear error, and
 /// one sync reclaims enough that commits work again with nothing lost.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_commit_burst_that_fills_the_segment_is_refused_then_recovers_after_a_sync() {
     let (db, root) = small_segment_database("burst_fills_segment");
@@ -1664,12 +1634,11 @@ fn a_commit_burst_that_fills_the_segment_is_refused_then_recovers_after_a_sync()
 /// materialized into the packs. A checkpoint in that window must not record
 /// coverage of frames the packs do not hold yet, or the WAL could be
 /// reclaimed past them and a crash would lose an acknowledged commit.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_checkpoint_does_not_claim_an_unmaterialized_transaction() {
     use crate::PackfileStorage;
     let root = test_root("checkpoint_unmaterialized");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let transaction = db.begin_transaction();
     transaction
         .put(ShardType::State, [0x91; 16], node(1), &data(b"state"))
@@ -1710,7 +1679,6 @@ fn a_checkpoint_does_not_claim_an_unmaterialized_transaction() {
 /// version table. The shared segment is reclaimed only once both have
 /// reported: after the first pool's step the second still holds it, and after
 /// the second's the reclaimed segment holds no covered group.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn shared_reclaim_waits_for_every_pools_version_checkpoint() {
     let (db, root) = small_segment_database("shared_delta_coverage");
@@ -1758,7 +1726,7 @@ fn shared_reclaim_waits_for_every_pools_version_checkpoint() {
 #[test]
 fn transaction_commit_applies_and_publishes_once() {
     let root = test_root("transaction_commit");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let state_collection = [0x61; 16];
     let event_collection = [0x62; 16];
     let transaction = db.begin_transaction();
@@ -1819,11 +1787,10 @@ fn transaction_commit_applies_and_publishes_once() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn versioned_transaction_read_rejects_stale_commit_and_retries() {
     let root = test_root("versioned_transaction_read");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let pool = ShardType::Edges;
     let collection = [0x73; 16];
     let key = node(1);
@@ -1917,11 +1884,10 @@ fn versioned_transaction_read_rejects_stale_commit_and_retries() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn versioned_transaction_byte_read_preserves_payload_without_reencoding() {
     let root = test_root("versioned_transaction_bytes");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let pool = ShardType::Edges;
     let collection = [0x74; 16];
     let key = node(1);
@@ -1943,11 +1909,10 @@ fn versioned_transaction_byte_read_preserves_payload_without_reencoding() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn versioned_read_retries_when_publication_is_not_materialized() {
     let root = test_root("versioned_read_unmaterialized");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let pool = ShardType::Edges;
     let collection = [0x75; 16];
     let key = node(1);
@@ -1974,7 +1939,6 @@ fn versioned_read_retries_when_publication_is_not_materialized() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn versioned_point_reads_match_their_token_during_concurrent_publication() {
     use std::collections::HashMap;
@@ -1982,7 +1946,7 @@ fn versioned_point_reads_match_their_token_during_concurrent_publication() {
     use std::sync::Mutex;
 
     let root = test_root("versioned_point_read_concurrent");
-    let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+    let db = Arc::new(Database::open(root.clone()).unwrap());
     let pool = ShardType::Edges;
     let collection = [0x74; 16];
     let key = node(3);
@@ -2092,7 +2056,7 @@ fn versioned_point_reads_match_their_token_during_concurrent_publication() {
 #[test]
 fn retrying_commit_and_recovery_can_run_concurrently() {
     let root = test_root("transaction_concurrent_recovery");
-    let database = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+    let database = Arc::new(Database::open(root.clone()).unwrap());
     let transaction = Arc::new(database.begin_transaction());
     let collection = [0x66; 16];
     let node_id = node(1);
@@ -2158,13 +2122,12 @@ fn retrying_commit_and_recovery_can_run_concurrently() {
 /// certifying a published-but-unmaterialized group. It must be pinned while
 /// such a group exists and released once the group reaches the packs, or every
 /// versioned read wedges behind a phantom publication.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn unmaterialized_floor_pins_until_group_is_materialized() {
     use std::sync::Arc;
 
     let root = test_root("unmaterialized_floor");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let collection = [0x5au8; 16];
     let pool = ShardType::State;
 
@@ -2224,7 +2187,7 @@ fn published_transaction_is_visible_before_materialization() {
     let event_collection = [0x62; 16];
     let state_node = node(1);
     let event_node = node(2);
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let old_node = node(9);
     database
         .pool(ShardType::State)
@@ -2309,7 +2272,7 @@ fn published_transaction_is_visible_before_materialization() {
     drop(transaction);
     database.recover_pending_transactions().unwrap();
     drop(database);
-    let reopened = SharedDatabase::open(root.clone()).unwrap();
+    let reopened = Database::open(root.clone()).unwrap();
     assert!(reopened
         .pool(ShardType::State)
         .get(&state_collection, &state_node)
@@ -2327,7 +2290,7 @@ fn published_transaction_is_visible_before_materialization() {
 #[test]
 fn partial_materialization_retries_through_overlay_and_drains_it() {
     let root = test_root("transaction_materialization_retry");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let state_collection = [0x71; 16];
     let event_collection = [0x72; 16];
     let state_node = node(1);
@@ -2342,7 +2305,7 @@ fn partial_materialization_retries_through_overlay_and_drains_it() {
         event_collection,
     );
     let state_mutation =
-        transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
+        transaction.stage.snapshot_mutations()[ShardType::State.index()][0].clone();
     database
         .pool(ShardType::State)
         .apply_transaction_mutation(&state_mutation, 0)
@@ -2398,7 +2361,7 @@ fn partial_materialization_retries_through_overlay_and_drains_it() {
 #[test]
 fn dropped_partial_transaction_recovers_from_wal_and_drains_overlay() {
     let root = test_root("transaction_orphan_recovery");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let state_collection = [0x81; 16];
     let event_collection = [0x82; 16];
     let state_node = node(1);
@@ -2413,7 +2376,7 @@ fn dropped_partial_transaction_recovers_from_wal_and_drains_overlay() {
         event_collection,
     );
     let state_mutation =
-        transaction.stage.snapshot_mutations()[shard_index(ShardType::State)][0].clone();
+        transaction.stage.snapshot_mutations()[ShardType::State.index()][0].clone();
     database
         .pool(ShardType::State)
         .apply_transaction_mutation(&state_mutation, 0)
@@ -2453,7 +2416,7 @@ fn a_written_pool_replays_on_reopen() {
     let root = test_root("replay");
     let collection = [0x11u8; 16];
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         db.pool(ShardType::State)
             .put(
                 &collection,
@@ -2463,7 +2426,7 @@ fn a_written_pool_replays_on_reopen() {
             .unwrap();
         db.pool(ShardType::State).sync_all().unwrap();
     }
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let got = db
         .pool(ShardType::State)
         .get(&collection, &node(1))
@@ -2480,7 +2443,7 @@ fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
     let state_collection = [0x33u8; 16];
     let event_collection = [0x44u8; 16];
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         db.pool(ShardType::State)
             .put(
                 &state_collection,
@@ -2524,7 +2487,7 @@ fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
     // Reopen: the fresh coordinator has no state frame to derive a
     // watermark from. A checkpoint must preserve the recorded coverage
     // rather than erase it, or the next replay would start from zero.
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     db.pool(ShardType::State).force_index_checkpoint().unwrap();
     assert_eq!(
         PackfileStorage::read_journal_lsn(&root.join("pools/mtpl-state")),
@@ -2551,7 +2514,7 @@ fn a_missing_wal_is_seeded_above_the_pools_recorded_coverage() {
     .unwrap();
     assert!(!root.join("wal.bin").exists());
 
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
     assert!(
         scan.base_lsn > 7,
@@ -2572,22 +2535,22 @@ fn a_missing_wal_is_seeded_above_the_pools_recorded_coverage() {
 #[test]
 fn a_second_writer_on_one_root_is_refused() {
     let root = test_root("one_writer");
-    let first = SharedDatabase::open(root.clone()).unwrap();
-    let second = SharedDatabase::open(root.clone());
+    let first = Database::open(root.clone()).unwrap();
+    let second = Database::open(root.clone());
     assert!(
         second.is_err(),
         "a second writer must not open the same root"
     );
     drop(first);
     // Releasing the first handle frees the root for a new writer.
-    SharedDatabase::open(root.clone()).unwrap();
+    Database::open(root.clone()).unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn a_per_pool_journal_is_refused_inside_a_shared_root() {
     let root = test_root("legacy_gate");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let err = db
         .pool(ShardType::State)
         .enable_journal(root.join("pools/mtpl-state/wal.bin"))
@@ -2603,7 +2566,7 @@ fn a_per_pool_journal_is_refused_inside_a_shared_root() {
 #[test]
 fn open_uses_default_pool_policies_enabling_compression() {
     let root = test_root("default_policies");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     for shard in ShardType::ALL {
         assert!(
             db.pool(shard).is_compression_enabled(),
@@ -2625,7 +2588,7 @@ fn open_with_policies_applies_per_pool_settings() {
     policies.state.compress = false;
     policies.edges.checksum_policy = crate::packfile::ChecksumPolicy::WriteOnly;
 
-    let db = SharedDatabase::open_with_policies(root.clone(), policies).unwrap();
+    let db = Database::open_with_policies(root.clone(), policies).unwrap();
     assert!(!db.state().is_compression_enabled());
     assert!(db.event_dag().is_compression_enabled());
     assert!(db.edges().is_compression_enabled());
@@ -2642,7 +2605,6 @@ fn open_with_policies_applies_per_pool_settings() {
 /// just-published version alongside pre-publication data, its conditional
 /// commit validates against that version and overwrites another writer's
 /// update. A lost token means exactly that hole.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn concurrent_versioned_rmw_keeps_every_update() {
     use std::sync::Arc;
@@ -2650,7 +2612,7 @@ fn concurrent_versioned_rmw_keeps_every_update() {
     const WORKERS: u8 = 16;
 
     let root = test_root("concurrent_versioned_rmw");
-    let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+    let db = Arc::new(Database::open(root.clone()).unwrap());
     let pool = ShardType::Edges;
     let collection = [0x7au8; 16];
     let key = node(1);
@@ -2722,7 +2684,6 @@ fn concurrent_versioned_rmw_keeps_every_update() {
 /// A record's write token is stable across re-reads and across a reopen, where
 /// it is seeded from the retained WAL plus, for reclaimed groups, the frame's
 /// `last_write_lsn`.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn record_versions_are_stable_and_survive_reopen() {
     let root = test_root("record_version_reopen");
@@ -2731,7 +2692,7 @@ fn record_versions_are_stable_and_survive_reopen() {
     let key = node(1);
     let write_version;
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         let txn = db.begin_transaction();
         txn.put(
             pool,
@@ -2755,7 +2716,7 @@ fn record_versions_are_stable_and_survive_reopen() {
         assert_eq!(versions2[0], write_version, "warm token is stable");
         db.pool(pool).sync_all().unwrap();
     }
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let reader = db.begin_transaction();
     let (records, versions) = reader
         .get_with_record_versions(pool, &collection, &[key])
@@ -2771,7 +2732,6 @@ fn record_versions_are_stable_and_survive_reopen() {
 
 /// A record the live map does not know (its WAL group was reclaimed) is seeded
 /// from its frame's own `last_write_lsn`.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn cold_record_token_seeds_from_frame_metadata() {
     let root = test_root("record_frame_seed");
@@ -2780,7 +2740,7 @@ fn cold_record_token_seeds_from_frame_metadata() {
     let key = node(1);
     let write_version;
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         let txn = db.begin_transaction();
         txn.put(
             pool,
@@ -2800,7 +2760,7 @@ fn cold_record_token_seeds_from_frame_metadata() {
     // Drop the retained WAL so the reopen cannot seed the token from it; the
     // only remaining source is the record's frame metadata.
     let _ = std::fs::remove_file(root.join("wal.bin"));
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let reader = db.begin_transaction();
     let (records, versions) = reader
         .get_with_record_versions(pool, &collection, &[key])
@@ -2817,11 +2777,10 @@ fn cold_record_token_seeds_from_frame_metadata() {
 /// A frame whose record token is `0` — a legacy v4 frame with no
 /// `last_write_lsn` tag, or a write made without a journal — reads as version
 /// `0`, not as a never-written sentinel.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn zero_token_frame_reads_version_zero() {
     let root = test_root("record_legacy_zero");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let pool = ShardType::State;
     let collection = [0x76u8; 16];
     let key = node(1);
@@ -2848,7 +2807,6 @@ fn zero_token_frame_reads_version_zero() {
 
 /// A direct (autocommit) put stamps a non-zero token into its frame, so the
 /// token survives reclamation of the WAL group and a reopen.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn direct_put_token_survives_reclaim_and_reopen() {
     let root = test_root("record_direct_reclaim");
@@ -2857,7 +2815,7 @@ fn direct_put_token_survives_reclaim_and_reopen() {
     let key = node(1);
     let write_version;
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         db.pool(pool)
             .put(
                 &collection,
@@ -2879,7 +2837,7 @@ fn direct_put_token_survives_reclaim_and_reopen() {
     }
     // Reclaim the WAL group; the frame's own stamp must still name the token.
     let _ = std::fs::remove_file(root.join("wal.bin"));
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let reader = db.begin_transaction();
     let (records, versions) = reader
         .get_with_record_versions(pool, &collection, &[key])
@@ -2895,7 +2853,6 @@ fn direct_put_token_survives_reclaim_and_reopen() {
 
 /// A direct put that was published but not checkpointed is replayed on reopen,
 /// and the replayed frame carries the group's token rather than a zero one.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn unsynced_direct_put_replays_with_its_token() {
     let root = test_root("record_direct_replay");
@@ -2904,7 +2861,7 @@ fn unsynced_direct_put_replays_with_its_token() {
     let key = node(1);
     let write_version;
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         db.pool(pool)
             .put(
                 &collection,
@@ -2921,7 +2878,7 @@ fn unsynced_direct_put_replays_with_its_token() {
         // Deliberately no sync: the group is durable in the WAL only and the
         // next open must replay it with the group's token.
     }
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     assert_eq!(
         db.pool(pool)
             .record_last_write_lsn(&collection, &key)
@@ -2941,11 +2898,10 @@ fn unsynced_direct_put_replays_with_its_token() {
 
 /// Removing a collection leaves its records absent, but their token resolves to
 /// the delete's LSN so a pre-delete token is stale and a delete token passes.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn absent_record_resolves_to_collection_delete_lsn() {
     let root = test_root("record_delete_token");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let pool = ShardType::State;
     let collection = [0x73u8; 16];
     let key = node(1);
@@ -3005,13 +2961,12 @@ fn absent_record_resolves_to_collection_delete_lsn() {
 
 /// Per-record tokens only conflict for the same record: two writers touching
 /// different records of one collection both commit.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn disjoint_record_writes_do_not_conflict() {
     use std::sync::{Arc, Barrier};
 
     let root = test_root("record_disjoint");
-    let db = Arc::new(SharedDatabase::open(root.clone()).unwrap());
+    let db = Arc::new(Database::open(root.clone()).unwrap());
     let pool = ShardType::State;
     let collection = [0x72u8; 16];
     let keys = [node(1), node(2)];
@@ -3055,11 +3010,10 @@ fn disjoint_record_writes_do_not_conflict() {
 
 /// Per-record tokens conflict for the same record: the second writer holding a
 /// stale token is rejected.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn same_record_write_conflicts() {
     let root = test_root("record_same_key_conflict");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let pool = ShardType::State;
     let collection = [0x71u8; 16];
     let key = node(1);
@@ -3136,7 +3090,7 @@ fn files_under(dir: &std::path::Path, out: &mut Vec<String>) {
 #[test]
 fn a_fresh_shared_database_creates_only_the_files_it_needs() {
     let root = test_root("lean-layout");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let mut names = Vec::new();
     files_under(&root, &mut names);
     assert!(!names.iter().any(|n| n == ".mtxdb.lock"), "{names:?}");
@@ -3174,7 +3128,7 @@ fn pools_written_through_a_shared_database_read_back_read_only() {
     let root = test_root("seed-read-back");
     let collection = [3u8; 16];
     {
-        let database = SharedDatabase::open(root.clone()).unwrap();
+        let database = Database::open(root.clone()).unwrap();
         for (index, shard) in ShardType::ALL.into_iter().enumerate() {
             let id = u8::try_from(index).unwrap().saturating_add(1);
             let payload = [id; 8];
@@ -3226,7 +3180,7 @@ fn pool_dirs(root: &std::path::Path) -> Vec<String> {
 #[test]
 fn pools_are_created_by_their_first_write() {
     let root = test_root("lazy-pools");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     assert!(pool_dirs(&root).is_empty(), "{:?}", pool_dirs(&root));
     for shard in ShardType::ALL {
         assert!(database
@@ -3249,7 +3203,7 @@ fn pools_are_created_by_their_first_write() {
     database.coordinator().sync().unwrap();
     drop(database);
 
-    let reopened = SharedDatabase::open(root.clone()).unwrap();
+    let reopened = Database::open(root.clone()).unwrap();
     assert_eq!(pool_dirs(&root), vec!["mtpl-edges".to_owned()]);
     assert_eq!(
         reopened
@@ -3266,7 +3220,7 @@ fn pools_are_created_by_their_first_write() {
 #[test]
 fn a_read_only_open_of_an_absent_pool_is_empty_and_creates_nothing() {
     let root = test_root("absent-pool-read-only");
-    drop(SharedDatabase::open(root.clone()).unwrap());
+    drop(Database::open(root.clone()).unwrap());
     let layout = crate::layout::DatabaseLayout::open_read_only(root.clone()).unwrap();
     for shard in ShardType::ALL {
         let reader = PackfileStorage::open_read_only(layout.pool_path(shard)).unwrap();
@@ -3279,10 +3233,9 @@ fn a_read_only_open_of_an_absent_pool_is_empty_and_creates_nothing() {
 /// pool's data once the writer creates it: first through the shared WAL, then
 /// after the writer's sync has made packs and a checkpoint.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn a_reader_opened_before_a_pool_exists_sees_its_first_writes() {
     let root = test_root("reader-before-pool");
-    let database = SharedDatabase::open(root.clone()).unwrap();
+    let database = Database::open(root.clone()).unwrap();
     let pool_dir = database.layout().pool_path(ShardType::State);
     assert!(!pool_dir.exists());
     let reader = PackfileStorage::open_read_committed_shared(
@@ -3324,4 +3277,18 @@ fn a_reader_opened_before_a_pool_exists_sees_its_first_writes() {
         Some(b"first".to_vec()),
         "the durable read path must also see the new pool"
     );
+}
+
+/// Every pool must have its own policy slot. Adding a `ShardType` without
+/// wiring a field into `PoolPolicies` would make two pools share one.
+#[test]
+fn every_pool_has_its_own_policy_slot() {
+    let policies = super::PoolPolicies::default();
+    let mut addresses: Vec<*const super::PoolPolicy> = ShardType::ALL
+        .iter()
+        .map(|shard| std::ptr::from_ref(policies.for_shard(*shard)))
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    assert_eq!(addresses.len(), ShardType::ALL.len());
 }

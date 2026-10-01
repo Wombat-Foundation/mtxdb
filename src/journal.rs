@@ -1794,7 +1794,6 @@ pub struct JournalCoordinator {
     /// `transaction_materialized` and each pool's materialized watermark
     /// advance notify it.
     materialized_cv: Condvar,
-    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     materialized_lock: Mutex<()>,
     /// Appended-but-not-yet-committed groups, with the highest LSN each carried
     /// per pool. Appending a transaction group makes it visible before it is
@@ -2159,7 +2158,6 @@ impl JournalCoordinator {
     /// Seed a cold record's version from durable state (its frame metadata).
     /// Never overwrites a live entry, and a collection that was deleted
     /// resolves an absent record to its delete LSN rather than the seed.
-    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn seed_record_version(
         &self,
         pool: ShardType,
@@ -2182,7 +2180,6 @@ impl JournalCoordinator {
     /// Snapshot the logical versions this pool's checkpoint can safely claim.
     /// Versions above `covered_lsn` remain represented by retained WAL and
     /// must not be folded into the checkpoint baseline.
-    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn collection_versions_through(
         &self,
         pool: ShardType,
@@ -2251,7 +2248,6 @@ impl JournalCoordinator {
     /// Block until a materialization may have advanced the read boundary, or
     /// `timeout` elapses. A spurious wake is fine: callers re-check the
     /// boundary and wait again.
-    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn wait_for_materialized(&self, timeout: std::time::Duration) {
         let mut guard = self.materialized_lock.lock();
         self.materialized_cv.wait_for(&mut guard, timeout);
@@ -2267,7 +2263,6 @@ impl JournalCoordinator {
     /// predates a publication with the version that publication already
     /// advanced.
     #[must_use]
-    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn unmaterialized_floor(&self) -> u64 {
         self.unmaterialized
             .lock()
@@ -2499,7 +2494,6 @@ impl JournalCoordinator {
     /// The error for a commit refused because the segment is full, naming the
     /// pools reclaim is waiting on when that is known.
     fn explain_full_segment(&self, error: io::Error, journal: &Journal) -> io::Error {
-        #[cfg(feature = "multi-reader")]
         if error.kind() == io::ErrorKind::WouldBlock {
             let blockers = journal.blocking_pools(&self.coverage.lock().covered);
             if !blockers.is_empty() {
@@ -2509,8 +2503,6 @@ impl JournalCoordinator {
                 );
             }
         }
-        #[cfg(not(feature = "multi-reader"))]
-        let _ = (self, journal);
         error
     }
 
@@ -3385,11 +3377,6 @@ impl JournalCoordinator {
     ) -> io::Result<Option<CommitReceipt>> {
         let _publication = self.publication.lock();
         self.validate_expectations(expectations, record_expectations)?;
-        #[cfg(not(feature = "multi-reader"))]
-        {
-            let _ = expectations;
-            let _ = record_expectations;
-        }
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed append",
@@ -3585,14 +3572,14 @@ impl JournalCoordinator {
     /// MiB. It is not available outside tests: a value of zero would force a
     /// checkpoint on every sync and one above the segment cap would switch the
     /// forced reclaim off.
-    #[cfg(all(test, feature = "multi-reader"))]
+    #[cfg(test)]
     pub(crate) fn set_reclaim_trigger_len(&self, len: u64) {
         self.reclaim_trigger_len.store(len, Ordering::Relaxed);
     }
 
     /// Shrink the segment cap, and the trigger with it (a quarter of the cap),
     /// so a test can reach the hard limit with a few hundred KiB.
-    #[cfg(all(test, feature = "multi-reader"))]
+    #[cfg(test)]
     pub(crate) fn set_segment_cap(&self, cap: u64) {
         self.journal.lock().segment_cap = cap;
         self.set_reclaim_trigger_len(cap / 4);
@@ -4261,7 +4248,7 @@ impl Journal {
     /// a caller create a segment whose numbering does not line up with the
     /// pools' recorded coverage, so this is not public. Callers that open a
     /// database root should go through
-    /// [`crate::database::SharedDatabase::open`], which computes the seed from
+    /// [`crate::database::Database::open`], which computes the seed from
     /// the pools' `journal.lsn` and passes it here.
     ///
     /// # Errors

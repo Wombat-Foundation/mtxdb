@@ -1964,10 +1964,7 @@ pub struct PackfileStorage {
     /// not mean this handle's in-memory index contains those records. Advancing
     /// this pair requires loading the corresponding checkpoint, not a live
     /// packfile rescan. See [`Self::get_read_committed`].
-    // Only read back by the (feature-gated) read-committed overlay; a
-    // non-`multi-reader` build still writes it once at open so the two
-    // build configurations share one open path, but never reads it back.
-    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
+    // Read back by the read-committed overlay.
     read_covered_lsn: AtomicU64,
     /// Journal LSN through which this handle's in-memory index has applied
     /// mutations. Unlike durable coverage, this advances immediately after a
@@ -2295,7 +2292,6 @@ impl PackfileStorage {
 
     /// Open a read-only observer with the read-committed journal overlay
     /// enabled, in one call.
-    #[cfg(feature = "multi-reader")]
     ///
     /// This is the intended constructor for an authoritative read-only worker
     /// handle. The durable read APIs ([`StorageEngine::get_many`],
@@ -2336,7 +2332,6 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Same as [`Self::open_read_committed`].
-    #[cfg(feature = "multi-reader")]
     pub fn open_read_committed_shared(
         base_dir: PathBuf,
         wal_path: impl AsRef<Path>,
@@ -2410,7 +2405,6 @@ impl PackfileStorage {
 
     /// Open a writable pool that belongs to a shared database. The database
     /// root's writer lock covers it, so the pool creates no `.mtxdb.lock`.
-    #[cfg_attr(not(feature = "multi-reader"), allow(dead_code))]
     pub(crate) fn open_shared_member(
         base_dir: PathBuf,
         compress: bool,
@@ -4127,7 +4121,6 @@ impl PackfileStorage {
         &self,
         journal: &JournalCoordinator,
     ) -> Result<(JournalCursor, JournalReplayLease), StorageError> {
-        #[cfg(feature = "multi-reader")]
         {
             let _transaction_lifecycle = self.transaction_overlay_lifecycle.lock();
             if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
@@ -4217,7 +4210,6 @@ impl PackfileStorage {
                 Ok((cursor, lease))
             };
 
-        #[cfg(feature = "multi-reader")]
         let (cursor, lease) = {
             let _transaction_lifecycle = self.transaction_overlay_lifecycle.lock();
             if self.transaction_overlay_users.load(Ordering::Acquire) != 0 {
@@ -4228,8 +4220,6 @@ impl PackfileStorage {
             }
             capture_boundary()?
         };
-        #[cfg(not(feature = "multi-reader"))]
-        let (cursor, lease) = capture_boundary()?;
 
         // Open every scanner and capture every file-length boundary before
         // releasing any requested collection's put lock. The subsequent pack
@@ -5103,13 +5093,10 @@ impl PackfileStorage {
     /// the next replay start from a stale bound. Coverage only ever advances.
     fn checkpoint_covered_lsn(&self) -> Option<u64> {
         self.journal().map(|journal| {
-            #[cfg(feature = "multi-reader")]
             let committed = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
                 Some(pool) => journal.committed_lsn_for_pool(pool),
                 None => journal.committed_lsn(),
             };
-            #[cfg(not(feature = "multi-reader"))]
-            let committed = journal.committed_lsn();
             // The shared-WAL coverage batch and the full checkpoint both run
             // `sync_all` after capturing this and before recording it, so a
             // frame at or below `committed` that has been applied is covered.
@@ -5126,15 +5113,7 @@ impl PackfileStorage {
     /// Snapshot this pool's logical versions through the checkpoint coverage
     /// boundary. Versions above that boundary remain in the retained WAL and
     /// must not be claimed by the checkpoint.
-    #[cfg_attr(
-        not(feature = "multi-reader"),
-        allow(
-            clippy::unused_self,
-            reason = "the journal and pool are only consulted on the multi-reader path"
-        )
-    )]
     fn checkpoint_logical_versions(&self, covered_lsn: Option<u64>) -> Vec<([u8; 16], u64)> {
-        #[cfg(feature = "multi-reader")]
         if let (Some(journal), Some(pool), Some(covered_lsn)) = (
             self.journal(),
             pool_from_tag(self.journal_pool.load(Ordering::Acquire)),
@@ -5695,7 +5674,7 @@ impl PackfileStorage {
     /// cut would leave, by cutting every pack back to the length an fsync has
     /// covered. Bytes written but not yet fsynced are what a crash may lose;
     /// bytes still buffered in memory are not in the copy at all.
-    #[cfg(all(test, feature = "multi-reader"))]
+    #[cfg(test)]
     pub(crate) fn test_cut_packs_to_synced(&self, image_dir: &Path) {
         for (_, shard) in self.shards.all_shards() {
             let name = shard.path.file_name().expect("a pack has a file name");
@@ -6700,7 +6679,6 @@ impl PackfileStorage {
     /// The per-record write LSN recorded in a durable record's frame, for
     /// seeding a cold optimistic token. `None` when the record is absent or
     /// carries no `last_write_lsn` tag (a legacy v4 frame, read as version 0).
-    #[cfg(feature = "multi-reader")]
     pub(crate) fn record_last_write_lsn(
         &self,
         collection_id: &[u8; 16],
@@ -8184,7 +8162,6 @@ impl PackfileStorage {
     /// # Errors
     /// Returns [`StorageError::Unsupported`] unless this store is attached to
     /// a pool-tagged shared journal.
-    #[cfg(feature = "multi-reader")]
     pub fn recheck_collection_version(
         &self,
         collection_id: &[u8; 16],
@@ -9775,7 +9752,6 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Same as [`Self::enable_journal`].
-    #[cfg(feature = "multi-reader")]
     pub fn enable_journal_with_sequence(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -9903,7 +9879,6 @@ impl PackfileStorage {
                     }
                     // The index now reflects this group, so let versioned reads
                     // certify it.
-                    #[cfg(feature = "multi-reader")]
                     self.note_materialized_lsn(entry.lsn);
                     replayed = replayed.saturating_add(1);
                 }
@@ -10031,7 +10006,7 @@ impl PackfileStorage {
     }
 
     /// Whether a journal overlay is installed on the read path.
-    #[cfg(all(test, feature = "multi-reader"))]
+    #[cfg(test)]
     pub(crate) fn read_journal_installed(&self) -> bool {
         self.read_journal.lock().is_some()
     }
@@ -10050,7 +10025,7 @@ impl PackfileStorage {
 
     /// Test-only: refreshes on this store's overlay that reached
     /// `fs::metadata`, i.e. were not skipped by the publish-signal gate.
-    #[cfg(all(test, feature = "multi-reader"))]
+    #[cfg(test)]
     pub(crate) fn read_journal_stat_checks(&self) -> u64 {
         self.read_journal
             .lock()
@@ -10059,7 +10034,7 @@ impl PackfileStorage {
     }
 
     /// Total segment bytes the retained transaction overlay has scanned.
-    #[cfg(all(test, feature = "multi-reader"))]
+    #[cfg(test)]
     pub(crate) fn transaction_overlay_scanned_bytes(&self) -> u64 {
         self.transaction_overlay_scanned.load(Ordering::Relaxed)
     }
@@ -10541,11 +10516,8 @@ impl PackfileStorage {
         // the only WAL copy of a collection's latest version. Until version
         // tables are included in delta batches, require the full checkpoint
         // path whenever shared-WAL version tracking is enabled.
-        #[cfg(feature = "multi-reader")]
         let checkpoint_versions_require_anchor =
             pool_from_tag(self.journal_pool.load(Ordering::Acquire)).is_some();
-        #[cfg(not(feature = "multi-reader"))]
-        let checkpoint_versions_require_anchor = false;
         if journal_needs_reclaim
             && !checkpoint_versions_require_anchor
             && !rotating

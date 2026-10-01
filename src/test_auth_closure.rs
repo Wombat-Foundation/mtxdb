@@ -5,7 +5,7 @@
 
 use super::auth_closure::{AuthClosure, ClosureOutcome};
 use super::closure_store::{self, ClosureCoverage};
-use super::database::SharedDatabase;
+use super::database::Database;
 use super::layout::ShardType;
 use super::matrix_adjacency::MatrixAdjacency;
 use super::storage::StorageError;
@@ -24,7 +24,7 @@ fn test_root(name: &str) -> PathBuf {
 /// A room whose events form a chain off `$create`. `$orphan` references a parent
 /// that was never recorded, so its walk is incomplete and cascades nowhere else
 /// because it is the only event depending on it.
-fn record_room(db: &SharedDatabase) -> MatrixAdjacency {
+fn record_room(db: &Database) -> MatrixAdjacency {
     let adjacency = MatrixAdjacency::new(POOL, ROOM);
     adjacency
         .record_event(db, "$create", &[], &[], None)
@@ -44,7 +44,7 @@ fn record_room(db: &SharedDatabase) -> MatrixAdjacency {
 #[test]
 fn rebuild_publishes_per_event_and_reports_the_skipped_one() {
     let root = test_root("partial");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adjacency = record_room(&db);
     let closure = AuthClosure::from_adjacency(adjacency);
 
@@ -117,7 +117,7 @@ fn rebuild_publishes_per_event_and_reports_the_skipped_one() {
 #[test]
 fn readers_distinguish_complete_incomplete_and_absent() {
     let root = test_root("tri-state");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adjacency = record_room(&db);
     let closure = AuthClosure::from_adjacency(adjacency);
     closure.rebuild(&db).unwrap();
@@ -162,7 +162,7 @@ fn readers_distinguish_complete_incomplete_and_absent() {
 #[test]
 fn verify_accepts_the_gap_as_intentional() {
     let root = test_root("verify-gap");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let closure = AuthClosure::from_adjacency(record_room(&db));
     closure.rebuild(&db).unwrap();
 
@@ -181,7 +181,7 @@ fn verify_accepts_the_gap_as_intentional() {
 #[test]
 fn a_head_that_omits_a_real_gap_is_reported() {
     let root = test_root("verify-omission");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let closure = AuthClosure::from_adjacency(record_room(&db));
     closure.rebuild(&db).unwrap();
 
@@ -224,7 +224,7 @@ fn a_head_that_omits_a_real_gap_is_reported() {
 #[test]
 fn no_generation_yet_is_not_a_failure() {
     let root = test_root("unpublished");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let closure = AuthClosure::from_adjacency(record_room(&db));
     assert!(closure.head(&db).unwrap().is_none());
     assert!(closure.verify(&db).unwrap().is_consistent());
@@ -242,7 +242,7 @@ fn no_generation_yet_is_not_a_failure() {
 #[test]
 fn an_auth_cycle_is_corruption_not_a_gap() {
     let root = test_root("cycle");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adjacency = MatrixAdjacency::new(POOL, ROOM);
     adjacency
         .record_event(&db, "$a", &[], &["$b"], None)
@@ -269,7 +269,7 @@ fn an_auth_cycle_is_corruption_not_a_gap() {
 #[test]
 fn a_cycle_abandons_its_generation_instead_of_leaving_an_orphan() {
     let root = test_root("cycle-orphan");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     // A good generation first, so the orphan left by the cycle is distinguishable
     // from the retained generations.
     let good = AuthClosure::from_adjacency(record_room(&db));

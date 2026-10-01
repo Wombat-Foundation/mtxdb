@@ -949,7 +949,7 @@ impl PackfileStorage {
     /// Normal commits scan only the suffix appended since the previous
     /// activation, because the previous overlay's position is kept; a full
     /// scan from the segment start happens only for the first activation, after
-    /// a reclaim or replacement, or on recovery. Only `SharedDatabase`, the
+    /// a reclaim or replacement, or on recovery. Only `Database`, the
     /// segment's single writer, reaches this path; read-only workers use
     /// [`Self::enable_read_journal`].
     ///
@@ -1226,16 +1226,11 @@ impl PackfileStorage {
     /// fallback cannot be certified beyond this.
     fn durable_read_boundary(&self) -> u64 {
         let materialized = self.materialized_lsn.load(Ordering::Acquire);
-        #[cfg(feature = "multi-reader")]
         {
             materialized.min(
                 self.journal()
                     .map_or(u64::MAX, |journal| journal.unmaterialized_floor()),
             )
-        }
-        #[cfg(not(feature = "multi-reader"))]
-        {
-            materialized
         }
     }
 
@@ -1253,7 +1248,6 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<(Vec<Option<NodeData>>, u64), StorageError> {
-        #[cfg(feature = "multi-reader")]
         {
             const ATTEMPTS: usize = 64;
             let Some(pool) =
@@ -1308,10 +1302,6 @@ impl PackfileStorage {
                  (version={version}, boundary={boundary})"
             )))
         }
-        #[cfg(not(feature = "multi-reader"))]
-        {
-            Ok((self.get_read_committed(collection_id, ids)?, 0))
-        }
     }
 
     /// Read records with each record's write LSN, sampled so that every
@@ -1332,7 +1322,6 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         ids: &[NodeId],
     ) -> Result<(Vec<Option<NodeData>>, Vec<u64>), StorageError> {
-        #[cfg(feature = "multi-reader")]
         {
             const ATTEMPTS: usize = 64;
             let Some(pool) =
@@ -1378,20 +1367,12 @@ impl PackfileStorage {
                  (version={version}, boundary={boundary})"
             )))
         }
-        #[cfg(not(feature = "multi-reader"))]
-        {
-            Ok((
-                self.get_read_committed(collection_id, ids)?,
-                vec![0; ids.len()],
-            ))
-        }
     }
 
     /// Resolve each requested record's version against the coordinator map,
     /// cold-seeding a durable record from its frame metadata. Returns `None`
     /// when a version exceeds `boundary`, meaning the data that was read does
     /// not yet cover it and the caller must retry.
-    #[cfg(feature = "multi-reader")]
     fn record_versions_for_read(
         &self,
         journal: &crate::journal::JournalCoordinator,
@@ -1430,15 +1411,6 @@ impl PackfileStorage {
     /// it is available to a read-only worker. A record resolved absent by a
     /// collection delete reports the delete LSN; an absent or legacy record
     /// reports `0`.
-    #[cfg_attr(
-        not(feature = "multi-reader"),
-        allow(
-            clippy::unused_self,
-            clippy::unnecessary_wraps,
-            reason = "the durable frame token is only read on the multi-reader path, so the \
-                      fallible lookup (and its `Result`) only exists there"
-        )
-    )]
     fn snapshot_record_versions(
         &self,
         overlay: Option<&ReadJournal>,
@@ -1463,14 +1435,11 @@ impl PackfileStorage {
                 }
             }
         }
-        #[cfg(feature = "multi-reader")]
         for (index, id) in ids.iter().enumerate() {
             if versions[index] == 0 && data[index].is_some() {
                 versions[index] = self.record_last_write_lsn(collection_id, id)?.unwrap_or(0);
             }
         }
-        #[cfg(not(feature = "multi-reader"))]
-        let _ = data;
         Ok(versions)
     }
 }

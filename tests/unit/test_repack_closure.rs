@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use mtxdb::auth_closure::AuthClosure;
 use mtxdb::matrix_adjacency::MatrixAdjacency;
-use mtxdb::{BitmapSet, ShardType, SharedDatabase};
+use mtxdb::{BitmapSet, Database, ShardType};
 
 const POOL: ShardType = ShardType::Edges;
 const ROOM: &str = "!repack:example.org";
@@ -48,7 +48,7 @@ struct Observed {
     per_collection: Vec<([u8; 16], usize)>,
 }
 
-fn observe(db: &SharedDatabase, adjacency: &MatrixAdjacency, closure: &AuthClosure) -> Observed {
+fn observe(db: &Database, adjacency: &MatrixAdjacency, closure: &AuthClosure) -> Observed {
     let ids = EVENTS
         .iter()
         .map(|&(id, _)| (id.to_owned(), adjacency.short_id(db, id).unwrap()))
@@ -83,7 +83,7 @@ fn observe(db: &SharedDatabase, adjacency: &MatrixAdjacency, closure: &AuthClosu
 
 /// Rewrite every collection in the edges pool in place. No live roots are
 /// configured, so repack must GC nothing and keep every live record.
-fn repack_pool(db: &SharedDatabase) -> usize {
+fn repack_pool(db: &Database) -> usize {
     let storage = db.edges();
     let collections = storage.collection_ids();
     assert!(
@@ -105,7 +105,7 @@ fn repack_pool(db: &SharedDatabase) -> usize {
 #[test]
 fn repack_preserves_short_ids_adjacency_and_published_closures() {
     let dir = root("preserve");
-    let db = SharedDatabase::open(dir.clone()).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
     let adjacency = MatrixAdjacency::new(POOL, ROOM);
     for &(id, auth) in EVENTS {
         adjacency.record_event(&db, id, &[], auth, None).unwrap();
@@ -163,7 +163,7 @@ fn repack_preserves_short_ids_adjacency_and_published_closures() {
     );
 
     drop(db);
-    let db = SharedDatabase::open(dir.clone()).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
     assert_eq!(
         observe(&db, &adjacency, &closure),
         before,

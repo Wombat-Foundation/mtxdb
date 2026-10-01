@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::matrix_adjacency::*;
-use crate::database::SharedDatabase;
+use crate::database::Database;
 use crate::layout::ShardType;
 use crate::storage::StorageError;
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ fn adjacency() -> MatrixAdjacency {
 #[test]
 fn records_and_reads_prev_auth_and_relation() {
     let root = test_root("roundtrip");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adj = adjacency();
     adj.record_event(&db, "$create", &[], &[], None).unwrap();
     adj.record_event(&db, "$msg", &["$create"], &["$create"], None)
@@ -68,7 +68,7 @@ fn records_and_reads_prev_auth_and_relation() {
 #[test]
 fn recording_is_idempotent_but_an_event_never_changes() {
     let root = test_root("idempotent");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adj = adjacency();
     let relation = Some(RelationRef {
         target: "$t",
@@ -108,7 +108,7 @@ fn recording_is_idempotent_but_an_event_never_changes() {
 fn spec_relation_types_have_fixed_ids_regardless_of_import_order() {
     let ids = |name: &str, first: &[&str]| {
         let root = test_root(name);
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         let adj = adjacency();
         for rel_type in first {
             adj.kind_id(&db, rel_type).unwrap();
@@ -134,7 +134,7 @@ fn spec_relation_types_have_fixed_ids_regardless_of_import_order() {
 fn unknown_relation_types_are_preserved_and_ids_are_stable_across_reopen() {
     let root = test_root("unknown");
     let (custom, other) = {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         let adj = adjacency();
         let custom = adj.kind_id(&db, "org.example.custom").unwrap();
         let other = adj.kind_id(&db, "org.example.other").unwrap();
@@ -155,7 +155,7 @@ fn unknown_relation_types_are_preserved_and_ids_are_stable_across_reopen() {
         .unwrap();
         (custom, other)
     };
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adj = adjacency();
     // Ids never change once assigned, however the types are asked for later.
     assert_eq!(adj.kind_id(&db, "org.example.other").unwrap(), other);
@@ -180,7 +180,7 @@ fn unknown_relation_types_are_preserved_and_ids_are_stable_across_reopen() {
 #[test]
 fn visibility_filter_hides_relations_only() {
     let root = test_root("visibility");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adj = adjacency();
     adj.record_event(
         &db,
@@ -216,7 +216,7 @@ fn visibility_filter_hides_relations_only() {
 #[test]
 fn relation_changes_never_touch_the_auth_adjacency() {
     let root = test_root("auth-isolation");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adj = adjacency();
     adj.record_event(&db, "$a", &[], &["$create"], None)
         .unwrap();
@@ -244,7 +244,7 @@ fn relation_changes_never_touch_the_auth_adjacency() {
 #[test]
 fn relation_kind_space_is_a_hard_u16_limit() {
     let root = test_root("kind-limit");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adj = adjacency();
     adj.kind_id(&db, "m.thread").unwrap();
     adj.set_kind_counter_for_test(&db, u32::from(u16::MAX))
@@ -267,7 +267,7 @@ fn relation_kind_space_is_a_hard_u16_limit() {
 #[test]
 fn purge_removes_events_and_the_kind_dictionary_together() {
     let root = test_root("purge");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let adj = adjacency();
     adj.record_event(
         &db,

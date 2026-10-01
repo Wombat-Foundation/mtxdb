@@ -362,3 +362,15 @@ fn enclosing_root_finds_a_shared_root_from_a_pool_directory() {
     fs::create_dir_all(&standalone).unwrap();
     assert!(super::enclosing_root(&standalone).unwrap().is_none());
 }
+
+#[test]
+fn a_pool_index_is_its_position_in_the_canonical_order() {
+    for (position, shard_type) in ShardType::ALL.into_iter().enumerate() {
+        assert_eq!(shard_type.index(), position);
+        assert_eq!(ShardType::ALL[shard_type.index()], shard_type);
+    }
+    let mut seen: Vec<usize> = ShardType::ALL.iter().map(|t| t.index()).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), ShardType::ALL.len(), "indexes are distinct");
+}

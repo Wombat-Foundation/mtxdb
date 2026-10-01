@@ -15,8 +15,7 @@
 //!   only the `bitmaps` feature and no transaction engine. A caller with its own
 //!   adjacency can compute [`AuthGraph::compute`], [`AuthGraph::union_of`] and
 //!   [`AuthGraph::union_of_with_given`] in a default build.
-//! - The persisted generation layer ([`AuthClosure`]) additionally needs
-//!   `multi-reader`: it reads a room through
+//! - The persisted generation layer ([`AuthClosure`]) reads a room through
 //!   [`MatrixAdjacency`](crate::matrix_adjacency::MatrixAdjacency), materializes
 //!   an [`AuthGraph`], and publishes closure generations through a
 //!   [`ClosureStore`] and its [`LogicalHead`](crate::logical_head::LogicalHead).
@@ -37,17 +36,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::bitmap_set::{BitmapSet, DomainTag};
 use crate::storage::StorageError;
 
-#[cfg(feature = "multi-reader")]
 use crate::closure_store::{
     ClosureCoverageBuilder, ClosureHead, ClosureSnapshot, ClosureStore, GenerationBuilder,
 };
-#[cfg(feature = "multi-reader")]
-use crate::database::SharedDatabase;
-#[cfg(feature = "multi-reader")]
+use crate::database::Database;
 use crate::layout::ShardType;
-#[cfg(feature = "multi-reader")]
 use crate::matrix_adjacency::{MatrixAdjacency, AUTH};
-#[cfg(feature = "multi-reader")]
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
 /// Outcome of an ancestors-only auth-closure walk.
@@ -311,11 +305,10 @@ impl<'a> Walk<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Persisted generation layer (`multi-reader` + `bitmaps`)
+// Persisted generation layer (`bitmaps`)
 // ---------------------------------------------------------------------------
 
 /// Closure records written per committed batch while rebuilding.
-#[cfg(feature = "multi-reader")]
 const BATCH_SIZE: usize = 256;
 
 /// Whether an error is a finding about the stored data rather than a failure to
@@ -324,13 +317,11 @@ const BATCH_SIZE: usize = 256;
 /// Corruption is the answer, not the fault: a hand-truncated coverage record or a
 /// generation whose head and coverage record disagree are both things verify
 /// exists to notice. Everything else is a read that did not happen.
-#[cfg(feature = "multi-reader")]
 fn is_malformed(error: &StorageError) -> bool {
     matches!(error, StorageError::Corrupt(_))
 }
 
 /// A published closure generation.
-#[cfg(feature = "multi-reader")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuildReport {
     /// Generation number.
@@ -362,7 +353,6 @@ pub struct RebuildReport {
     pub warnings: Vec<String>,
 }
 
-#[cfg(feature = "multi-reader")]
 impl RebuildReport {
     /// Whether the generation covers every id in `1..source_next` with a real
     /// closure record. A strict caller that cannot tolerate an absent-by-design
@@ -380,7 +370,6 @@ impl RebuildReport {
 }
 
 /// Result of [`AuthClosure::verify`].
-#[cfg(feature = "multi-reader")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthClosureVerifyReport {
     /// Closures recomputed from direct auth edges.
@@ -391,7 +380,6 @@ pub struct AuthClosureVerifyReport {
     pub problems: Vec<String>,
 }
 
-#[cfg(feature = "multi-reader")]
 impl AuthClosureVerifyReport {
     /// Whether every invariant held.
     #[must_use]
@@ -400,7 +388,6 @@ impl AuthClosureVerifyReport {
     }
 }
 
-#[cfg(feature = "multi-reader")]
 fn closure_scope(events: [u8; 16]) -> [u8; 16] {
     let mut canonical = b"matrix-auth-closure:".to_vec();
     canonical.extend_from_slice(&events);
@@ -408,7 +395,6 @@ fn closure_scope(events: [u8; 16]) -> [u8; 16] {
 }
 
 /// One room's persisted auth closures.
-#[cfg(feature = "multi-reader")]
 #[derive(Debug, Clone, Copy)]
 pub struct AuthClosure {
     adjacency: MatrixAdjacency,
@@ -416,7 +402,6 @@ pub struct AuthClosure {
     domain: DomainTag,
 }
 
-#[cfg(feature = "multi-reader")]
 impl AuthClosure {
     /// Address `room_id`'s auth closures inside `pool`.
     #[must_use]
@@ -449,7 +434,7 @@ impl AuthClosure {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt record.
-    pub fn graph(&self, db: &SharedDatabase) -> Result<AuthGraph, StorageError> {
+    pub fn graph(&self, db: &Database) -> Result<AuthGraph, StorageError> {
         let events = self.adjacency.events_index();
         let next = events.counter(db)?;
         let ids: Vec<u32> = (1..next).collect();
@@ -475,7 +460,7 @@ impl AuthClosure {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt head.
-    pub fn head(&self, db: &SharedDatabase) -> Result<Option<ClosureHead>, StorageError> {
+    pub fn head(&self, db: &Database) -> Result<Option<ClosureHead>, StorageError> {
         self.store.head(db)
     }
 
@@ -483,7 +468,7 @@ impl AuthClosure {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt head or coverage record.
-    pub fn snapshot(&self, db: &SharedDatabase) -> Result<Option<ClosureSnapshot>, StorageError> {
+    pub fn snapshot(&self, db: &Database) -> Result<Option<ClosureSnapshot>, StorageError> {
         self.store.snapshot(db)
     }
 
@@ -494,11 +479,7 @@ impl AuthClosure {
     /// # Errors
     /// Returns an error on a read failure, a corrupt record, or an `auth`
     /// cycle.
-    pub fn compute(
-        &self,
-        db: &SharedDatabase,
-        event_id: &str,
-    ) -> Result<ClosureOutcome, StorageError> {
+    pub fn compute(&self, db: &Database, event_id: &str) -> Result<ClosureOutcome, StorageError> {
         self.graph(db)?.compute(event_id)
     }
 
@@ -506,11 +487,7 @@ impl AuthClosure {
     ///
     /// # Errors
     /// As [`Self::compute`].
-    pub fn compute_at(
-        &self,
-        db: &SharedDatabase,
-        short_id: u32,
-    ) -> Result<ClosureOutcome, StorageError> {
+    pub fn compute_at(&self, db: &Database, short_id: u32) -> Result<ClosureOutcome, StorageError> {
         self.graph(db)?.compute_at(short_id)
     }
 
@@ -521,7 +498,7 @@ impl AuthClosure {
     /// As [`Self::compute`].
     pub fn union_of(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         event_ids: &[&str],
         include_given: bool,
     ) -> Result<ClosureOutcome, StorageError> {
@@ -540,11 +517,7 @@ impl AuthClosure {
     ///
     /// # Errors
     /// Returns an error on a read failure or a record stored for another domain.
-    pub fn get(
-        &self,
-        db: &SharedDatabase,
-        event_id: &str,
-    ) -> Result<Option<BitmapSet>, StorageError> {
+    pub fn get(&self, db: &Database, event_id: &str) -> Result<Option<BitmapSet>, StorageError> {
         let Some(short_id) = self.adjacency.short_id(db, event_id)? else {
             return Ok(None);
         };
@@ -555,11 +528,7 @@ impl AuthClosure {
     ///
     /// # Errors
     /// As [`Self::get`].
-    pub fn get_at(
-        &self,
-        db: &SharedDatabase,
-        short_id: u32,
-    ) -> Result<Option<BitmapSet>, StorageError> {
+    pub fn get_at(&self, db: &Database, short_id: u32) -> Result<Option<BitmapSet>, StorageError> {
         match self.store.get(db, short_id)? {
             Some(blob) => Ok(Some(BitmapSet::decode_in_domain(&blob, self.domain)?)),
             None => Ok(None),
@@ -581,7 +550,7 @@ impl AuthClosure {
     /// # Errors
     /// Returns an error on a read/stage/commit failure, a corrupt record, an
     /// `auth` cycle, or a lost publish race (`StorageError::StaleRead`).
-    pub fn rebuild(&self, db: &SharedDatabase) -> Result<RebuildReport, StorageError> {
+    pub fn rebuild(&self, db: &Database) -> Result<RebuildReport, StorageError> {
         let events = self.adjacency.events_index();
         let next = events.counter(db)?;
         let graph = self.graph(db)?;
@@ -642,7 +611,7 @@ impl AuthClosure {
     /// # Errors
     /// Returns an error only when a record cannot be read; disagreements are
     /// reported in the returned report.
-    pub fn verify(&self, db: &SharedDatabase) -> Result<AuthClosureVerifyReport, StorageError> {
+    pub fn verify(&self, db: &Database) -> Result<AuthClosureVerifyReport, StorageError> {
         let mut report = AuthClosureVerifyReport::default();
         let storage = self.store.verify(db)?;
         report.problems.extend(
@@ -732,10 +701,9 @@ impl AuthClosure {
     }
 }
 
-#[cfg(feature = "multi-reader")]
 fn flush(
     builder: &mut GenerationBuilder,
-    db: &SharedDatabase,
+    db: &Database,
     batch: &mut Vec<(u32, Vec<u8>)>,
 ) -> Result<(), StorageError> {
     if batch.is_empty() {

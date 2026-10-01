@@ -5,7 +5,7 @@ use bytes::Bytes;
 use super::closure_store;
 use super::closure_store::*;
 use super::short_id::{EdgeFamily, ShortIdIndex};
-use crate::database::SharedDatabase;
+use crate::database::Database;
 use crate::layout::ShardType;
 use crate::storage::{NodeData, StorageError};
 use std::path::PathBuf;
@@ -24,7 +24,7 @@ fn store() -> ClosureStore {
     ClosureStore::new(POOL, SCOPE)
 }
 
-fn build(db: &SharedDatabase, tag: u8, ids: std::ops::Range<u32>) -> ClosureHead {
+fn build(db: &Database, tag: u8, ids: std::ops::Range<u32>) -> ClosureHead {
     let store = store();
     let mut builder = store.begin(db).unwrap();
     let blobs: Vec<(u32, Vec<u8>)> = ids
@@ -47,7 +47,7 @@ fn build(db: &SharedDatabase, tag: u8, ids: std::ops::Range<u32>) -> ClosureHead
 #[test]
 fn unpublished_generation_is_invisible_then_published_atomically() {
     let root = test_root("publish");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     assert_eq!(store().head(&db).unwrap(), None);
     assert_eq!(store().get(&db, 1).unwrap(), None);
 
@@ -69,7 +69,7 @@ fn unpublished_generation_is_invisible_then_published_atomically() {
 #[test]
 fn republish_swaps_generation_and_retirement_keeps_the_predecessor() {
     let root = test_root("swap");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     build(&db, 1, 1..4);
     let second = build(&db, 2, 1..6);
     assert_eq!((second.generation, second.previous), (2, 1));
@@ -94,7 +94,7 @@ fn republish_swaps_generation_and_retirement_keeps_the_predecessor() {
 #[test]
 fn stale_builder_loses_the_race_and_can_abandon() {
     let root = test_root("race");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let store = store();
     let mut slow = store.begin(&db).unwrap();
     slow.add(&db, &[(1, b"slow".as_slice())]).unwrap();
@@ -126,7 +126,7 @@ fn stale_builder_loses_the_race_and_can_abandon() {
 fn reopen_preserves_head_and_orphans_are_reclaimed() {
     let root = test_root("reopen");
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         build(&db, 4, 1..4);
         // A crash mid-build: generation written, head never swapped. The
         // builder has no destructor; ending this scope models abandoning it.
@@ -135,7 +135,7 @@ fn reopen_preserves_head_and_orphans_are_reclaimed() {
             crashed.add(&db, &[(1, b"partial".as_slice())]).unwrap();
         }
     }
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let head = store().head(&db).unwrap().unwrap();
     assert_eq!((head.generation, head.count, head.source_next), (1, 3, 4));
     assert_eq!(store().get(&db, 3).unwrap(), Some(vec![4, 3]));
@@ -152,7 +152,7 @@ fn reopen_preserves_head_and_orphans_are_reclaimed() {
 #[test]
 fn verify_reports_gaps_and_empty_blobs_are_rejected() {
     let root = test_root("verify");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let mut builder = store().begin(&db).unwrap();
     assert!(builder.add(&db, &[(1, b"".as_slice())]).is_err());
     builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
@@ -169,7 +169,7 @@ fn verify_reports_gaps_and_empty_blobs_are_rejected() {
 #[test]
 fn skipped_coverage_round_trips_and_separates_the_three_states() {
     let root = test_root("coverage");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let mut builder = store().begin(&db).unwrap();
     // Cover 1..8, store closures for all but 3 and 4.
     let blobs: Vec<(u32, Vec<u8>)> = [1u32, 2, 5, 6, 7]
@@ -227,7 +227,7 @@ fn skipped_coverage_round_trips_and_separates_the_three_states() {
 #[test]
 fn publish_rejects_an_id_that_is_both_stored_and_skipped() {
     let root = test_root("coverage-stray");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let mut builder = store().begin(&db).unwrap();
     builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
     // Id 1 is both stored and claimed skipped. Coverage resolves first, so a
@@ -245,7 +245,7 @@ fn publish_rejects_an_id_that_is_both_stored_and_skipped() {
 #[test]
 fn publish_rejects_skipped_ids_outside_the_covered_range() {
     let root = test_root("coverage-range");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let mut builder = store().begin(&db).unwrap();
     builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
     for bad in [0u32, 4, 9] {
@@ -261,7 +261,7 @@ fn publish_rejects_skipped_ids_outside_the_covered_range() {
 #[test]
 fn get_many_serves_skipped_and_absent_without_retrying() {
     let root = test_root("get-many-coverage");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let mut builder = store().begin(&db).unwrap();
     // Cover 1..6, store 1, 3 and 5, skip 2 and 4.
     let blobs: Vec<(u32, Vec<u8>)> = [1u32, 3, 5]
@@ -301,7 +301,7 @@ fn get_many_serves_skipped_and_absent_without_retrying() {
 #[test]
 fn get_many_all_skipped_needs_no_record_read() {
     let root = test_root("get-many-all-skipped");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let mut builder = store().begin(&db).unwrap();
     builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
     builder.publish(&db, 4, &[2, 3]).unwrap();
@@ -316,7 +316,7 @@ fn get_many_all_skipped_needs_no_record_read() {
 #[test]
 fn get_many_reports_a_missing_record_for_a_complete_id() {
     let root = test_root("get-many-corrupt");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let mut builder = store().begin(&db).unwrap();
     builder
         .add(&db, &[(1, b"a".as_slice()), (2, b"b".as_slice())])
@@ -343,7 +343,7 @@ fn get_many_reports_a_missing_record_for_a_complete_id() {
 #[test]
 fn get_many_retries_when_the_head_moves_under_it() {
     let root = test_root("get-many-moved");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     build(&db, 7, 1..3);
 
     // Republish *between* the head read and the record read. Without the hook
@@ -390,7 +390,7 @@ fn get_many_retries_when_the_head_moves_under_it() {
 #[test]
 fn pinned_reads_skip_the_head_reresolve_loop() {
     let root = test_root("coverage-pinned");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     build(&db, 7, 1..4);
     // 4 is not covered at all, so it is absent without any head retry.
     let snapshot = store().snapshot(&db).unwrap().unwrap();
@@ -411,7 +411,7 @@ fn pinned_reads_skip_the_head_reresolve_loop() {
 #[test]
 fn a_pinned_read_of_a_retired_generation_is_stale_not_corrupt() {
     let root = test_root("pinned-retired");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     build(&db, 7, 1..4);
     let pinned = store().snapshot(&db).unwrap().unwrap();
     assert_eq!(pinned.head.generation, 1);
@@ -441,7 +441,7 @@ fn a_pinned_read_of_a_retired_generation_is_stale_not_corrupt() {
 #[test]
 fn a_pinned_read_of_an_unmoved_generation_with_no_record_is_corrupt() {
     let root = test_root("pinned-corrupt");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     // Claims full coverage of 1..4 but stores only 1 and 2.
     let mut builder = store().begin(&db).unwrap();
     builder
@@ -463,7 +463,7 @@ fn a_pinned_read_of_an_unmoved_generation_with_no_record_is_corrupt() {
 #[test]
 fn publish_rejects_a_stored_id_outside_the_covered_range() {
     let root = test_root("stored-range");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let first = build(&db, 7, 1..4);
 
     // Id 10 is stored but the generation claims to cover only 1..5, so the
@@ -494,7 +494,7 @@ fn publish_rejects_a_stored_id_outside_the_covered_range() {
 #[test]
 fn every_published_head_partitions_its_covered_range() {
     let root = test_root("partition");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let first = build(&db, 7, 1..4);
 
     // Stored ids outside the range and stored/skipped overlap are both rejected,
@@ -537,7 +537,7 @@ fn every_published_head_partitions_its_covered_range() {
 #[test]
 fn the_coverage_record_round_trips_and_a_zero_count_writes_none() {
     let root = test_root("coverage-record");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
 
     // No skipped ids: publish must not write a coverage record at all, and the
     // snapshot must still resolve to the empty set.
@@ -577,7 +577,7 @@ fn the_coverage_record_round_trips_and_a_zero_count_writes_none() {
 #[test]
 fn verify_reports_a_head_count_that_disagrees_with_the_coverage_record() {
     let root = test_root("coverage-mismatch");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let mut builder = store().begin(&db).unwrap();
     builder.add(&db, &[(1, b"a".as_slice())]).unwrap();
     let head = builder.publish(&db, 5, &[2, 3]).unwrap();
@@ -618,7 +618,7 @@ fn verify_reports_a_head_count_that_disagrees_with_the_coverage_record() {
 #[test]
 fn snapshot_retries_when_the_head_moves_under_it() {
     let root = test_root("snapshot-race");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
 
     // Generation 1 must have skipped ids, so `snapshot` actually reads a coverage
     // record. With `skipped_count == 0` there is no coverage read to race, and a
@@ -666,7 +666,7 @@ fn snapshot_retries_when_the_head_moves_under_it() {
 #[test]
 fn a_complete_generation_costs_one_head_read_and_no_coverage_read() {
     let root = test_root("read-count");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     build(&db, 7, 1..4);
 
     let _ = closure_store::test::take_head_reads();
@@ -685,7 +685,7 @@ fn a_complete_generation_costs_one_head_read_and_no_coverage_read() {
 #[test]
 fn scope_purge_is_atomic_with_the_short_id_scope() {
     let root = test_root("purge");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let ids = ShortIdIndex::new(POOL, SCOPE);
     ids.record_edges(&db, b"$a", EdgeFamily::plain(1), &[b"$b"])
         .unwrap();
@@ -721,7 +721,7 @@ fn blob_for(generation: u64, id: u32) -> Vec<u8> {
     ]
 }
 
-fn publish_full(db: &SharedDatabase) -> ClosureHead {
+fn publish_full(db: &Database) -> ClosureHead {
     let mut builder = store().begin(db).unwrap();
     let generation = builder.generation();
     for batch in [1..4u32, 4..CRASH_IDS] {
@@ -739,7 +739,7 @@ fn crash_child() {
         return;
     };
     let root = PathBuf::from(std::env::var("MTXDB_CRASH_ROOT").unwrap());
-    let db = SharedDatabase::open(root).unwrap();
+    let db = Database::open(root).unwrap();
     match scenario.as_str() {
         "rebuild" => {
             publish_full(&db);
@@ -776,18 +776,18 @@ fn run_child(root: &PathBuf, scenario: &str, crash_at: &str) -> bool {
 fn crash_child_without_a_crash_point_succeeds() {
     let root = test_root("crash-control");
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         publish_full(&db);
     }
     assert!(!run_child(&root, "rebuild", "no-such-point"));
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     assert_eq!(assert_complete_snapshot(&db).generation, 2);
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The published generation is complete, uniform and self-consistent.
-fn assert_complete_snapshot(db: &SharedDatabase) -> ClosureHead {
+fn assert_complete_snapshot(db: &Database) -> ClosureHead {
     let head = store()
         .head(db)
         .unwrap()
@@ -817,14 +817,14 @@ fn assert_complete_snapshot(db: &SharedDatabase) -> ClosureHead {
 fn crash_rebuild_keeps_old_generation(name: &str, crash_at: &str, written: &[u32]) {
     let root = test_root(name);
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         publish_full(&db);
     }
     assert!(
         run_child(&root, "rebuild", crash_at),
         "child must crash at {crash_at}"
     );
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     // The crash left exactly the expected partial orphan under generation 2.
     for id in 1..CRASH_IDS {
         assert_eq!(
@@ -878,11 +878,11 @@ fn crash_staged_head_swap_before_commit() {
 fn crash_after_head_publication_before_sync() {
     let root = test_root("crash-after-commit");
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         publish_full(&db);
     }
     assert!(run_child(&root, "rebuild", "publish-after-commit"));
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     // A killed process keeps its page-cache writes, so the swap is normally
     // durable; a power loss could lose it. Either outcome is a complete
     // generation, which is the invariant under test.
@@ -902,7 +902,7 @@ fn crash_after_head_publication_before_sync() {
 fn crash_retire(name: &str, crash_at: &str, generation_one_survives: bool) {
     let root = test_root(name);
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         for _ in 0..3 {
             publish_full(&db);
         }
@@ -911,7 +911,7 @@ fn crash_retire(name: &str, crash_at: &str, generation_one_survives: bool) {
         run_child(&root, "retire", crash_at),
         "child must crash at {crash_at}"
     );
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     assert_eq!(
         store().raw_generation_record(&db, 1, 1).is_some(),
         generation_one_survives,
@@ -949,7 +949,7 @@ fn crash_during_orphan_cleanup_after_commit() {
 #[test]
 fn concurrent_readers_never_see_a_mixed_generation() {
     let root = test_root("readers");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     publish_full(&db);
     let done = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {

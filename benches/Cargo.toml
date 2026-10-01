@@ -27,7 +27,7 @@ bytes = "1.5"
 crc32fast = "1.4"
 fjall = "2.11.2"
 libmdbx = "0.6"
-mtxdb = { path = "..", features = ["multi-reader"] }
+mtxdb = { path = ".." }
 rusqlite = "0.32"
 
 [target.'cfg(windows)'.dependencies]

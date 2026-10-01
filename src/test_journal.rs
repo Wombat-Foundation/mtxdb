@@ -3,11 +3,9 @@ use super::{
     set_changes_since_force_untrusted, BackgroundFailure, BackgroundState, GroupCommitConfig,
     Journal, JournalCoordinator, Mutation,
 };
-#[cfg(feature = "multi-reader")]
 use super::{TxnStage, TxnStageState};
 use std::fs;
 use std::io::Write as _;
-#[cfg(feature = "multi-reader")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,7 +92,6 @@ fn put(collection: u8, node: u8, payload: &[u8]) -> Mutation {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_segment_round_trips_pool_tags() {
     use crate::layout::ShardType;
     let path = temp_path("shared_pool_tags");
@@ -135,7 +132,6 @@ fn shared_segment_round_trips_pool_tags() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_segment_rejects_untagged_frames() {
     let path = temp_path("shared_untagged");
     let _ = fs::remove_file(&path);
@@ -148,7 +144,6 @@ fn shared_segment_rejects_untagged_frames() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_committed_watermark_is_per_pool() {
     use crate::layout::ShardType;
     let path = temp_path("shared_pool_watermark");
@@ -210,7 +205,6 @@ fn shared_committed_watermark_is_per_pool() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_reclaim_waits_for_a_staged_pools_frame() {
     use crate::layout::ShardType;
     let path = temp_path("shared_staged_required");
@@ -246,7 +240,6 @@ fn shared_reclaim_waits_for_a_staged_pools_frame() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_reclaim_does_not_wait_for_an_idle_pool() {
     use crate::layout::ShardType;
     let path = temp_path("shared_idle_pool_reclaim");
@@ -301,7 +294,6 @@ fn shared_reclaim_does_not_wait_for_an_idle_pool() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn per_pool_segment_rejects_tagged_frames() {
     use crate::layout::ShardType;
     let path = temp_path("perpool_tagged");
@@ -318,7 +310,6 @@ fn per_pool_segment_rejects_tagged_frames() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn open_mode_must_match_segment_version() {
     let path = temp_path("version_mismatch");
     let _ = fs::remove_file(&path);
@@ -338,7 +329,6 @@ fn open_mode_must_match_segment_version() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn coordinator_publishes_tagged_frames() {
     use crate::layout::ShardType;
     let path = temp_path("coordinator_tagged");
@@ -364,7 +354,6 @@ fn coordinator_publishes_tagged_frames() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn transaction_stage_publishes_all_pools_as_one_shared_group() {
     use crate::layout::ShardType;
 
@@ -410,7 +399,6 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn transaction_stage_publishes_after_autocommit_groups_in_lsn_order() {
     use crate::layout::ShardType;
 
@@ -510,7 +498,6 @@ fn coordinator_visible_lsn_matches_committed_after_sync() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn published_groups_are_visible_not_durable_until_one_fsync_covers_them() {
     use crate::layout::ShardType;
     let path = temp_path("published_groups_one_fsync");
@@ -548,7 +535,6 @@ fn empty_group_publication_is_rejected() {
 
     let error = coordinator.publish_group(&[]).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    #[cfg(feature = "multi-reader")]
     {
         use crate::layout::ShardType;
         let error = coordinator
@@ -1080,7 +1066,6 @@ fn a_scan_reports_the_bytes_it_consumed() {
 
 /// Zero `len` bytes of the file at `start`, standing in for a page that
 /// never reached the disk.
-#[cfg(feature = "multi-reader")]
 fn punch_hole(path: &Path, start: u64, len: u64) {
     use std::io::{Seek, SeekFrom, Write};
     let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
@@ -1090,14 +1075,12 @@ fn punch_hole(path: &Path, start: u64, len: u64) {
 }
 
 /// The embedded mark a shared segment currently claims.
-#[cfg(feature = "multi-reader")]
 fn durable_mark(path: &Path) -> u64 {
     let bytes = fs::read(path).unwrap();
     let (version, _base_sequence, _base_lsn) = super::validate_file_header(&bytes).unwrap();
     super::read_durable_len_from_header(&bytes, version, u64::try_from(bytes.len()).unwrap())
 }
 
-#[cfg(feature = "multi-reader")]
 fn open_shared_arc(label: &str) -> Arc<JournalCoordinator> {
     let path = temp_path(label);
     let _ = fs::remove_file(&path);
@@ -1105,7 +1088,6 @@ fn open_shared_arc(label: &str) -> Arc<JournalCoordinator> {
     Arc::new(JournalCoordinator::new(journal, &scan))
 }
 
-#[cfg(feature = "multi-reader")]
 fn publish(coordinator: &JournalCoordinator, node: u8, payload: &[u8]) -> super::CommitReceipt {
     coordinator
         .publish_group_tagged(crate::layout::ShardType::State, &[put(1, node, payload)])
@@ -1113,7 +1095,6 @@ fn publish(coordinator: &JournalCoordinator, node: u8, payload: &[u8]) -> super:
 }
 
 /// The embedded mark advances only after the data fsync succeeds.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_sync_records_the_embedded_durable_mark_after_its_fsync() {
     let coordinator = open_shared_arc("embedded_mark_after_sync");
@@ -1129,7 +1110,6 @@ fn a_sync_records_the_embedded_durable_mark_after_its_fsync() {
     fs::remove_file(path).unwrap();
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_failed_fsync_does_not_advance_the_embedded_mark() {
     let coordinator = open_shared_arc("embedded_mark_failed_fsync");
@@ -1144,7 +1124,6 @@ fn a_failed_fsync_does_not_advance_the_embedded_mark() {
     fs::remove_file(path).unwrap();
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_hole_above_the_embedded_mark_is_truncated() {
     let coordinator = open_shared_arc("embedded_hole_above_mark");
@@ -1163,7 +1142,6 @@ fn a_hole_above_the_embedded_mark_is_truncated() {
     fs::remove_file(path).unwrap();
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_hole_below_the_embedded_mark_still_fails_closed() {
     let coordinator = open_shared_arc("embedded_hole_below_mark");
@@ -1183,7 +1161,6 @@ fn a_hole_below_the_embedded_mark_still_fails_closed() {
     fs::remove_file(path).unwrap();
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn recovery_marks_groups_it_keeps() {
     let path = temp_path("embedded_recovery_mark");
@@ -1206,7 +1183,6 @@ fn recovery_marks_groups_it_keeps() {
 /// A torn newest slot leaves the previous valid slot usable. The immutable
 /// base header is separate: corrupting it still fails header validation
 /// rather than being interpreted as a durability-mark failure.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_torn_newest_mark_falls_back_without_trusting_the_tail() {
     let coordinator = open_shared_arc("embedded_mark_slots");
@@ -1233,7 +1209,6 @@ fn a_torn_newest_mark_falls_back_without_trusting_the_tail() {
 }
 
 /// Overwrite `bytes` at `offset`, standing in for a torn or garbled write.
-#[cfg(feature = "multi-reader")]
 fn overwrite(path: &Path, offset: usize, bytes: &[u8]) {
     use std::io::{Seek, SeekFrom};
     let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
@@ -1243,7 +1218,6 @@ fn overwrite(path: &Path, offset: usize, bytes: &[u8]) {
 }
 
 /// Both mark slots as currently decoded from the file's header region.
-#[cfg(feature = "multi-reader")]
 fn mark_slots(path: &Path) -> [Option<(u64, u64)>; 2] {
     let bytes = fs::read(path).unwrap();
     super::MARK_SLOT_OFFSETS.map(|offset| {
@@ -1254,7 +1228,6 @@ fn mark_slots(path: &Path) -> [Option<(u64, u64)>; 2] {
 /// Groups begin after the base header's sector and both mark sectors, and
 /// each region sits in a sector of its own, so a torn write to one cannot
 /// reach another.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn groups_start_after_a_reserved_sector_aligned_mark_region() {
     assert_eq!(super::FILE_HEADER_LEN % super::MARK_SECTOR_LEN, 0);
@@ -1281,7 +1254,6 @@ fn groups_start_after_a_reserved_sector_aligned_mark_region() {
 
 /// A fresh segment has written no mark: both slots are unwritten and claim
 /// nothing.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn an_unwritten_mark_region_claims_nothing() {
     let coordinator = open_shared_arc("mark_unwritten");
@@ -1295,7 +1267,6 @@ fn an_unwritten_mark_region_claims_nothing() {
 
 /// Marks alternate between the two slots by generation, so a write always
 /// goes to the slot that does not hold the newest mark.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn marks_alternate_between_the_two_slots() {
     let coordinator = open_shared_arc("mark_alternate");
@@ -1325,7 +1296,6 @@ fn marks_alternate_between_the_two_slots() {
 
 /// Fault injection: the newest slot is torn, so recovery falls back to the
 /// older slot's mark instead of losing the mark altogether.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_torn_newest_slot_falls_back_to_the_older_one() {
     let coordinator = open_shared_arc("mark_torn_newest");
@@ -1350,7 +1320,6 @@ fn a_torn_newest_slot_falls_back_to_the_older_one() {
 /// Fault injection: both slots are invalid. Durability is then unknown,
 /// not proven, so recovery treats damage as an unacknowledged tail and
 /// truncates instead of refusing to open.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn two_invalid_slots_mean_unknown_durability() {
     let coordinator = open_shared_arc("mark_both_invalid");
@@ -1380,7 +1349,6 @@ fn two_invalid_slots_mean_unknown_durability() {
 /// The base header and the mark slots are checked independently: garbling
 /// every mark leaves the base header valid and the segment openable, while
 /// garbling the base header is detected even with valid marks.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn base_header_and_mark_slots_are_corrupted_independently() {
     let coordinator = open_shared_arc("mark_vs_base");
@@ -1419,7 +1387,6 @@ fn base_header_and_mark_slots_are_corrupted_independently() {
 /// than proving power-loss behavior. The reason the slots have sectors of their own: a
 /// mark write torn across its whole sector leaves the base header and the
 /// first group readable.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_torn_mark_sector_cannot_reach_the_base_header() {
     let coordinator = open_shared_arc("mark_sector_torn");
@@ -1447,7 +1414,6 @@ fn a_torn_mark_sector_cannot_reach_the_base_header() {
 /// The mark is written with a positioned write, so it never moves the
 /// append cursor: groups published after a sync land at the end, not at
 /// the mark's offset.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_mark_write_leaves_the_append_cursor_alone() {
     let coordinator = open_shared_arc("mark_cursor");
@@ -1468,7 +1434,6 @@ fn a_mark_write_leaves_the_append_cursor_alone() {
 /// file is fsynced, so the mark is durable with the data and covers all of
 /// it; the old segment's marks are gone. A hole in what it retained is
 /// corruption and still fails closed.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn reclaim_writes_a_first_generation_mark_with_the_rebuilt_data() {
     let coordinator = open_shared_arc("mark_reclaim");
@@ -1500,7 +1465,6 @@ fn reclaim_writes_a_first_generation_mark_with_the_rebuilt_data() {
 /// group whose header checksum verifies but whose LSN skips ahead cannot be
 /// produced by a crash on an append-only file, so it stays fatal even above
 /// the mark: dropping it would hide a writer bug.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_checksum_valid_group_with_a_wrong_lsn_is_fatal_even_above_the_mark() {
     let coordinator = open_shared_arc("mark_fatal_class");
@@ -1926,7 +1890,6 @@ fn journal_signal_setup_failure_is_reported_before_attachment() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_sequence_orders_groups_across_segments_and_allows_gaps() {
     let dir = temp_path("shared_sequence");
     let _ = fs::remove_dir_all(&dir);
@@ -2270,7 +2233,6 @@ fn replay_lease_advance_is_monotonic() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
     use crate::layout::ShardType;
 
@@ -2308,7 +2270,6 @@ fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
 /// A reclaim the lease alone holds back is not a pool-coverage stall: it must
 /// not arm the stall/remediation path while a rebuild pins its own window.
 #[test]
-#[cfg(feature = "multi-reader")]
 fn lease_limited_shared_reclaim_is_not_recorded_as_a_stall() {
     use crate::layout::ShardType;
 
@@ -3063,7 +3024,6 @@ fn claim_retries_when_a_commit_lands_between_claim_and_recheck() {
     fs::remove_file(coordinator.path()).unwrap();
 }
 /// A shared segment with tagged groups spread across all pools.
-#[cfg(feature = "multi-reader")]
 fn shared_journal_with_groups(label: &str, groups: u8) -> (Journal, std::path::PathBuf) {
     use crate::layout::ShardType;
     let path = temp_path(label);
@@ -3092,14 +3052,12 @@ fn shared_journal_with_groups(label: &str, groups: u8) -> (Journal, std::path::P
     (journal, path)
 }
 
-#[cfg(feature = "multi-reader")]
 fn directory_of_file(path: &std::path::Path) -> Vec<super::GroupMark> {
     super::marks_from_scan(&Journal::scan_read_only(path).unwrap())
 }
 
 /// The directory built on append, and the one built when reopening, must
 /// both equal what a scan of the file finds.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn group_directory_matches_a_scan_of_the_file() {
     let (journal, path) = shared_journal_with_groups("dir_matches_scan", 9);
@@ -3115,7 +3073,6 @@ fn group_directory_matches_a_scan_of_the_file() {
 /// Reclaiming through the directory must leave exactly the bytes the
 /// full-scan reclaim leaves, report the same result, and keep appends and a
 /// later reclaim working.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn directory_reclaim_writes_the_same_file_as_the_scan_reclaim() {
     // Groups carry two LSNs each, so LSN 7 ends the fourth group.
@@ -3182,7 +3139,6 @@ fn directory_reclaim_writes_the_same_file_as_the_scan_reclaim() {
 
 /// A directory that disagrees with the file must not be trusted: reclaim
 /// falls back to the scan, gets the right answer, and repairs the directory.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_stale_directory_falls_back_to_the_scan() {
     let (mut journal, path) = shared_journal_with_groups("dir_stale", 6);
@@ -3197,7 +3153,6 @@ fn a_stale_directory_falls_back_to_the_scan() {
 
 /// The boundary the directory yields must equal the one a scan of the file
 /// yields, for every coverage combination.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn directory_boundary_equals_the_scan_boundary() {
     use crate::layout::ShardType;
@@ -3246,7 +3201,6 @@ fn directory_boundary_equals_the_scan_boundary() {
 /// A frame with no pool tag cannot be attributed to any pool's coverage, so
 /// the boundary must stop before its group even when every tagged pool has
 /// reported past it.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn an_untagged_frame_stops_the_boundary() {
     use super::{boundary_through, GroupMark, UNATTRIBUTED_POOL_BIT};
@@ -3286,7 +3240,6 @@ fn an_untagged_frame_stops_the_boundary() {
 
 /// A directory whose offsets make the retained suffix start mid-group must
 /// not fail the reclaim: the suffix check errors, and the scan path decides.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn a_misaligned_directory_falls_back_to_the_scan_instead_of_failing() {
     let (mut broken, broken_path) = shared_journal_with_groups("dir_misaligned", 6);
@@ -3325,7 +3278,6 @@ fn a_misaligned_directory_falls_back_to_the_scan_instead_of_failing() {
 }
 /// The directory's accounting follows appends and reclaims, and its worst
 /// case is what the format allows.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn group_directory_accounting_follows_appends_and_reclaims() {
     use super::{GroupDirectoryStats, GroupMark};
@@ -3346,7 +3298,6 @@ fn group_directory_accounting_follows_appends_and_reclaims() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn collection_version_advances_with_each_publish() {
     use crate::layout::ShardType;
 
@@ -3381,7 +3332,6 @@ fn collection_version_advances_with_each_publish() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn collection_version_is_recovered_from_the_segment() {
     use crate::layout::ShardType;
 
@@ -3406,7 +3356,6 @@ fn collection_version_is_recovered_from_the_segment() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn expectations_are_staged_and_discarded_with_the_transaction() {
     use super::CollectionExpectation;
     use crate::layout::ShardType;
@@ -3435,7 +3384,6 @@ fn expectations_are_staged_and_discarded_with_the_transaction() {
 }
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn stale_expectations_reject_the_publish_without_appending() {
     use super::{CollectionExpectation, StaleVersion};
     use crate::layout::ShardType;

@@ -29,10 +29,10 @@
 //! unbounded and belongs in an ordered index, not a per-event edge record.
 //!
 //! JSON handling is the caller's: this module takes already-extracted event
-//! ids and relation type strings. Gated on `multi-reader` with the transaction
-//! layer it uses.
+//! ids and relation type strings. Built on the transaction layer in
+//! [`crate::database`].
 
-use crate::database::{DatabaseTransaction, SharedDatabase};
+use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::short_id::{EdgeFamily, EdgeKey, FamilyEdges, ShortIdIndex};
 use crate::storage::StorageError;
@@ -162,7 +162,7 @@ impl MatrixAdjacency {
     /// kind dictionary is out of `u16` ids.
     pub fn record_event(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         event_id: &str,
         prev: &[&str],
         auth: &[&str],
@@ -213,11 +213,7 @@ impl MatrixAdjacency {
     ///
     /// # Errors
     /// Returns an error on a read failure.
-    pub fn short_id(
-        &self,
-        db: &SharedDatabase,
-        event_id: &str,
-    ) -> Result<Option<u32>, StorageError> {
+    pub fn short_id(&self, db: &Database, event_id: &str) -> Result<Option<u32>, StorageError> {
         // `get_or_create` would allocate; look the key up without writing.
         self.events.lookup(db, event_id.as_bytes())
     }
@@ -228,7 +224,7 @@ impl MatrixAdjacency {
     /// Returns an error on a read failure or a corrupt record.
     pub fn prev_of(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         event_id: &str,
     ) -> Result<Option<Vec<String>>, StorageError> {
         self.targets_of(db, event_id, PREV)
@@ -241,7 +237,7 @@ impl MatrixAdjacency {
     /// Returns an error on a read failure or a corrupt record.
     pub fn auth_of(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         event_id: &str,
     ) -> Result<Option<Vec<String>>, StorageError> {
         self.targets_of(db, event_id, AUTH)
@@ -254,7 +250,7 @@ impl MatrixAdjacency {
     /// missing from the dictionary.
     pub fn relation_of(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         event_id: &str,
         visibility: &dyn EventVisibility,
     ) -> Result<Option<Relation>, StorageError> {
@@ -296,7 +292,7 @@ impl MatrixAdjacency {
     /// # Errors
     /// An error (publishing nothing) once the dictionary would exceed `u16::MAX`
     /// ids; or a storage error.
-    pub fn kind_id(&self, db: &SharedDatabase, rel_type: &str) -> Result<u16, StorageError> {
+    pub fn kind_id(&self, db: &Database, rel_type: &str) -> Result<u16, StorageError> {
         let mut keys: Vec<&[u8]> = KNOWN_RELATION_TYPES.iter().map(|t| t.as_bytes()).collect();
         keys.push(rel_type.as_bytes());
         let ids = self.kinds.get_or_create(db, &keys)?;
@@ -312,11 +308,7 @@ impl MatrixAdjacency {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt record.
-    pub fn relation_type(
-        &self,
-        db: &SharedDatabase,
-        kind: u16,
-    ) -> Result<Option<String>, StorageError> {
+    pub fn relation_type(&self, db: &Database, kind: u16) -> Result<Option<String>, StorageError> {
         self.kinds
             .resolve(db, &[u32::from(kind)])?
             .into_iter()
@@ -330,7 +322,7 @@ impl MatrixAdjacency {
     #[cfg(test)]
     pub(crate) fn set_kind_counter_for_test(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         next: u32,
     ) -> Result<(), StorageError> {
         self.kinds.set_counter_for_test(db, next)
@@ -338,7 +330,7 @@ impl MatrixAdjacency {
 
     /// The dictionary id of `rel_type` if it has one, without allocating.
     #[cfg(test)]
-    pub(crate) fn kinds_lookup_for_test(&self, db: &SharedDatabase, rel_type: &str) -> Option<u32> {
+    pub(crate) fn kinds_lookup_for_test(&self, db: &Database, rel_type: &str) -> Option<u32> {
         self.kinds.lookup(db, rel_type.as_bytes()).unwrap()
     }
 
@@ -347,7 +339,7 @@ impl MatrixAdjacency {
     ///
     /// # Errors
     /// Returns an error only when a record cannot be read.
-    pub fn verify(&self, db: &SharedDatabase) -> Result<AdjacencyVerifyReport, StorageError> {
+    pub fn verify(&self, db: &Database) -> Result<AdjacencyVerifyReport, StorageError> {
         let mut report = AdjacencyVerifyReport::default();
         report.problems.extend(
             self.events
@@ -371,7 +363,7 @@ impl MatrixAdjacency {
     ///
     /// # Errors
     /// Returns an error if the delete cannot be staged or committed.
-    pub fn purge(&self, db: &SharedDatabase) -> Result<(), StorageError> {
+    pub fn purge(&self, db: &Database) -> Result<(), StorageError> {
         let txn = db.begin_transaction();
         self.stage_purge(&txn)?;
         txn.commit()
@@ -388,7 +380,7 @@ impl MatrixAdjacency {
 
     fn targets_of(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         event_id: &str,
         family: EdgeFamily,
     ) -> Result<Option<Vec<String>>, StorageError> {

@@ -74,9 +74,13 @@ impl PoolPolicies {
 
 const POOL_COUNT: usize = ShardType::ALL.len();
 
-/// A database root open for writing through one shared durability fence.
+/// A database root open for writing: every pool behind one write-ahead log,
+/// with atomic cross-pool transactions and record-version compare-and-set.
 ///
-/// Dropping it releases the root writer lock and the pools it opened.
+/// Available in every build; no feature flag is needed to open or write a
+/// database, or for another process to read a live one through
+/// [`PackfileStorage::open_read_committed_shared`]. Dropping the handle releases
+/// the root writer lock and the pools it opened.
 pub struct Database {
     layout: DatabaseLayout,
     coordinator: Arc<JournalCoordinator>,
@@ -94,7 +98,9 @@ pub struct Database {
     _lock: SharedWalLock,
 }
 
-/// Compatibility alias for the pre-`Database` name.
+/// The pre-`Database` name, kept for existing callers. The shared WAL it was
+/// named for is now simply how every `Database` works.
+#[deprecated(note = "use Database instead")]
 pub type SharedDatabase = Database;
 
 /// Total time and call count for one commit phase.
@@ -186,7 +192,7 @@ enum DatabaseRef<'a> {
 impl std::ops::Deref for DatabaseRef<'_> {
     type Target = Database;
 
-    fn deref(&self) -> &SharedDatabase {
+    fn deref(&self) -> &Database {
         match self {
             Self::Borrowed(database) => database,
             Self::Owned(database) => database,
@@ -637,7 +643,7 @@ impl Database {
             pools.iter().map(Arc::downgrade).collect();
         coordinator.set_blocker_remediation(move |pool| {
             let storage = weak_pools
-                .get(shard_index(pool))
+                .get(pool.index())
                 .and_then(std::sync::Weak::upgrade);
             if let Some(Err(error)) =
                 storage.map(|storage| storage.force_index_checkpoint_detached())
@@ -672,7 +678,7 @@ impl Database {
     /// The open store for `shard`.
     #[must_use]
     pub fn pool(&self, shard: ShardType) -> &Arc<PackfileStorage> {
-        &self.pools[shard_index(shard)]
+        &self.pools[shard.index()]
     }
 
     /// The State store (`ShardType::State`).
@@ -844,7 +850,7 @@ impl Database {
             .map_or(0, |receipt| receipt.last_lsn);
         let batches = stage.snapshot_mutations();
         for pool in ShardType::ALL {
-            for (index, mutation) in batches[shard_index(pool)].iter().enumerate() {
+            for (index, mutation) in batches[pool.index()].iter().enumerate() {
                 if stage.mutation_applied(pool, index) {
                     continue;
                 }
@@ -920,7 +926,7 @@ impl Database {
 /// This is the seed `Journal::open_shared_with_base` consumes; it is kept
 /// internal so a caller cannot create a shared segment with an arbitrary base
 /// that disagrees with the pools' recorded coverage. Open a root through
-/// [`SharedDatabase::open`] instead.
+/// [`Database::open`] instead.
 ///
 pub(crate) fn shared_wal_seed_lsn(layout: &DatabaseLayout) -> u64 {
     let mut watermark = 0_u64;
@@ -946,16 +952,6 @@ fn stale_read_from_publish(error: std::io::Error) -> StorageError {
         };
     }
     StorageError::Io(error)
-}
-
-/// Index of `shard` in the canonical pool array.
-const fn shard_index(shard: ShardType) -> usize {
-    match shard {
-        ShardType::State => 0,
-        ShardType::EventDag => 1,
-        ShardType::Edges => 2,
-        ShardType::ServerInfo => 3,
-    }
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use mtxdb::layout::ShardType;
 use mtxdb::storage::{NodeData, NodeId};
-use mtxdb::SharedDatabase;
+use mtxdb::Database;
 
 const COLLECTION: [u8; 16] = [7; 16];
 /// A quarter of the 256 MiB segment cap, the default `RECLAIM_TRIGGER_LEN` in
@@ -58,7 +58,7 @@ fn main() {
     let root = base.join(format!("mtxdb_bench_wal_steady_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
-    let db = SharedDatabase::open(root.clone()).expect("open shared database");
+    let db = Database::open(root.clone()).expect("open shared database");
     let pack_budget = std::env::var("MTXDB_WS_PACK_BUDGET_MB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

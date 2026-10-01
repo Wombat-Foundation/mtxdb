@@ -4,8 +4,7 @@
 //! test binary. Folding the ungated ones into submodules of this single target
 //! keeps `cargo test`/`cargo build --tests` to one link step for them. Files
 //! that need a distinct feature set keep their own `[[test]]` entry with
-//! `required-features` (`shared_wal_processes` needs `multi-reader`), so the
-//! default build neither compiles nor links them.
+//! `required-features`, so a build without them neither compiles nor links them.
 //!
 //! This lives at `tests/unit/main.rs` rather than `tests/unit.rs` so a bare
 //! `mod X;` finds each sibling file directly. Cargo does not autodiscover
@@ -27,7 +26,7 @@ mod test_index_checkpoint;
 mod test_matrix_policy;
 mod test_packfile_layout;
 mod test_redo;
-#[cfg(all(feature = "multi-reader", feature = "bitmaps"))]
+#[cfg(feature = "bitmaps")]
 mod test_repack_closure;
-#[cfg(all(feature = "multi-reader", feature = "bitmaps"))]
+#[cfg(feature = "bitmaps")]
 mod test_room_auth;

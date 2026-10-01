@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::short_id::*;
-use crate::database::SharedDatabase;
+use crate::database::Database;
 use crate::layout::ShardType;
 use crate::storage::StorageError;
 use std::path::PathBuf;
@@ -24,7 +24,7 @@ fn index() -> ShortIdIndex {
 #[test]
 fn allocation_is_dense_stable_and_idempotent() {
     let root = test_root("alloc");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let ids = index()
         .get_or_create(&db, &[b"$a", b"$b", b"$a", b"$c"])
         .unwrap();
@@ -46,7 +46,7 @@ fn allocation_is_dense_stable_and_idempotent() {
 #[test]
 fn record_edges_is_atomic_immutable_and_leaf_safe() {
     let root = test_root("edges");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let (create, none) = index().record_edges(&db, b"$create", PLAIN, &[]).unwrap();
     assert!(
         none.is_empty(),
@@ -87,10 +87,10 @@ fn record_edges_is_atomic_immutable_and_leaf_safe() {
 fn reopen_preserves_ids_and_purge_resets_the_scope() {
     let root = test_root("reopen");
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         index().record_edges(&db, b"$x", PLAIN, &[b"$y"]).unwrap();
     }
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     assert_eq!(
         index().get_or_create(&db, &[b"$y", b"$x", b"$z"]).unwrap(),
         vec![2, 1, 3]
@@ -105,7 +105,7 @@ fn reopen_preserves_ids_and_purge_resets_the_scope() {
 #[test]
 fn concurrent_allocators_never_share_or_duplicate_ids() {
     let root = test_root("race");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let results: Vec<Vec<(String, u32)>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..6)
             .map(|thread| {
@@ -143,7 +143,7 @@ fn concurrent_allocators_never_share_or_duplicate_ids() {
 #[test]
 fn exhaustion_is_a_hard_error_and_publishes_nothing() {
     let root = test_root("overflow");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     index().set_counter_for_test(&db, SHORT_ID_MAX).unwrap();
     // The last valid id is allocatable...
     assert_eq!(
@@ -174,7 +174,7 @@ fn exhaustion_is_a_hard_error_and_publishes_nothing() {
 #[test]
 fn corrupt_counter_is_reported_not_repaired() {
     let root = test_root("corrupt");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     index().get_or_create(&db, &[b"$a"]).unwrap();
     {
         use crate::storage::NodeData;
@@ -194,7 +194,7 @@ fn corrupt_counter_is_reported_not_repaired() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-fn typed_edges(db: &SharedDatabase, id: u32) -> Vec<(u32, u16)> {
+fn typed_edges(db: &Database, id: u32) -> Vec<(u32, u16)> {
     index()
         .edges(db, id, TYPED)
         .unwrap()
@@ -207,7 +207,7 @@ fn typed_edges(db: &SharedDatabase, id: u32) -> Vec<(u32, u16)> {
 #[test]
 fn typed_family_keeps_kinds_sorted_and_rejects_changes() {
     let root = test_root("typed");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let edge = |target: &'static [u8], kind| EdgeKey { target, kind };
     // Two edges to one target that differ only by kind are both kept.
     let first = index()
@@ -263,7 +263,7 @@ fn typed_family_keeps_kinds_sorted_and_rejects_changes() {
 #[test]
 fn families_are_independent_per_owner_in_one_transaction() {
     let root = test_root("families");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let recorded = index()
         .record_event(
             &db,
@@ -317,7 +317,7 @@ fn families_are_independent_per_owner_in_one_transaction() {
 #[test]
 fn a_family_cannot_be_reinterpreted_or_given_kinds_when_untyped() {
     let root = test_root("flags");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     index()
         .record_event(
             &db,
@@ -361,7 +361,7 @@ fn a_family_cannot_be_reinterpreted_or_given_kinds_when_untyped() {
 #[test]
 fn concurrent_writers_are_idempotent_and_never_overwrite() {
     let root = test_root("race-idempotent");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let outcomes: Vec<Result<(), StorageError>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..8usize)
             .map(|thread| {
@@ -407,7 +407,7 @@ fn concurrent_writers_are_idempotent_and_never_overwrite() {
 #[test]
 fn lookup_never_allocates() {
     let root = test_root("lookup");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     assert_eq!(index().lookup(&db, b"$a").unwrap(), None);
     // A miss left no trace: the first real allocation still gets id 1.
     assert_eq!(index().get_or_create(&db, &[b"$a"]).unwrap(), vec![1]);
@@ -420,7 +420,7 @@ fn lookup_never_allocates() {
 #[test]
 fn a_lowered_max_id_refuses_inside_the_transaction() {
     let root = test_root("max-id");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let small = index().with_max_id(3);
     assert_eq!(
         small.get_or_create(&db, &[b"$a", b"$b", b"$c"]).unwrap(),

@@ -36,14 +36,14 @@
 //! together or not at all.
 //!
 //! Ids start at 1 and never wrap; exhausting `u32` is a checked error. The
-//! CAS is atomic within the single writer process; it is unavailable without the
-//! `multi-reader` feature, like the transaction layer it uses.
+//! CAS is atomic within the single writer process, through the transaction layer
+//! in [`crate::database`].
 
 use std::collections::{BTreeSet, HashMap};
 
 use bytes::Bytes;
 
-use crate::database::{DatabaseTransaction, SharedDatabase};
+use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
 
@@ -324,7 +324,7 @@ impl ShortIdIndex {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt counter.
-    pub fn counter(&self, db: &SharedDatabase) -> Result<u32, StorageError> {
+    pub fn counter(&self, db: &Database) -> Result<u32, StorageError> {
         let txn = db.begin_transaction();
         let (records, _) =
             txn.get_with_record_versions(self.pool, &self.collection_id, &[COUNTER_ID])?;
@@ -340,11 +340,7 @@ impl ShortIdIndex {
     /// Returns an error on a hash collision between different keys, on
     /// corruption, when the `u32` id space is exhausted, or when the retry
     /// budget is spent on a contended counter.
-    pub fn get_or_create(
-        &self,
-        db: &SharedDatabase,
-        keys: &[&[u8]],
-    ) -> Result<Vec<u32>, StorageError> {
+    pub fn get_or_create(&self, db: &Database, keys: &[&[u8]]) -> Result<Vec<u32>, StorageError> {
         self.write_with_retry(db, keys, None).map(|(ids, _)| ids)
     }
 
@@ -353,7 +349,7 @@ impl ShortIdIndex {
     /// # Errors
     /// Returns an error on a read failure, a corrupt record, or a hash collision
     /// with a different key.
-    pub fn lookup(&self, db: &SharedDatabase, key: &[u8]) -> Result<Option<u32>, StorageError> {
+    pub fn lookup(&self, db: &Database, key: &[u8]) -> Result<Option<u32>, StorageError> {
         let txn = db.begin_transaction();
         let (records, _) =
             txn.get_with_record_versions(self.pool, &self.collection_id, &[forward_id(key)])?;
@@ -385,7 +381,7 @@ impl ShortIdIndex {
     /// typing, or an error for a non-zero kind on an untyped family.
     pub fn record_event(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         owner: &[u8],
         families: &[FamilyEdges<'_>],
     ) -> Result<RecordedEvent, StorageError> {
@@ -411,7 +407,7 @@ impl ShortIdIndex {
     /// As [`Self::record_event`].
     pub fn record_edges(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         owner: &[u8],
         family: EdgeFamily,
         targets: &[&[u8]],
@@ -436,7 +432,7 @@ impl ShortIdIndex {
     /// with different flags.
     pub fn edges(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         short_id: u32,
         family: EdgeFamily,
     ) -> Result<Option<Vec<Edge>>, StorageError> {
@@ -460,7 +456,7 @@ impl ShortIdIndex {
     /// Returns an error on a read failure or a corrupt record.
     pub fn resolve(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         short_ids: &[u32],
     ) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
         let ids: Vec<NodeId> = short_ids
@@ -485,7 +481,7 @@ impl ShortIdIndex {
     #[cfg(test)]
     pub(crate) fn set_counter_for_test(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         next: u32,
     ) -> Result<(), StorageError> {
         let txn = db.begin_transaction();
@@ -502,7 +498,7 @@ impl ShortIdIndex {
     ///
     /// # Errors
     /// Returns an error if the delete cannot be staged or committed.
-    pub fn purge(&self, db: &SharedDatabase) -> Result<(), StorageError> {
+    pub fn purge(&self, db: &Database) -> Result<(), StorageError> {
         let txn = db.begin_transaction();
         self.stage_purge(&txn)?;
         txn.commit()
@@ -527,7 +523,7 @@ impl ShortIdIndex {
     /// are reported in the returned report.
     pub fn verify(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         families: &[EdgeFamily],
     ) -> Result<ShortIdVerifyReport, StorageError> {
         let txn = db.begin_transaction();
@@ -592,7 +588,7 @@ impl ShortIdIndex {
     /// remaining keys (in family order), or `None` for a plain allocation.
     fn write_with_retry(
         &self,
-        db: &SharedDatabase,
+        db: &Database,
         keys: &[&[u8]],
         families: Option<&[FamilyEdges<'_>]>,
     ) -> Result<(Vec<u32>, RecordedEvent), StorageError> {

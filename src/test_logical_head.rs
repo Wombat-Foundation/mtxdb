@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::logical_head::*;
-use crate::database::SharedDatabase;
+use crate::database::Database;
 use crate::layout::ShardType;
 use crate::storage::{NodeData, StorageError};
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ fn test_root(name: &str) -> PathBuf {
     path
 }
 
-fn set(db: &SharedDatabase, id: &[u8; 16], target: u8, meta: &'static [u8]) {
+fn set(db: &Database, id: &[u8; 16], target: u8, meta: &'static [u8]) {
     let heads = LogicalHead::new(POOL, HEADS);
     let txn = db.begin_transaction();
     let read = heads.read(&txn, id).unwrap();
@@ -31,7 +31,7 @@ fn set(db: &SharedDatabase, id: &[u8; 16], target: u8, meta: &'static [u8]) {
     txn.commit().unwrap();
 }
 
-fn current(db: &SharedDatabase, id: &[u8; 16]) -> Option<LogicalHeadValue> {
+fn current(db: &Database, id: &[u8; 16]) -> Option<LogicalHeadValue> {
     let txn = db.begin_transaction();
     LogicalHead::new(POOL, HEADS).read(&txn, id).unwrap().value
 }
@@ -50,7 +50,7 @@ fn encoding_roundtrips_and_rejects_malformed() {
 #[test]
 fn create_then_update_replaces_head() {
     let root = test_root("update");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let id = [1u8; 16];
     assert_eq!(current(&db, &id), None);
     set(&db, &id, 2, b"first");
@@ -67,11 +67,10 @@ fn create_then_update_replaces_head() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[cfg(feature = "multi-reader")]
 #[test]
 fn stale_writer_is_rejected_by_engine_cas() {
     let root = test_root("stale");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let heads = LogicalHead::new(POOL, HEADS);
     let id = [4u8; 16];
     set(&db, &id, 5, b"a");
@@ -100,11 +99,10 @@ fn stale_writer_is_rejected_by_engine_cas() {
 
 /// A head swap commits atomically with other records in the same
 /// transaction, and a stale head rolls the companion write back too.
-#[cfg(feature = "multi-reader")]
 #[test]
 fn head_swap_is_atomic_with_companion_write() {
     let root = test_root("atomic");
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     let heads = LogicalHead::new(POOL, HEADS);
     let id = [8u8; 16];
     let other = [0x49u8; 16];
@@ -148,11 +146,11 @@ fn reopen_reconstructs_head() {
     let root = test_root("reopen");
     let id = [0xA1u8; 16];
     {
-        let db = SharedDatabase::open(root.clone()).unwrap();
+        let db = Database::open(root.clone()).unwrap();
         set(&db, &id, 1, b"one");
         set(&db, &id, 2, b"two");
     }
-    let db = SharedDatabase::open(root.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
     assert_eq!(
         current(&db, &id),
         Some(LogicalHeadValue::new([2u8; 16], b"two".as_slice()))

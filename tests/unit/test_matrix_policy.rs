@@ -3,7 +3,6 @@
 use mtxdb::matrix_policy::*;
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn matrix_pool_policies_skips_state_compression() {
     let policies = matrix_pool_policies();
     assert!(!policies.state.compress);

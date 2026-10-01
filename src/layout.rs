@@ -255,6 +255,21 @@ impl ShardType {
     /// Every shard type defined by the current database layout.
     pub const ALL: [Self; 4] = [Self::State, Self::EventDag, Self::Edges, Self::ServerInfo];
 
+    /// This pool's position in [`Self::ALL`], the canonical pool order. Use it to
+    /// index per-pool arrays so they cannot drift from `ALL` when a pool is added.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        let mut position = 0;
+        while position < Self::ALL.len() {
+            if Self::ALL[position] as usize == self as usize {
+                return position;
+            }
+            position = position.saturating_add(1);
+        }
+        // Unreachable: every variant is in `ALL`, and a test checks it.
+        Self::ALL.len()
+    }
+
     /// Stable on-disk directory name for this pool.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

@@ -12,8 +12,8 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(clippy::module_name_repetitions)]
 
-/// Transitive auth closures: pure in-memory computation under `bitmaps`, plus
-/// the persisted generation layer under `multi-reader`.
+/// Transitive auth closures: pure in-memory computation plus the persisted
+/// generation layer, both under `bitmaps`.
 #[cfg(feature = "bitmaps")]
 pub mod auth_closure;
 /// Named application-owned lookup indexes sharing the normal packfile engine.
@@ -39,12 +39,10 @@ pub mod index;
 ///
 /// This module itself stays always-on: the write-ahead journal
 /// (`enable_journal`/`replay_journal`) is a same-process durability/group-
-/// commit accelerator any embedded deployment can opt into. Only the
-/// cross-process *read-committed overlay* built on top of it — letting a
-/// separate OS process observe a live writer's committed-but-not-yet-
-/// checkpointed data — is gated behind the `multi-reader` feature; see
-/// `packfile::storage::read_journal` and Cargo.toml's `multi-reader` doc
-/// comment.
+/// commit accelerator any embedded deployment can opt into. The cross-process
+/// *read-committed overlay* built on top of it — letting a separate OS process
+/// observe a live writer's committed-but-not-yet-checkpointed data — is always
+/// available too; see `packfile::storage::read_journal`.
 pub mod journal;
 /// Database-root layout and named independent packfile pools.
 pub mod layout;
@@ -59,7 +57,7 @@ pub mod packfile;
 /// Per-record retention, durability, and ordering policy.
 pub mod record_class;
 /// Public façade and error surface over a room's auth closures.
-#[cfg(all(feature = "multi-reader", feature = "bitmaps"))]
+#[cfg(feature = "bitmaps")]
 pub mod room_auth;
 /// Fixed-size shard file pool that packfiles are written into.
 pub mod shard;
@@ -74,17 +72,17 @@ pub mod template;
 /// Persisted, ordered timeline index with copy-on-write roots.
 pub mod timeline;
 
-#[cfg(all(test, feature = "multi-reader", feature = "bitmaps"))]
+#[cfg(all(test, feature = "bitmaps"))]
 mod test_auth_closure;
 #[cfg(all(test, feature = "bitmaps"))]
 mod test_bitmap_set;
-#[cfg(all(test, feature = "multi-reader"))]
+#[cfg(test)]
 mod test_closure_store;
-#[cfg(all(test, feature = "multi-reader"))]
+#[cfg(test)]
 mod test_logical_head;
-#[cfg(all(test, feature = "multi-reader"))]
+#[cfg(test)]
 mod test_matrix_adjacency;
-#[cfg(all(test, feature = "multi-reader"))]
+#[cfg(test)]
 mod test_short_id;
 
 pub use auxiliary::{
@@ -93,14 +91,13 @@ pub use auxiliary::{
 #[cfg(feature = "bitmaps")]
 pub use bitmap_set::{BitmapSet, DomainTag, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
 pub use cache::NodeCache;
+#[allow(deprecated)]
+pub use database::SharedDatabase;
 pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
-    SharedDatabase,
 };
 pub use index::LossyIndex;
-#[cfg(feature = "multi-reader")]
 pub use journal::SharedWalLock;
-#[cfg(feature = "multi-reader")]
 pub use journal::{CollectionExpectation, StagedLookup, TxnStage, TxnStageState};
 pub use journal::{
     DurabilityStats, DurabilityToken, DurableWaitLatency, GroupCommitConfig, GroupDirectoryStats,

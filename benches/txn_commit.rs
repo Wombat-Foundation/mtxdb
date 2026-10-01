@@ -76,7 +76,7 @@ use mtxdb::journal::{Journal, MAX_TXN_STAGE_BYTES};
 use mtxdb::layout::ShardType;
 use mtxdb::packfile::ChecksumPolicy;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb::{PoolPolicies, PoolPolicy, SharedDatabase};
+use mtxdb::{PoolPolicies, PoolPolicy, Database};
 
 /// One fixed collection, so every run fights the same index/shard layout.
 const COLLECTION: [u8; 16] = [0xA5; 16];
@@ -213,7 +213,7 @@ fn fmt_bytes(bytes: u64) -> String {
 
 /// Open one fresh shared-WAL database root, with per-pool compression chosen
 /// by `MTXDB_TXN_COMPRESS`.
-fn open_db(dir: PathBuf, compress: bool) -> SharedDatabase {
+fn open_db(dir: PathBuf, compress: bool) -> Database {
     let policy = PoolPolicy {
         compress,
         checksum_policy: ChecksumPolicy::Full,
@@ -224,7 +224,7 @@ fn open_db(dir: PathBuf, compress: bool) -> SharedDatabase {
         edges: policy,
         server_info: policy,
     };
-    SharedDatabase::open_with_policies(dir, policies).expect("open shared database")
+    Database::open_with_policies(dir, policies).expect("open shared database")
 }
 
 // ── Run definitions ─────────────────────────────────────────────────
@@ -338,7 +338,7 @@ struct Sample {
     staged_peak: u64,
 }
 
-fn sync_pool(db: &SharedDatabase) -> Duration {
+fn sync_pool(db: &Database) -> Duration {
     let started = Instant::now();
     db.pool(SHARD).sync().expect("pool sync");
     started.elapsed()

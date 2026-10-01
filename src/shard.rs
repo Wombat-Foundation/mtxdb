@@ -2973,8 +2973,8 @@ impl ShardPool {
     ///   (reached via the packfile storage sync path), and shard fsyncs are
     ///   acceleration recovered from the journal on reopen. A separate process
     ///   observes committed data through the read-committed overlay
-    ///   (`PackfileStorage::open_read_committed` / `get_read_committed`, the
-    ///   `multi-reader` feature), whose boundary is the journal's committed
+    ///   (`PackfileStorage::open_read_committed` / `get_read_committed`), whose
+    ///   boundary is the journal's committed
     ///   LSN. That boundary can advance *before* this call, and a
     ///   visible-but-uncommitted group is not crash-durable.
     /// * Without a journal, a peer sees shard bytes only after an explicit
