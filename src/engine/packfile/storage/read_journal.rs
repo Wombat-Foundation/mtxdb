@@ -633,7 +633,7 @@ impl ReadJournal {
                     // A shared segment interleaves all pools' frames; apply
                     // only this pool's. `None` pool is a per-pool segment,
                     // whose frames are all this store's.
-                    if self.pool.is_some_and(|pool| entry.pool != Some(pool)) {
+                    if self.pool.is_some_and(|pool| entry.pool != pool) {
                         continue;
                     }
                     match &entry.mutation {

@@ -9855,7 +9855,7 @@ impl PackfileStorage {
                     if entry.lsn <= covered {
                         continue;
                     }
-                    if pool.is_some_and(|pool| entry.pool != Some(pool)) {
+                    if pool.is_some_and(|pool| entry.pool != pool) {
                         continue;
                     }
                     match &entry.mutation {

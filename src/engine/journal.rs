@@ -25,50 +25,34 @@ const FILE_MAGIC: &[u8; 8] = b"MTXWAL01";
 const GROUP_MAGIC: &[u8; 4] = b"MWG1";
 const GROUP_COMMIT_MAGIC: &[u8; 4] = b"CMIT";
 
-/// On-disk journal format version. The single place that decides frame
-/// dialect: callers match on this rather than comparing raw version numbers,
-/// so a future bump only has to add a variant here.
+/// The sole on-disk journal format. Every mutation carries its physical pool
+/// tag, even when a journal currently serves only one pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JournalVersion {
-    /// Per-pool segment. Mutation frames are untagged and the flag byte must be
-    /// zero. Version 4 adds the embedded durability-mark header fields.
-    V4,
-    /// Shared multi-pool segment. Every mutation frame carries a mandatory pool
-    /// tag in the flag byte, so one physical WAL can carry the state,
-    /// event-DAG, and edges pools and recovery can route each frame back
-    /// to its pool.
-    V5PoolTagged,
+    V1,
 }
 
 impl JournalVersion {
-    /// Version a freshly created per-pool segment uses.
-    const fn per_pool() -> Self {
-        Self::V4
-    }
-
-    /// Version a freshly created shared (multi-pool) segment uses.
     const fn shared() -> Self {
-        Self::V5PoolTagged
+        Self::V1
     }
 
     const fn as_u32(self) -> u32 {
         match self {
-            Self::V4 => 4,
-            Self::V5PoolTagged => 5,
+            Self::V1 => 1,
         }
     }
 
     fn from_u32(value: u32) -> io::Result<Self> {
         match value {
-            4 => Ok(Self::V4),
-            5 => Ok(Self::V5PoolTagged),
+            1 => Ok(Self::V1),
             _ => Err(invalid_data("unsupported journal version")),
         }
     }
 
     /// Whether every mutation frame in this segment must carry a pool tag.
     const fn is_pool_tagged(self) -> bool {
-        matches!(self, Self::V5PoolTagged)
+        true
     }
 }
 
@@ -953,15 +937,9 @@ type PendingPromotion = (u64, Vec<(ShardType, u64)>);
 /// the whole group's end, not the LSN of its own frame within it: the group may
 /// only be dropped once every pool in it has reported coverage through
 /// `last_lsn`.
-fn pool_extents(
-    last_lsn: u64,
-    pools: impl Iterator<Item = Option<ShardType>>,
-) -> Vec<(ShardType, u64)> {
+fn pool_extents(last_lsn: u64, pools: impl Iterator<Item = ShardType>) -> Vec<(ShardType, u64)> {
     let mut extents: Vec<(ShardType, u64)> = Vec::new();
     for pool in pools {
-        let Some(pool) = pool else {
-            continue;
-        };
         if !extents.iter().any(|(existing, _)| *existing == pool) {
             extents.push((pool, last_lsn));
         }
@@ -981,7 +959,7 @@ pub struct JournalEntry {
     pub frame_len: u64,
     /// Pool the frame belongs to. `None` for a version-2 (per-pool) segment;
     /// `Some` for every frame of a pool-tagged version-3 segment.
-    pub pool: Option<ShardType>,
+    pub pool: ShardType,
     /// Decoded mutation.
     pub mutation: Mutation,
 }
@@ -1182,9 +1160,8 @@ const _: () = assert!(
 );
 
 /// The bit standing for `pool` in [`GroupMark::pools`].
-fn pool_bit(pool: Option<ShardType>) -> u8 {
-    pool.and_then(|pool| ShardType::ALL.into_iter().position(|known| known == pool))
-        .map_or(UNATTRIBUTED_POOL_BIT, |index| 1_u8 << index)
+fn pool_bit(pool: ShardType) -> u8 {
+    1_u8 << pool.index()
 }
 
 /// What the in-memory directory remembers about one complete group.
@@ -1965,7 +1942,7 @@ impl JournalCoordinator {
         let mut record_versions: HashMap<(ShardType, [u8; 16]), RecordVersions> = HashMap::new();
         for group in &scan.groups {
             for entry in &group.entries {
-                let Some(pool) = entry.pool else { continue };
+                let pool = entry.pool;
                 match &entry.mutation {
                     Mutation::Put {
                         collection_id,
@@ -2011,10 +1988,8 @@ impl JournalCoordinator {
         let mut pool_committed: HashMap<ShardType, u64> = HashMap::new();
         for group in &scan.groups {
             for entry in &group.entries {
-                if let Some(pool) = entry.pool {
-                    let watermark = pool_committed.entry(pool).or_insert(0);
-                    *watermark = (*watermark).max(group.last_lsn);
-                }
+                let watermark = pool_committed.entry(entry.pool).or_insert(0);
+                *watermark = (*watermark).max(group.last_lsn);
             }
         }
         // Seed each collection's logical version and each record's write LSN
@@ -3214,7 +3189,7 @@ impl JournalCoordinator {
     /// exhausted, or the append fails. A partial append poisons the
     /// underlying journal; publication is rejected until reopen/recovery.
     pub fn publish_group(&self, mutations: &[Mutation]) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(None, mutations)], false, &[], &[])?
+        self.publish_groups(&[(ShardType::State, mutations)], false, &[], &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3231,7 +3206,7 @@ impl JournalCoordinator {
         pool: ShardType,
         mutations: &[Mutation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(Some(pool), mutations)], false, &[], &[])?
+        self.publish_groups(&[(pool, mutations)], false, &[], &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3251,7 +3226,7 @@ impl JournalCoordinator {
         mutations: &[Mutation],
         expectations: &[CollectionExpectation],
     ) -> io::Result<CommitReceipt> {
-        self.publish_groups(&[(Some(pool), mutations)], false, expectations, &[])?
+        self.publish_groups(&[(pool, mutations)], false, expectations, &[])?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "cannot publish an empty group")
             })
@@ -3288,7 +3263,7 @@ impl JournalCoordinator {
     ) -> io::Result<CommitReceipt> {
         let staged = batches
             .iter()
-            .map(|(pool, mutations)| (Some(*pool), *mutations))
+            .map(|(pool, mutations)| (*pool, *mutations))
             .collect::<Vec<_>>();
         self.publish_groups(&staged, true, expectations, record_expectations)?
             .ok_or_else(|| {
@@ -3371,11 +3346,10 @@ impl JournalCoordinator {
     /// Advance the collection and per-record version trackers for a published
     /// group, under the publication lock, so a later conditional commit
     /// validates against the version this group published.
-    fn note_published_versions(&self, staged: &[(Option<ShardType>, &[Mutation])], last_lsn: u64) {
+    fn note_published_versions(&self, staged: &[(ShardType, &[Mutation])], last_lsn: u64) {
         let mut versions = self.collection_versions.lock();
         let mut records = self.record_versions.lock();
         for (pool, mutations) in staged {
-            let Some(pool) = pool else { continue };
             for mutation in *mutations {
                 match mutation {
                     Mutation::Put {
@@ -3417,7 +3391,7 @@ impl JournalCoordinator {
     /// watermark past the group before the group is on the floor list.
     fn publish_groups(
         &self,
-        staged: &[(Option<ShardType>, &[Mutation])],
+        staged: &[(ShardType, &[Mutation])],
         transaction: bool,
         expectations: &[CollectionExpectation],
         record_expectations: &[RecordExpectation],
@@ -3435,7 +3409,7 @@ impl JournalCoordinator {
                 "journal is poisoned after a failed append",
             ));
         }
-        let group_mutations: Vec<(Option<ShardType>, Mutation)> = staged
+        let group_mutations: Vec<(ShardType, Mutation)> = staged
             .iter()
             .flat_map(|(pool, mutations)| mutations.iter().cloned().map(|m| (*pool, m)))
             .collect();
@@ -4273,11 +4247,11 @@ impl Journal {
     /// data-bearing segment's header is invalid, if any committed group fails
     /// validation, or if the segment exceeds `MAX_SEGMENT_LEN`.
     pub fn open(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
-        Self::open_versioned(path, JournalVersion::per_pool(), 1)
+        Self::open_shared(path)
     }
 
     /// Open a shared (multi-pool) journal segment, or create one if the file is
-    /// absent. The segment is created as `JournalVersion::V5PoolTagged`, so
+    /// absent. The segment is created as the v1 pool-tagged format, so
     /// every mutation frame appended through it must carry a pool tag.
     ///
     /// # Errors
@@ -4443,7 +4417,11 @@ impl Journal {
         let untagged = mutations
             .iter()
             .cloned()
-            .map(|mutation| (None, mutation))
+            // A direct single-pool journal has no separate pool argument. It
+            // is still encoded in the one supported wire format, using State
+            // as the default pool for this low-level helper. Production
+            // multi-pool callers use the tagged API below.
+            .map(|mutation| (ShardType::State, mutation))
             .collect::<Vec<_>>();
         self.append_group_inner(&untagged, sequence)
     }
@@ -4455,7 +4433,7 @@ impl Journal {
     /// this segment is not pool-tagged.
     pub fn append_group_tagged_with_sequence(
         &mut self,
-        mutations: &[(Option<ShardType>, Mutation)],
+        mutations: &[(ShardType, Mutation)],
         sequence: Option<u64>,
     ) -> io::Result<CommitReceipt> {
         self.append_group_inner(mutations, sequence)
@@ -4463,7 +4441,7 @@ impl Journal {
 
     fn append_group_for_current_mode(
         &mut self,
-        mutations: &[(Option<ShardType>, Mutation)],
+        mutations: &[(ShardType, Mutation)],
         sequence: Option<u64>,
     ) -> io::Result<CommitReceipt> {
         if self.version.is_pool_tagged() {
@@ -4483,7 +4461,7 @@ impl Journal {
     /// [`JournalVersion::is_pool_tagged`]).
     fn append_group_inner(
         &mut self,
-        mutations: &[(Option<ShardType>, Mutation)],
+        mutations: &[(ShardType, Mutation)],
         sequence: Option<u64>,
     ) -> io::Result<CommitReceipt> {
         if self.poisoned {
@@ -4742,7 +4720,7 @@ impl Journal {
         sequence: u64,
         first_lsn: u64,
         last_lsn: u64,
-        mutations: &[(Option<ShardType>, Mutation)],
+        mutations: &[(ShardType, Mutation)],
     ) {
         self.groups.push(GroupMark {
             sequence,
@@ -5262,7 +5240,7 @@ fn encode_group(
 
 fn encode_mutation(
     lsn: u64,
-    pool: Option<ShardType>,
+    pool: ShardType,
     version: JournalVersion,
     mutation: &Mutation,
     into: &mut Vec<u8>,
@@ -5270,22 +5248,7 @@ fn encode_mutation(
     // The flag byte is the pool tag in a v3 segment and must be zero in a v2
     // segment; enforce the pairing rather than silently writing an ambiguous
     // frame.
-    let pool_byte = match (version.is_pool_tagged(), pool) {
-        (true, Some(pool)) => pool_tag(pool),
-        (true, None) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a pool-tagged journal frame requires a pool tag",
-            ))
-        }
-        (false, Some(_)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a per-pool journal frame must not carry a pool tag",
-            ))
-        }
-        (false, None) => 0,
-    };
+    let pool_byte = pool_tag(pool);
 
     let start = into.len();
     // Zeroed fixed area; `MF_FLAGS` and the DeleteCollection-only fields stay
@@ -5684,7 +5647,7 @@ fn decode_mutations(
             lsn,
             offset: u64::try_from(payload_offset.saturating_add(start)).unwrap_or(u64::MAX),
             frame_len: u64::try_from(crc_end.saturating_sub(start)).unwrap_or(u64::MAX),
-            pool,
+            pool: pool.ok_or_else(|| invalid_data("journal frame has no pool tag"))?,
             mutation,
         });
         cursor = crc_end;

@@ -1527,7 +1527,7 @@ fn a_checksum_valid_group_with_a_wrong_lsn_is_fatal_even_above_the_mark() {
         }],
     };
     let mut bytes = Vec::new();
-    super::encode_group(&group, super::JournalVersion::V5PoolTagged, &mut bytes).unwrap();
+    super::encode_group(&group, super::JournalVersion::V1, &mut bytes).unwrap();
     fs::OpenOptions::new()
         .append(true)
         .open(&path)
