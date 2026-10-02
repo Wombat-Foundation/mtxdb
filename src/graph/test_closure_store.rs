@@ -754,9 +754,15 @@ fn crash_child() {
     }
 }
 
-/// Run `scenario` in a child that stops at `crash_at`; returns whether it exited
-/// with `CRASH_EXIT_CODE` (the injected crash), as opposed to a panic or a clean
-/// exit.
+/// Pause between `open_db` attempts while the writer lock is still held.
+const OPEN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Attempts `open_db` makes before giving up: `OPEN_RETRY_ATTEMPTS` x
+/// `OPEN_RETRY_INTERVAL` is a ~10 s ceiling. It is only a ceiling; the lock
+/// clears within milliseconds in practice, so it just turns a lock that is
+/// genuinely held (a leaked `Database`) into a panic instead of a hang.
+const OPEN_RETRY_ATTEMPTS: u32 = 2000;
+
 /// Open `root`, retrying while its writer lock is briefly still held.
 ///
 /// The lock is an `flock` on an open file description. This module spawns
@@ -767,7 +773,7 @@ fn crash_child() {
 /// is really held stays held, so the retry is bounded.
 fn open_db(root: &Path) -> Database {
     let mut last = None;
-    for _ in 0..2000 {
+    for _ in 0..OPEN_RETRY_ATTEMPTS {
         match Database::open(root.to_path_buf()) {
             Ok(db) => return db,
             Err(error)
@@ -775,7 +781,7 @@ fn open_db(root: &Path) -> Database {
                     || matches!(&error, StorageError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock) =>
             {
                 last = Some(error);
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::thread::sleep(OPEN_RETRY_INTERVAL);
             }
             Err(error) => panic!("open {}: {error}", root.display()),
         }
@@ -783,6 +789,9 @@ fn open_db(root: &Path) -> Database {
     panic!("open {}: {:?}", root.display(), last);
 }
 
+/// Run `scenario` in a child that stops at `crash_at`; returns whether it exited
+/// with `CRASH_EXIT_CODE` (the injected crash), as opposed to a panic or a clean
+/// exit.
 fn run_child(root: &PathBuf, scenario: &str, crash_at: &str) -> bool {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
