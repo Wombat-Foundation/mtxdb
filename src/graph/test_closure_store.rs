@@ -705,7 +705,7 @@ fn scope_purge_is_atomic_with_the_short_id_scope() {
 }
 
 // ---------------------------------------------------------------------------
-// Crash injection: a real child process is aborted at an exact step (no
+// Crash injection: a real child process is stopped at an exact step (no
 // destructors, no flush), and the parent reopens the store. The invariant in
 // every case: readers see the old complete generation or the new complete one,
 // never a partial or mixed generation.
@@ -751,10 +751,10 @@ fn crash_child() {
     }
 }
 
-/// Run `scenario` in a child that aborts at `crash_at`; returns whether it died
-/// of SIGABRT (the injected crash), as opposed to a panic or a clean exit.
+/// Run `scenario` in a child that stops at `crash_at`; returns whether it exited
+/// with `CRASH_EXIT_CODE` (the injected crash), as opposed to a panic or a clean
+/// exit.
 fn run_child(root: &PathBuf, scenario: &str, crash_at: &str) -> bool {
-    use std::os::unix::process::ExitStatusExt;
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -767,7 +767,7 @@ fn run_child(root: &PathBuf, scenario: &str, crash_at: &str) -> bool {
         .output()
         .unwrap()
         .status;
-    status.signal() == Some(6)
+    status.code() == Some(CRASH_EXIT_CODE)
 }
 
 /// Control: with no matching crash point the child completes normally, so the

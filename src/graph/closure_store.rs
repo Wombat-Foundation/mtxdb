@@ -194,13 +194,22 @@ pub(crate) mod test {
     }
 }
 
-/// Test-only crash injection: abort the process (no destructors, no flush) when
+/// Exit code of a child stopped by [`crash_point`]. Distinct from 0 (clean run)
+/// and 101 (panic), so a test can tell an injected crash from either.
+#[cfg(test)]
+pub(super) const CRASH_EXIT_CODE: i32 = 86;
+
+/// Test-only crash injection: end the process (no destructors, no flush) when
 /// `MTXDB_CRASH_AT` names this point, so recovery tests can kill a real child
 /// process at an exact step.
+///
+/// Exits with [`CRASH_EXIT_CODE`] rather than `abort()`: `exit` skips the same
+/// Rust destructors, but a `SIGABRT` would be dumped by systemd-coredump and
+/// raise a desktop crash report for every injected crash.
 #[cfg(test)]
 fn crash_point(name: &str) {
     if std::env::var("MTXDB_CRASH_AT").as_deref() == Ok(name) {
-        std::process::abort();
+        std::process::exit(CRASH_EXIT_CODE);
     }
 }
 
