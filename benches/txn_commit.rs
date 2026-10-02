@@ -76,7 +76,7 @@ use mtxdb::journal::{Journal, MAX_TXN_STAGE_BYTES};
 use mtxdb::layout::ShardType;
 use mtxdb::packfile::ChecksumPolicy;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb::{PoolPolicies, PoolPolicy, Database};
+use mtxdb::{Database, PoolPolicies, PoolPolicy};
 
 /// One fixed collection, so every run fights the same index/shard layout.
 const COLLECTION: [u8; 16] = [0xA5; 16];

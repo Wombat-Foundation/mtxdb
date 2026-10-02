@@ -34,7 +34,7 @@ use bytes::Bytes;
 use mtxdb::journal::JournalCoordinator;
 use mtxdb::layout::ShardType;
 use mtxdb::storage::{NodeData, NodeId};
-use mtxdb::{GroupCommitConfig, PhaseTiming, Database};
+use mtxdb::{Database, GroupCommitConfig, PhaseTiming};
 
 const COLLECTION: [u8; 16] = [0xA5; 16];
 

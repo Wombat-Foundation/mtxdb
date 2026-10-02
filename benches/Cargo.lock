@@ -594,6 +594,7 @@ dependencies = [
  "crc32fast",
  "fs2",
  "jobserver",
+ "memchr",
  "memmap2",
  "parking_lot",
  "sha2",

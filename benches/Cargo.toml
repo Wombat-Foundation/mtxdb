@@ -155,3 +155,9 @@ harness = false
 name = "pack_scan_profile"
 path = "pack_scan_profile.rs"
 harness = false
+
+# End-to-end search-pack cost (index + query shapes) on a real-data corpus.
+[[bench]]
+name = "search_scan"
+path = "search_scan.rs"
+harness = false
