@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use bytes::Bytes;
 
 use super::closure_store;
