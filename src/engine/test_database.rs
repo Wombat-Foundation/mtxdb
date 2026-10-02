@@ -508,7 +508,7 @@ fn server_info_is_a_shared_wal_transaction_pool() {
     let pools = scan.groups[0]
         .entries
         .iter()
-        .filter_map(|entry| entry.pool)
+        .map(|entry| entry.pool)
         .collect::<Vec<_>>();
     assert!(pools.contains(&ShardType::State));
     assert!(pools.contains(&ShardType::ServerInfo));
@@ -1786,7 +1786,7 @@ fn transaction_commit_applies_and_publishes_once() {
             .iter()
             .map(|entry| entry.pool)
             .collect::<Vec<_>>(),
-        vec![Some(ShardType::EventDag), Some(ShardType::State)]
+        vec![ShardType::EventDag, ShardType::State]
     );
     drop(transaction);
     drop(db);

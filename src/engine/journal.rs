@@ -49,11 +49,6 @@ impl JournalVersion {
             _ => Err(invalid_data("unsupported journal version")),
         }
     }
-
-    /// Whether every mutation frame in this segment must carry a pool tag.
-    const fn is_pool_tagged(self) -> bool {
-        true
-    }
 }
 
 // File header field byte ranges. `FILE_HEADER_LEN` is the sum of the fields.
@@ -4354,11 +4349,7 @@ impl Journal {
             .last()
             .map_or(base_lsn, |group| group.last_lsn.saturating_add(1));
 
-        let mark_generation = if version.is_pool_tagged() {
-            newest_mark(&bytes).map_or(0, |slot| slot.generation)
-        } else {
-            0
-        };
+        let mark_generation = newest_mark(&bytes).map_or(0, |slot| slot.generation);
         let mut journal = Self {
             path,
             file,
@@ -4444,21 +4435,12 @@ impl Journal {
         mutations: &[(ShardType, Mutation)],
         sequence: Option<u64>,
     ) -> io::Result<CommitReceipt> {
-        if self.version.is_pool_tagged() {
-            self.append_group_tagged_with_sequence(mutations, sequence)
-        } else {
-            let untagged = mutations
-                .iter()
-                .cloned()
-                .map(|(_, mutation)| mutation)
-                .collect::<Vec<_>>();
-            self.append_group_with_sequence(&untagged, sequence)
-        }
+        self.append_group_tagged_with_sequence(mutations, sequence)
     }
 
     /// Shared implementation for a group of mutations, each paired with its
     /// optional pool tag. The tag must match the segment's dialect (see
-    /// [`JournalVersion::is_pool_tagged`]).
+    /// the journal's single v1 format.
     fn append_group_inner(
         &mut self,
         mutations: &[(ShardType, Mutation)],
@@ -4607,9 +4589,6 @@ impl Journal {
     /// is ignored: the previous mark stays in the other slot, or recovery sees
     /// no mark and truncates conservatively.
     fn write_mark(&mut self, durable_len: u64) {
-        if !self.version.is_pool_tagged() {
-            return;
-        }
         let generation = self.mark_generation.saturating_add(1);
         let bytes = encode_mark_slot(MarkSlot {
             generation,
@@ -4976,7 +4955,7 @@ impl Journal {
         // it is durable. Put its mark inside it, first generation, so the mark
         // is durable with the data and the old segment's marks, which described
         // offsets that no longer exist, are simply gone.
-        let rebuilt_mark = self.version.is_pool_tagged().then(|| MarkSlot {
+        let rebuilt_mark = Some(MarkSlot {
             generation: 1,
             durable_len: u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
         });
@@ -5160,10 +5139,7 @@ pub(crate) fn cut_segment_image_to_durable_mark(path: &Path) -> io::Result<()> {
 /// keep no mark and count every byte durable, so an invalid group fails closed.
 /// A missing or unreadable mark, or one claiming more than the file holds,
 /// yields `0`.
-fn read_durable_len_from_header(bytes: &[u8], version: JournalVersion, file_len: u64) -> u64 {
-    if !version.is_pool_tagged() {
-        return u64::MAX;
-    }
+fn read_durable_len_from_header(bytes: &[u8], _version: JournalVersion, file_len: u64) -> u64 {
     newest_mark(bytes)
         .map(|slot| slot.durable_len)
         .filter(|&durable_len| durable_len <= file_len)
@@ -5241,7 +5217,7 @@ fn encode_group(
 fn encode_mutation(
     lsn: u64,
     pool: ShardType,
-    version: JournalVersion,
+    _version: JournalVersion,
     mutation: &Mutation,
     into: &mut Vec<u8>,
 ) -> io::Result<()> {
@@ -5567,7 +5543,7 @@ fn decode_mutations(
     first_lsn: u64,
     record_count: u32,
     payload_offset: usize,
-    version: JournalVersion,
+    _version: JournalVersion,
 ) -> io::Result<Vec<JournalEntry>> {
     let mut cursor = 0_usize;
     let mut entries = Vec::with_capacity(usize::try_from(record_count).unwrap_or(0));
@@ -5587,17 +5563,8 @@ fn decode_mutations(
         if frame[MF_FLAGS] != [0, 0] {
             return Err(invalid_data("unsupported journal mutation flags"));
         }
-        let pool = if version.is_pool_tagged() {
-            if !matches!(tag, 1..=4) {
-                return Err(invalid_data("pool-tagged frame has no valid pool tag"));
-            }
-            pool_from_tag(tag)
-        } else {
-            if tag != 0 {
-                return Err(invalid_data("untagged frame has a nonzero flag byte"));
-            }
-            None
-        };
+        let pool = pool_from_tag(tag)
+            .ok_or_else(|| invalid_data("journal frame has no valid pool tag"))?;
         let lsn = u64::from_le_bytes(frame[MF_LSN].try_into().expect("fixed slice"));
         let expected = first_lsn
             .checked_add(u64::from(index))
@@ -5647,7 +5614,7 @@ fn decode_mutations(
             lsn,
             offset: u64::try_from(payload_offset.saturating_add(start)).unwrap_or(u64::MAX),
             frame_len: u64::try_from(crc_end.saturating_sub(start)).unwrap_or(u64::MAX),
-            pool: pool.ok_or_else(|| invalid_data("journal frame has no pool tag"))?,
+            pool,
             mutation,
         });
         cursor = crc_end;

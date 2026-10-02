@@ -100,9 +100,9 @@ fn shared_segment_round_trips_pool_tags() {
     let (mut journal, scan) = Journal::open_shared(&path).unwrap();
     assert_eq!(scan.groups.len(), 0);
     let tagged = [
-        (Some(ShardType::State), put(1, 1, b"state")),
-        (Some(ShardType::EventDag), put(2, 2, b"event")),
-        (Some(ShardType::Edges), put(3, 3, b"edges")),
+        (ShardType::State, put(1, 1, b"state")),
+        (ShardType::EventDag, put(2, 2, b"event")),
+        (ShardType::Edges, put(3, 3, b"edges")),
     ];
     journal
         .append_group_tagged_with_sequence(&tagged, None)
@@ -118,28 +118,21 @@ fn shared_segment_round_trips_pool_tags() {
         .collect();
     assert_eq!(
         pools,
-        vec![
-            Some(ShardType::State),
-            Some(ShardType::EventDag),
-            Some(ShardType::Edges),
-        ]
+        vec![ShardType::State, ShardType::EventDag, ShardType::Edges,]
     );
 
     // Recovery must preserve the tags so each frame can be routed.
     let (_journal, scan) = Journal::open_shared(&path).unwrap();
-    assert_eq!(scan.groups[0].entries[1].pool, Some(ShardType::EventDag));
+    assert_eq!(scan.groups[0].entries[1].pool, ShardType::EventDag);
     fs::remove_file(path).unwrap();
 }
 
 #[test]
-fn shared_segment_rejects_untagged_frames() {
+fn single_pool_helper_writes_a_tagged_frame() {
     let path = temp_path("shared_untagged");
     let _ = fs::remove_file(&path);
     let (mut journal, _) = Journal::open_shared(&path).unwrap();
-    assert!(
-        journal.append_group(&[put(1, 1, b"x")]).is_err(),
-        "a pool-tagged segment must reject an untagged frame"
-    );
+    journal.append_group(&[put(1, 1, b"x")]).unwrap();
     fs::remove_file(path).unwrap();
 }
 
@@ -294,37 +287,28 @@ fn shared_reclaim_does_not_wait_for_an_idle_pool() {
 }
 
 #[test]
-fn per_pool_segment_rejects_tagged_frames() {
+fn all_openers_accept_the_v1_tagged_format() {
     use crate::layout::ShardType;
     let path = temp_path("perpool_tagged");
     let _ = fs::remove_file(&path);
     let (mut journal, _) = Journal::open(&path).unwrap();
-    let tagged = [(Some(ShardType::State), put(1, 1, b"x"))];
-    assert!(
-        journal
-            .append_group_tagged_with_sequence(&tagged, None)
-            .is_err(),
-        "a per-pool segment must reject a tagged frame"
-    );
+    let tagged = [(ShardType::State, put(1, 1, b"x"))];
+    journal
+        .append_group_tagged_with_sequence(&tagged, None)
+        .unwrap();
     fs::remove_file(path).unwrap();
 }
 
 #[test]
-fn open_mode_must_match_segment_version() {
+fn open_modes_share_the_v1_format() {
     let path = temp_path("version_mismatch");
     let _ = fs::remove_file(&path);
     Journal::open(&path).unwrap();
-    assert!(
-        Journal::open_shared(&path).is_err(),
-        "a per-pool segment must not open as shared"
-    );
+    Journal::open_shared(&path).unwrap();
     fs::remove_file(&path).unwrap();
 
     Journal::open_shared(&path).unwrap();
-    assert!(
-        Journal::open(&path).is_err(),
-        "a shared segment must not open as per-pool"
-    );
+    Journal::open(&path).unwrap();
     fs::remove_file(path).unwrap();
 }
 
@@ -349,7 +333,7 @@ fn coordinator_publishes_tagged_frames() {
         .iter()
         .map(|entry| entry.pool)
         .collect();
-    assert_eq!(pools, vec![Some(ShardType::State), Some(ShardType::Edges)]);
+    assert_eq!(pools, vec![ShardType::State, ShardType::Edges]);
     fs::remove_file(path).unwrap();
 }
 
@@ -428,11 +412,7 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
             .iter()
             .map(|entry| entry.pool)
             .collect::<Vec<_>>(),
-        vec![
-            Some(ShardType::Edges),
-            Some(ShardType::EventDag),
-            Some(ShardType::State)
-        ]
+        vec![ShardType::Edges, ShardType::EventDag, ShardType::State]
     );
     assert_eq!(stage.state(), TxnStageState::JournalPublished);
     fs::remove_file(path).unwrap();
@@ -469,9 +449,9 @@ fn transaction_stage_publishes_after_autocommit_groups_in_lsn_order() {
     let scan = Journal::scan_read_only(&path).unwrap();
     assert_eq!(scan.groups.len(), 2);
     assert_eq!(scan.groups[0].entries.len(), 1);
-    assert_eq!(scan.groups[0].entries[0].pool, Some(ShardType::State));
+    assert_eq!(scan.groups[0].entries[0].pool, ShardType::State);
     assert_eq!(scan.groups[1].entries.len(), 1);
-    assert_eq!(scan.groups[1].entries[0].pool, Some(ShardType::EventDag));
+    assert_eq!(scan.groups[1].entries[0].pool, ShardType::EventDag);
     assert_eq!(coordinator.visible_lsn(), 2);
     fs::remove_file(path).unwrap();
 }
@@ -1208,7 +1188,7 @@ fn recovery_marks_groups_it_keeps() {
     let (mut journal, _) = Journal::open_shared(&path).unwrap();
     journal
         .append_group_for_current_mode(
-            &[(Some(crate::layout::ShardType::State), put(1, 1, b"cached"))],
+            &[(crate::layout::ShardType::State, put(1, 1, b"cached"))],
             None,
         )
         .unwrap();
@@ -1522,7 +1502,7 @@ fn a_checksum_valid_group_with_a_wrong_lsn_is_fatal_even_above_the_mark() {
             lsn: bad_lsn,
             offset: 0,
             frame_len: 0,
-            pool: Some(crate::layout::ShardType::State),
+            pool: crate::layout::ShardType::State,
             mutation: put(1, 2, b"skipped"),
         }],
     };
@@ -1545,8 +1525,7 @@ fn a_checksum_valid_group_with_a_wrong_lsn_is_fatal_even_above_the_mark() {
     fs::remove_file(path).unwrap();
 }
 
-/// A per-pool segment keeps no mark, so its mark region stays unwritten and
-/// it fails closed on any hole, as it always did.
+/// The v1 format records a durability mark for every journal.
 #[test]
 fn a_per_pool_segment_keeps_no_mark_and_fails_closed() {
     let coordinator = open_arc("per_pool_no_mark");
@@ -1560,8 +1539,8 @@ fn a_per_pool_segment_keeps_no_mark_and_fails_closed() {
     assert!(
         bytes[super::MARK_SECTOR_LEN..super::FILE_HEADER_LEN]
             .iter()
-            .all(|&byte| byte == 0),
-        "a per-pool segment must not write a mark"
+            .any(|&byte| byte != 0),
+        "a v1 segment must write a mark"
     );
 
     {
@@ -3072,8 +3051,8 @@ fn shared_journal_with_groups(label: &str, groups: u8) -> (Journal, std::path::P
         journal
             .append_group_tagged_with_sequence(
                 &[
-                    (Some(first), put(1, i, b"first-frame")),
-                    (Some(second), put(2, i, b"second-frame")),
+                    (first, put(1, i, b"first-frame")),
+                    (second, put(2, i, b"second-frame")),
                 ],
                 None,
             )
@@ -3132,7 +3111,7 @@ fn directory_reclaim_writes_the_same_file_as_the_scan_reclaim() {
         for journal in [&mut by_directory, &mut by_scan] {
             journal
                 .append_group_tagged_with_sequence(
-                    &[(Some(crate::layout::ShardType::State), put(3, 9, b"after"))],
+                    &[(crate::layout::ShardType::State, put(3, 9, b"after"))],
                     None,
                 )
                 .unwrap();
@@ -3195,7 +3174,7 @@ fn directory_boundary_equals_the_scan_boundary() {
         'groups: for group in &scan.groups {
             for entry in &group.entries {
                 match entry.pool {
-                    Some(pool) if covered.get(&pool).is_some_and(|lsn| *lsn >= group.last_lsn) => {}
+                    pool if covered.get(&pool).is_some_and(|lsn| *lsn >= group.last_lsn) => {}
                     _ => break 'groups,
                 }
             }
