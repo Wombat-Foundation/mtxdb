@@ -1800,12 +1800,18 @@ pub struct JournalCoordinator {
     /// conditional commit's validation and the version advance are one step
     /// under the publication lock. Seeded from the recovered segment on open;
     /// reclaim drops the WAL history a version was derived from, so a collection
-    /// whose last write is reclaimed reads `0` after a reopen until its next
-    /// write (checkpoint persistence is the follow-up that closes this).
+    /// whose last write is reclaimed reads its checkpoint baseline after a
+    /// reopen (see `version_floor`) until its next write.
     collection_versions: Mutex<HashMap<(ShardType, [u8; 16]), u64>>,
     /// Per-record write LSNs for the live published suffix, keyed by
     /// `(pool, collection)`. See [`RecordVersions`].
     record_versions: Mutex<HashMap<(ShardType, [u8; 16]), RecordVersions>>,
+    /// Per-collection checkpoint baseline, fixed at open. A record that is
+    /// absent with no live entry or tombstone resolves to this instead of `0`,
+    /// so a delete whose WAL group was reclaimed cannot make a pre-delete "absent
+    /// at 0" observation match again. Unlike `collection_versions` it does not
+    /// advance with later writes, so an absent record's token stays stable.
+    version_floor: Mutex<HashMap<(ShardType, [u8; 16]), u64>>,
     /// First LSNs of transaction groups that are published but whose writes are
     /// not yet all in the packs. See [`Self::publish_groups`].
     unmaterialized: Mutex<std::collections::BTreeSet<u64>>,
@@ -2033,6 +2039,7 @@ impl JournalCoordinator {
             pool_committed: Mutex::new(pool_committed),
             collection_versions: Mutex::new(collection_versions),
             record_versions: Mutex::new(record_versions),
+            version_floor: Mutex::new(HashMap::new()),
             unmaterialized: Mutex::new(std::collections::BTreeSet::new()),
             materialized_cv: Condvar::new(),
             materialized_lock: Mutex::new(()),
@@ -2226,10 +2233,32 @@ impl JournalCoordinator {
         versions: &[([u8; 16], u64)],
     ) {
         let mut current = self.collection_versions.lock();
+        let mut floor = self.version_floor.lock();
         for &(collection_id, version) in versions {
             let entry = current.entry((pool, collection_id)).or_insert(0);
             *entry = (*entry).max(version);
+            let baseline = floor.entry((pool, collection_id)).or_insert(0);
+            *baseline = (*baseline).max(version);
         }
+    }
+
+    /// Version of a record known to be absent: its live entry or delete LSN,
+    /// else the collection's checkpoint baseline, else `0`.
+    #[must_use]
+    pub(crate) fn absent_record_version(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_id: &[u8; 16],
+    ) -> u64 {
+        self.record_version(pool, collection_id, node_id)
+            .or_else(|| {
+                self.version_floor
+                    .lock()
+                    .get(&(pool, *collection_id))
+                    .copied()
+            })
+            .unwrap_or(0)
     }
 
     /// Highest committed group `last_lsn` that carried at least one frame for
@@ -3304,13 +3333,11 @@ impl JournalCoordinator {
             // or was never seeded; both read as legacy version 0. The read
             // path seeds cold records from their frame metadata before staging
             // the expectation, so a missing entry here means 0.
-            let actual = self
-                .record_version(
-                    expectation.pool,
-                    &expectation.collection_id,
-                    &expectation.node_id,
-                )
-                .unwrap_or(0);
+            let actual = self.absent_record_version(
+                expectation.pool,
+                &expectation.collection_id,
+                &expectation.node_id,
+            );
             if actual != expectation.expected {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,

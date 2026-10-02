@@ -1394,7 +1394,8 @@ impl PackfileStorage {
                 let lsn = self.record_last_write_lsn(collection_id, id)?.unwrap_or(0);
                 version = Some(journal.seed_record_version(pool, *collection_id, *id, lsn));
             }
-            let version = version.unwrap_or(0);
+            let version =
+                version.unwrap_or_else(|| journal.absent_record_version(pool, collection_id, id));
             if version > boundary {
                 return Ok(None);
             }

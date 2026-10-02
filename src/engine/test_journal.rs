@@ -353,6 +353,46 @@ fn coordinator_publishes_tagged_frames() {
     fs::remove_file(path).unwrap();
 }
 
+/// After a reclaim and reopen the WAL no longer says a record was ever written
+/// or deleted. An absent record must then resolve to the checkpoint baseline,
+/// not `0`, so a pre-delete "absent at 0" expectation is rejected.
+#[test]
+fn absent_record_resolves_to_checkpoint_baseline_after_reopen() {
+    use crate::layout::ShardType;
+    let path = temp_path("absent_record_baseline");
+    let _ = fs::remove_file(&path);
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    let collection = [1_u8; 16];
+    let record = [2_u8; 16];
+
+    assert_eq!(
+        coordinator.absent_record_version(ShardType::State, &collection, &record),
+        0,
+        "a never-written collection reads 0"
+    );
+
+    coordinator.restore_collection_versions(ShardType::State, &[(collection, 9)]);
+    assert_eq!(
+        coordinator.absent_record_version(ShardType::State, &collection, &record),
+        9,
+        "the reclaimed history leaves the checkpoint baseline"
+    );
+    assert_eq!(
+        coordinator.absent_record_version(ShardType::State, &[3_u8; 16], &record),
+        0,
+        "other collections are unaffected"
+    );
+    // The baseline is fixed at open: later writes to the collection must not
+    // move an absent record's token.
+    coordinator.restore_collection_versions(ShardType::State, &[(collection, 4)]);
+    assert_eq!(
+        coordinator.absent_record_version(ShardType::State, &collection, &record),
+        9
+    );
+    fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn transaction_stage_publishes_all_pools_as_one_shared_group() {
     use crate::layout::ShardType;
