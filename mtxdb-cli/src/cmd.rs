@@ -7060,9 +7060,10 @@ fn cmd_scan_single(
             };
             let shards = pool.all_shards();
             let ids: Vec<PackId> = shards.iter().map(|(_, shard)| shard.pack_id).collect();
-            let Ok(pack_id) = selector.resolve(ids.iter()) else {
+            if !ids.iter().any(|id| selector.matches(id)) {
                 continue;
-            };
+            }
+            let pack_id = selector.resolve(ids.iter())?;
             if let Some((_, shard)) = shards
                 .into_iter()
                 .find(|(_, shard)| shard.pack_id == pack_id)

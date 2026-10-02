@@ -44,9 +44,12 @@ fn unescape(field: &str) -> String {
     out
 }
 
-fn load(path: &str) -> Vec<SearchDocument> {
+/// Parse the corpus; the second value is how many lines were unusable.
+fn load(path: &str) -> (Vec<SearchDocument>, usize) {
     let text = std::fs::read_to_string(path).expect("read corpus");
-    text.lines()
+    let total = text.lines().count();
+    let docs: Vec<SearchDocument> = text
+        .lines()
         .filter_map(|line| {
             let mut f = line.splitn(6, '\t');
             Some(SearchDocument {
@@ -58,7 +61,9 @@ fn load(path: &str) -> Vec<SearchDocument> {
                 body: Some(unescape(f.next()?)),
             })
         })
-        .collect()
+        .collect();
+    let skipped = total - docs.len();
+    (docs, skipped)
 }
 
 fn millis(d: Duration) -> f64 {
@@ -104,8 +109,9 @@ fn build(docs: &[SearchDocument]) -> (PathBuf, PackfileStorage, Duration) {
     SearchIndexes::open(&store, "bench")
         .index_many(docs)
         .expect("index");
+    let indexed = started.elapsed();
     store.sync_all().expect("sync");
-    (dir, store, started.elapsed())
+    (dir, store, indexed)
 }
 
 /// Midpoint of the corpus timestamp range, without overflow.
@@ -118,15 +124,20 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn main() {
-    let corpus =
-        std::env::var("MTXDB_SEARCH_CORPUS").expect("set MTXDB_SEARCH_CORPUS to a corpus TSV");
+    let Ok(corpus) = std::env::var("MTXDB_SEARCH_CORPUS") else {
+        eprintln!("search_scan: MTXDB_SEARCH_CORPUS not set; skipping");
+        return;
+    };
     let reps = env_or("MTXDB_SEARCH_REPS", "7")
         .parse()
         .unwrap_or(7usize)
         .max(1);
     let common = env_or("MTXDB_SEARCH_TERMS", "the");
     let rare = env_or("MTXDB_SEARCH_RARE", "wombat");
-    let docs = load(&corpus);
+    let (docs, skipped) = load(&corpus);
+    if skipped > 0 {
+        eprintln!("search_scan: skipped {skipped} malformed corpus lines");
+    }
     let first = docs.first().expect("corpus is not empty");
     let bytes: usize = docs
         .iter()
