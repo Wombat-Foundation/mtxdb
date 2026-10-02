@@ -34,24 +34,35 @@ use crate::PackfileStorage;
 /// Version byte on every search record, so a pack written by a different
 /// encoding is reported rather than silently mis-decoded.
 ///
-/// Still `1` even though the header gained a flags byte. No version-1 pack has
-/// ever existed on a disk, so there is nothing for a bump to disambiguate; the
-/// bump is owed to the first format change that follows a release.
-pub(crate) const RECORD_VERSION: u8 = 1;
+/// `2` is the first encoding with a flags byte. Version `1` described the
+/// header before redaction existed and would misparse these records by reading
+/// the flags as the first byte of the timestamp, so the bump is what makes the
+/// two distinguishable. No version-1 pack was ever written to disk, so there is
+/// nothing to migrate; the cost of bumping now is zero and the cost of bumping
+/// after a release is a compatibility rule.
+pub(crate) const RECORD_VERSION: u8 = 2;
 
 /// Body text was stripped by [`SearchIndexes::redact`]. Header fields are kept,
 /// so the event stays findable by room, sender, type, and timestamp while its
 /// body matches no text query.
 pub(crate) const FLAG_REDACTED: u8 = 0x01;
 
+/// Every searchable field was cleared by [`SearchIndexes::remove`].
+///
+/// Stronger than [`FLAG_REDACTED`]: a redacted event keeps a findable header,
+/// a removed one matches nothing at all. The record still exists — mtxdb never
+/// deletes — but it carries no room, sender, type, timestamp, event id or body,
+/// and the scan skips it outright rather than trusting the empty fields.
+pub(crate) const FLAG_REMOVED: u8 = 0x02;
+
 /// Flag bits this build understands. Every other bit is rejected as corruption,
 /// so a record carrying a flag we cannot honour fails loudly instead of being
 /// read as an ordinary one.
 ///
-/// `0x02` is reserved for a future header-invisible delete and is deliberately
-/// *not* accepted yet. Reading it would mean silently exposing a record the
-/// writer meant to hide, so unknown bits fail closed.
-pub(crate) const KNOWN_FLAGS: u8 = FLAG_REDACTED;
+/// Unknown bits fail closed on purpose: reading a record whose writer meant it
+/// to be invisible would silently expose it, so the decoder reports the record
+/// rather than approximating it.
+pub(crate) const KNOWN_FLAGS: u8 = FLAG_REDACTED | FLAG_REMOVED;
 
 /// Length of a record's fixed header: version, flags, timestamp, and four field
 /// lengths. The timestamp sits early so a time-bounded query can reject a
@@ -145,8 +156,9 @@ impl<'a> SearchIndexes<'a> {
     /// document whose fields changed since it was last indexed replaces the
     /// stored record in place.
     ///
-    /// Redaction is sticky, so this silently does nothing for an event that has
-    /// been redacted: an ordinary re-ingest cannot put a taken-down body back.
+    /// Redaction and removal are both sticky, so this silently does nothing for
+    /// an event that has been redacted or removed: an ordinary re-ingest cannot
+    /// put a taken-down body back, nor resurrect an event that was deleted.
     /// Clearing a redaction is an explicit operation, or a rebuild from a
     /// primary store that carries the redaction itself. That is a deliberate
     /// asymmetry — an importer that could quietly undo a takedown would be a
@@ -163,7 +175,7 @@ impl<'a> SearchIndexes<'a> {
     /// record already stored for this event cannot be decoded.
     pub fn index(&self, document: &SearchDocument) -> Result<(), StorageError> {
         let node_id = record_id(&document.event_id);
-        if self.is_redacted(&node_id)? {
+        if self.is_sticky(&node_id)? {
             return Ok(());
         }
         let data = NodeData::new(bytes::Bytes::from(encode(document)?));
@@ -176,14 +188,17 @@ impl<'a> SearchIndexes<'a> {
         )
     }
 
-    /// Whether the record stored under `node_id` carries [`FLAG_REDACTED`].
+    /// Whether the record stored under `node_id` is one [`Self::index`] must
+    /// leave alone.
     ///
-    /// An event that was never indexed is not redacted.
-    fn is_redacted(&self, node_id: &NodeId) -> Result<bool, StorageError> {
+    /// Both sticky states qualify: [`FLAG_REDACTED`] (body taken down, header
+    /// kept) and [`FLAG_REMOVED`] (the record is invisible). An event that was
+    /// never indexed is neither, and stays writable.
+    fn is_sticky(&self, node_id: &NodeId) -> Result<bool, StorageError> {
         let Some(existing) = self.engine.get(&self.collection_id, node_id)? else {
             return Ok(false);
         };
-        Ok(Record::decode(&existing.bytes)?.flags & FLAG_REDACTED != 0)
+        Ok(Record::decode(&existing.bytes)?.flags & (FLAG_REDACTED | FLAG_REMOVED) != 0)
     }
 
     /// Add several documents.
@@ -191,7 +206,8 @@ impl<'a> SearchIndexes<'a> {
     /// Each document goes through the same upsert as [`Self::index`], so this
     /// is correct for re-ingest but does not coalesce writes into one batch.
     /// Returns the number of documents submitted. Documents suppressed by an
-    /// earlier redaction still count: they were submitted, not written.
+    /// earlier redaction or removal still count: they were submitted, not
+    /// written.
     ///
     /// # Errors
     /// Propagates the first failure from [`Self::index`]; documents already
@@ -206,7 +222,7 @@ impl<'a> SearchIndexes<'a> {
     /// Strip an event's searchable text, keeping its header fields.
     ///
     /// mtxdb never deletes or mutates a record — a redaction is a new version
-    /// of the same record, carrying [`FLAG_REDACTED`] and an empty body. The
+    /// of the same record, carrying `FLAG_REDACTED` and an empty body. The
     /// event remains findable by room, sender, type, and timestamp while its
     /// body stops matching any text query.
     ///
@@ -214,6 +230,10 @@ impl<'a> SearchIndexes<'a> {
     /// re-ingest of the same event cannot restore the text. Clearing a
     /// redaction is an explicit operation, or a rebuild from a primary store
     /// that records the redaction itself.
+    ///
+    /// Redacting a record that was already [`Self::remove`]d reports `true` and
+    /// writes nothing: a removal is strictly stronger than a redaction, and
+    /// rewriting it here would put the header fields back.
     ///
     /// This does **not** erase the plaintext from disk. The pack is append-only,
     /// so the pre-redaction frame survives until a repack or a rebuild drops
@@ -241,7 +261,9 @@ impl<'a> SearchIndexes<'a> {
             return Ok(false);
         };
         let record = Record::decode(&existing.bytes)?;
-        if record.flags & FLAG_REDACTED != 0 {
+        if record.flags & (FLAG_REDACTED | FLAG_REMOVED) != 0 {
+            // Already terminal. Redacting a redacted record is a no-op;
+            // redacting a *removed* one must not write the header fields back.
             return Ok(true);
         }
         // Same encoder as an ordinary write, so the redacted record has exactly
@@ -255,6 +277,62 @@ impl<'a> SearchIndexes<'a> {
             record.event_id.as_bytes(),
             &[],
         )?;
+        self.engine.create_or_upsert_established_validated(
+            &self.collection_id,
+            &self.metadata(),
+            &node_id,
+            &NodeData::new(bytes::Bytes::from(replacement)),
+            &mut |_existing| Ok(()),
+        )?;
+        Ok(true)
+    }
+
+    /// Drop an event from the pack: clear every searchable field and mark the
+    /// record `FLAG_REMOVED`.
+    ///
+    /// [`Self::redact`] keeps the header so the event stays findable by room,
+    /// sender, type and timestamp. `remove` is the stronger operation, for when
+    /// those fields are themselves the sensitive part: the new version of the
+    /// record carries no room, sender, type, timestamp or event id, and the
+    /// flag makes the scan skip it outright instead of trusting the empty
+    /// fields — an empty query must not surface it as a blank hit either.
+    ///
+    /// Like a redaction this is a new *version* of the record, not a tombstone,
+    /// so mtxdb's write-once rule still holds. It also inherits redaction's
+    /// limits: the pack is append-only, so the pre-removal frame survives until
+    /// a repack or a rebuild drops superseded versions. This removes the event
+    /// from search results; it does not erase the bytes from disk.
+    ///
+    /// Sticky: [`Self::index`] will not write over a removed record, so a later
+    /// re-ingest cannot bring the event back. [`Self::redact`] on a removed
+    /// record reports `true` and writes nothing, so it cannot downgrade a
+    /// removal into a findable header.
+    ///
+    /// Idempotent: removing an already-removed record writes nothing.
+    ///
+    /// # Concurrency
+    /// The same single-writer caveat as [`Self::redact`]: this is a
+    /// read-then-write, and a concurrent [`Self::index`] for the same event can
+    /// interleave between the read and the write and win. Serializing writers
+    /// is the caller's job.
+    ///
+    /// Returns `false` if the event was not in the pack.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] on read or write failure, or
+    /// [`StorageError::Corrupt`] if the stored record cannot be decoded.
+    pub fn remove(&self, event_id: &str) -> Result<bool, StorageError> {
+        let node_id = record_id(event_id);
+        let Some(existing) = self.engine.get(&self.collection_id, &node_id)? else {
+            return Ok(false);
+        };
+        let record = Record::decode(&existing.bytes)?;
+        if record.flags & FLAG_REMOVED != 0 {
+            return Ok(true);
+        }
+        // Every declared field zero-length and the body empty: the payload
+        // holds nothing but the version, the flag and four zero lengths.
+        let replacement = encode_fields(FLAG_REMOVED, 0, &[], &[], &[], &[], &[])?;
         self.engine.create_or_upsert_established_validated(
             &self.collection_id,
             &self.metadata(),
@@ -503,6 +581,12 @@ struct Matcher<'a> {
 
 impl Matcher<'_> {
     fn matches(&self, record: &Record<'_>) -> bool {
+        // Removal outranks every predicate, including the absence of all of
+        // them: the flag is the authority, so a removed record is skipped even
+        // though its cleared fields would otherwise satisfy an empty query.
+        if record.flags & FLAG_REMOVED != 0 {
+            return false;
+        }
         if let Some((start, end)) = self.time_range {
             if record.timestamp < start || record.timestamp > end {
                 return false;
@@ -567,8 +651,9 @@ fn encode(document: &SearchDocument) -> Result<Vec<u8>, StorageError> {
 
 /// Encode one record from its already-separated fields.
 ///
-/// Shared by the write path and [`SearchIndexes::redact`], so a redaction
-/// produces a record in exactly the shape an ordinary write would.
+/// Shared by the write path and by [`SearchIndexes::redact`] and
+/// [`SearchIndexes::remove`], so a redaction or a removal produces a record in
+/// exactly the shape an ordinary write would.
 fn encode_fields(
     flags: u8,
     timestamp: u64,

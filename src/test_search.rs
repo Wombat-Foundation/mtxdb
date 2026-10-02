@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::search::{FLAG_REDACTED, KNOWN_FLAGS, RECORD_VERSION};
+use crate::search::{FLAG_REDACTED, FLAG_REMOVED, KNOWN_FLAGS, RECORD_VERSION};
 use crate::storage::{NodeData, StorageEngine, StorageError};
 use crate::{PackfileStorage, SearchDocument, SearchIndexes, SearchQuery};
 
@@ -983,11 +983,11 @@ fn redacting_twice_writes_nothing_the_second_time() {
 /// without the guarantee its writer intended.
 #[test]
 fn an_unknown_flag_bit_is_rejected_rather_than_ignored() {
-    // 0x02 is reserved for a future header-invisible delete. Accepting it today
-    // would read a record whose whole point is invisibility as an ordinary one.
-    // Each case gets its own pack because a corrupt record fails the whole scan
-    // and there is no per-record delete to clean up between them.
-    for (case, flags) in [("reserved", 0x02_u8), ("high", 0x80), ("all", u8::MAX)] {
+    // 0x01 (redacted) and 0x02 (removed) are the two flags this build
+    // understands; anything else belongs to a writer we cannot honour. Each
+    // case gets its own pack because a corrupt record fails the whole scan and
+    // there is no per-record delete to clean up between them.
+    for (case, flags) in [("unused-low", 0x04_u8), ("high", 0x80), ("all", u8::MAX)] {
         let (_dir, store) = store(&format!("unknown_flag_{case}"));
         let index = SearchIndexes::open(&store, "ns");
 
@@ -1048,5 +1048,291 @@ fn the_redaction_flag_is_what_gets_persisted() {
         stored.bytes[1] & !KNOWN_FLAGS,
         0,
         "a written record must never set a bit the decoder would reject"
+    );
+}
+
+/// Removal is the other half of the takedown story: `redact` keeps the header
+/// findable so the event can still be located, `remove` clears the header so it
+/// cannot be. Every query shape must come back empty for the removed event.
+#[test]
+fn remove_hides_the_event_from_every_query() {
+    let (_dir, store) = store("remove");
+    let index = SearchIndexes::open(&store, "ns");
+    index
+        .index(&doc(
+            "$a",
+            "!r:one",
+            "@u:alice",
+            "m.room.message",
+            1_000,
+            Some("secret plans"),
+        ))
+        .expect("index");
+    index
+        .index(&doc(
+            "$b",
+            "!r:one",
+            "@u:bob",
+            "m.room.message",
+            2_000,
+            Some("ordinary chatter"),
+        ))
+        .expect("index");
+
+    assert!(
+        index.remove("$a").expect("remove"),
+        "removing a known event reports true"
+    );
+
+    let mut query = SearchQuery::default();
+    // Text...
+    assert!(index
+        .search(terms(&mut query, &["secret"]))
+        .expect("search")
+        .is_empty());
+
+    // ...every header field...
+    query.terms.clear();
+    query.room_id = Some("!r:one".to_owned());
+    assert_eq!(index.search(&query).expect("search"), vec!["$b"]);
+    query.room_id = None;
+    query.sender = Some("@u:alice".to_owned());
+    assert!(index.search(&query).expect("search").is_empty());
+    query.sender = None;
+    query.event_type = Some("m.room.message".to_owned());
+    assert_eq!(index.search(&query).expect("search"), vec!["$b"]);
+    query.event_type = None;
+    query.time_range = Some((1_000, 1_000));
+    assert!(index.search(&query).expect("search").is_empty());
+
+    // ...and the unfiltered query, which is the one that would surface a blank
+    // hit if the flag were not authoritative over the cleared fields.
+    query.time_range = None;
+    assert_eq!(index.search(&query).expect("search"), vec!["$b"]);
+}
+
+#[test]
+fn remove_is_idempotent_and_reports_unknown_events() {
+    let (_dir, store) = store("remove_edge");
+    let index = SearchIndexes::open(&store, "ns");
+    index
+        .index(&doc(
+            "$a",
+            "!r:one",
+            "@u:a",
+            "m.room.message",
+            1_000,
+            Some("text"),
+        ))
+        .expect("index");
+
+    assert!(
+        !index.remove("$absent").expect("remove unknown"),
+        "an unindexed event reports false"
+    );
+
+    let after_first = index.len().expect("len").expect("established");
+    assert!(index.remove("$a").expect("remove"));
+    assert_eq!(
+        index.len().expect("len").expect("established"),
+        after_first,
+        "a removal replaces the record rather than adding one"
+    );
+    assert!(index.remove("$a").expect("remove again"));
+    assert_eq!(
+        index.len().expect("len").expect("established"),
+        after_first,
+        "a repeated removal must not append another record"
+    );
+}
+
+/// Removal is sticky for the same reason redaction is: the importer re-reads
+/// the primary store, where the event still exists, and a naive LWW upsert
+/// would put it straight back into the index.
+#[test]
+fn reingest_cannot_resurrect_a_removed_event() {
+    let (_dir, store) = store("remove_sticky");
+    let index = SearchIndexes::open(&store, "ns");
+    index
+        .index(&doc(
+            "$a",
+            "!r:one",
+            "@u:alice",
+            "m.room.message",
+            1_000,
+            Some("secret plans"),
+        ))
+        .expect("index");
+    assert!(index.remove("$a").expect("remove"));
+
+    // The importer comes back around with the original document.
+    index
+        .index(&doc(
+            "$a",
+            "!r:one",
+            "@u:alice",
+            "m.room.message",
+            9_999,
+            Some("secret plans"),
+        ))
+        .expect("reindex");
+
+    let mut query = SearchQuery::default();
+    assert!(index
+        .search(terms(&mut query, &["secret"]))
+        .expect("search")
+        .is_empty());
+    query.terms.clear();
+    query.time_range = Some((9_999, 9_999));
+    assert!(
+        index.search(&query).expect("search").is_empty(),
+        "a suppressed re-ingest must not partially apply its fields"
+    );
+
+    // The stored record still carries the removal, which is what the sticky
+    // check reads back rather than any in-memory state.
+    let stored = store
+        .get(&index.collection_id(), &crate::search::record_id("$a"))
+        .expect("get")
+        .expect("present");
+    assert_eq!(
+        stored.bytes[1] & FLAG_REMOVED,
+        FLAG_REMOVED,
+        "re-ingest must leave FLAG_REMOVED in place"
+    );
+}
+
+/// A removal must not be downgraded into a findable header by a later
+/// `redact`, which would rewrite the record with the room and sender restored.
+#[test]
+fn redact_does_not_downgrade_a_removal() {
+    let (_dir, store) = store("remove_then_redact");
+    let index = SearchIndexes::open(&store, "ns");
+    index
+        .index(&doc(
+            "$a",
+            "!r:one",
+            "@u:alice",
+            "m.room.message",
+            1_000,
+            Some("secret plans"),
+        ))
+        .expect("index");
+    assert!(index.remove("$a").expect("remove"));
+
+    let after_remove = index.len().expect("len").expect("established");
+    assert!(
+        index.redact("$a").expect("redact"),
+        "redacting a removed event reports true"
+    );
+    assert_eq!(
+        index.len().expect("len").expect("established"),
+        after_remove,
+        "redacting a removed event must write nothing"
+    );
+
+    let query = SearchQuery {
+        room_id: Some("!r:one".to_owned()),
+        ..SearchQuery::default()
+    };
+    assert!(
+        index.search(&query).expect("search").is_empty(),
+        "the header must stay cleared"
+    );
+
+    let stored = store
+        .get(&index.collection_id(), &crate::search::record_id("$a"))
+        .expect("get")
+        .expect("present");
+    assert_eq!(
+        stored.bytes[1], FLAG_REMOVED,
+        "the record must still be removed, not redacted"
+    );
+}
+
+/// The removal flag and the cleared payload must survive the round trip through
+/// the pack, since both the sticky check and the scan's skip depend on reading
+/// them back.
+#[test]
+fn the_removal_flag_is_what_gets_persisted() {
+    let (_dir, store) = store("remove_roundtrip");
+    let index = SearchIndexes::open(&store, "ns");
+    index
+        .index(&doc(
+            "$a",
+            "!r:one",
+            "@u:a",
+            "m.room.message",
+            5_000,
+            Some("text"),
+        ))
+        .expect("index");
+    assert!(index.remove("$a").expect("remove"));
+
+    // Read the raw stored record back through the engine, not through search.
+    let stored = store
+        .get(&index.collection_id(), &crate::search::record_id("$a"))
+        .expect("get")
+        .expect("present");
+    assert_eq!(
+        stored.bytes[0], RECORD_VERSION,
+        "a written record carries the current version byte"
+    );
+    assert_eq!(
+        stored.bytes[1] & FLAG_REMOVED,
+        FLAG_REMOVED,
+        "the removed record must carry FLAG_REMOVED on disk"
+    );
+    assert_eq!(
+        stored.bytes[1] & !KNOWN_FLAGS,
+        0,
+        "a written record must never set a bit the decoder would reject"
+    );
+    // Header only: version, flags, timestamp and four zero field lengths, with
+    // no room, sender, type, event id or body left to decode.
+    assert_eq!(
+        stored.bytes.len(),
+        18,
+        "a removed record must hold no searchable field"
+    );
+}
+
+/// The flags byte made this a different encoding from version 1, where the byte
+/// at offset 1 was the first byte of the timestamp. An old-shape record must be
+/// reported, not misparsed.
+#[test]
+fn an_unsupported_record_version_is_reported() {
+    // Pinned deliberately: version 1 is the header *without* a flags byte, and
+    // no version-1 pack ever reached a disk, so there is nothing to stay
+    // compatible with. Reverting the bump would make the two shapes
+    // indistinguishable again — which is what this assertion is for.
+    assert_eq!(
+        RECORD_VERSION, 2,
+        "the flags byte is a new encoding and takes the version with it"
+    );
+
+    let (_dir, store) = store("old_version");
+    let index = SearchIndexes::open(&store, "ns");
+
+    let mut record = vec![RECORD_VERSION - 1, 0];
+    record.extend_from_slice(&7_u64.to_le_bytes());
+    for _ in 0..4 {
+        record.extend_from_slice(&0_u16.to_le_bytes());
+    }
+
+    store
+        .put(
+            &index.collection_id(),
+            &[0xCF_u8; 16],
+            &NodeData::new(bytes::Bytes::from(record)),
+        )
+        .expect("put");
+
+    let error = index
+        .search(&SearchQuery::default())
+        .expect_err("must reject a record from the previous encoding");
+    assert!(
+        matches!(&error, StorageError::Corrupt(message) if message.contains("unsupported version")),
+        "expected an unsupported-version error, got {error:?}"
     );
 }
