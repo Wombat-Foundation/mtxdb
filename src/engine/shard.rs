@@ -58,6 +58,28 @@ fn kick_writeback(file: &File, offset: u64, len: u64) {
     };
 }
 
+/// `create_dir_all`, then flush every directory it created and the entry of each
+/// in its parent, so a power loss cannot drop a freshly created ancestor (and
+/// everything under it) after the leaf's contents are durable.
+pub(crate) fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
+    let mut created: Vec<&Path> = Vec::new();
+    for ancestor in dir.ancestors() {
+        if ancestor.as_os_str().is_empty() || ancestor.exists() {
+            break;
+        }
+        created.push(ancestor);
+    }
+    fs::create_dir_all(dir)?;
+    // Shallowest first: each directory's own entries, then its parent's.
+    for created_dir in created.into_iter().rev() {
+        sync_directory(created_dir)?;
+        if let Some(parent) = created_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
 /// Flush a directory's entries to stable storage.
 ///
 /// Unix can fsync a directory descriptor directly. Windows has no std API for
@@ -1873,7 +1895,7 @@ impl ShardPool {
             return Ok(shard);
         }
         let slot = *self.active_write.lock();
-        fs::create_dir_all(&self.base_dir)?;
+        create_dir_all_durable(&self.base_dir)?;
         let (file, path, pack_id) = Self::create_packfile_atomically(&self.base_dir, &[])?;
         let file_len = file.metadata()?.len();
         let shard = Arc::new(Shard::new(slot, pack_id, file, path, file_len));

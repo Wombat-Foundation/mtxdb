@@ -138,6 +138,11 @@ fn reopen_preserves_head_and_orphans_are_reclaimed() {
     assert_eq!((head.generation, head.count, head.source_next), (1, 3, 4));
     assert_eq!(store().get(&db, 3).unwrap(), Some(vec![4, 3]));
     assert!(store().verify(&db).unwrap().is_consistent());
+    // Generation 2 sits above the head, so it is indistinguishable from a live
+    // builder's reservation and is left alone.
+    assert_eq!(store().retire_superseded(&db).unwrap(), 0);
+    // Once a later publish moves the head past it, it is a plain orphan.
+    build(&db, 5, 1..4);
     assert_eq!(
         store().retire_superseded(&db).unwrap(),
         1,

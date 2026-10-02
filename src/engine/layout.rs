@@ -483,13 +483,13 @@ impl DatabaseLayout {
     ) -> io::Result<()> {
         match hard_link(temporary, path) {
             Ok(()) => {
-                Self::sync_descriptor_parent(path);
+                Self::sync_descriptor_parent(path)?;
                 Self::sweep_descriptor_temps(path, "create");
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 Self::validate_existing_descriptor(path)?;
-                Self::sync_descriptor_parent(path);
+                Self::sync_descriptor_parent(path)?;
                 Self::sweep_descriptor_temps(path, "create");
                 Ok(())
             }
@@ -515,7 +515,7 @@ impl DatabaseLayout {
                 }
                 match fs::rename(temporary, path) {
                     Ok(()) => {
-                        Self::sync_descriptor_parent(path);
+                        Self::sync_descriptor_parent(path)?;
                         Self::sweep_descriptor_temps(path, "create");
                         Ok(())
                     }
@@ -532,18 +532,20 @@ impl DatabaseLayout {
         }
     }
 
-    /// Attempt to sync the descriptor's parent directory, ignoring failures.
-    fn sync_descriptor_parent(path: &Path) {
-        // The descriptor contents are synced before installation. Directory
-        // sync is best-effort: some supported filesystems reject it, and a
-        // lost first-install directory entry can be safely recreated on the
-        // next open. `Ok` means installed, not guaranteed durable across a
-        // sudden power loss.
+    /// Sync the descriptor's parent directory so the installed entry survives a
+    /// power loss. A rooted pool has no `pool.meta` fallback for the seed, so a
+    /// lost `db.meta` would be recreated with a different seed; failures
+    /// therefore propagate. Only filesystems that report directory sync as
+    /// unsupported are tolerated.
+    fn sync_descriptor_parent(path: &Path) -> io::Result<()> {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let _ = crate::shard::sync_directory(parent);
+        match crate::shard::sync_directory(parent) {
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(()),
+            other => other,
+        }
     }
 
     /// Remove regular sibling files named `.<descriptor>.<kind>.*`.

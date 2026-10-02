@@ -1140,13 +1140,16 @@ impl ClosureStore {
             return Ok(0);
         };
         let next = decode_counter(&record.bytes)?;
-        let keep = |generation: u64| {
-            head.as_ref()
-                .is_some_and(|head| generation == head.generation || generation == head.previous)
+        // Only generations below the head are safe to retire. One at or above
+        // it may belong to a builder that `begin` reserved but has not yet
+        // published; deleting that would leave the head pointing at a deleted
+        // collection. With no head yet, every generation is in progress.
+        let Some(head) = head else {
+            return Ok(0);
         };
         let mut removed = 0u64;
-        for generation in 1..next {
-            if !keep(generation) {
+        for generation in 1..head.generation.min(next) {
+            if generation != head.previous {
                 txn.delete_collection(self.pool, self.generation_collection(generation))?;
                 removed = removed.saturating_add(1);
             }
