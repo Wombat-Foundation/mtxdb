@@ -695,7 +695,7 @@ fn test_open_packfile_rejects_identity_mismatch() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("pack_0000000000000002.pack");
 
-    // Header genuinely says pack_id 0 — a valid v4 header on its
+    // Header genuinely says pack_id 0 — a valid current-format header on its
     // own terms, just not what this filename claims.
     let mut buf = Vec::new();
     write_header(&mut buf, &test_pack_id(0)).unwrap();
@@ -705,7 +705,7 @@ fn test_open_packfile_rejects_identity_mismatch() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     let msg = err.to_string();
     assert!(
-        msg.contains("0x0000000000000000") && msg.contains("0x0000000000000002"),
+        msg.contains(&test_pack_id(0).to_string()) && msg.contains(&test_pack_id(2).to_string()),
         "error must name both the header's actual pack_id and the filename's expected one, got: {msg}"
     );
 
