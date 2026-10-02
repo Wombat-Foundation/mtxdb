@@ -1880,9 +1880,10 @@ fn coordinator_reclaims_without_reusing_lsns() {
 /// base-jump check, so the reclaim must advance the publish signal too.
 #[test]
 fn a_reclaim_advances_the_publish_signal() {
-    let path = temp_path("reclaim_publish_signal");
-    let _ = fs::remove_file(&path);
-    let (journal, scan) = Journal::open(&path).unwrap();
+    // The signal file lives beside the segment under a fixed name, so these
+    // tests need a directory of their own rather than a shared temp dir.
+    let dir = ReplayTestDir::new("reclaim_publish_signal");
+    let (journal, scan) = Journal::open(dir.journal_path()).unwrap();
     let coordinator = JournalCoordinator::new(journal, &scan);
     coordinator.enable_publish_signal().unwrap();
     let signal = coordinator.publish_signal().expect("signal created");
@@ -1905,28 +1906,18 @@ fn a_reclaim_advances_the_publish_signal() {
         (epoch, revision.saturating_add(2)),
         "a reclaim advances the revision even though it publishes nothing"
     );
-
-    drop(coordinator);
-    let _ = fs::remove_file(&path);
-    let _ = fs::remove_file(crate::packfile::publish_signal::PublishSignal::path_for(
-        &path,
-    ));
 }
 
 #[test]
 fn journal_signal_setup_failure_is_reported_before_attachment() {
-    let path = temp_path("publish_signal_setup_failure");
-    let signal_path = crate::packfile::publish_signal::PublishSignal::path_for(&path);
-    let _ = fs::remove_file(&signal_path);
-    let (journal, scan) = Journal::open(&path).unwrap();
+    let dir = ReplayTestDir::new("publish_signal_setup_failure");
+    let signal_path = crate::packfile::publish_signal::PublishSignal::path_for(&dir.journal_path());
+    let (journal, scan) = Journal::open(dir.journal_path()).unwrap();
     fs::create_dir(&signal_path).unwrap();
     let coordinator = JournalCoordinator::new(journal, &scan);
 
     assert!(coordinator.enable_publish_signal().is_err());
     assert!(coordinator.publish_signal().is_none());
-
-    fs::remove_dir(&signal_path).unwrap();
-    let _ = fs::remove_file(&path);
 }
 
 #[test]
