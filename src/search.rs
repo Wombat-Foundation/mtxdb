@@ -19,6 +19,9 @@
 //! event overwrites the single record derived from its event id, and a scan is
 //! taken against captured pack lengths.
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
+
 use memchr::memmem;
 
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
@@ -30,12 +33,30 @@ use crate::PackfileStorage;
 
 /// Version byte on every search record, so a pack written by a different
 /// encoding is reported rather than silently mis-decoded.
-const RECORD_VERSION: u8 = 1;
+///
+/// Still `1` even though the header gained a flags byte. No version-1 pack has
+/// ever existed on a disk, so there is nothing for a bump to disambiguate; the
+/// bump is owed to the first format change that follows a release.
+pub(crate) const RECORD_VERSION: u8 = 1;
 
-/// Length of a record's fixed header: version, timestamp, and four field
+/// Body text was stripped by [`SearchIndexes::redact`]. Header fields are kept,
+/// so the event stays findable by room, sender, type, and timestamp while its
+/// body matches no text query.
+pub(crate) const FLAG_REDACTED: u8 = 0x01;
+
+/// Flag bits this build understands. Every other bit is rejected as corruption,
+/// so a record carrying a flag we cannot honour fails loudly instead of being
+/// read as an ordinary one.
+///
+/// `0x02` is reserved for a future header-invisible delete and is deliberately
+/// *not* accepted yet. Reading it would mean silently exposing a record the
+/// writer meant to hide, so unknown bits fail closed.
+pub(crate) const KNOWN_FLAGS: u8 = FLAG_REDACTED;
+
+/// Length of a record's fixed header: version, flags, timestamp, and four field
 /// lengths. The timestamp sits early so a time-bounded query can reject a
 /// record without touching any variable-length field.
-const HEADER_LEN: usize = 1 + 8 + 4 * 2;
+const HEADER_LEN: usize = 1 + 1 + 8 + 4 * 2;
 
 /// Domain separator mixed into the record id derivation, so a search record id
 /// can never coincide with an id some other scheme derives from the same event
@@ -77,7 +98,7 @@ pub struct SearchQuery {
     pub event_type: Option<String>,
     /// Inclusive `(start, end)` origin-server timestamp range.
     pub time_range: Option<(u64, u64)>,
-    /// Maximum results. `0` means no limit.
+    /// Maximum results, newest first. `0` means no limit.
     pub limit: usize,
 }
 
@@ -124,11 +145,27 @@ impl<'a> SearchIndexes<'a> {
     /// document whose fields changed since it was last indexed replaces the
     /// stored record in place.
     ///
+    /// Redaction is sticky, so this silently does nothing for an event that has
+    /// been redacted: an ordinary re-ingest cannot put a taken-down body back.
+    /// Clearing a redaction is an explicit operation, or a rebuild from a
+    /// primary store that carries the redaction itself. That is a deliberate
+    /// asymmetry — an importer that could quietly undo a takedown would be a
+    /// standing bypass of it.
+    ///
+    /// The existence check costs one read per event. That is the right trade
+    /// while nothing calls this in a hot loop, and it should be measured when
+    /// ingest is wired up; dropping it would trade a takedown guarantee for a
+    /// read.
+    ///
     /// # Errors
-    /// Returns [`StorageError::Io`] on write failure, or [`StorageError::Corrupt`]
-    /// if a field is too long to encode.
+    /// Returns [`StorageError::Io`] on read or write failure, or
+    /// [`StorageError::Corrupt`] if a field is too long to encode, or if the
+    /// record already stored for this event cannot be decoded.
     pub fn index(&self, document: &SearchDocument) -> Result<(), StorageError> {
         let node_id = record_id(&document.event_id);
+        if self.is_redacted(&node_id)? {
+            return Ok(());
+        }
         let data = NodeData::new(bytes::Bytes::from(encode(document)?));
         self.engine.create_or_upsert_established_validated(
             &self.collection_id,
@@ -139,11 +176,22 @@ impl<'a> SearchIndexes<'a> {
         )
     }
 
+    /// Whether the record stored under `node_id` carries [`FLAG_REDACTED`].
+    ///
+    /// An event that was never indexed is not redacted.
+    fn is_redacted(&self, node_id: &NodeId) -> Result<bool, StorageError> {
+        let Some(existing) = self.engine.get(&self.collection_id, node_id)? else {
+            return Ok(false);
+        };
+        Ok(Record::decode(&existing.bytes)?.flags & FLAG_REDACTED != 0)
+    }
+
     /// Add several documents.
     ///
     /// Each document goes through the same upsert as [`Self::index`], so this
     /// is correct for re-ingest but does not coalesce writes into one batch.
-    /// Returns the number of documents accepted.
+    /// Returns the number of documents submitted. Documents suppressed by an
+    /// earlier redaction still count: they were submitted, not written.
     ///
     /// # Errors
     /// Propagates the first failure from [`Self::index`]; documents already
@@ -155,6 +203,68 @@ impl<'a> SearchIndexes<'a> {
         Ok(documents.len())
     }
 
+    /// Strip an event's searchable text, keeping its header fields.
+    ///
+    /// mtxdb never deletes or mutates a record — a redaction is a new version
+    /// of the same record, carrying [`FLAG_REDACTED`] and an empty body. The
+    /// event remains findable by room, sender, type, and timestamp while its
+    /// body stops matching any text query.
+    ///
+    /// The flag is sticky: [`Self::index`] will not overwrite it, so a later
+    /// re-ingest of the same event cannot restore the text. Clearing a
+    /// redaction is an explicit operation, or a rebuild from a primary store
+    /// that records the redaction itself.
+    ///
+    /// This does **not** erase the plaintext from disk. The pack is append-only,
+    /// so the pre-redaction frame survives until a repack or a rebuild drops
+    /// superseded versions. See the design doc for what that does and does not
+    /// guarantee.
+    ///
+    /// Idempotent: redacting an already-redacted record writes nothing.
+    ///
+    /// # Concurrency
+    /// This is a read-then-write and is correct only under a single-writer
+    /// assumption — one ingest or redaction path at a time per pack. A
+    /// concurrent [`Self::index`] for the same event can interleave between the
+    /// read and the write and win, because the engine exposes no
+    /// compare-and-swap over a record's current version. Serializing writers is
+    /// the caller's job.
+    ///
+    /// Returns `false` if the event was not in the pack.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] on read or write failure, or
+    /// [`StorageError::Corrupt`] if the stored record cannot be decoded.
+    pub fn redact(&self, event_id: &str) -> Result<bool, StorageError> {
+        let node_id = record_id(event_id);
+        let Some(existing) = self.engine.get(&self.collection_id, &node_id)? else {
+            return Ok(false);
+        };
+        let record = Record::decode(&existing.bytes)?;
+        if record.flags & FLAG_REDACTED != 0 {
+            return Ok(true);
+        }
+        // Same encoder as an ordinary write, so the redacted record has exactly
+        // the shape a redaction is supposed to produce.
+        let replacement = encode_fields(
+            FLAG_REDACTED,
+            record.timestamp,
+            record.room_id,
+            record.sender,
+            record.event_type,
+            record.event_id.as_bytes(),
+            &[],
+        )?;
+        self.engine.create_or_upsert_established_validated(
+            &self.collection_id,
+            &self.metadata(),
+            &node_id,
+            &NodeData::new(bytes::Bytes::from(replacement)),
+            &mut |_existing| Ok(()),
+        )?;
+        Ok(true)
+    }
+
     /// Drop the whole search pack. The primary event store is untouched, so
     /// this only discards derived data.
     ///
@@ -164,10 +274,17 @@ impl<'a> SearchIndexes<'a> {
         self.engine.delete_collection(&self.collection_id)
     }
 
-    /// Return the event ids of every indexed document satisfying `query`.
+    /// Return the event ids of every indexed document satisfying `query`,
+    /// newest first.
     ///
-    /// Results are sorted, so output is deterministic despite the scan yielding
-    /// records in unspecified order. `limit` is applied after sorting.
+    /// Results are ordered by descending timestamp, with the event id as a
+    /// tie-break so the order is total and therefore deterministic. The scan
+    /// itself yields records in unspecified order, so this ordering is imposed
+    /// here.
+    ///
+    /// When `query.limit` is non-zero the result set is bounded: matches are
+    /// accumulated in a heap of at most `limit` entries, so memory does not
+    /// scale with the number of hits. Only the newest `limit` survive.
     ///
     /// Cost is one pass over the pack, proportional to its size.
     ///
@@ -199,8 +316,11 @@ impl<'a> SearchIndexes<'a> {
             time_range: query.time_range,
         };
 
+        let bounded = query.limit != 0;
         let scan = self.engine.scan_collection(&self.collection_id)?;
-        let mut hits: Vec<String> = Vec::new();
+        // A max-heap of hits, ordered so that the *worst* surviving hit is the
+        // maximum; that is the one dropped once the heap is full.
+        let mut top: BinaryHeap<Hit> = BinaryHeap::new();
         for entry in scan {
             let (node_id, data) = entry?;
             // The collection's genesis metadata record lives in the same
@@ -209,16 +329,21 @@ impl<'a> SearchIndexes<'a> {
                 continue;
             }
             let record = Record::decode(&data.bytes)?;
-            if matcher.matches(&record) {
-                hits.push(record.event_id.to_owned());
+            if !matcher.matches(&record) {
+                continue;
+            }
+            top.push(Hit {
+                timestamp: record.timestamp,
+                event_id: record.event_id.to_owned(),
+            });
+            if bounded && top.len() > query.limit {
+                top.pop();
             }
         }
 
-        hits.sort_unstable();
-        if query.limit != 0 && hits.len() > query.limit {
-            hits.truncate(query.limit);
-        }
-        Ok(hits)
+        let mut hits = top.into_vec();
+        hits.sort_unstable_by(Hit::newest_first);
+        Ok(hits.into_iter().map(|hit| hit.event_id).collect())
     }
 
     fn metadata(&self) -> CollectionMetadata {
@@ -237,8 +362,49 @@ impl<'a> SearchIndexes<'a> {
     }
 }
 
+/// One match, ordered for two different purposes.
+///
+/// [`Ord`] is the *reverse* of the displayed order, so that the maximum of a
+/// `BinaryHeap<Hit>` is the hit that would appear last — the one to discard
+/// when the heap is full. [`Hit::newest_first`] is the display order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Hit {
+    timestamp: u64,
+    event_id: String,
+}
+
+impl Hit {
+    /// Newest first, event id ascending to break timestamp ties.
+    fn newest_first(&self, other: &Self) -> CmpOrdering {
+        other
+            .timestamp
+            .cmp(&self.timestamp)
+            .then_with(|| self.event_id.cmp(&other.event_id))
+    }
+}
+
+impl Ord for Hit {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Deliberately the same comparator as `newest_first`. It reads
+        // backwards because a max-heap and an ascending sort disagree about
+        // what "greatest" means: a sort places the greatest element last,
+        // which is the oldest hit, and a heap pops the greatest element first,
+        // which should also be the oldest hit. Sharing one comparator keeps the
+        // discarded element and the last-placed element the same by
+        // construction rather than by two definitions agreeing.
+        self.newest_first(other)
+    }
+}
+
+impl PartialOrd for Hit {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// A decoded search record, borrowing its fields out of the stored payload.
 struct Record<'a> {
+    flags: u8,
     timestamp: u64,
     room_id: &'a [u8],
     sender: &'a [u8],
@@ -266,15 +432,22 @@ impl<'a> Record<'a> {
         if header[0] != RECORD_VERSION {
             return Err(corrupt(&format!("unsupported version {}", header[0])));
         }
+        let flags = header[1];
+        // Fail closed on a flag this build does not implement, so a record
+        // written by a future version is reported rather than silently read
+        // without the guarantee its writer intended.
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(corrupt(&format!("unknown flag bits {flags:#04x}")));
+        }
         let timestamp = u64::from_le_bytes(
-            header[1..9]
+            header[2..10]
                 .try_into()
                 .map_err(|_| corrupt("truncated timestamp"))?,
         );
-        let room_len = u16::from_le_bytes(header[9..11].try_into().expect("2 bytes"));
-        let sender_len = u16::from_le_bytes(header[11..13].try_into().expect("2 bytes"));
-        let type_len = u16::from_le_bytes(header[13..15].try_into().expect("2 bytes"));
-        let event_id_len = u16::from_le_bytes(header[15..17].try_into().expect("2 bytes"));
+        let room_len = u16::from_le_bytes(header[10..12].try_into().expect("2 bytes"));
+        let sender_len = u16::from_le_bytes(header[12..14].try_into().expect("2 bytes"));
+        let type_len = u16::from_le_bytes(header[14..16].try_into().expect("2 bytes"));
+        let event_id_len = u16::from_le_bytes(header[16..18].try_into().expect("2 bytes"));
 
         let lengths = [room_len, sender_len, type_len, event_id_len];
         let declared: usize = lengths
@@ -308,6 +481,7 @@ impl<'a> Record<'a> {
             .ok_or_else(|| corrupt("truncated body"))?;
 
         Ok(Self {
+            flags,
             timestamp,
             room_id,
             sender,
@@ -360,7 +534,7 @@ impl Matcher<'_> {
 /// Domain-separated and spread, never a constant prefix: `LossyIndex` buckets
 /// on the id, so an id that varied only in its low bits would put an entire
 /// pack into one bucket.
-fn record_id(event_id: &str) -> NodeId {
+pub(crate) fn record_id(event_id: &str) -> NodeId {
     let mut hasher = DigestAlgorithm::Blake3.hasher();
     hasher.update(ID_DOMAIN);
     hasher.update(event_id.as_bytes());
@@ -380,14 +554,31 @@ fn encode(document: &SearchDocument) -> Result<Vec<u8>, StorageError> {
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
-
-    let fields: [&[u8]; 5] = [
+    encode_fields(
+        0,
+        document.timestamp,
         document.room_id.as_bytes(),
         document.sender.as_bytes(),
         document.event_type.as_bytes(),
         document.event_id.as_bytes(),
         body.as_bytes(),
-    ];
+    )
+}
+
+/// Encode one record from its already-separated fields.
+///
+/// Shared by the write path and [`SearchIndexes::redact`], so a redaction
+/// produces a record in exactly the shape an ordinary write would.
+fn encode_fields(
+    flags: u8,
+    timestamp: u64,
+    room_id: &[u8],
+    sender: &[u8],
+    event_type: &[u8],
+    event_id: &[u8],
+    body: &[u8],
+) -> Result<Vec<u8>, StorageError> {
+    let fields: [&[u8]; 5] = [room_id, sender, event_type, event_id, body];
 
     let mut lengths = [0_u16; 4];
     for (slot, field) in lengths.iter_mut().zip(&fields) {
@@ -406,7 +597,12 @@ fn encode(document: &SearchDocument) -> Result<Vec<u8>, StorageError> {
 
     let mut out = Vec::with_capacity(capacity);
     out.push(RECORD_VERSION);
-    out.extend_from_slice(&document.timestamp.to_le_bytes());
+    debug_assert!(
+        flags & !KNOWN_FLAGS == 0,
+        "only flags the decoder accepts may be written"
+    );
+    out.push(flags);
+    out.extend_from_slice(&timestamp.to_le_bytes());
     for length in lengths {
         out.extend_from_slice(&length.to_le_bytes());
     }
