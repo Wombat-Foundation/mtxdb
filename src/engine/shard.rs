@@ -1029,6 +1029,30 @@ impl ShardPool {
         ))
     }
 
+    /// Pick the slot new writes should go to after reopen.
+    ///
+    /// Pack addresses are random, so slot order (address order) says nothing
+    /// about which pack is newest. Prefer the most recently modified pack that
+    /// still has room; if every pack is full, take the most recent anyway and
+    /// let the first write rotate. Ties fall back to the later slot.
+    fn choose_active_slot(
+        shards: &[Option<Arc<Shard>>],
+        max_shard_bytes: u64,
+        next_slot: u16,
+    ) -> u16 {
+        shards
+            .iter()
+            .flatten()
+            .map(|shard| {
+                let modified = fs::metadata(&shard.path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (shard.file_len() < max_shard_bytes, modified, shard.slot)
+            })
+            .max()
+            .map_or_else(|| next_slot.saturating_sub(1), |(_, _, slot)| slot)
+    }
+
     /// Bootstrap a brand-new pool: create the first pack file, persist
     /// `pool.meta` (with a fresh seed if needed).
     /// Returns `(bucket_seed, pool_meta_persist_time, initial_pack_create_time)`.
@@ -1247,7 +1271,7 @@ impl ShardPool {
         let (recovery_time, recovery_calls, packfile_open_time, packfile_open_calls) =
             Self::recover_and_open_packs(writable, pack_files, &mut shards, &mut next_slot)?;
 
-        let highest_active = next_slot.saturating_sub(1);
+        let highest_active = Self::choose_active_slot(&shards, max_shard_bytes, next_slot);
 
         // Restore bucket_seed from pool.meta if available. A corrupt pool.meta
         // is a hard error.

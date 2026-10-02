@@ -1384,3 +1384,34 @@ fn a_standalone_writer_creates_an_absent_rooted_pool_directory() {
     drop(store);
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Pack addresses are random, so the pack with the highest address is not the
+/// newest. Reopen must keep writing to the most recent pack that has room, not
+/// to whichever pack sorts last.
+#[test]
+fn test_reopen_picks_most_recent_pack_not_highest_address() {
+    let dir = test_dir("reopen_recent_pack");
+    let newest_path = {
+        let pool = ShardPool::open(dir.clone()).unwrap();
+        for _ in 0..6 {
+            pool.rotate().unwrap();
+        }
+        pool.active_shard().path.clone()
+    };
+    // Age every other pack so the last-created one is unambiguously newest,
+    // independent of filesystem timestamp granularity.
+    let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "pack") && path != newest_path {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+    }
+    let pool = ShardPool::open(dir).unwrap();
+    assert_eq!(pool.active_shard().path, newest_path);
+}
