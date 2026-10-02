@@ -129,6 +129,9 @@ mod test_matrix_adjacency;
 #[path = "matrix/test_room_auth.rs"]
 mod test_room_auth;
 #[cfg(test)]
+#[path = "test_search.rs"]
+mod test_search;
+#[cfg(test)]
 #[path = "graph/test_short_id.rs"]
 mod test_short_id;
 

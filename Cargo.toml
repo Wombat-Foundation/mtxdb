@@ -132,6 +132,9 @@ blake3 = "=1.5.5"
 bytes = "1.5"
 crc32fast = "1.4"
 fs2 = "0.4"
+# Substring search for the search-pack scan loop (`memmem::Finder`). Reused
+# across records, so one `Finder` is built per query term, not per record.
+memchr = "2.7"
 memmap2 = "0.9.11"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 roaring = { version = "0.10.12", optional = true }
