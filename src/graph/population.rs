@@ -488,8 +488,6 @@ pub struct GcReport {
     pub dropped: usize,
     /// Collections still inside their grace period.
     pub pending: usize,
-    /// Surviving collections repacked so the dropped bytes can be reclaimed.
-    pub repacked: usize,
 }
 
 impl ShortIdIndex {
@@ -1011,14 +1009,11 @@ impl ShortIdIndex {
         Ok(())
     }
 
-    /// Delete every queued collection whose grace period ended by `now_ms`,
-    /// then repack the surviving population collections so the shards the
-    /// dropped data sat in can be retired.
+    /// Delete every queued collection whose grace period ended by `now_ms`.
     ///
     /// Dropping a collection is a tombstone; its bytes return only once every
-    /// collection sharing the shard has been repacked. This repacks the live
-    /// log generation and the live runs, which are small, and does not touch
-    /// the scope's id records.
+    /// collection sharing the shard has been repacked, and the scope's id
+    /// records share the log's shards (see [`Self::repack_live_collections`]).
     ///
     /// # Errors
     /// Returns an error on a read, write or repack failure.
@@ -1059,15 +1054,24 @@ impl ShortIdIndex {
             &NodeData::new(Bytes::from(encode_gc(&pending)?)),
         )?;
         txn.commit()?;
-        let repacked = self.repack_live_collections(db)?;
         Ok(GcReport {
             dropped: due.len(),
             pending: pending.len(),
-            repacked,
         })
     }
 
-    fn repack_live_collections(&self, db: &Database) -> Result<usize, StorageError> {
+    /// Repack the live log generation and the live runs.
+    ///
+    /// Measured at 1M owners: after compaction and garbage collection this
+    /// reclaimed nothing (0 shards retired) and grew the packs by the size of
+    /// the repacked run, because the dropped log generation shares its shards
+    /// with the scope's id records, which stay referenced. It is therefore not
+    /// part of [`Self::collect_garbage`]; call it only if the shards in
+    /// question hold nothing else.
+    ///
+    /// # Errors
+    /// Returns an error on a read or repack failure.
+    pub fn repack_live_collections(&self, db: &Database) -> Result<usize, StorageError> {
         let counters = self.counters(db)?;
         let txn = db.begin_transaction();
         let manifest = self.read_manifest(&txn, counters.manifest_version)?;

@@ -103,7 +103,34 @@ fn dir_bytes(dir: &Path) -> u64 {
     })
 }
 
-fn build_store(dir: &Path, owners: u32) {
+/// Bytes of every file under `dir` whose name contains `needle`, recursively.
+fn tree_bytes(dir: &Path, needle: &str) -> u64 {
+    let mut total = 0_u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total = total.saturating_add(tree_bytes(&path, needle));
+        } else if entry.file_name().to_string_lossy().contains(needle) {
+            total = total.saturating_add(entry.metadata().map_or(0, |meta| meta.len()));
+        }
+    }
+    total
+}
+
+fn state_line(dir: &Path) -> String {
+    format!(
+        "wal {:.1} MiB, delta {:.1} MiB, checkpoint {:.1} MiB, packs {:.1} MiB",
+        mib(tree_bytes(dir, "wal").saturating_add(tree_bytes(dir, "journal"))),
+        mib(tree_bytes(dir, "delta")),
+        mib(tree_bytes(dir, "checkpoint")),
+        mib(tree_bytes(dir, ".pack"))
+    )
+}
+
+fn build_store(dir: &Path, owners: u32) -> Database {
     let db = Database::open(dir.to_path_buf()).expect("open");
     let with_payload = env_u32("MTXDB_PB_PAYLOAD", 1) != 0;
     let sync_every = env_u32("MTXDB_PB_SYNC_EVERY", 20);
@@ -144,6 +171,7 @@ fn build_store(dir: &Path, owners: u32) {
         secs * 1e6 / f64::from(owners.max(1)),
         mib(dir_bytes(dir))
     );
+    db
 }
 
 /// Peak anonymous memory (`RssAnon`) while `work` runs, sampled every
@@ -238,8 +266,7 @@ fn read_runs(db: &Database, owners: u32) -> usize {
 
 /// Time `sync_all` after a fixed batch of fresh writes on a store of `owners`
 /// events: the cost should track the batch, not the store.
-fn sync_scaling(dir: &Path, owners: u32) {
-    let db = Database::open(dir.to_path_buf()).expect("open");
+fn sync_scaling(db: &Database, dir: &Path, owners: u32) {
     let mut sync_ms = Vec::new();
     let mut write_ms = Vec::new();
     for round in 0..10_u32 {
@@ -259,11 +286,12 @@ fn sync_scaling(dir: &Path, owners: u32) {
             })
             .collect();
         let began = Instant::now();
-        index().record_events(&db, &events).expect("record");
+        index().record_events(db, &events).expect("record");
         write_ms.push(began.elapsed().as_secs_f64() * 1e3);
         let began = Instant::now();
         db.edges().sync_all().expect("sync");
         sync_ms.push(began.elapsed().as_secs_f64() * 1e3);
+        println!("    round {round}: {}", state_line(dir));
     }
     let summary = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
@@ -276,6 +304,38 @@ fn sync_scaling(dir: &Path, owners: u32) {
          record_events median {w_med:.1} ms, max {w_max:.1} ms"
     );
     println!("  per-sync ms: {sync_ms:.1?}");
+}
+
+/// Compact the whole log, let the grace period pass, collect garbage, and
+/// report whether any pack bytes or shards came back.
+fn reclaim(db: &Database, dir: &Path) {
+    let pool = db.edges();
+    println!(
+        "  before: {}, shards retired {}",
+        state_line(dir),
+        pool.shards_retired()
+    );
+    let started = Instant::now();
+    let report = index().compact(db, 0, 0, true).expect("compact");
+    println!(
+        "  compact: {:.1}s {report:?}",
+        started.elapsed().as_secs_f64()
+    );
+    db.edges().sync_all().expect("sync");
+    println!(
+        "  after compact: {}, shards retired {}",
+        state_line(dir),
+        pool.shards_retired()
+    );
+    let started = Instant::now();
+    let gc = index().collect_garbage(db, 1).expect("gc");
+    db.edges().sync_all().expect("sync");
+    println!(
+        "  gc: {:.1}s {gc:?}\n  after gc: {}, shards retired {}",
+        started.elapsed().as_secs_f64(),
+        state_line(dir),
+        pool.shards_retired()
+    );
 }
 
 fn child(mode: &str, dir: &Path) {
@@ -370,12 +430,29 @@ fn main() {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        build_store(&dir, owners);
-        if env_u32("MTXDB_PB_SYNC_SCALING", 0) != 0 {
-            sync_scaling(&dir, owners);
+        let db = build_store(&dir, owners);
+        println!("  after build: {}", state_line(&dir));
+        if env_u32("MTXDB_PB_RECLAIM", 0) != 0 {
+            reclaim(&db, &dir);
+            drop(db);
             let _ = std::fs::remove_dir_all(&dir);
             continue;
         }
+        if env_u32("MTXDB_PB_SYNC_SCALING", 0) != 0 {
+            // The rounds run in this process right after the build; set
+            // MTXDB_PB_REOPEN=1 to reopen the store first and compare.
+            let db = if env_u32("MTXDB_PB_REOPEN", 0) != 0 {
+                drop(db);
+                Database::open(dir.clone()).expect("reopen")
+            } else {
+                db
+            };
+            sync_scaling(&db, &dir, owners);
+            drop(db);
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        drop(db);
         if env_u32("MTXDB_PB_BUILD_ONLY", 0) != 0 {
             let _ = std::fs::remove_dir_all(&dir);
             continue;

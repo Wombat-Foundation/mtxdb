@@ -277,10 +277,6 @@ fn a_dropped_generation_expires_the_pin_only_after_the_grace_period() {
 
     let late = index().collect_garbage(&db, 100 + GRACE_MS).unwrap();
     assert_eq!((late.dropped, late.pending), (1, 0));
-    assert!(
-        late.repacked >= 1,
-        "a repack of the live collections is requested"
-    );
     // A Database-level delete reaches live reads only after a reopen (see
     // `a_committed_delete_collection_hides_synced_records`, ignored), so expiry
     // is asserted on the reopened store.
