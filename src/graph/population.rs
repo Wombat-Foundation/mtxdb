@@ -391,6 +391,10 @@ impl PopulationPin {
     }
 }
 
+/// Every run collection a write was started for, as `(scope, run)`.
+#[cfg(test)]
+pub(crate) static WRITTEN_RUNS: Mutex<Vec<([u8; 16], [u8; 16])>> = Mutex::new(Vec::new());
+
 type CacheKey = ([u8; 16], u32);
 
 /// A small LRU of merged bases, keyed by scope and manifest version, so a new
@@ -445,9 +449,22 @@ struct PublishPlan {
     counters: ScopeCounters,
     counter_token: u64,
     version: u32,
+    run_collection: [u8; 16],
+    /// The encoded manifest for `version`. It is written by the publish
+    /// transaction itself: two compactions that prepared from different
+    /// counter states would otherwise overwrite each other's record.
+    manifest: Vec<u8>,
     retired: Vec<[u8; 16]>,
     now_ms: u64,
     grace_ms: u64,
+}
+
+/// How one publish transaction ended.
+enum Published {
+    Done(usize),
+    /// Another compaction moved the counter's epoch, start or manifest; the
+    /// prepared run is stale and the compaction starts over.
+    Superseded,
 }
 
 /// What one compaction did.
@@ -641,8 +658,13 @@ impl ShortIdIndex {
         pinned: &ScopeCounters,
         error: StorageError,
     ) -> StorageError {
+        let dropped = match &error {
+            StorageError::StaleGeneration { .. } => true,
+            StorageError::Corrupt(message) => message.contains("is missing"),
+            _ => false,
+        };
         match self.counters(db) {
-            Ok(live) if live.manifest_version != pinned.manifest_version => {
+            Ok(live) if dropped && live.manifest_version != pinned.manifest_version => {
                 StorageError::StaleGeneration {
                     generation: u64::from(pinned.manifest_version),
                     current: Some(u64::from(live.manifest_version)),
@@ -710,8 +732,8 @@ impl ShortIdIndex {
     /// folded log generation and any merged runs are queued for deletion
     /// `grace_ms` after `now_ms`; [`Self::collect_garbage`] performs it.
     ///
-    /// The runs and manifest are written first, in transactions nothing
-    /// references; one final transaction moves the counter's epoch, start
+    /// The run is written first, in transactions nothing references; one final
+    /// transaction writes the manifest and moves the counter's epoch, start
     /// sequence and manifest version together, carrying any entries appended
     /// meanwhile into the new generation. A commit landing inside that short
     /// transaction makes it stale and the compaction is retried from a fresh
@@ -800,6 +822,12 @@ impl ShortIdIndex {
             chunks: u32::try_from(carry.len().div_ceil(RUN_CHUNK_ENTRIES))
                 .map_err(|_| StorageError::Exhausted("short-id run chunks".to_owned()))?,
         };
+        // Queue the run for deletion before it exists: an attempt that is
+        // abandoned (another compactor won, or a crash) leaves a queued
+        // collection that garbage collection removes. The publish takes the
+        // entry off the list.
+        let run_collection = self.run_collection(&run);
+        self.queue_garbage(db, &[(run_collection, now_ms.saturating_add(grace_ms))])?;
         self.write_run(db, &run, &carry)?;
         kept.push(run);
         let new_manifest = Manifest {
@@ -813,21 +841,14 @@ impl ShortIdIndex {
                 "short-id runs do not cover the folded owner sequence".to_owned(),
             ));
         }
-        let manifest_txn = db.begin_transaction();
-        manifest_txn.put(
-            self.pool,
-            self.collection_id,
-            derived_id(MANIFEST_PREFIX, version, 0),
-            &NodeData::new(Bytes::from(new_manifest.encode()?)),
-        )?;
-        manifest_txn.commit()?;
-
         let retired_collections = self.publish_compaction(
             db,
             &PublishPlan {
                 counters,
                 counter_token,
                 version,
+                run_collection,
+                manifest: new_manifest.encode()?,
                 retired,
                 now_ms,
                 grace_ms,
@@ -841,26 +862,66 @@ impl ShortIdIndex {
         }))
     }
 
-    /// The compaction's last step: one transaction that moves the counter and
-    /// queues the retired collections.
+    /// Append `items` to the garbage list.
+    fn queue_garbage(&self, db: &Database, items: &[([u8; 16], u64)]) -> Result<(), StorageError> {
+        let txn = db.begin_transaction();
+        let (record, token) = self.read_record(&txn, &self.collection_id, GC_ID)?;
+        let mut garbage = match record {
+            Some(record) => decode_gc(&record.bytes)?,
+            None => Vec::new(),
+        };
+        garbage.extend_from_slice(items);
+        txn.expect_record_version(self.pool, self.collection_id, GC_ID, token)?;
+        txn.put(
+            self.pool,
+            self.collection_id,
+            GC_ID,
+            &NodeData::new(Bytes::from(encode_gc(&garbage)?)),
+        )?;
+        txn.commit()
+    }
+
+    /// The compaction's last step. The run and manifest stay valid for as
+    /// long as the counter's epoch, start and manifest version are unchanged,
+    /// so only the publish is retried when a writer commits first.
     fn publish_compaction(&self, db: &Database, plan: &PublishPlan) -> Result<usize, StorageError> {
-        // Publish. Writers kept appending while the run was built, so this
-        // transaction re-reads the counter itself and carries the few entries
-        // appended since into the new generation; only a commit landing
-        // between that read and this commit makes it stale, which keeps a busy
-        // room from starving the compaction.
+        let mut last = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.publish_once(db, plan) {
+                Ok(Published::Done(retired)) => return Ok(retired),
+                Ok(Published::Superseded) => {
+                    return Err(StorageError::StaleRead {
+                        pool: self.pool,
+                        collection_id: self.collection_id,
+                        expected: plan.counter_token,
+                        actual: 0,
+                    })
+                }
+                Err(error) if error.is_stale_read() => last = Some(error),
+                Err(error) => return Err(error),
+            }
+            // Give the writer that beat us a gap to idle in.
+            let backoff = u64::try_from(attempt.min(10)).unwrap_or(10);
+            std::thread::sleep(std::time::Duration::from_micros(
+                100_u64.saturating_mul(backoff),
+            ));
+        }
+        Err(last.unwrap_or_else(|| StorageError::Internal("publish retry budget".to_owned())))
+    }
+
+    /// One transaction that moves the counter and queues the retired
+    /// collections. Writers kept appending while the run was built, so it
+    /// re-reads the counter itself and carries the few entries appended since
+    /// into the new generation; only a commit landing between that read and
+    /// this commit makes it stale.
+    fn publish_once(&self, db: &Database, plan: &PublishPlan) -> Result<Published, StorageError> {
         let publish = db.begin_transaction();
         let (live, live_token) = self.read_counters(&publish)?;
         if live.log_epoch != plan.counters.log_epoch
             || live.manifest_version != plan.counters.manifest_version
             || live.log_epoch_start_seq != plan.counters.log_epoch_start_seq
         {
-            return Err(StorageError::StaleRead {
-                pool: self.pool,
-                collection_id: self.collection_id,
-                expected: plan.counter_token,
-                actual: live_token,
-            });
+            return Ok(Published::Superseded);
         }
         let new_epoch = plan.counters.log_epoch.saturating_add(1);
         let new_generation = self.owner_log_collection(new_epoch);
@@ -885,6 +946,8 @@ impl ShortIdIndex {
             Some(record) => decode_gc(&record.bytes)?,
             None => Vec::new(),
         };
+        // The run is installed: it is live, not garbage.
+        garbage.retain(|(collection, _)| *collection != plan.run_collection);
         let deadline = plan.now_ms.saturating_add(plan.grace_ms);
         let retired_collections = plan.retired.len();
         garbage.extend(
@@ -912,8 +975,14 @@ impl ShortIdIndex {
             GC_ID,
             &NodeData::new(Bytes::from(encode_gc(&garbage)?)),
         )?;
+        publish.put(
+            self.pool,
+            self.collection_id,
+            derived_id(MANIFEST_PREFIX, plan.version, 0),
+            &NodeData::new(Bytes::from(plan.manifest.clone())),
+        )?;
         publish.commit()?;
-        Ok(retired_collections)
+        Ok(Published::Done(retired_collections))
     }
 
     fn write_run(
@@ -923,6 +992,8 @@ impl ShortIdIndex {
         entries: &[Entry],
     ) -> Result<(), StorageError> {
         let collection = self.run_collection(run);
+        #[cfg(test)]
+        WRITTEN_RUNS.lock().push((self.collection_id, collection));
         let mut index = 0_u32;
         for group in entries.chunks(RUN_CHUNK_ENTRIES * CHUNKS_PER_TXN) {
             let txn = db.begin_transaction();
@@ -1000,7 +1071,14 @@ impl ShortIdIndex {
         let counters = self.counters(db)?;
         let txn = db.begin_transaction();
         let manifest = self.read_manifest(&txn, counters.manifest_version)?;
-        let mut live = vec![self.owner_log_collection(counters.log_epoch)];
+        // Repacking an empty collection brings back records of collections
+        // deleted before it (see the ignored engine test
+        // `repacking_an_empty_collection_resurrects_a_deleted_one`), so the
+        // current generation is repacked only once it holds entries.
+        let mut live = Vec::new();
+        if counters.next_owner_seq > counters.log_epoch_start_seq {
+            live.push(self.owner_log_collection(counters.log_epoch));
+        }
         live.extend(manifest.runs.iter().map(|run| self.run_collection(run)));
         let pool = db.pool(self.pool);
         for collection in &live {
@@ -1045,9 +1123,12 @@ impl ShortIdIndex {
         txn: &DatabaseTransaction<'_>,
         counters: &ScopeCounters,
     ) -> Result<(), StorageError> {
-        let manifest = self.read_manifest(txn, counters.manifest_version)?;
-        for run in &manifest.runs {
-            txn.delete_collection(self.pool, self.run_collection(run))?;
+        // Purge is the recovery tool: a manifest that cannot be read must not
+        // stop it, so the runs it names are skipped and the rest still dropped.
+        if let Ok(manifest) = self.read_manifest(txn, counters.manifest_version) {
+            for run in &manifest.runs {
+                txn.delete_collection(self.pool, self.run_collection(run))?;
+            }
         }
         let (record, _) = self.read_record(txn, &self.collection_id, GC_ID)?;
         if let Some(record) = record {

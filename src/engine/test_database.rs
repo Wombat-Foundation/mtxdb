@@ -3418,3 +3418,34 @@ fn a_committed_delete_collection_hides_synced_records() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Repacking a collection that holds no records must not bring back the
+/// records of a collection deleted before it. Today they reappear.
+#[test]
+#[ignore = "engine bug: repack_collection_reachable on an empty collection resurrects a deleted collection's records"]
+fn repacking_an_empty_collection_resurrects_a_deleted_one() {
+    let root = test_root("repack_empty_resurrects");
+    let db = Database::open(root.clone()).unwrap();
+    let (doomed, empty) = ([0x71_u8; 16], [0x72_u8; 16]);
+    let put = db.begin_transaction();
+    put.put(ShardType::Edges, doomed, node(1), &data(b"doomed"))
+        .unwrap();
+    put.commit().unwrap();
+    let delete = db.begin_transaction();
+    delete.delete_collection(ShardType::Edges, doomed).unwrap();
+    delete.commit().unwrap();
+    let read = |db: &Database| {
+        db.begin_transaction()
+            .get_with_record_versions(ShardType::Edges, &doomed, &[node(1)])
+            .unwrap()
+            .0[0]
+            .is_some()
+    };
+    assert!(!read(&db), "the delete itself must take effect");
+    db.pool(ShardType::Edges)
+        .repack_collection_reachable(&empty, |_, _| Vec::new())
+        .unwrap();
+    assert!(!read(&db), "the repack brought the deleted record back");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}

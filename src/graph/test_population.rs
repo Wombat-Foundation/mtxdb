@@ -1,5 +1,5 @@
-use super::population::run_chunk_id_for_test;
 use super::population::*;
+use super::population::{run_chunk_id_for_test, WRITTEN_RUNS};
 use crate::database::Database;
 use crate::layout::ShardType;
 use crate::short_id::{BatchEvent, ScopeCounters, ShortIdIndex};
@@ -34,20 +34,32 @@ fn hash(i: u32) -> ElementHash {
     ElementHash::from_digest32(digest)
 }
 
+/// `record_events`, retried while the engine reports a retryable
+/// `WouldBlock` (record versions advancing under a read), as a caller would.
+fn record_retrying(scope: &ShortIdIndex, db: &Database, events: &[BatchEvent<'_>]) {
+    for _ in 0..1000 {
+        match scope.record_events(db, events) {
+            Ok(_) => return,
+            Err(error) if error.is_would_block() => std::thread::yield_now(),
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+    panic!("record_events kept blocking");
+}
+
 fn record(db: &Database, range: std::ops::Range<u32>) {
     for i in range {
         let key = format!("$e{i}").into_bytes();
         let payload = encode_owner_payload(hash(i));
-        index()
-            .record_events(
-                db,
-                &[BatchEvent {
-                    owner: &key,
-                    families: &[],
-                    owner_payload: Some(&payload),
-                }],
-            )
-            .unwrap();
+        record_retrying(
+            &index(),
+            db,
+            &[BatchEvent {
+                owner: &key,
+                families: &[],
+                owner_payload: Some(&payload),
+            }],
+        );
     }
 }
 
@@ -414,6 +426,77 @@ fn verify_flags_runs_that_disagree_with_the_log() {
     txn.commit().unwrap();
     let report = index().verify(&db, &[]).unwrap();
     assert!(!report.is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Every run a compaction attempt started writing is either live or queued for
+/// deletion, however many attempts raced and were abandoned: two compactors
+/// and a writer on one scope.
+#[test]
+fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
+    let scope = ShortIdIndex::new(ShardType::Edges, [0x6f; 16]);
+    let root = test_root("leak");
+    let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            for i in 0..300_u32 {
+                let key = format!("$e{i}").into_bytes();
+                let payload = encode_owner_payload(hash(i));
+                record_retrying(
+                    &scope,
+                    &db,
+                    &[BatchEvent {
+                        owner: &key,
+                        families: &[],
+                        owner_payload: Some(&payload),
+                    }],
+                );
+                std::thread::sleep(std::time::Duration::from_micros(150));
+            }
+        })
+    };
+    let compactors: Vec<_> = (0..2)
+        .map(|_| {
+            let db = db.clone();
+            let writer_done = std::sync::Arc::new(());
+            std::thread::spawn(move || {
+                let _ = writer_done;
+                for _ in 0..40 {
+                    // A starved attempt may report a stale read; leaks are
+                    // what is under test, not progress.
+                    let _ = scope.compact(&db, 0, GRACE_MS, true);
+                }
+            })
+        })
+        .collect();
+    writer.join().unwrap();
+    for compactor in compactors {
+        compactor.join().unwrap();
+    }
+    scope.compact(&db, 0, GRACE_MS, true).unwrap();
+    let known: Vec<[u8; 16]> = scope
+        .run_collections_for_test(&db)
+        .unwrap()
+        .into_iter()
+        .map(|(collection, _)| collection)
+        .collect();
+    let written: Vec<[u8; 16]> = WRITTEN_RUNS
+        .lock()
+        .iter()
+        .filter(|(owner, _)| *owner == [0x6f; 16])
+        .map(|(_, run)| *run)
+        .collect();
+    assert!(!written.is_empty());
+    for run in &written {
+        assert!(
+            known.contains(run),
+            "a written run is neither live nor queued"
+        );
+    }
+    let report = scope.verify(&db, &[]).unwrap();
+    assert!(report.is_consistent(), "{:?}", report.problems);
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
