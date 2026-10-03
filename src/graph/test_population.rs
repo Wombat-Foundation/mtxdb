@@ -541,3 +541,72 @@ fn a_run_collected_before_the_publish_is_never_published() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The scope's records stay in one pool while the owner log and the runs live
+/// in another: counter, manifests and garbage list in `Edges`; generations and
+/// runs in `ServerInfo`.
+#[test]
+fn the_log_and_runs_can_live_in_their_own_pool() {
+    let scope =
+        ShortIdIndex::new(ShardType::Edges, [0x75; 16]).with_log_pool(ShardType::ServerInfo);
+    let root = test_root("log-pool");
+    let db = Database::open(root.clone()).unwrap();
+    let put = |range: std::ops::Range<u32>| {
+        for i in range {
+            let key = format!("$e{i}").into_bytes();
+            let payload = encode_owner_payload(hash(i));
+            record_retrying(
+                &scope,
+                &db,
+                &[BatchEvent {
+                    owner: &key,
+                    families: &[],
+                    owner_payload: Some(&payload),
+                }],
+            );
+        }
+    };
+    let has = |pool: ShardType, collection: [u8; 16], id| {
+        db.begin_transaction()
+            .get_with_record_versions(pool, &collection, &[id])
+            .unwrap()
+            .0[0]
+            .is_some()
+    };
+    put(0..30);
+    let generation0 = scope.owner_log_collection(0);
+    let entry1 = crate::short_id::owner_log_record_id_for_test(1);
+    assert!(has(ShardType::ServerInfo, generation0, entry1));
+    assert!(!has(ShardType::Edges, generation0, entry1));
+
+    scope.compact(&db, 0, 0, true).unwrap().unwrap();
+    put(30..40);
+    let runs = scope.run_collections_for_test(&db).unwrap();
+    assert!(runs.iter().any(|(_, present)| *present));
+    for (collection, _) in &runs {
+        assert!(!has(
+            ShardType::Edges,
+            *collection,
+            run_chunk_id_for_test(0)
+        ));
+    }
+    let snapshot = scope.population_snapshot(&db).unwrap();
+    assert_eq!(snapshot.len(), 40);
+    assert!(scope.verify(&db, &[]).unwrap().is_consistent());
+
+    assert_eq!(scope.collect_garbage(&db, u64::MAX).unwrap().dropped, 1);
+    assert!(!has(ShardType::ServerInfo, generation0, entry1));
+    assert_eq!(scope.repack_live_collections(&db).unwrap(), 2);
+    assert_eq!(scope.population_snapshot(&db).unwrap().len(), 40);
+
+    scope.purge(&db).unwrap();
+    for (collection, _) in &runs {
+        assert!(!has(
+            ShardType::ServerInfo,
+            *collection,
+            run_chunk_id_for_test(0)
+        ));
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}

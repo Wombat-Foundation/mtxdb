@@ -516,7 +516,17 @@ impl ShortIdIndex {
         collection: &[u8; 16],
         id: NodeId,
     ) -> Result<(Option<NodeData>, u64), StorageError> {
-        let (records, tokens) = txn.get_with_record_versions(self.pool, collection, &[id])?;
+        self.read_record_in(self.pool, txn, collection, id)
+    }
+
+    fn read_record_in(
+        &self,
+        pool: crate::layout::ShardType,
+        txn: &DatabaseTransaction<'_>,
+        collection: &[u8; 16],
+        id: NodeId,
+    ) -> Result<(Option<NodeData>, u64), StorageError> {
+        let (records, tokens) = txn.get_with_record_versions(pool, collection, &[id])?;
         Ok((
             records.into_iter().next().flatten(),
             tokens.first().copied().unwrap_or(0),
@@ -563,7 +573,7 @@ impl ShortIdIndex {
             let ids: Vec<NodeId> = (chunk..end)
                 .map(|i| derived_id(RUN_CHUNK_PREFIX, i, 0))
                 .collect();
-            let (records, _) = txn.get_with_record_versions(self.pool, &collection, &ids)?;
+            let (records, _) = txn.get_with_record_versions(self.log_pool, &collection, &ids)?;
             for record in records {
                 let record = record.ok_or(StorageError::StaleGeneration {
                     generation: u64::from(run.version),
@@ -946,7 +956,7 @@ impl ShortIdIndex {
             live.next_owner_seq,
         )? {
             publish.put(
-                self.pool,
+                self.log_pool,
                 new_generation,
                 owner_log_record_id(entry.seq),
                 &NodeData::new(Bytes::from(encode_owner_log(
@@ -1021,7 +1031,7 @@ impl ShortIdIndex {
             let txn = db.begin_transaction();
             for chunk in group.chunks(RUN_CHUNK_ENTRIES) {
                 txn.put(
-                    self.pool,
+                    self.log_pool,
                     collection,
                     derived_id(RUN_CHUNK_PREFIX, index, 0),
                     &NodeData::new(Bytes::from(encode_chunk(chunk)?)),
@@ -1069,7 +1079,7 @@ impl ShortIdIndex {
         }
         txn.expect_record_version(self.pool, self.collection_id, GC_ID, token)?;
         for (collection, _) in &due {
-            txn.delete_collection(self.pool, *collection)?;
+            txn.delete_collection(self.log_pool, *collection)?;
         }
         txn.put(
             self.pool,
@@ -1101,7 +1111,7 @@ impl ShortIdIndex {
         let manifest = self.read_manifest(&txn, counters.manifest_version)?;
         let mut live = vec![self.owner_log_collection(counters.log_epoch)];
         live.extend(manifest.runs.iter().map(|run| self.run_collection(run)));
-        let pool = db.pool(self.pool);
+        let pool = db.pool(self.log_pool);
         for collection in &live {
             pool.repack_collection_reachable(collection, |_, _| Vec::new())?;
         }
@@ -1130,8 +1140,12 @@ impl ShortIdIndex {
         collections
             .into_iter()
             .map(|collection| {
-                let (record, _) =
-                    self.read_record(&txn, &collection, derived_id(RUN_CHUNK_PREFIX, 0, 0))?;
+                let (record, _) = self.read_record_in(
+                    self.log_pool,
+                    &txn,
+                    &collection,
+                    derived_id(RUN_CHUNK_PREFIX, 0, 0),
+                )?;
                 Ok((collection, record.is_some()))
             })
             .collect()
@@ -1148,13 +1162,13 @@ impl ShortIdIndex {
         // stop it, so the runs it names are skipped and the rest still dropped.
         if let Ok(manifest) = self.read_manifest(txn, counters.manifest_version) {
             for run in &manifest.runs {
-                txn.delete_collection(self.pool, self.run_collection(run))?;
+                txn.delete_collection(self.log_pool, self.run_collection(run))?;
             }
         }
         let (record, _) = self.read_record(txn, &self.collection_id, GC_ID)?;
         if let Some(record) = record {
             for (collection, _) in decode_gc(&record.bytes)? {
-                txn.delete_collection(self.pool, collection)?;
+                txn.delete_collection(self.log_pool, collection)?;
             }
         }
         Ok(())

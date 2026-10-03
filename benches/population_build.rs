@@ -54,7 +54,12 @@ fn env_u32(key: &str, default: u32) -> u32 {
 }
 
 fn index() -> ShortIdIndex {
-    ShortIdIndex::new(ShardType::Edges, SCOPE)
+    let scope = ShortIdIndex::new(ShardType::Edges, SCOPE);
+    if env_u32("MTXDB_PB_LOG_POOL", 0) != 0 {
+        scope.with_log_pool(ShardType::ServerInfo)
+    } else {
+        scope
+    }
 }
 
 /// A spread-out 32-byte digest for event `i`.
@@ -309,7 +314,11 @@ fn sync_scaling(db: &Database, dir: &Path, owners: u32) {
 /// Compact the whole log, let the grace period pass, collect garbage, and
 /// report whether any pack bytes or shards came back.
 fn reclaim(db: &Database, dir: &Path) {
-    let pool = db.edges();
+    let pool = db.pool(if env_u32("MTXDB_PB_LOG_POOL", 0) != 0 {
+        ShardType::ServerInfo
+    } else {
+        ShardType::Edges
+    });
     println!(
         "  before: {}, shards retired {}",
         state_line(dir),
@@ -329,7 +338,17 @@ fn reclaim(db: &Database, dir: &Path) {
     );
     let started = Instant::now();
     let gc = index().collect_garbage(db, 1).expect("gc");
+    println!("  after gc (before repack): {}", state_line(dir));
+    if env_u32("MTXDB_PB_REPACK", 0) != 0 {
+        let repack = Instant::now();
+        let repacked = index().repack_live_collections(db).expect("repack");
+        println!(
+            "  repack of {repacked} live collections: {:.1}s",
+            repack.elapsed().as_secs_f64()
+        );
+    }
     db.edges().sync_all().expect("sync");
+    pool.sync_all().expect("sync");
     println!(
         "  gc: {:.1}s {gc:?}\n  after gc: {}, shards retired {}",
         started.elapsed().as_secs_f64(),

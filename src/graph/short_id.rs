@@ -456,6 +456,10 @@ impl ShortIdVerifyReport {
 #[derive(Debug, Clone, Copy)]
 pub struct ShortIdIndex {
     pub(crate) pool: ShardType,
+    /// The pool holding owner-log generations and compacted runs. Defaults to
+    /// `pool`; a pool holding little else lets a dropped generation's shards
+    /// retire (see [`Self::with_log_pool`]).
+    pub(crate) log_pool: ShardType,
     pub(crate) collection_id: [u8; 16],
     max_id: u32,
 }
@@ -466,9 +470,29 @@ impl ShortIdIndex {
     pub fn new(pool: ShardType, collection_id: [u8; 16]) -> Self {
         Self {
             pool,
+            log_pool: pool,
             collection_id,
             max_id: SHORT_ID_MAX,
         }
+    }
+
+    /// Keep owner-log generations and compacted runs in `log_pool` instead of
+    /// the scope's own pool.
+    ///
+    /// Dropping a collection is a tombstone; its bytes come back only when a
+    /// repack retires every shard they sit in. In the scope's own pool the log
+    /// shares shards with the id records, which stay live, so a dropped
+    /// generation frees nothing (measured at 1M owners). In a pool that holds
+    /// little else, a drop followed by [`Self::repack_live_collections`]
+    /// retires whole shards. Counter, manifests and the garbage list stay in
+    /// the scope's pool, and one transaction may span both.
+    ///
+    /// Choose it once per scope, before any owner is recorded: entries
+    /// already written stay where they were.
+    #[must_use]
+    pub fn with_log_pool(mut self, log_pool: ShardType) -> Self {
+        self.log_pool = log_pool;
+        self
     }
 
     /// Lower the largest id this scope may allocate (at most [`SHORT_ID_MAX`]),
@@ -567,7 +591,7 @@ impl ShortIdIndex {
         }
         let ids: Vec<NodeId> = (from..to).map(owner_log_record_id).collect();
         let (records, _) =
-            txn.get_with_record_versions(self.pool, &self.owner_log_collection(epoch), &ids)?;
+            txn.get_with_record_versions(self.log_pool, &self.owner_log_collection(epoch), &ids)?;
         (from..to)
             .zip(records)
             .map(|(seq, record)| {
@@ -845,7 +869,7 @@ impl ShortIdIndex {
         // says how many there have been.
         let (counters, _) = self.read_counters(txn)?;
         for epoch in 0..=counters.log_epoch {
-            txn.delete_collection(self.pool, self.owner_log_collection(epoch))?;
+            txn.delete_collection(self.log_pool, self.owner_log_collection(epoch))?;
         }
         self.stage_population_purge(txn, &counters)?;
         txn.delete_collection(self.pool, self.collection_id)?;
@@ -1309,7 +1333,7 @@ impl ShortIdIndex {
             let log = self.owner_log_collection(counters.log_epoch);
             for (seq, payload) in allocation.owner_log {
                 txn.put(
-                    self.pool,
+                    self.log_pool,
                     log,
                     owner_log_record_id(seq),
                     &NodeData::new(Bytes::from(payload)),
