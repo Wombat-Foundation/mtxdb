@@ -1485,7 +1485,8 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     for (lane, chunk) in lanes.iter_mut().zip(lattice_bytes.as_chunks::<2>().0) {
         *lane = u16::from_le_bytes(*chunk);
     }
-    let state_group_id = rezzy::hamt::state_group_id_from_lthash(&rezzy::state::LtHash(lanes));
+    let lattice = rezzy::state::LtLattice::<1024>::from(lanes);
+    let state_group_id = rezzy::hamt::state_group_id_from_lthash(&lattice);
 
     let mut out = Vec::new();
     writeln!(out, "// HAMT state-group root (Synapse wire v1)").unwrap();
@@ -9055,6 +9056,7 @@ fn import_pdu_events(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_pdu_events_with_raw(
     db: &Database,
     store: &PackfileStorage,
@@ -9088,15 +9090,6 @@ fn import_pdu_events_with_raw(
 
     let collection_hex = format_id(&collection_id);
 
-    // Decode and dedup in one pass, retaining the first occurrence of each
-    // node ID directly — no intermediate full-size buffer, so a large
-    // federation response's bodies are held once, not twice. The 128-bit
-    // node ID is a truncated hash, so two distinct event IDs can in
-    // principle truncate to the same key; that is a collision and must be
-    // rejected rather than silently collapsed. A same-ID repeat that carries
-    // the same event_id is the same logical event and counts as already
-    // present — the old per-event loop would have found the record its first
-    // occurrence just stored.
     let first: Vec<([u8; 16], String, NodeData)> = {
         let mut first = Vec::with_capacity(events.len());
         let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(events.len());
@@ -9134,11 +9127,6 @@ fn import_pdu_events_with_raw(
         first
     };
 
-    // One batched index probe for dedup/collision checks, then one `put_many`
-    // for only the genuinely-new records — instead of N get+put round trips,
-    // one index/pack generation, and a locality-ordered rather than
-    // offset-coalesced set of candidate reads (get_many sorts candidates;
-    // merging them into prefetch extents is the opt-in read plan).
     let probe_ids: Vec<[u8; 16]> = first.iter().map(|(id, _, _)| *id).collect();
     let existing = store.get_many(&collection_id, &probe_ids)?;
     let mut to_write: Vec<([u8; 16], NodeData)> = Vec::new();
@@ -9153,34 +9141,11 @@ fn import_pdu_events_with_raw(
             to_write.push((id_bytes, data));
         }
     }
-    // Record the auth adjacency before touching the event pool. The batch is atomic
-    // per room, so a structural conflict (the same event with a different prev or
-    // auth) rejects the import before any primary write and leaves no partial
-    // adjacency; a later re-import repairs adjacency for events written without it.
     record_matrix_adjacency_with_raw(db, template, events, raw_adjacency)?;
 
-    // Keep physical event order causal even when the input is newest-first.
-    // This is especially important for establishment batches: the metadata
-    // frame must lead, but the event frames should still be parent-before-child.
-    if let Some(order) = topological_event_order_with_template(events, template)? {
-        let mut order_by_node = HashMap::with_capacity(order.len());
-        for event in events {
-            if let (Some(event_id), Some(node_id)) =
-                (event_id(event), template_node_id(template, event)?)
-            {
-                if let Some(position) = order.get(event_id) {
-                    order_by_node.insert(node_id, *position);
-                }
-            }
-        }
-        to_write
-            .sort_by_key(|(node_id, _)| order_by_node.get(node_id).copied().unwrap_or(usize::MAX));
-    }
+    // Preserve causal order even when input arrives newest-first.
+    sort_events_topologically(&mut to_write, events, template)?;
 
-    // Genesis metadata precedes the batch's records, so it is the collection's
-    // first frame and is durable no later than any application record. A
-    // failure here aborts the batch: proceeding would write records into a
-    // collection with no genesis record. The engine enforces this ordering.
     if resolved.batch_has_create {
         established_collections.insert(collection_id);
         let extension = MatrixRoomExtension::from_events(events);
@@ -9192,6 +9157,60 @@ fn import_pdu_events_with_raw(
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
 
+    repair_import_state_groups(state_store, events, auth_chain, &resolved.canonical_id);
+
+    if let Some(room_id) = detected_collection {
+        eprintln!("{room_id} ({collection_hex})");
+    } else {
+        eprintln!("collection {collection_hex}");
+    }
+    eprintln!("  imported: {event_count} events");
+    if skipped > 0 {
+        eprintln!("  skipped: {skipped} events (missing event_id)");
+    }
+    if already_present > 0 {
+        let suffix = if already_present > already_present_ids.len() as u64 {
+            ", ..."
+        } else {
+            ""
+        };
+        eprintln!(
+            "  already present: {already_present} [{}{suffix}]",
+            already_present_ids.join(", "),
+        );
+    }
+
+    Ok(())
+}
+
+fn sort_events_topologically(
+    to_write: &mut [([u8; 16], NodeData)],
+    events: &[OwnedValue],
+    template: &CollectionTemplate,
+) -> anyhow::Result<()> {
+    let Some(order) = topological_event_order_with_template(events, template)? else {
+        return Ok(());
+    };
+    let mut order_by_node = HashMap::with_capacity(order.len());
+    for event in events {
+        if let (Some(event_id), Some(node_id)) =
+            (event_id(event), template_node_id(template, event)?)
+        {
+            if let Some(position) = order.get(event_id) {
+                order_by_node.insert(node_id, *position);
+            }
+        }
+    }
+    to_write.sort_by_key(|(node_id, _)| order_by_node.get(node_id).copied().unwrap_or(usize::MAX));
+    Ok(())
+}
+
+fn repair_import_state_groups(
+    state_store: &PackfileStorage,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+    canonical_id: &str,
+) {
     // Replayed batches still need state-group repair when the derived index is
     // incomplete, but a complete replay should not rebuild the whole DAG.
     // Read the existing mappings in one backend batch and only walk the DAG
@@ -9235,8 +9254,7 @@ fn import_pdu_events_with_raw(
     let unresolved_count = if loaded {
         0
     } else {
-        let state_computation =
-            compute_state_groups_partial(events, auth_chain, &resolved.canonical_id);
+        let state_computation = compute_state_groups_partial(events, auth_chain, canonical_id);
         let unresolved = state_computation.unresolved;
         state_groups = state_computation.groups;
         computed_instances = state_computation.instances;
@@ -9282,7 +9300,7 @@ fn import_pdu_events_with_raw(
         }
     }
     if !computed_instances.is_empty() {
-        match materialize_state_hamts(state_store, &resolved.canonical_id, &computed_instances) {
+        match materialize_state_hamts(state_store, canonical_id, &computed_instances) {
             Ok(written) => eprintln!(
                 "  state HAMT: {written} records materialized for {} state groups",
                 computed_instances.len()
@@ -9290,29 +9308,6 @@ fn import_pdu_events_with_raw(
             Err(error) => eprintln!("warning: unable to persist state HAMT: {error}"),
         }
     }
-
-    if let Some(room_id) = detected_collection {
-        eprintln!("{room_id} ({collection_hex})");
-    } else {
-        eprintln!("collection {collection_hex}");
-    }
-    eprintln!("  imported: {event_count} events");
-    if skipped > 0 {
-        eprintln!("  skipped: {skipped} events (missing event_id)");
-    }
-    if already_present > 0 {
-        let suffix = if already_present > already_present_ids.len() as u64 {
-            ", ..."
-        } else {
-            ""
-        };
-        eprintln!(
-            "  already present: {already_present} [{}{suffix}]",
-            already_present_ids.join(", "),
-        );
-    }
-
-    Ok(())
 }
 
 /// Resolve a Matrix input's room collection and prove that it is established
@@ -11420,10 +11415,10 @@ fn record_matrix_adjacency_with_raw(
         let (Some(room_id), Some(event_id)) = (event_room_id(event), event_id(event)) else {
             continue;
         };
-        let fields = raw_adjacency
-            .and_then(|raw| raw.get(index))
-            .map(MatrixEventFields::from_owned)
-            .unwrap_or_else(|| MatrixEventFields::from_event(event_id, event));
+        let fields = raw_adjacency.and_then(|raw| raw.get(index)).map_or_else(
+            || MatrixEventFields::from_event(event_id, event),
+            MatrixEventFields::from_owned,
+        );
         rooms.entry(room_id).or_default().push(fields);
     }
     for (room_id, fields) in rooms {

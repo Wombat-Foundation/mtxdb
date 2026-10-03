@@ -132,7 +132,7 @@ pub(crate) fn encode_state_hamt_root(
     out.extend_from_slice(&room_id_len.to_be_bytes());
     out.extend_from_slice(room_id.as_bytes());
     out.extend_from_slice(root_hash);
-    for lane in &lattice.0 {
+    for lane in lattice.as_ref() {
         out.extend_from_slice(&lane.to_le_bytes());
     }
     debug_assert_eq!(
