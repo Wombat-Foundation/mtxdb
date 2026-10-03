@@ -126,6 +126,11 @@ multi-reader = []
 # façade. See docs/docs/auth-chain-closures-plan.md.
 bitmaps = ["dep:roaring"]
 
+# MSC4521 set reconciliation over the persisted event population (owner log,
+# sorted runs, resident kernel): element hashing, kernels and the `Population`
+# trait come from `rezzy-recon`. Off by default; carries that dependency.
+reconcile = ["dep:rezzy-recon"]
+
 [dependencies]
 arc-swap = "1"
 blake3 = "=1.5.5"
@@ -137,6 +142,7 @@ fs2 = "0.4"
 memchr = "2.7"
 memmap2 = "0.9.11"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
+rezzy-recon = { path = "../rezzy/rezzy-recon", version = "0.6.0-rc.1", optional = true }
 roaring = { version = "0.10.12", optional = true }
 sha2 = "0.10"
 zstd = { version = "0.13", default-features = false, optional = true }
