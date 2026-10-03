@@ -217,6 +217,12 @@ pub(crate) fn reverse_record_id_for_test(short_id: u32) -> NodeId {
     indexed_id(REVERSE_PREFIX, short_id)
 }
 
+/// The id of an owner-log entry, exposed so a test can corrupt one.
+#[cfg(test)]
+pub(crate) fn owner_log_record_id_for_test(seq: u32) -> NodeId {
+    owner_log_record_id(seq)
+}
+
 /// The id of an edges record, exposed for the same reason.
 #[cfg(test)]
 pub(crate) fn edges_record_id_for_test(short_id: u32, family: u16) -> NodeId {
@@ -231,8 +237,14 @@ fn header(magic: [u8; 4]) -> Vec<u8> {
 }
 
 fn check_header<'a>(bytes: &'a [u8], magic: [u8; 4], what: &str) -> Result<&'a [u8], StorageError> {
-    if bytes.len() < 5 || bytes[..4] != magic || bytes[4] != SHORT_ID_FORMAT_VERSION {
+    if bytes.len() < 5 || bytes[..4] != magic {
         return Err(StorageError::Corrupt(format!("short-id {what} header")));
+    }
+    if bytes[4] != SHORT_ID_FORMAT_VERSION {
+        return Err(StorageError::Corrupt(format!(
+            "unsupported short-id format v{} in {what} record (this build reads v{SHORT_ID_FORMAT_VERSION})",
+            bytes[4]
+        )));
     }
     Ok(&bytes[5..])
 }
@@ -509,32 +521,36 @@ impl ShortIdIndex {
         derive_collection_id(Some(MEMBER_NAMESPACE_INTL), &name)
     }
 
-    /// The owner-log entries with `from <= seq < to`, which must all lie in the
-    /// current generation.
+    /// The owner-log entries of generation `epoch` with `from <= seq < to`.
+    ///
+    /// The current generation is bounded below by `log_epoch_start_seq`. An
+    /// older generation is readable only while it has not been dropped (a
+    /// snapshot's grace period); which sequence numbers it holds is the
+    /// caller's knowledge, so a missing entry is reported as corruption.
     ///
     /// # Errors
-    /// Returns an error if the range reaches below the current generation
-    /// (those entries were folded into a run), above the assigned sequence, or
-    /// if an entry in range is missing or corrupt.
+    /// Returns an error if `epoch` is in the future, the range reaches below
+    /// the current generation (for `epoch == log_epoch`) or above the assigned
+    /// sequence, or if an entry in range is missing or corrupt.
     pub fn owner_log(
         &self,
         db: &Database,
+        epoch: u32,
         from: u32,
         to: u32,
     ) -> Result<Vec<OwnerLogEntry>, StorageError> {
         let txn = db.begin_transaction();
         let (counters, _) = self.read_counters(&txn)?;
-        if from < counters.log_epoch_start_seq || to > counters.next_owner_seq || from > to {
+        let below_current = epoch == counters.log_epoch && from < counters.log_epoch_start_seq;
+        if epoch > counters.log_epoch || below_current || to > counters.next_owner_seq || from > to
+        {
             return Err(StorageError::Internal(
-                "owner-log range outside the current generation".to_owned(),
+                "owner-log range outside the requested generation".to_owned(),
             ));
         }
         let ids: Vec<NodeId> = (from..to).map(owner_log_record_id).collect();
-        let (records, _) = txn.get_with_record_versions(
-            self.pool,
-            &self.owner_log_collection(counters.log_epoch),
-            &ids,
-        )?;
+        let (records, _) =
+            txn.get_with_record_versions(self.pool, &self.owner_log_collection(epoch), &ids)?;
         (from..to)
             .zip(records)
             .map(|(seq, record)| {
@@ -891,6 +907,7 @@ impl ShortIdIndex {
                 }
             }
         }
+        self.verify_owner_log(db, &txn, counters, &mut report)?;
         report.owners_checked = owner_bits;
         if owner_bits != counters.next_owner_seq.saturating_sub(1) {
             report.problems.push(format!(
@@ -899,6 +916,60 @@ impl ShortIdIndex {
             ));
         }
         Ok(report)
+    }
+
+    /// The current owner-log generation: every entry exists, decodes, and names
+    /// a distinct id whose forward record carries the owner bit. Older
+    /// generations were folded into runs and are checked against them.
+    fn verify_owner_log(
+        &self,
+        db: &Database,
+        txn: &DatabaseTransaction<'_>,
+        counters: ScopeCounters,
+        report: &mut ShortIdVerifyReport,
+    ) -> Result<(), StorageError> {
+        let get = |id: NodeId| -> Result<Option<NodeData>, StorageError> {
+            let (records, _) =
+                txn.get_with_record_versions(self.pool, &self.collection_id, &[id])?;
+            Ok(records.into_iter().next().flatten())
+        };
+        match self.owner_log(
+            db,
+            counters.log_epoch,
+            counters.log_epoch_start_seq,
+            counters.next_owner_seq,
+        ) {
+            Ok(entries) => {
+                let mut distinct: HashSet<u32> = HashSet::new();
+                for entry in &entries {
+                    if !distinct.insert(entry.short_id) {
+                        report.problems.push(format!(
+                            "owner-log entry {} repeats id {}",
+                            entry.seq, entry.short_id
+                        ));
+                    }
+                    let owned = get(indexed_id(REVERSE_PREFIX, entry.short_id))?
+                        .map(|r| {
+                            check_header(&r.bytes, REVERSE_MAGIC, "reverse").map(<[u8]>::to_vec)
+                        })
+                        .transpose()?
+                        .and_then(|key| get(forward_id(&key)).transpose())
+                        .transpose()?
+                        .map(|f| decode_forward(&f.bytes).map(|f| f.owner))
+                        .transpose()?;
+                    if owned != Some(true) {
+                        report.problems.push(format!(
+                            "owner-log entry {} names id {} without an owner bit",
+                            entry.seq, entry.short_id
+                        ));
+                    }
+                }
+            }
+            Err(error) => report
+                .problems
+                .push(format!("owner log unreadable: {error}")),
+        }
+        Ok(())
     }
 
     /// `families` is `Some` when `keys[0]` owns the edge lists built from the

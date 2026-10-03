@@ -702,7 +702,12 @@ fn owned<'a>(owner: &'a [u8], payload: &'a [u8]) -> BatchEvent<'a> {
 fn log(db: &Database) -> Vec<(u32, u32, Vec<u8>)> {
     let counters = index().counters(db).unwrap();
     index()
-        .owner_log(db, counters.log_epoch_start_seq, counters.next_owner_seq)
+        .owner_log(
+            db,
+            counters.log_epoch,
+            counters.log_epoch_start_seq,
+            counters.next_owner_seq,
+        )
         .unwrap()
         .into_iter()
         .map(|e| (e.seq, e.short_id, e.payload))
@@ -857,6 +862,64 @@ fn purge_removes_the_owner_log_too() {
     // The generation collection is gone: a fresh owner starts a fresh log.
     index().record_events(&db, &[owned(b"$b", b"pb")]).unwrap();
     assert_eq!(log(&db), vec![(1, 1, b"pb".to_vec())]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_old_format_store_is_reported_as_unsupported() {
+    let root = test_root("old-format");
+    let db = Database::open(root.clone()).unwrap();
+    index().get_or_create(&db, &[b"$a"]).unwrap();
+    // Rewrite the counter as a v3 record (3, not the current version).
+    let txn = db.begin_transaction();
+    txn.put(
+        POOL,
+        SCOPE,
+        *b"MTXD-SID-CNTR-v1",
+        &crate::storage::NodeData::new(bytes::Bytes::from(vec![
+            b'S', b'I', b'D', b'C', 3, 0, 0, 0, 2,
+        ])),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    let error = index().counters(&db).unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported short-id format v3"),
+        "{error}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn verify_checks_each_log_entry_against_its_forward_record() {
+    let root = test_root("verify-log");
+    let db = Database::open(root.clone()).unwrap();
+    index()
+        .record_events(&db, &[owned(b"$a", b"pa"), owned(b"$b", b"pb")])
+        .unwrap();
+    assert!(index().verify(&db, &[PLAIN]).unwrap().is_consistent());
+    // Point entry 2 at id 1: the bit count still matches, the entry is wrong.
+    let counters = index().counters(&db).unwrap();
+    let txn = db.begin_transaction();
+    let mut bad = b"OWNL\x04".to_vec();
+    bad.extend_from_slice(&1_u32.to_be_bytes());
+    bad.extend_from_slice(b"pb");
+    txn.put(
+        POOL,
+        index().owner_log_collection(counters.log_epoch),
+        super::short_id::owner_log_record_id_for_test(2),
+        &crate::storage::NodeData::new(bytes::Bytes::from(bad)),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    let report = index().verify(&db, &[PLAIN]).unwrap();
+    assert!(
+        report.problems.iter().any(|p| p.contains("repeats id 1")),
+        "{:?}",
+        report.problems
+    );
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
