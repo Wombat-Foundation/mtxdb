@@ -2145,18 +2145,14 @@ impl ShardPool {
                 "record payload exceeds u32::MAX",
             )
         })?;
-        let frame_len = packfile::FRAME_FIXED_LEN
+        packfile::FRAME_FIXED_LEN
             .checked_add(payload_len)
-            .expect("fixed frame length plus u32 payload cannot overflow u32");
-        if frame_len > packfile::MAX_RECORD_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "record payload too large: {frame_len} > {}",
-                    packfile::MAX_RECORD_LEN
-                ),
-            ));
-        }
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "record frame length exceeds u32::MAX",
+                )
+            })?;
         Ok(())
     }
 
@@ -2335,7 +2331,7 @@ impl ShardPool {
             let frame_len_bytes: [u8; 4] = mem[offset_usize..prefix_end].try_into().unwrap();
             let frame_len = u32::from_le_bytes(frame_len_bytes);
 
-            if !(packfile::FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
+            if !(packfile::FRAME_FIXED_LEN..=packfile::MAX_FRAME_LEN).contains(&frame_len) {
                 return Err(StorageError::Corrupt(format!(
                     "invalid record length: {frame_len}"
                 )));
@@ -2446,7 +2442,7 @@ impl ShardPool {
                     .try_into()
                     .expect("validated length prefix range"),
             );
-            if !(packfile::FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
+            if !(packfile::FRAME_FIXED_LEN..=packfile::MAX_FRAME_LEN).contains(&frame_len) {
                 return Err(StorageError::Corrupt(format!(
                     "invalid record length: {frame_len}"
                 )));
@@ -2543,7 +2539,7 @@ impl ShardPool {
             let frame_len_bytes: [u8; 4] = mem[offset..prefix_end].try_into().unwrap();
             let frame_len = u32::from_le_bytes(frame_len_bytes);
 
-            if !(packfile::FRAME_FIXED_LEN..=packfile::MAX_RECORD_LEN).contains(&frame_len) {
+            if !(packfile::FRAME_FIXED_LEN..=packfile::MAX_FRAME_LEN).contains(&frame_len) {
                 return Err(StorageError::Corrupt(format!(
                     "invalid record length: {frame_len}"
                 )));
@@ -2680,12 +2676,6 @@ impl ShardPool {
                         "raw node length differs from framed uncompressed_len".into(),
                     )
                 });
-        }
-        if uncompressed_len > packfile::MAX_DATA_LEN {
-            return Err(StorageError::Corrupt(format!(
-                "framed uncompressed_len too large: {uncompressed_len} > {}",
-                packfile::MAX_DATA_LEN
-            )));
         }
         #[cfg(feature = "zstd")]
         {

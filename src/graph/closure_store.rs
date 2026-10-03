@@ -48,7 +48,6 @@ use bytes::Bytes;
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::logical_head::{LogicalHead, LogicalHeadValue};
-use crate::packfile;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
@@ -502,16 +501,7 @@ fn validate_publish(
             set.len()
         )));
     }
-    // The encoded coverage record must fit one engine record; a pathological
-    // interleaving of skipped and stored ids yields one run per skipped id.
     let payload = encode_coverage(set);
-    if payload.len() > usize::try_from(packfile::MAX_DATA_LEN).unwrap_or(usize::MAX) {
-        return Err(StorageError::Internal(format!(
-            "closure coverage needs {} bytes, above the {}-byte record limit",
-            payload.len(),
-            packfile::MAX_DATA_LEN
-        )));
-    }
     Ok((stored_count, skipped_count, payload))
 }
 

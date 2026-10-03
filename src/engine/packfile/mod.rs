@@ -317,15 +317,6 @@ pub struct ShardHeader {
     pub created_at: u64,
 }
 
-/// Maximum record size (64KB). Bounds the *uncompressed* on-disk frame
-/// length (`FRAME_FIXED_LEN + data.len()`, i.e. what the frame would
-/// take up were it stored raw) — checked at write time against the
-/// caller's plaintext `data`, and at read time against the actual on-disk
-/// frame length, which never exceeds the uncompressed bound (compression
-/// is only ever used when it shrinks a frame; see [`write_record`]).
-/// Reject anything larger during recovery scan.
-pub const MAX_RECORD_LEN: u32 = 64 * 1024;
-
 /// Per-frame flag: `data` is zstd-compressed on disk; decompress to
 /// `uncompressed_len` bytes before returning it to the caller.
 ///
@@ -427,10 +418,6 @@ impl ChecksumPolicy {
 /// between the length prefix and the node bytes: 1-byte flags + 4-byte
 /// `uncompressed_len` + 16-byte `collection_id` + 16-byte `hash`.
 pub(crate) const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
-
-/// Maximum plaintext node payload in one frame. This is lower than
-/// [`MAX_RECORD_LEN`] because the fixed v3 frame fields consume space too.
-pub const MAX_DATA_LEN: u32 = MAX_RECORD_LEN - FRAME_FIXED_LEN;
 
 /// A scanned `(collection_id, hash, file_offset)` entry from a packfile.
 pub type ScanEntry = ([u8; 16], [u8; 16], u64);
@@ -753,6 +740,28 @@ fn invalid_data(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
 
+/// Largest frame length a reader accepts: a frame lives wholly inside one
+/// shard, and shard offsets are bounded by `IndexEntry::MAX_OFFSET`, so a
+/// longer prefix can only be corruption. This is a sanity ceiling, not a
+/// record-size policy (that belongs to the collection template).
+pub(crate) const MAX_FRAME_LEN: u32 = {
+    // `IndexEntry::MAX_OFFSET` is `(1 << 32) - 2`; express the same
+    // invariant in the destination type instead of narrowing a u64.
+    u32::MAX - 1
+};
+
+/// Append exactly `n` bytes from `reader` to `buf`, allocating only as bytes
+/// actually arrive. A corrupt length prefix on a short stream therefore fails
+/// with `UnexpectedEof` instead of pre-allocating `n` bytes up front.
+fn read_exact_growing(reader: &mut impl Read, buf: &mut Vec<u8>, n: usize) -> io::Result<()> {
+    let start = buf.len();
+    reader.take(n as u64).read_to_end(buf)?;
+    if buf.len().saturating_sub(start) != n {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
+}
+
 /// Read a record length prefix, distinguishing clean EOF from a torn prefix.
 ///
 /// A zero-byte read is the normal end of an append-only pack. Once even one
@@ -821,7 +830,7 @@ pub fn map_pack(file: &File) -> io::Result<memmap2::Mmap> {
 }
 
 /// zstd compression level used for record payloads. A low level: packfile
-/// frames are small (<= [`MAX_RECORD_LEN`]) and written on the hot append
+/// frames are written on the hot append
 /// path, so this favors write throughput over squeezing out the last few
 /// percent of ratio.
 #[cfg(feature = "zstd")]
@@ -835,16 +844,27 @@ fn zstd_maybe_compress(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Decompress a frame's node bytes to exactly `expected_len` (the framed
-/// `uncompressed_len`, already range-checked by the caller). Shared by the
+/// `uncompressed_len`, a disk-provided u32, so only trusted once the output matches it). Shared by the
 /// buffered [`read_record`] path and the shard zero-copy decode path.
 #[cfg(feature = "zstd")]
 pub(crate) fn zstd_decompress(node_bytes: &[u8], expected_len: usize) -> io::Result<Vec<u8>> {
-    let decompressed = zstd::bulk::decompress(node_bytes, expected_len).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("zstd decompress failed: {e}"),
-        )
-    })?;
+    // Stream into a growing buffer: `bulk::decompress` allocates its full
+    // `capacity` up front, and `expected_len` is a disk-provided u32, so a
+    // corrupt header could otherwise demand up to 4 GiB before any byte is
+    // decoded. `take` also stops a frame that expands past its declared size.
+    let mut decompressed = Vec::new();
+    zstd::stream::read::Decoder::new(node_bytes)
+        .and_then(|decoder| {
+            decoder
+                .take((expected_len as u64).saturating_add(1))
+                .read_to_end(&mut decompressed)
+        })
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("zstd decompress failed: {e}"),
+            )
+        })?;
     if decompressed.len() != expected_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -864,7 +884,7 @@ pub(crate) fn zstd_decompress(node_bytes: &[u8], expected_len: usize) -> io::Res
 ///
 /// # Errors
 /// Returns `io::Error` on write failure, or if `record.data` would make
-/// even an uncompressed frame exceed [`MAX_RECORD_LEN`] (checked against
+/// even an uncompressed frame exceed [`u32::MAX`] (checked against
 /// the plaintext on-disk frame length — `FRAME_FIXED_LEN` plus
 /// `record.data.len()` — before compression, so this bound is never
 /// looser than what [`read_record`] will actually accept).
@@ -919,26 +939,32 @@ pub(crate) fn encode_record_with_options(
     compress: bool,
     write_checksum: bool,
 ) -> io::Result<Vec<u8>> {
-    let uncompressed_len =
-        u32::try_from(record.data.len()).expect("record payload exceeds u32::MAX");
+    let uncompressed_len = u32::try_from(record.data.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "record payload exceeds u32::MAX",
+        )
+    })?;
     let metadata_block = match &record.metadata {
         Some(metadata) if !metadata.is_empty() => Some(metadata.encode()?),
         _ => None,
     };
-    let metadata_len = metadata_block.as_ref().map_or(0, |block| {
-        u32::try_from(block.len()).expect("bounded below")
-    });
-    let plaintext_frame_len = FRAME_FIXED_LEN
+    let metadata_len = metadata_block.as_ref().map_or(Ok(0), |block| {
+        u32::try_from(block.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame metadata exceeds u32::MAX",
+            )
+        })
+    })?;
+    // The frame length prefix is a u32; return an input error rather than
+    // panicking when the payload and metadata cannot fit in it.
+    FRAME_FIXED_LEN
         .checked_add(metadata_len)
-        .expect("record frame length exceeds u32::MAX")
-        .checked_add(uncompressed_len)
-        .expect("record frame length exceeds u32::MAX");
-    if plaintext_frame_len > MAX_RECORD_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("record payload too large: {plaintext_frame_len} > {MAX_RECORD_LEN}"),
-        ));
-    }
+        .and_then(|len| len.checked_add(uncompressed_len))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "record frame exceeds u32::MAX")
+        })?;
 
     #[cfg(feature = "zstd")]
     let compressed = compress
@@ -964,9 +990,9 @@ pub(crate) fn encode_record_with_options(
 
     let frame_len = FRAME_FIXED_LEN
         .checked_add(metadata_len)
-        .expect("bounded by MAX_RECORD_LEN")
-        .checked_add(u32::try_from(node_bytes.len()).expect("bounded by MAX_RECORD_LEN"))
-        .expect("bounded by MAX_RECORD_LEN");
+        .expect("bounded by u32::MAX")
+        .checked_add(u32::try_from(node_bytes.len()).expect("bounded by u32::MAX"))
+        .expect("bounded by u32::MAX");
     let total_len = 4_u64.wrapping_add(u64::from(frame_len)).wrapping_add(4);
 
     // Assemble the whole frame in one buffer and issue a single
@@ -1029,15 +1055,15 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     };
 
     let frame_len = u32::from_le_bytes(len_buf);
-    if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
+    if !(FRAME_FIXED_LEN..=MAX_FRAME_LEN).contains(&frame_len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid record length: {frame_len}"),
         ));
     }
 
-    let mut payload = vec![0u8; usize::try_from(frame_len).expect("u32 always fits in usize")];
-    reader.read_exact(&mut payload)?;
+    let mut payload = Vec::new();
+    read_exact_growing(reader, &mut payload, frame_len as usize)?;
 
     let mut crc_buf = [0u8; 4];
     reader.read_exact(&mut crc_buf)?;
@@ -1087,17 +1113,11 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     };
 
     let data = if flags & FLAG_COMPRESSED != 0 {
-        if uncompressed_len > MAX_DATA_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_DATA_LEN}"),
-            ));
-        }
         #[cfg(feature = "zstd")]
         {
             Bytes::from(zstd_decompress(
                 node_bytes,
-                usize::try_from(uncompressed_len).expect("checked above"),
+                usize::try_from(uncompressed_len).expect("u32 fits in usize"),
             )?)
         }
         #[cfg(not(feature = "zstd"))]
@@ -1174,10 +1194,8 @@ struct FrameHeader {
 ///
 /// `tlv_len` comes straight from disk. The metadata block (its 5-byte prefix
 /// plus the TLV bytes) shares the frame's post-header body with the node bytes,
-/// so it must satisfy `block_len <= frame_len - FRAME_FIXED_LEN`. Because
-/// `frame_len` is itself capped at [`MAX_RECORD_LEN`], this both rejects a
-/// frame whose metadata overruns it and caps the metadata allocation at the
-/// record-size limit instead of the `u32` field's ~4 GiB range.
+/// so it must satisfy `block_len <= frame_len - FRAME_FIXED_LEN`. This rejects
+/// a metadata block that overruns its containing frame before allocation.
 fn checked_metadata_block_len(tlv_len: u32, frame_len: u32) -> io::Result<u32> {
     let block_len = 5u32
         .checked_add(tlv_len)
@@ -1200,7 +1218,7 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
     };
 
     let frame_len = u32::from_le_bytes(len_buf);
-    if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
+    if !(FRAME_FIXED_LEN..=MAX_FRAME_LEN).contains(&frame_len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid record length: {frame_len}"),
@@ -1254,12 +1272,6 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
         .ok_or_else(|| invalid_data("frame metadata overruns the frame"))?;
     let uncompressed_len = u32::from_le_bytes(fixed[1..5].try_into().unwrap());
     if flags & FLAG_COMPRESSED != 0 {
-        if uncompressed_len > MAX_DATA_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("framed uncompressed_len too large: {uncompressed_len} > {MAX_DATA_LEN}"),
-            ));
-        }
     } else if uncompressed_len != node_region_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2059,7 +2071,7 @@ pub fn extract_packfile_collection(
         };
 
         let frame_len = u32::from_le_bytes(len_buf);
-        if !(FRAME_FIXED_LEN..=MAX_RECORD_LEN).contains(&frame_len) {
+        if !(FRAME_FIXED_LEN..=MAX_FRAME_LEN).contains(&frame_len) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid record length: {frame_len}"),
@@ -2067,10 +2079,14 @@ pub fn extract_packfile_collection(
         }
 
         let total_frame_len = (frame_len as usize).saturating_add(8);
-        frame_buf.resize(total_frame_len, 0);
-        frame_buf[0..4].copy_from_slice(&len_buf);
+        frame_buf.clear();
+        frame_buf.extend_from_slice(&len_buf);
 
-        match reader.read_exact(&mut frame_buf[4..total_frame_len]) {
+        match read_exact_growing(
+            &mut reader,
+            &mut frame_buf,
+            total_frame_len.saturating_sub(4),
+        ) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 stats.torn_tail = true;

@@ -215,7 +215,12 @@ fn test_read_record_metadata_spans_multiple_discard_chunks() {
     // Incompressible so it stays large on disk and forces several
     // discard-buffer iterations through the streaming loop.
     let data: Vec<u8> = (0..(SCAN_DISCARD_BUF_LEN * 3 + 500))
-        .map(|i| (i as u64).wrapping_mul(2_654_435_761).to_le_bytes()[0])
+        .map(|i| {
+            u64::try_from(i)
+                .expect("range index fits in u64")
+                .wrapping_mul(2_654_435_761)
+                .to_le_bytes()[0]
+        })
         .collect();
     let record = test_record_raw([0x99; 16], &data);
     let mut buf = Vec::new();
@@ -254,7 +259,7 @@ fn test_read_record_metadata_detects_payload_corruption() {
 /// A frame whose metadata block declares more bytes than the frame can
 /// hold must be rejected *before* the reader allocates a buffer sized by
 /// that disk-supplied length, rather than requesting an allocation far
-/// larger than the frame (and the `MAX_RECORD_LEN` cap) permits.
+/// larger than the frame (and the `u32::MAX` cap) permits.
 #[test]
 fn test_metadata_length_cannot_exceed_frame() {
     let frame_len = FRAME_FIXED_LEN + 5;
@@ -303,7 +308,7 @@ fn test_checked_metadata_block_len_boundary() {
     );
     // A frame shorter than the fixed header cannot hold any metadata.
     // Production callers reject it earlier via the `FRAME_FIXED_LEN
-    // ..= MAX_RECORD_LEN` range check; this pins the helper's own behavior.
+    // ..= u32::MAX` range check; this pins the helper's own behavior.
     assert_eq!(
         checked_metadata_block_len(0, FRAME_FIXED_LEN - 1)
             .unwrap_err()
@@ -609,32 +614,31 @@ fn test_record_serialized_len() {
 }
 
 #[test]
-fn test_write_record_payload_too_large() {
+fn test_write_record_larger_than_historical_pdu_limit() {
     let r = Record {
         collection_id: [0u8; 16],
         hash: [0u8; 16],
-        data: Bytes::from(vec![0u8; MAX_RECORD_LEN as usize + 1]),
+        data: Bytes::from(vec![0u8; 64 * 1024 + 1]),
         metadata: None,
     };
     let mut buf = Vec::new();
-    let err = write_record(&mut buf, &r).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    write_record(&mut buf, &r).unwrap();
 }
 
-/// The largest *incompressible* payload that still fits at the write
-/// boundary — `FRAME_FIXED_LEN + data.len() == MAX_RECORD_LEN` — must
-/// round-trip. Regression test: an earlier version bounded the write
-/// check by `32 + data.len()` (the pre-compression frame's fixed
-/// size) while the read bound was `FRAME_FIXED_LEN + data.len()`, a
-/// 5-byte mismatch that let a write succeed at exactly this size and
-/// then fail on read.
+/// A record larger than the historical PDU limit still round-trips through
+/// the generic packfile codec. PDU-specific limits belong to the template.
 #[test]
-fn test_write_read_roundtrip_at_max_record_len_boundary() {
-    let data_len = MAX_RECORD_LEN as usize - FRAME_FIXED_LEN as usize;
+fn test_write_read_roundtrip_above_pdu_limit() {
+    let data_len = 128 * 1024;
     // Pseudorandom, not zeros/repeats, so zstd can't shrink it below
     // the raw size — this must take the uncompressed-fallback path.
     let data: Vec<u8> = (0..data_len)
-        .map(|i| (i as u64).wrapping_mul(2_654_435_761).to_le_bytes()[0])
+        .map(|i| {
+            u64::try_from(i)
+                .expect("range index fits in u64")
+                .wrapping_mul(2_654_435_761)
+                .to_le_bytes()[0]
+        })
         .collect();
     let record = test_record_raw([0xaa; 16], &data);
     let mut buf = Vec::new();
@@ -1267,4 +1271,19 @@ fn test_extract_packfile_collection_rejects_corrupted_crc() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A corrupt length prefix far beyond the data actually present must fail
+/// cleanly (and, past the shard ceiling, immediately) rather than allocate.
+#[test]
+fn test_read_record_corrupt_huge_prefix_fails_without_allocating() {
+    for prefix in [u32::MAX - 5, MAX_FRAME_LEN] {
+        let mut buf = prefix.to_le_bytes().to_vec();
+        buf.extend_from_slice(&[0u8; 64]);
+        let err = read_record(&mut buf.as_slice()).unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+        ));
+    }
 }

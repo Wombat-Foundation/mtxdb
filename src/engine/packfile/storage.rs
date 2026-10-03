@@ -1040,13 +1040,13 @@ impl std::error::Error for DeltaBatchTooLarge {}
 /// adjacency (that would require a per-candidate frame-length probe).
 const READ_RUN_GAP_BYTES: u64 = 128;
 
-/// Largest on-disk size of a single frame: the 4-byte length prefix, a
-/// [`packfile::MAX_RECORD_LEN`]-bounded body, and the 4-byte CRC. Used as the
-/// per-candidate frame-length estimate when planning merged read extents: it
-/// over-approximates so the plan never advises short of a frame's true end,
-/// and it avoids a per-candidate length-prefix probe (which would fault in the
-/// very cold page the plan exists to prefetch).
-const MAX_FRAME_DISK_LEN: u64 = (packfile::MAX_RECORD_LEN + 8) as u64;
+/// Per-candidate frame-length estimate used when planning merged read
+/// extents. Frames have no fixed upper bound, so this is a prefetch heuristic
+/// (length prefix + a typical body + CRC), not a limit: a larger frame is
+/// still read correctly, the plan just advises a shorter prefetch window. It
+/// avoids a per-candidate length-prefix probe, which would fault in the very
+/// cold page the plan exists to prefetch.
+const MAX_FRAME_DISK_LEN: u64 = 64 * 1024 + 8;
 
 /// Tuning for `get_many`'s merged read plan.
 ///
