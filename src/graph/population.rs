@@ -17,6 +17,11 @@ use crate::storage::StorageError;
 use rezzy_recon::triage::NodeSummary;
 use rezzy_recon::{AlgebraicError, ElementHash, Population, SortedPopulation};
 
+/// Owner-log entries read per call: bounds the transient records held while
+/// the snapshot materializes, so peak memory tracks the population and not the
+/// log's record overhead.
+const READ_CHUNK: u32 = 4096;
+
 /// Length of an owner-log payload: `h64` then `h128`, both big-endian.
 pub const OWNER_PAYLOAD_LEN: usize = 24;
 
@@ -108,11 +113,15 @@ impl ShortIdIndex {
             ));
         }
         let ceiling = counters.next_owner_seq;
-        let entries = self.owner_log(db, counters.log_epoch, 1, ceiling)?;
-        let elements = entries
-            .iter()
-            .map(|entry| decode_owner_payload(entry.seq, &entry.payload))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut elements = Vec::new();
+        let mut from = 1;
+        while from < ceiling {
+            let to = from.saturating_add(READ_CHUNK).min(ceiling);
+            for entry in self.owner_log(db, counters.log_epoch, from, to)? {
+                elements.push(decode_owner_payload(entry.seq, &entry.payload)?);
+            }
+            from = to;
+        }
         Ok(PopulationSnapshot {
             manifest_version: 0,
             owner_seq_ceiling: ceiling,
