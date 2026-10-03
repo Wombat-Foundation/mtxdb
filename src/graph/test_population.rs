@@ -277,11 +277,6 @@ fn a_dropped_generation_expires_the_pin_only_after_the_grace_period() {
 
     let late = index().collect_garbage(&db, 100 + GRACE_MS).unwrap();
     assert_eq!((late.dropped, late.pending), (1, 0));
-    // A Database-level delete reaches live reads only after a reopen (see
-    // `a_committed_delete_collection_hides_synced_records`, ignored), so expiry
-    // is asserted on the reopened store.
-    drop(db);
-    let db = Database::open(root.clone()).unwrap();
     let expired = index().materialize_population(&db, &pin, None);
     assert!(
         matches!(expired, Err(StorageError::StaleGeneration { .. })),

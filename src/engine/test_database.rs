@@ -3392,9 +3392,9 @@ fn a_worst_case_power_cut_keeps_what_was_synced_and_never_half_applies() {
 
 /// A `Database` transaction's `delete_collection` must hide the collection's
 /// records from reads in the same process, also when they were already synced
-/// to the packs. Today they stay readable until the store is reopened.
+/// to the packs. A read miss used to rescan the packs, which still hold the
+/// tombstoned records, and rebuild the collection from them.
 #[test]
-#[ignore = "engine bug: a committed delete_collection is not visible to live reads once the records were synced; takes effect after reopen"]
 fn a_committed_delete_collection_hides_synced_records() {
     let root = test_root("delete_visible_after_sync");
     let db = Database::open(root.clone()).unwrap();
@@ -3420,9 +3420,9 @@ fn a_committed_delete_collection_hides_synced_records() {
 }
 
 /// Repacking a collection that holds no records must not bring back the
-/// records of a collection deleted before it. Today they reappear.
+/// records of a collection deleted before it (the repack's own read refreshed
+/// the deleted collection from the packs).
 #[test]
-#[ignore = "engine bug: repack_collection_reachable on an empty collection resurrects a deleted collection's records"]
 fn repacking_an_empty_collection_resurrects_a_deleted_one() {
     let root = test_root("repack_empty_resurrects");
     let db = Database::open(root.clone()).unwrap();
@@ -3446,6 +3446,56 @@ fn repacking_an_empty_collection_resurrects_a_deleted_one() {
         .repack_collection_reachable(&empty, |_, _| Vec::new())
         .unwrap();
     assert!(!read(&db), "the repack brought the deleted record back");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The tombstone check must not block a collection that was deleted and then
+/// written again: the first write clears the tombstone, and reads see the
+/// new records.
+#[test]
+fn a_deleted_collection_can_be_recreated_and_read() {
+    let root = test_root("delete_then_recreate");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0x71_u8; 16];
+    let write = |id: u8, payload: &'static [u8]| {
+        let txn = db.begin_transaction();
+        txn.put(ShardType::Edges, collection, node(id), &data(payload))
+            .unwrap();
+        txn.commit().unwrap();
+    };
+    let read = |id: u8| {
+        db.begin_transaction()
+            .get_with_record_versions(ShardType::Edges, &collection, &[node(id)])
+            .unwrap()
+            .0[0]
+            .as_ref()
+            .map(|record| record.bytes.to_vec())
+    };
+    write(1, b"old");
+    db.pool(ShardType::Edges).sync_all().unwrap();
+    let delete = db.begin_transaction();
+    delete
+        .delete_collection(ShardType::Edges, collection)
+        .unwrap();
+    delete.commit().unwrap();
+    assert_eq!(read(1), None);
+    write(2, b"new");
+    assert_eq!(read(2), Some(b"new".to_vec()));
+    assert_eq!(
+        read(1),
+        None,
+        "the deleted record came back with the new one"
+    );
+    db.pool(ShardType::Edges).sync_all().unwrap();
+    drop(db);
+    let db = Database::open(root.clone()).unwrap();
+    let after = db
+        .begin_transaction()
+        .get_with_record_versions(ShardType::Edges, &collection, &[node(1), node(2)])
+        .unwrap()
+        .0;
+    assert!(after[0].is_none() && after[1].is_some());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

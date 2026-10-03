@@ -1099,14 +1099,7 @@ impl ShortIdIndex {
         let counters = self.counters(db)?;
         let txn = db.begin_transaction();
         let manifest = self.read_manifest(&txn, counters.manifest_version)?;
-        // Repacking an empty collection brings back records of collections
-        // deleted before it (see the ignored engine test
-        // `repacking_an_empty_collection_resurrects_a_deleted_one`), so the
-        // current generation is repacked only once it holds entries.
-        let mut live = Vec::new();
-        if counters.next_owner_seq > counters.log_epoch_start_seq {
-            live.push(self.owner_log_collection(counters.log_epoch));
-        }
+        let mut live = vec![self.owner_log_collection(counters.log_epoch)];
         live.extend(manifest.runs.iter().map(|run| self.run_collection(run)));
         let pool = db.pool(self.pool);
         for collection in &live {

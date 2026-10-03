@@ -6419,6 +6419,14 @@ impl PackfileStorage {
     pub fn refresh_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
+        // A delete is a tombstone: the collection's records stay in the packs
+        // until a repack retires their shard, so a rescan would rebuild the
+        // collection from them and bring it back. Read the tombstone file, not
+        // the in-memory set: a reader following a writer that deleted and then
+        // re-created the collection must see the clearing.
+        if Self::load_deleted_collections(&self.base_dir).contains(collection_id) {
+            return Ok(());
+        }
         // A refresh that publishes a *newly discovered* collection must be
         // excluded from a concurrent checkpoint's fingerprint→snapshot
         // window, exactly like a new-collection `put`/`put_many` (see the
