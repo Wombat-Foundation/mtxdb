@@ -277,6 +277,11 @@ fn a_dropped_generation_expires_the_pin_only_after_the_grace_period() {
 
     let late = index().collect_garbage(&db, 100 + GRACE_MS).unwrap();
     assert_eq!((late.dropped, late.pending), (1, 0));
+    // The dropped generation reports a missing entry, not corruption.
+    assert!(matches!(
+        index().owner_log(&db, 0, 1, 21),
+        Err(StorageError::NotFound(_))
+    ));
     let expired = index().materialize_population(&db, &pin, None);
     assert!(
         matches!(expired, Err(StorageError::StaleGeneration { .. })),

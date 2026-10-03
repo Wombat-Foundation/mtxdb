@@ -545,9 +545,11 @@ impl ShortIdIndex {
             &self.collection_id,
             derived_id(MANIFEST_PREFIX, version, 0),
         )?;
-        let record = record.ok_or_else(|| {
-            StorageError::Corrupt(format!("short-id manifest {version} is missing"))
-        })?;
+        let record = record.ok_or(StorageError::NotFound(derived_id(
+            MANIFEST_PREFIX,
+            version,
+            0,
+        )))?;
         let manifest = Manifest::decode(&record.bytes)?;
         if manifest.version != version {
             return Err(StorageError::Corrupt(
@@ -675,11 +677,10 @@ impl ShortIdIndex {
         pinned: &ScopeCounters,
         error: StorageError,
     ) -> StorageError {
-        let dropped = match &error {
-            StorageError::StaleGeneration { .. } => true,
-            StorageError::Corrupt(message) => message.contains("is missing"),
-            _ => false,
-        };
+        let dropped = matches!(
+            error,
+            StorageError::StaleGeneration { .. } | StorageError::NotFound(_)
+        );
         match self.counters(db) {
             Ok(live) if dropped && live.manifest_version != pinned.manifest_version => {
                 StorageError::StaleGeneration {

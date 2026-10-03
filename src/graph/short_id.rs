@@ -561,7 +561,8 @@ impl ShortIdIndex {
     /// # Errors
     /// Returns an error if `epoch` is in the future, the range reaches below
     /// the current generation (for `epoch == log_epoch`) or above the assigned
-    /// sequence, or if an entry in range is missing or corrupt.
+    /// sequence, or if an entry in range is corrupt. An entry that is missing
+    /// (its generation was dropped) is [`StorageError::NotFound`].
     pub fn owner_log(
         &self,
         db: &Database,
@@ -595,9 +596,7 @@ impl ShortIdIndex {
         (from..to)
             .zip(records)
             .map(|(seq, record)| {
-                let record = record.ok_or_else(|| {
-                    StorageError::Corrupt(format!("owner-log entry {seq} is missing"))
-                })?;
+                let record = record.ok_or(StorageError::NotFound(owner_log_record_id(seq)))?;
                 decode_owner_log(seq, &record.bytes)
             })
             .collect()
