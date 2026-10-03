@@ -315,6 +315,7 @@ impl MatrixAdjacency {
             .iter()
             .zip(&families)
             .map(|(event, families)| BatchEvent {
+                owner_payload: None,
                 owner: event.owner,
                 families,
             })

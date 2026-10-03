@@ -39,16 +39,17 @@
 //! CAS is atomic within the single writer process, through the transaction layer
 //! in [`crate::database`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
+use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
 /// Wire version shared by every short-id record.
-pub const SHORT_ID_FORMAT_VERSION: u8 = 3;
+pub const SHORT_ID_FORMAT_VERSION: u8 = 4;
 /// Largest id that may be allocated.
 pub const SHORT_ID_MAX: u32 = u32::MAX - 1;
 
@@ -56,10 +57,17 @@ const COUNTER_MAGIC: [u8; 4] = *b"SIDC";
 const FORWARD_MAGIC: [u8; 4] = *b"SIDF";
 const REVERSE_MAGIC: [u8; 4] = *b"SIDR";
 const EDGES_MAGIC: [u8; 4] = *b"SIDE";
+const OWNER_LOG_MAGIC: [u8; 4] = *b"OWNL";
 
 const COUNTER_ID: NodeId = *b"MTXD-SID-CNTR-v1";
 const REVERSE_PREFIX: [u8; 8] = *b"MTXSIDR\0";
 const EDGES_PREFIX: [u8; 8] = *b"MTXSIDE\0";
+const OWNER_LOG_PREFIX: [u8; 8] = *b"MTXOWNL\0";
+const OWNER_LOG_SCOPE: &[u8] = b"short-id-owner-log";
+
+/// Forward-record flag: the key has been recorded as an *owner* (an event the
+/// caller holds), as opposed to merely allocated an id as an edge target.
+const FORWARD_OWNER: u8 = 0b01;
 
 const FLAG_TYPED: u8 = 0b01;
 
@@ -149,6 +157,14 @@ pub struct BatchEvent<'a> {
     pub owner: &'a [u8],
     /// The owner's edge lists, one per family.
     pub families: &'a [FamilyEdges<'a>],
+    /// If set, this event is an *owner*: one the caller holds, as opposed to
+    /// an id allocated only because something referenced it. The first time a
+    /// key is recorded as an owner (its owner bit goes false -> true) the
+    /// payload is appended to the owner log under the next sequence number;
+    /// recording the same owner again, in this batch or later, appends
+    /// nothing. The payload is opaque here (for populations, the element
+    /// hashes). The same owner twice in a batch must carry the same payload.
+    pub owner_payload: Option<&'a [u8]>,
 }
 
 /// Outcome of [`ShortIdIndex::record_event`].
@@ -227,30 +243,123 @@ fn read_u32(bytes: &[u8], what: &str) -> Result<u32, StorageError> {
         .map_err(|_| StorageError::Corrupt(format!("short-id {what} length")))
 }
 
-fn encode_counter(next: u32) -> Vec<u8> {
+/// The scope's allocation counters, all stored in one CAS-guarded record.
+///
+/// Ids and owner sequence numbers are dense and start at 1. The owner log is
+/// written into one *generation* collection at a time, named by `log_epoch`;
+/// `log_epoch_start_seq` is the first sequence number of the current
+/// generation, so earlier entries live in an older generation or have been
+/// folded into a compacted run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeCounters {
+    /// The next short id to allocate.
+    pub next_id: u32,
+    /// The next owner-log sequence number to assign.
+    pub next_owner_seq: u32,
+    /// The generation the owner log is currently written to.
+    pub log_epoch: u32,
+    /// First owner-log sequence number of `log_epoch`.
+    pub log_epoch_start_seq: u32,
+}
+
+impl Default for ScopeCounters {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            next_owner_seq: 1,
+            log_epoch: 0,
+            log_epoch_start_seq: 1,
+        }
+    }
+}
+
+fn encode_counter(counters: ScopeCounters) -> Vec<u8> {
     let mut out = header(COUNTER_MAGIC);
-    out.extend_from_slice(&next.to_be_bytes());
+    for value in [
+        counters.next_id,
+        counters.next_owner_seq,
+        counters.log_epoch,
+        counters.log_epoch_start_seq,
+    ] {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
     out
 }
 
-fn decode_counter(bytes: &[u8]) -> Result<u32, StorageError> {
-    read_u32(check_header(bytes, COUNTER_MAGIC, "counter")?, "counter")
+fn decode_counter(bytes: &[u8]) -> Result<ScopeCounters, StorageError> {
+    let body = check_header(bytes, COUNTER_MAGIC, "counter")?;
+    if body.len() != 16 {
+        return Err(StorageError::Corrupt("short-id counter length".to_owned()));
+    }
+    Ok(ScopeCounters {
+        next_id: read_u32(&body[..4], "counter")?,
+        next_owner_seq: read_u32(&body[4..8], "counter")?,
+        log_epoch: read_u32(&body[8..12], "counter")?,
+        log_epoch_start_seq: read_u32(&body[12..16], "counter")?,
+    })
 }
 
-fn encode_forward(short_id: u32, key: &[u8]) -> Vec<u8> {
+fn encode_forward(short_id: u32, owner: bool, key: &[u8]) -> Vec<u8> {
     let mut out = header(FORWARD_MAGIC);
+    out.push(if owner { FORWARD_OWNER } else { 0 });
     out.extend_from_slice(&short_id.to_be_bytes());
     out.extend_from_slice(key);
     out
 }
 
-/// Decode a forward record into `(short_id, key)`.
-fn decode_forward(bytes: &[u8]) -> Result<(u32, &[u8]), StorageError> {
+/// A decoded forward record.
+struct Forward<'a> {
+    short_id: u32,
+    owner: bool,
+    key: &'a [u8],
+}
+
+fn decode_forward(bytes: &[u8]) -> Result<Forward<'_>, StorageError> {
     let body = check_header(bytes, FORWARD_MAGIC, "forward")?;
-    if body.len() < 4 {
+    if body.len() < 5 || body[0] & !FORWARD_OWNER != 0 {
         return Err(StorageError::Corrupt("short-id forward length".to_owned()));
     }
-    Ok((read_u32(&body[..4], "forward")?, &body[4..]))
+    Ok(Forward {
+        short_id: read_u32(&body[1..5], "forward")?,
+        owner: body[0] & FORWARD_OWNER != 0,
+        key: &body[5..],
+    })
+}
+
+fn encode_owner_log(short_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = header(OWNER_LOG_MAGIC);
+    out.extend_from_slice(&short_id.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// One owner-log entry: the event that became an owner at `seq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerLogEntry {
+    /// Dense, never-reused sequence number.
+    pub seq: u32,
+    /// The owner's short id.
+    pub short_id: u32,
+    /// The caller's opaque payload (for populations, the element hashes).
+    pub payload: Vec<u8>,
+}
+
+fn decode_owner_log(seq: u32, bytes: &[u8]) -> Result<OwnerLogEntry, StorageError> {
+    let body = check_header(bytes, OWNER_LOG_MAGIC, "owner log")?;
+    if body.len() < 4 {
+        return Err(StorageError::Corrupt(
+            "short-id owner log length".to_owned(),
+        ));
+    }
+    Ok(OwnerLogEntry {
+        seq,
+        short_id: read_u32(&body[..4], "owner log")?,
+        payload: body[4..].to_vec(),
+    })
+}
+
+fn owner_log_record_id(seq: u32) -> NodeId {
+    indexed_id(OWNER_LOG_PREFIX, seq)
 }
 
 fn encode_reverse(key: &[u8]) -> Vec<u8> {
@@ -311,6 +420,8 @@ pub struct ShortIdVerifyReport {
     pub ids_checked: u32,
     /// Edge lists decoded.
     pub edge_lists_checked: u32,
+    /// Forward records carrying the owner bit.
+    pub owners_checked: u32,
     /// Human-readable invariant violations; empty means consistent.
     pub problems: Vec<String>,
 }
@@ -362,12 +473,99 @@ impl ShortIdIndex {
     /// # Errors
     /// Returns an error on a read failure or a corrupt counter.
     pub fn counter(&self, db: &Database) -> Result<u32, StorageError> {
+        self.counters(db).map(|counters| counters.next_id)
+    }
+
+    /// All of the scope's counters, read together.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt counter.
+    pub fn counters(&self, db: &Database) -> Result<ScopeCounters, StorageError> {
         let txn = db.begin_transaction();
-        let (records, _) =
+        self.read_counters(&txn).map(|(counters, _)| counters)
+    }
+
+    fn read_counters(
+        &self,
+        txn: &DatabaseTransaction<'_>,
+    ) -> Result<(ScopeCounters, u64), StorageError> {
+        let (records, tokens) =
             txn.get_with_record_versions(self.pool, &self.collection_id, &[COUNTER_ID])?;
         match records.into_iter().next().flatten() {
-            Some(record) => decode_counter(&record.bytes),
-            None => Ok(1),
+            Some(record) => Ok((decode_counter(&record.bytes)?, tokens[0])),
+            None => Ok((ScopeCounters::default(), tokens[0])),
+        }
+    }
+
+    /// The collection holding generation `epoch` of the owner log. Each
+    /// generation is its own collection so a folded generation can be dropped
+    /// with one `delete_collection`.
+    #[must_use]
+    pub fn owner_log_collection(&self, epoch: u32) -> [u8; 16] {
+        let mut name = Vec::with_capacity(OWNER_LOG_SCOPE.len().saturating_add(20));
+        name.extend_from_slice(OWNER_LOG_SCOPE);
+        name.extend_from_slice(&self.collection_id);
+        name.extend_from_slice(&epoch.to_be_bytes());
+        derive_collection_id(Some(MEMBER_NAMESPACE_INTL), &name)
+    }
+
+    /// The owner-log entries with `from <= seq < to`, which must all lie in the
+    /// current generation.
+    ///
+    /// # Errors
+    /// Returns an error if the range reaches below the current generation
+    /// (those entries were folded into a run), above the assigned sequence, or
+    /// if an entry in range is missing or corrupt.
+    pub fn owner_log(
+        &self,
+        db: &Database,
+        from: u32,
+        to: u32,
+    ) -> Result<Vec<OwnerLogEntry>, StorageError> {
+        let txn = db.begin_transaction();
+        let (counters, _) = self.read_counters(&txn)?;
+        if from < counters.log_epoch_start_seq || to > counters.next_owner_seq || from > to {
+            return Err(StorageError::Internal(
+                "owner-log range outside the current generation".to_owned(),
+            ));
+        }
+        let ids: Vec<NodeId> = (from..to).map(owner_log_record_id).collect();
+        let (records, _) = txn.get_with_record_versions(
+            self.pool,
+            &self.owner_log_collection(counters.log_epoch),
+            &ids,
+        )?;
+        (from..to)
+            .zip(records)
+            .map(|(seq, record)| {
+                let record = record.ok_or_else(|| {
+                    StorageError::Corrupt(format!("owner-log entry {seq} is missing"))
+                })?;
+                decode_owner_log(seq, &record.bytes)
+            })
+            .collect()
+    }
+
+    /// Whether `key` has been recorded as an owner; `None` if it has no id.
+    ///
+    /// # Errors
+    /// As [`Self::lookup`].
+    pub fn is_owner(&self, db: &Database, key: &[u8]) -> Result<Option<bool>, StorageError> {
+        let txn = db.begin_transaction();
+        let (records, _) =
+            txn.get_with_record_versions(self.pool, &self.collection_id, &[forward_id(key)])?;
+        match records.into_iter().next().flatten() {
+            None => Ok(None),
+            Some(record) => {
+                let forward = decode_forward(&record.bytes)?;
+                if forward.key == key {
+                    Ok(Some(forward.owner))
+                } else {
+                    Err(StorageError::Collision(
+                        "short-id key hash collision between different keys".to_owned(),
+                    ))
+                }
+            }
         }
     }
 
@@ -393,9 +591,9 @@ impl ShortIdIndex {
         match records.into_iter().next().flatten() {
             None => Ok(None),
             Some(record) => {
-                let (short_id, stored_key) = decode_forward(&record.bytes)?;
-                if stored_key == key {
-                    Ok(Some(short_id))
+                let forward = decode_forward(&record.bytes)?;
+                if forward.key == key {
+                    Ok(Some(forward.short_id))
                 } else {
                     Err(StorageError::Collision(
                         "short-id key hash collision between different keys".to_owned(),
@@ -586,7 +784,10 @@ impl ShortIdIndex {
             self.pool,
             self.collection_id,
             COUNTER_ID,
-            &NodeData::new(Bytes::from(encode_counter(next))),
+            &NodeData::new(Bytes::from(encode_counter(ScopeCounters {
+                next_id: next,
+                ..ScopeCounters::default()
+            }))),
         )?;
         txn.commit()
     }
@@ -607,6 +808,12 @@ impl ShortIdIndex {
     /// # Errors
     /// Returns an error if the delete cannot be staged.
     pub fn stage_purge(&self, txn: &DatabaseTransaction<'_>) -> Result<(), StorageError> {
+        // The owner-log generations are separate collections; the counter
+        // says how many there have been.
+        let (counters, _) = self.read_counters(txn)?;
+        for epoch in 0..=counters.log_epoch {
+            txn.delete_collection(self.pool, self.owner_log_collection(epoch))?;
+        }
         txn.delete_collection(self.pool, self.collection_id)?;
         Ok(())
     }
@@ -627,10 +834,12 @@ impl ShortIdIndex {
         let (counter, _) =
             txn.get_with_record_versions(self.pool, &self.collection_id, &[COUNTER_ID])?;
         let mut report = ShortIdVerifyReport::default();
-        let next = match counter.into_iter().next().flatten() {
+        let counters = match counter.into_iter().next().flatten() {
             Some(record) => decode_counter(&record.bytes)?,
             None => return Ok(report),
         };
+        let next = counters.next_id;
+        let mut owner_bits = 0_u32;
         let get = |id: NodeId| -> Result<Option<NodeData>, StorageError> {
             let (records, _) =
                 txn.get_with_record_versions(self.pool, &self.collection_id, &[id])?;
@@ -647,11 +856,15 @@ impl ShortIdIndex {
             let key = check_header(&reverse.bytes, REVERSE_MAGIC, "reverse")?;
             match get(forward_id(key))? {
                 Some(forward) => {
-                    let (forward_short, forward_key) = decode_forward(&forward.bytes)?;
-                    if forward_short != short_id || forward_key != key {
+                    let stored = decode_forward(&forward.bytes)?;
+                    if stored.short_id != short_id || stored.key != key {
                         report.problems.push(format!(
-                            "id {short_id}: forward record disagrees (id {forward_short})"
+                            "id {short_id}: forward record disagrees (id {})",
+                            stored.short_id
                         ));
+                    }
+                    if stored.owner {
+                        owner_bits = owner_bits.saturating_add(1);
                     }
                 }
                 None => report
@@ -677,6 +890,13 @@ impl ShortIdIndex {
                     }
                 }
             }
+        }
+        report.owners_checked = owner_bits;
+        if owner_bits != counters.next_owner_seq.saturating_sub(1) {
+            report.problems.push(format!(
+                "{owner_bits} owner bits but {} owner-log sequence numbers assigned",
+                counters.next_owner_seq.saturating_sub(1)
+            ));
         }
         Ok(report)
     }
@@ -713,6 +933,7 @@ impl ShortIdIndex {
         &self,
         txn: &DatabaseTransaction<'_>,
         keys: &[&[u8]],
+        owners: &HashMap<&[u8], &[u8]>,
     ) -> Result<Allocation, StorageError> {
         // Read the counter and every forward record together, before staging
         // anything: staged records report token 0, and the tokens must match
@@ -722,44 +943,71 @@ impl ShortIdIndex {
         read_ids.extend(keys.iter().map(|key| forward_id(key)));
         let (records, tokens) =
             txn.get_with_record_versions(self.pool, &self.collection_id, &read_ids)?;
-        let mut next = match &records[0] {
-            Some(record) => decode_counter(&record.bytes)?,
-            None => 1,
+        let (mut counters, counter_token) = match &records[0] {
+            Some(record) => (decode_counter(&record.bytes)?, tokens[0]),
+            None => (ScopeCounters::default(), tokens[0]),
         };
-        let counter_token = tokens[0];
         let mut allocation = Allocation {
             ids: Vec::with_capacity(keys.len()),
             fresh: Vec::new(),
             staged: Vec::new(),
-            counter: (counter_token, next),
+            owner_log: Vec::new(),
+            counter: (counter_token, counters),
         };
         let mut seen: HashMap<&[u8], u32> = HashMap::new();
+        // Keys whose owner bit this attempt has already set, so a key that
+        // appears more than once in the batch flips exactly once.
+        let mut flipped: HashSet<u32> = HashSet::new();
         for (index, key) in keys.iter().enumerate() {
             let slot = index.saturating_add(1);
+            let payload = owners.get(key).copied();
             if let Some(record) = &records[slot] {
-                let (short_id, stored_key) = decode_forward(&record.bytes)?;
-                if stored_key != *key {
+                let forward = decode_forward(&record.bytes)?;
+                if forward.key != *key {
                     return Err(StorageError::Collision(
                         "short-id key hash collision between different keys".to_owned(),
                     ));
                 }
-                allocation.ids.push(short_id);
+                allocation.ids.push(forward.short_id);
+                // The exactly-once guard: the log entry is staged only when
+                // the owner bit goes false -> true, in the same CAS as the
+                // forward record that carries the bit. A second record of the
+                // same owner (a replay, a re-fetch) finds the bit set and
+                // stages nothing, so the population toggle cannot undo itself.
+                if let Some(payload) = payload {
+                    if !forward.owner && flipped.insert(forward.short_id) {
+                        Self::stage_owner(
+                            &mut allocation,
+                            &mut counters,
+                            forward.short_id,
+                            payload,
+                        )?;
+                        allocation.staged.push((
+                            forward_id(key),
+                            encode_forward(forward.short_id, true, key),
+                            Some(tokens[slot]),
+                        ));
+                    }
+                }
             } else if let Some(short_id) = seen.get(key) {
                 allocation.ids.push(*short_id);
             } else {
-                if next > self.max_id {
+                if counters.next_id > self.max_id {
                     return Err(StorageError::Exhausted(
                         "short-id space exhausted for this scope".to_owned(),
                     ));
                 }
-                let short_id = next;
-                next = next.saturating_add(1);
+                let short_id = counters.next_id;
+                counters.next_id = counters.next_id.saturating_add(1);
                 seen.insert(key, short_id);
                 allocation.fresh.push(short_id);
                 allocation.ids.push(short_id);
+                if let Some(payload) = payload {
+                    Self::stage_owner(&mut allocation, &mut counters, short_id, payload)?;
+                }
                 allocation.staged.push((
                     forward_id(key),
-                    encode_forward(short_id, key),
+                    encode_forward(short_id, payload.is_some(), key),
                     Some(tokens[slot]),
                 ));
                 allocation.staged.push((
@@ -769,8 +1017,29 @@ impl ShortIdIndex {
                 ));
             }
         }
-        allocation.counter.1 = next;
+        allocation.counter.1 = counters;
         Ok(allocation)
+    }
+
+    /// Assign the next owner-log sequence number to `short_id` and queue its
+    /// entry.
+    fn stage_owner(
+        allocation: &mut Allocation,
+        counters: &mut ScopeCounters,
+        short_id: u32,
+        payload: &[u8],
+    ) -> Result<(), StorageError> {
+        if counters.next_owner_seq > SHORT_ID_MAX {
+            return Err(StorageError::Exhausted(
+                "owner-log sequence space exhausted for this scope".to_owned(),
+            ));
+        }
+        let seq = counters.next_owner_seq;
+        counters.next_owner_seq = seq.saturating_add(1);
+        allocation
+            .owner_log
+            .push((seq, encode_owner_log(short_id, payload)));
+        Ok(())
     }
 
     /// Merge the requested edge lists with what is stored and stage the changes.
@@ -858,7 +1127,20 @@ impl ShortIdIndex {
         starts: &[usize],
         events: &[BatchEvent<'_>],
     ) -> Result<(Vec<RecordedEvent>, bool), StorageError> {
-        let mut allocation = self.allocate(txn, keys)?;
+        let mut owners: HashMap<&[u8], &[u8]> = HashMap::new();
+        for event in events {
+            if let Some(payload) = event.owner_payload {
+                if owners
+                    .insert(event.owner, payload)
+                    .is_some_and(|p| p != payload)
+                {
+                    return Err(StorageError::Collision(
+                        "short-id owner payload differs from one already in this batch".to_owned(),
+                    ));
+                }
+            }
+        }
+        let mut allocation = self.allocate(txn, keys, &owners)?;
         let mut claimed: HashMap<NodeId, Vec<Edge>> = HashMap::new();
         let mut recorded = Vec::with_capacity(events.len());
         for (event, &start) in events.iter().zip(starts) {
@@ -882,15 +1164,24 @@ impl ShortIdIndex {
         txn: &DatabaseTransaction<'_>,
         allocation: Allocation,
     ) -> Result<(), StorageError> {
-        if !allocation.fresh.is_empty() {
-            let (token, next) = allocation.counter;
+        if !allocation.fresh.is_empty() || !allocation.owner_log.is_empty() {
+            let (token, counters) = allocation.counter;
             txn.expect_record_version(self.pool, self.collection_id, COUNTER_ID, token)?;
             txn.put(
                 self.pool,
                 self.collection_id,
                 COUNTER_ID,
-                &NodeData::new(Bytes::from(encode_counter(next))),
+                &NodeData::new(Bytes::from(encode_counter(counters))),
             )?;
+            let log = self.owner_log_collection(counters.log_epoch);
+            for (seq, payload) in allocation.owner_log {
+                txn.put(
+                    self.pool,
+                    log,
+                    owner_log_record_id(seq),
+                    &NodeData::new(Bytes::from(payload)),
+                )?;
+            }
         }
         for (id, payload, token) in allocation.staged {
             if let Some(token) = token {
@@ -912,7 +1203,7 @@ impl ShortIdIndex {
         keys: &[&[u8]],
         families: Option<&[FamilyEdges<'_>]>,
     ) -> Result<Attempt, StorageError> {
-        let mut allocation = self.allocate(txn, keys)?;
+        let mut allocation = self.allocate(txn, keys, &HashMap::new())?;
         let edges = match families {
             Some(families) => {
                 self.stage_edges(txn, &mut allocation, 0, families, &mut HashMap::new())?
@@ -944,8 +1235,10 @@ struct Allocation {
     fresh: Vec<u32>,
     /// `(record id, payload, CAS token)`; a `None` token means a fresh record.
     staged: Vec<(NodeId, Vec<u8>, Option<u64>)>,
-    /// `(counter token, next id after this attempt)`.
-    counter: (u64, u32),
+    /// Owner-log entries `(seq, payload)` to write into the current generation.
+    owner_log: Vec<(u32, Vec<u8>)>,
+    /// `(counter token, counters after this attempt)`.
+    counter: (u64, ScopeCounters),
 }
 
 struct Attempt {

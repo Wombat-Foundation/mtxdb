@@ -472,10 +472,12 @@ fn a_batch_allocates_once_and_events_may_reference_each_other() {
             &db,
             &[
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$a",
                     families: &a_families,
                 },
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$b",
                     families: &b_families,
                 },
@@ -525,10 +527,12 @@ fn a_failed_batch_publishes_nothing() {
             &db,
             &[
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$fine",
                     families: &ok,
                 },
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$stored",
                     families: &conflict,
                 },
@@ -568,10 +572,12 @@ fn a_duplicate_owner_in_a_batch_matches_or_collides() {
             &db,
             &[
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$e",
                     families: &same,
                 },
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$e",
                     families: &same,
                 },
@@ -585,10 +591,12 @@ fn a_duplicate_owner_in_a_batch_matches_or_collides() {
             &db,
             &[
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$fresh",
                     families: &same,
                 },
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$fresh",
                     families: &different,
                 },
@@ -627,10 +635,12 @@ fn exhaustion_mid_batch_publishes_nothing() {
             &db,
             &[
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$e1",
                     families: &first,
                 },
                 BatchEvent {
+                    owner_payload: None,
                     owner: b"$e2",
                     families: &second,
                 },
@@ -679,4 +689,174 @@ fn record_ids_vary_in_the_bytes_the_index_uses() {
         "bytes 8..12 (the index tag) collide: {} distinct of {total}",
         tags.len()
     );
+}
+
+fn owned<'a>(owner: &'a [u8], payload: &'a [u8]) -> BatchEvent<'a> {
+    BatchEvent {
+        owner,
+        families: &[],
+        owner_payload: Some(payload),
+    }
+}
+
+fn log(db: &Database) -> Vec<(u32, u32, Vec<u8>)> {
+    let counters = index().counters(db).unwrap();
+    index()
+        .owner_log(db, counters.log_epoch_start_seq, counters.next_owner_seq)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.seq, e.short_id, e.payload))
+        .collect()
+}
+
+#[test]
+fn recording_an_owner_twice_logs_it_once() {
+    let root = test_root("owner-twice");
+    let db = Database::open(root.clone()).unwrap();
+    index().record_events(&db, &[owned(b"$a", b"pa")]).unwrap();
+    let after_first = index().counters(&db).unwrap();
+    // A replay, a re-fetch, and the same owner twice in one batch.
+    index().record_events(&db, &[owned(b"$a", b"pa")]).unwrap();
+    index()
+        .record_events(&db, &[owned(b"$b", b"pb"), owned(b"$b", b"pb")])
+        .unwrap();
+    index().record_events(&db, &[owned(b"$b", b"pb")]).unwrap();
+    assert_eq!(index().counters(&db).unwrap().next_owner_seq, 3);
+    assert_eq!(
+        log(&db),
+        vec![(1, 1, b"pa".to_vec()), (2, 2, b"pb".to_vec())]
+    );
+    assert_eq!(after_first.next_owner_seq, 2);
+    let report = index().verify(&db, &[PLAIN]).unwrap();
+    assert!(report.is_consistent(), "{:?}", report.problems);
+    assert_eq!(report.owners_checked, 2);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_edge_target_that_becomes_an_owner_is_logged_once() {
+    let root = test_root("owner-after-target");
+    let db = Database::open(root.clone()).unwrap();
+    // `$parent` is allocated an id only because `$child` names it.
+    let edges = [EdgeKey::plain(b"$parent")];
+    let families = [FamilyEdges {
+        family: PLAIN,
+        edges: &edges,
+    }];
+    index()
+        .record_events(
+            &db,
+            &[BatchEvent {
+                owner: b"$child",
+                families: &families,
+                owner_payload: Some(b"child"),
+            }],
+        )
+        .unwrap();
+    assert_eq!(index().is_owner(&db, b"$parent").unwrap(), Some(false));
+    assert_eq!(log(&db).len(), 1, "a target is not an owner");
+
+    // Now the parent arrives: its bit flips and it is logged, once.
+    index()
+        .record_events(&db, &[owned(b"$parent", b"parent")])
+        .unwrap();
+    index()
+        .record_events(&db, &[owned(b"$parent", b"parent")])
+        .unwrap();
+    assert_eq!(index().is_owner(&db, b"$parent").unwrap(), Some(true));
+    assert_eq!(log(&db).len(), 2);
+    // An owner that is also a target in the same batch flips once.
+    index()
+        .record_events(
+            &db,
+            &[
+                BatchEvent {
+                    owner: b"$grand",
+                    families: &[],
+                    owner_payload: None,
+                },
+                owned(b"$child2", b"c2"),
+                BatchEvent {
+                    owner: b"$x",
+                    families: &[FamilyEdges {
+                        family: PLAIN,
+                        edges: &[EdgeKey::plain(b"$child2")],
+                    }],
+                    owner_payload: Some(b"x"),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(index().is_owner(&db, b"$grand").unwrap(), Some(false));
+    assert_eq!(log(&db).len(), 4);
+    assert!(index().verify(&db, &[PLAIN]).unwrap().is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn conflicting_owner_payloads_in_one_batch_collide() {
+    let root = test_root("owner-conflict");
+    let db = Database::open(root.clone()).unwrap();
+    let error = index()
+        .record_events(&db, &[owned(b"$a", b"one"), owned(b"$a", b"two")])
+        .unwrap_err();
+    assert!(matches!(error, StorageError::Collision(_)), "{error:?}");
+    assert_eq!(index().counters(&db).unwrap().next_owner_seq, 1);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Several writers record the same owners at once: every owner is logged
+/// exactly once and the log stays dense.
+#[test]
+fn racing_writers_log_each_owner_once() {
+    let root = test_root("owner-race");
+    let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
+    let keys: Vec<Vec<u8>> = (0..24).map(|i| format!("$e{i}").into_bytes()).collect();
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let db = db.clone();
+            let keys = keys.clone();
+            std::thread::spawn(move || {
+                for key in &keys {
+                    index().record_events(&db, &[owned(key, key)]).unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let entries = log(&db);
+    assert_eq!(entries.len(), keys.len());
+    let mut payloads: Vec<_> = entries.iter().map(|e| e.2.clone()).collect();
+    payloads.sort();
+    let mut expected = keys.clone();
+    expected.sort();
+    assert_eq!(payloads, expected);
+    assert!(entries
+        .iter()
+        .enumerate()
+        .all(|(i, e)| e.0 as usize == i + 1));
+    let report = index().verify(&db, &[PLAIN]).unwrap();
+    assert!(report.is_consistent(), "{:?}", report.problems);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn purge_removes_the_owner_log_too() {
+    let root = test_root("owner-purge");
+    let db = Database::open(root.clone()).unwrap();
+    index().record_events(&db, &[owned(b"$a", b"pa")]).unwrap();
+    index().purge(&db).unwrap();
+    assert_eq!(index().counters(&db).unwrap(), ScopeCounters::default());
+    assert_eq!(index().is_owner(&db, b"$a").unwrap(), None);
+    // The generation collection is gone: a fresh owner starts a fresh log.
+    index().record_events(&db, &[owned(b"$b", b"pb")]).unwrap();
+    assert_eq!(log(&db), vec![(1, 1, b"pb".to_vec())]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
 }
