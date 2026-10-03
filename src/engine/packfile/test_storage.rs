@@ -10418,8 +10418,8 @@ fn pack_files_bytes(dir: &std::path::Path) -> (usize, u64) {
     for entry in fs::read_dir(dir).unwrap().flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "pack") {
-            count += 1;
-            bytes += entry.metadata().unwrap().len();
+            count = usize::saturating_add(count, 1);
+            bytes = u64::saturating_add(bytes, entry.metadata().unwrap().len());
         }
     }
     (count, bytes)
