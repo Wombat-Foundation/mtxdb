@@ -267,7 +267,7 @@ fn sync_scaling(dir: &Path, owners: u32) {
     }
     let summary = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
-        (v[v.len() / 2], v[v.len() - 1])
+        (v[v.len() / 2], v.last().copied().unwrap_or(0.0))
     };
     let (s_med, s_max) = summary(sync_ms.clone());
     let (w_med, w_max) = summary(write_ms);
