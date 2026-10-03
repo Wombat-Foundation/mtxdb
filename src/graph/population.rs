@@ -516,11 +516,10 @@ impl ShortIdIndex {
         collection: &[u8; 16],
         id: NodeId,
     ) -> Result<(Option<NodeData>, u64), StorageError> {
-        self.read_record_in(self.pool, txn, collection, id)
+        Self::read_record_in(self.pool, txn, collection, id)
     }
 
     fn read_record_in(
-        &self,
         pool: crate::layout::ShardType,
         txn: &DatabaseTransaction<'_>,
         collection: &[u8; 16],
@@ -1140,7 +1139,7 @@ impl ShortIdIndex {
         collections
             .into_iter()
             .map(|collection| {
-                let (record, _) = self.read_record_in(
+                let (record, _) = Self::read_record_in(
                     self.log_pool,
                     &txn,
                     &collection,

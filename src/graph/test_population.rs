@@ -610,3 +610,34 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Backfill: a writer commits back to back with no idle gap. Compaction must
+/// still land every time it is called. This held without any per-scope lock
+/// once refresh-on-miss was off (the O(store) rescans had stretched every
+/// publish window); it guards against that regressing.
+#[test]
+fn a_back_to_back_writer_cannot_starve_compaction() {
+    let root = test_root("starve");
+    let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || record(&db, 0..2000))
+    };
+    let mut landed = 0;
+    while !writer.is_finished() {
+        match index().compact(&db, 0, GRACE_MS, true) {
+            Ok(Some(_)) => landed += 1,
+            Ok(None) => {}
+            Err(error) => panic!("compaction starved: {error:?}"),
+        }
+    }
+    writer.join().unwrap();
+    index().compact(&db, 0, GRACE_MS, true).unwrap();
+    assert!(landed >= 1, "compaction never ran against the writer");
+    let report = index().verify(&db, &[]).unwrap();
+    assert!(report.is_consistent(), "{:?}", report.problems);
+    assert_eq!(report.owners_checked, 2000);
+    assert_serves(&index().population_snapshot(&db).unwrap(), 0..2000);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
