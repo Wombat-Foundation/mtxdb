@@ -128,7 +128,7 @@ fn build_store(dir: &Path, owners: u32) {
         next = end;
         // Syncing lets the journal reclaim; without it a large build fills
         // the segment and commits fail.
-        if sync_every != 0 && (next / BATCH) % sync_every == 0 {
+        if sync_every != 0 && (next / BATCH).checked_rem(sync_every) == Some(0) {
             db.edges().sync_all().expect("sync");
         }
     }
