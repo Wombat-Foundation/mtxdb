@@ -1,5 +1,5 @@
 use super::population::*;
-use super::population::{run_chunk_id_for_test, WRITTEN_RUNS};
+use super::population::{run_chunk_id_for_test, BEFORE_PUBLISH, WRITTEN_RUNS};
 use crate::database::Database;
 use crate::layout::ShardType;
 use crate::short_id::{BatchEvent, ScopeCounters, ShortIdIndex};
@@ -493,6 +493,56 @@ fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
     }
     let report = scope.verify(&db, &[]).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Garbage collection takes the run queued for an in-progress compaction (its
+/// grace period is already over): the publish must notice and abandon that
+/// attempt, not publish a manifest naming a deleted run.
+#[test]
+fn a_run_collected_before_the_publish_is_never_published() {
+    let scope = ShortIdIndex::new(ShardType::Edges, [0x70; 16]);
+    let root = test_root("collected-run");
+    let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
+    for i in 0..20_u32 {
+        let key = format!("$e{i}").into_bytes();
+        let payload = encode_owner_payload(hash(i));
+        record_retrying(
+            &scope,
+            &db,
+            &[BatchEvent {
+                owner: &key,
+                families: &[],
+                owner_payload: Some(&payload),
+            }],
+        );
+    }
+    let hook_db = db.clone();
+    BEFORE_PUBLISH.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // grace_ms = 0 below, so the queued run is already due.
+            let report = scope.collect_garbage(&hook_db, u64::MAX).unwrap();
+            assert_eq!(report.dropped, 1, "the in-progress run was not queued");
+        }));
+    });
+    let report = scope.compact(&db, 0, 0, true).unwrap().unwrap();
+    // The first attempt was abandoned; the second wrote and published a new run.
+    let runs: Vec<_> = WRITTEN_RUNS
+        .lock()
+        .iter()
+        .filter(|(owner, _)| *owner == [0x70; 16])
+        .map(|(_, run)| *run)
+        .collect();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(report.manifest_version, 1);
+    // A delete reaches reads only after a reopen (engine bug), so check there:
+    // the published manifest's run must still exist.
+    drop(db);
+    let db = Database::open(root.clone()).unwrap();
+    let snapshot = scope.population_snapshot(&db).unwrap();
+    assert_eq!(snapshot.len(), 20);
+    assert!(scope.verify(&db, &[]).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

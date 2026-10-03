@@ -395,6 +395,16 @@ impl PopulationPin {
 #[cfg(test)]
 pub(crate) static WRITTEN_RUNS: Mutex<Vec<([u8; 16], [u8; 16])>> = Mutex::new(Vec::new());
 
+/// Runs once, on the compacting thread, between writing a run and publishing it.
+#[cfg(test)]
+type PublishHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_PUBLISH: std::cell::RefCell<Option<PublishHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 type CacheKey = ([u8; 16], u32);
 
 /// A small LRU of merged bases, keyed by scope and manifest version, so a new
@@ -839,6 +849,12 @@ impl ShortIdIndex {
                 "short-id runs do not cover the folded owner sequence".to_owned(),
             ));
         }
+        #[cfg(test)]
+        BEFORE_PUBLISH.with(|hook| {
+            if let Some(mut hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let retired_collections = self.publish_compaction(
             db,
             &PublishPlan {
@@ -944,8 +960,16 @@ impl ShortIdIndex {
             Some(record) => decode_gc(&record.bytes)?,
             None => Vec::new(),
         };
-        // The run is installed: it is live, not garbage.
+        // The run is installed: it is live, not garbage. If it is no longer
+        // on the list, garbage collection took it (its grace period ended
+        // while the run was being written) and the collection is gone, so
+        // publishing would name a deleted run. The opposite order is safe:
+        // collection would fail its compare-and-set on this list and retry.
+        let queued = garbage.len();
         garbage.retain(|(collection, _)| *collection != plan.run_collection);
+        if garbage.len() == queued {
+            return Ok(Published::Superseded);
+        }
         let deadline = plan.now_ms.saturating_add(plan.grace_ms);
         let retired_collections = plan.retired.len();
         garbage.extend(
