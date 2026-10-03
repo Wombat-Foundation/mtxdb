@@ -81,6 +81,10 @@ pub mod matrix_policy;
 /// On-disk packfile format and the storage engine built on top of it.
 #[path = "engine/packfile/mod.rs"]
 pub mod packfile;
+/// A room's reconciliation population, pinned from the owner log.
+#[cfg(feature = "reconcile")]
+#[path = "graph/population.rs"]
+pub mod population;
 /// Per-record retention, durability, and ordering policy.
 #[path = "engine/record_class.rs"]
 pub mod record_class;
@@ -125,6 +129,10 @@ mod test_logical_head;
 #[cfg(test)]
 #[path = "matrix/test_matrix_adjacency.rs"]
 mod test_matrix_adjacency;
+#[cfg(test)]
+#[cfg(feature = "reconcile")]
+#[path = "graph/test_population.rs"]
+mod test_population;
 #[cfg(all(test, feature = "bitmaps"))]
 #[path = "matrix/test_room_auth.rs"]
 mod test_room_auth;
