@@ -10411,3 +10411,80 @@ fn read_snapshot_reports_the_durable_group_token() {
     drop(snapshot);
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn pack_files_bytes(dir: &std::path::Path) -> (usize, u64) {
+    let mut count = 0;
+    let mut bytes = 0;
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "pack") {
+            count += 1;
+            bytes += entry.metadata().unwrap().len();
+        }
+    }
+    (count, bytes)
+}
+
+/// `delete_collection` drops the index and persists a tombstone; it does not
+/// itself free pack bytes. The space comes back only when a later repack of
+/// some collection retires the shard that nothing references any more.
+#[test]
+fn delete_collection_frees_pack_bytes_only_after_a_later_repack_retires_the_shard() {
+    let dir = test_dir("delete_reclaim");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+
+    let doomed = distinct_id(1);
+    let live = distinct_id(2);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &doomed,
+            &NodeData::new(bytes::Bytes::from(vec![0xAB; 64 * 1024])),
+        )
+        .unwrap();
+    // Rotate so the survivor lands in a different shard from the doomed data.
+    store.shards.active_shard().file_len.store(
+        shard::MAX_SHARD_BYTES - 10,
+        std::sync::atomic::Ordering::Release,
+    );
+    store
+        .put(
+            &OTHER_COLLECTION,
+            &live,
+            &NodeData::new(bytes::Bytes::from_static(b"survivor")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    let (packs_before, bytes_before) = pack_files_bytes(&dir);
+    assert!(packs_before >= 2, "setup must span two shards");
+
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store.sync_all().unwrap();
+    assert!(store.get(&TEST_COLLECTION, &doomed).unwrap().is_none());
+    assert_eq!(
+        pack_files_bytes(&dir),
+        (packs_before, bytes_before),
+        "delete alone must not remove pack bytes"
+    );
+    assert_eq!(store.shards_retired(), 0);
+
+    store.set_live_roots(&OTHER_COLLECTION, vec![live]);
+    store
+        .repack_collection_reachable(&OTHER_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    store.sync_all().unwrap();
+
+    assert!(
+        store.shards_retired() > 0,
+        "the repack should retire the shard only the deleted collection used"
+    );
+    let (_, bytes_after) = pack_files_bytes(&dir);
+    assert!(
+        bytes_after < bytes_before,
+        "retiring the shard must free its bytes ({bytes_after} >= {bytes_before})"
+    );
+    assert_eq!(
+        store.get(&OTHER_COLLECTION, &live).unwrap().unwrap().bytes,
+        bytes::Bytes::from_static(b"survivor")
+    );
+}
