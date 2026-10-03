@@ -76,6 +76,31 @@ fn test_dir_parsing() {
 }
 
 #[test]
+fn test_info_selector_modes_and_mutual_exclusion() {
+    // Positional, --pack, and --collection are each accepted alone.
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "info", "0x1f"])
+        .is_ok());
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "info", "--pack", "0x1f"])
+        .is_ok());
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "info", "--collection", "!room:server"])
+        .is_ok());
+    assert!(build_cli().try_get_matches_from(["mtxdb", "info"]).is_ok());
+
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "info", "--pack", "0x1f", "--collection", "0x2f"])
+        .is_err());
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "info", "0x1f", "--pack", "0x2f"])
+        .is_err());
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "info", "0x1f", "--collection", "0x2f"])
+        .is_err());
+}
+
+#[test]
 fn optional_decode_formats_require_equals_and_default_to_auto() {
     fn check(bare: &[&str], explicit: &[&str]) {
         let bare_matches = build_cli().try_get_matches_from(bare).unwrap();
@@ -137,6 +162,16 @@ fn test_read_plan_flag_parsing() {
     assert!(build_cli()
         .try_get_matches_from(["mtxdb", "--read-plan", "ssd", "shards"])
         .is_err());
+}
+
+#[test]
+fn scan_rejects_unknown_decode_format() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "scan", "0x01", "--decode=hff"])
+        .is_err());
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "scan", "0x01", "--decode=hamt"])
+        .is_ok());
 }
 
 #[test]

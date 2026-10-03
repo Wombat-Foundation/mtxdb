@@ -1,6 +1,7 @@
 //! CLI for the mtxdb content-addressed storage engine.
 
 mod cmd;
+mod state_hamt;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -112,6 +113,9 @@ pub(crate) enum Commands {
     Stats {
         json: bool,
     },
+    Memory {
+        evict: bool,
+    },
     Meta {
         target: String,
         json: bool,
@@ -120,6 +124,12 @@ pub(crate) enum Commands {
         decode: Option<String>,
     },
     Info {
+        /// Positional selector; its namespace is inferred (pack for a 1-16 hex
+        /// prefix, pack or collection for 32 hex by existence).
+        selector: Option<String>,
+        /// Explicit `--pack` selector; bypasses inference.
+        pack: Option<String>,
+        /// Explicit `--collection` selector; bypasses inference.
         collection: Option<String>,
         stats: bool,
     },
@@ -208,7 +218,6 @@ pub(crate) enum PacksAction {
         pack: String,
         collection: String,
         out: PathBuf,
-        dest_pack_id: Option<String>,
     },
 }
 
@@ -238,6 +247,7 @@ fn build_cli() -> Command {
         .subcommand(sub_shards())
         .subcommand(sub_collections())
         .subcommand(sub_stats())
+        .subcommand(sub_memory())
         .subcommand(sub_meta())
         .subcommand(sub_sync())
         .subcommand(sub_completions())
@@ -336,6 +346,25 @@ fn sub_stats() -> Command {
         )
 }
 
+fn sub_memory() -> Command {
+    Command::new("memory")
+        .about("Inspect or evict mtxdb's in-process decoded-node caches")
+        .long_about(
+            "Inspect or evict mtxdb's in-process decoded-node caches.\n\n".to_owned()
+                + "This reports heap objects decoded by the current mtxdb process only. "
+                + "It does not include durable records, indexes, memory-mapped files, or "
+                + "the operating system's filesystem page cache. A one-shot CLI process "
+                + "starts with an empty decoded-node cache; this is primarily useful to "
+                + "long-lived embedders.",
+        )
+        .arg(
+            Arg::new("evict")
+                .long("evict")
+                .action(ArgAction::SetTrue)
+                .help("Evict decoded nodes held by this process; does not flush the OS page cache"),
+        )
+}
+
 fn sub_meta() -> Command {
     Command::new("meta")
         .about("Inspect on-disk metadata and durability artifacts (read-only)")
@@ -429,7 +458,8 @@ fn sort_arg(help: &'static str) -> Arg {
 }
 
 fn sub_init() -> Command {
-    Command::new("init").about("Create a new mtxdb database root (db.meta + pools).")
+    Command::new("init")
+        .about("Create a new mtxdb database root (db.meta); pools are created on first write.")
 }
 
 fn sub_subprocess_writer() -> Command {
@@ -526,6 +556,7 @@ fn sub_scan() -> Command {
                 .num_args(0..=1)
                 .default_missing_value("auto")
                 .require_equals(true)
+                .value_parser(["auto", "json", "hamt", "state", "raw"])
                 .help("Decode and display payload format (e.g. json, hamt, state, raw, or auto)"),
         )
         .arg(
@@ -560,13 +591,40 @@ fn sub_info() -> Command {
     Command::new("info")
         .about("Show storage info for a collection or a pack")
         .arg(
-            Arg::new("collection")
+            Arg::new("selector")
                 .required(false)
+                .conflicts_with_all(["pack", "collection"])
                 .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "A `0x`-prefixed collection ID (32 hex digits after `0x`) or a pack ID \
-                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits). Omit it to \
-                     show database and pool metadata.",
+                    "A `0x`-prefixed pack filename prefix (1-16 hex digits, as shown by `mtxdb \
+                     shards`), a `0x`-prefixed 32-hex id naming a pack or a collection, or a \
+                     canonical collection sigil such as !room:server. A 32-hex selector is inferred: it \
+                     resolves to a pack if only a pack matches, to a collection if only a \
+                     collection matches, and is an error if both match (specify --pack or \
+                     --collection to disambiguate). Mutually exclusive with --pack/--collection. \
+                     Omit to show database and pool metadata.",
+                ),
+        )
+        .arg(
+            Arg::new("pack")
+                .long("pack")
+                .conflicts_with("collection")
+                .value_name("PACK_ID")
+                .help(
+                    "Interpret the selector as a pack (0x-prefixed full 32-hex id, or a unique \
+                     1-16 hex filename prefix). Bypasses inference; errors if no such pack \
+                     exists.",
+                ),
+        )
+        .arg(
+            Arg::new("collection")
+                .long("collection")
+                .conflicts_with("pack")
+                .value_name("COLLECTION")
+                .help(
+                    "Interpret the selector as a collection (0x-prefixed 32-hex id, or a \
+                     canonical sigil such as !room:server). Bypasses inference; errors if no \
+                     such collection exists.",
                 ),
         )
         .arg(
@@ -667,7 +725,7 @@ fn sub_packs() -> Command {
                         .long("pack")
                         .required(true)
                         .value_name("PACK_ID")
-                        .help("Pack identity (0x-prefixed 16 hex digits)"),
+                        .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
                 ),
         )
         .subcommand(sub_packs_dump())
@@ -684,8 +742,9 @@ fn sub_packs_dump() -> Command {
              `payload` is a decoded JSON convenience value (which may differ in whitespace, \
              key order, or numeric spelling) and is absent for binary payloads. Unlike \
              `export`, this is a complete view of one pack (all collections, superseded \
-             frames included), not a collection's live set. Pack IDs are pool-local, so a \
-             pack id present in more than one pool is rejected unless -t selects one.",
+             frames included), not a collection's live set. Pack identities are globally \
+             unique addresses, so if the same id is present in more than one selected pool \
+             it is still rejected as ambiguous unless -t selects one.",
         )
         .arg(
             Arg::new("pack")
@@ -693,7 +752,7 @@ fn sub_packs_dump() -> Command {
                 .long("pack")
                 .required(true)
                 .value_name("PACK_ID")
-                .help("Pack identity (0x-prefixed 16 hex digits)"),
+                .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
         )
         .arg(
             Arg::new("collection")
@@ -726,7 +785,7 @@ fn sub_packs_extract() -> Command {
                 .long("pack")
                 .required(true)
                 .value_name("PACK_ID")
-                .help("Source pack identity (0x-prefixed 16 hex digits)"),
+                .help("Source pack identity (full 32-hex 0x-prefixed id, or a unique filename prefix)"),
         )
         .arg(
             Arg::new("collection")
@@ -742,13 +801,7 @@ fn sub_packs_extract() -> Command {
                 .long("out")
                 .required(true)
                 .value_name("FILE")
-                .help("Path for the extracted packfile"),
-        )
-        .arg(
-            Arg::new("dest_pack_id")
-                .long("dest-pack-id")
-                .value_name("PACK_ID")
-                .help("Pack identity to stamp in the output header (defaults to 0, or parsed from pack_{hex}.pack filename)"),
+                .help("Path for the extracted packfile; it is stamped with a fresh random pack identity"),
         )
 }
 
@@ -959,6 +1012,9 @@ fn parse_cli() -> Cli {
         Some(("stats", m)) => Commands::Stats {
             json: m.get_flag("json"),
         },
+        Some(("memory", m)) => Commands::Memory {
+            evict: m.get_flag("evict"),
+        },
         Some(("meta", m)) => Commands::Meta {
             target: m.get_one::<String>("target").unwrap().clone(),
             json: m.get_flag("json"),
@@ -971,6 +1027,8 @@ fn parse_cli() -> Cli {
             decode: m.get_one::<String>("decode").cloned(),
         },
         Some(("info", m)) => Commands::Info {
+            selector: m.get_one::<String>("selector").cloned(),
+            pack: m.get_one::<String>("pack").cloned(),
             collection: m.get_one::<String>("collection").cloned(),
             stats: m.get_flag("stats"),
         },
@@ -1022,7 +1080,6 @@ fn parse_cli() -> Cli {
                     pack: sub.get_one::<String>("pack").unwrap().clone(),
                     collection: sub.get_one::<String>("collection").unwrap().clone(),
                     out: PathBuf::from(sub.get_one::<String>("out").unwrap()),
-                    dest_pack_id: sub.get_one::<String>("dest_pack_id").cloned(),
                 },
                 _ => unreachable!("subcommand_required enforces a packs action"),
             },

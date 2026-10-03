@@ -106,15 +106,30 @@ default = ["zstd"]
 # writes raw frames and refuses to read compressed ones.
 zstd = ["dep:zstd", "dep:zstd-sys"]
 
-# Cross-process write-ahead journal + read-committed overlay, for a
-# single-writer/multi-reader deployment where separate OS processes need to
-# read a live writer's committed-but-not-yet-checkpointed data (e.g. a
-# Synapse worker deployment). Off by default: a genuinely single-process
-# embedded deployment never needs this, and it costs real code (journal.rs,
-# the read-journal overlay, the refresh-on-miss read path) that a
-# single-process build shouldn't have to carry. See docs/TODO.txt's
-# "process model" entries for the deployment-shape reasoning.
+# Cross-process read-committed workers. Always available: `Database`, the
+# shared WAL, transactions, record-version compare-and-set and recovery, the
+# in-process read journal and `open_read_committed` for read-only use, and the
+# writer's publish signal and replay cursors (single-process repack uses them).
+# This feature adds only the API for attaching another OS process to a live
+# shared WAL (`PackfileStorage::open_read_committed_shared` and
+# `enable_read_journal_shared`) and the process-level tests. It never swaps in
+# different behavior: without it those APIs are simply absent, and there are no
+# alternate CAS or version paths.
 multi-reader = []
+
+# Roaring-backed `u32` bitmap sets (`bitmap_set`): generic set algebra over
+# domain-tagged ordinal spaces, for auth-chain closures and other large or
+# frequently-intersected index sets (membership intersections, relation
+# fan-out, candidate sets, query AND/OR/NOT). Off by default; carries the
+# `roaring` dependency. Enables the bitmap sets and everything built on them:
+# the auth-closure walk and its persisted generations, and the room auth
+# façade. See docs/docs/auth-chain-closures-plan.md.
+bitmaps = ["dep:roaring"]
+
+# MSC4521 set reconciliation over the persisted event population (owner log,
+# sorted runs, resident kernel): element hashing, kernels and the `Population`
+# trait come from `rezzy-recon`. Off by default; carries that dependency.
+reconcile = ["dep:rezzy-recon"]
 
 [dependencies]
 arc-swap = "1"
@@ -122,8 +137,13 @@ blake3 = "=1.5.5"
 bytes = "1.5"
 crc32fast = "1.4"
 fs2 = "0.4"
+# Substring search for the search-pack scan loop (`memmem::Finder`). Reused
+# across records, so one `Finder` is built per query term, not per record.
+memchr = "2.7"
 memmap2 = "0.9.11"
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
+rezzy-recon = { path = "../rezzy/rezzy-recon", version = "0.6.0-rc.1", optional = true }
+roaring = { version = "0.10.12", optional = true }
 sha2 = "0.10"
 zstd = { version = "0.13", default-features = false, optional = true }
 
@@ -141,10 +161,15 @@ zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
 [target.'cfg(windows)'.dependencies]
 zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
 
+# Keep cc's transitive jobserver below the release that introduced getrandom
+# 0.4, preserving the crate's Rust 1.81 build floor during cargo update.
+[build-dependencies]
+jobserver = "=0.1.32"
+
 # INTEGRATION TESTS. Ungated files are folded into one `tests/unit/main.rs`
 # target so `cargo test` links a single binary for them (see that file's
-# header). Feature-gated suites keep their own target with `required-features`,
-# so the default build neither compiles nor links them.
+# header). A suite that needs a feature keeps its own target with
+# `required-features`, so a build without it neither compiles nor links it.
 [[test]]
 name = "unit"
 path = "tests/unit/main.rs"

@@ -9,15 +9,18 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context};
 
 use mtxdb::auxiliary::AuxiliaryIndex;
+use mtxdb::matrix_adjacency::EventRecord;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
+use mtxdb::packfile::PackId;
+use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
-    derive_collection_id, frame_digest, record_logical_id, CollectionKeyRule, CollectionMetadata,
-    CollectionTemplate, DatabaseLayout, DigestAlgorithm, EstablishmentRule, FrameIdInput,
-    FrameIdPolicy, MatrixRoomVersion, PackfileStorage, PayloadPolicy, RecordIdentityRule,
-    ShardType,
+    derive_collection_id, frame_digest, record_logical_id, state_group_instance_id,
+    CollectionKeyRule, CollectionMetadata, CollectionTemplate, Database, DatabaseLayout,
+    DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion,
+    PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
 };
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -25,12 +28,10 @@ use simd_json::OwnedValue;
 use crate::{Cli, Commands, PacksAction};
 
 const MAX_DEBUG_UNRESOLVED: usize = 20;
-const STATE_GROUP_DIGEST_BYTES: usize = 32;
-const BASE64_BITS_PER_CHARACTER: usize = 6;
-const STATE_GROUP_ID_LENGTH: usize =
-    (STATE_GROUP_DIGEST_BYTES * 8).div_ceil(BASE64_BITS_PER_CHARACTER);
+/// Byte width of an STGP state-group instance id (128-bit).
+const STATE_GROUP_ID_LENGTH: usize = 16;
 
-/// Auxiliary namespace for the derived `event_id -> state_group_id` cache.
+/// Auxiliary namespace for the derived `event_id -> state-group instance` cache.
 ///
 /// The namespace is versioned. These values are derived data, so any change to
 /// the derivation (hashing, resolution rules, ordering) must bump the suffix.
@@ -41,17 +42,25 @@ const STATE_GROUP_ID_LENGTH: usize =
 /// recovering from that requires purging the namespace.
 /// The previous unversioned namespace is intentionally left as dead weight;
 /// auxiliary indexes are not globally enumerated or garbage-collected here.
-const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
+///
+/// v2: the state-group id changed from a BLAKE3 digest of the sorted entries to
+/// the unkeyed `LtHash` digest used by Synapse/sithnapse and materialized into
+/// each `MTHR` root.
+///
+/// v3: the value is a raw 128-bit `STGP` state-group *instance* id, derived from
+/// the sorted parent instance ids and the state `LtHash`, instead of the
+/// base64url `LtHash` digest. The `STGP` record holds the parent links and the
+/// shared `STAT` root id, so equal state content reached through different
+/// parents stays distinct.
+const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v3";
 
-fn valid_state_group_id(value: &str) -> bool {
+/// Whether `value` is a well-formed 128-bit STGP state-group instance id.
+fn valid_state_group_id(value: &[u8]) -> bool {
     value.len() == STATE_GROUP_ID_LENGTH
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 enum StateGroupLoad {
-    Complete(HashMap<String, String>),
+    Complete(HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>),
     Missing,
     Invalid {
         event_id: String,
@@ -78,19 +87,15 @@ fn state_groups_from_values(event_ids: &[String], values: Vec<Option<Vec<u8>>>) 
         let Some(value) = value else {
             return StateGroupLoad::Missing;
         };
-        let Ok(value) = String::from_utf8(value) else {
-            return StateGroupLoad::Invalid {
-                event_id: event_id.clone(),
-                reason: "invalid UTF-8",
-            };
-        };
         if !valid_state_group_id(&value) {
             return StateGroupLoad::Invalid {
                 event_id: event_id.clone(),
-                reason: "invalid state-group ID format",
+                reason: "invalid state-group instance ID width",
             };
         }
-        groups.insert(event_id.clone(), value);
+        let mut id = [0u8; STATE_GROUP_ID_LENGTH];
+        id.copy_from_slice(&value);
+        groups.insert(event_id.clone(), id);
     }
     StateGroupLoad::Complete(groups)
 }
@@ -259,6 +264,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Info { .. } => "info",
         Commands::Sync { .. } => "sync",
         Commands::Stats { .. } => "stats",
+        Commands::Memory { .. } => "memory",
         Commands::Meta { .. } => "meta",
         Commands::Import { .. } => "import",
         Commands::Export { .. } => "export",
@@ -331,6 +337,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_collections(cli, *all, *layout, *canonical, sort.as_deref(), *limit),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
+        Commands::Memory { evict } => cmd_memory(cli, *evict),
         Commands::Meta {
             target,
             json,
@@ -338,10 +345,22 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             offset,
             decode,
         } => cmd_meta(cli, target, *json, *limit, *offset, decode.as_deref()),
-        Commands::Info { collection, stats } => match collection {
-            Some(collection) => cmd_info(cli, collection, *stats),
-            None => cmd_info_default(cli, *stats),
-        },
+        Commands::Info {
+            selector,
+            pack,
+            collection,
+            stats,
+        } => {
+            if let Some(pack) = pack {
+                cmd_info(cli, pack, Some(InfoTarget::Pack), *stats)
+            } else if let Some(collection) = collection {
+                cmd_info(cli, collection, Some(InfoTarget::Collection), *stats)
+            } else if let Some(selector) = selector {
+                cmd_info(cli, selector, None, *stats)
+            } else {
+                cmd_info_default(cli, *stats)
+            }
+        }
         Commands::Scan {
             selector,
             verbose,
@@ -483,9 +502,10 @@ fn cmd_init(cli: &Cli) -> anyhow::Result<()> {
         println!("mtxdb database already initialized at `{}`", root.display());
     } else {
         println!("initialized mtxdb database at `{}`", root.display());
-        for shard_type in ShardType::ALL {
-            println!("  pools/{}", shard_type.as_str());
-        }
+        // Only the root descriptor exists yet: each pool is created by its first
+        // write, so list the pools it will hold rather than directories.
+        let pools: Vec<&str> = ShardType::ALL.iter().map(|shard| shard.as_str()).collect();
+        println!("  pools (created on first write): {}", pools.join(", "));
     }
     Ok(())
 }
@@ -741,15 +761,31 @@ where
     Ok(())
 }
 
+/// A pool's directory. A pool is created by its first write, so a pool that was
+/// never written has no directory yet and is simply empty: the path is returned
+/// either way, and opening it read-only yields an empty store.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "about thirty call sites are written against the fallible form, \
+              several as `let Ok(..) = .. else { continue }`"
+)]
 fn pool_dir(layout: &DatabaseLayout, shard_type: ShardType) -> anyhow::Result<PathBuf> {
-    layout
-        .pool_dir_read_only(shard_type)
-        .with_context(|| format!("failed to open {} shard pool", shard_type.as_str()))
+    Ok(layout.pool_path(shard_type))
 }
 
-/// The directory of a specific pool, regardless of `--shard-type`.
-fn pool_dir_for(cli: &Cli, shard_type: ShardType) -> anyhow::Result<PathBuf> {
-    pool_dir(&open_layout(cli)?, shard_type)
+/// Return a pool that exists on disk, or `None` for one never written (or one a
+/// database predates, such as `mtpl-server-info`). `-t all` skips those, and
+/// read-only inspection must not create them.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "kept fallible to match `pool_dir` at its call sites"
+)]
+fn existing_pool_dir(
+    layout: &DatabaseLayout,
+    shard_type: ShardType,
+) -> anyhow::Result<Option<PathBuf>> {
+    let path = layout.pool_path(shard_type);
+    Ok(path.is_dir().then_some(path))
 }
 
 fn selected_pool_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
@@ -1406,7 +1442,7 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Wire format (`MTHR`, version 1): a big-endian `u16` room-prefix length,
 /// the room-prefix bytes, a big-endian `u16` room-ID length, the UTF-8 room
-/// ID, a 32-byte root hash, and a 2048-byte lattice of 1024 big-endian lanes.
+/// ID, a 32-byte root hash, and a 2048-byte lattice of 1024 little-endian lanes.
 /// Returns `None` when the bytes don't match this layout.
 fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     const MAGIC: &[u8; 4] = b"MTHR";
@@ -1439,17 +1475,40 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     let room_id = core::str::from_utf8(bytes.get(room_id_start..root_hash_start)?).ok()?;
     let room_prefix = bytes.get(prefix_start..room_id_len_offset)?;
     let root_hash = bytes.get(root_hash_start..lattice_start)?;
-    let lattice_digest = blake3_digest(bytes.get(lattice_start..end)?);
+    let lattice_bytes = bytes.get(lattice_start..end)?;
+    let lattice_digest = blake3_digest(lattice_bytes);
+
+    // The lattice is 1024 little-endian u16 lanes; its unkeyed LtHash digest is
+    // the state-group id (BLAKE2b over the lanes), the same identity the
+    // event->state-group aux index stores.
+    let mut lanes = [0u16; 1024];
+    for (lane, chunk) in lanes.iter_mut().zip(lattice_bytes.as_chunks::<2>().0) {
+        *lane = u16::from_le_bytes(*chunk);
+    }
+    let lattice = rezzy::state::LtLattice::<1024>::from(lanes);
+    let state_group_id = rezzy::hamt::state_group_id_from_lthash(&lattice);
 
     let mut out = Vec::new();
     writeln!(out, "// HAMT state-group root (Synapse wire v1)").unwrap();
     writeln!(out, "// room prefix: 0x{}", hex::encode(room_prefix)).unwrap();
-    writeln!(out, "// room ID: {room_id:?}").unwrap();
-    writeln!(out, "// root hash: {}...", hex::encode(&root_hash[..8])).unwrap();
+    writeln!(out, "// room ID: {room_id}").unwrap();
+    writeln!(
+        out,
+        "// root MTHN node id: 0x{}",
+        hex::encode(&root_hash[..16])
+    )
+    .unwrap();
+    writeln!(out, "// root node id: 0x{}", hex::encode(&root_hash[..16])).unwrap();
     writeln!(out, "// lattice: {LATTICE_LEN} bytes (1024 u16 lanes)").unwrap();
     writeln!(
         out,
-        "// lattice digest (BLAKE3): {}",
+        "// state-group id (LtHash): 0x{}",
+        hex::encode(state_group_id)
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "// logical digest (BLAKE3): 0x{}",
         hex::encode(lattice_digest)
     )
     .unwrap();
@@ -1560,13 +1619,45 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
         let hash = &bytes[start..start + HASH_LEN];
         writeln!(
             out,
-            "  child[{child_index}] slot={slot}: {}...",
-            hex::encode(&hash[..8])
+            "  child[{child_index}] slot={slot}: node_id: 0x{}",
+            hex::encode(&hash[..16])
         )
         .unwrap();
         child_index += 1;
     }
 
+    Some(out)
+}
+
+/// Decode an `STGP\x01` state-group instance record into a readable form: its
+/// parent instance ids, state `LtHash` digest, and shared `STAT` root id.
+/// Returns `None` for any other payload.
+fn decode_state_group(bytes: &[u8]) -> Option<Vec<u8>> {
+    let instance = mtxdb::decode_state_group_record(bytes).ok()?;
+    let mut out = Vec::new();
+    writeln!(out, "// STGP state-group instance (v1)").unwrap();
+    writeln!(
+        out,
+        "// {} parent(s), {} bytes",
+        instance.parents.len(),
+        bytes.len()
+    )
+    .unwrap();
+    if instance.parents.is_empty() {
+        writeln!(out, "  parents: (none)").unwrap();
+    } else {
+        writeln!(out, "  parents:").unwrap();
+        for parent in &instance.parents {
+            writeln!(out, "    0x{}", hex::encode(parent)).unwrap();
+        }
+    }
+    writeln!(
+        out,
+        "  lthash (state identity): 0x{}",
+        hex::encode(instance.lthash)
+    )
+    .unwrap();
+    writeln!(out, "  STAT root id: 0x{}", hex::encode(instance.root_id)).unwrap();
     Some(out)
 }
 
@@ -1669,6 +1760,9 @@ fn pretty_print_payload(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     if let Some(hamt) = decode_hamt_node(bytes) {
         return Some(hamt);
+    }
+    if let Some(state_group) = decode_state_group(bytes) {
+        return Some(state_group);
     }
     let (format_version, metadata, json) = decode_event_json_record(bytes)?;
     let mut output = Vec::new();
@@ -2364,27 +2458,58 @@ fn cmd_collections_in_dir(
     }
     println!();
     if layout {
+        if canonical {
+            println!(
+                "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                "total",
+                "",
+                total_nodes,
+                "",
+                "",
+                if disk_known {
+                    fmt_disk_megabytes(total_disk_bytes)
+                } else {
+                    "?".to_owned()
+                },
+                "",
+                "",
+                ""
+            );
+        } else {
+            println!(
+                "  {:<34}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+                "total",
+                total_nodes,
+                "",
+                "",
+                if disk_known {
+                    fmt_disk_megabytes(total_disk_bytes)
+                } else {
+                    "?".to_owned()
+                },
+                "",
+                "",
+                ""
+            );
+        }
+    } else if canonical {
         println!(
-            "  {:<34}  {:<canonical_field_width$}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
+            "  {:<34}  {:<canonical_field_width$}  {total_nodes:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
             "total",
             "",
-            total_nodes,
             "",
             "",
+            fmt_index_kilobytes(total_memory),
             if disk_known {
                 fmt_disk_megabytes(total_disk_bytes)
             } else {
                 "?".to_owned()
             },
-            "",
-            "",
-            ""
         );
     } else {
         println!(
-            "  {:<34}  {:<canonical_field_width$}  {total_nodes:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
+            "  {:<34}  {total_nodes:>7}  {:>8}  {:>6}  {:>12}  {:>13}",
             "total",
-            "",
             "",
             "",
             fmt_index_kilobytes(total_memory),
@@ -2414,7 +2539,13 @@ fn cmd_collections_in_dir(
 /// Confirm that every packfile in `dir` uses the format this CLI can read.
 /// This reads only the fixed 4 KiB shard descriptors; it never scans frames.
 fn validate_packfile_headers(dir: &Path) -> anyhow::Result<()> {
-    for entry in fs::read_dir(dir)? {
+    // A pool never written has no directory and no shard headers to validate.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let path = entry?.path();
         if path.extension().is_none_or(|extension| extension != "pack") {
             continue;
@@ -2463,7 +2594,7 @@ fn interleaving_worth_noting(collections: u64, excess_runs: u64) -> bool {
 /// runs, interleaving excess, and — when fragmentation is worth acting on —
 /// the note that repack is never automatic.
 fn print_pack_physical_layout(
-    shard_entries: &[(u64, u64, u8)],
+    shard_entries: &[(PackId, u64, u8)],
     physical: &mtxdb::packfile::layout::PhysicalLayout,
 ) {
     // Aggregate only over the packs listed in `shard_entries`: the caller
@@ -2483,8 +2614,8 @@ fn print_pack_physical_layout(
         .sum();
     println!("physical layout: {runs} contiguous runs; {interleaved} excess runs from interleaving (includes superseded frames)");
     println!(
-        "{:>19}  {:>11}  {:>6}  {:>10}  {:>12}",
-        "pack id", "collections", "runs", "excess", "largest run"
+        "{:>21}  {:>11}  {:>6}  {:>10}  {:>12}",
+        "pack", "collections", "runs", "excess", "largest run"
     );
     for (pack_id, _, _) in shard_entries {
         let stats = physical.packs.get(pack_id);
@@ -2493,7 +2624,8 @@ fn print_pack_physical_layout(
         let excess = runs.saturating_sub(collections as u64);
         let largest = stats.map_or(0, |stats| stats.largest_segment_bytes);
         println!(
-            "0x{pack_id:016x}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
+            "0x{}  {collections:>11}  {runs:>6}  {excess:>10}  {:>12}",
+            &pack_id.as_hex()[..16],
             fmt_bytes(largest)
         );
     }
@@ -2534,7 +2666,7 @@ fn cmd_shards_coalesced(
 ) -> anyhow::Result<()> {
     struct ShardRow {
         db_label: String,
-        pack_id: u64,
+        pack_id: PackId,
         file_bytes: u64,
         version: u8,
         is_active: bool,
@@ -2580,7 +2712,7 @@ fn cmd_shards_coalesced(
                 continue;
             }
             shard_entries.sort_unstable_by_key(|&(id, _, _)| id);
-            let active_pack_id = shard_entries.iter().map(|(id, _, _)| *id).max();
+            let active_pack_id = shard_entries.last().map(|(id, _, _)| *id);
             let (stats_map, _) = decode_stats_snapshot(&pool_dir);
             let node_counts = PackfileStorage::shard_node_counts_from_disk(&pool_dir);
             let collection_counts = PackfileStorage::shard_collection_counts_from_disk(&pool_dir);
@@ -2703,8 +2835,8 @@ fn cmd_shards_coalesced(
             .max(8);
 
         println!(
-            "{:<db_width$}  {:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
-            "database", "pack id", "ver", "bytes", "nodes", "collections", "index", "syncs",
+            "{:<db_width$}  {:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+            "database", "pack", "ver", "bytes", "nodes", "collections", "index", "syncs",
         );
         for row in &rows {
             let nodes_str = row.nodes.map_or_else(|| "?".to_owned(), |n| n.to_string());
@@ -2715,12 +2847,12 @@ fn cmd_shards_coalesced(
                 .index_bytes
                 .map_or_else(|| "?".to_owned(), fmt_megabytes);
             println!(
-                "{:<db_width$}  {:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+                "{:<db_width$}  {:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
                 row.db_label,
                 format!(
-                    "0x{:016x}{}",
-                    row.pack_id,
-                    if row.is_active { "*" } else { " " }
+                    "0x{}{}",
+                    &row.pack_id.as_hex()[..16],
+                    if row.is_active { " *" } else { "  " }
                 ),
                 row.version,
                 fmt_bytes(row.file_bytes),
@@ -2732,7 +2864,7 @@ fn cmd_shards_coalesced(
         }
         println!();
         println!(
-            "{:<db_width$}  {:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+            "{:<db_width$}  {:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
             "total",
             "",
             "",
@@ -2819,6 +2951,64 @@ fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
         }
     }
     run_multi_dir(cli, |sub_cli| cmd_stats_single(sub_cli, json))
+}
+
+fn cmd_memory(cli: &Cli, evict: bool) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| cmd_memory_single(sub_cli, evict))
+}
+
+fn cmd_memory_single(cli: &Cli, evict: bool) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let selected = cli.shard_type;
+    let mut reported = false;
+
+    for shard_type in cli.shard_types() {
+        let pool = if selected.is_some() {
+            Some(pool_dir(&layout, shard_type)?)
+        } else {
+            existing_pool_dir(&layout, shard_type)?
+        };
+        let Some(pool) = pool else {
+            continue;
+        };
+        let store =
+            PackfileStorage::open_read_only(pool.clone()).context("failed to open store")?;
+        let before = store.resident_cache_stats();
+        let evicted = if evict {
+            store.evict_resident_caches()
+        } else {
+            0
+        };
+        let after = store.resident_cache_stats();
+        if evict {
+            println!(
+                "{} ({}) — evicted {} decoded nodes; {} remain across {} collection caches (hits={}, misses={})",
+                pool.display(),
+                shard_type.as_str(),
+                evicted,
+                after.entries,
+                after.collections,
+                after.hits,
+                after.misses,
+            );
+        } else {
+            println!(
+                "{} ({}) — {} decoded nodes resident across {} collection caches (hits={}, misses={})",
+                pool.display(),
+                shard_type.as_str(),
+                before.entries,
+                before.collections,
+                before.hits,
+                before.misses,
+            );
+        }
+        reported = true;
+    }
+
+    if !reported && selected.is_none() {
+        bail!("no shard pools found")
+    }
+    Ok(())
 }
 
 #[allow(
@@ -3465,7 +3655,7 @@ fn stats_json_object(
         let _ = writeln!(
             shards,
             "    {{\"pack_id\":{},\"bytes\":{},\"writes\":{},\"syncs\":{}}}{comma}",
-            summary.pack_id,
+            json_string(&summary.pack_id.to_string()),
             summary.stats.bytes_written,
             summary.stats.write_count,
             summary.stats.sync_count
@@ -3573,7 +3763,7 @@ fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Re
             bail!("unknown shards sort column `{column}`");
         }
         shard_entries.sort_by(|left, right| {
-            let value = |entry: &(u64, u64, u8)| match column {
+            let value = |entry: &(PackId, u64, u8)| match column {
                 "bytes" => entry.1,
                 "nodes" => node_counts
                     .as_ref()
@@ -3639,7 +3829,7 @@ fn cmd_shards_in_dir(dir: &Path, layout: bool, sort: Option<&str>) -> anyhow::Re
 
 /// Calculate each pack's associated collection-index allocation and the
 /// de-duplicated allocation for the whole pool from the persisted directory.
-fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<u64, usize>)> {
+fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<PackId, usize>)> {
     let summaries = PackfileStorage::collection_summaries_from_disk(dir)?;
     let collection_shards = PackfileStorage::collection_shards_from_disk(dir)?;
     let mut total = 0_usize;
@@ -3654,12 +3844,23 @@ fn index_requirements_from_disk(dir: &Path) -> Option<(usize, HashMap<u64, usize
     Some((total, by_shard))
 }
 
-/// Discover only canonical v4 `pack_{pack_id:016x}.pack` files.
+/// Discover canonical `pack_<hex>.pack` files.
 ///
-fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
+/// The filename carries only a truncated (optionally full) address prefix; the
+/// authoritative 128-bit address is read from the header and checked against
+/// the filename prefix. Returns `(address, bytes, format version)` ordered by
+/// address.
+fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(PackId, u64, u8)>> {
     let mut packs = Vec::new();
     let mut seen = HashSet::new();
-    for entry in fs::read_dir(dir)? {
+    // A pool is created by its first write, so a pool directory that does not
+    // exist holds no packs.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(packs),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "pack") {
@@ -3668,61 +3869,65 @@ fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(u64, u64, u8)>> {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let id_hex = match stem.strip_prefix("pack_") {
-            Some(id_hex) => id_hex,
-            None if stem.starts_with("shard_") => {
-                bail!(
-                    "found pre-v4 shard file {}; reset it rather than opening it as v4",
-                    path.display()
-                );
-            }
-            None => continue,
-        };
-        if id_hex.len() != 16
-            || !id_hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
+        if stem.starts_with("shard_") {
             bail!(
-                "invalid v4 pack filename {}; expected pack_{{16 lowercase hex digits}}.pack",
+                "found pre-v4 shard file {}; reset it rather than opening it as v4",
                 path.display()
             );
         }
-        let pack_id = u64::from_str_radix(id_hex, 16)?;
-        if !seen.insert(pack_id) {
-            bail!("duplicate pack_id {pack_id:#x} in {}", dir.display());
-        }
+        let Some((prefix_bytes, prefix_digits)) = PackId::parse_filename_prefix(stem) else {
+            if stem.starts_with("pack_") {
+                bail!(
+                    "invalid pack filename {}; expected pack_<lowercase hex digits>.pack",
+                    path.display()
+                );
+            }
+            // Another application's `.pack` file: ignore it.
+            continue;
+        };
+        let name_hex = mtxdb::packfile::hex_lower(&prefix_bytes[..prefix_digits.div_ceil(2)]);
         let file = fs::File::open(&path)
             .with_context(|| format!("failed to open pack `{}`", path.display()))?;
         let header = mtxdb::packfile::read_header(&mut BufReader::new(file))
             .with_context(|| format!("unsupported or corrupt pack `{}`", path.display()))?
             .with_context(|| format!("invalid pack header `{}`", path.display()))?;
-        if header.pack_id != pack_id {
+        if !header.pack_id.as_hex().starts_with(&name_hex) {
             bail!(
-                "pack {} identifies itself as {:#x}",
+                "pack {} identifies itself as {} but its filename prefix disagrees",
                 path.display(),
                 header.pack_id
             );
         }
-        packs.push((pack_id, entry.metadata()?.len(), mtxdb::packfile::VERSION));
+        if !seen.insert(header.pack_id) {
+            bail!(
+                "duplicate pack address {} in {}",
+                header.pack_id,
+                dir.display()
+            );
+        }
+        packs.push((
+            header.pack_id,
+            entry.metadata()?.len(),
+            mtxdb::packfile::VERSION,
+        ));
     }
     packs.sort_unstable_by_key(|(pack_id, _, _)| *pack_id);
     Ok(packs)
 }
 
-/// Pack ID to `(write_count, bytes_written, sync_count)`, as decoded from
+/// Pack address to `(write_count, bytes_written, sync_count)`, as decoded from
 /// `shard_stats.bin`.
-type ShardStatsMap = std::collections::HashMap<u64, (u64, u64, u64)>;
+type ShardStatsMap = std::collections::HashMap<PackId, (u64, u64, u64)>;
 
 /// Decode `shard_stats.bin` — same binary format as
 /// `ShardPool::restore_persisted_stats`, but standalone. Returns a map
-/// from a `pack_id` key to `(write_count,
-/// bytes_written, sync_count)` and the snapshot's persisted-at timestamp.
+/// from a pack address to `(write_count, bytes_written, sync_count)` and the
+/// snapshot's persisted-at timestamp.
 fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     const STATS_MAGIC: &[u8; 4] = b"MSTA";
-    const STATS_VERSION: u8 = 4;
+    const STATS_VERSION: u8 = 5;
     const STATS_HEADER_LEN: usize = 4 + 1 + 8;
-    const STATS_RECORD_LEN: usize = 8 + 8 * 3;
+    const STATS_RECORD_LEN: usize = mtxdb::packfile::PACK_ID_LEN + 8 * 3;
 
     let mut stats_map = std::collections::HashMap::new();
     let mut persisted_at = None;
@@ -3739,10 +3944,12 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     let body = &buf[STATS_HEADER_LEN..];
     for chunk in body.chunks(STATS_RECORD_LEN) {
         if let Ok(rec) = <&[u8; STATS_RECORD_LEN]>::try_from(chunk) {
-            let pack_id = u64::from_le_bytes(rec[0..8].try_into().unwrap());
-            let write_count = u64::from_le_bytes(rec[8..16].try_into().unwrap());
-            let bytes_written = u64::from_le_bytes(rec[16..24].try_into().unwrap());
-            let sync_count = u64::from_le_bytes(rec[24..32].try_into().unwrap());
+            let pack_id = PackId(rec[0..mtxdb::packfile::PACK_ID_LEN].try_into().unwrap());
+            let cursor = mtxdb::packfile::PACK_ID_LEN;
+            let write_count = u64::from_le_bytes(rec[cursor..cursor + 8].try_into().unwrap());
+            let bytes_written =
+                u64::from_le_bytes(rec[cursor + 8..cursor + 16].try_into().unwrap());
+            let sync_count = u64::from_le_bytes(rec[cursor + 16..cursor + 24].try_into().unwrap());
             stats_map.insert(pack_id, (write_count, bytes_written, sync_count));
         }
     }
@@ -3751,21 +3958,23 @@ fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
 
 /// Print the shard table header and rows.
 fn print_shard_table(
-    shard_entries: &[(u64, u64, u8)],
+    shard_entries: &[(PackId, u64, u8)],
     stats_map: &ShardStatsMap,
-    node_counts: Option<&std::collections::HashMap<u64, u64>>,
-    collection_counts: Option<&std::collections::HashMap<u64, u64>>,
+    node_counts: Option<&std::collections::HashMap<PackId, u64>>,
+    collection_counts: Option<&std::collections::HashMap<PackId, u64>>,
     total_collections: Option<usize>,
     index_requirement: Option<usize>,
-    index_requirements_by_shard: Option<&HashMap<u64, usize>>,
+    index_requirements_by_shard: Option<&HashMap<PackId, usize>>,
 ) {
-    // `ShardPool::open_internal` restores the newest pack as its append
+    // `ShardPool::open_internal` restores the last-slotted pack as its append
     // destination. Mirror that recovery rule here without opening a writer.
-    let active_pack_id = shard_entries.iter().map(|(pack_id, _, _)| *pack_id).max();
+    // Shards are discovered in address order, so the last entry is the newest
+    // slot (addresses are random, so this is discovery order, not age).
+    let active_pack_id = shard_entries.last().map(|(pack_id, _, _)| *pack_id);
 
     println!(
-        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
-        "pack id", "ver", "bytes", "nodes", "collections", "index", "syncs",
+        "{:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+        "pack", "ver", "bytes", "nodes", "collections", "index", "syncs",
     );
     let mut total_bytes = 0u64;
     let mut total_nodes = node_counts.map(|_| 0u64);
@@ -3782,13 +3991,14 @@ fn print_shard_table(
             .and_then(|requirements| requirements.get(&pack_id))
             .map_or_else(|| "?".to_owned(), |bytes| fmt_megabytes(*bytes));
         println!(
-            "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+            "{:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
             format!(
-                "0x{pack_id:016x}{}",
+                "0x{}{}",
+                &pack_id.as_hex()[..16],
                 if active_pack_id == Some(pack_id) {
-                    "*"
+                    " *"
                 } else {
-                    " "
+                    "  "
                 }
             ),
             version,
@@ -3806,7 +4016,7 @@ fn print_shard_table(
     }
     println!();
     println!(
-        "{:>19}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
+        "{:>21}  {:>3}  {:>10}  {:>8}  {:>11}  {:>12}  {:>6}",
         "total",
         "",
         fmt_bytes(total_bytes),
@@ -3847,36 +4057,270 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// `info` accepts a collection selector (a canonical sigil, or a
-/// `0x`-prefixed 32-hex logical ID) or a pack selector (`0x`-prefixed, 1–16 hex
-/// digits, as printed by `mtxdb shards`). Dispatch on the hex length the same
-/// way `scan` does; bare hex is not accepted.
+/// `info` accepts a collection selector (a canonical sigil, a bare `0x`-less
+/// sigil, or a `0x`-prefixed 32-hex logical ID) or a pack selector
+/// (`0x`-prefixed, 1–16 hex digits, as printed by `mtxdb shards`).
+///
+/// A `0x`-prefixed 32-hex selector is genuinely ambiguous now that a pack's
+/// full address is 32 hex digits: it can name either a collection or a pack,
+/// and the two are indistinguishable by length. `classify_info_selector`
+/// therefore resolves that length against the selected store — a live pack
+/// with that exact address, and/or a live collection with that id — and
+/// errors when both match so the caller must disambiguate explicitly
+/// (`--pack` or `--collection`). Bare hex is not accepted.
 /// What an `info` selector names.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InfoTarget {
     Pack,
     Collection,
 }
 
-/// Classify an `info` selector by the digits after its canonical lowercase
-/// `0x` prefix: 1-16 name a pack, exactly 32 name a collection, and any other
-/// count is an error. A selector without a `0x` prefix is handed to the
-/// collection parser (which accepts only a canonical sigil such as `!room`);
-/// an uppercase `0X` prefix is rejected rather than guessed at.
-fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
+/// One live pack discovered in a selected pool, with enough provenance to name
+/// it in an ambiguity diagnostic.
+struct PackLocation {
+    database: PathBuf,
+    shard_type: ShardType,
+    pack_id: PackId,
+    file_bytes: u64,
+    version: u8,
+}
+
+impl std::fmt::Display for PackLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} [{}]",
+            self.pack_id,
+            pool_label(&self.database, self.shard_type)
+        )
+    }
+}
+
+/// A short human label for a pool: the database dir name plus shard type.
+fn pool_label(database: &Path, shard_type: ShardType) -> String {
+    let db = database
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_else(|| database.to_str().unwrap_or("?"));
+    format!("{db}:{shard_type:?}")
+}
+
+/// Every live pack across the selected pools, with its database and shard type.
+///
+/// Cost: opens every selected database and globs every selected pool's pack
+/// directory. This is fine once per `info` invocation, but must not be called
+/// per-selector inside a multi-selector command — hoist the pool walk and
+/// reuse it instead. Discovery failures are skipped; an invalid database
+/// selection yields an empty inventory.
+fn pack_locations_in_selected_pools(cli: &Cli) -> Vec<PackLocation> {
+    let Ok(dirs) = valid_database_dirs(cli) else {
+        return Vec::new();
+    };
+    let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+    let mut locations = Vec::new();
+    for db_dir in dirs {
+        let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
+            continue;
+        };
+        for &shard_type in &shard_types {
+            let Ok(dir) = pool_dir(&layout, shard_type) else {
+                continue;
+            };
+            if let Ok(files) = glob_pack_files(&dir) {
+                locations.extend(files.into_iter().map(|(pack_id, file_bytes, version)| {
+                    PackLocation {
+                        database: db_dir.clone(),
+                        shard_type,
+                        pack_id,
+                        file_bytes,
+                        version,
+                    }
+                }));
+            }
+        }
+    }
+    locations
+}
+
+/// Whether a live collection with this id exists in any selected pool.
+///
+/// Same cost caveat as [`pack_locations_in_selected_pools`]: a single `info`
+/// disambiguation is fine, a per-selector loop in a multi-selector command is
+/// not. Unreadable databases and pools are skipped; returns `false` if no
+/// readable pool reports a match.
+fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
+    let Ok(dirs) = valid_database_dirs(cli) else {
+        return false;
+    };
+    let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+    for db_dir in dirs {
+        let Ok(layout) = DatabaseLayout::open_read_only(db_dir) else {
+            continue;
+        };
+        for &shard_type in &shard_types {
+            let Ok(dir) = pool_dir(&layout, shard_type) else {
+                continue;
+            };
+            let has = if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir)
+            {
+                summaries.iter().any(|(id, _, _, _)| id == target_id)
+            } else if let Ok(store) = PackfileStorage::open_read_only(dir) {
+                store.collection_index_info(target_id).is_some()
+            } else {
+                false
+            };
+            if has {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Classify an `info`/`scan` selector by inference. See
+/// [`classify_info_selector_explicit`]; this is the no-override form.
+fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarget> {
+    classify_info_selector_explicit(cli, selector, None)
+}
+
+/// Classify a selector, optionally under an explicit namespace.
+///
+/// With `explicit` set (from `info --pack` / `info --collection`), the requested
+/// type is used directly — inference is skipped — and the selector is validated
+/// against that type: `--pack` accepts the full 0x-prefixed 32-hex address or a
+/// 1-16 hex filename prefix that resolves to exactly one pack (ambiguity errors
+/// and asks for the full address); `--collection` accepts an exact 32-hex id or
+/// a canonical `!room` sigil. Either errors if nothing of that type matches.
+/// `--pack` also rejects a single address present in multiple selected pools.
+///
+/// Without it, classification is inferred by the digits after the canonical
+/// lowercase `0x` prefix: 1-16 name a pack prefix, exactly 32 can name either a
+/// full pack address or a collection, and any other count is an error. A
+/// selector without a `0x` prefix is classified as a collection without
+/// validation; an uppercase `0X` prefix is rejected. Short pack prefixes are
+/// also classified without validation; callers must parse them before use.
+/// For an ambiguous 32-hex selector the database is checked:
+/// - If only an existing pack matches, it resolves as [`InfoTarget::Pack`].
+/// - If only a collection exists (or neither exists yet), it resolves as [`InfoTarget::Collection`].
+/// - If both a live pack and a collection match the same ID, an error requires
+///   an explicit `--pack` or `--collection` (with the exact 32-hex id).
+///
+/// Returns the target plus the reusable pack inventory when pack
+/// classification required a discovery walk.
+fn classify_info_selector_with_inventory(
+    cli: &Cli,
+    selector: &str,
+    explicit: Option<InfoTarget>,
+) -> anyhow::Result<(InfoTarget, Option<Vec<PackLocation>>)> {
+    match explicit {
+        Some(InfoTarget::Pack) => {
+            // A full 32-hex address, or a 1-16 hex filename prefix (64 bits is
+            // the ergonomic default). A prefix must resolve to exactly one
+            // pack in exactly one pool; anything else is reported with the
+            // specific conflict. Never a collection.
+            let pack_selector = parse_pack_id_selector(selector)?;
+            let locations = pack_locations_in_selected_pools(cli);
+            let matched: Vec<&PackLocation> = locations
+                .iter()
+                .filter(|location| pack_selector.matches(&location.pack_id))
+                .collect();
+            let distinct: std::collections::BTreeSet<PackId> =
+                matched.iter().map(|location| location.pack_id).collect();
+            match (distinct.len(), matched.len()) {
+                (0, _) => bail!("pack {selector}: not found"),
+                // Hand the walk to the caller so the display path need not
+                // repeat it.
+                (1, 1) => return Ok((InfoTarget::Pack, Some(locations))),
+                (1, _) => {
+                    // One pack, present in more than one selected pool.
+                    let where_ = matched
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    bail!(
+                        "pack {selector} exists in {} selected pools ({where_}); narrow with \
+                         --dir or -t to a single pool",
+                        matched.len()
+                    )
+                }
+                (n, m) => {
+                    // More than one distinct pack matches the prefix.
+                    let ids = distinct
+                        .iter()
+                        .map(PackId::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let pool_hint = if m > n {
+                        " (some also appear in more than one pool, so narrow with --dir or -t)"
+                    } else {
+                        ""
+                    };
+                    bail!(
+                        "pack prefix `{selector}` matches {n} different packs ({ids}); use the \
+                         full 0x-prefixed {PACK_ID_HEX_LEN}-hex id{pool_hint}"
+                    )
+                }
+            }
+        }
+        Some(InfoTarget::Collection) => {
+            let id = parse_collection_selector(selector)?;
+            if !collection_id_exists(cli, &id) {
+                bail!("collection {selector}: not found");
+            }
+            return Ok((InfoTarget::Collection, None));
+        }
+        None => {}
+    }
     let Some(hex) = selector.strip_prefix("0x") else {
         if selector.starts_with("0X") {
             bail!("invalid ID `{selector}`: the prefix must be lowercase `0x`");
         }
-        return Ok(InfoTarget::Collection);
+        return Ok((InfoTarget::Collection, None));
     };
     match hex.len() {
-        1..=16 => Ok(InfoTarget::Pack),
-        32 => Ok(InfoTarget::Collection),
+        // A bare prefix does not need a walk to classify; the display path
+        // resolves it against the pool it was narrowed to.
+        1..=16 => Ok((InfoTarget::Pack, None)),
+        32 => {
+            let pack_id = parse_pack_id_selector(selector)
+                .ok()
+                .and_then(|sel| match sel {
+                    PackSelector::Exact(id) => Some(id),
+                    PackSelector::Prefix(_) => None,
+                });
+            let collection_id = parse_collection_id(selector).ok();
+
+            let locations = pack_locations_in_selected_pools(cli);
+            let pack_matches =
+                pack_id.is_some_and(|id| locations.iter().any(|location| location.pack_id == id));
+            let collection_matches = collection_id.is_some_and(|id| collection_id_exists(cli, &id));
+
+            if pack_matches && collection_matches {
+                bail!(
+                    "selector `{selector}` matches both a pack and a collection; specify one:\n  \
+                     mtxdb info --pack {selector}\n  \
+                     mtxdb info --collection {selector}"
+                );
+            }
+            if pack_matches {
+                Ok((InfoTarget::Pack, Some(locations)))
+            } else {
+                Ok((InfoTarget::Collection, None))
+            }
+        }
         found => {
             bail!(
-                "invalid ID `{selector}`: after `0x` expected 32 hex digits (a collection) or \
-                 1-16 (a pack), found {found} characters{}",
+                "invalid ID `{selector}`: after `0x` expected 32 hex digits (a collection or full pack address) \
+                 or 1-16 (a pack filename prefix), found {found} characters{}",
                 if hex.starts_with("0x") {
                     " (the `0x` prefix is doubled)"
                 } else {
@@ -3887,9 +4331,25 @@ fn classify_info_selector(selector: &str) -> anyhow::Result<InfoTarget> {
     }
 }
 
+/// Classify a selector, returning only the target. Thin wrapper over
+/// [`classify_info_selector_with_inventory`] for callers that do not reuse the
+/// pack inventory the classification may have walked.
+fn classify_info_selector_explicit(
+    cli: &Cli,
+    selector: &str,
+    explicit: Option<InfoTarget>,
+) -> anyhow::Result<InfoTarget> {
+    Ok(classify_info_selector_with_inventory(cli, selector, explicit)?.0)
+}
+
 #[allow(clippy::too_many_lines)]
-fn cmd_info_coalesced(cli: &Cli, selector: &str, deep: bool) -> anyhow::Result<()> {
-    let target = classify_info_selector(selector)?;
+fn cmd_info_coalesced(
+    cli: &Cli,
+    selector: &str,
+    deep: bool,
+    explicit: Option<InfoTarget>,
+) -> anyhow::Result<()> {
+    let (target, inventory) = classify_info_selector_with_inventory(cli, selector, explicit)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
         vec![st]
@@ -3960,7 +4420,7 @@ fn cmd_info_coalesced(cli: &Cli, selector: &str, deep: bool) -> anyhow::Result<(
             Ok(())
         }
         InfoTarget::Pack => {
-            let pack_id = parse_pack_id_selector(selector)?;
+            let selector = parse_pack_id_selector(selector)?;
             let mut matches = Vec::new();
             for db_dir in &valid_dirs {
                 let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
@@ -3970,28 +4430,45 @@ fn cmd_info_coalesced(cli: &Cli, selector: &str, deep: bool) -> anyhow::Result<(
                     let Ok(dir) = pool_dir(&layout, shard_type) else {
                         continue;
                     };
-                    let shard_entries: Vec<(u64, u64, u8)> = match glob_pack_files(&dir) {
-                        Ok(files) => files
-                            .into_iter()
-                            .filter(|&(id, _, _)| id == pack_id)
-                            .collect(),
-                        Err(_) => continue,
+                    let files = if let Some(locations) = inventory.as_deref() {
+                        locations
+                            .iter()
+                            .filter(|location| {
+                                location.database == *db_dir && location.shard_type == shard_type
+                            })
+                            .map(|location| {
+                                (location.pack_id, location.file_bytes, location.version)
+                            })
+                            .collect()
+                    } else {
+                        let Ok(files) = glob_pack_files(&dir) else {
+                            continue;
+                        };
+                        files
                     };
-                    if !shard_entries.is_empty() {
-                        matches.push((db_dir.clone(), shard_type, dir, shard_entries));
+                    let ids: Vec<PackId> = files.iter().map(|&(id, _, _)| id).collect();
+                    if !ids.iter().any(|id| selector.matches(id)) {
+                        continue;
                     }
+                    let pack_id = selector.resolve(ids.iter())?;
+                    let shard_entries: Vec<(PackId, u64, u8)> = files
+                        .into_iter()
+                        .filter(|&(id, _, _)| id == pack_id)
+                        .collect();
+                    matches.push((db_dir.clone(), shard_type, dir, pack_id, shard_entries));
                 }
             }
 
             if matches.is_empty() {
                 eprintln!(
-                    "pack 0x{pack_id:016x}: not found across {} database(s)",
+                    "pack {selector}: not found across {} database(s)",
                     valid_dirs.len()
                 );
                 return Ok(());
             }
 
-            for (i, (db_dir, shard_type, dir, shard_entries)) in matches.iter().enumerate() {
+            for (i, (db_dir, shard_type, dir, pack_id, shard_entries)) in matches.iter().enumerate()
+            {
                 if i > 0 {
                     println!();
                 }
@@ -4000,7 +4477,7 @@ fn cmd_info_coalesced(cli: &Cli, selector: &str, deep: bool) -> anyhow::Result<(
                     db_dir.display(),
                     shard_type.as_str()
                 );
-                print_pack_info(dir, pack_id, shard_entries, *shard_type);
+                print_pack_info(dir, *pack_id, shard_entries, *shard_type);
             }
             if matches.len() > 1 {
                 println!();
@@ -4362,7 +4839,7 @@ fn meta_pools(root: &Path, report: &mut MetaReport, limit: usize, offset: usize,
         for path in packs.into_iter().skip(offset).take(limit) {
             match pack_identity(&path) {
                 PackIdentity::Valid { pack_id, length } => report.line(format!(
-                    "  {}: {} bytes, pack_id={pack_id:#x}",
+                    "  {}: {} bytes, pack_id={pack_id}",
                     path.display(),
                     length
                 )),
@@ -4378,7 +4855,7 @@ fn meta_pools(root: &Path, report: &mut MetaReport, limit: usize, offset: usize,
 }
 
 enum PackIdentity {
-    Valid { pack_id: u64, length: u64 },
+    Valid { pack_id: PackId, length: u64 },
     NonCanonical(String),
     Invalid(anyhow::Error),
 }
@@ -4398,6 +4875,9 @@ impl PackIssueLevel {
     }
 }
 
+/// Read a canonical filename's full pack ID and file length, checking prefix
+/// agreement with the header. Noncanonical names are reported separately;
+/// I/O and header-validation failures become `PackIdentity::Invalid`.
 fn pack_identity(path: &Path) -> PackIdentity {
     let stem = path
         .file_stem()
@@ -4406,29 +4886,20 @@ fn pack_identity(path: &Path) -> PackIdentity {
     let Some(stem) = stem else {
         return PackIdentity::Invalid(anyhow!("pack filename is not valid UTF-8"));
     };
-    let Some(hex) = stem.strip_prefix("pack_") else {
+    let Some((prefix_bytes, prefix_digits)) = PackId::parse_filename_prefix(&stem) else {
         return PackIdentity::NonCanonical(format!(
-            "pack filename `{stem}` is non-canonical; expected pack_<16 hex digits>.pack"
+            "pack filename `{stem}` is non-canonical; expected pack_<lowercase hex digits>.pack"
         ));
     };
-    if hex.len() != 16
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return PackIdentity::NonCanonical(format!(
-            "pack filename `{stem}` is non-canonical; expected pack_<16 lowercase hex digits>.pack"
-        ));
-    }
-    let result = (|| -> anyhow::Result<(u64, u64)> {
-        let filename_id = u64::from_str_radix(hex, 16)?;
+    let name_hex = mtxdb::packfile::hex_lower(&prefix_bytes[..prefix_digits.div_ceil(2)]);
+    let result = (|| -> anyhow::Result<(PackId, u64)> {
         let length = fs::metadata(path)?.len();
         let mut file = BufReader::new(fs::File::open(path)?);
         let header =
             mtxdb::packfile::read_header(&mut file)?.ok_or_else(|| anyhow!("not a packfile"))?;
-        if header.pack_id != filename_id {
+        if !header.pack_id.as_hex().starts_with(&name_hex) {
             bail!(
-                "pack filename id {filename_id:#x} disagrees with header id {:#x}",
+                "pack filename prefix {name_hex} disagrees with header id {}",
                 header.pack_id
             );
         }
@@ -4956,16 +5427,29 @@ fn cmd_info_default_single(cli: &Cli, stats: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_info(cli: &Cli, selector: &str, deep: bool) -> anyhow::Result<()> {
+fn cmd_info(
+    cli: &Cli,
+    selector: &str,
+    explicit: Option<InfoTarget>,
+    deep: bool,
+) -> anyhow::Result<()> {
     if cli.coalesce {
-        return cmd_info_coalesced(cli, selector, deep);
+        return cmd_info_coalesced(cli, selector, deep, explicit);
     }
-    run_multi_dir(cli, |sub_cli| cmd_info_single(sub_cli, selector, deep))
+    run_multi_dir(cli, |sub_cli| {
+        cmd_info_single(sub_cli, selector, deep, explicit)
+    })
 }
 
-fn cmd_info_single(cli: &Cli, selector: &str, deep: bool) -> anyhow::Result<()> {
-    match classify_info_selector(selector)? {
-        InfoTarget::Pack => cmd_info_pack(cli, selector),
+fn cmd_info_single(
+    cli: &Cli,
+    selector: &str,
+    deep: bool,
+    explicit: Option<InfoTarget>,
+) -> anyhow::Result<()> {
+    let (target, inventory) = classify_info_selector_with_inventory(cli, selector, explicit)?;
+    match target {
+        InfoTarget::Pack => cmd_info_pack(cli, selector, inventory.as_deref()),
         InfoTarget::Collection => cmd_info_collection(cli, selector, deep),
     }
 }
@@ -5017,8 +5501,8 @@ fn print_pack_lifetime(path: &Path) {
 )]
 fn print_pack_info(
     dir: &Path,
-    pack_id: u64,
-    shard_entries: &[(u64, u64, u8)],
+    pack_id: PackId,
+    shard_entries: &[(PackId, u64, u8)],
     shard_type: ShardType,
 ) {
     let (stats_map, _) = decode_stats_snapshot(dir);
@@ -5050,8 +5534,8 @@ fn print_pack_info(
 
     println!();
     println!("type: {}", shard_type.as_str());
-    println!("generation: {pack_id} (0x{pack_id:016x})");
-    let path = dir.join(format!("pack_{pack_id:016x}.pack"));
+    println!("pack: {pack_id}");
+    let path = dir.join(pack_id.filename());
     println!("path: {}", path.display());
 
     print_pack_lifetime(&path);
@@ -5132,42 +5616,76 @@ fn print_pack_info(
     }
 }
 
-fn cmd_info_pack(cli: &Cli, selector: &str) -> anyhow::Result<()> {
-    let pack_id = parse_pack_id_selector(selector)?;
+/// Display matching packs in the selected pools. An optional inventory must
+/// belong to this database and avoids repeating discovery. Ambiguous prefixes
+/// and discovery errors propagate; a missing pack is an error only when a
+/// specific pool is selected.
+fn cmd_info_pack(
+    cli: &Cli,
+    selector: &str,
+    inventory: Option<&[PackLocation]>,
+) -> anyhow::Result<()> {
+    let selector = parse_pack_id_selector(selector)?;
+    // Reuse the pack walk classification already did for this database when it
+    // is available; only a bare prefix (classified without a walk) falls back
+    // to globbing the pool.
+    let pool_packs = |shard_type: ShardType| -> Option<Vec<(PackId, u64, u8)>> {
+        inventory.map(|locations| {
+            locations
+                .iter()
+                .filter(|location| location.shard_type == shard_type)
+                .map(|location| (location.pack_id, location.file_bytes, location.version))
+                .collect()
+        })
+    };
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
             let dir = pool_dir(&db_layout, shard_type)?;
-            let shard_entries: Vec<(u64, u64, u8)> = glob_pack_files(&dir)?
+            let all = match pool_packs(shard_type) {
+                Some(all) => all,
+                None => glob_pack_files(&dir)?,
+            };
+            let ids: Vec<PackId> = all.iter().map(|&(id, _, _)| id).collect();
+            if !ids.iter().any(|id| selector.matches(id)) {
+                continue;
+            }
+            let pack_id = selector.resolve(ids.iter())?;
+            let shard_entries: Vec<(PackId, u64, u8)> = all
                 .into_iter()
                 .filter(|&(id, _, _)| id == pack_id)
                 .collect();
-            if !shard_entries.is_empty() {
-                if matched_any {
-                    println!();
-                    println!();
-                }
-                print_section_header(shard_type);
-                print_pack_info(&dir, pack_id, &shard_entries, shard_type);
-                matched_any = true;
+            if matched_any {
+                println!();
+                println!();
             }
+            print_section_header(shard_type);
+            print_pack_info(&dir, pack_id, &shard_entries, shard_type);
+            matched_any = true;
         }
         if !matched_any {
-            eprintln!("pack 0x{pack_id:016x}: not found");
+            eprintln!("pack {selector}: not found");
         }
         return Ok(());
     }
     let dir = selected_pool_dir(cli)?;
-    let shard_entries: Vec<(u64, u64, u8)> = glob_pack_files(&dir)?
+    let shard_type = cli.require_shard_type()?;
+    let all = match pool_packs(shard_type) {
+        Some(all) => all,
+        None => glob_pack_files(&dir)?,
+    };
+    let ids: Vec<PackId> = all.iter().map(|&(id, _, _)| id).collect();
+    let pack_id = selector.resolve(ids.iter())?;
+    let shard_entries: Vec<(PackId, u64, u8)> = all
         .into_iter()
         .filter(|&(id, _, _)| id == pack_id)
         .collect();
     if shard_entries.is_empty() {
-        eprintln!("pack 0x{pack_id:016x}: not found");
+        eprintln!("pack {selector}: not found");
         return Ok(());
     }
-    print_pack_info(&dir, pack_id, &shard_entries, cli.require_shard_type()?);
+    print_pack_info(&dir, pack_id, &shard_entries, shard_type);
     Ok(())
 }
 
@@ -5177,7 +5695,7 @@ fn print_collection_info(
     len: usize,
     mem: usize,
     capacity: u32,
-    shards: &[u64],
+    shards: &[PackId],
     deep: bool,
 ) {
     let hex = format_id(collection_id);
@@ -5211,7 +5729,7 @@ fn print_collection_info(
                         pack_bytes.sort_unstable_by_key(|(pack_id, _)| **pack_id);
                         println!("    per pack:");
                         for (pack_id, bytes) in pack_bytes {
-                            println!("      0x{pack_id:016x}: {}", fmt_bytes(*bytes));
+                            println!("      {}: {}", pack_id.filename_stem(), fmt_bytes(*bytes));
                         }
                     }
                 }
@@ -5442,6 +5960,213 @@ fn collection_metadata_for(
         extension: Some(extension.encode_blob()),
         role: Some("event".to_owned()),
         schema: Some("matrix.event.v1".to_owned()),
+    }
+}
+
+/// Build and persist the state HAMTs and `STGP` derivation records for a room.
+///
+/// `STAT` content is materialized once per distinct state `LtHash`; every
+/// derivation, including merges that reach the same state through different
+/// parents, gets its own `STGP` record whose id is derived from the sorted
+/// parent instance ids and the `LtHash`. Returns the number of records written.
+/// Node ids are the first 16 bytes of each node's structural hash; roots use a
+/// domain-separated id derived from the room and `LtHash`, so roots and
+/// structural-hash nodes cannot collide. A record already present with
+/// identical bytes is skipped; a different value under the same id is a hard
+/// error.
+fn materialize_state_hamts(
+    state_store: &PackfileStorage,
+    room_id: &str,
+    instances: &HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+) -> anyhow::Result<usize> {
+    let Some(stat_collection) = crate::state_hamt::state_hamt_collection_id(room_id) else {
+        return Ok(0);
+    };
+    let Some(stgp_collection) = mtxdb::state_group_collection_id(room_id) else {
+        return Ok(0);
+    };
+    let room_prefix = crate::state_hamt::room_hamt_prefix(room_id);
+
+    let mut seen_stat: HashMap<[u8; 16], bytes::Bytes> = HashMap::new();
+    let mut stat_records: Vec<(NodeId, NodeData)> = Vec::new();
+    let mut seen_stgp: HashMap<[u8; 16], bytes::Bytes> = HashMap::new();
+    let mut stgp_records: Vec<(NodeId, NodeData)> = Vec::new();
+    let mut content_done: HashSet<[u8; 32]> = HashSet::new();
+
+    for (instance_id, instance) in instances {
+        if instance.set.entries.is_empty() {
+            continue;
+        }
+        if content_done.insert(instance.lthash) {
+            let mut entries: Vec<(String, String, String)> = instance
+                .set
+                .entries
+                .iter()
+                .map(|((event_type, state_key), event_id)| {
+                    (event_type.clone(), state_key.clone(), event_id.clone())
+                })
+                .collect();
+            entries.sort();
+            let built = crate::state_hamt::build_state_hamt(room_id, &room_prefix, &entries)
+                .map_err(|error| anyhow!(error))?;
+            if built.state_group_id != instance.lthash {
+                bail!("state HAMT digest mismatch for room {room_id}");
+            }
+            for (hash, node_bytes) in built.nodes {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&hash[..16]);
+                push_hamt_record(
+                    &mut seen_stat,
+                    &mut stat_records,
+                    id,
+                    bytes::Bytes::from(node_bytes),
+                )?;
+            }
+            let root_node =
+                crate::state_hamt::state_hamt_root_node_id(room_id, &built.state_group_id);
+            push_hamt_record(
+                &mut seen_stat,
+                &mut stat_records,
+                root_node,
+                bytes::Bytes::from(built.root_record),
+            )?;
+        }
+
+        let record = mtxdb::StateGroupInstance {
+            parents: instance.parents.clone(),
+            lthash: instance.lthash,
+            root_id: crate::state_hamt::state_hamt_root_node_id(room_id, &instance.lthash),
+        };
+        push_hamt_record(
+            &mut seen_stgp,
+            &mut stgp_records,
+            *instance_id,
+            bytes::Bytes::from(mtxdb::encode_state_group_record(&record)),
+        )?;
+    }
+
+    let stat_records = filter_new_records(state_store, &stat_collection, stat_records)?;
+    if !stat_records.is_empty() {
+        ensure_collection_metadata(state_store, &stat_collection, &state_hamt_metadata(room_id))?;
+        state_store.put_many(&stat_collection, &stat_records)?;
+    }
+    let stgp_records = filter_new_records(state_store, &stgp_collection, stgp_records)?;
+    if !stgp_records.is_empty() {
+        ensure_collection_metadata(
+            state_store,
+            &stgp_collection,
+            &state_group_metadata(room_id),
+        )?;
+        state_store.put_many(&stgp_collection, &stgp_records)?;
+    }
+    Ok(stat_records.len().saturating_add(stgp_records.len()))
+}
+
+/// Drop records already present in `collection` and reject an id already bound
+/// to different bytes.
+///
+/// `STAT` content and `STGP` instance records are immutable, so a write must
+/// never overwrite an existing payload: a differing payload under the same id
+/// is a hard collision, not a last-writer-wins update.
+fn filter_new_records<S: StorageEngine + ?Sized>(
+    state_store: &S,
+    collection_id: &[u8; 16],
+    records: Vec<(NodeId, NodeData)>,
+) -> anyhow::Result<Vec<(NodeId, NodeData)>> {
+    if records.is_empty() {
+        return Ok(records);
+    }
+    let ids: Vec<NodeId> = records.iter().map(|(id, _)| *id).collect();
+    let existing = state_store.get_many_bytes(collection_id, &ids)?;
+    let mut fresh = Vec::new();
+    for ((id, data), existing) in records.into_iter().zip(existing) {
+        match existing {
+            None => fresh.push((id, data)),
+            Some(bytes) if bytes == data.bytes => {}
+            Some(_) => bail!(
+                "immutable record {} in collection {} already exists with different bytes",
+                format_id(&id),
+                format_id(collection_id)
+            ),
+        }
+    }
+    Ok(fresh)
+}
+
+/// Ensure `collection` carries exactly `metadata`, tolerating an unchanged
+/// re-import and rejecting a conflicting definition.
+fn ensure_collection_metadata(
+    state_store: &PackfileStorage,
+    collection_id: &[u8; 16],
+    metadata: &CollectionMetadata,
+) -> anyhow::Result<()> {
+    match state_store.get_collection_metadata(collection_id)? {
+        Some(existing) if &existing == metadata => Ok(()),
+        Some(_) => bail!(
+            "collection {} has conflicting metadata",
+            format_id(collection_id)
+        ),
+        None => {
+            state_store.ensure_collection_metadata(collection_id, metadata)?;
+            Ok(())
+        }
+    }
+}
+
+/// Insert a HAMT record unless an identical one was already queued.
+fn push_hamt_record(
+    seen: &mut HashMap<[u8; 16], bytes::Bytes>,
+    records: &mut Vec<(NodeId, NodeData)>,
+    id: [u8; 16],
+    value: bytes::Bytes,
+) -> anyhow::Result<()> {
+    match seen.entry(id) {
+        std::collections::hash_map::Entry::Occupied(existing) => {
+            if existing.get() != &value {
+                bail!(
+                    "HAMT record id {} collides with a different value",
+                    format_id(&id)
+                );
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(value.clone());
+            records.push((id, NodeData::new(value)));
+        }
+    }
+    Ok(())
+}
+
+/// Genesis metadata for a room's `STAT` HAMT collection, matching the layout
+/// `sithnapse` writes.
+fn state_hamt_metadata(room_id: &str) -> CollectionMetadata {
+    CollectionMetadata {
+        member_namespace: Some(*b"STAT"),
+        collection_canonical_id: room_id.as_bytes().to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+        role: Some("state_hamt".to_owned()),
+        schema: Some("sithnapse.state-hamt.v1".to_owned()),
+    }
+}
+
+/// Genesis metadata for a room's `STGP` state-group instance collection.
+fn state_group_metadata(room_id: &str) -> CollectionMetadata {
+    CollectionMetadata {
+        member_namespace: Some(*b"STGP"),
+        collection_canonical_id: room_id.as_bytes().to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+        role: Some("state_group".to_owned()),
+        schema: Some("sithnapse.state-group.v1".to_owned()),
     }
 }
 
@@ -5744,6 +6469,8 @@ fn classify_record_payload(data: &[u8]) -> &'static str {
         "HAMT node"
     } else if data.starts_with(b"MTHR") {
         "HAMT state-group root"
+    } else if data.starts_with(b"STGP") {
+        "state-group instance"
     } else if data.starts_with(b"AUX1") {
         "auxiliary index value"
     } else if decode_event_json_record(data).is_some() {
@@ -5973,40 +6700,112 @@ fn print_collection_details(dir: &Path, collection_id: &[u8; 16], deep: bool) {
     }
 }
 
-fn print_collection_shards(shards: &[u64]) {
+fn print_collection_shards(shards: &[PackId]) {
     match shards {
-        [shard] => println!("  {:<12} 0x{shard:016x}", "pack:"),
+        [shard] => println!("  {:<12} {shard}", "pack:"),
         [] => {}
         _ => println!(
             "  {:<12} {}",
             "packs:",
             shards
                 .iter()
-                .map(|id| format!("0x{id:016x}"))
+                .map(PackId::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     }
 }
 
-/// Parse an operator-facing pack identifier. Slots are deliberately not
-/// accepted here: they are recycled implementation details, while a pack ID
-/// is the permanent identity printed by `mtxdb shards`.
-fn parse_pack_id_selector(selector: &str) -> anyhow::Result<u64> {
-    let Some(hex) = selector.strip_prefix("0x") else {
-        bail!("invalid pack ID `{selector}`; use the lowercase 0x-prefixed ID shown by `mtxdb shards`");
-    };
-    if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        if hex.len() == 32 {
+/// An operator-facing pack identifier. Slots are deliberately not accepted
+/// here: they are recycled implementation details, while a pack address is the
+/// permanent identity printed by `mtxdb shards`. A selector is either the full
+/// 32-hex address or a 1–16 hex filename prefix; the prefix is resolved against
+/// a pool's discovered packs, where it must be unique.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PackSelector {
+    /// A full 128-bit address, matched exactly.
+    Exact(PackId),
+    /// A lowercase hex prefix of an address (typically the 16-hex filename stem).
+    Prefix(String),
+}
+
+impl PackSelector {
+    /// Parse a lowercase `0x`-prefixed full address or 1–16 hex digit prefix.
+    ///
+    /// Rejects malformed selectors and the full all-zero address. A zero prefix
+    /// is allowed; existence and uniqueness are checked separately by `resolve`.
+    fn parse(selector: &str) -> anyhow::Result<Self> {
+        let Some(hex) = selector.strip_prefix("0x") else {
             bail!(
-                "invalid pack ID `{selector}`; that's 32 hex digits, which looks like a \
-                 collection ID, not a pack ID — pack IDs are 1–16 hex digits, shown by \
+                "invalid pack ID `{selector}`; use the lowercase 0x-prefixed ID shown by \
                  `mtxdb shards`"
             );
+        };
+        if hex.is_empty()
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            bail!("invalid pack ID `{selector}`; expected lowercase hexadecimal digits after 0x");
         }
-        bail!("invalid pack ID `{selector}`; expected 1–16 hexadecimal digits after 0x");
+        if hex.len() == PACK_ID_HEX_LEN {
+            let id = PackId::from_hex(hex)
+                .ok_or_else(|| anyhow!("invalid pack ID `{selector}`; not a 128-bit address"))?;
+            return Ok(Self::Exact(id));
+        }
+        if hex.len() > PACK_FILENAME_PREFIX_HEX {
+            bail!(
+                "invalid pack ID `{selector}`; expected 1–{PACK_FILENAME_PREFIX_HEX} hex digits \
+                 (a filename prefix) or {PACK_ID_HEX_LEN} (the full address)"
+            );
+        }
+        Ok(Self::Prefix(hex.to_owned()))
     }
-    u64::from_str_radix(hex, 16).with_context(|| format!("invalid pack ID `{selector}`"))
+
+    /// Whether `id` matches this selector.
+    fn matches(&self, id: &PackId) -> bool {
+        match self {
+            Self::Exact(exact) => id == exact,
+            Self::Prefix(prefix) => id.has_hex_prefix(prefix),
+        }
+    }
+
+    /// Resolve to exactly one address among `candidates`, erroring on zero or
+    /// multiple matches (a short prefix must be unambiguous).
+    fn resolve<'a>(
+        &self,
+        candidates: impl IntoIterator<Item = &'a PackId>,
+    ) -> anyhow::Result<PackId> {
+        let matches: Vec<PackId> = candidates
+            .into_iter()
+            .filter(|id| self.matches(id))
+            .copied()
+            .collect();
+        match matches.as_slice() {
+            [id] => Ok(*id),
+            [] => bail!("pack {self}: not found"),
+            _ => bail!("pack {self}: matches multiple packs; use a longer selector"),
+        }
+    }
+}
+
+impl std::fmt::Display for PackSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact(id) => write!(f, "{id}"),
+            Self::Prefix(prefix) => write!(f, "0x{prefix}"),
+        }
+    }
+}
+
+/// Hex digits in a full [`PackId`] address.
+const PACK_ID_HEX_LEN: usize = mtxdb::packfile::PACK_ID_LEN * 2;
+/// Hex digits in the truncated filename prefix of a pack address.
+const PACK_FILENAME_PREFIX_HEX: usize = mtxdb::packfile::PACK_FILENAME_PREFIX_HEX;
+
+/// Parse an operator-facing pack identifier into a selector.
+fn parse_pack_id_selector(selector: &str) -> anyhow::Result<PackSelector> {
+    PackSelector::parse(selector)
 }
 
 /// Common options shared by `scan_pack` and `cmd_scan_collection`.
@@ -6070,7 +6869,7 @@ fn cmd_scan_coalesced(
     sort: Option<&str>,
     reverse: bool,
 ) -> anyhow::Result<()> {
-    let target = classify_info_selector(selector)?;
+    let target = classify_info_selector(cli, selector)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
         vec![st]
@@ -6111,7 +6910,7 @@ fn cmd_scan_coalesced(
             }
         }
         InfoTarget::Pack => {
-            let pack_id = parse_pack_id_selector(selector)?;
+            let selector = parse_pack_id_selector(selector)?;
             for db_dir in &valid_dirs {
                 let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
                     continue;
@@ -6122,7 +6921,7 @@ fn cmd_scan_coalesced(
                         continue;
                     };
                     if let Ok(files) = glob_pack_files(&dir) {
-                        if files.iter().any(|&(id, _, _)| id == pack_id) {
+                        if files.iter().any(|&(id, _, _)| selector.matches(&id)) {
                             found_in_db = true;
                             break;
                         }
@@ -6242,27 +7041,34 @@ fn cmd_scan_single(
     };
     // `info` and `scan` share `classify_info_selector`, so the same selector
     // works for both and a malformed one gets the same explanation.
-    let looks_like_pack_id = classify_info_selector(selector)? == InfoTarget::Pack;
+    let looks_like_pack_id = classify_info_selector(cli, selector)? == InfoTarget::Pack;
     if !looks_like_pack_id {
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
         }
         return cmd_scan_collection(cli, selector, &opts);
     }
-    let pack_id = parse_pack_id_selector(selector)?;
+    let selector = parse_pack_id_selector(selector)?;
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
-            let pool_dir = pool_dir(&db_layout, shard_type)?;
+            let Some(pool_dir) = existing_pool_dir(&db_layout, shard_type)? else {
+                continue;
+            };
             let Ok(pool) = ShardPool::open_read_only(pool_dir) else {
                 continue;
             };
-            let shard = pool
-                .all_shards()
+            let shards = pool.all_shards();
+            let ids: Vec<PackId> = shards.iter().map(|(_, shard)| shard.pack_id).collect();
+            if !ids.iter().any(|id| selector.matches(id)) {
+                continue;
+            }
+            let pack_id = selector.resolve(ids.iter())?;
+            if let Some((_, shard)) = shards
                 .into_iter()
-                .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard));
-            if let Some(shard) = shard {
+                .find(|(_, shard)| shard.pack_id == pack_id)
+            {
                 if matched_any {
                     println!();
                     println!();
@@ -6273,18 +7079,21 @@ fn cmd_scan_single(
             }
         }
         if !matched_any {
-            eprintln!("pack 0x{pack_id:016x}: not found");
+            eprintln!("pack {selector}: not found");
         }
         return Ok(());
     }
     let shard_type = cli.require_shard_type()?;
     let pool_dir = selected_pool_dir(cli)?;
     let pool = ShardPool::open_read_only(pool_dir).context("failed to open shard store")?;
-    let shard = pool
-        .all_shards()
+    let shards = pool.all_shards();
+    let ids: Vec<PackId> = shards.iter().map(|(_, shard)| shard.pack_id).collect();
+    let pack_id = selector.resolve(ids.iter())?;
+    let shard = shards
         .into_iter()
-        .find_map(|(_, shard)| (shard.pack_id == pack_id).then_some(shard))
-        .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))?;
+        .find(|(_, shard)| shard.pack_id == pack_id)
+        .map(|(_, shard)| shard)
+        .with_context(|| format!("pack {selector} not found"))?;
     scan_pack(cli, &shard, pack_id, collection_filter, &opts, shard_type)
 }
 
@@ -6296,7 +7105,7 @@ fn cmd_scan_single(
 fn scan_pack(
     _cli: &Cli,
     shard: &std::sync::Arc<mtxdb::shard::Shard>,
-    pack_id: u64,
+    pack_id: PackId,
     collection_filter: Option<[u8; 16]>,
     opts: &ScanOptions,
     shard_type: ShardType,
@@ -6317,7 +7126,7 @@ fn scan_pack(
             continue;
         }
         matched_records = matched_records.saturating_add(1);
-        if opts.is_sorting() || records.len() < max_rows {
+        if opts.is_sorting() || opts.reverse || records.len() < max_rows {
             records.push((record_collection, record_id, offset));
         } else {
             truncated = true;
@@ -6338,9 +7147,10 @@ fn scan_pack(
             }
             None => unreachable!(),
         }
-        if opts.reverse {
-            records.reverse();
-        }
+        truncated = records.len() > max_rows;
+    }
+    if opts.reverse {
+        records.reverse();
         truncated = records.len() > max_rows;
     }
     if opts.raw {
@@ -6351,7 +7161,7 @@ fn scan_pack(
             out.write_all(&data.data)?;
             if opts.verbose {
                 eprintln!(
-                    "pack 0x{pack_id:016x}: raw frame @ {offset} ({} bytes, checksum verified)",
+                    "pack {pack_id}: raw frame @ {offset} ({} bytes, checksum verified)",
                     data.data.len()
                 );
             }
@@ -6364,13 +7174,13 @@ fn scan_pack(
     }
     if truncated {
         println!(
-            "pack 0x{pack_id:016x}: {} bytes, showing first {max_rows} matching records (at least {})",
+            "pack {pack_id}: {} bytes, showing first {max_rows} matching records (at least {})",
             std::fs::metadata(path)?.len(),
             matched_records,
         );
     } else {
         println!(
-            "pack 0x{pack_id:016x}: {} bytes, {} records",
+            "pack {pack_id}: {} bytes, {} records",
             std::fs::metadata(path)?.len(),
             matched_records,
         );
@@ -6379,13 +7189,17 @@ fn scan_pack(
     for (collection_id, node_id, offset) in records.iter().take(max_rows) {
         let collection_hex = format_id(collection_id);
         let id_hex = format_id(node_id);
-        let need_record = opts.verbose || opts.header || opts.decode.is_some();
+        let should_decode = opts.decode.is_some() || (opts.verbose && !opts.header);
+        // State scans render the event -> state-group mapping inline, so they
+        // read frames even without `--verbose`/`--decode`; other shards keep
+        // the read-free default.
+        let need_record = should_decode || opts.header || shard_type == ShardType::State;
         let data = need_record
             .then(|| ShardPool::read_at_committed(shard, *offset, true))
             .transpose()?;
         let payload = data
             .as_ref()
-            .map(|data| scan_payload_cell(&data.data, shard_type));
+            .map(|data| scan_payload_cell(&data.data, shard_type, should_decode));
         println!(
             "{}",
             scan_table_row(&collection_hex, &id_hex, *offset, payload.as_deref())
@@ -6395,7 +7209,6 @@ fn scan_pack(
                 print_scan_record_header(record, collection_id);
             }
         }
-        let should_decode = opts.decode.is_some() || (opts.verbose && !opts.header);
         if should_decode {
             if let Some(data) =
                 data.filter(|data| scan_payload_suffix(&data.data, shard_type).is_none())
@@ -6440,9 +7253,14 @@ fn scan_table_row(location: &str, id: &str, offset: u64, payload: Option<&str>) 
 
 /// The PAYLOAD cell for one row: a decodable payload prints below the row
 /// instead (its formatted form spans lines), so the cell just says so.
-fn scan_payload_cell(data: &[u8], shard_type: ShardType) -> String {
-    scan_payload_suffix(data, shard_type)
-        .unwrap_or_else(|| format!("{} bytes (decoded below)", data.len()))
+fn scan_payload_cell(data: &[u8], shard_type: ShardType, decodes_below: bool) -> String {
+    scan_payload_suffix(data, shard_type).unwrap_or_else(|| {
+        if decodes_below {
+            format!("{} bytes (decoded below)", data.len())
+        } else {
+            format!("{} bytes", data.len())
+        }
+    })
 }
 
 /// Print every physical frame for a collection across all packs. This is a
@@ -6505,7 +7323,7 @@ fn cmd_scan_collection_in_pool(
         }
         let matched_pack = scan_collection_shard(&shard, &mut context)?;
         packs = packs.saturating_add(usize::from(matched_pack));
-        if bounded && !opts.is_sorting() && context.frames >= max_rows {
+        if bounded && !opts.is_sorting() && !opts.reverse && context.frames >= max_rows {
             break;
         }
     }
@@ -6544,7 +7362,7 @@ fn cmd_scan_collection_in_pool(
         }
         return Ok(frames);
     }
-    if context.mode.is_sorting() {
+    if context.mode.is_sorting() || context.reverse {
         if context.show_section_header && !context.header_printed {
             if context.needs_section_spacing {
                 println!();
@@ -6602,7 +7420,9 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
-            let pool_dir = pool_dir(&db_layout, shard_type)?;
+            let Some(pool_dir) = existing_pool_dir(&db_layout, shard_type)? else {
+                continue;
+            };
             let frames = cmd_scan_collection_in_pool(
                 &pool_dir,
                 collection_id,
@@ -6650,7 +7470,11 @@ fn sort_collection_records(context: &mut CollectionScanContext) {
             }
             None => unreachable!(),
         }
-        if context.reverse {
+    }
+    if context.reverse {
+        if context.mode.is_raw() {
+            context.raw_matches.reverse();
+        } else {
             context.sorted_records.reverse();
         }
     }
@@ -6736,7 +7560,7 @@ fn scan_collection_shard(
         context.frames = context.frames.saturating_add(1);
         if context.mode.is_raw() {
             context.raw_matches.push((shard.clone(), record_id, offset));
-        } else if context.mode.is_sorting() {
+        } else if context.mode.is_sorting() || context.reverse {
             context
                 .sorted_records
                 .push((shard.clone(), record_id, offset));
@@ -6745,6 +7569,7 @@ fn scan_collection_shard(
         }
         if context.max_rows != usize::MAX
             && !context.mode.is_sorting()
+            && !context.reverse
             && context.frames >= context.max_rows
         {
             break;
@@ -6770,7 +7595,8 @@ fn print_collection_record(
         print_scan_table_header("PACK", scan_payload_label(context.shard_type));
         context.header_printed = true;
     }
-    let need_record = context.mode.verbose() || context.header || context.decode.is_some();
+    let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
+    let need_record = should_decode || context.header || context.shard_type == ShardType::State;
     let data = need_record
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
@@ -6778,13 +7604,13 @@ fn print_collection_record(
         if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
             "collection metadata".to_owned()
         } else {
-            scan_payload_cell(&data.data, context.shard_type)
+            scan_payload_cell(&data.data, context.shard_type, should_decode)
         }
     });
     println!(
         "{}",
         scan_table_row(
-            &format!("0x{:016x}", shard.pack_id),
+            &shard.pack_id.filename_stem(),
             &format_id(&record_id),
             offset,
             payload.as_deref(),
@@ -6795,7 +7621,6 @@ fn print_collection_record(
             print_scan_record_header(record, &context.collection_id);
         }
     }
-    let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
     if should_decode {
         if let Some(data) =
             data.filter(|data| scan_payload_suffix(&data.data, context.shard_type).is_none())
@@ -6880,13 +7705,17 @@ fn print_scan_payload(data: &[u8], decode: Option<&str>) {
     let rendered = if let Some(mode) = decode {
         match mode {
             "json" => pretty_json_stream(data),
-            "hamt" => decode_hamt_root(data).or_else(|| decode_hamt_node(data)),
+            "hamt" => decode_hamt_root(data)
+                .or_else(|| decode_hamt_node(data))
+                .or_else(|| decode_state_group(data)),
             "state" => {
                 if data.len() == 8 {
                     let state_group = u64::from_be_bytes(data.try_into().unwrap());
                     Some(format!("PTR: 0x{state_group:016x}\n").into_bytes())
                 } else {
-                    decode_hamt_root(data).or_else(|| decode_hamt_node(data))
+                    decode_hamt_root(data)
+                        .or_else(|| decode_hamt_node(data))
+                        .or_else(|| decode_state_group(data))
                 }
             }
             "raw" => Some(hex_bytes(data).into_bytes()),
@@ -6912,6 +7741,27 @@ fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
     if shard_type == ShardType::State && data.len() == 8 {
         let state_group = u64::from_be_bytes(data.try_into().ok()?);
         return Some(format!("PTR: 0x{state_group:016x}"));
+    }
+    if data.starts_with(b"AUX1") {
+        // Auxiliary values retain their four-byte magic and full 32-byte
+        // key digest on disk.  The scanner does not have the logical key
+        // needed to verify that digest, but it can still render the value
+        // portion instead of incorrectly calling the whole envelope opaque.
+        const AUXILIARY_VALUE_OFFSET: usize = 4 + 32;
+        if data.len() < AUXILIARY_VALUE_OFFSET {
+            return Some(format!("{} bytes (malformed AUX1 envelope)", data.len()));
+        }
+        let value = &data[AUXILIARY_VALUE_OFFSET..];
+        // A 16-byte value in the state shard is an `event -> STGP instance`
+        // pointer; render it in the same `PTR:` form as the legacy pointer.
+        if value.len() == STATE_GROUP_ID_LENGTH {
+            return Some(format!("PTR: {}", format_id(value)));
+        }
+        let rendered = std::str::from_utf8(value)
+            .ok()
+            .filter(|text| text.bytes().all(|byte| !byte.is_ascii_control()))
+            .map_or_else(|| hex_bytes(value), ToOwned::to_owned);
+        return Some(format!("AUX1 value: {rendered}"));
     }
     if pretty_print_payload(data).is_some() {
         return None;
@@ -6943,35 +7793,33 @@ fn cmd_import(
     // Admission is based on the actual pack contents rather than a sidecar:
     // a stale summary must not make an unestablished room look established.
     let mut established_collections = matrix_create_collections_on_disk(&pool_dir)?;
-    // Import buffers appends (one positioned write per ~1 MiB of frames
-    // instead of one per record) and ends with a single `sync_all`, which
-    // flushes and fsyncs everything below — the explicit durability schedule
-    // the buffered append policy is meant for. A `put` command that syncs
-    // per record stays on the default eager path.
-    let store = open_store(cli)?.with_append_policy(mtxdb::shard::AppendPolicy::buffered());
+    // One `Database` owns every pool for the whole import, so the event, state and
+    // edges pools share one write-ahead log and the root's single-writer lock: no
+    // other writer can interleave halfway through a shell glob, and the per-room
+    // auth adjacency is recorded through the same database as the records it
+    // describes. Every pool the import touches is synced once at the end.
+    let layout = open_layout(cli)?;
+    let shard = cli.require_shard_type()?;
+    let db = Database::open(layout.root().to_path_buf()).with_context(|| {
+        format!(
+            "failed to open the database at `{}` for writing",
+            layout.root().display()
+        )
+    })?;
+    let store: &PackfileStorage = db.pool(shard);
+    store.set_read_plan_policy(cli.read_plan);
     // State-group mappings belong in the State pool, not the event pool.
-    let state_dir = pool_dir_for(cli, ShardType::State)?;
-    let separate_state_store = if state_dir == pool_dir {
-        None
-    } else {
-        Some({
-            let state_store = PackfileStorage::open(state_dir)
-                .context("failed to open the state pool")?
-                .with_append_policy(mtxdb::shard::AppendPolicy::buffered());
-            state_store.set_read_plan_policy(cli.read_plan);
-            state_store
-        })
-    };
-    let state_store = separate_state_store.as_ref().unwrap_or(&store);
+    let state_store: &PackfileStorage = db.pool(ShardType::State);
+    state_store.set_read_plan_policy(cli.read_plan);
     let mut failures = 0_usize;
     for (index, path) in paths.iter().enumerate() {
         if index != 0 {
             eprintln!();
         }
         if let Err(error) = cmd_import_file(
-            &store,
+            &db,
+            store,
             state_store,
-            &pool_dir,
             path,
             collection_override,
             &import_template,
@@ -6984,10 +7832,15 @@ fn cmd_import(
     store
         .sync_all()
         .context("persisting import shard and collection summaries")?;
-    if separate_state_store.is_some() {
+    if shard != ShardType::State {
         state_store
             .sync_all()
             .context("persisting state-group summaries")?;
+    }
+    if shard != ShardType::Edges {
+        db.pool(ShardType::Edges)
+            .sync_all()
+            .context("persisting auth adjacency and edges summaries")?;
     }
     if failures != 0 {
         bail!("import completed with {failures} failed input file(s)");
@@ -7410,28 +8263,26 @@ fn export_lines(
     collection_id: &[u8; 16],
     format: ExportFormat,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
-    let mut shards = pool.all_shards();
-    shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
+    let shards = pool.all_shards();
 
-    // Enumerate the collection's frames in physical order. `seen` fixes the
-    // output order at first sight; `winners` records the highest-pack-id frame
-    // for each node id (latest offset within a pack wins on ties). Since open
-    // slots shards in ascending pack-id order and the index overwrites on
-    // duplicate hashes, this reproduces the live index's winner.
+    // Enumerate the collection's node ids in physical scan order; `seen` fixes
+    // the output order at first sight. The winning frame for each id is not
+    // chosen here: pack addresses are random, so ordering by address would not
+    // reproduce the live index. The envelope path asks the index for the live
+    // location instead (see `get_location`), so it always exports the same
+    // frame that `get` would return.
     let mut seen = HashSet::new();
     let mut ordered_ids = Vec::new();
-    let mut winners: HashMap<NodeId, (u64, u64)> = HashMap::new();
-    let mut pack_paths: HashMap<u64, PathBuf> = HashMap::new();
+    let mut pack_paths: HashMap<PackId, PathBuf> = HashMap::new();
     for (_, shard) in &shards {
         pack_paths.insert(shard.pack_id, shard.path.clone());
-        for_each_frame(&shard.path, |offset, frame| {
+        for_each_frame(&shard.path, |_offset, frame| {
             if frame.collection_id != *collection_id {
                 return Ok(());
             }
             if seen.insert(frame.hash) {
                 ordered_ids.push(frame.hash);
             }
-            winners.insert(frame.hash, (shard.pack_id, offset));
             Ok(())
         })?;
     }
@@ -7439,7 +8290,7 @@ fn export_lines(
     // Keep one open handle per pack for the whole pass: envelope export reads
     // the winning frame at its offset, and reopening each pack per record would
     // turn a large export into an open/close storm.
-    let mut readers: HashMap<u64, BufReader<fs::File>> = HashMap::new();
+    let mut readers: HashMap<PackId, BufReader<fs::File>> = HashMap::new();
 
     let mut lines = Vec::with_capacity(ordered_ids.len());
     for node_id in ordered_ids {
@@ -7453,8 +8304,9 @@ fn export_lines(
                 // Read the winning frame directly so the payload and the frame
                 // metadata in one envelope always describe the same frame,
                 // rather than mixing an index-resolved payload with a
-                // separately scanned metadata copy.
-                let Some(&(pack_id, offset)) = winners.get(&node_id) else {
+                // separately scanned metadata copy. The winning location comes
+                // from the live index, matching what `get` returns.
+                let Some((pack_id, offset)) = store.get_location(collection_id, &node_id)? else {
                     continue;
                 };
                 let Some(path) = pack_paths.get(&pack_id) else {
@@ -7480,8 +8332,8 @@ fn export_lines(
 /// cached handle (opened on first use) so a per-record read is a seek, not an
 /// open/close pair.
 fn read_frame_at(
-    readers: &mut HashMap<u64, BufReader<fs::File>>,
-    pack_id: u64,
+    readers: &mut HashMap<PackId, BufReader<fs::File>>,
+    pack_id: PackId,
     path: &Path,
     offset: u64,
 ) -> anyhow::Result<mtxdb::packfile::Record> {
@@ -7672,7 +8524,7 @@ const PACK_DUMP_SCHEMA: &str = "mtxdb.pack.dump/v1";
 fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
     match action {
         PacksAction::List { all } => cmd_shards(cli, *all, false, None),
-        PacksAction::Inspect { pack } => cmd_info_pack(cli, pack),
+        PacksAction::Inspect { pack } => cmd_info_pack(cli, pack, None),
         PacksAction::Dump {
             pack,
             collection,
@@ -7682,34 +8534,40 @@ fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
             pack,
             collection,
             out,
-            dest_pack_id,
-        } => cmd_packs_extract(cli, pack, collection, out, dest_pack_id.as_deref()),
+        } => cmd_packs_extract(cli, pack, collection, out),
     }
 }
 
-/// Resolve a numeric pack ID to its shard pool type and physical file path.
-/// Refuses to resolve if the pack ID is ambiguous across multiple pools unless
-/// `-t` narrows the search.
-fn resolve_pack_file(cli: &Cli, pack_id: u64) -> anyhow::Result<(ShardType, PathBuf)> {
+/// Resolve a pack selector to its shard pool type, physical file path, and
+/// address. Refuses to resolve if the selector is ambiguous across multiple
+/// pools unless `-t` narrows the search.
+fn resolve_pack_file(
+    cli: &Cli,
+    selector: &PackSelector,
+) -> anyhow::Result<(ShardType, PathBuf, PackId)> {
     let layout = open_layout(cli)?;
-    let mut matches: Vec<(ShardType, PathBuf)> = Vec::new();
+    let mut matches: Vec<(ShardType, PathBuf, PackId)> = Vec::new();
     for shard_type in cli.shard_types() {
         let dir = pool_dir(&layout, shard_type)?;
         if !dir.is_dir() {
             continue;
         }
-        let path = dir.join(format!("pack_{pack_id:016x}.pack"));
-        if path.is_file() {
-            matches.push((shard_type, path));
+        let Ok(packs) = glob_pack_files(&dir) else {
+            continue;
+        };
+        for (pack_id, _, _) in packs {
+            if selector.matches(&pack_id) {
+                matches.push((shard_type, dir.join(pack_id.filename()), pack_id));
+            }
         }
     }
     match matches.as_slice() {
-        [(shard_type, path)] => Ok((*shard_type, path.clone())),
-        [] => bail!("pack 0x{pack_id:016x}: not found"),
+        [(shard_type, path, pack_id)] => Ok((*shard_type, path.clone(), *pack_id)),
+        [] => bail!("pack {selector}: not found"),
         _ => {
-            let pools: Vec<&str> = matches.iter().map(|(kind, _)| kind.as_str()).collect();
+            let pools: Vec<&str> = matches.iter().map(|(kind, _, _)| kind.as_str()).collect();
             bail!(
-                "pack 0x{pack_id:016x} exists in multiple pools ({}); pass -t <type> to disambiguate — pack IDs are pool-local",
+                "pack {selector} is ambiguous (matches in {}); pass -t <type> or a longer selector",
                 pools.join(", ")
             );
         }
@@ -7728,14 +8586,14 @@ fn cmd_packs_dump(
     out: Option<&Path>,
 ) -> anyhow::Result<()> {
     cli.require_single_dir("packs dump")?;
-    let pack_id = parse_pack_id_selector(pack_selector)?;
+    let selector = parse_pack_id_selector(pack_selector)?;
     let collection_filter = collection_selector
         .map(parse_collection_selector)
         .transpose()?;
 
-    // `pack_id` is pool-local, so the same numeric id can exist in more than
-    // one pool. Refuse to merge two different packs into one output stream.
-    let (shard_type, path) = resolve_pack_file(cli, pack_id)?;
+    // Refuse to merge two different packs (e.g. a short prefix matching in more
+    // than one pool) into one output stream.
+    let (shard_type, path, pack_id) = resolve_pack_file(cli, &selector)?;
 
     let stdout = io::stdout();
     let mut writer: Box<dyn Write> = match out {
@@ -7753,19 +8611,19 @@ fn cmd_packs_dump(
             continue;
         }
         writer
-            .write_all(pack_dump_line(shard_type.as_str(), pack_id, offset, &record).as_bytes())?;
+            .write_all(pack_dump_line(shard_type.as_str(), &pack_id, offset, &record).as_bytes())?;
         writer.write_all(b"\n")?;
         written = written.saturating_add(1);
     }
     writer.flush()?;
     if scanner.torn_tail() {
         eprintln!(
-            "warning: pack 0x{pack_id:016x} ends in a torn frame; its tail was not dumped \
+            "warning: pack {pack_id} ends in a torn frame; its tail was not dumped \
              (a concurrent writer can cause this)"
         );
     }
     eprintln!(
-        "dumped {written} frames from pack 0x{pack_id:016x} ({} pool)",
+        "dumped {written} frames from pack {pack_id} ({} pool)",
         shard_type.as_str()
     );
     Ok(())
@@ -7778,12 +8636,11 @@ fn cmd_packs_extract(
     pack_selector: &str,
     collection_selector: &str,
     out: &Path,
-    dest_pack_id_selector: Option<&str>,
 ) -> anyhow::Result<()> {
     cli.require_single_dir("packs extract")?;
-    let pack_id = parse_pack_id_selector(pack_selector)?;
+    let selector = parse_pack_id_selector(pack_selector)?;
     let collection_id = parse_collection_selector(collection_selector)?;
-    let (shard_type, source_path) = resolve_pack_file(cli, pack_id)?;
+    let (shard_type, source_path, pack_id) = resolve_pack_file(cli, &selector)?;
 
     // Guard against accidental source file truncation when --out points to the same file.
     if let (Ok(src_canon), Ok(dst_canon)) = (source_path.canonicalize(), out.canonicalize()) {
@@ -7807,13 +8664,16 @@ fn cmd_packs_extract(
         }
     }
 
-    let dest_pack_id = resolve_dest_pack_id(out, dest_pack_id_selector)?;
+    // The extracted pack is a brand-new globally unique pack, so it gets a
+    // fresh random address rather than inheriting the source's (or one derived
+    // from the output filename).
+    let dest_pack_id = PackId::random();
 
     let stats = mtxdb::packfile::extract_packfile_collection(
         &source_path,
         out,
         &collection_id,
-        dest_pack_id,
+        &dest_pack_id,
     )
     .with_context(|| {
         format!(
@@ -7826,53 +8686,32 @@ fn cmd_packs_extract(
 
     if stats.torn_tail {
         eprintln!(
-            "warning: pack 0x{pack_id:016x} ends in a torn frame; its tail was not extracted \
+            "warning: pack {pack_id} ends in a torn frame; its tail was not extracted \
              (a concurrent writer can cause this)"
         );
     }
     eprintln!(
-        "extracted {} frames ({} bytes) from pack 0x{pack_id:016x} ({} pool) into {}",
+        "extracted {} frames ({} bytes) from pack {pack_id} ({} pool) into {} as new pack {}",
         stats.frames_extracted,
         stats.frame_bytes_written,
         shard_type.as_str(),
         out.display(),
+        dest_pack_id,
     );
     Ok(())
-}
-
-/// Determine the pack identity to stamp in the extracted packfile's header.
-/// If an explicit selector is given, parses it; otherwise if the output file
-/// is named `pack_{16 hex digits}.pack`, parses that ID to preserve pool naming
-/// invariants; otherwise defaults to 0.
-fn resolve_dest_pack_id(dest_path: &Path, override_id: Option<&str>) -> anyhow::Result<u64> {
-    if let Some(selector) = override_id {
-        return parse_pack_id_selector(selector);
-    }
-    if let Some(stem) = dest_path.file_stem().and_then(|s| s.to_str()) {
-        if dest_path.extension().is_some_and(|ext| ext == "pack") {
-            if let Some(hex) = stem.strip_prefix("pack_") {
-                if hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    if let Ok(id) = u64::from_str_radix(hex, 16) {
-                        return Ok(id);
-                    }
-                }
-            }
-        }
-    }
-    Ok(0)
 }
 
 /// Render one `mtxdb.pack.dump/v1` line for a pack frame.
 fn pack_dump_line(
     pool: &str,
-    pack_id: u64,
+    pack_id: &PackId,
     offset: u64,
     record: &mtxdb::packfile::Record,
 ) -> String {
     let mut fields: Vec<(&'static str, String)> = vec![
         ("schema", json_string(PACK_DUMP_SCHEMA)),
         ("pool", json_string(pool)),
-        ("pack_id", json_string(&format!("0x{pack_id:016x}"))),
+        ("pack_id", json_string(&pack_id.to_string())),
         ("offset", offset.to_string()),
         (
             "collection_id",
@@ -7899,9 +8738,9 @@ fn pack_dump_line(
     reason = "the file-level import orchestration intentionally handles several import phases"
 )]
 fn cmd_import_file(
+    db: &Database,
     store: &PackfileStorage,
     state_store: &PackfileStorage,
-    dir: &Path,
     path: &Path,
     collection_override: Option<&str>,
     template: &CollectionTemplate,
@@ -7913,11 +8752,11 @@ fn cmd_import_file(
         .is_some_and(|extension| extension == "jsonl");
 
     if is_jsonl {
-        let (events, detected_collection) =
+        let (events, detected_collection, raw_adjacency) =
             parse_jsonl_events(&content).or_else(|jsonl_error| {
                 // Some existing DAG exports carry a `.jsonl` suffix despite
                 // being a pretty-printed federation JSON document.
-                parse_federation_events(&content).map_err(|federation_error| {
+                parse_federation_events(&content).map(|(events, collection)| (events, collection, Vec::new())).map_err(|federation_error| {
                     anyhow!(
                         "{jsonl_error}; also not a valid Matrix federation document: {federation_error}"
                     )
@@ -7926,13 +8765,14 @@ fn cmd_import_file(
         if events.is_empty() {
             bail!("no events found in {}", path.display());
         }
-        import_pdu_events(
+        import_pdu_events_with_raw(
+            db,
             store,
             state_store,
-            dir,
             path,
             &events,
             &[],
+            Some(&raw_adjacency),
             detected_collection.as_deref(),
             collection_override,
             template,
@@ -7966,9 +8806,9 @@ fn cmd_import_file(
             0
         } else {
             import_pdu_events(
+                db,
                 store,
                 state_store,
-                dir,
                 path,
                 &federation.pdus,
                 &federation.auth_chain,
@@ -7988,22 +8828,15 @@ fn cmd_import_file(
 
         // Import auth chain events into the edges shard pool.
         if !federation.auth_chain.is_empty() {
-            // Derive the edges pool dir from the event pool dir.
-            // pool_dir is {root}/pools/mtpl-event; edges is {root}/pools/mtpl-edges.
-            let edges_dir = dir
-                .parent()
-                .map(|p| p.join("mtpl-edges"))
-                .context("deriving edges pool path")?;
-            fs::create_dir_all(&edges_dir)?;
-            let auth_store = PackfileStorage::open(edges_dir).context("opening edges store")?;
-            // This open bypasses `open_store`, so carry the caller's
-            // `--read-plan` choice over from the event store instead of
-            // silently running the default.
+            // The auth chain's event records go to the edges pool, through the same
+            // database as the rest of the import.
+            let auth_store: &PackfileStorage = db.edges();
+            // Carry the caller's `--read-plan` choice over from the event store.
             auth_store.set_read_plan_policy(store.read_plan_policy());
-            // Resolve the derived adjacency records before writing any auth
-            // events, so a structural conflict rejects the import before the
-            // edges pool is mutated.
-            let edge_plan = plan_matrix_edges(&auth_store, template, &federation.auth_chain)?;
+            // Record the derived adjacency before writing any auth events, so a
+            // structural conflict rejects the import before the edges pool is
+            // mutated.
+            record_matrix_adjacency(db, template, &federation.auth_chain)?;
             let mut auth_count = 0u64;
             let mut auth_skipped = 0u64;
             // Auth-chain events may span multiple rooms (collections). Group
@@ -8107,7 +8940,6 @@ fn cmd_import_file(
                     auth_count = auth_count.saturating_add(to_write.len() as u64);
                 }
             }
-            write_matrix_edges(&auth_store, edge_plan)?;
             auth_store.sync_all()?;
             eprintln!(
                 "imported {auth_count} edges events ({} dangling references)",
@@ -8198,12 +9030,41 @@ fn import_room_version(
     reason = "the PDU import phase intentionally owns validation, batching, and state-group work"
 )]
 fn import_pdu_events(
+    db: &Database,
     store: &PackfileStorage,
     state_store: &PackfileStorage,
-    dir: &Path,
     path: &Path,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
+    detected_collection: Option<&str>,
+    collection_override: Option<&str>,
+    template: &CollectionTemplate,
+    established_collections: &mut HashSet<[u8; 16]>,
+) -> anyhow::Result<()> {
+    import_pdu_events_with_raw(
+        db,
+        store,
+        state_store,
+        path,
+        events,
+        auth_chain,
+        None,
+        detected_collection,
+        collection_override,
+        template,
+        established_collections,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_pdu_events_with_raw(
+    db: &Database,
+    store: &PackfileStorage,
+    state_store: &PackfileStorage,
+    path: &Path,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+    raw_adjacency: Option<&[rezzy::OwnedMatrixEvent]>,
     detected_collection: Option<&str>,
     collection_override: Option<&str>,
     template: &CollectionTemplate,
@@ -8229,15 +9090,6 @@ fn import_pdu_events(
 
     let collection_hex = format_id(&collection_id);
 
-    // Decode and dedup in one pass, retaining the first occurrence of each
-    // node ID directly — no intermediate full-size buffer, so a large
-    // federation response's bodies are held once, not twice. The 128-bit
-    // node ID is a truncated hash, so two distinct event IDs can in
-    // principle truncate to the same key; that is a collision and must be
-    // rejected rather than silently collapsed. A same-ID repeat that carries
-    // the same event_id is the same logical event and counts as already
-    // present — the old per-event loop would have found the record its first
-    // occurrence just stored.
     let first: Vec<([u8; 16], String, NodeData)> = {
         let mut first = Vec::with_capacity(events.len());
         let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(events.len());
@@ -8275,11 +9127,6 @@ fn import_pdu_events(
         first
     };
 
-    // One batched index probe for dedup/collision checks, then one `put_many`
-    // for only the genuinely-new records — instead of N get+put round trips,
-    // one index/pack generation, and a locality-ordered rather than
-    // offset-coalesced set of candidate reads (get_many sorts candidates;
-    // merging them into prefetch extents is the opt-in read plan).
     let probe_ids: Vec<[u8; 16]> = first.iter().map(|(id, _, _)| *id).collect();
     let existing = store.get_many(&collection_id, &probe_ids)?;
     let mut to_write: Vec<([u8; 16], NodeData)> = Vec::new();
@@ -8294,24 +9141,11 @@ fn import_pdu_events(
             to_write.push((id_bytes, data));
         }
     }
-    // Resolve the derived adjacency records before touching the event pool. A
-    // structural conflict (same source key, different prev/auth) is thus
-    // rejected before any primary write, keeping the event and edges pools in
-    // step; a later re-import repairs any missing derived records.
-    let edge_dir = dir
-        .parent()
-        .map(|parent| parent.join("mtpl-edges"))
-        .context("deriving edges pool path")?;
-    fs::create_dir_all(&edge_dir)?;
-    let edge_store = PackfileStorage::open(edge_dir)
-        .context("opening edges store")?
-        .with_append_policy(mtxdb::shard::AppendPolicy::buffered());
-    let edge_plan = plan_matrix_edges(&edge_store, template, events)?;
+    record_matrix_adjacency_with_raw(db, template, events, raw_adjacency)?;
 
-    // Genesis metadata precedes the batch's records, so it is the collection's
-    // first frame and is durable no later than any application record. A
-    // failure here aborts the batch: proceeding would write records into a
-    // collection with no genesis record. The engine enforces this ordering.
+    // Preserve causal order even when input arrives newest-first.
+    sort_events_topologically(&mut to_write, events, template)?;
+
     if resolved.batch_has_create {
         established_collections.insert(collection_id);
         let extension = MatrixRoomExtension::from_events(events);
@@ -8319,28 +9153,64 @@ fn import_pdu_events(
         store.create_or_put_established(&collection_id, &metadata, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     } else if !to_write.is_empty() {
-        if let Some(order) = topological_event_order(events) {
-            let mut order_by_node = HashMap::with_capacity(order.len());
-            for event in events {
-                if let (Some(event_id), Some(node_id)) =
-                    (event_id(event), template_node_id(template, event)?)
-                {
-                    if let Some(position) = order.get(event_id) {
-                        order_by_node.insert(node_id, *position);
-                    }
-                }
-            }
-            to_write.sort_by_key(|(node_id, _)| {
-                order_by_node.get(node_id).copied().unwrap_or(usize::MAX)
-            });
-        }
         store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
 
-    write_matrix_edges(&edge_store, edge_plan)?;
-    edge_store.sync_all()?;
+    repair_import_state_groups(state_store, events, auth_chain, &resolved.canonical_id);
 
+    if let Some(room_id) = detected_collection {
+        eprintln!("{room_id} ({collection_hex})");
+    } else {
+        eprintln!("collection {collection_hex}");
+    }
+    eprintln!("  imported: {event_count} events");
+    if skipped > 0 {
+        eprintln!("  skipped: {skipped} events (missing event_id)");
+    }
+    if already_present > 0 {
+        let suffix = if already_present > already_present_ids.len() as u64 {
+            ", ..."
+        } else {
+            ""
+        };
+        eprintln!(
+            "  already present: {already_present} [{}{suffix}]",
+            already_present_ids.join(", "),
+        );
+    }
+
+    Ok(())
+}
+
+fn sort_events_topologically(
+    to_write: &mut [([u8; 16], NodeData)],
+    events: &[OwnedValue],
+    template: &CollectionTemplate,
+) -> anyhow::Result<()> {
+    let Some(order) = topological_event_order_with_template(events, template)? else {
+        return Ok(());
+    };
+    let mut order_by_node = HashMap::with_capacity(order.len());
+    for event in events {
+        if let (Some(event_id), Some(node_id)) =
+            (event_id(event), template_node_id(template, event)?)
+        {
+            if let Some(position) = order.get(event_id) {
+                order_by_node.insert(node_id, *position);
+            }
+        }
+    }
+    to_write.sort_by_key(|(node_id, _)| order_by_node.get(node_id).copied().unwrap_or(usize::MAX));
+    Ok(())
+}
+
+fn repair_import_state_groups(
+    state_store: &PackfileStorage,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+    canonical_id: &str,
+) {
     // Replayed batches still need state-group repair when the derived index is
     // incomplete, but a complete replay should not rebuild the whole DAG.
     // Read the existing mappings in one backend batch and only walk the DAG
@@ -8379,12 +9249,15 @@ fn import_pdu_events(
             }
         }
     }
+    let mut computed_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> =
+        HashMap::new();
     let unresolved_count = if loaded {
         0
     } else {
-        let state_computation = compute_state_groups_partial(events, auth_chain);
+        let state_computation = compute_state_groups_partial(events, auth_chain, canonical_id);
         let unresolved = state_computation.unresolved;
         state_groups = state_computation.groups;
+        computed_instances = state_computation.instances;
         if !unresolved.is_empty() {
             eprintln!(
                 "warning: partial state-group computation: {} event(s) have missing parents or are in cycles; resolvable events were retained",
@@ -8420,35 +9293,21 @@ fn import_pdu_events(
         // a benign last-writer win.
         let entries: Vec<(&[u8], &[u8])> = state_groups
             .iter()
-            .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
+            .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
             .collect();
         if let Err(error) = aux.put_many(&entries) {
             eprintln!("warning: unable to persist state groups: {error}");
         }
     }
-
-    if let Some(room_id) = detected_collection {
-        eprintln!("{room_id} ({collection_hex})");
-    } else {
-        eprintln!("collection {collection_hex}");
+    if !computed_instances.is_empty() {
+        match materialize_state_hamts(state_store, canonical_id, &computed_instances) {
+            Ok(written) => eprintln!(
+                "  state HAMT: {written} records materialized for {} state groups",
+                computed_instances.len()
+            ),
+            Err(error) => eprintln!("warning: unable to persist state HAMT: {error}"),
+        }
     }
-    eprintln!("  imported: {event_count} events");
-    if skipped > 0 {
-        eprintln!("  skipped: {skipped} events (missing event_id)");
-    }
-    if already_present > 0 {
-        let suffix = if already_present > already_present_ids.len() as u64 {
-            ", ..."
-        } else {
-            ""
-        };
-        eprintln!(
-            "  already present: {already_present} [{}{suffix}]",
-            already_present_ids.join(", "),
-        );
-    }
-
-    Ok(())
 }
 
 /// Resolve a Matrix input's room collection and prove that it is established
@@ -8651,9 +9510,21 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
     Ok(established)
 }
 
-fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
+fn parse_jsonl_events(
+    content: &[u8],
+) -> anyhow::Result<(
+    Vec<OwnedValue>,
+    Option<String>,
+    Vec<rezzy::OwnedMatrixEvent>,
+)> {
     let text = std::str::from_utf8(content).context("input is not valid UTF-8 JSONL")?;
     let mut events = Vec::new();
+    let mut raw_lines = Vec::new();
+    let mut raw_detected_collection = None;
+    // Reusable scratch for zero-alloc room_id extraction from raw bytes.
+    // Allocated once here, grows to fit the largest event, then zero-alloc
+    // on every subsequent call (steady-state: 0 heap allocations per event).
+    let mut scratch = rezzy::MatrixEventScratch::with_capacity(16, 16, 64);
     for (line_number, line) in text.lines().enumerate() {
         let line_number = line_number
             .checked_add(1)
@@ -8662,13 +9533,22 @@ fn parse_jsonl_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option
         if line.is_empty() {
             continue;
         }
+        if raw_detected_collection.is_none() {
+            if let Ok(view) = rezzy::extract_matrix_event_into(line.as_bytes(), &mut scratch) {
+                raw_detected_collection = view.room_id.map(str::to_owned);
+            }
+        }
         let mut bytes = line.as_bytes().to_vec();
         let event = simd_json::to_owned_value(&mut bytes)
             .with_context(|| format!("invalid JSONL event on line {line_number}"))?;
         events.push(event);
+        raw_lines.push(line.as_bytes());
     }
-    let detected_collection = events.iter().find_map(event_room_id).map(str::to_owned);
-    Ok((events, detected_collection))
+    let detected_collection = raw_detected_collection
+        .or_else(|| events.iter().find_map(event_room_id).map(str::to_owned));
+    let raw_adjacency = rezzy::OwnedMatrixEvent::extract_batch(&raw_lines)
+        .map_err(|error| anyhow!("extracting raw Matrix adjacency metadata: {error:?}"))?;
+    Ok((events, detected_collection, raw_adjacency))
 }
 
 fn parse_federation_events(content: &[u8]) -> anyhow::Result<(Vec<OwnedValue>, Option<String>)> {
@@ -8864,9 +9744,18 @@ fn extract_event_edge_ids(
 /// Returns events in topological order (parents before children), or
 /// `Err` with the list of events involved in a cycle or whose parents
 /// are missing from the DAG.
+#[cfg(test)]
 fn topo_sort_dag(
     frontier: &mtxdb::dag::ActiveRoomFrontier,
     reverse_map: &HashMap<u64, String>,
+) -> Result<Vec<usize>, Vec<String>> {
+    topo_sort_dag_with_tie_break(frontier, reverse_map, None)
+}
+
+fn topo_sort_dag_with_tie_break(
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
+    reverse_map: &HashMap<u64, String>,
+    node_ids: Option<&HashMap<u64, [u8; 16]>>,
 ) -> Result<Vec<usize>, Vec<String>> {
     let n = frontier.nodes.len();
     if n == 0 {
@@ -8895,30 +9784,36 @@ fn topo_sort_dag(
     }
 
     // Seed the queue with nodes that have zero in-degree.
-    let mut queue: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::new();
+    let mut queue: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
     for (idx, &deg) in in_degree.iter().enumerate() {
         if deg == 0 {
-            let event_id = reverse_map
+            let node_id = reverse_map
                 .get(&frontier.nodes[idx].short_id)
                 .cloned()
                 .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[idx].short_id));
-            queue.push(Reverse((event_id, idx)));
+            let tie = node_ids
+                .and_then(|ids| ids.get(&frontier.nodes[idx].short_id))
+                .map_or_else(|| node_id.into_bytes(), |id| id.to_vec());
+            queue.push(Reverse((tie, idx)));
         }
     }
 
     let mut sorted = Vec::with_capacity(n);
-    while let Some(Reverse((_, idx))) = queue.pop() {
+    while let Some(Reverse((_tie, idx))) = queue.pop() {
         sorted.push(idx);
         for &child in &children[idx] {
             in_degree[child] = in_degree[child]
                 .checked_sub(1)
                 .expect("DAG in-degree underflow");
             if in_degree[child] == 0 {
-                let event_id = reverse_map
+                let node_id = reverse_map
                     .get(&frontier.nodes[child].short_id)
                     .cloned()
                     .unwrap_or_else(|| format!("short:{:016x}", frontier.nodes[child].short_id));
-                queue.push(Reverse((event_id, child)));
+                let tie = node_ids
+                    .and_then(|ids| ids.get(&frontier.nodes[child].short_id))
+                    .map_or_else(|| node_id.into_bytes(), |id| id.to_vec());
+                queue.push(Reverse((tie, child)));
             }
         }
     }
@@ -8942,21 +9837,45 @@ fn topo_sort_dag(
     }
 }
 
+#[cfg(test)]
 fn topological_event_order(events: &[OwnedValue]) -> Option<HashMap<String, usize>> {
     let (frontier, _id_map, reverse_map) = build_event_dag(events);
     let sorted = topo_sort_dag(&frontier, &reverse_map).ok()?;
-    Some(
-        sorted
-            .into_iter()
-            .enumerate()
-            .filter_map(|(order, index)| {
-                reverse_map
-                    .get(&frontier.nodes[index].short_id)
-                    .cloned()
-                    .map(|event_id| (event_id, order))
-            })
-            .collect(),
-    )
+    Some(event_order_map(&frontier, &reverse_map, sorted))
+}
+
+fn topological_event_order_with_template(
+    events: &[OwnedValue],
+    template: &CollectionTemplate,
+) -> anyhow::Result<Option<HashMap<String, usize>>> {
+    let (frontier, _id_map, reverse_map) = build_event_dag(events);
+    let mut node_ids = HashMap::new();
+    for event in events {
+        if let (Some(event_id), Some(node_id)) =
+            (event_id(event), template_node_id(template, event)?)
+        {
+            node_ids.insert(event_short_id(event_id), node_id);
+        }
+    }
+    let sorted = topo_sort_dag_with_tie_break(&frontier, &reverse_map, Some(&node_ids)).ok();
+    Ok(sorted.map(|sorted| event_order_map(&frontier, &reverse_map, sorted)))
+}
+
+fn event_order_map(
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
+    reverse_map: &HashMap<u64, String>,
+    sorted: Vec<usize>,
+) -> HashMap<String, usize> {
+    sorted
+        .into_iter()
+        .enumerate()
+        .filter_map(|(order, index)| {
+            reverse_map
+                .get(&frontier.nodes[index].short_id)
+                .cloned()
+                .map(|event_id| (event_id, order))
+        })
+        .collect()
 }
 
 /// Results from a partial state-group walk.
@@ -8965,8 +9884,20 @@ fn topological_event_order(events: &[OwnedValue]) -> Option<HashMap<String, usiz
 /// be resolved. `unresolved` contains events blocked by missing parents or
 /// cycles.
 struct PartialStateComputation {
-    groups: HashMap<String, String>,
+    groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
     unresolved: Vec<String>,
+    /// One record per derived state-group instance, retained so an import can
+    /// materialize its `STGP` record and (deduplicated) `STAT` content.
+    instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+}
+
+/// One resolved state-group derivation: the parent instance ids it descends
+/// from, the resulting state `LtHash`, and the state set to materialize into
+/// the shared `STAT` content.
+struct StateInstance {
+    parents: Vec<[u8; STATE_GROUP_ID_LENGTH]>,
+    lthash: [u8; 32],
+    set: StateSet,
 }
 
 /// Compute state groups for a set of events by walking the event DAG in
@@ -8976,22 +9907,27 @@ struct PartialStateComputation {
 /// the DAG so that `auth_edges` resolve correctly, but only PDU state
 /// events contribute to the state set.
 ///
-/// Returns a map from `event_id` -> `state_group_id` (base64url-encoded
-/// BLAKE3 digest of the state set) for resolvable events. Each event inherits
-/// the state from its `prev_events` and applies its own state change (if it is
-/// a state event with `state_key`). Events blocked by missing parents or
-/// cycles are reported separately in `unresolved`.
+/// Returns a map from `event_id` -> 128-bit `STGP` state-group instance id for
+/// resolvable events. Each event inherits the state from its `prev_events` and
+/// applies its own state change (if it is a state event with `state_key`). A
+/// state-changing event, or a merge whose parents do not already share a single
+/// instance, derives a new instance keyed by the parent instance ids and the
+/// state `LtHash`; an ordinary event that changes nothing reuses its parent's
+/// instance. Events blocked by missing parents or cycles are reported
+/// separately in `unresolved`.
 fn compute_state_groups_partial(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
+    room_id: &str,
 ) -> PartialStateComputation {
-    compute_state_groups_partial_in_view(events, auth_chain, StateView::Federated)
+    compute_state_groups_partial_in_view(events, auth_chain, StateView::Federated, room_id)
 }
 
 fn compute_state_groups_partial_in_view(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
     view: StateView,
+    room_id: &str,
 ) -> PartialStateComputation {
     // Borrow the input when there is no auth chain to merge in; cloning every
     // parsed event just to concatenate two slices doubles peak memory on large
@@ -9017,6 +9953,7 @@ fn compute_state_groups_partial_in_view(
         return PartialStateComputation {
             groups: HashMap::new(),
             unresolved: Vec::new(),
+            instances: HashMap::new(),
         };
     }
 
@@ -9031,21 +9968,33 @@ fn compute_state_groups_partial_in_view(
         }
     }
 
-    let result = walk_state_groups(&frontier, &sorted, &reverse_map, &events_by_sid, view);
+    let result = walk_state_groups(
+        room_id,
+        &frontier,
+        &sorted,
+        &reverse_map,
+        &events_by_sid,
+        view,
+    );
 
     PartialStateComputation {
-        groups: result,
+        groups: result.0,
         unresolved,
+        instances: result.1,
     }
 }
 
 fn walk_state_groups(
+    room_id: &str,
     frontier: &mtxdb::dag::ActiveRoomFrontier,
     sorted: &[usize],
     reverse_map: &HashMap<u64, String>,
     events_by_sid: &HashMap<u64, &OwnedValue>,
     view: StateView,
-) -> HashMap<String, String> {
+) -> (
+    HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
+    HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+) {
     // How many resident children still need each event's state. Once the last
     // child is processed the state is dropped, so memory follows the DAG's
     // frontier width instead of holding one state per event for the whole run.
@@ -9061,14 +10010,20 @@ fn walk_state_groups(
         }
     }
 
-    let empty = SharedState::new(StateSet::new());
+    let empty_set = StateSet::new();
+    let empty = SharedState::new(
+        empty_set,
+        state_group_instance_id(room_id, &[], &StateSet::new().lthash()),
+    );
     let mut state_at: HashMap<u64, Arc<SharedState>> = HashMap::new();
-    let mut result: HashMap<String, String> = HashMap::new();
+    let mut result: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
+    let mut instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> = HashMap::new();
 
     for &idx in sorted {
         let short_id = frontier.nodes[idx].short_id;
         let mut parent_ids: Vec<u64> = Vec::new();
         let mut parents: Vec<Arc<SharedState>> = Vec::new();
+        let mut parent_instances: Vec<[u8; STATE_GROUP_ID_LENGTH]> = Vec::new();
         for edge in frontier.prev_edges(idx) {
             if !edge.is_resident() {
                 continue;
@@ -9076,6 +10031,7 @@ fn walk_state_groups(
             let parent_id = frontier.nodes[edge.arena_index()].short_id;
             parent_ids.push(parent_id);
             if let Some(parent_state) = state_at.get(&parent_id) {
+                parent_instances.push(parent_state.instance);
                 parents.push(Arc::clone(parent_state));
             }
         }
@@ -9091,7 +10047,7 @@ fn walk_state_groups(
             [first, rest @ ..]
                 if rest
                     .iter()
-                    .all(|p| Arc::ptr_eq(p, first) || p.digest == first.digest) =>
+                    .all(|p| Arc::ptr_eq(p, first) || p.lthash == first.lthash) =>
             {
                 Arc::clone(first)
             }
@@ -9100,11 +10056,15 @@ fn walk_state_groups(
                 for parent in &parents {
                     merged.merge(&parent.set);
                 }
-                SharedState::new(merged)
+                let instance =
+                    state_group_instance_id(room_id, &parent_instances, &merged.lthash());
+                SharedState::new(merged, instance)
             }
         };
 
-        // Only a state event produces a new state set.
+        // Only a state event produces a new state set. A merge whose parents
+        // do not already share one instance derives a new instance too, so the
+        // merge topology survives even when the state does not change.
         let state = match events_by_sid.get(&short_id) {
             Some(ev) if is_state_event(ev) && !view.excludes(ev) => {
                 let key = state_key(ev);
@@ -9112,13 +10072,26 @@ fn walk_state_groups(
                 let eid = event_id(ev).unwrap_or("").to_owned();
                 let mut set = base.set.clone();
                 set.set(state_type, &key, eid);
-                SharedState::new(set)
+                let instance = state_group_instance_id(room_id, &parent_instances, &set.lthash());
+                SharedState::new(set, instance)
             }
-            _ => base,
+            _ if distinct_instances(&parent_instances) > 1 => {
+                let instance = state_group_instance_id(room_id, &parent_instances, &base.lthash);
+                SharedState::new(base.set.clone(), instance)
+            }
+            _ => Arc::clone(&base),
         };
 
+        instances
+            .entry(state.instance)
+            .or_insert_with(|| StateInstance {
+                parents: canonical_parents(&parent_instances),
+                lthash: state.lthash,
+                set: state.set.clone(),
+            });
+
         if let Some(eid) = reverse_map.get(&short_id) {
-            result.insert(eid.clone(), state.digest.clone());
+            result.insert(eid.clone(), state.instance);
         }
         for parent_id in parent_ids {
             if let Some(count) = remaining_children.get_mut(&parent_id) {
@@ -9132,7 +10105,23 @@ fn walk_state_groups(
             state_at.insert(short_id, state);
         }
     }
-    result
+    (result, instances)
+}
+
+/// Number of distinct instance ids in `instances`.
+fn distinct_instances(instances: &[[u8; STATE_GROUP_ID_LENGTH]]) -> usize {
+    let mut ids = instances.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.len()
+}
+
+/// Sort and deduplicate parent instance ids for a canonical record.
+fn canonical_parents(parents: &[[u8; STATE_GROUP_ID_LENGTH]]) -> Vec<[u8; STATE_GROUP_ID_LENGTH]> {
+    let mut canonical = parents.to_vec();
+    canonical.sort_unstable();
+    canonical.dedup();
+    canonical
 }
 
 /// Return the events whose `prev_events` reference a parent absent from this
@@ -9247,17 +10236,23 @@ fn partial_topo_sort_dag(
     (sorted, unresolved)
 }
 
-/// A state set with its state-group digest computed once, so events that share
-/// a state also share the digest instead of re-sorting and re-hashing it.
+/// A state set with its `LtHash` and state-group instance id computed once, so
+/// events that share a state also share them instead of re-sorting and
+/// re-hashing.
 struct SharedState {
     set: StateSet,
-    digest: String,
+    lthash: [u8; 32],
+    instance: [u8; STATE_GROUP_ID_LENGTH],
 }
 
 impl SharedState {
-    fn new(set: StateSet) -> Arc<Self> {
-        let digest = set.digest_base64url();
-        Arc::new(Self { set, digest })
+    fn new(set: StateSet, instance: [u8; STATE_GROUP_ID_LENGTH]) -> Arc<Self> {
+        let lthash = set.lthash();
+        Arc::new(Self {
+            set,
+            lthash,
+            instance,
+        })
     }
 }
 
@@ -9291,29 +10286,27 @@ impl StateSet {
         }
     }
 
-    /// Deterministic hash of the state set for use as a state-group ID.
+    /// Unkeyed `LtHash` digest over the logical `(type, state_key, event_id)`
+    /// entries: the state identity shared by every derivation that reaches it.
     ///
-    /// The digest is BLAKE3 over the sorted `(type, state_key,
-    /// event_id)` entries. This is **not** an `LtHash`; it is a standard
-    /// collision-resistant hash suitable for identifying state sets.
+    /// `LtHash` addition is commutative, so entry order does not matter. This
+    /// matches `sithnapse`'s state identity and the lattice embedded in every
+    /// materialized `MTHR` root.
+    fn lthash(&self) -> [u8; 32] {
+        let entries: Vec<(String, String, String)> = self
+            .entries
+            .iter()
+            .map(|((event_type, state_key), event_id)| {
+                (event_type.clone(), state_key.clone(), event_id.clone())
+            })
+            .collect();
+        crate::state_hamt::state_group_id(&entries)
+    }
+
+    /// The `LtHash` digest as unpadded base64url, for golden tests.
+    #[cfg(test)]
     fn digest_base64url(&self) -> String {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-
-        let mut entries: Vec<_> = self.entries.iter().collect();
-        entries.sort();
-
-        let mut hasher_input = Vec::new();
-        for ((event_type, state_key), event_id) in &entries {
-            hasher_input.extend_from_slice(event_type.as_bytes());
-            hasher_input.push(0);
-            hasher_input.extend_from_slice(state_key.as_bytes());
-            hasher_input.push(0);
-            hasher_input.extend_from_slice(event_id.as_bytes());
-            hasher_input.push(0);
-        }
-        let hash = blake3_digest(&hasher_input);
-        URL_SAFE_NO_PAD.encode(&hash[..])
+        crate::state_hamt::encode_state_group_id(&self.lthash())
     }
 }
 
@@ -9942,23 +10935,23 @@ fn cmd_repack(
 /// what was shown.
 struct RepackPreview {
     collections: Vec<[u8; 16]>,
-    pack_ids: Vec<u64>,
+    pack_ids: Vec<PackId>,
 }
 
 enum RepackTarget {
     Collection([u8; 16]),
-    Packs(Vec<u64>),
+    Packs(Vec<PackSelector>),
     All,
 }
 
-/// Parse one or more permanent pack IDs. Numeric slots and ranges are not
+/// Parse one or more permanent pack selectors. Numeric slots and ranges are not
 /// accepted because slots are recycled implementation details.
-fn parse_pack_selectors(selectors: &[String]) -> anyhow::Result<Vec<u64>> {
-    let mut pack_ids = std::collections::BTreeSet::new();
+fn parse_pack_selectors(selectors: &[String]) -> anyhow::Result<Vec<PackSelector>> {
+    let mut selectors_out = std::collections::BTreeSet::new();
     for selector in selectors {
-        pack_ids.insert(parse_pack_id_selector(selector)?);
+        selectors_out.insert(parse_pack_id_selector(selector)?);
     }
-    Ok(pack_ids.into_iter().collect())
+    Ok(selectors_out.into_iter().collect())
 }
 
 fn resolve_repack_target(
@@ -9989,17 +10982,19 @@ fn resolve_repack_target(
 
 fn resolve_repack_packs(
     store: &PackfileStorage,
-    pack_ids: &[u64],
+    selectors: &[PackSelector],
 ) -> anyhow::Result<(Vec<[u8; 16]>, Vec<u16>)> {
-    let slots = pack_ids
+    let summaries = store.shard_summaries();
+    let ids: Vec<PackId> = summaries.iter().map(|summary| summary.pack_id).collect();
+    let slots = selectors
         .iter()
-        .map(|&pack_id| {
-            store
-                .shard_summaries()
-                .into_iter()
+        .map(|selector| {
+            let pack_id = selector.resolve(ids.iter())?;
+            summaries
+                .iter()
                 .find(|summary| summary.pack_id == pack_id)
                 .map(|summary| summary.slot)
-                .with_context(|| format!("pack ID 0x{pack_id:016x} not found"))
+                .with_context(|| format!("pack {selector} not found"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     resolve_repack_slots(store, &slots)
@@ -10043,13 +11038,13 @@ fn repack_preview(
     let (collections, shards) = resolve_repack_target(&preview_store, target)?;
     if collections.is_empty() {
         match target {
-            RepackTarget::Packs(pack_ids) => {
-                let pack_ids = pack_ids
+            RepackTarget::Packs(selectors) => {
+                let selectors = selectors
                     .iter()
-                    .map(|id| format!("0x{id:016x}"))
+                    .map(PackSelector::to_string)
                     .collect::<Vec<_>>()
                     .join(", ");
-                println!("no collections reference selected packs: {pack_ids}");
+                println!("no collections reference selected packs: {selectors}");
             }
             RepackTarget::All => println!("no collections found in active packs"),
             RepackTarget::Collection(_) => {}
@@ -10078,7 +11073,7 @@ fn repack_preview(
         total_dropped_bytes = total_dropped_bytes.saturating_add(plan.dropped_bytes);
     }
 
-    let pack_summaries: std::collections::HashMap<u16, (u64, u64)> = preview_store
+    let pack_summaries: std::collections::HashMap<u16, (PackId, u64)> = preview_store
         .shard_summaries()
         .into_iter()
         .map(|summary| (summary.slot, (summary.pack_id, summary.file_bytes)))
@@ -10092,7 +11087,7 @@ fn repack_preview(
     });
     let pack_labels = pack_ids
         .iter()
-        .map(|id| format!("0x{id:016x}"))
+        .map(PackId::filename_stem)
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -10103,10 +11098,13 @@ fn repack_preview(
         shards.len(),
         if shards.len() == 1 { "" } else { "s" },
     );
-    let label_width = "0x0000000000000000".len();
+    let label_width = "pack_0000000000000000".len();
     for slot in &shards {
-        let (pack_id, bytes) = pack_summaries.get(slot).copied().unwrap_or((0, 0));
-        println!("  0x{pack_id:016x}: {:>9}", fmt_bytes(bytes));
+        let (pack_id, bytes) = pack_summaries
+            .get(slot)
+            .copied()
+            .unwrap_or((PackId([0; mtxdb::packfile::PACK_ID_LEN]), 0));
+        println!("  {}: {:>9}", pack_id.filename_stem(), fmt_bytes(bytes));
     }
     println!(
         "  {:>label_width$}: {:>9}",
@@ -10144,7 +11142,7 @@ fn repack_collections(
             .find(|summary| summary.slot == slot)
             .map_or_else(
                 || "retired pack".to_owned(),
-                |summary| format!("0x{:016x}", summary.pack_id),
+                |summary| summary.pack_id.filename_stem(),
             )
     };
     let results = if topo {
@@ -10290,352 +11288,169 @@ fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
     edges
 }
 
-const EDGE_MAGIC: &[u8] = b"EDG1";
-const EDGE_ID_BYTES: usize = 16;
-const EDGE_COUNT_BYTES: usize = 4;
+/// The longest `rel_type` the importer records. Longer values are not real
+/// relation types and are dropped, not errors.
+const MAX_RELATION_TYPE_BYTES: usize = 255;
 
-/// Adjacency records an import would append, grouped by collection.
-type MatrixEdgePlan = Vec<([u8; 16], Vec<(NodeId, NodeData)>)>;
-
-/// Resolve the compact adjacency records an import would append for each
-/// Matrix event. The source's 128-bit logical ID is the pack record key; the
-/// payload stores typed target IDs, not repeated source/target event-ID
-/// strings.
+/// One Matrix event's auth-index fields, owned for safe batch retention.
 ///
-/// Decodes and reconciles against the store without mutating it. Splitting the
-/// read/reconcile pass from the write lets an importer reject a structural
-/// conflict *before* it appends the primary event records, so a conflicting
-/// input cannot leave the event and edges pools out of step.
-fn plan_matrix_edges(
-    store: &PackfileStorage,
+/// The batch must outlive the reusable parsing scratch used by raw extraction;
+/// therefore these fields deliberately do not borrow from a `MatrixEventView`
+/// or from the source `OwnedValue`.
+struct MatrixEventFields {
+    event_id: String,
+    prev: Vec<String>,
+    auth: Vec<String>,
+    /// `(target event id, relation type)` from `content.m.relates_to`.
+    relation: Option<(String, String)>,
+}
+
+impl MatrixEventFields {
+    fn from_owned(event: &rezzy::OwnedMatrixEvent) -> Self {
+        Self {
+            event_id: event.event_id.clone().unwrap_or_default(),
+            prev: event.prev_events.clone(),
+            auth: event.auth_events.clone(),
+            relation: event.relates_to.clone(),
+        }
+    }
+
+    fn from_event(event_id: &str, event: &OwnedValue) -> Self {
+        let mut fields = Self {
+            event_id: event_id.to_owned(),
+            prev: Vec::new(),
+            auth: Vec::new(),
+            relation: None,
+        };
+        let OwnedValue::Object(object) = event else {
+            return fields;
+        };
+        for (field, targets) in [
+            ("prev_events", &mut fields.prev),
+            ("auth_events", &mut fields.auth),
+        ] {
+            if let Some(OwnedValue::Array(values)) = object.get(field) {
+                for value in values.iter() {
+                    // Room versions 1 and 2 reference `[event_id, hashes]`.
+                    let target = match value {
+                        OwnedValue::String(id) => Some(id.as_str()),
+                        OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        targets.push(target.to_owned());
+                    }
+                }
+            }
+        }
+        // One relation per event, from `rel_type` and `event_id`, as Synapse's
+        // `event_relations` stores it. A bare `m.in_reply_to` reply fallback has no
+        // `rel_type` and is not a relation there either.
+        if let Some(OwnedValue::Object(content)) = object.get("content") {
+            if let Some(OwnedValue::Object(relates_to)) = content.get("m.relates_to") {
+                if let (Some(OwnedValue::String(rel_type)), Some(OwnedValue::String(target))) =
+                    (relates_to.get("rel_type"), relates_to.get("event_id"))
+                {
+                    // `rel_type` is user-supplied and becomes a dictionary entry, so
+                    // one too long to be a real identifier is dropped rather than
+                    // failing the whole import. Relations are best-effort here.
+                    if rel_type.len() <= MAX_RELATION_TYPE_BYTES {
+                        fields.relation = Some((target.to_owned(), rel_type.to_owned()));
+                    }
+                }
+            }
+        }
+        fields
+    }
+
+    fn as_record<'a>(&'a self, prev: &'a [&'a str], auth: &'a [&'a str]) -> EventRecord<'a> {
+        EventRecord {
+            event_id: self.event_id.as_str(),
+            prev,
+            auth,
+            relation: self.relation.as_ref().map(|(target, rel_type)| {
+                mtxdb::matrix_adjacency::RelationRef {
+                    target: target.as_str(),
+                    rel_type: rel_type.as_str(),
+                }
+            }),
+        }
+    }
+}
+
+/// Record each Matrix event's `prev_events`, `auth_events` and relation in its
+/// room's auth index, one atomic batch per room.
+///
+/// Parent references are Matrix event IDs, so a record identity other than
+/// `/event_id` cannot name a referenced event; those templates record nothing.
+///
+/// Call this before writing the primary event records: a structural conflict (the
+/// same event with different `prev` or `auth`) is rejected as a unit before any
+/// event is written, and the batch is atomic, so a failure leaves no partial
+/// adjacency. Recording is idempotent, so a later re-import repairs adjacency for
+/// events that were written but not recorded.
+fn record_matrix_adjacency(
+    db: &Database,
     template: &CollectionTemplate,
     events: &[OwnedValue],
-) -> anyhow::Result<MatrixEdgePlan> {
-    // Parent references contain Matrix event IDs, so a custom record identity
-    // such as /sender cannot be derived for a referenced event. The checked-in
-    // Matrix importer profile requires /event_id; generic templates that use
-    // another identity do not publish MtxAdjacency records.
+) -> anyhow::Result<()> {
+    record_matrix_adjacency_with_raw(db, template, events, None)
+}
+
+fn record_matrix_adjacency_with_raw(
+    db: &Database,
+    template: &CollectionTemplate,
+    events: &[OwnedValue],
+    raw_adjacency: Option<&[rezzy::OwnedMatrixEvent]>,
+) -> anyhow::Result<()> {
     if !matches!(
         &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
     ) {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    // Ordered maps so the written record order is deterministic across runs
-    // (`put_many` preserves caller order); a `HashMap` would randomize it.
-    let mut by_collection: BTreeMap<[u8; 16], BTreeMap<NodeId, MtxAdjacency>> = BTreeMap::new();
-    for event in events {
-        let Some(source_id) = template_node_id(template, event)? else {
+    // Ordered, so the order adjacency is recorded in is the same on every run.
+    let mut rooms: BTreeMap<&str, Vec<MatrixEventFields>> = BTreeMap::new();
+    for (index, event) in events.iter().enumerate() {
+        let (Some(room_id), Some(event_id)) = (event_room_id(event), event_id(event)) else {
             continue;
         };
-        let Some(room_id) = event_room_id(event) else {
-            continue;
-        };
-        let adjacency = mtx_relationships(template, event)?;
-        // EDG1 is the initial adjacency format; it has not shipped, so no
-        // deployed legacy collection needs migration or versioned separation.
-        let collection_id = template_collection_id(template, room_id);
-        let records = by_collection.entry(collection_id).or_default();
-        if let Some(previous) = records.get_mut(&source_id) {
-            reconcile_mtx_adjacency(previous, &adjacency).with_context(|| {
-                format!(
-                    "event {} has conflicting prev/auth edges in one import",
-                    hex::encode(source_id)
-                )
-            })?;
-        } else {
-            records.insert(source_id, adjacency);
-        }
+        let fields = raw_adjacency.and_then(|raw| raw.get(index)).map_or_else(
+            || MatrixEventFields::from_event(event_id, event),
+            MatrixEventFields::from_owned,
+        );
+        rooms.entry(room_id).or_default().push(fields);
     }
-
-    let mut plan = Vec::new();
-    for (collection_id, records) in by_collection {
-        let ids: Vec<NodeId> = records.keys().copied().collect();
-        let existing = store.get_many(&collection_id, &ids)?;
-        let mut to_write = Vec::new();
-        for (id, old) in ids.into_iter().zip(existing) {
-            let adjacency = records
-                .get(&id)
-                .expect("each requested source ID came from records");
-            if let Some(old) = old {
-                let mut merged = decode_mtx_adjacency(&old.bytes).with_context(|| {
-                    format!(
-                        "decoding stored edge adjacency for event {}",
-                        hex::encode(id)
-                    )
-                })?;
-                if reconcile_mtx_adjacency(&mut merged, adjacency).with_context(|| {
-                    format!(
-                        "stored edge adjacency for event {} has conflicting prev/auth edges",
-                        hex::encode(id)
-                    )
-                })? {
-                    let data = encode_mtx_adjacency(&merged)?;
-                    to_write.push((id, NodeData::new(bytes::Bytes::from(data))));
-                }
-            } else {
-                let data = encode_mtx_adjacency(adjacency)?;
-                to_write.push((id, NodeData::new(bytes::Bytes::from(data))));
+    for (room_id, fields) in rooms {
+        let room = RoomAuth::new(ShardType::Edges, room_id);
+        for chunk in fields.chunks(MAX_BATCH_EVENTS) {
+            // One contiguous reference buffer per edge kind avoids a nested
+            // Vec allocation for every event while preserving EventRecord's
+            // borrowed-slice API.
+            let prev_capacity = chunk.iter().map(|field| field.prev.len()).sum();
+            let auth_capacity = chunk.iter().map(|field| field.auth.len()).sum();
+            let mut prev = Vec::with_capacity(prev_capacity);
+            let mut auth = Vec::with_capacity(auth_capacity);
+            let mut ranges = Vec::with_capacity(chunk.len());
+            for field in chunk {
+                let prev_start = prev.len();
+                prev.extend(field.prev.iter().map(String::as_str));
+                let auth_start = auth.len();
+                auth.extend(field.auth.iter().map(String::as_str));
+                ranges.push((prev_start, prev.len(), auth_start, auth.len()));
             }
+            let records: Vec<EventRecord<'_>> = chunk
+                .iter()
+                .zip(ranges.iter())
+                .map(|(field, &(prev_start, prev_end, auth_start, auth_end))| {
+                    field.as_record(&prev[prev_start..prev_end], &auth[auth_start..auth_end])
+                })
+                .collect();
+            room.record_events(db, &records)
+                .with_context(|| format!("recording auth adjacency for room {room_id}"))?;
         }
-        if !to_write.is_empty() {
-            plan.push((collection_id, to_write));
-        }
-    }
-    Ok(plan)
-}
-
-/// Append a plan from [`plan_matrix_edges`] to the edges pool.
-fn write_matrix_edges(store: &PackfileStorage, plan: MatrixEdgePlan) -> anyhow::Result<()> {
-    for (collection_id, to_write) in plan {
-        store.put_many(&collection_id, &to_write)?;
     }
     Ok(())
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct MtxAdjacency {
-    prev: Vec<NodeId>,
-    auth: Vec<NodeId>,
-    related: Vec<(NodeId, String)>,
-}
-
-/// Require the structural event edges to agree, while monotonically unioning
-/// related edges that may arrive in a later import or duplicate batch record.
-/// Returns true only when the destination adjacency changed.
-fn reconcile_mtx_adjacency(
-    existing: &mut MtxAdjacency,
-    incoming: &MtxAdjacency,
-) -> anyhow::Result<bool> {
-    anyhow::ensure!(existing.prev == incoming.prev, "prev edges differ");
-    anyhow::ensure!(existing.auth == incoming.auth, "auth edges differ");
-    let mut changed = false;
-    for edge in &incoming.related {
-        if !existing.related.contains(edge) {
-            existing.related.push(edge.clone());
-            changed = true;
-        }
-    }
-    Ok(changed)
-}
-
-fn encode_mtx_adjacency(adjacency: &MtxAdjacency) -> anyhow::Result<Vec<u8>> {
-    let prev_count = u32::try_from(adjacency.prev.len()).context("too many prev edges")?;
-    let auth_count = u32::try_from(adjacency.auth.len()).context("too many auth edges")?;
-    let related_count = u32::try_from(adjacency.related.len()).context("too many related edges")?;
-    let related_bytes = adjacency
-        .related
-        .iter()
-        .try_fold(0usize, |sum, (_, kind)| {
-            let kind_len = u16::try_from(kind.len()).context("edge kind is too long")?;
-            sum.checked_add(EDGE_ID_BYTES)
-                .and_then(|n| n.checked_add(std::mem::size_of::<u16>()))
-                .and_then(|n| n.checked_add(usize::from(kind_len)))
-                .context("edge adjacency length overflow")
-        })?;
-    let ids_bytes = adjacency
-        .prev
-        .len()
-        .checked_add(adjacency.auth.len())
-        .and_then(|count| count.checked_mul(EDGE_ID_BYTES))
-        .context("edge adjacency length overflow")?;
-    let capacity = EDGE_MAGIC
-        .len()
-        .checked_add(3 * EDGE_COUNT_BYTES)
-        .and_then(|n| n.checked_add(ids_bytes))
-        .and_then(|n| n.checked_add(related_bytes))
-        .context("edge adjacency length overflow")?;
-    let mut out = Vec::with_capacity(capacity);
-    out.extend_from_slice(EDGE_MAGIC);
-    out.extend_from_slice(&prev_count.to_le_bytes());
-    for id in &adjacency.prev {
-        out.extend_from_slice(id);
-    }
-    out.extend_from_slice(&auth_count.to_le_bytes());
-    for id in &adjacency.auth {
-        out.extend_from_slice(id);
-    }
-    out.extend_from_slice(&related_count.to_le_bytes());
-    for (id, kind) in &adjacency.related {
-        let kind_len = u16::try_from(kind.len()).context("edge kind is too long")?;
-        out.extend_from_slice(id);
-        out.extend_from_slice(&kind_len.to_le_bytes());
-        out.extend_from_slice(kind.as_bytes());
-    }
-    debug_assert_eq!(
-        out.len(),
-        capacity,
-        "encoded adjacency must match its computed size"
-    );
-    Ok(out)
-}
-
-fn decode_mtx_adjacency(bytes: &[u8]) -> anyhow::Result<MtxAdjacency> {
-    anyhow::ensure!(
-        bytes.len() >= EDGE_MAGIC.len(),
-        "truncated edge adjacency magic"
-    );
-    anyhow::ensure!(
-        &bytes[..EDGE_MAGIC.len()] == EDGE_MAGIC,
-        "unknown edge adjacency version"
-    );
-    let mut offset = EDGE_MAGIC.len();
-    let read_count = |bytes: &[u8], offset: &mut usize| -> anyhow::Result<usize> {
-        let end = offset
-            .checked_add(EDGE_COUNT_BYTES)
-            .context("edge offset overflow")?;
-        let raw: [u8; EDGE_COUNT_BYTES] = bytes
-            .get(*offset..end)
-            .context("truncated edge adjacency count")?
-            .try_into()
-            .expect("slice length checked");
-        *offset = end;
-        Ok(u32::from_le_bytes(raw) as usize)
-    };
-    let read_ids =
-        |bytes: &[u8], offset: &mut usize, count: usize| -> anyhow::Result<Vec<NodeId>> {
-            let total = count
-                .checked_mul(EDGE_ID_BYTES)
-                .context("edge ID count overflow")?;
-            let end = offset.checked_add(total).context("edge offset overflow")?;
-            let raw = bytes.get(*offset..end).context("truncated edge IDs")?;
-            *offset = end;
-            let (ids, remainder) = raw.as_chunks::<EDGE_ID_BYTES>();
-            debug_assert!(remainder.is_empty(), "ID byte length is a multiple of 16");
-            Ok(ids.to_vec())
-        };
-    let prev_count = read_count(bytes, &mut offset)?;
-    let prev = read_ids(bytes, &mut offset, prev_count)?;
-    let auth_count = read_count(bytes, &mut offset)?;
-    let auth = read_ids(bytes, &mut offset, auth_count)?;
-    let related_count = read_count(bytes, &mut offset)?;
-    // Each related edge occupies at least an ID plus its kind length, so the
-    // count cannot exceed the remaining bytes divided by that minimum. Reject
-    // an oversized count before `Vec::with_capacity` acts on it.
-    let min_related_bytes = EDGE_ID_BYTES
-        .checked_add(std::mem::size_of::<u16>())
-        .context("edge adjacency length overflow")?;
-    let remaining = bytes
-        .len()
-        .checked_sub(offset)
-        .context("edge offset underflow")?;
-    let max_related = remaining
-        .checked_div(min_related_bytes)
-        .context("edge adjacency length overflow")?;
-    anyhow::ensure!(
-        related_count <= max_related,
-        "truncated related-edge entries"
-    );
-    let mut related = Vec::with_capacity(related_count);
-    for _ in 0..related_count {
-        let id_end = offset
-            .checked_add(EDGE_ID_BYTES)
-            .context("edge offset overflow")?;
-        let id: NodeId = bytes
-            .get(offset..id_end)
-            .context("truncated related-edge ID")?
-            .try_into()
-            .expect("slice length checked");
-        offset = id_end;
-        let kind_len_end = offset.checked_add(2).context("edge offset overflow")?;
-        let kind_len_raw: [u8; 2] = bytes
-            .get(offset..kind_len_end)
-            .context("truncated related-edge kind length")?
-            .try_into()
-            .expect("slice length checked");
-        offset = kind_len_end;
-        let kind_end = offset
-            .checked_add(usize::from(u16::from_le_bytes(kind_len_raw)))
-            .context("edge offset overflow")?;
-        let kind = std::str::from_utf8(
-            bytes
-                .get(offset..kind_end)
-                .context("truncated related-edge kind")?,
-        )?
-        .to_owned();
-        offset = kind_end;
-        related.push((id, kind));
-    }
-    anyhow::ensure!(offset == bytes.len(), "trailing bytes in edge adjacency");
-    Ok(MtxAdjacency {
-        prev,
-        auth,
-        related,
-    })
-}
-
-fn matrix_event_id_for_template(
-    template: &CollectionTemplate,
-    event_id: &str,
-) -> anyhow::Result<NodeId> {
-    let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
-        bail!("Matrix edge IDs require a pointer-based template record identity");
-    };
-    anyhow::ensure!(
-        pointer == "/event_id",
-        "Matrix edge IDs require record identity /event_id"
-    );
-    let algorithm = match template.record_id_rule.digest_algorithm {
-        DigestAlgorithm::Blake3 => "blake3-128",
-        DigestAlgorithm::Sha256 => "sha2-256",
-        DigestAlgorithm::Unknown(id) => bail!("unsupported template digest algorithm id {id}"),
-    };
-    derive_template_key(algorithm, event_id)
-}
-
-fn mtx_relationships(
-    template: &CollectionTemplate,
-    event: &OwnedValue,
-) -> anyhow::Result<MtxAdjacency> {
-    let mut adjacency = MtxAdjacency::default();
-    let OwnedValue::Object(fields) = event else {
-        return Ok(adjacency);
-    };
-    for (field, targets) in [
-        ("prev_events", &mut adjacency.prev),
-        ("auth_events", &mut adjacency.auth),
-    ] {
-        if let Some(OwnedValue::Array(values)) = fields.get(field) {
-            for value in values.iter() {
-                let target = match value {
-                    OwnedValue::String(id) => Some(id.as_str()),
-                    OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
-                    _ => None,
-                };
-                if let Some(target) = target {
-                    targets.push(matrix_event_id_for_template(template, target)?);
-                }
-            }
-        }
-    }
-    let Some(OwnedValue::Object(content)) = fields.get("content") else {
-        return Ok(adjacency);
-    };
-    let Some(OwnedValue::Object(relates_to)) = content.get("m.relates_to") else {
-        return Ok(adjacency);
-    };
-    if let (Some(OwnedValue::String(rel_type)), Some(OwnedValue::String(target))) =
-        (relates_to.get("rel_type"), relates_to.get("event_id"))
-    {
-        let kind = format!("relates_to:{rel_type}");
-        // Related edges are best-effort and EDG1 stores the kind length as a
-        // `u16`; a user-supplied `rel_type` too long to encode is dropped
-        // rather than failing the whole import.
-        if u16::try_from(kind.len()).is_ok() {
-            adjacency
-                .related
-                .push((matrix_event_id_for_template(template, target)?, kind));
-        }
-    }
-    if let Some(OwnedValue::Object(reply)) = relates_to.get("m.in_reply_to") {
-        if let Some(OwnedValue::String(target)) = reply.get("event_id") {
-            adjacency.related.push((
-                matrix_event_id_for_template(template, target)?,
-                "relates_to:m.in_reply_to".to_owned(),
-            ));
-        }
-    }
-    Ok(adjacency)
 }
 
 fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {

@@ -1,0 +1,790 @@
+//! On-disk serialization of the per-collection indexes (`index.checkpoint`).
+//!
+//! Packfiles stay authoritative: this file is a rebuildable acceleration
+//! structure. A full `rewrite` (see `PackfileStorage::persist_index_checkpoint`)
+//! is done atomically (temp file + rename) whenever the delta log can't
+//! continue — a structural change, a broken continuation, or the log's size
+//! cap. Between rewrites, incremental index mutations are persisted as
+//! batches in the `index.delta` log ([`crate::index::delta`]); the checkpoint
+//! pins the exact pack set those frames continue, and a crash at any point
+//! leaves a fingerprint mismatch the next open resolves with a rescan — never
+//! a wrong replay.
+//!
+//! Layout (all little-endian, fixed width — see [`crate::index::format`]):
+//!
+//! ```text
+//!   [CheckpointHeader 104B]
+//!   [CollectionDirEntry * count, 56B each]
+//!   [collection 0 raw slots: capacity * 8B]
+//!   [collection 1 raw slots: capacity * 8B]
+//!   [PackTableEntry * pack_table_count, 20B each]
+//!   [CollectionVersionEntry * logical_version_count, 24B each]
+//!   ...
+//! ```
+//!
+//! The header's `pack_fingerprint` is a deterministic hash of the
+//! `(pack_id, length)` set the checkpoint describes. An opener only trusts
+//! the file when that fingerprint matches the packs currently on disk (optionally
+//! with a gated delta replay continuing it); any append, rotation, or repack
+//! changes it and forces a rescan.
+
+use std::collections::HashSet;
+use std::fs;
+use std::io::{self, Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use memmap2::Mmap;
+
+use super::format::{
+    CheckpointHeader, CollectionDirEntry, CollectionVersionEntry, PackTableEntry,
+    CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN, COLLECTION_VERSION_ENTRY_LEN,
+    PACK_TABLE_ENTRY_LEN,
+};
+use crate::packfile::PackId;
+
+/// Magic identifying the persisted-index checkpoint format.
+pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
+/// Current wire version (see [`CheckpointHeader::version`]).
+///
+/// Bumped to 6: the header carries a pack table (`slot -> pack_id`
+/// bindings for every pack live at checkpoint-write time). `slot` in a
+/// checkpoint's raw index slots (and in `DeltaFrame.slot`) is the writer's
+/// local, process-scoped `ShardPool` slot, not a stable identity — a fresh
+/// reader's `discover_shards` reassigns slots by first-free-in-`pack_id`-order,
+/// which does not reproduce the writer's numbering once any shard has ever
+/// been retired (retirement leaves a permanent hole in the writer's table).
+/// The pack table lets a reader translate every checkpoint-encoded slot to
+/// its own local slot for the same `pack_id` (globally unique and immutable)
+/// instead of trusting the writer's raw slot number. A v5 checkpoint has no
+/// pack table and is rejected outright by the strict magic/version check
+/// below, forcing the normal full-rescan fallback — never a partial/best-effort
+/// read of a v5 file under the v6 reader.
+///
+/// Bumped to 7: the header carries `base_delta_seq`, the highest redo `delta_seq`
+/// the checkpoint incorporates (see `CheckpointHeader::base_delta_seq`). A v6
+/// checkpoint has no such field and is rebuilt.
+///
+/// Bumped to 5: the header now carries the journal `covered_lsn` the index
+/// snapshot incorporates, so a read-committed reader binds its overlay
+/// coverage to the exact index it loaded instead of a separately-read
+/// `journal.lsn`. A v4 checkpoint has no such field and is rebuilt.
+///
+/// Bumped to 4: homes and tails are now persisted alongside packed slots.
+/// A pre-v4 checkpoint has `homes_bytes`/`tails_bytes` of 0 and is loaded
+/// with empty identity side tables (cold-start tag-collision verification
+/// cost). A v4 checkpoint carries hydrated identity, eliminating packfile
+/// reads for tag collisions on cold start.
+///
+/// Bumped to 9: the checkpoint carries a sorted logical-version table after
+/// the pack table. The version table includes tombstoned collection IDs, so
+/// stale expectations remain stale after their WAL groups are reclaimed.
+/// A v8 checkpoint is rejected and rebuilt; no version tokens existed before
+/// this version, so the first v9 checkpoint establishes their baseline.
+///
+/// Bumped to 8: the pack table's [`PackTableEntry`] stores the 16-byte
+/// [`PackId`] identity (v7 used the 32-byte form), so each entry shrank from
+/// 36 to 20 bytes. The magic/version check below rejects a v7 file outright,
+/// forcing the normal full-rescan fallback rather than misreading the
+/// narrower entries.
+pub const CHECKPOINT_VERSION: u32 = 9;
+/// File name of the persisted index checkpoint inside a store's base dir.
+pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
+
+/// Whether an opener verifies the checkpoint body's CRC32.
+///
+/// This policy is intentionally independent from [`crate::packfile::ChecksumPolicy`]:
+/// frame checksums, delta-log checksums, and checkpoint integrity protect
+/// different on-disk structures and must not be disabled together by accident.
+/// `WriteOnly` retains the CRC when writing a checkpoint for offline/recovery
+/// tooling, but trusts it during normal opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointChecksumPolicy {
+    /// Verify the persisted checkpoint CRC32 at every open (the default).
+    Full,
+    /// Retain the CRC32 on write but skip its read-time verification.
+    WriteOnly,
+}
+
+impl CheckpointChecksumPolicy {
+    /// Select the process-wide checkpoint policy from `MTXDB_CHECKPOINT_CHECKSUM`.
+    /// Unknown values intentionally retain the safe default.
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var("MTXDB_CHECKPOINT_CHECKSUM").as_deref() {
+            Ok("writeonly") => Self::WriteOnly,
+            Ok("full" | _) | Err(_) => Self::Full,
+        }
+    }
+
+    #[must_use]
+    fn verifies_reads(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+/// Disambiguates concurrent checkpoint tmp filenames within this process,
+/// paired with the process id for uniqueness across processes — same pattern
+/// as `SHARD_ROOMS_TMP_COUNTER` / `shard::STATS_TMP_COUNTER`.
+static CHECKPOINT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A checkpoint read off disk, validated enough to trust for index rebuild.
+#[derive(Debug)]
+pub struct LoadedCheckpoint {
+    /// The pack-fingerprint the checkpoint was written against.
+    pub fingerprint: u64,
+    /// Journal LSN this checkpoint's index snapshot covers, captured atomically
+    /// with the snapshot. Zero when the checkpoint was written without a
+    /// journal.
+    pub covered_lsn: u64,
+    /// The highest redo `delta_seq` this checkpoint incorporates.
+    pub base_delta_seq: u64,
+    /// One entry per collection, in the checkpoint's directory order.
+    pub collections: Vec<LoadedCollection>,
+    /// Keeps the raw slot arrays alive for mmap-backed indexes built from
+    /// this checkpoint.
+    pub mmap: Arc<Mmap>,
+    /// `(writer's local shard slot, pack_id)` for every pack live at
+    /// checkpoint-write time. Every `slot` embedded in this checkpoint's
+    /// raw index slots (and in any delta frame that continues it) refers to
+    /// one of these slots — translate through this table to a reader's own
+    /// local slot rather than trusting the slot number directly. See the
+    /// `CHECKPOINT_VERSION` doc comment for why.
+    pub pack_table: Vec<(u16, PackId)>,
+    /// Per-pool logical versions captured through `covered_lsn`, including
+    /// IDs of collections deleted after their last live record was written.
+    pub logical_versions: Vec<([u8; 16], u64)>,
+}
+
+/// One collection's raw slots, homes, and tails in the checkpoint mapping.
+#[derive(Debug)]
+pub struct LoadedCollection {
+    /// The collection whose slots these are.
+    pub collection_id: [u8; 16],
+    /// Checkpoint generation for this collection (reserved for a future
+    /// delta-log; always 0 today).
+    pub generation: u64,
+    /// Absolute byte offset of the raw `capacity * 8` slot array.
+    pub slots_offset: usize,
+    /// Absolute byte offset of the homes array (`capacity * 8` bytes).
+    /// 0 when the checkpoint is pre-v4 and homes were not persisted.
+    pub homes_offset: usize,
+    /// Absolute byte offset of the tails array (`capacity * 8` bytes).
+    /// 0 when the checkpoint is pre-v4 and tails were not persisted.
+    pub tails_offset: usize,
+    /// Allocated index capacity.
+    pub capacity: u32,
+    /// Number of non-empty slots, recorded at checkpoint write time.
+    pub slot_count: u32,
+    /// Whether homes/tails are present in this checkpoint.
+    pub has_homes_tails: bool,
+}
+
+/// Deterministic FNV-1a hash of the `(pack_id, file_len)` set a checkpoint
+/// (or an open store's current packs) describes. The set is sorted before
+/// hashing so the result is order-independent.
+#[must_use]
+pub fn pack_fingerprint(packs: &[(PackId, u64)]) -> u64 {
+    let mut sorted: Vec<(PackId, u64)> = packs.to_vec();
+    sorted.sort_unstable();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (pack_id, file_len) in sorted {
+        for byte in pack_id.as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        for byte in file_len.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// Decode the 8-byte capacity prefix of a `LossyIndex::serialize` blob.
+fn blob_capacity(blob: &[u8]) -> Option<u64> {
+    let head: [u8; 8] = blob.get(..8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(head))
+}
+
+/// Number of occupied (non-`0u64`) slots in a `LossyIndex::serialize` blob's
+/// slot section. The blob format is `[capacity_u64][slots × cap][homes × cap][tails × cap]`.
+fn blob_slot_count(blob: &[u8]) -> u32 {
+    let Some(capacity) = blob_capacity(blob) else {
+        return 0;
+    };
+    let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
+    let slots_end = 8_usize.saturating_add(cap.saturating_mul(8));
+    let slots = blob.get(8..slots_end).unwrap_or(&[]);
+    u32::try_from(
+        slots
+            .chunks_exact(8)
+            .filter(|slot| *slot != [0u8; 8])
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+}
+
+/// Write a complete checkpoint atomically: temp file, fsync, rename over the
+/// final path. `collections` holds each collection's `serialize` blob plus the
+/// index generation it was written at (recorded in its directory entry so a
+/// delta log's frames can be gated against the same generation on replay),
+/// the first collection listed becoming the first in the directory order.
+///
+/// # Contract
+/// The `fingerprint` and every `collections` blob must be *captured
+/// atomically*: derived from pack-file lengths and index slots that were both
+/// observed while every collection's writer lock was held. This function only
+/// makes that already-consistent (pack set, index snapshot) pair durable; it
+/// cannot reconcile the two if a concurrent `put` changed either side between
+/// capture and this call. The sole caller
+/// (`PackfileStorage::persist_index_checkpoint`) satisfies this by pinning the
+/// pack lengths and all collection generations under every `put_mutex` (and
+/// rotating the delta epoch there too) before handing them to this function.
+///
+/// # Errors
+/// Returns `io::Error` on any failure; the previous checkpoint (if any) is
+/// left intact in that case.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the three phases (directory, slots/homes/tails offsets, body write) are one atomic construction; splitting them would scatter overflow-checked arithmetic that must stay in lockstep"
+)]
+pub fn write_checkpoint(
+    path: &Path,
+    fingerprint: u64,
+    covered_lsn: u64,
+    base_delta_seq: u64,
+    collections: &[([u8; 16], u64, &[u8])],
+    pack_table: &[(u16, PackId)],
+    logical_versions: &[([u8; 16], u64)],
+) -> std::io::Result<()> {
+    let pack_table_count = u32::try_from(pack_table.len())
+        .map_err(|_| std::io::Error::other("too many packs for checkpoint pack table u32"))?;
+    let pack_table_bytes = u64::try_from(pack_table.len())
+        .ok()
+        .and_then(|n| n.checked_mul(PACK_TABLE_ENTRY_LEN as u64))
+        .ok_or_else(|| std::io::Error::other("checkpoint pack table size overflow"))?;
+    let logical_version_count = u32::try_from(logical_versions.len())
+        .map_err(|_| std::io::Error::other("too many logical versions for checkpoint u32"))?;
+    let logical_version_bytes = u64::try_from(logical_versions.len())
+        .ok()
+        .and_then(|n| n.checked_mul(COLLECTION_VERSION_ENTRY_LEN as u64))
+        .ok_or_else(|| std::io::Error::other("checkpoint logical-version size overflow"))?;
+    if logical_versions
+        .windows(2)
+        .any(|pair| pair[0].0 >= pair[1].0)
+        || logical_versions
+            .iter()
+            .any(|(_, version)| *version > covered_lsn)
+    {
+        return Err(std::io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "checkpoint logical versions must be sorted, unique, and covered by its LSN",
+        ));
+    }
+
+    let count = u32::try_from(collections.len())
+        .map_err(|_| std::io::Error::other("too many collections for checkpoint u32"))?;
+    let directory_bytes = u64::try_from(collections.len())
+        .ok()
+        .and_then(|n| n.checked_mul(COLLECTION_DIR_ENTRY_LEN as u64))
+        .ok_or_else(|| std::io::Error::other("checkpoint directory size overflow"))?;
+
+    // Compute per-section byte lengths from the serialize blobs.
+    // Blob format: [capacity_u64][slots × cap][homes × cap][tails × cap]
+    let mut slots_bytes: u64 = 0;
+    let mut homes_bytes: u64 = 0;
+    let mut tails_bytes: u64 = 0;
+    for (_, _, blob) in collections {
+        let capacity = blob_capacity(blob)
+            .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
+        let cap8 = capacity
+            .checked_mul(8)
+            .ok_or_else(|| std::io::Error::other("collection capacity × 8 overflow"))?;
+        slots_bytes = slots_bytes
+            .checked_add(cap8)
+            .ok_or_else(|| std::io::Error::other("checkpoint slots size overflow"))?;
+        // homes and tails are each capacity × 8 bytes when present in the blob
+        let blob_body = blob.len().saturating_sub(8);
+        let cap_usize = usize::try_from(capacity).unwrap_or(usize::MAX);
+        if blob_body >= cap_usize.saturating_mul(24) {
+            homes_bytes = homes_bytes
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint homes size overflow"))?;
+            tails_bytes = tails_bytes
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint tails size overflow"))?;
+        }
+    }
+
+    let body_bytes = slots_bytes
+        .checked_add(homes_bytes)
+        .and_then(|v| v.checked_add(tails_bytes))
+        .ok_or_else(|| std::io::Error::other("checkpoint body size overflow"))?;
+    let total_len = CHECKPOINT_HEADER_LEN
+        .saturating_add(usize::try_from(directory_bytes).unwrap_or(usize::MAX))
+        .saturating_add(usize::try_from(body_bytes).unwrap_or(usize::MAX))
+        .saturating_add(usize::try_from(pack_table_bytes).unwrap_or(usize::MAX))
+        .saturating_add(usize::try_from(logical_version_bytes).unwrap_or(usize::MAX));
+    // Reserve the header first, then build the body directly into the final
+    // buffer. This avoids retaining a second checkpoint-sized body merely to
+    // calculate the CRC carried by the header.
+    let mut buf = Vec::with_capacity(total_len);
+    buf.resize(CHECKPOINT_HEADER_LEN, 0);
+
+    // Phase 1: build directory entries, tracking per-collection offsets.
+    //
+    // Offsets must mirror Phase 3's actual write order exactly: each
+    // collection's slots/homes/tails are written back-to-back as one block
+    // (not as three separate all-slots/all-homes/all-tails sections), so a
+    // single running `body_offset` — not three independent per-kind
+    // counters — is what keeps a later collection's offsets from landing
+    // inside an earlier collection's bytes.
+    let mut body_offset: u64 = 0;
+    let mut dir_entries = Vec::with_capacity(collections.len());
+    for (collection_id, generation, blob) in collections {
+        let capacity = blob_capacity(blob)
+            .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
+        let capacity32 = u32::try_from(capacity)
+            .map_err(|_| std::io::Error::other("index capacity exceeds u32"))?;
+        let cap8 = capacity
+            .checked_mul(8)
+            .ok_or_else(|| std::io::Error::other("collection capacity × 8 overflow"))?;
+        let blob_body = blob.len().saturating_sub(8);
+        let cap_usize = usize::try_from(capacity).unwrap_or(usize::MAX);
+        let has_homes_tails = blob_body >= cap_usize.saturating_mul(24);
+
+        let slots_offset = body_offset;
+        let (homes_offset, tails_offset) = if has_homes_tails {
+            let homes_offset = body_offset
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint homes offset overflow"))?;
+            let tails_offset = homes_offset
+                .checked_add(cap8)
+                .ok_or_else(|| std::io::Error::other("checkpoint tails offset overflow"))?;
+            (homes_offset, tails_offset)
+        } else {
+            (0, 0)
+        };
+        dir_entries.push(CollectionDirEntry {
+            collection_id: *collection_id,
+            generation: *generation,
+            slots_offset,
+            homes_offset,
+            tails_offset,
+            capacity: capacity32,
+            slot_count: blob_slot_count(blob),
+        });
+        let block_bytes = if has_homes_tails {
+            cap8.checked_mul(3)
+                .ok_or_else(|| std::io::Error::other("collection capacity × 24 overflow"))?
+        } else {
+            cap8
+        };
+        body_offset = body_offset
+            .checked_add(block_bytes)
+            .ok_or_else(|| std::io::Error::other("checkpoint body offset overflow"))?;
+    }
+
+    // Phase 2: write directory entries.
+    for entry in &dir_entries {
+        buf.extend_from_slice(&entry.encode());
+    }
+
+    // Phase 3: write slots, homes, tails as separate contiguous sections.
+    for (_, _, blob) in collections {
+        let capacity = blob_capacity(blob)
+            .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
+        let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
+        let slots_end = 8_usize.saturating_add(cap.saturating_mul(8));
+        let homes_end = slots_end.saturating_add(cap.saturating_mul(8));
+        let tails_end = homes_end.saturating_add(cap.saturating_mul(8));
+        // Slots
+        if let Some(slots) = blob.get(8..slots_end) {
+            buf.extend_from_slice(slots);
+        }
+        // Homes
+        if let Some(homes) = blob.get(slots_end..homes_end) {
+            buf.extend_from_slice(homes);
+        }
+        // Tails
+        if let Some(tails) = blob.get(homes_end..tails_end) {
+            buf.extend_from_slice(tails);
+        }
+    }
+
+    // Phase 4: write the pack table (slot -> pack_id bindings), one fixed-
+    // width entry per currently-live pack. Appended after the slots/homes/
+    // tails body so existing offset math above is untouched.
+    for &(slot, pack_id) in pack_table {
+        buf.extend_from_slice(&PackTableEntry { slot, pack_id }.encode());
+    }
+    // Phase 5: persist logical versions, sorted by collection id so the section
+    // is deterministic and can be validated without allocating a hash set.
+    for &(collection_id, last_write_lsn) in logical_versions {
+        buf.extend_from_slice(
+            &CollectionVersionEntry {
+                collection_id,
+                last_write_lsn,
+            }
+            .encode(),
+        );
+    }
+
+    let content_crc32 = crc32fast::hash(&buf[CHECKPOINT_HEADER_LEN..]);
+
+    let header = CheckpointHeader {
+        magic: CHECKPOINT_MAGIC,
+        version: CHECKPOINT_VERSION,
+        collection_count: count,
+        directory_bytes,
+        slots_bytes,
+        pack_fingerprint: fingerprint,
+        content_crc32,
+        homes_bytes,
+        tails_bytes,
+        covered_lsn,
+        pack_table_count,
+        pack_table_bytes,
+        base_delta_seq,
+        logical_version_count,
+        logical_version_bytes,
+    };
+    buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
+
+    let unique = CHECKPOINT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = PathBuf::from(format!(
+        "{}.tmp.{}.{unique}",
+        path.display(),
+        std::process::id()
+    ));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut tmp = fs::File::create(&tmp_path)?;
+        tmp.write_all(&buf)?;
+        // `sync_data` (fdatasync), not `sync_all` (fsync): per POSIX,
+        // fdatasync durably flushes the file's data plus whatever metadata
+        // is needed to retrieve it (the extended length included) — that's
+        // the whole content/length guarantee this write needs. It skips
+        // metadata that's *not* needed to read the data back (mtime/ctime).
+        // That's a real distinction, not a claim that all inode metadata is
+        // irrelevant here generally (permissions/ownership can still matter
+        // operationally) — it just happens that none of the metadata this
+        // skips is read back through this temp name: it's renamed over
+        // `path` immediately below and never opened by this name again. The
+        // caller (`persist_index_checkpoint`) separately fsyncs the base
+        // directory after the rename, which is what makes the rename itself
+        // durable; if that directory fsync fails, reopen falls back to
+        // whichever checkpoint (old or new) is actually intact rather than
+        // trusting the rename — this change doesn't alter that fallback.
+        tmp.sync_data()
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    fs::rename(&tmp_path, path)
+}
+
+/// Read and validate a checkpoint. Returns `None` for any problem — a
+/// missing, truncated, or malformed file is treated identically to "no
+/// checkpoint", and the caller falls back to rebuilding from the packs.
+#[must_use]
+pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
+    read_checkpoint_with_policy(path, CheckpointChecksumPolicy::from_env())
+}
+
+/// As [`read_checkpoint`], with an explicit integrity policy for callers that
+/// need deterministic configuration rather than the process environment.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "split across branches, too lazy to consolidate right now"
+)]
+pub fn read_checkpoint_with_policy(
+    path: &Path,
+    checksum_policy: CheckpointChecksumPolicy,
+) -> Option<LoadedCheckpoint> {
+    let file = fs::File::open(path).ok()?;
+    let mmap = Arc::new(crate::packfile::map_pack(&file).ok()?);
+    let buf: &[u8] = &mmap;
+    let header_bytes: [u8; CHECKPOINT_HEADER_LEN] =
+        buf.get(..CHECKPOINT_HEADER_LEN)?.try_into().ok()?;
+    let header = CheckpointHeader::decode(&header_bytes)?;
+    if header.magic != CHECKPOINT_MAGIC || header.version != CHECKPOINT_VERSION {
+        return None;
+    }
+    let count = header.collection_count as usize;
+    if header.directory_bytes
+        != u64::try_from(count)
+            .ok()?
+            .checked_mul(COLLECTION_DIR_ENTRY_LEN as u64)?
+    {
+        return None;
+    }
+    let slot_base =
+        CHECKPOINT_HEADER_LEN.checked_add(usize::try_from(header.directory_bytes).ok()?)?;
+    let body_bytes = header
+        .slots_bytes
+        .checked_add(header.homes_bytes)
+        .and_then(|v| v.checked_add(header.tails_bytes))?;
+    // Slots are unique u16 values, so a valid pack table cannot exceed 65,536
+    // entries; reject before `pack_table` and its dedupe sets reserve capacity
+    // from `pack_table_count`.
+    if header.pack_table_count > u32::from(u16::MAX).saturating_add(1) {
+        return None;
+    }
+    if header.pack_table_bytes
+        != u64::from(header.pack_table_count).checked_mul(PACK_TABLE_ENTRY_LEN as u64)?
+    {
+        return None;
+    }
+    if header.logical_version_bytes
+        != u64::from(header.logical_version_count)
+            .checked_mul(COLLECTION_VERSION_ENTRY_LEN as u64)?
+    {
+        return None;
+    }
+    let pack_table_base = slot_base.checked_add(usize::try_from(body_bytes).ok()?)?;
+    let logical_versions_base =
+        pack_table_base.checked_add(usize::try_from(header.pack_table_bytes).ok()?)?;
+    if buf.len()
+        != logical_versions_base.checked_add(usize::try_from(header.logical_version_bytes).ok()?)?
+    {
+        return None;
+    }
+
+    // Verify the whole directory+slots body against the header's CRC in one
+    // pass, in place of re-deriving each collection's occupancy by walking
+    // its slots. This is strictly stronger than the old per-collection walk
+    // (it also covers the directory entries — `capacity`/`slot_count`
+    // themselves — which the walk never checked), and costs the same O(bytes)
+    // as a single SIMD-accelerated hash instead of a manual scan-and-branch
+    // loop over every slot of every collection.
+    if checksum_policy.verifies_reads() {
+        let content_crc32 = crc32fast::hash(buf.get(CHECKPOINT_HEADER_LEN..)?);
+        if content_crc32 != header.content_crc32 {
+            return None;
+        }
+    }
+
+    let mut collections = Vec::with_capacity(count);
+    for i in 0..count {
+        let entry_offset =
+            CHECKPOINT_HEADER_LEN.checked_add(i.checked_mul(COLLECTION_DIR_ENTRY_LEN)?)?;
+        let entry_bytes: [u8; COLLECTION_DIR_ENTRY_LEN] = buf
+            .get(entry_offset..entry_offset.saturating_add(COLLECTION_DIR_ENTRY_LEN))?
+            .try_into()
+            .ok()?;
+        let entry = CollectionDirEntry::decode(&entry_bytes)?;
+        if entry.capacity < 16 || !entry.capacity.is_power_of_two() {
+            return None;
+        }
+        // A corrupt or malicious directory entry could otherwise claim more
+        // occupied slots than the table has room for; a downstream consumer
+        // sizing an allocation off `slot_count` (e.g. a post-restart grow)
+        // would then trust a value with no upper bound instead of the
+        // checkpoint being rejected here. (An *understated* count — the
+        // failure mode the old occupancy walk additionally caught — is now
+        // caught by the CRC check above instead: any bit that makes
+        // `slot_count` disagree with the actual slots, or with what was
+        // written, changes the body's hash.)
+        if entry.slot_count > entry.capacity {
+            return None;
+        }
+        let slots_len = (entry.capacity as usize).checked_mul(8)?;
+        let region = slot_base.checked_add(usize::try_from(entry.slots_offset).ok()?)?;
+        if region.checked_add(slots_len)? > buf.len() {
+            return None;
+        }
+        let has_homes_tails = header.homes_bytes > 0 && header.tails_bytes > 0;
+        let homes_region = if has_homes_tails {
+            let r = slot_base.checked_add(usize::try_from(entry.homes_offset).ok()?)?;
+            if r.checked_add(slots_len)? > buf.len() {
+                return None;
+            }
+            r
+        } else {
+            0
+        };
+        let tails_region = if has_homes_tails {
+            let r = slot_base.checked_add(usize::try_from(entry.tails_offset).ok()?)?;
+            if r.checked_add(slots_len)? > buf.len() {
+                return None;
+            }
+            r
+        } else {
+            0
+        };
+        collections.push(LoadedCollection {
+            collection_id: entry.collection_id,
+            generation: entry.generation,
+            slots_offset: region,
+            homes_offset: homes_region,
+            tails_offset: tails_region,
+            capacity: entry.capacity,
+            slot_count: entry.slot_count,
+            has_homes_tails,
+        });
+    }
+
+    let mut pack_table = Vec::with_capacity(header.pack_table_count as usize);
+    let mut seen_slots = HashSet::with_capacity(header.pack_table_count as usize);
+    let mut seen_pack_ids = HashSet::with_capacity(header.pack_table_count as usize);
+    for i in 0..header.pack_table_count as usize {
+        let entry_offset = pack_table_base.checked_add(i.checked_mul(PACK_TABLE_ENTRY_LEN)?)?;
+        let entry_bytes: [u8; PACK_TABLE_ENTRY_LEN] = buf
+            .get(entry_offset..entry_offset.saturating_add(PACK_TABLE_ENTRY_LEN))?
+            .try_into()
+            .ok()?;
+        let entry = PackTableEntry::decode(&entry_bytes)?;
+        if !seen_slots.insert(entry.slot) || !seen_pack_ids.insert(entry.pack_id) {
+            return None;
+        }
+        pack_table.push((entry.slot, entry.pack_id));
+    }
+
+    let mut logical_versions = Vec::with_capacity(header.logical_version_count as usize);
+    let mut previous_id = None;
+    for i in 0..header.logical_version_count as usize {
+        let entry_offset =
+            logical_versions_base.checked_add(i.checked_mul(COLLECTION_VERSION_ENTRY_LEN)?)?;
+        let entry_bytes: [u8; COLLECTION_VERSION_ENTRY_LEN] = buf
+            .get(entry_offset..entry_offset.saturating_add(COLLECTION_VERSION_ENTRY_LEN))?
+            .try_into()
+            .ok()?;
+        let entry = CollectionVersionEntry::decode(&entry_bytes)?;
+        if previous_id.is_some_and(|previous| previous >= entry.collection_id)
+            || entry.last_write_lsn > header.covered_lsn
+        {
+            return None;
+        }
+        previous_id = Some(entry.collection_id);
+        logical_versions.push((entry.collection_id, entry.last_write_lsn));
+    }
+
+    Some(LoadedCheckpoint {
+        fingerprint: header.pack_fingerprint,
+        covered_lsn: header.covered_lsn,
+        base_delta_seq: header.base_delta_seq,
+        collections,
+        mmap,
+        pack_table,
+        logical_versions,
+    })
+}
+
+/// Lightweight read of the persisted checkpoint's `pack_fingerprint`.
+///
+/// Returns `Ok(Some(fp))` for a valid checkpoint, `Ok(None)` if the file
+/// is missing (fresh store), and `Err` if the file exists but is truncated,
+/// has invalid magic/version, or an I/O error occurs.
+///
+/// # Errors
+///
+/// Returns a [`crate::index::delta::DeltaFingerprintError`] when an existing
+/// checkpoint cannot be read or validated.
+pub fn read_pack_fingerprint(
+    path: &Path,
+) -> Result<Option<u64>, crate::index::delta::DeltaFingerprintError> {
+    Ok(read_checkpoint_summary(path)?.map(|summary| summary.fingerprint))
+}
+
+/// What a checkpoint's header says, without reading its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointSummary {
+    /// The pack fingerprint the checkpoint was written against.
+    pub fingerprint: u64,
+    /// The journal LSN its index covers, or zero when written without a journal.
+    pub covered_lsn: u64,
+    /// The highest redo `delta_seq` it incorporates.
+    pub base_delta_seq: u64,
+}
+
+/// Lightweight read of a checkpoint's header: its `pack_fingerprint` and the
+/// journal `covered_lsn` it records.
+///
+/// Same contract as [`read_pack_fingerprint`]: `Ok(None)` for a missing file,
+/// `Err` for a truncated one or one with an invalid magic or version.
+///
+/// # Errors
+///
+/// Returns a [`crate::index::delta::DeltaFingerprintError`] when an existing
+/// checkpoint cannot be read or validated.
+pub fn read_checkpoint_summary(
+    path: &Path,
+) -> Result<Option<CheckpointSummary>, crate::index::delta::DeltaFingerprintError> {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(crate::index::delta::io_error(path, "open checkpoint", e)),
+    };
+    let mut buf = [0u8; CHECKPOINT_HEADER_LEN];
+    let mut handle = file.take(CHECKPOINT_HEADER_LEN as u64);
+    handle
+        .read_exact(&mut buf)
+        .map_err(|e| crate::index::delta::io_error(path, "read checkpoint header", e))?;
+    let header = CheckpointHeader::decode(&buf)
+        .ok_or_else(|| crate::index::delta::invalid(path, "checkpoint header decode failed"))?;
+    if header.magic != CHECKPOINT_MAGIC || header.version != CHECKPOINT_VERSION {
+        return Err(crate::index::delta::invalid(
+            path,
+            "invalid checkpoint magic/version",
+        ));
+    }
+    Ok(Some(CheckpointSummary {
+        fingerprint: header.pack_fingerprint,
+        covered_lsn: header.covered_lsn,
+        base_delta_seq: header.base_delta_seq,
+    }))
+}
+
+/// Result of reading the durable fingerprint.
+#[derive(Debug, Clone, Copy)]
+pub struct DurableFingerprint {
+    /// The durable pack fingerprint (checkpoint fp advanced by delta log tail).
+    pub fingerprint: u64,
+    /// Whether the delta log ended with a torn tail (expected if writer crashed mid-append).
+    /// If true, a refresh may still be needed to pick up the incomplete batch.
+    pub torn_tail: bool,
+}
+
+/// Read the durable pack fingerprint for a store directory.
+///
+/// The durable fingerprint is the checkpoint's `pack_fingerprint`, advanced
+/// by the validated delta log's `tail_fingerprint` when one exists and its
+/// `base_fingerprint` matches the checkpoint.  This detects synced appends
+/// that only wrote to the delta log without rewriting the checkpoint.
+///
+/// Returns `Ok(Some(fp))` for a validated durable fingerprint, `Ok(None)`
+/// when there is no checkpoint (fresh store), and `Err` when the checkpoint
+/// is corrupt or the delta log cannot be reliably read. On `Err` the caller
+/// must treat the state as unknown and force a refresh.
+///
+/// # Errors
+///
+/// Returns a [`crate::index::delta::DeltaFingerprintError`] when the delta
+/// log exists but cannot be validated or read reliably.
+pub fn read_durable_fingerprint(
+    base_dir: &Path,
+) -> Result<Option<DurableFingerprint>, crate::index::delta::DeltaFingerprintError> {
+    let ckpt_path = base_dir.join(INDEX_CHECKPOINT_FILE);
+    let Some(ckpt_fp) = read_pack_fingerprint(&ckpt_path)? else {
+        return Ok(None);
+    };
+    let delta_path = base_dir.join(format!(
+        "{}.{:016x}",
+        crate::index::delta::INDEX_DELTA_FILE,
+        ckpt_fp,
+    ));
+    // Use the lightweight forward parser to avoid decoding every DeltaFrame.
+    match crate::index::delta::read_delta_tail_fingerprint(&delta_path) {
+        Ok(Some(tail_fp)) if tail_fp.base_fingerprint == ckpt_fp => Ok(Some(DurableFingerprint {
+            fingerprint: tail_fp.tail_fingerprint,
+            torn_tail: tail_fp.torn_tail,
+        })),
+        Ok(Some(_) | None) => Ok(Some(DurableFingerprint {
+            fingerprint: ckpt_fp,
+            torn_tail: false,
+        })),
+        Err(e) => Err(e),
+    }
+}

@@ -27,7 +27,9 @@ bytes = "1.5"
 crc32fast = "1.4"
 fjall = "2.11.2"
 libmdbx = "0.6"
-mtxdb = { path = "..", features = ["multi-reader"] }
+base64 = "0.22"
+mtxdb = { path = "..", features = ["reconcile"] }
+rezzy-recon = { path = "../../rezzy/rezzy-recon" }
 rusqlite = "0.32"
 
 [target.'cfg(windows)'.dependencies]
@@ -71,6 +73,11 @@ tests_outside_test_module = "warn"
 verbose_file_reads = "warn"
 
 [[bench]]
+name = "population_build"
+path = "population_build.rs"
+harness = false
+
+[[bench]]
 name = "storage"
 path = "storage.rs"
 harness = false
@@ -107,6 +114,13 @@ name = "compare_external"
 path = "compare_external.rs"
 harness = false
 
+# Matrix-shaped matched workload; semantic scenarios are added as native APIs
+# land, without changing the existing four-way synthetic comparison.
+[[bench]]
+name = "matrix_workload"
+path = "matrix_workload.rs"
+harness = false
+
 # Plain-autocommit vs staged-transaction writes through the shared WAL.
 [[bench]]
 name = "txn_commit"
@@ -117,6 +131,12 @@ harness = false
 [[bench]]
 name = "txn_contention"
 path = "txn_contention.rs"
+harness = false
+
+# Concurrent writers while a reader catches up through bounded WAL replay pages.
+[[bench]]
+name = "replay_paging"
+path = "replay_paging.rs"
 harness = false
 
 # Long-running writes and syncs against one shared WAL: the segment must stay bounded.
@@ -141,4 +161,10 @@ harness = false
 [[bench]]
 name = "pack_scan_profile"
 path = "pack_scan_profile.rs"
+harness = false
+
+# End-to-end search-pack cost (index + query shapes) on a real-data corpus.
+[[bench]]
+name = "search_scan"
+path = "search_scan.rs"
 harness = false

@@ -26,6 +26,29 @@ mod tests {
         })
     }
 
+    fn current_pack_path(dir: &Path) -> PathBuf {
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .expect("store directory must be readable")
+            .map(|entry| {
+                entry
+                    .expect("store directory entry must be readable")
+                    .path()
+            })
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "pack")
+                    && path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| stem.starts_with("pack_"))
+            })
+            .collect();
+        assert_eq!(paths.len(), 1, "expected one live pack, found {paths:?}");
+        paths.pop().expect("the live pack path was just validated")
+    }
+
     fn assert_delete_then_recreate_in_log(
         operations: &[mtxdb::index::delta::DeltaOperation],
         collection: [u8; 16],
@@ -357,6 +380,52 @@ mod tests {
     }
 
     #[test]
+    fn previous_version_checkpoint_falls_back_to_rescan_and_rebuilds_current() {
+        use mtxdb::packfile::storage::OpenPath;
+
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb_index_checkpoint_v7_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = make_store(&dir);
+        store.sync_all().unwrap();
+        drop(store);
+
+        let cp_file = checkpoint_path(&dir);
+        let mut buf = std::fs::read(&cp_file).unwrap();
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 9);
+
+        // Patch only the version field to the previous version (7). This is
+        // enough to exercise the version gate: the reader must reject the
+        // file *before* it looks at the body, so a real v7-width body (36-byte
+        // pack-table entries) need not be constructed here.
+        buf[8..12].copy_from_slice(&7u32.to_le_bytes());
+        std::fs::write(&cp_file, &buf).unwrap();
+
+        // Reopen: must reject v7 and fall back to FullScan
+        let reopened = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(reopened.open_timings().unwrap().path, OpenPath::FullScan);
+        assert_all_records(&reopened);
+
+        // Sync all: must rebuild checkpoint with v8
+        reopened.sync_all().unwrap();
+        drop(reopened);
+
+        let rewritten = std::fs::read(&cp_file).unwrap();
+        assert_eq!(u32::from_le_bytes(rewritten[8..12].try_into().unwrap()), 9);
+
+        // Next open should use Checkpoint path
+        let reopened_v8 = PackfileStorage::open(dir.clone()).unwrap();
+        assert_eq!(
+            reopened_v8.open_timings().unwrap().path,
+            OpenPath::Checkpoint
+        );
+        assert_all_records(&reopened_v8);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn unsynced_append_invalidates_checkpoint_then_recovers() {
         let dir = std::env::temp_dir().join(format!(
             "mtxdb_index_checkpoint_sync_{}",
@@ -511,7 +580,7 @@ mod tests {
         // Snapshot the committed boundary BEFORE the unsynced buffered put:
         // the pack file's on-disk length and the checkpoint bytes holding
         // the pack_fingerprint (computed from exactly those lengths).
-        let pack_path = dir.join("pack_0000000000000000.pack");
+        let pack_path = current_pack_path(&dir);
         let pack_len_before = std::fs::metadata(&pack_path).unwrap().len();
         let checkpoint_before = std::fs::read(checkpoint_path(&dir)).unwrap();
         assert!(
