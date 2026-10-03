@@ -59,7 +59,7 @@ const REVERSE_MAGIC: [u8; 4] = *b"SIDR";
 const EDGES_MAGIC: [u8; 4] = *b"SIDE";
 const OWNER_LOG_MAGIC: [u8; 4] = *b"OWNL";
 
-const COUNTER_ID: NodeId = *b"MTXD-SID-CNTR-v1";
+pub(crate) const COUNTER_ID: NodeId = *b"MTXD-SID-CNTR-v1";
 const REVERSE_PREFIX: [u8; 8] = *b"MTXSIDR\0";
 const EDGES_PREFIX: [u8; 8] = *b"MTXSIDE\0";
 const OWNER_LOG_PREFIX: [u8; 8] = *b"MTXOWNL\0";
@@ -72,7 +72,7 @@ const FORWARD_OWNER: u8 = 0b01;
 const FLAG_TYPED: u8 = 0b01;
 
 /// Maximum optimistic-retry rounds before a stale read is returned.
-const MAX_ATTEMPTS: usize = 64;
+pub(crate) const MAX_ATTEMPTS: usize = 64;
 
 /// A named adjacency family within a scope. Its edge lists are immutable once
 /// written.
@@ -191,7 +191,7 @@ fn forward_id(key: &[u8]) -> NodeId {
 /// puts every such record in one bucket and gives them all one tag, which turns
 /// each insert into a scan of the whole chain: ingesting a 60,000-event room took
 /// about a minute that way. Hashing spreads both fields.
-fn derived_id(prefix: [u8; 8], short_id: u32, discriminator: u16) -> NodeId {
+pub(crate) fn derived_id(prefix: [u8; 8], short_id: u32, discriminator: u16) -> NodeId {
     let mut input = [0u8; 14];
     input[..8].copy_from_slice(&prefix);
     input[8..12].copy_from_slice(&short_id.to_be_bytes());
@@ -229,21 +229,25 @@ pub(crate) fn edges_record_id_for_test(short_id: u32, family: u16) -> NodeId {
     edges_record_id(short_id, family)
 }
 
-fn header(magic: [u8; 4]) -> Vec<u8> {
+pub(crate) fn header(magic: [u8; 4]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(&magic);
     out.push(SHORT_ID_FORMAT_VERSION);
     out
 }
 
-fn check_header<'a>(bytes: &'a [u8], magic: [u8; 4], what: &str) -> Result<&'a [u8], StorageError> {
+pub(crate) fn check_header<'a>(
+    bytes: &'a [u8],
+    magic: [u8; 4],
+    what: &str,
+) -> Result<&'a [u8], StorageError> {
     if bytes.len() < 5 || bytes[..4] != magic || bytes[4] != SHORT_ID_FORMAT_VERSION {
         return Err(StorageError::Corrupt(format!("short-id {what} header")));
     }
     Ok(&bytes[5..])
 }
 
-fn read_u32(bytes: &[u8], what: &str) -> Result<u32, StorageError> {
+pub(crate) fn read_u32(bytes: &[u8], what: &str) -> Result<u32, StorageError> {
     <[u8; 4]>::try_from(bytes)
         .map(u32::from_be_bytes)
         .map_err(|_| StorageError::Corrupt(format!("short-id {what} length")))
@@ -255,7 +259,9 @@ fn read_u32(bytes: &[u8], what: &str) -> Result<u32, StorageError> {
 /// written into one *generation* collection at a time, named by `log_epoch`;
 /// `log_epoch_start_seq` is the first sequence number of the current
 /// generation, so earlier entries live in an older generation or have been
-/// folded into a compacted run.
+/// folded into a compacted run. `manifest_version` names the run manifest that
+/// covers the folded entries (0: none); it lives here so a reader gets the
+/// manifest and the log tail it pairs with from one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScopeCounters {
     /// The next short id to allocate.
@@ -266,6 +272,9 @@ pub struct ScopeCounters {
     pub log_epoch: u32,
     /// First owner-log sequence number of `log_epoch`.
     pub log_epoch_start_seq: u32,
+    /// The run manifest covering owner-log sequence numbers below
+    /// `log_epoch_start_seq` (0: no runs).
+    pub manifest_version: u32,
 }
 
 impl Default for ScopeCounters {
@@ -275,17 +284,19 @@ impl Default for ScopeCounters {
             next_owner_seq: 1,
             log_epoch: 0,
             log_epoch_start_seq: 1,
+            manifest_version: 0,
         }
     }
 }
 
-fn encode_counter(counters: ScopeCounters) -> Vec<u8> {
+pub(crate) fn encode_counter(counters: ScopeCounters) -> Vec<u8> {
     let mut out = header(COUNTER_MAGIC);
     for value in [
         counters.next_id,
         counters.next_owner_seq,
         counters.log_epoch,
         counters.log_epoch_start_seq,
+        counters.manifest_version,
     ] {
         out.extend_from_slice(&value.to_be_bytes());
     }
@@ -294,7 +305,7 @@ fn encode_counter(counters: ScopeCounters) -> Vec<u8> {
 
 fn decode_counter(bytes: &[u8]) -> Result<ScopeCounters, StorageError> {
     let body = check_header(bytes, COUNTER_MAGIC, "counter")?;
-    if body.len() != 16 {
+    if body.len() != 20 {
         return Err(StorageError::Corrupt("short-id counter length".to_owned()));
     }
     Ok(ScopeCounters {
@@ -302,6 +313,7 @@ fn decode_counter(bytes: &[u8]) -> Result<ScopeCounters, StorageError> {
         next_owner_seq: read_u32(&body[4..8], "counter")?,
         log_epoch: read_u32(&body[8..12], "counter")?,
         log_epoch_start_seq: read_u32(&body[12..16], "counter")?,
+        manifest_version: read_u32(&body[16..20], "counter")?,
     })
 }
 
@@ -332,7 +344,7 @@ fn decode_forward(bytes: &[u8]) -> Result<Forward<'_>, StorageError> {
     })
 }
 
-fn encode_owner_log(short_id: u32, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_owner_log(short_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = header(OWNER_LOG_MAGIC);
     out.extend_from_slice(&short_id.to_be_bytes());
     out.extend_from_slice(payload);
@@ -364,7 +376,7 @@ fn decode_owner_log(seq: u32, bytes: &[u8]) -> Result<OwnerLogEntry, StorageErro
     })
 }
 
-fn owner_log_record_id(seq: u32) -> NodeId {
+pub(crate) fn owner_log_record_id(seq: u32) -> NodeId {
     indexed_id(OWNER_LOG_PREFIX, seq)
 }
 
@@ -443,8 +455,8 @@ impl ShortIdVerifyReport {
 /// One short-id scope (a collection inside one pool).
 #[derive(Debug, Clone, Copy)]
 pub struct ShortIdIndex {
-    pool: ShardType,
-    collection_id: [u8; 16],
+    pub(crate) pool: ShardType,
+    pub(crate) collection_id: [u8; 16],
     max_id: u32,
 }
 
@@ -491,7 +503,7 @@ impl ShortIdIndex {
         self.read_counters(&txn).map(|(counters, _)| counters)
     }
 
-    fn read_counters(
+    pub(crate) fn read_counters(
         &self,
         txn: &DatabaseTransaction<'_>,
     ) -> Result<(ScopeCounters, u64), StorageError> {
@@ -538,7 +550,7 @@ impl ShortIdIndex {
     }
 
     /// [`Self::owner_log`] inside the caller's transaction.
-    fn owner_log_in(
+    pub(crate) fn owner_log_in(
         &self,
         txn: &DatabaseTransaction<'_>,
         epoch: u32,
@@ -835,8 +847,32 @@ impl ShortIdIndex {
         for epoch in 0..=counters.log_epoch {
             txn.delete_collection(self.pool, self.owner_log_collection(epoch))?;
         }
+        self.stage_population_purge(txn, &counters)?;
         txn.delete_collection(self.pool, self.collection_id)?;
         Ok(())
+    }
+
+    /// Without `reconcile` nothing writes runs, so there is nothing to drop.
+    #[cfg(not(feature = "reconcile"))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn stage_population_purge(
+        &self,
+        _txn: &DatabaseTransaction<'_>,
+        _counters: &ScopeCounters,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Without `reconcile` nothing writes manifests, so there is nothing to
+    /// check.
+    #[cfg(not(feature = "reconcile"))]
+    #[allow(clippy::unused_self)]
+    fn verify_manifest(
+        &self,
+        _txn: &DatabaseTransaction<'_>,
+        _counters: &ScopeCounters,
+        _problems: &mut Vec<String>,
+    ) {
     }
 
     /// Check the scope's invariants: every id below the counter has a reverse
@@ -934,6 +970,7 @@ impl ShortIdIndex {
             }
         }
         self.verify_owner_log(txn, counters, &mut report)?;
+        self.verify_manifest(txn, &counters, &mut report.problems);
         report.owners_checked = owner_bits;
         if owner_bits != counters.next_owner_seq.saturating_sub(1) {
             report.problems.push(format!(

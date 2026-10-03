@@ -10488,3 +10488,50 @@ fn delete_collection_frees_pack_bytes_only_after_a_later_repack_retires_the_shar
         bytes::Bytes::from_static(b"survivor")
     );
 }
+
+/// Repacking a surviving collection must not bring back a deleted one that
+/// shared its shard.
+#[test]
+fn repacking_a_survivor_does_not_resurrect_a_deleted_collection_in_its_shard() {
+    let dir = test_dir("delete_then_repack_same_shard");
+    let store = PackfileStorage::open(dir).unwrap();
+    let doomed = distinct_id(1);
+    let live = distinct_id(2);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &doomed,
+            &NodeData::new(bytes::Bytes::from_static(b"doomed")),
+        )
+        .unwrap();
+    store
+        .put(
+            &OTHER_COLLECTION,
+            &live,
+            &NodeData::new(bytes::Bytes::from_static(b"survivor")),
+        )
+        .unwrap();
+
+    // No sync: the doomed record may still sit in the shard's append buffer.
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    assert!(store.get(&TEST_COLLECTION, &doomed).unwrap().is_none());
+
+    store
+        .repack_collection_reachable(&OTHER_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    store.sync_all().unwrap();
+    // A collection with no records at all.
+    store
+        .repack_collection_reachable(&[0x5a; 16], |_hash, _data| Vec::new())
+        .unwrap();
+    store.sync_all().unwrap();
+
+    assert!(
+        store.get(&TEST_COLLECTION, &doomed).unwrap().is_none(),
+        "the repack brought the deleted collection's record back"
+    );
+    assert_eq!(
+        store.get(&OTHER_COLLECTION, &live).unwrap().unwrap().bytes,
+        bytes::Bytes::from_static(b"survivor")
+    );
+}

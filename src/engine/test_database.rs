@@ -3389,3 +3389,32 @@ fn a_worst_case_power_cut_keeps_what_was_synced_and_never_half_applies() {
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(image);
 }
+
+/// A `Database` transaction's `delete_collection` must hide the collection's
+/// records from reads in the same process, also when they were already synced
+/// to the packs. Today they stay readable until the store is reopened.
+#[test]
+#[ignore = "engine bug: a committed delete_collection is not visible to live reads once the records were synced; takes effect after reopen"]
+fn a_committed_delete_collection_hides_synced_records() {
+    let root = test_root("delete_visible_after_sync");
+    let db = Database::open(root.clone()).unwrap();
+    let doomed = [0x71_u8; 16];
+    let put = db.begin_transaction();
+    put.put(ShardType::Edges, doomed, node(1), &data(b"doomed"))
+        .unwrap();
+    put.commit().unwrap();
+    db.pool(ShardType::Edges).sync_all().unwrap();
+
+    let delete = db.begin_transaction();
+    delete.delete_collection(ShardType::Edges, doomed).unwrap();
+    delete.commit().unwrap();
+
+    let read = db.begin_transaction();
+    let (records, _) = read
+        .get_with_record_versions(ShardType::Edges, &doomed, &[node(1)])
+        .unwrap();
+    assert!(records[0].is_none(), "the deleted record is still readable");
+    drop(read);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
