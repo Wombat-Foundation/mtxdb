@@ -113,6 +113,9 @@ impl ShortIdIndex {
             ));
         }
         let ceiling = counters.next_owner_seq;
+        // One transaction per chunk is fine: an entry below the ceiling was
+        // committed with the counter that bounds it and is never rewritten, so
+        // the chunks need no common snapshot.
         let mut elements = Vec::new();
         let mut from = 1;
         while from < ceiling {
