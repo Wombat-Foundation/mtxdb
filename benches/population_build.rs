@@ -133,8 +133,10 @@ fn build_store(dir: &Path, owners: u32) {
         }
     }
     db.edges().sync_all().expect("sync");
-    write_runs(&db, owners);
-    db.edges().sync_all().expect("sync");
+    if env_u32("MTXDB_PB_RUNS", 1) != 0 {
+        write_runs(&db, owners);
+        db.edges().sync_all().expect("sync");
+    }
     let secs = started.elapsed().as_secs_f64();
     println!(
         "  build store (payload={with_payload}, sync_every={sync_every}): {:.1}s, {:.1} us/event, {:.1} MiB on disk",
@@ -234,6 +236,48 @@ fn read_runs(db: &Database, owners: u32) -> usize {
     SortedPopulation::new(hashes).len()
 }
 
+/// Time `sync_all` after a fixed batch of fresh writes on a store of `owners`
+/// events: the cost should track the batch, not the store.
+fn sync_scaling(dir: &Path, owners: u32) {
+    let db = Database::open(dir.to_path_buf()).expect("open");
+    let mut sync_ms = Vec::new();
+    let mut write_ms = Vec::new();
+    for round in 0..10_u32 {
+        let start = owners.saturating_add(round.saturating_mul(BATCH));
+        let end = start.saturating_add(BATCH);
+        let keys: Vec<Vec<u8>> = (start..end).map(event_id).collect();
+        let payloads: Vec<[u8; 24]> = (start..end)
+            .map(|i| encode_owner_payload(ElementHash::from_digest32(digest(i))))
+            .collect();
+        let events: Vec<BatchEvent<'_>> = keys
+            .iter()
+            .zip(&payloads)
+            .map(|(key, payload)| BatchEvent {
+                owner: key,
+                families: &[],
+                owner_payload: Some(payload),
+            })
+            .collect();
+        let began = Instant::now();
+        index().record_events(&db, &events).expect("record");
+        write_ms.push(began.elapsed().as_secs_f64() * 1e3);
+        let began = Instant::now();
+        db.edges().sync_all().expect("sync");
+        sync_ms.push(began.elapsed().as_secs_f64() * 1e3);
+    }
+    let summary = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        (v[v.len() / 2], v[v.len() - 1])
+    };
+    let (s_med, s_max) = summary(sync_ms.clone());
+    let (w_med, w_max) = summary(write_ms);
+    println!(
+        "  sync_all after {BATCH} writes: median {s_med:.1} ms, max {s_max:.1} ms; \
+         record_events median {w_med:.1} ms, max {w_max:.1} ms"
+    );
+    println!("  per-sync ms: {sync_ms:.1?}");
+}
+
 fn child(mode: &str, dir: &Path) {
     let db = Database::open(dir.to_path_buf()).expect("open");
     let started = Instant::now();
@@ -327,6 +371,11 @@ fn main() {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         build_store(&dir, owners);
+        if env_u32("MTXDB_PB_SYNC_SCALING", 0) != 0 {
+            sync_scaling(&dir, owners);
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
         if env_u32("MTXDB_PB_BUILD_ONLY", 0) != 0 {
             let _ = std::fs::remove_dir_all(&dir);
             continue;
