@@ -534,7 +534,18 @@ impl ShortIdIndex {
         to: u32,
     ) -> Result<Vec<OwnerLogEntry>, StorageError> {
         let txn = db.begin_transaction();
-        let (counters, _) = self.read_counters(&txn)?;
+        self.owner_log_in(&txn, epoch, from, to)
+    }
+
+    /// [`Self::owner_log`] inside the caller's transaction.
+    fn owner_log_in(
+        &self,
+        txn: &DatabaseTransaction<'_>,
+        epoch: u32,
+        from: u32,
+        to: u32,
+    ) -> Result<Vec<OwnerLogEntry>, StorageError> {
+        let (counters, _) = self.read_counters(txn)?;
         let below_current = epoch == counters.log_epoch && from < counters.log_epoch_start_seq;
         if epoch > counters.log_epoch || below_current || to > counters.next_owner_seq || from > to
         {
@@ -840,14 +851,35 @@ impl ShortIdIndex {
         db: &Database,
         families: &[EdgeFamily],
     ) -> Result<ShortIdVerifyReport, StorageError> {
-        let txn = db.begin_transaction();
-        let (counter, _) =
-            txn.get_with_record_versions(self.pool, &self.collection_id, &[COUNTER_ID])?;
+        // A transaction reads the live store, not a snapshot, so a writer
+        // committing mid-pass can make a healthy store look inconsistent.
+        // Every write moves the counter record (ids and owner sequence
+        // numbers both live there), so a pass is trusted only if the counter's
+        // version is unchanged when it ends.
+        for _ in 0..MAX_ATTEMPTS {
+            let txn = db.begin_transaction();
+            let (_, before) = self.read_counters(&txn)?;
+            let report = self.verify_pass(&txn, families)?;
+            let (_, after) = self.read_counters(&txn)?;
+            if before == after {
+                return Ok(report);
+            }
+        }
+        Err(StorageError::Internal(
+            "short-id verify: store changed on every pass".to_owned(),
+        ))
+    }
+
+    fn verify_pass(
+        &self,
+        txn: &DatabaseTransaction<'_>,
+        families: &[EdgeFamily],
+    ) -> Result<ShortIdVerifyReport, StorageError> {
+        let (counters, _) = self.read_counters(txn)?;
         let mut report = ShortIdVerifyReport::default();
-        let counters = match counter.into_iter().next().flatten() {
-            Some(record) => decode_counter(&record.bytes)?,
-            None => return Ok(report),
-        };
+        if counters == ScopeCounters::default() {
+            return Ok(report);
+        }
         let next = counters.next_id;
         let mut owner_bits = 0_u32;
         let get = |id: NodeId| -> Result<Option<NodeData>, StorageError> {
@@ -901,7 +933,7 @@ impl ShortIdIndex {
                 }
             }
         }
-        self.verify_owner_log(db, &txn, counters, &mut report)?;
+        self.verify_owner_log(txn, counters, &mut report)?;
         report.owners_checked = owner_bits;
         if owner_bits != counters.next_owner_seq.saturating_sub(1) {
             report.problems.push(format!(
@@ -917,7 +949,6 @@ impl ShortIdIndex {
     /// generations were folded into runs and are checked against them.
     fn verify_owner_log(
         &self,
-        db: &Database,
         txn: &DatabaseTransaction<'_>,
         counters: ScopeCounters,
         report: &mut ShortIdVerifyReport,
@@ -927,8 +958,8 @@ impl ShortIdIndex {
                 txn.get_with_record_versions(self.pool, &self.collection_id, &[id])?;
             Ok(records.into_iter().next().flatten())
         };
-        match self.owner_log(
-            db,
+        match self.owner_log_in(
+            txn,
             counters.log_epoch,
             counters.log_epoch_start_seq,
             counters.next_owner_seq,

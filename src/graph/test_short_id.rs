@@ -898,3 +898,35 @@ fn verify_checks_each_log_entry_against_its_forward_record() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `verify` racing a writer must never report a problem on a healthy store:
+/// a pass that overlapped a commit is discarded and rerun.
+#[test]
+fn verify_racing_a_writer_reports_no_false_problems() {
+    let root = test_root("verify-race");
+    let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
+    // Ids that already exist as non-owners: the writer flips their owner bits
+    // under a pass that has already fixed its counters.
+    let keys: Vec<Vec<u8>> = (0..600).map(|i| format!("$e{i}").into_bytes()).collect();
+    let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    index().get_or_create(&db, &refs).unwrap();
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            for key in &keys {
+                let key = key.clone();
+                index().record_events(&db, &[owned(&key, &key)]).unwrap();
+            }
+        })
+    };
+    while !writer.is_finished() {
+        let report = index().verify(&db, &[PLAIN]).unwrap();
+        assert!(report.is_consistent(), "{:?}", report.problems);
+    }
+    writer.join().unwrap();
+    let report = index().verify(&db, &[PLAIN]).unwrap();
+    assert!(report.is_consistent(), "{:?}", report.problems);
+    assert_eq!(report.owners_checked, 600);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
