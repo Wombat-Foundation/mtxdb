@@ -49,7 +49,7 @@ use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
 /// Wire version shared by every short-id record.
-pub const SHORT_ID_FORMAT_VERSION: u8 = 4;
+pub const SHORT_ID_FORMAT_VERSION: u8 = 3;
 /// Largest id that may be allocated.
 pub const SHORT_ID_MAX: u32 = u32::MAX - 1;
 
@@ -237,14 +237,8 @@ fn header(magic: [u8; 4]) -> Vec<u8> {
 }
 
 fn check_header<'a>(bytes: &'a [u8], magic: [u8; 4], what: &str) -> Result<&'a [u8], StorageError> {
-    if bytes.len() < 5 || bytes[..4] != magic {
+    if bytes.len() < 5 || bytes[..4] != magic || bytes[4] != SHORT_ID_FORMAT_VERSION {
         return Err(StorageError::Corrupt(format!("short-id {what} header")));
-    }
-    if bytes[4] != SHORT_ID_FORMAT_VERSION {
-        return Err(StorageError::Corrupt(format!(
-            "unsupported short-id format v{} in {what} record (this build reads v{SHORT_ID_FORMAT_VERSION})",
-            bytes[4]
-        )));
     }
     Ok(&bytes[5..])
 }

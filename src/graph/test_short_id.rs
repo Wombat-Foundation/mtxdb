@@ -867,32 +867,6 @@ fn purge_removes_the_owner_log_too() {
 }
 
 #[test]
-fn an_old_format_store_is_reported_as_unsupported() {
-    let root = test_root("old-format");
-    let db = Database::open(root.clone()).unwrap();
-    index().get_or_create(&db, &[b"$a"]).unwrap();
-    // Rewrite the counter as a v3 record (3, not the current version).
-    let txn = db.begin_transaction();
-    txn.put(
-        POOL,
-        SCOPE,
-        *b"MTXD-SID-CNTR-v1",
-        &crate::storage::NodeData::new(bytes::Bytes::from(vec![
-            b'S', b'I', b'D', b'C', 3, 0, 0, 0, 2,
-        ])),
-    )
-    .unwrap();
-    txn.commit().unwrap();
-    let error = index().counters(&db).unwrap_err();
-    assert!(
-        error.to_string().contains("unsupported short-id format v3"),
-        "{error}"
-    );
-    drop(db);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
 fn verify_checks_each_log_entry_against_its_forward_record() {
     let root = test_root("verify-log");
     let db = Database::open(root.clone()).unwrap();
@@ -903,7 +877,8 @@ fn verify_checks_each_log_entry_against_its_forward_record() {
     // Point entry 2 at id 1: the bit count still matches, the entry is wrong.
     let counters = index().counters(&db).unwrap();
     let txn = db.begin_transaction();
-    let mut bad = b"OWNL\x04".to_vec();
+    let mut bad = b"OWNL".to_vec();
+    bad.push(SHORT_ID_FORMAT_VERSION);
     bad.extend_from_slice(&1_u32.to_be_bytes());
     bad.extend_from_slice(b"pb");
     txn.put(
