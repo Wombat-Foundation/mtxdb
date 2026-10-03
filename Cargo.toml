@@ -142,7 +142,7 @@ fs2 = "0.4"
 memchr = "2.7"
 memmap2 = "0.9.11"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
-rezzy-recon = { path = "../rezzy/rezzy-recon", version = "0.6.0-rc.1", optional = true }
+rezzy-recon = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha", version = "0.6.0-rc.1", optional = true }
 roaring = { version = "0.10.12", optional = true }
 sha2 = "0.10"
 zstd = { version = "0.13", default-features = false, optional = true }
