@@ -3499,3 +3499,30 @@ fn a_deleted_collection_can_be_recreated_and_read() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A miss in the single writer's own collection after a sync must not rescan
+/// the collection: the durable fingerprint moved because this process wrote it.
+#[test]
+fn a_miss_after_a_sync_does_not_refresh_the_collection() {
+    let root = test_root("no_refresh_after_sync");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0x74_u8; 16];
+    for round in 0..3_u8 {
+        let txn = db.begin_transaction();
+        txn.put(ShardType::Edges, collection, node(round), &data(b"x"))
+            .unwrap();
+        txn.commit().unwrap();
+        db.pool(ShardType::Edges).sync_all().unwrap();
+        // A first-time key: absent, as every new event's forward record is.
+        let missing = db
+            .begin_transaction()
+            .get_with_record_versions(ShardType::Edges, &collection, &[node(100 + round)])
+            .unwrap()
+            .0;
+        assert!(missing[0].is_none());
+    }
+    let stats = db.pool(ShardType::Edges).stats();
+    assert_eq!(stats.miss_refreshes, 0, "a miss rescanned the collection");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -638,6 +638,13 @@ impl Database {
             let policy = policies.for_shard(shard);
             let store =
                 PackfileStorage::open_shared_member(dir, policy.compress, policy.checksum_policy)?;
+            // This process holds the exclusive WAL lock, so its in-memory
+            // index is authoritative and a negative lookup is a true miss.
+            // Left on, every miss after a sync (which moves the durable
+            // fingerprint) rescans the whole collection and bumps its
+            // generation, which in turn makes the next sync write a
+            // whole-index snapshot: per-sync cost proportional to the store.
+            store.set_refresh_on_miss(false);
             store.enable_shared_journal(Arc::clone(&coordinator), shard)?;
             store.replay_journal()?;
             pools.push(Arc::new(store));
