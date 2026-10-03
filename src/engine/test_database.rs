@@ -3419,9 +3419,9 @@ fn a_committed_delete_collection_hides_synced_records() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Repacking a collection that holds no records must not bring back the
-/// records of a collection deleted before it (the repack's own read refreshed
-/// the deleted collection from the packs).
+/// Repacking an empty collection must not bring back records from a
+/// collection deleted before it. A repack's own read refreshes via
+/// `refresh_collection`, which consults the tombstone file.
 #[test]
 fn repacking_an_empty_collection_resurrects_a_deleted_one() {
     let root = test_root("repack_empty_resurrects");
@@ -3525,4 +3525,45 @@ fn a_miss_after_a_sync_does_not_refresh_the_collection() {
     assert_eq!(stats.miss_refreshes, 0, "a miss rescanned the collection");
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Only the single writer turns refresh-on-miss off. A read-only worker opened
+/// beside it keeps it on, so a miss still finds what the writer has committed
+/// and synced since the worker's last look.
+#[test]
+#[cfg(feature = "multi-reader")]
+fn a_read_only_worker_still_refreshes_on_a_miss_while_the_writer_does_not() {
+    let root = test_root("reader-refresh-on-miss");
+    let database = Database::open(root.clone()).unwrap();
+    let collection = [0x75_u8; 16];
+    let pool = database.pool(ShardType::State);
+    pool.put(&collection, &node(1), &data(b"one")).unwrap();
+    pool.sync_all().unwrap();
+    let reader = PackfileStorage::open_read_committed_shared(
+        database.layout().pool_path(ShardType::State),
+        database.layout().shared_wal_path(),
+        ShardType::State,
+    )
+    .unwrap();
+    assert!(reader.get(&collection, &node(1)).unwrap().is_some());
+
+    pool.put(&collection, &node(2), &data(b"two")).unwrap();
+    pool.sync_all().unwrap();
+    pool.force_index_checkpoint().unwrap();
+
+    let found = reader
+        .get_many_with_refresh(&collection, &[node(2)])
+        .unwrap();
+    assert_eq!(
+        found[0].as_ref().map(|record| record.bytes.to_vec()),
+        Some(b"two".to_vec()),
+        "the worker's miss did not find the writer's new record"
+    );
+    assert!(
+        reader.stats().miss_refreshes >= 1,
+        "the worker never refreshed"
+    );
+    // The writer misses a first-time key without rescanning.
+    assert!(pool.get_many_with_refresh(&collection, &[node(9)]).unwrap()[0].is_none());
+    assert_eq!(pool.stats().miss_refreshes, 0);
 }

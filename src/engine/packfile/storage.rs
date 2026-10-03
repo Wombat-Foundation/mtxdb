@@ -1485,6 +1485,9 @@ impl Iterator for CollectionScan<'_> {
 /// Index tables that must advance together when a reader reloads a checkpoint.
 /// Individual table guards are mapped from this shared lock, so a reload's
 /// replacement is indivisible with respect to every table lookup.
+/// `(file_length, mtime_secs, parsed_ids)` for the deleted collections cache.
+type DeletedCollectionsCache = Option<(u64, u64, HashSet<[u8; 16]>)>;
+
 struct IndexTables {
     collections: HashMap<[u8; 16], ArcSwap<RoomGeneration>>,
     collection_order: Vec<[u8; 16]>,
@@ -1641,6 +1644,11 @@ pub struct PackfileStorage {
     /// protect a collection's lifecycle, but distinct collections may be
     /// recreated or deleted concurrently, hence the separate lock here.
     deleted_collections: parking_lot::Mutex<HashSet<[u8; 16]>>,
+    /// Cache of the deleted collections file: `(length, mtime_secs) -> parsed set`.
+    /// Readers call `refresh_collection` on misses, which reparsed the file each
+    /// time until the writer deleted or re-created a collection (changing the
+    /// file). Cached by file metadata to handle concurrent changes.
+    deleted_collections_cache: parking_lot::Mutex<DeletedCollectionsCache>,
     live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
     repack_threshold_entries: AtomicU64,
     cache_capacity: usize,
@@ -2797,6 +2805,7 @@ impl PackfileStorage {
             initial_durable_fingerprint: initial_durable_fp,
             collection_creation: parking_lot::RwLock::new(()),
             deleted_collections: parking_lot::Mutex::new(deleted_collections),
+            deleted_collections_cache: parking_lot::Mutex::new(None),
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
@@ -4565,6 +4574,55 @@ impl PackfileStorage {
         base_dir.join("deleted.collections")
     }
 
+    fn write_deleted_collections_atomic(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        let path = Self::deleted_collections_path(&self.base_dir);
+        let temp_path = path.with_extension("tmp");
+        fs::write(&temp_path, bytes).map_err(StorageError::Io)?;
+        fs::rename(&temp_path, &path).map_err(StorageError::Io)?;
+        // Invalidate the cache on write so the next read picks up the change.
+        *self.deleted_collections_cache.lock() = None;
+        Ok(())
+    }
+
+    fn load_deleted_collections_cached(&self) -> Result<HashSet<[u8; 16]>, StorageError> {
+        let path = Self::deleted_collections_path(&self.base_dir);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                *self.deleted_collections_cache.lock() = None;
+                return Ok(HashSet::new());
+            }
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+        let key = (
+            metadata.len(),
+            metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs()),
+        );
+        {
+            let cache = self.deleted_collections_cache.lock();
+            if let Some((cached_len, cached_time, cached_set)) = cache.as_ref() {
+                if *cached_len == key.0 && *cached_time == key.1 {
+                    return Ok(cached_set.clone());
+                }
+            }
+        }
+        let bytes = fs::read(&path).map_err(StorageError::Io)?;
+        let set: HashSet<[u8; 16]> = bytes
+            .chunks_exact(16)
+            .map(|chunk| {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(chunk);
+                id
+            })
+            .collect();
+        *self.deleted_collections_cache.lock() = Some((key.0, key.1, set.clone()));
+        Ok(set)
+    }
+
     fn load_deleted_collections(base_dir: &std::path::Path) -> HashSet<[u8; 16]> {
         let path = Self::deleted_collections_path(base_dir);
         let Ok(bytes) = fs::read(&path) else {
@@ -4581,12 +4639,11 @@ impl PackfileStorage {
     }
 
     fn persist_deleted_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
-        let path = Self::deleted_collections_path(&self.base_dir);
         let mut set = self.deleted_collections.lock();
         set.insert(*collection_id);
         let bytes: Vec<u8> = set.iter().flat_map(|id| id.iter().copied()).collect();
-        fs::write(&path, &bytes).map_err(StorageError::Io)?;
-        Ok(())
+        drop(set);
+        self.write_deleted_collections_atomic(&bytes)
     }
 
     /// Fast path for `store_generation`'s new-collection case: most
@@ -4601,11 +4658,11 @@ impl PackfileStorage {
     }
 
     fn clear_deleted_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
-        let path = Self::deleted_collections_path(&self.base_dir);
         let mut set = self.deleted_collections.lock();
         if set.remove(collection_id) {
             let bytes: Vec<u8> = set.iter().flat_map(|id| id.iter().copied()).collect();
-            fs::write(&path, &bytes).map_err(StorageError::Io)?;
+            drop(set);
+            self.write_deleted_collections_atomic(&bytes)?;
         }
         Ok(())
     }
@@ -6424,7 +6481,10 @@ impl PackfileStorage {
         // collection from them and bring it back. Read the tombstone file, not
         // the in-memory set: a reader following a writer that deleted and then
         // re-created the collection must see the clearing.
-        if Self::load_deleted_collections(&self.base_dir).contains(collection_id) {
+        if self
+            .load_deleted_collections_cached()?
+            .contains(collection_id)
+        {
             return Ok(());
         }
         // A refresh that publishes a *newly discovered* collection must be
