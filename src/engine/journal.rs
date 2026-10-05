@@ -1274,7 +1274,7 @@ fn boundary_through(
     for group in groups {
         for (index, pool) in ShardType::ALL.into_iter().enumerate() {
             if group.pools & (1_u8 << index) != 0
-                && !covered.get(&pool).is_some_and(|lsn| *lsn >= group.last_lsn)
+                && covered.get(&pool).is_none_or(|lsn| *lsn < group.last_lsn)
             {
                 // This pool's coverage stops the cut here; report it as the
                 // blocker so reclaim can say why the suffix was retained.
@@ -4726,7 +4726,7 @@ impl Journal {
                 .enumerate()
                 .filter(|(index, pool)| {
                     group.pools & (1_u8 << index) != 0
-                        && !covered.get(pool).is_some_and(|lsn| *lsn >= group.last_lsn)
+                        && covered.get(pool).is_none_or(|lsn| *lsn < group.last_lsn)
                 })
                 .map(|(_, pool)| pool)
                 .collect();

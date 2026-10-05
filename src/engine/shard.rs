@@ -884,7 +884,7 @@ impl ShardPool {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if !path.extension().is_some_and(|e| e == "pack") {
+            if path.extension().is_none_or(|e| e != "pack") {
                 continue;
             }
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -2318,7 +2318,7 @@ impl ShardPool {
 
             if offset_usize
                 .checked_add(4)
-                .map_or(true, |end| end > file_len_usize || end > mem.len())
+                .is_none_or(|end| end > file_len_usize || end > mem.len())
             {
                 if attempt == 0 {
                     Self::remap_shard(shard)?;
@@ -2340,7 +2340,7 @@ impl ShardPool {
             let frame_end = prefix_end
                 .checked_add(frame_len as usize)
                 .and_then(|end| end.checked_add(4));
-            if frame_end.map_or(true, |end| end > file_len_usize || end > mem.len()) {
+            if frame_end.is_none_or(|end| end > file_len_usize || end > mem.len()) {
                 if attempt == 0 {
                     Self::remap_shard(shard)?;
                     continue;
@@ -2526,7 +2526,7 @@ impl ShardPool {
 
             if offset
                 .checked_add(4)
-                .map_or(true, |end| end > file_len_usize || end > mem.len())
+                .is_none_or(|end| end > file_len_usize || end > mem.len())
             {
                 if attempt == 0 {
                     Self::remap_shard(shard)?;
@@ -2699,7 +2699,7 @@ impl ShardPool {
             .map_err(crate::storage::StorageError::Io)?
             .len();
         let mut guard = shard.mmap.write();
-        if guard.as_ref().map_or(true, |m| (m.len() as u64) < file_len) {
+        if guard.as_ref().is_none_or(|m| (m.len() as u64) < file_len) {
             *guard = Some(Arc::new(
                 packfile::map_pack(&shard.file).map_err(crate::storage::StorageError::Io)?,
             ));

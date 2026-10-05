@@ -494,7 +494,7 @@ fn validate_publish(
     let covered = u64::from(source_next.saturating_sub(1));
     if u64::from(stored_count)
         .checked_add(set.len())
-        .map_or(true, |total| total > covered)
+        .is_none_or(|total| total > covered)
     {
         return Err(StorageError::Internal(format!(
             "{stored_count} stored and {} skipped closures exceed the {covered} covered ids",

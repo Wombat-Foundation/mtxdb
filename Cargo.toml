@@ -2,7 +2,7 @@
 name = "mtxdb"
 version.workspace = true
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.90"
 publish = false
 # Without this, Cargo auto-discovers benches/*.rs as this package's own bench
 # targets purely by their being physically under benches/ (which is now
@@ -52,7 +52,7 @@ resolver = "2"
 # parses every member's graph plus the shared lock for every command -- so a
 # member there would drag the whole workspace's floor up to 1.85. Keeping it
 # out (like benches/, which has its own `[workspace]` table)
-# preserves the library's 1.81 MSRV. Build/lint/test it with
+# preserves the library's 1.90 MSRV. Build/lint/test it with
 # `--manifest-path mtxdb-cli/Cargo.toml`.
 members = []
 
@@ -133,7 +133,7 @@ reconcile = ["dep:rezzy-recon"]
 
 [dependencies]
 arc-swap = "1"
-blake3 = "=1.5.5"
+blake3 = "1.8.7"
 bytes = "1.5"
 crc32fast = "1.4"
 fs2 = "0.4"
@@ -143,9 +143,9 @@ memchr = "2.7"
 memmap2 = "0.9.11"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 rezzy-recon = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha", version = "0.6.0-rc.1", optional = true }
-roaring = { version = "0.10.12", optional = true }
-sha2 = "0.10"
-zstd = { version = "0.13", default-features = false, optional = true }
+roaring = { version = "0.11.5", optional = true }
+sha2 = "0.11"
+zstd = { version = "0.14", default-features = false, optional = true }
 
 # `zstd`/`zstd-safe` don't forward a "pkg-config"/"vendored" feature of their
 # own, so reach `zstd-sys` directly at the same version zstd-safe resolves to
@@ -162,9 +162,9 @@ zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
 zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
 
 # Keep cc's transitive jobserver below the release that introduced getrandom
-# 0.4, preserving the crate's Rust 1.81 build floor during cargo update.
+# 0.4, preserving the crate's Rust 1.90 build floor during cargo update.
 [build-dependencies]
-jobserver = "=0.1.32"
+jobserver = "0.1.35"
 
 # INTEGRATION TESTS. Ungated files are folded into one `tests/unit/main.rs`
 # target so `cargo test` links a single binary for them (see that file's
