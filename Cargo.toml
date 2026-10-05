@@ -161,11 +161,6 @@ zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
 [target.'cfg(windows)'.dependencies]
 zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
 
-# Keep cc's transitive jobserver below the release that introduced getrandom
-# 0.4, preserving the crate's Rust 1.90 build floor during cargo update.
-[build-dependencies]
-jobserver = "0.1.35"
-
 # INTEGRATION TESTS. Ungated files are folded into one `tests/unit/main.rs`
 # target so `cargo test` links a single binary for them (see that file's
 # header). A suite that needs a feature keeps its own target with

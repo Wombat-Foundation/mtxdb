@@ -222,7 +222,6 @@ dependencies = [
  "bytes",
  "crc32fast",
  "fs2",
- "jobserver",
  "memchr",
  "memmap2",
  "parking_lot",
@@ -280,7 +279,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#16c240c9183ad33ea48f86bed4d61e8d273718e5"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#0970e945dd099d9326649984b8ebaa7e92911a25"
 dependencies = [
  "base64",
  "sha2",
