@@ -9468,9 +9468,9 @@ impl PackfileStorage {
         let additions = puts
             .keys()
             .filter(|node_id| {
-                generation.as_ref().is_none_or(|generation| {
-                    generation.index.lookup_all(node_id).next().is_none()
-                })
+                generation
+                    .as_ref()
+                    .is_none_or(|generation| generation.index.lookup_all(node_id).next().is_none())
             })
             .count();
         let length = durable_len.saturating_add(additions);

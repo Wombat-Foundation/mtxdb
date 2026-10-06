@@ -133,6 +133,14 @@ fn single_pool_helper_writes_a_tagged_frame() {
     let _ = fs::remove_file(&path);
     let (mut journal, _) = Journal::open_shared(&path).unwrap();
     journal.append_group(&[put(1, 1, b"x")]).unwrap();
+    journal.make_durable().unwrap();
+    drop(journal);
+
+    let (_, scan) = Journal::open_shared(&path).unwrap();
+    assert_eq!(
+        scan.groups[0].entries[0].pool,
+        crate::layout::ShardType::State
+    );
     fs::remove_file(path).unwrap();
 }
 
@@ -1527,8 +1535,8 @@ fn a_checksum_valid_group_with_a_wrong_lsn_is_fatal_even_above_the_mark() {
 
 /// The v1 format records a durability mark for every journal.
 #[test]
-fn a_per_pool_segment_keeps_no_mark_and_fails_closed() {
-    let coordinator = open_arc("per_pool_no_mark");
+fn a_per_pool_segment_with_mark_fails_closed() {
+    let coordinator = open_arc("per_pool_marked");
     let path = coordinator.path().clone();
     let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
     let middle = coordinator.publish_group(&[put(1, 2, b"middle")]).unwrap();
