@@ -483,9 +483,9 @@ impl ShortIdIndex {
     /// repack retires every shard they sit in. In the scope's own pool the log
     /// shares shards with the id records, which stay live, so a dropped
     /// generation frees nothing (measured at 1M owners). In a pool that holds
-    /// little else, a drop followed by [`Self::repack_live_collections`]
-    /// retires whole shards. Counter, manifests and the garbage list stay in
-    /// the scope's pool, and one transaction may span both.
+    /// little else, a drop followed by `repack_live_collections` retires whole
+    /// shards. Counter, manifests and the garbage list stay in the scope's
+    /// pool, and one transaction may span both.
     ///
     /// Choose it once per scope, before any owner is recorded: entries
     /// already written stay where they were.

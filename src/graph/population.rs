@@ -776,7 +776,7 @@ impl ShortIdIndex {
                 other => return other,
             }
             // Give the writer that beat us a gap to idle in.
-            let backoff = u64::try_from(attempt.min(10)).unwrap_or(10);
+            let backoff = u64::try_from(attempt.saturating_add(1).min(10)).unwrap_or(10);
             std::thread::sleep(std::time::Duration::from_micros(
                 200_u64.saturating_mul(backoff),
             ));
@@ -925,7 +925,7 @@ impl ShortIdIndex {
                 Err(error) => return Err(error),
             }
             // Give the writer that beat us a gap to idle in.
-            let backoff = u64::try_from(attempt.min(10)).unwrap_or(10);
+            let backoff = u64::try_from(attempt.saturating_add(1).min(10)).unwrap_or(10);
             std::thread::sleep(std::time::Duration::from_micros(
                 100_u64.saturating_mul(backoff),
             ));
