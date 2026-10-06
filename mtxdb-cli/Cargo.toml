@@ -2,10 +2,8 @@
 name = "mtxdb-cli"
 version = "0.1.0-beta.1"
 edition = "2021"
-# Unlike the library (1.81), the CLI's deps are higher: clap 4.6 needs 1.85
-# (edition 2024) and simd-json 0.18 declares `rust-version = "1.88"`, so the
-# CLI floor is 1.88.
-rust-version = "1.88"
+# The CLI depends on the library, whose MSRV is 1.90.
+rust-version = "1.90"
 publish = false
 
 repository = "https://github.com/Wombat-Foundation/mtxdb"

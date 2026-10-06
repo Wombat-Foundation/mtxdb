@@ -2,7 +2,7 @@
 name = "mtxdb-benches"
 version = "0.1.0-beta.1"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.90"
 publish = false
 
 # Deliberately outside the root [workspace]'s `members` — same reasoning as
