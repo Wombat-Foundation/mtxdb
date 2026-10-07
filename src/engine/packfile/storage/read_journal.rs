@@ -1468,6 +1468,7 @@ impl PackfileStorage {
 /// consistent, and drop it.
 pub struct ReadSnapshot {
     storage: Arc<PackfileStorage>,
+    _snapshot_gate: parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()>,
     overlay: parking_lot::ArcMutexGuard<parking_lot::RawMutex, Option<ReadJournal>>,
     boundary: u64,
     incarnation: Option<u64>,
@@ -1496,6 +1497,7 @@ impl PackfileStorage {
     /// Propagates the same refresh/reload failures as
     /// [`Self::get_read_committed`].
     pub fn read_snapshot(self: &Arc<Self>) -> Result<ReadSnapshot, StorageError> {
+        let snapshot_gate = self.read_snapshot_gate.lock_arc();
         let overlay = self.refresh_read_journal()?;
         let boundary = match overlay.as_ref() {
             Some(overlay) => overlay.observed_lsn.min(self.durable_read_boundary()),
@@ -1513,6 +1515,7 @@ impl PackfileStorage {
             .then(std::time::Instant::now);
         Ok(ReadSnapshot {
             storage: Arc::clone(self),
+            _snapshot_gate: snapshot_gate,
             overlay,
             boundary,
             incarnation,

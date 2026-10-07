@@ -1944,6 +1944,11 @@ pub struct PackfileStorage {
     /// several reads with an owned [`parking_lot::ArcMutexGuard`], independent
     /// of the store borrow.
     read_journal: Arc<parking_lot::Mutex<Option<ReadJournal>>>,
+    /// Serializes direct index mutations with the boundary captured by a
+    /// [`ReadSnapshot`]. Kept separate from `read_journal` because checkpoint
+    /// and overlay maintenance may rebuild that state while a direct write is
+    /// in progress.
+    read_snapshot_gate: Arc<parking_lot::Mutex<()>>,
     /// Number of in-process transactions whose published groups are still
     /// being materialized. While non-zero, ordinary reads consult the journal
     /// overlay before the live index.
@@ -2827,6 +2832,7 @@ impl PackfileStorage {
             journal_recovery: parking_lot::Mutex::new(Vec::new()),
             replaying: AtomicBool::new(false),
             read_journal: Arc::new(parking_lot::Mutex::new(None)),
+            read_snapshot_gate: Arc::new(parking_lot::Mutex::new(())),
             parked_transaction_overlay: parking_lot::Mutex::new(None),
             transaction_overlay_lifecycle: parking_lot::Mutex::new(()),
             transaction_overlay_users: AtomicU64::new(0),
@@ -8542,9 +8548,9 @@ impl PackfileStorage {
         data: &NodeData,
         metadata: Option<FrameMetadata>,
     ) -> Result<(), StorageError> {
+        let _snapshot_gate = self.read_snapshot_gate.lock();
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
-        let _read_journal_guard = self.read_journal.lock();
         self.put_internal_locked(collection_id, id, data, metadata)
     }
 
@@ -8695,9 +8701,9 @@ impl PackfileStorage {
         entries: &[(NodeId, NodeData)],
         metadatas: Option<&[Option<FrameMetadata>]>,
     ) -> Result<usize, StorageError> {
+        let _snapshot_gate = self.read_snapshot_gate.lock();
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
-        let _read_journal_guard = self.read_journal.lock();
         let written = self.put_many_internal_locked(collection_id, entries, metadatas)?;
         if written > 0 {
             self.put_many_calls.fetch_add(1, Ordering::Relaxed);
@@ -9348,6 +9354,7 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        let _snapshot_gate = self.read_snapshot_gate.lock();
         // Acquire the collection's put mutex to serialize with any in-flight put,
         // preventing a concurrent put from resurrecting the collection after we
         // remove it from the generation map.
