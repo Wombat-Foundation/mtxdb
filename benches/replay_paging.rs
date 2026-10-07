@@ -85,7 +85,7 @@ fn per_second(count: u128, duration: Duration) -> u128 {
     count.saturating_mul(1_000_000_000) / duration.as_nanos().max(1)
 }
 
-fn setup(label: &str, seed_groups: usize, payload_size: usize, checkpoint_seed: bool) -> BenchDb {
+fn setup(label: &str, seed_groups: usize, payload_size: usize) -> BenchDb {
     let parent =
         std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     fs::create_dir_all(&parent).expect("create benchmark root");
@@ -131,19 +131,13 @@ fn setup(label: &str, seed_groups: usize, payload_size: usize, checkpoint_seed: 
                 .expect("seed pack and journal");
         }
     }
-    if checkpoint_seed {
-        for store in &stores {
-            store.sync_all().expect("sync seeded pool");
-        }
-    } else {
-        // Flush pack bytes and make the WAL durable without writing checkpoint
-        // coverage. The fallback arm takes a cursor next, then checkpoints
-        // under its lease so reclaim can advance exactly through that cursor.
-        for store in &stores {
-            store.flush_all().expect("flush seeded pack pool");
-        }
-        journal.sync().expect("sync seeded journal");
+    // Flush pack bytes and make the WAL durable without writing checkpoint
+    // coverage. The fallback arm takes a cursor next, then checkpoints under
+    // its lease so reclaim can advance exactly through that cursor.
+    for store in &stores {
+        store.flush_all().expect("flush seeded pack pool");
     }
+    journal.sync().expect("sync seeded journal");
     BenchDb {
         stores,
         journal,
@@ -163,7 +157,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
     // Keep the seeded WAL retained until the initial replay lease is installed.
     // Checkpointing every pool here can reclaim the shared prefix past the
     // EventDag pool's older per-pool coverage watermark.
-    let db = setup(label, seed_groups, payload_size, false);
+    let db = setup(label, seed_groups, payload_size);
 
     // Capture all eight collections together; the resulting cursor is the
     // common replay start for every reader thread.
@@ -409,7 +403,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
 fn run_reclaim_fallback_arm() -> Result<(), Box<dyn Error>> {
     let payload_size = env_usize("MTXDB_RP_PAYLOAD", 128);
     let seed_groups = env_usize("MTXDB_RP_FALLBACK_SEED_GROUPS", 4_096);
-    let db = setup("forced_fallback", seed_groups, payload_size, false);
+    let db = setup("forced_fallback", seed_groups, payload_size);
     // ServerInfo is seeded last, so its pool watermark reaches the shared WAL
     // tail. Using EventDag here would leave later pools' seed groups after the
     // cursor and make the fallback page contain more than the test group.
