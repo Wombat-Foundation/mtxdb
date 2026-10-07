@@ -215,11 +215,11 @@ fn test_read_record_metadata_spans_multiple_discard_chunks() {
     // Incompressible so it stays large on disk and forces several
     // discard-buffer iterations through the streaming loop.
     let data: Vec<u8> = (0..(SCAN_DISCARD_BUF_LEN * 3 + 500))
-        .map(|i| {
-            u64::try_from(i)
-                .expect("range index fits in u64")
-                .wrapping_mul(2_654_435_761)
-                .to_le_bytes()[0]
+        .scan(0x9E37_79B9_7F4A_7C15u64, |state, _| {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            Some(*state as u8)
         })
         .collect();
     let record = test_record_raw([0x99; 16], &data);
