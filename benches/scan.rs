@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use mtxdb::packfile::{scan_packfile_iter, PackId};
+use mtxdb::packfile::{PackId, scan_packfile_iter};
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::{DatabaseLayout, PackfileStorage, ShardPool, ShardType};
 
