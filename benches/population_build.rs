@@ -184,7 +184,9 @@ fn peak_anon_kib<T>(work: impl FnOnce() -> T) -> (T, u64) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         });
-        let value = work();
+        let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        stop.store(true, Ordering::Relaxed);
+        let value = value.unwrap_or_else(std::panic::resume_unwind);
         peak.fetch_max(status_kib("RssAnon:"), Ordering::Relaxed);
         stop.store(true, Ordering::Relaxed);
         value
