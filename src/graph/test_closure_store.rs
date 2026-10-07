@@ -1,4 +1,3 @@
-
 assert!(
     !closure_store::test::generation_exists(&store, &db, 1, &[1]).unwrap(),
     "the stale publish discarded its generation"
