@@ -153,8 +153,19 @@ pub fn enclosing_pool_seed(pool_dir: &Path) -> io::Result<Option<u64>> {
         return Ok(None);
     };
     let meta_path = root.join(DB_META_FILENAME);
-    if !meta_path.is_file() {
-        return Ok(None);
+    match fs::metadata(&meta_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unrecognized mtxdb database descriptor: {}",
+                    meta_path.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     }
     Ok(Some(pool_seed(read_db_meta(&meta_path)?.seed, shard_type)))
 }
