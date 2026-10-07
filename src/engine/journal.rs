@@ -2487,7 +2487,7 @@ impl JournalCoordinator {
             *self.replay_lease_stall.lock() = None;
             return;
         }
-        let emergency = len >= self.emergency_len();
+        let emergency = len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4);
         let mut stall = self.replay_lease_stall.lock();
         let previous = *stall;
         let grace_from = previous.map_or(len, |old| old.grace_from);

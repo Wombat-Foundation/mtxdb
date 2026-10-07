@@ -125,7 +125,10 @@ impl RecordClass {
     /// Whether a write is flushed before it is acknowledged.
     #[must_use]
     pub const fn is_synchronous(&self) -> bool {
-matches!(self.durability, Durability::GroupCommit | Durability::Synchronous)
+        matches!(
+            self.durability,
+            Durability::GroupCommit | Durability::Synchronous
+        )
     }
 
     /// Whether the most recent writes may be lost on a crash.
