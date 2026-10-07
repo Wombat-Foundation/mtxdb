@@ -160,7 +160,10 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
     let page_size = env_usize("MTXDB_RP_PAGE", 64);
     let seed_groups = env_usize("MTXDB_RP_SEED_GROUPS_PER_POOL", 1_000);
     let payload_size = env_usize("MTXDB_RP_PAYLOAD", 128);
-    let db = setup(label, seed_groups, payload_size, true);
+    // Keep the seeded WAL retained until the initial replay lease is installed.
+    // Checkpointing every pool here can reclaim the shared prefix past the
+    // EventDag pool's older per-pool coverage watermark.
+    let db = setup(label, seed_groups, payload_size, false);
 
     // Capture all eight collections together; the resulting cursor is the
     // common replay start for every reader thread.
