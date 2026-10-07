@@ -153,5 +153,5 @@ sub:	##H Run a command for each crate (set c)
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .PHONY: extras/cloc
-extras/cloc:
-	cloc HEAD --fmt=2
+extras/cloc:	##H Count lines of code for the HEAD revision
+	cloc --git HEAD --fmt=2

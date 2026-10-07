@@ -632,6 +632,9 @@ impl ShortIdIndex {
     /// corruption, when the `u32` id space is exhausted, or when the retry
     /// budget is spent on a contended counter.
     pub fn get_or_create(&self, db: &Database, keys: &[&[u8]]) -> Result<Vec<u32>, StorageError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
         self.write_with_retry(db, keys, None).map(|(ids, _)| ids)
     }
 
