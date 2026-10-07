@@ -782,6 +782,12 @@ impl PackfileStorage {
         // already have advanced past this index.
         self.read_covered_lsn
             .store(checkpoint_covered, Ordering::Release);
+        // The checkpoint reload replaced this handle's index with the
+        // checkpoint image, so its materialized watermark must advance with
+        // the coverage. Otherwise read snapshots clamp the freshly reloaded
+        // index back to the worker's open-time LSN.
+        self.materialized_lsn
+            .fetch_max(checkpoint_covered, Ordering::Release);
         self.read_reloads.fetch_add(1, Ordering::Relaxed);
         true
     }

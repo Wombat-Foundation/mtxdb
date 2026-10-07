@@ -481,6 +481,8 @@ def matrix_scenario(output: str) -> Scenario:
             "cold_point_us",
             "cold_batch_us",
         ):
+            if metric.startswith("cold_") and row["evicted"] != "true":
+                continue
             scenario.tracked[base + metric] = float(row[metric])
         scenario.rows.append(row)
     return scenario
@@ -532,6 +534,8 @@ def matrix_timeline_scenario(output: str) -> Scenario:
             "cold_fwd_page_us",
             "cold_bwd_page_us",
         ):
+            if metric.startswith("cold_") and row["evicted"] != "true":
+                continue
             scenario.tracked[base + metric] = float(row[metric])
         scenario.rows.append(row)
     return scenario

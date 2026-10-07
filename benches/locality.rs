@@ -915,14 +915,15 @@ pub fn run_stage1_intra_shard_compaction_prototype() {
     );
     let compacted_dir = temp_dir.join("compacted");
     fs::create_dir_all(&compacted_dir).unwrap();
+    let sibling_pack_ids: Vec<packfile::PackId> = summaries.iter().map(|s| s.pack_id).collect();
 
     let mut total_records_written = 0usize;
     let mut total_bytes_written = 0u64;
     let mut total_write_time = Duration::ZERO;
     let mut total_fsync_time = Duration::ZERO;
     for summary in &summaries {
-        let shard_path = ShardPool::pack_path(&temp_dir, &summary.pack_id, &[]);
-        let dest_path = ShardPool::pack_path(&compacted_dir, &summary.pack_id, &[]);
+        let shard_path = ShardPool::pack_path(&temp_dir, &summary.pack_id, &sibling_pack_ids);
+        let dest_path = ShardPool::pack_path(&compacted_dir, &summary.pack_id, &sibling_pack_ids);
         let (records, bytes, write_time, fsync_time) =
             compact_shard_intra(&store, &shard_path, &dest_path, &summary.pack_id).unwrap();
         subrow(

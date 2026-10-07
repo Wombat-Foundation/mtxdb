@@ -76,6 +76,8 @@ pub enum RedoError {
     OffsetTooLarge(u64),
     /// A set carries a zero record length.
     ZeroRecordLen,
+    /// A set carries the reserved all-zero pack identity.
+    ZeroPackId,
     /// A tombstone carries an identity or a locator.
     TombstoneCarriesLocator,
     /// `delta_seq` did not strictly increase (or did not start above the base).
@@ -97,6 +99,7 @@ impl std::fmt::Display for RedoError {
                 write!(f, "redo offset {offset} exceeds the index's maximum")
             }
             Self::ZeroRecordLen => write!(f, "a redo set has a zero record length"),
+            Self::ZeroPackId => write!(f, "a redo set has a zero pack id"),
             Self::TombstoneCarriesLocator => {
                 write!(f, "a redo tombstone carries an identity or locator")
             }
@@ -145,6 +148,9 @@ impl RedoRecord {
                 if record_len == 0 {
                     return Err(RedoError::ZeroRecordLen);
                 }
+                if pack_id.is_zero() {
+                    return Err(RedoError::ZeroPackId);
+                }
                 put(&mut buf, 16, &[OP_SET]);
                 put(&mut buf, 20, &full_hash);
                 put(&mut buf, 36, pack_id.as_bytes());
@@ -183,6 +189,9 @@ impl RedoRecord {
                 }
                 if record_len == 0 {
                     return Err(RedoError::ZeroRecordLen);
+                }
+                if pack_id.is_zero() {
+                    return Err(RedoError::ZeroPackId);
                 }
                 RedoOp::Set {
                     full_hash,
@@ -231,4 +240,42 @@ pub fn validate_sequence(records: &[RedoRecord], base_sequence: u64) -> Result<(
         after = record.delta_seq;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zero_pack_set() -> RedoRecord {
+        RedoRecord {
+            collection_id: [1; 16],
+            op: RedoOp::Set {
+                full_hash: [2; 16],
+                pack_id: PackId([0; 16]),
+                offset: 0,
+                record_len: 1,
+            },
+            delta_seq: 1,
+            base_generation: 0,
+        }
+    }
+
+    #[test]
+    fn zero_pack_id_is_rejected_when_encoding() {
+        assert_eq!(zero_pack_set().encode(), Err(RedoError::ZeroPackId));
+    }
+
+    #[test]
+    fn zero_pack_id_is_rejected_when_decoding() {
+        let mut record = zero_pack_set();
+        record.op = RedoOp::Set {
+            full_hash: [2; 16],
+            pack_id: PackId([3; 16]),
+            offset: 0,
+            record_len: 1,
+        };
+        let mut encoded = record.encode().unwrap();
+        encoded[36..52].fill(0);
+        assert_eq!(RedoRecord::decode(&encoded), Err(RedoError::ZeroPackId));
+    }
 }

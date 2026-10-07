@@ -143,11 +143,24 @@ pub(crate) fn encode_state_hamt_root(
     out
 }
 
-/// The room-scoped prefix stored in root records: `SHA-256(room_id)[..8]` for
-/// ordinary rooms. (MSC4291 hash-shaped room ids would decode their own
-/// base64url hash instead; the CLI imports ordinary `!localpart:server` rooms.)
+/// The room-scoped prefix stored in root records. MSC4291 room ids are the
+/// sigil `!` followed by an unpadded base64url-encoded 32-byte hash; those use
+/// the decoded hash prefix. Ordinary `!localpart:server` ids use the legacy
+/// SHA-256-of-text fallback.
 #[must_use]
 pub(crate) fn room_hamt_prefix(room_id: &str) -> [u8; 8] {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+
+    if let Some(encoded) = room_id.strip_prefix('!') {
+        if let Ok(decoded) = URL_SAFE_NO_PAD.decode(encoded) {
+            if decoded.len() == 32 {
+                let mut prefix = [0u8; 8];
+                prefix.copy_from_slice(&decoded[..8]);
+                return prefix;
+            }
+        }
+    }
     let digest = DigestAlgorithm::Sha256.digest(room_id.as_bytes());
     let mut prefix = [0u8; 8];
     prefix.copy_from_slice(&digest[..8]);
@@ -295,5 +308,18 @@ mod tests {
             r#"["m.room\"name","line\nkey"]"#
         );
         assert_eq!(room_hamt_prefix("!room:example.org").len(), 8);
+    }
+
+    #[test]
+    fn msc4291_room_prefix_uses_decoded_hash() {
+        let hash = [0x5a; 32];
+        let room_id = format!("!{}", encode_base64(&hash));
+        assert_eq!(room_hamt_prefix(&room_id), hash[..8]);
+    }
+
+    fn encode_base64(bytes: &[u8]) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        URL_SAFE_NO_PAD.encode(bytes)
     }
 }

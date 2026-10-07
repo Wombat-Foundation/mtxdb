@@ -219,7 +219,7 @@ fn test_read_record_metadata_spans_multiple_discard_chunks() {
             *state ^= *state << 13;
             *state ^= *state >> 7;
             *state ^= *state << 17;
-            Some(*state as u8)
+            Some(u8::try_from(*state & 0xff).expect("low byte fits in u8"))
         })
         .collect();
     let record = test_record_raw([0x99; 16], &data);

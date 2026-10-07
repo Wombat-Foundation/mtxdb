@@ -121,7 +121,7 @@ fn setup(label: &str, seed_groups: usize, payload_size: usize, checkpoint_seed: 
     let payload = NodeData::new(Bytes::from(vec![0xA7; payload_size]));
     for (pool_index, store) in stores.iter().enumerate() {
         for sequence in 0..seed_groups {
-            let collection = if pool_index == 0 {
+            let collection = if pool_index == 1 {
                 collections[sequence % collections.len()]
             } else {
                 collection_id(100 + pool_index)
@@ -164,7 +164,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
 
     // Capture all eight collections together; the resulting cursor is the
     // common replay start for every reader thread.
-    let (scans, cursor, initial_lease) = db.stores[3]
+    let (scans, cursor, initial_lease) = db.stores[1]
         .scan_collections_at_snapshot(&db.collections)
         .expect("take initial multi-collection snapshot");
     let initial_records: usize = scans
@@ -196,7 +196,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
                 let payload = NodeData::new(Bytes::from(vec![pool_tag; payload_size]));
                 let started = Instant::now();
                 for sequence in 0..writes {
-                    let collection = if pool_index == 3 {
+                    let collection = if pool_index == 1 {
                         collections[sequence % collections.len()]
                     } else {
                         collection_id(100 + pool_index)
@@ -246,7 +246,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
                 initial_lease.take().expect("initial snapshot lease"),
             )
         } else {
-            let (scans, cursor, lease) = db.stores[3]
+            let (scans, cursor, lease) = db.stores[1]
                 .scan_collections_at_snapshot(&db.collections)
                 .expect("take reader snapshot");
             drop(scans);
@@ -325,7 +325,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
     let mut snapshot_samples = Vec::new();
     for width in [1, 2, 4, 8] {
         let started = Instant::now();
-        let (scans, _, lease) = db.stores[3]
+        let (scans, _, lease) = db.stores[1]
             .scan_collections_at_snapshot(&db.collections[..width])
             .expect("take concurrent multi-collection snapshot");
         let count: usize = scans
@@ -406,7 +406,7 @@ fn run_reclaim_fallback_arm() -> Result<(), Box<dyn Error>> {
     let payload_size = env_usize("MTXDB_RP_PAYLOAD", 128);
     let seed_groups = env_usize("MTXDB_RP_FALLBACK_SEED_GROUPS", 4_096);
     let db = setup("forced_fallback", seed_groups, payload_size, false);
-    let (scans, cursor, lease) = db.stores[3]
+    let (scans, cursor, lease) = db.stores[1]
         .scan_collections_at_snapshot(&db.collections)
         .expect("take fallback-arm snapshot");
     drop(scans);
@@ -437,7 +437,7 @@ fn run_reclaim_fallback_arm() -> Result<(), Box<dyn Error>> {
     }
     drop(lease);
 
-    db.stores[3].put(
+    db.stores[1].put(
         &db.collections[0],
         &node_id(999, 0),
         &NodeData::new(Bytes::from(vec![0xD3; payload_size])),
