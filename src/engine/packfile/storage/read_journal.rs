@@ -1503,7 +1503,10 @@ impl PackfileStorage {
         };
         let incarnation = overlay.as_ref().and_then(ReadJournal::publish_epoch);
         let publish_token = overlay.as_ref().and_then(ReadJournal::publish_token);
-        let captured_lsn = overlay.as_ref().map_or(0, |value| value.observed_lsn);
+        let captured_lsn = overlay.as_ref().map_or_else(
+            || Self::read_journal_lsn(&self.base_dir),
+            |value| value.observed_lsn,
+        );
         let pin_started = self
             .stats_enabled
             .load(Ordering::Relaxed)

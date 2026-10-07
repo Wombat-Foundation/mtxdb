@@ -611,6 +611,7 @@ impl StorageError {
     #[must_use]
     pub fn is_would_block(&self) -> bool {
         matches!(self, Self::WouldBlock(_))
+            || matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock)
     }
 
     /// Whether this storage configuration does not support the requested
@@ -618,6 +619,7 @@ impl StorageError {
     #[must_use]
     pub fn is_unsupported(&self) -> bool {
         matches!(self, Self::Unsupported(_))
+            || matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::Unsupported)
     }
 
     /// Whether this error is a retryable collection-version conflict from a

@@ -967,6 +967,26 @@ fn writer_reads_leave_the_overlay_off_after_commits_and_sync() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn read_snapshot_after_sync_reads_database_pool_records() {
+    let root = test_root("snapshot_after_sync");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0x79; 16];
+    let pool = db.pool(ShardType::State);
+    let txn = db.begin_transaction();
+    txn.put(ShardType::State, collection, node(1), &data(b"value"))
+        .unwrap();
+    txn.commit().unwrap();
+    pool.sync_all().unwrap();
+
+    let snapshot = pool.read_snapshot().unwrap();
+    let records = snapshot.get(&collection, &[node(1)]).unwrap();
+    assert_eq!(payload_of(records[0].as_ref()), Some(b"value".to_vec()));
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// One thread commits while another reads: a reader must see every commit
 /// the writer has finished, whether or not the overlay is installed at that
 /// moment.

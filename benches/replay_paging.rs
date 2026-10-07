@@ -265,6 +265,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
             let replay_started = Instant::now();
             let mut local_pages = Vec::new();
             loop {
+                let done_before_read = done.load(Ordering::Acquire);
                 let started = Instant::now();
                 let page = journal
                     .changes_since(&cursor, page_size)
@@ -289,7 +290,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
                     );
                     _lease.advance(page.through_lsn);
                     cursor = page.next_cursor;
-                } else if done.load(Ordering::Acquire) == worker_count {
+                } else if done_before_read == worker_count {
                     break;
                 } else {
                     std::thread::yield_now();

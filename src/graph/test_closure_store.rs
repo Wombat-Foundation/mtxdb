@@ -112,9 +112,10 @@ fn stale_builder_loses_the_race_and_can_abandon() {
         "generation numbers are never reused"
     );
     another.abandon(&db).unwrap();
-    assert!(
-        store.retire_superseded(&db).unwrap() >= 1,
-        "orphan from the loser reclaimed"
+    assert_eq!(
+        store.retire_superseded(&db).unwrap(),
+        0,
+        "the stale publish already discarded its generation"
     );
     drop(db);
     let _ = std::fs::remove_dir_all(&root);

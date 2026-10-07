@@ -191,7 +191,6 @@ fn peak_anon_kib<T>(work: impl FnOnce() -> T) -> (T, u64) {
             Err(payload) => std::panic::resume_unwind(payload),
         };
         peak.fetch_max(status_kib("RssAnon:"), Ordering::Relaxed);
-        stop.store(true, Ordering::Relaxed);
         value
     });
     (value, peak.load(Ordering::Relaxed).saturating_sub(baseline))

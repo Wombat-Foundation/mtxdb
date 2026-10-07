@@ -326,16 +326,20 @@ fn a_lost_publish_race_leaves_the_winner_readable_and_the_loser_reclaimable() {
     room.record_event(&db, &event("$root", &[])).unwrap();
 
     let store = room.closure_for_test().store();
-    let first = store.begin(&db).unwrap();
-    let second = store.begin(&db).unwrap();
+    let baseline = room.rebuild(&db).unwrap().generation;
+    let closure = crate::closure_store::test::generation_record(store, &db, baseline, 1)
+        .unwrap()
+        .expect("baseline closure record");
+    let mut first = store.begin(&db).unwrap();
+    let mut second = store.begin(&db).unwrap();
     let first_generation = first.generation();
     let second_generation = second.generation();
 
-    // Leave the only event skipped so the manually published generation is
-    // structurally valid without duplicating the rebuild walk here.
-    let winner = first.publish(&db, 2, &[1]).unwrap();
+    first.add(&db, &[(1, closure.as_slice())]).unwrap();
+    second.add(&db, &[(1, closure.as_slice())]).unwrap();
+    let winner = first.publish(&db, 2, &[]).unwrap();
     assert_eq!(winner.generation, first_generation);
-    let error = second.publish(&db, 2, &[1]).unwrap_err();
+    let error = second.publish(&db, 2, &[]).unwrap_err();
     assert!(
         matches!(
             &error,
@@ -357,7 +361,7 @@ fn a_lost_publish_race_leaves_the_winner_readable_and_the_loser_reclaimable() {
             room.closure_for_test().store(),
             &db,
             second_generation,
-            &[],
+            &[1],
         )
         .unwrap(),
         "the losing generation must be discarded on a stale publish"
@@ -367,7 +371,7 @@ fn a_lost_publish_race_leaves_the_winner_readable_and_the_loser_reclaimable() {
         room.closure_for_test().store(),
         &db,
         first_generation,
-        &[],
+        &[1],
     )
     .unwrap());
     room.retire_old_generations(&db).unwrap();
@@ -376,7 +380,7 @@ fn a_lost_publish_race_leaves_the_winner_readable_and_the_loser_reclaimable() {
             room.closure_for_test().store(),
             &db,
             first_generation,
-            &[],
+            &[1],
         )
         .unwrap(),
         "retirement must preserve the winning generation"

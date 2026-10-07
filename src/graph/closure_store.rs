@@ -25,8 +25,8 @@
 //! by CAS. Readers never see a partial generation: until the swap they read the
 //! old one. If another builder published first, `publish` fails with
 //! `StorageError::StaleRead` and the caller discards its work with
-//! [`GenerationBuilder::abandon`](crate::closure_store::GenerationBuilder::abandon). A crash before the swap leaves an orphan
-//! generation collection that [`ClosureStore::retire_superseded`](crate::closure_store::ClosureStore::retire_superseded) reclaims.
+//! A failed publish discards its generation. A crash before the swap leaves an
+//! orphan generation collection that [`ClosureStore::retire_superseded`](crate::closure_store::ClosureStore::retire_superseded) reclaims.
 //!
 //! The head also records the short-id counter the generation was built against
 //! (`source_next`) and the coverage it achieved: ids in `1..source_next` that
@@ -520,23 +520,48 @@ fn decode_record(bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
     Ok(bytes[5..].to_vec())
 }
 
-fn encode_counter(next: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(13);
+#[derive(Clone, Copy)]
+struct GenerationCounter {
+    next: u64,
+    retired_through: u64,
+}
+
+fn encode_counter(counter: GenerationCounter) -> Vec<u8> {
+    let mut out = Vec::with_capacity(21);
     out.extend_from_slice(&COUNTER_MAGIC);
     out.push(CLOSURE_FORMAT_VERSION);
-    out.extend_from_slice(&next.to_be_bytes());
+    out.extend_from_slice(&counter.next.to_be_bytes());
+    out.extend_from_slice(&counter.retired_through.to_be_bytes());
     out
 }
 
-fn decode_counter(bytes: &[u8]) -> Result<u64, StorageError> {
-    if bytes.len() != 13 || bytes[..4] != COUNTER_MAGIC || bytes[4] != CLOSURE_FORMAT_VERSION {
+fn decode_counter(bytes: &[u8]) -> Result<GenerationCounter, StorageError> {
+    if (bytes.len() != 13 && bytes.len() != 21)
+        || bytes[..4] != COUNTER_MAGIC
+        || bytes[4] != CLOSURE_FORMAT_VERSION
+    {
         return Err(StorageError::Corrupt(
             "closure generation counter".to_owned(),
         ));
     }
     let mut raw = [0u8; 8];
     raw.copy_from_slice(&bytes[5..13]);
-    Ok(u64::from_be_bytes(raw))
+    let next = u64::from_be_bytes(raw);
+    let retired_through = if bytes.len() == 21 {
+        raw.copy_from_slice(&bytes[13..21]);
+        u64::from_be_bytes(raw)
+    } else {
+        0
+    };
+    if retired_through >= next && next != 0 {
+        return Err(StorageError::Corrupt(
+            "closure generation retirement cursor".to_owned(),
+        ));
+    }
+    Ok(GenerationCounter {
+        next,
+        retired_through,
+    })
 }
 
 fn encode_head_metadata(head: &ClosureHead) -> Vec<u8> {
@@ -967,10 +992,14 @@ impl ClosureStore {
             let txn = db.begin_transaction();
             let (records, tokens) =
                 txn.get_with_record_versions(self.pool, &self.head_collection(), &[COUNTER_ID])?;
-            let generation = match records.into_iter().next().flatten() {
+            let counter = match records.into_iter().next().flatten() {
                 Some(record) => decode_counter(&record.bytes)?,
-                None => 1,
+                None => GenerationCounter {
+                    next: 1,
+                    retired_through: 0,
+                },
             };
+            let generation = counter.next;
             let next = generation
                 .checked_add(1)
                 .ok_or_else(|| StorageError::Internal("closure generation overflow".to_owned()))?;
@@ -982,7 +1011,10 @@ impl ClosureStore {
                 self.pool,
                 self.head_collection(),
                 COUNTER_ID,
-                &NodeData::new(Bytes::from(encode_counter(next))),
+                &NodeData::new(Bytes::from(encode_counter(GenerationCounter {
+                    next,
+                    retired_through: counter.retired_through,
+                }))),
             )?;
             match txn.commit() {
                 Ok(()) => {
@@ -1077,12 +1109,12 @@ impl ClosureStore {
     pub fn retire_superseded(&self, db: &Database) -> Result<u64, StorageError> {
         let txn = db.begin_transaction();
         let (head, _) = self.read_head(&txn)?;
-        let (records, _) =
+        let (records, tokens) =
             txn.get_with_record_versions(self.pool, &self.head_collection(), &[COUNTER_ID])?;
         let Some(record) = records.into_iter().next().flatten() else {
             return Ok(0);
         };
-        let next = decode_counter(&record.bytes)?;
+        let counter = decode_counter(&record.bytes)?;
         // Only generations below the head are safe to retire. One at or above
         // it may belong to a builder that `begin` reserved but has not yet
         // published; deleting that would leave the head pointing at a deleted
@@ -1090,13 +1122,41 @@ impl ClosureStore {
         let Some(head) = head else {
             return Ok(0);
         };
-        let mut removed = 0u64;
-        for generation in 1..head.generation.min(next) {
-            if generation != head.previous {
-                txn.delete_collection(self.pool, self.generation_collection(generation))?;
-                removed = removed.saturating_add(1);
-            }
+        // The cursor names the predecessor retained by the last pass. When a
+        // newer head exists, that predecessor is now safe to delete and the
+        // cursor can move to the new head's predecessor in the same CAS.
+        if counter.retired_through == head.previous {
+            return Ok(0);
         }
+        let old_cursor = counter.retired_through;
+        let mut removed = 0u64;
+        let end = head.generation.saturating_sub(1);
+        if old_cursor != 0 && old_cursor != head.previous {
+            txn.delete_collection(self.pool, self.generation_collection(old_cursor))?;
+            removed = removed.saturating_add(1);
+        }
+        for generation in old_cursor.saturating_add(1)..=end {
+            if generation == head.previous {
+                continue;
+            }
+            txn.delete_collection(self.pool, self.generation_collection(generation))?;
+            removed = removed.saturating_add(1);
+        }
+        let retired_through = if head.previous == 0 {
+            end
+        } else {
+            head.previous
+        };
+        txn.expect_record_version(self.pool, self.head_collection(), COUNTER_ID, tokens[0])?;
+        txn.put(
+            self.pool,
+            self.head_collection(),
+            COUNTER_ID,
+            &NodeData::new(Bytes::from(encode_counter(GenerationCounter {
+                retired_through,
+                ..counter
+            }))),
+        )?;
         crash_point("retire-before-commit");
         txn.commit()?;
         crash_point("retire-after-commit");
@@ -1157,7 +1217,7 @@ impl ClosureStore {
         let (records, _) =
             txn.get_with_record_versions(self.pool, &self.head_collection(), &[COUNTER_ID])?;
         if let Some(record) = records.into_iter().next().flatten() {
-            for generation in 1..decode_counter(&record.bytes)? {
+            for generation in 1..decode_counter(&record.bytes)?.next {
                 txn.delete_collection(self.pool, self.generation_collection(generation))?;
             }
         }
@@ -1324,7 +1384,14 @@ impl GenerationBuilder {
             .heads()
             .stage_replace(&txn, &HEAD_LOGICAL_ID, self.head_token, &value)?;
         crash_point("publish-before-commit");
-        txn.commit()?;
+        if let Err(error) = txn.commit() {
+            if error.is_stale_read() {
+                if let Err(cleanup) = self.discard_generation(db) {
+                    eprintln!("closure publish: could not discard stale generation: {cleanup}");
+                }
+            }
+            return Err(error);
+        }
         crash_point("publish-after-commit");
         Ok(head)
     }
@@ -1381,5 +1448,25 @@ pub(crate) mod test {
             &ids,
         )?;
         Ok(records.into_iter().any(|record| record.is_some()))
+    }
+
+    pub(crate) fn generation_record(
+        store: &super::ClosureStore,
+        db: &super::Database,
+        generation: u64,
+        short_id: u32,
+    ) -> Result<Option<Vec<u8>>, super::StorageError> {
+        let txn = db.begin_transaction();
+        let (records, _) = txn.get_with_record_versions(
+            store.pool,
+            &store.generation_collection(generation),
+            &[super::record_id(short_id)],
+        )?;
+        records
+            .into_iter()
+            .next()
+            .flatten()
+            .map(|record| super::decode_record(&record.bytes))
+            .transpose()
     }
 }
