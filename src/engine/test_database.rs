@@ -983,6 +983,7 @@ fn read_snapshot_after_sync_reads_database_pool_records() {
     let records = snapshot.get(&collection, &[node(1)]).unwrap();
     assert_eq!(payload_of(records[0].as_ref()), Some(b"value".to_vec()));
 
+    drop(snapshot);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }

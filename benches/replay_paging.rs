@@ -410,7 +410,10 @@ fn run_reclaim_fallback_arm() -> Result<(), Box<dyn Error>> {
     let payload_size = env_usize("MTXDB_RP_PAYLOAD", 128);
     let seed_groups = env_usize("MTXDB_RP_FALLBACK_SEED_GROUPS", 4_096);
     let db = setup("forced_fallback", seed_groups, payload_size, false);
-    let (scans, cursor, lease) = db.stores[1]
+    // ServerInfo is seeded last, so its pool watermark reaches the shared WAL
+    // tail. Using EventDag here would leave later pools' seed groups after the
+    // cursor and make the fallback page contain more than the test group.
+    let (scans, cursor, lease) = db.stores[3]
         .scan_collections_at_snapshot(&db.collections)
         .expect("take fallback-arm snapshot");
     drop(scans);

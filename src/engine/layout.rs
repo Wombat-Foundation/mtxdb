@@ -514,7 +514,14 @@ impl DatabaseLayout {
                 if error.kind() == io::ErrorKind::Unsupported
                     || error.kind() == io::ErrorKind::PermissionDenied =>
             {
-                Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied && path.exists() {
+                    Self::validate_existing_descriptor(path)?;
+                    Self::sync_descriptor_parent(path)?;
+                    Self::sweep_descriptor_temps(path, "create");
+                    Ok(())
+                } else {
+                    Err(error)
+                }
             }
             Err(error) => Err(error),
         }
