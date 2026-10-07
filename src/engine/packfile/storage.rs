@@ -150,10 +150,6 @@ pub struct OpenTimings {
     pub persisted_stats_restore: std::time::Duration,
     /// Persisting pool.meta reservation and syncing file contents (fresh pool only; ZERO on existing pool).
     pub pool_meta_persist: std::time::Duration,
-    /// Creating the initial packfile atomically, writing its header, syncing,
-    /// renaming, and performing the final directory sync (fresh pool only;
-    /// ZERO on existing pool).
-    pub initial_pack_create: std::time::Duration,
     /// Unattributed time inside the `metadata_restore` span.
     pub metadata_unattributed: std::time::Duration,
     /// Shard-open time not covered by the named shard phases.
@@ -214,7 +210,6 @@ impl Default for OpenTimings {
             pool_meta_restore: std::time::Duration::ZERO,
             persisted_stats_restore: std::time::Duration::ZERO,
             pool_meta_persist: std::time::Duration::ZERO,
-            initial_pack_create: std::time::Duration::ZERO,
             metadata_unattributed: std::time::Duration::ZERO,
             shard_open_unattributed: std::time::Duration::ZERO,
             metadata_load: std::time::Duration::ZERO,
@@ -2497,7 +2492,6 @@ impl PackfileStorage {
             timings.pool_meta_restore = shard_timings.pool_meta_restore;
             timings.persisted_stats_restore = shard_timings.persisted_stats_restore;
             timings.pool_meta_persist = shard_timings.pool_meta_persist;
-            timings.initial_pack_create = shard_timings.initial_pack_create;
             timings.metadata_unattributed = shard_timings.metadata_unattributed;
             timings.shard_open_unattributed = shard_timings.unattributed;
         }

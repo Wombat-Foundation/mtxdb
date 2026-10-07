@@ -702,10 +702,6 @@ pub struct ShardOpenTimings {
     pub persisted_stats_restore: Duration,
     /// Persisting pool.meta reservation and syncing file contents (fresh pool only; ZERO on existing pool).
     pub pool_meta_persist: Duration,
-    /// Creating the initial packfile atomically, writing its header, syncing,
-    /// renaming, and performing the final directory sync (fresh pool only;
-    /// ZERO on existing pool).
-    pub initial_pack_create: Duration,
     /// Unattributed time inside the `metadata_restore` span.
     pub metadata_unattributed: Duration,
     /// Time not covered by the named phases (sorting, allocation, and other
@@ -1055,7 +1051,7 @@ impl ShardPool {
 
     /// Bootstrap a brand-new pool: create the first pack file, persist
     /// `pool.meta` (with a fresh seed if needed).
-    /// Returns `(bucket_seed, pool_meta_persist_time, initial_pack_create_time)`.
+    /// Returns `(bucket_seed, pool_meta_persist_time)`.
     ///
     /// # Errors
     /// Returns `io::Error` if the pool is empty and not writable.
@@ -1065,12 +1061,12 @@ impl ShardPool {
         mut bucket_seed: u64,
         seed_from_root: bool,
         writable: bool,
-    ) -> io::Result<(u64, Duration, Duration)> {
+    ) -> io::Result<(u64, Duration)> {
         if !writable {
             // A pool whose `pool.meta` exists but which has no pack yet is
             // valid and empty: packs are created lazily on the first write.
             if bucket_seed != 0 {
-                return Ok((bucket_seed, Duration::ZERO, Duration::ZERO));
+                return Ok((bucket_seed, Duration::ZERO));
             }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1100,7 +1096,7 @@ impl ShardPool {
             sync_directory(base_dir)?;
         }
 
-        Ok((bucket_seed, pool_meta_persist_time, Duration::ZERO))
+        Ok((bucket_seed, pool_meta_persist_time))
     }
 
     /// Restore `bucket_seed` from `pool.meta`. Returns `(bucket_seed,
@@ -1150,7 +1146,6 @@ impl ShardPool {
         let metadata_subphases_sum = timings
             .pool_meta_restore
             .saturating_add(timings.pool_meta_persist)
-            .saturating_add(timings.initial_pack_create)
             .saturating_add(timings.persisted_stats_restore);
         timings.metadata_unattributed = timings
             .metadata_restore
@@ -1279,13 +1274,13 @@ impl ShardPool {
         let (bucket_seed, seed_from_root, pool_meta_restore_time) =
             Self::restore_pool_meta_state(&base_dir)?;
 
-        let (pool_meta_persist_time, initial_pack_create_time, bucket_seed) =
+        let (pool_meta_persist_time, bucket_seed) =
             if shards.iter().all(std::option::Option::is_none) {
-                let (bs, pmp, ipc) =
+                let (bs, pmp) =
                     Self::initialize_empty_pool(&base_dir, bucket_seed, seed_from_root, writable)?;
-                (pmp, ipc, bs)
+                (pmp, bs)
             } else {
-                (Duration::ZERO, Duration::ZERO, bucket_seed)
+                (Duration::ZERO, bucket_seed)
             };
 
         // Restoring is a pure read of shard_stats.bin applied to our own
@@ -1317,7 +1312,6 @@ impl ShardPool {
                 pool_meta_restore: pool_meta_restore_time,
                 persisted_stats_restore: persisted_stats_restore_time,
                 pool_meta_persist: pool_meta_persist_time,
-                initial_pack_create: initial_pack_create_time,
                 total,
                 ..Default::default()
             },

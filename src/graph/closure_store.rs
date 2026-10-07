@@ -1078,10 +1078,14 @@ impl ClosureStore {
                 snapshot.skipped.contains(short_id),
                 records.into_iter().next().flatten(),
             ) {
-                (false, Some(record)) => {
-                    decode_record(&record.bytes)?;
-                    report.records_checked = report.records_checked.saturating_add(1);
-                }
+                (false, Some(record)) => match decode_record(&record.bytes) {
+                    Ok(_) => {
+                        report.records_checked = report.records_checked.saturating_add(1);
+                    }
+                    Err(error) => report.problems.push(format!(
+                        "closure record for id {short_id} is unreadable: {error}"
+                    )),
+                },
                 (false, None) => report
                     .problems
                     .push(format!("covered id {short_id} has no closure record")),
