@@ -789,7 +789,7 @@ impl ShortIdIndex {
         let mut last = None;
         for attempt in 0..MAX_ATTEMPTS {
             match self.compact_once(db, now_ms, grace_ms, force) {
-                Err(error) if error.is_stale_read() => last = Some(error),
+                Err(error) if error.is_stale_read() || error.is_would_block() => last = Some(error),
                 other => return other,
             }
             // Give the writer that beat us a gap to idle in.
@@ -938,7 +938,7 @@ impl ShortIdIndex {
                         actual: 0,
                     })
                 }
-                Err(error) if error.is_stale_read() => last = Some(error),
+                Err(error) if error.is_stale_read() || error.is_would_block() => last = Some(error),
                 Err(error) => return Err(error),
             }
             // Give the writer that beat us a gap to idle in.
