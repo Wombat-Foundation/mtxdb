@@ -743,13 +743,15 @@ impl ShortIdIndex {
                     }
                     match txn.commit() {
                         Ok(()) => return Ok(recorded),
-                        Err(error) if error.is_stale_read() || error.is_would_block() => {
-                            last = Some(error);
-                        }
+                        Err(error) if error.is_stale_read() => last = Some(error),
                         Err(error) => return Err(error),
                     }
                 }
-                Err(error) if error.is_stale_read() || error.is_would_block() => last = Some(error),
+                Err(error)
+                    if error.is_stale_read() || matches!(error, StorageError::WouldBlock(_)) =>
+                {
+                    last = Some(error);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -1079,12 +1081,14 @@ impl ShortIdIndex {
                 }
                 Ok(outcome) => match txn.commit() {
                     Ok(()) => return Ok((outcome.ids, outcome.recorded)),
-                    Err(error) if error.is_stale_read() || error.is_would_block() => {
-                        last = Some(error);
-                    }
+                    Err(error) if error.is_stale_read() => last = Some(error),
                     Err(error) => return Err(error),
                 },
-                Err(error) if error.is_stale_read() || error.is_would_block() => last = Some(error),
+                Err(error)
+                    if error.is_stale_read() || matches!(error, StorageError::WouldBlock(_)) =>
+                {
+                    last = Some(error);
+                }
                 Err(error) => return Err(error),
             }
         }
