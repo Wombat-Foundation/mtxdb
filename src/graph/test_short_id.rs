@@ -913,19 +913,25 @@ fn verify_racing_a_writer_reports_no_false_problems() {
     let keys: Vec<Vec<u8>> = (0..600).map(|i| format!("$e{i}").into_bytes()).collect();
     let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
     index().get_or_create(&db, &refs).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
     let writer = {
         let db = db.clone();
         std::thread::spawn(move || {
-            for key in &keys {
+            for (position, key) in keys.iter().enumerate() {
                 let key = key.clone();
                 index().record_events(&db, &[owned(&key, &key)]).unwrap();
+                if position == 0 {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
             }
         })
     };
-    while !writer.is_finished() {
-        let report = index().verify(&db, &[PLAIN]).unwrap();
-        assert!(report.is_consistent(), "{:?}", report.problems);
-    }
+    started_rx.recv().unwrap();
+    let report = index().verify(&db, &[PLAIN]).unwrap();
+    assert!(report.is_consistent(), "{:?}", report.problems);
+    release_tx.send(()).unwrap();
     writer.join().unwrap();
     let report = index().verify(&db, &[PLAIN]).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);

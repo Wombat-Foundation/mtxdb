@@ -98,16 +98,6 @@ fn status_kib(field: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn dir_bytes(dir: &Path) -> u64 {
-    std::fs::read_dir(dir).map_or(0, |entries| {
-        entries
-            .flatten()
-            .filter_map(|entry| entry.metadata().ok())
-            .map(|meta| meta.len())
-            .fold(0, u64::saturating_add)
-    })
-}
-
 /// Bytes of every file under `dir` whose name contains `needle`, recursively.
 fn tree_bytes(dir: &Path, needle: &str) -> u64 {
     let mut total = 0_u64;
@@ -174,7 +164,7 @@ fn build_store(dir: &Path, owners: u32) -> Database {
         "  build store (payload={with_payload}, sync_every={sync_every}): {:.1}s, {:.1} us/event, {:.1} MiB on disk",
         secs,
         secs * 1e6 / f64::from(owners.max(1)),
-        mib(dir_bytes(dir))
+        mib(tree_bytes(dir, ""))
     );
     db
 }

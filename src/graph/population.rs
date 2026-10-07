@@ -411,7 +411,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-type CacheKey = ([u8; 16], u32);
+type CacheKey = ([u8; 16], u32, u64);
 
 /// A small LRU of merged bases, keyed by scope and manifest version, so a new
 /// snapshot costs a tail read and not a merge.
@@ -646,7 +646,18 @@ impl ShortIdIndex {
     ) -> Result<PopulationSnapshot, StorageError> {
         let counters = pin.counters;
         let version = counters.manifest_version;
-        let key = (self.collection_id, version);
+        // The manifest version is reset by purge. Include the latest run token
+        // so a newly rebuilt version cannot reuse a base from the old scope.
+        let generation = if version == 0 {
+            0
+        } else {
+            let txn = db.begin_transaction();
+            self.read_manifest(&txn, version)?
+                .runs
+                .last()
+                .map_or(0, |run| run.token)
+        };
+        let key = (self.collection_id, version, generation);
         let cached = cache.and_then(|cache| cache.get(key));
         let base = if let Some(base) = cached {
             base
@@ -1196,6 +1207,14 @@ impl ShortIdIndex {
                         "manifest {} folds through {} but the log starts at {}",
                         manifest.version, manifest.folded_through, counters.log_epoch_start_seq
                     ));
+                }
+                for run in &manifest.runs {
+                    if let Err(error) = self.load_run(txn, run) {
+                        problems.push(format!(
+                            "manifest {} run {} unreadable: {error}",
+                            manifest.version, run.version
+                        ));
+                    }
                 }
                 if manifest.total_entries() != folded {
                     problems.push(format!(

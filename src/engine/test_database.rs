@@ -3419,14 +3419,12 @@ fn a_committed_delete_collection_hides_synced_records() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Repacking an empty collection must not bring back records from a
-/// collection deleted before it. A repack's own read refreshes via
-/// `refresh_collection`, which consults the tombstone file.
+/// Repacking a deleted collection must not bring its old records back.
 #[test]
-fn repacking_an_empty_collection_resurrects_a_deleted_one() {
+fn repacking_a_deleted_collection_does_not_resurrect_it() {
     let root = test_root("repack_empty_resurrects");
     let db = Database::open(root.clone()).unwrap();
-    let (doomed, empty) = ([0x71_u8; 16], [0x72_u8; 16]);
+    let doomed = [0x71_u8; 16];
     let put = db.begin_transaction();
     put.put(ShardType::Edges, doomed, node(1), &data(b"doomed"))
         .unwrap();
@@ -3443,7 +3441,7 @@ fn repacking_an_empty_collection_resurrects_a_deleted_one() {
     };
     assert!(!read(&db), "the delete itself must take effect");
     db.pool(ShardType::Edges)
-        .repack_collection_reachable(&empty, |_, _| Vec::new())
+        .repack_collection_reachable(&doomed, |_, _| Vec::new())
         .unwrap();
     assert!(!read(&db), "the repack brought the deleted record back");
     drop(db);

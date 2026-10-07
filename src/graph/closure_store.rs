@@ -1307,12 +1307,18 @@ impl GenerationBuilder {
         // generation with no skipped ids writes no record at all; a head that
         // then claims `skipped_count > 0` is a mismatch `verify` reports.
         if !set.is_empty() {
-            txn.put(
+            if let Err(error) = txn.put(
                 self.store.pool,
                 collection,
                 coverage_id(),
                 &NodeData::new(Bytes::from(payload)),
-            )?;
+            ) {
+                drop(txn);
+                if let Err(cleanup) = self.discard_generation(db) {
+                    eprintln!("closure publish: could not discard failed generation: {cleanup}");
+                }
+                return Err(StorageError::Io(error));
+            }
         }
         self.store
             .heads()

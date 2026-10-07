@@ -2147,10 +2147,11 @@ impl ShardPool {
         })?;
         packfile::FRAME_FIXED_LEN
             .checked_add(payload_len)
+            .filter(|&len| len <= packfile::MAX_FRAME_LEN)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "record frame length exceeds u32::MAX",
+                    "record frame length exceeds shard frame limit",
                 )
             })?;
         Ok(())

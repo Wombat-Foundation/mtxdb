@@ -7498,6 +7498,16 @@ impl PackfileStorage {
         let collection_arc = self.put_mutex(collection_id);
         let collection_guard = collection_arc.lock();
 
+        // A deleted collection's old frames remain in packs until garbage
+        // collection. Never let a repack scan those historical frames back
+        // into the live index.
+        if self
+            .load_deleted_collections_cached()?
+            .contains(collection_id)
+        {
+            return Ok((0, 0));
+        }
+
         // The scan below reads packfiles directly, so any records still
         // sitting in a shard's append buffer would be invisible to it and
         // get silently dropped by this repack. Flush first so the whole
