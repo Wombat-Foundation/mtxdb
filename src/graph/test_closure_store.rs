@@ -1,15 +1,10 @@
-assert!(
-    !closure_store::test::generation_exists(&store, &db, 1, &[1]).unwrap(),
-    "the stale publish discarded its generation"
-);
-assert_eq!(store.retire_superseded(&db).unwrap(), 0);
-
 use super::closure_store;
 use super::closure_store::*;
 use super::short_id::{EdgeFamily, ShortIdIndex};
 use crate::database::Database;
 use crate::layout::ShardType;
 use crate::storage::{NodeData, StorageError};
+use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
