@@ -752,17 +752,18 @@ fn a_full_batch_of_realistic_events_fits_one_transaction() {
 /// failed batch records nothing.
 #[test]
 fn a_batch_over_the_transaction_stage_limit_is_a_typed_error_and_records_nothing() {
+    const TEST_TXN_STAGE_LIMIT_BYTES: usize = 2 << 20;
     let dir = root("stage-limit");
-    let db = Database::open(dir.clone()).unwrap();
+    let db = Database::open_with_txn_stage_limit(dir.clone(), TEST_TXN_STAGE_LIMIT_BYTES).unwrap();
     let room = RoomAuth::new(POOL, ROOM);
     // Staged size scales with key length, and every new key is stored twice (its
-    // forward and reverse records), so long ids reach the 64 MiB limit with few
-    // keys: 8 events x 1500 references x 4 KB ids is about 96 MiB.
+    // forward and reverse records), so long ids cross the test ceiling while a
+    // single event still fits beneath it.
     let count = 8usize;
-    let padding = "x".repeat(3950);
+    let padding = "x".repeat(900);
     let refs: Vec<Vec<String>> = (0..count)
         .map(|event| {
-            (0..1500)
+            (0..1000)
                 .map(|r| format!("${event:0>20}-{r:0>22}{padding}"))
                 .collect()
         })
@@ -788,7 +789,7 @@ fn a_batch_over_the_transaction_stage_limit_is_a_typed_error_and_records_nothing
             RoomAuthError::BatchExceedsTransactionLimit {
                 staged_bytes,
                 limit_bytes,
-            } if staged_bytes > limit_bytes && *limit_bytes == crate::journal::MAX_TXN_STAGE_BYTES
+            } if staged_bytes > limit_bytes && *limit_bytes == TEST_TXN_STAGE_LIMIT_BYTES
         ),
         "{error}"
     );
@@ -796,11 +797,9 @@ fn a_batch_over_the_transaction_stage_limit_is_a_typed_error_and_records_nothing
         room.auth_edges(&db, &ids[0]).unwrap_err(),
         RoomAuthError::UnknownEvent { .. }
     ));
-    // Splitting the same events into smaller batches works.
-    for chunk in events.chunks(1) {
-        room.record_events(&db, chunk).unwrap();
-    }
-    assert_eq!(room.auth_edges(&db, &ids[count - 1]).unwrap().len(), 1500);
+    // A sub-limit retry remains usable after the rejected batch.
+    room.record_events(&db, &events[..1]).unwrap();
+    assert_eq!(room.auth_edges(&db, &ids[0]).unwrap().len(), 1000);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }

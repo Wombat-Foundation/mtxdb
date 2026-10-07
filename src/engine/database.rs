@@ -98,6 +98,7 @@ pub struct Database {
     layout: DatabaseLayout,
     coordinator: Arc<JournalCoordinator>,
     pools: [Arc<PackfileStorage>; POOL_COUNT],
+    txn_stage_limit_bytes: usize,
     /// Published transactions whose materialization still needs to be
     /// completed. The queue owns the transaction stage, so dropping a caller's
     /// handle cannot orphan the visibility overlay.
@@ -627,6 +628,26 @@ impl Database {
     /// Returns an error if the root lock is held, the shared segment cannot be
     /// opened, or any pool cannot be opened or attached.
     pub fn open_with_policies(root: PathBuf, policies: PoolPolicies) -> Result<Self, StorageError> {
+        Self::open_with_policies_and_stage_limit(
+            root,
+            policies,
+            crate::journal::MAX_TXN_STAGE_BYTES,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_txn_stage_limit(
+        root: PathBuf,
+        limit_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_policies_and_stage_limit(root, PoolPolicies::default(), limit_bytes)
+    }
+
+    fn open_with_policies_and_stage_limit(
+        root: PathBuf,
+        policies: PoolPolicies,
+        txn_stage_limit_bytes: usize,
+    ) -> Result<Self, StorageError> {
         let layout = DatabaseLayout::open(root)?;
         let wal_path = layout.shared_wal_path();
         let lock = SharedWalLock::acquire(layout.root())?;
@@ -678,6 +699,7 @@ impl Database {
             layout,
             coordinator,
             pools,
+            txn_stage_limit_bytes,
             recovery_queue: parking_lot::Mutex::new(Vec::new()),
             recovery_lifecycle: parking_lot::Mutex::new(()),
             commit_phases: CommitPhases::default(),
@@ -732,7 +754,7 @@ impl Database {
     pub fn begin_transaction(&self) -> DatabaseTransaction<'_> {
         DatabaseTransaction {
             database: DatabaseRef::Borrowed(self),
-            stage: Arc::new(TxnStage::new()),
+            stage: Arc::new(TxnStage::with_limit(self.txn_stage_limit_bytes)),
             lifecycle: parking_lot::Mutex::new(()),
         }
     }
@@ -746,7 +768,7 @@ impl Database {
     pub fn begin_owned_transaction(self: &Arc<Self>) -> DatabaseTransaction<'static> {
         DatabaseTransaction {
             database: DatabaseRef::Owned(Arc::clone(self)),
-            stage: Arc::new(TxnStage::new()),
+            stage: Arc::new(TxnStage::with_limit(self.txn_stage_limit_bytes)),
             lifecycle: parking_lot::Mutex::new(()),
         }
     }

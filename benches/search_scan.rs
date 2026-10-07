@@ -62,7 +62,9 @@ fn load(path: &str) -> (Vec<SearchDocument>, usize) {
             })
         })
         .collect();
-    let skipped = total - docs.len();
+    let skipped = total
+        .checked_sub(docs.len())
+        .expect("parsed document count cannot exceed input line count");
     (docs, skipped)
 }
 

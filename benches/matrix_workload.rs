@@ -696,7 +696,7 @@ fn mount_fstype(path: &Path) -> Option<String> {
         let mount_path = Path::new(mount_point);
         if canonical.starts_with(mount_path) {
             let depth = mount_path.components().count();
-            let deeper_or_equal = best.as_ref().map_or(true, |(d, _)| depth >= *d);
+            let deeper_or_equal = best.as_ref().is_none_or(|(d, _)| depth >= *d);
             if deeper_or_equal {
                 best = Some((depth, fstype.to_owned()));
             }

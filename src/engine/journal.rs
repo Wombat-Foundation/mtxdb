@@ -189,7 +189,7 @@ pub struct RecordExpectation {
 /// other transactions sharing the process.
 pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
 
-/// A transaction staged more than [`MAX_TXN_STAGE_BYTES`].
+/// A transaction staged more than its configured stage limit.
 ///
 /// Carried inside an [`io::Error`] of kind `InvalidInput`, so a caller can tell
 /// "this transaction is too big, split it" from any other I/O failure without
@@ -205,18 +205,18 @@ pub struct StageTooLarge {
 
 impl std::fmt::Display for StageTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "transaction journal stage exceeds its 64 MiB limit")
+        write!(f, "transaction journal stage exceeds its configured limit")
     }
 }
 
 impl std::error::Error for StageTooLarge {}
 
-fn stage_too_large(staged_bytes: usize) -> io::Error {
+fn stage_too_large_with_limit(staged_bytes: usize, limit_bytes: usize) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         StageTooLarge {
             staged_bytes,
-            limit_bytes: MAX_TXN_STAGE_BYTES,
+            limit_bytes,
         },
     )
 }
@@ -323,6 +323,7 @@ impl std::error::Error for StaleVersion {}
 pub struct TxnStage {
     state: std::sync::atomic::AtomicU8,
     data: Mutex<TxnStageData>,
+    limit_bytes: usize,
     #[cfg(test)]
     lookup_many_calls: std::sync::atomic::AtomicU64,
 }
@@ -343,6 +344,12 @@ impl TxnStage {
     /// Create an empty stage for one transaction attempt.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_limit(MAX_TXN_STAGE_BYTES)
+    }
+
+    /// Create an empty stage with an explicit payload limit.
+    #[must_use]
+    pub(crate) fn with_limit(limit_bytes: usize) -> Self {
         Self {
             state: std::sync::atomic::AtomicU8::new(Self::ACTIVE),
             data: Mutex::new(TxnStageData {
@@ -354,6 +361,7 @@ impl TxnStage {
                 appended: [false; ShardType::ALL.len()],
                 receipt: None,
             }),
+            limit_bytes,
             #[cfg(test)]
             lookup_many_calls: std::sync::atomic::AtomicU64::new(0),
         }
@@ -592,8 +600,8 @@ impl TxnStage {
                 "transaction stage size overflow",
             )
         })?;
-        if total > MAX_TXN_STAGE_BYTES {
-            return Err(stage_too_large(total));
+        if total > self.limit_bytes {
+            return Err(stage_too_large_with_limit(total, self.limit_bytes));
         }
         Ok(())
     }
@@ -622,8 +630,8 @@ impl TxnStage {
                 "transaction stage size overflow",
             )
         })?;
-        if total > MAX_TXN_STAGE_BYTES {
-            return Err(stage_too_large(total));
+        if total > self.limit_bytes {
+            return Err(stage_too_large_with_limit(total, self.limit_bytes));
         }
         data.pools[pool_index(pool)].push(Mutation::Put {
             collection_id,
@@ -667,8 +675,8 @@ impl TxnStage {
                 "transaction stage size overflow",
             )
         })?;
-        if total > MAX_TXN_STAGE_BYTES {
-            return Err(stage_too_large(total));
+        if total > self.limit_bytes {
+            return Err(stage_too_large_with_limit(total, self.limit_bytes));
         }
         let pool_mutations = &mut data.pools[pool_index(pool)];
         pool_mutations.extend(entries.iter().map(|(node_id, payload)| Mutation::Put {
@@ -703,8 +711,8 @@ impl TxnStage {
                 "transaction stage size overflow",
             )
         })?;
-        if total > MAX_TXN_STAGE_BYTES {
-            return Err(stage_too_large(total));
+        if total > self.limit_bytes {
+            return Err(stage_too_large_with_limit(total, self.limit_bytes));
         }
         data.pools[pool_index(pool)].push(Mutation::DeleteCollection { collection_id });
         data.applied[pool_index(pool)].push(false);
