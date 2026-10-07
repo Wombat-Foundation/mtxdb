@@ -8970,6 +8970,7 @@ impl StorageEngine for PackfileStorage {
             ));
         }
 
+        let _snapshot_gate = self.read_snapshot_gate.lock();
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
 
@@ -9030,6 +9031,7 @@ impl StorageEngine for PackfileStorage {
             return Ok(());
         }
 
+        let _snapshot_gate = self.read_snapshot_gate.lock();
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
 
@@ -9075,6 +9077,7 @@ impl StorageEngine for PackfileStorage {
     ) -> Result<(), StorageError> {
         validate_established_upsert_inputs(collection_id, metadata, node_id)?;
 
+        let _snapshot_gate = self.read_snapshot_gate.lock();
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
 
