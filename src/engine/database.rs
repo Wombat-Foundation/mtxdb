@@ -635,7 +635,7 @@ impl Database {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "bitmaps"))]
     pub(crate) fn open_with_txn_stage_limit(
         root: PathBuf,
         limit_bytes: usize,

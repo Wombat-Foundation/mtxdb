@@ -1459,6 +1459,7 @@ pub(crate) mod test {
         Ok(records.into_iter().any(|record| record.is_some()))
     }
 
+    #[cfg(feature = "bitmaps")]
     pub(crate) fn generation_record(
         store: &super::ClosureStore,
         db: &super::Database,
