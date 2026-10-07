@@ -412,6 +412,10 @@ fn run<B: Backend>(mut backend: B, dataset: &Dataset, ids: &[NodeId]) {
     backend.open();
     let cold_open_ms = started.elapsed().as_secs_f64() * 1e3;
     let (cold_found, cold_point_us) = time_point(&backend, ids);
+    backend.close();
+    let batch_evicted = evict_dir(&path);
+    let evicted = evicted && batch_evicted;
+    backend.open();
     let (cold_batch_found, cold_batch_us) = time_batch(&backend, ids);
 
     // Warm open with the same (now hot) cache, no eviction.
