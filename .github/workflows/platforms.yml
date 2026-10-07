@@ -4,6 +4,8 @@ name: Native platforms
 on:
   push:
     branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
   workflow_dispatch:
 
 permissions:
@@ -61,4 +63,5 @@ jobs:
         run: brew install vmtouch
 
       - name: Run benchmarks
+        if: github.event_name == 'push'
         run: cargo bench --locked --manifest-path benches/Cargo.toml --benches --all-targets
