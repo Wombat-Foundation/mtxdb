@@ -1,8 +1,9 @@
-    assert!(
-        !closure_store::test::generation_exists(&store, &db, 1, &[1]).unwrap(),
-        "the stale publish discarded its generation"
-    );
-    assert_eq!(store.retire_superseded(&db).unwrap(), 0);
+
+assert!(
+    !closure_store::test::generation_exists(&store, &db, 1, &[1]).unwrap(),
+    "the stale publish discarded its generation"
+);
+assert_eq!(store.retire_superseded(&db).unwrap(), 0);
 
 use super::closure_store;
 use super::closure_store::*;
