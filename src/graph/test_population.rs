@@ -479,7 +479,7 @@ fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
         .filter(|(owner, _)| *owner == [0x6f; 16])
         .map(|(_, run)| *run)
         .collect();
-    assert!(!written.is_empty());
+    assert_ne!(written, Vec::<[u8; 16]>::new());
     for run in &written {
         assert!(
             known.contains(run),

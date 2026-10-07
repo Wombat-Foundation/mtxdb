@@ -54,7 +54,10 @@ fn a_chain_is_ancestors_only_before_any_generation_exists() {
     let mut chain = room.auth_chain(&db, "$msg").unwrap();
     chain.sort();
     assert_eq!(chain, vec!["$create", "$member", "$power"]);
-    assert!(room.auth_chain(&db, "$create").unwrap().is_empty());
+    assert_eq!(
+        room.auth_chain(&db, "$create").unwrap(),
+        Vec::<String>::new()
+    );
 
     assert!(room.is_in_auth_chain(&db, "$create", "$msg").unwrap());
     assert!(!room.is_in_auth_chain(&db, "$msg", "$msg").unwrap());

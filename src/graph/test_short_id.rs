@@ -654,7 +654,10 @@ fn exhaustion_mid_batch_publishes_nothing() {
         "nothing published"
     );
     assert_eq!(index().lookup(&db, b"$t1").unwrap(), None);
-    assert!(index().record_events(&db, &[]).unwrap().is_empty());
+    assert_eq!(
+        index().record_events(&db, &[]).unwrap(),
+        Vec::<RecordedEvent>::new()
+    );
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

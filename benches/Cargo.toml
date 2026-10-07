@@ -29,7 +29,7 @@ fjall = "2.11.2"
 libmdbx = "0.6"
 base64 = "0.22"
 mtxdb = { path = "..", features = ["reconcile"] }
-rezzy-recon = { path = "../../rezzy/rezzy-recon" }
+rezzy-recon = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha", version = "0.6.0-rc.1" }
 rusqlite = "0.32"
 
 [target.'cfg(windows)'.dependencies]

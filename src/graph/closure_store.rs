@@ -146,53 +146,6 @@ fn take_snapshot_hook() -> Option<SnapshotHook> {
     SNAPSHOT_HOOK.with(|slot| slot.borrow_mut().take())
 }
 
-/// Test hook namespace, so tests reach these without importing every item.
-#[cfg(test)]
-pub(crate) mod test {
-    pub(crate) use super::{arm_snapshot_hook, disarm_snapshot_hook, take_head_reads};
-
-    /// The coverage record's node id, so a test can corrupt it directly.
-    pub(crate) fn coverage_id() -> super::NodeId {
-        super::coverage_id()
-    }
-
-    /// The collection a generation's records live in, so a test can write into
-    /// it directly.
-    pub(crate) fn generation_collection(store: &super::ClosureStore, generation: u64) -> [u8; 16] {
-        store.generation_collection(generation)
-    }
-
-    /// Encode a coverage set exactly as `publish` would, so a test can write a
-    /// record that disagrees with its head.
-    pub(crate) fn encode_coverage_for_test(set: &super::ClosureCoverageSet) -> Vec<u8> {
-        super::encode_coverage(set)
-    }
-
-    /// Whether `generation`'s collection still holds anything, checking both its
-    /// coverage record and its closures for `short_ids`.
-    ///
-    /// A refused or failed publish must leave no records behind, and a reader
-    /// cannot see that: the head never named the generation. This reads the
-    /// collection directly.
-    pub(crate) fn generation_exists(
-        store: &super::ClosureStore,
-        db: &super::Database,
-        generation: u64,
-        short_ids: &[u32],
-    ) -> Result<bool, super::StorageError> {
-        let txn = db.begin_transaction();
-        let mut ids: Vec<super::NodeId> =
-            short_ids.iter().map(|id| super::record_id(*id)).collect();
-        ids.push(super::coverage_id());
-        let (records, _) = txn.get_with_record_versions(
-            store.pool,
-            &store.generation_collection(generation),
-            &ids,
-        )?;
-        Ok(records.into_iter().any(|record| record.is_some()))
-    }
-}
-
 /// Exit code of a child stopped by [`crash_point`]. Distinct from 0 (clean run)
 /// and 101 (panic), so a test can tell an injected crash from either.
 #[cfg(test)]
@@ -1386,5 +1339,41 @@ impl GenerationBuilder {
     /// Returns an error if the delete cannot be committed.
     pub fn abandon(self, db: &Database) -> Result<(), StorageError> {
         self.discard_generation(db)
+    }
+}
+
+/// Test hook namespace, so tests reach these without importing every item.
+#[cfg(test)]
+pub(crate) mod test {
+    pub(crate) use super::{arm_snapshot_hook, disarm_snapshot_hook, take_head_reads};
+
+    pub(crate) fn coverage_id() -> super::NodeId {
+        super::coverage_id()
+    }
+
+    pub(crate) fn generation_collection(store: &super::ClosureStore, generation: u64) -> [u8; 16] {
+        store.generation_collection(generation)
+    }
+
+    pub(crate) fn encode_coverage_for_test(set: &super::ClosureCoverageSet) -> Vec<u8> {
+        super::encode_coverage(set)
+    }
+
+    pub(crate) fn generation_exists(
+        store: &super::ClosureStore,
+        db: &super::Database,
+        generation: u64,
+        short_ids: &[u32],
+    ) -> Result<bool, super::StorageError> {
+        let txn = db.begin_transaction();
+        let mut ids: Vec<super::NodeId> =
+            short_ids.iter().map(|id| super::record_id(*id)).collect();
+        ids.push(super::coverage_id());
+        let (records, _) = txn.get_with_record_versions(
+            store.pool,
+            &store.generation_collection(generation),
+            &ids,
+        )?;
+        Ok(records.into_iter().any(|record| record.is_some()))
     }
 }

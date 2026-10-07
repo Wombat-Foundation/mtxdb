@@ -58,10 +58,10 @@ fn empty_pack_searches_empty_without_error() {
     let (_dir, store) = store("empty_pack");
     let index = SearchIndexes::open(&store, "ns");
     assert_eq!(index.len().expect("len"), None);
-    assert!(index
-        .search(&SearchQuery::default())
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index.search(&SearchQuery::default()).expect("search"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -174,10 +174,10 @@ fn non_ascii_body_is_searchable_verbatim() {
         vec!["$b"]
     );
     // ASCII-only folding: non-ASCII case variants are deliberately not folded.
-    assert!(index
-        .search(terms(&mut query, &["WÖRLD"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index.search(terms(&mut query, &["WÖRLD"])).expect("search"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -314,7 +314,7 @@ fn filters_compose_as_a_conjunction() {
     // alice only ever sent a message, so this conjunction is empty.
     query.sender = Some("@u:alice".to_owned());
     query.event_type = Some("m.room.member".to_owned());
-    assert!(index.search(&query).expect("search").is_empty());
+    assert_eq!(index.search(&query).expect("search"), Vec::<String>::new());
 }
 
 #[test]
@@ -345,9 +345,9 @@ fn time_range_bounds_are_inclusive() {
 
     // Inverted and disjoint ranges simply match nothing.
     query.time_range = Some((3_000, 1_000));
-    assert!(index.search(&query).expect("search").is_empty());
+    assert_eq!(index.search(&query).expect("search"), Vec::<String>::new());
     query.time_range = Some((9_000, 9_500));
-    assert!(index.search(&query).expect("search").is_empty());
+    assert_eq!(index.search(&query).expect("search"), Vec::<String>::new());
 }
 
 #[test]
@@ -474,10 +474,12 @@ fn documents_without_a_body_are_still_searchable_by_header() {
     assert_eq!(index.search(&query).expect("search"), vec!["$a"]);
 
     // No body means no text to match.
-    assert!(index
-        .search(terms(&mut query, &["anything"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index
+            .search(terms(&mut query, &["anything"]))
+            .expect("search"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -537,10 +539,10 @@ fn clear_drops_the_pack_without_touching_other_namespaces() {
     index.clear().expect("clear");
 
     let mut query = SearchQuery::default();
-    assert!(index
-        .search(terms(&mut query, &["gone"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index.search(terms(&mut query, &["gone"])).expect("search"),
+        Vec::<String>::new()
+    );
     assert_eq!(
         other.search(terms(&mut query, &["still"])).expect("search"),
         vec!["$b"]
@@ -568,10 +570,10 @@ fn namespaces_are_isolated() {
         a.search(terms(&mut query, &["alpha"])).expect("search"),
         vec!["$a"]
     );
-    assert!(b
-        .search(terms(&mut query, &["alpha"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        b.search(terms(&mut query, &["alpha"])).expect("search"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -764,10 +766,12 @@ fn redact_removes_body_text_but_keeps_the_event_findable() {
     );
 
     // The text no longer matches...
-    assert!(index
-        .search(terms(&mut query, &["secret"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index
+            .search(terms(&mut query, &["secret"]))
+            .expect("search"),
+        Vec::<String>::new()
+    );
     // ...but the event is still reachable by every header field.
     query.terms.clear();
     query.room_id = Some("!r:one".to_owned());
@@ -820,10 +824,12 @@ fn an_event_indexed_without_a_body_needs_no_redaction() {
     // Redacting an already-body-less record is a no-op that still reports true.
     assert!(index.redact("$a").expect("redact"));
     let mut query = SearchQuery::default();
-    assert!(index
-        .search(terms(&mut query, &["anything"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index
+            .search(terms(&mut query, &["anything"]))
+            .expect("search"),
+        Vec::<String>::new()
+    );
 }
 
 /// A re-ingest is the obvious way to defeat a takedown by accident: the importer
@@ -878,16 +884,19 @@ fn reingest_cannot_restore_a_redacted_body() {
         .expect("reindex edited");
 
     let mut query = SearchQuery::default();
-    assert!(index
-        .search(terms(&mut query, &["secret"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index
+            .search(terms(&mut query, &["secret"]))
+            .expect("search"),
+        Vec::<String>::new()
+    );
     // The edited timestamp was not applied either: suppression is total, not a
     // partial merge.
     query.terms.clear();
     query.time_range = Some((9_999, 9_999));
-    assert!(
-        index.search(&query).expect("search").is_empty(),
+    assert_eq!(
+        index.search(&query).expect("search"),
+        Vec::<String>::new(),
         "a suppressed re-ingest must not partially apply its fields"
     );
 
@@ -908,10 +917,12 @@ fn a_bodyless_event_is_still_reindexable_with_a_body() {
         .expect("index encrypted");
 
     let mut query = SearchQuery::default();
-    assert!(index
-        .search(terms(&mut query, &["decrypted"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index
+            .search(terms(&mut query, &["decrypted"]))
+            .expect("search"),
+        Vec::<String>::new()
+    );
 
     // The event is later decrypted and re-ingested. That must take effect,
     // because this event was never redacted.
@@ -1086,10 +1097,12 @@ fn remove_hides_the_event_from_every_query() {
 
     let mut query = SearchQuery::default();
     // Text...
-    assert!(index
-        .search(terms(&mut query, &["secret"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index
+            .search(terms(&mut query, &["secret"]))
+            .expect("search"),
+        Vec::<String>::new()
+    );
 
     // ...every header field...
     query.terms.clear();
@@ -1097,13 +1110,13 @@ fn remove_hides_the_event_from_every_query() {
     assert_eq!(index.search(&query).expect("search"), vec!["$b"]);
     query.room_id = None;
     query.sender = Some("@u:alice".to_owned());
-    assert!(index.search(&query).expect("search").is_empty());
+    assert_eq!(index.search(&query).expect("search"), Vec::<String>::new());
     query.sender = None;
     query.event_type = Some("m.room.message".to_owned());
     assert_eq!(index.search(&query).expect("search"), vec!["$b"]);
     query.event_type = None;
     query.time_range = Some((1_000, 1_000));
-    assert!(index.search(&query).expect("search").is_empty());
+    assert_eq!(index.search(&query).expect("search"), Vec::<String>::new());
 
     // ...and the unfiltered query, which is the one that would surface a blank
     // hit if the flag were not authoritative over the cleared fields.
@@ -1178,14 +1191,17 @@ fn reingest_cannot_resurrect_a_removed_event() {
         .expect("reindex");
 
     let mut query = SearchQuery::default();
-    assert!(index
-        .search(terms(&mut query, &["secret"]))
-        .expect("search")
-        .is_empty());
+    assert_eq!(
+        index
+            .search(terms(&mut query, &["secret"]))
+            .expect("search"),
+        Vec::<String>::new()
+    );
     query.terms.clear();
     query.time_range = Some((9_999, 9_999));
-    assert!(
-        index.search(&query).expect("search").is_empty(),
+    assert_eq!(
+        index.search(&query).expect("search"),
+        Vec::<String>::new(),
         "a suppressed re-ingest must not partially apply its fields"
     );
 
@@ -1235,8 +1251,9 @@ fn redact_does_not_downgrade_a_removal() {
         room_id: Some("!r:one".to_owned()),
         ..SearchQuery::default()
     };
-    assert!(
-        index.search(&query).expect("search").is_empty(),
+    assert_eq!(
+        index.search(&query).expect("search"),
+        Vec::<String>::new(),
         "the header must stay cleared"
     );
 

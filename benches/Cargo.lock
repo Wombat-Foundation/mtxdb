@@ -608,7 +608,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "parking_lot",
- "rezzy-recon 0.6.0-rc.1 (git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha)",
+ "rezzy-recon",
  "sha2",
  "zstd",
  "zstd-sys",
@@ -624,7 +624,7 @@ dependencies = [
  "fjall",
  "libmdbx",
  "mtxdb",
- "rezzy-recon 0.6.0-rc.1",
+ "rezzy-recon",
  "rusqlite",
 ]
 
@@ -766,15 +766,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-dependencies = [
- "base64 0.23.1",
- "sha2",
-]
-
-[[package]]
-name = "rezzy-recon"
-version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#d5171b5cf9d5a52b9c985850d9e32dc3f21394bb"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#c3946ba34c335714a08e036948d4295547f9d00f"
 dependencies = [
  "base64 0.23.1",
  "sha2",
@@ -1051,18 +1043,18 @@ checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.60"
+version = "0.8.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6400fc4bb7426f6faac3fb07566122bb18622e3022bd2c36426a92ed489b1dbe"
+checksum = "879fb705ce98c32e41ebdb970fbe1204f8492423b314c6ab0354c3e7b5542866"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.60"
+version = "0.8.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99c27cc7525bad4df59a45e073c45b2c2aa820efb588234cc23a547ec69a34db"
+checksum = "708882a28301d604fa039cc7727607a98d04c4b86dc76ec9cc683f805d709759"
 dependencies = [
  "proc-macro2",
  "quote",
