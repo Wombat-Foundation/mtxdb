@@ -1132,6 +1132,11 @@ impl ClosureStore {
         if counter.retired_through == head.previous {
             return Ok(0);
         }
+        if counter.retired_through > head.previous {
+            return Err(StorageError::Corrupt(
+                "closure generation retirement cursor".to_owned(),
+            ));
+        }
         let old_cursor = counter.retired_through;
         let mut removed = 0u64;
         let end = head.generation.saturating_sub(1);
