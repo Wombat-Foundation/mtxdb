@@ -2237,6 +2237,20 @@ fn recover_packfile_with(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::{PackId, PACK_ID_LEN};
+
+    /// Deterministic nonzero pack identity for fixtures, with `n` in the
+    /// leading bytes so filename prefixes remain stable.
+    pub(crate) fn pack_id_for(n: u64) -> PackId {
+        let mut bytes = [0u8; PACK_ID_LEN];
+        bytes[..8].copy_from_slice(&n.to_be_bytes());
+        bytes[PACK_ID_LEN - 1] = 0xA5;
+        PackId(bytes)
+    }
+}
+
+#[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "test_packfile.rs"]
 mod tests;

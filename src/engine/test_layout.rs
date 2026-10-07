@@ -170,23 +170,24 @@ fn concurrent_first_open_installs_one_complete_descriptor() {
 }
 
 #[test]
-fn descriptor_install_falls_back_to_rename_when_hard_links_are_unavailable() {
+fn descriptor_install_rejects_filesystems_without_no_replace_install() {
     let root = CleanupDir::new("hard_link_fallback");
     fs::create_dir_all(root.path()).unwrap();
     let temporary = root.path().join(".db.meta.create.test");
     let descriptor = root.path().join(DB_META_FILENAME);
     fs::write(&temporary, super::db_meta_bytes(0x1234_5678_9abc_def1)).unwrap();
 
-    super::DatabaseLayout::install_descriptor_temp(&temporary, &descriptor, |_, _| {
+    let error = super::DatabaseLayout::install_descriptor_temp(&temporary, &descriptor, |_, _| {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "hard links unavailable in test",
         ))
     })
-    .unwrap();
+    .unwrap_err();
 
-    assert!(super::parse_db_meta(&fs::read(&descriptor).unwrap()).is_some());
-    assert!(!temporary.exists());
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(!descriptor.exists());
+    assert!(temporary.exists());
 }
 
 #[test]

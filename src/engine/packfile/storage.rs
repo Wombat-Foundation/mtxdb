@@ -9952,7 +9952,7 @@ impl PackfileStorage {
                             // frame carries the same record token it would have
                             // had at its original materialization.
                             let metadata = FrameMetadata {
-                                last_write_lsn: Some(entry.lsn),
+                                last_write_lsn: Some(group.last_lsn),
                                 ..FrameMetadata::default()
                             };
                             let data = NodeData::new(bytes::Bytes::from(payload.clone()));

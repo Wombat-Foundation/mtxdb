@@ -642,13 +642,13 @@ fn a_record_whose_lengths_overrun_its_payload_is_rejected() {
 }
 
 /// Ordering must be by recency, not by event id. The fixture deliberately
-/// makes the two disagree: event ids ascend while timestamps descend, so a
+/// makes the two disagree: event ids ascend while timestamps ascend, so a
 /// result set ordered by id would come out exactly reversed.
 #[test]
 fn results_are_newest_first_not_event_id_order() {
     let (_dir, store) = store("recency");
     let index = SearchIndexes::open(&store, "ns");
-    for (id, ts) in [("$a", 300_u64), ("$b", 200), ("$c", 100)] {
+    for (id, ts) in [("$a", 100_u64), ("$b", 200), ("$c", 300)] {
         index
             .index(&doc(
                 id,
@@ -665,13 +665,13 @@ fn results_are_newest_first_not_event_id_order() {
     terms(&mut query, &["marker"]);
     assert_eq!(
         index.search(&query).expect("search"),
-        vec!["$a", "$b", "$c"],
+        vec!["$c", "$b", "$a"],
         "newest first, which is the reverse of event-id order for this fixture"
     );
 
     // A limit must keep the newest, not the lowest ids.
     query.limit = 2;
-    assert_eq!(index.search(&query).expect("search"), vec!["$a", "$b"]);
+    assert_eq!(index.search(&query).expect("search"), vec!["$c", "$b"]);
 
     // A limit larger than the hit count is not a truncation.
     query.limit = 99;

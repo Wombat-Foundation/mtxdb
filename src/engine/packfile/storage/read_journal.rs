@@ -644,15 +644,15 @@ impl ReadJournal {
                         } => {
                             self.puts.entry(*collection_id).or_default().insert(
                                 *node_id,
-                                (bytes::Bytes::copy_from_slice(payload), entry.lsn),
+                                (bytes::Bytes::copy_from_slice(payload), group.last_lsn),
                             );
                         }
                         JournalMutation::DeleteCollection { collection_id } => {
                             self.puts.remove(collection_id);
                             self.delete_lsn
                                 .entry(*collection_id)
-                                .and_modify(|lsn| *lsn = (*lsn).max(entry.lsn))
-                                .or_insert(entry.lsn);
+                                .and_modify(|lsn| *lsn = (*lsn).max(group.last_lsn))
+                                .or_insert(group.last_lsn);
                         }
                     }
                 }

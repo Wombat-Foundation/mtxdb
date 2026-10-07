@@ -399,7 +399,7 @@ pub fn try_derive_collection_id(
 ///
 /// # Panics
 /// Panics if `member_namespace` is `Some(ns)` and `ns` is not a registered member
-/// namespace (`EVNT`, `PREV`, `AUTH`, `STAT`, `INTL`).
+/// namespace (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`).
 /// Physical pool tags like `b"EDGE"` must **never** be passed here.
 /// For fallible callers handling untrusted or dynamic input, use [`try_derive_collection_id`].
 #[must_use]
@@ -408,7 +408,7 @@ pub fn derive_collection_id(
     collection_canonical_id: &[u8],
 ) -> [u8; 16] {
     try_derive_collection_id(member_namespace, collection_canonical_id)
-        .expect("member_namespace must be a valid registered namespace (EVNT, PREV, AUTH, STAT, INTL) or None")
+        .expect("member_namespace must be a valid registered namespace (EVNT, PREV, AUTH, STAT, STGP, FWD , INTL) or None")
 }
 
 /// The reserved node id under which a collection's metadata (genesis) record

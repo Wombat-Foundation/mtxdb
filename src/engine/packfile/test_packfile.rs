@@ -33,17 +33,7 @@ fn test_record_raw(hash: [u8; 16], data: &[u8]) -> Record {
 /// Deterministic [`PackId`] fixture: the integer's big-endian bytes in the
 /// first 8 of 32, so its hex display leads with the integer (matching the
 /// filenames used in these tests).
-fn test_pack_id(n: u64) -> PackId {
-    let mut bytes = [0u8; PACK_ID_LEN];
-    bytes[..8].copy_from_slice(&n.to_be_bytes());
-    // Keep the leading 8 bytes as `n` so the 16-hex filename prefix is
-    // stable, but stamp an explicit nonzero marker in the trailing byte so
-    // even `test_pack_id(0)` is a valid (non-reserved) identity rather than
-    // the all-zero sentinel. Tests that specifically need the zero sentinel
-    // construct `PackId([0; PACK_ID_LEN])` directly.
-    bytes[PACK_ID_LEN - 1] = 0xA5;
-    PackId(bytes)
-}
+use super::test_support::pack_id_for as test_pack_id;
 
 #[test]
 fn test_write_read_roundtrip() {

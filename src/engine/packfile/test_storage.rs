@@ -10388,6 +10388,10 @@ fn read_snapshot_reports_the_durable_group_token() {
         other_versions[0] > 0,
         "the second record's token must also be durable"
     );
+    assert_eq!(
+        versions[0], other_versions[0],
+        "records in one journal group must share a token"
+    );
     drop(snapshot);
 
     let (mut journal, _) = Journal::open(&wal).unwrap();

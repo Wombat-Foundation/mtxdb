@@ -1210,7 +1210,7 @@ impl ShortIdIndex {
         allocation: &mut Allocation,
         start: usize,
         families: &[FamilyEdges<'_>],
-        claimed: &mut HashMap<NodeId, Vec<Edge>>,
+        claimed: &mut HashMap<NodeId, (bool, Vec<Edge>)>,
     ) -> Result<Vec<Vec<Edge>>, StorageError> {
         let owner = allocation.ids[start];
         // Read every existing edge record of the owner in one call, before
@@ -1257,16 +1257,16 @@ impl ShortIdIndex {
             let record = edges_record_id(owner, family.family.id);
             if let Some(earlier) = claimed.get(&record) {
                 // Already staged by an earlier event of this batch.
-                if *earlier != list {
+                if earlier.0 != family.family.typed || earlier.1 != list {
                     return Err(StorageError::Collision(
-                        "short-id edge list differs from one already in this batch".to_owned(),
+                        "short-id edge family differs from one already in this batch".to_owned(),
                     ));
                 }
             } else if stored.is_none() {
                 allocation
                     .staged
                     .push((record, encode_edges(family.family, &list)?, token));
-                claimed.insert(record, list.clone());
+                claimed.insert(record, (family.family.typed, list.clone()));
             }
             lists.push(list);
         }
@@ -1297,7 +1297,7 @@ impl ShortIdIndex {
             }
         }
         let mut allocation = self.allocate(txn, keys, &owners)?;
-        let mut claimed: HashMap<NodeId, Vec<Edge>> = HashMap::new();
+        let mut claimed: HashMap<NodeId, (bool, Vec<Edge>)> = HashMap::new();
         let mut recorded = Vec::with_capacity(events.len());
         for (event, &start) in events.iter().zip(starts) {
             let edges =

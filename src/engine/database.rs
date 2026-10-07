@@ -314,8 +314,10 @@ impl DatabaseTransaction<'_> {
         // Keep this transaction's stage fixed until the live records and
         // version token have been sampled; otherwise a concurrent commit on
         // this handle could make staged values pair with a post-commit token.
-        let _lifecycle = self.lifecycle.lock();
-        let staged = self.stage.lookup_many(pool, collection_id, node_ids);
+        let staged = {
+            let _lifecycle = self.lifecycle.lock();
+            self.stage.lookup_many(pool, collection_id, node_ids)
+        };
         let mut results = Vec::with_capacity(node_ids.len());
         let mut live_slots = Vec::new();
         let mut live_ids = Vec::new();

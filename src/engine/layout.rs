@@ -471,8 +471,8 @@ impl DatabaseLayout {
 
     /// Install the synced first-create descriptor at `temporary` into `path`.
     ///
-    /// Uses `hard_link`, falling back to rename on `Unsupported` or
-    /// `PermissionDenied`. An existing destination or a concurrently removed
+    /// Uses `hard_link`; there is no portable no-replace rename fallback, so
+    /// `Unsupported` and `PermissionDenied` are returned. An existing destination or a concurrently removed
     /// temporary file is accepted only if the destination validates. Other
     /// installation and validation errors propagate. Parent sync and cleanup
     /// are best-effort.
@@ -503,30 +503,7 @@ impl DatabaseLayout {
                 if error.kind() == io::ErrorKind::Unsupported
                     || error.kind() == io::ErrorKind::PermissionDenied =>
             {
-                // Some filesystems do not support hard links (and some report
-                // that as `PermissionDenied`). The source is a fully synced
-                // sibling temp and first-create bytes are deterministic, so
-                // same-directory rename is an atomic install fallback. The seed
-                // is random, so never replace a descriptor another opener has
-                // already installed (checked above). Any other error is a real
-                // fault and is propagated below.
-                if path.exists() {
-                    return Self::validate_existing_descriptor(path);
-                }
-                match fs::rename(temporary, path) {
-                    Ok(()) => {
-                        Self::sync_descriptor_parent(path)?;
-                        Self::sweep_descriptor_temps(path, "create");
-                        Ok(())
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        Self::validate_existing_descriptor(path)
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        Self::validate_existing_descriptor(path)
-                    }
-                    Err(error) => Err(error),
-                }
+                Err(error)
             }
             Err(error) => Err(error),
         }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::packfile::test_support::pack_id_for;
 
 fn test_dir(name: &str) -> PathBuf {
     use std::sync::atomic::AtomicU64;
@@ -22,20 +23,6 @@ fn test_record(collection: u8, hash_byte: u8, data: &[u8]) -> Record {
         data: bytes::Bytes::copy_from_slice(data),
         metadata: None,
     }
-}
-
-/// A deterministic [`packfile::PackId`] for fixtures: the value `n` in the
-/// leading 8 bytes, so its 16-hex filename prefix is a stable function of
-/// `n` and ordering by full bytes matches ordering by `n`.
-fn pack_id_for(n: u64) -> packfile::PackId {
-    let mut bytes = [0u8; packfile::PACK_ID_LEN];
-    bytes[..8].copy_from_slice(&n.to_be_bytes());
-    // Stamp an explicit nonzero marker in the trailing byte so even
-    // `n == 0` yields a valid identity (the all-zero address is reserved).
-    // The leading 8 bytes still encode `n`, so the 16-hex filename prefix
-    // is unchanged.
-    bytes[packfile::PACK_ID_LEN - 1] = 0xA5;
-    packfile::PackId(bytes)
 }
 
 #[test]

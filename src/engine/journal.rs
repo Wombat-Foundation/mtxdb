@@ -1739,6 +1739,9 @@ pub struct JournalCoordinator {
     reclaim_trigger_len: AtomicU64,
     /// Set while a reclaim over the trigger cannot shrink the segment.
     reclaim_stall: Mutex<Option<ReclaimStall>>,
+    /// Set when an active replay lease, rather than pool coverage, holds the
+    /// reclaim boundary back. Kept separate from pool-stall remediation.
+    replay_lease_stall: Mutex<Option<ReclaimStall>>,
     /// Advances whenever any pool's reported coverage does.
     coverage_epoch: AtomicU64,
     /// Times a reclaim over the trigger has been found unable to shrink the
@@ -2000,6 +2003,7 @@ impl JournalCoordinator {
             committed_lsn: AtomicU64::new(committed_lsn),
             reclaim_trigger_len: AtomicU64::new(RECLAIM_TRIGGER_LEN),
             reclaim_stall: Mutex::new(None),
+            replay_lease_stall: Mutex::new(None),
             coverage_epoch: AtomicU64::new(0),
             reclaim_stalls: AtomicU64::new(0),
             blocker_remediation: Mutex::new(None),
@@ -2362,7 +2366,9 @@ impl JournalCoordinator {
                         self.bump_publish_signal();
                     }
                     let reclaimed = reclaimed.map(Some);
-                    if !lease_limited {
+                    if lease_limited {
+                        self.record_replay_lease_outcome(&journal);
+                    } else {
                         // A cut held back only by an active replay lease is not a
                         // pool-coverage stall. Recording one would drive forced
                         // checkpoints and warning logs for as long as a rebuild
@@ -2370,6 +2376,7 @@ impl JournalCoordinator {
                         // is dropped records the real outcome.
                         let coverage = self.coverage.lock();
                         self.record_reclaim_outcome(&journal, &coverage.covered);
+                        *self.replay_lease_stall.lock() = None;
                     }
                     return reclaimed;
                 }
@@ -2470,6 +2477,30 @@ impl JournalCoordinator {
                 journal.segment_cap,
                 self.reclaim_trigger_len(),
                 journal.blocking_pools(covered)
+            );
+        }
+    }
+
+    fn record_replay_lease_outcome(&self, journal: &Journal) {
+        let len = journal.file_len;
+        if len <= self.reclaim_trigger_len() {
+            *self.replay_lease_stall.lock() = None;
+            return;
+        }
+        let emergency = len >= self.emergency_len();
+        let mut stall = self.replay_lease_stall.lock();
+        let previous = *stall;
+        let grace_from = previous.map_or(len, |old| old.grace_from);
+        *stall = Some(ReclaimStall {
+            at_len: len,
+            coverage_epoch: self.coverage_epoch.load(Ordering::Acquire),
+            grace_from,
+            reported: previous.is_some_and(|old| old.reported) || emergency,
+        });
+        if emergency && !previous.is_some_and(|old| old.reported) {
+            eprintln!(
+                "warning: shared WAL reclaim is held by an active replay lease at {len} of {} bytes",
+                journal.segment_cap
             );
         }
     }
@@ -3300,9 +3331,9 @@ impl JournalCoordinator {
         }
         for expectation in record_expectations {
             // A missing entry is a record whose version predates this process
-            // or was never seeded; both read as legacy version 0. The read
-            // path seeds cold records from their frame metadata before staging
-            // the expectation, so a missing entry here means 0.
+            // or was never seeded. Use the pool/collection baseline for that
+            // case; the read path seeds cold records from frame metadata before
+            // staging the expectation.
             let actual = self.absent_record_version(
                 expectation.pool,
                 &expectation.collection_id,
@@ -3562,6 +3593,10 @@ impl JournalCoordinator {
     /// Whether a stalled reclaim (if there is one) still lets `pool`'s sync
     /// force a checkpoint at segment length `len`.
     fn stall_permits_forcing(&self, len: u64, pool: Option<ShardType>) -> bool {
+        if let Some(stall) = *self.replay_lease_stall.lock() {
+            return self.coverage_epoch.load(Ordering::Acquire) != stall.coverage_epoch
+                || len >= stall.at_len.saturating_add(self.reclaim_retry_growth());
+        }
         let Some(stall) = *self.reclaim_stall.lock() else {
             return true;
         };
