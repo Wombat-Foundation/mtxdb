@@ -170,7 +170,9 @@ impl Manifest {
             return Err(corrupt());
         }
         let runs = list
-            .chunks_exact(RUN_META_LEN)
+            .as_chunks::<RUN_META_LEN>()
+            .0
+            .iter()
             .map(|c| {
                 Ok(RunMeta {
                     version: read_u32(&c[..4], "manifest")?,
@@ -216,7 +218,9 @@ fn decode_chunk(bytes: &[u8]) -> Result<Vec<Entry>, StorageError> {
         ));
     }
     entries
-        .chunks_exact(OWNER_PAYLOAD_LEN)
+        .as_chunks::<OWNER_PAYLOAD_LEN>()
+        .0
+        .iter()
         .map(|entry| decode_entry("run chunk", entry))
         .collect()
 }
@@ -244,7 +248,9 @@ fn decode_gc(bytes: &[u8]) -> Result<Vec<([u8; 16], u64)>, StorageError> {
     if count.checked_mul(24) != Some(list.len()) {
         return Err(corrupt());
     }
-    list.chunks_exact(24)
+    list.as_chunks::<24>()
+        .0
+        .iter()
         .map(|c| {
             Ok((
                 <[u8; 16]>::try_from(&c[..16]).map_err(|_| corrupt())?,

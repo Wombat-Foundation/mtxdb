@@ -200,7 +200,7 @@ impl PackId {
         }
         let byte_len = digits.len() / 2;
         let mut bytes = vec![0u8; byte_len];
-        for (index, chunk) in digits.as_bytes().chunks_exact(2).enumerate() {
+        for (index, chunk) in digits.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let hi = hex_value(chunk[0])?;
             let lo = hex_value(chunk[1])?;
             bytes[index] = (hi << 4) | lo;
@@ -223,7 +223,7 @@ impl PackId {
             return None;
         }
         let mut bytes = [0u8; PACK_ID_LEN];
-        for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        for (index, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let hi = hex_value(chunk[0])?;
             let lo = hex_value(chunk[1])?;
             bytes[index] = (hi << 4) | lo;

@@ -1329,7 +1329,9 @@ pub fn read_persisted_shard_collections(
     let fingerprint = u64::from_le_bytes(buf[5..13].try_into().ok()?);
     let persisted_at = u64::from_le_bytes(buf[13..21].try_into().ok()?);
     let records = body
-        .chunks_exact(SHARD_ROOMS_RECORD_LEN)
+        .as_chunks::<SHARD_ROOMS_RECORD_LEN>()
+        .0
+        .iter()
         .map(|chunk| {
             // The record is fixed-width, so destructure by const offsets
             // rather than accumulating them: `SR_PACK_ID`(16) +
@@ -4612,7 +4614,9 @@ impl PackfileStorage {
         }
         let bytes = fs::read(&path).map_err(StorageError::Io)?;
         let set: HashSet<[u8; 16]> = bytes
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|chunk| {
                 let mut id = [0u8; 16];
                 id.copy_from_slice(chunk);
@@ -4629,7 +4633,9 @@ impl PackfileStorage {
             return HashSet::new();
         };
         bytes
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|chunk| {
                 let mut id = [0u8; 16];
                 id.copy_from_slice(chunk);

@@ -25,7 +25,7 @@ fn index() -> ShortIdIndex {
 fn hash(i: u32) -> ElementHash {
     let mut digest = [0_u8; 32];
     let mut x = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    for chunk in digest.chunks_exact_mut(8) {
+    for chunk in digest.as_chunks_mut::<8>().0 {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;

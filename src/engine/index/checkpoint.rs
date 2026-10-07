@@ -217,8 +217,10 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
     let slots = blob.get(8..slots_end).unwrap_or(&[]);
     u32::try_from(
         slots
-            .chunks_exact(8)
-            .filter(|slot| *slot != [0u8; 8])
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .filter(|slot| **slot != [0u8; 8])
             .count(),
     )
     .unwrap_or(u32::MAX)

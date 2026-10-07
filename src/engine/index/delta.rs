@@ -1042,7 +1042,7 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
             // index state.
             break;
         }
-        for frame_bytes in frames_bytes.chunks_exact(DELTA_FRAME_LEN) {
+        for frame_bytes in frames_bytes.as_chunks::<DELTA_FRAME_LEN>().0 {
             frames.push(DeltaFrame::decode(frame_bytes)?);
         }
         tail_fingerprint = Some(batch_tail_fingerprint);
