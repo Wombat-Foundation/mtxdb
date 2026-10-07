@@ -3515,10 +3515,9 @@ fn a_miss_after_a_sync_does_not_refresh_the_collection() {
         db.pool(ShardType::Edges).sync_all().unwrap();
         // A first-time key: absent, as every new event's forward record is.
         let missing = db
-            .begin_transaction()
-            .get_with_record_versions(ShardType::Edges, &collection, &[node(100 + round)])
-            .unwrap()
-            .0;
+            .pool(ShardType::Edges)
+            .get_many_with_refresh(&collection, &[node(100 + round)])
+            .unwrap();
         assert!(missing[0].is_none());
     }
     let stats = db.pool(ShardType::Edges).stats();
