@@ -8544,6 +8544,7 @@ impl PackfileStorage {
     ) -> Result<(), StorageError> {
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
+        let _read_journal_guard = self.read_journal.lock();
         self.put_internal_locked(collection_id, id, data, metadata)
     }
 
@@ -8696,6 +8697,7 @@ impl PackfileStorage {
     ) -> Result<usize, StorageError> {
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
+        let _read_journal_guard = self.read_journal.lock();
         let written = self.put_many_internal_locked(collection_id, entries, metadatas)?;
         if written > 0 {
             self.put_many_calls.fetch_add(1, Ordering::Relaxed);
