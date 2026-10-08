@@ -8541,25 +8541,29 @@ fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
     }
 }
 
-/// Resolve a pack selector to its shard pool type, physical file path, and
-/// address. Refuses to resolve if the selector is ambiguous across multiple
-/// pools unless `-t` narrows the search.
+/// Find the actual directory entry for a pack address.
 fn find_pack_path(dir: &Path, pack_id: PackId) -> anyhow::Result<PathBuf> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if path.extension().is_none_or(|ext| ext != "pack") {
             continue;
         }
-        let file = fs::File::open(&path)?;
-        if mtxdb::packfile::read_header(&mut BufReader::new(file))?
-            .is_some_and(|header| header.pack_id == pack_id)
-        {
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        let Ok(header) = mtxdb::packfile::read_header(&mut BufReader::new(file)) else {
+            continue;
+        };
+        if header.is_some_and(|header| header.pack_id == pack_id) {
             return Ok(path);
         }
     }
-    bail!("pack {pack_id} disappeared from {}", dir.display())
+    bail!("pack {pack_id} not found in {}", dir.display())
 }
 
+/// Resolve a pack selector to its shard pool type, physical file path, and
+/// address. Refuses to resolve if the selector is ambiguous across multiple
+/// pools unless `-t` narrows the search.
 fn resolve_pack_file(
     cli: &Cli,
     selector: &PackSelector,

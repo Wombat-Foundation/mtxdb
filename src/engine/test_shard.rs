@@ -1372,6 +1372,19 @@ fn a_standalone_writer_creates_an_absent_rooted_pool_directory() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[test]
+fn a_standalone_rooted_writer_uses_the_database_writer_lock() {
+    let root = test_dir("rooted_standalone_writer_lock");
+    let layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
+    let _root_lock = crate::journal::SharedWalLock::acquire(&root).unwrap();
+    let pool = layout.pool_path(crate::layout::ShardType::State);
+
+    let Err(error) = ShardPool::open(pool) else {
+        panic!("root writer lock must exclude pool writers")
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+}
+
 /// Pack addresses are random, so the pack with the highest address is not the
 /// newest. Reopen must keep writing to the most recent pack that has room, not
 /// to whichever pack sorts last.

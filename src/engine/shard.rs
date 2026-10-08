@@ -965,24 +965,24 @@ impl ShardPool {
             ));
         }
         // PackId is random and must not decide which duplicate record wins
-        // during a rebuild. The immutable header timestamp reflects pack
-        // creation order; the filesystem change time disambiguates packs
-        // created in the same header timestamp second. Address is only the
-        // final deterministic tie-breaker for copied/legacy packs.
-        pack_files.sort_unstable_by_key(|(address, path)| {
-            let created = File::open(path)
-                .and_then(|file| {
-                    let mut reader = BufReader::new(file);
-                    packfile::read_header(&mut reader)
-                })
-                .ok()
-                .flatten()
-                .map_or(0, |header| header.created_at);
-            let modified = fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            (created, modified, *address)
-        });
+        // during a rebuild. Read the immutable header and filesystem stamp
+        // once per pack, fail rather than silently swallowing metadata errors, then sort the cached
+        // keys. The immutable header timestamp is the primary order; address
+        // is only a deterministic fallback when timestamps are equal.
+        let mut ordered = Vec::with_capacity(pack_files.len());
+        for (address, path) in pack_files {
+            let file = File::open(&path)?;
+            let mut reader = BufReader::new(file);
+            let header = packfile::read_header(&mut reader)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("pack {} has no header", path.display()),
+                )
+            })?;
+            ordered.push(((header.created_at, address), (address, path)));
+        }
+        ordered.sort_by_cached_key(|(key, _)| *key);
+        pack_files = ordered.into_iter().map(|(_, pack)| pack).collect();
         Ok(pack_files)
     }
 
@@ -1251,8 +1251,8 @@ impl ShardPool {
         let open_started = Instant::now();
         // A member of a shared database creates its directory with its first
         // pack; an absent rooted pool is simply empty, for readers too.
-        let rooted_pool = crate::layout::enclosing_pool_seed(&base_dir)?.is_some();
-        let rooted_member = !take_writer_lock || rooted_pool;
+        let rooted_pool = crate::layout::enclosing_root(&base_dir)?;
+        let rooted_member = !take_writer_lock || rooted_pool.is_some();
         // A writer that takes its own lock needs the directory for the lock file,
         // so it creates it, even for a pool inside a root. Only a member opened
         // under the root's lock defers creation to its first pack.
@@ -1271,10 +1271,7 @@ impl ShardPool {
         let writer_lock_started = Instant::now();
         let writer_lock = (writable && take_writer_lock)
             .then(|| {
-                if rooted_pool {
-                    let root = base_dir.parent().and_then(Path::parent).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "invalid rooted pool path")
-                    })?;
+                if let Some(root) = rooted_pool.as_deref() {
                     Self::acquire_lock_path(&root.join(".mtxdb.wal.lock"))
                 } else {
                     Self::acquire_writer_lock(&base_dir)

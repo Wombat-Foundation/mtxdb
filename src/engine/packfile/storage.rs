@@ -8585,28 +8585,6 @@ impl PackfileStorage {
         cache: Arc<NodeCache>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
-        // All fallible work is complete. Only now make the batch visible to
-        // the shared index, delta state, and shard bookkeeping.
-        if progress.invalidate_delta {
-            self.invalidate_delta_log(collection_id);
-        } else {
-            for (id, slot, offset, record_len) in progress.pending_deltas.drain(..) {
-                self.record_redo(
-                    collection_id,
-                    progress.generation,
-                    &id,
-                    slot,
-                    offset,
-                    record_len,
-                );
-            }
-        }
-        self.record_put_many_shard_collections(
-            collection_id,
-            &progress.pending_shard_collection_counts,
-            &progress.pending_shard_collections,
-        );
-
         // Apply cache mutations only after all disk writes succeed, so a
         // failed batch does not leak partial state into the shared cache.
         // Resolve and insert one entry at a time: retaining a prepared clone
@@ -8635,6 +8613,28 @@ impl PackfileStorage {
             // in-place success path.
             self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         }
+
+        // All fallible work is complete. Only now make the batch visible to
+        // the shared index, delta state, and shard bookkeeping.
+        if progress.invalidate_delta {
+            self.invalidate_delta_log(collection_id);
+        } else {
+            for (id, slot, offset, record_len) in progress.pending_deltas.drain(..) {
+                self.record_redo(
+                    collection_id,
+                    progress.generation,
+                    &id,
+                    slot,
+                    offset,
+                    record_len,
+                );
+            }
+        }
+        self.record_put_many_shard_collections(
+            collection_id,
+            &progress.pending_shard_collection_counts,
+            &progress.pending_shard_collections,
+        );
 
         for lsn in progress.pending_materialized.drain(..) {
             self.note_published_materialized(lsn);
