@@ -8104,9 +8104,14 @@ fn packfile_storage_create_or_upsert_established_validated_contract() {
         COLLECTION_METADATA_RECORD_ID,
         NodeData::new(valid_meta.encode().into()),
     )];
-    sim_store
-        .put_many_internal_locked(&target_col_id, &seed, None)
-        .unwrap();
+    {
+        // The locked entry point requires the caller to hold the put mutex.
+        let put_mutex = sim_store.put_mutex(&target_col_id);
+        let _guard = put_mutex.lock();
+        sim_store
+            .put_many_internal_locked(&target_col_id, &seed, None)
+            .unwrap();
+    }
 
     let err = sim_store
         .create_or_upsert_established_validated(
