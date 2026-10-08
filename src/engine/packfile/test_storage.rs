@@ -2584,6 +2584,52 @@ fn test_concurrent_put_survives_checkpoint_rewrites() {
 /// issued after the rewrite has entered that window returns in a small
 /// fraction of it. A proper wall-clock benchmark of this same property
 /// lives in `benches/storage.rs` (`cargo bench`), where it belongs.
+/// `put_many` publishes the new generation before recording its redo state;
+/// that is safe only because a checkpoint holds every collection put mutex
+/// while it captures index and delta state. Race batches against checkpoints
+/// and require every record to survive a reopen.
+#[test]
+fn test_put_many_racing_checkpoints_survives_reopen() {
+    const BATCHES: usize = 40;
+    const PER_BATCH: usize = 64;
+    let dir = test_dir("put_many_racing_checkpoints");
+    let store = std::sync::Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+    let entry = |batch: usize, i: usize| {
+        let mut id = [0u8; 16];
+        let mixed = ((batch * PER_BATCH + i) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        id[..8].copy_from_slice(&mixed.to_be_bytes());
+        id[8..12].copy_from_slice(&u32::try_from(batch * PER_BATCH + i).unwrap().to_be_bytes());
+        (id, NodeData::new(bytes::Bytes::from_static(b"payload")))
+    };
+
+    let writer = {
+        let store = std::sync::Arc::clone(&store);
+        std::thread::spawn(move || {
+            for batch in 0..BATCHES {
+                let entries: Vec<_> = (0..PER_BATCH).map(|i| entry(batch, i)).collect();
+                store.put_many(&TEST_COLLECTION, &entries).unwrap();
+            }
+        })
+    };
+    while !writer.is_finished() {
+        store.sync_all().unwrap();
+    }
+    writer.join().unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let reopened = PackfileStorage::open(dir).unwrap();
+    for batch in 0..BATCHES {
+        for i in 0..PER_BATCH {
+            let (id, _) = entry(batch, i);
+            assert!(
+                reopened.get(&TEST_COLLECTION, &id).unwrap().is_some(),
+                "batch {batch} record {i} lost across checkpoint race"
+            );
+        }
+    }
+}
+
 #[test]
 fn test_put_does_not_block_on_slow_checkpoint_rewrite() {
     use std::sync::atomic::AtomicBool;

@@ -8585,6 +8585,10 @@ impl PackfileStorage {
         cache: &Arc<NodeCache>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
+        debug_assert!(
+            self.put_mutex(collection_id).is_locked(),
+            "put_many publication requires the collection put mutex"
+        );
         if progress.structural_change {
             let index = progress
                 .owned_index
