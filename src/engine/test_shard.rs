@@ -1278,6 +1278,50 @@ fn test_pack_creation_sequence_survives_reopen() {
     assert_eq!(sequences, [1, 2, 3]);
 }
 
+#[test]
+fn test_scan_orders_legacy_packs_before_sequenced_packs() {
+    let dir = test_dir("scan_legacy_before_sequenced");
+    let make_pack = |pack_id: packfile::PackId, created_at: u64, creation_seq: u32| {
+        let mut buf = Vec::new();
+        packfile::write_header_with_created_at(&mut buf, &pack_id, created_at, creation_seq)
+            .unwrap();
+        std::fs::write(dir.join(pack_id.filename()), buf).unwrap();
+    };
+
+    let sequenced = pack_id_for(3);
+    let legacy = pack_id_for(5);
+    // The legacy pack has the later timestamp but must still sort first.
+    make_pack(sequenced, 1, 1);
+    make_pack(legacy, 9, 0);
+
+    let pool = ShardPool::open(dir).unwrap();
+    assert_eq!(pool.get_shard(0).unwrap().pack_id, legacy);
+    assert_eq!(pool.get_shard(1).unwrap().pack_id, sequenced);
+}
+
+#[test]
+fn test_open_rejects_a_truncated_pack_without_header() {
+    let dir = test_dir("scan_headerless_pack");
+    std::fs::write(dir.join(pack_id_for(7).filename()), b"").unwrap();
+    assert!(ShardPool::open(dir).is_err());
+}
+
+#[test]
+fn two_rooted_pools_open_in_one_process_without_self_blocking() {
+    let root = test_dir("rooted_two_pools_one_process");
+    let layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
+    let state = ShardPool::open(layout.pool_path(crate::layout::ShardType::State));
+    // The first standalone writer owns the root lock; a second one must fail
+    // fast rather than block forever on the same file.
+    let second = ShardPool::open(layout.pool_path(crate::layout::ShardType::Edges));
+    assert!(state.is_ok());
+    assert_eq!(
+        second.err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::WouldBlock)
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Regression: `MAX_SHARD_BYTES` must stay within the offset field that
 /// `IndexEntry` stores as `offset + 1`, so the maximum valid offset must
 /// never reach the empty-slot sentinel boundary.

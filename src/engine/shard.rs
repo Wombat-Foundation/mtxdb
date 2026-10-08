@@ -952,6 +952,21 @@ impl ShardPool {
         Ok(pack_files)
     }
 
+    /// Creation-order sort key. Sequenced headers order by their persisted
+    /// pool-local sequence; legacy headers (sequence zero) sort before every
+    /// sequenced pack, by timestamp. The address is only the final
+    /// deterministic tie-breaker.
+    fn pack_order_key(
+        header: &packfile::ShardHeader,
+        address: packfile::PackId,
+    ) -> (bool, u32, u64, packfile::PackId) {
+        if header.creation_seq == 0 {
+            (false, 0, header.created_at, address)
+        } else {
+            (true, header.creation_seq, 0, address)
+        }
+    }
+
     /// Discover and sort pack files in `base_dir`, enforcing the
     /// `MAX_SHARDS` capacity bound. Returns the next pool-local creation
     /// sequence along with the sorted paths so opening a pool does not reread
@@ -979,12 +994,7 @@ impl ShardPool {
         let mut next_creation_seq = 1;
         for (address, path, header) in pack_files {
             next_creation_seq = next_creation_seq.max(header.creation_seq.saturating_add(1));
-            let key = if header.creation_seq == 0 {
-                (false, 0, header.created_at, address)
-            } else {
-                (true, header.creation_seq, 0, address)
-            };
-            ordered.push((key, (address, path)));
+            ordered.push((Self::pack_order_key(&header, address), (address, path)));
         }
         ordered.sort_by_cached_key(|(key, _)| *key);
         Ok((
@@ -1055,7 +1065,8 @@ impl ShardPool {
     /// Pack addresses are random, so the slot order is meaningful only because
     /// discovery assigns slots in creation order. Prefer the newest pack that
     /// still has room; if every pack is full, take the newest anyway and let
-    /// the first write rotate.
+    /// the first write rotate. Called only at open, where slots were just
+    /// assigned in creation order.
     fn choose_active_slot(
         shards: &[Option<Arc<Shard>>],
         max_shard_bytes: u64,
@@ -1276,7 +1287,7 @@ impl ShardPool {
         let writer_lock = (writable && take_writer_lock)
             .then(|| {
                 if let Some(root) = rooted_pool.as_deref() {
-                    Self::acquire_lock_path(&root.join(".mtxdb.wal.lock"))
+                    Self::acquire_lock_path(&root.join(crate::layout::WAL_LOCK_FILENAME))
                 } else {
                     Self::acquire_writer_lock(&base_dir)
                 }
@@ -1555,13 +1566,8 @@ impl ShardPool {
         let existing: std::collections::HashSet<packfile::PackId> =
             shards.iter().flatten().map(|s| s.pack_id).collect();
         let mut sorted_files = pack_files;
-        sorted_files.sort_unstable_by_key(|(address, _, header)| {
-            if header.creation_seq == 0 {
-                (false, 0, header.created_at, *address)
-            } else {
-                (true, header.creation_seq, 0, *address)
-            }
-        });
+        sorted_files
+            .sort_unstable_by_key(|(address, _, header)| Self::pack_order_key(header, *address));
         let discovered_next_seq = sorted_files
             .iter()
             .map(|(_, _, header)| header.creation_seq.saturating_add(1).max(1))

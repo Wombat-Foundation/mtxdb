@@ -60,6 +60,10 @@ fn db_meta_pool_list() -> Vec<u8> {
 /// File name of the database-root descriptor.
 pub const DB_META_FILENAME: &str = "db.meta";
 
+/// Database-root shared-WAL lock file, held by the WAL owner and by any pool
+/// writer opened inside the root.
+pub const WAL_LOCK_FILENAME: &str = ".mtxdb.wal.lock";
+
 /// `magic + version + seed + version_len` header length.
 const DB_META_FIXED_LEN: usize = 4 + 1 + DB_META_SEED_LEN + 1;
 

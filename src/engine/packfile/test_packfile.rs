@@ -517,6 +517,23 @@ fn test_creation_sequence_header_roundtrip() {
 }
 
 #[test]
+fn extract_inherits_the_source_ordering_key() {
+    let dir = std::env::temp_dir().join(format!("mtxdb_extract_key_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (src, dst) = (dir.join("src.pack"), dir.join("dst.pack"));
+    let mut buf = Vec::new();
+    write_header_with_created_at(&mut buf, &test_pack_id(1), 77, 5).unwrap();
+    std::fs::write(&src, buf).unwrap();
+
+    extract_packfile_collection(&src, &dst, &[1u8; 16], &test_pack_id(2)).unwrap();
+    let header = read_header(&mut std::fs::File::open(&dst).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!((header.created_at, header.creation_seq), (77, 5));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn zero_pack_id_is_rejected_by_hex_parse() {
     // The all-zero address is reserved and never a valid identity.
     assert!(PackId::from_hex(&"0".repeat(PACK_ID_LEN * 2)).is_none());

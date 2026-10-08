@@ -4771,7 +4771,7 @@ fn metadata_magic(bytes: &[u8]) -> String {
 }
 
 fn meta_locks(root: &Path, report: &mut MetaReport) {
-    let wal_lock = root.join(".mtxdb.wal.lock");
+    let wal_lock = root.join(mtxdb::layout::WAL_LOCK_FILENAME);
     if wal_lock.exists() {
         meta_lock_line(&wal_lock, report);
     }

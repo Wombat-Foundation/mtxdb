@@ -5712,7 +5712,7 @@ impl SharedWalLock {
                 ),
             ));
         }
-        let path = db_root.join(".mtxdb.wal.lock");
+        let path = db_root.join(crate::layout::WAL_LOCK_FILENAME);
         Ok(Self {
             _lock: crate::shard::ShardPool::acquire_lock_path(&path)?,
         })

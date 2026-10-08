@@ -2119,12 +2119,18 @@ pub fn extract_packfile_collection(
 
     let dst_file = File::create(dest_path)?;
     let mut writer = BufWriter::new(dst_file);
-    // Keep extracted packs in the sequenced format. A pack extracted from a
-    // legacy source starts at sequence one; extracting from a sequenced pack
-    // places the copy after its source when it is later opened in the same
-    // pool. Pool-local collisions remain deterministic via the pack address.
-    let creation_seq = source_header.creation_seq.saturating_add(1).max(1);
-    write_header_with_creation_seq(&mut writer, dest_pack_id, creation_seq)?;
+    // The extract is a subset copy of the source, so it inherits the source's
+    // ordering key (creation time and pool-local sequence) rather than
+    // claiming a new position. Allocating `source_seq + 1` would collide with
+    // the pack the pool created right after the source and let the random
+    // address decide ties. Equal keys against the source itself are harmless:
+    // the copied records are identical.
+    write_header_with_created_at(
+        &mut writer,
+        dest_pack_id,
+        source_header.created_at,
+        source_header.creation_seq,
+    )?;
 
     let mut stats = PackExtractStats {
         frames_extracted: 0,
