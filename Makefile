@@ -37,6 +37,13 @@ check: ##H Cargo check (core) and code dupe
 	$(CARGO) check  --workspace --all-targets --all-features
 	jscpd $$(git ls-files '*.rs')
 
+
+.PHONY: macro
+macro: ##H See macro expansion costs
+	set -o pipefail; \
+	$(CARGO) +nightly rustc -- -Zmacro-stats 2>&1 | awk -f scripts/macro_totals.awk
+
+
 .PHONY: lint
 lint: ##H Run clippy lints across the workspace crates
 	$(CARGO) clippy  --workspace --all-targets --all-features -- $(if $(CI),-D warnings)
