@@ -964,7 +964,25 @@ impl ShardPool {
                 ),
             ));
         }
-        pack_files.sort_unstable_by_key(|(address, _)| *address);
+        // PackId is random and must not decide which duplicate record wins
+        // during a rebuild. The immutable header timestamp reflects pack
+        // creation order; the filesystem change time disambiguates packs
+        // created in the same header timestamp second. Address is only the
+        // final deterministic tie-breaker for copied/legacy packs.
+        pack_files.sort_unstable_by_key(|(address, path)| {
+            let created = File::open(path)
+                .and_then(|file| {
+                    let mut reader = BufReader::new(file);
+                    packfile::read_header(&mut reader)
+                })
+                .ok()
+                .flatten()
+                .map_or(0, |header| header.created_at);
+            let modified = fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (created, modified, *address)
+        });
         Ok(pack_files)
     }
 
@@ -1233,8 +1251,8 @@ impl ShardPool {
         let open_started = Instant::now();
         // A member of a shared database creates its directory with its first
         // pack; an absent rooted pool is simply empty, for readers too.
-        let rooted_member =
-            !take_writer_lock || crate::layout::enclosing_pool_seed(&base_dir)?.is_some();
+        let rooted_pool = crate::layout::enclosing_pool_seed(&base_dir)?.is_some();
+        let rooted_member = !take_writer_lock || rooted_pool;
         // A writer that takes its own lock needs the directory for the lock file,
         // so it creates it, even for a pool inside a root. Only a member opened
         // under the root's lock defers creation to its first pack.
@@ -1252,7 +1270,16 @@ impl ShardPool {
 
         let writer_lock_started = Instant::now();
         let writer_lock = (writable && take_writer_lock)
-            .then(|| Self::acquire_writer_lock(&base_dir))
+            .then(|| {
+                if rooted_pool {
+                    let root = base_dir.parent().and_then(Path::parent).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid rooted pool path")
+                    })?;
+                    Self::acquire_lock_path(&root.join(".mtxdb.wal.lock"))
+                } else {
+                    Self::acquire_writer_lock(&base_dir)
+                }
+            })
             .transpose()?;
         let writer_lock_time = writer_lock_started.elapsed();
 

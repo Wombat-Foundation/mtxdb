@@ -411,7 +411,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-type CacheKey = ([u8; 16], u32, u64);
+type CacheKey = (std::path::PathBuf, usize, [u8; 16], u32, u64);
 
 /// A small LRU of merged bases, keyed by scope and manifest version, so a new
 /// snapshot costs a tail read and not a merge.
@@ -443,9 +443,9 @@ impl PopulationCache {
         self.len() == 0
     }
 
-    fn get(&self, key: CacheKey) -> Option<Arc<PopulationBase>> {
+    fn get(&self, key: &CacheKey) -> Option<Arc<PopulationBase>> {
         let mut entries = self.entries.lock();
-        let position = entries.iter().position(|(k, _)| *k == key)?;
+        let position = entries.iter().position(|(k, _)| k == key)?;
         let entry = entries.remove(position)?;
         let base = Arc::clone(&entry.1);
         entries.push_front(entry);
@@ -657,8 +657,14 @@ impl ShortIdIndex {
                 .last()
                 .map_or(0, |run| run.token)
         };
-        let key = (self.collection_id, version, generation);
-        let cached = cache.and_then(|cache| cache.get(key));
+        let key = (
+            db.layout().root().to_path_buf(),
+            self.pool.index(),
+            self.collection_id,
+            version,
+            generation,
+        );
+        let cached = cache.and_then(|cache| cache.get(&key));
         let base = if let Some(base) = cached {
             base
         } else {
@@ -1085,9 +1091,17 @@ impl ShortIdIndex {
         let Some(record) = record else {
             return Ok(GcReport::default());
         };
+        // A stale compactor can queue a run address that a competing
+        // compactor has since published. Never delete a collection currently
+        // named by the live manifest, even if its stale GC entry is due.
+        let counters = self.read_counters(&txn)?.0;
+        let manifest = self.read_manifest(&txn, counters.manifest_version)?;
+        let mut live = std::collections::HashSet::new();
+        live.insert(self.owner_log_collection(counters.log_epoch));
+        live.extend(manifest.runs.iter().map(|run| self.run_collection(run)));
         let (due, pending): (Vec<_>, Vec<_>) = decode_gc(&record.bytes)?
             .into_iter()
-            .partition(|(_, deadline)| *deadline <= now_ms);
+            .partition(|(collection, deadline)| *deadline <= now_ms && !live.contains(collection));
         if due.is_empty() {
             return Ok(GcReport {
                 pending: pending.len(),

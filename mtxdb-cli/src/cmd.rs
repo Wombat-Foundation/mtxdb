@@ -3925,7 +3925,7 @@ type ShardStatsMap = std::collections::HashMap<PackId, (u64, u64, u64)>;
 /// snapshot's persisted-at timestamp.
 fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     const STATS_MAGIC: &[u8; 4] = b"MSTA";
-    const STATS_VERSION: u8 = 5;
+    const STATS_VERSION: u8 = 6;
     const STATS_HEADER_LEN: usize = 4 + 1 + 8;
     const STATS_RECORD_LEN: usize = mtxdb::packfile::PACK_ID_LEN + 8 * 3;
 
@@ -4477,7 +4477,8 @@ fn cmd_info_coalesced(
                     db_dir.display(),
                     shard_type.as_str()
                 );
-                print_pack_info(dir, *pack_id, shard_entries, *shard_type);
+                let path = find_pack_path(dir, *pack_id)?;
+                print_pack_info(dir, &path, *pack_id, shard_entries, *shard_type);
             }
             if matches.len() > 1 {
                 println!();
@@ -5501,6 +5502,7 @@ fn print_pack_lifetime(path: &Path) {
 )]
 fn print_pack_info(
     dir: &Path,
+    path: &Path,
     pack_id: PackId,
     shard_entries: &[(PackId, u64, u8)],
     shard_type: ShardType,
@@ -5535,7 +5537,6 @@ fn print_pack_info(
     println!();
     println!("type: {}", shard_type.as_str());
     println!("pack: {pack_id}");
-    let path = dir.join(pack_id.filename());
     println!("path: {}", path.display());
 
     print_pack_lifetime(&path);
@@ -5661,7 +5662,8 @@ fn cmd_info_pack(
                 println!();
             }
             print_section_header(shard_type);
-            print_pack_info(&dir, pack_id, &shard_entries, shard_type);
+            let path = find_pack_path(&dir, pack_id)?;
+            print_pack_info(&dir, &path, pack_id, &shard_entries, shard_type);
             matched_any = true;
         }
         if !matched_any {
@@ -5685,7 +5687,8 @@ fn cmd_info_pack(
         eprintln!("pack {selector}: not found");
         return Ok(());
     }
-    print_pack_info(&dir, pack_id, &shard_entries, shard_type);
+    let path = find_pack_path(&dir, pack_id)?;
+    print_pack_info(&dir, &path, pack_id, &shard_entries, shard_type);
     Ok(())
 }
 
@@ -8541,6 +8544,22 @@ fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
 /// Resolve a pack selector to its shard pool type, physical file path, and
 /// address. Refuses to resolve if the selector is ambiguous across multiple
 /// pools unless `-t` narrows the search.
+fn find_pack_path(dir: &Path, pack_id: PackId) -> anyhow::Result<PathBuf> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "pack") {
+            continue;
+        }
+        let file = fs::File::open(&path)?;
+        if mtxdb::packfile::read_header(&mut BufReader::new(file))?
+            .is_some_and(|header| header.pack_id == pack_id)
+        {
+            return Ok(path);
+        }
+    }
+    bail!("pack {pack_id} disappeared from {}", dir.display())
+}
+
 fn resolve_pack_file(
     cli: &Cli,
     selector: &PackSelector,
@@ -8557,7 +8576,7 @@ fn resolve_pack_file(
         };
         for (pack_id, _, _) in packs {
             if selector.matches(&pack_id) {
-                matches.push((shard_type, dir.join(pack_id.filename()), pack_id));
+                matches.push((shard_type, find_pack_path(&dir, pack_id)?, pack_id));
             }
         }
     }
@@ -9287,25 +9306,29 @@ fn repair_import_state_groups(
     eprintln!(
         "  state groups: {source} {unique_state_group_count} state groups across {mapped_event_count} events, {stateless_event_count} events unmapped ({unresolved_count} unresolved)"
     );
-    if !loaded && !state_groups.is_empty() {
-        // State-group derivation is a function of each event's ancestry, not
-        // batch composition, so concurrent imports writing the same keys have
-        // a benign last-writer win.
+    let mut materialized = computed_instances.is_empty();
+    if !computed_instances.is_empty() {
+        match materialize_state_hamts(state_store, canonical_id, &computed_instances) {
+            Ok(written) => {
+                materialized = true;
+                eprintln!(
+                    "  state HAMT: {written} records materialized for {} state groups",
+                    computed_instances.len()
+                );
+            }
+            Err(error) => eprintln!("warning: unable to persist state HAMT: {error}"),
+        }
+    }
+    if materialized && !loaded && !state_groups.is_empty() {
+        // Publish mappings only after their target HAMTs are durable. A later
+        // replay must not mistake a partially materialized repair for a
+        // complete cached result.
         let entries: Vec<(&[u8], &[u8])> = state_groups
             .iter()
             .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
             .collect();
         if let Err(error) = aux.put_many(&entries) {
             eprintln!("warning: unable to persist state groups: {error}");
-        }
-    }
-    if !computed_instances.is_empty() {
-        match materialize_state_hamts(state_store, canonical_id, &computed_instances) {
-            Ok(written) => eprintln!(
-                "  state HAMT: {written} records materialized for {} state groups",
-                computed_instances.len()
-            ),
-            Err(error) => eprintln!("warning: unable to persist state HAMT: {error}"),
         }
     }
 }

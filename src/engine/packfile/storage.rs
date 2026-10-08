@@ -1423,6 +1423,7 @@ struct PutManyProgress {
     pending_shard_collection_counts: Vec<PackId>,
     invalidate_delta: bool,
     undo_log: Vec<EntryUndo>,
+    pending_materialized: Vec<Option<u64>>,
 }
 
 /// A snapshot-consistent, lazily-read scan over one collection's live records.
@@ -4240,7 +4241,18 @@ impl PackfileStorage {
         for collection_id in &collection_ids {
             // Own the generation `Arc` so it stays pinned while the pack walk
             // runs after every collection put lock has been released.
-            let generation = self.generation(collection_id).map(|guard| (*guard).clone());
+            let generation = self.generation(collection_id).map(|guard| {
+                let generation = Arc::clone(&*guard);
+                if generation.index.is_mmap_backed() {
+                    generation
+                } else {
+                    Arc::new(RoomGeneration {
+                        index: generation.index.clone(),
+                        cache: Arc::clone(&generation.cache),
+                        generation: generation.generation,
+                    })
+                }
+            });
             let shards = self.shards.all_shards();
             let scanners = if generation.is_some() {
                 Self::open_collection_scan_shards(&shards)?
@@ -8289,7 +8301,7 @@ impl PackfileStorage {
             metadata,
         };
         let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
-        self.note_published_materialized(receipt_lsn);
+        progress.pending_materialized.push(receipt_lsn);
         if let Some(shard) = self.shards.get_shard(slot) {
             progress
                 .pending_shard_collections
@@ -8384,7 +8396,7 @@ impl PackfileStorage {
         id: &NodeId,
         data: &NodeData,
         metadata: Option<FrameMetadata>,
-    ) -> Result<(u16, u64, u64), StorageError> {
+    ) -> Result<(u16, u64, u64, Option<u64>), StorageError> {
         // Publish the group before writing its frame so the frame can carry the
         // group's LSN as its record version. This mirrors the transaction path:
         // the group is durable and visible from the WAL (and replayed on
@@ -8404,8 +8416,7 @@ impl PackfileStorage {
             metadata,
         };
         let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
-        self.note_published_materialized(receipt_lsn);
-        Ok((slot, offset, disk_bytes))
+        Ok((slot, offset, disk_bytes, receipt_lsn))
     }
 
     /// Merge a group's LSN into a frame's metadata as its `last_write_lsn`.
@@ -8520,6 +8531,7 @@ impl PackfileStorage {
             pending_shard_collection_counts: Vec::with_capacity(entries_len),
             invalidate_delta: false,
             undo_log: Vec::new(),
+            pending_materialized: Vec::with_capacity(entries_len),
         }
     }
 
@@ -8539,6 +8551,95 @@ impl PackfileStorage {
             })?;
         }
         Ok(true)
+    }
+
+    fn append_put_many_entries(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+        metadatas: Option<&[Option<FrameMetadata>]>,
+        old_gen: Option<&RoomGeneration>,
+        progress: &mut PutManyProgress,
+    ) -> Result<(), StorageError> {
+        for (index, (id, data)) in entries.iter().enumerate() {
+            let metadata = metadatas.and_then(|m| m.get(index)).cloned().flatten();
+            self.append_put_many_entry(collection_id, id, data, metadata, old_gen, progress)?;
+        }
+
+        if progress.index_needs_rebuild {
+            let rebuilt = self.rebuild_index(collection_id)?;
+            // rebuild_index automatically discovers all the records we just appended
+            self.replace_collection_shard_counts(
+                collection_id,
+                &self.slot_counts_to_pack_id_counts(&rebuilt.slot_counts()),
+            );
+            progress.owned_index = Some(rebuilt);
+        }
+        Ok(())
+    }
+
+    fn publish_put_many_state(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+        cache: Arc<NodeCache>,
+        progress: &mut PutManyProgress,
+    ) -> Result<(), StorageError> {
+        // All fallible work is complete. Only now make the batch visible to
+        // the shared index, delta state, and shard bookkeeping.
+        if progress.invalidate_delta {
+            self.invalidate_delta_log(collection_id);
+        } else {
+            for (id, slot, offset, record_len) in progress.pending_deltas.drain(..) {
+                self.record_redo(
+                    collection_id,
+                    progress.generation,
+                    &id,
+                    slot,
+                    offset,
+                    record_len,
+                );
+            }
+        }
+        self.record_put_many_shard_collections(
+            collection_id,
+            &progress.pending_shard_collection_counts,
+            &progress.pending_shard_collections,
+        );
+
+        // Apply cache mutations only after all disk writes succeed, so a
+        // failed batch does not leak partial state into the shared cache.
+        // Resolve and insert one entry at a time: retaining a prepared clone
+        // of the entire batch here would defeat the cache's size bound.
+        for (id, data) in entries {
+            let mut data_to_cache = data.clone();
+            for child in &mut data_to_cache.children {
+                if let NodeRef::Lazy(child_id) = child {
+                    if let Some(child_data) = self.pinned.get(child_id) {
+                        *child = NodeRef::Resolved(*child_id, child_data);
+                    }
+                }
+            }
+            cache.insert(*id, Arc::new(data_to_cache));
+        }
+
+        if progress.structural_change {
+            let index = progress
+                .owned_index
+                .take()
+                .expect("structural_change is only set once owned_index is materialized");
+            self.store_generation(collection_id, index, Some(cache), false)?;
+        } else {
+            // Every record landed on the live, already-published index in
+            // place -- no new generation to publish, matching `put`'s
+            // in-place success path.
+            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        }
+
+        for lsn in progress.pending_materialized.drain(..) {
+            self.note_published_materialized(lsn);
+        }
+        Ok(())
     }
 
     fn put_internal(
@@ -8576,7 +8677,7 @@ impl PackfileStorage {
             None
         };
 
-        let (slot, offset, disk_bytes) =
+        let (slot, offset, disk_bytes, receipt_lsn) =
             self.append_put_record(collection_id, id, data, metadata)?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
@@ -8601,6 +8702,7 @@ impl PackfileStorage {
                     }
                     gen.cache.insert(*id, Arc::new(data_to_cache));
                     self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+                    self.note_published_materialized(receipt_lsn);
                     return Ok(());
                 }
             }
@@ -8691,6 +8793,7 @@ impl PackfileStorage {
         };
 
         self.store_generation(collection_id, index, Some(cache), false)?;
+        self.note_published_materialized(receipt_lsn);
 
         Ok(())
     }
@@ -8772,83 +8875,19 @@ impl PackfileStorage {
             }};
         }
 
-        for (index, (id, data)) in entries.iter().enumerate() {
-            let metadata = metadatas.and_then(|m| m.get(index)).cloned().flatten();
-            if let Err(error) = self.append_put_many_entry(
-                collection_id,
-                id,
-                data,
-                metadata,
-                old_gen.as_deref().map(|generation| &**generation),
-                &mut progress,
-            ) {
-                rollback_and_fail!(error);
-            }
-        }
-
-        if progress.index_needs_rebuild {
-            let rebuilt = match self.rebuild_index(collection_id) {
-                Ok(index) => index,
-                Err(error) => rollback_and_fail!(error),
-            };
-            // rebuild_index automatically discovers all the records we just appended
-            self.replace_collection_shard_counts(
-                collection_id,
-                &self.slot_counts_to_pack_id_counts(&rebuilt.slot_counts()),
-            );
-            progress.owned_index = Some(rebuilt);
-        }
-
-        // All fallible work is complete. Only now make the batch visible to
-        // the shared index, delta state, and shard bookkeeping.
-        if progress.invalidate_delta {
-            self.invalidate_delta_log(collection_id);
-        } else {
-            for (id, slot, offset, record_len) in progress.pending_deltas {
-                self.record_redo(
-                    collection_id,
-                    progress.generation,
-                    &id,
-                    slot,
-                    offset,
-                    record_len,
-                );
-            }
-        }
-        self.record_put_many_shard_collections(
+        if let Err(error) = self.append_put_many_entries(
             collection_id,
-            &progress.pending_shard_collection_counts,
-            &progress.pending_shard_collections,
-        );
-
-        // Apply cache mutations only after all disk writes succeed, so a
-        // failed batch does not leak partial state into the shared cache.
-        // Resolve and insert one entry at a time: retaining a prepared clone
-        // of the entire batch here would defeat the cache's size bound.
-        for (id, data) in entries {
-            let mut data_to_cache = data.clone();
-            for child in &mut data_to_cache.children {
-                if let NodeRef::Lazy(child_id) = child {
-                    if let Some(child_data) = self.pinned.get(child_id) {
-                        *child = NodeRef::Resolved(*child_id, child_data);
-                    }
-                }
-            }
-            cache.insert(*id, Arc::new(data_to_cache));
+            entries,
+            metadatas,
+            old_gen.as_deref().map(|generation| &**generation),
+            &mut progress,
+        ) {
+            rollback_and_fail!(error);
         }
-
-        if progress.structural_change {
-            let index = progress
-                .owned_index
-                .expect("structural_change is only set once owned_index is materialized");
-            if let Err(error) = self.store_generation(collection_id, index, Some(cache), false) {
-                rollback_and_fail!(error);
-            }
-        } else {
-            // Every record landed on the live, already-published index in
-            // place -- no new generation to publish, matching `put`'s
-            // in-place success path.
-            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        if let Err(error) =
+            self.publish_put_many_state(collection_id, entries, cache, &mut progress)
+        {
+            rollback_and_fail!(error);
         }
 
         Ok(entries.len())
