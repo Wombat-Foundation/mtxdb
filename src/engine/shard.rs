@@ -5,7 +5,7 @@ use std::io::{self, BufReader, Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -587,6 +587,8 @@ pub struct ShardPool {
     active_write: parking_lot::Mutex<u16>,
     /// Serializes shard rotation (finding/creating the next shard).
     rotation_lock: parking_lot::Mutex<()>,
+    /// Next pool-local sequence assigned to a newly created pack.
+    next_creation_seq: AtomicU32,
     base_dir: PathBuf,
     /// Per-pool rotation threshold, in bytes. Defaults to `MAX_SHARD_BYTES`
     /// but may be set lower (e.g. by a benchmark that wants many small
@@ -967,11 +969,8 @@ impl ShardPool {
         // PackId is random and must not decide which duplicate record wins
         // during a rebuild. Read the immutable header once per pack, fail
         // rather than silently swallowing metadata errors, then sort the
-        // cached keys. The immutable header timestamp is the primary order;
-        // address is only a deterministic fallback when timestamps are equal.
-        // Header timestamps have one-second precision, so packs created in
-        // the same second remain inherently ambiguous until the header format
-        // gains a persisted creation sequence.
+        // cached keys. New headers use their persisted creation sequence;
+        // legacy headers fall back to timestamp/address ordering.
         let mut ordered = Vec::with_capacity(pack_files.len());
         for (address, path) in pack_files {
             let file = File::open(&path)?;
@@ -982,7 +981,12 @@ impl ShardPool {
                     format!("pack {} has no header", path.display()),
                 )
             })?;
-            ordered.push(((header.created_at, address), (address, path)));
+            let key = if header.creation_seq == 0 {
+                (false, 0, header.created_at, address)
+            } else {
+                (true, header.creation_seq, 0, address)
+            };
+            ordered.push((key, (address, path)));
         }
         ordered.sort_by_cached_key(|(key, _)| *key);
         pack_files = ordered.into_iter().map(|(_, pack)| pack).collect();
@@ -1163,6 +1167,7 @@ impl ShardPool {
         stats_persisted_at: Option<u64>,
         mut timings: ShardOpenTimings,
         writer_lock: Option<WriterLock>,
+        next_creation_seq: u32,
     ) -> Self {
         let metadata_subphases_sum = timings
             .pool_meta_restore
@@ -1184,6 +1189,7 @@ impl ShardPool {
             shards: RwLock::new(shards),
             active_write: parking_lot::Mutex::new(highest_active),
             rotation_lock: parking_lot::Mutex::new(()),
+            next_creation_seq: AtomicU32::new(next_creation_seq),
             base_dir,
             max_shard_bytes,
             bucket_seed,
@@ -1290,6 +1296,19 @@ impl ShardPool {
         let pack_files = Self::discover_pack_files_sorted(&base_dir)?;
         let discovery_time = discovery_started.elapsed();
 
+        let next_creation_seq = pack_files
+            .iter()
+            .map(|(_, path)| {
+                let file = File::open(path)?;
+                let mut reader = BufReader::new(file);
+                Ok(packfile::read_header(&mut reader)?
+                    .map_or(1, |header| header.creation_seq.saturating_add(1).max(1)))
+            })
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(1);
+
         let (recovery_time, recovery_calls, packfile_open_time, packfile_open_calls) =
             Self::recover_and_open_packs(writable, pack_files, &mut shards, &mut next_slot)?;
 
@@ -1343,6 +1362,7 @@ impl ShardPool {
                 ..Default::default()
             },
             writer_lock,
+            next_creation_seq,
         ))
     }
 
@@ -1824,12 +1844,18 @@ impl ShardPool {
     fn create_packfile_atomically(
         base_dir: &Path,
         siblings: &[packfile::PackId],
+        creation_seq: u32,
     ) -> io::Result<(File, PathBuf, packfile::PackId)> {
         let pack_id = packfile::PackId::random();
         let path = Self::pack_path(base_dir, &pack_id, siblings);
         let unique = PACK_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("tmp.{}.{unique}", std::process::id()));
-        let file = match packfile::open_packfile(&tmp_path, true, &pack_id) {
+        let file = match packfile::open_packfile_with_creation_seq(
+            &tmp_path,
+            true,
+            &pack_id,
+            creation_seq,
+        ) {
             Ok(file) => file,
             Err(error) => {
                 let _ = fs::remove_file(&tmp_path);
@@ -1841,6 +1867,14 @@ impl ShardPool {
             return Err(error);
         }
         Ok((file, path, pack_id))
+    }
+
+    fn next_creation_seq(&self) -> io::Result<u32> {
+        self.next_creation_seq
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current != u32::MAX).then_some(current.saturating_add(1))
+            })
+            .map_err(|_| io::Error::other("pack creation sequence exhausted"))
     }
 
     /// Get a reference to a shard by ID.
@@ -1941,7 +1975,9 @@ impl ShardPool {
         }
         let slot = *self.active_write.lock();
         create_dir_all_durable(&self.base_dir)?;
-        let (file, path, pack_id) = Self::create_packfile_atomically(&self.base_dir, &[])?;
+        let creation_seq = self.next_creation_seq()?;
+        let (file, path, pack_id) =
+            Self::create_packfile_atomically(&self.base_dir, &[], creation_seq)?;
         let file_len = file.metadata()?.len();
         let shard = Arc::new(Shard::new(slot, pack_id, file, path, file_len));
         sync_directory(&self.base_dir)?;
@@ -2755,8 +2791,9 @@ impl ShardPool {
             if shards[candidate as usize].is_none() {
                 let sibling_ids: Vec<packfile::PackId> =
                     shards.iter().flatten().map(|s| s.pack_id).collect();
+                let creation_seq = self.next_creation_seq()?;
                 let (file, path, pack_id) =
-                    Self::create_packfile_atomically(&self.base_dir, &sibling_ids)?;
+                    Self::create_packfile_atomically(&self.base_dir, &sibling_ids, creation_seq)?;
                 let file_len = file.metadata()?.len();
                 shards[candidate as usize] = Some(Arc::new(Shard::new(
                     candidate, pack_id, file, path, file_len,

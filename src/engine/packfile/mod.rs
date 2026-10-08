@@ -315,6 +315,8 @@ pub struct ShardHeader {
     pub pack_id: PackId,
     /// Unix-seconds creation timestamp (telemetry only; never identity).
     pub created_at: u64,
+    /// Monotonic creation sequence within a pool; zero means a legacy header.
+    pub creation_seq: u32,
 }
 
 /// Per-frame flag: `data` is zstd-compressed on disk; decompress to
@@ -1463,6 +1465,19 @@ fn read_record_metadata_skip_payload_with_end(
 /// Never in practice: the only internal conversion (`HEADER_LEN` as
 /// `u32`) is a compile-time constant well within range.
 pub fn write_header(writer: &mut impl Write, pack_id: &PackId) -> io::Result<()> {
+    write_header_with_creation_seq(writer, pack_id, 0)
+}
+
+/// Write a pack header with a pool-local monotonic creation sequence.
+///
+/// # Errors
+/// Returns `io::Error` if the pack ID is reserved or the header cannot be
+/// written.
+pub fn write_header_with_creation_seq(
+    writer: &mut impl Write,
+    pack_id: &PackId,
+    creation_seq: u32,
+) -> io::Result<()> {
     if pack_id.is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1474,6 +1489,35 @@ pub fn write_header(writer: &mut impl Write, pack_id: &PackId) -> io::Result<()>
         .map_err(io::Error::other)?
         .as_secs();
 
+    write_header_with_created_at(writer, pack_id, created_at, creation_seq)
+}
+
+/// Write a pack header using an explicit creation time and sequence.
+///
+/// This is kept separate from [`write_header_with_creation_seq`] so tests and
+/// recovery tools can construct headers without reaching into the encoded
+/// layout. Callers creating new packs should use the system-time wrapper.
+///
+/// # Errors
+/// Returns `io::Error` if the pack ID is reserved or the header cannot be
+/// written.
+///
+/// # Panics
+/// Never in practice: the internal conversion of `HEADER_LEN` to `u32` is a
+/// compile-time constant within range.
+pub fn write_header_with_created_at(
+    writer: &mut impl Write,
+    pack_id: &PackId,
+    created_at: u64,
+    creation_seq: u32,
+) -> io::Result<()> {
+    if pack_id.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to write the reserved all-zero pack id to a header",
+        ));
+    }
+
     let mut buf = [0u8; HEADER_LEN];
     buf[0..4].copy_from_slice(&MAGIC);
     buf[4] = VERSION;
@@ -1484,8 +1528,7 @@ pub fn write_header(writer: &mut impl Write, pack_id: &PackId) -> io::Result<()>
     cursor = cursor.saturating_add(PACK_ID_LEN);
     buf[cursor..cursor.saturating_add(8)].copy_from_slice(&created_at.to_le_bytes());
     cursor = cursor.saturating_add(8);
-    // feature_flags (u32) follows; stays zero — reserved for future use.
-    let _ = cursor;
+    buf[cursor..cursor.saturating_add(4)].copy_from_slice(&creation_seq.to_le_bytes());
 
     let crc = crc32fast::hash(&buf[..CRC_COVERED_LEN]);
     buf[CRC_COVERED_LEN..CRC_COVERED_LEN.wrapping_add(4)].copy_from_slice(&crc.to_le_bytes());
@@ -1640,9 +1683,14 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     cursor = cursor.saturating_add(PACK_ID_LEN);
     let created_at = u64::from_le_bytes(buf[cursor..cursor.saturating_add(8)].try_into().unwrap());
 
+    cursor = cursor.saturating_add(8);
+    let creation_seq =
+        u32::from_le_bytes(buf[cursor..cursor.saturating_add(4)].try_into().unwrap());
+
     Ok(Some(ShardHeader {
         pack_id,
         created_at,
+        creation_seq,
     }))
 }
 
@@ -1661,6 +1709,19 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
 /// unsupported header version, or `InvalidData` for an invalid header or an
 /// identity mismatch.
 pub fn open_packfile(path: &Path, create: bool, pack_id: &PackId) -> io::Result<File> {
+    open_packfile_with_creation_seq(path, create, pack_id, 0)
+}
+
+/// Open or create a packfile, assigning `creation_seq` when creating it.
+///
+/// # Errors
+/// Returns the same errors as [`open_packfile`].
+pub fn open_packfile_with_creation_seq(
+    path: &Path,
+    create: bool,
+    pack_id: &PackId,
+    creation_seq: u32,
+) -> io::Result<File> {
     if create {
         let mut options = OpenOptions::new();
         options.read(true).create(true);
@@ -1675,7 +1736,7 @@ pub fn open_packfile(path: &Path, create: bool, pack_id: &PackId) -> io::Result<
         let mut file = options.open(path)?;
 
         if file.metadata()?.len() == 0 {
-            write_header(&mut file, pack_id)?;
+            write_header_with_creation_seq(&mut file, pack_id, creation_seq)?;
             file.sync_all()?;
         } else {
             let mut reader = BufReader::new(&file);

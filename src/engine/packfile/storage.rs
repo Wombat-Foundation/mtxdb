@@ -8616,7 +8616,13 @@ impl PackfileStorage {
         }
 
         // All fallible work is complete. Only now make the batch visible to
-        // the shared index, delta state, and shard bookkeeping.
+        // the shared index, delta state, and shard bookkeeping. The caller
+        // holds this collection's put mutex for the entire operation, and a
+        // checkpoint takes every collection put mutex before it captures its
+        // index and delta state. Consequently a checkpoint cannot observe the
+        // generation publication below without also waiting for these redo
+        // updates; keeping the redo writes after the fallible publication
+        // avoids leaving redo state behind when publication fails.
         if progress.invalidate_delta {
             self.invalidate_delta_log(collection_id);
         } else {

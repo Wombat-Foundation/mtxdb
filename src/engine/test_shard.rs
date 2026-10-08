@@ -1215,10 +1215,7 @@ fn test_scan_orders_packs_by_header_creation_time() {
 
     let make_pack = |pack_id: packfile::PackId, created_at: u64| {
         let mut buf = Vec::new();
-        packfile::write_header(&mut buf, &pack_id).unwrap();
-        buf[25..33].copy_from_slice(&created_at.to_le_bytes());
-        let crc = crc32fast::hash(&buf[..37]);
-        buf[37..41].copy_from_slice(&crc.to_le_bytes());
+        packfile::write_header_with_created_at(&mut buf, &pack_id, created_at, 0).unwrap();
         std::fs::write(dir.join(pack_id.filename()), buf).unwrap();
     };
 
@@ -1230,6 +1227,28 @@ fn test_scan_orders_packs_by_header_creation_time() {
     let pool = ShardPool::open(dir).unwrap();
     assert_eq!(pool.get_shard(0).unwrap().pack_id, older);
     assert_eq!(pool.get_shard(1).unwrap().pack_id, newer);
+}
+
+/// Persisted creation sequences resolve same-second rotations without falling
+/// back to the random pack address.
+#[test]
+fn test_scan_orders_same_timestamp_by_creation_sequence() {
+    let dir = test_dir("scan_pack_creation_sequence");
+
+    let make_pack = |pack_id: packfile::PackId, creation_seq: u32| {
+        let mut buf = Vec::new();
+        packfile::write_header_with_created_at(&mut buf, &pack_id, 1, creation_seq).unwrap();
+        std::fs::write(dir.join(pack_id.filename()), buf).unwrap();
+    };
+
+    let newer_address = pack_id_for(3);
+    let older_address = pack_id_for(5);
+    make_pack(newer_address, 2);
+    make_pack(older_address, 1);
+
+    let pool = ShardPool::open(dir).unwrap();
+    assert_eq!(pool.get_shard(0).unwrap().pack_id, older_address);
+    assert_eq!(pool.get_shard(1).unwrap().pack_id, newer_address);
 }
 
 /// Regression: `MAX_SHARD_BYTES` must stay within the offset field that
