@@ -965,10 +965,13 @@ impl ShardPool {
             ));
         }
         // PackId is random and must not decide which duplicate record wins
-        // during a rebuild. Read the immutable header and filesystem stamp
-        // once per pack, fail rather than silently swallowing metadata errors, then sort the cached
-        // keys. The immutable header timestamp is the primary order; address
-        // is only a deterministic fallback when timestamps are equal.
+        // during a rebuild. Read the immutable header once per pack, fail
+        // rather than silently swallowing metadata errors, then sort the
+        // cached keys. The immutable header timestamp is the primary order;
+        // address is only a deterministic fallback when timestamps are equal.
+        // Header timestamps have one-second precision, so packs created in
+        // the same second remain inherently ambiguous until the header format
+        // gains a persisted creation sequence.
         let mut ordered = Vec::with_capacity(pack_files.len());
         for (address, path) in pack_files {
             let file = File::open(&path)?;

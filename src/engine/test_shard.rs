@@ -1152,7 +1152,8 @@ fn test_shard_stats_track_write_sync() {
 }
 
 /// The startup scan correctly parses the `pack_<16hex>.pack` filename
-/// format and assigns shards to sequential slots in address order.
+/// format and uses address order as the deterministic fallback when synthetic
+/// test headers share the same one-second creation timestamp.
 #[test]
 fn test_scan_parses_pack_id_filename_format() {
     let dir = test_dir("scan_pack_id_format");
@@ -1188,7 +1189,7 @@ fn test_scan_parses_pack_id_filename_format() {
 
     let pool = ShardPool::open(dir).unwrap();
 
-    // Files are assigned to slots in address order (0, 3, 5).
+    // Equal-timestamp files are assigned to slots in address order (0, 3, 5).
     let s0 = pool.get_shard(0).unwrap();
     assert_eq!(s0.pack_id, zero, "pack_0000000000000000.pack → id 0");
     assert_eq!(s0.slot, 0);
