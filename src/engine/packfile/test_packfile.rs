@@ -505,6 +505,18 @@ fn test_header_roundtrip() {
 }
 
 #[test]
+fn test_creation_sequence_header_roundtrip() {
+    let mut buf = Vec::new();
+    write_header_with_created_at(&mut buf, &test_pack_id(42), 123, 17).unwrap();
+
+    let header = read_header(&mut Cursor::new(&buf))
+        .unwrap()
+        .expect("valid sequenced header");
+    assert_eq!(header.created_at, 123);
+    assert_eq!(header.creation_seq, 17);
+}
+
+#[test]
 fn zero_pack_id_is_rejected_by_hex_parse() {
     // The all-zero address is reserved and never a valid identity.
     assert!(PackId::from_hex(&"0".repeat(PACK_ID_LEN * 2)).is_none());

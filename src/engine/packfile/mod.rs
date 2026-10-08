@@ -300,8 +300,8 @@ const CRC_COVERED_LEN: usize = 4 // magic
     + 1 // version
     + 4 // header_len (u32)
     + PACK_ID_LEN // pack_id
-    + 8 // created_at (u64, unix seconds)
-    + 4; // feature_flags (u32, reserved)
+    + 8 // created_at (u64, unix seconds; legacy ordering fallback)
+    + 4; // creation_seq (u32, zero for legacy headers)
 
 /// A shard's immutable descriptor, parsed from its reserved header.
 ///
@@ -309,11 +309,16 @@ const CRC_COVERED_LEN: usize = 4 // magic
 /// lets a reader detect a shard file that's been copied or renamed
 /// inconsistently — the two should always agree (by prefix), and a mismatch
 /// means something outside mtxdb moved this file.
+///
+/// The format version remains compatible with older readers: they ignore the
+/// former reserved field and therefore retain timestamp/address ordering.
+/// Current readers authenticate and use that field as `creation_seq`; a zero
+/// value identifies a legacy header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardHeader {
     /// The pack's globally unique, immutable identity.
     pub pack_id: PackId,
-    /// Unix-seconds creation timestamp (telemetry only; never identity).
+    /// Unix-seconds creation timestamp, used to order legacy headers.
     pub created_at: u64,
     /// Monotonic creation sequence within a pool; zero means a legacy header.
     pub creation_seq: u32,
@@ -1455,6 +1460,10 @@ fn read_record_metadata_skip_payload_with_end(
 /// of the above — zero-padded to fill `HEADER_LEN`. Written once, at
 /// creation, and never mutated again (see [`VERSION`]'s doc for why).
 ///
+/// This compatibility form writes no pool-local creation sequence. New pool
+/// creation must use [`write_header_with_creation_seq`]; a zero sequence makes
+/// the reader use the timestamp fallback.
+///
 /// # Errors
 /// Returns `io::Error` on write failure, if the system clock is before the
 /// Unix epoch (treated as a hard error rather than silently recording a wrong
@@ -1694,7 +1703,8 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     }))
 }
 
-/// Open or create a packfile, writing the header if it's new.
+/// Open or create a legacy packfile, writing a zero-sequence header if new.
+/// Pool creation uses [`open_packfile_with_creation_seq`] instead.
 ///
 /// With `create` set, opens for writing and initializes and syncs the header
 /// of an empty file. Otherwise opens an existing file read-only.
@@ -2097,7 +2107,7 @@ pub fn extract_packfile_collection(
     let src_file = File::open(source_path)?;
     let mut reader = BufReader::with_capacity(RECOVERY_BUFFER_BYTES, src_file);
 
-    let Some(_header) = read_header(&mut reader)? else {
+    let Some(source_header) = read_header(&mut reader)? else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -2109,7 +2119,12 @@ pub fn extract_packfile_collection(
 
     let dst_file = File::create(dest_path)?;
     let mut writer = BufWriter::new(dst_file);
-    write_header(&mut writer, dest_pack_id)?;
+    // Keep extracted packs in the sequenced format. A pack extracted from a
+    // legacy source starts at sequence one; extracting from a sequenced pack
+    // places the copy after its source when it is later opened in the same
+    // pool. Pool-local collisions remain deterministic via the pack address.
+    let creation_seq = source_header.creation_seq.saturating_add(1).max(1);
+    write_header_with_creation_seq(&mut writer, dest_pack_id, creation_seq)?;
 
     let mut stats = PackExtractStats {
         frames_extracted: 0,

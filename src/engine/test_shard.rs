@@ -1251,6 +1251,33 @@ fn test_scan_orders_same_timestamp_by_creation_sequence() {
     assert_eq!(pool.get_shard(1).unwrap().pack_id, newer_address);
 }
 
+#[test]
+fn test_pack_creation_sequence_survives_reopen() {
+    let dir = test_dir("pack_creation_sequence_reopen");
+
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    pool.try_active_shard().unwrap();
+    pool.rotate().unwrap();
+    drop(pool);
+
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    pool.rotate().unwrap();
+
+    let mut sequences = pool
+        .all_shards()
+        .into_iter()
+        .map(|(_, shard)| {
+            let mut reader = std::io::BufReader::new(std::fs::File::open(&shard.path).unwrap());
+            packfile::read_header(&mut reader)
+                .unwrap()
+                .expect("created pack has a header")
+                .creation_seq
+        })
+        .collect::<Vec<_>>();
+    sequences.sort_unstable();
+    assert_eq!(sequences, [1, 2, 3]);
+}
+
 /// Regression: `MAX_SHARD_BYTES` must stay within the offset field that
 /// `IndexEntry` stores as `offset + 1`, so the maximum valid offset must
 /// never reach the empty-slot sentinel boundary.

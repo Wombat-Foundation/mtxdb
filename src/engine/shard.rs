@@ -869,7 +869,9 @@ impl ShardPool {
     /// A `shard_*.pack` file is rejected with `Unsupported` (hard cutover).
     /// Other applications' `.pack` files are ignored. Duplicate full addresses
     /// are rejected.
-    fn discover_pack_files(base_dir: &Path) -> io::Result<Vec<(packfile::PackId, PathBuf)>> {
+    fn discover_pack_files(
+        base_dir: &Path,
+    ) -> io::Result<Vec<(packfile::PackId, PathBuf, packfile::ShardHeader)>> {
         let mut pack_files = Vec::new();
         let mut seen = std::collections::HashSet::new();
         // An absent directory is an empty pool (see `pool_path`): packs are
@@ -945,17 +947,19 @@ impl ShardPool {
                     ),
                 ));
             }
-            pack_files.push((header.pack_id, path));
+            pack_files.push((header.pack_id, path, header));
         }
         Ok(pack_files)
     }
 
     /// Discover and sort pack files in `base_dir`, enforcing the
-    /// `MAX_SHARDS` capacity bound. Files are ordered by address, which is
-    /// stable and independent of creation order (ordering policy is the
-    /// caller's concern, not the address's).
-    fn discover_pack_files_sorted(base_dir: &Path) -> io::Result<Vec<(packfile::PackId, PathBuf)>> {
-        let mut pack_files = Self::discover_pack_files(base_dir)?;
+    /// `MAX_SHARDS` capacity bound. Returns the next pool-local creation
+    /// sequence along with the sorted paths so opening a pool does not reread
+    /// every header.
+    fn discover_pack_files_sorted(
+        base_dir: &Path,
+    ) -> io::Result<(Vec<(packfile::PackId, PathBuf)>, u32)> {
+        let pack_files = Self::discover_pack_files(base_dir)?;
         if pack_files.len() > MAX_SHARDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -967,20 +971,14 @@ impl ShardPool {
             ));
         }
         // PackId is random and must not decide which duplicate record wins
-        // during a rebuild. Read the immutable header once per pack, fail
-        // rather than silently swallowing metadata errors, then sort the
-        // cached keys. New headers use their persisted creation sequence;
-        // legacy headers fall back to timestamp/address ordering.
+        // during a rebuild. The immutable header was already read during
+        // discovery; fail rather than silently swallowing metadata errors,
+        // then sort the cached keys. New headers use their persisted creation
+        // sequence; legacy headers fall back to timestamp/address ordering.
         let mut ordered = Vec::with_capacity(pack_files.len());
-        for (address, path) in pack_files {
-            let file = File::open(&path)?;
-            let mut reader = BufReader::new(file);
-            let header = packfile::read_header(&mut reader)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("pack {} has no header", path.display()),
-                )
-            })?;
+        let mut next_creation_seq = 1;
+        for (address, path, header) in pack_files {
+            next_creation_seq = next_creation_seq.max(header.creation_seq.saturating_add(1));
             let key = if header.creation_seq == 0 {
                 (false, 0, header.created_at, address)
             } else {
@@ -989,8 +987,10 @@ impl ShardPool {
             ordered.push((key, (address, path)));
         }
         ordered.sort_by_cached_key(|(key, _)| *key);
-        pack_files = ordered.into_iter().map(|(_, pack)| pack).collect();
-        Ok(pack_files)
+        Ok((
+            ordered.into_iter().map(|(_, pack)| pack).collect(),
+            next_creation_seq,
+        ))
     }
 
     /// Recover (if writable) and open every pack file, slotting them into
@@ -1052,10 +1052,10 @@ impl ShardPool {
 
     /// Pick the slot new writes should go to after reopen.
     ///
-    /// Pack addresses are random, so slot order (address order) says nothing
-    /// about which pack is newest. Prefer the most recently modified pack that
-    /// still has room; if every pack is full, take the most recent anyway and
-    /// let the first write rotate. Ties fall back to the later slot.
+    /// Pack addresses are random, so the slot order is meaningful only because
+    /// discovery assigns slots in creation order. Prefer the newest pack that
+    /// still has room; if every pack is full, take the newest anyway and let
+    /// the first write rotate.
     fn choose_active_slot(
         shards: &[Option<Arc<Shard>>],
         max_shard_bytes: u64,
@@ -1064,14 +1064,9 @@ impl ShardPool {
         shards
             .iter()
             .flatten()
-            .map(|shard| {
-                let modified = fs::metadata(&shard.path)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                (shard.file_len() < max_shard_bytes, modified, shard.slot)
-            })
+            .map(|shard| (shard.file_len() < max_shard_bytes, shard.slot))
             .max()
-            .map_or_else(|| next_slot.saturating_sub(1), |(_, _, slot)| slot)
+            .map_or_else(|| next_slot.saturating_sub(1), |(_, slot)| slot)
     }
 
     /// Bootstrap a brand-new pool: create the first pack file, persist
@@ -1293,21 +1288,8 @@ impl ShardPool {
         let mut next_slot: u16 = 0;
 
         let discovery_started = Instant::now();
-        let pack_files = Self::discover_pack_files_sorted(&base_dir)?;
+        let (pack_files, next_creation_seq) = Self::discover_pack_files_sorted(&base_dir)?;
         let discovery_time = discovery_started.elapsed();
-
-        let next_creation_seq = pack_files
-            .iter()
-            .map(|(_, path)| {
-                let file = File::open(path)?;
-                let mut reader = BufReader::new(file);
-                Ok(packfile::read_header(&mut reader)?
-                    .map_or(1, |header| header.creation_seq.saturating_add(1).max(1)))
-            })
-            .collect::<io::Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(1);
 
         let (recovery_time, recovery_calls, packfile_open_time, packfile_open_calls) =
             Self::recover_and_open_packs(writable, pack_files, &mut shards, &mut next_slot)?;
@@ -1573,8 +1555,21 @@ impl ShardPool {
         let existing: std::collections::HashSet<packfile::PackId> =
             shards.iter().flatten().map(|s| s.pack_id).collect();
         let mut sorted_files = pack_files;
-        sorted_files.sort_unstable_by_key(|(id, _)| *id);
-        for (pack_id, path) in sorted_files {
+        sorted_files.sort_unstable_by_key(|(address, _, header)| {
+            if header.creation_seq == 0 {
+                (false, 0, header.created_at, *address)
+            } else {
+                (true, header.creation_seq, 0, *address)
+            }
+        });
+        let discovered_next_seq = sorted_files
+            .iter()
+            .map(|(_, _, header)| header.creation_seq.saturating_add(1).max(1))
+            .max()
+            .unwrap_or(1);
+        self.next_creation_seq
+            .fetch_max(discovered_next_seq, Ordering::Relaxed);
+        for (pack_id, path, _) in sorted_files {
             if existing.contains(&pack_id) {
                 continue;
             }
