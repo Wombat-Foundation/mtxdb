@@ -8582,13 +8582,27 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
-        cache: Arc<NodeCache>,
+        cache: &Arc<NodeCache>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
-        // Apply cache mutations only after all disk writes succeed, so a
-        // failed batch does not leak partial state into the shared cache.
-        // Resolve and insert one entry at a time: retaining a prepared clone
-        // of the entire batch here would defeat the cache's size bound.
+        if progress.structural_change {
+            let index = progress
+                .owned_index
+                .take()
+                .expect("structural_change is only set once owned_index is materialized");
+            self.store_generation(collection_id, index, Some(Arc::clone(cache)), false)?;
+        } else {
+            // Every record landed on the live, already-published index in
+            // place -- no new generation to publish, matching `put`'s
+            // in-place success path.
+            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+        }
+
+        // Apply cache mutations only after all fallible generation publication
+        // succeeds, so a failed batch does not leak partial state into the
+        // shared cache. Resolve and insert one entry at a time: retaining a
+        // prepared clone of the entire batch here would defeat the cache's
+        // size bound.
         for (id, data) in entries {
             let mut data_to_cache = data.clone();
             for child in &mut data_to_cache.children {
@@ -8599,19 +8613,6 @@ impl PackfileStorage {
                 }
             }
             cache.insert(*id, Arc::new(data_to_cache));
-        }
-
-        if progress.structural_change {
-            let index = progress
-                .owned_index
-                .take()
-                .expect("structural_change is only set once owned_index is materialized");
-            self.store_generation(collection_id, index, Some(cache), false)?;
-        } else {
-            // Every record landed on the live, already-published index in
-            // place -- no new generation to publish, matching `put`'s
-            // in-place success path.
-            self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         }
 
         // All fallible work is complete. Only now make the batch visible to
@@ -8885,7 +8886,7 @@ impl PackfileStorage {
             rollback_and_fail!(error);
         }
         if let Err(error) =
-            self.publish_put_many_state(collection_id, entries, cache, &mut progress)
+            self.publish_put_many_state(collection_id, entries, &cache, &mut progress)
         {
             rollback_and_fail!(error);
         }

@@ -1206,6 +1206,32 @@ fn test_scan_parses_pack_id_filename_format() {
     assert!(pool.get_shard(3).is_none());
 }
 
+/// An older header timestamp wins over a newer timestamp even when the pack
+/// addresses sort in the opposite order. This is the rebuild ordering policy;
+/// equal timestamps remain covered by the filename-format test above.
+#[test]
+fn test_scan_orders_packs_by_header_creation_time() {
+    let dir = test_dir("scan_pack_creation_time");
+
+    let make_pack = |pack_id: packfile::PackId, created_at: u64| {
+        let mut buf = Vec::new();
+        packfile::write_header(&mut buf, &pack_id).unwrap();
+        buf[25..33].copy_from_slice(&created_at.to_le_bytes());
+        let crc = crc32fast::hash(&buf[..37]);
+        buf[37..41].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(dir.join(pack_id.filename()), buf).unwrap();
+    };
+
+    let older = pack_id_for(5);
+    let newer = pack_id_for(3);
+    make_pack(older, 1);
+    make_pack(newer, 2);
+
+    let pool = ShardPool::open(dir).unwrap();
+    assert_eq!(pool.get_shard(0).unwrap().pack_id, older);
+    assert_eq!(pool.get_shard(1).unwrap().pack_id, newer);
+}
+
 /// Regression: `MAX_SHARD_BYTES` must stay within the offset field that
 /// `IndexEntry` stores as `offset + 1`, so the maximum valid offset must
 /// never reach the empty-slot sentinel boundary.
