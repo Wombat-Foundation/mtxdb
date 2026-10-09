@@ -3,7 +3,7 @@
 mod cmd;
 mod state_hamt;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Context as _;
@@ -102,6 +102,7 @@ pub(crate) enum Commands {
         all: bool,
         layout: bool,
         canonical: bool,
+        per_db: bool,
         sort: Option<String>,
         limit: i64,
     },
@@ -427,6 +428,12 @@ fn sub_collections() -> Command {
                 .long("canonical")
                 .action(ArgAction::SetTrue)
                 .help("Show each collection's canonical ID"),
+        )
+        .arg(
+            Arg::new("per_db")
+                .long("per-db")
+                .action(ArgAction::SetTrue)
+                .help("With --coalesce, also print one totals row per database"),
         )
         .arg(limit_arg())
         .arg(sort_arg("collection, nodes, idx-load (alias: load), shards, index, disk, packs, avoidable, segments, fragmentation"))
@@ -941,23 +948,105 @@ fn read_plan_from_mode(mode: &str) -> ReadPlanPolicy {
     }
 }
 
+/// With `--coalesce`, also take the databases in the current directory: the
+/// directory itself if it is a database root, else each immediate child that
+/// is one. Already-listed directories are not repeated.
+fn add_cwd_databases(dirs: &mut Vec<PathBuf>) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let mut found = Vec::new();
+    if mtxdb::is_database_root(&cwd).unwrap_or(false) {
+        found.push(cwd);
+    } else if let Ok(entries) = std::fs::read_dir(&cwd) {
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if path.is_dir() && mtxdb::is_database_root(&path).unwrap_or(false) {
+                found.push(path);
+            }
+        }
+        found.sort();
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut seen: Vec<PathBuf> = dirs.iter().map(|d| canon(d)).collect();
+    for path in found {
+        let c = canon(&path);
+        if !seen.contains(&c) {
+            seen.push(c);
+            dirs.push(path);
+        }
+    }
+}
+
+/// Let one `-d`/`--dir` take several directories, so a shell glob works
+/// (`mtxdb -d pid-* collections`). Clap gives `-d` exactly one value, so each
+/// bare token after it that `is_dir` is rewritten to its own `-d`, and one
+/// that `is_file` is dropped (so `-d *` skips stray files). The first other
+/// token (a subcommand, a key, a flag) ends the run.
+fn expand_dir_args(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    is_dir: impl Fn(&Path) -> bool,
+    is_file: impl Fn(&Path) -> bool,
+) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::new();
+    // `Value` is the token right after `-d` (clap's own value); `Run` is any
+    // further bare tokens, which are the extra directories.
+    #[derive(PartialEq)]
+    enum State {
+        Idle,
+        Value,
+        Run,
+    }
+    let mut state = State::Idle;
+    for arg in args {
+        let text = arg.to_string_lossy();
+        if text == "-d" || text == "--dir" {
+            state = State::Value;
+            out.push(arg);
+        } else if state == State::Value {
+            state = State::Run;
+            out.push(arg);
+        } else if state == State::Run && !text.starts_with('-') && is_dir(Path::new(&arg)) {
+            out.push("-d".into());
+            out.push(arg);
+        } else if state == State::Run && !text.starts_with('-') && is_file(Path::new(&arg)) {
+            // A stray file in a glob; not a database, not a subcommand.
+        } else {
+            state = State::Idle;
+            out.push(arg);
+        }
+    }
+    out
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the exhaustive clap-to-command mapping is clearest in one match"
 )]
 fn parse_cli() -> Cli {
-    let matches = build_cli().get_matches();
+    let matches = build_cli().get_matches_from(expand_dir_args(std::env::args_os(), Path::is_dir, Path::is_file));
 
     if matches.get_flag("version") || matches.get_flag("version_upper") {
         println!("mtxdb {}", build_cli().get_version().unwrap());
         std::process::exit(0);
     }
 
-    let dirs: Vec<PathBuf> = matches
+    let mut dirs: Vec<PathBuf> = matches
         .get_many::<String>("dir")
         .map(|vals| vals.map(PathBuf::from).collect())
         .unwrap_or_default();
     let coalesce = matches.get_flag("coalesce");
+    // Precedence: explicit `-d`, then a database root in the current
+    // directory, then `MTXDB_DIR`. The env var is only a fallback default.
+    if matches.value_source("dir") == Some(clap::parser::ValueSource::EnvVariable) {
+        if let Ok(cwd) = std::env::current_dir() {
+            if mtxdb::is_database_root(&cwd).unwrap_or(false) {
+                dirs = vec![cwd];
+            }
+        }
+    }
+    if coalesce {
+        add_cwd_databases(&mut dirs);
+    }
     let _ = DEBUG_ENABLED.set(matches.get_flag("debug"));
     let read_plan = read_plan_from_mode(
         matches
@@ -999,6 +1088,7 @@ fn parse_cli() -> Cli {
             all: m.get_flag("all"),
             layout: m.get_flag("layout"),
             canonical: m.get_flag("canonical"),
+            per_db: m.get_flag("per_db"),
             sort: m.get_one::<String>("sort").cloned(),
             limit: *m
                 .get_one::<i64>("limit")

@@ -134,6 +134,59 @@ fn fmt_bytes(n: u64) -> String {
     }
 }
 
+/// Integer with thousands separators (`77468` -> `77,468`).
+fn fmt_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Decimal size scaled to the largest fitting unit with three significant
+/// digits (`9026000` -> `9.03 MB`), so index memory and disk read alike.
+fn fmt_size_decimal(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value >= 100.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else if value >= 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
+/// One totals row per database, then the sum, for `collections --per-db`.
+fn print_per_db_totals(rows: &[(PathBuf, usize, usize, usize, u64)]) {
+    let names: Vec<String> = rows.iter().map(|r| r.0.display().to_string()).collect();
+    let width = names.iter().map(String::len).max().unwrap_or(8).max(8);
+    println!(
+        "per database\n  {:<width$}  {:>11}  {:>10}  {:>12}  {:>10}",
+        "database", "collections", "nodes", "index memory", "disk"
+    );
+    for (name, row) in names.iter().zip(rows) {
+        println!(
+            "  {name:<width$}  {:>11}  {:>10}  {:>12}  {:>10}",
+            fmt_thousands(row.1 as u64),
+            fmt_thousands(row.2 as u64),
+            fmt_size_decimal(row.3 as u64),
+            fmt_size_decimal(row.4)
+        );
+    }
+}
+
 /// Decimal megabytes, rounded exactly to five fractional digits, for index
 /// memory shown in human-facing collection output.
 fn fmt_megabytes(bytes: usize) -> String {
@@ -332,9 +385,18 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             all,
             layout,
             canonical,
+            per_db,
             sort,
             limit,
-        } => cmd_collections(cli, *all, *layout, *canonical, sort.as_deref(), *limit),
+        } => cmd_collections(
+            cli,
+            *all,
+            *layout,
+            *canonical,
+            *per_db,
+            sort.as_deref(),
+            *limit,
+        ),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
         Commands::Memory { evict } => cmd_memory(cli, *evict),
@@ -432,7 +494,8 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             cmd_delete(cli, collections, *yes)
         }
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
-        Commands::Sync { all } => cmd_sync(cli, *all),
+        // `-t all` means every pool, same as `sync --all`.
+        Commands::Sync { all } => cmd_sync(cli, *all || cli.shard_type.is_none()),
         Commands::Init => {
             cli.require_single_dir("init")?;
             cmd_init(cli)
@@ -1793,6 +1856,7 @@ fn cmd_collections(
     all: bool,
     layout: bool,
     canonical: bool,
+    per_db: bool,
     sort: Option<&str>,
     limit: i64,
 ) -> anyhow::Result<()> {
@@ -1805,6 +1869,7 @@ fn cmd_collections(
                 all,
                 layout,
                 canonical,
+                per_db,
                 sort,
                 limit,
             );
@@ -1904,12 +1969,17 @@ fn format_canonical_display(display: &str, width: usize, role_width: usize) -> S
     clippy::too_many_lines,
     reason = "coalesced table construction and formatting is kept together"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the collections flags; a one-off options struct would only rename them"
+)]
 fn cmd_collections_coalesced(
     cli: &Cli,
     valid_dirs: &[PathBuf],
     all: bool,
     layout: bool,
     canonical: bool,
+    per_db: bool,
     sort: Option<&str>,
     limit: i64,
 ) -> anyhow::Result<()> {
@@ -1945,6 +2015,8 @@ fn cmd_collections_coalesced(
 
         let mut map: HashMap<[u8; 16], CoalescedCol> = HashMap::new();
         let mut total_dbs_with_collections = HashSet::new();
+        // (database, collections, nodes, index bytes, disk bytes)
+        let mut db_rows: Vec<(PathBuf, usize, usize, usize, u64)> = Vec::new();
 
         for db_dir in valid_dirs {
             let Ok(layout_db) = DatabaseLayout::open_read_only(db_dir.clone()) else {
@@ -1972,7 +2044,11 @@ fn cmd_collections_coalesced(
             total_dbs_with_collections.insert(db_dir.clone());
             let collection_shards = PackfileStorage::collection_shards_from_disk(&pool_dir);
             let sidecar_disk = PackfileStorage::collection_disk_bytes_from_disk(&pool_dir);
-            let physical = if physical_needed {
+            // A pool with no persisted sidecars (a live writer that has not
+            // checkpointed) has no disk or shard figures to read, so scan its
+            // packs instead of reporting zero.
+            let physical = if physical_needed || sidecar_disk.is_none() || collection_shards.is_none()
+            {
                 physical_layout(&pool_dir).ok()
             } else {
                 None
@@ -1987,6 +2063,7 @@ fn cmd_collections_coalesced(
                 HashMap::new()
             };
 
+            let mut db_row = (db_dir.clone(), 0_usize, 0_usize, 0_usize, 0_u64);
             for (col_id, nodes, memory, capacity) in summaries {
                 let disk = physical
                     .as_ref()
@@ -1998,11 +2075,13 @@ fn cmd_collections_coalesced(
                             .and_then(|sd| sd.get(&col_id).copied())
                     })
                     .unwrap_or(0);
+                let stats = physical.as_ref().and_then(|p| p.collections.get(&col_id));
                 let shards_in_this_db = collection_shards
                     .as_ref()
                     .and_then(|cs| cs.get(&col_id))
-                    .map_or(1, Vec::len);
-                let stats = physical.as_ref().and_then(|p| p.collections.get(&col_id));
+                    .map(Vec::len)
+                    .or_else(|| stats.map(|s| s.pack_bytes.len()))
+                    .map_or(1, |n| n.max(1));
                 let runs = stats.map_or(0, |s| s.segments);
                 let largest = stats.map_or(0, |s| s.largest_segment_bytes);
                 let avoidable = avoidable_spread_bytes(stats);
@@ -2021,6 +2100,10 @@ fn cmd_collections_coalesced(
                     avoidable: 0,
                 });
 
+                db_row.1 = db_row.1.saturating_add(1);
+                db_row.2 = db_row.2.saturating_add(nodes);
+                db_row.3 = db_row.3.saturating_add(memory);
+                db_row.4 = db_row.4.saturating_add(disk);
                 entry.nodes = entry.nodes.saturating_add(nodes);
                 entry.memory = entry.memory.saturating_add(memory);
                 entry.capacity = entry.capacity.saturating_add(capacity);
@@ -2048,6 +2131,7 @@ fn cmd_collections_coalesced(
                     }
                 }
             }
+            db_rows.push(db_row);
         }
 
         if map.is_empty() {
@@ -2101,8 +2185,11 @@ fn cmd_collections_coalesced(
         let mut total_nodes = 0_usize;
         let mut total_memory = 0_usize;
         let mut total_disk_bytes = 0_u64;
+        let mut total_capacity = 0_u64;
         let total_rows = ordered.len();
+        let smallest_index = ordered.iter().map(|c| c.memory).min().unwrap_or(0);
         for item in &ordered {
+            total_capacity = total_capacity.saturating_add(u64::from(item.capacity));
             total_nodes = total_nodes.saturating_add(item.nodes);
             total_memory = total_memory.saturating_add(item.memory);
             total_disk_bytes = total_disk_bytes.saturating_add(item.disk_bytes);
@@ -2179,23 +2266,54 @@ fn cmd_collections_coalesced(
             }
         }
         println!();
+        if per_db {
+            print_per_db_totals(&db_rows);
+            println!();
+        }
+        let db_count = total_dbs_with_collections.len();
+        let per_node = |bytes: u64| {
+            if total_nodes == 0 {
+                "-".to_owned()
+            } else {
+                format!("{} B/node", bytes / total_nodes as u64)
+            }
+        };
+        let load = if total_capacity == 0 {
+            "-".to_owned()
+        } else {
+            format!("{:.1}% load", total_nodes as f64 * 100.0 / total_capacity as f64)
+        };
+        println!("summary");
         println!(
-            "total: {total_nodes} nodes across {total_rows} collections, {} index memory, {}",
-            fmt_megabytes(total_memory),
-            fmt_disk_megabytes(total_disk_bytes)
+            "  collections   {} distinct across {db_count} database(s)",
+            fmt_thousands(total_rows as u64)
         );
         println!(
-            "{total_rows} collection(s) across {} database(s), {} on disk",
-            total_dbs_with_collections.len(),
-            fmt_disk_megabytes(total_disk_bytes)
+            "  nodes         {} (summed over databases; replicas counted separately)",
+            fmt_thousands(total_nodes as u64)
         );
+        println!(
+            "  index memory  {} (hash-table capacity; {}, {load})",
+            fmt_size_decimal(total_memory as u64),
+            per_node(total_memory as u64)
+        );
+        println!(
+            "  disk          {} (physical, incl. superseded frames; {})",
+            fmt_size_decimal(total_disk_bytes),
+            per_node(total_disk_bytes)
+        );
+        let index_count: u64 = db_rows.iter().map(|r| r.1 as u64).sum();
+        if total_memory as u64 > total_disk_bytes && smallest_index > 0 {
+            println!(
+                "  note          index exceeds disk: each per-database collection index has a minimum size ({} x {} = {})",
+                fmt_thousands(index_count),
+                fmt_size_decimal(smallest_index as u64),
+                fmt_size_decimal((smallest_index as u64).saturating_mul(index_count))
+            );
+        }
         if has_canonical_conflict {
             println!("* conflicting canonical collection IDs detected across databases");
         }
-        println!(
-            "note: collection IDs deduplicated across {} database(s), node counts and metrics summed",
-            total_dbs_with_collections.len()
-        );
     }
     Ok(())
 }
@@ -2315,12 +2433,18 @@ fn cmd_collections_in_dir(
                 "disk" | "packs" | "avoidable" | "segments" | "fragmentation"
             )
         });
-    let physical = if physical_needed {
-        Some(physical_layout(dir)?)
+    let sidecar_disk = PackfileStorage::collection_disk_bytes_from_disk(dir);
+    // Without persisted sidecars (a live writer that has not checkpointed)
+    // there is nothing to read disk or shard figures from; scan the packs
+    // rather than print `?`, as the coalesced report does.
+    let physical = if physical_needed || sidecar_disk.is_none() || collection_shards.is_none() {
+        physical_layout(dir).ok()
     } else {
         None
     };
-    let sidecar_disk = PackfileStorage::collection_disk_bytes_from_disk(dir);
+    if physical_needed && physical.is_none() {
+        bail!("failed to scan the physical pack layout of `{}`", dir.display());
+    }
     let disk_bytes: HashMap<_, _> = physical
         .as_ref()
         .map(|layout| {
@@ -2332,7 +2456,7 @@ fn cmd_collections_in_dir(
         })
         .or(sidecar_disk.clone())
         .unwrap_or_default();
-    let disk_known = physical_needed || sidecar_disk.is_some();
+    let disk_known = physical.is_some() || sidecar_disk.is_some();
 
     if collections.is_empty() {
         println!("no collections found");
@@ -2414,16 +2538,24 @@ fn cmd_collections_in_dir(
             .map_or("[unregistered]", String::as_str);
         let canonical_display = format_canonical_display(canonical_id, canonical_width, role_width);
         let load = fmt_load_percent(*nodes, *capacity);
-        let shards = collection_shards
+        let shard_count = collection_shards
             .as_ref()
             .and_then(|by_collection| by_collection.get(collection_id))
+            .map(Vec::len)
+            .or_else(|| {
+                physical
+                    .as_ref()
+                    .and_then(|p| p.collections.get(collection_id))
+                    .map(|stats| stats.pack_bytes.len())
+            });
+        let shards = shard_count
             .map_or_else(
                 || "?".to_owned(),
-                |shards| {
-                    if shards.len() == 1 {
+                |count| {
+                    if count == 1 {
                         String::new()
                     } else {
-                        shards.len().to_string()
+                        count.to_string()
                     }
                 },
             );

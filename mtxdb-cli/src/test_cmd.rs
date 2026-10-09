@@ -432,6 +432,7 @@ fn shard_types_yields_all_three_when_no_type_is_selected() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -453,6 +454,7 @@ fn shard_types_yields_just_the_selected_type() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -474,6 +476,7 @@ fn listing_all_overrides_the_default_pool_selection() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: true,
             layout: false,
             canonical: false,
@@ -498,6 +501,7 @@ fn collections_dash_t_all_iterates_every_pool_without_the_all_flag() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -506,7 +510,7 @@ fn collections_dash_t_all_iterates_every_pool_without_the_all_flag() {
         },
     };
 
-    cmd_collections(&cli, false, false, false, None, -1).unwrap();
+    cmd_collections(&cli, false, false, false, false, None, -1).unwrap();
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -545,6 +549,7 @@ fn collections_with_a_specific_type_still_targets_only_that_pool() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -553,7 +558,7 @@ fn collections_with_a_specific_type_still_targets_only_that_pool() {
         },
     };
 
-    cmd_collections(&cli, false, false, false, None, -1).unwrap();
+    cmd_collections(&cli, false, false, false, false, None, -1).unwrap();
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1741,7 +1746,7 @@ fn import_keeps_existing_record_when_event_id_matches() {
     // this assertion measures whether the existing event record was
     // rewritten.  Replaying the event may legitimately populate a
     // missing state-group mapping.
-    let state_store = PackfileStorage::open(dir.join("state")).unwrap();
+    let state_store = db.state().as_ref();
     let event = import_event("$a", "@alice", "!room");
     let node_id = template_node_id(&template, &event).unwrap().unwrap();
     store
@@ -1757,7 +1762,7 @@ fn import_keeps_existing_record_when_event_id_matches() {
     import_pdu_events(
         &db,
         store,
-        &state_store,
+        state_store,
         &path,
         &[event],
         &[],
@@ -1778,8 +1783,8 @@ fn import_keeps_existing_record_when_event_id_matches() {
 fn importer_loads_complete_cached_state_groups_without_recomputing() {
     let (db, dir, path, template, collection_id) = import_fixture("import_cached_state_groups");
     let store = db.event_dag();
-    let state_store = PackfileStorage::open(dir.join("state")).unwrap();
-    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+    let state_store = db.state().as_ref();
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
     let event = import_event("$cached", "@alice", "!room");
     let cached_group = [b'A'; STATE_GROUP_ID_LENGTH];
@@ -1790,7 +1795,7 @@ fn importer_loads_complete_cached_state_groups_without_recomputing() {
     import_pdu_events(
         &db,
         store,
-        &state_store,
+        state_store,
         &path,
         std::slice::from_ref(&event),
         &[],
@@ -1819,12 +1824,12 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
     let (db, dir, path, template, collection_id) =
         import_fixture("import_old_namespace_state_groups");
     let store = db.event_dag();
-    let state_store = PackfileStorage::open(dir.join("state")).unwrap();
-    let old_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, OLD_NAMESPACE);
+    let state_store = db.state().as_ref();
+    let old_aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, OLD_NAMESPACE);
     old_aux.ensure_metadata().unwrap();
     let stale = [b'A'; STATE_GROUP_ID_LENGTH];
     old_aux.put(b"$cached", &stale).unwrap();
-    let new_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+    let new_aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
 
     let event = import_event("$cached", "@alice", "!room");
     let mut established = HashSet::new();
@@ -1832,7 +1837,7 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
     import_pdu_events(
         &db,
         store,
-        &state_store,
+        state_store,
         &path,
         std::slice::from_ref(&event),
         &[],
@@ -1855,8 +1860,8 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
 fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     let (db, dir, path, template, collection_id) = import_fixture("import_state_group_repair");
     let store = db.event_dag();
-    let state_store = PackfileStorage::open(dir.join("state")).unwrap();
-    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+    let state_store = db.state().as_ref();
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
     let child = owned_value(
         r#"{"event_id":"$child","sender":"@alice","room_id":"!room","type":"m.room.message","prev_events":["$parent"],"content":{"room_version":"11"}}"#,
@@ -1866,7 +1871,7 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     import_pdu_events(
         &db,
         store,
-        &state_store,
+        state_store,
         &path,
         std::slice::from_ref(&child),
         &[],
@@ -1884,7 +1889,7 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     import_pdu_events(
         &db,
         store,
-        &state_store,
+        state_store,
         &path,
         &[repaired_parent, child],
         &[],
@@ -1956,7 +1961,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         first_import_records,
         "reimport must not append duplicate edge or auth-chain records"
     );
-    let auth_store = PackfileStorage::open(auth_dir).unwrap();
+    let auth_store = db.edges().as_ref();
     let auth_col = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), b"!room");
     let meta = auth_store
         .get_collection_metadata(&auth_col)
@@ -3992,6 +3997,7 @@ fn coalesced_shards_and_collections_and_stats() {
         coalesce: true,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -3999,9 +4005,9 @@ fn coalesced_shards_and_collections_and_stats() {
             limit: 10,
         },
     };
-    cmd_collections(&cli_cols, false, false, false, Some("nodes"), 10).unwrap();
-    cmd_collections(&cli_cols, false, false, false, Some("idx-load"), 10).unwrap();
-    cmd_collections(&cli_cols, false, false, false, Some("load"), 10).unwrap();
+    cmd_collections(&cli_cols, false, false, false, false, Some("nodes"), 10).unwrap();
+    cmd_collections(&cli_cols, false, false, false, false, Some("idx-load"), 10).unwrap();
+    cmd_collections(&cli_cols, false, false, false, false, Some("load"), 10).unwrap();
 
     let mut cli_cols_coalesce = cli_cols.clone();
     cli_cols_coalesce.coalesce = true;
@@ -4010,11 +4016,12 @@ fn coalesced_shards_and_collections_and_stats() {
         false,
         false,
         false,
+        false,
         Some("idx-load"),
         10,
     )
     .unwrap();
-    cmd_collections(&cli_cols_coalesce, false, false, false, Some("load"), 10).unwrap();
+    cmd_collections(&cli_cols_coalesce, false, false, false, false, Some("load"), 10).unwrap();
 
     let cli_stats = Cli {
         dirs: vec![dir1.clone(), dir2.clone()],
@@ -4417,6 +4424,7 @@ fn a_missing_root_is_an_error_but_an_unwritten_pool_is_empty() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -4424,7 +4432,7 @@ fn a_missing_root_is_an_error_but_an_unwritten_pool_is_empty() {
             limit: 0,
         },
     };
-    let error = cmd_collections(&cli(&missing), false, false, false, None, 0).unwrap_err();
+    let error = cmd_collections(&cli(&missing), false, false, false, false, None, 0).unwrap_err();
     assert!(
         error.to_string().contains("no mtxdb database"),
         "a missing root must be diagnosed as such: {error}"
@@ -4433,7 +4441,7 @@ fn a_missing_root_is_an_error_but_an_unwritten_pool_is_empty() {
 
     let root = unique_temp_dir();
     let layout = DatabaseLayout::open(root.clone()).unwrap();
-    cmd_collections(&cli(&root), false, false, false, None, 0)
+    cmd_collections(&cli(&root), false, false, false, false, None, 0)
         .expect("an unwritten pool is empty, not an error");
     assert!(
         !layout.pool_path(ShardType::State).exists(),

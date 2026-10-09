@@ -180,3 +180,35 @@ fn test_read_plan_mode_maps_to_policy() {
     assert_eq!(read_plan_from_mode("prefetch"), ReadPlanPolicy::prefetch());
     assert_ne!(read_plan_from_mode("prefetch"), ReadPlanPolicy::disabled());
 }
+
+#[test]
+fn dir_flag_takes_a_shell_glob_of_directories() {
+    let is_dir = |p: &Path| p.to_string_lossy().starts_with("pid-");
+    let args = ["mtxdb", "-c", "-d", "pid-1", "pid-2", "collections", "-t", "all"];
+    let expanded = expand_dir_args(args.map(Into::into), is_dir, |_| false);
+    let m = build_cli().try_get_matches_from(expanded).unwrap();
+    let dirs: Vec<_> = m.get_many::<String>("dir").unwrap().map(String::as_str).collect();
+    assert_eq!(dirs, vec!["pid-1", "pid-2"]);
+    assert_eq!(m.subcommand_name(), Some("collections"));
+}
+
+#[test]
+fn dir_expansion_leaves_non_directory_tokens_alone() {
+    let args = ["mtxdb", "get", "-d", "pid-1", "some-key"];
+    let expanded = expand_dir_args(args.map(Into::into), |p| p.to_string_lossy() == "pid-1", |_| false);
+    assert_eq!(expanded, args.map(std::ffi::OsString::from));
+}
+
+#[test]
+fn dir_expansion_drops_stray_files_from_a_glob() {
+    let args = ["mtxdb", "-c", "-d", "pid-1", "pid-2", "pids.tar", "collections"];
+    let expanded = expand_dir_args(
+        args.map(Into::into),
+        |p| p.to_string_lossy().starts_with("pid-"),
+        |p| p.to_string_lossy().ends_with(".tar"),
+    );
+    let m = build_cli().try_get_matches_from(expanded).unwrap();
+    let dirs: Vec<_> = m.get_many::<String>("dir").unwrap().map(String::as_str).collect();
+    assert_eq!(dirs, vec!["pid-1", "pid-2"]);
+    assert_eq!(m.subcommand_name(), Some("collections"));
+}
