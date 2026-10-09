@@ -35,8 +35,17 @@
     clippy::uninlined_format_args
 )]
 
+#[path = "support/bench_cache.rs"]
 mod bench_cache;
-use bench_cache::{evict_dir, is_ram_backed, vmtouch_on_path};
+#[path = "support/bench_evict.rs"]
+mod bench_evict;
+#[path = "support/bench_ram.rs"]
+mod bench_ram;
+#[path = "support/bench_vmtouch.rs"]
+mod bench_vmtouch;
+use bench_evict::evict_dir;
+use bench_ram::is_ram_backed;
+use bench_vmtouch::vmtouch_on_path;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -662,15 +671,6 @@ fn run_timeline<B: TimelineBackend>(mut backend: B, dataset: &Dataset) {
     }
 }
 
-/// Best-effort page-cache eviction via `vmtouch -e`, which only drops *clean,
-/// unmapped* pages of the named path. No root needed; `false` if vmtouch is
-/// missing or fails (in which case the "cold" numbers are warm).
-/// Filesystem type of the mount holding `path`, from `/proc/mounts` (the
-/// longest mount point that prefixes `path`). `None` if `/proc/mounts` is
-/// unreadable or no entry matches (non-Linux).
-/// True when `path` lives on an in-memory filesystem, where "cold reads" are a
-/// contradiction: the data never leaves RAM and neither `drop_caches` nor
-/// `vmtouch` can evict it.
 /// PID-suffixed scratch root; `MTXDB_BENCH_ROOT` redirects it off a RAM-backed
 /// tmpfs so the cold phases mean something.
 fn bench_root() -> PathBuf {

@@ -126,7 +126,17 @@ fn fmt_bytes(n: u64) -> String {
     if unit == 0 {
         format!("{n} B")
     } else {
-        format_scaled(n, divisor, 1, UNITS[unit])
+        let formatted = format_scaled(n, divisor, 1, UNITS[unit]);
+        if formatted.starts_with("1000 ") && unit < max_unit {
+            format_scaled(
+                n,
+                divisor.saturating_mul(1024),
+                1,
+                UNITS[unit.saturating_add(1)],
+            )
+        } else {
+            formatted
+        }
     }
 }
 
@@ -165,7 +175,17 @@ fn fmt_size_decimal(bytes: u64) -> String {
         } else {
             2
         };
-        format_scaled(bytes, divisor, decimals, UNITS[unit])
+        let formatted = format_scaled(bytes, divisor, decimals, UNITS[unit]);
+        if formatted.starts_with("1000 ") && unit < max_unit {
+            format_scaled(
+                bytes,
+                divisor.saturating_mul(1000),
+                2,
+                UNITS[unit.saturating_add(1)],
+            )
+        } else {
+            formatted
+        }
     }
 }
 
@@ -198,7 +218,7 @@ fn format_scaled(bytes: u64, divisor: u64, decimals: u32, unit: &str) -> String 
 }
 
 /// One totals row per database, then the sum, for `collections --per-db`.
-fn print_per_db_totals(rows: &[(PathBuf, usize, usize, usize, u64)]) {
+fn print_per_db_totals(rows: &[(PathBuf, usize, usize, usize, u64, usize)]) {
     let names: Vec<String> = rows.iter().map(|r| r.0.display().to_string()).collect();
     let width = names.iter().map(String::len).max().unwrap_or(8).max(8);
     println!(
@@ -2054,6 +2074,7 @@ fn cmd_collections_coalesced(
         capacity: u32,
         disk_bytes: u64,
         shards_count: usize,
+        shards_known: bool,
         runs: u64,
         largest_segment: u64,
         avoidable: u64,
@@ -2085,7 +2106,7 @@ fn cmd_collections_coalesced(
         let mut map: HashMap<[u8; 16], CoalescedCol> = HashMap::new();
         let mut total_dbs_with_collections = HashSet::new();
         // (database, collections, nodes, index bytes, disk bytes)
-        let mut db_rows: Vec<(PathBuf, usize, usize, usize, u64)> = Vec::new();
+        let mut db_rows: Vec<(PathBuf, usize, usize, usize, u64, usize)> = Vec::new();
 
         for db_dir in valid_dirs {
             let Ok(layout_db) = DatabaseLayout::open_read_only(db_dir.clone()) else {
@@ -2132,7 +2153,7 @@ fn cmd_collections_coalesced(
                 HashMap::new()
             };
 
-            let mut db_row = (db_dir.clone(), 0_usize, 0_usize, 0_usize, 0_u64);
+            let mut db_row = (db_dir.clone(), 0_usize, 0_usize, 0_usize, 0_u64, 0_usize);
             for (col_id, nodes, memory, capacity) in summaries {
                 let disk = physical
                     .as_ref()
@@ -2145,12 +2166,10 @@ fn cmd_collections_coalesced(
                     })
                     .unwrap_or(0);
                 let stats = physical.as_ref().and_then(|p| p.collections.get(&col_id));
-                let shards_in_this_db = collection_shards
+                let shard_count_in_this_db = collection_shards
                     .as_ref()
                     .and_then(|cs| cs.get(&col_id))
-                    .map(Vec::len)
-                    .or_else(|| stats.map(|s| s.pack_bytes.len()))
-                    .map_or(1, |n| n.max(1));
+                    .map(|shards| shards.len().max(1));
                 let runs = stats.map_or(0, |s| s.segments);
                 let largest = stats.map_or(0, |s| s.largest_segment_bytes);
                 let avoidable = avoidable_spread_bytes(stats);
@@ -2164,6 +2183,7 @@ fn cmd_collections_coalesced(
                     capacity: 0,
                     disk_bytes: 0,
                     shards_count: 0,
+                    shards_known: true,
                     runs: 0,
                     largest_segment: 0,
                     avoidable: 0,
@@ -2173,11 +2193,20 @@ fn cmd_collections_coalesced(
                 db_row.2 = db_row.2.saturating_add(nodes);
                 db_row.3 = db_row.3.saturating_add(memory);
                 db_row.4 = db_row.4.saturating_add(disk);
+                db_row.5 = if db_row.5 == 0 {
+                    memory
+                } else {
+                    db_row.5.min(memory)
+                };
                 entry.nodes = entry.nodes.saturating_add(nodes);
                 entry.memory = entry.memory.saturating_add(memory);
                 entry.capacity = entry.capacity.saturating_add(capacity);
                 entry.disk_bytes = entry.disk_bytes.saturating_add(disk);
-                entry.shards_count = entry.shards_count.saturating_add(shards_in_this_db);
+                if let Some(shard_count) = shard_count_in_this_db {
+                    entry.shards_count = entry.shards_count.saturating_add(shard_count);
+                } else {
+                    entry.shards_known = false;
+                }
                 entry.runs = entry.runs.saturating_add(runs);
                 entry.largest_segment = entry.largest_segment.max(largest);
                 entry.avoidable = entry.avoidable.saturating_add(avoidable);
@@ -2256,7 +2285,6 @@ fn cmd_collections_coalesced(
         let mut total_disk_bytes = 0_u64;
         let mut total_capacity = 0_u64;
         let total_rows = ordered.len();
-        let smallest_index = ordered.iter().map(|c| c.memory).min().unwrap_or(0);
         for item in &ordered {
             total_capacity = total_capacity.saturating_add(u64::from(item.capacity));
             total_nodes = total_nodes.saturating_add(item.nodes);
@@ -2285,7 +2313,9 @@ fn cmd_collections_coalesced(
             let canonical_display =
                 format_canonical_display(&canonical_id, canonical_width, role_width);
             let load = fmt_load_percent(item.nodes, item.capacity);
-            let shards = if item.shards_count == 1 {
+            let shards = if !item.shards_known {
+                "?".to_owned()
+            } else if item.shards_count == 1 {
                 String::new()
             } else {
                 item.shards_count.to_string()
@@ -2300,14 +2330,14 @@ fn cmd_collections_coalesced(
                 if canonical {
                     println!(
                         "  {hex:<34}  {canonical_display}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
-                        item.nodes, load, item.shards_count, disk_display, item.runs, fmt_bytes(item.largest_segment), avoidable_str
+                        item.nodes, load, shards, disk_display, item.runs, fmt_bytes(item.largest_segment), avoidable_str
                     );
                 } else {
                     println!(
                         "  {hex:<34}  {:>7}  {:>8}  {:>6}  {:>13}  {:>5}  {:>10}  {:>13}",
                         item.nodes,
                         load,
-                        item.shards_count,
+                        shards,
                         disk_display,
                         item.runs,
                         fmt_bytes(item.largest_segment),
@@ -2383,6 +2413,11 @@ fn cmd_collections_coalesced(
             per_node(total_disk_bytes)
         );
         let index_count: u64 = db_rows.iter().map(|r| r.1 as u64).sum();
+        let smallest_index = db_rows
+            .iter()
+            .filter_map(|row| (row.5 > 0).then_some(row.5))
+            .min()
+            .unwrap_or(0);
         if total_memory as u64 > total_disk_bytes && smallest_index > 0 {
             println!(
                 "  note          index exceeds disk: each per-database collection index has a minimum size ({} x {} = {})",
@@ -2624,13 +2659,7 @@ fn cmd_collections_in_dir(
         let shard_count = collection_shards
             .as_ref()
             .and_then(|by_collection| by_collection.get(collection_id))
-            .map(Vec::len)
-            .or_else(|| {
-                physical
-                    .as_ref()
-                    .and_then(|p| p.collections.get(collection_id))
-                    .map(|stats| stats.pack_bytes.len())
-            });
+            .map(Vec::len);
         let shards = shard_count.map_or_else(
             || "?".to_owned(),
             |count| {

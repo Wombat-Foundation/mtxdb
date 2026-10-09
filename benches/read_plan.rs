@@ -50,8 +50,18 @@
     clippy::uninlined_format_args
 )]
 
+#[path = "support/bench_cache.rs"]
 mod bench_cache;
-use bench_cache::{evict_dir, is_ram_backed, mount_fstype, vmtouch_on_path};
+#[path = "support/bench_evict.rs"]
+mod bench_evict;
+#[path = "support/bench_ram.rs"]
+mod bench_ram;
+#[path = "support/bench_vmtouch.rs"]
+mod bench_vmtouch;
+use bench_cache::mount_fstype;
+use bench_evict::evict_dir;
+use bench_ram::is_ram_backed;
+use bench_vmtouch::vmtouch_on_path;
 
 use std::collections::HashSet;
 use std::fs;
@@ -181,18 +191,6 @@ impl Snapshot {
     }
 }
 
-// ── Cache eviction / scratch root ───────────────────────────────────
-
-/// Best-effort page-cache eviction via `vmtouch -e`. Only drops *clean*
-/// pages of the named files, and only while no process has them mapped —
-/// callers must have dropped the store first. No root needed; returns
-/// `false` if vmtouch is missing or fails.
-/// Filesystem type of the mount holding `path`, from `/proc/mounts` (the
-/// longest mount point that prefixes `path`). `None` if `/proc/mounts`
-/// is unreadable or no entry matches (non-Linux).
-/// True when `path` lives on an in-memory filesystem (`tmpfs`, `ramfs`,
-/// `devtmpfs`), where "cold reads" are a contradiction: the data never
-/// leaves RAM and neither `drop_caches` nor `vmtouch` can evict it.
 /// Run the root page-cache drop directly, rather than asking the operator
 /// to paste it. Returns `Ok(())` only if the write succeeded (i.e. the
 /// bench is running as root); a permission error comes back as `Err` so the

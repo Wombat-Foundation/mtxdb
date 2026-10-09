@@ -65,8 +65,12 @@
     clippy::uninlined_format_args
 )]
 
+#[path = "support/bench_cache.rs"]
+mod bench_cache;
+use bench_cache::mount_fstype;
+
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -172,28 +176,6 @@ fn bench_root() -> PathBuf {
         }
     })
     .clone()
-}
-
-/// Filesystem type of the mount holding `path`, from `/proc/mounts`. Used only
-/// to label the report, so a run against tmpfs is not mistaken for a cold one.
-fn mount_fstype(path: &Path) -> Option<String> {
-    let canonical = path.canonicalize().ok()?;
-    let mounts = fs::read_to_string("/proc/mounts").ok()?;
-    let mut best: Option<(usize, String)> = None;
-    for line in mounts.lines() {
-        let mut fields = line.split(' ');
-        let _dev = fields.next()?;
-        let mount_point = fields.next()?;
-        let fstype = fields.next()?;
-        let mount_path = Path::new(mount_point);
-        if canonical.starts_with(mount_path) {
-            let depth = mount_path.components().count();
-            if best.as_ref().is_none_or(|(d, _)| depth >= *d) {
-                best = Some((depth, fstype.to_owned()));
-            }
-        }
-    }
-    best.map(|(_, fstype)| fstype)
 }
 
 fn fmt_bytes(bytes: u64) -> String {
