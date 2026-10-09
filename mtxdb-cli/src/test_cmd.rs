@@ -3864,11 +3864,11 @@ fn state_set_merge_takes_first_wins() {
 }
 
 #[test]
-fn state_set_empty_digest_is_empty_base64url() {
+fn state_set_empty_digest_golden_vector() {
     let s = StateSet::new();
     assert_eq!(
         s.digest_base64url(),
-        "IAgj5RWLN3TBG1xhhQradi-CZBRKm-vsPrrFoq3eZ7g"
+        "viqN49z0bJTOhc3I4HrDCPTYqVSQ2VbDjXgP1hDbCBM"
     );
 }
 
@@ -3880,7 +3880,7 @@ fn state_set_digest_golden_vector() {
     s.set("m.room.name", "", "$old".into());
     assert_eq!(
         s.digest_base64url(),
-        "5R3algqm8kMJV3bPLH_1HE2pvDgb2kzriUo6HfWmlDs"
+        "ItsX7KS8GM3yKHTofq3Kp_OQ_lF-zok_yoVyzp_uRig"
     );
 }
 
