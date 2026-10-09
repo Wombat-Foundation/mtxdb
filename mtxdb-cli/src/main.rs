@@ -981,11 +981,14 @@ fn add_cwd_databases(dirs: &mut Vec<PathBuf>) {
 /// (`mtxdb -d pid-* collections`). Clap gives `-d` exactly one value, so each
 /// bare token after it that `is_dir` is rewritten to its own `-d`, and one
 /// that `is_file` is dropped (so `-d *` skips stray files). The first other
-/// token (a subcommand, a key, a flag) ends the run.
+/// token (a subcommand, a key, a flag) ends the run. A token naming a
+/// subcommand is never rewritten, and once one is seen files are kept, since
+/// they are that subcommand's operands (`mtxdb import -d db events.json`).
 fn expand_dir_args(
     args: impl IntoIterator<Item = std::ffi::OsString>,
     is_dir: impl Fn(&Path) -> bool,
     is_file: impl Fn(&Path) -> bool,
+    is_subcommand: impl Fn(&str) -> bool,
 ) -> Vec<std::ffi::OsString> {
     // `Value` is the token right after `-d` (clap's own value); `Run` is any
     // further bare tokens, which are the extra directories.
@@ -998,18 +1001,24 @@ fn expand_dir_args(
 
     let mut out = Vec::new();
     let mut state = State::Idle;
+    let mut seen_subcommand = false;
     for arg in args {
         let text = arg.to_string_lossy();
+        let bare_run = state == State::Run && !text.starts_with('-');
         if text == "-d" || text == "--dir" {
             state = State::Value;
             out.push(arg);
         } else if state == State::Value {
             state = State::Run;
             out.push(arg);
-        } else if state == State::Run && !text.starts_with('-') && is_dir(Path::new(&arg)) {
+        } else if state != State::Value && !text.starts_with('-') && is_subcommand(&text) {
+            seen_subcommand = true;
+            state = State::Idle;
+            out.push(arg);
+        } else if bare_run && is_dir(Path::new(&arg)) {
             out.push("-d".into());
             out.push(arg);
-        } else if state == State::Run && !text.starts_with('-') && is_file(Path::new(&arg)) {
+        } else if bare_run && !seen_subcommand && is_file(Path::new(&arg)) {
             // A stray file in a glob; not a database, not a subcommand.
         } else {
             state = State::Idle;
@@ -1024,10 +1033,12 @@ fn expand_dir_args(
     reason = "the exhaustive clap-to-command mapping is clearest in one match"
 )]
 fn parse_cli() -> Cli {
-    let matches = build_cli().get_matches_from(expand_dir_args(
+    let command = build_cli();
+    let matches = command.clone().get_matches_from(expand_dir_args(
         std::env::args_os(),
         Path::is_dir,
         Path::is_file,
+        |name| command.find_subcommand(name).is_some(),
     ));
 
     if matches.get_flag("version") || matches.get_flag("version_upper") {

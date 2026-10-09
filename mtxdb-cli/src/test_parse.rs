@@ -181,6 +181,34 @@ fn test_read_plan_mode_maps_to_policy() {
     assert_ne!(read_plan_from_mode("prefetch"), ReadPlanPolicy::disabled());
 }
 
+fn is_subcommand(name: &str) -> bool {
+    build_cli().find_subcommand(name).is_some()
+}
+
+#[test]
+fn dir_expansion_keeps_subcommand_file_operands() {
+    let args = ["mtxdb", "import", "-d", "db", "events.json"];
+    let expanded = expand_dir_args(
+        args.map(Into::into),
+        |p| p.to_string_lossy() == "db",
+        |p| p.to_string_lossy().ends_with(".json"),
+        is_subcommand,
+    );
+    assert_eq!(expanded, args.map(std::ffi::OsString::from));
+}
+
+#[test]
+fn dir_expansion_does_not_rewrite_a_directory_named_like_a_subcommand() {
+    let args = ["mtxdb", "-d", "pid-1", "collections"];
+    let expanded = expand_dir_args(
+        args.map(Into::into),
+        |p| matches!(p.to_string_lossy().as_ref(), "pid-1" | "collections"),
+        |_| false,
+        is_subcommand,
+    );
+    assert_eq!(expanded, args.map(std::ffi::OsString::from));
+}
+
 #[test]
 fn dir_flag_takes_a_shell_glob_of_directories() {
     let is_dir = |p: &Path| p.to_string_lossy().starts_with("pid-");
@@ -194,7 +222,7 @@ fn dir_flag_takes_a_shell_glob_of_directories() {
         "-t",
         "all",
     ];
-    let expanded = expand_dir_args(args.map(Into::into), is_dir, |_| false);
+    let expanded = expand_dir_args(args.map(Into::into), is_dir, |_| false, is_subcommand);
     let m = build_cli().try_get_matches_from(expanded).unwrap();
     let dirs: Vec<_> = m
         .get_many::<String>("dir")
@@ -212,6 +240,7 @@ fn dir_expansion_leaves_non_directory_tokens_alone() {
         args.map(Into::into),
         |p| p.to_string_lossy() == "pid-1",
         |_| false,
+        is_subcommand,
     );
     assert_eq!(expanded, args.map(std::ffi::OsString::from));
 }
@@ -231,6 +260,7 @@ fn dir_expansion_drops_stray_files_from_a_glob() {
         args.map(Into::into),
         |p| p.to_string_lossy().starts_with("pid-"),
         |p| p.to_string_lossy().ends_with(".tar"),
+        is_subcommand,
     );
     let m = build_cli().try_get_matches_from(expanded).unwrap();
     let dirs: Vec<_> = m
