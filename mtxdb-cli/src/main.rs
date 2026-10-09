@@ -987,7 +987,6 @@ fn expand_dir_args(
     is_dir: impl Fn(&Path) -> bool,
     is_file: impl Fn(&Path) -> bool,
 ) -> Vec<std::ffi::OsString> {
-    let mut out = Vec::new();
     // `Value` is the token right after `-d` (clap's own value); `Run` is any
     // further bare tokens, which are the extra directories.
     #[derive(PartialEq)]
@@ -996,6 +995,8 @@ fn expand_dir_args(
         Value,
         Run,
     }
+
+    let mut out = Vec::new();
     let mut state = State::Idle;
     for arg in args {
         let text = arg.to_string_lossy();
@@ -1023,7 +1024,11 @@ fn expand_dir_args(
     reason = "the exhaustive clap-to-command mapping is clearest in one match"
 )]
 fn parse_cli() -> Cli {
-    let matches = build_cli().get_matches_from(expand_dir_args(std::env::args_os(), Path::is_dir, Path::is_file));
+    let matches = build_cli().get_matches_from(expand_dir_args(
+        std::env::args_os(),
+        Path::is_dir,
+        Path::is_file,
+    ));
 
     if matches.get_flag("version") || matches.get_flag("version_upper") {
         println!("mtxdb {}", build_cli().get_version().unwrap());

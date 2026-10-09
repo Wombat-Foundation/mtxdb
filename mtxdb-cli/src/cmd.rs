@@ -114,32 +114,28 @@ fn load_state_groups(
 
 /// Human-readable byte count (`512 B`, `4.3 KB`, `1.2 MB`, `2.1 GB`) —
 /// raw byte counts in a shard listing are unreadable past a few digits.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "display-only rounding to 1 decimal place; losing bits below f64's 52-bit mantissa at exabyte scale is invisible at that precision"
-)]
 fn fmt_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let max_unit = UNITS.len().saturating_sub(1);
-    let mut value = n as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < max_unit {
-        value /= 1024.0;
+    let mut divisor = 1_u64;
+    while n.checked_div(divisor).expect("byte divisor is nonzero") >= 1024 && unit < max_unit {
+        divisor = divisor.saturating_mul(1024);
         unit = unit.saturating_add(1);
     }
     if unit == 0 {
         format!("{n} B")
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        format_scaled(n, divisor, 1, UNITS[unit])
     }
 }
 
 /// Integer with thousands separators (`77468` -> `77,468`).
 fn fmt_thousands(n: u64) -> String {
     let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let mut out = String::with_capacity(digits.len().saturating_add(digits.len() / 3));
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && digits.len().saturating_sub(i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -151,20 +147,53 @@ fn fmt_thousands(n: u64) -> String {
 /// digits (`9026000` -> `9.03 MB`), so index memory and disk read alike.
 fn fmt_size_decimal(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
-        unit += 1;
+    let max_unit = UNITS.len().saturating_sub(1);
+    let mut divisor = 1_u64;
+    while bytes.checked_div(divisor).expect("byte divisor is nonzero") >= 1000 && unit < max_unit {
+        divisor = divisor.saturating_mul(1000);
+        unit = unit.saturating_add(1);
     }
     if unit == 0 {
         format!("{bytes} B")
-    } else if value >= 100.0 {
-        format!("{value:.0} {}", UNITS[unit])
-    } else if value >= 10.0 {
-        format!("{value:.1} {}", UNITS[unit])
     } else {
-        format!("{value:.2} {}", UNITS[unit])
+        let whole = bytes.checked_div(divisor).expect("byte divisor is nonzero");
+        let decimals = if whole >= 100 {
+            0
+        } else if whole >= 10 {
+            1
+        } else {
+            2
+        };
+        format_scaled(bytes, divisor, decimals, UNITS[unit])
+    }
+}
+
+fn format_scaled(bytes: u64, divisor: u64, decimals: u32, unit: &str) -> String {
+    let whole = bytes.checked_div(divisor).expect("byte divisor is nonzero");
+    let scale = 10_u128.pow(decimals);
+    let remainder = bytes.checked_rem(divisor).expect("byte divisor is nonzero");
+    let fractional = u128::from(remainder)
+        .checked_mul(scale)
+        .expect("scaled byte remainder fits u128")
+        .checked_add(u128::from(divisor / 2))
+        .expect("rounded byte remainder fits u128")
+        .checked_div(u128::from(divisor))
+        .expect("byte divisor is nonzero");
+    let rounded = if fractional == scale {
+        (u128::from(whole.saturating_add(1)), 0_u128)
+    } else {
+        (u128::from(whole), fractional)
+    };
+    if decimals == 0 {
+        format!("{} {unit}", rounded.0)
+    } else {
+        format!(
+            "{}.{:0width$} {unit}",
+            rounded.0,
+            rounded.1,
+            width = decimals as usize
+        )
     }
 }
 
@@ -390,12 +419,11 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             limit,
         } => cmd_collections(
             cli,
-            *all,
-            *layout,
-            *canonical,
-            *per_db,
-            sort.as_deref(),
-            *limit,
+            &CollectionOptions {
+                flags: CollectionFlags::from_bools([*all, *layout, *canonical, *per_db]),
+                sort: sort.as_deref(),
+                limit: *limit,
+            },
         ),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
@@ -1851,32 +1879,71 @@ fn listing_shard_types(cli: &Cli, all: bool) -> Vec<ShardType> {
     }
 }
 
-fn cmd_collections(
-    cli: &Cli,
-    all: bool,
-    layout: bool,
-    canonical: bool,
-    per_db: bool,
-    sort: Option<&str>,
+#[derive(Clone, Copy)]
+struct CollectionFlags(u8);
+
+impl CollectionFlags {
+    const ALL: u8 = 1;
+    const LAYOUT: u8 = 2;
+    const CANONICAL: u8 = 4;
+    const PER_DB: u8 = 8;
+
+    fn from_bools(values: [bool; 4]) -> Self {
+        let mut bits = 0;
+        if values[0] {
+            bits |= Self::ALL;
+        }
+        if values[1] {
+            bits |= Self::LAYOUT;
+        }
+        if values[2] {
+            bits |= Self::CANONICAL;
+        }
+        if values[3] {
+            bits |= Self::PER_DB;
+        }
+        Self(bits)
+    }
+
+    fn all(self) -> bool {
+        self.0 & Self::ALL != 0
+    }
+
+    fn layout(self) -> bool {
+        self.0 & Self::LAYOUT != 0
+    }
+
+    fn canonical(self) -> bool {
+        self.0 & Self::CANONICAL != 0
+    }
+
+    fn per_db(self) -> bool {
+        self.0 & Self::PER_DB != 0
+    }
+}
+
+struct CollectionOptions<'a> {
+    flags: CollectionFlags,
+    sort: Option<&'a str>,
     limit: i64,
-) -> anyhow::Result<()> {
+}
+
+fn cmd_collections(cli: &Cli, options: &CollectionOptions<'_>) -> anyhow::Result<()> {
     if cli.coalesce {
         let valid_dirs = valid_database_dirs(cli)?;
         if valid_dirs.len() > 1 {
-            return cmd_collections_coalesced(
-                cli,
-                &valid_dirs,
-                all,
-                layout,
-                canonical,
-                per_db,
-                sort,
-                limit,
-            );
+            return cmd_collections_coalesced(cli, &valid_dirs, options);
         }
     }
     run_multi_dir(cli, |sub_cli| {
-        cmd_collections_single(sub_cli, all, layout, canonical, sort, limit)
+        cmd_collections_single(
+            sub_cli,
+            options.flags.all(),
+            options.flags.layout(),
+            options.flags.canonical(),
+            options.sort,
+            options.limit,
+        )
     })
 }
 
@@ -1976,12 +2043,7 @@ fn format_canonical_display(display: &str, width: usize, role_width: usize) -> S
 fn cmd_collections_coalesced(
     cli: &Cli,
     valid_dirs: &[PathBuf],
-    all: bool,
-    layout: bool,
-    canonical: bool,
-    per_db: bool,
-    sort: Option<&str>,
-    limit: i64,
+    options: &CollectionOptions<'_>,
 ) -> anyhow::Result<()> {
     struct CoalescedCol {
         id: [u8; 16],
@@ -1996,6 +2058,13 @@ fn cmd_collections_coalesced(
         largest_segment: u64,
         avoidable: u64,
     }
+
+    let all = options.flags.all();
+    let layout = options.flags.layout();
+    let canonical = options.flags.canonical();
+    let per_db = options.flags.per_db();
+    let sort = options.sort;
+    let limit = options.limit;
 
     let types = listing_shard_types(cli, all);
     let physical_needed = layout
@@ -2047,12 +2116,12 @@ fn cmd_collections_coalesced(
             // A pool with no persisted sidecars (a live writer that has not
             // checkpointed) has no disk or shard figures to read, so scan its
             // packs instead of reporting zero.
-            let physical = if physical_needed || sidecar_disk.is_none() || collection_shards.is_none()
-            {
-                physical_layout(&pool_dir).ok()
-            } else {
-                None
-            };
+            let physical =
+                if physical_needed || sidecar_disk.is_none() || collection_shards.is_none() {
+                    physical_layout(&pool_dir).ok()
+                } else {
+                    None
+                };
             let canonical_map: HashMap<[u8; 16], String> = if canonical {
                 PackfileStorage::open_read_only(pool_dir.clone())
                     .ok()
@@ -2275,13 +2344,24 @@ fn cmd_collections_coalesced(
             if total_nodes == 0 {
                 "-".to_owned()
             } else {
-                format!("{} B/node", bytes / total_nodes as u64)
+                format!(
+                    "{} B/node",
+                    bytes
+                        .checked_div(u64::try_from(total_nodes).expect("node count fits u64"))
+                        .expect("total nodes is nonzero")
+                )
             }
         };
         let load = if total_capacity == 0 {
             "-".to_owned()
         } else {
-            format!("{:.1}% load", total_nodes as f64 * 100.0 / total_capacity as f64)
+            let tenths = u128::try_from(total_nodes)
+                .expect("node count fits u128")
+                .checked_mul(1000)
+                .expect("scaled node count fits u128")
+                .checked_div(u128::from(total_capacity))
+                .expect("total capacity is nonzero");
+            format!("{}.{:01}% load", tenths / 10, tenths % 10)
         };
         println!("summary");
         println!(
@@ -2443,7 +2523,10 @@ fn cmd_collections_in_dir(
         None
     };
     if physical_needed && physical.is_none() {
-        bail!("failed to scan the physical pack layout of `{}`", dir.display());
+        bail!(
+            "failed to scan the physical pack layout of `{}`",
+            dir.display()
+        );
     }
     let disk_bytes: HashMap<_, _> = physical
         .as_ref()
@@ -2548,17 +2631,16 @@ fn cmd_collections_in_dir(
                     .and_then(|p| p.collections.get(collection_id))
                     .map(|stats| stats.pack_bytes.len())
             });
-        let shards = shard_count
-            .map_or_else(
-                || "?".to_owned(),
-                |count| {
-                    if count == 1 {
-                        String::new()
-                    } else {
-                        count.to_string()
-                    }
-                },
-            );
+        let shards = shard_count.map_or_else(
+            || "?".to_owned(),
+            |count| {
+                if count == 1 {
+                    String::new()
+                } else {
+                    count.to_string()
+                }
+            },
+        );
         let disk = disk_bytes.get(collection_id).copied().unwrap_or(0);
         let disk_display = if disk_known {
             fmt_disk_megabytes(disk)
@@ -5671,7 +5753,7 @@ fn print_pack_info(
     println!("pack: {pack_id}");
     println!("path: {}", path.display());
 
-    print_pack_lifetime(&path);
+    print_pack_lifetime(path);
 
     let (write_count, bytes_written, sync_count) =
         stats_map.get(&pack_id).copied().unwrap_or_default();

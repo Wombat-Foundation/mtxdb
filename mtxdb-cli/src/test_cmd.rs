@@ -12,9 +12,9 @@ use super::{
     parse_pack_selectors, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
     resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
     template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-    verify_auth_chain_edges, CollectionTemplate, MatrixRoomExtension, MetaReport, PackIdentity,
-    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
-    STATE_GROUP_NAMESPACE,
+    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate,
+    MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
+    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{Cli, Commands};
 use bytes::Bytes;
@@ -510,7 +510,15 @@ fn collections_dash_t_all_iterates_every_pool_without_the_all_flag() {
         },
     };
 
-    cmd_collections(&cli, false, false, false, false, None, -1).unwrap();
+    cmd_collections(
+        &cli,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: None,
+            limit: -1,
+        },
+    )
+    .unwrap();
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -558,7 +566,15 @@ fn collections_with_a_specific_type_still_targets_only_that_pool() {
         },
     };
 
-    cmd_collections(&cli, false, false, false, false, None, -1).unwrap();
+    cmd_collections(
+        &cli,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: None,
+            limit: -1,
+        },
+    )
+    .unwrap();
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1740,7 +1756,7 @@ fn import_rejects_cross_record_event_id_collision() {
 
 #[test]
 fn import_keeps_existing_record_when_event_id_matches() {
-    let (db, dir, path, template, collection_id) = import_fixture("import_keep_same_event");
+    let (db, _, path, template, collection_id) = import_fixture("import_keep_same_event");
     let store = db.event_dag();
     // Keep the derived state-group index separate from the event store so
     // this assertion measures whether the existing event record was
@@ -1781,7 +1797,7 @@ fn import_keeps_existing_record_when_event_id_matches() {
 
 #[test]
 fn importer_loads_complete_cached_state_groups_without_recomputing() {
-    let (db, dir, path, template, collection_id) = import_fixture("import_cached_state_groups");
+    let (db, _, path, template, collection_id) = import_fixture("import_cached_state_groups");
     let store = db.event_dag();
     let state_store = db.state().as_ref();
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
@@ -1821,7 +1837,7 @@ fn importer_loads_complete_cached_state_groups_without_recomputing() {
 #[test]
 fn importer_ignores_the_previous_unversioned_state_group_cache() {
     const OLD_NAMESPACE: &str = "sys:matrix-state-groups";
-    let (db, dir, path, template, collection_id) =
+    let (db, _, path, template, collection_id) =
         import_fixture("import_old_namespace_state_groups");
     let store = db.event_dag();
     let state_store = db.state().as_ref();
@@ -1858,7 +1874,7 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
 
 #[test]
 fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
-    let (db, dir, path, template, collection_id) = import_fixture("import_state_group_repair");
+    let (db, _, path, template, collection_id) = import_fixture("import_state_group_repair");
     let store = db.event_dag();
     let state_store = db.state().as_ref();
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
@@ -4005,23 +4021,54 @@ fn coalesced_shards_and_collections_and_stats() {
             limit: 10,
         },
     };
-    cmd_collections(&cli_cols, false, false, false, false, Some("nodes"), 10).unwrap();
-    cmd_collections(&cli_cols, false, false, false, false, Some("idx-load"), 10).unwrap();
-    cmd_collections(&cli_cols, false, false, false, false, Some("load"), 10).unwrap();
+    cmd_collections(
+        &cli_cols,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("nodes"),
+            limit: 10,
+        },
+    )
+    .unwrap();
+    cmd_collections(
+        &cli_cols,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("idx-load"),
+            limit: 10,
+        },
+    )
+    .unwrap();
+    cmd_collections(
+        &cli_cols,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("load"),
+            limit: 10,
+        },
+    )
+    .unwrap();
 
     let mut cli_cols_coalesce = cli_cols.clone();
     cli_cols_coalesce.coalesce = true;
     cmd_collections(
         &cli_cols_coalesce,
-        false,
-        false,
-        false,
-        false,
-        Some("idx-load"),
-        10,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("idx-load"),
+            limit: 10,
+        },
     )
     .unwrap();
-    cmd_collections(&cli_cols_coalesce, false, false, false, false, Some("load"), 10).unwrap();
+    cmd_collections(
+        &cli_cols_coalesce,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("load"),
+            limit: 10,
+        },
+    )
+    .unwrap();
 
     let cli_stats = Cli {
         dirs: vec![dir1.clone(), dir2.clone()],
@@ -4432,7 +4479,15 @@ fn a_missing_root_is_an_error_but_an_unwritten_pool_is_empty() {
             limit: 0,
         },
     };
-    let error = cmd_collections(&cli(&missing), false, false, false, false, None, 0).unwrap_err();
+    let error = cmd_collections(
+        &cli(&missing),
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: None,
+            limit: 0,
+        },
+    )
+    .unwrap_err();
     assert!(
         error.to_string().contains("no mtxdb database"),
         "a missing root must be diagnosed as such: {error}"
@@ -4441,8 +4496,15 @@ fn a_missing_root_is_an_error_but_an_unwritten_pool_is_empty() {
 
     let root = unique_temp_dir();
     let layout = DatabaseLayout::open(root.clone()).unwrap();
-    cmd_collections(&cli(&root), false, false, false, false, None, 0)
-        .expect("an unwritten pool is empty, not an error");
+    cmd_collections(
+        &cli(&root),
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: None,
+            limit: 0,
+        },
+    )
+    .expect("an unwritten pool is empty, not an error");
     assert!(
         !layout.pool_path(ShardType::State).exists(),
         "read-only inspection must not create the pool"
