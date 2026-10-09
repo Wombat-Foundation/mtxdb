@@ -1143,15 +1143,21 @@ impl ClosureStore {
         let old_cursor = counter.retired_through;
         let mut removed = 0u64;
         if old_cursor != 0 && predecessor != Some(0) && predecessor != Some(old_cursor) {
-            txn.delete_collection(self.pool, self.generation_collection(old_cursor))?;
-            removed = removed.saturating_add(1);
+            let collection = self.generation_collection(old_cursor);
+            if db.pool(self.pool).try_collection_exists(&collection)? {
+                txn.delete_collection(self.pool, collection)?;
+                removed = removed.saturating_add(1);
+            }
         }
         for generation in old_cursor.saturating_add(1)..=end {
             if predecessor == Some(generation) {
                 continue;
             }
-            txn.delete_collection(self.pool, self.generation_collection(generation))?;
-            removed = removed.saturating_add(1);
+            let collection = self.generation_collection(generation);
+            if db.pool(self.pool).try_collection_exists(&collection)? {
+                txn.delete_collection(self.pool, collection)?;
+                removed = removed.saturating_add(1);
+            }
         }
         let retired_through =
             predecessor.map_or(end, |previous| if previous == 0 { end } else { previous });

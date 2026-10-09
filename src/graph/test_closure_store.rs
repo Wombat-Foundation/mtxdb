@@ -111,9 +111,11 @@ fn stale_builder_loses_the_race_and_can_abandon() {
         "generation numbers are never reused"
     );
     another.abandon(&db).unwrap();
-    // The first-head sweep is idempotent even though stale publish already
-    // discarded generation 1; it must not reject the persisted cursor state.
-    store.retire_superseded(&db).unwrap();
+    assert_eq!(
+        store.retire_superseded(&db).unwrap(),
+        0,
+        "the stale publish already discarded its generation"
+    );
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
