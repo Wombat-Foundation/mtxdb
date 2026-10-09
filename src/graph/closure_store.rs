@@ -1131,21 +1131,18 @@ impl ClosureStore {
         // The cursor names the predecessor retained by the last pass. When a
         // newer head exists, that predecessor is now safe to delete and the
         // cursor can move to the new head's predecessor in the same CAS.
-        if predecessor == Some(counter.retired_through)
-            || predecessor.is_none() && counter.retired_through == end
-        {
+        let cursor_limit = predecessor.filter(|&previous| previous != 0).unwrap_or(end);
+        if counter.retired_through == cursor_limit {
             return Ok(0);
         }
-        if predecessor.is_some_and(|previous| counter.retired_through > previous)
-            || predecessor.is_none() && counter.retired_through > end
-        {
+        if counter.retired_through > cursor_limit {
             return Err(StorageError::Corrupt(
                 "closure generation retirement cursor".to_owned(),
             ));
         }
         let old_cursor = counter.retired_through;
         let mut removed = 0u64;
-        if old_cursor != 0 && predecessor != Some(old_cursor) {
+        if old_cursor != 0 && predecessor != Some(0) && predecessor != Some(old_cursor) {
             txn.delete_collection(self.pool, self.generation_collection(old_cursor))?;
             removed = removed.saturating_add(1);
         }
