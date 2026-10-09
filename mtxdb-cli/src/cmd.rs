@@ -127,7 +127,7 @@ fn fmt_bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         let formatted = format_scaled(n, divisor, 1, UNITS[unit]);
-        if formatted.starts_with("1000 ") && unit < max_unit {
+        if formatted.starts_with("1024.0 ") && unit < max_unit {
             format_scaled(
                 n,
                 divisor.saturating_mul(1024),
