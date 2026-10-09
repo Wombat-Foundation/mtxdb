@@ -24,9 +24,9 @@
 //! still unpublished generation; [`GenerationBuilder::publish`](crate::closure_store::GenerationBuilder::publish) swaps the head
 //! by CAS. Readers never see a partial generation: until the swap they read the
 //! old one. If another builder published first, `publish` fails with
-//! `StorageError::StaleRead` and the caller discards its work with
-//! A failed publish discards its generation. A crash before the swap leaves an
-//! orphan generation collection that [`ClosureStore::retire_superseded`](crate::closure_store::ClosureStore::retire_superseded) reclaims.
+//! `StorageError::StaleRead` and discards its generation. A crash before the
+//! swap leaves an orphan generation collection that
+//! [`ClosureStore::retire_superseded`](crate::closure_store::ClosureStore::retire_superseded) reclaims.
 //!
 //! The head also records the short-id counter the generation was built against
 //! (`source_next`) and the coverage it achieved: ids in `1..source_next` that
@@ -1122,40 +1122,42 @@ impl ClosureStore {
         // Only generations below the head are safe to retire. One at or above
         // it may belong to a builder that `begin` reserved but has not yet
         // published; deleting that would leave the head pointing at a deleted
-        // collection. With no head yet, every generation is in progress.
-        let Some(head) = head else {
-            return Ok(0);
+        // collection. With no head yet, retain the newest reservation and
+        // reclaim only older reservations left by crashed builders.
+        let (end, predecessor) = match head {
+            Some(head) => (head.generation.saturating_sub(1), Some(head.previous)),
+            None => (counter.next.saturating_sub(2), None),
         };
         // The cursor names the predecessor retained by the last pass. When a
         // newer head exists, that predecessor is now safe to delete and the
         // cursor can move to the new head's predecessor in the same CAS.
-        if counter.retired_through == head.previous {
+        if predecessor == Some(counter.retired_through)
+            || predecessor.is_none() && counter.retired_through == end
+        {
             return Ok(0);
         }
-        if counter.retired_through > head.previous {
+        if predecessor.is_some_and(|previous| counter.retired_through > previous)
+            || predecessor.is_none() && counter.retired_through > end
+        {
             return Err(StorageError::Corrupt(
                 "closure generation retirement cursor".to_owned(),
             ));
         }
         let old_cursor = counter.retired_through;
         let mut removed = 0u64;
-        let end = head.generation.saturating_sub(1);
-        if old_cursor != 0 && old_cursor != head.previous {
+        if old_cursor != 0 && predecessor != Some(old_cursor) {
             txn.delete_collection(self.pool, self.generation_collection(old_cursor))?;
             removed = removed.saturating_add(1);
         }
         for generation in old_cursor.saturating_add(1)..=end {
-            if generation == head.previous {
+            if predecessor == Some(generation) {
                 continue;
             }
             txn.delete_collection(self.pool, self.generation_collection(generation))?;
             removed = removed.saturating_add(1);
         }
-        let retired_through = if head.previous == 0 {
-            end
-        } else {
-            head.previous
-        };
+        let retired_through =
+            predecessor.map_or(end, |previous| if previous == 0 { end } else { previous });
         txn.expect_record_version(self.pool, self.head_collection(), COUNTER_ID, tokens[0])?;
         txn.put(
             self.pool,

@@ -8,11 +8,14 @@ function num(s) { gsub(/_/, "", s); return s + 0 }
 
 { print }
 
-/^macro-stats =+$/ { rules++ }
-
 /^macro-stats / && !/^macro-stats =/ && !/Macro Name/ && !/^macro-stats -/ && !/MACRO EXPANSION/ {
 	n = split($0, f, /[ \t]+/)
-	if (n < 6 || f[n] !~ /^[0-9_.]+$/ || f[n - 3] !~ /^[0-9_]+$/) next
+	if (n < 6 ||
+		f[n - 4] !~ /^[0-9][0-9_]*$/ ||
+		f[n - 3] !~ /^[0-9][0-9_]*$/ ||
+		f[n - 2] !~ /^[0-9][0-9_]*([.][0-9][0-9_]*)?$/ ||
+		f[n - 1] !~ /^[0-9][0-9_]*$/ ||
+		f[n] !~ /^[0-9][0-9_]*([.][0-9][0-9_]*)?$/) next
 	uses = num(f[n - 4]); bytes = num(f[n - 1]); lines = num(f[n - 3])
 	name = $0
 	sub(/^macro-stats +/, "", name)
@@ -24,7 +27,7 @@ function num(s) { gsub(/_/, "", s); return s + 0 }
 	tu += uses; tl += lines; tb += bytes
 }
 
-/^macro-stats =+$/ && rules == 2 {
+END {
 	printf "macro-stats %-34s %6s %10s %12s\n", "TOTALS", "Uses", "Lines", "Bytes"
 	split("crate macros,derives,std/external", order, ",")
 	for (i = 1; i <= 3; i++) {

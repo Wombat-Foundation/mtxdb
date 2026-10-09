@@ -518,8 +518,7 @@ fn test_creation_sequence_header_roundtrip() {
 
 #[test]
 fn extract_inherits_the_source_ordering_key() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_extract_key_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_dir("extract_key");
     let (src, dst) = (dir.join("src.pack"), dir.join("dst.pack"));
     let mut buf = Vec::new();
     write_header_with_created_at(&mut buf, &test_pack_id(1), 77, 5).unwrap();
@@ -530,7 +529,6 @@ fn extract_inherits_the_source_ordering_key() {
         .unwrap()
         .unwrap();
     assert_eq!((header.created_at, header.creation_seq), (77, 5));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

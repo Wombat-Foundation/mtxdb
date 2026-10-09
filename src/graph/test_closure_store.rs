@@ -153,6 +153,30 @@ fn reopen_preserves_head_and_orphans_are_reclaimed() {
 }
 
 #[test]
+fn no_head_reclaims_old_reservations_but_keeps_newest() {
+    let root = test_root("no-head-orphans");
+    let db = open_db(&root);
+    {
+        let mut crashed = store().begin(&db).unwrap();
+        crashed.add(&db, &[(1, b"orphan".as_slice())]).unwrap();
+    }
+    drop(db);
+
+    let db = open_db(&root);
+    let mut active = store().begin(&db).unwrap();
+    active.add(&db, &[(1, b"active".as_slice())]).unwrap();
+    assert_eq!(active.generation(), 2);
+    assert!(closure_store::test::generation_exists(&store(), &db, 1, &[1]).unwrap());
+
+    assert_eq!(store().retire_superseded(&db).unwrap(), 1);
+    assert!(!closure_store::test::generation_exists(&store(), &db, 1, &[1]).unwrap());
+    assert!(closure_store::test::generation_exists(&store(), &db, 2, &[1]).unwrap());
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn verify_reports_gaps_and_empty_blobs_are_rejected() {
     let root = test_root("verify");
     let db = open_db(&root);

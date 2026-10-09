@@ -411,7 +411,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-type CacheKey = (std::path::PathBuf, usize, [u8; 16], u32, u64);
+type CacheKey = (std::path::PathBuf, usize, usize, [u8; 16], u32, u64);
 
 /// A small LRU of merged bases, keyed by scope and manifest version, so a new
 /// snapshot costs a tail read and not a merge.
@@ -660,6 +660,7 @@ impl ShortIdIndex {
         let key = (
             db.layout().root().to_path_buf(),
             self.pool.index(),
+            self.log_pool.index(),
             self.collection_id,
             version,
             generation,
