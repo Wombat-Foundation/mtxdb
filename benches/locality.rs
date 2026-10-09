@@ -475,9 +475,6 @@ fn drop_caches_for_dir(dir: &Path) -> Eviction {
     }
 }
 
-/// Whether `vmtouch` is callable on `$PATH` at all. Checked once up front
-/// so a missing install is a loud banner at startup, not something a
-/// reader has to notice buried in a "Cache state: Warm" line four phases in.
 // ── Benchmark ──────────────────────────────────────────────────────
 
 fn shard_bytes_label(n: Option<u64>) -> String {
