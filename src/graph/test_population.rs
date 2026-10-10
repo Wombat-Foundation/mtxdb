@@ -303,7 +303,8 @@ fn writers_racing_compaction_lose_nothing() {
         std::thread::spawn(move || {
             // A writer with idle gaps, as a room's traffic has.
             for i in 0..400 {
-                record(&db, i..i + 1);
+                let end = i + 1;
+                record(&db, i..end);
                 std::thread::sleep(std::time::Duration::from_micros(150));
             }
         })

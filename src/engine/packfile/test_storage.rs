@@ -9143,7 +9143,7 @@ fn a_wrong_but_in_bounds_locator_rejects_the_log_and_the_open_rescans() {
     if let Some(DeltaOperation::Redo(record)) = operations
         .iter_mut()
         .filter(|operation| matches!(operation, DeltaOperation::Redo(_)))
-        .last()
+        .next_back()
     {
         if let RedoOp::Set {
             offset, record_len, ..

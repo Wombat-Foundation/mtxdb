@@ -1607,8 +1607,8 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     // the state-group id (BLAKE2b over the lanes), the same identity the
     // event->state-group aux index stores.
     let mut lanes = [0u16; 1024];
-    for (lane, chunk) in lanes.iter_mut().zip(lattice_bytes.as_chunks::<2>().0) {
-        *lane = u16::from_le_bytes(*chunk);
+    for (lane, chunk) in lanes.iter_mut().zip(lattice_bytes.chunks_exact(2)) {
+        *lane = u16::from_le_bytes([chunk[0], chunk[1]]);
     }
     let lattice = rezzy::incremental::LtLattice::<1024>::from(lanes);
     let state_group_id = rezzy::hamt::state_group_id_from_lthash(&lattice);
@@ -9740,9 +9740,7 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
     let deleted_path = dir.join("deleted.collections");
     let deleted_bytes = fs::read(&deleted_path).unwrap_or_default();
     let deleted: HashSet<[u8; 16]> = deleted_bytes
-        .as_chunks::<16>()
-        .0
-        .iter()
+        .chunks_exact(16)
         .map(|chunk| {
             let mut id = [0u8; 16];
             id.copy_from_slice(chunk);
