@@ -766,7 +766,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a992c45d290bd50cfca7eedd888486a27eb273e1"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#74d8aabace81354fbe9f340985fbd79b8d469282"
 dependencies = [
  "base64 0.23.1",
  "sha2",
