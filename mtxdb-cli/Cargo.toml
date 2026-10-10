@@ -80,7 +80,6 @@ clap_complete = { version = "=4.6.11", optional = true }
 hex = "0.4"
 mtxdb = { path = ".." }
 rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
-simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
 
 # INTEGRATION TESTS. Ungated files are folded into one `tests/unit/main.rs`
 # target so `cargo test` links a single binary for them (see that file's

@@ -22,14 +22,28 @@ use mtxdb::{
     DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion,
     PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
 };
-use simd_json::prelude::*;
-use simd_json::OwnedValue;
+use rezzy::json::{self, Object, Value as OwnedValue};
 
 use crate::{Cli, Commands, PacksAction};
 
 const MAX_DEBUG_UNRESOLVED: usize = 20;
 /// Byte width of an STGP state-group instance id (128-bit).
 const STATE_GROUP_ID_LENGTH: usize = 16;
+
+trait JsonValueExt {
+    fn encode(&self) -> String;
+    fn encode_pp(&self) -> String;
+}
+
+impl JsonValueExt for OwnedValue {
+    fn encode(&self) -> String {
+        json::write_string_value(self).expect("JSON serialization cannot fail")
+    }
+
+    fn encode_pp(&self) -> String {
+        json::write_string_pretty(self).expect("JSON serialization cannot fail")
+    }
+}
 
 /// Auxiliary namespace for the derived `event_id -> state-group instance` cache.
 ///
@@ -1121,8 +1135,8 @@ fn print_get_verbose(
     eprintln!("  pool:       {}", shard_type.as_str());
     eprintln!("  payload:    {} bytes", data.bytes.len());
 
-    let mut bytes = data.bytes.to_vec();
-    let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
+    let bytes = data.bytes.to_vec();
+    let Ok(event) = OwnedValue::parse_bytes(&bytes) else {
         eprintln!("  format:     binary/non-JSON");
         return;
     };
@@ -1178,8 +1192,8 @@ fn get_matches_in_store(
 }
 
 fn extract_origin_server_ts(bytes: &[u8]) -> Option<u64> {
-    let mut copy = bytes.to_vec();
-    let event = simd_json::to_owned_value(&mut copy).ok()?;
+    let copy = bytes.to_vec();
+    let event = OwnedValue::parse_bytes(&copy).ok()?;
     if let OwnedValue::Object(fields) = &event {
         fields
             .get("origin_server_ts")
@@ -1444,8 +1458,8 @@ fn pretty_json_stream(bytes: &[u8]) -> Option<Vec<u8>> {
     let values = split_json_stream(bytes)?;
     let mut output = Vec::new();
     for value in values {
-        let mut value = value.to_vec();
-        let json = simd_json::to_owned_value(&mut value).ok()?;
+        let value = value.to_vec();
+        let json = OwnedValue::parse_bytes(&value).ok()?;
         let formatted = json.encode_pp();
         output.extend_from_slice(formatted.as_bytes());
         output.push(b'\n');
@@ -1544,8 +1558,8 @@ fn single_json_document(bytes: &[u8]) -> Option<Vec<u8>> {
     let [value] = values.as_slice() else {
         return None;
     };
-    let mut value = value.to_vec();
-    let json = simd_json::to_owned_value(&mut value).ok()?;
+    let value = value.to_vec();
+    let json = OwnedValue::parse_bytes(&value).ok()?;
     Some(json.encode_pp().into_bytes())
 }
 
@@ -1820,12 +1834,12 @@ fn decode_hamt_leaf_pair(bytes: &[u8], cursor: &mut usize) -> Option<(String, St
         *cursor = start;
         return None;
     };
-    let mut key_bytes = key_json.into_bytes();
-    let Ok(value) = simd_json::to_owned_value(&mut key_bytes) else {
+    let key_bytes = key_json.into_bytes();
+    let Ok(value) = OwnedValue::parse_bytes(&key_bytes) else {
         *cursor = start;
         return None;
     };
-    let simd_json::OwnedValue::Array(elements) = value else {
+    let OwnedValue::Array(elements) = value else {
         *cursor = start;
         return None;
     };
@@ -4838,10 +4852,10 @@ impl MetaReport {
     fn line(&mut self, line: impl Into<String>) {
         let line = line.into();
         self.lines.push(line.clone());
-        let mut fields = simd_json::owned::Object::new();
+        let mut fields = Object::new();
         fields.insert("kind".to_owned(), OwnedValue::from("text"));
         fields.insert("message".to_owned(), OwnedValue::from(line));
-        self.json_records.push(OwnedValue::Object(Box::new(fields)));
+        self.json_records.push(OwnedValue::Object(fields));
     }
 
     fn finding(&mut self, level: &str, path: &Path, message: impl std::fmt::Display) {
@@ -4859,12 +4873,12 @@ impl MetaReport {
         let message = message.to_string();
         let path = path.display().to_string();
         self.lines.push(format!("[{severity}] {path}: {message}"));
-        let mut fields = simd_json::owned::Object::new();
+        let mut fields = Object::new();
         fields.insert("kind".to_owned(), OwnedValue::from("diagnostic"));
         fields.insert("severity".to_owned(), OwnedValue::from(severity));
         fields.insert("path".to_owned(), OwnedValue::from(path));
         fields.insert("message".to_owned(), OwnedValue::from(message));
-        self.json_records.push(OwnedValue::Object(Box::new(fields)));
+        self.json_records.push(OwnedValue::Object(fields));
     }
 
     fn print(self, json: bool) {
@@ -4880,7 +4894,7 @@ impl MetaReport {
 
     fn json_value(self) -> OwnedValue {
         let mut records = self.json_records;
-        let mut summary = simd_json::owned::Object::new();
+        let mut summary = Object::new();
         summary.insert("kind".to_owned(), OwnedValue::from("summary"));
         summary.insert(
             "note".to_owned(),
@@ -4898,8 +4912,8 @@ impl MetaReport {
             "unknown".to_owned(),
             OwnedValue::from(u64::try_from(self.unknown_count).unwrap_or(u64::MAX)),
         );
-        records.insert(0, OwnedValue::Object(Box::new(summary)));
-        OwnedValue::Array(Box::new(records))
+        records.insert(0, OwnedValue::Object(summary));
+        OwnedValue::Array(records)
     }
 }
 
@@ -5237,9 +5251,9 @@ fn format_mutation(mutation: &mtxdb::journal::Mutation, decode: Option<&str>) ->
                         let _ = write!(line, " payload_hex=0x{}", hex::encode(payload));
                     }
                     "json" | "auto" => {
-                        let mut bytes = payload.clone();
+                        let bytes = payload.clone();
                         if std::str::from_utf8(&bytes).is_ok() {
-                            if let Ok(value) = simd_json::to_owned_value(&mut bytes) {
+                            if let Ok(value) = OwnedValue::parse_bytes(&bytes) {
                                 let _ = write!(line, " payload={value}");
                             }
                         }
@@ -5386,9 +5400,9 @@ fn meta_deltas(root: &Path, report: &mut MetaReport, limit: usize, offset: usize
                     format!("epoch is not selected by current checkpoint fingerprint ({checkpoint_fingerprint:?}); likely orphaned or stale"),
                 );
             }
-            if let Some(log) = mtxdb::index::delta::read_delta_log_v3(&path) {
+            if let Some(log) = mtxdb::index::delta::read_delta_log(&path) {
                 report.line(format!(
-                "delta {} epoch={fingerprint:#x}: v3 operations={} base={:#x} tail={:#x} committed_len={} torn_tail={} coverage={}",
+                "delta {} epoch={fingerprint:#x}: v1 operations={} base={:#x} tail={:#x} committed_len={} torn_tail={} coverage={}",
                 path.display(),
                 log.operations.len(),
                 log.base_fingerprint,
@@ -5406,26 +5420,6 @@ fn meta_deltas(root: &Path, report: &mut MetaReport, limit: usize, offset: usize
                 }
                 for operation in log.operations.iter().skip(offset).take(limit) {
                     report.line(format!("  {}", format_delta_operation(operation)));
-                }
-            } else if let Some(log) = mtxdb::index::delta::read_delta_log(&path) {
-                report.line(format!(
-                    "delta {}: v2 frames={} base={:#x} tail={:#x} committed_len={} torn_tail={}",
-                    path.display(),
-                    log.frames.len(),
-                    log.base_fingerprint,
-                    log.tail_fingerprint,
-                    log.file_len,
-                    log.torn_tail
-                ));
-                if log.torn_tail {
-                    report.finding(
-                        "WARN",
-                        &path,
-                        "truncated or invalid tail; committed prefix decoded",
-                    );
-                }
-                for frame in log.frames.iter().skip(offset).take(limit) {
-                    report.line(format!("  {}", format_delta_frame(frame)));
                 }
             } else {
                 report.finding("WARN", &path, "invalid, corrupt, or unsupported delta log");
@@ -6130,11 +6124,10 @@ impl MatrixRoomExtension {
     /// Serialize the self-describing JSON blob stored in
     /// [`CollectionMetadata::extension`].
     fn encode_blob(&self) -> Vec<u8> {
-        use simd_json::prelude::Writable;
         let mut fields = vec![
             format!(
                 "\"ext\":{}",
-                simd_json::OwnedValue::from(MATRIX_ROOM_EXT).encode()
+                OwnedValue::from(MATRIX_ROOM_EXT).encode()
             ),
             format!("\"fmt\":{MATRIX_ROOM_EXT_FMT}"),
         ];
@@ -6147,7 +6140,7 @@ impl MatrixRoomExtension {
             if let Some(value) = value {
                 fields.push(format!(
                     "\"{key}\":{}",
-                    simd_json::OwnedValue::from(value.as_str()).encode()
+                    OwnedValue::from(value.as_str()).encode()
                 ));
             }
         }
@@ -6158,8 +6151,8 @@ impl MatrixRoomExtension {
     }
 
     fn decode_blob(blob: &[u8]) -> Option<Self> {
-        let mut bytes = blob.to_vec();
-        let value = simd_json::to_owned_value(&mut bytes).ok()?;
+        let bytes = blob.to_vec();
+        let value = OwnedValue::parse_bytes(&bytes).ok()?;
         if event_string_field(&value, "ext") != Some(MATRIX_ROOM_EXT) {
             return None;
         }
@@ -6484,7 +6477,7 @@ const ROOM_CONFIG_TYPES: [&str; 6] = [
     "m.room.encryption",
 ];
 
-fn string_array(fields: &simd_json::owned::Object, key: &str) -> Vec<String> {
+fn string_array(fields: &Object, key: &str) -> Vec<String> {
     match fields.get(key) {
         Some(OwnedValue::Array(items)) => items
             .iter()
@@ -6544,8 +6537,8 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
             .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
         stats.min_size = Some(stats.min_size.map_or(size, |m| m.min(size)));
         stats.max_size = stats.max_size.max(size);
-        let mut bytes = record.data.to_vec();
-        let parsed = simd_json::to_owned_value(&mut bytes).ok();
+        let bytes = record.data.to_vec();
+        let parsed = OwnedValue::parse_bytes(&bytes).ok();
         let Some(event @ OwnedValue::Object(_)) = parsed else {
             let kind = classify_record_payload(&record.data);
             let count = stats.kinds.entry(kind.to_owned()).or_default();
@@ -6561,7 +6554,7 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
         let kind = event_string_field(&event, "type").unwrap_or("");
         let ts = fields
             .get("origin_server_ts")
-            .and_then(ValueAsScalar::as_i64);
+            .and_then(OwnedValue::as_i64);
         let event_id = event_id(&event).unwrap_or("").to_owned();
         if is_state_event(&event) {
             stats.state_events = stats.state_events.saturating_add(1);
@@ -6609,7 +6602,7 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
             stats.max_ts = Some(stats.max_ts.map_or(ts, |m| m.max(ts)));
             bump(&mut stats.months, &format_utc_ms(ts)[..7]);
         }
-        if let Some(depth) = fields.get("depth").and_then(ValueAsScalar::as_i64) {
+        if let Some(depth) = fields.get("depth").and_then(OwnedValue::as_i64) {
             stats.min_depth = Some(stats.min_depth.map_or(depth, |m| m.min(depth)));
             stats.max_depth = Some(stats.max_depth.map_or(depth, |m| m.max(depth)));
         }
@@ -8186,7 +8179,7 @@ fn extract_display_id_pointer<'a>(
                 path.display()
             );
         };
-        for label in labels.iter() {
+        for label in labels {
             let OwnedValue::Object(obj) = label else {
                 bail!(
                     "template {} declares a collection label that is not an object",
@@ -8227,9 +8220,9 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     let Some(path) = path else {
         return Ok(default_matrix_import_template());
     };
-    let mut bytes =
+    let bytes =
         fs::read(path).with_context(|| format!("reading template {}", path.display()))?;
-    let template: OwnedValue = simd_json::to_owned_value(&mut bytes)
+    let template: OwnedValue = OwnedValue::parse_bytes(&bytes)
         .with_context(|| format!("template {} is not valid JSON", path.display()))?;
     let (identity_pointer, membership_pointer) = validate_required_keys(&template, path)?;
     // Every collection has exactly one establishment record; there is no
@@ -8691,8 +8684,8 @@ fn payload_fields(payload: &[u8]) -> Vec<(&'static str, String)> {
 /// Compact single-line JSON encoding of one stored value, or `None` if the
 /// payload is not a single JSON document (e.g. a binary HAMT node).
 fn compact_json_value(bytes: &[u8]) -> Option<String> {
-    let mut copy = bytes.to_vec();
-    let value = simd_json::to_owned_value(&mut copy).ok()?;
+    let copy = bytes.to_vec();
+    let value = OwnedValue::parse_bytes(&copy).ok()?;
     Some(value.encode())
 }
 
@@ -9235,8 +9228,8 @@ fn reject_cross_record_collision(
     incoming_event_id: &str,
     existing_record: &NodeData,
 ) -> anyhow::Result<()> {
-    let mut existing_bytes = existing_record.bytes.to_vec();
-    let existing_event_id = simd_json::to_owned_value(&mut existing_bytes)
+    let existing_bytes = existing_record.bytes.to_vec();
+    let existing_event_id = OwnedValue::parse_bytes(&existing_bytes)
         .ok()
         .and_then(|event| event_id(&event).map(str::to_owned));
     if existing_event_id.as_deref() != Some(incoming_event_id) {
@@ -9768,8 +9761,8 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
             if deleted.contains(&record.collection_id) {
                 continue;
             }
-            let mut bytes = record.data.to_vec();
-            let Ok(event) = simd_json::to_owned_value(&mut bytes) else {
+            let bytes = record.data.to_vec();
+            let Ok(event) = OwnedValue::parse_bytes(&bytes) else {
                 continue;
             };
             if matrix_create_event_id(&event).is_some() {
@@ -9808,8 +9801,8 @@ fn parse_jsonl_events(
                 raw_detected_collection = view.room_id.map(str::to_owned);
             }
         }
-        let mut bytes = line.as_bytes().to_vec();
-        let event = simd_json::to_owned_value(&mut bytes)
+        let bytes = line.as_bytes().to_vec();
+        let event = OwnedValue::parse_bytes(&bytes)
             .with_context(|| format!("invalid JSONL event on line {line_number}"))?;
         events.push(event);
         raw_lines.push(line.as_bytes());
@@ -9842,8 +9835,8 @@ const FEDERATION_JSON_HINT: &str =
     "expected Matrix federation JSON with a `pdus` array, an `auth_chain` array, or both; JSONL files must contain one event per line";
 
 fn parse_federation_input(content: &[u8]) -> anyhow::Result<FederationInput> {
-    let mut bytes = content.to_vec();
-    let val: OwnedValue = simd_json::to_owned_value(&mut bytes).context("invalid JSON")?;
+    let bytes = content.to_vec();
+    let val: OwnedValue = OwnedValue::parse_bytes(&bytes).context("invalid JSON")?;
     let has_pdu_field = val.get("pdus").is_some();
     let has_auth_chain_field = val.get("auth_chain").is_some();
     if !has_pdu_field && !has_auth_chain_field {
@@ -9890,7 +9883,7 @@ fn verify_auth_chain_edges(
         let Some(OwnedValue::Array(auth_events)) = fields.get("auth_events") else {
             continue;
         };
-        for reference in auth_events.iter() {
+        for reference in auth_events {
             let target = match reference {
                 OwnedValue::String(s) => Some(s.as_str()),
                 OwnedValue::Array(parts) => parts.first().and_then(|v| v.as_str()),
@@ -10590,7 +10583,7 @@ fn has_event_flag(event: &OwnedValue, flag: &str) -> bool {
         return false;
     };
     fields.iter().any(|(key, value)| {
-        matches!(value, OwnedValue::Static(simd_json::StaticNode::Bool(true)))
+        matches!(value, OwnedValue::Bool(true))
             && key.trim_start_matches('_').replace('-', "_") == flag
     })
 }
@@ -11528,8 +11521,8 @@ fn cmd_repack_target(
 }
 
 fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
-    let mut input = data.to_vec();
-    let val: simd_json::OwnedValue = match simd_json::to_owned_value(&mut input) {
+    let input = data.to_vec();
+    let val: OwnedValue = match OwnedValue::parse_bytes(&input) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -11600,7 +11593,7 @@ impl MatrixEventFields {
             ("auth_events", &mut fields.auth),
         ] {
             if let Some(OwnedValue::Array(values)) = object.get(field) {
-                for value in values.iter() {
+                for value in values {
                     // Room versions 1 and 2 reference `[event_id, hashes]`.
                     let target = match value {
                         OwnedValue::String(id) => Some(id.as_str()),

@@ -15,6 +15,7 @@ use super::{
     verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate,
     MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
     MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    JsonValueExt,
 };
 use crate::{Cli, Commands};
 use bytes::Bytes;
@@ -30,8 +31,7 @@ use mtxdb::{
     content_digest, derive_collection_id, Database, DatabaseLayout, DigestAlgorithm,
     MatrixRoomVersion, ShardType,
 };
-use simd_json::prelude::{ValueAsScalar, ValueObjectAccess, Writable};
-use simd_json::OwnedValue;
+use rezzy::json::Value as OwnedValue;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,8 +39,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use base64::Engine;
 
 fn owned_value(json: &str) -> OwnedValue {
-    let mut bytes = json.as_bytes().to_vec();
-    simd_json::to_owned_value(&mut bytes).expect("valid JSON fixture")
+    let bytes = json.as_bytes().to_vec();
+    OwnedValue::parse_bytes(&bytes).expect("valid JSON fixture")
 }
 
 /// A string field of a JSON object, or `None` if the key is absent or not
@@ -180,12 +180,12 @@ fn meta_json_summary_has_numeric_severity_counts() {
     report.finding("ERROR", Path::new("error"), "unreadable");
     let value = report.json_value();
     let encoded = value.encode();
-    let mut bytes = encoded.into_bytes();
-    let parsed = simd_json::to_owned_value(&mut bytes).expect("meta JSON must parse");
-    let simd_json::OwnedValue::Array(records) = parsed else {
+    let bytes = encoded.into_bytes();
+    let parsed = OwnedValue::parse_bytes(&bytes).expect("meta JSON must parse");
+    let OwnedValue::Array(records) = parsed else {
         panic!("meta JSON must be an array");
     };
-    let simd_json::OwnedValue::Object(summary) = &records[0] else {
+    let OwnedValue::Object(summary) = &records[0] else {
         panic!("summary must be an object");
     };
     assert_eq!(
@@ -1624,8 +1624,8 @@ fn imported_event_payload_uses_rezzy_redaction() {
         }"#,
     );
     let bytes = redacted_event_bytes(&event, "11").unwrap();
-    let mut json = bytes.to_vec();
-    let redacted = simd_json::to_owned_value(&mut json).unwrap();
+    let json = bytes.to_vec();
+    let redacted = OwnedValue::parse_bytes(&json).unwrap();
     assert!(redacted.get("unsigned").is_none());
     assert!(redacted.get("__pdu_count").is_none());
     assert!(redacted.get("__soft_failed").is_none());
@@ -2740,11 +2740,10 @@ fn encode_lps(s: &str) -> Vec<u8> {
 /// encoding is a single JSON 2-element array string, not a raw tuple
 /// codec.
 fn hamt_leaf_key_json(event_type: &str, state_key: &str) -> String {
-    use simd_json::prelude::Writable;
-    simd_json::OwnedValue::Array(Box::new(vec![
-        simd_json::OwnedValue::from(event_type),
-        simd_json::OwnedValue::from(state_key),
-    ]))
+    OwnedValue::Array(vec![
+        OwnedValue::from(event_type),
+        OwnedValue::from(state_key),
+    ])
     .encode()
 }
 
