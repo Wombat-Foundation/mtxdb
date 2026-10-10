@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use mtxdb::packfile::layout::*;
-use mtxdb::packfile::{write_header, write_record, PackId, Record, PACK_ID_LEN};
+use mtxdb::packfile::{write_header_with_creation_seq, write_record, PackId, Record, PACK_ID_LEN};
 use std::fs::File;
 use std::io;
 
@@ -38,7 +38,7 @@ fn physical_layout_counts_cross_pack_spread_and_interleaved_runs() {
     ] {
         let path = dir.join(pack_id.filename());
         let mut file = File::create(path).unwrap();
-        write_header(&mut file, &pack_id).unwrap();
+        write_header_with_creation_seq(&mut file, &pack_id, 1).unwrap();
         for (index, collection_id) in records.into_iter().enumerate() {
             write_record(
                 &mut file,

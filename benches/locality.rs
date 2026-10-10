@@ -381,7 +381,7 @@ fn compact_shard_intra(
 
     let file = fs::File::create(dest_path)?;
     let mut buffered = std::io::BufWriter::with_capacity(1024 * 1024, file);
-    packfile::write_header(&mut buffered, dest_pack_id)?;
+    packfile::write_header_with_creation_seq(&mut buffered, dest_pack_id, 1)?;
 
     let mut records_written = 0usize;
     let mut bytes_written = 0u64;

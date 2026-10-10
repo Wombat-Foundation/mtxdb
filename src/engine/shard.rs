@@ -950,19 +950,14 @@ impl ShardPool {
         Ok(pack_files)
     }
 
-    /// Creation-order sort key. Sequenced headers order by their persisted
-    /// pool-local sequence; legacy headers (sequence zero) sort before every
-    /// sequenced pack, by timestamp. The address is only the final
-    /// deterministic tie-breaker.
+    /// Creation-order sort key: the persisted pool-local sequence, with the
+    /// address as the final deterministic tie-breaker. Header parsing rejects
+    /// a zero sequence, so every pack carries a real one.
     fn pack_order_key(
         header: &packfile::ShardHeader,
         address: packfile::PackId,
-    ) -> (bool, u32, u64, packfile::PackId) {
-        if header.creation_seq == 0 {
-            (false, 0, header.created_at, address)
-        } else {
-            (true, header.creation_seq, 0, address)
-        }
+    ) -> (u32, packfile::PackId) {
+        (header.creation_seq, address)
     }
 
     /// Discover and sort pack files in `base_dir`, enforcing the
@@ -987,7 +982,7 @@ impl ShardPool {
         // during a rebuild. The immutable header was already read during
         // discovery; fail rather than silently swallowing metadata errors,
         // then sort the cached keys. New headers use their persisted creation
-        // sequence; legacy headers fall back to timestamp/address ordering.
+        // sequence.
         let mut ordered = Vec::with_capacity(pack_files.len());
         let mut next_creation_seq = 1;
         for (address, path, header) in pack_files {

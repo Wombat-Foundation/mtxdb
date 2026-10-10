@@ -1071,7 +1071,7 @@ fn packs_dump_rejects_a_pack_selector_present_in_multiple_pools() {
         bytes[mtxdb::packfile::PACK_ID_LEN - 1] = tail;
         let pack_id = PackId(bytes);
         let mut file = std::fs::File::create(pool.join(pack_id.filename())).unwrap();
-        mtxdb::packfile::write_header(&mut file, &pack_id).unwrap();
+        mtxdb::packfile::write_header_with_creation_seq(&mut file, &pack_id, 1).unwrap();
     }
     let cli = Cli {
         dirs: vec![dir.clone()],

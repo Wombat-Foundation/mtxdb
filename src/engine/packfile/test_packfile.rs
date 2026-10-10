@@ -495,7 +495,7 @@ fn test_zero_length_rejected() {
 #[test]
 fn test_header_roundtrip() {
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(42)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(42), 1).unwrap();
     assert_eq!(buf.len(), HEADER_LEN);
 
     let mut cursor = Cursor::new(&buf);
@@ -544,7 +544,7 @@ fn zero_pack_id_is_rejected_by_hex_parse() {
 #[test]
 fn zero_pack_id_is_rejected_by_write_header() {
     let mut buf = Vec::new();
-    let err = write_header(&mut buf, &PackId([0u8; PACK_ID_LEN])).unwrap_err();
+    let err = write_header_with_creation_seq(&mut buf, &PackId([0u8; PACK_ID_LEN]), 1).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(buf.is_empty(), "no header bytes may be emitted");
 }
@@ -608,7 +608,7 @@ fn test_header_empty_returns_none() {
 #[test]
 fn test_header_crc_mismatch_is_an_error_not_none() {
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(1)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(1), 1).unwrap();
     // Corrupt a byte inside the CRC-covered region (the pack_id
     // field) without touching magic/version/header_len — this must
     // surface as corruption, not as "not a packfile".
@@ -719,7 +719,7 @@ fn test_open_packfile_rejects_identity_mismatch() {
     // Header genuinely says pack_id 0 — a valid current-format header on its
     // own terms, just not what this filename claims.
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     std::fs::write(&path, &buf).unwrap();
 
     let err = open_packfile(&path, false, &test_pack_id(2)).unwrap_err();
@@ -817,7 +817,7 @@ fn test_scan_packfile_torn_tail() {
     // bytes, so read_record can't even complete reading the length
     // prefix and hits UnexpectedEof.
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(&mut buf, &test_record_raw([0xaa; 16], b"data")).unwrap();
     buf.extend_from_slice(&[0xff; 3]); // torn trailing bytes
     std::fs::write(&path, &buf).unwrap();
@@ -831,7 +831,7 @@ fn test_scan_records_iter_reports_torn_tail() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("pack_0000000000000000.pack");
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(&mut buf, &test_record_raw([0xaa; 16], b"data")).unwrap();
     buf.extend_from_slice(&[0xff; 3]); // torn trailing bytes
     std::fs::write(&path, &buf).unwrap();
@@ -859,7 +859,7 @@ fn test_scan_and_recover_truncates_torn_tail() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("shard_00.pack");
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(&mut buf, &test_record_raw([0xaa; 16], b"good")).unwrap();
     let valid_len = buf.len();
     // Simulate a realistic torn tail: valid length prefix declaring a
@@ -886,7 +886,7 @@ fn test_scan_and_recover_truncates_partial_length_prefix() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("pack_0000000000000000.pack");
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(&mut buf, &test_record_raw([0xaa; 16], b"good")).unwrap();
     let valid_len = buf.len();
     buf.extend_from_slice(&[0x12, 0x34, 0x56]);
@@ -903,7 +903,7 @@ fn test_scan_and_recover_clean_file() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("shard_00.pack");
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(&mut buf, &test_record_raw([0xbb; 16], b"ok")).unwrap();
     write_record(&mut buf, &test_record_raw([0xcc; 16], b"ok2")).unwrap();
     let expected_len = buf.len();
@@ -922,7 +922,7 @@ fn test_recover_packfile_matches_scan_and_recover_at_every_cut() {
     let dir = test_dir("recover_matches");
     std::fs::create_dir_all(&dir).unwrap();
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     let header_len = buf.len();
     for (index, byte) in [0xa1u8, 0xa2, 0xa3, 0xa4].into_iter().enumerate() {
         let payload = vec![byte; 7 + index * 40];
@@ -991,7 +991,7 @@ fn test_scan_packfile_returns_collection_id() {
     let collection1 = [0x01; 16];
     let collection2 = [0x02; 16];
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(
         &mut buf,
         &test_record(collection1, [0xAA; 16], b"collection1 msg"),
@@ -1022,7 +1022,7 @@ fn test_scan_packfile_skip_payload_matches_scan_packfile() {
     let collection1 = [0x01; 16];
     let collection2 = [0x02; 16];
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(
         &mut buf,
         &test_record(collection1, [0xAA; 16], b"short raw payload"),
@@ -1057,7 +1057,7 @@ fn test_scan_packfile_skip_payload_stops_at_truncated_crc() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("shard_00.pack");
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(&mut buf, &test_record([0x01; 16], [0xAA; 16], b"complete")).unwrap();
     let complete_len = buf.len();
     write_record(&mut buf, &test_record([0x02; 16], [0xBB; 16], b"torn")).unwrap();
@@ -1094,7 +1094,7 @@ fn test_scan_rejects_oversized_frame_metadata() {
     frame[tlv_len_at..tlv_len_at + 4].copy_from_slice(&(u32::MAX - 5).to_le_bytes());
 
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     buf.extend_from_slice(&frame);
     std::fs::write(&path, &buf).unwrap();
 
@@ -1121,7 +1121,7 @@ fn test_extract_packfile_collection_slices_target_collection_verbatim() {
     let collection_b = [0x22; 16];
 
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0x100)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0x100), 1).unwrap();
 
     let target_record_first = Record {
         collection_id: collection_a,
@@ -1200,7 +1200,7 @@ fn test_extract_packfile_collection_handles_torn_tail() {
 
     let collection_a = [0x11; 16];
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(
         &mut buf,
         &test_record(collection_a, [0x01; 16], b"valid record"),
@@ -1236,7 +1236,7 @@ fn test_extract_packfile_collection_handles_torn_payload_body() {
 
     let collection_a = [0x11; 16];
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(
         &mut buf,
         &test_record(collection_a, [0x01; 16], b"valid record"),
@@ -1270,7 +1270,7 @@ fn test_extract_packfile_collection_rejects_corrupted_crc() {
 
     let collection_a = [0x11; 16];
     let mut buf = Vec::new();
-    write_header(&mut buf, &test_pack_id(0)).unwrap();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
     write_record(
         &mut buf,
         &test_record(collection_a, [0x01; 16], b"valid record"),

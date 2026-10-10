@@ -858,7 +858,7 @@ fn test_shard_pool_open_fails_on_identity_mismatch() {
     // filename whose prefix claims another.
     let path = ShardPool::pack_path(&dir, &pack_id_for(7), &[]);
     let mut buf = Vec::new();
-    packfile::write_header(&mut buf, &pack_id_for(0)).unwrap();
+    packfile::write_header_with_creation_seq(&mut buf, &pack_id_for(0), 1).unwrap();
     std::fs::write(&path, &buf).unwrap();
     // The pool fails to open — identity mismatch is corruption.
     match ShardPool::open(dir) {
@@ -876,7 +876,7 @@ fn test_shard_pool_open_fails_on_corrupt_header_crc() {
     let pack_id = pack_id_for(0);
     let path = ShardPool::pack_path(&dir, &pack_id, &[]);
     let mut buf = Vec::new();
-    packfile::write_header(&mut buf, &pack_id).unwrap();
+    packfile::write_header_with_creation_seq(&mut buf, &pack_id, 1).unwrap();
     buf[12] ^= 0xFF; // corrupt a byte inside the CRC-covered region
     std::fs::write(&path, &buf).unwrap();
 
@@ -1008,7 +1008,7 @@ fn test_scan_discovers_valid_shards_in_pack_id_order() {
     let live_pack = pack_id_for(99);
     let live_path = dir.join(live_pack.filename());
     let mut live_buf = Vec::new();
-    packfile::write_header(&mut live_buf, &live_pack).unwrap();
+    packfile::write_header_with_creation_seq(&mut live_buf, &live_pack, 1).unwrap();
     packfile::write_record(
         &mut live_buf,
         &packfile::Record {
@@ -1025,7 +1025,7 @@ fn test_scan_discovers_valid_shards_in_pack_id_order() {
     let leftover_pack = pack_id_for(0);
     let leftover_path = dir.join(leftover_pack.filename());
     let mut buf = Vec::new();
-    packfile::write_header(&mut buf, &leftover_pack).unwrap();
+    packfile::write_header_with_creation_seq(&mut buf, &leftover_pack, 1).unwrap();
     packfile::write_record(
         &mut buf,
         &packfile::Record {
@@ -1072,7 +1072,7 @@ fn test_scan_retains_valid_shard_when_newer_header_is_torn() {
     let valid_pack = pack_id_for(1);
     let old_path = dir.join(valid_pack.filename());
     let mut old = Vec::new();
-    packfile::write_header(&mut old, &valid_pack).unwrap();
+    packfile::write_header_with_creation_seq(&mut old, &valid_pack, 1).unwrap();
     std::fs::write(&old_path, old).unwrap();
 
     // A higher-address filename with a torn header — pool open
@@ -1162,7 +1162,7 @@ fn test_scan_parses_pack_id_filename_format() {
     // the address encoded by its own filename prefix.
     let make_pack = |collection_byte: u8, pack_id: packfile::PackId| -> Vec<u8> {
         let mut buf = Vec::new();
-        packfile::write_header(&mut buf, &pack_id).unwrap();
+        packfile::write_header_with_creation_seq(&mut buf, &pack_id, 1).unwrap();
         packfile::write_record(
             &mut buf,
             &packfile::Record {
@@ -1204,29 +1204,6 @@ fn test_scan_parses_pack_id_filename_format() {
 
     // Slot 3 was never created; pool should have no shard there.
     assert!(pool.get_shard(3).is_none());
-}
-
-/// An older header timestamp wins over a newer timestamp even when the pack
-/// addresses sort in the opposite order. This is the rebuild ordering policy;
-/// equal timestamps remain covered by the filename-format test above.
-#[test]
-fn test_scan_orders_packs_by_header_creation_time() {
-    let dir = test_dir("scan_pack_creation_time");
-
-    let make_pack = |pack_id: packfile::PackId, created_at: u64| {
-        let mut buf = Vec::new();
-        packfile::write_header_with_created_at(&mut buf, &pack_id, created_at, 0).unwrap();
-        std::fs::write(dir.join(pack_id.filename()), buf).unwrap();
-    };
-
-    let older = pack_id_for(5);
-    let newer = pack_id_for(3);
-    make_pack(older, 1);
-    make_pack(newer, 2);
-
-    let pool = ShardPool::open(dir).unwrap();
-    assert_eq!(pool.get_shard(0).unwrap().pack_id, older);
-    assert_eq!(pool.get_shard(1).unwrap().pack_id, newer);
 }
 
 /// Persisted creation sequences resolve same-second rotations without falling
@@ -1278,25 +1255,24 @@ fn test_pack_creation_sequence_survives_reopen() {
     assert_eq!(sequences, [1, 2, 3]);
 }
 
+/// A pack whose header carries `creation_seq == 0` is invalid: it is neither
+/// sorted by timestamp nor given a synthesized sequence, the pool refuses to
+/// open.
 #[test]
-fn test_scan_orders_legacy_packs_before_sequenced_packs() {
-    let dir = test_dir("scan_legacy_before_sequenced");
-    let make_pack = |pack_id: packfile::PackId, created_at: u64, creation_seq: u32| {
-        let mut buf = Vec::new();
-        packfile::write_header_with_created_at(&mut buf, &pack_id, created_at, creation_seq)
-            .unwrap();
-        std::fs::write(dir.join(pack_id.filename()), buf).unwrap();
-    };
+fn test_open_rejects_a_pack_with_zero_creation_sequence() {
+    let dir = test_dir("scan_zero_creation_seq");
+    let pack_id = pack_id_for(5);
+    let mut buf = Vec::new();
+    packfile::write_header_with_created_at(&mut buf, &pack_id, 9, 1).unwrap();
+    // creation_seq sits after magic(4) + version(1) + header_len(4) +
+    // pack_id(16) + created_at(8); the CRC follows it.
+    let seq_at = 4 + 1 + 4 + packfile::PACK_ID_LEN + 8;
+    buf[seq_at..seq_at + 4].copy_from_slice(&0u32.to_le_bytes());
+    let crc = crc32fast::hash(&buf[..seq_at + 4]);
+    buf[seq_at + 4..seq_at + 8].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(dir.join(pack_id.filename()), buf).unwrap();
 
-    let sequenced = pack_id_for(3);
-    let legacy = pack_id_for(5);
-    // The legacy pack has the later timestamp but must still sort first.
-    make_pack(sequenced, 1, 1);
-    make_pack(legacy, 9, 0);
-
-    let pool = ShardPool::open(dir).unwrap();
-    assert_eq!(pool.get_shard(0).unwrap().pack_id, legacy);
-    assert_eq!(pool.get_shard(1).unwrap().pack_id, sequenced);
+    assert!(ShardPool::open(dir).is_err());
 }
 
 #[test]

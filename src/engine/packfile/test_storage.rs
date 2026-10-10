@@ -5102,7 +5102,7 @@ fn test_scan_existing_skips_malformed_filenames() {
     let pack_id = PackId(valid_bytes);
     let valid_path = dir.join(pack_id.filename());
     let mut buf = Vec::new();
-    packfile::write_header(&mut buf, &pack_id).unwrap();
+    packfile::write_header_with_creation_seq(&mut buf, &pack_id, 1).unwrap();
     packfile::write_record(
         &mut buf,
         &packfile::Record {

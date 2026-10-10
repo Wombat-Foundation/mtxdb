@@ -17,7 +17,7 @@ use crate::storage::DigestAlgorithm;
 pub const MAGIC: [u8; 4] = *b"MTDB";
 
 /// Packfile format version byte following `MAGIC` in the header (see
-/// [`write_header`]/[`read_header`]).
+/// [`write_header_with_creation_seq`]/[`read_header`]).
 ///
 /// Current v1 packfile format. This is a hard-cutover format: unrecognized
 /// version bytes are rejected and callers must rebuild or migrate the store.
@@ -31,7 +31,7 @@ pub const VERSION: u8 = 0x01;
 /// Total reserved header size in bytes: every shard file's first record
 /// starts at exactly this offset. One 4KiB page — ample collection for the
 /// descriptor fields plus future growth, with no benefit to a larger
-/// reservation (see [`write_header`] for the field layout).
+/// reservation (see [`write_header_with_creation_seq`] for the field layout).
 pub const HEADER_LEN: usize = 4096;
 
 /// Byte length of a [`PackId`].
@@ -296,8 +296,8 @@ const CRC_COVERED_LEN: usize = 4 // magic
     + 1 // version
     + 4 // header_len (u32)
     + PACK_ID_LEN // pack_id
-    + 8 // created_at (u64, unix seconds; legacy ordering fallback)
-    + 4; // creation_seq (u32, zero for legacy headers)
+    + 8 // created_at (u64, unix seconds)
+    + 4; // creation_seq (u32, nonzero)
 
 /// A shard's immutable descriptor, parsed from its reserved header.
 ///
@@ -306,17 +306,15 @@ const CRC_COVERED_LEN: usize = 4 // magic
 /// inconsistently — the two should always agree (by prefix), and a mismatch
 /// means something outside mtxdb moved this file.
 ///
-/// The format version remains compatible with older readers: they ignore the
-/// former reserved field and therefore retain timestamp/address ordering.
-/// Current readers authenticate and use that field as `creation_seq`; a zero
-/// value identifies a legacy header.
+/// The reader authenticates `creation_seq` and rejects a zero value as
+/// invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardHeader {
     /// The pack's globally unique, immutable identity.
     pub pack_id: PackId,
-    /// Unix-seconds creation timestamp, used to order legacy headers.
+    /// Unix-seconds creation timestamp.
     pub created_at: u64,
-    /// Monotonic creation sequence within a pool; zero means a legacy header.
+    /// Monotonic creation sequence within a pool; never zero.
     pub creation_seq: u32,
 }
 
@@ -1452,32 +1450,15 @@ fn read_record_metadata_skip_payload_with_end(
 }
 
 /// Write a new pack file's [`HEADER_LEN`]-byte reserved header: magic,
-/// version, header length, `pack_id`, creation time, and a CRC over all
-/// of the above — zero-padded to fill `HEADER_LEN`. Written once, at
-/// creation, and never mutated again (see [`VERSION`]'s doc for why).
-///
-/// This compatibility form writes no pool-local creation sequence. New pool
-/// creation must use [`write_header_with_creation_seq`]; a zero sequence makes
-/// the reader use the timestamp fallback.
+/// version, header length, `pack_id`, creation time, pool-local monotonic
+/// creation sequence, and a CRC over all of the above — zero-padded to fill
+/// `HEADER_LEN`. Written once, at creation, and never mutated again (see
+/// [`VERSION`]'s doc for why).
 ///
 /// # Errors
-/// Returns `io::Error` on write failure, if the system clock is before the
-/// Unix epoch (treated as a hard error rather than silently recording a wrong
-/// creation time), or if `pack_id` is the reserved all-zero address — refused
-/// so a creation or import path can never persist it as a real identity.
-///
-/// # Panics
-/// Never in practice: the only internal conversion (`HEADER_LEN` as
-/// `u32`) is a compile-time constant well within range.
-pub fn write_header(writer: &mut impl Write, pack_id: &PackId) -> io::Result<()> {
-    write_header_with_creation_seq(writer, pack_id, 0)
-}
-
-/// Write a pack header with a pool-local monotonic creation sequence.
-///
-/// # Errors
-/// Returns `io::Error` if the pack ID is reserved or the header cannot be
-/// written.
+/// Returns `io::Error` if the pack ID is reserved, if `creation_seq` is zero
+/// (`InvalidInput`; zero is not a valid sequence), if the system clock is
+/// before the Unix epoch, or if the header cannot be written.
 pub fn write_header_with_creation_seq(
     writer: &mut impl Write,
     pack_id: &PackId,
@@ -1516,6 +1497,12 @@ pub fn write_header_with_created_at(
     created_at: u64,
     creation_seq: u32,
 ) -> io::Result<()> {
+    if creation_seq == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to write a pack header with creation_seq 0",
+        ));
+    }
     if pack_id.is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1691,6 +1678,12 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     cursor = cursor.saturating_add(8);
     let creation_seq =
         u32::from_le_bytes(buf[cursor..cursor.saturating_add(4)].try_into().unwrap());
+    if creation_seq == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shard header carries creation_seq 0",
+        ));
+    }
 
     Ok(Some(ShardHeader {
         pack_id,
@@ -1699,8 +1692,9 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     }))
 }
 
-/// Open or create a legacy packfile, writing a zero-sequence header if new.
-/// Pool creation uses [`open_packfile_with_creation_seq`] instead.
+/// Open an existing packfile. Creating one needs a nonzero creation sequence,
+/// so a `create` of an empty file fails here; pool creation uses
+/// [`open_packfile_with_creation_seq`] instead.
 ///
 /// With `create` set, opens for writing and initializes and syncs the header
 /// of an empty file. Otherwise opens an existing file read-only.
