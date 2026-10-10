@@ -266,7 +266,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#e28994086fe7f46258b0493ef02f7fb0049c8119"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a992c45d290bd50cfca7eedd888486a27eb273e1"
 dependencies = [
  "base64",
  "sha2",

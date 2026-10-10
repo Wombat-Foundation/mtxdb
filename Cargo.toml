@@ -99,7 +99,7 @@ verbose_file_reads = "warn"
 path = "src/lib.rs"
 
 [features]
-default = ["zstd"]
+default = ["zstd", "bitmaps"]
 # Record-payload compression. On by default, so stores keep writing and reading
 # zstd frames; disable (with `default-features = false`) for builds that must
 # not carry zstd. A build without it always
@@ -116,6 +116,11 @@ zstd = ["dep:zstd", "dep:zstd-sys"]
 # different behavior: without it those APIs are simply absent, and there are no
 # alternate CAS or version paths.
 multi-reader = []
+
+# Domain-tagged bitmap sets and Matrix auth-closure APIs. This remains
+# switchable for minimal builds, while staying enabled by default for
+# compatibility with the public graph and Matrix APIs.
+bitmaps = ["dep:rezzy-recon"]
 
 # MSC4521 set reconciliation over the persisted event population (owner log,
 # sorted runs, resident kernel): element hashing, kernels and the `Population`

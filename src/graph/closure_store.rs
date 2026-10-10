@@ -1,7 +1,7 @@
 //! Persisted, immutable closure generations published through a
 //! [`LogicalHead`].
 //!
-//! A *closure* is a derived per-id blob (for auth chains, a serialized roaring
+//! A *closure* is a derived per-id blob (for auth chains, a serialized rezzy
 //! bitmap of an event's transitive auth ancestors) keyed by a room-local `u32`
 //! short id (see [`crate::short_id`]). The blob encoding is the caller's; this
 //! module stores opaque bytes and needs no bitmap dependency.

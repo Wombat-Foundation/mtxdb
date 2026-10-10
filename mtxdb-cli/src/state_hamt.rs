@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use mtxdb::{derive_group_member_collection_id, DigestAlgorithm, MEMBER_NAMESPACE_STAT};
 use rezzy::hamt::{build_hamt_root_handle, HamtNode, NodeRef, PersistedInternalNode};
-use rezzy::state::LtHash;
+use rezzy::incremental::LtHash;
 
 /// Little-endian byte length of the retained `LtHash` lattice (1024 `u16`
 /// lanes) stored in every root record.

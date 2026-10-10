@@ -1,4 +1,4 @@
-//! Domain-tagged `u32` sets with Roaring bitmaps and generic set algebra.
+//! Domain-tagged `u32` sets with rezzy bitmaps and generic set algebra.
 //!
 //! A [`BitmapSet`] is a compact set of `u32` **ordinals** held entirely in
 //! memory. The ordinals come from a caller-owned ordinal space — typically a
@@ -14,25 +14,22 @@
 //! user or `NodeId` scope) so both sides allocate from the same numbers. The tag
 //! does not choose that scope for you; it only makes a mismatch loud.
 //!
-//! Storage is always Roaring. Roaring's array containers are already compact for
-//! small sets, so there is no second encoding here. A set that is small and
-//! rarely intersected is still frequently better as an ordinary sorted
-//! `Vec<u32>`, and the caller decides which representation to use.
+//! Storage uses rezzy's dependency-free Roaring-compatible bitmap
+//! representation. A set that is small and rarely intersected is still
+//! frequently better as an ordinary sorted `Vec<u32>`, and the caller decides
+//! which representation to use.
 //!
 //! # Wire format
 //!
 //! ```text
-//! [magic:4 = "BMPS"][version:1][domain:16][Roaring payload...]
+//! [magic:4 = "BMPS"][version:1][domain:16][rezzy RBMP payload...]
 //! ```
 //!
 //! The magic, version and domain tag are this crate's; the payload is
-//! `RoaringBitmap`'s own format, which is deliberately not stable across Roaring
-//! releases, so this module never promises a stored bitmap survives a
-//! dependency upgrade without re-encoding. Nothing here does I/O or
-//! transactions: persistence is the caller's, layered on the existing
-//! opaque-blob stores.
+//! rezzy's canonical `RBMP` format. Nothing here does I/O or transactions:
+//! persistence is the caller's, layered on the existing opaque-blob stores.
 
-use roaring::RoaringBitmap;
+use rezzy_recon::bitmap::Bitmap as RezzyBitmap;
 
 use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, StorageError};
@@ -98,11 +95,11 @@ impl DomainTag {
     }
 }
 
-/// A domain-tagged set of `u32` ordinals, backed by a Roaring bitmap.
+/// A domain-tagged set of `u32` ordinals, backed by a rezzy bitmap.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BitmapSet {
     domain: DomainTag,
-    bitmap: RoaringBitmap,
+    bitmap: RezzyBitmap,
 }
 
 impl BitmapSet {
@@ -111,7 +108,7 @@ impl BitmapSet {
     pub fn new(domain: DomainTag) -> Self {
         Self {
             domain,
-            bitmap: RoaringBitmap::new(),
+            bitmap: RezzyBitmap::new(),
         }
     }
 
@@ -218,26 +215,27 @@ impl BitmapSet {
     )]
     pub fn difference(&self, other: &Self) -> Result<Self, StorageError> {
         self.check_domain(other)?;
+        let mut bitmap = self.bitmap.clone();
+        bitmap -= &other.bitmap;
         Ok(Self {
             domain: self.domain,
-            bitmap: &self.bitmap - &other.bitmap,
+            bitmap,
         })
     }
 
-    /// Serialize this set (header plus Roaring payload).
+    /// Serialize this set (header plus rezzy's canonical bitmap payload).
     ///
     /// # Errors
-    /// Returns [`StorageError::Corrupt`] if the in-memory Roaring encoder fails,
-    /// which does not happen for a `Vec` writer.
+    /// Returns the underlying bitmap encoding error if the payload cannot be
+    /// serialized.
     pub fn encode(&self) -> Result<Vec<u8>, StorageError> {
-        let capacity = HEADER_LEN.saturating_add(self.bitmap.serialized_size());
+        let payload = self.bitmap.encode();
+        let capacity = HEADER_LEN.saturating_add(payload.len());
         let mut out = Vec::with_capacity(capacity);
         out.extend_from_slice(&BITMAP_SET_MAGIC);
         out.push(BITMAP_SET_FORMAT_VERSION);
         out.extend_from_slice(self.domain.as_bytes());
-        self.bitmap
-            .serialize_into(&mut out)
-            .map_err(|error| StorageError::Corrupt(format!("bitmap-set encode: {error}")))?;
+        out.extend_from_slice(&payload);
         Ok(out)
     }
 
@@ -245,8 +243,7 @@ impl BitmapSet {
     ///
     /// # Errors
     /// Returns [`StorageError::Corrupt`] if `bytes` is truncated, has a bad
-    /// magic or version, carries trailing bytes after the Roaring payload, or is
-    /// not a valid Roaring bitmap.
+    /// magic or version, or is not a valid rezzy bitmap.
     pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         if bytes.len() < HEADER_LEN
             || bytes[..BITMAP_SET_MAGIC.len()] != BITMAP_SET_MAGIC
@@ -256,14 +253,8 @@ impl BitmapSet {
         }
         let mut domain = [0u8; DOMAIN_LEN];
         domain.copy_from_slice(&bytes[5..HEADER_LEN]);
-        let mut payload = &bytes[HEADER_LEN..];
-        let bitmap = RoaringBitmap::deserialize_from(&mut payload)
+        let bitmap = RezzyBitmap::decode(&bytes[HEADER_LEN..])
             .map_err(|error| StorageError::Corrupt(format!("bitmap-set payload: {error}")))?;
-        if !payload.is_empty() {
-            return Err(StorageError::Corrupt(
-                "bitmap-set trailing bytes".to_owned(),
-            ));
-        }
         Ok(Self {
             domain: DomainTag::new(domain),
             bitmap,

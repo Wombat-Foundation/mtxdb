@@ -390,6 +390,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "parking_lot",
+ "rezzy-recon",
  "sha2",
  "zstd",
  "zstd-sys",
@@ -510,21 +511,31 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#e28994086fe7f46258b0493ef02f7fb0049c8119"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a992c45d290bd50cfca7eedd888486a27eb273e1"
 dependencies = [
  "base64",
  "blake3",
  "hashbrown 0.17.1",
  "rezzy-json",
+ "rezzy-recon",
  "sha2",
 ]
 
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#e28994086fe7f46258b0493ef02f7fb0049c8119"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a992c45d290bd50cfca7eedd888486a27eb273e1"
 dependencies = [
  "ryu",
+]
+
+[[package]]
+name = "rezzy-recon"
+version = "0.6.0-rc.1"
+source = "git+https://gitlab.com/gamesguru/rezzy.git?branch=alpha#a992c45d290bd50cfca7eedd888486a27eb273e1"
+dependencies = [
+ "base64",
+ "sha2",
 ]
 
 [[package]]

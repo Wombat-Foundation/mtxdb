@@ -1596,7 +1596,7 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     for (lane, chunk) in lanes.iter_mut().zip(lattice_bytes.as_chunks::<2>().0) {
         *lane = u16::from_le_bytes(*chunk);
     }
-    let lattice = rezzy::state::LtLattice::<1024>::from(lanes);
+    let lattice = rezzy::incremental::LtLattice::<1024>::from(lanes);
     let state_group_id = rezzy::hamt::state_group_id_from_lthash(&lattice);
 
     let mut out = Vec::new();
