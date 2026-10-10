@@ -49,7 +49,7 @@ use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
 /// Wire version shared by every short-id record.
-pub const SHORT_ID_FORMAT_VERSION: u8 = 3;
+pub const SHORT_ID_FORMAT_VERSION: u8 = 1;
 /// Largest id that may be allocated.
 pub const SHORT_ID_MAX: u32 = u32::MAX - 1;
 

@@ -46,49 +46,11 @@ use crate::packfile::PackId;
 
 /// Magic identifying the persisted-index checkpoint format.
 pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
-/// Current wire version (see [`CheckpointHeader::version`]).
+/// Current v1 wire version (see [`CheckpointHeader::version`]).
 ///
-/// Bumped to 6: the header carries a pack table (`slot -> pack_id`
-/// bindings for every pack live at checkpoint-write time). `slot` in a
-/// checkpoint's raw index slots (and in `DeltaFrame.slot`) is the writer's
-/// local, process-scoped `ShardPool` slot, not a stable identity — a fresh
-/// reader's `discover_shards` reassigns slots by first-free-in-`pack_id`-order,
-/// which does not reproduce the writer's numbering once any shard has ever
-/// been retired (retirement leaves a permanent hole in the writer's table).
-/// The pack table lets a reader translate every checkpoint-encoded slot to
-/// its own local slot for the same `pack_id` (globally unique and immutable)
-/// instead of trusting the writer's raw slot number. A v5 checkpoint has no
-/// pack table and is rejected outright by the strict magic/version check
-/// below, forcing the normal full-rescan fallback — never a partial/best-effort
-/// read of a v5 file under the v6 reader.
-///
-/// Bumped to 7: the header carries `base_delta_seq`, the highest redo `delta_seq`
-/// the checkpoint incorporates (see `CheckpointHeader::base_delta_seq`). A v6
-/// checkpoint has no such field and is rebuilt.
-///
-/// Bumped to 5: the header now carries the journal `covered_lsn` the index
-/// snapshot incorporates, so a read-committed reader binds its overlay
-/// coverage to the exact index it loaded instead of a separately-read
-/// `journal.lsn`. A v4 checkpoint has no such field and is rebuilt.
-///
-/// Bumped to 4: homes and tails are now persisted alongside packed slots.
-/// A pre-v4 checkpoint has `homes_bytes`/`tails_bytes` of 0 and is loaded
-/// with empty identity side tables (cold-start tag-collision verification
-/// cost). A v4 checkpoint carries hydrated identity, eliminating packfile
-/// reads for tag collisions on cold start.
-///
-/// Bumped to 9: the checkpoint carries a sorted logical-version table after
-/// the pack table. The version table includes tombstoned collection IDs, so
-/// stale expectations remain stale after their WAL groups are reclaimed.
-/// A v8 checkpoint is rejected and rebuilt; no version tokens existed before
-/// this version, so the first v9 checkpoint establishes their baseline.
-///
-/// Bumped to 8: the pack table's [`PackTableEntry`] stores the 16-byte
-/// [`PackId`] identity (v7 used the 32-byte form), so each entry shrank from
-/// 36 to 20 bytes. The magic/version check below rejects a v7 file outright,
-/// forcing the normal full-rescan fallback rather than misreading the
-/// narrower entries.
-pub const CHECKPOINT_VERSION: u32 = 9;
+/// This is a hard-cutover format; a mismatched version causes the checkpoint
+/// to be rebuilt rather than decoded through a legacy layout.
+pub const CHECKPOINT_VERSION: u32 = 1;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
 

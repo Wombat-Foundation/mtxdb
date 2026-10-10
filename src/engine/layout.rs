@@ -42,7 +42,7 @@ impl Drop for TempFileGuard {
 /// [`PackfileStorage`](crate::PackfileStorage) remains available as a
 /// lower-level single-pool API.
 const DB_META_MAGIC: &[u8; 4] = b"MTXD";
-const DB_META_VERSION: u8 = 3;
+const DB_META_VERSION: u8 = 1;
 const DB_META_SEED_LEN: usize = 8;
 /// The pool list a descriptor must carry, built from the pool directory names
 /// so it can never drift from them. A root whose descriptor lists other names

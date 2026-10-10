@@ -57,7 +57,7 @@ use crate::template::{
 };
 
 /// Version byte of every timeline record and the cursor encoding.
-pub const TIMELINE_FORMAT_VERSION: u8 = 0x02;
+pub const TIMELINE_FORMAT_VERSION: u8 = 0x01;
 /// Maximum entries per leaf record.
 pub const TIMELINE_LEAF_CAP: usize = 128;
 

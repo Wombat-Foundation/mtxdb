@@ -2844,14 +2844,14 @@ fn test_crash_between_checkpoint_rename_and_retirement_uses_new_checkpoint() {
     }
 }
 
-/// Collection creation and growth become per-collection v3 snapshots, so
+/// Collection creation and growth become per-collection v1 snapshots, so
 /// neither mutation requires a store-wide checkpoint rewrite.
 #[test]
 fn delta_invalidation_triggers_are_new_collections_and_growth() {
     const ROUNDS: u8 = 5;
 
     // Arm A: one new collection per barrier -- the Complement room-churn
-    // shape. Each create adds a collection snapshot to the v3 log.
+    // shape. Each create adds a collection snapshot to the v1 log.
     let store_a = PackfileStorage::open(test_dir("delta_triggers_new_collections")).unwrap();
     let before_a = store_a.stats();
     for round in 0..ROUNDS {
@@ -2965,8 +2965,7 @@ fn delta_invalidation_triggers_are_new_collections_and_growth() {
 /// no whole-index snapshot.
 fn assert_log_has_redo_and_no_snapshot(store: &PackfileStorage, min_redo: usize) {
     let base = store.delta_state.lock().base_fingerprint.unwrap();
-    let log =
-        delta::read_delta_log_v3(&PackfileStorage::delta_path(&store.base_dir, base)).unwrap();
+    let log = delta::read_delta_log(&PackfileStorage::delta_path(&store.base_dir, base)).unwrap();
     assert!(
         log.operations
             .iter()
@@ -2994,7 +2993,7 @@ fn batch_node(index: u32) -> NodeId {
 /// planned and reported as such, and nothing is lost.
 #[test]
 fn a_batch_that_crosses_the_cap_below_the_rotation_length_rotates_the_log() {
-    let dir = test_dir("v3_delta_cap_batch");
+    let dir = test_dir("v1_delta_cap_batch");
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let collection = [0xD3; 16];
     store
@@ -3046,7 +3045,7 @@ fn a_batch_that_crosses_the_cap_below_the_rotation_length_rotates_the_log() {
 /// serialized, and the projection is the length the batch would have had.
 #[test]
 fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
-    let dir = test_dir("v3_snapshot_preflight");
+    let dir = test_dir("v1_snapshot_preflight");
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let collection = [0xD6; 16];
     store
@@ -3057,7 +3056,7 @@ fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
     store.invalidate_delta_log(&collection);
 
     let state = store.delta_state.lock().clone();
-    let Err(error) = store.build_v3_pending_batch(&state, false) else {
+    let Err(error) = store.build_v1_pending_batch(&state, false) else {
         panic!("the snapshot must not fit under a 1 KiB cap");
     };
     let detail = PackfileStorage::delta_batch_too_large(&error).expect("a too-large batch");
@@ -3066,13 +3065,13 @@ fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
         .get(&collection)
         .map(|room| room.load_full().index.serialized_len())
         .unwrap();
-    let expected = delta::v3_empty_batch_len() + delta::v3_snapshot_frame_len(blob_len).unwrap();
+    let expected = delta::v1_empty_batch_len() + delta::v1_snapshot_frame_len(blob_len).unwrap();
     assert_eq!(detail.batch_bytes, expected);
     assert_eq!(detail.cap, 1024);
 
     // With the real cap the same pending snapshot builds.
     store.delta_log_cap_override.store(0, Ordering::Relaxed);
-    assert!(store.build_v3_pending_batch(&state, false).is_ok());
+    assert!(store.build_v1_pending_batch(&state, false).is_ok());
     drop(store);
     fs::remove_dir_all(dir).unwrap();
 }
@@ -3168,7 +3167,7 @@ fn a_checkpoint_records_a_phase_breakdown() {
 }
 
 #[test]
-fn concurrent_puts_during_sync_keep_using_the_v3_append_path() {
+fn concurrent_puts_during_sync_keep_using_the_v1_append_path() {
     let dir = test_dir("concurrent_put_sync_delta");
     let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
     store
@@ -3261,7 +3260,7 @@ fn checkpoint_rewrite_budget_defers_invalidated_rewrites() {
     );
     assert_eq!(
         skips, 0,
-        "v3 snapshots avoid checkpoint skips for ordinary structural changes"
+        "v1 snapshots avoid checkpoint skips for ordinary structural changes"
     );
     assert_eq!(
         after.delta_appends - before.delta_appends,
@@ -3269,7 +3268,7 @@ fn checkpoint_rewrite_budget_defers_invalidated_rewrites() {
     );
     drop(store);
 
-    // The v3 log replays the collection snapshots on reopen.
+    // The v1 log replays the collection snapshots on reopen.
     let reopened = PackfileStorage::open(dir).unwrap();
     assert_eq!(
         reopened
@@ -3277,7 +3276,7 @@ fn checkpoint_rewrite_budget_defers_invalidated_rewrites() {
             .expect("open must record timings")
             .path,
         OpenPath::Checkpoint,
-        "the checkpoint plus v3 log should avoid a full scan"
+        "the checkpoint plus v1 log should avoid a full scan"
     );
     for (cid, id, expected) in &written {
         let got = reopened
@@ -3814,7 +3813,7 @@ fn test_probe_reopen_first_append_sync_path_no_growth() {
     // Discriminates reopen-materialization cost from real capacity-growth
     // cost: build to a load well under the 75% grow threshold (so the
     // post-reopen append batch cannot trigger `index_grow_count`), then
-    // reopen and append. Reopen should continue the v3 epoch directly.
+    // reopen and append. Reopen should continue the v1 epoch directly.
     let dir = test_dir("probe_reopen_sync_no_growth");
     let total = 2000u32; // 2032 / 4096 is well under the 75% grow threshold.
     build_reopen_probe_checkpoint(&dir, total);
@@ -8626,7 +8625,7 @@ fn a_torn_or_damaged_coverage_batch_loses_no_records() {
     let delta_path = PackfileStorage::delta_path(&dir, checkpoint.fingerprint);
     let intact = fs::read(&delta_path).unwrap();
     assert!(
-        delta::read_delta_log_v3(&delta_path)
+        delta::read_delta_log(&delta_path)
             .unwrap()
             .coverage
             .is_some(),
@@ -8641,7 +8640,7 @@ fn a_torn_or_damaged_coverage_batch_loses_no_records() {
     for (label, bytes) in [("torn", intact[..cut].to_vec()), ("bit flip", damaged)] {
         fs::write(&delta_path, &bytes).unwrap();
         let claimed = PackfileStorage::read_journal_lsn(&dir);
-        let last_claim = delta::read_delta_log_v3(&delta_path)
+        let last_claim = delta::read_delta_log(&delta_path)
             .and_then(|log| log.coverage)
             .unwrap_or(0);
         assert!(
@@ -8765,7 +8764,7 @@ fn the_one_pass_durable_state_matches_for_a_foreign_or_torn_log() {
 
     // Foreign: a log that continues a different checkpoint is inert.
     fs::remove_file(&log_path).unwrap();
-    delta::append_v3_batch_with_durability(
+    delta::append_batch_with_durability(
         &log_path,
         true,
         checkpoint.fingerprint ^ 1,
@@ -8872,7 +8871,7 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
         drop(store);
 
         let path = PackfileStorage::delta_path(&dir, base);
-        let log = delta::read_delta_log_v3(&path).unwrap();
+        let log = delta::read_delta_log(&path).unwrap();
         let mut operations = log.operations;
         let mut mutated = 0;
         for operation in &mut operations {
@@ -8883,7 +8882,7 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
         }
         assert!(mutated > 0, "the log must hold redo records");
         fs::remove_file(&path).unwrap();
-        delta::append_v3_batch_with_durability(
+        delta::append_batch_with_durability(
             &path,
             true,
             log.base_fingerprint,
@@ -9126,7 +9125,7 @@ fn a_wrong_but_in_bounds_locator_rejects_the_log_and_the_open_rescans() {
     let base = store.delta_state.lock().base_fingerprint.unwrap();
     drop(store);
     let path = PackfileStorage::delta_path(&dir, base);
-    let log = delta::read_delta_log_v3(&path).unwrap();
+    let log = delta::read_delta_log(&path).unwrap();
     let mut operations = log.operations;
     let (donor_offset, donor_len) = operations
         .iter()
@@ -9155,7 +9154,7 @@ fn a_wrong_but_in_bounds_locator_rejects_the_log_and_the_open_rescans() {
         }
     }
     fs::remove_file(&path).unwrap();
-    delta::append_v3_batch_with_durability(
+    delta::append_batch_with_durability(
         &path,
         true,
         log.base_fingerprint,

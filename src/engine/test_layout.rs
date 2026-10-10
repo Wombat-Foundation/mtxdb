@@ -330,16 +330,14 @@ fn a_root_keeps_its_wal_at_the_root() {
     );
 }
 
-/// A version 1 descriptor carried a WAL-layout byte that no longer exists.
-/// It is rejected outright, so a root written that way is never opened and
-/// reinterpreted.
+/// An unsupported descriptor version is rejected outright, so a root written
+/// that way is never opened and reinterpreted.
 #[test]
-fn a_version_one_descriptor_is_rejected() {
-    let root = test_dir("version_one");
+fn an_unsupported_descriptor_version_is_rejected() {
+    let root = test_dir("unsupported_version");
     fs::create_dir_all(&root).unwrap();
     let mut bytes = super::db_meta_bytes(0x1234_5678_9abc_def1);
-    bytes[4] = 1;
-    bytes[5] = 1; // the old WAL-layout byte
+    bytes[4] = super::DB_META_VERSION.wrapping_add(1);
     fs::write(root.join(DB_META_FILENAME), &bytes).unwrap();
     assert_eq!(
         DatabaseLayout::open(root.clone()).unwrap_err().kind(),

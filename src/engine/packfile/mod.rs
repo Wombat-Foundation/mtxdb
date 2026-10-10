@@ -19,18 +19,14 @@ pub const MAGIC: [u8; 4] = *b"MTDB";
 /// Packfile format version byte following `MAGIC` in the header (see
 /// [`write_header`]/[`read_header`]).
 ///
-/// Version 5: replaces the pool-local monotonic `pack_id: u64` identity with a
-/// globally unique, cryptographically random 128-bit [`PackId`]. The
-/// address is unique across pools, databases, and hosts, so an extracted or
-/// imported pack can be adopted verbatim (no rename, no header rewrite) and
-/// referenced globally. Filename changes from `pack_{pack_id:016x}.pack` to
-/// `pack_{short_address}.pack`. Hard cutover: earlier versions are rejected.
+/// Current v1 packfile format. This is a hard-cutover format: unrecognized
+/// version bytes are rejected and callers must rebuild or migrate the store.
 ///
 /// There is no persisted numeric id, runtime slot, or creation sequence in the
 /// header: identity is the address, ordering is the caller's concern (by
 /// timestamp/offset or an explicit conflict policy), and the runtime
 /// slot/index is entirely internal to the storage implementation.
-pub const VERSION: u8 = 0x05;
+pub const VERSION: u8 = 0x01;
 
 /// Total reserved header size in bytes: every shard file's first record
 /// starts at exactly this offset. One 4KiB page — ample collection for the

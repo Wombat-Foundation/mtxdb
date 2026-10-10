@@ -40,7 +40,7 @@ use crate::PackfileStorage;
 /// two distinguishable. No version-1 pack was ever written to disk, so there is
 /// nothing to migrate; the cost of bumping now is zero and the cost of bumping
 /// after a release is a compatibility rule.
-pub(crate) const RECORD_VERSION: u8 = 2;
+pub(crate) const RECORD_VERSION: u8 = 1;
 
 /// Body text was stripped by [`SearchIndexes::redact`]. Header fields are kept,
 /// so the event stays findable by room, sender, type, and timestamp while its

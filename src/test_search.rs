@@ -1314,24 +1314,14 @@ fn the_removal_flag_is_what_gets_persisted() {
     );
 }
 
-/// The flags byte made this a different encoding from version 1, where the byte
-/// at offset 1 was the first byte of the timestamp. An old-shape record must be
-/// reported, not misparsed.
+/// A record carrying any version other than the current one must be reported,
+/// not misparsed.
 #[test]
 fn an_unsupported_record_version_is_reported() {
-    // Pinned deliberately: version 1 is the header *without* a flags byte, and
-    // no version-1 pack ever reached a disk, so there is nothing to stay
-    // compatible with. Reverting the bump would make the two shapes
-    // indistinguishable again — which is what this assertion is for.
-    assert_eq!(
-        RECORD_VERSION, 2,
-        "the flags byte is a new encoding and takes the version with it"
-    );
-
     let (_dir, store) = store("old_version");
     let index = SearchIndexes::open(&store, "ns");
 
-    let mut record = vec![RECORD_VERSION - 1, 0];
+    let mut record = vec![RECORD_VERSION.wrapping_sub(1), 0];
     record.extend_from_slice(&7_u64.to_le_bytes());
     for _ in 0..4 {
         record.extend_from_slice(&0_u16.to_le_bytes());

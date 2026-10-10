@@ -344,10 +344,9 @@ const STATS_FILENAME: &str = "shard_stats.bin";
 
 /// Magic bytes + version identifying the stats file format.
 const STATS_MAGIC: &[u8; 4] = b"MSTA";
-/// v6 keys each record by the pack's full 16-byte [`packfile::PackId`] (v5
-/// used the 32-byte form). The snapshot is a rebuildable observability cache,
-/// so a stale or unreadable file is simply not restored.
-const STATS_VERSION: u8 = 6;
+/// The snapshot is a rebuildable observability cache, so a stale or unreadable
+/// file is simply not restored.
+const STATS_VERSION: u8 = 1;
 
 /// Minimum interval between implicit stats-snapshot writes from the hot
 /// dirty-sync path ([`ShardPool::sync_dirty`]). The snapshot is
@@ -356,7 +355,7 @@ const STATS_VERSION: u8 = 6;
 /// still persist it.
 const STATS_FLUSH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// On-disk size of one v6 stats record: `pack_id`(16) + 3×counter(8) = 40.
+/// On-disk size of one v1 stats record: `pack_id`(16) + 3×counter(8) = 40.
 const STATS_RECORD_LEN: usize = packfile::PACK_ID_LEN + 8 * 3;
 
 /// Header size: magic(4) + version(1) + `persisted_at`(8).
@@ -367,9 +366,8 @@ const STATS_HEADER_LEN: usize = 4 + 1 + 8;
 /// reserve here.
 const POOL_META_FILENAME: &str = "pool.meta";
 
-/// Pool metadata format version. v4 also records the creating `mtxdb`
-/// version, which replaced the separate one-time `store.meta` file.
-const POOL_META_VERSION: u8 = 4;
+/// Pool metadata format v1. It also records the creating `mtxdb` version.
+const POOL_META_VERSION: u8 = 1;
 
 /// `pool.meta` bytes before the creator version string:
 /// magic(4) + version(1) + `bucket_seed`(8) + `version_len`(1).

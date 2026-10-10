@@ -53,7 +53,7 @@ use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
 /// Wire version of closure records, the generation counter and the coverage
 /// record.
-pub const CLOSURE_FORMAT_VERSION: u8 = 4;
+pub const CLOSURE_FORMAT_VERSION: u8 = 1;
 
 const HEAD_LOGICAL_ID: NodeId = *b"MTXD-CLS-HEAD-v1";
 const COUNTER_ID: NodeId = *b"MTXD-CLS-NEXTG-1";

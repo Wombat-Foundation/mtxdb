@@ -9,6 +9,7 @@ mod tests {
 
     use bytes::Bytes;
 
+    use mtxdb::index::checkpoint::CHECKPOINT_VERSION;
     use mtxdb::storage::{NodeData, NodeId, StorageEngine};
     use mtxdb::PackfileStorage;
 
@@ -380,11 +381,13 @@ mod tests {
     }
 
     #[test]
-    fn previous_version_checkpoint_falls_back_to_rescan_and_rebuilds_current() {
+    fn unsupported_version_checkpoint_falls_back_to_rescan_and_rebuilds_current() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir =
-            std::env::temp_dir().join(format!("mtxdb_index_checkpoint_v7_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "mtxdb_index_checkpoint_bad_version_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
 
         let store = make_store(&dir);
@@ -393,34 +396,39 @@ mod tests {
 
         let cp_file = checkpoint_path(&dir);
         let mut buf = std::fs::read(&cp_file).unwrap();
-        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 9);
+        assert_eq!(
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            CHECKPOINT_VERSION
+        );
 
-        // Patch only the version field to the previous version (7). This is
+        // Patch only the version field to an unsupported version. This is
         // enough to exercise the version gate: the reader must reject the
-        // file *before* it looks at the body, so a real v7-width body (36-byte
-        // pack-table entries) need not be constructed here.
-        buf[8..12].copy_from_slice(&7u32.to_le_bytes());
+        // file before it looks at the body.
+        buf[8..12].copy_from_slice(&CHECKPOINT_VERSION.wrapping_sub(1).to_le_bytes());
         std::fs::write(&cp_file, &buf).unwrap();
 
-        // Reopen: must reject v7 and fall back to FullScan
+        // Reopen: must reject the unsupported version and fall back to FullScan.
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
         assert_eq!(reopened.open_timings().unwrap().path, OpenPath::FullScan);
         assert_all_records(&reopened);
 
-        // Sync all: must rebuild checkpoint with v8
+        // Sync all: must rebuild the current checkpoint.
         reopened.sync_all().unwrap();
         drop(reopened);
 
         let rewritten = std::fs::read(&cp_file).unwrap();
-        assert_eq!(u32::from_le_bytes(rewritten[8..12].try_into().unwrap()), 9);
+        assert_eq!(
+            u32::from_le_bytes(rewritten[8..12].try_into().unwrap()),
+            CHECKPOINT_VERSION
+        );
 
         // Next open should use Checkpoint path
-        let reopened_v8 = PackfileStorage::open(dir.clone()).unwrap();
+        let reopened_v1 = PackfileStorage::open(dir.clone()).unwrap();
         assert_eq!(
-            reopened_v8.open_timings().unwrap().path,
+            reopened_v1.open_timings().unwrap().path,
             OpenPath::Checkpoint
         );
-        assert_all_records(&reopened_v8);
+        assert_all_records(&reopened_v1);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -679,7 +687,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn clean_sync_and_v3_replays_incremental_and_structural_changes() {
+    fn clean_sync_and_v1_replays_incremental_and_structural_changes() {
         use mtxdb::packfile::storage::OpenPath;
 
         let dir = std::env::temp_dir().join(format!(
@@ -763,7 +771,7 @@ mod tests {
         assert_eq!(got.bytes.as_ref(), payload_for(1, 777).as_slice());
         drop(reopened);
 
-        // A structural deletion is represented by a tombstone in the v3 log,
+        // A structural deletion is represented by a tombstone in the v1 log,
         // alongside this collection's pending incremental write.
         let store = PackfileStorage::open(dir.clone()).unwrap();
         store
@@ -798,7 +806,7 @@ mod tests {
             let got = reopened
                 .get(&cid, &nid)
                 .expect("lookup succeeds")
-                .expect("record survives v3 replay");
+                .expect("record survives v1 replay");
             assert_eq!(got.bytes.as_ref(), payload_for(1, i).as_slice());
         }
 
@@ -864,7 +872,7 @@ mod tests {
         );
         assert!(store.is_shard_collections_stale());
 
-        // A structural deletion uses the v3 tombstone append; still deferred.
+        // A structural deletion uses the v1 tombstone append; still deferred.
         store.delete_collection(&collection_id(2)).unwrap();
         store.sync().unwrap();
         let sync = store
@@ -933,8 +941,8 @@ mod tests {
         let delta_path =
             current_delta_path(&dir).expect("session 1's append must leave a delta log epoch");
         assert_eq!(
-            delta::read_delta_log_v3(&delta_path)
-                .expect("session 1 must leave a decodable v3 log")
+            delta::read_delta_log(&delta_path)
+                .expect("session 1 must leave a decodable v1 log")
                 .operations
                 .len(),
             1,
@@ -954,8 +962,8 @@ mod tests {
         store.sync_all().unwrap();
         drop(store);
 
-        let log = delta::read_delta_log_v3(&delta_path)
-            .expect("both appends must decode as one continued v3 log");
+        let log = delta::read_delta_log(&delta_path)
+            .expect("both appends must decode as one continued v1 log");
         assert_eq!(
             log.operations.len(),
             2,
@@ -987,11 +995,11 @@ mod tests {
     }
 
     #[test]
-    fn v3_collection_snapshots_and_tombstones_replay_across_reopen() {
-        use mtxdb::index::delta::{read_delta_log_v3, DeltaOperation};
+    fn v1_collection_snapshots_and_tombstones_replay_across_reopen() {
+        use mtxdb::index::delta::{read_delta_log, DeltaOperation};
 
         let dir = std::env::temp_dir().join(format!(
-            "mtxdb_index_checkpoint_v3_structural_{}",
+            "mtxdb_index_checkpoint_v1_structural_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1010,12 +1018,12 @@ mod tests {
             )
             .unwrap();
         store.sync_all().unwrap();
-        let path = current_delta_path(&dir).expect("new collection snapshot writes v3 log");
-        let log = read_delta_log_v3(&path).expect("snapshot log decodes");
+        let path = current_delta_path(&dir).expect("new collection snapshot writes v1 log");
+        let log = read_delta_log(&path).expect("snapshot log decodes");
         assert!(log.operations.iter().any(|operation| matches!(
             operation,
             DeltaOperation::CollectionSnapshot { collection_id, .. }
-                if *collection_id == new_collection
+                if collection_id == &new_collection
         )));
         drop(store);
 
@@ -1031,12 +1039,12 @@ mod tests {
         );
         reopened.delete_collection(&deleted_collection).unwrap();
         reopened.sync_all().unwrap();
-        let path = current_delta_path(&dir).expect("deletion leaves v3 log");
-        let log = read_delta_log_v3(&path).expect("tombstone log decodes");
+        let path = current_delta_path(&dir).expect("deletion leaves v1 log");
+        let log = read_delta_log(&path).expect("tombstone log decodes");
         assert!(log.operations.iter().any(|operation| matches!(
             operation,
             DeltaOperation::CollectionTombstone { collection_id, .. }
-                if *collection_id == deleted_collection
+                if collection_id == &deleted_collection
         )));
         assert!(!reopened.collection_ids().contains(&deleted_collection));
         let restored_node = node_id(2, 901);
@@ -1049,8 +1057,8 @@ mod tests {
             )
             .unwrap();
         reopened.sync_all().unwrap();
-        let path = current_delta_path(&dir).expect("recreation leaves v3 log");
-        let log = read_delta_log_v3(&path).expect("delete and recreation log decodes");
+        let path = current_delta_path(&dir).expect("recreation leaves v1 log");
+        let log = read_delta_log(&path).expect("delete and recreation log decodes");
         assert_delete_then_recreate_in_log(&log.operations, deleted_collection);
         drop(reopened);
 

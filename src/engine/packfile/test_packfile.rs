@@ -737,21 +737,19 @@ fn test_open_packfile_rejects_identity_mismatch() {
     open_packfile(&ok_path, false, &test_pack_id(0)).unwrap();
 }
 
-/// A recognizable pre-cutover v1 file (right magic, version 0x01,
-/// otherwise well-formed) must be refused with a specific,
+/// A recognizable unsupported-version file must be refused with a specific,
 /// identifiable error — not silently treated as absent/empty data.
 #[test]
-fn test_open_packfile_refuses_v1_with_specific_error() {
-    let dir = test_dir("packfile_v1_refused");
+fn test_open_packfile_refuses_unknown_version_with_specific_error() {
+    let dir = test_dir("packfile_unknown_version_refused");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("shard_00.pack");
 
-    // A valid v1 file: 5-byte header (magic + version 0x01) followed
-    // by a real, well-formed record — this is what an actual
-    // pre-cutover store's shard file looks like, not a corrupt one.
+    // A valid file with an unsupported version: 5-byte header followed by a
+    // real, well-formed record, not merely a corrupt/truncated input.
     let mut buf = Vec::new();
     buf.extend_from_slice(&MAGIC);
-    buf.push(0x01);
+    buf.push(VERSION.wrapping_add(1));
     write_record(&mut buf, &test_record_raw([0x11; 16], b"old data")).unwrap();
     std::fs::write(&path, &buf).unwrap();
 
@@ -759,7 +757,8 @@ fn test_open_packfile_refuses_v1_with_specific_error() {
     assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     let msg = err.to_string();
     assert!(
-        msg.contains("0x01") && msg.to_lowercase().contains("reset or migrate"),
+        msg.contains(&format!("0x{:02x}", VERSION.wrapping_add(1)))
+            && msg.to_lowercase().contains("reset or migrate"),
         "error must identify the offending version and advise resetting/migrating, got: {msg}"
     );
 
@@ -780,15 +779,14 @@ fn test_open_packfile_refuses_v1_with_specific_error() {
     );
 }
 
-/// The same v1-rejection must also hold for a v1 file too short to
-/// fill a v2 `HEADER_LEN` buffer — version mismatch must be caught by
-/// the 5-byte prefix check before ever attempting to read a full
-/// `HEADER_LEN`, not collapsed into "empty" by an early EOF.
+/// The same rejection must also hold for an unsupported-version file too
+/// short to fill a `HEADER_LEN` buffer — version mismatch must be caught by
+/// the 5-byte prefix check before ever attempting to read a full header.
 #[test]
-fn test_read_header_refuses_short_v1_file_not_silently_empty() {
+fn test_read_header_refuses_short_unknown_version_not_silently_empty() {
     let mut buf = Vec::new();
     buf.extend_from_slice(&MAGIC);
-    buf.push(0x01); // v1, and nothing else — far shorter than HEADER_LEN
+    buf.push(VERSION.wrapping_add(1));
     let mut cursor = Cursor::new(&buf);
     let err = read_header(&mut cursor).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Unsupported);
