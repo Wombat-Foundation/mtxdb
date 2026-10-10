@@ -27,14 +27,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - rust: "1.81.0"
+          - rust: "1.90.0"
             label: "MSRV (default features)"
-          # The CLI lives in its own workspace (see mtxdb-cli/Cargo.toml): its
-          # edition-2024 deps (clap 4.6) and simd-json 0.18 set its floor at
-          # 1.88. It cannot share the `toolchain-checks` workspace because
-          # Cargo parses every member's graph + the shared lock, which would
-          # drag these library rows up to 1.85+ too.
-          - rust: "1.88.0"
+          # The CLI lives in its own workspace (see mtxdb-cli/Cargo.toml) and
+          # depends on the library, so it uses the library's 1.90 MSRV.
+          - rust: "1.90.0"
             label: "cli feature"
           # The cross-process read-committed overlay (`multi-reader`) has its
           # own submodule (`packfile::storage::read_journal`) gated out of the
@@ -42,7 +39,7 @@ jobs:
           # row rather than relying on the `all-features` job below to catch
           # a break here -- `--all-features` compiling says nothing about
           # `--no-default-features --features multi-reader` compiling.
-          - rust: "1.81.0"
+          - rust: "1.90.0"
             label: "multi-reader feature"
     steps:
       - uses: actions/checkout@v4
@@ -60,9 +57,8 @@ jobs:
           rustc --version
           cargo --version
 
-      # 1.81.0 is the library's MSRV (enables core::error::Error) and stays
-      # reachable only because mtxdb-cli is its own workspace. The `cli
-      # feature` row runs at 1.88.0, the CLI's own floor.
+      # 1.90.0 is the library and CLI MSRV. The CLI remains in its own
+      # workspace so its lockfile and dependency graph stay isolated.
       - name: Lint (default features)
         if: matrix.label == 'MSRV (default features)'
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -102,7 +98,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.81.0", "1.82.0", "1.85.0", "1.92.0", "1.98.1", "stable", "nightly"]
+        rust: ["1.90.0", "1.92.0", "1.98.1", "stable", "nightly"]
     steps:
       - uses: actions/checkout@v4
         with:

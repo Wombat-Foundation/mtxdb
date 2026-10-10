@@ -79,6 +79,28 @@ ROW_EXT = re.compile(
     re.MULTILINE | re.VERBOSE,
 )
 
+ROW_MATRIX = re.compile(
+    r"^bench:\s+matrix\s+BACKEND=(?P<backend>\w+)\s+ROOMS=(?P<rooms>\d+)"
+    r"\s+EVENTS=(?P<events>\d+)\s+LOOKUPS=(?P<lookups>\d+)\s+BATCH=(?P<batch>\d+)"
+    r"\s+WRITE_MS=(?P<write>[\d.]+)\s+BYTES=(?P<bytes>\d+)\s+EVICTED=(?P<evicted>\w+)"
+    r"\s+WARM_OPEN_MS=(?P<warm_open>[\d.]+)\s+COLD_OPEN_MS=(?P<cold_open>[\d.]+)"
+    r"\s+WARM_POINT_US=(?P<warm_point>[\d.]+)\s+WARM_BATCH_US=(?P<warm_batch>[\d.]+)"
+    r"\s+COLD_POINT_US=(?P<cold_point>[\d.]+)\s+COLD_BATCH_US=(?P<cold_batch>[\d.]+)",
+    re.MULTILINE,
+)
+
+ROW_MATRIX_TIMELINE = re.compile(
+    r"""
+    ^bench:\s+matrix_timeline\s+BACKEND=(?P<backend>\w+)\s+ROOMS=(?P<rooms>\d+)
+    \s+EVENTS=(?P<events>\d+)\s+PAGE=(?P<page>\d+)
+    \s+WRITE_MS=(?P<write>[\d.]+)\s+BYTES=(?P<bytes>\d+)\s+EVICTED=(?P<evicted>true|false)
+    \s+WARM_FWD_PAGES=(?P<warm_fwd_pages>\d+)\s+WARM_BWD_PAGES=(?P<warm_bwd_pages>\d+)
+    \s+WARM_FWD_PAGE_US=(?P<warm_fwd>[\d.]+)\s+WARM_BWD_PAGE_US=(?P<warm_bwd>[\d.]+)
+    \s+COLD_FWD_PAGE_US=(?P<cold_fwd>[\d.]+)\s+COLD_BWD_PAGE_US=(?P<cold_bwd>[\d.]+)
+    """,
+    re.MULTILINE | re.VERBOSE,
+)
+
 ROW_IMPORT = re.compile(
     r"""
     ^bench:\s+import\s+MODE=(?P<mode>\w+)\s+COLLECTIONS=(?P<collections>\d+)
@@ -405,6 +427,116 @@ def external_scenario(output: str) -> Scenario:
         ):
             if row[metric] is not None:
                 scenario.tracked[base + metric] = float(row[metric])
+        scenario.rows.append(row)
+    return scenario
+
+
+def matrix_scenario(output: str) -> Scenario:
+    """Build the matched Matrix-shaped workload scenario."""
+    scenario = Scenario(
+        filename="matrix.csv",
+        columns=[
+            "backend",
+            "rooms",
+            "events",
+            "lookups",
+            "batch",
+            "write_ms",
+            "bytes",
+            "evicted",
+            "warm_open_ms",
+            "cold_open_ms",
+            "warm_point_us",
+            "warm_batch_us",
+            "cold_point_us",
+            "cold_batch_us",
+        ],
+    )
+    for m in ROW_MATRIX.finditer(output):
+        row = {
+            "backend": m["backend"],
+            "rooms": int(m["rooms"]),
+            "events": int(m["events"]),
+            "lookups": int(m["lookups"]),
+            "batch": int(m["batch"]),
+            "write_ms": float(m["write"]),
+            "bytes": int(m["bytes"]),
+            "evicted": m["evicted"],
+            "warm_open_ms": float(m["warm_open"]),
+            "cold_open_ms": float(m["cold_open"]),
+            "warm_point_us": float(m["warm_point"]),
+            "warm_batch_us": float(m["warm_batch"]),
+            "cold_point_us": float(m["cold_point"]),
+            "cold_batch_us": float(m["cold_batch"]),
+        }
+        base = f"matrix/{m['backend']}/{m['events']}/{m['batch']}/"
+        # `evicted` records the cache state, not a trend, so it is excluded.
+        for metric in (
+            "write_ms",
+            "bytes",
+            "warm_open_ms",
+            "cold_open_ms",
+            "warm_point_us",
+            "warm_batch_us",
+            "cold_point_us",
+            "cold_batch_us",
+        ):
+            if metric.startswith("cold_") and row["evicted"] != "true":
+                continue
+            scenario.tracked[base + metric] = float(row[metric])
+        scenario.rows.append(row)
+    return scenario
+
+
+def matrix_timeline_scenario(output: str) -> Scenario:
+    """Build the room-timeline pagination scenario (SQLite baseline)."""
+    scenario = Scenario(
+        filename="matrix_timeline.csv",
+        columns=[
+            "backend",
+            "rooms",
+            "events",
+            "page",
+            "write_ms",
+            "bytes",
+            "evicted",
+            "warm_fwd_pages",
+            "warm_bwd_pages",
+            "warm_fwd_page_us",
+            "warm_bwd_page_us",
+            "cold_fwd_page_us",
+            "cold_bwd_page_us",
+        ],
+    )
+    for m in ROW_MATRIX_TIMELINE.finditer(output):
+        row = {
+            "backend": m["backend"],
+            "rooms": int(m["rooms"]),
+            "events": int(m["events"]),
+            "page": int(m["page"]),
+            "write_ms": float(m["write"]),
+            "bytes": int(m["bytes"]),
+            "evicted": m["evicted"],
+            "warm_fwd_pages": int(m["warm_fwd_pages"]),
+            "warm_bwd_pages": int(m["warm_bwd_pages"]),
+            "warm_fwd_page_us": float(m["warm_fwd"]),
+            "warm_bwd_page_us": float(m["warm_bwd"]),
+            "cold_fwd_page_us": float(m["cold_fwd"]),
+            "cold_bwd_page_us": float(m["cold_bwd"]),
+        }
+        base = f"matrix_timeline/{m['backend']}/{m['events']}/{m['page']}/"
+        # `evicted`, `warm_*_pages` describe the run, not a trend.
+        for metric in (
+            "write_ms",
+            "bytes",
+            "warm_fwd_page_us",
+            "warm_bwd_page_us",
+            "cold_fwd_page_us",
+            "cold_bwd_page_us",
+        ):
+            if metric.startswith("cold_") and row["evicted"] != "true":
+                continue
+            scenario.tracked[base + metric] = float(row[metric])
         scenario.rows.append(row)
     return scenario
 
@@ -834,6 +966,9 @@ def parse_current(path: Path) -> list[Scenario]:
                     + ", ".join(missing)
                 )
     scenarios.append(ext)
+
+    scenarios.append(matrix_scenario(output))
+    scenarios.append(matrix_timeline_scenario(output))
 
     scenarios.extend(storage_scenarios(output))
     scenarios.extend(elephant_scenarios(output))

@@ -15,6 +15,10 @@
     clippy::uninlined_format_args
 )]
 
+#[path = "support/bench_vmtouch.rs"]
+mod bench_vmtouch;
+use bench_vmtouch::vmtouch_on_path;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -355,7 +359,7 @@ fn compact_shard_intra(
     store: &PackfileStorage,
     shard_path: &Path,
     dest_path: &Path,
-    dest_pack_id: u64,
+    dest_pack_id: &packfile::PackId,
 ) -> std::io::Result<CompactionCost> {
     let start = Instant::now();
     let entries = packfile::scan_packfile(shard_path)?;
@@ -377,7 +381,7 @@ fn compact_shard_intra(
 
     let file = fs::File::create(dest_path)?;
     let mut buffered = std::io::BufWriter::with_capacity(1024 * 1024, file);
-    packfile::write_header(&mut buffered, dest_pack_id)?;
+    packfile::write_header_with_creation_seq(&mut buffered, dest_pack_id, 1)?;
 
     let mut records_written = 0usize;
     let mut bytes_written = 0u64;
@@ -469,18 +473,6 @@ fn drop_caches_for_dir(dir: &Path) -> Eviction {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Eviction::NotFound,
         Err(e) => Eviction::Failed(e.to_string()),
     }
-}
-
-/// Whether `vmtouch` is callable on `$PATH` at all. Checked once up front
-/// so a missing install is a loud banner at startup, not something a
-/// reader has to notice buried in a "Cache state: Warm" line four phases in.
-fn vmtouch_on_path() -> bool {
-    std::process::Command::new("vmtouch")
-        .arg("-h")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
 }
 
 // ── Benchmark ──────────────────────────────────────────────────────
@@ -915,18 +907,19 @@ pub fn run_stage1_intra_shard_compaction_prototype() {
     );
     let compacted_dir = temp_dir.join("compacted");
     fs::create_dir_all(&compacted_dir).unwrap();
+    let sibling_pack_ids: Vec<packfile::PackId> = summaries.iter().map(|s| s.pack_id).collect();
 
     let mut total_records_written = 0usize;
     let mut total_bytes_written = 0u64;
     let mut total_write_time = Duration::ZERO;
     let mut total_fsync_time = Duration::ZERO;
     for summary in &summaries {
-        let shard_path = ShardPool::pack_path(&temp_dir, summary.pack_id);
-        let dest_path = ShardPool::pack_path(&compacted_dir, summary.pack_id);
+        let shard_path = ShardPool::pack_path(&temp_dir, &summary.pack_id, &sibling_pack_ids);
+        let dest_path = ShardPool::pack_path(&compacted_dir, &summary.pack_id, &sibling_pack_ids);
         let (records, bytes, write_time, fsync_time) =
-            compact_shard_intra(&store, &shard_path, &dest_path, summary.pack_id).unwrap();
+            compact_shard_intra(&store, &shard_path, &dest_path, &summary.pack_id).unwrap();
         subrow(
-            &format!("shard {:#06x}:", summary.pack_id),
+            &format!("shard {}:", summary.pack_id),
             format!(
                 "{records} records, {} — write {write_time:.2?}, fsync {fsync_time:.2?}",
                 format_bytes(bytes)

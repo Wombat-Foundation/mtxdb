@@ -50,6 +50,19 @@
     clippy::uninlined_format_args
 )]
 
+#[path = "support/bench_cache.rs"]
+mod bench_cache;
+#[path = "support/bench_evict.rs"]
+mod bench_evict;
+#[path = "support/bench_ram.rs"]
+mod bench_ram;
+#[path = "support/bench_vmtouch.rs"]
+mod bench_vmtouch;
+use bench_cache::mount_fstype;
+use bench_evict::evict_dir;
+use bench_ram::is_ram_backed;
+use bench_vmtouch::vmtouch_on_path;
+
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write as _;
@@ -176,67 +189,6 @@ impl Snapshot {
             disk_read_bytes: self.disk_read_bytes.saturating_sub(earlier.disk_read_bytes),
         }
     }
-}
-
-// ── Cache eviction / scratch root ───────────────────────────────────
-
-/// Best-effort page-cache eviction via `vmtouch -e`. Only drops *clean*
-/// pages of the named files, and only while no process has them mapped —
-/// callers must have dropped the store first. No root needed; returns
-/// `false` if vmtouch is missing or fails.
-fn evict_dir(dir: &Path) -> bool {
-    std::process::Command::new("vmtouch")
-        .arg("-e")
-        .arg(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-fn vmtouch_on_path() -> bool {
-    std::process::Command::new("vmtouch")
-        .arg("-h")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
-
-/// Filesystem type of the mount holding `path`, from `/proc/mounts` (the
-/// longest mount point that prefixes `path`). `None` if `/proc/mounts`
-/// is unreadable or no entry matches (non-Linux).
-fn mount_fstype(path: &Path) -> Option<String> {
-    let canonical = path.canonicalize().ok()?;
-    let mounts = fs::read_to_string("/proc/mounts").ok()?;
-    let mut best: Option<(usize, String)> = None;
-    for line in mounts.lines() {
-        // Fields are space-separated; the mount point (field 2) escapes
-        // spaces as `\040`, which canonical paths won't contain here.
-        let mut fields = line.split(' ');
-        let _dev = fields.next()?;
-        let mount_point = fields.next()?;
-        let fstype = fields.next()?;
-        let mount_path = Path::new(mount_point);
-        if canonical.starts_with(mount_path) {
-            let depth = mount_path.components().count();
-            let deeper_or_equal = best.as_ref().map_or(true, |(d, _)| depth >= *d);
-            if deeper_or_equal {
-                best = Some((depth, fstype.to_owned()));
-            }
-        }
-    }
-    best.map(|(_, fstype)| fstype)
-}
-
-/// True when `path` lives on an in-memory filesystem (`tmpfs`, `ramfs`,
-/// `devtmpfs`), where "cold reads" are a contradiction: the data never
-/// leaves RAM and neither `drop_caches` nor `vmtouch` can evict it.
-fn is_ram_backed(path: &Path) -> bool {
-    matches!(
-        mount_fstype(path).as_deref(),
-        Some("tmpfs" | "ramfs" | "devtmpfs")
-    )
 }
 
 /// Run the root page-cache drop directly, rather than asking the operator

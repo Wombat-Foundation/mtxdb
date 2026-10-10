@@ -2,10 +2,7 @@
 name = "mtxdb-cli"
 version = "0.1.0-beta.1"
 edition = "2021"
-# Unlike the library (1.81), the CLI's deps are higher: clap 4.6 needs 1.85
-# (edition 2024) and simd-json 0.18 declares `rust-version = "1.88"`, so the
-# CLI floor is 1.88.
-rust-version = "1.88"
+rust-version = "1.87"
 publish = false
 
 repository = "https://github.com/Wombat-Foundation/mtxdb"
@@ -77,12 +74,11 @@ completions = ["dep:clap_complete"]
 anyhow = "1.0"
 base64 = "0.23.1"
 bytes = "1.5"
-clap = { version = "=4.6.6", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
-clap_complete = { version = "=4.6.9", optional = true }
+clap = { version = "=4.6.7", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
+clap_complete = { version = "=4.6.11", optional = true }
 hex = "0.4"
 mtxdb = { path = ".." }
 rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
-simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
 
 # INTEGRATION TESTS. Ungated files are folded into one `tests/unit/main.rs`
 # target so `cargo test` links a single binary for them (see that file's

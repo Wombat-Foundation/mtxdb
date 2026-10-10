@@ -2,13 +2,14 @@
 
 use mtxdb::index::redo::*;
 use mtxdb::index::IndexEntry;
+use mtxdb::packfile::{PackId, PACK_ID_LEN};
 
 fn set(seq: u64) -> RedoRecord {
     RedoRecord {
         collection_id: [0xC1; 16],
         op: RedoOp::Set {
             full_hash: [0xA5; 16],
-            pack_id: 7,
+            pack_id: PackId([7; PACK_ID_LEN]),
             offset: 4096,
             record_len: 61,
         },
@@ -61,7 +62,7 @@ fn unknown_operations_and_nonzero_reserved_bytes_are_rejected() {
         bytes[16] = op;
         assert_eq!(RedoRecord::decode(&bytes), Err(RedoError::UnknownOp(op)));
     }
-    for at in [17usize, 18, 19, 44, 45, 46, 47, 76, 77, 78, 79] {
+    for at in [17usize, 18, 19] {
         let mut bytes = good;
         bytes[at] = 1;
         assert_eq!(
@@ -78,13 +79,13 @@ fn an_offset_above_the_index_maximum_is_rejected_both_ways() {
     let mut record = set(1);
     record.op = RedoOp::Set {
         full_hash: [1; 16],
-        pack_id: 1,
+        pack_id: PackId([1; PACK_ID_LEN]),
         offset: too_far,
         record_len: 61,
     };
     assert_eq!(record.encode(), Err(RedoError::OffsetTooLarge(too_far)));
     let mut bytes = set(1).encode().unwrap();
-    bytes[48..56].copy_from_slice(&too_far.to_le_bytes());
+    bytes[52..60].copy_from_slice(&too_far.to_le_bytes());
     assert_eq!(
         RedoRecord::decode(&bytes),
         Err(RedoError::OffsetTooLarge(too_far))
@@ -93,7 +94,7 @@ fn an_offset_above_the_index_maximum_is_rejected_both_ways() {
     let mut ok = set(1);
     ok.op = RedoOp::Set {
         full_hash: [1; 16],
-        pack_id: 1,
+        pack_id: PackId([1; PACK_ID_LEN]),
         offset: IndexEntry::MAX_OFFSET,
         record_len: 61,
     };
@@ -103,9 +104,9 @@ fn an_offset_above_the_index_maximum_is_rejected_both_ways() {
 #[test]
 fn a_set_needs_a_length_and_a_tombstone_carries_no_locator() {
     let mut bytes = set(1).encode().unwrap();
-    bytes[56..60].fill(0);
+    bytes[60..64].fill(0);
     assert_eq!(RedoRecord::decode(&bytes), Err(RedoError::ZeroRecordLen));
-    for at in [20usize, 36, 48, 56] {
+    for at in [20usize, 36, 52, 60] {
         let mut bytes = tombstone(1).encode().unwrap();
         bytes[at] = 1;
         assert_eq!(

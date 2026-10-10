@@ -1,8 +1,9 @@
 //! CLI for the mtxdb content-addressed storage engine.
 
 mod cmd;
+mod state_hamt;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Context as _;
@@ -101,6 +102,7 @@ pub(crate) enum Commands {
         all: bool,
         layout: bool,
         canonical: bool,
+        per_db: bool,
         sort: Option<String>,
         limit: i64,
     },
@@ -112,6 +114,9 @@ pub(crate) enum Commands {
     Stats {
         json: bool,
     },
+    Memory {
+        evict: bool,
+    },
     Meta {
         target: String,
         json: bool,
@@ -120,6 +125,12 @@ pub(crate) enum Commands {
         decode: Option<String>,
     },
     Info {
+        /// Positional selector; its namespace is inferred (pack for a 1-16 hex
+        /// prefix, pack or collection for 32 hex by existence).
+        selector: Option<String>,
+        /// Explicit `--pack` selector; bypasses inference.
+        pack: Option<String>,
+        /// Explicit `--collection` selector; bypasses inference.
         collection: Option<String>,
         stats: bool,
     },
@@ -208,7 +219,6 @@ pub(crate) enum PacksAction {
         pack: String,
         collection: String,
         out: PathBuf,
-        dest_pack_id: Option<String>,
     },
 }
 
@@ -238,6 +248,7 @@ fn build_cli() -> Command {
         .subcommand(sub_shards())
         .subcommand(sub_collections())
         .subcommand(sub_stats())
+        .subcommand(sub_memory())
         .subcommand(sub_meta())
         .subcommand(sub_sync())
         .subcommand(sub_completions())
@@ -336,6 +347,25 @@ fn sub_stats() -> Command {
         )
 }
 
+fn sub_memory() -> Command {
+    Command::new("memory")
+        .about("Inspect or evict mtxdb's in-process decoded-node caches")
+        .long_about(
+            "Inspect or evict mtxdb's in-process decoded-node caches.\n\n".to_owned()
+                + "This reports heap objects decoded by the current mtxdb process only. "
+                + "It does not include durable records, indexes, memory-mapped files, or "
+                + "the operating system's filesystem page cache. A one-shot CLI process "
+                + "starts with an empty decoded-node cache; this is primarily useful to "
+                + "long-lived embedders.",
+        )
+        .arg(
+            Arg::new("evict")
+                .long("evict")
+                .action(ArgAction::SetTrue)
+                .help("Evict decoded nodes held by this process; does not flush the OS page cache"),
+        )
+}
+
 fn sub_meta() -> Command {
     Command::new("meta")
         .about("Inspect on-disk metadata and durability artifacts (read-only)")
@@ -399,6 +429,12 @@ fn sub_collections() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Show each collection's canonical ID"),
         )
+        .arg(
+            Arg::new("per_db")
+                .long("per-db")
+                .action(ArgAction::SetTrue)
+                .help("With --coalesce, also print one totals row per database"),
+        )
         .arg(limit_arg())
         .arg(sort_arg("collection, nodes, idx-load (alias: load), shards, index, disk, packs, avoidable, segments, fragmentation"))
 }
@@ -429,7 +465,8 @@ fn sort_arg(help: &'static str) -> Arg {
 }
 
 fn sub_init() -> Command {
-    Command::new("init").about("Create a new mtxdb database root (db.meta + pools).")
+    Command::new("init")
+        .about("Create a new mtxdb database root (db.meta); pools are created on first write.")
 }
 
 fn sub_subprocess_writer() -> Command {
@@ -526,6 +563,7 @@ fn sub_scan() -> Command {
                 .num_args(0..=1)
                 .default_missing_value("auto")
                 .require_equals(true)
+                .value_parser(["auto", "json", "hamt", "state", "raw"])
                 .help("Decode and display payload format (e.g. json, hamt, state, raw, or auto)"),
         )
         .arg(
@@ -560,13 +598,40 @@ fn sub_info() -> Command {
     Command::new("info")
         .about("Show storage info for a collection or a pack")
         .arg(
-            Arg::new("collection")
+            Arg::new("selector")
                 .required(false)
+                .conflicts_with_all(["pack", "collection"])
                 .value_name("PACK_ID|COLLECTION")
                 .help(
-                    "A `0x`-prefixed collection ID (32 hex digits after `0x`) or a pack ID \
-                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits). Omit it to \
-                     show database and pool metadata.",
+                    "A `0x`-prefixed pack filename prefix (1-16 hex digits, as shown by `mtxdb \
+                     shards`), a `0x`-prefixed 32-hex id naming a pack or a collection, or a \
+                     canonical collection sigil such as !room:server. A 32-hex selector is inferred: it \
+                     resolves to a pack if only a pack matches, to a collection if only a \
+                     collection matches, and is an error if both match (specify --pack or \
+                     --collection to disambiguate). Mutually exclusive with --pack/--collection. \
+                     Omit to show database and pool metadata.",
+                ),
+        )
+        .arg(
+            Arg::new("pack")
+                .long("pack")
+                .conflicts_with("collection")
+                .value_name("PACK_ID")
+                .help(
+                    "Interpret the selector as a pack (0x-prefixed full 32-hex id, or a unique \
+                     1-16 hex filename prefix). Bypasses inference; errors if no such pack \
+                     exists.",
+                ),
+        )
+        .arg(
+            Arg::new("collection")
+                .long("collection")
+                .conflicts_with("pack")
+                .value_name("COLLECTION")
+                .help(
+                    "Interpret the selector as a collection (0x-prefixed 32-hex id, or a \
+                     canonical sigil such as !room:server). Bypasses inference; errors if no \
+                     such collection exists.",
                 ),
         )
         .arg(
@@ -667,7 +732,7 @@ fn sub_packs() -> Command {
                         .long("pack")
                         .required(true)
                         .value_name("PACK_ID")
-                        .help("Pack identity (0x-prefixed 16 hex digits)"),
+                        .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
                 ),
         )
         .subcommand(sub_packs_dump())
@@ -684,8 +749,9 @@ fn sub_packs_dump() -> Command {
              `payload` is a decoded JSON convenience value (which may differ in whitespace, \
              key order, or numeric spelling) and is absent for binary payloads. Unlike \
              `export`, this is a complete view of one pack (all collections, superseded \
-             frames included), not a collection's live set. Pack IDs are pool-local, so a \
-             pack id present in more than one pool is rejected unless -t selects one.",
+             frames included), not a collection's live set. Pack identities are globally \
+             unique addresses, so if the same id is present in more than one selected pool \
+             it is still rejected as ambiguous unless -t selects one.",
         )
         .arg(
             Arg::new("pack")
@@ -693,7 +759,7 @@ fn sub_packs_dump() -> Command {
                 .long("pack")
                 .required(true)
                 .value_name("PACK_ID")
-                .help("Pack identity (0x-prefixed 16 hex digits)"),
+                .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
         )
         .arg(
             Arg::new("collection")
@@ -726,7 +792,7 @@ fn sub_packs_extract() -> Command {
                 .long("pack")
                 .required(true)
                 .value_name("PACK_ID")
-                .help("Source pack identity (0x-prefixed 16 hex digits)"),
+                .help("Source pack identity (full 32-hex 0x-prefixed id, or a unique filename prefix)"),
         )
         .arg(
             Arg::new("collection")
@@ -742,13 +808,7 @@ fn sub_packs_extract() -> Command {
                 .long("out")
                 .required(true)
                 .value_name("FILE")
-                .help("Path for the extracted packfile"),
-        )
-        .arg(
-            Arg::new("dest_pack_id")
-                .long("dest-pack-id")
-                .value_name("PACK_ID")
-                .help("Pack identity to stamp in the output header (defaults to 0, or parsed from pack_{hex}.pack filename)"),
+                .help("Path for the extracted packfile; it is stamped with a fresh random pack identity"),
         )
 }
 
@@ -888,23 +948,121 @@ fn read_plan_from_mode(mode: &str) -> ReadPlanPolicy {
     }
 }
 
+/// With `--coalesce`, also take the databases in the current directory: the
+/// directory itself if it is a database root, else each immediate child that
+/// is one. Already-listed directories are not repeated.
+fn add_cwd_databases(dirs: &mut Vec<PathBuf>) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let mut found = Vec::new();
+    if mtxdb::is_database_root(&cwd).unwrap_or(false) {
+        found.push(cwd);
+    } else if let Ok(entries) = std::fs::read_dir(&cwd) {
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if path.is_dir() && mtxdb::is_database_root(&path).unwrap_or(false) {
+                found.push(path);
+            }
+        }
+        found.sort();
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut seen: Vec<PathBuf> = dirs.iter().map(|d| canon(d)).collect();
+    for path in found {
+        let c = canon(&path);
+        if !seen.contains(&c) {
+            seen.push(c);
+            dirs.push(path);
+        }
+    }
+}
+
+/// Let one `-d`/`--dir` take several directories, so a shell glob works
+/// (`mtxdb -d pid-* collections`). Clap gives `-d` exactly one value, so each
+/// bare token after it that `is_dir` is rewritten to its own `-d`, and one
+/// that `is_file` is dropped (so `-d *` skips stray files). The first other
+/// token (a subcommand, a key, a flag) ends the run. A token naming a
+/// subcommand is never rewritten, and once one is seen files are kept, since
+/// they are that subcommand's operands (`mtxdb import -d db events.json`).
+fn expand_dir_args(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    is_dir: impl Fn(&Path) -> bool,
+    is_file: impl Fn(&Path) -> bool,
+    is_subcommand: impl Fn(&str) -> bool,
+) -> Vec<std::ffi::OsString> {
+    // `Value` is the token right after `-d` (clap's own value); `Run` is any
+    // further bare tokens, which are the extra directories.
+    #[derive(PartialEq)]
+    enum State {
+        Idle,
+        Value,
+        Run,
+    }
+
+    let mut out = Vec::new();
+    let mut state = State::Idle;
+    let mut seen_subcommand = false;
+    for arg in args {
+        let text = arg.to_string_lossy();
+        let bare_run = state == State::Run && !text.starts_with('-');
+        if text == "-d" || text == "--dir" {
+            state = State::Value;
+            out.push(arg);
+        } else if state == State::Value {
+            state = State::Run;
+            out.push(arg);
+        } else if state != State::Value && !text.starts_with('-') && is_subcommand(&text) {
+            seen_subcommand = true;
+            state = State::Idle;
+            out.push(arg);
+        } else if bare_run && is_dir(Path::new(&arg)) {
+            out.push("-d".into());
+            out.push(arg);
+        } else if bare_run && !seen_subcommand && is_file(Path::new(&arg)) {
+            // A stray file in a glob; not a database, not a subcommand.
+        } else {
+            state = State::Idle;
+            out.push(arg);
+        }
+    }
+    out
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the exhaustive clap-to-command mapping is clearest in one match"
 )]
 fn parse_cli() -> Cli {
-    let matches = build_cli().get_matches();
+    let command = build_cli();
+    let matches = command.clone().get_matches_from(expand_dir_args(
+        std::env::args_os(),
+        Path::is_dir,
+        Path::is_file,
+        |name| command.find_subcommand(name).is_some(),
+    ));
 
     if matches.get_flag("version") || matches.get_flag("version_upper") {
         println!("mtxdb {}", build_cli().get_version().unwrap());
         std::process::exit(0);
     }
 
-    let dirs: Vec<PathBuf> = matches
+    let mut dirs: Vec<PathBuf> = matches
         .get_many::<String>("dir")
         .map(|vals| vals.map(PathBuf::from).collect())
         .unwrap_or_default();
     let coalesce = matches.get_flag("coalesce");
+    // Precedence: explicit `-d`, then a database root in the current
+    // directory, then `MTXDB_DIR`. The env var is only a fallback default.
+    if matches.value_source("dir") == Some(clap::parser::ValueSource::EnvVariable) {
+        if let Ok(cwd) = std::env::current_dir() {
+            if mtxdb::is_database_root(&cwd).unwrap_or(false) {
+                dirs = vec![cwd];
+            }
+        }
+    }
+    if coalesce {
+        add_cwd_databases(&mut dirs);
+    }
     let _ = DEBUG_ENABLED.set(matches.get_flag("debug"));
     let read_plan = read_plan_from_mode(
         matches
@@ -946,6 +1104,7 @@ fn parse_cli() -> Cli {
             all: m.get_flag("all"),
             layout: m.get_flag("layout"),
             canonical: m.get_flag("canonical"),
+            per_db: m.get_flag("per_db"),
             sort: m.get_one::<String>("sort").cloned(),
             limit: *m
                 .get_one::<i64>("limit")
@@ -959,6 +1118,9 @@ fn parse_cli() -> Cli {
         Some(("stats", m)) => Commands::Stats {
             json: m.get_flag("json"),
         },
+        Some(("memory", m)) => Commands::Memory {
+            evict: m.get_flag("evict"),
+        },
         Some(("meta", m)) => Commands::Meta {
             target: m.get_one::<String>("target").unwrap().clone(),
             json: m.get_flag("json"),
@@ -971,6 +1133,8 @@ fn parse_cli() -> Cli {
             decode: m.get_one::<String>("decode").cloned(),
         },
         Some(("info", m)) => Commands::Info {
+            selector: m.get_one::<String>("selector").cloned(),
+            pack: m.get_one::<String>("pack").cloned(),
             collection: m.get_one::<String>("collection").cloned(),
             stats: m.get_flag("stats"),
         },
@@ -1022,7 +1186,6 @@ fn parse_cli() -> Cli {
                     pack: sub.get_one::<String>("pack").unwrap().clone(),
                     collection: sub.get_one::<String>("collection").unwrap().clone(),
                     out: PathBuf::from(sub.get_one::<String>("out").unwrap()),
-                    dest_pack_id: sub.get_one::<String>("dest_pack_id").cloned(),
                 },
                 _ => unreachable!("subcommand_required enforces a packs action"),
             },

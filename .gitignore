@@ -19,6 +19,10 @@ __pycache__
 .pytest_cache
 .mypy_cache
 
+# git stuff
+*.diff
+*.patch
+
 # other stuff
 .env
 docs/*.md

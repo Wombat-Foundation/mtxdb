@@ -1,56 +1,46 @@
 use super::{
-    blake3_digest, build_event_dag, canonical_column_width, cmd_collections, cmd_get,
-    cmd_import_file, cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
+    build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import, cmd_import_file,
+    cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
     collection_canonical_id, compile_import_template, compute_state_groups_partial,
-    decode_event_json_record, decode_hamt_node, decode_hamt_root, decode_mtx_adjacency,
-    default_matrix_import_template, derive_template_key, display_collection_role,
-    encode_mtx_adjacency, event_id, event_room_id, event_short_id, export_envelope_line,
-    extract_pointer_string, fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id,
-    glob_pack_files, import_pdu_events, interleaving_worth_noting, listing_shard_types,
-    load_state_groups, matrix_batch_has_create, matrix_event_id_for_template, matrix_event_node_id,
+    decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
+    derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
+    export_envelope_line, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
+    format_canonical_display, format_id, glob_pack_files, import_pdu_events,
+    interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
     matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
-    meta_pools, meta_raw, mtx_relationships, pack_identity, parse_federation_input,
-    parse_pack_id_selector, parse_pack_selectors, plan_matrix_edges, pretty_print_payload,
-    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-    split_canonical_display, template_collection_id, template_node_id, topological_event_order,
-    valid_state_group_id, verify_auth_chain_edges, write_matrix_edges, CollectionTemplate,
-    MatrixRoomExtension, MetaReport, MtxAdjacency, PackIdentity, StateGroupLoad, StateSet,
+    meta_pools, meta_raw, pack_identity, parse_federation_input, parse_pack_id_selector,
+    parse_pack_selectors, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
+    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
+    template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
+    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate,
+    MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
     MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    JsonValueExt,
 };
 use crate::{Cli, Commands};
 use bytes::Bytes;
 use mtxdb::packfile::storage::PackfileStorage;
+use mtxdb::packfile::PackId;
+use mtxdb::room_auth::RoomAuth;
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::template::{
     CollectionKeyRule, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
 };
 use mtxdb::{
-    content_digest, derive_collection_id, DatabaseLayout, DigestAlgorithm, MatrixRoomVersion,
-    ShardType,
+    content_digest, derive_collection_id, Database, DatabaseLayout, DigestAlgorithm,
+    MatrixRoomVersion, ShardType,
 };
-use simd_json::prelude::{ValueAsScalar, ValueObjectAccess, Writable};
-use simd_json::OwnedValue;
+use rezzy::json::Value as OwnedValue;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine;
 
-/// Plan and append in one step, mirroring the production import paths that
-/// keep the two phases separate for preflight.
-fn persist_matrix_edges(
-    store: &PackfileStorage,
-    template: &CollectionTemplate,
-    events: &[OwnedValue],
-) -> anyhow::Result<()> {
-    let plan = plan_matrix_edges(store, template, events)?;
-    write_matrix_edges(store, plan)
-}
-
 fn owned_value(json: &str) -> OwnedValue {
-    let mut bytes = json.as_bytes().to_vec();
-    simd_json::to_owned_value(&mut bytes).expect("valid JSON fixture")
+    let bytes = json.as_bytes().to_vec();
+    OwnedValue::parse_bytes(&bytes).expect("valid JSON fixture")
 }
 
 /// A string field of a JSON object, or `None` if the key is absent or not
@@ -71,6 +61,83 @@ fn state_scan_decodes_big_endian_state_group_payload() {
     assert_eq!(
         scan_payload_suffix(&2u64.to_be_bytes(), ShardType::EventDag),
         Some("8 bytes (undecodable, magic=0x00000000)".to_owned())
+    );
+}
+
+#[test]
+fn scan_renders_auxiliary_envelope_value() {
+    let mut payload = b"AUX1".to_vec();
+    payload.extend_from_slice(&[0xabu8; 32]);
+    payload.extend_from_slice(b"state-group-id");
+    assert_eq!(
+        scan_payload_suffix(&payload, ShardType::State),
+        Some("AUX1 value: state-group-id".to_owned())
+    );
+}
+
+#[test]
+fn scan_reports_truncated_auxiliary_envelope() {
+    assert_eq!(
+        scan_payload_suffix(b"AUX1", ShardType::State),
+        Some("4 bytes (malformed AUX1 envelope)".to_owned())
+    );
+}
+
+#[test]
+fn scan_renders_the_event_to_state_group_pointer() {
+    let mut payload = b"AUX1".to_vec();
+    payload.extend_from_slice(&[0xabu8; 32]);
+    payload.extend_from_slice(&[0x12u8; STATE_GROUP_ID_LENGTH]);
+    assert_eq!(
+        scan_payload_suffix(&payload, ShardType::State),
+        Some(format!("PTR: 0x{}", "12".repeat(16)))
+    );
+}
+
+#[test]
+fn scan_decodes_a_state_group_instance() {
+    let instance = mtxdb::StateGroupInstance {
+        parents: vec![[0x11; 16], [0x22; 16]],
+        lthash: [0x33; 32],
+        root_id: [0x44; 16],
+    };
+    let payload = mtxdb::encode_state_group_record(&instance);
+    // The one-line cell stays empty so `--verbose`/`--decode` prints the
+    // recognized multi-line form instead.
+    assert!(scan_payload_suffix(&payload, ShardType::State).is_none());
+    let decoded = super::decode_state_group(&payload).expect("STGP decode");
+    let text = String::from_utf8(decoded).unwrap();
+    assert!(text.contains("STGP state-group instance"));
+    assert!(text.contains(&"11".repeat(16)));
+    assert!(text.contains(&"33".repeat(32)));
+    assert!(text.contains(&"44".repeat(16)));
+    assert!(pretty_print_payload(&payload).is_some());
+}
+
+#[test]
+fn immutable_record_filter_skips_duplicates_and_rejects_collisions() {
+    use mtxdb::storage::InMemoryStorage;
+    let store = InMemoryStorage::new();
+    let collection = [0u8; 16];
+    let id = [1u8; 16];
+
+    let fresh =
+        super::filter_new_records(&store, &collection, vec![(id, NodeData::from_slice(b"a"))])
+            .unwrap();
+    assert_eq!(fresh.len(), 1);
+    store
+        .put_many(&collection, &[(id, NodeData::from_slice(b"a"))])
+        .unwrap();
+
+    let fresh =
+        super::filter_new_records(&store, &collection, vec![(id, NodeData::from_slice(b"a"))])
+            .unwrap();
+    assert!(fresh.is_empty(), "identical payload is skipped");
+
+    assert!(
+        super::filter_new_records(&store, &collection, vec![(id, NodeData::from_slice(b"b"))])
+            .is_err(),
+        "a differing payload under the same id is a hard collision"
     );
 }
 
@@ -113,12 +180,12 @@ fn meta_json_summary_has_numeric_severity_counts() {
     report.finding("ERROR", Path::new("error"), "unreadable");
     let value = report.json_value();
     let encoded = value.encode();
-    let mut bytes = encoded.into_bytes();
-    let parsed = simd_json::to_owned_value(&mut bytes).expect("meta JSON must parse");
-    let simd_json::OwnedValue::Array(records) = parsed else {
+    let bytes = encoded.into_bytes();
+    let parsed = OwnedValue::parse_bytes(&bytes).expect("meta JSON must parse");
+    let OwnedValue::Array(records) = parsed else {
         panic!("meta JSON must be an array");
     };
-    let simd_json::OwnedValue::Object(summary) = &records[0] else {
+    let OwnedValue::Object(summary) = &records[0] else {
         panic!("summary must be an object");
     };
     assert_eq!(
@@ -207,6 +274,7 @@ fn checkpoint_pack_comparison_excludes_noncanonical_pack_but_checks_valid_set() 
         0,
         &[],
         &[],
+        &[],
     )
     .unwrap();
     let mut report = MetaReport::default();
@@ -239,6 +307,7 @@ fn checkpoint_pack_comparison_is_quiet_when_packs_match() {
         0,
         &[],
         &[],
+        &[],
     )
     .unwrap();
     let mut report = MetaReport::default();
@@ -263,6 +332,7 @@ fn checkpoint_pack_comparison_skips_invalid_pack_with_explicit_note() {
         mtxdb::index::checkpoint::pack_fingerprint(&[]),
         0,
         0,
+        &[],
         &[],
         &[],
     )
@@ -337,7 +407,9 @@ fn sync_all_does_not_materialize_empty_pools() {
     cmd_sync(&cli, true).unwrap();
 
     for shard_type in ShardType::ALL {
-        let pool = layout.pool_dir_read_only(shard_type).unwrap();
+        // Pools are created by their first write, so a pool nothing wrote to has
+        // no directory at all; either way it must hold no pack.
+        let pool = layout.pool_path(shard_type);
         assert!(
             glob_pack_files(&pool).unwrap().is_empty(),
             "sync --all must not create a pack in the empty {} pool",
@@ -360,6 +432,7 @@ fn shard_types_yields_all_three_when_no_type_is_selected() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -381,6 +454,7 @@ fn shard_types_yields_just_the_selected_type() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -402,6 +476,7 @@ fn listing_all_overrides_the_default_pool_selection() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: true,
             layout: false,
             canonical: false,
@@ -426,6 +501,7 @@ fn collections_dash_t_all_iterates_every_pool_without_the_all_flag() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -434,7 +510,15 @@ fn collections_dash_t_all_iterates_every_pool_without_the_all_flag() {
         },
     };
 
-    cmd_collections(&cli, false, false, false, None, -1).unwrap();
+    cmd_collections(
+        &cli,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: None,
+            limit: -1,
+        },
+    )
+    .unwrap();
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -473,6 +557,7 @@ fn collections_with_a_specific_type_still_targets_only_that_pool() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -481,7 +566,15 @@ fn collections_with_a_specific_type_still_targets_only_that_pool() {
         },
     };
 
-    cmd_collections(&cli, false, false, false, None, -1).unwrap();
+    cmd_collections(
+        &cli,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: None,
+            limit: -1,
+        },
+    )
+    .unwrap();
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -503,6 +596,28 @@ fn stats_dash_t_all_iterates_every_pool() {
 }
 
 #[test]
+fn stats_json_quotes_the_pack_id() {
+    // `PackId`'s Display is `0x<hex>`, which is not a bare JSON number, so
+    // the shard entry must render it as a quoted string.
+    let id = mtxdb::packfile::PackId::from_hex("ab12cd34ef567890ab12cd34ef567890").unwrap();
+    let summaries = [mtxdb::shard::ShardSummary {
+        slot: 0,
+        pack_id: id,
+        file_bytes: 4096,
+        stats: mtxdb::shard::ShardStats::default(),
+    }];
+    let json = super::stats_json_object(
+        std::path::Path::new("/nonexistent"),
+        &mtxdb::packfile::storage::RuntimeStats::default(),
+        &summaries,
+    );
+    assert!(
+        json.contains("\"pack_id\":\"0xab12cd34ef567890ab12cd34ef567890\""),
+        "{json}"
+    );
+}
+
+#[test]
 fn info_explains_a_malformed_hex_selector() {
     let cli = Cli {
         dirs: Vec::new(),
@@ -510,58 +625,269 @@ fn info_explains_a_malformed_hex_selector() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
-            collection: Some(String::new()),
+            selector: Some(String::new()),
+            pack: None,
+            collection: None,
             stats: false,
         },
     };
-    let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63", false).unwrap_err();
+    let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63", None, false).unwrap_err();
     assert!(doubled.to_string().contains("doubled"), "{doubled}");
-    let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF", false).unwrap_err();
+    let short = cmd_info(&cli, "0x144ACE34F53560B728FA9E33DD3FEF", None, false).unwrap_err();
     assert!(short.to_string().contains("found 30 characters"), "{short}");
 }
 
 #[test]
 fn info_selector_boundary_between_pack_and_collection() {
+    let cli = Cli {
+        dirs: Vec::new(),
+        shard_type: None,
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Info {
+            selector: None,
+            pack: None,
+            collection: None,
+            stats: false,
+        },
+    };
     let digits = |n: usize| format!("0x{}", "a".repeat(n));
     assert_eq!(
-        super::classify_info_selector("7").unwrap(),
+        super::classify_info_selector(&cli, "7").unwrap(),
         super::InfoTarget::Collection
     );
     assert_eq!(
-        super::classify_info_selector(&digits(1)).unwrap(),
+        super::classify_info_selector(&cli, &digits(1)).unwrap(),
         super::InfoTarget::Pack
     );
     assert_eq!(
-        super::classify_info_selector(&digits(16)).unwrap(),
+        super::classify_info_selector(&cli, &digits(16)).unwrap(),
         super::InfoTarget::Pack
     );
-    let upper = super::classify_info_selector("0X1").unwrap_err();
+    let upper = super::classify_info_selector(&cli, "0X1").unwrap_err();
     assert!(upper.to_string().contains("lowercase"), "{upper}");
     assert_eq!(
-        super::classify_info_selector(&digits(32)).unwrap(),
+        super::classify_info_selector(&cli, &digits(32)).unwrap(),
         super::InfoTarget::Collection
     );
-    for n in [0, 17, 31, 33] {
+    for n in [0, 17, 31, 33, 64] {
         assert!(
-            super::classify_info_selector(&digits(n)).is_err(),
+            super::classify_info_selector(&cli, &digits(n)).is_err(),
             "{n} digits after 0x must be rejected"
         );
     }
 }
 
 #[test]
+fn info_selector_32_hex_disambiguation() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let pool = layout.pool_dir(ShardType::State).unwrap();
+    let store = mtxdb::PackfileStorage::open(pool.clone()).unwrap();
+
+    // 1. Write a record to create a pack and collection
+    let collection_a = [0x42u8; 16];
+    let data = mtxdb::NodeData::new(bytes::Bytes::from_static(b"data1"));
+    store.put(&collection_a, &[0x01; 16], &data).unwrap();
+    store.sync_all().unwrap();
+
+    let files = glob_pack_files(&pool).unwrap();
+    let pack_id = files[0].0;
+    let pack_hex = format!("0x{}", pack_id.as_hex());
+    let col_hex = format_id(&collection_a);
+
+    let cli = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: Some(ShardType::State),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Info {
+            selector: None,
+            pack: None,
+            collection: None,
+            stats: false,
+        },
+    };
+
+    // Pack hex resolves to Pack
+    assert_eq!(
+        super::classify_info_selector(&cli, &pack_hex).unwrap(),
+        super::InfoTarget::Pack
+    );
+
+    // Collection hex resolves to Collection
+    assert_eq!(
+        super::classify_info_selector(&cli, &col_hex).unwrap(),
+        super::InfoTarget::Collection
+    );
+
+    // If a collection with the EXACT same ID as pack_id is created, it becomes ambiguous:
+    let collision_data = mtxdb::NodeData::new(bytes::Bytes::from_static(b"collision"));
+    store
+        .put(pack_id.as_bytes(), &[0x02; 16], &collision_data)
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    // Positional inference now fails with actionable advice naming both
+    // real flags (they exist and are verified below).
+    let ambiguous_err = super::classify_info_selector(&cli, &pack_hex).unwrap_err();
+    let msg = ambiguous_err.to_string();
+    assert!(
+        msg.contains("matches both a pack and a collection"),
+        "{msg}"
+    );
+    assert!(msg.contains("--pack"), "{msg}");
+    assert!(msg.contains("--collection"), "{msg}");
+
+    // `--pack` bypasses inference and resolves the pack even under collision.
+    assert_eq!(
+        super::classify_info_selector_explicit(&cli, &pack_hex, Some(super::InfoTarget::Pack))
+            .unwrap(),
+        super::InfoTarget::Pack
+    );
+    // `--collection` bypasses inference and resolves the collection.
+    assert_eq!(
+        super::classify_info_selector_explicit(&cli, &col_hex, Some(super::InfoTarget::Collection))
+            .unwrap(),
+        super::InfoTarget::Collection
+    );
+    // A unique prefix resolves under `--pack`...
+    let prefix = format!("0x{}", &pack_id.as_hex()[..16]);
+    assert_eq!(
+        super::classify_info_selector_explicit(&cli, &prefix, Some(super::InfoTarget::Pack))
+            .unwrap(),
+        super::InfoTarget::Pack
+    );
+    // ...and `--pack` with an unknown id errors rather than falling through.
+    let missing = format!("0x{}", "ff".repeat(mtxdb::packfile::PACK_ID_LEN));
+    assert!(
+        super::classify_info_selector_explicit(&cli, &missing, Some(super::InfoTarget::Pack))
+            .is_err()
+    );
+    // `--collection` never falls back to a pack: an address with no such
+    // collection errors, even though it is a live pack.
+    let no_collection = format!("0x{}", "ee".repeat(mtxdb::packfile::PACK_ID_LEN));
+    assert!(super::classify_info_selector_explicit(
+        &cli,
+        &no_collection,
+        Some(super::InfoTarget::Collection)
+    )
+    .is_err());
+    // The deliberately-created colliding collection *does* resolve under
+    // `--collection` for the pack's address — that is the point of the flag.
+    assert_eq!(
+        super::classify_info_selector_explicit(
+            &cli,
+            &pack_hex,
+            Some(super::InfoTarget::Collection)
+        )
+        .unwrap(),
+        super::InfoTarget::Collection
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn info_pack_flag_reports_same_id_in_multiple_pools() {
+    // A full PackId present in two selected pools cannot be disambiguated
+    // by using the full address — the error must say to narrow the pool.
+    let dir1 = unique_temp_dir();
+    let dir2 = unique_temp_dir();
+    let l1 = DatabaseLayout::open(dir1.clone()).unwrap();
+    let l2 = DatabaseLayout::open(dir2.clone()).unwrap();
+    let p1 = l1.pool_dir(ShardType::EventDag).unwrap();
+    let p2 = l2.pool_dir(ShardType::EventDag).unwrap();
+
+    let s1 = PackfileStorage::open(p1.clone()).unwrap();
+    s1.put(
+        &[0x11; 16],
+        &[0x33; 16],
+        &NodeData::new(Bytes::from_static(b"a")),
+    )
+    .unwrap();
+    // Fully durable before the file is copied into the second pool.
+    s1.sync_all().unwrap();
+    drop(s1);
+    // Give dir2 its own pool, then copy dir1's pack into it so the same
+    // PackId is live in both selected pools.
+    let s2 = PackfileStorage::open(p2.clone()).unwrap();
+    s2.put(
+        &[0x22; 16],
+        &[0x44; 16],
+        &NodeData::new(Bytes::from_static(b"b")),
+    )
+    .unwrap();
+    s2.sync_all().unwrap();
+    drop(s2);
+
+    let pack_file = std::fs::read_dir(&p1)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .expect("dir1 pool has a pack file");
+    let pack_id = glob_pack_files(&p1).unwrap()[0].0;
+    std::fs::copy(&pack_file, p2.join(pack_file.file_name().unwrap())).unwrap();
+
+    let cli = Cli {
+        dirs: vec![dir1.clone(), dir2.clone()],
+        shard_type: Some(ShardType::EventDag),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Info {
+            selector: None,
+            pack: None,
+            collection: None,
+            stats: false,
+        },
+    };
+
+    let full = format!("0x{}", pack_id.as_hex());
+    let err = super::classify_info_selector_explicit(&cli, &full, Some(super::InfoTarget::Pack))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("selected pools"), "{msg}");
+    assert!(msg.contains("--dir or -t"), "{msg}");
+
+    std::fs::remove_dir_all(&dir1).ok();
+    std::fs::remove_dir_all(&dir2).ok();
+}
+
+#[test]
 fn only_the_canonical_lowercase_prefix_is_accepted() {
-    assert_eq!(super::parse_pack_id_selector("0x1f").unwrap(), 0x1f);
+    let cli = Cli {
+        dirs: Vec::new(),
+        shard_type: None,
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Info {
+            selector: None,
+            pack: None,
+            collection: None,
+            stats: false,
+        },
+    };
+    // A short 0x-prefixed prefix is a filename-prefix selector.
+    let short = super::parse_pack_id_selector("0x1f").unwrap();
+    assert!(short.matches(&PackId([0x1f; mtxdb::packfile::PACK_ID_LEN])));
+    assert!(!short.matches(&PackId([0x20; mtxdb::packfile::PACK_ID_LEN])));
+    // A full 32-hex address is an exact selector.
+    let full = "ab".repeat(mtxdb::packfile::PACK_ID_LEN);
+    assert!(super::parse_pack_id_selector(&format!("0x{full}")).is_ok());
+    assert!(super::parse_pack_id_selector(&format!("0x{}", full.to_uppercase())).is_err());
+
     let id = format_id(&[0xABu8; 16]);
     let upper = id.replacen("0x", "0X", 1);
     assert!(super::parse_pack_id_selector("0X1f").is_err());
     assert!(super::parse_collection_id(&upper).is_err());
     assert!(super::parse_node_id(&upper).is_err());
-    assert!(super::classify_info_selector(&upper).is_err());
+    assert!(super::classify_info_selector(&cli, &upper).is_err());
     // Every selector `info` routes to a pack must parse as one.
     for selector in ["0x1", "0xffffffffffffffff"] {
         assert_eq!(
-            super::classify_info_selector(selector).unwrap(),
+            super::classify_info_selector(&cli, selector).unwrap(),
             super::InfoTarget::Pack
         );
         assert!(
@@ -597,6 +923,7 @@ fn export_envelope_carries_exact_bytes_and_frame_metadata() {
         content_digest: Some([0x44u8; 32]),
         digest_algorithm: DigestAlgorithm::Blake3,
         role: Some(b"event".to_vec()),
+        last_write_lsn: None,
         unknown: vec![(0x7f, vec![0xDE, 0xAD])],
     };
     // Deliberately non-canonical JSON (spaces) so a reserialized payload
@@ -671,7 +998,7 @@ fn export_envelope_base64_encodes_non_json_payloads() {
 fn packs_dump_writes_decoded_jsonl_for_a_pack() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let pool = layout.pool_dir(ShardType::EventDag).unwrap();
     let store = PackfileStorage::open(pool).unwrap();
     let collection_id = [0x11; 16];
     let node_id = [0x22; 16];
@@ -697,7 +1024,7 @@ fn packs_dump_writes_decoded_jsonl_for_a_pack() {
         },
     };
     let out_file = dir.join("dump.jsonl");
-    super::cmd_packs_dump(&cli, &format!("0x{pack_id:016x}"), None, Some(&out_file)).unwrap();
+    super::cmd_packs_dump(&cli, &pack_id.to_string(), None, Some(&out_file)).unwrap();
 
     let content = std::fs::read_to_string(&out_file).unwrap();
     let lines: Vec<&str> = content.lines().collect();
@@ -708,7 +1035,7 @@ fn packs_dump_writes_decoded_jsonl_for_a_pack() {
         Some("mtxdb.pack.dump/v1")
     );
     assert_eq!(json_str(&value, "pool").as_deref(), Some("mtpl-event"));
-    let expected_pack = format!("0x{pack_id:016x}");
+    let expected_pack = pack_id.to_string();
     assert_eq!(
         json_str(&value, "pack_id").as_deref(),
         Some(expected_pack.as_str())
@@ -732,19 +1059,19 @@ fn packs_dump_writes_decoded_jsonl_for_a_pack() {
 }
 
 #[test]
-fn packs_dump_rejects_a_pack_id_present_in_multiple_pools() {
+fn packs_dump_rejects_a_pack_selector_present_in_multiple_pools() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    for shard_type in [ShardType::EventDag, ShardType::State] {
-        let store = PackfileStorage::open(layout.pool_dir_read_only(shard_type).unwrap()).unwrap();
-        store
-            .put(
-                &[0x11; 16],
-                &[0x22; 16],
-                &NodeData::new(Bytes::from_static(b"shared-id")),
-            )
-            .unwrap();
-        store.sync().unwrap();
+    // Deterministic addresses sharing the leading hex digits `ab` in two
+    // pools: a `0xab` prefix selector is ambiguous across them.
+    for (shard_type, tail) in [(ShardType::EventDag, 1u8), (ShardType::State, 2u8)] {
+        let pool = layout.pool_dir(shard_type).unwrap();
+        let mut bytes = [0u8; mtxdb::packfile::PACK_ID_LEN];
+        bytes[0] = 0xAB;
+        bytes[mtxdb::packfile::PACK_ID_LEN - 1] = tail;
+        let pack_id = PackId(bytes);
+        let mut file = std::fs::File::create(pool.join(pack_id.filename())).unwrap();
+        mtxdb::packfile::write_header_with_creation_seq(&mut file, &pack_id, 1).unwrap();
     }
     let cli = Cli {
         dirs: vec![dir.clone()],
@@ -755,8 +1082,8 @@ fn packs_dump_rejects_a_pack_id_present_in_multiple_pools() {
             action: super::PacksAction::List { all: true },
         },
     };
-    let error = super::cmd_packs_dump(&cli, "0x0", None, None).unwrap_err();
-    assert!(error.to_string().contains("multiple pools"), "{error}");
+    let error = super::cmd_packs_dump(&cli, "0xab", None, None).unwrap_err();
+    assert!(error.to_string().contains("ambiguous"), "{error}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -782,7 +1109,7 @@ fn packs_dump_errors_when_the_pack_is_absent() {
 fn packs_extract_slices_target_collection_into_valid_pack() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let pool = layout.pool_dir(ShardType::EventDag).unwrap();
     let store = PackfileStorage::open(pool).unwrap();
 
     let room1_selector = "!room1:example.org";
@@ -836,14 +1163,7 @@ fn packs_extract_slices_target_collection_into_valid_pack() {
     };
 
     let out_pack = dir.join("room1_extracted.pack");
-    super::cmd_packs_extract(
-        &cli,
-        &format!("0x{pack_id:016x}"),
-        room1_selector,
-        &out_pack,
-        Some("0xabc"),
-    )
-    .unwrap();
+    super::cmd_packs_extract(&cli, &pack_id.to_string(), room1_selector, &out_pack).unwrap();
 
     assert!(out_pack.is_file());
 
@@ -861,20 +1181,25 @@ fn packs_extract_slices_target_collection_into_valid_pack() {
     assert!(scanner.next().is_none());
     assert!(!scanner.torn_tail());
 
-    // Validate header pack_id stamped in dest pack
+    // Validate header address stamped in dest pack: a fresh identity,
+    // distinct from the source pack's.
     let mut file = std::fs::File::open(&out_pack).unwrap();
     let header = mtxdb::packfile::read_header(&mut file).unwrap().unwrap();
-    assert_eq!(header.pack_id, 0xabc);
+    assert_ne!(header.pack_id, pack_id);
+    assert_eq!(
+        header.pack_id.as_hex().len(),
+        mtxdb::packfile::PACK_ID_LEN * 2
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A temp database with one record synced into an `EventDag` pack, and a
 /// `packs` CLI over it. Returns the directory, the CLI and the pack's id.
-fn one_record_pack_fixture() -> (PathBuf, Cli, u64) {
+fn one_record_pack_fixture() -> (PathBuf, Cli, PackId) {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let pool = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let pool = layout.pool_dir(ShardType::EventDag).unwrap();
     let store = PackfileStorage::open(pool).unwrap();
     store
         .put(
@@ -905,16 +1230,15 @@ fn packs_extract_rejects_same_source_and_dest() {
 
     let source_path = DatabaseLayout::open(dir.clone())
         .unwrap()
-        .pool_dir_read_only(ShardType::EventDag)
+        .pool_dir(ShardType::EventDag)
         .unwrap()
-        .join(format!("pack_{pack_id:016x}.pack"));
+        .join(pack_id.filename());
 
     let error = super::cmd_packs_extract(
         &cli,
-        &format!("0x{pack_id:016x}"),
+        &pack_id.to_string(),
         "0x11111111111111111111111111111111",
         &source_path,
-        None,
     )
     .unwrap_err();
     assert!(
@@ -926,31 +1250,10 @@ fn packs_extract_rejects_same_source_and_dest() {
 }
 
 #[test]
-fn packs_extract_derives_pack_id_from_filename_when_unspecified() {
-    let (dir, cli, pack_id) = one_record_pack_fixture();
-
-    let out_pack = dir.join("pack_000000000000000f.pack");
-    super::cmd_packs_extract(
-        &cli,
-        &format!("0x{pack_id:016x}"),
-        "0x11111111111111111111111111111111",
-        &out_pack,
-        None,
-    )
-    .unwrap();
-
-    let mut file = std::fs::File::open(&out_pack).unwrap();
-    let header = mtxdb::packfile::read_header(&mut file).unwrap().unwrap();
-    assert_eq!(header.pack_id, 0x0f);
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
 fn export_envelope_resolves_the_winning_frame_after_an_overwrite() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let pool_dir = layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let pool_dir = layout.pool_dir(ShardType::EventDag).unwrap();
 
     let collection_id = [0x11; 16];
     let node_id = [0x22; 16];
@@ -1053,7 +1356,7 @@ fn get_event_selector_matches_the_imported_record_id() {
 fn get_dash_t_all_finds_record_across_pools() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
     let store = PackfileStorage::open(state_dir).unwrap();
     let col_id = [0x01; 16];
     let node_id = [0x02; 16];
@@ -1089,7 +1392,7 @@ fn get_dash_t_all_finds_record_across_pools() {
 fn get_and_scan_with_header_and_decode() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
     let store = PackfileStorage::open(state_dir).unwrap();
 
     let canonical_id = b"sys:flat-kv";
@@ -1201,7 +1504,7 @@ fn get_and_scan_with_header_and_decode() {
 fn info_dash_t_all_finds_collection_across_pools() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
     let store = PackfileStorage::open(state_dir).unwrap();
     let col_id = [0x01; 16];
     let node_id = [0x02; 16];
@@ -1216,12 +1519,14 @@ fn info_dash_t_all_finds_collection_across_pools() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
-            collection: Some(col_hex.clone()),
+            selector: Some(col_hex.clone()),
+            pack: None,
+            collection: None,
             stats: false,
         },
     };
 
-    cmd_info(&cli, &col_hex, false).unwrap();
+    cmd_info(&cli, &col_hex, None, false).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1229,7 +1534,7 @@ fn info_dash_t_all_finds_collection_across_pools() {
 fn scan_dash_t_all_finds_collection_across_pools() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let state_dir = layout.pool_dir_read_only(ShardType::State).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
     let store = PackfileStorage::open(state_dir).unwrap();
     let col_id = [0x01; 16];
     let node_id = [0x02; 16];
@@ -1289,22 +1594,13 @@ fn sender_identity_template() -> CollectionTemplate {
 }
 
 #[allow(clippy::type_complexity)]
-fn import_fixture(
-    name: &str,
-) -> (
-    PackfileStorage,
-    PathBuf,
-    PathBuf,
-    CollectionTemplate,
-    [u8; 16],
-) {
+fn import_fixture(name: &str) -> (Database, PathBuf, PathBuf, CollectionTemplate, [u8; 16]) {
     let dir = unique_temp_dir().join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
     let template = sender_identity_template();
     let collection_id = template_collection_id(&template, "!room");
     let path = dir.join("fixture.json");
-    (store, dir, path, template, collection_id)
+    (db, dir, path, template, collection_id)
 }
 
 fn import_event(event_id_: &str, sender: &str, room: &str) -> OwnedValue {
@@ -1317,19 +1613,19 @@ fn import_event(event_id_: &str, sender: &str, room: &str) -> OwnedValue {
 fn imported_event_payload_uses_rezzy_redaction() {
     let event = owned_value(
         r#"{
-                "event_id":"$event",
-                "room_id":"!room",
-                "sender":"@alice",
-                "type":"m.room.message",
-                "content":{"body":"hello","msgtype":"m.text"},
-                "unsigned":{"age_ts":4},
-                "__pdu_count":123,
-                "__soft_failed":false
-            }"#,
+            "event_id":"$event",
+            "room_id":"!room",
+            "sender":"@alice",
+            "type":"m.room.message",
+            "content":{"body":"hello","msgtype":"m.text"},
+            "unsigned":{"age_ts":4},
+            "__pdu_count":123,
+            "__soft_failed":false
+        }"#,
     );
     let bytes = redacted_event_bytes(&event, "11").unwrap();
-    let mut json = bytes.to_vec();
-    let redacted = simd_json::to_owned_value(&mut json).unwrap();
+    let json = bytes.to_vec();
+    let redacted = OwnedValue::parse_bytes(&json).unwrap();
     assert!(redacted.get("unsigned").is_none());
     assert!(redacted.get("__pdu_count").is_none());
     assert!(redacted.get("__soft_failed").is_none());
@@ -1344,7 +1640,8 @@ fn imported_event_payload_uses_rezzy_redaction() {
 
 #[test]
 fn import_dedups_repeated_event_id_within_one_input() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_dedup");
+    let (db, _dir, path, template, collection_id) = import_fixture("import_dedup");
+    let store = db.event_dag();
     let mut established = HashSet::new();
     established.insert(collection_id);
     let events = vec![
@@ -1352,9 +1649,9 @@ fn import_dedups_repeated_event_id_within_one_input() {
         import_event("$a", "@alice", "!room"),
     ];
     import_pdu_events(
-        &store,
-        &store,
-        &dir,
+        &db,
+        store,
+        store,
         &path,
         &events,
         &[],
@@ -1382,7 +1679,8 @@ fn import_dedups_repeated_event_id_within_one_input() {
 
 #[test]
 fn import_rejects_two_event_ids_mapping_to_one_node_id() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_input_collision");
+    let (db, _dir, path, template, collection_id) = import_fixture("import_input_collision");
+    let store = db.event_dag();
     let mut established = HashSet::new();
     established.insert(collection_id);
     let events = vec![
@@ -1390,9 +1688,9 @@ fn import_rejects_two_event_ids_mapping_to_one_node_id() {
         import_event("$b", "@alice", "!room"),
     ];
     let error = import_pdu_events(
-        &store,
-        &store,
-        &dir,
+        &db,
+        store,
+        store,
         &path,
         &events,
         &[],
@@ -1415,8 +1713,8 @@ fn import_rejects_two_event_ids_mapping_to_one_node_id() {
 
 #[test]
 fn import_rejects_cross_record_event_id_collision() {
-    let (store, dir, path, template, collection_id) =
-        import_fixture("import_cross_record_collision");
+    let (db, _dir, path, template, collection_id) = import_fixture("import_cross_record_collision");
+    let store = db.event_dag();
     let existing = import_event("$c", "@alice", "!room");
     let node_id = template_node_id(&template, &existing).unwrap().unwrap();
     store
@@ -1431,9 +1729,9 @@ fn import_rejects_cross_record_event_id_collision() {
     let mut established = HashSet::new();
     established.insert(collection_id);
     let error = import_pdu_events(
-        &store,
-        &store,
-        &dir,
+        &db,
+        store,
+        store,
         &path,
         &[incoming],
         &[],
@@ -1458,12 +1756,13 @@ fn import_rejects_cross_record_event_id_collision() {
 
 #[test]
 fn import_keeps_existing_record_when_event_id_matches() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_keep_same_event");
+    let (db, _, path, template, collection_id) = import_fixture("import_keep_same_event");
+    let store = db.event_dag();
     // Keep the derived state-group index separate from the event store so
     // this assertion measures whether the existing event record was
     // rewritten.  Replaying the event may legitimately populate a
     // missing state-group mapping.
-    let state_store = PackfileStorage::open(dir.join("state")).unwrap();
+    let state_store = db.state().as_ref();
     let event = import_event("$a", "@alice", "!room");
     let node_id = template_node_id(&template, &event).unwrap().unwrap();
     store
@@ -1477,9 +1776,9 @@ fn import_keeps_existing_record_when_event_id_matches() {
     let mut established = HashSet::new();
     established.insert(collection_id);
     import_pdu_events(
-        &store,
-        &state_store,
-        &dir,
+        &db,
+        store,
+        state_store,
         &path,
         &[event],
         &[],
@@ -1498,20 +1797,21 @@ fn import_keeps_existing_record_when_event_id_matches() {
 
 #[test]
 fn importer_loads_complete_cached_state_groups_without_recomputing() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_cached_state_groups");
-    let state_store = PackfileStorage::open(dir.join("state")).unwrap();
-    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+    let (db, _, path, template, collection_id) = import_fixture("import_cached_state_groups");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
     let event = import_event("$cached", "@alice", "!room");
-    let cached_group = "A".repeat(STATE_GROUP_ID_LENGTH);
-    aux.put(b"$cached", cached_group.as_bytes()).unwrap();
+    let cached_group = [b'A'; STATE_GROUP_ID_LENGTH];
+    aux.put(b"$cached", &cached_group).unwrap();
     let state_writes_before = state_store.stats().put_many_calls;
     let mut established = HashSet::new();
     established.insert(collection_id);
     import_pdu_events(
-        &store,
-        &state_store,
-        &dir,
+        &db,
+        store,
+        state_store,
         &path,
         std::slice::from_ref(&event),
         &[],
@@ -1537,22 +1837,23 @@ fn importer_loads_complete_cached_state_groups_without_recomputing() {
 #[test]
 fn importer_ignores_the_previous_unversioned_state_group_cache() {
     const OLD_NAMESPACE: &str = "sys:matrix-state-groups";
-    let (store, dir, path, template, collection_id) =
+    let (db, _, path, template, collection_id) =
         import_fixture("import_old_namespace_state_groups");
-    let state_store = PackfileStorage::open(dir.join("state")).unwrap();
-    let old_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, OLD_NAMESPACE);
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let old_aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, OLD_NAMESPACE);
     old_aux.ensure_metadata().unwrap();
-    let stale = "A".repeat(STATE_GROUP_ID_LENGTH);
-    old_aux.put(b"$cached", stale.as_bytes()).unwrap();
-    let new_aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+    let stale = [b'A'; STATE_GROUP_ID_LENGTH];
+    old_aux.put(b"$cached", &stale).unwrap();
+    let new_aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
 
     let event = import_event("$cached", "@alice", "!room");
     let mut established = HashSet::new();
     established.insert(collection_id);
     import_pdu_events(
-        &store,
-        &state_store,
-        &dir,
+        &db,
+        store,
+        state_store,
         &path,
         std::slice::from_ref(&event),
         &[],
@@ -1563,21 +1864,20 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
     )
     .unwrap();
 
-    // v1 cannot see the old entry, so the import recomputes and persists a
-    // real digest; the old namespace is left untouched as dead weight.
-    let recomputed = new_aux.get(b"$cached").unwrap().expect("v1 mapping");
-    assert_ne!(recomputed.as_slice(), stale.as_bytes());
-    assert!(valid_state_group_id(
-        std::str::from_utf8(&recomputed).unwrap()
-    ));
-    assert_eq!(old_aux.get(b"$cached").unwrap(), Some(stale.into_bytes()));
+    // v3 cannot see the old entry, so the import recomputes and persists a
+    // real instance id; the old namespace is left untouched as dead weight.
+    let recomputed = new_aux.get(b"$cached").unwrap().expect("v3 mapping");
+    assert_ne!(recomputed.as_slice(), stale.as_slice());
+    assert!(valid_state_group_id(&recomputed));
+    assert_eq!(old_aux.get(b"$cached").unwrap(), Some(stale.to_vec()));
 }
 
 #[test]
 fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
-    let (store, dir, path, template, collection_id) = import_fixture("import_state_group_repair");
-    let state_store = PackfileStorage::open(dir.join("state")).unwrap();
-    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+    let (db, _, path, template, collection_id) = import_fixture("import_state_group_repair");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
     let child = owned_value(
         r#"{"event_id":"$child","sender":"@alice","room_id":"!room","type":"m.room.message","prev_events":["$parent"],"content":{"room_version":"11"}}"#,
@@ -1585,9 +1885,9 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     let mut established = HashSet::new();
     established.insert(collection_id);
     import_pdu_events(
-        &store,
-        &state_store,
-        &dir,
+        &db,
+        store,
+        state_store,
         &path,
         std::slice::from_ref(&child),
         &[],
@@ -1603,9 +1903,9 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
         r#"{"event_id":"$parent","sender":"@server","room_id":"!room","type":"m.room.create","content":{"room_version":"11"}}"#,
     );
     import_pdu_events(
-        &store,
-        &state_store,
-        &dir,
+        &db,
+        store,
+        state_store,
         &path,
         &[repaired_parent, child],
         &[],
@@ -1616,9 +1916,7 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     )
     .unwrap();
     let state_group = aux.get(b"$child").unwrap().expect("repaired mapping");
-    assert!(valid_state_group_id(
-        std::str::from_utf8(&state_group).unwrap()
-    ));
+    assert!(valid_state_group_id(&state_group));
 }
 
 /// Open every pack in a pool and total the records it physically holds.
@@ -1628,7 +1926,7 @@ fn count_pack_records(pool_dir: &Path) -> u64 {
         return total;
     }
     for (pack_id, _, _) in glob_pack_files(pool_dir).unwrap() {
-        let pack = pool_dir.join(format!("pack_{pack_id:016x}.pack"));
+        let pack = pool_dir.join(pack_id.filename());
         let file = std::fs::File::open(pack).unwrap();
         let mut reader = std::io::BufReader::new(file);
         if mtxdb::packfile::read_header(&mut reader).unwrap().is_none() {
@@ -1646,58 +1944,40 @@ fn count_pack_records(pool_dir: &Path) -> u64 {
 fn auth_chain_reimport_writes_nothing_new() {
     let root = unique_temp_dir();
     let pool_dir = root.join("pools").join("mtpl-event");
-    std::fs::create_dir_all(&pool_dir).unwrap();
-    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
     let input = root.join("export.json");
     std::fs::write(
-            &input,
-            r#"{
-                "pdus": [
-                    {"event_id":"$c","room_id":"!room","sender":"@server",
-                     "type":"m.room.create","state_key":"","content":{"creator":"@server","room_version":"10"},
-                     "auth_events":[]}
-                ],
-                "auth_chain": [
-                    {"event_id":"$a1","room_id":"!room","sender":"@server",
-                     "type":"m.room.member","state_key":"@server",
-                     "content":{"membership":"join"},"auth_events":[]}
-                ]
-            }"#,
-        )
-        .unwrap();
+        &input,
+        r#"{
+            "pdus": [
+                {"event_id":"$c","room_id":"!room","sender":"@server",
+                 "type":"m.room.create","state_key":"","content":{"creator":"@server","room_version":"10"},
+                 "auth_events":[]}
+            ],
+            "auth_chain": [
+                {"event_id":"$a1","room_id":"!room","sender":"@server",
+                 "type":"m.room.member","state_key":"@server",
+                 "content":{"membership":"join"},"auth_events":[]}
+            ]
+        }"#,
+    )
+    .unwrap();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
 
-    cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
-        &input,
-        None,
-        &template,
-        &mut established,
-    )
-    .unwrap();
+    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
     let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
     let first_import_records = count_pack_records(&auth_dir);
     // Declares the create so batch_has_create resolves for any follow-up.
-    cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
-        &input,
-        None,
-        &template,
-        &mut established,
-    )
-    .unwrap();
+    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
 
     assert_eq!(
         count_pack_records(&auth_dir),
         first_import_records,
         "reimport must not append duplicate edge or auth-chain records"
     );
-    let auth_store = PackfileStorage::open(auth_dir).unwrap();
+    let auth_store = db.edges().as_ref();
     let auth_col = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), b"!room");
     let meta = auth_store
         .get_collection_metadata(&auth_col)
@@ -1711,9 +1991,8 @@ fn auth_chain_reimport_writes_nothing_new() {
 #[test]
 fn import_establishment_persists_the_matrix_extension() {
     let root = unique_temp_dir();
-    let pool_dir = root.join("pools").join("mtpl-event");
-    std::fs::create_dir_all(&pool_dir).unwrap();
-    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
     let input = root.join("export.json");
     // The create and a user record share one batch, so the import writes
     // metadata and records together. The genesis record must be written
@@ -1722,30 +2001,21 @@ fn import_establishment_persists_the_matrix_extension() {
     std::fs::write(
         &input,
         r#"{
-                "pdus": [
-                    {"event_id":"$c","room_id":"!room","sender":"@server",
-                     "type":"m.room.create","state_key":"",
-                     "content":{"creator":"@server","room_version":"10"},
-                     "auth_events":[]},
-                    {"event_id":"$m","room_id":"!room","sender":"@server",
-                     "type":"m.room.message","content":{},
-                     "auth_events":[]}
-                ]
-            }"#,
+            "pdus": [
+                {"event_id":"$c","room_id":"!room","sender":"@server",
+                 "type":"m.room.create","state_key":"",
+                 "content":{"creator":"@server","room_version":"10"},
+                 "auth_events":[]},
+                {"event_id":"$m","room_id":"!room","sender":"@server",
+                 "type":"m.room.message","content":{},
+                 "auth_events":[]}
+            ]
+        }"#,
     )
     .unwrap();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
-    cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
-        &input,
-        None,
-        &template,
-        &mut established,
-    )
-    .unwrap();
+    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
 
     let collection_id = template_collection_id(&template, "!room");
     let metadata = store
@@ -1758,7 +2028,7 @@ fn import_establishment_persists_the_matrix_extension() {
 
     // The self-describing blob is readable back through the same path
     // `info` uses, and carries the room version without touching a payload.
-    let extension = matrix_room_extension_from_store(&store, &collection_id)
+    let extension = matrix_room_extension_from_store(store, &collection_id)
         .expect("extension read back from the header");
     assert_eq!(extension.room_id.as_deref(), Some("!room"));
     assert_eq!(extension.create_event_id.as_deref(), Some("$c"));
@@ -1769,7 +2039,6 @@ fn import_establishment_persists_the_matrix_extension() {
 
 #[test]
 fn pack_selectors_accept_only_pack_ids_and_deduplicate() {
-    assert_eq!(parse_pack_id_selector("0x3").unwrap(), 3);
     assert!(
         parse_pack_id_selector("3").is_err(),
         "decimal slots are not pack IDs"
@@ -1778,10 +2047,22 @@ fn pack_selectors_accept_only_pack_ids_and_deduplicate() {
         parse_pack_id_selector("0x3-5").is_err(),
         "ranges are not pack IDs"
     );
-    assert_eq!(
-        parse_pack_selectors(&["0x3".to_owned(), "0x0002".to_owned(), "0x3".to_owned()]).unwrap(),
-        vec![2, 3]
-    );
+    // Anything longer than the full address is rejected.
+    assert!(parse_pack_id_selector(&format!(
+        "0x{}",
+        "a".repeat(mtxdb::packfile::PACK_ID_LEN * 2 + 2)
+    ))
+    .is_err());
+    // A short prefix and a full 32-hex address are both accepted, and
+    // exact duplicates are collapsed.
+    let full = "ab".repeat(mtxdb::packfile::PACK_ID_LEN);
+    let selectors = parse_pack_selectors(&[
+        format!("0x{full}"),
+        "0x0002".to_owned(),
+        format!("0x{full}"),
+    ])
+    .unwrap();
+    assert_eq!(selectors.len(), 2);
 }
 
 #[test]
@@ -1810,12 +2091,12 @@ fn event_room_id_ignores_collection_id_and_missing_field() {
 fn matrix_room_extension_reads_the_create_event() {
     let create = owned_value(
         r#"{
-                "type": "m.room.create",
-                "state_key": "",
-                "event_id": "$create:example.org",
-                "room_id": "!room:example.org",
-                "content": {"creator": "@alice:example.org", "room_version": "10"}
-            }"#,
+            "type": "m.room.create",
+            "state_key": "",
+            "event_id": "$create:example.org",
+            "room_id": "!room:example.org",
+            "content": {"creator": "@alice:example.org", "room_version": "10"}
+        }"#,
     );
     let message =
         owned_value(r#"{"type":"m.room.message","event_id":"$m","room_id":"!room:example.org"}"#);
@@ -2066,9 +2347,8 @@ fn v12_reference_event_id(event: &OwnedValue) -> String {
 #[test]
 fn import_v12_followup_batch_lands_in_the_create_collection() {
     let root = unique_temp_dir();
-    let pool_dir = root.join("pools").join("mtpl-event");
-    std::fs::create_dir_all(&pool_dir).unwrap();
-    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
 
@@ -2087,16 +2367,16 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
     // `!<hash>` room-id form ordinary events reference.
     let create_path = root.join("create.json");
     std::fs::write(
-            &create_path,
-            format!(
-                r#"{{"pdus":[{{"event_id":"{create_id}","sender":"@server","type":"m.room.create","state_key":"","content":{{"creator":"@server","room_version":"12"}},"auth_events":[]}}]}}"#
-            ),
-        )
-        .unwrap();
+        &create_path,
+        format!(
+            r#"{{"pdus":[{{"event_id":"{create_id}","sender":"@server","type":"m.room.create","state_key":"","content":{{"creator":"@server","room_version":"12"}},"auth_events":[]}}]}}"#
+        ),
+    )
+    .unwrap();
     cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
+        &db,
+        store,
+        store,
         &create_path,
         None,
         &template,
@@ -2121,16 +2401,16 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
     ));
     let message_path = root.join("message.json");
     std::fs::write(
-            &message_path,
-            format!(
-                r#"{{"pdus":[{{"event_id":"$m1","room_id":"{room_id}","sender":"@server","type":"m.room.message","content":{{}},"auth_events":[]}}]}}"#
-            ),
-        )
-        .unwrap();
+        &message_path,
+        format!(
+            r#"{{"pdus":[{{"event_id":"$m1","room_id":"{room_id}","sender":"@server","type":"m.room.message","content":{{}},"auth_events":[]}}]}}"#
+        ),
+    )
+    .unwrap();
     cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
+        &db,
+        store,
+        store,
         &message_path,
         None,
         &template,
@@ -2150,9 +2430,8 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
 #[test]
 fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
     let root = unique_temp_dir();
-    let pool_dir = root.join("pools").join("mtpl-event");
-    std::fs::create_dir_all(&pool_dir).unwrap();
-    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
 
@@ -2165,9 +2444,9 @@ fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/v12-room-slice.jsonl");
     cmd_import_file(
-        &store,
-        &store,
-        &pool_dir,
+        &db,
+        store,
+        store,
         &fixture,
         None,
         &template,
@@ -2248,19 +2527,19 @@ fn checked_in_matrix_template_matches_the_executable_importer() {
 #[test]
 fn compile_import_template_rejects_an_unsupported_digest_algorithm() {
     let template = br#"{
-            "format": "mtxdb.collection-template/v1",
-            "name": "matrix-event-v1",
-            "record": {
-                "identity": {
-                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
-                    "internal_key": {"algorithm": "sha256-truncated"}
-                }
-            },
-            "collection": {
-                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
-            },
-            "establishment": {"selector": "type == m.room.create && state_key == ''"}
-        }"#;
+        "format": "mtxdb.collection-template/v1",
+        "name": "matrix-event-v1",
+        "record": {
+            "identity": {
+                "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                "internal_key": {"algorithm": "sha256-truncated"}
+            }
+        },
+        "collection": {
+            "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
+        },
+        "establishment": {"selector": "type == m.room.create && state_key == ''"}
+    }"#;
     let error = compile_reject(template).expect_err(
         "an unsupported digest algorithm must be rejected at compile time, not mid-import",
     );
@@ -2273,23 +2552,23 @@ fn compile_import_template_rejects_an_unsupported_digest_algorithm() {
 #[test]
 fn compile_import_template_rejects_a_projection_payload_policy() {
     let template = br#"{
-            "format": "mtxdb.collection-template/v1",
-            "name": "matrix-event-v1",
-            "record": {
-                "identity": {
-                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
-                    "internal_key": {"algorithm": "sha2-256"}
-                },
-                "payload": {"policy": "projection", "include": ["/type", "/sender"]}
+        "format": "mtxdb.collection-template/v1",
+        "name": "matrix-event-v1",
+        "record": {
+            "identity": {
+                "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                "internal_key": {"algorithm": "sha2-256"}
             },
-            "collection": {
-                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
-            },
-            "establishment": {"selector": "type == m.room.create && state_key == ''"}
-        }"#;
+            "payload": {"policy": "projection", "include": ["/type", "/sender"]}
+        },
+        "collection": {
+            "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
+        },
+        "establishment": {"selector": "type == m.room.create && state_key == ''"}
+    }"#;
     let error = compile_reject(template).expect_err(
-            "a projection payload policy must be rejected instead of degrading to full-source retention",
-        );
+        "a projection payload policy must be rejected instead of degrading to full-source retention",
+    );
     assert!(
         format!("{error:#}").contains(r#"payload policy "projection" is not supported"#),
         "unexpected error: {error:#}"
@@ -2299,23 +2578,23 @@ fn compile_import_template_rejects_a_projection_payload_policy() {
 #[test]
 fn compile_import_template_rejects_a_non_string_payload_policy() {
     let template = br#"{
-            "format": "mtxdb.collection-template/v1",
-            "name": "matrix-event-v1",
-            "record": {
-                "identity": {
-                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
-                    "internal_key": {"algorithm": "sha2-256"}
-                },
-                "payload": {"policy": 42}
+        "format": "mtxdb.collection-template/v1",
+        "name": "matrix-event-v1",
+        "record": {
+            "identity": {
+                "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                "internal_key": {"algorithm": "sha2-256"}
             },
-            "collection": {
-                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
-            },
-            "establishment": {"selector": "type == m.room.create && state_key == ''"}
-        }"#;
+            "payload": {"policy": 42}
+        },
+        "collection": {
+            "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}}
+        },
+        "establishment": {"selector": "type == m.room.create && state_key == ''"}
+    }"#;
     let error = compile_reject(template).expect_err(
-            "a present non-string payload policy must be rejected instead of silently compiling to source retention",
-        );
+        "a present non-string payload policy must be rejected instead of silently compiling to source retention",
+    );
     assert!(
         format!("{error:#}").contains("payload policy must be a string"),
         "unexpected error: {error:#}"
@@ -2325,21 +2604,21 @@ fn compile_import_template_rejects_a_non_string_payload_policy() {
 #[test]
 fn compile_import_template_rejects_a_distinct_display_label() {
     let template = br#"{
-            "format": "mtxdb.collection-template/v1",
-            "name": "matrix-event-v1",
-            "record": {
-                "identity": {
-                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
-                    "internal_key": {"algorithm": "sha2-256"}
-                },
-                "payload": {"policy": "retain-source"}
+        "format": "mtxdb.collection-template/v1",
+        "name": "matrix-event-v1",
+        "record": {
+            "identity": {
+                "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                "internal_key": {"algorithm": "sha2-256"}
             },
-            "collection": {
-                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
-                "labels": [{"name": "display_id", "value": "/canonical_alias"}]
-            },
-            "establishment": {"selector": "type == m.room.create && state_key == ''"}
-        }"#;
+            "payload": {"policy": "retain-source"}
+        },
+        "collection": {
+            "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
+            "labels": [{"name": "display_id", "value": "/canonical_alias"}]
+        },
+        "establishment": {"selector": "type == m.room.create && state_key == ''"}
+    }"#;
     let error = compile_reject(template).expect_err(
         "a distinct display label must be rejected since the importer cannot persist it",
     );
@@ -2352,21 +2631,21 @@ fn compile_import_template_rejects_a_distinct_display_label() {
 #[test]
 fn compile_import_template_rejects_non_array_labels() {
     let template = br#"{
-            "format": "mtxdb.collection-template/v1",
-            "name": "matrix-event-v1",
-            "record": {
-                "identity": {
-                    "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
-                    "internal_key": {"algorithm": "sha2-256"}
-                },
-                "payload": {"policy": "retain-source"}
+        "format": "mtxdb.collection-template/v1",
+        "name": "matrix-event-v1",
+        "record": {
+            "identity": {
+                "extract": {"kind": "json-pointer-rfc-6901", "path": "/event_id"},
+                "internal_key": {"algorithm": "sha2-256"}
             },
-            "collection": {
-                "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
-                "labels": {"name": "display_id", "value": "membership-value"}
-            },
-            "establishment": {"selector": "type == m.room.create && state_key == ''"}
-        }"#;
+            "payload": {"policy": "retain-source"}
+        },
+        "collection": {
+            "membership": {"extract": {"kind": "json-pointer-rfc-6901", "path": "/room_id"}},
+            "labels": {"name": "display_id", "value": "membership-value"}
+        },
+        "establishment": {"selector": "type == m.room.create && state_key == ''"}
+    }"#;
     let error = compile_reject(template)
         .expect_err("a present non-array collection.labels must not be silently treated as absent");
     assert!(
@@ -2387,21 +2666,21 @@ fn compile_import_template_rejects_a_malformed_display_label() {
     ] {
         let template = format!(
             r#"{{
-                "format": "mtxdb.collection-template/v1",
-                "name": "matrix-event-v1",
-                "record": {{
-                    "identity": {{
-                        "extract": {{"kind": "json-pointer-rfc-6901", "path": "/event_id"}},
-                        "internal_key": {{"algorithm": "sha2-256"}}
-                    }},
-                    "payload": {{"policy": "retain-source"}}
+            "format": "mtxdb.collection-template/v1",
+            "name": "matrix-event-v1",
+            "record": {{
+                "identity": {{
+                    "extract": {{"kind": "json-pointer-rfc-6901", "path": "/event_id"}},
+                    "internal_key": {{"algorithm": "sha2-256"}}
                 }},
-                "collection": {{
-                    "membership": {{"extract": {{"kind": "json-pointer-rfc-6901", "path": "/room_id"}}}},
-                    "labels": [{{"name": "display_id", "value": {label_value}}}]
-                }},
-                "establishment": {{"selector": "type == m.room.create && state_key == ''"}}
-            }}"#
+                "payload": {{"policy": "retain-source"}}
+            }},
+            "collection": {{
+                "membership": {{"extract": {{"kind": "json-pointer-rfc-6901", "path": "/room_id"}}}},
+                "labels": [{{"name": "display_id", "value": {label_value}}}]
+            }},
+            "establishment": {{"selector": "type == m.room.create && state_key == ''"}}
+        }}"#
         );
         let error = compile_reject(template.as_bytes()).expect_err(
             "a malformed display label value must not silently fall back to the membership pointer",
@@ -2461,11 +2740,10 @@ fn encode_lps(s: &str) -> Vec<u8> {
 /// encoding is a single JSON 2-element array string, not a raw tuple
 /// codec.
 fn hamt_leaf_key_json(event_type: &str, state_key: &str) -> String {
-    use simd_json::prelude::Writable;
-    simd_json::OwnedValue::Array(Box::new(vec![
-        simd_json::OwnedValue::from(event_type),
-        simd_json::OwnedValue::from(state_key),
-    ]))
+    OwnedValue::Array(vec![
+        OwnedValue::from(event_type),
+        OwnedValue::from(state_key),
+    ])
     .encode()
 }
 
@@ -2574,7 +2852,7 @@ fn hamt_state_group_root() {
     assert!(text.contains(room_id));
     assert!(text.contains("abababababababab"));
     assert!(text.contains("2048 bytes"));
-    assert!(text.contains("lattice digest (BLAKE3): "));
+    assert!(text.contains("logical digest (BLAKE3): "));
 }
 
 #[test]
@@ -2728,338 +3006,339 @@ fn build_event_dag_resolves_prev_and_auth_edges() {
     assert_eq!(msg_node.auth.1, 2); // 2 auth_events
 }
 
+/// A database root and its (lazily created) pools, for the adjacency tests.
+fn adjacency_db(name: &str) -> (Database, PathBuf) {
+    let root = unique_temp_dir().join(name);
+    (Database::open(root.clone()).unwrap(), root)
+}
+
+fn room_adjacency(room: &str) -> mtxdb::matrix_adjacency::MatrixAdjacency {
+    mtxdb::matrix_adjacency::MatrixAdjacency::new(ShardType::Edges, room)
+}
+
 #[test]
-fn matrix_edges_persist_as_one_compact_record_per_source_event() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
-    let mut template = default_matrix_import_template();
-    template.record_id_rule.digest_algorithm = DigestAlgorithm::Sha256;
+fn matrix_adjacency_records_prev_auth_and_relation() {
+    let (db, root) = adjacency_db("adjacency_basic");
+    let template = default_matrix_import_template();
     let event = owned_value(
         r#"{"event_id":"$source","room_id":"!r:x","type":"m.room.message","prev_events":["$prev1",["$prev2",{}]],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$related"}}}"#,
     );
-    let source = template_node_id(&template, &event).unwrap().unwrap();
-    let adjacency = mtx_relationships(&template, &event).unwrap();
-    assert_eq!(adjacency.prev.len(), 2);
-    assert_eq!(adjacency.auth.len(), 1);
-    assert_eq!(adjacency.related.len(), 1);
-    let expected = encode_mtx_adjacency(&MtxAdjacency {
-        prev: vec![
-            matrix_event_id_for_template(&template, "$prev1").unwrap(),
-            matrix_event_id_for_template(&template, "$prev2").unwrap(),
-        ],
-        auth: vec![matrix_event_id_for_template(&template, "$auth").unwrap()],
-        related: vec![(
-            matrix_event_id_for_template(&template, "$related").unwrap(),
-            "relates_to:m.reference".to_owned(),
-        )],
-    })
-    .unwrap();
-    assert_eq!(&expected[..4], b"EDG1");
-    assert_eq!(decode_mtx_adjacency(&expected).unwrap(), adjacency);
+    record_matrix_adjacency(&db, &template, std::slice::from_ref(&event)).unwrap();
 
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&event)).unwrap();
-    let collection = template_collection_id(&template, "!r:x");
-    let stored = store
-        .get(&collection, &source)
+    let adjacency = room_adjacency("!r:x");
+    assert_eq!(
+        adjacency.prev_of(&db, "$source").unwrap(),
+        Some(vec!["$prev1".to_owned(), "$prev2".to_owned()]),
+        "both the plain and the [id, hashes] reference forms are recorded"
+    );
+    assert_eq!(
+        adjacency.auth_of(&db, "$source").unwrap(),
+        Some(vec!["$auth".to_owned()])
+    );
+    let relation = adjacency
+        .relation_of(&db, "$source", &mtxdb::matrix_adjacency::AlwaysVisible)
         .unwrap()
-        .expect("source event adjacency record");
-    assert_eq!(stored.bytes.as_ref(), expected.as_slice());
-    assert_eq!(count_pack_records(&root), 1);
+        .expect("the relation is recorded");
+    assert_eq!(
+        (relation.target.as_str(), relation.rel_type.as_str()),
+        ("$related", "m.reference")
+    );
 
-    // Reimport is idempotent and verifies that a source key never silently
-    // accepts a different adjacency value.
-    persist_matrix_edges(&store, &template, &[event]).unwrap();
-    assert_eq!(count_pack_records(&root), 1);
-    drop(store);
+    // Recording again is a no-op.
+    record_matrix_adjacency(&db, &template, &[event]).unwrap();
+    assert!(adjacency.verify(&db).unwrap().is_consistent());
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn mtx_adjacency_round_trip_and_rejects_malformed_records() {
-    let adjacency = MtxAdjacency {
-        prev: vec![[1; 16], [2; 16]],
-        auth: vec![[3; 16]],
-        related: vec![([4; 16], "relates_to:m.reference".to_owned())],
-    };
-    let encoded = encode_mtx_adjacency(&adjacency).unwrap();
-    assert_eq!(decode_mtx_adjacency(&encoded).unwrap(), adjacency);
-    assert!(decode_mtx_adjacency(&encoded[..encoded.len() - 1]).is_err());
-    let mut trailing = encoded;
-    trailing.push(0);
-    assert!(decode_mtx_adjacency(&trailing).is_err());
-    assert!(decode_mtx_adjacency(b"EDG9").is_err());
-    let oversized_related_count = [
-        b"EDG1".as_slice(),
-        &0u32.to_le_bytes(),
-        &0u32.to_le_bytes(),
-        &u32::MAX.to_le_bytes(),
-    ]
-    .concat();
-    assert!(decode_mtx_adjacency(&oversized_related_count).is_err());
-}
-
-#[test]
-fn mtx_edges_preserve_empty_adjacencies_and_reject_conflicts() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
+fn matrix_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
+    let (db, root) = adjacency_db("adjacency_leaf");
     let template = default_matrix_import_template();
-    let event = owned_value(
+    let leaf = owned_value(
         r#"{"event_id":"$leaf","room_id":"!r:x","type":"m.room.message","content":{"body":"leaf"}}"#,
     );
-    let source = template_node_id(&template, &event).unwrap().unwrap();
-    let collection = template_collection_id(&template, "!r:x");
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&event)).unwrap();
-    let stored = store
-        .get(&collection, &source)
-        .unwrap()
-        .expect("leaf marker");
-    assert_eq!(
-        decode_mtx_adjacency(&stored.bytes).unwrap(),
-        MtxAdjacency::default()
+    let child = owned_value(
+        r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","prev_events":["$ghost"],"auth_events":["$leaf"]}"#,
     );
+    record_matrix_adjacency(&db, &template, &[leaf, child]).unwrap();
 
-    let conflicting = encode_mtx_adjacency(&MtxAdjacency {
-        prev: vec![[8; 16]],
-        ..MtxAdjacency::default()
-    })
-    .unwrap();
-    store
-        .put(
-            &collection,
-            &source,
-            &NodeData::new(Bytes::from(conflicting)),
-        )
-        .unwrap();
-    assert!(persist_matrix_edges(&store, &template, &[event]).is_err());
-    drop(store);
+    let adjacency = room_adjacency("!r:x");
+    assert_eq!(adjacency.auth_of(&db, "$leaf").unwrap(), Some(Vec::new()));
+    assert_eq!(adjacency.prev_of(&db, "$leaf").unwrap(), Some(Vec::new()));
+    assert_eq!(
+        adjacency.auth_of(&db, "$ghost").unwrap(),
+        None,
+        "an event only referenced by another has no recorded adjacency"
+    );
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_edges_group_duplicates_per_source_and_separate_rooms() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
+fn matrix_adjacency_groups_duplicates_and_separates_rooms() {
+    let (db, root) = adjacency_db("adjacency_rooms");
     let template = default_matrix_import_template();
     let event_a = owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
     let event_a_duplicate =
         owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
     let event_b = owned_value(r#"{"event_id":"$same","room_id":"!b:x","prev_events":["$q"]}"#);
-    persist_matrix_edges(&store, &template, &[event_a, event_a_duplicate, event_b]).unwrap();
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection_a = template_collection_id(&template, "!a:x");
-    let collection_b = template_collection_id(&template, "!b:x");
-    let a = store.get(&collection_a, &source).unwrap().unwrap();
-    let b = store.get(&collection_b, &source).unwrap().unwrap();
+    record_matrix_adjacency(&db, &template, &[event_a, event_a_duplicate, event_b]).unwrap();
+
     assert_eq!(
-        decode_mtx_adjacency(&a.bytes).unwrap().prev,
-        vec![matrix_event_node_id("$p").unwrap()]
+        room_adjacency("!a:x").prev_of(&db, "$same").unwrap(),
+        Some(vec!["$p".to_owned()])
     );
     assert_eq!(
-        decode_mtx_adjacency(&b.bytes).unwrap().prev,
-        vec![matrix_event_node_id("$q").unwrap()]
+        room_adjacency("!b:x").prev_of(&db, "$same").unwrap(),
+        Some(vec!["$q".to_owned()])
     );
-    assert_eq!(count_pack_records(&root), 2);
-    drop(store);
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_edges_union_related_edges_across_batch_and_reimports() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
+fn matrix_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
+    let (db, root) = adjacency_db("adjacency_conflict");
     let template = default_matrix_import_template();
-    let event_a = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$first"}}}"#,
-    );
-    let event_b = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$second"}}}"#,
-    );
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
-
-    persist_matrix_edges(&store, &template, &[event_a.clone(), event_b.clone()]).unwrap();
-    let stored = store.get(&collection, &source).unwrap().unwrap();
-    let adjacency = decode_mtx_adjacency(&stored.bytes).unwrap();
-    assert_eq!(adjacency.prev, vec![matrix_event_node_id("$p").unwrap()]);
-    assert_eq!(adjacency.auth, vec![matrix_event_node_id("$auth").unwrap()]);
-    assert_eq!(
-        adjacency.related,
-        vec![
-            (
-                matrix_event_node_id("$first").unwrap(),
-                "relates_to:m.reference".to_owned()
-            ),
-            (
-                matrix_event_node_id("$second").unwrap(),
-                "relates_to:m.annotation".to_owned()
-            ),
-        ]
-    );
-
-    // A later import adds another related edge without changing prev/auth.
-    let event_c = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$third"}}}"#,
-    );
-    persist_matrix_edges(&store, &template, &[event_c]).unwrap();
-    let updated = store.get(&collection, &source).unwrap().unwrap();
-    assert_eq!(
-        decode_mtx_adjacency(&updated.bytes).unwrap().related.len(),
-        3
-    );
-
-    // A repeated import is a no-op, and structural-edge conflicts remain errors.
-    let records_before = count_pack_records(&root);
-    persist_matrix_edges(&store, &template, &[event_a, event_b]).unwrap();
-    assert_eq!(count_pack_records(&root), records_before);
-    let conflict = owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"]}"#);
-    assert!(persist_matrix_edges(&store, &template, &[conflict]).is_err());
-
-    drop(store);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn matrix_edges_redacted_reimport_preserves_related_edges() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
-    let template = default_matrix_import_template();
-    let unredacted = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
-    );
-    // Redaction keeps event_id, prev_events and auth_events but empties content.
-    let redacted = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
-    );
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
-
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&unredacted)).unwrap();
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&redacted))
-        .expect("a redacted re-import must not be rejected");
-
-    let stored = store.get(&collection, &source).unwrap().unwrap();
-    assert_eq!(
-        decode_mtx_adjacency(&stored.bytes).unwrap().related,
-        vec![(
-            matrix_event_node_id("$target").unwrap(),
-            "relates_to:m.reference".to_owned()
-        )],
-        "the stored related edge must survive a redacted re-import"
-    );
-
-    drop(store);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn matrix_edges_mixed_redacted_and_unredacted_duplicates_union_related() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
-    let template = default_matrix_import_template();
-    let redacted = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
-    );
-    let unredacted = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
-    );
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
-
-    // The redacted copy is seen first; the later unredacted duplicate must
-    // union its related edge rather than be rejected as a conflict.
-    persist_matrix_edges(&store, &template, &[redacted, unredacted]).unwrap();
-
-    let stored = store.get(&collection, &source).unwrap().unwrap();
-    assert_eq!(
-        decode_mtx_adjacency(&stored.bytes).unwrap().related,
-        vec![(
-            matrix_event_node_id("$target").unwrap(),
-            "relates_to:m.reference".to_owned()
-        )],
-    );
-
-    drop(store);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn matrix_edge_preflight_rejects_conflict_without_writing() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
-    let template = default_matrix_import_template();
+    let adjacency = room_adjacency("!a:x");
     let original = owned_value(
+        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"]}"#,
+    );
+    record_matrix_adjacency(&db, &template, std::slice::from_ref(&original)).unwrap();
+
+    // A later import whose event differs from the recorded one fails as a unit:
+    // the good event before it is not recorded either.
+    let fine = owned_value(r#"{"event_id":"$fine","room_id":"!a:x","prev_events":["$p"]}"#);
+    let conflicting = owned_value(
+        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"],"auth_events":["$auth"]}"#,
+    );
+    let error = record_matrix_adjacency(&db, &template, &[fine, conflicting])
+        .expect_err("a differing prev edge must be rejected");
+    assert!(
+        format!("{error:#}").contains("recording auth adjacency for room !a:x"),
+        "saw: {error:#}"
+    );
+    assert_eq!(adjacency.short_id(&db, "$fine").unwrap(), None);
+    assert_eq!(
+        adjacency.prev_of(&db, "$same").unwrap(),
+        Some(vec!["$p".to_owned()]),
+        "the recorded adjacency is untouched"
+    );
+
+    // Two conflicting copies inside one batch fail the same way.
+    let first = owned_value(r#"{"event_id":"$dup","room_id":"!a:x","prev_events":["$p"]}"#);
+    let second = owned_value(r#"{"event_id":"$dup","room_id":"!a:x","prev_events":["$q"]}"#);
+    assert!(record_matrix_adjacency(&db, &template, &[first, second]).is_err());
+    assert_eq!(adjacency.short_id(&db, "$dup").unwrap(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn matrix_adjacency_keeps_a_relation_across_redacted_copies() {
+    let (db, root) = adjacency_db("adjacency_redaction");
+    let template = default_matrix_import_template();
+    let adjacency = room_adjacency("!a:x");
+    let visible = mtxdb::matrix_adjacency::AlwaysVisible;
+    // Redaction keeps event_id, prev_events and auth_events but empties content.
+    let unredacted = owned_value(
+        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
+    );
+    let redacted = owned_value(
         r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{}}"#,
     );
-    let conflicting = owned_value(
-        r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"],"auth_events":["$auth"],"content":{}}"#,
-    );
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
+    let target = |db: &Database| {
+        adjacency
+            .relation_of(db, "$same", &visible)
+            .unwrap()
+            .map(|relation| relation.target)
+    };
 
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&original)).unwrap();
-    let before = store.get(&collection, &source).unwrap().unwrap();
-
-    let error = plan_matrix_edges(&store, &template, &[conflicting])
-        .expect_err("a differing prev edge must be rejected during planning");
-    assert!(
-        error.to_string().contains("conflicting prev/auth"),
-        "saw: {error}"
-    );
-
-    let after = store.get(&collection, &source).unwrap().unwrap();
+    record_matrix_adjacency(&db, &template, std::slice::from_ref(&unredacted)).unwrap();
+    record_matrix_adjacency(&db, &template, std::slice::from_ref(&redacted))
+        .expect("a redacted re-import must not be rejected");
     assert_eq!(
-        after.bytes, before.bytes,
-        "planning must not mutate the store when it rejects a conflict"
+        target(&db).as_deref(),
+        Some("$target"),
+        "the stored relation survives a redacted re-import"
     );
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
 
-    drop(store);
+    // Seen redacted first, then unredacted in the same input: the relation is added.
+    let (db, root) = adjacency_db("adjacency_redaction_order");
+    record_matrix_adjacency(&db, &template, &[redacted, unredacted]).unwrap();
+    assert_eq!(target(&db).as_deref(), Some("$target"));
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_edges_drop_unrepresentable_relation_kind() {
-    let root = unique_temp_dir();
-    let store = PackfileStorage::open(root.clone()).unwrap();
+fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
+    let (db, root) = adjacency_db("adjacency_relation_edges");
     let template = default_matrix_import_template();
-    // A `rel_type` long enough that `relates_to:<rel_type>` cannot fit the
-    // `u16` kind length EDG1 stores.
-    let long_rel_type = "x".repeat(usize::from(u16::MAX));
-    let event = owned_value(&format!(
-        r#"{{"event_id":"$same","room_id":"!a:x","content":{{"m.relates_to":{{"rel_type":"{long_rel_type}","event_id":"$target"}}}}}}"#
+    let adjacency = room_adjacency("!a:x");
+    let visible = mtxdb::matrix_adjacency::AlwaysVisible;
+    // A rich-reply fallback has no `rel_type`, so it is not a relation.
+    let reply = owned_value(
+        r#"{"event_id":"$reply","room_id":"!a:x","prev_events":["$p"],"content":{"m.relates_to":{"m.in_reply_to":{"event_id":"$target"}}}}"#,
+    );
+    // A `rel_type` too long to be a real identifier is dropped, not an error.
+    let long_rel_type = "x".repeat(300);
+    let long = owned_value(&format!(
+        r#"{{"event_id":"$long","room_id":"!a:x","prev_events":["$p"],"content":{{"m.relates_to":{{"rel_type":"{long_rel_type}","event_id":"$target"}}}}}}"#
     ));
-    let source = matrix_event_node_id("$same").unwrap();
-    let collection = template_collection_id(&template, "!a:x");
+    record_matrix_adjacency(&db, &template, &[reply, long])
+        .expect("an unrepresentable relation must not fail the import");
 
-    persist_matrix_edges(&store, &template, std::slice::from_ref(&event))
-        .expect("an unrepresentable related edge must be dropped, not fail the import");
-    let stored = store.get(&collection, &source).unwrap().unwrap();
-    assert!(decode_mtx_adjacency(&stored.bytes)
-        .unwrap()
-        .related
-        .is_empty());
-
-    drop(store);
+    for event in ["$reply", "$long"] {
+        assert!(adjacency
+            .relation_of(&db, event, &visible)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            adjacency.prev_of(&db, event).unwrap(),
+            Some(vec!["$p".to_owned()]),
+            "the event's own adjacency is still recorded"
+        );
+    }
+    drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn compute_state_groups_shares_state_across_events_and_merges_forks() {
-    // Reference: what each event's state group must be, computed by
-    // materializing the full state set for every event.
+fn matrix_adjacency_is_not_recorded_for_templates_without_event_id_identity() {
+    let (db, root) = adjacency_db("adjacency_other_identity");
+    // A record identity other than /event_id cannot name a referenced event.
+    let template = sender_identity_template();
+    let event =
+        owned_value(r#"{"event_id":"$e","room_id":"!r:x","sender":"@alice","prev_events":["$p"]}"#);
+    record_matrix_adjacency(&db, &template, &[event]).unwrap();
+    assert_eq!(room_adjacency("!r:x").short_id(&db, "$e").unwrap(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn matrix_adjacency_skips_events_without_a_room_or_event_id() {
+    let (db, root) = adjacency_db("adjacency_skips");
+    let template = default_matrix_import_template();
+    let no_room = owned_value(r#"{"event_id":"$orphan","prev_events":["$p"]}"#);
+    let no_id = owned_value(r#"{"room_id":"!r:x","prev_events":["$p"]}"#);
+    let fine = owned_value(r#"{"event_id":"$fine","room_id":"!r:x"}"#);
+    record_matrix_adjacency(&db, &template, &[no_room, no_id, fine]).unwrap();
+    let adjacency = room_adjacency("!r:x");
+    assert!(adjacency.short_id(&db, "$fine").unwrap().is_some());
+    assert_eq!(adjacency.short_id(&db, "$orphan").unwrap(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn matrix_adjacency_splits_a_large_room_into_batches() {
+    let (db, root) = adjacency_db("adjacency_large");
+    let template = default_matrix_import_template();
+    // One more than a batch holds, so the room is recorded in two transactions.
+    let count = mtxdb::room_auth::MAX_BATCH_EVENTS + 1;
+    let events: Vec<OwnedValue> = (0..count)
+        .map(|index| {
+            let auth = if index == 0 {
+                String::new()
+            } else {
+                format!(r#""$e{}""#, index - 1)
+            };
+            owned_value(&format!(
+                r#"{{"event_id":"$e{index}","room_id":"!big:x","auth_events":[{auth}]}}"#
+            ))
+        })
+        .collect();
+    record_matrix_adjacency(&db, &template, &events).unwrap();
+
+    let auth = RoomAuth::new(ShardType::Edges, "!big:x");
+    let last = format!("$e{}", count - 1);
+    assert_eq!(
+        auth.auth_chain(&db, &last).unwrap().len(),
+        count - 1,
+        "every event of both batches is recorded and chained"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_import_records_auth_adjacency_that_survives_a_reopen() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let input = root.join("export.json");
+    std::fs::write(
+        &input,
+        r#"{
+            "pdus": [
+                {"event_id":"$c","room_id":"!room","sender":"@server",
+                 "type":"m.room.create","state_key":"",
+                 "content":{"creator":"@server","room_version":"10"},
+                 "auth_events":[],"prev_events":[]},
+                {"event_id":"$m","room_id":"!room","sender":"@server",
+                 "type":"m.room.message","content":{},
+                 "auth_events":["$c","$member"],"prev_events":["$c"]},
+                {"event_id":"$x","room_id":"!room","sender":"@server",
+                 "type":"m.room.message","content":{},
+                 "auth_events":["$c","$member","$m"],"prev_events":["$m"]}
+            ],
+            "auth_chain": [
+                {"event_id":"$member","room_id":"!room","sender":"@server",
+                 "type":"m.room.member","state_key":"@server",
+                 "content":{"membership":"join"},"auth_events":["$c"]}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let template = default_matrix_import_template();
+    let mut established = HashSet::new();
+    cmd_import_file(
+        &db,
+        db.event_dag(),
+        db.event_dag(),
+        &input,
+        None,
+        &template,
+        &mut established,
+    )
+    .unwrap();
+    db.edges().sync_all().unwrap();
+    drop(db);
+
+    let db = Database::open(root.clone()).unwrap();
+    let auth = RoomAuth::new(ShardType::Edges, "!room");
+    let mut edges = auth.auth_edges(&db, "$x").unwrap();
+    edges.sort();
+    assert_eq!(
+        edges,
+        vec!["$c", "$m", "$member"],
+        "order is not part of the contract"
+    );
+    let mut chain = auth.auth_chain(&db, "$x").unwrap();
+    chain.sort();
+    assert_eq!(chain, vec!["$c", "$m", "$member"]);
+    // The auth-chain event was recorded through the same path as the PDUs.
+    assert_eq!(auth.auth_edges(&db, "$member").unwrap(), vec!["$c"]);
+    assert!(auth.auth_edges(&db, "$c").unwrap().is_empty());
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn compute_state_groups_inherit_and_split_on_derivation() {
     let mut events = Vec::new();
     events.push(owned_value(
-            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
-        ));
+        r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
+    ));
     let mut prev = "$create".to_owned();
-    let mut expected_state = StateSet::new();
-    expected_state.set("m.room.create", "", "$create".to_owned());
-    let mut expected: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    expected.insert("$create".into(), expected_state.digest_base64url());
     // A long chain: every 50th event is a state event, the rest messages.
     for i in 0..5000u32 {
         let id = format!("$e{i}");
         let json = if i % 50 == 0 {
-            expected_state.set("m.room.member", &format!("@u{i}:x"), id.clone());
             format!(
                 r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.member","state_key":"@u{i}:x","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
             )
@@ -3068,40 +3347,33 @@ fn compute_state_groups_shares_state_across_events_and_merges_forks() {
                 r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
             )
         };
-        expected.insert(id.clone(), expected_state.digest_base64url());
         events.push(owned_value(&json));
         prev = id;
     }
     // Fork off the tip: two branches set the same key differently, then a
-    // merge event lists both parents. The first parent must win.
-    let mut left_state = StateSet::new();
-    left_state.entries = expected_state.entries.clone();
-    left_state.set("m.room.topic", "", "$left".to_owned());
-    let mut right_state = StateSet::new();
-    right_state.entries = expected_state.entries.clone();
-    right_state.set("m.room.topic", "", "$right".to_owned());
+    // merge event lists both parents.
     events.push(owned_value(&format!(
-            r#"{{"event_id":"$left","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
-        )));
+        r#"{{"event_id":"$left","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
+    )));
     events.push(owned_value(&format!(
-            r#"{{"event_id":"$right","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
-        )));
+        r#"{{"event_id":"$right","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@a:x","prev_events":["{prev}"],"content":{{}}}}"#
+    )));
     events.push(owned_value(
-            r#"{"event_id":"$merge","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$left","$right"],"content":{}}"#,
-        ));
-    expected.insert("$left".into(), left_state.digest_base64url());
-    expected.insert("$right".into(), right_state.digest_base64url());
-    expected.insert("$merge".into(), left_state.digest_base64url());
+        r#"{"event_id":"$merge","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$left","$right"],"content":{}}"#,
+    ));
 
-    let groups = compute_state_groups_partial(&events, &[]).groups;
-    assert_eq!(groups.len(), expected.len());
-    for (event_id, want) in &expected {
-        assert_eq!(&groups[event_id], want, "state group for {event_id}");
-    }
-    // Messages between two state events share one group; a state event
-    // starts a new one.
+    let groups = compute_state_groups_partial(&events, &[], "!r:x").groups;
+    assert_eq!(groups.len(), events.len());
+    // Messages between two state events share one instance; a state event
+    // starts a new derivation.
     assert_eq!(groups["$e1"], groups["$e49"]);
     assert_ne!(groups["$e49"], groups["$e50"]);
+    assert_ne!(groups["$create"], groups["$e0"]);
+    // The forks differ, and the merge is its own derivation even though the
+    // resolved state matches the first parent (first-wins).
+    assert_ne!(groups["$left"], groups["$right"]);
+    assert_ne!(groups["$merge"], groups["$left"]);
+    assert_ne!(groups["$merge"], groups["$right"]);
 }
 
 #[test]
@@ -3116,7 +3388,8 @@ fn rejected_events_never_contribute_state_and_soft_failed_only_in_the_client_vie
         let after = owned_value(
             r#"{"event_id":"$after","room_id":"!r:x","type":"m.room.message","prev_events":["$bad"],"content":{}}"#,
         );
-        super::compute_state_groups_partial_in_view(&[create, flagged, after], &[], view).groups
+        super::compute_state_groups_partial_in_view(&[create, flagged, after], &[], view, "!r:x")
+            .groups
     };
     let federated = super::StateView::Federated;
     let client = super::StateView::Client;
@@ -3164,40 +3437,33 @@ fn compute_state_groups_assigns_groups_per_event() {
     let msg = owned_value(
         r#"{"event_id":"$msg","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$join"],"auth_events":["$join"],"content":{"body":"hi"}}"#,
     );
-    let groups = compute_state_groups_partial(&[create, member, msg], &[]).groups;
-    // All three events should have a state group.
+    let groups = compute_state_groups_partial(&[create, member, msg], &[], "!r:x").groups;
+    // All three events should have a state-group instance.
     assert!(groups.contains_key("$create"));
     assert!(groups.contains_key("$join"));
     assert!(groups.contains_key("$msg"));
-    // State group IDs are valid unpadded base64url.
     for sg in groups.values() {
-        assert_ne!(sg, "");
-        assert!(sg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(valid_state_group_id(sg));
     }
+    // The message inherits its parent's instance; the state event starts a new
+    // derivation.
+    assert_ne!(groups["$create"], groups["$join"]);
+    assert_eq!(groups["$join"], groups["$msg"]);
 }
 
 #[test]
 fn compute_state_groups_empty_input() {
-    let groups = compute_state_groups_partial(&[], &[]).groups;
+    let groups = compute_state_groups_partial(&[], &[], "!r:x").groups;
     assert!(groups.is_empty());
 }
 
 #[test]
-fn state_group_id_validation_requires_a_base64url_digest() {
-    let golden = StateSet::new().digest_base64url();
-    assert_eq!(golden.len(), STATE_GROUP_ID_LENGTH);
+fn state_group_id_validation_requires_a_128_bit_instance_id() {
+    let golden = [b'A'; STATE_GROUP_ID_LENGTH];
     assert!(valid_state_group_id(&golden));
-    assert!(!valid_state_group_id(
-        &"A".repeat(golden.len().saturating_sub(1))
-    ));
-    assert!(!valid_state_group_id(
-        &"A".repeat(golden.len().saturating_add(1))
-    ));
-    let almost_digest = "A".repeat(golden.len().saturating_sub(1));
-    assert!(!valid_state_group_id(&format!("{almost_digest}$")));
-    assert!(!valid_state_group_id(&format!("{almost_digest}.")));
+    assert!(!valid_state_group_id(&[0u8; STATE_GROUP_ID_LENGTH - 1]));
+    assert!(!valid_state_group_id(&[0u8; STATE_GROUP_ID_LENGTH + 1]));
+    assert!(!valid_state_group_id(&[]));
 }
 
 #[test]
@@ -3207,11 +3473,11 @@ fn state_group_cache_loads_complete_values_and_falls_back_on_missing_or_invalid(
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
-    let first = "A".repeat(STATE_GROUP_ID_LENGTH);
-    let second = "B".repeat(STATE_GROUP_ID_LENGTH);
+    let first = [b'A'; STATE_GROUP_ID_LENGTH];
+    let second = [b'B'; STATE_GROUP_ID_LENGTH];
     aux.put_many(&[
-        (b"first".as_slice(), first.as_bytes()),
-        (b"second".as_slice(), second.as_bytes()),
+        (b"first".as_slice(), first.as_slice()),
+        (b"second".as_slice(), second.as_slice()),
     ])
     .unwrap();
     let ids = vec!["first".to_owned(), "second".to_owned()];
@@ -3239,7 +3505,7 @@ fn state_group_cache_loads_complete_values_and_falls_back_on_missing_or_invalid(
 #[test]
 fn state_groups_from_values_treats_a_cardinality_mismatch_as_invalid() {
     let ids = vec!["first".to_owned(), "second".to_owned()];
-    let value = Some("A".repeat(STATE_GROUP_ID_LENGTH).into_bytes());
+    let value = Some(vec![b'A'; STATE_GROUP_ID_LENGTH]);
     assert!(matches!(
         super::state_groups_from_values(&ids, vec![value.clone()]),
         StateGroupLoad::Invalid { .. }
@@ -3270,7 +3536,7 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     let incomplete = owned_value(
         r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","prev_events":["$parent"],"content":{}}"#,
     );
-    let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[]);
+    let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[], "!r:x");
     assert!(!first.groups.contains_key("$child"));
     assert!(!first.unresolved.is_empty());
     assert_eq!(aux.get(b"$child").unwrap(), None);
@@ -3278,20 +3544,18 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     let parent = owned_value(
         r#"{"event_id":"$parent","room_id":"!r:x","type":"m.room.create","content":{}}"#,
     );
-    let repaired = compute_state_groups_partial(&[parent, incomplete], &[]);
+    let repaired = compute_state_groups_partial(&[parent, incomplete], &[], "!r:x");
     assert!(repaired.groups.contains_key("$child"));
     assert!(repaired.unresolved.is_empty());
     let entries: Vec<(&[u8], &[u8])> = repaired
         .groups
         .iter()
-        .map(|(event_id, state_group_id)| (event_id.as_bytes(), state_group_id.as_bytes()))
+        .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
         .collect();
     aux.put_many(&entries).unwrap();
     let repaired_id = aux.get(b"$child").unwrap().unwrap();
     assert_eq!(repaired_id.len(), STATE_GROUP_ID_LENGTH);
-    assert!(valid_state_group_id(
-        std::str::from_utf8(&repaired_id).unwrap()
-    ));
+    assert!(valid_state_group_id(&repaired_id));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -3315,7 +3579,7 @@ fn partial_state_groups_report_cycles() {
     let second = owned_value(
         r#"{"event_id":"$second","room_id":"!r:x","type":"m.room.message","prev_events":["$first"],"content":{}}"#,
     );
-    let result = compute_state_groups_partial(&[first, second], &[]);
+    let result = compute_state_groups_partial(&[first, second], &[], "!r:x");
     assert!(result.groups.is_empty());
     assert_eq!(result.unresolved.len(), 2);
 }
@@ -3328,12 +3592,16 @@ fn compute_state_groups_deterministic() {
     let member = owned_value(
         r#"{"event_id":"$join","room_id":"!r:x","type":"m.room.member","state_key":"@a:x","sender":"@a:x","prev_events":["$create"],"auth_events":["$create"],"content":{}}"#,
     );
-    let g1 = compute_state_groups_partial(&[create.clone(), member.clone()], &[]).groups;
-    let g2 = compute_state_groups_partial(&[create, member], &[]).groups;
+    let g1 = compute_state_groups_partial(&[create.clone(), member.clone()], &[], "!r:x").groups;
+    let g2 = compute_state_groups_partial(&[create, member], &[], "!r:x").groups;
     assert_eq!(g1, g2);
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture exercises several batch-composition invariants together"
+)]
 fn compute_state_groups_is_stable_across_overlapping_batches() {
     let create = owned_value(
         r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
@@ -3366,6 +3634,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             merge.clone(),
         ],
         &[],
+        "!r:x",
     );
     let with_fork = compute_state_groups_partial(
         &[
@@ -3377,6 +3646,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             sibling.clone(),
         ],
         &[],
+        "!r:x",
     );
     let with_orphan = compute_state_groups_partial(
         &[
@@ -3388,6 +3658,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             orphan,
         ],
         &[],
+        "!r:x",
     );
     let with_auth_chain = compute_state_groups_partial(
         &[
@@ -3398,6 +3669,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             merge.clone(),
         ],
         &[sibling],
+        "!r:x",
     );
     let reordered = compute_state_groups_partial(
         &[
@@ -3408,6 +3680,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             create.clone(),
         ],
         &[],
+        "!r:x",
     );
     let without_branch_b = compute_state_groups_partial(
         &[
@@ -3417,6 +3690,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
             merge.clone(),
         ],
         &[],
+        "!r:x",
     );
 
     assert_eq!(base.groups["$join"], with_fork.groups["$join"]);
@@ -3455,19 +3729,21 @@ fn compute_state_groups_uses_first_prev_as_tie_break_for_now() {
 
     // The walker currently resolves a same-key conflict by taking the
     // first prev_events entry. This is not full Matrix state resolution;
-    // changing it requires a state-group namespace bump.
+    // changing it requires a state-group namespace bump. The merge still gets
+    // its own instance because it has two distinct parents.
     let first_groups = compute_state_groups_partial(
         &[create.clone(), first.clone(), second.clone(), merge_first],
         &[],
+        "!r:x",
     )
     .groups;
     let second_groups =
-        compute_state_groups_partial(&[create, first, second, merge_second], &[]).groups;
+        compute_state_groups_partial(&[create, first, second, merge_second], &[], "!r:x").groups;
 
     assert_ne!(first_groups["$first"], first_groups["$second"]);
-    assert_eq!(first_groups["$merge-first"], first_groups["$first"]);
+    assert_ne!(first_groups["$merge-first"], first_groups["$first"]);
     assert_ne!(first_groups["$merge-first"], first_groups["$second"]);
-    assert_eq!(second_groups["$merge-second"], second_groups["$second"]);
+    assert_ne!(second_groups["$merge-second"], second_groups["$second"]);
     assert_ne!(second_groups["$merge-second"], second_groups["$first"]);
 }
 
@@ -3510,9 +3786,9 @@ fn verify_auth_chain_edges_auth_chain_as_known_set() {
 #[test]
 fn parse_federation_input_separates_pdus_and_auth_chain() {
     let json = r#"{
-            "pdus": [{"event_id": "$p1", "room_id": "!r:x", "type": "m.room.message"}],
-            "auth_chain": [{"event_id": "$a1", "room_id": "!r:x", "type": "m.room.create"}]
-        }"#;
+        "pdus": [{"event_id": "$p1", "room_id": "!r:x", "type": "m.room.message"}],
+        "auth_chain": [{"event_id": "$a1", "room_id": "!r:x", "type": "m.room.create"}]
+    }"#;
     let input = parse_federation_input(json.as_bytes()).unwrap();
     assert_eq!(input.pdus.len(), 1);
     assert_eq!(input.auth_chain.len(), 1);
@@ -3587,27 +3863,23 @@ fn state_set_merge_takes_first_wins() {
 }
 
 #[test]
-fn state_set_empty_digest_is_empty_base64url() {
+fn state_set_empty_digest_golden_vector() {
     let s = StateSet::new();
-    let digest = s.digest_base64url();
-    let expected = blake3_digest(&[]);
     assert_eq!(
-        digest,
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&expected[..])
+        s.digest_base64url(),
+        "viqN49z0bJTOhc3I4HrDCPTYqVSQ2VbDjXgP1hDbCBM"
     );
 }
 
-/// Pins the BLAKE3 state-set digest so switching algorithm (or changing
-/// the `(type, state_key, event_id)` framing) is a visible, deliberate
-/// format break rather than a silent re-identification of every state
-/// group.
+/// Pins the unkeyed `LtHash` state-group digest so changing the state-group
+/// framing remains a visible, deliberate format break.
 #[test]
 fn state_set_digest_golden_vector() {
     let mut s = StateSet::new();
     s.set("m.room.name", "", "$old".into());
     assert_eq!(
         s.digest_base64url(),
-        "OKDTgyf8lcTKVnc1KyNz-rvgFxdOhu3TM6leFuxVpas"
+        "ItsX7KS8GM3yKHTofq3Kp_OQ_lF-zok_yoVyzp_uRig"
     );
 }
 
@@ -3708,14 +3980,14 @@ fn coalesced_shards_and_collections_and_stats() {
     let l1 = DatabaseLayout::open(dir1.clone()).unwrap();
     let l2 = DatabaseLayout::open(dir2.clone()).unwrap();
 
-    let s1 = PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s1 = PackfileStorage::open(l1.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     let col = [0x11; 16];
     let n1 = [0x22; 16];
     let d1 = NodeData::new(Bytes::from_static(b"payload 1"));
     s1.put(&col, &n1, &d1).unwrap();
     s1.sync().unwrap();
 
-    let s2 = PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s2 = PackfileStorage::open(l2.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     let n2 = [0x33; 16];
     let d2 = NodeData::new(Bytes::from_static(b"payload 2"));
     s2.put(&col, &n2, &d2).unwrap();
@@ -3740,6 +4012,7 @@ fn coalesced_shards_and_collections_and_stats() {
         coalesce: true,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Collections {
+            per_db: false,
             all: false,
             layout: false,
             canonical: false,
@@ -3747,22 +4020,54 @@ fn coalesced_shards_and_collections_and_stats() {
             limit: 10,
         },
     };
-    cmd_collections(&cli_cols, false, false, false, Some("nodes"), 10).unwrap();
-    cmd_collections(&cli_cols, false, false, false, Some("idx-load"), 10).unwrap();
-    cmd_collections(&cli_cols, false, false, false, Some("load"), 10).unwrap();
+    cmd_collections(
+        &cli_cols,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("nodes"),
+            limit: 10,
+        },
+    )
+    .unwrap();
+    cmd_collections(
+        &cli_cols,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("idx-load"),
+            limit: 10,
+        },
+    )
+    .unwrap();
+    cmd_collections(
+        &cli_cols,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("load"),
+            limit: 10,
+        },
+    )
+    .unwrap();
 
     let mut cli_cols_coalesce = cli_cols.clone();
     cli_cols_coalesce.coalesce = true;
     cmd_collections(
         &cli_cols_coalesce,
-        false,
-        false,
-        false,
-        Some("idx-load"),
-        10,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("idx-load"),
+            limit: 10,
+        },
     )
     .unwrap();
-    cmd_collections(&cli_cols_coalesce, false, false, false, Some("load"), 10).unwrap();
+    cmd_collections(
+        &cli_cols_coalesce,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: Some("load"),
+            limit: 10,
+        },
+    )
+    .unwrap();
 
     let cli_stats = Cli {
         dirs: vec![dir1.clone(), dir2.clone()],
@@ -3790,14 +4095,14 @@ fn coalesced_get_resolves_conflict_by_origin_server_ts() {
     let hex_id = format_id(&node);
 
     // dir1 has older ts
-    let s1 = PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s1 = PackfileStorage::open(l1.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     let old_json = br#"{"origin_server_ts": 1000, "body": "old"}"#;
     s1.put(&col, &node, &NodeData::new(Bytes::from_static(old_json)))
         .unwrap();
     s1.sync().unwrap();
 
     // dir2 has newer ts
-    let s2 = PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s2 = PackfileStorage::open(l2.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     let new_json = br#"{"origin_server_ts": 2000, "body": "new"}"#;
     s2.put(&col, &node, &NodeData::new(Bytes::from_static(new_json)))
         .unwrap();
@@ -3891,7 +4196,7 @@ fn coalesced_repack_materializes_canonical_database() {
     let node1 = [0x22; 16];
     let node2 = [0x33; 16];
 
-    let s1 = PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s1 = PackfileStorage::open(l1.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     s1.put(
         &col,
         &node1,
@@ -3902,7 +4207,7 @@ fn coalesced_repack_materializes_canonical_database() {
     .unwrap();
     s1.sync().unwrap();
 
-    let s2 = PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s2 = PackfileStorage::open(l2.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     s2.put(
         &col,
         &node2,
@@ -3934,7 +4239,7 @@ fn coalesced_repack_materializes_canonical_database() {
 
     // Target directory must be a valid canonical database
     let out_layout = DatabaseLayout::open_read_only(out_dir.clone()).unwrap();
-    let out_pool = out_layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let out_pool = out_layout.pool_dir(ShardType::EventDag).unwrap();
     let out_store = PackfileStorage::open_read_only(out_pool).unwrap();
 
     // Both nodes must be present in the newly materialized database
@@ -3943,10 +4248,9 @@ fn coalesced_repack_materializes_canonical_database() {
     let r2 = out_store.get(&col, &node2).unwrap();
     assert!(r2.is_some());
 
-    // Target store must have exactly 1 pack (linearized canonical pack 0)
+    // Target store must have exactly 1 pack (a freshly materialized one)
     let summaries = out_store.shard_summaries();
     assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0].pack_id, 0);
 
     std::fs::remove_dir_all(&dir1).ok();
     std::fs::remove_dir_all(&dir2).ok();
@@ -3962,8 +4266,7 @@ fn coalesced_repack_accepts_matrix_room_selectors() {
     let collection_id = matrix_room_collection_id(room);
     let node_id = [0x44; 16];
 
-    let store =
-        PackfileStorage::open(layout.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let store = PackfileStorage::open(layout.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     store
         .put(
             &collection_id,
@@ -3992,7 +4295,7 @@ fn coalesced_repack_accepts_matrix_room_selectors() {
     cmd_repack_coalesced(&cli, &out_dir, Some(room), &[], false, &[], false, true).unwrap();
 
     let out_layout = DatabaseLayout::open_read_only(out_dir.clone()).unwrap();
-    let out_pool = out_layout.pool_dir_read_only(ShardType::EventDag).unwrap();
+    let out_pool = out_layout.pool_dir(ShardType::EventDag).unwrap();
     let out_store = PackfileStorage::open_read_only(out_pool).unwrap();
     assert!(out_store.get(&collection_id, &node_id).unwrap().is_some());
 
@@ -4013,7 +4316,7 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
     let node1 = [0x33; 16];
     let node2 = [0x44; 16];
 
-    let s1 = PackfileStorage::open(l1.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s1 = PackfileStorage::open(l1.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     s1.put(
         &col1,
         &node1,
@@ -4022,7 +4325,7 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
     .unwrap();
     s1.sync().unwrap();
 
-    let s2 = PackfileStorage::open(l2.pool_dir_read_only(ShardType::EventDag).unwrap()).unwrap();
+    let s2 = PackfileStorage::open(l2.pool_dir(ShardType::EventDag).unwrap()).unwrap();
     s2.put(
         &col2,
         &node2,
@@ -4037,11 +4340,13 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
         coalesce: true,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
-            collection: Some(format_id(&col1)),
+            selector: Some(format_id(&col1)),
+            pack: None,
+            collection: None,
             stats: false,
         },
     };
-    cmd_info(&cli_info, &format_id(&col1), false).unwrap();
+    cmd_info(&cli_info, &format_id(&col1), None, false).unwrap();
 
     let cli_scan = Cli {
         dirs: vec![dir1.clone(), dir2.clone()],
@@ -4084,4 +4389,124 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
 
     std::fs::remove_dir_all(&dir1).ok();
     std::fs::remove_dir_all(&dir2).ok();
+}
+
+/// Importing into a root that was only initialized must work: `init` creates just
+/// `db.meta`, so the pools do not exist yet and the first write creates them.
+#[test]
+fn import_into_a_freshly_initialized_root_creates_pools_on_first_write() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    for shard_type in ShardType::ALL {
+        assert!(
+            !layout.pool_path(shard_type).exists(),
+            "a fresh root has no pool directories"
+        );
+    }
+    let input = dir.join("export.json");
+    std::fs::write(
+        &input,
+        r#"{
+            "pdus": [
+                {"event_id":"$c","room_id":"!room","sender":"@server",
+                 "type":"m.room.create","state_key":"",
+                 "content":{"creator":"@server","room_version":"10"},
+                 "auth_events":[],"prev_events":[]},
+                {"event_id":"$m","room_id":"!room","sender":"@server",
+                 "type":"m.room.message","content":{},
+                 "auth_events":["$c"],"prev_events":["$c"]}
+            ]
+        }"#,
+    )
+    .unwrap();
+    let cli = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: Some(ShardType::EventDag),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Import {
+            paths: vec![input.clone()],
+            collection: None,
+            template: None,
+        },
+    };
+
+    cmd_import(&cli, &[input], None, None).expect("import into a fresh root");
+
+    assert!(
+        layout.pool_path(ShardType::EventDag).is_dir(),
+        "the event pool exists once it was written"
+    );
+    assert!(
+        !glob_pack_files(&layout.pool_path(ShardType::EventDag))
+            .unwrap()
+            .is_empty(),
+        "the import wrote a pack"
+    );
+    // Read-only inspection of the pools that were never written still works.
+    let inspect = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: None,
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Shards {
+            all: false,
+            layout: false,
+            sort: None,
+        },
+    };
+    cmd_shards(&inspect, false, false, None).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A missing database root is an error that says so; a valid root whose pool was
+/// never written is just empty, and inspecting it creates nothing.
+#[test]
+fn a_missing_root_is_an_error_but_an_unwritten_pool_is_empty() {
+    let missing = unique_temp_dir();
+    let cli = |dir: &Path| Cli {
+        dirs: vec![dir.to_path_buf()],
+        shard_type: Some(ShardType::State),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Collections {
+            per_db: false,
+            all: false,
+            layout: false,
+            canonical: false,
+            sort: None,
+            limit: 0,
+        },
+    };
+    let error = cmd_collections(
+        &cli(&missing),
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: None,
+            limit: 0,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("no mtxdb database"),
+        "a missing root must be diagnosed as such: {error}"
+    );
+    assert!(!missing.exists(), "inspection must not create the root");
+
+    let root = unique_temp_dir();
+    let layout = DatabaseLayout::open(root.clone()).unwrap();
+    cmd_collections(
+        &cli(&root),
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: None,
+            limit: 0,
+        },
+    )
+    .expect("an unwritten pool is empty, not an error");
+    assert!(
+        !layout.pool_path(ShardType::State).exists(),
+        "read-only inspection must not create the pool"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
 }
