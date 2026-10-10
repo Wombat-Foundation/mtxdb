@@ -78,7 +78,7 @@ bytes = "1.5"
 clap = { version = "=4.6.7", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
 clap_complete = { version = "=4.6.11", optional = true }
 hex = "0.4"
-mtxdb = { path = "..", features = ["bitmaps"] }
+mtxdb = { path = ".." }
 rezzy = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha" }
 simd-json = { version = "0.18", default-features = false, features = ["runtime-detection"] }
 

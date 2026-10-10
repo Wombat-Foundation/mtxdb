@@ -117,15 +117,6 @@ zstd = ["dep:zstd", "dep:zstd-sys"]
 # alternate CAS or version paths.
 multi-reader = []
 
-# Roaring-backed `u32` bitmap sets (`bitmap_set`): generic set algebra over
-# domain-tagged ordinal spaces, for auth-chain closures and other large or
-# frequently-intersected index sets (membership intersections, relation
-# fan-out, candidate sets, query AND/OR/NOT). Off by default; carries the
-# `roaring` dependency. Enables the bitmap sets and everything built on them:
-# the auth-closure walk and its persisted generations, and the room auth
-# façade. See docs/docs/auth-chain-closures-plan.md.
-bitmaps = ["dep:roaring"]
-
 # MSC4521 set reconciliation over the persisted event population (owner log,
 # sorted runs, resident kernel): element hashing, kernels and the `Population`
 # trait come from `rezzy-recon`. Off by default; carries that dependency.
@@ -143,7 +134,6 @@ memchr = "2.7"
 memmap2 = "0.9.11"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 rezzy-recon = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha", version = "0.6.0-rc.1", optional = true }
-roaring = { version = "0.11.5", optional = true }
 sha2 = "0.11"
 zstd = { version = "0.14", default-features = false, optional = true }
 
