@@ -669,7 +669,7 @@ fn decode_coverage(bytes: &[u8]) -> Result<ClosureCoverageSet, StorageError> {
         return Err(corrupt());
     }
     let mut runs: Vec<(u32, u32)> = Vec::with_capacity(body.len() / RUN_LEN);
-    for chunk in body.as_chunks::<RUN_LEN>().0 {
+    for chunk in body.chunks_exact(RUN_LEN) {
         let start = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let stored = u32::from_be_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
         let Some(end) = start.checked_add(stored) else {
