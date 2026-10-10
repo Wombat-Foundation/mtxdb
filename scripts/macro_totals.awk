@@ -15,7 +15,7 @@ function num(s) { gsub(/_/, "", s); return s + 0 }
 		f[n - 3] !~ /^[0-9][0-9_]*$/ ||
 		f[n - 2] !~ /^[0-9][0-9_]*([.][0-9][0-9_]*)?$/ ||
 		f[n - 1] !~ /^[0-9][0-9_]*$/ ||
-		f[n] !~ /^[0-9][0-9_]*([.][0-9][0-9_]*)?$/) next
+		f[n] !~ /^[0-9][0-9_]*([.][0-9][0-9_]*)?$/) { skipped++; next }
 	uses = num(f[n - 4]); bytes = num(f[n - 1]); lines = num(f[n - 3])
 	name = $0
 	sub(/^macro-stats +/, "", name)
@@ -35,4 +35,5 @@ END {
 		printf "macro-stats %-34s %6d %10d %12d\n", k, u[k], l[k], b[k]
 	}
 	printf "macro-stats %-34s %6d %10d %12d\n", "ALL (nested counted twice)", tu, tl, tb
+	if (skipped) printf "macro-stats WARNING: %d unparsed rows excluded from totals\n", skipped
 }
