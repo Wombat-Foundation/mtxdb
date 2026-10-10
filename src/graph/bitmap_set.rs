@@ -14,7 +14,7 @@
 //! user or `NodeId` scope) so both sides allocate from the same numbers. The tag
 //! does not choose that scope for you; it only makes a mismatch loud.
 //!
-//! Storage uses rezzy's dependency-free Roaring-compatible bitmap
+//! Storage uses rezzy's dependency-free compressed bitmap
 //! representation. A set that is small and rarely intersected is still
 //! frequently better as an ordinary sorted `Vec<u32>`, and the caller decides
 //! which representation to use.
