@@ -196,7 +196,7 @@ impl PackId {
         }
         let byte_len = digits.len() / 2;
         let mut bytes = vec![0u8; byte_len];
-        for (index, chunk) in digits.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        for (index, chunk) in digits.as_bytes().chunks_exact(2).enumerate() {
             let hi = hex_value(chunk[0])?;
             let lo = hex_value(chunk[1])?;
             bytes[index] = (hi << 4) | lo;
@@ -219,7 +219,7 @@ impl PackId {
             return None;
         }
         let mut bytes = [0u8; PACK_ID_LEN];
-        for (index, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
             let hi = hex_value(chunk[0])?;
             let lo = hex_value(chunk[1])?;
             bytes[index] = (hi << 4) | lo;
@@ -1692,101 +1692,91 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
     }))
 }
 
-/// Open an existing packfile. Creating one needs a nonzero creation sequence,
-/// so a `create` of an empty file fails here; pool creation uses
-/// [`open_packfile_with_creation_seq`] instead.
+/// Open an existing packfile, never creating one. Creation needs a nonzero
+/// creation sequence and goes through [`open_packfile_with_creation_seq`].
 ///
-/// With `create` set, opens for writing and initializes and syncs the header
-/// of an empty file. Otherwise opens an existing file read-only.
-///
-/// `pack_id` is the caller's expected full identity, written on initialization
-/// and checked against an existing header. This function does not validate the
+/// With `writable` set, opens for appending; otherwise read-only. Either way
+/// the header is validated and its `pack_id` checked against `pack_id`, the
+/// caller's expected full identity. This function does not validate the
 /// filename, which may contain only a prefix of the identity.
 ///
 /// # Errors
-/// Propagates open, metadata, header-write, and sync errors. Returns
-/// `InvalidInput` when initializing with an all-zero ID, `Unsupported` for an
-/// unsupported header version, or `InvalidData` for an invalid header or an
-/// identity mismatch.
-pub fn open_packfile(path: &Path, create: bool, pack_id: &PackId) -> io::Result<File> {
-    open_packfile_with_creation_seq(path, create, pack_id, 0)
-}
-
-/// Open or create a packfile, assigning `creation_seq` when creating it.
-///
-/// # Errors
-/// Returns the same errors as [`open_packfile`].
-pub fn open_packfile_with_creation_seq(
-    path: &Path,
-    create: bool,
-    pack_id: &PackId,
-    creation_seq: u32,
-) -> io::Result<File> {
-    if create {
+/// Propagates open and metadata errors (`NotFound` for a missing file).
+/// Returns `Unsupported` for an unsupported header version, or `InvalidData`
+/// for an invalid or empty header, a zero creation sequence, or an identity
+/// mismatch.
+pub fn open_packfile(path: &Path, writable: bool, pack_id: &PackId) -> io::Result<File> {
+    let file = if writable {
         let mut options = OpenOptions::new();
-        options.read(true).create(true);
-        // Unix flushes use positioned writes through the append-capable
-        // handle. Windows' append access masks FILE_WRITE_DATA, which is
-        // required by set_len during torn-tail rollback; its write path
-        // therefore opens an ordinary writable handle instead.
+        options.read(true);
+        // See `open_packfile_with_creation_seq` for the per-platform handle.
         #[cfg(unix)]
         options.append(true);
         #[cfg(not(unix))]
         options.write(true);
-        let mut file = options.open(path)?;
-
-        if file.metadata()?.len() == 0 {
-            write_header_with_creation_seq(&mut file, pack_id, creation_seq)?;
-            file.sync_all()?;
-        } else {
-            let mut reader = BufReader::new(&file);
-            let Some(header) = read_header(&mut reader)? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid packfile header",
-                ));
-            };
-            if header.pack_id != *pack_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "shard file {} identifies itself as {} in its header, \
-                         but its filename says {} — \
-                         copied or renamed inconsistently with its own history",
-                        path.display(),
-                        header.pack_id,
-                        pack_id,
-                    ),
-                ));
-            }
-        }
-        Ok(file)
+        options.open(path)?
     } else {
-        // Read-only path: open with read-only permissions, validate
-        // the header, never write or create.
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(&file);
-        let Some(header) = read_header(&mut reader)? else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid packfile header",
-            ));
-        };
-        if header.pack_id != *pack_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "shard file {} identifies itself as {} in its header, \
-                     but its filename says {} — \
-                     copied or renamed inconsistently with its own history",
-                    path.display(),
-                    header.pack_id,
-                    pack_id,
-                ),
-            ));
-        }
-        Ok(file)
+        File::open(path)?
+    };
+    validate_header_identity(&file, path, pack_id)?;
+    Ok(file)
+}
+
+/// Check that `file`'s header parses and names `pack_id`.
+fn validate_header_identity(file: &File, path: &Path, pack_id: &PackId) -> io::Result<()> {
+    let mut reader = BufReader::new(file);
+    let Some(header) = read_header(&mut reader)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid packfile header",
+        ));
+    };
+    if header.pack_id != *pack_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "shard file {} identifies itself as {} in its header, \
+                 but its filename says {} — \
+                 copied or renamed inconsistently with its own history",
+                path.display(),
+                header.pack_id,
+                pack_id,
+            ),
+        ));
     }
+    Ok(())
+}
+
+/// Open or create a packfile, writing a header with `creation_seq` when the
+/// file is empty. An existing file is validated like [`open_packfile`].
+///
+/// # Errors
+/// Returns `InvalidInput` when initializing with a zero `creation_seq` or an
+/// all-zero ID, plus the errors of [`open_packfile`].
+pub fn open_packfile_with_creation_seq(
+    path: &Path,
+    pack_id: &PackId,
+    creation_seq: u32,
+) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).create(true);
+    // Unix flushes use positioned writes through the append-capable
+    // handle. Windows' append access masks FILE_WRITE_DATA, which is
+    // required by set_len during torn-tail rollback; its write path
+    // therefore opens an ordinary writable handle instead.
+    #[cfg(unix)]
+    options.append(true);
+    #[cfg(not(unix))]
+    options.write(true);
+    let mut file = options.open(path)?;
+
+    if file.metadata()?.len() == 0 {
+        write_header_with_creation_seq(&mut file, pack_id, creation_seq)?;
+        file.sync_all()?;
+    } else {
+        validate_header_identity(&file, path, pack_id)?;
+    }
+    Ok(file)
 }
 
 /// Scan an existing packfile and return `(collection_id, hash, offset)` entries.

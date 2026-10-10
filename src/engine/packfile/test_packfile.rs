@@ -1302,3 +1302,37 @@ fn test_read_record_corrupt_huge_prefix_fails_without_allocating() {
         ));
     }
 }
+
+#[test]
+fn test_write_header_rejects_zero_creation_sequence() {
+    let mut buf = Vec::new();
+    let err = write_header_with_creation_seq(&mut buf, &test_pack_id(1), 0).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    let err = write_header_with_created_at(&mut buf, &test_pack_id(1), 5, 0).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn test_open_packfile_never_creates_or_initializes() {
+    let dir = std::env::temp_dir().join(format!("mtxdb_open_no_create_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing = dir.join("missing.pack");
+    assert!(open_packfile(&missing, true, &test_pack_id(1)).is_err());
+    assert!(!missing.exists());
+
+    let empty = dir.join("empty.pack");
+    std::fs::write(&empty, b"").unwrap();
+    assert!(open_packfile(&empty, true, &test_pack_id(1)).is_err());
+    assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
+
+    let zero_seq = dir.join("zero.pack");
+    assert_eq!(
+        open_packfile_with_creation_seq(&zero_seq, &test_pack_id(1), 0)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

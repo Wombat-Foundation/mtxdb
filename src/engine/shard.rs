@@ -1844,18 +1844,14 @@ impl ShardPool {
         let path = Self::pack_path(base_dir, &pack_id, siblings);
         let unique = PACK_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("tmp.{}.{unique}", std::process::id()));
-        let file = match packfile::open_packfile_with_creation_seq(
-            &tmp_path,
-            true,
-            &pack_id,
-            creation_seq,
-        ) {
-            Ok(file) => file,
-            Err(error) => {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(error);
-            }
-        };
+        let file =
+            match packfile::open_packfile_with_creation_seq(&tmp_path, &pack_id, creation_seq) {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+            };
         if let Err(error) = fs::rename(&tmp_path, &path) {
             let _ = fs::remove_file(&tmp_path);
             return Err(error);
