@@ -8953,6 +8953,82 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
     );
 }
 
+/// A checkpoint whose bridging delta log has vanished — the state a store is
+/// left in when the background checkpoint worker fails to append the log, or
+/// its append is interrupted — is rejected by name (`DeltaLogMissing`) and the
+/// open falls back to a rescan that still finds every record. This is the gate
+/// a reopen reports through `OpenTimings` after such a failure.
+#[test]
+fn a_missing_delta_log_is_named_on_the_full_scan_fallback() {
+    let dir = test_dir("missing_delta_log");
+    let collection = [0xDC; 16];
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(&collection, &batch_node(0), &NodeData::from_slice(b"base"))
+        .unwrap();
+    store.sync_all().unwrap();
+    for id in 1..=5 {
+        store
+            .put(&collection, &batch_node(id), &NodeData::from_slice(b"redo"))
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    let base = store.delta_state.lock().base_fingerprint.unwrap();
+    drop(store);
+
+    fs::remove_file(PackfileStorage::delta_path(&dir, base)).unwrap();
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let timings = reopened.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert_eq!(
+        timings.checkpoint_reject,
+        Some(CheckpointReject::DeltaLogMissing)
+    );
+    for id in 0..=5 {
+        assert!(reopened
+            .get(&collection, &batch_node(id))
+            .unwrap()
+            .is_some());
+    }
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A store directory with no checkpoint at all is rejected by name
+/// (`MissingOrMalformed`) and the open rescans.
+#[test]
+fn a_missing_checkpoint_is_named_on_the_full_scan_fallback() {
+    let dir = test_dir("missing_checkpoint");
+    let collection = [0xDD; 16];
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    for id in 0..=5 {
+        store
+            .put(&collection, &batch_node(id), &NodeData::from_slice(b"base"))
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let timings = reopened.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert_eq!(
+        timings.checkpoint_reject,
+        Some(CheckpointReject::MissingOrMalformed)
+    );
+    for id in 0..=5 {
+        assert!(reopened
+            .get(&collection, &batch_node(id))
+            .unwrap()
+            .is_some());
+    }
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// Differential: a collection driven through many batches, overwrites and
 /// several capacity growths after its checkpoint, synced only as deltas, must
 /// reopen to exactly what the live session held: every identity at its last
