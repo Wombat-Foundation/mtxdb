@@ -105,11 +105,11 @@ fn head_swap_is_atomic_with_companion_write() {
     let id = [8u8; 16];
     let other = [0x49u8; 16];
     let companion_id = [9u8; 16];
-    set(&db, &id, 1, b"v1");
+    set(&db, &id, 1, b"first");
 
     let slow = db.begin_transaction();
     let read = heads.read(&slow, &id).unwrap();
-    set(&db, &id, 2, b"v2");
+    set(&db, &id, 2, b"second");
     slow.put(
         POOL,
         other,
@@ -122,7 +122,7 @@ fn head_swap_is_atomic_with_companion_write() {
             &slow,
             &id,
             read.token,
-            &LogicalHeadValue::new([3u8; 16], b"v3".as_slice()),
+            &LogicalHeadValue::new([3u8; 16], b"third".as_slice()),
         )
         .unwrap();
     assert!(slow.commit().unwrap_err().is_stale_read());

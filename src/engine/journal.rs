@@ -99,7 +99,7 @@ const GROUP_TRAILER_LEN: usize = GT_CRC.end;
 // Mutation frame field byte ranges. A frame is `FRAME_FIXED_LEN` fixed bytes,
 // then the payload, then `FRAME_TRAILER_LEN` CRC bytes.
 const MF_KIND: std::ops::Range<usize> = 0..1;
-/// Pool tag (version 3) or reserved zero (version 2).
+/// Pool tag; always `1..=4`.
 const MF_POOL: std::ops::Range<usize> = 1..2;
 const MF_FLAGS: std::ops::Range<usize> = 2..4;
 const MF_LSN: std::ops::Range<usize> = 4..12;
@@ -905,11 +905,9 @@ const fn pool_index(pool: ShardType) -> usize {
     }
 }
 
-/// Wire code for a pool tag in a pool-tagged (`FILE_VERSION_POOL_TAGGED`)
-/// mutation frame's previously reserved flag byte.
+/// Wire code for a pool tag in a mutation frame's flag byte.
 ///
-/// `0` is reserved for "untagged", which only a version-2 segment may contain;
-/// a version-3 frame must carry `1..=4`.
+/// Every frame carries a pool tag in `1..=4`; `0` is never written.
 pub(crate) const fn pool_tag(pool: ShardType) -> u8 {
     match pool {
         ShardType::State => 1,
@@ -919,8 +917,8 @@ pub(crate) const fn pool_tag(pool: ShardType) -> u8 {
     }
 }
 
-/// Inverse of [`pool_tag`]. `0` (untagged) maps to `None`; any other
-/// out-of-range code is rejected by the frame decoder.
+/// Inverse of [`pool_tag`]. `0` and any other out-of-range code map to
+/// `None`, which the frame decoder rejects.
 pub(crate) const fn pool_from_tag(tag: u8) -> Option<ShardType> {
     match tag {
         1 => Some(ShardType::State),
@@ -960,8 +958,7 @@ pub struct JournalEntry {
     pub offset: u64,
     /// Encoded frame length in bytes (fixed fields + payload + CRC).
     pub frame_len: u64,
-    /// Pool the frame belongs to. `None` for a version-2 (per-pool) segment;
-    /// `Some` for every frame of a pool-tagged version-3 segment.
+    /// Pool the frame belongs to. Every frame carries its pool tag.
     pub pool: ShardType,
     /// Decoded mutation.
     pub mutation: Mutation,
@@ -5264,9 +5261,7 @@ fn encode_mutation(
     mutation: &Mutation,
     into: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // The flag byte is the pool tag in a v3 segment and must be zero in a v2
-    // segment; enforce the pairing rather than silently writing an ambiguous
-    // frame.
+    // The flag byte is always the pool tag.
     let pool_byte = pool_tag(pool);
 
     let start = into.len();

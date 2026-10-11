@@ -8408,7 +8408,7 @@ fn a_reader_attached_earlier_reloads_through_the_delta_coverage_prefix() {
 
     // Coverage moves ahead by delta batches, overwriting key 1 on the way.
     writer.put(&collection, &key(2), &value(b"two")).unwrap();
-    writer.put(&collection, &key(1), &value(b"one-v2")).unwrap();
+    writer.put(&collection, &key(1), &value(b"one-rewritten")).unwrap();
     writer.sync().unwrap();
     writer.put(&collection, &key(3), &value(b"three")).unwrap();
     writer.sync().unwrap();
@@ -8430,7 +8430,7 @@ fn a_reader_attached_earlier_reloads_through_the_delta_coverage_prefix() {
     assert_eq!(
         payloads,
         vec![
-            Some(&b"one-v2"[..]),
+            Some(&b"one-rewritten"[..]),
             Some(&b"two"[..]),
             Some(&b"three"[..]),
             Some(&b"four"[..]),
@@ -10449,7 +10449,7 @@ fn read_snapshot_reports_the_durable_group_token() {
         .append_group(&[JournalMutation::Put {
             collection_id: collection,
             node_id: key,
-            payload: b"v2".to_vec(),
+            payload: b"rewritten".to_vec(),
         }])
         .unwrap();
     drop(journal);
