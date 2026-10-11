@@ -51,6 +51,41 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
+fn add_usize(left: usize, right: usize) -> usize {
+    left.checked_add(right).expect("benchmark usize addition")
+}
+
+fn mul_usize(left: usize, right: usize) -> usize {
+    left.checked_mul(right)
+        .expect("benchmark usize multiplication")
+}
+
+fn add_u64(left: u64, right: u64) -> u64 {
+    left.checked_add(right).expect("benchmark u64 addition")
+}
+
+fn sub_u64(left: u64, right: u64) -> u64 {
+    left.checked_sub(right).expect("benchmark u64 subtraction")
+}
+
+fn to_f64(value: u64) -> f64 {
+    f64::from(u32::try_from(value).expect("benchmark value fits in u32"))
+}
+
+fn usize_f64(value: usize) -> f64 {
+    to_f64(u64::try_from(value).expect("benchmark usize fits in u64"))
+}
+
+fn mib_f64(bytes: u64) -> f64 {
+    to_f64(bytes) / to_f64(1_u64 << 20)
+}
+
+fn sample_index(seed: u64, count: u64) -> u64 {
+    mix(seed)
+        .checked_rem(count)
+        .expect("nonempty benchmark index")
+}
+
 fn mix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -100,7 +135,7 @@ fn index_files(dir: &Path) -> String {
             format!(
                 "{} {:.2} MiB",
                 e.file_name().to_string_lossy(),
-                e.metadata().map_or(0, |m| m.len()) as f64 / f64::from(1 << 20)
+                mib_f64(e.metadata().map_or(0, |m| m.len()))
             )
         })
         .collect();
@@ -130,21 +165,27 @@ fn build(dir: &Path, target: u64, mixed: bool) -> u64 {
     let mut written = 0u64;
     while written < target {
         let len = if mixed {
-            usize::try_from(1 + mix(seq ^ 77) % (64 << 10)).expect("len")
+            add_usize(
+                usize::try_from(mix(seq ^ 77) % (64_u64 << 10)).expect("len"),
+                1,
+            )
         } else {
             16
         };
         let data = if mixed {
-            let start = usize::try_from(mix(seq) % 1024).expect("start") * 8;
-            NodeData::from_slice(&big[start..start + len.min(big.len() - start)])
+            let start = mul_usize(usize::try_from(mix(seq) % 1024).expect("start"), 8);
+            let available = big.len().checked_sub(start).expect("start within filler");
+            let end = add_usize(start, len.min(available));
+            NodeData::from_slice(&big[start..end])
         } else {
             tiny.clone()
         };
         store
             .put(&COLLECTION, &node_id(seq), &data)
             .expect("put record");
-        seq += 1;
-        written += len as u64 + 61 - 16;
+        seq = add_u64(seq, 1);
+        let frame_bytes = add_u64(u64::try_from(len).expect("length fits in u64"), 61);
+        written = add_u64(written, sub_u64(frame_bytes, 16));
         if seq.is_multiple_of(100_000) {
             store.sync_all().expect("sync_all");
             written = dir_pack_bytes(dir);
@@ -177,33 +218,44 @@ struct Idx {
 impl Idx {
     const FAN: usize = 16;
     fn ids_at() -> usize {
-        Self::FAN + 256 * 4
+        add_usize(Self::FAN, mul_usize(256, 4))
     }
     fn offs_at(&self) -> usize {
-        Self::ids_at() + self.count * 16
+        add_usize(Self::ids_at(), mul_usize(self.count, 16))
     }
     fn fan(&self, i: usize) -> usize {
-        let at = Self::FAN + i * 4;
-        u32::from_le_bytes(self.bytes[at..at + 4].try_into().expect("fan")) as usize
+        let at = add_usize(Self::FAN, mul_usize(i, 4));
+        let end = add_usize(at, 4);
+        usize::try_from(u32::from_le_bytes(
+            self.bytes[at..end].try_into().expect("fan"),
+        ))
+        .expect("fan fits in usize")
     }
     fn id(&self, i: usize) -> &[u8] {
-        let at = Self::ids_at() + i * 16;
-        &self.bytes[at..at + 16]
+        let at = add_usize(Self::ids_at(), mul_usize(i, 16));
+        let end = add_usize(at, 16);
+        &self.bytes[at..end]
     }
     fn off(&self, i: usize) -> u64 {
-        let at = self.offs_at() + i * 4;
+        let at = add_usize(self.offs_at(), mul_usize(i, 4));
+        let end = add_usize(at, 4);
         u64::from(u32::from_le_bytes(
-            self.bytes[at..at + 4].try_into().expect("off"),
+            self.bytes[at..end].try_into().expect("off"),
         ))
     }
     fn get(&self, key: &[u8; 16]) -> Option<u64> {
         let b = usize::from(key[0]);
-        let mut lo = if b == 0 { 0 } else { self.fan(b - 1) };
+        let mut lo = if b == 0 {
+            0
+        } else {
+            self.fan(b.checked_sub(1).expect("nonzero fanout byte"))
+        };
         let mut hi = self.fan(b);
         while lo < hi {
-            let mid = lo + (hi - lo) / 2;
+            let span = hi.checked_sub(lo).expect("ordered binary-search bounds");
+            let mid = add_usize(lo, span / 2);
             match self.id(mid).cmp(&key[..]) {
-                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Less => lo = add_usize(mid, 1),
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => return Some(self.off(mid)),
             }
@@ -216,10 +268,10 @@ impl Idx {
         let mut found = 0;
         for key in keys {
             while pos < self.count && self.id(pos) < &key[..] {
-                pos += 1;
+                pos = add_usize(pos, 1);
             }
             if pos < self.count && self.id(pos) == &key[..] {
-                found += 1;
+                found = add_usize(found, 1);
             }
         }
         found
@@ -232,16 +284,19 @@ fn build_idx(entries: &[([u8; 16], [u8; 16], u64)]) -> Vec<u8> {
         .map(|e| (e.1, u32::try_from(e.2).expect("offset fits u32")))
         .collect();
     sorted.sort_unstable();
-    let mut out = Vec::with_capacity(16 + 1024 + sorted.len() * 20 + 4);
+    let entry_bytes = mul_usize(sorted.len(), 20);
+    let capacity = add_usize(add_usize(add_usize(16, 1024), entry_bytes), 4);
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
     let mut fan = [0u32; 256];
     for (id, _) in &sorted {
-        fan[usize::from(id[0])] += 1;
+        let slot = usize::from(id[0]);
+        fan[slot] = fan[slot].checked_add(1).expect("fanout count");
     }
     let mut run = 0u32;
     for f in &mut fan {
-        run += *f;
+        run = run.checked_add(*f).expect("fanout total");
         *f = run;
         out.extend_from_slice(&run.to_le_bytes());
     }
@@ -263,7 +318,7 @@ fn check_header(bytes: &[u8]) -> usize {
         .expect("count");
     assert_eq!(
         bytes.len(),
-        16 + 1024 + count * 20 + 4,
+        add_usize(add_usize(add_usize(16, 1024), mul_usize(count, 20)), 4,),
         "idx length matches its layout"
     );
     count
@@ -295,7 +350,7 @@ fn header_only(path: &Path) -> usize {
 
 fn load_idx(path: &Path) -> Idx {
     let mut bytes = std::fs::read(path).expect("read idx");
-    let tail = bytes.len() - 4;
+    let tail = bytes.len().checked_sub(4).expect("idx crc trailer");
     let crc = u32::from_le_bytes(bytes[tail..].try_into().expect("crc"));
     assert_eq!(crc, crc32fast::hash(&bytes[..tail]), "idx crc");
     assert_eq!(&bytes[..8], MAGIC, "idx magic");
@@ -306,6 +361,175 @@ fn load_idx(path: &Path) -> Idx {
         bytes: Backing::Heap(bytes),
         count,
     }
+}
+
+fn prepare(dir: &Path, cold: bool) {
+    if cold && !sync_and_evict(dir) {
+        println!("  (eviction failed; cold numbers are really warm)");
+    }
+}
+
+fn measure_reopen(dir: &Path, pack: &Path, idx_path: &Path, manifest_len: u64, cold: bool) {
+    let state = if cold { "cold" } else { "warm" };
+    prepare(dir, cold);
+    let (store, t_open) = timed(|| PackfileStorage::open(dir.to_path_buf()).expect("open"));
+    let first = timed(|| store.get(&COLLECTION, &node_id(0)).expect("get").is_some()).1;
+    let timings = store.open_timings().expect("timings");
+    drop(store);
+    println!(
+        "  [{state}] current open {:.0} ms (pack recovery {:.0}, checkpoint decode {:.0}, \
+         index materialization {:.0}), first read {:.2} ms",
+        ms(t_open),
+        ms(timings.packfile_recovery),
+        ms(timings.checkpoint_decode),
+        ms(timings.index_materialization),
+        ms(first),
+    );
+
+    prepare(dir, cold);
+    let (n, t) = timed(|| scan_and_recover_packfile(pack).expect("scan").len());
+    println!("  [{state}] scan rebuild {:.0} ms ({n} entries)", ms(t));
+
+    prepare(dir, cold);
+    let (_, t) = timed(|| load_idx(idx_path));
+    println!("  [{state}] .idx reopen (read + CRC) {:.1} ms", ms(t));
+
+    prepare(dir, cold);
+    let (_, t) = timed(|| {
+        assert_eq!(
+            std::fs::metadata(pack).expect("stat").len(),
+            manifest_len,
+            "manifest length"
+        );
+        black_box(header_only(idx_path))
+    });
+    println!(
+        "  [{state}] trusted, metadata-only (stat pack + idx header/fanout) {:.2} ms",
+        ms(t)
+    );
+
+    prepare(dir, cold);
+    let (_, t) = timed(|| {
+        assert_eq!(
+            std::fs::metadata(pack).expect("stat").len(),
+            manifest_len,
+            "manifest length"
+        );
+        black_box(map_idx(idx_path).count)
+    });
+    println!(
+        "  [{state}] trusted, mmap .idx (header check, no CRC) {:.2} ms",
+        ms(t)
+    );
+
+    prepare(dir, cold);
+    let (_, t) = timed(|| {
+        assert_eq!(
+            std::fs::metadata(pack).expect("stat").len(),
+            manifest_len,
+            "manifest length"
+        );
+        black_box(load_idx(idx_path).count)
+    });
+    println!("  [{state}] trusted, read + CRC .idx {:.1} ms", ms(t));
+
+    prepare(dir, cold);
+    let (_, t) = timed(|| black_box(crc32fast::hash(&std::fs::read(pack).expect("read"))));
+    println!(
+        "  [{state}] digest-verify reopen (read whole pack + CRC) {:.0} ms",
+        ms(t)
+    );
+}
+
+fn measure_cold_lookups(dir: &Path, idx_path: &Path, records: u64) {
+    let probe: Vec<[u8; 16]> = (0..1000_u64)
+        .map(|i| node_id(sample_index(i ^ 5, records)))
+        .collect();
+    prepare(dir, true);
+    let fresh = map_idx(idx_path);
+    let (found, t) = timed(|| probe.iter().filter(|k| fresh.get(k).is_some()).count());
+    assert_eq!(found, probe.len(), "cold mmap lookups hit");
+    println!(
+        "  [cold] mmap: first 1000 random lookups {:.1} ms total",
+        ms(t)
+    );
+}
+
+fn measure_warm_lookups(
+    dir: &Path,
+    pack: &Path,
+    idx_path: &Path,
+    idx: &Idx,
+    records: u64,
+    lookups: usize,
+) {
+    let keys: Vec<[u8; 16]> = (0..u64::try_from(lookups).expect("lookup count fits in u64"))
+        .map(|i| node_id(sample_index(i, records)))
+        .collect();
+    let (found, t) = timed(|| keys.iter().filter(|k| idx.get(k).is_some()).count());
+    assert_eq!(found, lookups, "every point lookup hits");
+    println!(
+        "  point lookups: {:.0} ns each over {lookups} random keys",
+        t.as_secs_f64() * 1e9 / usize_f64(lookups)
+    );
+
+    let mapped = map_idx(idx_path);
+    let (found, t) = timed(|| keys.iter().filter(|k| mapped.get(k).is_some()).count());
+    assert_eq!(found, lookups, "every mmap lookup hits");
+    println!(
+        "  point lookups (mmap, resident): {:.0} ns each",
+        t.as_secs_f64() * 1e9 / usize_f64(lookups)
+    );
+
+    measure_end_to_end(pack, idx, &keys, lookups);
+
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    let (found, t) = timed(|| idx.batch(&sorted));
+    assert_eq!(found, lookups, "every batch key hits");
+    println!(
+        "  sorted batch ({lookups} keys, merge-walk over the whole index): {:.1} ms",
+        ms(t)
+    );
+
+    let store = PackfileStorage::open(dir.to_path_buf()).expect("open");
+    let (found, t) = timed(|| {
+        keys.iter()
+            .filter(|k| store.get(&COLLECTION, k).expect("get").is_some())
+            .count()
+    });
+    assert_eq!(found, lookups, "store lookups hit");
+    println!(
+        "  end-to-end via store.get (hash locator + frame read): {:.0} ns each",
+        t.as_secs_f64() * 1e9 / usize_f64(lookups)
+    );
+}
+
+fn measure_end_to_end(pack: &Path, idx: &Idx, keys: &[[u8; 16]], lookups: usize) {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(pack).expect("open pack");
+    let mut buf = vec![0u8; 72 << 10];
+    let (found, t) = timed(|| {
+        let mut ok = 0;
+        for key in keys {
+            let off = idx.get(key).expect("hit");
+            let n = file.read_at(&mut buf[..4096], off).expect("pread");
+            let rec = if let Ok(rec) = mtxdb::packfile::read_record(&mut &buf[..n]) {
+                rec
+            } else {
+                let n = file.read_at(&mut buf, off).expect("pread");
+                mtxdb::packfile::read_record(&mut &buf[..n]).expect("read frame")
+            };
+            black_box(&rec);
+            ok = add_usize(ok, 1);
+        }
+        ok
+    });
+    assert_eq!(found, lookups, "end-to-end hits");
+    println!(
+        "  end-to-end via .idx (locate + pread + read_record; naive read path, not tuned): {:.0} ns each",
+        t.as_secs_f64() * 1e9 / usize_f64(lookups)
+    );
 }
 
 fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
@@ -335,12 +559,11 @@ fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
     println!(
         "\n== {label}: {records} records, pack {} MiB ({:.0} B/frame), built in {:.1} s ==",
         pack_len >> 20,
-        pack_len as f64 / records as f64,
+        to_f64(pack_len) / to_f64(records),
         build_t.as_secs_f64(),
     );
     println!("  index files: {}", index_files(&dir));
 
-    // Scan once to learn the entries (also the rebuild cost, measured per cache state below).
     let entries = scan_and_recover_packfile(&pack).expect("scan");
     assert_eq!(entries.len() as u64, records, "scan saw every record");
     let idx_path = dir.join("pack.idx");
@@ -360,173 +583,24 @@ fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
     println!(
         "  .idx size {:.2} MiB ({:.1} B/entry) vs checkpoint {:.2} MiB; build+write+fsync {:.0} ms \
          (sort alone {:.0} ms)",
-        idx_bytes.len() as f64 / f64::from(1 << 20),
-        idx_bytes.len() as f64 / records as f64,
-        checkpoint_bytes(&dir) as f64 / f64::from(1 << 20),
+        mib_f64(u64::try_from(idx_bytes.len()).expect("index length fits in u64")),
+        to_f64(u64::try_from(idx_bytes.len()).expect("index length fits in u64"))
+            / to_f64(records),
+        mib_f64(checkpoint_bytes(&dir)),
         ms(idx_build),
         ms(sort_only),
     );
     drop(idx_bytes);
     let manifest_len = pack_len;
     drop(entries);
+    let idx = load_idx(&idx_path);
 
     for cold in [false, true] {
-        let state = if cold { "cold" } else { "warm" };
-        let prep = |d: &Path| {
-            if cold && !sync_and_evict(d) {
-                println!("  (eviction failed; cold numbers are really warm)");
-            }
-        };
-        prep(&dir);
-        let (store, t) = timed(|| PackfileStorage::open(dir.clone()).expect("open"));
-        let t_open = t;
-        let first = timed(|| store.get(&COLLECTION, &node_id(0)).expect("get").is_some()).1;
-        let timings = store.open_timings().expect("timings");
-        drop(store);
-        println!(
-            "  [{state}] current open {:.0} ms (pack recovery {:.0}, checkpoint decode {:.0}, \
-             index materialization {:.0}), first read {:.2} ms",
-            ms(t_open),
-            ms(timings.packfile_recovery),
-            ms(timings.checkpoint_decode),
-            ms(timings.index_materialization),
-            ms(first),
-        );
-
-        prep(&dir);
-        let (n, t) = timed(|| scan_and_recover_packfile(&pack).expect("scan").len());
-        println!("  [{state}] scan rebuild {:.0} ms ({n} entries)", ms(t));
-
-        prep(&dir);
-        let (idx, t) = timed(|| load_idx(&idx_path));
-        println!("  [{state}] .idx reopen (read + CRC) {:.1} ms", ms(t));
-
-        prep(&dir);
-        let (_, t) = timed(|| {
-            assert_eq!(
-                std::fs::metadata(&pack).expect("stat").len(),
-                manifest_len,
-                "manifest length"
-            );
-            black_box(header_only(&idx_path))
-        });
-        println!(
-            "  [{state}] trusted, metadata-only (stat pack + idx header/fanout) {:.2} ms",
-            ms(t)
-        );
-
-        prep(&dir);
-        let (mapped, t) = timed(|| {
-            assert_eq!(
-                std::fs::metadata(&pack).expect("stat").len(),
-                manifest_len,
-                "manifest length"
-            );
-            map_idx(&idx_path)
-        });
-        println!(
-            "  [{state}] trusted, mmap .idx (header check, no CRC) {:.2} ms",
-            ms(t)
-        );
-
-        prep(&dir);
-        let (_, t) = timed(|| {
-            assert_eq!(
-                std::fs::metadata(&pack).expect("stat").len(),
-                manifest_len,
-                "manifest length"
-            );
-            black_box(load_idx(&idx_path).count)
-        });
-        println!("  [{state}] trusted, read + CRC .idx {:.1} ms", ms(t));
-
-        prep(&dir);
-        let (_, t) = timed(|| black_box(crc32fast::hash(&std::fs::read(&pack).expect("read"))));
-        println!(
-            "  [{state}] digest-verify reopen (read whole pack + CRC) {:.0} ms",
-            ms(t)
-        );
-
+        measure_reopen(&dir, &pack, &idx_path, manifest_len, cold);
         if cold {
-            // Page-fault cost of the first lookups on a freshly mapped, evicted index.
-            let probe: Vec<[u8; 16]> = (0..1000u64)
-                .map(|i| node_id(mix(i ^ 5) % records))
-                .collect();
-            prep(&dir);
-            let fresh = map_idx(&idx_path);
-            let (found, t) = timed(|| probe.iter().filter(|k| fresh.get(k).is_some()).count());
-            assert_eq!(found, probe.len(), "cold mmap lookups hit");
-            println!(
-                "  [cold] mmap: first 1000 random lookups {:.1} ms total",
-                ms(t)
-            );
-        }
-        drop(mapped);
-        if !cold {
-            let keys: Vec<[u8; 16]> = (0..lookups as u64)
-                .map(|i| node_id(mix(i) % records))
-                .collect();
-            let (found, t) = timed(|| keys.iter().filter(|k| idx.get(k).is_some()).count());
-            assert_eq!(found, lookups, "every point lookup hits");
-            println!(
-                "  point lookups: {:.0} ns each over {lookups} random keys",
-                t.as_secs_f64() * 1e9 / lookups as f64
-            );
-            let mapped = map_idx(&idx_path);
-            let (found, t) = timed(|| keys.iter().filter(|k| mapped.get(k).is_some()).count());
-            assert_eq!(found, lookups, "every mmap lookup hits");
-            println!(
-                "  point lookups (mmap, resident): {:.0} ns each",
-                t.as_secs_f64() * 1e9 / lookups as f64
-            );
-            {
-                use std::os::unix::fs::FileExt;
-                let file = std::fs::File::open(&pack).expect("open pack");
-                // pread into a reused buffer, then decode and validate the frame.
-                let mut buf = vec![0u8; 72 << 10];
-                let (found, t) = timed(|| {
-                    let mut ok = 0;
-                    for k in &keys {
-                        let off = idx.get(k).expect("hit");
-                        // 4 KiB first; a longer frame fails with EOF and is re-read whole.
-                        let n = file.read_at(&mut buf[..4096], off).expect("pread");
-                        let rec = if let Ok(rec) = mtxdb::packfile::read_record(&mut &buf[..n]) {
-                            rec
-                        } else {
-                            let n = file.read_at(&mut buf, off).expect("pread");
-                            mtxdb::packfile::read_record(&mut &buf[..n]).expect("read frame")
-                        };
-                        black_box(&rec);
-                        ok += 1;
-                    }
-                    ok
-                });
-                assert_eq!(found, lookups, "end-to-end hits");
-                println!(
-                    "  end-to-end via .idx (locate + pread + read_record; naive read path, not tuned): {:.0} ns each",
-                    t.as_secs_f64() * 1e9 / lookups as f64
-                );
-            }
-            let mut sorted = keys.clone();
-            sorted.sort_unstable();
-            let (found, t) = timed(|| idx.batch(&sorted));
-            assert_eq!(found, lookups, "every batch key hits");
-            println!(
-                "  sorted batch ({lookups} keys, merge-walk over the whole index): {:.1} ms",
-                ms(t)
-            );
-            let store = PackfileStorage::open(dir.clone()).expect("open");
-            let (found, t) = timed(|| {
-                keys.iter()
-                    .filter(|k| store.get(&COLLECTION, k).expect("get").is_some())
-                    .count()
-            });
-            assert_eq!(found, lookups, "store lookups hit");
-            println!(
-                "  end-to-end via store.get (hash locator + frame read): {:.0} ns each",
-                t.as_secs_f64() * 1e9 / lookups as f64
-            );
-            drop(store);
+            measure_cold_lookups(&dir, &idx_path, records);
+        } else {
+            measure_warm_lookups(&dir, &pack, &idx_path, &idx, records, lookups);
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
