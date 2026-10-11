@@ -218,9 +218,9 @@ fn corrupt_checkpoints_read_as_none() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A checkpoint written by the immediately preceding version (v7: 36-byte
-/// pack-table entries carrying the 32-byte `PackId`) must be rejected, not
-/// misread as v8's 20-byte entries. The version gate is what forces the
+/// A checkpoint written with a different version (36-byte
+/// pack-table entries carrying a 32-byte `PackId`) must be rejected, not
+/// misread as the current 20-byte entries. The version gate is what forces the
 /// caller's full-rescan fallback instead of serving a garbled index.
 #[test]
 fn previous_version_checkpoint_is_rejected() {

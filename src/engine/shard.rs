@@ -892,7 +892,7 @@ impl ShardPool {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(
-                        "found pre-v4 shard file {}; \
+                        "found unsupported shard_ pack file {}; \
                          use a fresh pool or explicitly migrate/reset it",
                         path.display()
                     ),
@@ -2621,7 +2621,7 @@ impl ShardPool {
         unreachable!("read_at remap-retry is bounded to two iterations")
     }
 
-    /// Verify and decode one complete v3 frame already bounded within an mmap.
+    /// Verify and decode one complete frame already bounded within an mmap.
     /// When `verify` is false — or the frame carries
     /// [`packfile::FLAG_CRC_DISABLED`] — the checksum is skipped, not
     /// compared; structural validation (lengths, flags, node bytes) still runs.

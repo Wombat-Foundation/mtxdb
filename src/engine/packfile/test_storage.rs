@@ -826,7 +826,7 @@ fn repack_persisted_checkpoint_reload_resolves_record_by_post_repack_offset() {
 
 /// Coverage for a post-repack delta epoch over *existing* pack identities:
 /// a delta written after repack's fresh checkpoint must replay for a cold
-/// reader and resolve through the checkpoint's v6 pack table, not the
+/// reader and resolve through the checkpoint's pack table, not the
 /// reader's own shard numbering.
 ///
 /// `repack_collection_reachable` persists a checkpoint (C1) naming the
@@ -2221,13 +2221,13 @@ fn test_get_location_rejects_an_active_transaction_overlay() {
     );
 }
 
-/// The shard→collection sidecar stamped with the previous version byte (v6)
+/// The shard→collection sidecar stamped with a different version byte
 /// must be rejected by the version gate before attempting to parse records.
 /// (Patching only the version byte is sufficient: the reader rejects the file
-/// before looking at the body, so a real v6-width body need not be constructed.)
+/// before looking at the body, so a real old-width body need not be constructed.)
 /// The sidecar is a rebuildable acceleration, so rejection routes open to
 /// scanning the collection directory, and a subsequent persist rewrites a
-/// valid v7 sidecar.
+/// valid sidecar.
 #[test]
 fn previous_version_shard_collections_sidecar_is_rejected_and_rebuilt() {
     let dir = test_dir("shard_collections_prev_version");
@@ -5891,8 +5891,8 @@ fn test_collection_directory_from_disk_matches_collection_summaries_after_sync()
         from_disk, expected,
         "the persisted directory's per-collection totals must match the live index's own counts"
     );
-    let disk_bytes = PackfileStorage::collection_disk_bytes_from_disk(&dir)
-        .expect("v5 sidecar physical metrics");
+    let disk_bytes =
+        PackfileStorage::collection_disk_bytes_from_disk(&dir).expect("sidecar physical metrics");
     assert!(disk_bytes.get(&TEST_COLLECTION).copied().unwrap_or(0) > 0);
     assert!(disk_bytes.get(&OTHER_COLLECTION).copied().unwrap_or(0) > 0);
     assert!(PackfileStorage::collection_directory_persisted_at(&dir).is_some());

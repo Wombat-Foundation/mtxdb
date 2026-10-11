@@ -2802,7 +2802,7 @@ fn cold_record_token_seeds_from_frame_metadata() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A frame whose record token is `0` — a legacy v4 frame with no
+/// A frame whose record token is `0` — a frame with no
 /// `last_write_lsn` tag, or a write made without a journal — reads as version
 /// `0`, not as a never-written sentinel.
 #[test]

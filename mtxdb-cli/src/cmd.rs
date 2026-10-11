@@ -4128,7 +4128,7 @@ fn glob_pack_files(dir: &Path) -> anyhow::Result<Vec<(PackId, u64, u8)>> {
         };
         if stem.starts_with("shard_") {
             bail!(
-                "found pre-v4 shard file {}; reset it rather than opening it as v4",
+                "found unsupported shard_ pack file {}; reset it rather than opening it",
                 path.display()
             );
         }
@@ -4182,7 +4182,7 @@ type ShardStatsMap = std::collections::HashMap<PackId, (u64, u64, u64)>;
 /// snapshot's persisted-at timestamp.
 fn decode_stats_snapshot(dir: &Path) -> (ShardStatsMap, Option<u64>) {
     const STATS_MAGIC: &[u8; 4] = b"MSTA";
-    const STATS_VERSION: u8 = 6;
+    const STATS_VERSION: u8 = 1;
     const STATS_HEADER_LEN: usize = 4 + 1 + 8;
     const STATS_RECORD_LEN: usize = mtxdb::packfile::PACK_ID_LEN + 8 * 3;
 

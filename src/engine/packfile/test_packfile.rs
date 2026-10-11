@@ -128,7 +128,7 @@ fn test_metadata_roundtrip() {
 }
 
 /// The per-record write LSN is a forward-compatible optional tag: absent
-/// means a legacy v4 frame (version 0), it round-trips exactly, and a value
+/// means a frame with no tag (version 0), it round-trips exactly, and a value
 /// that is not eight bytes is rejected rather than silently ignored.
 #[test]
 fn test_last_write_lsn_metadata_tag() {
@@ -155,7 +155,7 @@ fn test_last_write_lsn_metadata_tag() {
 }
 
 /// The metadata flag must be set only when metadata is present; a record
-/// with `None` (or empty) metadata stays byte-identical to a v4 frame with
+/// with `None` (or empty) metadata stays byte-identical to a frame with
 /// no metadata area, so generic records pay nothing.
 #[test]
 fn test_no_metadata_frame_is_unchanged() {

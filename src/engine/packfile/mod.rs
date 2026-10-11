@@ -337,7 +337,7 @@ pub const FLAG_COMPRESSED: u8 = 0x01;
 /// the byte layout differs from the flag's absence.
 pub const FLAG_METADATA: u8 = 0x04;
 
-/// Any flag bit a v4 reader understands. A frame carrying a bit outside this
+/// Any flag bit this reader understands. A frame carrying a bit outside this
 /// mask is rejected rather than misparsed.
 const KNOWN_FLAGS: u8 = FLAG_COMPRESSED | FLAG_CRC_DISABLED | FLAG_METADATA;
 
@@ -362,7 +362,7 @@ pub const META_TAG_ROLE: u8 = 0x03;
 pub const META_TAG_DIGEST_ALGORITHM: u8 = 0x04;
 
 /// TLV type: the LSN of the journal group that last wrote this record, an
-/// 8-byte little-endian value. Absent means a legacy v4 frame, whose version
+/// 8-byte little-endian value. Absent means a frame with no tag, whose version
 /// readers treat as `0`. This is the per-record optimistic-concurrency token:
 /// a conditional write names the LSN it observed and is rejected if the record
 /// has since been rewritten by a later group.
@@ -415,7 +415,7 @@ impl ChecksumPolicy {
     }
 }
 
-/// Byte length of the fixed part of a v3 frame's payload, i.e. everything
+/// Byte length of the fixed part of a frame's payload, i.e. everything
 /// between the length prefix and the node bytes: 1-byte flags + 4-byte
 /// `uncompressed_len` + 16-byte `collection_id` + 16-byte `hash`.
 pub(crate) const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
@@ -508,7 +508,7 @@ impl Iterator for PackfileScanner {
 
 /// A single record in the packfile.
 ///
-/// Frame layout on disk (v3):
+/// Frame layout on disk:
 /// ```text
 /// [u32 len]              — byte length of everything below down to (not including) crc32, little-endian
 /// [u8 flags]             — bit 0: node bytes are zstd-compressed
@@ -538,7 +538,7 @@ pub struct Record {
     /// The opaque node payload.
     pub data: Bytes,
     /// Optional versioned per-record metadata (see [`FrameMetadata`]). `None`
-    /// for a generic frame, which is byte-for-byte identical to a v4 record
+    /// for a generic frame, which is byte-for-byte identical to a record
     /// with no metadata area.
     pub metadata: Option<FrameMetadata>,
 }
@@ -572,7 +572,7 @@ pub struct FrameMetadata {
     /// Role/schema identifier, if supplied.
     pub role: Option<Vec<u8>>,
     /// LSN of the journal group that last wrote this record. Absent on a
-    /// legacy v4 frame, which a reader treats as version `0`.
+    /// frame with no tag, which a reader treats as version `0`.
     pub last_write_lsn: Option<u64>,
     /// Tags this build does not interpret, preserved verbatim so a
     /// read/rewrite cycle does not discard a newer writer's fields.
@@ -1566,7 +1566,7 @@ pub fn read_version(reader: &mut impl Read) -> io::Result<Option<u8>> {
 /// which all propagate this via `?`) can't mistake "this store is a
 /// format I don't understand" for "this store has no data":
 ///
-/// - Right magic, wrong version (most notably a pre-v2 store): a
+/// - Right magic, wrong version (most notably an older store): a
 ///   distinct, identifiable error naming the version found, not folded
 ///   into "not a packfile".
 /// - Right magic and version, but truncated before a full `HEADER_LEN`
@@ -1621,7 +1621,7 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
 
     // Phase 2: magic and version confirmed — read the rest of the
     // reserved header. Running out of bytes here means a genuinely
-    // truncated v2 header, which is corruption, not "not a packfile".
+    // truncated header, which is corruption, not "not a packfile".
     let mut buf = [0u8; HEADER_LEN];
     buf[..4].copy_from_slice(&magic);
     buf[4] = version;
@@ -1629,7 +1629,7 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
         if e.kind() == io::ErrorKind::UnexpectedEof {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("truncated v2 shard header: shorter than {HEADER_LEN} bytes"),
+                format!("truncated shard header: shorter than {HEADER_LEN} bytes"),
             )
         } else {
             e

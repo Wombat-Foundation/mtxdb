@@ -1318,7 +1318,7 @@ impl PackfileStorage {
     /// collection version.
     ///
     /// A record absent because its collection was deleted resolves to the
-    /// delete LSN, and a legacy v4 frame with no `last_write_lsn` tag resolves
+    /// delete LSN, and a frame with no `last_write_lsn` tag resolves
     /// to `0`. A cold record (written before this process, its group reclaimed)
     /// is seeded from its frame metadata the first time it is read.
     ///

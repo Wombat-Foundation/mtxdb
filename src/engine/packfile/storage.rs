@@ -6733,7 +6733,7 @@ impl PackfileStorage {
 
     /// The per-record write LSN recorded in a durable record's frame, for
     /// seeding a cold optimistic token. `None` when the record is absent or
-    /// carries no `last_write_lsn` tag (a legacy v4 frame, read as version 0).
+    /// carries no `last_write_lsn` tag (a frame with no tag, read as version 0).
     pub(crate) fn record_last_write_lsn(
         &self,
         collection_id: &[u8; 16],

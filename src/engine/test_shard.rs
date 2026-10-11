@@ -820,11 +820,11 @@ fn test_shard_pool_scan() {
 
 /// End-to-end: real data survives a real close-and-reopen through the
 /// actual `ShardPool::open` bootstrap, not just a raw byte-level
-/// `read_header` call — proves the v2 header roundtrips through the
+/// `read_header` call — proves the header roundtrips through the
 /// path a real process restart actually takes.
 #[test]
-fn test_shard_pool_reopen_survives_v2_header_roundtrip() {
-    let dir = test_dir("pool_reopen_v2");
+fn test_shard_pool_reopen_survives_header_roundtrip() {
+    let dir = test_dir("pool_reopen_header");
     let pool = ShardPool::open(dir.clone()).unwrap();
     let record = test_record(0x01, 0xAA, b"survives reopen");
     let (slot, offset) = pool.put_record(&record).unwrap();
@@ -887,11 +887,10 @@ fn test_shard_pool_open_fails_on_corrupt_header_crc() {
     }
 }
 
-/// End-to-end: `ShardPool::open` fails when a shard file has a
-/// v4 filename but contains v1 content — this is a pre-v4
-/// remnant, not a valid v4 pack.
+/// End-to-end: `ShardPool::open` fails when a pack file has a current
+/// filename but contains old-layout content — not a valid pack.
 #[test]
-fn test_shard_pool_open_fails_on_v1_with_v4_filename() {
+fn test_shard_pool_open_fails_on_old_layout_content() {
     let dir = test_dir("pool_open_v1_store");
     std::fs::create_dir_all(&dir).unwrap();
     let path = ShardPool::pack_path(&dir, &pack_id_for(0), &[]);
@@ -910,8 +909,8 @@ fn test_shard_pool_open_fails_on_v1_with_v4_filename() {
     .unwrap();
     std::fs::write(&path, &buf).unwrap();
 
-    // The pool fails to open — v1 content in a v4 filename slot
-    // is corruption.
+    // The pool fails to open — old-layout content in a current filename
+    // slot is corruption.
     match ShardPool::open(dir) {
         Err(e) => {
             assert!(
@@ -920,29 +919,29 @@ fn test_shard_pool_open_fails_on_v1_with_v4_filename() {
                 e.kind()
             );
         }
-        Ok(_) => panic!("expected error for v1 content in v4 filename"),
+        Ok(_) => panic!("expected error for old-layout content in a pack filename"),
     }
 }
 
-/// `discover_pack_files` rejects v3 filenames (e.g.
+/// `discover_pack_files` rejects `shard_` filenames (e.g.
 /// `pack_0004_0000000000000004.pack`) with `Unsupported` rather
 /// than silently skipping them.
 #[test]
-fn test_discover_rejects_v3_filenames() {
-    let dir = test_dir("discover_v3_reject");
+fn test_discover_rejects_shard_filenames() {
+    let dir = test_dir("discover_shard_reject");
     std::fs::create_dir_all(&dir).unwrap();
-    // Create a v3-format filename — 4-digit slot + underscore + 16-digit epoch.
+    // Create a `shard_` filename — 4-digit slot + underscore + 16-digit epoch.
     let path = dir.join("shard_0004_0000000000000004.pack");
     std::fs::write(&path, b"fake").unwrap();
     match ShardPool::discover_pack_files(&dir) {
         Err(e) => {
             assert_eq!(e.kind(), io::ErrorKind::Unsupported);
             assert!(
-                e.to_string().contains("pre-v4"),
-                "error should mention pre-v4, got: {e}"
+                e.to_string().contains("unsupported shard_"),
+                "error should mention the unsupported shard_ file, got: {e}"
             );
         }
-        Ok(_) => panic!("expected Unsupported error for v3 filename"),
+        Ok(_) => panic!("expected Unsupported error for shard_ filename"),
     }
 }
 
