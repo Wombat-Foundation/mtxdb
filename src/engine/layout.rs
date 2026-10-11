@@ -328,7 +328,7 @@ impl DatabaseLayout {
     /// is unknown.
     pub fn open(root: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&root)?;
-        Self::reject_legacy_flat_store(&root)?;
+        Self::reject_flat_store(&root)?;
         let meta_path = root.join(DB_META_FILENAME);
         if !meta_path.exists() {
             Self::write_descriptor(&meta_path)?;
@@ -403,7 +403,7 @@ impl DatabaseLayout {
             ));
         }
         let seed = read_db_meta(&meta_path)?.seed;
-        Self::reject_legacy_flat_store(&root)?;
+        Self::reject_flat_store(&root)?;
         Ok(Self { root, seed })
     }
 
@@ -422,7 +422,7 @@ impl DatabaseLayout {
         self.root.join("wal.bin")
     }
 
-    fn reject_legacy_flat_store(root: &Path) -> io::Result<()> {
+    fn reject_flat_store(root: &Path) -> io::Result<()> {
         for entry in fs::read_dir(root)? {
             let path = entry?.path();
             if path
@@ -432,7 +432,7 @@ impl DatabaseLayout {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "legacy flat mtxdb store at {}; migrate it or use a fresh database root before enabling named pools",
+                        "unpooled flat mtxdb store at {}; migrate it or use a fresh database root before enabling named pools",
                         root.display()
                     ),
                 ));

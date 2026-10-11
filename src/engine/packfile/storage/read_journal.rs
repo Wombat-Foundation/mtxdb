@@ -1395,7 +1395,7 @@ impl PackfileStorage {
             let mut version = journal.record_version(pool, collection_id, id);
             if version.is_none() && data[index].is_some() {
                 // A record the live map does not know is durable and cold;
-                // seed its token from the frame's own write LSN (legacy
+                // seed its token from the frame's own write LSN (journal-less
                 // frames carry none, read as version 0).
                 let lsn = self.record_last_write_lsn(collection_id, id)?.unwrap_or(0);
                 version = Some(journal.seed_record_version(pool, *collection_id, *id, lsn));
@@ -1418,7 +1418,7 @@ impl PackfileStorage {
     /// the ordered commit token a caller needs to make a record-versioned read
     /// authoritative without a second authority, and unlike the coordinator map
     /// it is available to a read-only worker. A record resolved absent by a
-    /// collection delete reports the delete LSN; an absent or legacy record
+    /// collection delete reports the delete LSN; an absent or journal-less record
     /// reports `0`.
     fn snapshot_record_versions(
         &self,
@@ -1621,7 +1621,7 @@ impl ReadSnapshot {
     ///
     /// The token is the LSN of the journal group that last wrote the record (or
     /// the delete LSN for a record resolved absent by a collection delete, or
-    /// `0` for a legacy frame with none). Two records committed in the same
+    /// `0` for a journal-less frame with none). Two records committed in the same
     /// group share a token, so a caller can pair a room's metadata with the
     /// generation-scoped FWD collection it names and compare one authoritative
     /// publication token instead of a separate SQL source version.

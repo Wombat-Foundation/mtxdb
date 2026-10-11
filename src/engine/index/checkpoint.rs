@@ -53,7 +53,7 @@ pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
 /// Current v1 wire version (see [`CheckpointHeader::version`]).
 ///
 /// This is a hard-cutover format; a mismatched version causes the checkpoint
-/// to be rebuilt rather than decoded through a legacy layout.
+/// to be rebuilt rather than decoded through a different layout.
 pub const CHECKPOINT_VERSION: u32 = 1;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";

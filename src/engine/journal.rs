@@ -785,7 +785,7 @@ impl TxnStage {
         }
         // Preserve the historical per-pool append order for the existing
         // pools; ServerInfo is appended after them without changing the WAL
-        // ordering of legacy frames.
+        // ordering of the other pools' frames.
         let pools = [
             ShardType::Edges,
             ShardType::EventDag,

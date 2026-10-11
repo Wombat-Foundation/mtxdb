@@ -275,7 +275,7 @@ impl DatabaseTransaction<'_> {
     /// transaction with [`StorageError::StaleRead`] if the record's write LSN
     /// at publication differs from `expected`. `expected` is the token returned
     /// by [`Self::get_with_record_versions`] for the same record (the
-    /// collection's delete LSN when the record was absent, or `0` for a legacy
+    /// collection's delete LSN when the record was absent, or `0` for a journal-less
     /// frame).
     ///
     /// # Errors

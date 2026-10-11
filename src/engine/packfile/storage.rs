@@ -975,7 +975,7 @@ const SHARD_ROOMS_RECORD_LEN: usize = crate::packfile::PACK_ID_LEN + 16 + 8 + 8 
 
 /// The largest record offset `IndexEntry` can represent: its 32-bit offset
 /// field stores `offset + 1`, reserving the all-zeros encoding for the empty
-/// sentinel. Offsets beyond this can only come from legacy or externally
+/// sentinel. Offsets beyond this can only come from externally
 /// created oversized packs — this engine's own writes rotate long before
 /// reaching it (`MAX_SHARD_BYTES` caps each shard's file size).
 const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexEntry::MAX_OFFSET;
@@ -2501,8 +2501,8 @@ impl PackfileStorage {
         let metadata_started = std::time::Instant::now();
         // Seed logical insertion order before scanning. A newly written collection
         // cannot appear in the sidecar until the next flush, so append it at
-        // first physical sight below. Legacy v1 sidecars yield no order and
-        // therefore use the same first-seen fallback for every collection.
+        // first physical sight below. A missing or unreadable sidecar yields no order and
+        // therefore uses the same first-seen fallback for every collection.
         let mut collection_order = persisted_collection_order(&base_dir).unwrap_or_default();
         let mut known_collections: HashSet<[u8; 16]> = collection_order.iter().copied().collect();
 
@@ -6511,7 +6511,7 @@ impl PackfileStorage {
         for (slot, entries) in scanned {
             for (hash, offset) in entries {
                 // `IndexEntry` can only represent offsets up to
-                // `PACK_INDEX_OFFSET_LIMIT`. Offsets a legacy or externally
+                // `PACK_INDEX_OFFSET_LIMIT`. Offsets an externally
                 // created oversized shard can no longer fit are rejected
                 // rather than silently skipped: writes are already capped at
                 // `MAX_SHARD_BYTES`, so a record beyond the limit means the
@@ -9890,7 +9890,7 @@ impl PackfileStorage {
     /// The coordinator must be built from a pool-tagged segment (see
     /// [`Journal::open_shared`]) and the caller must hold the root writer lock
     /// ([`crate::journal::SharedWalLock`]). This is opt-in; a store that never
-    /// calls it keeps the legacy per-pool journal path unchanged.
+    /// calls it keeps its private per-pool journal path unchanged.
     ///
     /// The store's existing durable coverage (the `journal.lsn` written beside
     /// its last checkpoint) is reported to the coordinator on attach. Without
@@ -10235,7 +10235,7 @@ impl PackfileStorage {
     }
 
     /// Apply a mutation staged by a database transaction without publishing
-    /// it to the legacy per-write journal queue. The transaction coordinator
+    /// it to the per-write journal queue. The transaction coordinator
     /// publishes the complete batch after every pool has applied successfully.
     pub(crate) fn apply_transaction_mutation(
         &self,

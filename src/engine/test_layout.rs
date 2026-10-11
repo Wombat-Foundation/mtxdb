@@ -225,13 +225,13 @@ fn first_open_reaps_orphaned_descriptor_temps() {
 }
 
 #[test]
-fn refuses_legacy_flat_packfiles() {
-    let root = test_dir("legacy");
+fn refuses_flat_packfiles() {
+    let root = test_dir("flat");
     fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("shard_0000_0000000000000000.pack"), b"legacy").unwrap();
+    fs::write(root.join("shard_0000_0000000000000000.pack"), b"flat").unwrap();
     let err = DatabaseLayout::open(root).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("legacy flat"));
+    assert!(err.to_string().contains("unpooled flat"));
 }
 
 #[test]
@@ -296,18 +296,18 @@ fn read_only_open_rejects_a_corrupt_descriptor() {
 }
 
 #[test]
-fn read_only_open_rejects_a_legacy_flat_store() {
-    let root = test_dir("read_only_legacy");
+fn read_only_open_rejects_a_flat_store() {
+    let root = test_dir("read_only_flat");
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join(DB_META_FILENAME),
         super::db_meta_bytes(0x1234_5678_9abc_def1),
     )
     .unwrap();
-    fs::write(root.join("shard_0000_0000000000000000.pack"), b"legacy").unwrap();
+    fs::write(root.join("shard_0000_0000000000000000.pack"), b"flat").unwrap();
     let err = DatabaseLayout::open_read_only(root).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("legacy flat"));
+    assert!(err.to_string().contains("unpooled flat"));
 }
 
 #[test]

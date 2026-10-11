@@ -5173,11 +5173,11 @@ fn meta_wal(
     paths.dedup();
     if root.join("wal.bin").is_file() {
         for (_, dir) in meta_pool_dirs(root) {
-            let legacy = dir.join("wal.bin");
-            if legacy.is_file() {
+            let pool_wal = dir.join("wal.bin");
+            if pool_wal.is_file() {
                 report.finding(
                     "WARN",
-                    &legacy,
+                    &pool_wal,
                     "per-pool WAL is present but ignored because root wal.bin selects shared WAL",
                 );
             }

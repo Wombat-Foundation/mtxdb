@@ -2576,7 +2576,7 @@ fn a_second_writer_on_one_root_is_refused() {
 
 #[test]
 fn a_per_pool_journal_is_refused_inside_a_shared_root() {
-    let root = test_root("legacy_gate");
+    let root = test_root("per_pool_gate");
     let db = Database::open(root.clone()).unwrap();
     let err = db
         .pool(ShardType::State)
@@ -2807,17 +2807,17 @@ fn cold_record_token_seeds_from_frame_metadata() {
 /// `0`, not as a never-written sentinel.
 #[test]
 fn zero_token_frame_reads_version_zero() {
-    let root = test_root("record_legacy_zero");
+    let root = test_root("record_journal_less_zero");
     let db = Database::open(root.clone()).unwrap();
     let pool = ShardType::State;
     let collection = [0x76u8; 16];
     let key = node(1);
-    // Apply directly with a zero token and no publication, modelling a legacy
+    // Apply directly with a zero token and no publication, modelling a journal-less
     // frame or a write made without a journal.
     let mutation = crate::journal::Mutation::Put {
         collection_id: collection,
         node_id: key,
-        payload: b"legacy".to_vec(),
+        payload: b"journal-less".to_vec(),
     };
     db.pool(pool)
         .apply_transaction_mutation(&mutation, 0)
@@ -2827,7 +2827,7 @@ fn zero_token_frame_reads_version_zero() {
     let (records, versions) = reader
         .get_with_record_versions(pool, &collection, &[key])
         .unwrap();
-    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"legacy");
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"journal-less");
     assert_eq!(versions[0], 0, "a zero-token frame reads as version 0");
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
