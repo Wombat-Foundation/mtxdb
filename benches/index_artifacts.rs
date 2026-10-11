@@ -377,8 +377,9 @@ fn measure_reopen(dir: &Path, pack: &Path, idx_path: &Path, manifest_len: u64, c
     let timings = store.open_timings().expect("timings");
     drop(store);
     println!(
-        "  [{state}] current open {:.0} ms (pack recovery {:.0}, checkpoint decode {:.0}, \
+        "  [{state}] current open via {:?} {:.0} ms (pack recovery {:.0}, checkpoint decode {:.0}, \
          index materialization {:.0}), first read {:.2} ms",
+        timings.path,
         ms(t_open),
         ms(timings.packfile_recovery),
         ms(timings.checkpoint_decode),
@@ -493,6 +494,10 @@ fn measure_warm_lookups(
     );
 
     let store = PackfileStorage::open(dir.to_path_buf()).expect("open");
+    println!(
+        "  store.get lookups run on an open via {:?}",
+        store.open_timings().map(|t| t.path)
+    );
     let (found, t) = timed(|| {
         keys.iter()
             .filter(|k| store.get(&COLLECTION, k).expect("get").is_some())
