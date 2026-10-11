@@ -54,19 +54,13 @@ impl JsonValueExt for OwnedValue {
 /// that is semantically stale cannot be detected without recomputing it. For
 /// the same reason a corrupted-but-well-formed entry is not self-correcting;
 /// recovering from that requires purging the namespace.
-/// The previous unversioned namespace is intentionally left as dead weight;
-/// auxiliary indexes are not globally enumerated or garbage-collected here.
 ///
-/// v2: the state-group id changed from a BLAKE3 digest of the sorted entries to
-/// the unkeyed `LtHash` digest used by Synapse/sithnapse and materialized into
-/// each `MTHR` root.
-///
-/// v3: the value is a raw 128-bit `STGP` state-group *instance* id, derived from
-/// the sorted parent instance ids and the state `LtHash`, instead of the
-/// base64url `LtHash` digest. The `STGP` record holds the parent links and the
-/// shared `STAT` root id, so equal state content reached through different
-/// parents stays distinct.
-const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v3";
+/// The value is a raw 128-bit `STGP` state-group *instance* id, derived from
+/// the sorted parent instance ids and the state `LtHash` (the unkeyed digest
+/// used by Synapse/sithnapse and materialized into each `MTHR` root). The
+/// `STGP` record holds the parent links and the shared `STAT` root id, so equal
+/// state content reached through different parents stays distinct.
+const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
 
 /// Whether `value` is a well-formed 128-bit STGP state-group instance id.
 fn valid_state_group_id(value: &[u8]) -> bool {

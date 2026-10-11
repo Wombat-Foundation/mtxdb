@@ -1864,9 +1864,9 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
     )
     .unwrap();
 
-    // v3 cannot see the old entry, so the import recomputes and persists a
+    // The versioned namespace cannot see the old entry, so the import recomputes and persists a
     // real instance id; the old namespace is left untouched as dead weight.
-    let recomputed = new_aux.get(b"$cached").unwrap().expect("v3 mapping");
+    let recomputed = new_aux.get(b"$cached").unwrap().expect("state-group mapping");
     assert_ne!(recomputed.as_slice(), stale.as_slice());
     assert!(valid_state_group_id(&recomputed));
     assert_eq!(old_aux.get(b"$cached").unwrap(), Some(stale.to_vec()));

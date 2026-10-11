@@ -208,7 +208,7 @@ pub enum StateGroupRelation {
     InstancesByLtHash,
     /// `parent instance id -> many child instances` (invert `parents`).
     ChildrenByParent,
-    /// `event_id -> instance id` (the v3 auxiliary mapping).
+    /// `event_id -> instance id` (the state-group auxiliary mapping).
     InstanceByEvent,
 }
 
