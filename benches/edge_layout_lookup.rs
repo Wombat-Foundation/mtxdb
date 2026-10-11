@@ -1,0 +1,691 @@
+//! Read and write cost of the chunked edge-layout prototype against the
+//! current `ShortIdIndex` store, on the same room.
+//!
+//! Benchmark-only: the prototype is not a production format, and its on-disk
+//! shape is the one `edge_layout_common.rs` writes. Both layouts live in the
+//! same kind of `Database` pool, so storage reads cost the same.
+//!
+//! Workload assumptions, stated once:
+//! - One room (`MTXDB_EL_TSV`), events recorded in file order in batches of
+//!   1000; ids are dense and first-seen for the prototype.
+//! - Lookups are a fixed seeded sample of `MTXDB_EL_OPS` (default 20000) events;
+//!   hits ask for those events, misses ask for the same ids with `~` appended.
+//! - The three paths are key -> id, id -> key and "all three edge lists of an
+//!   owner". The baseline reads three records for the last; the prototype reads
+//!   one chunk. The baseline has no batch API for key -> id or edges, so its
+//!   "batch" loops over single reads; only `resolve` is a native batch.
+//! - Prototype key -> id returns a hit only after the id -> key chunk confirms
+//!   the key, so a hash collision cannot pass as a hit. `naive` reads every run
+//!   record on each call; `merged` holds all runs in memory as one sorted
+//!   vector, loaded once (its load time is printed).
+//! - Every result is checked against the source ids (outside the timed region),
+//!   and the whole room is round-tripped once per layout before timing.
+//! - Cold = reopen the database, `sync`, evict the store's files with
+//!   `vmtouch -e`, then time the first `MTXDB_EL_COLD` (default 1000) calls.
+//!   The in-memory index is rebuilt by reopen, so cold measures pack reads.
+//! - Writes are timed separately: the prototype rewrites every chunk that
+//!   changed in a batch, and bytes written are reported apart from latency.
+//!
+//! ```text
+//! MTXDB_EL_TSV=room.tsv MTXDB_BENCH_ROOT=/run/media/shane/shane4tb-ent/bench-scratch \
+//!   cargo +1.90.0 bench --manifest-path benches/Cargo.toml --bench edge_layout_lookup
+//! ```
+
+use std::collections::{BTreeMap, HashSet};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use mtxdb::database::Database;
+use mtxdb::short_id::{Edge, EdgeFamily, ShortIdIndex};
+use mtxdb::storage::StorageEngine;
+
+#[path = "edge_layout_common.rs"]
+mod common;
+
+use common::{
+    baseline_scope, key_hash, len_f64, load, mib, num, per, record_rows, sizes, spread,
+    write_chunked, PutStats, Row, Variant, WriteStats, AUTH, CHUNK, CHUNK_COLLECTION,
+    KIND_EDGE_CHUNK, KIND_KEY_CHUNK, KIND_RUN, PREV, REL,
+};
+
+/// A key's three edge lists as target ids: prev, auth, relations.
+type Edges = [Vec<u32>; 3];
+/// Bytes of one prototype run entry: 16-byte key hash and a big-endian id.
+const RUN_ENTRY: usize = 20;
+const MICROS: f64 = 1_000_000.0;
+
+/// What a layout can do. A single read passes a slice of one.
+trait Layout {
+    fn key_to_ids(&self, keys: &[&str]) -> Vec<Option<u32>>;
+    fn id_to_keys(&self, ids: &[u32]) -> Vec<Option<String>>;
+    fn edges(&self, ids: &[u32]) -> Vec<Edges>;
+    /// Hash matches rejected because the stored key differed.
+    fn rejected(&self) -> u64 {
+        0
+    }
+}
+
+/// Opens a layout fresh, with no in-memory state from earlier calls.
+type Open<'a> = Box<dyn Fn() -> Box<dyn Layout> + 'a>;
+
+/// The current `ShortIdIndex` store.
+struct Baseline {
+    db: Database,
+    scope: ShortIdIndex,
+}
+
+impl Baseline {
+    fn open(dir: &Path) -> Self {
+        Self {
+            db: Database::open(dir.to_path_buf()).expect("open baseline"),
+            scope: baseline_scope(),
+        }
+    }
+
+    fn family(&self, id: u32, family: EdgeFamily) -> Vec<u32> {
+        self.scope
+            .edges(&self.db, id, family)
+            .expect("edges")
+            .map(|edges| edges.iter().map(|Edge { target, .. }| *target).collect())
+            .unwrap_or_default()
+    }
+}
+
+impl Layout for Baseline {
+    fn key_to_ids(&self, keys: &[&str]) -> Vec<Option<u32>> {
+        keys.iter()
+            .map(|key| self.scope.lookup(&self.db, key.as_bytes()).expect("lookup"))
+            .collect()
+    }
+
+    fn id_to_keys(&self, ids: &[u32]) -> Vec<Option<String>> {
+        self.scope
+            .resolve(&self.db, ids)
+            .expect("resolve")
+            .into_iter()
+            .map(|key| key.map(|bytes| String::from_utf8(bytes).expect("utf8 key")))
+            .collect()
+    }
+
+    fn edges(&self, ids: &[u32]) -> Vec<Edges> {
+        ids.iter()
+            .map(|id| {
+                [
+                    self.family(*id, PREV),
+                    self.family(*id, AUTH),
+                    self.family(*id, REL),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// The chunked prototype read through the same `Database`.
+struct Proto {
+    db: Database,
+    runs: usize,
+    /// All runs as one sorted vector, when loaded (`merged` variant).
+    merged: Option<Vec<([u8; 16], u32)>>,
+    /// Hash matches whose key did not match.
+    rejected: std::cell::Cell<u64>,
+}
+
+fn be32(bytes: &[u8], at: usize) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(at..at.saturating_add(4))?.try_into().ok()?;
+    Some(u32::from_be_bytes(raw))
+}
+
+/// The id of `hash` in a run record's entries, by binary search.
+fn search_run(entries: &[u8], hash: &[u8; 16]) -> Option<u32> {
+    let (mut lo, mut hi) = (0_usize, entries.len() / RUN_ENTRY);
+    while lo < hi {
+        let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+        let at = mid.saturating_mul(RUN_ENTRY);
+        let entry = entries.get(at..at.saturating_add(RUN_ENTRY))?;
+        match entry[..16].cmp(&hash[..]) {
+            std::cmp::Ordering::Equal => return be32(entry, 16),
+            std::cmp::Ordering::Less => lo = mid.saturating_add(1),
+            std::cmp::Ordering::Greater => hi = mid,
+        }
+    }
+    None
+}
+
+/// The key at `pos` in an id -> key chunk record.
+fn key_at(chunk: &[u8], pos: usize) -> Option<&[u8]> {
+    let mut at = 8_usize;
+    for _ in 0..pos {
+        at = at.saturating_add(usize::from(*chunk.get(at)?).saturating_add(1));
+    }
+    let len = usize::from(*chunk.get(at)?);
+    let start = at.saturating_add(1);
+    chunk.get(start..start.saturating_add(len))
+}
+
+/// The three lists at `pos` in an edge-list chunk record.
+fn edges_at(chunk: &[u8], pos: usize) -> Option<Edges> {
+    let count = usize::from(u16::from_be_bytes(chunk.get(8..10)?.try_into().ok()?));
+    let offsets = 10_usize;
+    let body = offsets.saturating_add(count.saturating_mul(4));
+    let off = usize::try_from(be32(chunk, offsets.saturating_add(pos.saturating_mul(4)))?).ok()?;
+    let head = body.saturating_add(off);
+    let lens = chunk.get(head..head.saturating_add(3))?;
+    let mut at = head.saturating_add(3);
+    let mut out: Edges = [Vec::new(), Vec::new(), Vec::new()];
+    for (list, len) in out.iter_mut().zip(lens) {
+        for _ in 0..*len {
+            list.push(be32(chunk, at)?);
+            at = at.saturating_add(4);
+        }
+    }
+    Some(out)
+}
+
+impl Proto {
+    fn open(dir: &Path, merge: bool, runs: usize) -> Self {
+        let mut proto = Self {
+            db: Database::open(dir.to_path_buf()).expect("open prototype"),
+            runs,
+            merged: None,
+            rejected: std::cell::Cell::new(0),
+        };
+        if merge {
+            proto.merged = Some(proto.load_runs());
+        }
+        proto
+    }
+
+    fn fetch(&self, kind: u8, n: usize) -> Option<bytes::Bytes> {
+        let id = spread(kind, u32::try_from(n).expect("record number"));
+        self.db
+            .edges()
+            .get(&CHUNK_COLLECTION, &id)
+            .expect("get")
+            .map(|data| data.bytes)
+    }
+
+    fn load_runs(&self) -> Vec<([u8; 16], u32)> {
+        let mut all = Vec::new();
+        for run in 0..self.runs {
+            let record = self.fetch(KIND_RUN, run).expect("run record");
+            for entry in record.get(8..).unwrap_or_default().chunks_exact(RUN_ENTRY) {
+                let hash: [u8; 16] = entry[..16].try_into().expect("hash");
+                all.push((hash, be32(entry, 16).expect("id")));
+            }
+        }
+        all.sort_unstable();
+        all
+    }
+
+    /// Candidate ids for key hashes, before the key check.
+    fn candidates(&self, hashes: &[[u8; 16]]) -> Vec<Option<u32>> {
+        if let Some(merged) = &self.merged {
+            return hashes
+                .iter()
+                .map(|hash| {
+                    merged
+                        .binary_search_by(|entry| entry.0.cmp(hash))
+                        .ok()
+                        .map(|i| merged[i].1)
+                })
+                .collect();
+        }
+        let mut out = vec![None; hashes.len()];
+        for run in (0..self.runs).rev() {
+            if out.iter().all(Option::is_some) {
+                break;
+            }
+            let record = self.fetch(KIND_RUN, run).expect("run record");
+            let entries = record.get(8..).unwrap_or_default();
+            for (slot, hash) in out.iter_mut().zip(hashes) {
+                if slot.is_none() {
+                    *slot = search_run(entries, hash);
+                }
+            }
+        }
+        out
+    }
+
+    /// `ids` grouped by the chunk that holds them: chunk -> (slot, position).
+    fn by_chunk(ids: &[Option<u32>]) -> BTreeMap<usize, Vec<(usize, usize)>> {
+        let mut groups: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+        for (slot, id) in ids.iter().enumerate() {
+            if let Some(id) = id {
+                let id = *id as usize;
+                groups
+                    .entry(id / CHUNK)
+                    .or_default()
+                    .push((slot, id % CHUNK));
+            }
+        }
+        groups
+    }
+
+    fn keys_of(&self, ids: &[Option<u32>]) -> Vec<Option<String>> {
+        let mut out = vec![None; ids.len()];
+        for (chunk, members) in Self::by_chunk(ids) {
+            let Some(record) = self.fetch(KIND_KEY_CHUNK, chunk) else {
+                continue;
+            };
+            for (slot, pos) in members {
+                out[slot] = key_at(&record, pos).map(|k| String::from_utf8_lossy(k).into_owned());
+            }
+        }
+        out
+    }
+}
+
+impl Layout for Proto {
+    fn key_to_ids(&self, keys: &[&str]) -> Vec<Option<u32>> {
+        let hashes: Vec<[u8; 16]> = keys.iter().map(|k| key_hash(k)).collect();
+        let found = self.candidates(&hashes);
+        let confirmed = self.keys_of(&found);
+        found
+            .iter()
+            .zip(&confirmed)
+            .zip(keys)
+            .map(|((id, stored), key)| match (id, stored) {
+                (Some(id), Some(stored)) if stored == key => Some(*id),
+                (Some(_), _) => {
+                    self.rejected.set(self.rejected.get().saturating_add(1));
+                    None
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn id_to_keys(&self, ids: &[u32]) -> Vec<Option<String>> {
+        let ids: Vec<Option<u32>> = ids.iter().copied().map(Some).collect();
+        self.keys_of(&ids)
+    }
+
+    fn edges(&self, ids: &[u32]) -> Vec<Edges> {
+        let ids: Vec<Option<u32>> = ids.iter().copied().map(Some).collect();
+        let mut out: Vec<Edges> = vec![Edges::default(); ids.len()];
+        for (chunk, members) in Self::by_chunk(&ids) {
+            let record = self.fetch(KIND_EDGE_CHUNK, chunk).expect("edge chunk");
+            for (slot, pos) in members {
+                out[slot] = edges_at(&record, pos).expect("edge entry");
+            }
+        }
+        out
+    }
+
+    fn rejected(&self) -> u64 {
+        self.rejected.get()
+    }
+}
+
+/// The sampled workload and the ids the layout under test assigned.
+struct Ctx<'a> {
+    rows: &'a [Row],
+    /// `rows[i]`'s id in the layout under test.
+    row_ids: Vec<u32>,
+    /// Row indexes of the sampled events.
+    sample: &'a [usize],
+    /// Absent keys, one per sampled event.
+    misses: &'a [String],
+}
+
+#[derive(Clone, Copy)]
+enum Op {
+    KeyHit,
+    KeyMiss,
+    IdToKey,
+    Edges,
+}
+
+impl Op {
+    const ALL: [Self; 4] = [Self::KeyHit, Self::KeyMiss, Self::IdToKey, Self::Edges];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::KeyHit => "key -> id (hit)",
+            Self::KeyMiss => "key -> id (miss)",
+            Self::IdToKey => "id -> key",
+            Self::Edges => "edge lists (all 3)",
+        }
+    }
+}
+
+/// Source edge keys of `row`, per list: sorted and de-duplicated.
+fn expected_edges(row: &Row) -> [Vec<String>; 3] {
+    let tidy = |ids: &[String]| {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    [
+        tidy(&row.prev),
+        tidy(&row.auth),
+        row.rel.clone().into_iter().collect(),
+    ]
+}
+
+/// Run one call of `op` over sample positions `range`; returns mismatches
+/// against the source rows. Verification is not part of the timed region.
+fn check_edges(layout: &dyn Layout, ctx: &Ctx<'_>, range: &Range<usize>, got: &[Edges]) -> usize {
+    let mut bad = 0_usize;
+    for (pos, lists) in range.clone().zip(got) {
+        let want = expected_edges(&ctx.rows[ctx.sample[pos]]);
+        for (ids, want) in lists.iter().zip(&want) {
+            let keys = layout.id_to_keys(ids);
+            let mut have: Vec<String> = keys.into_iter().flatten().collect();
+            have.sort_unstable();
+            if have.len() != ids.len() || have != *want {
+                bad = bad.saturating_add(1);
+            }
+        }
+    }
+    bad
+}
+
+/// One timed call of `op` plus its verification; returns the call's time and
+/// the number of results that disagreed with the source.
+fn call(layout: &dyn Layout, ctx: &Ctx<'_>, op: Op, range: &Range<usize>) -> (Duration, usize) {
+    let rows = |i: usize| &ctx.rows[ctx.sample[i]];
+    let ids = || -> Vec<u32> { range.clone().map(|i| ctx.row_ids[ctx.sample[i]]).collect() };
+    match op {
+        Op::KeyHit | Op::KeyMiss => {
+            let hit = matches!(op, Op::KeyHit);
+            let keys: Vec<&str> = range
+                .clone()
+                .map(|i| {
+                    if hit {
+                        rows(i).id.as_str()
+                    } else {
+                        ctx.misses[i].as_str()
+                    }
+                })
+                .collect();
+            let started = Instant::now();
+            let got = layout.key_to_ids(&keys);
+            let took = started.elapsed();
+            let bad = range
+                .clone()
+                .zip(&got)
+                .filter(|(i, id)| {
+                    let want = hit.then(|| ctx.row_ids[ctx.sample[*i]]);
+                    **id != want
+                })
+                .count();
+            (took, bad)
+        }
+        Op::IdToKey => {
+            let ids = ids();
+            let started = Instant::now();
+            let got = layout.id_to_keys(&ids);
+            let took = started.elapsed();
+            let bad = range
+                .clone()
+                .zip(&got)
+                .filter(|(i, key)| key.as_deref() != Some(rows(*i).id.as_str()))
+                .count();
+            (took, bad)
+        }
+        Op::Edges => {
+            let ids = ids();
+            let started = Instant::now();
+            let got = layout.edges(&ids);
+            let took = started.elapsed();
+            (took, check_edges(layout, ctx, range, &got))
+        }
+    }
+}
+
+/// Latency of `n` calls of `size` operations each, and mismatches found.
+struct Run {
+    calls: Vec<Duration>,
+    size: usize,
+    bad: usize,
+}
+
+fn run(layout: &dyn Layout, ctx: &Ctx<'_>, op: Op, size: usize, n: usize) -> Run {
+    let mut calls = Vec::new();
+    let mut bad = 0_usize;
+    let mut start = 0_usize;
+    while start < n {
+        let end = start.saturating_add(size).min(n);
+        let (took, wrong) = call(layout, ctx, op, &(start..end));
+        calls.push(took);
+        bad = bad.saturating_add(wrong);
+        start = end;
+    }
+    Run { calls, size, bad }
+}
+
+fn micros(d: Duration) -> f64 {
+    d.as_secs_f64() * MICROS
+}
+
+fn report(layout: &str, op: Op, mode: &str, run: &Run) {
+    let mut sorted = run.calls.clone();
+    sorted.sort_unstable();
+    let total = sorted
+        .iter()
+        .fold(Duration::ZERO, |acc, d| acc.saturating_add(*d));
+    let per_call = micros(total) / len_f64(sorted.len().max(1));
+    let at = |pct: usize| {
+        let i = sorted.len().saturating_sub(1).saturating_mul(pct) / 100;
+        sorted.get(i).copied().map_or(0.0, micros)
+    };
+    let max = sorted.last().copied().map_or(0.0, micros);
+    println!(
+        "  {layout:<15} {:<19} {mode:<10} {:>9.2} us/op | per call: mean {per_call:>9.2} p50 {:>9.2} p99 {:>9.2} max {max:>10.2} us | mismatches {}",
+        op.label(),
+        per_call / len_f64(run.size),
+        at(50),
+        at(99),
+        run.bad,
+    );
+}
+
+/// Warm table: an untimed pass, then single calls and batches of `batch`.
+fn warm(name: &str, layout: &dyn Layout, ctx: &Ctx<'_>, n: usize, batch: usize) {
+    for op in Op::ALL {
+        let _ = run(layout, ctx, op, batch, n);
+        report(name, op, "single", &run(layout, ctx, op, 1, n));
+        report(
+            name,
+            op,
+            &format!("batch {batch}"),
+            &run(layout, ctx, op, batch, n),
+        );
+    }
+}
+
+fn evict(dir: &Path) {
+    let _ = Command::new("sync").status();
+    let _ = Command::new("vmtouch").arg("-e").arg(dir).output();
+}
+
+/// Cold table: per op, reopen, evict, time the first `cold` single calls.
+fn cold(name: &str, dir: &Path, open: &dyn Fn() -> Box<dyn Layout>, ctx: &Ctx<'_>, cold_n: usize) {
+    for op in Op::ALL {
+        evict(dir);
+        let layout = open();
+        report(name, op, "cold", &run(layout.as_ref(), ctx, op, 1, cold_n));
+    }
+}
+
+/// Look every key of the room up and read every id back; returns each row's id.
+fn round_trip(layout: &dyn Layout, rows: &[Row]) -> Vec<u32> {
+    let mut row_ids = Vec::with_capacity(rows.len());
+    for chunk in rows.chunks(1000) {
+        let keys: Vec<&str> = chunk.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<u32> = layout
+            .key_to_ids(&keys)
+            .into_iter()
+            .map(|id| id.expect("every key has an id"))
+            .collect();
+        let back = layout.id_to_keys(&ids);
+        for (row, key) in chunk.iter().zip(back) {
+            assert_eq!(key.as_deref(), Some(row.id.as_str()), "id round trip");
+        }
+        row_ids.extend(ids);
+    }
+    row_ids
+}
+
+/// Deterministic sample of `n` row indexes.
+fn sample(rows: usize, n: usize) -> Vec<usize> {
+    let mut x = 0x2545_f491_4f6c_dd1d_u64;
+    let modulus = u64::try_from(rows).unwrap_or(1).max(1);
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            usize::try_from(x.checked_rem(modulus).unwrap_or(0)).unwrap_or(0)
+        })
+        .collect()
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn put_line(label: &str, stats: PutStats) {
+    println!(
+        "    {label:<22} {:>6} puts {:>9.2} MiB payload {:>9.1} ms in put ({:>8.1} us/put)",
+        stats.puts,
+        mib(stats.bytes),
+        stats.time.as_secs_f64() * 1000.0,
+        micros(stats.time) / num(stats.puts.max(1)),
+    );
+}
+
+fn report_writes(stats: &WriteStats, baseline: Duration, prototype: Duration, events: usize) {
+    println!(
+        "write cost (same {events} events, synced every 20 batches; prototype {} puts):",
+        stats.total_puts()
+    );
+    println!(
+        "  baseline record_rows wall {:.2} s | prototype write_chunked wall {:.2} s (sync {:.2} s)",
+        baseline.as_secs_f64(),
+        prototype.as_secs_f64(),
+        stats.sync_time.as_secs_f64(),
+    );
+    put_line("run (new, per batch)", stats.runs);
+    put_line("edge chunk (first write)", stats.edge_new);
+    put_line("edge chunk (rewrite)", stats.edge_rewrite);
+    put_line("key chunk (first write)", stats.key_new);
+    put_line("key chunk (rewrite)", stats.key_rewrite);
+    let rewritten = stats
+        .edge_rewrite
+        .bytes
+        .saturating_add(stats.key_rewrite.bytes);
+    println!(
+        "  payload written {:.2} MiB, of which rewrites {:.2} MiB ({:.0}%)",
+        mib(stats.payload_bytes()),
+        mib(rewritten),
+        100.0 * num(rewritten) / num(stats.payload_bytes().max(1)),
+    );
+}
+
+fn main() {
+    let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
+    let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
+    let n = env_usize("MTXDB_EL_OPS", 20_000);
+    let cold_n = env_usize("MTXDB_EL_COLD", 1_000);
+    let rows = load(&tsv, env_usize("MTXDB_EL_EVENTS", usize::MAX));
+    println!("{} events, {n} sampled ops, {cold_n} cold ops", rows.len());
+    let pid = std::process::id();
+    let dir_a = base.join(format!("mtxdb_bench_edgelookup_{pid}_baseline"));
+    let dir_b = base.join(format!("mtxdb_bench_edgelookup_{pid}_chunked"));
+    for dir in [&dir_a, &dir_b] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    let all = Variant {
+        label: "all",
+        prev: true,
+        auth: true,
+        rel: true,
+    };
+    let db = Database::open(dir_a.clone()).expect("open");
+    let started = Instant::now();
+    record_rows(&db, &rows, all);
+    let baseline_wall = started.elapsed();
+    db.edges().force_index_checkpoint().expect("checkpoint");
+    drop(db);
+
+    let db = Database::open(dir_b.clone()).expect("open");
+    let started = Instant::now();
+    let (ids, stats) = write_chunked(&db, &rows);
+    let prototype_wall = started.elapsed();
+    db.edges().force_index_checkpoint().expect("checkpoint");
+    drop(db);
+    let runs = rows.len().div_ceil(common::BATCH);
+    let hashes: HashSet<[u8; 16]> = ids.keys.iter().map(|k| key_hash(k)).collect();
+    println!(
+        "on disk ({} families): baseline {:.2} MiB = {:.1} B/event, prototype {:.2} MiB = {:.1} B/event; {} ids, {} distinct 128-bit key hashes",
+        all.label,
+        mib(sizes(&dir_a).total()),
+        per(sizes(&dir_a).total(), rows.len()),
+        mib(sizes(&dir_b).total()),
+        per(sizes(&dir_b).total(), rows.len()),
+        ids.keys.len(),
+        hashes.len(),
+    );
+    report_writes(&stats, baseline_wall, prototype_wall, rows.len());
+
+    let picks = sample(rows.len(), n);
+    let misses: Vec<String> = picks.iter().map(|i| format!("{}~", rows[*i].id)).collect();
+    let batch = env_usize("MTXDB_EL_BATCH", 100);
+    let layouts: [(&str, &Path, Open<'_>); 3] = [
+        (
+            "baseline",
+            &dir_a,
+            Box::new(|| Box::new(Baseline::open(&dir_a))),
+        ),
+        (
+            "proto-naive",
+            &dir_b,
+            Box::new(|| Box::new(Proto::open(&dir_b, false, runs))),
+        ),
+        (
+            "proto-merged",
+            &dir_b,
+            Box::new(|| Box::new(Proto::open(&dir_b, true, runs))),
+        ),
+    ];
+    for (name, dir, open) in &layouts {
+        let started = Instant::now();
+        let layout = open();
+        println!(
+            "[{name}] open {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        let started = Instant::now();
+        let row_ids = round_trip(layout.as_ref(), &rows);
+        println!(
+            "  full-room round trip ok ({} keys, {:.2} s)",
+            rows.len(),
+            started.elapsed().as_secs_f64()
+        );
+        let ctx = Ctx {
+            rows: &rows,
+            row_ids,
+            sample: &picks,
+            misses: &misses,
+        };
+        warm(name, layout.as_ref(), &ctx, n, batch);
+        println!(
+            "  hash matches rejected by the key check: {}",
+            layout.rejected()
+        );
+        drop(layout);
+        cold(name, dir, open.as_ref(), &ctx, cold_n);
+    }
+    for dir in [&dir_a, &dir_b] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

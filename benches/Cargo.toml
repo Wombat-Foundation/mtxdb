@@ -187,3 +187,9 @@ harness = false
 name = "edge_layout_measure"
 path = "edge_layout_measure.rs"
 harness = false
+
+# Read and write cost of the chunked edge-layout prototype against the current store.
+[[bench]]
+name = "edge_layout_lookup"
+path = "edge_layout_lookup.rs"
+harness = false
