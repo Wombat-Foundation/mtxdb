@@ -15,8 +15,12 @@
 //! ```text
 //!   [CheckpointHeader 104B]
 //!   [CollectionDirEntry * count, 56B each]
-//!   [collection 0 raw slots: capacity * 8B]
-//!   [collection 1 raw slots: capacity * 8B]
+//!   [collection 0 slots: capacity * 8B]
+//!   [collection 0 homes: capacity * 8B]
+//!   [collection 0 tails: capacity * 8B]
+//!   [collection 1 slots: capacity * 8B]
+//!   [collection 1 homes: capacity * 8B]
+//!   [collection 1 tails: capacity * 8B]
 //!   [PackTableEntry * pack_table_count, 20B each]
 //!   [CollectionVersionEntry * logical_version_count, 24B each]
 //!   ...
@@ -130,10 +134,10 @@ pub struct LoadedCollection {
     /// Absolute byte offset of the raw `capacity * 8` slot array.
     pub slots_offset: usize,
     /// Absolute byte offset of the homes array (`capacity * 8` bytes).
-    /// 0 when the checkpoint is pre-v4 and homes were not persisted.
+    /// 0 when homes were not persisted.
     pub homes_offset: usize,
     /// Absolute byte offset of the tails array (`capacity * 8` bytes).
-    /// 0 when the checkpoint is pre-v4 and tails were not persisted.
+    /// 0 when tails were not persisted.
     pub tails_offset: usize,
     /// Allocated index capacity.
     pub capacity: u32,

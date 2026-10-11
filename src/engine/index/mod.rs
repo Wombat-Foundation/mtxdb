@@ -176,8 +176,7 @@ impl IndexEntry {
 ///   filter and never an overwrite/equality proof.
 /// - Owned indexes keep `homes` and `tails` identity side tables: two
 ///   anonymous `u64`s (16 bytes) per entry beyond the packed entry array.
-///   Checkpoints retain only packed slots; identities are hydrated lazily
-///   from authoritative frame headers when a writer needs them.
+///   v1 checkpoints persist these tables as well.
 /// - Power-of-two capacity: shift-and-mask bucket selection, cache-aligned probes.
 #[derive(Debug)]
 pub struct LossyIndex {

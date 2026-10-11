@@ -89,10 +89,10 @@ pub struct CheckpointHeader {
     /// once, in full, at read time.
     pub content_crc32: u32,
     /// Total byte length of the homes section (all collections concatenated).
-    /// Zero for pre-v4 checkpoints.
+    /// Zero when homes were not persisted.
     pub homes_bytes: u64,
     /// Total byte length of the tails section (all collections concatenated).
-    /// Zero for pre-v4 checkpoints.
+    /// Zero when tails were not persisted.
     pub tails_bytes: u64,
     /// Journal LSN whose mutations this checkpoint's index snapshot already
     /// incorporates. Written atomically with the checkpoint, so a reader can
