@@ -493,15 +493,24 @@ pub(crate) fn write_chunked<'a>(db: &Database, rows: &'a [Row]) -> (Ids<'a>, Wri
     (ids, stats)
 }
 
-/// Percent of `dir`'s pages in the page cache, from `vmtouch`.
-fn resident_percent(dir: &Path) -> Option<f64> {
-    let out = Command::new("vmtouch").arg(dir).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().find(|l| l.contains("Resident Pages"))?;
-    line.split_whitespace()
-        .find_map(|word| word.strip_suffix('%'))?
-        .parse()
-        .ok()
+/// Percent of `dir`'s pages in the page cache, from machine-readable vmtouch output.
+fn resident_percent(dir: &Path) -> Result<f64, String> {
+    let out = Command::new("vmtouch")
+        .args(["-o", "kv"])
+        .arg(dir)
+        .output()
+        .map_err(|error| format!("could not run vmtouch residency check: {error}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "vmtouch residency check failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("ResidentPercent="))
+        .and_then(|percent| percent.parse().ok())
+        .ok_or_else(|| "vmtouch did not report ResidentPercent".to_owned())
 }
 
 /// Most page-cache residency, in percent, that still counts as cold.
@@ -514,16 +523,33 @@ pub(crate) const COLD_MAX_PERCENT: f64 = 5.0;
 pub(crate) fn evict_cold(dir: &Path) -> Result<f64, String> {
     let mut left = None;
     for _ in 0..5 {
-        let _ = Command::new("sync").status();
-        let _ = Command::new("vmtouch").arg("-e").arg(dir).output();
-        left = resident_percent(dir);
+        let sync = Command::new("sync")
+            .status()
+            .map_err(|error| format!("could not run sync before eviction: {error}"))?;
+        if !sync.success() {
+            return Err("sync exited unsuccessfully before eviction".to_owned());
+        }
+        let eviction = Command::new("vmtouch")
+            .arg("-e")
+            .arg(dir)
+            .output()
+            .map_err(|error| format!("could not run vmtouch eviction: {error}"))?;
+        if !eviction.status.success() {
+            return Err(format!(
+                "vmtouch eviction failed: {}",
+                String::from_utf8_lossy(&eviction.stderr).trim()
+            ));
+        }
+        left = Some(resident_percent(dir)?);
         if left.is_some_and(|p| p <= COLD_MAX_PERCENT) {
             break;
         }
     }
     match left {
         Some(p) if p <= COLD_MAX_PERCENT => Ok(p),
-        Some(p) => Err(format!("still {p:.1}% resident")),
+        Some(p) => Err(format!(
+            "still {p:.1}% resident after five eviction attempts"
+        )),
         None => Err("residency unknown".to_owned()),
     }
 }
