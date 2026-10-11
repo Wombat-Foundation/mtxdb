@@ -74,9 +74,9 @@ fn envelope_retains_full_key_digest() {
 }
 
 #[test]
-fn legacy_values_remain_readable() {
+fn unwrapped_values_are_rejected_as_corrupt() {
     let engine = InMemoryStorage::new();
-    let index = AuxiliaryIndex::open(&engine, "legacy");
+    let index = AuxiliaryIndex::open(&engine, "unwrapped");
     let digest = auxiliary_key_digest(b"key");
     let node_id: NodeId = digest[..16].try_into().unwrap();
     engine
@@ -86,7 +86,7 @@ fn legacy_values_remain_readable() {
             &NodeData::new(bytes::Bytes::from_static(b"old")),
         )
         .unwrap();
-    assert_eq!(index.get(b"key").unwrap(), Some(b"old".to_vec()));
+    assert!(matches!(index.get(b"key"), Err(StorageError::Corrupt(_))));
 }
 
 #[test]

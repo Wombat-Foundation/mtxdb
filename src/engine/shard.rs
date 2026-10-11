@@ -857,9 +857,7 @@ impl ShardPool {
     /// Discovers packfiles in the pool directory.
     ///
     /// Writers emit `pack_<16 lowercase hex digits>`, or
-    /// `pack_<32 lowercase hex digits>` when the short prefix collides. For
-    /// compatibility, discovery also accepts legacy underscore-joined 16-hex
-    /// groups up to the full address width. The filename is only a lookup key:
+    /// `pack_<32 lowercase hex digits>` when the short prefix collides. The filename is only a lookup key:
     /// the authoritative identity is read from (and validated against) the
     /// file's header. Uppercase hex is rejected to prevent case-insensitive
     /// collisions and enforce one canonical spelling.

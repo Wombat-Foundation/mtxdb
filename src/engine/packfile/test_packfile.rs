@@ -582,12 +582,19 @@ fn full_all_zero_filename_is_rejected_but_truncated_prefix_is_accepted() {
 }
 
 #[test]
-fn filename_prefix_rejects_more_than_full_address_width() {
-    assert!(PackId::parse_filename_prefix("pack_0000000000000000_0000000000000001").is_some());
-    assert!(PackId::parse_filename_prefix(
-        "pack_0000000000000000_0000000000000001_0000000000000002"
-    )
-    .is_none());
+fn filename_prefix_accepts_only_the_short_and_full_forms() {
+    assert!(PackId::parse_filename_prefix("pack_0000000000000001").is_some());
+    assert!(
+        PackId::parse_filename_prefix(&format!("pack_{}", "1".repeat(PACK_ID_LEN * 2))).is_some()
+    );
+    // Underscore-joined groups, in-between widths and over-long names are not
+    // forms `filename_for` emits.
+    assert!(PackId::parse_filename_prefix("pack_0000000000000000_0000000000000001").is_none());
+    assert!(PackId::parse_filename_prefix("pack_00000000000000000000").is_none());
+    assert!(
+        PackId::parse_filename_prefix(&format!("pack_{}", "1".repeat(PACK_ID_LEN * 2 + 2)))
+            .is_none()
+    );
 }
 
 #[test]

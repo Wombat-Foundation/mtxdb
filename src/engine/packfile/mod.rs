@@ -39,8 +39,7 @@ pub const PACK_ID_LEN: usize = 16;
 
 /// Filenames carry a shortened address prefix by default (64 bits); a colliding
 /// prefix is disambiguated with the full 128-bit address. The full address in
-/// the pack header remains authoritative. The parser also accepts legacy
-/// underscore-joined 16-hex groups, up to the full address width.
+/// the pack header remains authoritative.
 pub const PACK_FILENAME_PREFIX_HEX: usize = 16;
 
 /// A pack's globally unique, immutable identity: 16 cryptographically random
@@ -150,48 +149,29 @@ impl PackId {
     }
 
     /// Parse an address from a filename stem (the part before `.pack`). Accepts
-    /// the compact `pack_<16hex>` form, legacy underscore-joined groups of
-    /// 16-hex chunks up to 32 digits total, and the full `pack_<32hex>` form
-    /// emitted by [`PackId::filename_for`] on collision.
+    /// the compact `pack_<16hex>` form and the full `pack_<32hex>` form emitted
+    /// by [`PackId::filename_for`] on collision.
     ///
     /// Returns the parsed prefix bytes and how many hex digits were present, so
     /// callers can match against a full address's prefix.
     ///
     /// # Errors
-    /// Returns `None` if the stem is not one of those forms, if the combined
-    /// digits exceed a full [`PACK_ID_LEN`] address, or if it is the full
+    /// Returns `None` if the stem is not one of those forms, or if it is the full
     /// all-zero address (reserved, never a valid identity). A *truncated*
     /// all-zero prefix is still accepted: it can legitimately belong to a
     /// nonzero 128-bit address whose leading bits happen to be zero.
     #[must_use]
     pub fn parse_filename_prefix(stem: &str) -> Option<(Vec<u8>, usize)> {
-        let rest = stem.strip_prefix("pack_")?;
-        let mut digits = String::new();
-        for (index, group) in rest.split('_').enumerate() {
-            // The first group is normally the 16-hex truncated prefix, but the
-            // collision fallback emitted by [`PackId::filename_for`] is a single
-            // full 32-hex address. Later groups are always 16-hex continuation
-            // chunks of an underscore-joined prefix.
-            let valid_len = group.len() == PACK_FILENAME_PREFIX_HEX
-                || (index == 0 && group.len() == PACK_ID_LEN * 2);
-            if !valid_len {
-                return None;
-            }
-            if !group
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            {
-                return None;
-            }
-            digits.push_str(group);
-        }
-        if digits.is_empty() {
+        let digits = stem.strip_prefix("pack_")?;
+        // `filename_for` emits only the 16-hex prefix or the full 32-hex
+        // address (on collision).
+        if digits.len() != PACK_FILENAME_PREFIX_HEX && digits.len() != PACK_ID_LEN * 2 {
             return None;
         }
-        // Cap at a full address. `filename_for` emits only a 16-hex or 32-hex
-        // name; without this a longer underscore-joined stem would parse here
-        // and then fail the prefix-agreement check downstream.
-        if digits.len() > PACK_ID_LEN * 2 {
+        if !digits
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
             return None;
         }
         let byte_len = digits.len() / 2;

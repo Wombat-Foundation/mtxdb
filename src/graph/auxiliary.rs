@@ -106,8 +106,8 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
 
     /// Read a value by its logical key.
     ///
-    /// Legacy unwrapped values are returned unchanged. New values verify the
-    /// full 32-byte digest before returning the application payload.
+    /// Verifies the full 32-byte digest before returning the application
+    /// payload.
     ///
     /// # Errors
     /// Returns [`StorageError::Corrupt`] for a malformed or mismatched
@@ -264,7 +264,9 @@ fn decode_value(
     encoded: &[u8],
 ) -> Result<Vec<u8>, StorageError> {
     if !encoded.starts_with(VALUE_MAGIC) {
-        return Ok(encoded.to_vec());
+        return Err(StorageError::Corrupt(
+            "auxiliary-index value is missing its envelope".to_owned(),
+        ));
     }
     let digest_start = VALUE_MAGIC.len();
     let value_start = digest_start.checked_add(DIGEST_LEN).ok_or_else(|| {
