@@ -247,10 +247,10 @@ pub struct CollectionDirEntry {
     /// Byte offset of the collection's slot data in the checkpoint.
     pub slots_offset: u64,
     /// Byte offset of the collection's homes data in the checkpoint.
-    /// Zero for pre-v4 checkpoints (homes not persisted).
+    /// Zero when homes were not persisted.
     pub homes_offset: u64,
     /// Byte offset of the collection's tails data in the checkpoint.
-    /// Zero for pre-v4 checkpoints (tails not persisted).
+    /// Zero when tails were not persisted.
     pub tails_offset: u64,
     /// Number of slots allocated by the collection's index.
     pub capacity: u32,

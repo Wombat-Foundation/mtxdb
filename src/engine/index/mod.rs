@@ -1055,8 +1055,8 @@ impl LossyIndex {
 
     /// Deserialize an index from bytes with a given config (providing seed).
     ///
-    /// Accepts both the legacy slots-only format (`8 + cap*8` bytes) and the
-    /// v4 slots+homes+tails format (`8 + cap*24` bytes). Homes and tails are
+    /// Accepts both the slots-only format (`8 + cap*8` bytes) and the
+    /// slots+homes+tails format (`8 + cap*24` bytes). Homes and tails are
     /// populated from the blob when present; zeroed otherwise.
     ///
     /// # Errors

@@ -144,7 +144,7 @@ fn a_hydrated_checkpoint_loaded_index_can_grow_from_its_identity_tables() {
         assert_eq!(recovered.lookup(hash), Some(*locator));
     }
 
-    // A blob with no identity tables at all (pre-v4) is incomplete too.
+    // A blob with no identity tables at all (slots-only) is incomplete too.
     let bare = LossyIndex::deserialize_with_config(&blob[..slots_region], config).unwrap();
     assert!(!identities_complete(&bare));
 }
