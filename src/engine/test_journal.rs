@@ -3216,44 +3216,32 @@ fn directory_boundary_equals_the_scan_boundary() {
     }
     fs::remove_file(&path).unwrap();
 }
-/// A frame with no pool tag cannot be attributed to any pool's coverage, so
-/// the boundary must stop before its group even when every tagged pool has
-/// reported past it.
+/// The boundary stops at the first group whose pool has not reported coverage
+/// through it, and names that pool.
 #[test]
-fn an_untagged_frame_stops_the_boundary() {
-    use super::{boundary_through, GroupMark, UNATTRIBUTED_POOL_BIT};
+fn a_pool_without_coverage_stops_the_boundary() {
+    use super::{boundary_through, GroupMark};
     use crate::layout::ShardType;
     use std::collections::HashMap;
-    let mark = |last_lsn: u64, pools: u8| GroupMark {
+    let mark = |last_lsn: u64| GroupMark {
         sequence: last_lsn,
         first_lsn: last_lsn,
         last_lsn,
         end_offset: last_lsn * 100,
-        pools,
+        pools: 1,
     };
-    let state = 1_u8;
-    let groups = [
-        mark(1, state),
-        mark(2, state | UNATTRIBUTED_POOL_BIT),
-        mark(3, state),
-    ];
+    let groups = [mark(1), mark(2), mark(3)];
     let covered = HashMap::from([(ShardType::State, 99_u64)]);
-    assert_eq!(boundary_through(&groups, &covered), Some((1, None)));
-    assert_eq!(boundary_through(&groups[1..], &covered), None);
-    assert_eq!(boundary_through(&groups[2..], &covered), Some((3, None)));
-    // A tagged pool that has not reported blocks its group.
+    assert_eq!(boundary_through(&groups, &covered), Some((3, None)));
+    // A pool that has not reported blocks its group.
     assert_eq!(boundary_through(&groups[..1], &HashMap::new()), None);
-    // With a prefix covered, the blocking pool is named: group 2 carries a
-    // State frame whose coverage (1) does not reach it, so State blocks.
+    // With a prefix covered, the blocking pool is named: group 2's State
+    // coverage (1) does not reach it.
     let partial = HashMap::from([(ShardType::State, 1_u64)]);
     assert_eq!(
         boundary_through(&groups, &partial),
         Some((1, Some(ShardType::State)))
     );
-    // With State covered through group 2, only the untagged frame blocks it,
-    // and there is no pool to name.
-    let through_two = HashMap::from([(ShardType::State, 2_u64)]);
-    assert_eq!(boundary_through(&groups, &through_two), Some((1, None)));
 }
 
 /// A directory whose offsets make the retained suffix start mid-group must

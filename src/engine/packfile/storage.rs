@@ -324,8 +324,8 @@ pub struct SyncTimings {
     /// This is what `reclaim_copy`/`reclaim_fsync` scale with.
     pub reclaim_retained_bytes: u64,
     /// The pool whose missing coverage stopped the last reclaim cut, so the
-    /// suffix could not be dropped sooner. None when an untagged frame stopped
-    /// it or the caller could not attribute it. Diagnostics only.
+    /// suffix could not be dropped sooner. None when the whole segment was
+    /// droppable or the caller could not attribute it. Diagnostics only.
     pub reclaim_blocked_by: Option<crate::layout::ShardType>,
     /// Time spent in `remediate_lagging_pools`: in the non-background path this
     /// force-checkpoints a pool holding the shared WAL back, and the caller
@@ -1919,7 +1919,7 @@ pub struct PackfileStorage {
     /// risking acknowledged data (see [`Self::enable_journal`]).
     journal: parking_lot::Mutex<Option<Arc<JournalCoordinator>>>,
     /// Pool tag this store publishes under on a shared journal, as a
-    /// [`crate::journal::pool_tag`] code (`0` = untagged/per-pool). Set by
+    /// [`crate::journal::pool_tag`] code (`0` = not attached to a shared journal pool). Set by
     /// [`Self::enable_shared_journal`]; read on the publish and replay hot
     /// paths, so it is a plain atomic rather than behind the journal mutex.
     journal_pool: std::sync::atomic::AtomicU8,

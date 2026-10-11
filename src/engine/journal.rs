@@ -1114,10 +1114,6 @@ struct SyncCapture {
     file_len: u64,
 }
 
-/// Bit in [`GroupMark::pools`] for a frame with no pool tag, which no pool's
-/// coverage can account for.
-const UNATTRIBUTED_POOL_BIT: u8 = 0x80;
-
 /// What the group directory says about reclaiming a shared segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SharedBoundary {
@@ -1126,15 +1122,15 @@ enum SharedBoundary {
     /// Even the first group is still needed (or the segment is empty).
     NothingCovered,
     /// Every group through this LSN may be dropped. The second field names the
-    /// pool whose missing coverage stopped the cut (None when an untagged frame
-    /// did, or when the whole segment is droppable).
+    /// pool whose missing coverage stopped the cut (None when the whole segment
+    /// is droppable).
     Through(u64, Option<ShardType>),
 }
 
-// Pool bits are `1 << index`, so they must stay below the unattributed bit.
+// Pool bits are `1 << index`, so they must fit in `GroupMark::pools`.
 const _: () = assert!(
-    ShardType::ALL.len() < 7,
-    "GroupMark::pools has one bit per pool below UNATTRIBUTED_POOL_BIT"
+    ShardType::ALL.len() <= 8,
+    "GroupMark::pools has one bit per pool"
 );
 
 /// The bit standing for `pool` in [`GroupMark::pools`].
@@ -1244,8 +1240,7 @@ fn marks_from_scan(scan: &Scan) -> Vec<GroupMark> {
 
 /// The last group of the longest prefix of `groups` that a shared segment may
 /// drop: every pool with a frame in each group has reported coverage through the
-/// group's `last_lsn`, and the group holds no untagged frame (which no pool's
-/// coverage can account for). `None` when even the first group is still needed.
+/// group's `last_lsn`. `None` when even the first group is still needed.
 ///
 /// The one place this rule lives: the directory and the scan fallback both call
 /// it, so they cannot disagree.
@@ -1263,11 +1258,6 @@ fn boundary_through(
                 // blocker so reclaim can say why the suffix was retained.
                 return boundary.map(|lsn| (lsn, Some(pool)));
             }
-        }
-        if group.pools & UNATTRIBUTED_POOL_BIT != 0 {
-            // No pool's coverage can account for an untagged frame: a real
-            // blocker with no pool to name.
-            return boundary.map(|lsn| (lsn, None));
         }
         boundary = Some(group.last_lsn);
     }
@@ -1341,8 +1331,8 @@ pub struct Reclaim {
     /// scale with segment size, so it is the number to bound.
     pub retained_bytes: u64,
     /// The pool whose missing coverage stopped the cut, so the suffix could not
-    /// be dropped. None when an untagged frame stopped it, the whole segment
-    /// was droppable, or the caller could not say. Diagnostics only.
+    /// be dropped. None when the whole segment was droppable, or the caller
+    /// could not say. Diagnostics only.
     pub blocked_by: Option<ShardType>,
     /// Time deciding the reclaim boundary (directory lookup, or a scan when the
     /// directory could not be trusted).
@@ -4710,8 +4700,7 @@ impl Journal {
 
     /// The pools that hold reclaim back: those with a frame in the oldest group
     /// still needed that have not reported coverage through it. Empty when the
-    /// directory cannot be trusted, or the oldest needed group holds a frame no
-    /// pool can be asked to cover (an untagged one).
+    /// directory cannot be trusted.
     fn blocking_pools(&self, covered: &HashMap<ShardType, u64>) -> Vec<ShardType> {
         if !self.directory_matches_file() {
             return Vec::new();
@@ -4728,9 +4717,6 @@ impl Journal {
                 .collect();
             if !blockers.is_empty() {
                 return blockers;
-            }
-            if group.pools & UNATTRIBUTED_POOL_BIT != 0 {
-                return Vec::new();
             }
         }
         Vec::new()
@@ -5104,8 +5090,7 @@ fn newest_mark(bytes: &[u8]) -> Option<MarkSlot> {
 
 /// Test-only: cut a **copy** of a journal segment back to its embedded
 /// durability mark, keeping the header. That is the worst case of a power cut:
-/// every frame written after the last fsync is lost. A per-pool segment keeps no
-/// mark and counts every byte durable, so it is left whole.
+/// every frame written after the last fsync is lost.
 ///
 /// # Errors
 /// Returns an error if the copy cannot be read, has an invalid header, or cannot
@@ -5124,9 +5109,7 @@ pub(crate) fn cut_segment_image_to_durable_mark(path: &Path) -> io::Result<()> {
     OpenOptions::new().write(true).open(path)?.set_len(keep)
 }
 
-/// How many leading bytes of the segment are known durable. Per-pool segments
-/// keep no mark and count every byte durable, so an invalid group fails closed.
-/// A missing or unreadable mark, or one claiming more than the file holds,
+/// How many leading bytes of the segment are known durable. A missing or unreadable mark, or one claiming more than the file holds,
 /// yields `0`.
 fn read_durable_len_from_header(bytes: &[u8], file_len: u64) -> u64 {
     newest_mark(bytes)
