@@ -288,7 +288,7 @@ pub fn state_group_collection_id(room_id: &str) -> Option<[u8; 16]> {
 ///
 /// ```text
 /// "STGP" (4)
-/// version 0x02 (1)
+/// version 0x01 (1)
 /// resolver tag (1)
 /// trust tag (1)
 /// parent count (u16 BE)
