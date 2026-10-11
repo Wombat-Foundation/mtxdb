@@ -9,6 +9,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[path = "edge_layout_format.rs"]
@@ -490,4 +491,39 @@ pub(crate) fn write_chunked<'a>(db: &Database, rows: &'a [Row]) -> (Ids<'a>, Wri
     store.sync_all().expect("sync");
     stats.sync_time = stats.sync_time.saturating_add(started.elapsed());
     (ids, stats)
+}
+
+/// Percent of `dir`'s pages in the page cache, from `vmtouch`.
+fn resident_percent(dir: &Path) -> Option<f64> {
+    let out = Command::new("vmtouch").arg(dir).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.contains("Resident Pages"))?;
+    line.split_whitespace()
+        .find_map(|word| word.strip_suffix('%'))?
+        .parse()
+        .ok()
+}
+
+/// Most page-cache residency, in percent, that still counts as cold.
+pub(crate) const COLD_MAX_PERCENT: f64 = 5.0;
+
+/// Flush and evict `dir` from the page cache, retrying a few times. Returns
+/// the residency left, or `Err` with it when the store is still too resident
+/// (or unmeasurable) to time as cold, so callers skip rather than report warm
+/// reads as cold.
+pub(crate) fn evict_cold(dir: &Path) -> Result<f64, String> {
+    let mut left = None;
+    for _ in 0..5 {
+        let _ = Command::new("sync").status();
+        let _ = Command::new("vmtouch").arg("-e").arg(dir).output();
+        left = resident_percent(dir);
+        if left.is_some_and(|p| p <= COLD_MAX_PERCENT) {
+            break;
+        }
+    }
+    match left {
+        Some(p) if p <= COLD_MAX_PERCENT => Ok(p),
+        Some(p) => Err(format!("still {p:.1}% resident")),
+        None => Err("residency unknown".to_owned()),
+    }
 }

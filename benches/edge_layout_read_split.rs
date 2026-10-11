@@ -26,7 +26,6 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use mtxdb::database::{Database, PoolPolicies, PoolPolicy};
@@ -38,8 +37,8 @@ use mtxdb::storage::StorageEngine;
 mod common;
 
 use common::{
-    baseline_scope, chunk_size, format, len_f64, load, locate, mib, num, record_rows, sizes,
-    spread, write_chunked, Row, Variant, CHUNK_COLLECTION, KIND_KEY_CHUNK,
+    baseline_scope, chunk_size, evict_cold, format, len_f64, load, locate, mib, num, record_rows,
+    sizes, spread, write_chunked, Row, Variant, CHUNK_COLLECTION, KIND_KEY_CHUNK,
 };
 
 const MICROS: f64 = 1_000_000.0;
@@ -136,26 +135,6 @@ fn layer(label: &str, reps: usize, n: usize, mut f: impl FnMut(usize) -> bool) {
     );
 }
 
-fn evict(dir: &Path) {
-    let _ = Command::new("sync").status();
-    let _ = Command::new("vmtouch").arg("-e").arg(dir).output();
-}
-
-/// `vmtouch`'s resident-page line for `dir`, to show what is in the page cache.
-fn residency(dir: &Path) -> String {
-    Command::new("vmtouch")
-        .arg(dir)
-        .output()
-        .ok()
-        .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .find(|line| line.contains("Resident Pages"))
-                .map(|line| line.trim().to_owned())
-        })
-        .unwrap_or_else(|| "residency unknown".to_owned())
-}
-
 /// Cold layer: per repetition, reopen, then evict the store's files, and time
 /// the first `n` calls of `f` against that handle. Reopen reads the whole store
 /// back into the page cache, so eviction must come after it; the in-memory
@@ -173,8 +152,13 @@ fn cold_layer<T>(
     let mut resident = Vec::new();
     for _ in 0..reps {
         let db = open(dir, policy);
-        evict(dir);
-        resident.push(residency(dir));
+        match evict_cold(dir) {
+            Ok(p) => resident.push(format!("{p:.1}%")),
+            Err(why) => {
+                println!("    cold {label:<19} SKIPPED: {why}");
+                return;
+            }
+        }
         let mut total = Duration::ZERO;
         for i in 0..n {
             let started = Instant::now();
@@ -188,7 +172,7 @@ fn cold_layer<T>(
         ));
     }
     println!(
-        "    cold {label:<19} {} us/call | mismatches {wrong} | after reopen: {}",
+        "    cold {label:<19} {} us/call | mismatches {wrong} | resident after eviction: {}",
         means.join(" "),
         resident.join(" ; ")
     );

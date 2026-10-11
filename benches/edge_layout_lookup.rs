@@ -45,7 +45,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use mtxdb::database::Database;
@@ -56,9 +55,9 @@ use mtxdb::storage::StorageEngine;
 mod common;
 
 use common::{
-    baseline_scope, key_hash, len_f64, load, locate, mib, num, per, record_rows, sizes, spread,
-    write_chunked, PutStats, Row, Variant, WriteStats, AUTH, CHUNK_COLLECTION, KIND_EDGE_CHUNK,
-    KIND_KEY_CHUNK, KIND_RUN, PREV, REL,
+    baseline_scope, evict_cold, key_hash, len_f64, load, locate, mib, num, per, record_rows, sizes,
+    spread, write_chunked, PutStats, Row, Variant, WriteStats, AUTH, CHUNK_COLLECTION,
+    KIND_EDGE_CHUNK, KIND_KEY_CHUNK, KIND_RUN, PREV, REL,
 };
 
 /// A key's three edge lists as target ids: prev, auth, relations.
@@ -505,11 +504,6 @@ fn warm(name: &str, layout: &dyn Layout, ctx: &Ctx<'_>, n: usize, batch: usize) 
     }
 }
 
-fn evict(dir: &Path) {
-    let _ = Command::new("sync").status();
-    let _ = Command::new("vmtouch").arg("-e").arg(dir).output();
-}
-
 /// Cold table: per op, reopen, then evict the store's files, and time the first
 /// `cold` single calls. Reopen reads the store back into the page cache, so
 /// eviction must follow it; the in-memory index survives, so the calls measure
@@ -517,8 +511,10 @@ fn evict(dir: &Path) {
 fn cold(name: &str, dir: &Path, open: &dyn Fn() -> Box<dyn Layout>, ctx: &Ctx<'_>, cold_n: usize) {
     for op in Op::ALL {
         let layout = open();
-        evict(dir);
-        report(name, op, "cold", &run(layout.as_ref(), ctx, op, 1, cold_n));
+        match evict_cold(dir) {
+            Ok(_) => report(name, op, "cold", &run(layout.as_ref(), ctx, op, 1, cold_n)),
+            Err(why) => println!("  {name} {} cold SKIPPED: {why}", op.label()),
+        }
     }
 }
 
