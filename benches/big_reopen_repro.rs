@@ -3,7 +3,8 @@
 //! Builds N records (`MTXDB_BR_RECORDS`, default 17,602,258), `sync_all`, drops,
 //! reopens once, and probes every `MTXDB_BR_STRIDE`th sequence number. Prints the
 //! open path and the first missing sequence number. Nothing else touches the
-//! store, so a miss here is not a benchmark-sequencing artifact.
+//! store; env knobs `MTXDB_BR_CYCLES`, `MTXDB_BR_EVICT`, `MTXDB_BR_FOREIGN_FILE` repeat the
+//! reopen with eviction and a foreign file in the directory.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -28,7 +29,10 @@ fn node_id(seq: u64) -> NodeId {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn main() {
@@ -45,23 +49,54 @@ fn main() {
     }
     store.sync_all().expect("sync_all");
     drop(store);
-    println!("built {records} records in {:.1} s", started.elapsed().as_secs_f64());
+    println!(
+        "built {records} records in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
 
-    let store = PackfileStorage::open(dir.clone()).expect("reopen");
-    let timings = store.open_timings().expect("timings");
-    println!("reopen path {:?}, total {:?}", timings.path, timings.total);
-    let (mut probed, mut missed, mut first_missing) = (0u64, 0u64, None);
-    let mut seq = 0;
-    while seq < records {
-        probed += 1;
-        if store.get(&COLLECTION, &node_id(seq)).expect("get").is_none() {
-            missed += 1;
-            first_missing.get_or_insert(seq);
-        }
-        seq += stride;
+    // The failing run also left a foreign `pack.idx` in the store directory and
+    // evicted the page cache between opens; both are switchable here.
+    if env_u64("MTXDB_BR_FOREIGN_FILE", 1) == 1 {
+        std::fs::write(dir.join("pack.idx"), b"MTXIDX01").expect("write foreign file");
     }
-    println!("probed {probed}, missed {missed}, first missing seq {first_missing:?}");
-    drop(store);
+    let cycles = env_u64("MTXDB_BR_CYCLES", 4);
+    let evict = env_u64("MTXDB_BR_EVICT", 1) == 1;
+    let mut missed = 0u64;
+    for cycle in 1..=cycles {
+        if evict {
+            let _ = std::process::Command::new("sync").status();
+            let _ = std::process::Command::new("vmtouch")
+                .arg("-e")
+                .arg(&dir)
+                .output();
+        }
+        let store = PackfileStorage::open(dir.clone()).expect("reopen");
+        let timings = store.open_timings().expect("timings");
+        let (mut probed, mut cycle_missed, mut first_missing) = (0u64, 0u64, None);
+        let mut seq = 0;
+        while seq < records {
+            probed = probed.checked_add(1).expect("probe count overflow");
+            if store
+                .get(&COLLECTION, &node_id(seq))
+                .expect("get")
+                .is_none()
+            {
+                cycle_missed = cycle_missed
+                    .checked_add(1)
+                    .expect("cycle miss count overflow");
+                first_missing.get_or_insert(seq);
+            }
+            seq = seq.checked_add(stride).expect("probe sequence overflow");
+        }
+        println!(
+            "cycle {cycle}: path {:?}, open {:?}, probed {probed}, missed {cycle_missed}, first missing {first_missing:?}",
+            timings.path, timings.total
+        );
+        missed = missed
+            .checked_add(cycle_missed)
+            .expect("total miss count overflow");
+        drop(store);
+    }
     if missed == 0 {
         let _ = std::fs::remove_dir_all(&dir);
     } else {
