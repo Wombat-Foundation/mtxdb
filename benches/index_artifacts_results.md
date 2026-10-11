@@ -2,7 +2,7 @@
 
 Harness: `benches/index_artifacts.rs` (measurement only). Reproduction of the large-store bug: `benches/big_reopen_repro.rs`.
 Machine: Linux 6.18, LUKS disk, 31 GiB RAM of which only ~3 GiB was page cache during the 1 GiB runs (see caveats). Cold = `sync` then `vmtouch -e` on the store directory before each timed step.
-Command: `MTXDB_IA_MIB=<256|1024> MTXDB_IA_FRAMES=tiny,mixed MTXDB_IA_LOOKUPS=100000 cargo +1.90.0 bench --manifest-path benches/Cargo.toml --bench index_artifacts`.
+Command (use `MTXDB_IA_MIB=256` for the 256 MiB runs): `MTXDB_IA_MIB=1024 MTXDB_IA_FRAMES=tiny,mixed MTXDB_IA_LOOKUPS=100000 cargo +1.90.0 bench --manifest-path benches/Cargo.toml --bench index_artifacts`.
 One run per cell, no repetitions: treat differences under ~20% as noise.
 
 ## 0. A bug found on the way (fixed in `ffa3ce2`, `76f332b`)
@@ -115,12 +115,12 @@ With large frames the whole cold cost is reading 1 GiB (about 6 s at ~165 MiB/s 
 
 ```
 Bytes per entry, 1 GiB tiny
-checkpoint + delta  ##############################  47.0   (828 MiB / 17.6M)
+checkpoint + delta  ##############################  49.3   (827.6 MiB / 17.6M)
 checkpoint alone    ############################    45.8
 sorted .idx         ############                    20.0
 ```
 
-The `.idx` is 2.3× smaller than the checkpoint alone and 2.5× smaller than checkpoint + delta log. The 768 MiB checkpoint is the 2^25-slot table (33.5M × 24 B) at 52% load; the power-of-two rounding is where the waste is.
+The `.idx` is 2.3× smaller than the checkpoint alone and 2.5× smaller than checkpoint + delta log (49.3 B/entry). The 768 MiB checkpoint is the 2^25-slot table (33.5M × 24 B) at 52% load; the power-of-two rounding is where the waste is.
 
 ## 5. Build cost of the `.idx` (seal-time)
 
@@ -150,7 +150,7 @@ The mapped 1 GiB figure includes minor page faults populating the mapping (336 M
 | `store.get`                   |       685 ns |    75,061 ns\* |    3,705 ns |
 | `.idx` locate + naive `pread` |     1,921 ns | 1,270,884 ns\* |   13,877 ns |
 
-\*The 1 GiB tiny rows are dominated by disk reads because the pack no longer fit in the ~3 GiB of page cache that was available; they measure the disk, not the indexes. The `.idx` end-to-end path is slower than `store.get` because of my untuned read path (plain `pread`, 4 KiB then 72 KiB retry), not the locator. These rows must not be read as "hash beats sorted".
+\*The 1 GiB tiny rows are dominated by disk reads because the reads were slow enough (75 µs per `store.get`) to indicate disk misses; page-cache residency was not measured, so the cause is unconfirmed. They do not measure the indexes. The `.idx` end-to-end path is slower than `store.get` because of my untuned read path (plain `pread`, 4 KiB then 72 KiB retry), not the locator. These rows must not be read as "hash beats sorted".
 
 ### 6.3 Cold mmap first-touch
 
@@ -167,7 +167,7 @@ First 1000 random lookups on a freshly mapped, evicted `.idx`: 612 ms (256 MiB t
 
 ## 8. Caveats
 
-- **The 1 GiB "warm" numbers are not fully warm.** Only ~3 GiB of the 31 GiB RAM was page cache (the rest in use by other processes), so a 1 GiB pack plus 768 MiB checkpoint plus `.idx` did not stay resident. That is why the 1 GiB "warm" scan (6.6 s) is close to cold (7.0 s) and `store.get` at 1 GiB tiny is disk-bound. The 256 MiB warm numbers, which fit in cache, are the reliable warm figures.
+- **The 1 GiB "warm" numbers are not fully warm.** Only ~3 GiB of the 31 GiB RAM was page cache (the rest in use by other processes), and the 1 GiB "warm" scan (6.6 s) is close to cold (7.0 s) while `store.get` at 1 GiB tiny takes 75 µs, so those steps look partly cold. The 1 GiB pack alone is smaller than 3 GiB, so size alone does not explain it, and I did not measure residency (`vmtouch`) to find the cause. The 256 MiB warm numbers, which fit in cache, are the reliable warm figures.
 - An earlier 1 GiB run was contaminated by tests running concurrently and is discarded; the rerun above is on an otherwise idle machine.
 - **Safety is not measured.** Trusting a sealed pack needs a seal protocol (pack fsync, manifest and `.idx` via tmp + fsync + rename, directory fsync) and a crash-injection test. The trusted-reopen numbers are a lower bound on cost, not a correctness result. A metadata-only reopen also does not detect corruption inside the pack; that needs lazy per-frame CRC, background scrub, or an explicit verify command.
 - Single collection, no overwrites, no multi-pack newest-wins (MIDX) resolution. The memtable + runs design for indexes larger than RAM is unmeasured.
