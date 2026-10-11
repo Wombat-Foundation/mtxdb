@@ -179,9 +179,9 @@ pub use search::{SearchDocument, SearchIndexes, SearchQuery};
 pub use shard::{LockHolderInfo, ShardPool};
 pub use state_group::{
     decode_state_group_record, encode_state_group_record, state_group_collection_id,
-    state_group_instance_full_id, state_group_instance_id, StateGroupId, StateGroupInstance,
-    StateGroupRelation, STATE_GROUP_DOMAIN_PREFIX, STATE_GROUP_RECORD_MAGIC,
-    STATE_GROUP_RECORD_VERSION,
+    state_group_instance_full_id, state_group_instance_id, StateGroupDerivation, StateGroupId,
+    StateGroupInstance, StateGroupRelation, StateGroupResolver, StateGroupTrust,
+    STATE_GROUP_DOMAIN_PREFIX, STATE_GROUP_RECORD_MAGIC, STATE_GROUP_RECORD_VERSION,
 };
 pub use storage::{
     content_digest, Digest32, DigestAlgorithm, DigestHasher, NodeData, NodeId, StorageEngine,

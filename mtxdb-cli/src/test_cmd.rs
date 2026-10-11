@@ -87,6 +87,10 @@ fn scan_decodes_a_state_group_instance() {
         parents: vec![[0x11; 16], [0x22; 16]],
         lthash: [0x33; 32],
         root_id: [0x44; 16],
+        derivation: mtxdb::StateGroupDerivation::new(
+            mtxdb::StateGroupResolver::V2,
+            mtxdb::StateGroupTrust::TrustedImport,
+        ),
     };
     let payload = mtxdb::encode_state_group_record(&instance);
     // The one-line cell stays empty so `--verbose`/`--decode` prints the
@@ -3359,8 +3363,9 @@ fn compute_state_groups_inherit_and_split_on_derivation() {
     assert_eq!(groups["$e1"], groups["$e49"]);
     assert_ne!(groups["$e49"], groups["$e50"]);
     assert_ne!(groups["$create"], groups["$e0"]);
-    // The forks differ, and the merge is its own derivation even though the
-    // resolved state matches the first parent (first-wins).
+    // The forks differ, and the merge is its own derivation. Its fixture
+    // declares no room version, so it falls back to the first-parent rule and
+    // the resolved state matches the first parent.
     assert_ne!(groups["$left"], groups["$right"]);
     assert_ne!(groups["$merge"], groups["$left"]);
     assert_ne!(groups["$merge"], groups["$right"]);
@@ -3700,7 +3705,7 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
 }
 
 #[test]
-fn compute_state_groups_uses_first_prev_as_tie_break_for_now() {
+fn first_parent_fallback_when_no_room_version_is_declared() {
     let create = owned_value(
         r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@a:x","content":{}}"#,
     );
@@ -3717,10 +3722,11 @@ fn compute_state_groups_uses_first_prev_as_tie_break_for_now() {
         r#"{"event_id":"$merge-second","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$second","$first"],"content":{}}"#,
     );
 
-    // The walker currently resolves a same-key conflict by taking the
-    // first prev_events entry. This is not full Matrix state resolution;
-    // changing it requires a state-group namespace bump. The merge still gets
-    // its own instance because it has two distinct parents.
+    // This batch declares no room version, so no state-resolution rules
+    // apply and the merge falls back to the retired first-parent rule: the
+    // same-key conflict is decided by the first prev_events entry, which
+    // makes the two merge orders disagree. The merge still gets its own
+    // instance because it has two distinct parents.
     let first_groups = compute_state_groups_partial(
         &[create.clone(), first.clone(), second.clone(), merge_first],
         &[],
@@ -4499,4 +4505,124 @@ fn a_missing_root_is_an_error_but_an_unwritten_pool_is_empty() {
         "read-only inspection must not create the pool"
     );
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A batch that declares a room version gets real Matrix state resolution: the
+/// merged state is decided by power levels, not by `prev_events` order. The
+/// retired first-parent merge gives the opposite answer for the same fork
+/// listed in the other order, which is the whole point of the resolver.
+#[test]
+fn real_resolution_decides_a_fork_by_power_level_not_prev_order() {
+    let create = owned_value(
+        r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10","creator":"@admin:x"}}"#,
+    );
+    let power_levels = owned_value(
+        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"users_default":0,"state_default":50,"events_default":0,"users":{"@admin:x":100}}}"#,
+    );
+    let admin_topic = owned_value(
+        r#"{"event_id":"$topic-admin","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"kept"}}"#,
+    );
+    let nobody_topic = owned_value(
+        r#"{"event_id":"$topic-nobody","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@nobody:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"dropped"}}"#,
+    );
+    let merge = |first: &str, second: &str, id: &str| {
+        owned_value(&format!(
+            r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":4,"prev_events":["{first}","{second}"],"auth_events":["$create","$pl"],"content":{{}}}}"#
+        ))
+    };
+    let batch = |first: &str, second: &str, id: &str| {
+        vec![
+            create.clone(),
+            power_levels.clone(),
+            admin_topic.clone(),
+            nobody_topic.clone(),
+            merge(first, second, id),
+        ]
+    };
+
+    let forward = compute_state_groups_partial(
+        &batch("$topic-admin", "$topic-nobody", "$merge-forward"),
+        &[],
+        "!r:x",
+    );
+    let reverse = compute_state_groups_partial(
+        &batch("$topic-nobody", "$topic-admin", "$merge-reverse"),
+        &[],
+        "!r:x",
+    );
+    assert!(
+        forward.incomplete.is_empty(),
+        "batch carries the whole auth closure: {:?}",
+        forward.incomplete
+    );
+    assert!(
+        reverse.incomplete.is_empty(),
+        "batch carries the whole auth closure: {:?}",
+        reverse.incomplete
+    );
+
+    let forward_id = forward.groups["$merge-forward"];
+    let reverse_id = reverse.groups["$merge-reverse"];
+    assert_eq!(
+        forward_id, reverse_id,
+        "prev_events order must not change the resolved state"
+    );
+
+    let resolved = &forward.instances[&forward_id];
+    let topic = resolved
+        .set
+        .entries
+        .get(&("m.room.topic".to_owned(), String::new()))
+        .map(String::as_str);
+    assert_eq!(
+        topic,
+        Some("$topic-admin"),
+        "the sender with power over state wins the conflict"
+    );
+}
+
+/// A merge whose inputs reference an event outside the batch cannot run the
+/// resolver: mtxdb's binary is `panic = "abort"`, so it must fall back rather
+/// than let rezzy look the id up. The fallback still yields a group, but the
+/// computation is marked incomplete so the import does not cache it as a real
+/// resolution.
+#[test]
+fn merges_with_a_gap_in_the_auth_closure_fall_back_and_refuse_to_cache() {
+    let create = owned_value(
+        r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10"}}"#,
+    );
+    let power_levels = owned_value(
+        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"users":{"@admin:x":100}}}"#,
+    );
+    let complete_topic = owned_value(
+        r#"{"event_id":"$topic-a","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"first"}}"#,
+    );
+    let gapped_topic = owned_value(
+        r#"{"event_id":"$topic-b","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl","$absent-auth"],"content":{"topic":"second"}}"#,
+    );
+    let merge = owned_value(
+        r#"{"event_id":"$merge","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":4,"prev_events":["$topic-a","$topic-b"],"auth_events":["$create","$pl"],"content":{}}"#,
+    );
+    let events = vec![create, power_levels, complete_topic, gapped_topic, merge];
+
+    let result = compute_state_groups_partial(&events, &[], "!r:x");
+    assert_eq!(
+        result.incomplete,
+        vec!["$absent-auth".to_owned()],
+        "the resolver reports exactly what the batch is short of"
+    );
+    assert!(
+        result.groups.contains_key("$merge"),
+        "the merge still gets a group from the fallback"
+    );
+    let resolved = &result.instances[&result.groups["$merge"]];
+    assert_eq!(
+        resolved
+            .set
+            .entries
+            .get(&("m.room.topic".to_owned(), String::new()))
+            .map(String::as_str),
+        Some("$topic-a"),
+        "the fallback keeps the first parent, as the retired merge did"
+    );
 }

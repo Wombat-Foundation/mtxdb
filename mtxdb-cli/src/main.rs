@@ -2,6 +2,8 @@
 
 mod cmd;
 mod state_hamt;
+mod state_policy;
+mod state_resolve;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

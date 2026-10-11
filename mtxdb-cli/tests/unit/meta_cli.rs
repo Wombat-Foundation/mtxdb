@@ -50,12 +50,9 @@ mod tests {
         let Value::Array(records) = value else {
             panic!("meta JSON must be an array");
         };
-        assert!(records.iter().any(|record| {
-            record
-                .get("severity")
-                .and_then(Value::as_str)
-                == Some("WARN")
-        }));
+        assert!(records
+            .iter()
+            .any(|record| { record.get("severity").and_then(Value::as_str) == Some("WARN") }));
 
         let _ = std::fs::remove_dir_all(root);
     }

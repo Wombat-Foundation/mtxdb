@@ -15,6 +15,7 @@ use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
 use mtxdb::shard::ShardPool;
+use mtxdb::state_group::{StateGroupDerivation, StateGroupTrust};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
     derive_collection_id, frame_digest, record_logical_id, state_group_instance_id,
@@ -24,6 +25,8 @@ use mtxdb::{
 };
 use rezzy::json::{self, Object, Value as OwnedValue};
 
+use crate::state_policy::{resolution_policy, ResolutionPolicy, StateView};
+use crate::state_resolve::{resolve_parents, LeanEventContext, StateEntries};
 use crate::{Cli, Commands, PacksAction};
 
 const MAX_DEBUG_UNRESOLVED: usize = 20;
@@ -60,7 +63,7 @@ impl JsonValueExt for OwnedValue {
 /// used by Synapse/sithnapse and materialized into each `MTHR` root). The
 /// `STGP` record holds the parent links and the shared `STAT` root id, so equal
 /// state content reached through different parents stays distinct.
-const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
+const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v2";
 
 /// Whether `value` is a well-formed 128-bit STGP state-group instance id.
 fn valid_state_group_id(value: &[u8]) -> bool {
@@ -1745,13 +1748,14 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Decode an `STGP\x01` state-group instance record into a readable form: its
-/// parent instance ids, state `LtHash` digest, and shared `STAT` root id.
+/// Decode an `STGP\x02` state-group instance record into a readable form: its
+/// parent instance ids, state `LtHash` digest, shared `STAT` root id, and the
+/// resolver/trust derivation that produced it.
 /// Returns `None` for any other payload.
 fn decode_state_group(bytes: &[u8]) -> Option<Vec<u8>> {
     let instance = mtxdb::decode_state_group_record(bytes).ok()?;
     let mut out = Vec::new();
-    writeln!(out, "// STGP state-group instance (v1)").unwrap();
+    writeln!(out, "// STGP state-group instance (v2)").unwrap();
     writeln!(
         out,
         "// {} parent(s), {} bytes",
@@ -1774,6 +1778,7 @@ fn decode_state_group(bytes: &[u8]) -> Option<Vec<u8>> {
     )
     .unwrap();
     writeln!(out, "  STAT root id: 0x{}", hex::encode(instance.root_id)).unwrap();
+    writeln!(out, "  derivation: {}", instance.derivation.as_str()).unwrap();
     Some(out)
 }
 
@@ -6263,6 +6268,7 @@ fn materialize_state_hamts(
             parents: instance.parents.clone(),
             lthash: instance.lthash,
             root_id: crate::state_hamt::state_hamt_root_node_id(room_id, &instance.lthash),
+            derivation: instance.derivation,
         };
         push_hamt_record(
             &mut seen_stgp,
@@ -6393,7 +6399,7 @@ fn state_group_metadata(room_id: &str) -> CollectionMetadata {
         payload: PayloadPolicy::Source,
         extension: None,
         role: Some("state_group".to_owned()),
-        schema: Some("sithnapse.state-group.v1".to_owned()),
+        schema: Some("sithnapse.state-group.v2".to_owned()),
     }
 }
 
@@ -9285,7 +9291,14 @@ fn import_pdu_events(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the PDU import phase owns validation, batching, and state-group work"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the PDU import phase is one sequential pipeline; splitting it would pass state by hand"
+)]
 fn import_pdu_events_with_raw(
     db: &Database,
     store: &PackfileStorage,
@@ -9386,7 +9399,13 @@ fn import_pdu_events_with_raw(
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
 
-    repair_import_state_groups(state_store, events, auth_chain, &resolved.canonical_id);
+    repair_import_state_groups(
+        state_store,
+        events,
+        auth_chain,
+        &resolved.canonical_id,
+        &room_version,
+    );
 
     if let Some(room_id) = detected_collection {
         eprintln!("{room_id} ({collection_hex})");
@@ -9434,11 +9453,62 @@ fn sort_events_topologically(
     Ok(())
 }
 
+/// Read the batch's cached `event_id` -> state-group mappings.
+///
+/// Returns `None` when the cache is absent, incomplete, invalid, or unreadable
+/// — every case that forces the batch to recompute — and reports why.
+fn load_cached_state_groups(
+    aux: &AuxiliaryIndex<'_, PackfileStorage>,
+    graph_event_ids: &[String],
+) -> Option<HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>> {
+    if graph_event_ids.is_empty() {
+        return None;
+    }
+    match load_state_groups(aux, graph_event_ids) {
+        Ok(StateGroupLoad::Complete(groups)) => Some(groups),
+        Ok(StateGroupLoad::Missing) => None,
+        Ok(StateGroupLoad::Invalid { event_id, reason }) => {
+            eprintln!(
+                "warning: invalid cached state-group mapping for {event_id} ({reason}); recomputing state groups"
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: unable to read state-group mappings; recomputing state groups: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// Report the merges that fell back to first-parent because this batch is
+/// missing part of the auth closure state resolution reads.
+fn warn_incomplete_merges(missing: &[String]) {
+    if missing.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: {} merge(s) fell back to first-parent state; this batch lacks these event(s) from the auth closure resolution reads",
+        missing.len()
+    );
+    for event_id in missing.iter().take(MAX_DEBUG_UNRESOLVED) {
+        eprintln!("  missing {event_id}");
+    }
+    if missing.len() > MAX_DEBUG_UNRESOLVED {
+        eprintln!(
+            "  ... {} more",
+            missing.len().saturating_sub(MAX_DEBUG_UNRESOLVED)
+        );
+    }
+}
+
 fn repair_import_state_groups(
     state_store: &PackfileStorage,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
     canonical_id: &str,
+    room_version: &str,
 ) {
     // Replayed batches still need state-group repair when the derived index is
     // incomplete, but a complete replay should not rebuild the whole DAG.
@@ -9456,35 +9526,36 @@ fn repair_import_state_groups(
         .map(str::to_owned)
         .filter(|event_id| seen_state_event_ids.insert(event_id.clone()))
         .collect::<Vec<_>>();
-    let mut state_groups = HashMap::new();
-    let mut loaded = false;
     let aux = AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
-    if !graph_event_ids.is_empty() {
-        match load_state_groups(&aux, &graph_event_ids) {
-            Ok(StateGroupLoad::Complete(groups)) => {
-                state_groups = groups;
-                loaded = true;
-            }
-            Ok(StateGroupLoad::Missing) => {}
-            Ok(StateGroupLoad::Invalid { event_id, reason }) => {
-                eprintln!(
-                    "warning: invalid cached state-group mapping for {event_id} ({reason}); recomputing state groups"
-                );
-            }
-            Err(error) => {
-                eprintln!(
-                    "warning: unable to read state-group mappings; recomputing state groups: {error}"
-                );
-            }
-        }
-    }
+    let cached = load_cached_state_groups(&aux, &graph_event_ids);
+    let loaded = cached.is_some();
+    let mut state_groups = cached.unwrap_or_default();
     let mut computed_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> =
         HashMap::new();
+    // Whether the computed mappings may be cached. A merge that fell back
+    // because this batch was missing part of the auth closure produces a
+    // first-parent group under a resolver-tagged id; caching it would hide the
+    // fact that a fuller import can compute the real resolution instead.
+    let mut publishable = true;
     let unresolved_count = if loaded {
         0
     } else {
-        let state_computation = compute_state_groups_partial(events, auth_chain, canonical_id);
+        let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
+        if !policy.resolvable() {
+            eprintln!(
+                "warning: room version {room_version} has no state-resolution rules mtxdb recognizes; state merges use the first-parent rule"
+            );
+        }
+        let state_computation = compute_state_groups_partial_with(
+            events,
+            auth_chain,
+            StateView::Federated,
+            canonical_id,
+            policy,
+        );
         let unresolved = state_computation.unresolved;
+        publishable = state_computation.incomplete.is_empty();
+        warn_incomplete_merges(&state_computation.incomplete);
         state_groups = state_computation.groups;
         computed_instances = state_computation.instances;
         if !unresolved.is_empty() {
@@ -9529,7 +9600,7 @@ fn repair_import_state_groups(
             Err(error) => eprintln!("warning: unable to persist state HAMT: {error}"),
         }
     }
-    if materialized && !loaded && !state_groups.is_empty() {
+    if materialized && !loaded && !state_groups.is_empty() && publishable {
         // Publish mappings only after their target HAMTs are durable. A later
         // replay must not mistake a partially materialized repair for a
         // complete cached result.
@@ -10120,15 +10191,29 @@ struct PartialStateComputation {
     /// One record per derived state-group instance, retained so an import can
     /// materialize its `STGP` record and (deduplicated) `STAT` content.
     instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+    /// Event ids at least one merge could not resolve because this batch does
+    /// not carry their auth closure. Non-empty means those merges fell back to
+    /// the legacy first-parent rule, so `groups` must not be cached as though
+    /// the real resolver had run — a later, fuller import recomputes them.
+    incomplete: Vec<String>,
+}
+
+/// What one DAG walk produced: the per-event group map, the derived instances
+/// worth materializing, and any auth-closure gap that forced a fallback.
+struct StateGroupWalk {
+    groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
+    instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+    incomplete: Vec<String>,
 }
 
 /// One resolved state-group derivation: the parent instance ids it descends
-/// from, the resulting state `LtHash`, and the state set to materialize into
-/// the shared `STAT` content.
+/// from, the resulting state `LtHash`, the state set to materialize into
+/// the shared `STAT` content, and the derivation that produced it.
 struct StateInstance {
     parents: Vec<[u8; STATE_GROUP_ID_LENGTH]>,
     lthash: [u8; 32],
     set: StateSet,
+    derivation: StateGroupDerivation,
 }
 
 /// Compute state groups for a set of events by walking the event DAG in
@@ -10146,6 +10231,11 @@ struct StateInstance {
 /// state `LtHash`; an ordinary event that changes nothing reuses its parent's
 /// instance. Events blocked by missing parents or cycles are reported
 /// separately in `unresolved`.
+/// The state-group walk a caller without an import context uses: the federated
+/// view, and whatever room version the batch's own `m.room.create` declares.
+/// A batch with no establishment record resolves under the retired merge
+/// rather than guessing a room version it was never told.
+#[cfg(test)]
 fn compute_state_groups_partial(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
@@ -10154,11 +10244,39 @@ fn compute_state_groups_partial(
     compute_state_groups_partial_in_view(events, auth_chain, StateView::Federated, room_id)
 }
 
+#[cfg(test)]
 fn compute_state_groups_partial_in_view(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
     view: StateView,
     room_id: &str,
+) -> PartialStateComputation {
+    compute_state_groups_partial_with(
+        events,
+        auth_chain,
+        view,
+        room_id,
+        batch_resolution_policy(events),
+    )
+}
+
+/// The resolver and trust claim a batch gets when no caller states one.
+#[cfg(test)]
+fn batch_resolution_policy(events: &[OwnedValue]) -> ResolutionPolicy {
+    let room_version = events
+        .iter()
+        .find(|event| matrix_create_event_id(event).is_some())
+        .and_then(|event| nested_event_string_field(event, "content", "room_version"))
+        .unwrap_or_default();
+    resolution_policy(room_version, StateGroupTrust::TrustedImport)
+}
+
+fn compute_state_groups_partial_with(
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+    view: StateView,
+    room_id: &str,
+    policy: ResolutionPolicy,
 ) -> PartialStateComputation {
     // Borrow the input when there is no auth chain to merge in; cloning every
     // parsed event just to concatenate two slices doubles peak memory on large
@@ -10185,6 +10303,7 @@ fn compute_state_groups_partial_in_view(
             groups: HashMap::new(),
             unresolved: Vec::new(),
             instances: HashMap::new(),
+            incomplete: Vec::new(),
         };
     }
 
@@ -10206,12 +10325,14 @@ fn compute_state_groups_partial_in_view(
         &reverse_map,
         &events_by_sid,
         view,
+        policy,
     );
 
     PartialStateComputation {
-        groups: result.0,
+        groups: result.groups,
         unresolved,
-        instances: result.1,
+        instances: result.instances,
+        incomplete: result.incomplete,
     }
 }
 
@@ -10222,29 +10343,19 @@ fn walk_state_groups(
     reverse_map: &HashMap<u64, String>,
     events_by_sid: &HashMap<u64, &OwnedValue>,
     view: StateView,
-) -> (
-    HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
-    HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
-) {
-    // How many resident children still need each event's state. Once the last
-    // child is processed the state is dropped, so memory follows the DAG's
-    // frontier width instead of holding one state per event for the whole run.
-    let mut remaining_children: HashMap<u64, usize> = HashMap::new();
-    for &idx in sorted {
-        for edge in frontier.prev_edges(idx) {
-            if edge.is_resident() {
-                let count = remaining_children
-                    .entry(frontier.nodes[edge.arena_index()].short_id)
-                    .or_default();
-                *count = count.saturating_add(1);
-            }
-        }
-    }
+    policy: ResolutionPolicy,
+) -> StateGroupWalk {
+    let mut remaining_children = count_resident_children(frontier, sorted);
+
+    // Built once for the whole walk and shared by every merge: rezzy events
+    // are materialized lazily and each id is walked at most once.
+    let mut context = LeanEventContext::new(events_by_sid.values().copied());
+    let mut incomplete: HashSet<String> = HashSet::new();
 
     let empty_set = StateSet::new();
     let empty = SharedState::new(
         empty_set,
-        state_group_instance_id(room_id, &[], &StateSet::new().lthash()),
+        state_group_instance_id(room_id, &[], &StateSet::new().lthash(), policy.derivation),
     );
     let mut state_at: HashMap<u64, Arc<SharedState>> = HashMap::new();
     let mut result: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
@@ -10267,11 +10378,13 @@ fn walk_state_groups(
             }
         }
 
-        // Union of the parents' states, with the first parent winning on a
-        // conflicting key. This is a temporary simplification of Matrix
-        // state resolution; changing it requires a state-group namespace bump.
-        // An event whose parents all agree shares their state instead of
-        // copying it, so a plain message event costs no allocation.
+        // State-resolution merge. Parents that already agree share their state
+        // instead of copying it, so a plain message event costs no allocation;
+        // only genuine divergence reaches rezzy. When rezzy cannot run — no
+        // recognized room version, or the batch is missing part of the auth
+        // closure it reads — the union falls back to the retired first-parent
+        // rule and the gap is recorded so the result is not cached as a
+        // real resolution.
         let base: Arc<SharedState> = match parents.as_slice() {
             [] => Arc::clone(&empty),
             [only] => Arc::clone(only),
@@ -10282,36 +10395,24 @@ fn walk_state_groups(
             {
                 Arc::clone(first)
             }
-            [..] => {
-                let mut merged = StateSet::new();
-                for parent in &parents {
-                    merged.merge(&parent.set);
-                }
-                let instance =
-                    state_group_instance_id(room_id, &parent_instances, &merged.lthash());
-                SharedState::new(merged, instance)
-            }
+            [..] => merge_parent_states(
+                &mut context,
+                &parents,
+                &parent_instances,
+                room_id,
+                policy,
+                &mut incomplete,
+            ),
         };
 
-        // Only a state event produces a new state set. A merge whose parents
-        // do not already share one instance derives a new instance too, so the
-        // merge topology survives even when the state does not change.
-        let state = match events_by_sid.get(&short_id) {
-            Some(ev) if is_state_event(ev) && !view.excludes(ev) => {
-                let key = state_key(ev);
-                let state_type = event_string_field(ev, "type").unwrap_or("");
-                let eid = event_id(ev).unwrap_or("").to_owned();
-                let mut set = base.set.clone();
-                set.set(state_type, &key, eid);
-                let instance = state_group_instance_id(room_id, &parent_instances, &set.lthash());
-                SharedState::new(set, instance)
-            }
-            _ if distinct_instances(&parent_instances) > 1 => {
-                let instance = state_group_instance_id(room_id, &parent_instances, &base.lthash);
-                SharedState::new(base.set.clone(), instance)
-            }
-            _ => Arc::clone(&base),
-        };
+        let state = derive_state(
+            events_by_sid.get(&short_id).copied(),
+            &base,
+            view,
+            &parent_instances,
+            room_id,
+            policy,
+        );
 
         instances
             .entry(state.instance)
@@ -10319,6 +10420,7 @@ fn walk_state_groups(
                 parents: canonical_parents(&parent_instances),
                 lthash: state.lthash,
                 set: state.set.clone(),
+                derivation: policy.derivation,
             });
 
         if let Some(eid) = reverse_map.get(&short_id) {
@@ -10336,7 +10438,122 @@ fn walk_state_groups(
             state_at.insert(short_id, state);
         }
     }
-    (result, instances)
+    let mut incomplete: Vec<String> = incomplete.into_iter().collect();
+    incomplete.sort();
+    StateGroupWalk {
+        groups: result,
+        instances,
+        incomplete,
+    }
+}
+
+/// How many resident children still need each event's state. Once the last
+/// child is processed the state is dropped, so memory follows the DAG's
+/// frontier width instead of holding one state per event for the whole run.
+fn count_resident_children(
+    frontier: &mtxdb::dag::ActiveRoomFrontier,
+    sorted: &[usize],
+) -> HashMap<u64, usize> {
+    let mut remaining_children: HashMap<u64, usize> = HashMap::new();
+    for &idx in sorted {
+        for edge in frontier.prev_edges(idx) {
+            if edge.is_resident() {
+                let count = remaining_children
+                    .entry(frontier.nodes[edge.arena_index()].short_id)
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+    remaining_children
+}
+
+/// The state an event descends to.
+///
+/// Only a state event the view keeps produces a new state set. A node whose
+/// parents do not already share one instance derives a new instance holding
+/// that state, so the merge topology survives even when the state itself did
+/// not change. Anything else shares its parent's state and costs no copy.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the derivation needs the event, the inherited state, and the identity inputs together"
+)]
+fn derive_state(
+    event: Option<&OwnedValue>,
+    base: &Arc<SharedState>,
+    view: StateView,
+    parent_instances: &[[u8; STATE_GROUP_ID_LENGTH]],
+    room_id: &str,
+    policy: ResolutionPolicy,
+) -> Arc<SharedState> {
+    match event {
+        Some(ev) if is_state_event(ev) && !view.excludes(ev) => {
+            let mut set = base.set.clone();
+            set.set(
+                event_string_field(ev, "type").unwrap_or(""),
+                &state_key(ev),
+                event_id(ev).unwrap_or("").to_owned(),
+            );
+            let instance = state_group_instance_id(
+                room_id,
+                parent_instances,
+                &set.lthash(),
+                policy.derivation,
+            );
+            SharedState::new(set, instance)
+        }
+        _ if distinct_instances(parent_instances) > 1 => {
+            let instance =
+                state_group_instance_id(room_id, parent_instances, &base.lthash, policy.derivation);
+            SharedState::new(base.set.clone(), instance)
+        }
+        _ => Arc::clone(base),
+    }
+}
+
+/// Resolve one genuinely divergent merge: the parents' states no longer agree,
+/// so this is where state resolution runs.
+///
+/// Parents that already agree reach `walk_state_groups`'s earlier arms and
+/// never get here, so this is only ever called with at least two distinct
+/// states. When rezzy cannot run — no recognized room version, or the batch
+/// is missing part of the auth closure it reads — the union falls back to the
+/// retired first-parent rule and the gap is recorded so the result is not
+/// cached as a real resolution. A room with no resolver at all falls back
+/// without a gap: the derivation already says `FirstParent`, so that is the
+/// recorded behavior rather than a shortfall.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the merge needs the context, the parents, and the identity inputs together"
+)]
+fn merge_parent_states(
+    context: &mut LeanEventContext<'_>,
+    parents: &[Arc<SharedState>],
+    parent_instances: &[[u8; STATE_GROUP_ID_LENGTH]],
+    room_id: &str,
+    policy: ResolutionPolicy,
+    incomplete: &mut HashSet<String>,
+) -> Arc<SharedState> {
+    let parent_entries: Vec<&StateEntries> =
+        parents.iter().map(|parent| &parent.set.entries).collect();
+    let merged = match resolve_parents(context, &parent_entries, policy) {
+        Ok(entries) => StateSet { entries },
+        Err(gap) => {
+            incomplete.extend(gap.missing);
+            let mut fallback = StateSet::new();
+            for parent in parents {
+                fallback.merge(&parent.set);
+            }
+            fallback
+        }
+    };
+    let instance = state_group_instance_id(
+        room_id,
+        parent_instances,
+        &merged.lthash(),
+        policy.derivation,
+    );
+    SharedState::new(merged, instance)
 }
 
 /// Number of distinct instance ids in `instances`.
@@ -10505,10 +10722,13 @@ impl StateSet {
             .insert((event_type.to_owned(), state_key.to_owned()), event_id);
     }
 
-    /// Merge another state set into this one. When both sets contain the
-    /// same (type, `state_key`) with different event IDs the conflict is
-    /// logged; the existing entry is kept (first-wins) which matches the
-    /// event ordering enforced by the topological sort caller.
+    /// Union another state set into this one, keeping the existing entry when
+    /// both sets name different event ids for the same `(type, state_key)`.
+    ///
+    /// This is the retired first-parent-wins merge, and it only runs where
+    /// state resolution cannot: no recognized room version, or a batch missing
+    /// part of the auth closure the resolver reads. Every other merge goes
+    /// through [`merge_parent_states`] instead.
     fn merge(&mut self, other: &StateSet) {
         for (key, eid) in &other.entries {
             self.entries
@@ -10542,45 +10762,7 @@ impl StateSet {
 }
 
 /// Check if an event is a state event (has a `state_key` field).
-/// Whether an event carries a top-level boolean `true` flag named `flag`
-/// (`"rejected"` or `"soft_failed"`). Servers annotate this differently, so
-/// leading underscores are ignored and `-` equals `_`: `__soft-failed`,
-/// `_soft-failed`, `soft-failed`, and `soft_failed` all name the same flag.
-fn has_event_flag(event: &OwnedValue, flag: &str) -> bool {
-    let OwnedValue::Object(fields) = event else {
-        return false;
-    };
-    fields.iter().any(|(key, value)| {
-        matches!(value, OwnedValue::Bool(true))
-            && key.trim_start_matches('_').replace('-', "_") == flag
-    })
-}
-
-/// Which view of room state a state group describes.
-///
-/// Federated state is what servers agree on: a soft-failed event is still part
-/// of it. A client never sees soft-failed events, so its state can differ, and
-/// therefore so can its state group. A rejected event fails authorization and
-/// belongs to neither view. Redactions change an event's content but not its
-/// ID, and a state group is keyed by `(type, state_key, event_id)`, so they
-/// affect neither view's group.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum StateView {
-    Federated,
-    #[allow(
-        dead_code,
-        reason = "the client-visible view, for callers that need it"
-    )]
-    Client,
-}
-
-impl StateView {
-    fn excludes(self, event: &OwnedValue) -> bool {
-        has_event_flag(event, "rejected")
-            || (self == Self::Client && has_event_flag(event, "soft_failed"))
-    }
-}
-
+/// Check if an event is a state event (has a `state_key` field).
 fn is_state_event(event: &OwnedValue) -> bool {
     let OwnedValue::Object(fields) = event else {
         return false;
@@ -10609,7 +10791,7 @@ fn event_room_id(value: &OwnedValue) -> Option<&str> {
     }
 }
 
-fn event_id(value: &OwnedValue) -> Option<&str> {
+pub(crate) fn event_id(value: &OwnedValue) -> Option<&str> {
     match value {
         OwnedValue::Object(object) => match object.get("event_id") {
             Some(OwnedValue::String(event_id)) => Some(event_id.as_str()),
@@ -10666,7 +10848,7 @@ fn matrix_batch_has_create(events: &[OwnedValue], collection_canonical_id: &str)
     })
 }
 
-fn event_string_field<'a>(value: &'a OwnedValue, field: &str) -> Option<&'a str> {
+pub(crate) fn event_string_field<'a>(value: &'a OwnedValue, field: &str) -> Option<&'a str> {
     match value {
         OwnedValue::Object(object) => match object.get(field) {
             Some(OwnedValue::String(value)) => Some(value.as_str()),
