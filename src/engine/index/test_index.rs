@@ -399,6 +399,53 @@ fn grow_by_recovering_hashes_rehashes_only_occupied_locations() {
 }
 
 #[test]
+fn grow_by_recovering_hashes_fails_closed_when_the_grown_table_rejects_the_rehash() {
+    // A doubled table is at most 37.5% full at the default load factor, so a
+    // rehash insert cannot normally be rejected. Reload a populated table with
+    // a load factor the doubled table cannot satisfy and every insert is
+    // rejected: growth must then return Ok(None) — the caller's pack-scan
+    // fallback — instead of Some(grown) that silently lacks entries (what
+    // `let _ = grown.insert(...)` used to publish).
+    let source = LossyIndex::with_config(16, IndexConfig::default());
+    let mut hashes = HashMap::new();
+    for offset in 0..3u64 {
+        let mut hash = [0u8; 16];
+        hash[..8].copy_from_slice(&offset.to_be_bytes());
+        source.insert(&hash, 0, offset).unwrap();
+        hashes.insert((0u16, offset), hash);
+    }
+    let blob = source.serialize();
+    let starved = LossyIndex::deserialize_with_config(
+        &blob,
+        IndexConfig {
+            load_factor_percent: 1,
+            ..IndexConfig::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(starved.len(), 3, "the blob carries three occupied slots");
+    let grown = starved
+        .grow_by_recovering_hashes(|shard, offset, _tag| Ok::<_, ()>(hashes[&(shard, offset)]))
+        .unwrap();
+    assert!(
+        grown.is_none(),
+        "a rejected rehash insert must fail the growth closed"
+    );
+
+    // Control: the same table at the default load factor grows and keeps
+    // every entry.
+    let normal = LossyIndex::deserialize_with_config(&blob, IndexConfig::default()).unwrap();
+    let grown = normal
+        .grow_by_recovering_hashes(|shard, offset, _tag| Ok::<_, ()>(hashes[&(shard, offset)]))
+        .unwrap()
+        .expect("a normally loaded table grows");
+    assert_eq!(grown.len(), 3);
+    for ((shard, offset), hash) in &hashes {
+        assert_eq!(grown.lookup(hash), Some((*shard, *offset)));
+    }
+}
+
+#[test]
 fn test_linear_probing() {
     let index = LossyIndex::new(16); // small table
     for i in 0..10u8 {

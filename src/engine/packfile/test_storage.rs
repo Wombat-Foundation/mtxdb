@@ -10721,3 +10721,34 @@ fn a_rebuild_insert_into_a_full_table_fails_instead_of_dropping_the_record() {
     );
     assert!(!index.is_empty(), "the table held entries before it filled");
 }
+
+#[test]
+fn build_index_fails_closed_when_the_table_rejects_an_insert() {
+    // `build_index` sizes its table at 2× the record count, so at the default
+    // load factor it can never reject an insert. A load factor whose threshold
+    // the sized table cannot satisfy makes the first insert fail; the build
+    // must surface that as `Corrupt`, not return an index silently missing the
+    // record (the pre-`insert_or_corrupt` code discarded the error).
+    let offsets: Vec<([u8; 16], u16, u64)> = (0..3u64)
+        .map(|seq| {
+            let mut hash = [0u8; 16];
+            hash[..8].copy_from_slice(&seq.to_be_bytes());
+            (hash, 0u16, 64 + seq * 64)
+        })
+        .collect();
+    let starved = crate::index::IndexConfig {
+        load_factor_percent: 1,
+        ..crate::index::IndexConfig::default()
+    };
+    let error = PackfileStorage::build_index(&offsets, starved).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("index insert failed") && message.contains("too full"),
+        "unexpected error: {message}"
+    );
+
+    // Control: the same offsets build completely at the default load factor.
+    let index =
+        PackfileStorage::build_index(&offsets, crate::index::IndexConfig::default()).unwrap();
+    assert_eq!(index.len(), offsets.len());
+}
