@@ -97,7 +97,7 @@ fn a_hydrated_checkpoint_loaded_index_can_grow_from_its_identity_tables() {
     let loaded = LossyIndex::deserialize_with_config(&blob, config).unwrap();
     assert!(
         identities_complete(&loaded),
-        "v6 blobs persist full identities"
+        "slots+homes+tails blobs persist full identities"
     );
     let grown = loaded
         .grow()

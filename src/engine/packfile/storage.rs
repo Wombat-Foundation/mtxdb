@@ -960,16 +960,12 @@ fn disk_bytes_from_physical(
 /// treated exactly like a missing/corrupt file (see
 /// `read_persisted_shard_collections`) — reset or let the next sync
 /// regenerate it, not a format this reader tries to still understand.
-/// This sidecar has changed shape three times already (adding insertion
-/// order, switching `slot` for `pack_id`, then v4 adding the
-/// pack-fingerprint gate); none of that carries forward, since nothing
-/// depends on reading a store from before the current format existed.
+/// The current sidecar format is a single pre-release format; nothing depends
+/// on reading a store from before it existed.
 const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
-/// v5 adds physical bytes to the reduced bookkeeping and pins it to the exact
-/// `(pack_id, file_len)` set by carrying the same `pack_fingerprint` as the
-/// index checkpoint. v7 uses the 16-byte [`PackId`] identity (v6 used the
-/// 32-byte form); the record width changed, so the version must advance and a
-/// v6 file is rejected and rebuilt.
+/// The current format carries physical bytes and pins the reduced bookkeeping
+/// to the exact `(pack_id, file_len)` set using the same `pack_fingerprint` as
+/// the index checkpoint.
 const SHARD_ROOMS_VERSION: u8 = 1;
 /// Header size: magic(4) + version(1) + `pack_fingerprint(8)` + `persisted_at(8)`.
 const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8 + 8;
@@ -3528,7 +3524,7 @@ impl PackfileStorage {
         // stable identity: a fresh reader's `discover_shards` reassigns
         // slots by first-free-in-pack_id-order, which does not reproduce
         // the writer's numbering once any shard has ever been retired (see
-        // `CHECKPOINT_VERSION`'s v6 doc comment). A checkpoint_slot with no
+        // checkpoint pack-table documentation). A checkpoint_slot with no
         // entry here (its pack_id isn't among this reader's currently-open
         // packs) is left unmapped; any index entry that actually needs it
         // makes `remap_slots` fail closed below, forcing a full rescan
@@ -5333,9 +5329,8 @@ impl PackfileStorage {
         // Every pack live right now, keyed by this writer's own local slot —
         // lets a reader translate this checkpoint's slot-encoded index
         // entries to its own local slot for the same pack_id, rather than
-        // trusting the writer's raw slot number (see CHECKPOINT_VERSION's
-        // doc comment on the v6 bump for why that's unsafe after a
-        // retirement).
+        // trusting the writer's raw slot number (see the checkpoint pack-table
+        // documentation for why that's unsafe after a retirement).
         let pack_table: Vec<(u16, PackId)> = live_shards
             .iter()
             .map(|(slot, shard)| (*slot, shard.pack_id))

@@ -940,7 +940,7 @@ impl LossyIndex {
     /// checkpoint's persisted pack table, translated through this reader's
     /// own currently-open packs) reconciles that against this reader's own
     /// entry numbering, which can differ once any shard has ever been retired
-    /// (see `CHECKPOINT_VERSION`'s v6 doc comment).
+    /// (see the checkpoint pack-table documentation).
     ///
     /// Checks first without touching storage: the common case (no shard has
     /// ever been retired, so a fresh reader's entry numbering already agrees

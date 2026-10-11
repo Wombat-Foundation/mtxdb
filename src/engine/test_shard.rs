@@ -611,14 +611,14 @@ fn test_concurrent_persist_stats_does_not_race() {
     assert!(!leftover_tmp, "a persist_stats tmp file was left behind");
 }
 
-/// A stats snapshot at the immediately preceding version (v5: 56-byte
-/// records keyed by the 32-byte `PackId`) must be ignored rather than
-/// misparsed as v6's 40-byte records. The snapshot is a rebuildable
+/// A stats snapshot at an immediately preceding format (56-byte records
+/// keyed by the 32-byte `PackId`) must be ignored rather than misparsed as
+/// the current 40-byte records. The snapshot is a rebuildable
 /// observability cache, so rejection just means "not restored".
 #[test]
 fn previous_version_stats_snapshot_is_not_restored() {
     let dir = test_dir("stats_prev_version");
-    // Hand-write a v5-format file: magic, version 5, timestamp, then one
+    // Hand-write a stale-format file: magic, an old version, timestamp, then one
     // 56-byte record (32-byte pack id + three u64 counters). No live shard
     // is needed: the version gate rejects the whole file before any record
     // is matched or decoded, which is exactly the behavior under test.
@@ -636,8 +636,8 @@ fn previous_version_stats_snapshot_is_not_restored() {
         STATS_VERSION - 1
     );
 
-    // Opening the pool with a stale v5 snapshot must ignore it without error,
-    // and a subsequent persist must overwrite it with a fresh v6 snapshot.
+    // Opening the pool with a stale snapshot must ignore it without error, and
+    // a subsequent persist must overwrite it with a fresh current snapshot.
     let pool = ShardPool::open(dir.clone()).unwrap();
     pool.persist_stats().unwrap();
     drop(pool);
