@@ -18,7 +18,7 @@ pub(crate) const SCOPE: [u8; 16] = [0x71; 16];
 pub(crate) const CHUNK_COLLECTION: [u8; 16] = [0x72; 16];
 pub(crate) const BATCH: usize = 1000;
 pub(crate) const SYNC_EVERY: usize = 20;
-pub(crate) const CHUNK: usize = 256;
+const DEFAULT_CHUNK: usize = 256;
 pub(crate) const PREV: EdgeFamily = EdgeFamily::plain(1);
 pub(crate) const AUTH: EdgeFamily = EdgeFamily::plain(2);
 pub(crate) const REL: EdgeFamily = EdgeFamily::typed(3);
@@ -29,6 +29,33 @@ pub(crate) const KIND_RUN: u8 = 3;
 const MIB: f64 = 1_048_576.0;
 const TWO_POW_32: f64 = 4_294_967_296.0;
 const TWO_POW_32_INT: u64 = 4_294_967_296;
+
+/// Ids per prototype chunk: `MTXDB_EL_CHUNK`, default 256. At most 256, so
+/// the `u16` offsets and counts in key chunks cannot overflow even with
+/// maximum-length keys.
+///
+/// # Panics
+/// If `MTXDB_EL_CHUNK` is not an integer in `1..=256`.
+pub(crate) fn chunk_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("MTXDB_EL_CHUNK").map_or(DEFAULT_CHUNK, |v| {
+            v.parse()
+                .ok()
+                .filter(|n| (1..=DEFAULT_CHUNK).contains(n))
+                .expect("MTXDB_EL_CHUNK must be an integer in 1..=256")
+        })
+    })
+}
+
+/// The chunk that holds `id`, and its position inside the chunk.
+pub(crate) fn locate(id: usize) -> (usize, usize) {
+    let size = chunk_size();
+    (
+        id.checked_div(size).unwrap_or(0),
+        id.checked_rem(size).unwrap_or(0),
+    )
+}
 
 /// One event of the room.
 pub(crate) struct Row {
@@ -274,14 +301,14 @@ impl<'a> Ids<'a> {
 }
 
 fn chunk_bounds(chunk: usize, len: usize) -> (usize, usize) {
-    let start = chunk.saturating_mul(CHUNK);
-    (start, start.saturating_add(CHUNK).min(len))
+    let start = chunk.saturating_mul(chunk_size());
+    (start, start.saturating_add(chunk_size()).min(len))
 }
 
 fn encode_edge_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
     let (start, end) = chunk_bounds(chunk, ids.lists.len());
     let mut body = Vec::new();
-    let mut offsets = Vec::with_capacity(CHUNK);
+    let mut offsets = Vec::with_capacity(chunk_size());
     for (prev, auth, rel) in &ids.lists[start..end] {
         offsets.push(u32::try_from(body.len()).expect("chunk fits u32"));
         for list in [prev, auth, rel] {
@@ -311,7 +338,7 @@ fn encode_edge_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
 fn encode_key_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
     let (start, end) = chunk_bounds(chunk, ids.keys.len());
     let mut body = Vec::new();
-    let mut offsets = Vec::with_capacity(CHUNK);
+    let mut offsets = Vec::with_capacity(chunk_size());
     for key in &ids.keys[start..end] {
         offsets.push(u16::try_from(body.len()).expect("key chunk body fits u16 offsets"));
         body.push(u8::try_from(key.len()).expect("key length"));
@@ -353,7 +380,7 @@ fn assign_batch<'a>(ids: &mut Ids<'a>, batch: &'a [Row]) -> BTreeSet<usize> {
         auth.sort_unstable();
         auth.dedup();
         ids.lists[owner as usize] = (prev, auth, rel);
-        dirty.insert(owner as usize / CHUNK);
+        dirty.insert(locate(owner as usize).0);
     }
     dirty
 }
@@ -417,7 +444,7 @@ fn timed_put(store: &dyn StorageEngine, stats: &mut PutStats, id: [u8; 16], byte
 }
 
 /// Write the prototype layout through `db`: dense short ids in first-seen order;
-/// edge lists and the id -> key map in chunks of [`CHUNK`] ids, every chunk that
+/// edge lists and the id -> key map in chunks of [`chunk_size`] ids, every chunk that
 /// changed in a batch rewritten whole; the key -> id map as one sorted run of
 /// (16-byte key hash, id) per batch. Syncs every [`SYNC_EVERY`] batches.
 pub(crate) fn write_chunked<'a>(db: &Database, rows: &'a [Row]) -> (Ids<'a>, WriteStats) {
@@ -429,8 +456,8 @@ pub(crate) fn write_chunked<'a>(db: &Database, rows: &'a [Row]) -> (Ids<'a>, Wri
     for (n, batch) in rows.chunks(BATCH).enumerate() {
         let first_new = ids.keys.len();
         let mut dirty = assign_batch(&mut ids, batch);
-        let tail = ids.keys.len().div_ceil(CHUNK);
-        dirty.extend((first_new / CHUNK)..tail);
+        let tail = ids.keys.len().div_ceil(chunk_size());
+        dirty.extend(locate(first_new).0..tail);
         let mut run: Vec<([u8; 16], u32)> = (first_new..ids.keys.len())
             .map(|i| (key_hash(ids.keys[i]), u32::try_from(i).expect("id")))
             .collect();
@@ -455,7 +482,7 @@ pub(crate) fn write_chunked<'a>(db: &Database, rows: &'a [Row]) -> (Ids<'a>, Wri
                 &encode_edge_chunk(&ids, chunk),
             );
         }
-        for chunk in (first_new / CHUNK)..tail {
+        for chunk in locate(first_new).0..tail {
             let number = u32::try_from(chunk).expect("chunk");
             let bucket = if seen_key.insert(chunk) {
                 &mut stats.key_new

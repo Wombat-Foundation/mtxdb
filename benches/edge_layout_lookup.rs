@@ -51,9 +51,9 @@ use mtxdb::storage::StorageEngine;
 mod common;
 
 use common::{
-    baseline_scope, key_hash, len_f64, load, mib, num, per, record_rows, sizes, spread,
-    write_chunked, PutStats, Row, Variant, WriteStats, AUTH, CHUNK, CHUNK_COLLECTION,
-    KIND_EDGE_CHUNK, KIND_KEY_CHUNK, KIND_RUN, PREV, REL,
+    baseline_scope, key_hash, len_f64, load, locate, mib, num, per, record_rows, sizes, spread,
+    write_chunked, PutStats, Row, Variant, WriteStats, AUTH, CHUNK_COLLECTION, KIND_EDGE_CHUNK,
+    KIND_KEY_CHUNK, KIND_RUN, PREV, REL,
 };
 
 /// A key's three edge lists as target ids: prev, auth, relations.
@@ -269,11 +269,8 @@ impl Proto {
         let mut groups: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
         for (slot, id) in ids.iter().enumerate() {
             if let Some(id) = id {
-                let id = *id as usize;
-                groups
-                    .entry(id / CHUNK)
-                    .or_default()
-                    .push((slot, id % CHUNK));
+                let (chunk, pos) = locate(*id as usize);
+                groups.entry(chunk).or_default().push((slot, pos));
             }
         }
         groups
@@ -573,8 +570,9 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 fn put_line(label: &str, stats: PutStats) {
     println!(
-        "    {label:<22} {:>6} puts {:>9.2} MiB payload {:>9.1} ms in put ({:>8.1} us/put)",
+        "    {label:<22} {:>6} puts {:>7.0} B/put {:>9.2} MiB payload {:>9.1} ms in put ({:>8.1} us/put)",
         stats.puts,
+        num(stats.bytes) / num(stats.puts.max(1)),
         mib(stats.bytes),
         stats.time.as_secs_f64() * 1000.0,
         micros(stats.time) / num(stats.puts.max(1)),
@@ -609,13 +607,54 @@ fn report_writes(stats: &WriteStats, baseline: Duration, prototype: Duration, ev
     );
 }
 
+/// Round-trip the room, then run the warm and cold tables for one layout.
+fn bench_layout(
+    name: &str,
+    dir: &Path,
+    open: &dyn Fn() -> Box<dyn Layout>,
+    rows: &[Row],
+    (picks, misses): (&[usize], &[String]),
+    (n, batch, cold_n): (usize, usize, usize),
+) {
+    let started = Instant::now();
+    let layout = open();
+    println!(
+        "[{name}] open {:.1} ms",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    let started = Instant::now();
+    let row_ids = round_trip(layout.as_ref(), rows);
+    println!(
+        "  full-room round trip ok ({} keys, {:.2} s)",
+        rows.len(),
+        started.elapsed().as_secs_f64()
+    );
+    let ctx = Ctx {
+        rows,
+        row_ids,
+        sample: picks,
+        misses,
+    };
+    warm(name, layout.as_ref(), &ctx, n, batch);
+    println!(
+        "  hash matches rejected by the key check: {}",
+        layout.rejected()
+    );
+    drop(layout);
+    cold(name, dir, open, &ctx, cold_n);
+}
+
 fn main() {
     let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     let n = env_usize("MTXDB_EL_OPS", 20_000);
     let cold_n = env_usize("MTXDB_EL_COLD", 1_000);
     let rows = load(&tsv, env_usize("MTXDB_EL_EVENTS", usize::MAX));
-    println!("{} events, {n} sampled ops, {cold_n} cold ops", rows.len());
+    println!(
+        "{} events, {n} sampled ops, {cold_n} cold ops, {} ids per chunk",
+        rows.len(),
+        common::chunk_size()
+    );
     let pid = std::process::id();
     let dir_a = base.join(format!("mtxdb_bench_edgelookup_{pid}_baseline"));
     let dir_b = base.join(format!("mtxdb_bench_edgelookup_{pid}_chunked"));
@@ -682,32 +721,14 @@ fn main() {
         ),
     ];
     for (name, dir, open) in &layouts {
-        let started = Instant::now();
-        let layout = open();
-        println!(
-            "[{name}] open {:.1} ms",
-            started.elapsed().as_secs_f64() * 1000.0
+        bench_layout(
+            name,
+            dir,
+            open.as_ref(),
+            &rows,
+            (&picks, &misses),
+            (n, batch, cold_n),
         );
-        let started = Instant::now();
-        let row_ids = round_trip(layout.as_ref(), &rows);
-        println!(
-            "  full-room round trip ok ({} keys, {:.2} s)",
-            rows.len(),
-            started.elapsed().as_secs_f64()
-        );
-        let ctx = Ctx {
-            rows: &rows,
-            row_ids,
-            sample: &picks,
-            misses: &misses,
-        };
-        warm(name, layout.as_ref(), &ctx, n, batch);
-        println!(
-            "  hash matches rejected by the key check: {}",
-            layout.rejected()
-        );
-        drop(layout);
-        cold(name, dir, open.as_ref(), &ctx, cold_n);
     }
     for dir in [&dir_a, &dir_b] {
         let _ = std::fs::remove_dir_all(dir);
