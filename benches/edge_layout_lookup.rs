@@ -20,9 +20,10 @@
 //!   vector, loaded once (its load time is printed).
 //! - Every result is checked against the source ids (outside the timed region),
 //!   and the whole room is round-tripped once per layout before timing.
-//! - Cold = reopen the database, `sync`, evict the store's files with
-//!   `vmtouch -e`, then time the first `MTXDB_EL_COLD` (default 1000) calls.
-//!   The in-memory index is rebuilt by reopen, so cold measures pack reads.
+//! - Cold = reopen the database, then `sync` and evict the store's files with
+//!   `vmtouch -e` (reopen itself reads the store into the page cache), then time
+//!   the first `MTXDB_EL_COLD` (default 1000) calls. The in-memory index
+//!   survives, so cold measures pack reads.
 //! - The confirmed variants are not collision-safe either: each run stores one
 //!   id per 128-bit hash and lookup yields one candidate, so if two distinct
 //!   keys collided, the check would reject the other key instead of finding its
@@ -167,23 +168,6 @@ fn search_run(entries: &[u8], hash: &[u8; 16]) -> Option<u32> {
     None
 }
 
-/// The key at `pos` in an id -> key chunk record, found through its offset table.
-fn key_at(chunk: &[u8], pos: usize) -> Option<&[u8]> {
-    let count = usize::from(u16::from_be_bytes(chunk.get(8..10)?.try_into().ok()?));
-    if pos >= count {
-        return None;
-    }
-    let at = 10_usize.saturating_add(pos.saturating_mul(2));
-    let off = usize::from(u16::from_be_bytes(
-        chunk.get(at..at.saturating_add(2))?.try_into().ok()?,
-    ));
-    let body = 10_usize.saturating_add(count.saturating_mul(2));
-    let head = body.saturating_add(off);
-    let len = usize::from(*chunk.get(head)?);
-    let start = head.saturating_add(1);
-    chunk.get(start..start.saturating_add(len))
-}
-
 /// The three lists at `pos` in an edge-list chunk record.
 fn edges_at(chunk: &[u8], pos: usize) -> Option<Edges> {
     let count = usize::from(u16::from_be_bytes(chunk.get(8..10)?.try_into().ok()?));
@@ -288,7 +272,9 @@ impl Proto {
                 continue;
             };
             for (slot, pos) in members {
-                out[slot] = key_at(&record, pos).map(|k| String::from_utf8_lossy(k).into_owned());
+                out[slot] = common::format::key_at(&record, pos)
+                    .ok()
+                    .map(|k| String::from_utf8_lossy(k).into_owned());
             }
         }
         out
@@ -524,11 +510,14 @@ fn evict(dir: &Path) {
     let _ = Command::new("vmtouch").arg("-e").arg(dir).output();
 }
 
-/// Cold table: per op, reopen, evict, time the first `cold` single calls.
+/// Cold table: per op, reopen, then evict the store's files, and time the first
+/// `cold` single calls. Reopen reads the store back into the page cache, so
+/// eviction must follow it; the in-memory index survives, so the calls measure
+/// pack reads.
 fn cold(name: &str, dir: &Path, open: &dyn Fn() -> Box<dyn Layout>, ctx: &Ctx<'_>, cold_n: usize) {
     for op in Op::ALL {
-        evict(dir);
         let layout = open();
+        evict(dir);
         report(name, op, "cold", &run(layout.as_ref(), ctx, op, 1, cold_n));
     }
 }

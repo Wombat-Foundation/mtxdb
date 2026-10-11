@@ -193,3 +193,9 @@ harness = false
 name = "edge_layout_lookup"
 path = "edge_layout_lookup.rs"
 harness = false
+
+# Which layer of the prototype's id -> key read costs the time: decode, fetch, compression, CRC.
+[[bench]]
+name = "edge_layout_read_split"
+path = "edge_layout_read_split.rs"
+harness = false

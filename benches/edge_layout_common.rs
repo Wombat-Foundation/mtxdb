@@ -3,11 +3,16 @@
 //! helpers.
 //!
 //! The prototype is a benchmark-only layout; nothing here is a production format.
+//! Each bench target uses a subset of these items.
+#![allow(dead_code)]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+#[path = "edge_layout_format.rs"]
+pub(crate) mod format;
 
 use mtxdb::database::Database;
 use mtxdb::layout::ShardType;
@@ -50,11 +55,7 @@ pub(crate) fn chunk_size() -> usize {
 
 /// The chunk that holds `id`, and its position inside the chunk.
 pub(crate) fn locate(id: usize) -> (usize, usize) {
-    let size = chunk_size();
-    (
-        id.checked_div(size).unwrap_or(0),
-        id.checked_rem(size).unwrap_or(0),
-    )
+    format::locate(id, chunk_size())
 }
 
 /// One event of the room.
@@ -301,8 +302,7 @@ impl<'a> Ids<'a> {
 }
 
 fn chunk_bounds(chunk: usize, len: usize) -> (usize, usize) {
-    let start = chunk.saturating_mul(chunk_size());
-    (start, start.saturating_add(chunk_size()).min(len))
+    format::chunk_bounds(chunk, chunk_size(), len)
 }
 
 fn encode_edge_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
@@ -332,26 +332,10 @@ fn encode_edge_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
     out
 }
 
-/// Id -> key chunk: magic, chunk number, entry count, one `u16` body offset per
-/// entry (so a position is found without walking the chunk), then the entries
-/// (length byte + key).
 fn encode_key_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
     let (start, end) = chunk_bounds(chunk, ids.keys.len());
-    let mut body = Vec::new();
-    let mut offsets = Vec::with_capacity(chunk_size());
-    for key in &ids.keys[start..end] {
-        offsets.push(u16::try_from(body.len()).expect("key chunk body fits u16 offsets"));
-        body.push(u8::try_from(key.len()).expect("key length"));
-        body.extend_from_slice(key.as_bytes());
-    }
-    let mut out = b"PREV".to_vec();
-    out.extend_from_slice(&u32::try_from(chunk).expect("chunk").to_be_bytes());
-    out.extend_from_slice(&u16::try_from(offsets.len()).expect("count").to_be_bytes());
-    for offset in offsets {
-        out.extend_from_slice(&offset.to_be_bytes());
-    }
-    out.extend_from_slice(&body);
-    out
+    format::encode_key_chunk(&ids.keys[start..end], u32::try_from(chunk).expect("chunk"))
+        .expect("key chunk encodes")
 }
 
 fn encode_run(entries: &mut [([u8; 16], u32)]) -> Vec<u8> {
