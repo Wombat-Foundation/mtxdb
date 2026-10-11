@@ -10752,3 +10752,78 @@ fn build_index_fails_closed_when_the_table_rejects_an_insert() {
         PackfileStorage::build_index(&offsets, crate::index::IndexConfig::default()).unwrap();
     assert_eq!(index.len(), offsets.len());
 }
+
+#[test]
+fn init_collection_from_scan_fails_closed_when_the_table_rejects_an_insert() {
+    // `open` hardcodes the default index config, so the FullScan rebuild path
+    // can only be starved by calling `init_collection_from_scan` directly. Its
+    // table is sized at 2× the record count (floored at 64), so a 1% load
+    // factor makes the first insert fail; the rebuild must surface that as
+    // `Corrupt`, not publish an index silently missing the record — the exact
+    // gap that let the original large-index rescan truncate.
+    let dir = test_dir("init_scan_fails_closed");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(1),
+            &NodeData::new(bytes::Bytes::from_static(b"scan-record")),
+        )
+        .unwrap();
+    store.sync().unwrap();
+
+    // Collect the real on-disk (slot, hash, offset) for the seeded record so
+    // the control path's disk-length pass has a true offset to read.
+    let mut records: Vec<ShardRecord> = Vec::new();
+    for entry in fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|extension| extension != "pack") {
+            continue;
+        }
+        for (collection, hash, offset) in ShardPool::scan_shard(&path).unwrap() {
+            if collection == TEST_COLLECTION {
+                records.push((0, hash, offset, PackId([0u8; crate::packfile::PACK_ID_LEN])));
+            }
+        }
+    }
+    assert_eq!(records.len(), 1, "the seeded record must be on disk");
+
+    let starved = crate::index::IndexConfig {
+        load_factor_percent: 1,
+        ..crate::index::IndexConfig::default()
+    };
+    let mut out = RoomScanOutput::default();
+    let error = PackfileStorage::init_collection_from_scan(
+        &TEST_COLLECTION,
+        &records,
+        &store.shards,
+        0,
+        starved,
+        &mut out,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("index rebuild dropped") && message.contains("too full"),
+        "unexpected error: {message}"
+    );
+
+    // Control: the same records rebuild completely at the default load factor,
+    // and the scan output counts their on-disk bytes.
+    let mut out = RoomScanOutput::default();
+    PackfileStorage::init_collection_from_scan(
+        &TEST_COLLECTION,
+        &records,
+        &store.shards,
+        0,
+        crate::index::IndexConfig::default(),
+        &mut out,
+    )
+    .unwrap();
+    let bytes =
+        out.collection_disk_bytes[&PackId([0u8; crate::packfile::PACK_ID_LEN])][&TEST_COLLECTION];
+    assert!(
+        bytes > 0,
+        "the rebuild must account for the record's disk bytes"
+    );
+}
