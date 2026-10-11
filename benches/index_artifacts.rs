@@ -498,6 +498,45 @@ fn measure_warm_lookups(
             .filter(|k| store.get(&COLLECTION, k).expect("get").is_some())
             .count()
     });
+    if found != lookups {
+        // Diagnose before failing: which sequence numbers does the store miss?
+        let mut missed = Vec::new();
+        for i in 0..lookups as u64 {
+            let seq = sample_index(i, records);
+            if store
+                .get(&COLLECTION, &node_id(seq))
+                .expect("get")
+                .is_none()
+            {
+                missed.push(seq);
+            }
+        }
+        missed.sort_unstable();
+        println!(
+            "  STORE MISSES {} of {lookups}; records {records}; min {:?} max {:?}; deciles of misses by seq/records: {:?}",
+            missed.len(),
+            missed.first(),
+            missed.last(),
+            (0..10u64)
+                .map(|d| {
+                    missed
+                        .iter()
+                        .filter(|&&q| {
+                            q.checked_mul(10)
+                                .expect("decile multiplication")
+                                .checked_div(records)
+                                .expect("nonempty benchmark index")
+                                == d
+                        })
+                        .count()
+                })
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  store collection index stats: {:?}",
+            store.open_timings().map(|t| t.path)
+        );
+    }
     assert_eq!(found, lookups, "store lookups hit");
     println!(
         "  end-to-end via store.get (hash locator + frame read): {:.0} ns each",
