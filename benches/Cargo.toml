@@ -175,3 +175,9 @@ harness = false
 name = "index_artifacts"
 path = "index_artifacts.rs"
 harness = false
+
+# Does a large store find every record after one clean reopen?
+[[bench]]
+name = "big_reopen_repro"
+path = "big_reopen_repro.rs"
+harness = false
