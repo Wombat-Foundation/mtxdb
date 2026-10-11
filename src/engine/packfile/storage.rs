@@ -3711,10 +3711,14 @@ impl PackfileStorage {
                 return None;
             }
             let index = match redo_by_collection.remove(&loaded.collection_id) {
-                Some(records) => if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) { index } else {
-                    timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
-                    return None;
-                },
+                Some(records) => {
+                    if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) {
+                        index
+                    } else {
+                        timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
+                        return None;
+                    }
+                }
                 None => index,
             };
             let Some(len) = u32::try_from(index.len()).ok() else {
@@ -3741,10 +3745,14 @@ impl PackfileStorage {
                 return None;
             }
             let index = match redo_by_collection.remove(&collection_id) {
-                Some(records) => if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) { index } else {
-                    timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
-                    return None;
-                },
+                Some(records) => {
+                    if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) {
+                        index
+                    } else {
+                        timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
+                        return None;
+                    }
+                }
                 None => index,
             };
             let Some(len) = u32::try_from(index.len()).ok() else {
