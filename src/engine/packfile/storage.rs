@@ -8374,9 +8374,9 @@ impl PackfileStorage {
                 u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            let inserted = grown.insert(id, slot, offset).is_ok();
+            insert_or_corrupt(&grown, id, slot, offset)?;
             progress.owned_index = Some(grown);
-            inserted
+            true
         };
         if inserted {
             if let Some(shard) = self.shards.get_shard(slot) {

@@ -769,8 +769,14 @@ impl LossyIndex {
         for (slot, offset, slot_tag) in locations {
             let hash = hash_at(slot, offset, slot_tag)?;
             // A doubled table is at most 37.5% full because insertion only
-            // requests growth at 75%, so this cannot hit TableFull.
-            let _ = grown.insert(&hash, slot, offset);
+            // requests growth at 75%, so TableFull should be unreachable —
+            // but the load threshold has overflowed before (see
+            // `max_occupied`), and a silently dropped insert here would
+            // publish a grown index missing entries. Fail the growth closed
+            // instead: `Ok(None)` sends the caller to its pack-scan rebuild.
+            if grown.insert(&hash, slot, offset).is_err() {
+                return Ok(None);
+            }
         }
         Ok(Some(grown))
     }
