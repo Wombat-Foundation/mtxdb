@@ -3711,12 +3711,9 @@ impl PackfileStorage {
                 return None;
             }
             let index = match redo_by_collection.remove(&loaded.collection_id) {
-                Some(records) => match Self::apply_redo_sets(index, &records, &pack_lookup) {
-                    Some(index) => index,
-                    None => {
-                        timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
-                        return None;
-                    }
+                Some(records) => if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) { index } else {
+                    timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
+                    return None;
                 },
                 None => index,
             };
@@ -3744,12 +3741,9 @@ impl PackfileStorage {
                 return None;
             }
             let index = match redo_by_collection.remove(&collection_id) {
-                Some(records) => match Self::apply_redo_sets(index, &records, &pack_lookup) {
-                    Some(index) => index,
-                    None => {
-                        timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
-                        return None;
-                    }
+                Some(records) => if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) { index } else {
+                    timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
+                    return None;
                 },
                 None => index,
             };

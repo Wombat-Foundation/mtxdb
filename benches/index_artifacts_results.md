@@ -22,14 +22,14 @@ Can a sealed pack reopen without reading the whole pack, and what does that save
 
 ## 2. What was compared
 
-| Strategy | What it does at reopen | Reads the pack? |
-|---|---|---|
-| **current** | `PackfileStorage::open`: decode checkpoint, materialize the hash index, validate every frame (pack recovery) | all of it |
-| **scan rebuild** | `scan_and_recover_packfile`: walk and CRC every frame | all of it |
-| **`.idx` read + CRC** | read the sorted index file and verify its CRC | no |
-| **trusted, mmap** | stat pack, mmap `.idx`, check header only | no |
-| **trusted, metadata-only** | stat pack against a manifest length, read `.idx` header + fanout (1040 B) | no |
-| **digest-verify** | read the whole pack and CRC it (what verifying a seal digest costs) | all of it |
+| Strategy                   | What it does at reopen                                                                                       | Reads the pack? |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------ | --------------- |
+| **current**                | `PackfileStorage::open`: decode checkpoint, materialize the hash index, validate every frame (pack recovery) | all of it       |
+| **scan rebuild**           | `scan_and_recover_packfile`: walk and CRC every frame                                                        | all of it       |
+| **`.idx` read + CRC**      | read the sorted index file and verify its CRC                                                                | no              |
+| **trusted, mmap**          | stat pack, mmap `.idx`, check header only                                                                    | no              |
+| **trusted, metadata-only** | stat pack against a manifest length, read `.idx` header + fanout (1040 B)                                    | no              |
+| **digest-verify**          | read the whole pack and CRC it (what verifying a seal digest costs)                                          | all of it       |
 
 Prototype `.idx`: 16-byte header (magic, count), `fanout[256]` u32, sorted 16-byte ids, u32 offsets, CRC32 trailer. One collection, ids = frame hashes. 20 bytes/entry plus ~1 KiB.
 
@@ -39,14 +39,14 @@ Workloads (one pack each; the harness asserts exactly one pack): **tiny** = 16-b
 
 ### 3.1 256 MiB, tiny frames (4,400,515 records)
 
-| Strategy | Warm | Cold |
-|---|---:|---:|
-| current open | 3075 | 4395 |
-| scan rebuild | 487 | 1536 |
-| digest-verify | 140 | 1527 |
-| `.idx` read + CRC | 18–41 | 496–519 |
-| trusted, mmap | 0.02 | 6.1 |
-| trusted, metadata-only | 0.02 | 0.40 |
+| Strategy               |  Warm |    Cold |
+| ---------------------- | ----: | ------: |
+| current open           |  3075 |    4395 |
+| scan rebuild           |   487 |    1536 |
+| digest-verify          |   140 |    1527 |
+| `.idx` read + CRC      | 18–41 | 496–519 |
+| trusted, mmap          |  0.02 |     6.1 |
+| trusted, metadata-only |  0.02 |    0.40 |
 
 ```mermaid
 xychart-beta
@@ -58,26 +58,26 @@ xychart-beta
 
 ### 3.2 256 MiB, mixed frames (8,149 records)
 
-| Strategy | Warm | Cold |
-|---|---:|---:|
-| current open | 111 | 1527 |
-| scan rebuild | 43 | 1517 |
-| digest-verify | 72 | 1650 |
-| `.idx` read + CRC | 0.1 | 1.3 |
-| trusted, mmap | 0.02 | 1.2 |
-| trusted, metadata-only | 0.01 | 0.5 |
+| Strategy               | Warm | Cold |
+| ---------------------- | ---: | ---: |
+| current open           |  111 | 1527 |
+| scan rebuild           |   43 | 1517 |
+| digest-verify          |   72 | 1650 |
+| `.idx` read + CRC      |  0.1 |  1.3 |
+| trusted, mmap          | 0.02 |  1.2 |
+| trusted, metadata-only | 0.01 |  0.5 |
 
 ### 3.3 1 GiB, tiny frames (17,602,258 records, quiet machine)
 
-| Strategy | "Warm" | Cold |
-|---|---:|---:|
+| Strategy                      | "Warm" |   Cold |
+| ----------------------------- | -----: | -----: |
 | current open (via Checkpoint) | 13,566 | 15,039 |
-| scan rebuild | 6,605 | 6,968 |
-| digest-verify | 5,368 | 6,378 |
-| `.idx` read + CRC | 1,673 | 1,668 |
-| trusted, read + CRC | 759 | 1,669 |
-| trusted, mmap | 0.04 | 28.7 |
-| trusted, metadata-only | 9.3 | 20.5 |
+| scan rebuild                  |  6,605 |  6,968 |
+| digest-verify                 |  5,368 |  6,378 |
+| `.idx` read + CRC             |  1,673 |  1,668 |
+| trusted, read + CRC           |    759 |  1,669 |
+| trusted, mmap                 |   0.04 |   28.7 |
+| trusted, metadata-only        |    9.3 |   20.5 |
 
 ```mermaid
 xychart-beta
@@ -91,27 +91,27 @@ Current-open phases at 1 GiB (warm): pack recovery 5.4 s, checkpoint decode 4.2 
 
 ### 3.4 1 GiB, mixed frames (32,832 records, 1018 MiB)
 
-| Strategy | "Warm" | Cold |
-|---|---:|---:|
-| current open (via Checkpoint) | 199 | 6,208 |
-| scan rebuild | 167 | 6,210 |
-| digest-verify | 268 | 6,301 |
-| `.idx` read + CRC | 0.2 | 1.7 |
-| trusted, mmap | 0.03 | 1.7 |
-| trusted, metadata-only | 0.01 | 0.9 |
+| Strategy                      | "Warm" |  Cold |
+| ----------------------------- | -----: | ----: |
+| current open (via Checkpoint) |    199 | 6,208 |
+| scan rebuild                  |    167 | 6,210 |
+| digest-verify                 |    268 | 6,301 |
+| `.idx` read + CRC             |    0.2 |   1.7 |
+| trusted, mmap                 |   0.03 |   1.7 |
+| trusted, metadata-only        |   0.01 |   0.9 |
 
 With large frames the whole cold cost is reading 1 GiB (about 6 s at ~165 MiB/s on this disk). The index is 1.5 MiB and irrelevant.
 
 ## 4. Sizes
 
-| | 256 MiB tiny | 1 GiB tiny | 1 GiB mixed |
-|---|---:|---:|---:|
-| pack | 256 MiB | 1024 MiB | 1018 MiB |
-| entries | 4.40M | 17.60M | 32,832 |
-| sorted `.idx` | 83.9 MiB | 335.7 MiB | 0.63 MiB |
-| `index.checkpoint` | n/a (not itemized) | 768.0 MiB | 1.50 MiB |
-| index delta log | n/a | 59.6 MiB | none |
-| checkpoint bytes/entry | n/a | 45.8 | 48 |
+|                        |       256 MiB tiny | 1 GiB tiny | 1 GiB mixed |
+| ---------------------- | -----------------: | ---------: | ----------: |
+| pack                   |            256 MiB |   1024 MiB |    1018 MiB |
+| entries                |              4.40M |     17.60M |      32,832 |
+| sorted `.idx`          |           83.9 MiB |  335.7 MiB |    0.63 MiB |
+| `index.checkpoint`     | n/a (not itemized) |  768.0 MiB |    1.50 MiB |
+| index delta log        |                n/a |   59.6 MiB |        none |
+| checkpoint bytes/entry |                n/a |       45.8 |          48 |
 
 ```
 Bytes per entry, 1 GiB tiny
@@ -124,10 +124,10 @@ The `.idx` is 2.3× smaller than the checkpoint alone and 2.5× smaller than che
 
 ## 5. Build cost of the `.idx` (seal-time)
 
-| | 256 MiB tiny | 1 GiB tiny | 1 GiB mixed |
-|---|---:|---:|---:|
-| sort alone | 402 ms | 1,530 ms | 2 ms |
-| build + write + fsync | 988 ms | 3,467 ms | 38 ms |
+|                       | 256 MiB tiny | 1 GiB tiny | 1 GiB mixed |
+| --------------------- | -----------: | ---------: | ----------: |
+| sort alone            |       402 ms |   1,530 ms |        2 ms |
+| build + write + fsync |       988 ms |   3,467 ms |       38 ms |
 
 About 87 ns/entry to sort, ~200 ns/entry end to end.
 
@@ -135,20 +135,20 @@ About 87 ns/entry to sort, ~200 ns/entry end to end.
 
 ### 6.1 Locator only, resident (100k random keys)
 
-| | 256 MiB tiny | 1 GiB tiny | 1 GiB mixed |
-|---|---:|---:|---:|
-| sorted `.idx`, heap | 323 ns | 439 ns | 74 ns |
-| sorted batch (100k sorted keys) | 11.1 ms | 51.2 ms | 0.7 ms |
-| `.idx` via mmap (just mapped) | 308 ns | 18,246 ns | 74 ns |
+|                                 | 256 MiB tiny | 1 GiB tiny | 1 GiB mixed |
+| ------------------------------- | -----------: | ---------: | ----------: |
+| sorted `.idx`, heap             |       323 ns |     439 ns |       74 ns |
+| sorted batch (100k sorted keys) |      11.1 ms |    51.2 ms |      0.7 ms |
+| `.idx` via mmap (just mapped)   |       308 ns |  18,246 ns |       74 ns |
 
 The mapped 1 GiB figure includes minor page faults populating the mapping (336 MiB, ~86k pages) and is not a steady-state locator cost; the heap number is. No hash-locator-only number exists (no index-only API); the hash side is only measurable end to end.
 
 ### 6.2 End to end (key → decoded frame)
 
-| | 256 MiB tiny | 1 GiB tiny | 1 GiB mixed |
-|---|---:|---:|---:|
-| `store.get` | 685 ns | 75,061 ns* | 3,705 ns |
-| `.idx` locate + naive `pread` | 1,921 ns | 1,270,884 ns* | 13,877 ns |
+|                               | 256 MiB tiny |     1 GiB tiny | 1 GiB mixed |
+| ----------------------------- | -----------: | -------------: | ----------: |
+| `store.get`                   |       685 ns |    75,061 ns\* |    3,705 ns |
+| `.idx` locate + naive `pread` |     1,921 ns | 1,270,884 ns\* |   13,877 ns |
 
 \*The 1 GiB tiny rows are dominated by disk reads because the pack no longer fit in the ~3 GiB of page cache that was available; they measure the disk, not the indexes. The `.idx` end-to-end path is slower than `store.get` because of my untuned read path (plain `pread`, 4 KiB then 72 KiB retry), not the locator. These rows must not be read as "hash beats sorted".
 
