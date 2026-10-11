@@ -3723,7 +3723,7 @@ fn first_parent_fallback_when_no_room_version_is_declared() {
     );
 
     // This batch declares no room version, so no state-resolution rules
-    // apply and the merge falls back to the retired first-parent rule: the
+    // apply and the merge falls back to the first-parent rule: the
     // same-key conflict is decided by the first prev_events entry, which
     // makes the two merge orders disagree. The merge still gets its own
     // instance because it has two distinct parents.

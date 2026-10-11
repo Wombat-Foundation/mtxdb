@@ -44,7 +44,7 @@ pub(crate) type StateEntries = HashMap<(String, String), String>;
 /// A merge that could not be resolved because the import batch does not carry
 /// everything the resolver reads.
 ///
-/// This is not an error: the caller falls back to the legacy first-parent
+/// This is not an error: the caller falls back to the first-parent
 /// merge and deliberately skips publishing the result so that a later, fuller
 /// import recomputes it under the real resolver.
 #[derive(Debug, Default)]
@@ -169,7 +169,7 @@ pub(crate) fn from_rezzy_state(state: &RezzyState) -> StateEntries {
 /// # Errors
 /// Returns [`IncompleteResolution`] when the batch is missing any event the
 /// resolver would read, or when `policy` names no resolver at all. The caller
-/// falls back to the legacy merge in both cases.
+/// falls back to the first-parent merge in both cases.
 pub(crate) fn resolve_parents(
     context: &mut LeanEventContext<'_>,
     parent_entries: &[&StateEntries],
@@ -177,7 +177,7 @@ pub(crate) fn resolve_parents(
 ) -> Result<StateEntries, IncompleteResolution> {
     let Some(version) = policy.rezzy_version else {
         // No recognized room version means no auth rules; the derivation
-        // already records `FirstParent`, so the caller uses the legacy merge.
+        // already records `FirstParent`, so the caller uses the first-parent merge.
         return Err(IncompleteResolution::default());
     };
     let maps: Vec<RezzyState> = parent_entries.iter().map(|e| to_rezzy_state(e)).collect();
@@ -250,9 +250,9 @@ fn u64_field(value: &OwnedValue, field: &str) -> u64 {
         .unwrap_or_default()
 }
 
-/// Read an array of event references. Matrix v1/v2 encode references as
-/// `[event_id, hashes]` pairs while later versions use plain strings; both
-/// forms name the id in the same place.
+/// Read an array of event references. Matrix rooms v1/v2 encode references as
+/// `[event_id, hashes]` pairs while later room versions use plain strings;
+/// both forms name the id in the same place.
 fn reference_list(value: &OwnedValue, field: &str) -> Vec<String> {
     let Some(OwnedValue::Array(items)) = value.get(field) else {
         return Vec::new();

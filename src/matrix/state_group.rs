@@ -30,16 +30,15 @@ use crate::template::{
 pub const STATE_GROUP_RECORD_MAGIC: [u8; 4] = *b"STGP";
 /// Version byte of the state-group instance record format.
 ///
-/// `0x02` adds the [`StateGroupDerivation`] tags after the version byte;
-/// `0x01` records predate resolver/trust-aware identity and are rejected.
-pub const STATE_GROUP_RECORD_VERSION: u8 = 0x02;
+/// The version byte is followed by the [`StateGroupDerivation`] tags.
+pub const STATE_GROUP_RECORD_VERSION: u8 = 0x01;
 
 /// Domain prefix for state-group instance identity hashing.
 ///
-/// Bumped from `v1` when resolver and trust became part of the derivation, so
-/// ids derived under the old first-parent rule cannot collide with ids derived
-/// under a real resolver.
-pub const STATE_GROUP_DOMAIN_PREFIX: &[u8] = b"mtxdb/state-group/v2";
+/// The resolver and trust mode are part of the derivation, so a group produced
+/// by the first-parent fallback never collides with one produced by a real
+/// resolver.
+pub const STATE_GROUP_DOMAIN_PREFIX: &[u8] = b"mtxdb/state-group/v1";
 
 /// A 128-bit state-group instance id (also a record/node id).
 pub type StateGroupId = [u8; 16];
@@ -48,12 +47,12 @@ pub type StateGroupId = [u8; 16];
 ///
 /// The same parents and the same `LtHash` resolved by two algorithms are two
 /// different derivations, so the resolver enters the instance id: a group
-/// produced by the retired first-parent merge never collides with one produced
-/// by Matrix State Resolution, and v1 never collides with v2.
+/// produced by the first-parent fallback never collides with one produced
+/// by Matrix State Resolution, and resolver V1 never collides with V2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StateGroupResolver {
-    /// The retired first-parent-wins merge, kept so that groups it wrote stay
-    /// decodable and distinguishable from real resolutions.
+    /// The first-parent-wins fallback, used where no real resolution can run
+    /// (incomplete auth closure, unrecognized room version).
     FirstParent,
     /// Matrix State Resolution v1 (room version 1).
     V1,
@@ -285,7 +284,7 @@ pub fn state_group_collection_id(room_id: &str) -> Option<[u8; 16]> {
     derive_group_member_collection_id(MEMBER_NAMESPACE_STGP, room_id.as_bytes())
 }
 
-/// Encode an `STGP\x02` instance record:
+/// Encode an `STGP\x01` instance record:
 ///
 /// ```text
 /// "STGP" (4)
@@ -328,7 +327,7 @@ pub fn encode_state_group_record(instance: &StateGroupInstance) -> Vec<u8> {
     out
 }
 
-/// Decode an `STGP\x02` instance record produced by
+/// Decode an `STGP\x01` instance record produced by
 /// [`encode_state_group_record`].
 ///
 /// # Errors

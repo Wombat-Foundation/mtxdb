@@ -110,13 +110,13 @@ impl StateView {
 /// exactly when `derivation.resolver` is
 /// [`StateGroupResolver::FirstParent`], i.e. when no real resolution ran
 /// because the room version is unrecognized — there are no auth rules to
-/// apply without one, so the merge keeps the retired first-parent rule rather
+/// apply without one, so the merge keeps the first-parent rule rather
 /// than guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResolutionPolicy {
     /// The identity-bearing half of the derivation.
     pub(crate) derivation: StateGroupDerivation,
-    /// The rezzy algorithm to run, or `None` for the legacy merge.
+    /// The rezzy algorithm to run, or `None` for the first-parent merge.
     pub(crate) rezzy_version: Option<StateResVersion>,
 }
 
@@ -147,7 +147,7 @@ const fn resolver_for(version: StateResVersion) -> StateGroupResolver {
 ///
 /// An unrecognized room version degrades to
 /// [`StateGroupResolver::FirstParent`] with no rezzy version, which is exactly
-/// "keep the retired merge": mtxdb cannot run auth rules it does not know.
+/// "keep the first-parent merge": mtxdb cannot run auth rules it does not know.
 #[must_use]
 pub(crate) fn resolution_policy(room_version: &str, trust: StateGroupTrust) -> ResolutionPolicy {
     let Some(version) = StateResVersion::from_room_version(room_version) else {

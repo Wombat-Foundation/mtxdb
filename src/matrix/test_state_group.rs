@@ -65,7 +65,7 @@ fn record_round_trips_through_encode_decode() {
         derivation: DERIVATION,
     };
     let bytes = encode_state_group_record(&instance);
-    assert_eq!(&bytes[..5], b"STGP\x02");
+    assert_eq!(&bytes[..5], b"STGP\x01");
     let decoded = decode_state_group_record(&bytes).unwrap();
     assert_eq!(decoded.lthash, instance.lthash);
     assert_eq!(decoded.root_id, instance.root_id);
@@ -100,7 +100,7 @@ fn record_decode_rejects_malformed_input() {
         root_id: parent(2),
         derivation: DERIVATION,
     });
-    wrong_version[4] = 0x01;
+    wrong_version[4] = 0x00;
     assert!(decode_state_group_record(&wrong_version).is_err());
     let mut bad_resolver = encode_state_group_record(&StateGroupInstance {
         parents: vec![],

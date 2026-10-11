@@ -63,7 +63,7 @@ impl JsonValueExt for OwnedValue {
 /// used by Synapse/sithnapse and materialized into each `MTHR` root). The
 /// `STGP` record holds the parent links and the shared `STAT` root id, so equal
 /// state content reached through different parents stays distinct.
-const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v2";
+const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
 
 /// Whether `value` is a well-formed 128-bit STGP state-group instance id.
 fn valid_state_group_id(value: &[u8]) -> bool {
@@ -1748,14 +1748,14 @@ fn decode_hamt_node(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Decode an `STGP\x02` state-group instance record into a readable form: its
+/// Decode an `STGP\x01` state-group instance record into a readable form: its
 /// parent instance ids, state `LtHash` digest, shared `STAT` root id, and the
 /// resolver/trust derivation that produced it.
 /// Returns `None` for any other payload.
 fn decode_state_group(bytes: &[u8]) -> Option<Vec<u8>> {
     let instance = mtxdb::decode_state_group_record(bytes).ok()?;
     let mut out = Vec::new();
-    writeln!(out, "// STGP state-group instance (v2)").unwrap();
+    writeln!(out, "// STGP state-group instance (v1)").unwrap();
     writeln!(
         out,
         "// {} parent(s), {} bytes",
@@ -6399,7 +6399,7 @@ fn state_group_metadata(room_id: &str) -> CollectionMetadata {
         payload: PayloadPolicy::Source,
         extension: None,
         role: Some("state_group".to_owned()),
-        schema: Some("sithnapse.state-group.v2".to_owned()),
+        schema: Some("sithnapse.state-group.v1".to_owned()),
     }
 }
 
@@ -10193,7 +10193,7 @@ struct PartialStateComputation {
     instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
     /// Event ids at least one merge could not resolve because this batch does
     /// not carry their auth closure. Non-empty means those merges fell back to
-    /// the legacy first-parent rule, so `groups` must not be cached as though
+    /// the first-parent rule, so `groups` must not be cached as though
     /// the real resolver had run — a later, fuller import recomputes them.
     incomplete: Vec<String>,
 }
@@ -10382,7 +10382,7 @@ fn walk_state_groups(
         // instead of copying it, so a plain message event costs no allocation;
         // only genuine divergence reaches rezzy. When rezzy cannot run — no
         // recognized room version, or the batch is missing part of the auth
-        // closure it reads — the union falls back to the retired first-parent
+        // closure it reads — the union falls back to the first-parent
         // rule and the gap is recorded so the result is not cached as a
         // real resolution.
         let base: Arc<SharedState> = match parents.as_slice() {
@@ -10518,7 +10518,7 @@ fn derive_state(
 /// never get here, so this is only ever called with at least two distinct
 /// states. When rezzy cannot run — no recognized room version, or the batch
 /// is missing part of the auth closure it reads — the union falls back to the
-/// retired first-parent rule and the gap is recorded so the result is not
+/// first-parent rule and the gap is recorded so the result is not
 /// cached as a real resolution. A room with no resolver at all falls back
 /// without a gap: the derivation already says `FirstParent`, so that is the
 /// recorded behavior rather than a shortfall.
@@ -10725,7 +10725,7 @@ impl StateSet {
     /// Union another state set into this one, keeping the existing entry when
     /// both sets name different event ids for the same `(type, state_key)`.
     ///
-    /// This is the retired first-parent-wins merge, and it only runs where
+    /// This is the first-parent-wins fallback, and it only runs where
     /// state resolution cannot: no recognized room version, or a batch missing
     /// part of the auth closure the resolver reads. Every other merge goes
     /// through [`merge_parent_states`] instead.
