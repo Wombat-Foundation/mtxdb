@@ -528,10 +528,7 @@ impl LossyIndex {
             let entry = IndexEntry(slots[bucket].load(Ordering::Acquire));
             if entry.is_empty() {
                 // Only reject when actually inserting into a new entry
-                let threshold = self
-                    .capacity
-                    .wrapping_mul(u32::from(self.config.load_factor_percent))
-                    / 100;
+                let threshold = max_occupied(self.capacity, self.config.load_factor_percent);
                 if self.len.load(Ordering::Relaxed) >= threshold {
                     self.bump_max_probe_len(probe_len);
                     return Err(InsertError::TableFull);
@@ -1273,6 +1270,16 @@ impl EntryUndo {
     pub fn was_empty(&self) -> bool {
         self.was_empty
     }
+}
+
+/// How many entries a table of `capacity` slots may hold at `load_factor_percent`.
+///
+/// Computed in `u64`: `capacity * percent` overflows `u32` from a capacity of
+/// 2^26 slots at 75%, and a wrapped threshold made large tables report
+/// `TableFull` at a few million entries.
+fn max_occupied(capacity: u32, load_factor_percent: u8) -> u32 {
+    let entries = u64::from(capacity).saturating_mul(u64::from(load_factor_percent)) / 100;
+    u32::try_from(entries).expect("a load factor of at most 90% fits the u32 capacity")
 }
 
 /// Errors that can occur while inserting into a [`LossyIndex`].

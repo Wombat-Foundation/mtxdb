@@ -2697,9 +2697,22 @@ impl PackfileStorage {
                 .max(NEW_COLLECTION_INDEX_FLOOR),
             index_config,
         );
+        let mut failed = 0usize;
+        let mut first_failure: Option<(u64, InsertError)> = None;
         for (slot, hash, offset, _pack_id) in records {
             check_index_offset(*slot, hash, *offset)?;
-            let _ = index.insert(hash, *slot, *offset);
+            if let Err(error) = index.insert(hash, *slot, *offset) {
+                failed = failed.saturating_add(1);
+                first_failure.get_or_insert((*offset, error));
+            }
+        }
+        if let Some((offset, error)) = first_failure {
+            return Err(StorageError::Corrupt(format!(
+                "index rebuild dropped {failed} of {} scanned records (first at offset {offset}: {error}); \
+                 indexed {}",
+                records.len(),
+                index.len(),
+            )));
         }
         for (slot, _hash, offset, pack_id) in records {
             let shard = shards

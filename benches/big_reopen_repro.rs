@@ -59,6 +59,14 @@ fn main() {
     if env_u64("MTXDB_BR_FOREIGN_FILE", 1) == 1 {
         std::fs::write(dir.join("pack.idx"), b"MTXIDX01").expect("write foreign file");
     }
+    if env_u64("MTXDB_BR_DROP_CHECKPOINT", 0) == 1 {
+        // Force the startup FullScan path.
+        for entry in std::fs::read_dir(&dir).expect("ls").flatten() {
+            if entry.file_name().to_string_lossy().starts_with("index.") {
+                std::fs::remove_file(entry.path()).expect("remove index file");
+            }
+        }
+    }
     let cycles = env_u64("MTXDB_BR_CYCLES", 4);
     let evict = env_u64("MTXDB_BR_EVICT", 1) == 1;
     let mut missed = 0u64;

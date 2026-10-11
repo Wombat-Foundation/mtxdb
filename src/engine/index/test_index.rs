@@ -851,3 +851,17 @@ fn test_lookup_iter_exhausts_remaining() {
     query[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
     assert_eq!(restored.lookup(&query), None);
 }
+
+#[test]
+fn the_load_threshold_does_not_overflow_for_large_tables() {
+    // 2^26 slots at 75% is 50,331,648 entries. The threshold used to be
+    // `capacity.wrapping_mul(75) / 100` in u32, which wrapped to 7,381,975.
+    assert_eq!(max_occupied(1 << 26, 75), 50_331_648);
+    assert_eq!(max_occupied(1 << 31, 90), 1_932_735_283);
+    assert_eq!(max_occupied(1 << 10, 75), 768);
+    assert_eq!(
+        (1u32 << 26).wrapping_mul(75) / 100,
+        7_381_975,
+        "the old u32 arithmetic is what produced the premature TableFull"
+    );
+}
