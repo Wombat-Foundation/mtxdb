@@ -1256,6 +1256,21 @@ fn plan_read_extents(
     extents
 }
 
+/// Insert into a freshly built or grown index, failing the operation instead of
+/// publishing an index that silently lacks the record.
+fn insert_or_corrupt(
+    index: &LossyIndex,
+    hash: &[u8; 16],
+    slot: u16,
+    offset: u64,
+) -> Result<(), StorageError> {
+    index.insert(hash, slot, offset).map_err(|error| {
+        StorageError::Corrupt(format!(
+            "index insert failed for the record at offset {offset} in shard {slot}: {error}"
+        ))
+    })
+}
+
 /// Reject a record whose in-shard offset the 32-bit `IndexEntry` field cannot
 /// represent, so the caller surfaces a `StorageError::Corrupt` instead of
 /// silently dropping the record (or panicking in `IndexEntry::new`).
@@ -4549,7 +4564,7 @@ impl PackfileStorage {
         );
         for (hash, slot, offset) in offsets {
             check_index_offset(*slot, hash, *offset)?;
-            let _ = index.insert(hash, *slot, *offset);
+            insert_or_corrupt(&index, hash, *slot, *offset)?;
         }
         Ok(index)
     }
@@ -6532,7 +6547,7 @@ impl PackfileStorage {
                 // around it would make its data unreachable while reporting a
                 // successful rebuild.
                 check_index_offset(slot, &hash, offset)?;
-                let _ = index.insert(&hash, slot, offset);
+                insert_or_corrupt(&index, &hash, slot, offset)?;
             }
         }
         Ok(index)
@@ -8738,20 +8753,20 @@ impl PackfileStorage {
                     // The failed insert did not mutate the table, so retry it
                     // after the in-memory rehash. This is the normal capacity
                     // path and must not turn into a full-pack scan.
-                    let _ = grown.insert(id, slot, offset);
+                    insert_or_corrupt(&grown, id, slot, offset)?;
                     index = grown;
                     self.record_redo(collection_id, generation, id, slot, offset, disk_bytes);
                 } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
                     // A checkpoint-backed index has locations but not homes.
                     // Recovering the hashes from those locations is bounded
                     // by this collection, unlike `rebuild_index`'s pack scan.
-                    let _ = grown.insert(id, slot, offset);
+                    insert_or_corrupt(&grown, id, slot, offset)?;
                     index = grown;
                     self.record_redo(collection_id, generation, id, slot, offset, disk_bytes);
                 } else {
                     self.invalidate_delta_log(collection_id);
                     index = self.rebuild_index(collection_id)?;
-                    let _ = index.insert(id, slot, offset);
+                    insert_or_corrupt(&index, id, slot, offset)?;
                 }
                 // The rebuild re-derived the collection's entire live set from
                 // scratch, so its shard distribution needs a full

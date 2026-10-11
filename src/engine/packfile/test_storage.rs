@@ -10591,3 +10591,27 @@ fn repacking_a_survivor_does_not_resurrect_a_deleted_collection_in_its_shard() {
         bytes::Bytes::from_static(b"survivor")
     );
 }
+
+#[test]
+fn a_rebuild_insert_into_a_full_table_fails_instead_of_dropping_the_record() {
+    // A table at its load threshold rejects new entries; the rebuild helpers
+    // must surface that, not publish an index that silently lacks the record.
+    let index = LossyIndex::with_config(16, crate::index::IndexConfig::default());
+    let mut seq = 0u64;
+    let rejected = loop {
+        let mut hash = [0u8; 16];
+        hash[..8].copy_from_slice(&seq.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+        hash[8..].copy_from_slice(&seq.to_be_bytes());
+        match insert_or_corrupt(&index, &hash, 0, 64 + seq) {
+            Ok(()) => seq += 1,
+            Err(error) => break error,
+        }
+        assert!(seq < 1_000, "a 16-slot table must fill long before 1000 inserts");
+    };
+    let message = rejected.to_string();
+    assert!(
+        message.contains("index insert failed") && message.contains("too full"),
+        "unexpected error: {message}"
+    );
+    assert!(!index.is_empty(), "the table held entries before it filled");
+}
