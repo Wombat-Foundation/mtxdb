@@ -7962,7 +7962,7 @@ fn scan_payload_suffix(data: &[u8]) -> Option<String> {
             return Some(format!("{} bytes (malformed AUX1 envelope)", data.len()));
         }
         let value = &data[AUXILIARY_VALUE_OFFSET..];
-        // A 16-byte value in the state shard is an `event -> STGP instance`
+        // A 16-byte auxiliary value is an `event -> STGP instance`
         // pointer; render it in the `PTR:` form.
         if value.len() == STATE_GROUP_ID_LENGTH {
             return Some(format!("PTR: {}", format_id(value)));
