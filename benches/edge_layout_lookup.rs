@@ -23,6 +23,12 @@
 //! - Cold = reopen the database, `sync`, evict the store's files with
 //!   `vmtouch -e`, then time the first `MTXDB_EL_COLD` (default 1000) calls.
 //!   The in-memory index is rebuilt by reopen, so cold measures pack reads.
+//! - `proto-hash-only` is the merged variant without the key check: a hit is
+//!   whatever the hash matched. It is NOT assumed safe; a query whose hash
+//!   collides with a stored key would return that key's id, and 0 mismatches on
+//!   this sample does not show otherwise. Reported only to price the check.
+//! - Id -> key chunks carry a `u16` offset table, so a position is read without
+//!   walking the chunk.
 //! - Writes are timed separately: the prototype rewrites every chunk that
 //!   changed in a batch, and bytes written are reported apart from latency.
 //!
@@ -130,6 +136,9 @@ struct Proto {
     merged: Option<Vec<([u8; 16], u32)>>,
     /// Hash matches whose key did not match.
     rejected: std::cell::Cell<u64>,
+    /// Confirm a hash match against the stored key. Off only in the explicitly
+    /// labeled hash-only variant, which trusts 128-bit hash identity.
+    confirm: bool,
 }
 
 fn be32(bytes: &[u8], at: usize) -> Option<u32> {
@@ -153,14 +162,20 @@ fn search_run(entries: &[u8], hash: &[u8; 16]) -> Option<u32> {
     None
 }
 
-/// The key at `pos` in an id -> key chunk record.
+/// The key at `pos` in an id -> key chunk record, found through its offset table.
 fn key_at(chunk: &[u8], pos: usize) -> Option<&[u8]> {
-    let mut at = 8_usize;
-    for _ in 0..pos {
-        at = at.saturating_add(usize::from(*chunk.get(at)?).saturating_add(1));
+    let count = usize::from(u16::from_be_bytes(chunk.get(8..10)?.try_into().ok()?));
+    if pos >= count {
+        return None;
     }
-    let len = usize::from(*chunk.get(at)?);
-    let start = at.saturating_add(1);
+    let at = 10_usize.saturating_add(pos.saturating_mul(2));
+    let off = usize::from(u16::from_be_bytes(
+        chunk.get(at..at.saturating_add(2))?.try_into().ok()?,
+    ));
+    let body = 10_usize.saturating_add(count.saturating_mul(2));
+    let head = body.saturating_add(off);
+    let len = usize::from(*chunk.get(head)?);
+    let start = head.saturating_add(1);
     chunk.get(start..start.saturating_add(len))
 }
 
@@ -184,12 +199,13 @@ fn edges_at(chunk: &[u8], pos: usize) -> Option<Edges> {
 }
 
 impl Proto {
-    fn open(dir: &Path, merge: bool, runs: usize) -> Self {
+    fn open(dir: &Path, merge: bool, confirm: bool, runs: usize) -> Self {
         let mut proto = Self {
             db: Database::open(dir.to_path_buf()).expect("open prototype"),
             runs,
             merged: None,
             rejected: std::cell::Cell::new(0),
+            confirm,
         };
         if merge {
             proto.merged = Some(proto.load_runs());
@@ -281,6 +297,9 @@ impl Layout for Proto {
     fn key_to_ids(&self, keys: &[&str]) -> Vec<Option<u32>> {
         let hashes: Vec<[u8; 16]> = keys.iter().map(|k| key_hash(k)).collect();
         let found = self.candidates(&hashes);
+        if !self.confirm {
+            return found;
+        }
         let confirmed = self.keys_of(&found);
         found
             .iter()
@@ -640,7 +659,7 @@ fn main() {
     let picks = sample(rows.len(), n);
     let misses: Vec<String> = picks.iter().map(|i| format!("{}~", rows[*i].id)).collect();
     let batch = env_usize("MTXDB_EL_BATCH", 100);
-    let layouts: [(&str, &Path, Open<'_>); 3] = [
+    let layouts: [(&str, &Path, Open<'_>); 4] = [
         (
             "baseline",
             &dir_a,
@@ -649,12 +668,17 @@ fn main() {
         (
             "proto-naive",
             &dir_b,
-            Box::new(|| Box::new(Proto::open(&dir_b, false, runs))),
+            Box::new(|| Box::new(Proto::open(&dir_b, false, true, runs))),
         ),
         (
             "proto-merged",
             &dir_b,
-            Box::new(|| Box::new(Proto::open(&dir_b, true, runs))),
+            Box::new(|| Box::new(Proto::open(&dir_b, true, true, runs))),
+        ),
+        (
+            "proto-hash-only",
+            &dir_b,
+            Box::new(|| Box::new(Proto::open(&dir_b, true, false, runs))),
         ),
     ];
     for (name, dir, open) in &layouts {

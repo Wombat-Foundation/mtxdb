@@ -305,14 +305,25 @@ fn encode_edge_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
     out
 }
 
+/// Id -> key chunk: magic, chunk number, entry count, one `u16` body offset per
+/// entry (so a position is found without walking the chunk), then the entries
+/// (length byte + key).
 fn encode_key_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
     let (start, end) = chunk_bounds(chunk, ids.keys.len());
+    let mut body = Vec::new();
+    let mut offsets = Vec::with_capacity(CHUNK);
+    for key in &ids.keys[start..end] {
+        offsets.push(u16::try_from(body.len()).expect("key chunk body fits u16 offsets"));
+        body.push(u8::try_from(key.len()).expect("key length"));
+        body.extend_from_slice(key.as_bytes());
+    }
     let mut out = b"PREV".to_vec();
     out.extend_from_slice(&u32::try_from(chunk).expect("chunk").to_be_bytes());
-    for key in &ids.keys[start..end] {
-        out.push(u8::try_from(key.len()).expect("key length"));
-        out.extend_from_slice(key.as_bytes());
+    out.extend_from_slice(&u16::try_from(offsets.len()).expect("count").to_be_bytes());
+    for offset in offsets {
+        out.extend_from_slice(&offset.to_be_bytes());
     }
+    out.extend_from_slice(&body);
     out
 }
 
