@@ -220,9 +220,20 @@ pub(crate) fn baseline_scope() -> ShortIdIndex {
 
 /// Record every row through `ShortIdIndex`; returns the number of edges written.
 pub(crate) fn record_rows(db: &Database, rows: &[Row], variant: Variant) -> usize {
+    record_rows_in(db, rows, variant, (BATCH, SYNC_EVERY))
+}
+
+/// As [`record_rows`], in batches of `batch` rows with a sync every `sync_every`
+/// batches and one at the end.
+pub(crate) fn record_rows_in(
+    db: &Database,
+    rows: &[Row],
+    variant: Variant,
+    (batch, sync_every): (usize, usize),
+) -> usize {
     let scope = baseline_scope();
     let mut edge_count = 0_usize;
-    for (n, chunk) in rows.chunks(BATCH).enumerate() {
+    for (n, chunk) in rows.chunks(batch).enumerate() {
         let lists: Vec<Lists<'_>> = chunk.iter().map(|row| lists_for(row, variant)).collect();
         let fams: Vec<Vec<FamilyEdges<'_>>> = lists.iter().map(families).collect();
         for l in &lists {
@@ -241,7 +252,7 @@ pub(crate) fn record_rows(db: &Database, rows: &[Row], variant: Variant) -> usiz
             })
             .collect();
         scope.record_events(db, &events).expect("record");
-        if n.saturating_add(1) % SYNC_EVERY == 0 {
+        if n.saturating_add(1).checked_rem(sync_every) == Some(0) {
             db.edges().sync_all().expect("sync");
         }
     }
@@ -428,69 +439,95 @@ fn timed_put(store: &dyn StorageEngine, stats: &mut PutStats, id: [u8; 16], byte
         .saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
 }
 
-/// Write the prototype layout through `db`: dense short ids in first-seen order;
-/// edge lists and the id -> key map in chunks of [`chunk_size`] ids, every chunk that
+/// The prototype layout's writer: dense short ids in first-seen order; edge lists
+/// and the id -> key map in chunks of [`chunk_size`] ids, every chunk that
 /// changed in a batch rewritten whole; the key -> id map as one sorted run of
-/// (16-byte key hash, id) per batch. Syncs every [`SYNC_EVERY`] batches.
-pub(crate) fn write_chunked<'a>(db: &Database, rows: &'a [Row]) -> (Ids<'a>, WriteStats) {
-    let store = db.edges();
-    let mut ids = Ids::default();
-    let mut stats = WriteStats::default();
-    let mut seen_edge: HashSet<usize> = HashSet::new();
-    let mut seen_key: HashSet<usize> = HashSet::new();
-    for (n, batch) in rows.chunks(BATCH).enumerate() {
-        let first_new = ids.keys.len();
-        let mut dirty = assign_batch(&mut ids, batch);
-        let tail = ids.keys.len().div_ceil(chunk_size());
+/// (16-byte key hash, id) per batch. State carries across [`Writer::append`]
+/// calls so batch sizes can change mid-stream.
+#[derive(Default)]
+pub(crate) struct Writer<'a> {
+    pub(crate) ids: Ids<'a>,
+    pub(crate) stats: WriteStats,
+    seen_edge: HashSet<usize>,
+    seen_key: HashSet<usize>,
+    batches: u32,
+}
+
+impl<'a> Writer<'a> {
+    /// Write `rows` in batches of `batch`, syncing every `sync_every` batches.
+    pub(crate) fn append(
+        &mut self,
+        db: &Database,
+        rows: &'a [Row],
+        (batch, sync_every): (usize, usize),
+    ) {
+        let store = db.edges();
+        for (n, rows) in rows.chunks(batch).enumerate() {
+            self.write_batch(store.as_ref(), rows);
+            if n.saturating_add(1).checked_rem(sync_every) == Some(0) {
+                self.sync(db);
+            }
+        }
+    }
+
+    pub(crate) fn sync(&mut self, db: &Database) {
+        let started = Instant::now();
+        db.edges().sync_all().expect("sync");
+        self.stats.sync_time = self.stats.sync_time.saturating_add(started.elapsed());
+    }
+
+    fn write_batch(&mut self, store: &dyn StorageEngine, batch: &'a [Row]) {
+        let first_new = self.ids.keys.len();
+        let mut dirty = assign_batch(&mut self.ids, batch);
+        let tail = self.ids.keys.len().div_ceil(chunk_size());
         dirty.extend(locate(first_new).0..tail);
-        let mut run: Vec<([u8; 16], u32)> = (first_new..ids.keys.len())
-            .map(|i| (key_hash(ids.keys[i]), u32::try_from(i).expect("id")))
+        let mut run: Vec<([u8; 16], u32)> = (first_new..self.ids.keys.len())
+            .map(|i| (key_hash(self.ids.keys[i]), u32::try_from(i).expect("id")))
             .collect();
-        let batch_no = u32::try_from(n).expect("batch");
         timed_put(
-            store.as_ref(),
-            &mut stats.runs,
-            spread(KIND_RUN, batch_no),
+            store,
+            &mut self.stats.runs,
+            spread(KIND_RUN, self.batches),
             &encode_run(&mut run),
         );
+        self.batches = self.batches.saturating_add(1);
         for chunk in dirty {
             let number = u32::try_from(chunk).expect("chunk");
-            let bucket = if seen_edge.insert(chunk) {
-                &mut stats.edge_new
+            let bucket = if self.seen_edge.insert(chunk) {
+                &mut self.stats.edge_new
             } else {
-                &mut stats.edge_rewrite
+                &mut self.stats.edge_rewrite
             };
             timed_put(
-                store.as_ref(),
+                store,
                 bucket,
                 spread(KIND_EDGE_CHUNK, number),
-                &encode_edge_chunk(&ids, chunk),
+                &encode_edge_chunk(&self.ids, chunk),
             );
         }
         for chunk in locate(first_new).0..tail {
             let number = u32::try_from(chunk).expect("chunk");
-            let bucket = if seen_key.insert(chunk) {
-                &mut stats.key_new
+            let bucket = if self.seen_key.insert(chunk) {
+                &mut self.stats.key_new
             } else {
-                &mut stats.key_rewrite
+                &mut self.stats.key_rewrite
             };
             timed_put(
-                store.as_ref(),
+                store,
                 bucket,
                 spread(KIND_KEY_CHUNK, number),
-                &encode_key_chunk(&ids, chunk),
+                &encode_key_chunk(&self.ids, chunk),
             );
         }
-        if n.saturating_add(1) % SYNC_EVERY == 0 {
-            let started = Instant::now();
-            store.sync_all().expect("sync");
-            stats.sync_time = stats.sync_time.saturating_add(started.elapsed());
-        }
     }
-    let started = Instant::now();
-    store.sync_all().expect("sync");
-    stats.sync_time = stats.sync_time.saturating_add(started.elapsed());
-    (ids, stats)
+}
+
+/// Write the whole room in the default batches; returns the ids and stats.
+pub(crate) fn write_chunked<'a>(db: &Database, rows: &'a [Row]) -> (Ids<'a>, WriteStats) {
+    let mut writer = Writer::default();
+    writer.append(db, rows, (BATCH, SYNC_EVERY));
+    writer.sync(db);
+    (writer.ids, writer.stats)
 }
 
 /// Percent of `dir`'s pages in the page cache, from machine-readable vmtouch output.
