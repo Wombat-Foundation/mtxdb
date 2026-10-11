@@ -8855,7 +8855,7 @@ fn logical_redo_replays_in_order_and_the_counter_resumes_above_the_log() {
 /// rescan that still finds every record. The unmodified log is trusted.
 #[test]
 fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
-    fn open_after(mutate: impl Fn(&mut RedoRecord)) -> (OpenPath, usize) {
+    fn open_after(mutate: impl Fn(&mut RedoRecord)) -> (OpenPath, Option<CheckpointReject>, usize) {
         let dir = test_dir("bad_redo_log");
         let collection = [0xD9; 16];
         let store = PackfileStorage::open(dir.clone()).unwrap();
@@ -8895,7 +8895,9 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
         .unwrap();
 
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
-        let path_taken = reopened.open_timings().unwrap().path;
+        let timings = reopened.open_timings().unwrap();
+        let path_taken = timings.path;
+        let reject = timings.checkpoint_reject;
         let found = (0..=5)
             .filter(|id| {
                 reopened
@@ -8906,10 +8908,14 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
             .count();
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
-        (path_taken, found)
+        (path_taken, reject, found)
     }
 
-    assert_eq!(open_after(|_| {}), (OpenPath::Checkpoint, 6), "control");
+    assert_eq!(
+        open_after(|_| {}),
+        (OpenPath::Checkpoint, None, 6),
+        "control"
+    );
     let unknown_pack = |record: &mut RedoRecord| {
         if let RedoOp::Set { pack_id, .. } = &mut record.op {
             *pack_id = PackId([0xEE; crate::packfile::PACK_ID_LEN]);
@@ -8921,9 +8927,106 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
         }
     };
     let flat_sequence = |record: &mut RedoRecord| record.delta_seq = 0;
-    assert_eq!(open_after(unknown_pack), (OpenPath::FullScan, 6));
-    assert_eq!(open_after(out_of_extent), (OpenPath::FullScan, 6));
-    assert_eq!(open_after(flat_sequence), (OpenPath::FullScan, 6));
+    assert_eq!(
+        open_after(unknown_pack),
+        (
+            OpenPath::FullScan,
+            Some(CheckpointReject::DeltaGenerationMismatch),
+            6
+        )
+    );
+    assert_eq!(
+        open_after(out_of_extent),
+        (
+            OpenPath::FullScan,
+            Some(CheckpointReject::DeltaGenerationMismatch),
+            6
+        )
+    );
+    assert_eq!(
+        open_after(flat_sequence),
+        (
+            OpenPath::FullScan,
+            Some(CheckpointReject::DeltaOperationInvalid),
+            6
+        )
+    );
+}
+
+/// A checkpoint whose bridging delta log has vanished — the state a store is
+/// left in when the background checkpoint worker fails to append the log, or
+/// its append is interrupted — is rejected by name (`DeltaLogMissing`) and the
+/// open falls back to a rescan that still finds every record. This is the gate
+/// a reopen reports through `OpenTimings` after such a failure.
+#[test]
+fn a_missing_delta_log_is_named_on_the_full_scan_fallback() {
+    let dir = test_dir("missing_delta_log");
+    let collection = [0xDC; 16];
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(&collection, &batch_node(0), &NodeData::from_slice(b"base"))
+        .unwrap();
+    store.sync_all().unwrap();
+    for id in 1..=5 {
+        store
+            .put(&collection, &batch_node(id), &NodeData::from_slice(b"redo"))
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    let base = store.delta_state.lock().base_fingerprint.unwrap();
+    drop(store);
+
+    fs::remove_file(PackfileStorage::delta_path(&dir, base)).unwrap();
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let timings = reopened.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert_eq!(
+        timings.checkpoint_reject,
+        Some(CheckpointReject::DeltaLogMissing)
+    );
+    for id in 0..=5 {
+        assert!(reopened
+            .get(&collection, &batch_node(id))
+            .unwrap()
+            .is_some());
+    }
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A store directory with no checkpoint at all is rejected by name
+/// (`MissingOrMalformed`) and the open rescans.
+#[test]
+fn a_missing_checkpoint_is_named_on_the_full_scan_fallback() {
+    let dir = test_dir("missing_checkpoint");
+    let collection = [0xDD; 16];
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    for id in 0..=5 {
+        store
+            .put(&collection, &batch_node(id), &NodeData::from_slice(b"base"))
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let timings = reopened.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert_eq!(
+        timings.checkpoint_reject,
+        Some(CheckpointReject::MissingOrMalformed)
+    );
+    for id in 0..=5 {
+        assert!(reopened
+            .get(&collection, &batch_node(id))
+            .unwrap()
+            .is_some());
+    }
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
 }
 
 /// Differential: a collection driven through many batches, overwrites and
@@ -10590,4 +10693,62 @@ fn repacking_a_survivor_does_not_resurrect_a_deleted_collection_in_its_shard() {
         store.get(&OTHER_COLLECTION, &live).unwrap().unwrap().bytes,
         bytes::Bytes::from_static(b"survivor")
     );
+}
+
+#[test]
+fn a_rebuild_insert_into_a_full_table_fails_instead_of_dropping_the_record() {
+    // A table at its load threshold rejects new entries; the rebuild helpers
+    // must surface that, not publish an index that silently lacks the record.
+    let index = LossyIndex::with_config(16, crate::index::IndexConfig::default());
+    let mut seq = 0u64;
+    let rejected = loop {
+        let mut hash = [0u8; 16];
+        hash[..8].copy_from_slice(&seq.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+        hash[8..].copy_from_slice(&seq.to_be_bytes());
+        match insert_or_corrupt(&index, &hash, 0, 64 + seq) {
+            Ok(()) => seq += 1,
+            Err(error) => break error,
+        }
+        assert!(
+            seq < 1_000,
+            "a 16-slot table must fill long before 1000 inserts"
+        );
+    };
+    let message = rejected.to_string();
+    assert!(
+        message.contains("index insert failed") && message.contains("too full"),
+        "unexpected error: {message}"
+    );
+    assert!(!index.is_empty(), "the table held entries before it filled");
+}
+
+#[test]
+fn build_index_fails_closed_when_the_table_rejects_an_insert() {
+    // `build_index` sizes its table at 2× the record count, so at the default
+    // load factor it can never reject an insert. A load factor whose threshold
+    // the sized table cannot satisfy makes the first insert fail; the build
+    // must surface that as `Corrupt`, not return an index silently missing the
+    // record (the pre-`insert_or_corrupt` code discarded the error).
+    let offsets: Vec<([u8; 16], u16, u64)> = (0..3u64)
+        .map(|seq| {
+            let mut hash = [0u8; 16];
+            hash[..8].copy_from_slice(&seq.to_be_bytes());
+            (hash, 0u16, 64 + seq * 64)
+        })
+        .collect();
+    let starved = crate::index::IndexConfig {
+        load_factor_percent: 1,
+        ..crate::index::IndexConfig::default()
+    };
+    let error = PackfileStorage::build_index(&offsets, starved).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("index insert failed") && message.contains("too full"),
+        "unexpected error: {message}"
+    );
+
+    // Control: the same offsets build completely at the default load factor.
+    let index =
+        PackfileStorage::build_index(&offsets, crate::index::IndexConfig::default()).unwrap();
+    assert_eq!(index.len(), offsets.len());
 }

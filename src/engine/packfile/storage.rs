@@ -88,6 +88,45 @@ pub enum OpenPath {
     FullScan,
 }
 
+/// Why `checkpoint_scan_out` refused to load a checkpoint, forcing the caller
+/// to the full-scan fallback. Recorded on [`OpenTimings`] so an operator (or
+/// the benchmark harness) can see which gate fired instead of only that the
+/// slow path was taken. `None` whenever the checkpoint loaded, or whenever the
+/// open never attempted one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointReject {
+    /// No checkpoint file existed, or it failed to decode (missing, truncated,
+    /// bad magic, unsupported version).
+    MissingOrMalformed,
+    /// Packs had advanced past the checkpoint but no delta log bridged the
+    /// gap (never written, removed, or unreadable).
+    DeltaLogMissing,
+    /// The delta log existed but its base or tail fingerprint did not match
+    /// the checkpoint or the live pack set. The fingerprint covers each
+    /// pack's `(pack_id, file_len)`, so a tail mismatch also covers a
+    /// pack-length change.
+    DeltaFingerprintMismatch,
+    /// A replayed operation was invalid on its face: a non-increasing delta
+    /// sequence, or a redo record naming an operation other than `Set`.
+    DeltaOperationInvalid,
+    /// A replayed operation named a generation that no longer matched the
+    /// live generation, or a redo record's extent lay outside the pack it
+    /// named.
+    DeltaGenerationMismatch,
+    /// A replayed operation failed to apply: frame replay, snapshot blob
+    /// shape, or index deserialize.
+    DeltaApplyFailed,
+    /// A redo record's locator led to a different frame than the record
+    /// named.
+    RedoLocatorUnverified,
+    /// A checkpoint index entry's writer-local slot had no live counterpart
+    /// and the entry needed it.
+    SlotRemapFailed,
+    /// Applying a delta-log frame or redo set onto a materialized index
+    /// failed.
+    IndexUpdateFailed,
+}
+
 /// How strictly `PackfileStorage::checkpoint_scan_out` validates the live pack
 /// set against a persisted checkpoint.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -194,6 +233,10 @@ pub struct OpenTimings {
     /// Where per-shard counts and home-shard assignment came from (checkpoint
     /// path only; the fallback path builds them from the scan).
     pub bookkeeping_source: BookkeepingSource,
+    /// Which gate refused the checkpoint when this open fell back to the full
+    /// scan. `None` on a successful checkpoint load and on opens that never
+    /// attempted one.
+    pub checkpoint_reject: Option<CheckpointReject>,
 }
 
 impl Default for OpenTimings {
@@ -225,6 +268,7 @@ impl Default for OpenTimings {
             total: std::time::Duration::ZERO,
             path: OpenPath::FullScan,
             bookkeeping_source: BookkeepingSource::SlotScan,
+            checkpoint_reject: None,
         }
     }
 }
@@ -1254,6 +1298,21 @@ fn plan_read_extents(
     // testable.
     extents.sort_unstable_by_key(|extent| (extent.slot, extent.start));
     extents
+}
+
+/// Insert into a freshly built or grown index, failing the operation instead of
+/// publishing an index that silently lacks the record.
+fn insert_or_corrupt(
+    index: &LossyIndex,
+    hash: &[u8; 16],
+    slot: u16,
+    offset: u64,
+) -> Result<(), StorageError> {
+    index.insert(hash, slot, offset).map_err(|error| {
+        StorageError::Corrupt(format!(
+            "index insert failed for the record at offset {offset} in shard {slot}: {error}"
+        ))
+    })
 }
 
 /// Reject a record whose in-shard offset the 32-bit `IndexEntry` field cannot
@@ -3223,7 +3282,10 @@ impl PackfileStorage {
         let checkpoint =
             crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir));
         timings.checkpoint_decode = decode_started.elapsed();
-        let checkpoint = checkpoint?;
+        let Some(checkpoint) = checkpoint else {
+            timings.checkpoint_reject = Some(CheckpointReject::MissingOrMalformed);
+            return None;
+        };
         let covered_lsn = checkpoint.covered_lsn;
         let fingerprint_started = std::time::Instant::now();
         let packs: Vec<(PackId, u64)> = open_shards
@@ -3301,6 +3363,7 @@ impl PackfileStorage {
                     if writable {
                         let _ = std::fs::remove_file(&delta_path);
                     }
+                    timings.checkpoint_reject = Some(CheckpointReject::DeltaFingerprintMismatch);
                     return None;
                 }
                 log_bytes_on_disk = log.file_len;
@@ -3311,6 +3374,7 @@ impl PackfileStorage {
                 if writable {
                     let _ = std::fs::remove_file(&delta_path);
                 }
+                timings.checkpoint_reject = Some(CheckpointReject::DeltaLogMissing);
                 return None;
             }
             timings.delta_replay = delta_started.elapsed();
@@ -3393,6 +3457,7 @@ impl PackfileStorage {
                     // Strictly increasing above the checkpoint's base sequence.
                     if record.delta_seq <= last_delta_seq {
                         reject_log();
+                        timings.checkpoint_reject = Some(CheckpointReject::DeltaOperationInvalid);
                         return None;
                     }
                     last_delta_seq = record.delta_seq;
@@ -3407,6 +3472,7 @@ impl PackfileStorage {
                     } = record.op
                     else {
                         reject_log();
+                        timings.checkpoint_reject = Some(CheckpointReject::DeltaOperationInvalid);
                         return None;
                     };
                     let extent_ok = pack_lookup.get(&pack_id).is_some_and(|(_, pack_len)| {
@@ -3418,6 +3484,7 @@ impl PackfileStorage {
                         || !extent_ok
                     {
                         reject_log();
+                        timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
                     redo_by_collection
@@ -3433,6 +3500,7 @@ impl PackfileStorage {
                         if writable {
                             let _ = std::fs::remove_file(&delta_path);
                         }
+                        timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
                     if let Some((_, index)) = snapshot_indexes.get(&frame.collection_id) {
@@ -3440,6 +3508,7 @@ impl PackfileStorage {
                             if writable {
                                 let _ = std::fs::remove_file(&delta_path);
                             }
+                            timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                             return None;
                         }
                     } else {
@@ -3462,16 +3531,27 @@ impl PackfileStorage {
                         if writable {
                             let _ = std::fs::remove_file(&delta_path);
                         }
+                        timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     };
-                    let capacity =
-                        usize::try_from(u64::from_le_bytes(capacity_bytes.try_into().ok()?))
-                            .ok()?;
-                    let expected_blob_len = capacity.checked_mul(24)?.checked_add(8)?;
+                    let capacity: usize = usize::try_from(u64::from_le_bytes(
+                        capacity_bytes.try_into().unwrap_or([0; 8]),
+                    ))
+                    .unwrap_or(usize::MAX);
+                    let Some(expected_blob_len) =
+                        capacity.checked_mul(24).and_then(|b| b.checked_add(8))
+                    else {
+                        if writable {
+                            let _ = std::fs::remove_file(&delta_path);
+                        }
+                        timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
+                        return None;
+                    };
                     if expected_blob_len != index_blob.len() {
                         if writable {
                             let _ = std::fs::remove_file(&delta_path);
                         }
+                        timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     }
                     let Ok(index) = LossyIndex::deserialize_with_config(&index_blob, index_config)
@@ -3479,6 +3559,7 @@ impl PackfileStorage {
                         if writable {
                             let _ = std::fs::remove_file(&delta_path);
                         }
+                        timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     };
                     frames_by_collection.remove(&collection_id);
@@ -3499,6 +3580,7 @@ impl PackfileStorage {
                         if writable {
                             let _ = std::fs::remove_file(&delta_path);
                         }
+                        timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
                     live_generations.remove(&collection_id);
@@ -3522,6 +3604,7 @@ impl PackfileStorage {
         // pages the pack recovery has just read.
         if !Self::redo_locators_verified(shards, &redo_by_collection, &pack_lookup) {
             reject_log();
+            timings.checkpoint_reject = Some(CheckpointReject::RedoLocatorUnverified);
             return None;
         }
 
@@ -3614,6 +3697,7 @@ impl PackfileStorage {
                         if writable {
                             let _ = std::fs::remove_file(&delta_path);
                         }
+                        timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
                         return None;
                     }
                     owned
@@ -3623,13 +3707,25 @@ impl PackfileStorage {
                 (index, loaded.generation)
             };
             if !index.remap_slots(&slot_remap) {
+                timings.checkpoint_reject = Some(CheckpointReject::SlotRemapFailed);
                 return None;
             }
             let index = match redo_by_collection.remove(&loaded.collection_id) {
-                Some(records) => Self::apply_redo_sets(index, &records, &pack_lookup)?,
+                Some(records) => {
+                    if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) {
+                        index
+                    } else {
+                        timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
+                        return None;
+                    }
+                }
                 None => index,
             };
-            current_len.insert(loaded.collection_id, u32::try_from(index.len()).ok()?);
+            let Some(len) = u32::try_from(index.len()).ok() else {
+                timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
+                return None;
+            };
+            current_len.insert(loaded.collection_id, len);
             scan_out.collections.insert(
                 loaded.collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
@@ -3645,13 +3741,25 @@ impl PackfileStorage {
                 continue;
             }
             if !index.remap_slots(&slot_remap) {
+                timings.checkpoint_reject = Some(CheckpointReject::SlotRemapFailed);
                 return None;
             }
             let index = match redo_by_collection.remove(&collection_id) {
-                Some(records) => Self::apply_redo_sets(index, &records, &pack_lookup)?,
+                Some(records) => {
+                    if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) {
+                        index
+                    } else {
+                        timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
+                        return None;
+                    }
+                }
                 None => index,
             };
-            current_len.insert(collection_id, u32::try_from(index.len()).ok()?);
+            let Some(len) = u32::try_from(index.len()).ok() else {
+                timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
+                return None;
+            };
+            current_len.insert(collection_id, len);
             scan_out.collections.insert(
                 collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
@@ -4549,7 +4657,7 @@ impl PackfileStorage {
         );
         for (hash, slot, offset) in offsets {
             check_index_offset(*slot, hash, *offset)?;
-            let _ = index.insert(hash, *slot, *offset);
+            insert_or_corrupt(&index, hash, *slot, *offset)?;
         }
         Ok(index)
     }
@@ -6532,7 +6640,7 @@ impl PackfileStorage {
                 // around it would make its data unreachable while reporting a
                 // successful rebuild.
                 check_index_offset(slot, &hash, offset)?;
-                let _ = index.insert(&hash, slot, offset);
+                insert_or_corrupt(&index, &hash, slot, offset)?;
             }
         }
         Ok(index)
@@ -8359,9 +8467,9 @@ impl PackfileStorage {
                 u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            let inserted = grown.insert(id, slot, offset).is_ok();
+            insert_or_corrupt(&grown, id, slot, offset)?;
             progress.owned_index = Some(grown);
-            inserted
+            true
         };
         if inserted {
             if let Some(shard) = self.shards.get_shard(slot) {
@@ -8738,20 +8846,20 @@ impl PackfileStorage {
                     // The failed insert did not mutate the table, so retry it
                     // after the in-memory rehash. This is the normal capacity
                     // path and must not turn into a full-pack scan.
-                    let _ = grown.insert(id, slot, offset);
+                    insert_or_corrupt(&grown, id, slot, offset)?;
                     index = grown;
                     self.record_redo(collection_id, generation, id, slot, offset, disk_bytes);
                 } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
                     // A checkpoint-backed index has locations but not homes.
                     // Recovering the hashes from those locations is bounded
                     // by this collection, unlike `rebuild_index`'s pack scan.
-                    let _ = grown.insert(id, slot, offset);
+                    insert_or_corrupt(&grown, id, slot, offset)?;
                     index = grown;
                     self.record_redo(collection_id, generation, id, slot, offset, disk_bytes);
                 } else {
                     self.invalidate_delta_log(collection_id);
                     index = self.rebuild_index(collection_id)?;
-                    let _ = index.insert(id, slot, offset);
+                    insert_or_corrupt(&index, id, slot, offset)?;
                 }
                 // The rebuild re-derived the collection's entire live set from
                 // scratch, so its shard distribution needs a full

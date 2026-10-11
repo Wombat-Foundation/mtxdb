@@ -67,16 +67,22 @@ fn main() {
             }
         }
     }
-    let cycles = env_u64("MTXDB_BR_CYCLES", 4);
+    let cycles = env_u64("MTXDB_BR_CYCLES", 4).max(1);
     let evict = env_u64("MTXDB_BR_EVICT", 1) == 1;
     let mut missed = 0u64;
     for cycle in 1..=cycles {
         if evict {
-            let _ = std::process::Command::new("sync").status();
-            let _ = std::process::Command::new("vmtouch")
+            let synced = std::process::Command::new("sync")
+                .status()
+                .is_ok_and(|status| status.success());
+            let evicted = std::process::Command::new("vmtouch")
                 .arg("-e")
                 .arg(&dir)
-                .output();
+                .output()
+                .is_ok_and(|out| out.status.success());
+            if !(synced && evicted) {
+                println!("  (cache eviction skipped or failed: sync ok {synced}, vmtouch ok {evicted})");
+            }
         }
         let store = PackfileStorage::open(dir.clone()).expect("reopen");
         let timings = store.open_timings().expect("timings");
@@ -97,8 +103,8 @@ fn main() {
             seq = seq.checked_add(stride).expect("probe sequence overflow");
         }
         println!(
-            "cycle {cycle}: path {:?}, open {:?}, probed {probed}, missed {cycle_missed}, first missing {first_missing:?}",
-            timings.path, timings.total
+            "cycle {cycle}: path {:?} (reject {:?}), open {:?}, probed {probed}, missed {cycle_missed}, first missing {first_missing:?}",
+            timings.path, timings.checkpoint_reject, timings.total
         );
         missed = missed
             .checked_add(cycle_missed)
