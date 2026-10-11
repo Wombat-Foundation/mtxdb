@@ -97,8 +97,8 @@ fn main() {
             seq = seq.checked_add(stride).expect("probe sequence overflow");
         }
         println!(
-            "cycle {cycle}: path {:?}, open {:?}, probed {probed}, missed {cycle_missed}, first missing {first_missing:?}",
-            timings.path, timings.total
+            "cycle {cycle}: path {:?} (reject {:?}), open {:?}, probed {probed}, missed {cycle_missed}, first missing {first_missing:?}",
+            timings.path, timings.checkpoint_reject, timings.total
         );
         missed = missed
             .checked_add(cycle_missed)

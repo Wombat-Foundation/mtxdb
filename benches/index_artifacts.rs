@@ -378,13 +378,17 @@ fn measure_reopen(dir: &Path, pack: &Path, idx_path: &Path, manifest_len: u64, c
     drop(store);
     println!(
         "  [{state}] current open via {:?} {:.0} ms (pack recovery {:.0}, checkpoint decode {:.0}, \
-         index materialization {:.0}), first read {:.2} ms",
+         index materialization {:.0}), first read {:.2} ms{}",
         timings.path,
         ms(t_open),
         ms(timings.packfile_recovery),
         ms(timings.checkpoint_decode),
         ms(timings.index_materialization),
         ms(first),
+        timings
+            .checkpoint_reject
+            .map(|r| format!(" [checkpoint rejected: {r:?}]"))
+            .unwrap_or_default(),
     );
 
     prepare(dir, cold);
@@ -495,8 +499,9 @@ fn measure_warm_lookups(
 
     let store = PackfileStorage::open(dir.to_path_buf()).expect("open");
     println!(
-        "  store.get lookups run on an open via {:?}",
-        store.open_timings().map(|t| t.path)
+        "  store.get lookups run on an open via {:?} (reject {:?})",
+        store.open_timings().map(|t| t.path),
+        store.open_timings().and_then(|t| t.checkpoint_reject),
     );
     let (found, t) = timed(|| {
         keys.iter()
@@ -538,8 +543,9 @@ fn measure_warm_lookups(
                 .collect::<Vec<_>>()
         );
         println!(
-            "  store collection index stats: {:?}",
-            store.open_timings().map(|t| t.path)
+            "  store collection index stats: {:?} (reject {:?})",
+            store.open_timings().map(|t| t.path),
+            store.open_timings().and_then(|t| t.checkpoint_reject),
         );
     }
     assert_eq!(found, lookups, "store lookups hit");

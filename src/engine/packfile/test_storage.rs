@@ -8855,7 +8855,7 @@ fn logical_redo_replays_in_order_and_the_counter_resumes_above_the_log() {
 /// rescan that still finds every record. The unmodified log is trusted.
 #[test]
 fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
-    fn open_after(mutate: impl Fn(&mut RedoRecord)) -> (OpenPath, usize) {
+    fn open_after(mutate: impl Fn(&mut RedoRecord)) -> (OpenPath, Option<CheckpointReject>, usize) {
         let dir = test_dir("bad_redo_log");
         let collection = [0xD9; 16];
         let store = PackfileStorage::open(dir.clone()).unwrap();
@@ -8895,7 +8895,9 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
         .unwrap();
 
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
-        let path_taken = reopened.open_timings().unwrap().path;
+        let timings = reopened.open_timings().unwrap();
+        let path_taken = timings.path;
+        let reject = timings.checkpoint_reject;
         let found = (0..=5)
             .filter(|id| {
                 reopened
@@ -8906,10 +8908,14 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
             .count();
         drop(reopened);
         fs::remove_dir_all(dir).unwrap();
-        (path_taken, found)
+        (path_taken, reject, found)
     }
 
-    assert_eq!(open_after(|_| {}), (OpenPath::Checkpoint, 6), "control");
+    assert_eq!(
+        open_after(|_| {}),
+        (OpenPath::Checkpoint, None, 6),
+        "control"
+    );
     let unknown_pack = |record: &mut RedoRecord| {
         if let RedoOp::Set { pack_id, .. } = &mut record.op {
             *pack_id = PackId([0xEE; crate::packfile::PACK_ID_LEN]);
@@ -8921,9 +8927,30 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
         }
     };
     let flat_sequence = |record: &mut RedoRecord| record.delta_seq = 0;
-    assert_eq!(open_after(unknown_pack), (OpenPath::FullScan, 6));
-    assert_eq!(open_after(out_of_extent), (OpenPath::FullScan, 6));
-    assert_eq!(open_after(flat_sequence), (OpenPath::FullScan, 6));
+    assert_eq!(
+        open_after(unknown_pack),
+        (
+            OpenPath::FullScan,
+            Some(CheckpointReject::DeltaGenerationMismatch),
+            6
+        )
+    );
+    assert_eq!(
+        open_after(out_of_extent),
+        (
+            OpenPath::FullScan,
+            Some(CheckpointReject::DeltaGenerationMismatch),
+            6
+        )
+    );
+    assert_eq!(
+        open_after(flat_sequence),
+        (
+            OpenPath::FullScan,
+            Some(CheckpointReject::DeltaOperationInvalid),
+            6
+        )
+    );
 }
 
 /// Differential: a collection driven through many batches, overwrites and
@@ -10606,7 +10633,10 @@ fn a_rebuild_insert_into_a_full_table_fails_instead_of_dropping_the_record() {
             Ok(()) => seq += 1,
             Err(error) => break error,
         }
-        assert!(seq < 1_000, "a 16-slot table must fill long before 1000 inserts");
+        assert!(
+            seq < 1_000,
+            "a 16-slot table must fill long before 1000 inserts"
+        );
     };
     let message = rejected.to_string();
     assert!(
