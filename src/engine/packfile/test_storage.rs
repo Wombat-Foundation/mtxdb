@@ -8408,7 +8408,9 @@ fn a_reader_attached_earlier_reloads_through_the_delta_coverage_prefix() {
 
     // Coverage moves ahead by delta batches, overwriting key 1 on the way.
     writer.put(&collection, &key(2), &value(b"two")).unwrap();
-    writer.put(&collection, &key(1), &value(b"one-rewritten")).unwrap();
+    writer
+        .put(&collection, &key(1), &value(b"one-rewritten"))
+        .unwrap();
     writer.sync().unwrap();
     writer.put(&collection, &key(3), &value(b"three")).unwrap();
     writer.sync().unwrap();

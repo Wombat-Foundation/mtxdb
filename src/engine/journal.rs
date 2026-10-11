@@ -25,31 +25,9 @@ const FILE_MAGIC: &[u8; 8] = b"MTXWAL01";
 const GROUP_MAGIC: &[u8; 4] = b"MWG1";
 const GROUP_COMMIT_MAGIC: &[u8; 4] = b"CMIT";
 
-/// The sole on-disk journal format. Every mutation carries its physical pool
-/// tag, even when a journal currently serves only one pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum JournalVersion {
-    V1,
-}
-
-impl JournalVersion {
-    const fn shared() -> Self {
-        Self::V1
-    }
-
-    const fn as_u32(self) -> u32 {
-        match self {
-            Self::V1 => 1,
-        }
-    }
-
-    fn from_u32(value: u32) -> io::Result<Self> {
-        match value {
-            1 => Ok(Self::V1),
-            _ => Err(invalid_data("unsupported journal version")),
-        }
-    }
-}
+/// The sole on-disk journal format version. Every mutation carries its
+/// physical pool tag, even when a journal currently serves only one pool.
+const JOURNAL_VERSION: u32 = 1;
 
 // File header field byte ranges. `FILE_HEADER_LEN` is the sum of the fields.
 const FH_MAGIC: std::ops::Range<usize> = 0..8;
@@ -1406,8 +1384,6 @@ pub struct Journal {
     /// Generation of the newest durability mark written to this segment; the
     /// next mark uses the next generation, in the other slot.
     mark_generation: u64,
-    /// On-disk format version of this segment.
-    version: JournalVersion,
     next_sequence: u64,
     next_lsn: u64,
     poisoned: bool,
@@ -4140,10 +4116,10 @@ impl Journal {
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SEGMENT_LEN {
             return Err(invalid_data("journal segment exceeds the 256 MiB limit"));
         }
-        let (version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
         let file_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        scan_bytes(&bytes, base_sequence, base_lsn, version, || {
-            read_durable_len_from_header(&bytes, version, file_len)
+        scan_bytes(&bytes, base_sequence, base_lsn, || {
+            read_durable_len_from_header(&bytes, file_len)
         })
     }
 
@@ -4193,7 +4169,7 @@ impl Journal {
         file.seek(SeekFrom::Start(0))?;
         let mut header = vec![0; FILE_HEADER_LEN];
         file.read_exact(&mut header)?;
-        let (version, _base_sequence, base_lsn) = validate_file_header(&header)?;
+        let (_base_sequence, base_lsn) = validate_file_header(&header)?;
         let scan_end = end.min(len);
         if start >= scan_end {
             return Ok(Scan {
@@ -4209,8 +4185,8 @@ impl Journal {
         let mut tail = Vec::new();
         file.take(scan_end.saturating_sub(start))
             .read_to_end(&mut tail)?;
-        scan_groups_from(&tail, start, 0, expected_lsn, base_lsn, version, || {
-            read_durable_len_from_header(&header, version, len)
+        scan_groups_from(&tail, start, 0, expected_lsn, base_lsn, || {
+            read_durable_len_from_header(&header, len)
         })
     }
 
@@ -4290,10 +4266,10 @@ impl Journal {
     /// every mutation frame appended through it must carry a pool tag.
     ///
     /// # Errors
-    /// Same as [`Self::open`], plus `InvalidData` if an existing segment is not
-    /// the pool-tagged version.
+    /// Same as [`Self::open`], plus `InvalidData` if an existing segment has an
+    /// unsupported version.
     pub fn open_shared(path: impl AsRef<Path>) -> io::Result<(Self, Scan)> {
-        Self::open_versioned(path, JournalVersion::shared(), 1)
+        Self::open_shared_with_base(path, 1)
     }
 
     /// Like [`Self::open_shared`], but when the segment is first created its
@@ -4313,21 +4289,7 @@ impl Journal {
         path: impl AsRef<Path>,
         base_lsn: u64,
     ) -> io::Result<(Self, Scan)> {
-        Self::open_versioned(path, JournalVersion::shared(), base_lsn.max(1))
-    }
-
-    /// Open a journal whose on-disk version must be `version`, creating it with
-    /// that version and base LSN `base_lsn` when the file is absent or shorter
-    /// than the header.
-    ///
-    /// # Errors
-    /// Same as [`Self::open`], plus `InvalidData` if an existing complete
-    /// segment was written by a different version.
-    fn open_versioned(
-        path: impl AsRef<Path>,
-        version: JournalVersion,
-        base_lsn: u64,
-    ) -> io::Result<(Self, Scan)> {
+        let base_lsn = base_lsn.max(1);
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -4348,24 +4310,19 @@ impl Journal {
             // failing open forever on a partial header.
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            write_file_header(&mut file, version, 1, base_lsn)?;
+            write_file_header(&mut file, 1, base_lsn)?;
             file.sync_all()?;
             sync_parent_dir(&path)?;
         }
 
         let bytes = fs::read(&path)?;
-        let (found_version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
-        if found_version != version {
-            return Err(invalid_data(
-                "journal segment version does not match open mode",
-            ));
-        }
+        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
         if bytes.len() as u64 > MAX_SEGMENT_LEN {
             return Err(invalid_data("journal segment exceeds the 256 MiB limit"));
         }
         let file_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let scan = scan_bytes(&bytes, base_sequence, base_lsn, version, || {
-            read_durable_len_from_header(&bytes, version, file_len)
+        let scan = scan_bytes(&bytes, base_sequence, base_lsn, || {
+            read_durable_len_from_header(&bytes, file_len)
         })?;
         if scan.truncated_tail {
             file.set_len(scan.valid_len)?;
@@ -4397,7 +4354,6 @@ impl Journal {
             base_sequence,
             base_lsn,
             mark_generation,
-            version,
             next_sequence,
             next_lsn,
             poisoned: false,
@@ -4520,7 +4476,7 @@ impl Journal {
                     io::Error::new(io::ErrorKind::InvalidInput, "mutation index exceeds u64")
                 })?)
                 .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
-            encode_mutation(lsn, *pool, self.version, mutation, &mut payload)?;
+            encode_mutation(lsn, *pool, mutation, &mut payload)?;
             if u64::try_from(payload.len()).unwrap_or(u64::MAX) > MAX_GROUP_LEN {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -4852,7 +4808,7 @@ impl Journal {
             .map_or((self.next_sequence, self.next_lsn), |group| {
                 (group.sequence, group.first_lsn)
             });
-        let mut rebuilt = file_header_bytes(self.version, new_base_sequence, new_base_lsn);
+        let mut rebuilt = file_header_bytes(new_base_sequence, new_base_lsn);
         if let Some(first) = retained.first() {
             // Read the suffix straight into the buffer that becomes the new
             // segment, after its header, so it is allocated once.
@@ -4873,7 +4829,6 @@ impl Journal {
                 first.sequence,
                 first.first_lsn,
                 new_base_lsn,
-                self.version,
                 || u64::MAX,
             ) else {
                 return self.reclaim_through_scan(covered_lsn);
@@ -4920,11 +4875,11 @@ impl Journal {
     fn reclaim_through_scan(&mut self, covered_lsn: u64) -> io::Result<Reclaim> {
         let scan_started = std::time::Instant::now();
         let bytes = fs::read(&self.path)?;
-        let (version, base_sequence, base_lsn) = validate_file_header(&bytes)?;
+        let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
         // Reclaim rewrites the segment from its own live file, so any invalid
         // group there is corruption, not a crash tail: treat every byte as
         // durable and let it fail.
-        let scan = scan_bytes(&bytes, base_sequence, base_lsn, version, || u64::MAX)?;
+        let scan = scan_bytes(&bytes, base_sequence, base_lsn, || u64::MAX)?;
         let boundary = scan_started.elapsed();
         let retained = scan
             .groups
@@ -4947,10 +4902,10 @@ impl Journal {
             .map_or((self.next_sequence, self.next_lsn), |group| {
                 (group.sequence, group.first_lsn)
             });
-        let mut rebuilt = file_header_bytes(self.version, new_base_sequence, new_base_lsn);
+        let mut rebuilt = file_header_bytes(new_base_sequence, new_base_lsn);
         let mut survivors = Vec::with_capacity(retained.len());
         for group in &retained {
-            encode_group(group, self.version, &mut rebuilt)?;
+            encode_group(group, &mut rebuilt)?;
             survivors.push(GroupMark {
                 sequence: group.sequence,
                 first_lsn: group.first_lsn,
@@ -5063,10 +5018,10 @@ fn read_range_into(path: &Path, start: u64, len: u64, out: &mut Vec<u8>) -> io::
     Ok(())
 }
 
-fn file_header_bytes(version: JournalVersion, base_sequence: u64, base_lsn: u64) -> Vec<u8> {
+fn file_header_bytes(base_sequence: u64, base_lsn: u64) -> Vec<u8> {
     let mut header = vec![0_u8; FILE_HEADER_LEN];
     header[FH_MAGIC].copy_from_slice(FILE_MAGIC);
-    header[FH_VERSION].copy_from_slice(&version.as_u32().to_le_bytes());
+    header[FH_VERSION].copy_from_slice(&JOURNAL_VERSION.to_le_bytes());
     header[FH_BASE_SEQUENCE].copy_from_slice(&base_sequence.to_le_bytes());
     header[FH_BASE_LSN].copy_from_slice(&base_lsn.to_le_bytes());
     let mut crc = Hasher::new();
@@ -5075,35 +5030,29 @@ fn file_header_bytes(version: JournalVersion, base_sequence: u64, base_lsn: u64)
     header
 }
 
-fn write_file_header(
-    file: &mut File,
-    version: JournalVersion,
-    base_sequence: u64,
-    base_lsn: u64,
-) -> io::Result<()> {
-    file.write_all(&file_header_bytes(version, base_sequence, base_lsn))
+fn write_file_header(file: &mut File, base_sequence: u64, base_lsn: u64) -> io::Result<()> {
+    file.write_all(&file_header_bytes(base_sequence, base_lsn))
 }
 
 /// Validate the file header, returning the base `(sequence, lsn)` this segment
 /// starts numbering at. A rotated segment records the first surviving group's
 /// numbers here so scanning never has to assume the sequence begins at 1.
-fn validate_file_header(bytes: &[u8]) -> io::Result<(JournalVersion, u64, u64)> {
+fn validate_file_header(bytes: &[u8]) -> io::Result<(u64, u64)> {
     let Some(header) = bytes.get(..FILE_HEADER_LEN) else {
         return Err(invalid_data("truncated journal file header"));
     };
     if &header[FH_MAGIC] != FILE_MAGIC {
         return Err(invalid_data("invalid journal magic"));
     }
-    let version = JournalVersion::from_u32(u32::from_le_bytes(
-        header[FH_VERSION].try_into().expect("fixed slice"),
-    ))?;
+    if u32::from_le_bytes(header[FH_VERSION].try_into().expect("fixed slice")) != JOURNAL_VERSION {
+        return Err(invalid_data("unsupported journal version"));
+    }
     let mut crc = Hasher::new();
     crc.update(&header[FH_BASE_CRC_COVERED]);
     if u32::from_le_bytes(header[FH_BASE_CRC].try_into().expect("fixed slice")) != crc.finalize() {
         return Err(invalid_data("journal header checksum mismatch"));
     }
     Ok((
-        version,
         u64::from_le_bytes(header[FH_BASE_SEQUENCE].try_into().expect("fixed slice")),
         u64::from_le_bytes(header[FH_BASE_LSN].try_into().expect("fixed slice")),
     ))
@@ -5167,9 +5116,9 @@ pub(crate) fn cut_segment_image_to_durable_mark(path: &Path) -> io::Result<()> {
     if bytes.len() < FILE_HEADER_LEN {
         return Ok(());
     }
-    let (version, _, _) = validate_file_header(&bytes)?;
+    let (_, _) = validate_file_header(&bytes)?;
     let file_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    let mark = read_durable_len_from_header(&bytes, version, file_len);
+    let mark = read_durable_len_from_header(&bytes, file_len);
     let header = u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX);
     let keep = mark.max(header).min(file_len);
     OpenOptions::new().write(true).open(path)?.set_len(keep)
@@ -5179,7 +5128,7 @@ pub(crate) fn cut_segment_image_to_durable_mark(path: &Path) -> io::Result<()> {
 /// keep no mark and count every byte durable, so an invalid group fails closed.
 /// A missing or unreadable mark, or one claiming more than the file holds,
 /// yields `0`.
-fn read_durable_len_from_header(bytes: &[u8], _version: JournalVersion, file_len: u64) -> u64 {
+fn read_durable_len_from_header(bytes: &[u8], file_len: u64) -> u64 {
     newest_mark(bytes)
         .map(|slot| slot.durable_len)
         .filter(|&durable_len| durable_len <= file_len)
@@ -5218,20 +5167,10 @@ fn encode_group_trailer(sequence: u64, group_crc: u32) -> [u8; GROUP_TRAILER_LEN
 
 /// Re-encode a committed group with its original sequence and LSNs, for a
 /// segment rewrite. Mirrors exactly the framing `commit_group` writes.
-fn encode_group(
-    group: &CommittedGroup,
-    version: JournalVersion,
-    into: &mut Vec<u8>,
-) -> io::Result<()> {
+fn encode_group(group: &CommittedGroup, into: &mut Vec<u8>) -> io::Result<()> {
     let mut payload = Vec::new();
     for entry in &group.entries {
-        encode_mutation(
-            entry.lsn,
-            entry.pool,
-            version,
-            &entry.mutation,
-            &mut payload,
-        )?;
+        encode_mutation(entry.lsn, entry.pool, &entry.mutation, &mut payload)?;
     }
     let record_count = u32::try_from(group.entries.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many journal mutations"))?;
@@ -5257,7 +5196,6 @@ fn encode_group(
 fn encode_mutation(
     lsn: u64,
     pool: ShardType,
-    _version: JournalVersion,
     mutation: &Mutation,
     into: &mut Vec<u8>,
 ) -> io::Result<()> {
@@ -5375,7 +5313,6 @@ fn scan_bytes(
     bytes: &[u8],
     base_sequence: u64,
     base_lsn: u64,
-    version: JournalVersion,
     durable_len: impl Fn() -> u64,
 ) -> io::Result<Scan> {
     if bytes.len() < FILE_HEADER_LEN {
@@ -5387,7 +5324,6 @@ fn scan_bytes(
         base_sequence,
         base_lsn,
         base_lsn,
-        version,
         durable_len,
     )
 }
@@ -5424,7 +5360,6 @@ fn scan_one_group(
     base_offset: u64,
     expected_sequence: u64,
     expected_lsn: u64,
-    version: JournalVersion,
 ) -> Result<GroupStep, GroupFault> {
     let remaining = bytes.len().saturating_sub(cursor);
     if remaining < GROUP_HEADER_LEN {
@@ -5467,14 +5402,8 @@ fn scan_one_group(
         .saturating_add(u64::try_from(payload_index).unwrap_or(u64::MAX))
         .try_into()
         .unwrap_or(usize::MAX);
-    let entries = decode_mutations(
-        payload,
-        group.first_lsn,
-        group.record_count,
-        payload_offset,
-        version,
-    )
-    .map_err(GroupFault::Fatal)?;
+    let entries = decode_mutations(payload, group.first_lsn, group.record_count, payload_offset)
+        .map_err(GroupFault::Fatal)?;
     Ok(GroupStep::Group {
         group,
         entries,
@@ -5505,7 +5434,6 @@ fn scan_groups_from(
     mut expected_sequence: u64,
     mut expected_lsn: u64,
     segment_base_lsn: u64,
-    version: JournalVersion,
     durable_len: impl Fn() -> u64,
 ) -> io::Result<Scan> {
     let mut cursor = 0usize;
@@ -5515,37 +5443,31 @@ fn scan_groups_from(
     let mut truncated_tail = false;
 
     while cursor < bytes.len() {
-        let (group, entries, total_len) = match scan_one_group(
-            bytes,
-            cursor,
-            base_offset,
-            expected_sequence,
-            expected_lsn,
-            version,
-        ) {
-            Ok(GroupStep::Group {
-                group,
-                entries,
-                total_len,
-            }) => (group, entries, total_len),
-            Ok(GroupStep::Incomplete) => {
-                truncated_tail = true;
-                break;
-            }
-            Err(GroupFault::Fatal(error)) => return Err(error),
-            Err(GroupFault::Crash(error)) => {
-                let at = base_offset.saturating_add(u64::try_from(cursor).unwrap_or(u64::MAX));
-                // The durability mark matters only here, on a failure a crash
-                // can explain, so it is read only now. Reading it on every scan
-                // would cost a file open and read on the hot incremental path
-                // for something a healthy segment never consults.
-                if at >= durable_len() {
+        let (group, entries, total_len) =
+            match scan_one_group(bytes, cursor, base_offset, expected_sequence, expected_lsn) {
+                Ok(GroupStep::Group {
+                    group,
+                    entries,
+                    total_len,
+                }) => (group, entries, total_len),
+                Ok(GroupStep::Incomplete) => {
                     truncated_tail = true;
                     break;
                 }
-                return Err(error);
-            }
-        };
+                Err(GroupFault::Fatal(error)) => return Err(error),
+                Err(GroupFault::Crash(error)) => {
+                    let at = base_offset.saturating_add(u64::try_from(cursor).unwrap_or(u64::MAX));
+                    // The durability mark matters only here, on a failure a crash
+                    // can explain, so it is read only now. Reading it on every scan
+                    // would cost a file open and read on the hot incremental path
+                    // for something a healthy segment never consults.
+                    if at >= durable_len() {
+                        truncated_tail = true;
+                        break;
+                    }
+                    return Err(error);
+                }
+            };
         groups.push(CommittedGroup {
             sequence: group.sequence,
             first_lsn: group.first_lsn,
@@ -5581,7 +5503,6 @@ fn decode_mutations(
     first_lsn: u64,
     record_count: u32,
     payload_offset: usize,
-    _version: JournalVersion,
 ) -> io::Result<Vec<JournalEntry>> {
     let mut cursor = 0_usize;
     let mut entries = Vec::with_capacity(usize::try_from(record_count).unwrap_or(0));

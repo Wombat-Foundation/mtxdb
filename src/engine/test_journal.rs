@@ -1105,8 +1105,8 @@ fn punch_hole(path: &Path, start: u64, len: u64) {
 /// The embedded mark a shared segment currently claims.
 fn durable_mark(path: &Path) -> u64 {
     let bytes = fs::read(path).unwrap();
-    let (version, _base_sequence, _base_lsn) = super::validate_file_header(&bytes).unwrap();
-    super::read_durable_len_from_header(&bytes, version, u64::try_from(bytes.len()).unwrap())
+    let (_base_sequence, _base_lsn) = super::validate_file_header(&bytes).unwrap();
+    super::read_durable_len_from_header(&bytes, u64::try_from(bytes.len()).unwrap())
 }
 
 fn open_shared_arc(label: &str) -> Arc<JournalCoordinator> {
@@ -1515,7 +1515,7 @@ fn a_checksum_valid_group_with_a_wrong_lsn_is_fatal_even_above_the_mark() {
         }],
     };
     let mut bytes = Vec::new();
-    super::encode_group(&group, super::JournalVersion::V1, &mut bytes).unwrap();
+    super::encode_group(&group, &mut bytes).unwrap();
     fs::OpenOptions::new()
         .append(true)
         .open(&path)
