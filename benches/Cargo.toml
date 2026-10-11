@@ -25,6 +25,7 @@ publish = false
 # it overrides this with the `bundled` feature below.
 bytes = "1.5"
 crc32fast = "1.4"
+memmap2 = "0.9"
 fjall = "2.11.2"
 libmdbx = "0.6"
 base64 = "0.22"
@@ -167,4 +168,10 @@ harness = false
 [[bench]]
 name = "search_scan"
 path = "search_scan.rs"
+harness = false
+
+# Reopen strategies for a sealed pack: checkpoint, scan, sorted .idx, trusted seal.
+[[bench]]
+name = "index_artifacts"
+path = "index_artifacts.rs"
 harness = false
