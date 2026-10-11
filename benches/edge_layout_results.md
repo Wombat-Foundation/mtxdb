@@ -90,6 +90,8 @@ decompression, and a copy into `Bytes`. Each layer is timed independently.
 
 Cold = reopen the database, then `sync` + `vmtouch -e` to evict the store's
 files from the page cache, then time the first `MTXDB_EL_COLD` calls.
+The packs are read through `memmap2` (`src/engine/shard.rs`), and pages mapped
+by a live process resist `vmtouch -e`, so `drop_caches` may not fix this either.
 The harness retries eviction up to 5 times and skips any run whose residency
 remains above 5%, so a failed eviction produces `SKIPPED` instead of a
 warm read mislabeled as cold.
@@ -128,25 +130,25 @@ adding ~150–330 µs per lookup. The variance across reps is high (one rep at
 32 ids was 140 µs, another 382 µs), consistent with page-cache warmth varying
 between runs on this HDD.
 
-## Lookup latency (full prototype, zstd + CRC, 32 ids per chunk)
+## Lookup latency (full prototype, zstd + CRC)
 
-| operation                  | warm single (µs) | cold single (µs) |
-| -------------------------- | ---------------- | ---------------- |
-| key → id hit (merged)      | 15.61            | SKIPPED          |
-| key → id miss (merged)     | 0.36             | SKIPPED          |
-| id → key                   | 14.42            | SKIPPED          |
-| edge lists (all 3)         | 13.82            | SKIPPED          |
-| key → id hit (hash-only)\* | 0.41             | SKIPPED          |
-| baseline key → id hit      | 1.83             | SKIPPED          |
-| baseline id → key          | 1.62             | SKIPPED          |
-| baseline edge lists        | 4.22             | SKIPPED          |
+Warm single calls, µs/op, by ids per chunk. 32 is the range of 3 runs; 256 is
+one run. Cold is not reported: the stores are mmapped (see Cold reads), and
+only the zstd prototype's evicted cleanly.
+
+| operation                  | 32 ids    | 256 ids | baseline  |
+| -------------------------- | --------- | ------- | --------- |
+| key → id hit (confirmed)   | 5.2–5.5   | 14–16   | 1.45–1.83 |
+| key → id miss              | 0.29–0.33 | -       | 0.90      |
+| id → key                   | 4.6–4.8   | 14–16   | 1.4–1.6   |
+| edge lists (all 3 families)| 5.0–5.4   | 13.8    | 3.7–4.2   |
+| key → id hit (hash-only)\* | 0.33–0.41 | -       | -         |
 
 \*hash-only is **not collision-safe**; it prices the confirming read only.
 
-The prototype's warm point reads are 8–9× the baseline (15.6 vs 1.8 µs).
-Edge lists are 3.3× slower (13.8 vs 4.2 µs). Cold numbers are skipped because
-the stores resist eviction; the read-split bench provides valid cold numbers
-for the zstd prototype only.
+At 32 ids per chunk the prototype's confirmed hits and id → key are about
+3–3.5× the baseline, edge lists about 1.3×, and misses about 3× faster. At 256
+ids the point reads are 8–9× the baseline and edge lists 3.3×.
 
 ## What this does and does not show
 
@@ -155,7 +157,7 @@ for the zstd prototype only.
 - The prototype is 6.6× smaller on disk (32 ids, zstd) and 4–5× faster to write.
 - Warm id→key latency is dominated by zstd decompression, not decode or CRC.
 - The offset-table decode is negligible (20–40 ns).
-- The prototype's warm point reads are 8–9× the baseline; edge lists ~3.3×.
+- At 32 ids the warm point reads are 3–3.5× the baseline and edge lists 1.3×; at 256 ids 8–9× and 3.3×.
 - On cold reads (zstd store only), the prototype's cold fetch is 30–55× warm,
   adding 150–330 µs per lookup.
 
