@@ -1015,15 +1015,12 @@ fn emit_get_data(data: &NodeData, raw: bool, decode: Option<&str>) -> anyhow::Re
                 .or_else(|| decode_hamt_node(&data.bytes))
                 .ok_or_else(|| anyhow::anyhow!("payload is not a valid HAMT root or node"))?,
             "state" => {
-                if data.bytes.len() == 8 {
-                    let state_group = u64::from_be_bytes(data.bytes.as_ref().try_into().unwrap());
-                    format!("PTR: 0x{state_group:016x}\n").into_bytes()
-                } else if let Some(hamt) =
+                if let Some(hamt) =
                     decode_hamt_root(&data.bytes).or_else(|| decode_hamt_node(&data.bytes))
                 {
                     hamt
                 } else {
-                    bail!("payload is not a state group pointer or HAMT node");
+                    bail!("payload is not a HAMT root or node");
                 }
             }
             "auto" => {
@@ -6119,10 +6116,7 @@ impl MatrixRoomExtension {
     /// [`CollectionMetadata::extension`].
     fn encode_blob(&self) -> Vec<u8> {
         let mut fields = vec![
-            format!(
-                "\"ext\":{}",
-                OwnedValue::from(MATRIX_ROOM_EXT).encode()
-            ),
+            format!("\"ext\":{}", OwnedValue::from(MATRIX_ROOM_EXT).encode()),
             format!("\"fmt\":{MATRIX_ROOM_EXT_FMT}"),
         ];
         for (key, value) in [
@@ -6546,9 +6540,7 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
         let count = stats.kinds.entry("JSON event".to_owned()).or_default();
         *count = count.saturating_add(1);
         let kind = event_string_field(&event, "type").unwrap_or("");
-        let ts = fields
-            .get("origin_server_ts")
-            .and_then(OwnedValue::as_i64);
+        let ts = fields.get("origin_server_ts").and_then(OwnedValue::as_i64);
         let event_id = event_id(&event).unwrap_or("").to_owned();
         if is_state_event(&event) {
             stats.state_events = stats.state_events.saturating_add(1);
@@ -7432,7 +7424,7 @@ fn scan_pack(
             .transpose()?;
         let payload = data
             .as_ref()
-            .map(|data| scan_payload_cell(&data.data, shard_type, should_decode));
+            .map(|data| scan_payload_cell(&data.data, should_decode));
         println!(
             "{}",
             scan_table_row(&collection_hex, &id_hex, *offset, payload.as_deref())
@@ -7443,9 +7435,7 @@ fn scan_pack(
             }
         }
         if should_decode {
-            if let Some(data) =
-                data.filter(|data| scan_payload_suffix(&data.data, shard_type).is_none())
-            {
+            if let Some(data) = data.filter(|data| scan_payload_suffix(&data.data).is_none()) {
                 print_scan_payload(&data.data, opts.decode.as_deref());
             }
         }
@@ -7486,8 +7476,8 @@ fn scan_table_row(location: &str, id: &str, offset: u64, payload: Option<&str>) 
 
 /// The PAYLOAD cell for one row: a decodable payload prints below the row
 /// instead (its formatted form spans lines), so the cell just says so.
-fn scan_payload_cell(data: &[u8], shard_type: ShardType, decodes_below: bool) -> String {
-    scan_payload_suffix(data, shard_type).unwrap_or_else(|| {
+fn scan_payload_cell(data: &[u8], decodes_below: bool) -> String {
+    scan_payload_suffix(data).unwrap_or_else(|| {
         if decodes_below {
             format!("{} bytes (decoded below)", data.len())
         } else {
@@ -7837,7 +7827,7 @@ fn print_collection_record(
         if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
             "collection metadata".to_owned()
         } else {
-            scan_payload_cell(&data.data, context.shard_type, should_decode)
+            scan_payload_cell(&data.data, should_decode)
         }
     });
     println!(
@@ -7855,9 +7845,7 @@ fn print_collection_record(
         }
     }
     if should_decode {
-        if let Some(data) =
-            data.filter(|data| scan_payload_suffix(&data.data, context.shard_type).is_none())
-        {
+        if let Some(data) = data.filter(|data| scan_payload_suffix(&data.data).is_none()) {
             print_scan_payload(&data.data, context.decode.as_deref());
         }
     }
@@ -7941,16 +7929,9 @@ fn print_scan_payload(data: &[u8], decode: Option<&str>) {
             "hamt" => decode_hamt_root(data)
                 .or_else(|| decode_hamt_node(data))
                 .or_else(|| decode_state_group(data)),
-            "state" => {
-                if data.len() == 8 {
-                    let state_group = u64::from_be_bytes(data.try_into().unwrap());
-                    Some(format!("PTR: 0x{state_group:016x}\n").into_bytes())
-                } else {
-                    decode_hamt_root(data)
-                        .or_else(|| decode_hamt_node(data))
-                        .or_else(|| decode_state_group(data))
-                }
-            }
+            "state" => decode_hamt_root(data)
+                .or_else(|| decode_hamt_node(data))
+                .or_else(|| decode_state_group(data)),
             "raw" => Some(hex_bytes(data).into_bytes()),
             _ => pretty_print_payload(data),
         }
@@ -7970,11 +7951,7 @@ fn print_scan_payload(data: &[u8], decode: Option<&str>) {
 /// decode; a decodable payload (plain JSON, or a recognized record shape
 /// like `event_json`) is printed below its record instead because its
 /// formatted representation spans lines.
-fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
-    if shard_type == ShardType::State && data.len() == 8 {
-        let state_group = u64::from_be_bytes(data.try_into().ok()?);
-        return Some(format!("PTR: 0x{state_group:016x}"));
-    }
+fn scan_payload_suffix(data: &[u8]) -> Option<String> {
     if data.starts_with(b"AUX1") {
         // Auxiliary values retain their four-byte magic and full 32-byte
         // key digest on disk.  The scanner does not have the logical key
@@ -7986,7 +7963,7 @@ fn scan_payload_suffix(data: &[u8], shard_type: ShardType) -> Option<String> {
         }
         let value = &data[AUXILIARY_VALUE_OFFSET..];
         // A 16-byte value in the state shard is an `event -> STGP instance`
-        // pointer; render it in the same `PTR:` form as the legacy pointer.
+        // pointer; render it in the `PTR:` form.
         if value.len() == STATE_GROUP_ID_LENGTH {
             return Some(format!("PTR: {}", format_id(value)));
         }
@@ -8214,8 +8191,7 @@ fn compile_import_template(path: Option<&Path>) -> anyhow::Result<CollectionTemp
     let Some(path) = path else {
         return Ok(default_matrix_import_template());
     };
-    let bytes =
-        fs::read(path).with_context(|| format!("reading template {}", path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("reading template {}", path.display()))?;
     let template: OwnedValue = OwnedValue::parse_bytes(&bytes)
         .with_context(|| format!("template {} is not valid JSON", path.display()))?;
     let (identity_pointer, membership_pointer) = validate_required_keys(&template, path)?;

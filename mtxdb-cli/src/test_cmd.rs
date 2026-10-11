@@ -12,10 +12,9 @@ use super::{
     parse_pack_selectors, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
     resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
     template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate,
+    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate, JsonValueExt,
     MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
     MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
-    JsonValueExt,
 };
 use crate::{Cli, Commands};
 use bytes::Bytes;
@@ -53,24 +52,12 @@ fn json_str(value: &OwnedValue, key: &str) -> Option<String> {
 }
 
 #[test]
-fn state_scan_decodes_big_endian_state_group_payload() {
-    assert_eq!(
-        scan_payload_suffix(&2u64.to_be_bytes(), ShardType::State),
-        Some("PTR: 0x0000000000000002".to_owned())
-    );
-    assert_eq!(
-        scan_payload_suffix(&2u64.to_be_bytes(), ShardType::EventDag),
-        Some("8 bytes (undecodable, magic=0x00000000)".to_owned())
-    );
-}
-
-#[test]
 fn scan_renders_auxiliary_envelope_value() {
     let mut payload = b"AUX1".to_vec();
     payload.extend_from_slice(&[0xabu8; 32]);
     payload.extend_from_slice(b"state-group-id");
     assert_eq!(
-        scan_payload_suffix(&payload, ShardType::State),
+        scan_payload_suffix(&payload),
         Some("AUX1 value: state-group-id".to_owned())
     );
 }
@@ -78,7 +65,7 @@ fn scan_renders_auxiliary_envelope_value() {
 #[test]
 fn scan_reports_truncated_auxiliary_envelope() {
     assert_eq!(
-        scan_payload_suffix(b"AUX1", ShardType::State),
+        scan_payload_suffix(b"AUX1"),
         Some("4 bytes (malformed AUX1 envelope)".to_owned())
     );
 }
@@ -89,7 +76,7 @@ fn scan_renders_the_event_to_state_group_pointer() {
     payload.extend_from_slice(&[0xabu8; 32]);
     payload.extend_from_slice(&[0x12u8; STATE_GROUP_ID_LENGTH]);
     assert_eq!(
-        scan_payload_suffix(&payload, ShardType::State),
+        scan_payload_suffix(&payload),
         Some(format!("PTR: 0x{}", "12".repeat(16)))
     );
 }
@@ -104,7 +91,7 @@ fn scan_decodes_a_state_group_instance() {
     let payload = mtxdb::encode_state_group_record(&instance);
     // The one-line cell stays empty so `--verbose`/`--decode` prints the
     // recognized multi-line form instead.
-    assert!(scan_payload_suffix(&payload, ShardType::State).is_none());
+    assert!(scan_payload_suffix(&payload).is_none());
     let decoded = super::decode_state_group(&payload).expect("STGP decode");
     let text = String::from_utf8(decoded).unwrap();
     assert!(text.contains("STGP state-group instance"));
@@ -1866,7 +1853,10 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
 
     // The versioned namespace cannot see the old entry, so the import recomputes and persists a
     // real instance id; the old namespace is left untouched as dead weight.
-    let recomputed = new_aux.get(b"$cached").unwrap().expect("state-group mapping");
+    let recomputed = new_aux
+        .get(b"$cached")
+        .unwrap()
+        .expect("state-group mapping");
     assert_ne!(recomputed.as_slice(), stale.as_slice());
     assert!(valid_state_group_id(&recomputed));
     assert_eq!(old_aux.get(b"$cached").unwrap(), Some(stale.to_vec()));
