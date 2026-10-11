@@ -81,7 +81,9 @@ fn main() {
                 .output()
                 .is_ok_and(|out| out.status.success());
             if !(synced && evicted) {
-                println!("  (cache eviction skipped or failed: sync ok {synced}, vmtouch ok {evicted})");
+                println!(
+                    "  (cache eviction skipped or failed: sync ok {synced}, vmtouch ok {evicted})"
+                );
             }
         }
         let store = PackfileStorage::open(dir.clone()).expect("reopen");

@@ -51,7 +51,12 @@ fn load(path: &Path, limit: usize) -> Vec<Row> {
             let prev = split(cols.next()?);
             let auth = split(cols.next()?);
             let rel = cols.next().filter(|r| !r.is_empty()).map(str::to_owned);
-            Some(Row { id, prev, auth, rel })
+            Some(Row {
+                id,
+                prev,
+                auth,
+                rel,
+            })
         })
         .collect()
 }
@@ -69,8 +74,73 @@ fn tree_bytes(dir: &Path, needle: &str) -> u64 {
     total
 }
 
+fn pack_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            pack_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "pack") {
+            out.push(path);
+        }
+    }
+}
+
+/// Classify every frame in the store's packs by its payload magic and report
+/// record counts, payload bytes and on-disk frame bytes per kind.
+fn breakdown(dir: &Path, events: usize) {
+    use std::collections::BTreeMap;
+    let mut packs = Vec::new();
+    pack_files(dir, &mut packs);
+    // kind -> (records, payload bytes, frame bytes)
+    let mut kinds: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+    for pack in &packs {
+        let len = std::fs::metadata(pack).expect("stat pack").len();
+        let records: Vec<(u64, mtxdb::packfile::Record)> = mtxdb::packfile::scan_records_iter(pack)
+            .expect("scan")
+            .map(|item| item.expect("record"))
+            .collect();
+        for (i, (offset, record)) in records.iter().enumerate() {
+            let end = records.get(i + 1).map_or(len, |next| next.0);
+            let kind = match record.data.get(..4) {
+                Some(b"SIDF") => "forward (key -> id)".to_owned(),
+                Some(b"SIDR") => "reverse (id -> key)".to_owned(),
+                Some(b"SIDE") => "edge list".to_owned(),
+                Some(b"OWNL") => "owner log".to_owned(),
+                Some(b"SIDC") => "counter".to_owned(),
+                _ => "other".to_owned(),
+            };
+            let entry = kinds.entry(kind).or_default();
+            entry.0 += 1;
+            entry.1 += record.data.len() as u64;
+            entry.2 += end - offset;
+        }
+    }
+    let per = |n: u64| n as f64 / events as f64;
+    println!("  pack frames by kind ({events} events):");
+    for (kind, (count, payload, frame)) in &kinds {
+        println!(
+            "    {kind:<22} {count:>8} records  payload {:>6.1} B/event ({:>5.1} B/rec)  frames {:>6.1} B/event ({:>5.1} B/rec)",
+            per(*payload),
+            *payload as f64 / *count as f64,
+            per(*frame),
+            *frame as f64 / *count as f64,
+        );
+    }
+    let total_records: u64 = kinds.values().map(|k| k.0).sum();
+    let checkpoint = tree_bytes(dir, "checkpoint");
+    let delta = tree_bytes(dir, "delta");
+    println!(
+        "    all frames: {total_records} records; checkpoint {:.1} B/record, delta log {:.1} B/record",
+        checkpoint as f64 / total_records.max(1) as f64,
+        delta as f64 / total_records.max(1) as f64,
+    );
+}
+
 fn run(base: &Path, rows: &[Row], label: &str, prev: bool, auth: bool, rel: bool) -> u64 {
-    let dir = base.join(format!("mtxdb_bench_edgelayout_{}_{label}", std::process::id()));
+    let dir = base.join(format!(
+        "mtxdb_bench_edgelayout_{}_{label}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     let db = Database::open(dir.clone()).expect("open");
     let scope = ShortIdIndex::new(ShardType::Edges, SCOPE);
@@ -79,9 +149,33 @@ fn run(base: &Path, rows: &[Row], label: &str, prev: bool, auth: bool, rel: bool
         let key_lists: Vec<(Vec<EdgeKey<'_>>, Vec<EdgeKey<'_>>, Vec<EdgeKey<'_>>)> = chunk
             .iter()
             .map(|row| {
-                let p: Vec<_> = if prev { row.prev.iter().map(|t| EdgeKey::plain(t.as_bytes())).collect() } else { vec![] };
-                let a: Vec<_> = if auth { row.auth.iter().map(|t| EdgeKey::plain(t.as_bytes())).collect() } else { vec![] };
-                let r: Vec<_> = if rel { row.rel.iter().map(|t| EdgeKey { target: t.as_bytes(), kind: 1 }).collect() } else { vec![] };
+                let p: Vec<_> = if prev {
+                    row.prev
+                        .iter()
+                        .map(|t| EdgeKey::plain(t.as_bytes()))
+                        .collect()
+                } else {
+                    vec![]
+                };
+                let a: Vec<_> = if auth {
+                    row.auth
+                        .iter()
+                        .map(|t| EdgeKey::plain(t.as_bytes()))
+                        .collect()
+                } else {
+                    vec![]
+                };
+                let r: Vec<_> = if rel {
+                    row.rel
+                        .iter()
+                        .map(|t| EdgeKey {
+                            target: t.as_bytes(),
+                            kind: 1,
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                };
                 (p, a, r)
             })
             .collect();
@@ -89,17 +183,39 @@ fn run(base: &Path, rows: &[Row], label: &str, prev: bool, auth: bool, rel: bool
             .iter()
             .map(|(p, a, r)| {
                 let mut f = Vec::new();
-                if !p.is_empty() { f.push(FamilyEdges { family: PREV, edges: p }); }
-                if !a.is_empty() { f.push(FamilyEdges { family: AUTH, edges: a }); }
-                if !r.is_empty() { f.push(FamilyEdges { family: REL, edges: r }); }
+                if !p.is_empty() {
+                    f.push(FamilyEdges {
+                        family: PREV,
+                        edges: p,
+                    });
+                }
+                if !a.is_empty() {
+                    f.push(FamilyEdges {
+                        family: AUTH,
+                        edges: a,
+                    });
+                }
+                if !r.is_empty() {
+                    f.push(FamilyEdges {
+                        family: REL,
+                        edges: r,
+                    });
+                }
                 f
             })
             .collect();
-        edge_count += key_lists.iter().map(|(p, a, r)| p.len() + a.len() + r.len()).sum::<usize>();
+        edge_count += key_lists
+            .iter()
+            .map(|(p, a, r)| p.len() + a.len() + r.len())
+            .sum::<usize>();
         let events: Vec<BatchEvent<'_>> = chunk
             .iter()
             .zip(&fam_lists)
-            .map(|(row, fams)| BatchEvent { owner: row.id.as_bytes(), families: fams, owner_payload: None })
+            .map(|(row, fams)| BatchEvent {
+                owner: row.id.as_bytes(),
+                families: fams,
+                owner_payload: None,
+            })
             .collect();
         scope.record_events(&db, &events).expect("record");
         if (n + 1) % 20 == 0 {
@@ -108,6 +224,10 @@ fn run(base: &Path, rows: &[Row], label: &str, prev: bool, auth: bool, rel: bool
     }
     db.edges().sync_all().expect("sync");
     drop(db);
+    if label == "owners only" || label == "prev+auth+relations" {
+        println!("[{label}]");
+        breakdown(&dir, rows.len());
+    }
     let packs = tree_bytes(&dir, ".pack");
     let checkpoint = tree_bytes(&dir, "checkpoint");
     let delta = tree_bytes(&dir, "delta");
@@ -127,7 +247,10 @@ fn run(base: &Path, rows: &[Row], label: &str, prev: bool, auth: bool, rel: bool
 
 fn main() {
     let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
-    let limit = std::env::var("MTXDB_EL_EVENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+    let limit = std::env::var("MTXDB_EL_EVENTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     let rows = load(&tsv, limit);
     println!("{} events from {}", rows.len(), tsv.display());
