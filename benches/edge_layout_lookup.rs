@@ -23,6 +23,10 @@
 //! - Cold = reopen the database, `sync`, evict the store's files with
 //!   `vmtouch -e`, then time the first `MTXDB_EL_COLD` (default 1000) calls.
 //!   The in-memory index is rebuilt by reopen, so cold measures pack reads.
+//! - The confirmed variants are not collision-safe either: each run stores one
+//!   id per 128-bit hash and lookup yields one candidate, so if two distinct
+//!   keys collided, the check would reject the other key instead of finding its
+//!   id. A real design needs collision buckets or another way to disambiguate.
 //! - `proto-hash-only` is the merged variant without the key check: a hit is
 //!   whatever the hash matched. It is NOT assumed safe; a query whose hash
 //!   collides with a stored key would return that key's id, and 0 mismatches on
@@ -67,9 +71,10 @@ trait Layout {
     fn key_to_ids(&self, keys: &[&str]) -> Vec<Option<u32>>;
     fn id_to_keys(&self, ids: &[u32]) -> Vec<Option<String>>;
     fn edges(&self, ids: &[u32]) -> Vec<Edges>;
-    /// Hash matches rejected because the stored key differed.
-    fn rejected(&self) -> u64 {
-        0
+    /// Hash matches rejected because the stored key differed; `None` when the
+    /// layout has no such check.
+    fn rejected(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -330,8 +335,8 @@ impl Layout for Proto {
         out
     }
 
-    fn rejected(&self) -> u64 {
-        self.rejected.get()
+    fn rejected(&self) -> Option<u64> {
+        self.confirm.then(|| self.rejected.get())
     }
 }
 
@@ -636,10 +641,10 @@ fn bench_layout(
         misses,
     };
     warm(name, layout.as_ref(), &ctx, n, batch);
-    println!(
-        "  hash matches rejected by the key check: {}",
-        layout.rejected()
-    );
+    match layout.rejected() {
+        Some(count) => println!("  hash matches rejected by the key check: {count}"),
+        None => println!("  key check: not applicable"),
+    }
     drop(layout);
     cold(name, dir, open, &ctx, cold_n);
 }
