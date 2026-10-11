@@ -67,7 +67,7 @@ xychart-beta
 | trusted, mmap          | 0.02 |  1.2 |
 | trusted, metadata-only | 0.01 |  0.5 |
 
-### 3.3 1 GiB, tiny frames (17,602,258 records, quiet machine)
+### 3.3 1 GiB, tiny frames (17,602,258 records)
 
 | Strategy                      | "Warm" |   Cold |
 | ----------------------------- | -----: | -----: |
@@ -141,7 +141,7 @@ About 87 ns/entry to sort, ~200 ns/entry end to end.
 | sorted batch (100k sorted keys) |      11.1 ms |    51.2 ms |      0.7 ms |
 | `.idx` via mmap (just mapped)   |       308 ns |  18,246 ns |       74 ns |
 
-The mapped 1 GiB figure includes minor page faults populating the mapping (336 MiB, ~86k pages) and is not a steady-state locator cost; the heap number is. No hash-locator-only number exists (no index-only API); the hash side is only measurable end to end.
+The mapped 1 GiB figure is consistent with minor page faults populating the mapping (336 MiB, ~86k pages) — that is a hypothesis; fault counts were not measured — and is not a steady-state locator cost; the heap number is. No hash-locator-only number exists (no index-only API); the hash side is only measurable end to end.
 
 ### 6.2 End to end (key → decoded frame)
 
@@ -168,7 +168,7 @@ First 1000 random lookups on a freshly mapped, evicted `.idx`: 612 ms (256 MiB t
 ## 8. Caveats
 
 - **The 1 GiB "warm" numbers are not fully warm.** Only ~3 GiB of the 31 GiB RAM was page cache (the rest in use by other processes), and the 1 GiB "warm" scan (6.6 s) is close to cold (7.0 s) while `store.get` at 1 GiB tiny takes 75 µs, so those steps look partly cold. The 1 GiB pack alone is smaller than 3 GiB, so size alone does not explain it, and I did not measure residency (`vmtouch`) to find the cause. The 256 MiB warm numbers, which fit in cache, are the reliable warm figures.
-- An earlier 1 GiB run was contaminated by tests running concurrently and is discarded; the rerun above is on an otherwise idle machine.
+- An earlier 1 GiB run was contaminated by tests running concurrently and is discarded; the rerun above had no other benchmark or build from this repository running, but other processes still held most of the machine's RAM (see the cache note above).
 - **Safety is not measured.** Trusting a sealed pack needs a seal protocol (pack fsync, manifest and `.idx` via tmp + fsync + rename, directory fsync) and a crash-injection test. The trusted-reopen numbers are a lower bound on cost, not a correctness result. A metadata-only reopen also does not detect corruption inside the pack; that needs lazy per-frame CRC, background scrub, or an explicit verify command.
 - Single collection, no overwrites, no multi-pack newest-wins (MIDX) resolution. The memtable + runs design for indexes larger than RAM is unmeasured.
 
