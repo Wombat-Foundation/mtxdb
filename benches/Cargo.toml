@@ -181,3 +181,9 @@ harness = false
 name = "big_reopen_repro"
 path = "big_reopen_repro.rs"
 harness = false
+
+# What the short-id edge store costs on disk for a real room.
+[[bench]]
+name = "edge_layout_measure"
+path = "edge_layout_measure.rs"
+harness = false
