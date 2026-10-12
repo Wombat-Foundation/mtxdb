@@ -1319,7 +1319,7 @@ fn test_write_header_rejects_zero_creation_sequence() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     let err = write_header_with_created_at(&mut buf, &test_pack_id(1), 5, 0).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(buf.is_empty());
+    assert_eq!(buf, []);
 }
 
 #[test]

@@ -1883,11 +1883,21 @@ impl ShardPool {
     }
 
     fn next_creation_seq(&self) -> io::Result<u32> {
-        self.next_creation_seq
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current != u32::MAX).then_some(current.saturating_add(1))
-            })
-            .map_err(|_| io::Error::other("pack creation sequence exhausted"))
+        let mut current = self.next_creation_seq.load(Ordering::Relaxed);
+        loop {
+            if current == u32::MAX {
+                return Err(io::Error::other("pack creation sequence exhausted"));
+            }
+            match self.next_creation_seq.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(current),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Get a reference to a shard by ID.

@@ -1387,7 +1387,10 @@ fn a_re_added_key_is_live_again_and_its_old_versions_are_superseded() {
     assert_eq!(stats.live_keys, 1);
     assert_eq!(stats.removed_keys, 0);
     assert_eq!(stats.superseded_frames, 2, "the first value and the marker");
-    assert!(store.removed_keys(&collection).unwrap().is_empty());
+    assert_eq!(
+        store.removed_keys(&collection).unwrap(),
+        Vec::<NodeId>::new()
+    );
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
 }

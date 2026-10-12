@@ -9249,8 +9249,7 @@ fn a_wrong_but_in_bounds_locator_rejects_the_log_and_the_open_rescans() {
     // Point the last record (id 5) at the first record's frame.
     if let Some(DeltaOperation::Redo(record)) = operations
         .iter_mut()
-        .filter(|operation| matches!(operation, DeltaOperation::Redo(_)))
-        .next_back()
+        .rfind(|operation| matches!(operation, DeltaOperation::Redo(_)))
     {
         if let RedoOp::Set {
             offset, record_len, ..
