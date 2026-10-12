@@ -9771,7 +9771,7 @@ fn scan_collections_at_snapshot_binds_one_boundary() {
         .flat_map(|group| group.entries.iter())
         .filter_map(|entry| match &entry.mutation {
             JournalMutation::Put { node_id, .. } => Some(*node_id),
-            JournalMutation::DeleteCollection { .. } => None,
+            JournalMutation::RemoveRecord { .. } | JournalMutation::DeleteCollection { .. } => None,
         })
         .collect();
     assert_eq!(replayed, vec![a_after, b_after]);

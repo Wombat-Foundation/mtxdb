@@ -348,6 +348,11 @@ pub const META_TAG_DIGEST_ALGORITHM: u8 = 0x04;
 /// has since been rewritten by a later group.
 pub const META_TAG_LAST_WRITE_LSN: u8 = 0x05;
 
+/// TLV type: this record version explicitly removes the logical key. The
+/// value is one byte with the value `1`; an empty payload alone never means
+/// removal.
+pub const META_TAG_REMOVED: u8 = 0x06;
+
 /// Per-frame flag: the 4-byte checksum field holds zeros, not a real CRC32,
 /// and must not be verified by any reader. Written when the store was
 /// configured with [`ChecksumPolicy::Disabled`] — the flag, not the checksum
@@ -554,6 +559,8 @@ pub struct FrameMetadata {
     /// LSN of the journal group that last wrote this record. Absent on a
     /// frame with no tag, which a reader treats as version `0`.
     pub last_write_lsn: Option<u64>,
+    /// Whether this record version removes its logical key.
+    pub removed: bool,
     /// Tags this build does not interpret, preserved verbatim so a
     /// read/rewrite cycle does not discard a newer writer's fields.
     pub unknown: Vec<(u8, Vec<u8>)>,
@@ -569,6 +576,7 @@ impl FrameMetadata {
             && self.content_digest.is_none()
             && self.role.is_none()
             && self.last_write_lsn.is_none()
+            && !self.removed
             && self.unknown.is_empty()
     }
 
@@ -597,6 +605,9 @@ impl FrameMetadata {
         }
         if let Some(lsn) = self.last_write_lsn {
             push_tlv(&mut tlv, META_TAG_LAST_WRITE_LSN, &lsn.to_le_bytes())?;
+        }
+        if self.removed {
+            push_tlv(&mut tlv, META_TAG_REMOVED, &[1])?;
         }
         for (tag, value) in &self.unknown {
             push_tlv(&mut tlv, *tag, value)?;
@@ -683,6 +694,12 @@ impl FrameMetadata {
                 META_TAG_ROLE => metadata.role = Some(value.to_vec()),
                 META_TAG_LAST_WRITE_LSN => {
                     metadata.last_write_lsn = Some(expect_u64(value, "last_write_lsn")?);
+                }
+                META_TAG_REMOVED => {
+                    if value != [1] {
+                        return Err(invalid_data("frame metadata: removed must be [1]"));
+                    }
+                    metadata.removed = true;
                 }
                 _ => metadata.unknown.push((tag, value.to_vec())),
             }

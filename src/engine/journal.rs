@@ -113,6 +113,13 @@ pub enum Mutation {
         /// Encoded record payload.
         payload: Vec<u8>,
     },
+    /// Append a removed version for one record identity.
+    RemoveRecord {
+        /// Collection containing the record.
+        collection_id: [u8; 16],
+        /// Record identity being removed.
+        node_id: [u8; 16],
+    },
     /// Remove a collection. This is a journal operation because a replayed
     /// put must not resurrect a collection deleted by a later committed LSN.
     DeleteCollection {
@@ -403,7 +410,7 @@ impl TxnStage {
             return vec![StagedLookup::Absent; node_ids.len()];
         }
         let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
-        let mut newest_put: HashMap<[u8; 16], (usize, &Vec<u8>)> = HashMap::new();
+        let mut newest_put: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
         let mut last_delete: Option<usize> = None;
         for (position, mutation) in data.pools[pool_index(pool)].iter().enumerate() {
             match mutation {
@@ -412,7 +419,13 @@ impl TxnStage {
                     node_id,
                     payload,
                 } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, payload));
+                    newest_put.insert(*node_id, (position, Some(payload)));
+                }
+                Mutation::RemoveRecord {
+                    collection_id: staged_collection,
+                    node_id,
+                } if staged_collection == collection_id && wanted.contains(node_id) => {
+                    newest_put.insert(*node_id, (position, None));
                 }
                 Mutation::DeleteCollection {
                     collection_id: staged_collection,
@@ -425,8 +438,8 @@ impl TxnStage {
             .map(|node_id| match (newest_put.get(node_id), last_delete) {
                 // A put older than the delete is hidden by it.
                 (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
-                (Some((_, payload)), _) => StagedLookup::Put((*payload).clone()),
-                (None, Some(_)) => StagedLookup::Deleted,
+                (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
+                (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
                 (None, None) => StagedLookup::Absent,
             })
             .collect()
@@ -618,6 +631,80 @@ impl TxnStage {
         });
         data.applied[pool_index(pool)].push(false);
         data.bytes = total;
+        Ok(())
+    }
+
+    /// Add a per-record removal to this attempt.
+    ///
+    /// The caller must establish that the key is live (or was put earlier in
+    /// this stage) before staging the removal. This keeps an absent-key
+    /// removal from creating a journal entry or advancing collection clocks.
+    ///
+    /// # Errors
+    /// Returns an error if the stage is inactive or its size limit would be
+    /// exceeded.
+    pub fn stage_remove_record(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_id: [u8; 16],
+    ) -> io::Result<()> {
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        let total = data.bytes.checked_add(64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction stage size overflow",
+            )
+        })?;
+        if total > self.limit_bytes {
+            return Err(stage_too_large_with_limit(total, self.limit_bytes));
+        }
+        data.pools[pool_index(pool)].push(Mutation::RemoveRecord {
+            collection_id,
+            node_id,
+        });
+        data.applied[pool_index(pool)].push(false);
+        data.bytes = total;
+        Ok(())
+    }
+
+    /// Remove staged point mutations for a key whose live value is absent.
+    /// Used to normalize `put` then `remove` into a true no-op before publish.
+    ///
+    /// # Errors
+    /// Returns an error if the stage is inactive.
+    pub fn forget_staged_record(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_id: [u8; 16],
+    ) -> io::Result<()> {
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        let index = pool_index(pool);
+        data.pools[index].retain(|mutation| {
+            !matches!(mutation,
+                Mutation::Put { collection_id: c, node_id: n, .. }
+                    | Mutation::RemoveRecord { collection_id: c, node_id: n }
+                    if *c == collection_id && *n == node_id)
+        });
+        // This helper only runs while the stage is active, before publication;
+        // no mutation can have been applied yet.
+        data.applied[index] = vec![false; data.pools[index].len()];
+        data.bytes = data
+            .pools
+            .iter()
+            .flatten()
+            .map(|mutation| match mutation {
+                Mutation::Put { payload, .. } => payload.len().saturating_add(64),
+                Mutation::RemoveRecord { .. } | Mutation::DeleteCollection { .. } => 64,
+            })
+            .sum();
         Ok(())
     }
 
@@ -1917,6 +2004,10 @@ impl JournalCoordinator {
                         collection_id,
                         node_id,
                         ..
+                    }
+                    | Mutation::RemoveRecord {
+                        collection_id,
+                        node_id,
                     } => {
                         let version = collection_versions
                             .entry((pool, *collection_id))
@@ -3353,6 +3444,10 @@ impl JournalCoordinator {
                         collection_id,
                         node_id,
                         ..
+                    }
+                    | Mutation::RemoveRecord {
+                        collection_id,
+                        node_id,
                     } => {
                         let version = versions.entry((*pool, *collection_id)).or_insert(0);
                         *version = (*version).max(last_lsn);
@@ -5195,6 +5290,7 @@ fn encode_mutation(
         frame[MF_KIND].copy_from_slice(&match mutation {
             Mutation::Put { .. } => [1],
             Mutation::DeleteCollection { .. } => [2],
+            Mutation::RemoveRecord { .. } => [3],
         });
         frame[MF_POOL].copy_from_slice(&[pool_byte]);
         frame[MF_LSN].copy_from_slice(&lsn.to_le_bytes());
@@ -5214,6 +5310,14 @@ fn encode_mutation(
             }
             Mutation::DeleteCollection { collection_id } => {
                 frame[MF_COLLECTION].copy_from_slice(collection_id);
+                &[]
+            }
+            Mutation::RemoveRecord {
+                collection_id,
+                node_id,
+            } => {
+                frame[MF_COLLECTION].copy_from_slice(collection_id);
+                frame[MF_NODE].copy_from_slice(node_id);
                 &[]
             }
         }
@@ -5550,6 +5654,10 @@ fn decode_mutations(
             2 if payload_len == 0 && node_id == [0; 16] => {
                 Mutation::DeleteCollection { collection_id }
             }
+            3 if payload_len == 0 && node_id != [0; 16] => Mutation::RemoveRecord {
+                collection_id,
+                node_id,
+            },
             _ => return Err(invalid_data("unknown or malformed journal mutation kind")),
         };
         entries.push(JournalEntry {

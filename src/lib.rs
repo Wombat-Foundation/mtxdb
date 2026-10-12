@@ -1,8 +1,8 @@
 //! mtxdb: a write-once, content-addressed packfile storage engine for Matrix.
 //!
-//! Never mutate, never delete, never tombstone. Every node is
-//! content-addressed and append-only; garbage collection is a background
-//! repack that rewrites only reachable data in traversal order.
+//! Records are append-only versions, including explicit removal versions;
+//! physical reclamation happens during background repack, which rewrites only
+//! reachable data in traversal order.
 //!
 //! Licensed under either of MIT or Apache-2.0, at your option. See
 //! `LICENSE-MIT` and `LICENSE-APACHE`.

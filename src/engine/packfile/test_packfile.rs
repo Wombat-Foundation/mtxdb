@@ -100,6 +100,7 @@ fn test_metadata_roundtrip() {
         digest_algorithm: DigestAlgorithm::Sha256,
         role: Some(b"canonical_event".to_vec()),
         last_write_lsn: Some(0x0102_0304_0506_0708),
+        removed: false,
         unknown: vec![(0x7f, vec![1, 2, 3])],
     };
     let record = Record {
@@ -1140,6 +1141,7 @@ fn test_extract_packfile_collection_slices_target_collection_verbatim() {
             digest_algorithm: DigestAlgorithm::Blake3,
             role: Some(b"event".to_vec()),
             last_write_lsn: Some(0x99),
+            removed: false,
             unknown: vec![(0x7f, vec![0xDE, 0xAD])],
         }),
     };

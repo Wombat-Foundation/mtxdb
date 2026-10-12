@@ -387,10 +387,10 @@ pub trait StorageEngine: Send + Sync {
     /// does not change the count. It includes the genesis metadata record
     /// (`COLLECTION_METADATA_RECORD_ID`) written by
     /// [`Self::ensure_collection_metadata`], so a collection with N application
-    /// records reports N + 1, and it includes tombstones (a deleted record's
-    /// empty payload is still an indexed record). The count reflects what this
-    /// handle can see, so a read-only or checkpoint-backed handle can lag the
-    /// writer until its index refreshes.
+    /// records reports N + 1. Empty payloads remain ordinary live values;
+    /// explicit removed record versions are absent from the logical count.
+    /// The count reflects what this handle can see, so a read-only or
+    /// checkpoint-backed handle can lag the writer until its index refreshes.
     ///
     /// # Errors
     /// Returns [`StorageError::Io`] on I/O failure.

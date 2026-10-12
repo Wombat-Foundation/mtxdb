@@ -4389,6 +4389,7 @@ impl PackfileStorage {
                 keys,
                 &generation.index,
                 &HashMap::new(),
+                &HashSet::new(),
                 shards,
                 &mut pinned,
                 &mut work,
@@ -4412,7 +4413,7 @@ impl PackfileStorage {
         // Snapshot the read-committed overlay once: committed-but-unflushed
         // puts, plus the per-collection delete boundary a reader's stale index
         // may not yet cover.
-        let (overlay_puts, overlay_deletes) = {
+        let (overlay_puts, overlay_removes, overlay_deletes) = {
             let guard = self.refresh_read_journal()?;
             match guard.as_ref() {
                 Some(journal) => {
@@ -4427,13 +4428,24 @@ impl PackfileStorage {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    (puts, deleted)
+                    let removes: HashSet<NodeId> = journal
+                        .removes
+                        .get(collection_id)
+                        .map(|entries| entries.keys().copied().collect())
+                        .unwrap_or_default();
+                    (puts, removes, deleted)
                 }
-                None => (HashMap::new(), false),
+                None => (HashMap::new(), HashSet::new(), false),
             }
         };
 
-        self.scan_collection_with_overlay(collection_id, &overlay_puts, overlay_deletes, put_guard)
+        self.scan_collection_with_overlay(
+            collection_id,
+            &overlay_puts,
+            &overlay_removes,
+            overlay_deletes,
+            put_guard,
+        )
     }
 
     /// Snapshot only materialized pack records. The replayable scan uses this
@@ -4445,7 +4457,14 @@ impl PackfileStorage {
         put_guard: &mut Option<MutexGuard<'_, ()>>,
     ) -> Result<CollectionScan<'_>, StorageError> {
         let overlay_puts = HashMap::new();
-        self.scan_collection_with_overlay(collection_id, &overlay_puts, false, put_guard)
+        let overlay_removes = HashSet::new();
+        self.scan_collection_with_overlay(
+            collection_id,
+            &overlay_puts,
+            &overlay_removes,
+            false,
+            put_guard,
+        )
     }
 
     /// Build lazy scan work, letting `overlay_puts` replace pack values.
@@ -4458,6 +4477,7 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         overlay_puts: &HashMap<NodeId, NodeData>,
+        overlay_removes: &HashSet<NodeId>,
         overlay_deletes: bool,
         put_guard: &mut Option<MutexGuard<'_, ()>>,
     ) -> Result<CollectionScan<'_>, StorageError> {
@@ -4501,6 +4521,7 @@ impl PackfileStorage {
                 keys,
                 &generation.index,
                 overlay_puts,
+                overlay_removes,
                 &shards,
                 &mut pinned,
                 &mut work,
@@ -4571,13 +4592,14 @@ impl PackfileStorage {
         keys: Vec<NodeId>,
         index: &LossyIndex,
         overlay_puts: &HashMap<NodeId, NodeData>,
+        overlay_removes: &HashSet<NodeId>,
         shards: &[(u16, Arc<Shard>)],
         pinned: &mut HashMap<u16, Arc<Shard>>,
         work: &mut Vec<ScanWork>,
     ) {
         for id in keys {
-            if overlay_puts.contains_key(&id) {
-                // The overlay value is newer than the durable one.
+            if overlay_puts.contains_key(&id) || overlay_removes.contains(&id) {
+                // An overlay mutation is newer than the durable one.
                 continue;
             }
             let candidates: Vec<(u16, u64)> = index.lookup_all(&id).collect();
@@ -6785,7 +6807,7 @@ impl PackfileStorage {
     ) -> Result<Option<NodeData>, StorageError> {
         Ok(self
             .resolve_with_lsn_from_pinned(id, candidates, pinned, track)?
-            .map(|(data, _)| data))
+            .and_then(|(data, _, removed)| (!removed).then_some(data)))
     }
 
     /// Like [`Self::resolve_from_pinned`], also returning the decoded frame's
@@ -6798,7 +6820,7 @@ impl PackfileStorage {
         candidates: &[(u16, u64)],
         pinned: &HashMap<u16, Arc<Shard>>,
         track: bool,
-    ) -> Result<Option<(NodeData, Option<u64>)>, StorageError> {
+    ) -> Result<Option<(NodeData, Option<u64>, bool)>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for &(slot, offset) in candidates {
             let Some(shard) = pinned.get(&slot) else {
@@ -6826,6 +6848,10 @@ impl PackfileStorage {
                         continue;
                     }
 
+                    let removed = record
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.removed);
                     let last_write_lsn =
                         record.metadata.and_then(|metadata| metadata.last_write_lsn);
                     let data = NodeData {
@@ -6838,7 +6864,7 @@ impl PackfileStorage {
                     // The cache remains populated by writes and swizzling,
                     // where it stores work that cannot be recovered by a
                     // simple mmap range.
-                    return Ok(Some((data, last_write_lsn)));
+                    return Ok(Some((data, last_write_lsn, removed)));
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -6871,7 +6897,7 @@ impl PackfileStorage {
         let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
         Ok(self
             .resolve_with_lsn_from_pinned(id, &candidates, &pinned, false)?
-            .and_then(|(_, lsn)| lsn))
+            .and_then(|(_, lsn, _)| lsn))
     }
 
     // repack_collection_rewrite and repack_collection_topo were retired: both scanned
@@ -7123,7 +7149,7 @@ impl PackfileStorage {
                 let mut map = HashMap::new();
                 for (slot, entries) in scanned {
                     for (hash, offset) in entries {
-                        map.insert(hash, (slot, offset));
+                        self.update_repack_record_map(&mut map, hash, slot, offset)?;
                     }
                 }
                 return Ok((map, None));
@@ -7142,7 +7168,7 @@ impl PackfileStorage {
                     packfile::scan_packfile_from(&shard.path, start).map_err(StorageError::Io)?;
                 for (rid, hash, offset) in entries {
                     if rid == *collection_id {
-                        map.insert(hash, (slot, offset));
+                        self.update_repack_record_map(&mut map, hash, slot, offset)?;
                     }
                 }
             }
@@ -7153,11 +7179,43 @@ impl PackfileStorage {
             let mut map = HashMap::new();
             for (slot, entries) in &scanned {
                 for (hash, offset) in entries {
-                    map.insert(*hash, (*slot, *offset));
+                    self.update_repack_record_map(&mut map, *hash, *slot, *offset)?;
                 }
             }
             Ok((map, None))
         }
+    }
+
+    /// Make a new frame for a key authoritative in the repack candidate map.
+    /// A removed frame deletes the key from that map; an ordinary frame
+    /// replaces its previous locator.
+    fn update_repack_record_map(
+        &self,
+        map: &mut RepackRecordMap,
+        hash: NodeId,
+        slot: u16,
+        offset: u64,
+    ) -> Result<(), StorageError> {
+        let Some(shard) = self.shards.get_shard(slot) else {
+            return Err(StorageError::Corrupt(format!(
+                "repack candidate references missing shard {slot}"
+            )));
+        };
+        let record = self.read_at(
+            &shard,
+            offset,
+            self.shards.checksum_policy().verifies_reads(),
+        )?;
+        if record
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.removed)
+        {
+            map.remove(&hash);
+        } else {
+            map.insert(hash, (slot, offset));
+        }
+        Ok(())
     }
 
     /// Incremental BFS reachability walk.
@@ -8578,6 +8636,7 @@ impl PackfileStorage {
             digest_algorithm: algorithm,
             role: role.map(<[u8]>::to_vec),
             last_write_lsn: None,
+            removed: false,
             unknown: Vec::new(),
         };
         self.put_internal(collection_id, id, data, Some(metadata))
@@ -8762,6 +8821,7 @@ impl PackfileStorage {
         data: &NodeData,
         metadata: Option<FrameMetadata>,
     ) -> Result<(), StorageError> {
+        let removed = metadata.as_ref().is_some_and(|metadata| metadata.removed);
         self.put_calls.fetch_add(1, Ordering::Relaxed);
         self.put_bytes
             .fetch_add(data.bytes.len() as u64, Ordering::Relaxed);
@@ -8792,15 +8852,7 @@ impl PackfileStorage {
                         self.record_disk_bytes(pack_id, collection_id, disk_bytes);
                     }
 
-                    let mut data_to_cache = data.clone();
-                    for child in &mut data_to_cache.children {
-                        if let NodeRef::Lazy(child_id) = child {
-                            if let Some(child_data) = self.pinned.get(child_id) {
-                                *child = NodeRef::Resolved(*child_id, child_data);
-                            }
-                        }
-                    }
-                    gen.cache.insert(*id, Arc::new(data_to_cache));
+                    self.update_record_cache(&gen, id, data, removed);
                     self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
                     self.note_published_materialized(receipt_lsn);
                     return Ok(());
@@ -8879,15 +8931,7 @@ impl PackfileStorage {
                 None => Arc::new(NodeCache::new(self.cache_capacity)),
             };
 
-            let mut data_to_cache = data.clone();
-            for child in &mut data_to_cache.children {
-                if let NodeRef::Lazy(child_id) = child {
-                    if let Some(child_data) = self.pinned.get(child_id) {
-                        *child = NodeRef::Resolved(*child_id, child_data);
-                    }
-                }
-            }
-            cache.insert(*id, Arc::new(data_to_cache));
+            self.update_record_cache_for(&cache, id, data, removed);
 
             (index, cache)
         };
@@ -8896,6 +8940,39 @@ impl PackfileStorage {
         self.note_published_materialized(receipt_lsn);
 
         Ok(())
+    }
+
+    /// Keep cached reads aligned with the latest record version.
+    fn update_record_cache(
+        &self,
+        generation: &RoomGeneration,
+        id: &NodeId,
+        data: &NodeData,
+        removed: bool,
+    ) {
+        self.update_record_cache_for(&generation.cache, id, data, removed);
+    }
+
+    fn update_record_cache_for(
+        &self,
+        cache: &NodeCache,
+        id: &NodeId,
+        data: &NodeData,
+        removed: bool,
+    ) {
+        if removed {
+            cache.remove(id);
+            return;
+        }
+        let mut data_to_cache = data.clone();
+        for child in &mut data_to_cache.children {
+            if let NodeRef::Lazy(child_id) = child {
+                if let Some(child_data) = self.pinned.get(child_id) {
+                    *child = NodeRef::Resolved(*child_id, child_data);
+                }
+            }
+        }
+        cache.insert(*id, Arc::new(data_to_cache));
     }
 
     fn put_many_internal(
@@ -10103,6 +10180,22 @@ impl PackfileStorage {
                             let data = NodeData::new(bytes::Bytes::from(payload.clone()));
                             self.put_internal(collection_id, node_id, &data, Some(metadata))?;
                         }
+                        JournalMutation::RemoveRecord {
+                            collection_id,
+                            node_id,
+                        } => {
+                            let metadata = FrameMetadata {
+                                last_write_lsn: Some(group.last_lsn),
+                                removed: true,
+                                ..FrameMetadata::default()
+                            };
+                            self.put_internal(
+                                collection_id,
+                                node_id,
+                                &NodeData::new(bytes::Bytes::new()),
+                                Some(metadata),
+                            )?;
+                        }
                         JournalMutation::DeleteCollection { collection_id } => {
                             self.delete_collection(collection_id)?;
                         }
@@ -10387,6 +10480,22 @@ impl PackfileStorage {
                 }
                 JournalMutation::DeleteCollection { collection_id } => {
                     self.delete_collection(collection_id)
+                }
+                JournalMutation::RemoveRecord {
+                    collection_id,
+                    node_id,
+                } => {
+                    let metadata = FrameMetadata {
+                        last_write_lsn: Some(write_lsn),
+                        removed: true,
+                        ..FrameMetadata::default()
+                    };
+                    self.put_internal(
+                        collection_id,
+                        node_id,
+                        &NodeData::new(bytes::Bytes::new()),
+                        Some(metadata),
+                    )
                 }
             };
             suppressed.set(previous);

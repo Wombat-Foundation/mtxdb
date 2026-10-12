@@ -250,6 +250,53 @@ impl DatabaseTransaction<'_> {
         self.stage.stage_delete_collection(pool, collection_id)
     }
 
+    /// Stage removal of one record. An absent key is a no-op: its observed
+    /// record version is still checked at commit, but it emits no WAL mutation
+    /// and does not advance the collection version.
+    ///
+    /// # Errors
+    /// Returns an error if the transaction is inactive, staging exceeds its
+    /// configured limit, or the read needed to establish liveness fails.
+    pub fn remove(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_id: NodeId,
+    ) -> io::Result<()> {
+        let _lifecycle = self.lifecycle.lock();
+        if self.stage.state() != TxnStageState::Active {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        if matches!(
+            self.stage.lookup(pool, &collection_id, &node_id),
+            StagedLookup::Deleted
+        ) {
+            return Ok(());
+        }
+
+        // Read the live value and its version together. The version
+        // precondition closes the race between this existence check and WAL
+        // publication; a concurrent writer makes this transaction stale.
+        let (live, versions) = self
+            .database
+            .pool(pool)
+            .get_with_record_versions(&collection_id, std::slice::from_ref(&node_id))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.stage
+            .stage_record_expectation(pool, collection_id, node_id, versions[0])?;
+
+        // Normalize any earlier staged put for this key. If the live key was
+        // absent, put-then-remove becomes a genuine no-op. Otherwise the
+        // removal marker replaces it directly.
+        self.stage
+            .forget_staged_record(pool, collection_id, node_id)?;
+        if live[0].is_some() {
+            self.stage
+                .stage_remove_record(pool, collection_id, node_id)?;
+        }
+        Ok(())
+    }
+
     /// Stage a collection-version precondition. [`Self::commit`] rejects the
     /// transaction with [`StorageError::StaleRead`] if the collection's logical
     /// version at publication differs from `expected`.

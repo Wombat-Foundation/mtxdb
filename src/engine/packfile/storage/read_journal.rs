@@ -227,6 +227,8 @@ pub(super) struct ReadJournal {
     tail_scratch: Vec<u8>,
     /// Committed puts as `(payload, lsn)`, keyed `collection_id -> node_id`.
     pub(super) puts: ReadJournalPuts,
+    /// Committed per-record removals, keyed `collection_id -> node_id`.
+    pub(super) removes: HashMap<[u8; 16], HashMap<NodeId, u64>>,
     /// Highest committed delete LSN per collection. This is a persistent
     /// boundary: durable fallback stays suppressed for the collection until the
     /// checkpoint covers the delete, because the durable index may still hold
@@ -310,6 +312,7 @@ impl ReadJournal {
             tail_resets: 0,
             tail_scratch: Vec::new(),
             puts: HashMap::new(),
+            removes: HashMap::new(),
             delete_lsn: HashMap::new(),
             transaction: false,
         }
@@ -318,6 +321,7 @@ impl ReadJournal {
     /// Drop all applied state so the next refresh rebuilds from the segment.
     pub(super) fn reset_overlay(&mut self) {
         self.puts.clear();
+        self.removes.clear();
         self.delete_lsn.clear();
         self.observed_lsn = 0;
         self.observed_valid_len = 0;
@@ -349,7 +353,56 @@ impl ReadJournal {
             entries.retain(|_, (_, lsn)| *lsn > covered);
             !entries.is_empty()
         });
+        self.removes.retain(|_, entries| {
+            entries.retain(|_, lsn| *lsn > covered);
+            !entries.is_empty()
+        });
         self.delete_lsn.retain(|_, lsn| *lsn > covered);
+    }
+
+    /// Apply one journal mutation to the read overlay.
+    fn apply_mutation(&mut self, mutation: &JournalMutation, lsn: u64) {
+        match mutation {
+            JournalMutation::Put {
+                collection_id,
+                node_id,
+                payload,
+            } => {
+                self.puts
+                    .entry(*collection_id)
+                    .or_default()
+                    .insert(*node_id, (bytes::Bytes::copy_from_slice(payload), lsn));
+                if let Some(removes) = self.removes.get_mut(collection_id) {
+                    removes.remove(node_id);
+                    if removes.is_empty() {
+                        self.removes.remove(collection_id);
+                    }
+                }
+            }
+            JournalMutation::RemoveRecord {
+                collection_id,
+                node_id,
+            } => {
+                if let Some(puts) = self.puts.get_mut(collection_id) {
+                    puts.remove(node_id);
+                    if puts.is_empty() {
+                        self.puts.remove(collection_id);
+                    }
+                }
+                self.removes
+                    .entry(*collection_id)
+                    .or_default()
+                    .insert(*node_id, lsn);
+            }
+            JournalMutation::DeleteCollection { collection_id } => {
+                self.puts.remove(collection_id);
+                self.removes.remove(collection_id);
+                self.delete_lsn
+                    .entry(*collection_id)
+                    .and_modify(|seen| *seen = (*seen).max(lsn))
+                    .or_insert(lsn);
+            }
+        }
     }
 
     /// Whether the segment's base has advanced past the coverage this reader's
@@ -636,25 +689,7 @@ impl ReadJournal {
                     if self.pool.is_some_and(|pool| entry.pool != pool) {
                         continue;
                     }
-                    match &entry.mutation {
-                        JournalMutation::Put {
-                            collection_id,
-                            node_id,
-                            payload,
-                        } => {
-                            self.puts.entry(*collection_id).or_default().insert(
-                                *node_id,
-                                (bytes::Bytes::copy_from_slice(payload), group.last_lsn),
-                            );
-                        }
-                        JournalMutation::DeleteCollection { collection_id } => {
-                            self.puts.remove(collection_id);
-                            self.delete_lsn
-                                .entry(*collection_id)
-                                .and_modify(|lsn| *lsn = (*lsn).max(group.last_lsn))
-                                .or_insert(group.last_lsn);
-                        }
-                    }
+                    self.apply_mutation(&entry.mutation, group.last_lsn);
                 }
                 self.observed_lsn = self.observed_lsn.max(group.last_lsn);
             }
@@ -986,6 +1021,7 @@ impl PackfileStorage {
                 if previous.pool == Some(pool) && previous.path.as_path() == path =>
             {
                 previous.puts.clear();
+                previous.removes.clear();
                 previous.delete_lsn.clear();
                 previous.covered = covered;
                 previous
@@ -1032,6 +1068,7 @@ impl PackfileStorage {
         {
             if let Some(mut overlay) = installed.take() {
                 overlay.puts.clear();
+                overlay.removes.clear();
                 overlay.delete_lsn.clear();
                 *self.parked_transaction_overlay.lock() = Some(overlay);
             }
@@ -1184,11 +1221,25 @@ impl PackfileStorage {
                 for (index, id) in ids.iter().enumerate() {
                     match committed.get(id) {
                         Some((payload, _)) => results[index] = Some(NodeData::new(payload.clone())),
+                        None if overlay
+                            .removes
+                            .get(collection_id)
+                            .is_some_and(|removed| removed.contains_key(id)) => {}
                         None => unresolved.push(index),
                     }
                 }
             }
-            None => unresolved.extend(0..ids.len()),
+            None => {
+                for (index, id) in ids.iter().enumerate() {
+                    if !overlay
+                        .removes
+                        .get(collection_id)
+                        .is_some_and(|removed| removed.contains_key(id))
+                    {
+                        unresolved.push(index);
+                    }
+                }
+            }
         }
         if overlay.delete_lsn.contains_key(collection_id) {
             None
@@ -1432,6 +1483,13 @@ impl PackfileStorage {
             if let Some(committed) = overlay.puts.get(collection_id) {
                 for (index, id) in ids.iter().enumerate() {
                     if let Some((_, lsn)) = committed.get(id) {
+                        versions[index] = *lsn;
+                    }
+                }
+            }
+            if let Some(removed) = overlay.removes.get(collection_id) {
+                for (index, id) in ids.iter().enumerate() {
+                    if let Some(lsn) = removed.get(id) {
                         versions[index] = *lsn;
                     }
                 }
