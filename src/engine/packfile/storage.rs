@@ -33,6 +33,8 @@ use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 mod read_journal;
 use read_journal::ReadJournal;
 pub use read_journal::ReadSnapshot;
+mod removal;
+pub use removal::RemovalStats;
 
 thread_local! {
     /// Suppresses journal publication while a committed transaction applies
@@ -946,6 +948,7 @@ type AdjacencyResult = (Vec<[u8; 16]>, HashMap<[u8; 16], Vec<[u8; 16]>>);
 /// One shard's scanned `(hash, offset)` entries for a single collection, as
 /// produced by a repack's initial shard scan.
 type ScannedShard = (u16, Vec<([u8; 16], u64)>);
+type ScannedRepackShard = (u16, Vec<([u8; 16], u64, bool)>);
 
 /// Deduplicated live-location map for one collection during a repack scan.
 type RepackRecordMap = HashMap<[u8; 16], (u16, u64)>;
@@ -4674,6 +4677,27 @@ impl PackfileStorage {
         Ok(scanned)
     }
 
+    fn scan_collection_repack_records(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<Vec<ScannedRepackShard>, StorageError> {
+        let mut scanned = Vec::new();
+        for (slot, shard) in self.shards.all_shards() {
+            let entries = packfile::scan_packfile_with_removal(
+                &shard.path,
+                self.shards.checksum_policy().verifies_reads(),
+            )?
+            .into_iter()
+            .filter(|entry| entry.collection_id == *collection_id)
+            .map(|entry| (entry.hash, entry.offset, entry.removed))
+            .collect::<Vec<_>>();
+            if !entries.is_empty() {
+                scanned.push((slot, entries));
+            }
+        }
+        Ok(scanned)
+    }
+
     /// Scan every open shard once and build deduplicated record maps for the
     /// requested collections. This is the batch counterpart to `scan_collection_records`:
     /// a shard-compaction preflight must not reread the same packfile once per
@@ -4689,10 +4713,20 @@ impl PackfileStorage {
             .map(|collection_id| (collection_id, (HashMap::new(), HashMap::new())))
             .collect();
         for (slot, shard) in self.shards.all_shards() {
-            for (collection_id, hash, offset) in packfile::scan_packfile(&shard.path)? {
-                if wanted.contains(&collection_id) {
-                    let (live, removed) = maps.entry(collection_id).or_default();
-                    self.update_repack_record_map(live, removed, hash, slot, offset)?;
+            for entry in packfile::scan_packfile_with_removal(
+                &shard.path,
+                self.shards.checksum_policy().verifies_reads(),
+            )? {
+                if wanted.contains(&entry.collection_id) {
+                    let (live, removed) = maps.entry(entry.collection_id).or_default();
+                    self.update_repack_record_map(
+                        live,
+                        removed,
+                        entry.hash,
+                        slot,
+                        entry.offset,
+                        entry.removed,
+                    )?;
                 }
             }
         }
@@ -7183,12 +7217,19 @@ impl PackfileStorage {
                 .iter()
                 .any(|(slot, (pack_id, _))| current_pack_ids.get(slot) != Some(pack_id));
             if pack_changed {
-                let scanned = self.scan_collection_records(collection_id)?;
+                let scanned = self.scan_collection_repack_records(collection_id)?;
                 let mut map = HashMap::new();
                 let mut removed = HashMap::new();
                 for (slot, entries) in scanned {
-                    for (hash, offset) in entries {
-                        self.update_repack_record_map(&mut map, &mut removed, hash, slot, offset)?;
+                    for (hash, offset, is_removed) in entries {
+                        self.update_repack_record_map(
+                            &mut map,
+                            &mut removed,
+                            hash,
+                            slot,
+                            offset,
+                            is_removed,
+                        )?;
                     }
                 }
                 self.finalize_repack_record_maps(&mut map, &mut removed)?;
@@ -7205,11 +7246,22 @@ impl PackfileStorage {
                     .get(&slot)
                     .filter(|(pack_id, _)| *pack_id == shard.pack_id)
                     .map_or(0, |(_, offset)| *offset);
-                let entries =
-                    packfile::scan_packfile_from(&shard.path, start).map_err(StorageError::Io)?;
-                for (rid, hash, offset) in entries {
-                    if rid == *collection_id {
-                        self.update_repack_record_map(&mut map, &mut removed, hash, slot, offset)?;
+                let entries = packfile::scan_packfile_from_with_removal(
+                    &shard.path,
+                    start,
+                    self.shards.checksum_policy().verifies_reads(),
+                )
+                .map_err(StorageError::Io)?;
+                for entry in entries {
+                    if entry.collection_id == *collection_id {
+                        self.update_repack_record_map(
+                            &mut map,
+                            &mut removed,
+                            entry.hash,
+                            slot,
+                            entry.offset,
+                            entry.removed,
+                        )?;
                     }
                 }
             }
@@ -7217,12 +7269,19 @@ impl PackfileStorage {
             Ok((map, removed, Some(prev)))
         } else {
             // First repack: full scan of every shard.
-            let scanned = self.scan_collection_records(collection_id)?;
+            let scanned = self.scan_collection_repack_records(collection_id)?;
             let mut map = HashMap::new();
             let mut removed = HashMap::new();
             for (slot, entries) in &scanned {
-                for (hash, offset) in entries {
-                    self.update_repack_record_map(&mut map, &mut removed, *hash, *slot, *offset)?;
+                for (hash, offset, is_removed) in entries {
+                    self.update_repack_record_map(
+                        &mut map,
+                        &mut removed,
+                        *hash,
+                        *slot,
+                        *offset,
+                        *is_removed,
+                    )?;
                 }
             }
             self.finalize_repack_record_maps(&mut map, &mut removed)?;
@@ -7238,21 +7297,13 @@ impl PackfileStorage {
         hash: NodeId,
         slot: u16,
         offset: u64,
+        is_removed: bool,
     ) -> Result<(), StorageError> {
         let Some(shard) = self.shards.get_shard(slot) else {
             return Err(StorageError::Corrupt(format!(
                 "repack candidate references missing shard {slot}"
             )));
         };
-        let record = self.read_at(
-            &shard,
-            offset,
-            self.shards.checksum_policy().verifies_reads(),
-        )?;
-        let is_removed = record
-            .metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.removed);
         let target = if is_removed { removed } else { map };
         let replace = if let Some(&(old_slot, old_offset)) = target.get(&hash) {
             let old_shard = self.shards.get_shard(old_slot).ok_or_else(|| {

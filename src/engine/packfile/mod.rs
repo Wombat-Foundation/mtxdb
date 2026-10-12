@@ -408,6 +408,16 @@ pub(crate) const FRAME_FIXED_LEN: u32 = 1 + 4 + 16 + 16;
 /// A scanned `(collection_id, hash, file_offset)` entry from a packfile.
 pub type ScanEntry = ([u8; 16], [u8; 16], u64);
 
+/// A frame locator plus its removal state, for internal maintenance scans
+/// that need to distinguish live records from removal markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanEntryWithRemoval {
+    pub collection_id: [u8; 16],
+    pub hash: [u8; 16],
+    pub offset: u64,
+    pub removed: bool,
+}
+
 /// Streaming packfile metadata scanner.
 pub struct PackfileScanner {
     reader: BufReader<File>,
@@ -1904,6 +1914,71 @@ pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<Scan
         }
     }
 
+    Ok(entries)
+}
+
+/// Scan frame metadata while retaining each frame's removal flag. Repack uses
+/// this to classify frames during the sequential pass rather than rereading
+/// each candidate by offset afterward.
+///
+/// When `verify_checksum` is false, the scanner validates frame bounds and
+/// metadata but seeks past payloads and checksums, matching the pool's
+/// configured read policy.
+pub(crate) fn scan_packfile_with_removal(
+    path: &Path,
+    verify_checksum: bool,
+) -> io::Result<Vec<ScanEntryWithRemoval>> {
+    scan_packfile_from_with_removal(path, 0, verify_checksum)
+}
+
+/// As [`scan_packfile_with_removal`], starting at a known frame boundary.
+pub(crate) fn scan_packfile_from_with_removal(
+    path: &Path,
+    start_offset: u64,
+    verify_checksum: bool,
+) -> io::Result<Vec<ScanEntryWithRemoval>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    if start_offset == 0 {
+        if read_header(&mut reader)?.is_none() {
+            return Ok(Vec::new());
+        }
+    } else {
+        use std::io::Seek;
+        let file_len = reader.get_ref().metadata()?.len();
+        if start_offset > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("start_offset {start_offset} exceeds file length {file_len} (likely a stale cursor from a previous epoch)"),
+            ));
+        }
+        reader.seek(io::SeekFrom::Start(start_offset))?;
+    }
+
+    let file_end = reader.get_ref().metadata()?.len();
+    let mut entries = Vec::new();
+    loop {
+        let offset = reader.stream_position()?;
+        let metadata = if verify_checksum {
+            read_record_metadata(&mut reader)
+        } else {
+            read_record_metadata_skip_payload_with_end(&mut reader, file_end)
+        };
+        match metadata {
+            Ok(Some(metadata)) => entries.push(ScanEntryWithRemoval {
+                collection_id: metadata.collection_id,
+                hash: metadata.hash,
+                offset,
+                removed: metadata
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|frame| frame.removed),
+            }),
+            Ok(None) => break,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+    }
     Ok(entries)
 }
 
