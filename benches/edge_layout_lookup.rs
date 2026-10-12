@@ -42,7 +42,7 @@
 //!   cargo +1.90.0 bench --manifest-path benches/Cargo.toml --bench edge_layout_lookup
 //! ```
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -71,6 +71,15 @@ trait Layout {
     fn key_to_ids(&self, keys: &[&str]) -> Vec<Option<u32>>;
     fn id_to_keys(&self, ids: &[u32]) -> Vec<Option<String>>;
     fn edges(&self, ids: &[u32]) -> Vec<Edges>;
+    /// One edge list per id: `which` 0 = prev, 1 = auth, 2 = relations. The
+    /// default reads all three; the baseline reads only the family asked for,
+    /// as `MatrixAdjacency` does.
+    fn list(&self, ids: &[u32], which: usize) -> Vec<Vec<u32>> {
+        self.edges(ids)
+            .into_iter()
+            .map(|mut lists| std::mem::take(&mut lists[which]))
+            .collect()
+    }
     /// Hash matches rejected because the stored key differed; `None` when the
     /// layout has no such check.
     fn rejected(&self) -> Option<u64> {
@@ -104,7 +113,15 @@ impl Baseline {
     }
 }
 
+const FAMILIES: [EdgeFamily; 3] = [PREV, AUTH, REL];
+
 impl Layout for Baseline {
+    fn list(&self, ids: &[u32], which: usize) -> Vec<Vec<u32>> {
+        ids.iter()
+            .map(|id| self.family(*id, FAMILIES[which]))
+            .collect()
+    }
+
     fn key_to_ids(&self, keys: &[&str]) -> Vec<Option<u32>> {
         keys.iter()
             .map(|key| self.scope.lookup(&self.db, key.as_bytes()).expect("lookup"))
@@ -342,10 +359,21 @@ enum Op {
     KeyMiss,
     IdToKey,
     Edges,
+    /// `targets_of` for prev: key -> id, edge list, resolve every target.
+    PrevOf,
+    /// `targets_of` for auth.
+    AuthOf,
 }
 
 impl Op {
-    const ALL: [Self; 4] = [Self::KeyHit, Self::KeyMiss, Self::IdToKey, Self::Edges];
+    const ALL: [Self; 6] = [
+        Self::KeyHit,
+        Self::KeyMiss,
+        Self::IdToKey,
+        Self::Edges,
+        Self::PrevOf,
+        Self::AuthOf,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -353,6 +381,8 @@ impl Op {
             Self::KeyMiss => "key -> id (miss)",
             Self::IdToKey => "id -> key",
             Self::Edges => "edge lists (all 3)",
+            Self::PrevOf => "prev_of (replay)",
+            Self::AuthOf => "auth_of (replay)",
         }
     }
 }
@@ -433,6 +463,23 @@ fn call(layout: &dyn Layout, ctx: &Ctx<'_>, op: Op, range: &Range<usize>) -> (Du
                 .count();
             (took, bad)
         }
+        Op::PrevOf | Op::AuthOf => {
+            let which = usize::from(matches!(op, Op::AuthOf));
+            let keys: Vec<&str> = range.clone().map(|i| rows(i).id.as_str()).collect();
+            let started = Instant::now();
+            let targets = targets_of(layout, &keys, which);
+            let took = started.elapsed();
+            let bad = range
+                .clone()
+                .zip(&targets)
+                .filter(|(i, got)| {
+                    let mut have = (*got).clone();
+                    have.sort_unstable();
+                    have != expected_edges(rows(*i))[which]
+                })
+                .count();
+            (took, bad)
+        }
         Op::Edges => {
             let ids = ids();
             let started = Instant::now();
@@ -441,6 +488,138 @@ fn call(layout: &dyn Layout, ctx: &Ctx<'_>, op: Op, range: &Range<usize>) -> (Du
             (took, check_edges(layout, ctx, range, &got))
         }
     }
+}
+
+/// Benchmark-only replay of `MatrixAdjacency::targets_of`'s read pattern, one
+/// call for the given keys: key -> id, the family's edge list, then one batched
+/// id -> key resolve over every target. Returns each key's target keys.
+fn targets_of(layout: &dyn Layout, keys: &[&str], which: usize) -> Vec<Vec<String>> {
+    let ids = layout.key_to_ids(keys);
+    let found: Vec<u32> = ids.iter().flatten().copied().collect();
+    let lists = layout.list(&found, which);
+    let all: Vec<u32> = lists.iter().flatten().copied().collect();
+    let mut resolved = layout.id_to_keys(&all).into_iter();
+    lists
+        .iter()
+        .map(|list| {
+            list.iter()
+                .map(|_| resolved.next().flatten().unwrap_or_default())
+                .collect()
+        })
+        .collect()
+}
+
+/// Benchmark-only replay of `RoomAuth::auth_chain_ids`' read pattern without a
+/// persisted closure: key -> id, then a breadth-first walk reading the auth list
+/// of each frontier in one batched call, then one id -> key resolve over every
+/// member. Returns the member keys and the number of levels walked.
+fn auth_chain(layout: &dyn Layout, key: &str) -> Option<(Vec<String>, usize)> {
+    let root = layout.key_to_ids(&[key])[0]?;
+    let mut seen: HashSet<u32> = HashSet::from([root]);
+    let mut frontier = vec![root];
+    let mut levels = 0_usize;
+    while !frontier.is_empty() {
+        let next: Vec<u32> = layout
+            .list(&frontier, 1)
+            .into_iter()
+            .flatten()
+            .filter(|id| seen.insert(*id))
+            .collect();
+        levels = levels.saturating_add(usize::from(!next.is_empty()));
+        frontier = next;
+    }
+    seen.remove(&root);
+    let members: Vec<u32> = seen.into_iter().collect();
+    let keys = layout.id_to_keys(&members).into_iter().flatten().collect();
+    Some((keys, levels))
+}
+
+/// The auth chain of `key` computed from the source rows alone.
+fn reference_chain(rows: &[Row], index: &HashMap<&str, usize>, key: &str) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut frontier = vec![key];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for k in frontier {
+            if let Some(i) = index.get(k) {
+                for auth in &rows[*i].auth {
+                    if seen.insert(auth.as_str()) {
+                        next.push(auth.as_str());
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+    let mut out: Vec<String> = seen.into_iter().map(str::to_owned).collect();
+    out.sort_unstable();
+    out
+}
+
+/// One timed auth-chain walk.
+struct Walk {
+    age: usize,
+    members: usize,
+    levels: usize,
+    micros: f64,
+}
+
+/// Auth-chain walks over `count` sampled events, reported by event age (file
+/// order terciles). Correctness is checked against the source outside the timed
+/// region. Warm.
+fn walks(name: &str, layout: &dyn Layout, rows: &[Row], count: usize) {
+    let index: HashMap<&str, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.id.as_str(), i))
+        .collect();
+    let mut done = Vec::new();
+    let mut bad = 0_usize;
+    for pick in sample(rows.len(), count) {
+        let key = rows[pick].id.as_str();
+        let started = Instant::now();
+        let got = auth_chain(layout, key);
+        let took = started.elapsed();
+        let Some((mut members, levels)) = got else {
+            bad = bad.saturating_add(1);
+            continue;
+        };
+        members.sort_unstable();
+        if members != reference_chain(rows, &index, key) {
+            bad = bad.saturating_add(1);
+        }
+        done.push(Walk {
+            age: pick.saturating_mul(3).checked_div(rows.len()).unwrap_or(0),
+            members: members.len(),
+            levels,
+            micros: micros(took),
+        });
+    }
+    for (age, label) in ["oldest third", "middle third", "newest third"]
+        .iter()
+        .enumerate()
+    {
+        let group: Vec<&Walk> = done.iter().filter(|w| w.age == age).collect();
+        let n = len_f64(group.len().max(1));
+        let total: f64 = group.iter().map(|w| w.micros).sum();
+        let members: f64 = group.iter().map(|w| len_f64(w.members)).sum();
+        let levels: f64 = group.iter().map(|w| len_f64(w.levels)).sum();
+        let mut sorted: Vec<f64> = group.iter().map(|w| w.micros).collect();
+        sorted.sort_by(f64::total_cmp);
+        let p99 = sorted
+            .get(sorted.len().saturating_sub(1).saturating_mul(99) / 100)
+            .copied()
+            .unwrap_or(0.0);
+        println!(
+            "  {name:<15} auth chain (replay) {label}: {} walks, mean {:.1} members, {:.1} levels, {:.1} us/walk ({:.2} us/member), p99 {p99:.0} us",
+            group.len(),
+            members / n,
+            levels / n,
+            total / n,
+            total / members.max(1.0),
+        );
+    }
+    println!("  {name:<15} auth chain mismatches {bad}");
 }
 
 /// Latency of `n` calls of `size` operations each, and mismatches found.
@@ -626,6 +805,12 @@ fn bench_layout(
         misses,
     };
     warm(name, layout.as_ref(), &ctx, n, batch);
+    walks(
+        name,
+        layout.as_ref(),
+        rows,
+        env_usize("MTXDB_EL_WALKS", 600),
+    );
     match layout.rejected() {
         Some(count) => println!("  hash matches rejected by the key check: {count}"),
         None => println!("  key check: not applicable"),
