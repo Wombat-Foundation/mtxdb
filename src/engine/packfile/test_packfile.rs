@@ -530,6 +530,7 @@ fn extract_inherits_the_source_ordering_key() {
         .unwrap()
         .unwrap();
     assert_eq!((header.created_at, header.creation_seq), (77, 5));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
