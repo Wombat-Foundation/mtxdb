@@ -2145,6 +2145,74 @@ fn retrying_commit_and_recovery_can_run_concurrently() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A published root must not become visible before the nodes it references,
+/// even while a cross-pool transaction is only partly materialized.
+#[test]
+fn published_root_never_precedes_its_nodes() {
+    let root = test_root("published_root_node_visibility");
+    let database = Database::open(root.clone()).unwrap();
+    let state_collection = [0x67; 16];
+    let root_collection = [0x68; 16];
+    let node_id = node(1);
+    let root_id = node(2);
+    let transaction = database.begin_transaction();
+    transaction
+        .put(
+            ShardType::State,
+            state_collection,
+            node_id,
+            &NodeData::new(bytes::Bytes::from_static(b"hamt node")),
+        )
+        .unwrap();
+    transaction
+        .put(
+            ShardType::EventDag,
+            root_collection,
+            root_id,
+            &NodeData::new(bytes::Bytes::from_static(b"hamt root")),
+        )
+        .unwrap();
+
+    // Publish, then materialize the root's pool first. This deliberately
+    // reverses the database's normal pool order to exercise the dangerous
+    // partial-materialization window.
+    let mut overlay = Some(activate_for(&database, &transaction.stage));
+    database.publish_transaction(&transaction.stage).unwrap();
+    transaction.stage.begin_materialization().unwrap();
+    let receipt = transaction.stage.published_receipt().unwrap();
+    database
+        .register_new_recovery_stage(Arc::clone(&transaction.stage), receipt, &mut overlay)
+        .unwrap();
+    let root_mutation =
+        transaction.stage.snapshot_mutations()[ShardType::EventDag.index()][0].clone();
+    database
+        .pool(ShardType::EventDag)
+        .apply_transaction_mutation(&root_mutation, receipt.last_lsn)
+        .unwrap();
+    transaction
+        .stage
+        .mark_mutation_applied(ShardType::EventDag, 0)
+        .unwrap();
+
+    let root_record = database
+        .pool(ShardType::EventDag)
+        .get_many(&root_collection, &[root_id])
+        .unwrap();
+    assert!(root_record[0].is_some());
+    let node_record = database
+        .pool(ShardType::State)
+        .get_many(&state_collection, &[node_id])
+        .unwrap();
+    assert!(node_record[0].is_some(), "visible root has no visible node");
+
+    // Finish the intentionally interrupted transaction and release its WAL
+    // overlay through the normal retry path.
+    transaction.commit().unwrap();
+    drop(transaction);
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The unmaterialized floor is the only thing that keeps a versioned read from
 /// certifying a published-but-unmaterialized group. It must be pinned while
 /// such a group exists and released once the group reaches the packs, or every
