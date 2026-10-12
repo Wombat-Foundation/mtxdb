@@ -2513,7 +2513,8 @@ impl ShardPool {
             if flags
                 & !(packfile::FLAG_COMPRESSED
                     | packfile::FLAG_CRC_DISABLED
-                    | packfile::FLAG_METADATA)
+                    | packfile::FLAG_METADATA
+                    | packfile::FLAG_REMOVED)
                 != 0
             {
                 return Err(StorageError::Corrupt(format!(
@@ -2639,7 +2640,10 @@ impl ShardPool {
 
         let flags = payload[0];
         if flags
-            & !(packfile::FLAG_COMPRESSED | packfile::FLAG_CRC_DISABLED | packfile::FLAG_METADATA)
+            & !(packfile::FLAG_COMPRESSED
+                | packfile::FLAG_CRC_DISABLED
+                | packfile::FLAG_METADATA
+                | packfile::FLAG_REMOVED)
             != 0
         {
             return Err(StorageError::Corrupt(format!(
@@ -2667,7 +2671,7 @@ impl ShardPool {
         hash.copy_from_slice(&payload[21..37]);
 
         let rest = &payload[37..];
-        let (metadata, node_offset, node_bytes) = if flags & packfile::FLAG_METADATA != 0 {
+        let (mut metadata, node_offset, node_bytes) = if flags & packfile::FLAG_METADATA != 0 {
             let (metadata, consumed) = packfile::FrameMetadata::decode(rest)
                 .map_err(|e| StorageError::Corrupt(format!("frame metadata: {e}")))?;
             let node_bytes = rest.get(consumed..).ok_or_else(|| {
@@ -2680,6 +2684,11 @@ impl ShardPool {
         } else {
             (None, 37, rest)
         };
+        if flags & packfile::FLAG_REMOVED != 0 {
+            metadata
+                .get_or_insert_with(packfile::FrameMetadata::default)
+                .removed = true;
+        }
 
         let data = Self::decode_node_bytes(
             flags,

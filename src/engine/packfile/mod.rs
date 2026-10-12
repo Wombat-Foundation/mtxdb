@@ -307,6 +307,11 @@ pub struct ShardHeader {
 /// the same flag bit instead of hardcoding it.
 pub const FLAG_COMPRESSED: u8 = 0x01;
 
+/// Per-frame flag: this version removes its logical record key. Readers that
+/// do not understand removal reject the frame through [`KNOWN_FLAGS`] rather
+/// than interpreting the marker payload as a live value.
+pub const FLAG_REMOVED: u8 = 0x08;
+
 /// Per-frame flag: a versioned, length-delimited metadata area follows the
 /// fixed header and precedes the node bytes (see [`FrameMetadata`]).
 ///
@@ -319,7 +324,7 @@ pub const FLAG_METADATA: u8 = 0x04;
 
 /// Any flag bit this reader understands. A frame carrying a bit outside this
 /// mask is rejected rather than misparsed.
-const KNOWN_FLAGS: u8 = FLAG_COMPRESSED | FLAG_CRC_DISABLED | FLAG_METADATA;
+const KNOWN_FLAGS: u8 = FLAG_COMPRESSED | FLAG_CRC_DISABLED | FLAG_METADATA | FLAG_REMOVED;
 
 /// Version byte for the optional per-frame metadata area.
 pub const METADATA_VERSION: u8 = 0x01;
@@ -347,11 +352,6 @@ pub const META_TAG_DIGEST_ALGORITHM: u8 = 0x04;
 /// a conditional write names the LSN it observed and is rejected if the record
 /// has since been rewritten by a later group.
 pub const META_TAG_LAST_WRITE_LSN: u8 = 0x05;
-
-/// TLV type: this record version explicitly removes the logical key. The
-/// value is one byte with the value `1`; an empty payload alone never means
-/// removal.
-pub const META_TAG_REMOVED: u8 = 0x06;
 
 /// Per-frame flag: the 4-byte checksum field holds zeros, not a real CRC32,
 /// and must not be verified by any reader. Written when the store was
@@ -529,7 +529,8 @@ pub struct Record {
 }
 
 /// Optional, versioned metadata carried in a frame when [`FLAG_METADATA`] is
-/// set. Stored between the fixed header and the node bytes, outside any
+/// set. Removal state is carried independently by [`FLAG_REMOVED`]. Metadata
+/// is stored between the fixed header and the node bytes, outside any
 /// compression, so it can be inspected without decompressing.
 ///
 /// The layout on disk is:
@@ -559,7 +560,8 @@ pub struct FrameMetadata {
     /// LSN of the journal group that last wrote this record. Absent on a
     /// frame with no tag, which a reader treats as version `0`.
     pub last_write_lsn: Option<u64>,
-    /// Whether this record version removes its logical key.
+    /// Whether this record version removes its logical key. Encoded in
+    /// [`FLAG_REMOVED`], not as a TLV, so old readers fail closed.
     pub removed: bool,
     /// Tags this build does not interpret, preserved verbatim so a
     /// read/rewrite cycle does not discard a newer writer's fields.
@@ -576,7 +578,6 @@ impl FrameMetadata {
             && self.content_digest.is_none()
             && self.role.is_none()
             && self.last_write_lsn.is_none()
-            && !self.removed
             && self.unknown.is_empty()
     }
 
@@ -605,9 +606,6 @@ impl FrameMetadata {
         }
         if let Some(lsn) = self.last_write_lsn {
             push_tlv(&mut tlv, META_TAG_LAST_WRITE_LSN, &lsn.to_le_bytes())?;
-        }
-        if self.removed {
-            push_tlv(&mut tlv, META_TAG_REMOVED, &[1])?;
         }
         for (tag, value) in &self.unknown {
             push_tlv(&mut tlv, *tag, value)?;
@@ -694,12 +692,6 @@ impl FrameMetadata {
                 META_TAG_ROLE => metadata.role = Some(value.to_vec()),
                 META_TAG_LAST_WRITE_LSN => {
                     metadata.last_write_lsn = Some(expect_u64(value, "last_write_lsn")?);
-                }
-                META_TAG_REMOVED => {
-                    if value != [1] {
-                        return Err(invalid_data("frame metadata: removed must be [1]"));
-                    }
-                    metadata.removed = true;
                 }
                 _ => metadata.unknown.push((tag, value.to_vec())),
             }
@@ -985,6 +977,13 @@ pub(crate) fn encode_record_with_options(
     if metadata_block.is_some() {
         flags |= FLAG_METADATA;
     }
+    if record
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.removed)
+    {
+        flags |= FLAG_REMOVED;
+    }
 
     let frame_len = FRAME_FIXED_LEN
         .checked_add(metadata_len)
@@ -1100,7 +1099,7 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
 
     // Optional metadata sits between the fixed header and the node bytes.
     let rest = &payload[37..];
-    let (metadata, node_bytes) = if flags & FLAG_METADATA != 0 {
+    let (mut metadata, node_bytes) = if flags & FLAG_METADATA != 0 {
         let (metadata, consumed) = FrameMetadata::decode(rest)?;
         let node_bytes = rest
             .get(consumed..)
@@ -1109,6 +1108,9 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     } else {
         (None, rest)
     };
+    if flags & FLAG_REMOVED != 0 {
+        metadata.get_or_insert_with(FrameMetadata::default).removed = true;
+    }
 
     let data = if flags & FLAG_COMPRESSED != 0 {
         #[cfg(feature = "zstd")]
@@ -1156,7 +1158,8 @@ pub struct RecordMetadata {
     pub collection_id: [u8; 16],
     /// The structural hash framed alongside the record.
     pub hash: [u8; 16],
-    /// Optional per-record metadata, if the frame carried [`FLAG_METADATA`].
+    /// Optional per-record metadata. Removal alone may set this to `Some`
+    /// without [`FLAG_METADATA`], because its state comes from [`FLAG_REMOVED`].
     pub metadata: Option<FrameMetadata>,
 }
 
@@ -1178,7 +1181,8 @@ struct FrameHeader {
     fixed: [u8; FRAME_FIXED_LEN as usize],
     collection_id: [u8; 16],
     hash: [u8; 16],
-    /// Optional metadata parsed from the frame, if [`FLAG_METADATA`] was set.
+    /// Optional metadata parsed from the frame. Removal alone may set this to
+    /// `Some` without [`FLAG_METADATA`], based on [`FLAG_REMOVED`].
     metadata: Option<FrameMetadata>,
     /// The raw on-disk metadata block (`[version][len][TLV...]`), empty when
     /// absent. Retained so callers can feed it into the frame CRC (the block
@@ -1235,7 +1239,7 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
     }
 
     // Read the optional metadata block (version byte + u32 length + TLV).
-    let (metadata, metadata_block) = if flags & FLAG_METADATA != 0 {
+    let (mut metadata, metadata_block) = if flags & FLAG_METADATA != 0 {
         let mut prefix = [0u8; 5];
         reader.read_exact(&mut prefix)?;
         let version = prefix[0];
@@ -1262,6 +1266,9 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
     } else {
         (None, Vec::new())
     };
+    if flags & FLAG_REMOVED != 0 {
+        metadata.get_or_insert_with(FrameMetadata::default).removed = true;
+    }
     let metadata_len = u32::try_from(metadata_block.len()).expect("bounded by frame length");
 
     let node_region_len = frame_len
