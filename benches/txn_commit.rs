@@ -668,7 +668,15 @@ fn print_phases(sample: &Sample) {
         return;
     }
     use std::fmt::Write as _;
-    let mut line = format!("      {barriers} barriers, ms total (per barrier):");
+    // Two different counts: `sync()` calls (one per group, plus the closing
+    // one) and WAL durability commits (what the coordinator counted). A
+    // `sync()` with nothing new to commit adds no commit, and callers that
+    // coalesce share one. Neither is a count of fsync syscalls; the figure
+    // for those is `wal.fsync` below, which is a time, not a count.
+    let mut line = format!(
+        "      {barriers} sync() calls, {} WAL commits; ms total (per sync() call):",
+        sample.fsyncs
+    );
     for (name, total) in sample.phases.fields() {
         let total_ms = total.as_secs_f64() * 1e3;
         let _ = write!(
