@@ -226,7 +226,7 @@ fn proto_layers(
             usize::from(u16::from_be_bytes(count)).clamp(1, 8)
         });
     layer("decode only", reps, n, |i| {
-        format::key_at(&raw, i % entries).is_ok()
+        format::key_at(&raw, i.checked_rem(entries).unwrap_or(0)).is_ok()
     });
     layer("fetch only", reps, n, |i| {
         fetch(&db, located[i].0).is_some()
