@@ -32,6 +32,7 @@ pub(crate) const REL: EdgeFamily = EdgeFamily::typed(3);
 pub(crate) const KIND_EDGE_CHUNK: u8 = 1;
 pub(crate) const KIND_KEY_CHUNK: u8 = 2;
 pub(crate) const KIND_RUN: u8 = 3;
+pub(crate) const KIND_CHILD_CHUNK: u8 = 4;
 const MIB: f64 = 1_048_576.0;
 const TWO_POW_32: f64 = 4_294_967_296.0;
 const TWO_POW_32_INT: u64 = 4_294_967_296;
@@ -313,6 +314,7 @@ pub(crate) struct Ids<'a> {
     pub(crate) by_key: HashMap<&'a str, u32>,
     pub(crate) keys: Vec<&'a str>,
     pub(crate) lists: Vec<IdLists>,
+    pub(crate) children: Vec<Vec<u32>>,
 }
 
 impl<'a> Ids<'a> {
@@ -324,6 +326,7 @@ impl<'a> Ids<'a> {
         self.by_key.insert(key, id);
         self.keys.push(key);
         self.lists.push(IdLists::default());
+        self.children.push(Vec::new());
         id
     }
 }
@@ -359,6 +362,35 @@ fn encode_edge_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
     out
 }
 
+fn encode_child_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
+    let (start, end) = chunk_bounds(chunk, ids.children.len());
+    let mut body = Vec::new();
+    let mut offsets = Vec::with_capacity(chunk_size());
+    for children in &ids.children[start..end] {
+        offsets.push(u32::try_from(body.len()).expect("child chunk fits u32"));
+        body.extend_from_slice(
+            &u32::try_from(children.len())
+                .expect("child list fits u32")
+                .to_be_bytes(),
+        );
+        for child in children {
+            body.extend_from_slice(&child.to_be_bytes());
+        }
+    }
+    let mut out = b"PCHD".to_vec();
+    out.extend_from_slice(&u32::try_from(chunk).expect("chunk").to_be_bytes());
+    out.extend_from_slice(
+        &u16::try_from(end.saturating_sub(start))
+            .expect("count")
+            .to_be_bytes(),
+    );
+    for offset in offsets {
+        out.extend_from_slice(&offset.to_be_bytes());
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
 fn encode_key_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
     let (start, end) = chunk_bounds(chunk, ids.keys.len());
     format::encode_key_chunk(&ids.keys[start..end], u32::try_from(chunk).expect("chunk"))
@@ -379,8 +411,13 @@ fn encode_run(entries: &mut [([u8; 16], u32)]) -> Vec<u8> {
 /// Allocate ids for one batch of rows and fill in their edge lists; returns the
 /// chunks whose edge lists changed (including chunks of earlier ids whose list
 /// is only filled in now, because the id was first seen as another event's edge).
-fn assign_batch<'a>(ids: &mut Ids<'a>, batch: &'a [Row]) -> BTreeSet<usize> {
+pub(crate) fn assign_batch<'a>(
+    ids: &mut Ids<'a>,
+    batch: &'a [Row],
+    include_children: bool,
+) -> (BTreeSet<usize>, BTreeSet<usize>) {
     let mut dirty = BTreeSet::new();
+    let mut dirty_children = BTreeSet::new();
     for row in batch {
         let owner = ids.id(&row.id);
         let mut prev: Vec<u32> = row.prev.iter().map(|t| ids.id(t)).collect();
@@ -392,8 +429,17 @@ fn assign_batch<'a>(ids: &mut Ids<'a>, batch: &'a [Row]) -> BTreeSet<usize> {
         auth.dedup();
         ids.lists[owner as usize] = (prev, auth, rel);
         dirty.insert(locate(owner as usize).0);
+        if include_children {
+            for parent in ids.lists[owner as usize].1.clone() {
+                let children = &mut ids.children[parent as usize];
+                if !children.contains(&owner) {
+                    children.push(owner);
+                    dirty_children.insert(locate(parent as usize).0);
+                }
+            }
+        }
     }
-    dirty
+    (dirty, dirty_children)
 }
 
 /// Puts, bytes and time spent in `put` for one class of prototype record.
@@ -413,6 +459,8 @@ pub(crate) struct WriteStats {
     pub(crate) edge_rewrite: PutStats,
     pub(crate) key_new: PutStats,
     pub(crate) key_rewrite: PutStats,
+    pub(crate) child_new: PutStats,
+    pub(crate) child_rewrite: PutStats,
     pub(crate) sync_time: Duration,
 }
 
@@ -424,6 +472,8 @@ impl WriteStats {
             self.edge_rewrite,
             self.key_new,
             self.key_rewrite,
+            self.child_new,
+            self.child_rewrite,
         ]
         .iter()
         .fold(0_u64, |acc, s| acc.saturating_add(s.bytes))
@@ -436,6 +486,8 @@ impl WriteStats {
             self.edge_rewrite,
             self.key_new,
             self.key_rewrite,
+            self.child_new,
+            self.child_rewrite,
         ]
         .iter()
         .fold(0_u64, |acc, s| acc.saturating_add(s.puts))
@@ -463,6 +515,26 @@ fn timed_put(
         .saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
 }
 
+/// Simulated compaction: write only the newest version of every record into a
+/// fresh store at `dir` and sync. Not the engine's compaction path; it prices the
+/// copy and shows the size a compacted store settles at.
+pub(crate) fn compact_latest(latest: &Latest, dir: &Path) -> (Duration, Sizes) {
+    let _ = std::fs::remove_dir_all(dir);
+    let db = Database::open(dir.to_path_buf()).expect("open");
+    let started = Instant::now();
+    for (id, bytes) in latest {
+        db.edges()
+            .put(&CHUNK_COLLECTION, id, &NodeData::from_slice(bytes))
+            .expect("put");
+    }
+    db.edges().sync_all().expect("sync");
+    let took = started.elapsed();
+    drop(db);
+    let after = sizes(dir);
+    let _ = std::fs::remove_dir_all(dir);
+    (took, after)
+}
+
 /// The prototype layout's writer: dense short ids in first-seen order; edge lists
 /// and the id -> key map in chunks of [`chunk_size`] ids, every chunk that
 /// changed in a batch rewritten whole; the key -> id map as one sorted run of
@@ -476,6 +548,7 @@ pub(crate) struct Writer<'a> {
     pub(crate) latest: Latest,
     seen_edge: HashSet<usize>,
     seen_key: HashSet<usize>,
+    seen_child: HashSet<usize>,
     batches: u32,
 }
 
@@ -487,9 +560,30 @@ impl<'a> Writer<'a> {
         rows: &'a [Row],
         (batch, sync_every): (usize, usize),
     ) {
+        self.append_inner(db, rows, (batch, sync_every), false);
+    }
+
+    /// Append auth edges in both owner-to-parent and parent-to-child
+    /// directions, matching the sithnapse edge-write shape.
+    pub(crate) fn append_bidirectional(
+        &mut self,
+        db: &Database,
+        rows: &'a [Row],
+        (batch, sync_every): (usize, usize),
+    ) {
+        self.append_inner(db, rows, (batch, sync_every), true);
+    }
+
+    fn append_inner(
+        &mut self,
+        db: &Database,
+        rows: &'a [Row],
+        (batch, sync_every): (usize, usize),
+        include_children: bool,
+    ) {
         let store = db.edges();
         for (n, rows) in rows.chunks(batch).enumerate() {
-            self.write_batch(store.as_ref(), rows);
+            self.write_batch(store.as_ref(), rows, include_children);
             if n.saturating_add(1).checked_rem(sync_every) == Some(0) {
                 self.sync(db);
             }
@@ -503,24 +597,9 @@ impl<'a> Writer<'a> {
         })
     }
 
-    /// Simulated compaction: write only the newest version of every record into
-    /// a fresh store at `dir` and sync. Not the engine's compaction path; it
-    /// prices the copy and shows the size a compacted store settles at.
+    /// Simulated compaction of this writer's records; see [`compact_latest`].
     pub(crate) fn simulate_compaction(&self, dir: &Path) -> (Duration, Sizes) {
-        let _ = std::fs::remove_dir_all(dir);
-        let db = Database::open(dir.to_path_buf()).expect("open");
-        let started = Instant::now();
-        for (id, bytes) in &self.latest {
-            db.edges()
-                .put(&CHUNK_COLLECTION, id, &NodeData::from_slice(bytes))
-                .expect("put");
-        }
-        db.edges().sync_all().expect("sync");
-        let took = started.elapsed();
-        drop(db);
-        let after = sizes(dir);
-        let _ = std::fs::remove_dir_all(dir);
-        (took, after)
+        compact_latest(&self.latest, dir)
     }
 
     pub(crate) fn sync(&mut self, db: &Database) {
@@ -529,9 +608,14 @@ impl<'a> Writer<'a> {
         self.stats.sync_time = self.stats.sync_time.saturating_add(started.elapsed());
     }
 
-    fn write_batch(&mut self, store: &dyn StorageEngine, batch: &'a [Row]) {
+    fn write_batch(
+        &mut self,
+        store: &dyn StorageEngine,
+        batch: &'a [Row],
+        include_children: bool,
+    ) {
         let first_new = self.ids.keys.len();
-        let mut dirty = assign_batch(&mut self.ids, batch);
+        let (mut dirty, dirty_children) = assign_batch(&mut self.ids, batch, include_children);
         let tail = self.ids.keys.len().div_ceil(chunk_size());
         dirty.extend(locate(first_new).0..tail);
         let mut run: Vec<([u8; 16], u32)> = (first_new..self.ids.keys.len())
@@ -570,6 +654,20 @@ impl<'a> Writer<'a> {
                 (bucket, &mut self.latest),
                 spread(KIND_KEY_CHUNK, number),
                 &encode_key_chunk(&self.ids, chunk),
+            );
+        }
+        for chunk in dirty_children {
+            let number = u32::try_from(chunk).expect("chunk");
+            let bucket = if self.seen_child.insert(chunk) {
+                &mut self.stats.child_new
+            } else {
+                &mut self.stats.child_rewrite
+            };
+            timed_put(
+                store,
+                (bucket, &mut self.latest),
+                spread(KIND_CHILD_CHUNK, number),
+                &encode_child_chunk(&self.ids, chunk),
             );
         }
     }

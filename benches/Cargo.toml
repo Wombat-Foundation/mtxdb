@@ -205,3 +205,8 @@ harness = false
 name = "edge_layout_read_split"
 path = "edge_layout_read_split.rs"
 harness = false
+
+[[bench]]
+name = "edge_layout_sithnapse"
+path = "edge_layout_sithnapse.rs"
+harness = false
