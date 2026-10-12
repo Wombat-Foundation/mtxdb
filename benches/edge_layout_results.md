@@ -150,6 +150,46 @@ At 32 ids per chunk the prototype's confirmed hits and id → key are about
 3–3.5× the baseline, edge lists about 1.3×, and misses about 3× faster. At 256
 ids the point reads are 8–9× the baseline and edge lists 3.3×.
 
+## Small-batch writes and garbage
+
+Events arrive in batches of B, appended after a 60,000-event preload (batches
+of 1,000), chunk 32, zstd + CRC, one machine, HDD. Fixture: the aria-net.org v6
+room (75,377 events; `docs/edge-layout-room.tsv`, from `benches/room_to_tsv.sh`).
+It is **not the room used above**, so these numbers do not compare with the
+tables above. Sync every 20 batches (the engine does not fsync per commit); the
+wall time includes those syncs, which is most of it at batch 1 and 2.
+
+| batch | baseline us/event | prototype us/event | baseline growth B/event | prototype growth B/event | prototype rewrites |
+| ----- | ----------------- | ------------------ | ----------------------- | ------------------------ | ------------------ |
+| 1     | 2,453-2,572       | 2,588-2,868        | 930                     | 1,320                    | 97%                |
+| 2     | 1,223-1,314       | 1,245-1,269        | 841                     | 689                      | 96%                |
+| 10    | 276-321           | 238-263            | 770                     | 200                      | 83%                |
+
+(2 reps; ranges.) Wall time is within noise at batch 1 and 2: about 5 of the
+roughly 5-6 s at batch 1 is the 100 periodic fsyncs. On disk the prototype
+grows 42% more at batch 1, and less from batch 2 up.
+
+Garbage (1 rep, the same runs): dead share is the part of pack bytes that
+a **simulated** compaction removes (copy only the newest version of each record
+into a fresh store; not the engine's compaction path).
+
+| batch | packs | after compaction | dead | copy time |
+| ----- | ----- | ---------------- | ---- | --------- |
+| 1     | 6.12 MiB | 4.33 MiB | 29% | 485 ms |
+| 2     | 5.17 MiB | 4.27 MiB | 17% | 575 ms |
+| 10    | 4.43 MiB | 4.21 MiB | 5%  | 435 ms |
+| 100   | 4.27 MiB | 4.20 MiB | 2%  | 479 ms |
+
+Baseline garbage is not measured. With a sync after **every** batch on the
+earlier room (1 rep), batch 1 took 33.5 ms/event (baseline) vs 39.8 ms
+(prototype): that run measured fsync latency, not chunk rewrites, and is a worst
+case.
+
+**Whether sithnapse benefits is not shown.** Sithnapse does not use
+`ShortIdIndex`; its live edge write is one event at a time (the lazy backfill in
+`_fetch_direct_edges`), preceded by a resolve and a SQL fetch, and it writes both
+the outbound auth list and the child list. The prototype stores only out-edges.
+
 ## What this does and does not show
 
 **Shown:**
