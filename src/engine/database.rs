@@ -317,25 +317,19 @@ impl DatabaseTransaction<'_> {
             .pool(pool)
             .get_with_record_versions(&collection_id, &pending)
             .map_err(|error| io::Error::other(error.to_string()))?;
-        for (node_id, version) in pending.iter().zip(&versions) {
-            self.stage
-                .stage_record_expectation(pool, collection_id, *node_id, *version)?;
-        }
-
         // Normalize any earlier staged put for these keys. A key that was
         // absent live becomes a genuine no-op after put-then-remove; a live
-        // key gets the removal marker directly.
-        let forget: std::collections::HashSet<NodeId> = pending.iter().copied().collect();
-        self.stage
-            .forget_staged_records(pool, collection_id, &forget)?;
+        // key gets the removal marker directly. The budget is checked before
+        // anything changes, so a refused batch leaves the transaction as it was.
         let live_ids: Vec<NodeId> = pending
             .iter()
             .zip(&live)
             .filter(|(_, value)| value.is_some())
             .map(|(node_id, _)| *node_id)
             .collect();
+        let preconditions: Vec<(NodeId, u64)> = pending.iter().copied().zip(versions).collect();
         self.stage
-            .stage_remove_records(pool, collection_id, &live_ids)
+            .stage_removals_normalized(pool, collection_id, &preconditions, &live_ids)
     }
 
     /// Stage a collection-version precondition. [`Self::commit`] rejects the

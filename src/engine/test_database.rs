@@ -3733,3 +3733,66 @@ fn a_read_only_worker_still_refreshes_on_a_miss_while_the_writer_does_not() {
     assert!(pool.get_many_with_refresh(&collection, &[node(9)]).unwrap()[0].is_none());
     assert_eq!(pool.stats().miss_refreshes, 0);
 }
+
+/// A removal batch that does not fit the stage's budget is refused whole: the
+/// puts it would have normalized stay staged, and no precondition is left
+/// behind to make an unrelated commit stale.
+#[test]
+fn rejected_remove_many_leaves_the_transaction_unchanged() {
+    const LIMIT: usize = 4096;
+    let root = test_root("remove-many-atomic");
+    let db = Database::open_with_txn_stage_limit(root.clone(), LIMIT).unwrap();
+    let collection = [7_u8; 16];
+    let live: Vec<NodeId> = (1..=100).map(node).collect();
+
+    for batch in live.chunks(20) {
+        let setup = db.begin_transaction();
+        for id in batch {
+            setup
+                .put(
+                    ShardType::EventDag,
+                    collection,
+                    *id,
+                    &NodeData::new(bytes::Bytes::from_static(b"live")),
+                )
+                .unwrap();
+        }
+        setup.commit().unwrap();
+    }
+
+    let txn = db.begin_transaction();
+    let staged = bytes::Bytes::from_static(b"staged replacement");
+    txn.put(
+        ShardType::EventDag,
+        collection,
+        live[0],
+        &NodeData::new(staged.clone()),
+    )
+    .unwrap();
+    txn.remove_many(ShardType::EventDag, collection, &live)
+        .expect_err("100 removals cost more than the stage allows");
+
+    let read = txn
+        .get(ShardType::EventDag, &collection, &[live[0]])
+        .unwrap();
+    assert_eq!(
+        read[0].as_ref().map(|data| data.bytes.clone()),
+        Some(staged),
+        "the staged put survives a refused removal batch"
+    );
+
+    // A concurrent update to a key of the refused batch must not strand a
+    // precondition that fails this transaction's commit.
+    let writer = db.begin_transaction();
+    writer
+        .put(
+            ShardType::EventDag,
+            collection,
+            live[1],
+            &NodeData::new(bytes::Bytes::from_static(b"concurrent")),
+        )
+        .unwrap();
+    writer.commit().unwrap();
+    txn.commit().expect("no leftover record precondition");
+    let _ = std::fs::remove_dir_all(root);
+}

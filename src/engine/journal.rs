@@ -716,6 +716,79 @@ impl TxnStage {
         Ok(())
     }
 
+    /// Stage a normalized removal batch all-or-nothing: drop this stage's earlier
+    /// mutations for `pending`, stage removal markers for `live_ids`, and record
+    /// each pending key's version precondition. The budget is checked before
+    /// anything changes, so an `Err` leaves the stage exactly as it was.
+    ///
+    /// # Errors
+    /// Returns an error if the stage is not active or the result would exceed
+    /// the stage's byte limit.
+    pub fn stage_removals_normalized(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        pending: &[([u8; 16], u64)],
+        live_ids: &[[u8; 16]],
+    ) -> io::Result<()> {
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        let forget: HashSet<[u8; 16]> = pending.iter().map(|(node_id, _)| *node_id).collect();
+        let index = pool_index(pool);
+        let mutation_charge = |mutation: &Mutation| match mutation {
+            Mutation::Put {
+                collection_id: c,
+                node_id,
+                payload,
+            } if *c == collection_id && forget.contains(node_id) => {
+                Some(payload.len().saturating_add(64))
+            }
+            Mutation::RemoveRecord {
+                collection_id: c,
+                node_id,
+            } if *c == collection_id && forget.contains(node_id) => Some(64),
+            _ => None,
+        };
+        let released = data.pools[index]
+            .iter()
+            .filter_map(mutation_charge)
+            .fold(0_usize, usize::saturating_add);
+        let overflow = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction stage size overflow",
+            )
+        };
+        let charge = live_ids.len().checked_mul(64).ok_or_else(overflow)?;
+        let total = data
+            .bytes
+            .saturating_sub(released)
+            .checked_add(charge)
+            .ok_or_else(overflow)?;
+        if total > self.limit_bytes {
+            return Err(stage_too_large_with_limit(total, self.limit_bytes));
+        }
+
+        data.pools[index].retain(|mutation| mutation_charge(mutation).is_none());
+        data.pools[index].extend(live_ids.iter().map(|node_id| Mutation::RemoveRecord {
+            collection_id,
+            node_id: *node_id,
+        }));
+        data.applied[index] = vec![false; data.pools[index].len()];
+        data.bytes = total;
+        for (node_id, expected) in pending {
+            data.record_expectations.push(RecordExpectation {
+                pool,
+                collection_id,
+                node_id: *node_id,
+                expected: *expected,
+            });
+        }
+        Ok(())
+    }
+
     /// Remove staged point mutations for a key whose live value is absent.
     /// Used to normalize `put` then `remove` into a true no-op before publish.
     ///
