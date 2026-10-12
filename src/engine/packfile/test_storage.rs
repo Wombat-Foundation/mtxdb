@@ -2572,18 +2572,6 @@ fn test_concurrent_put_survives_checkpoint_rewrites() {
     );
 }
 
-/// Deterministic, fast regression guard for the epoch-handoff protocol's
-/// actual point: a concurrent `put()` must not block on the checkpoint
-/// rewrite's serialize/write/rename, no matter how long that takes.
-/// Rather than inferring "not blocked" from a wall-clock race against
-/// real disk I/O (slow, and only as reliable as the dataset is large
-/// enough to make a real rewrite slow relative to test-machine noise —
-/// see the git history on this function for the timing-based version
-/// this replaced), this injects an artificial, arbitrarily long delay
-/// into the unlocked window via a test-only hook and asserts a `put()`
-/// issued after the rewrite has entered that window returns in a small
-/// fraction of it. A proper wall-clock benchmark of this same property
-/// lives in `benches/storage.rs` (`cargo bench`), where it belongs.
 /// `put_many` publishes the new generation before recording its redo state;
 /// that is safe only because a checkpoint holds every collection put mutex
 /// while it captures index and delta state. Race batches against checkpoints
@@ -2630,6 +2618,18 @@ fn test_put_many_racing_checkpoints_survives_reopen() {
     }
 }
 
+/// Deterministic, fast regression guard for the epoch-handoff protocol's
+/// actual point: a concurrent `put()` must not block on the checkpoint
+/// rewrite's serialize/write/rename, no matter how long that takes.
+/// Rather than inferring "not blocked" from a wall-clock race against
+/// real disk I/O (slow, and only as reliable as the dataset is large
+/// enough to make a real rewrite slow relative to test-machine noise —
+/// see the git history on this function for the timing-based version
+/// this replaced), this injects an artificial, arbitrarily long delay
+/// into the unlocked window via a test-only hook and asserts a `put()`
+/// issued after the rewrite has entered that window returns in a small
+/// fraction of it. A proper wall-clock benchmark of this same property
+/// lives in `benches/storage.rs` (`cargo bench`), where it belongs.
 #[test]
 fn test_put_does_not_block_on_slow_checkpoint_rewrite() {
     use std::sync::atomic::AtomicBool;
