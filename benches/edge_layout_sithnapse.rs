@@ -354,6 +354,150 @@ fn chunked_case(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// xorshift64, seeded, for a reproducible trace.
+fn next_rand(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+fn pick(state: &mut u64, len: usize) -> usize {
+    usize::try_from(next_rand(state))
+        .unwrap_or(0)
+        .checked_rem(len)
+        .unwrap_or(0)
+}
+
+/// Every id that `starts` can reach through auth edges, starts included.
+fn ancestors(auth_of: &HashMap<u32, Vec<u32>>, starts: &[u32]) -> HashSet<u32> {
+    let mut seen: HashSet<u32> = starts.iter().copied().collect();
+    let mut frontier = starts.to_vec();
+    while let Some(id) = frontier.pop() {
+        for parent in auth_of.get(&id).into_iter().flatten() {
+            if seen.insert(*parent) {
+                frontier.push(*parent);
+            }
+        }
+    }
+    seen
+}
+
+/// The parents whose child lists sithnapse's v2.1 forward walk
+/// (`get_forward_reachable_short_ids`) would read, built from the source rows.
+/// Each simulated conflict has a root, plus two descendants found by a random
+/// forward walk; the walk reads the child list of every node it expands, and only
+/// expands children that are ancestors of a conflicted event. `hot_percent` of
+/// the conflicts start at one of the busiest parents. Both choices are
+/// assumptions, since no real access trace exists; the trace is seeded.
+fn build_trace(
+    rows: &[Row],
+    ids: &Ids<'_>,
+    expected: &HashMap<u32, Vec<u32>>,
+    (limit, hot_percent): (usize, usize),
+) -> Vec<u32> {
+    let auth_of: HashMap<u32, Vec<u32>> = rows
+        .iter()
+        .map(|row| {
+            (
+                ids.by_key[row.id.as_str()],
+                row.auth.iter().map(|a| ids.by_key[a.as_str()]).collect(),
+            )
+        })
+        .collect();
+    let mut busiest: Vec<u32> = expected.keys().copied().collect();
+    busiest.sort_unstable_by_key(|id| std::cmp::Reverse(expected[id].len()));
+    busiest.truncate(5);
+    let mut rng = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut trace = Vec::new();
+    while trace.len() < limit {
+        let root = if pick(&mut rng, 100) < hot_percent {
+            busiest[pick(&mut rng, busiest.len())]
+        } else {
+            ids.by_key[rows[pick(&mut rng, rows.len())].id.as_str()]
+        };
+        let mut starts = vec![root];
+        let mut at = root;
+        for _ in 0..40 {
+            let Some(kids) = expected.get(&at).filter(|k| !k.is_empty()) else {
+                break;
+            };
+            at = kids[pick(&mut rng, kids.len())];
+            if starts.len() < 3 && pick(&mut rng, 8) == 0 {
+                starts.push(at);
+            }
+        }
+        starts.push(at);
+        let candidates = ancestors(&auth_of, &starts);
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut frontier = vec![root];
+        while let Some(current) = frontier.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            trace.push(current);
+            for child in expected.get(&current).into_iter().flatten() {
+                if candidates.contains(child) && !seen.contains(child) {
+                    frontier.push(*child);
+                }
+            }
+        }
+    }
+    trace.truncate(limit);
+    trace
+}
+
+/// Replay `trace` against the store, one child-list read per entry, checking each
+/// list against the source. Reports latency and gets per read, split between the
+/// busiest parents ("hot": 1,000 or more children) and the rest.
+fn replay_trace(
+    store: &dyn StorageEngine,
+    trace: &[u32],
+    expected: &HashMap<u32, Vec<u32>>,
+    span: Option<u32>,
+) {
+    let mut hot: Vec<(f64, usize)> = Vec::new();
+    let mut typical: Vec<(f64, usize)> = Vec::new();
+    let mut bad = 0_usize;
+    for parent in trace {
+        let started = Instant::now();
+        let (mut got, gets) = children_of(store, *parent, span);
+        let micros = started.elapsed().as_secs_f64() * 1e6;
+        got.sort_unstable();
+        let mut want = expected.get(parent).cloned().unwrap_or_default();
+        want.sort_unstable();
+        want.dedup();
+        bad = bad.saturating_add(usize::from(got != want));
+        if want.len() >= 1_000 {
+            hot.push((micros, gets));
+        } else {
+            typical.push((micros, gets));
+        }
+    }
+    let all: Vec<(f64, usize)> = hot.iter().chain(&typical).copied().collect();
+    for (label, reads) in [("all", &all), ("hot", &hot), ("typical", &typical)] {
+        let mut sorted: Vec<f64> = reads.iter().map(|r| r.0).collect();
+        sorted.sort_by(f64::total_cmp);
+        let at = |pct: usize| {
+            sorted
+                .get(sorted.len().saturating_sub(1).saturating_mul(pct) / 100)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        let count = len_f64(reads.len().max(1));
+        let mean: f64 = sorted.iter().sum::<f64>() / count;
+        let gets: f64 = reads.iter().map(|r| len_f64(r.1)).sum::<f64>() / count;
+        println!(
+            "      trace {label:<7} {:>6} reads: mean {mean:>8.1} us, p50 {:>8.1} p95 {:>8.1} p99 {:>8.1} | {gets:.1} gets/read",
+            reads.len(),
+            at(50),
+            at(95),
+            at(99),
+        );
+    }
+    println!("      trace mismatches {bad}");
+}
+
 /// Read cost of a child list after the appends: the busiest parent, and a sample
 /// of parents drawn from the events' auth lists (so busy parents weigh in as
 /// often as they are named). Every list read is checked against the source rows.
@@ -412,6 +556,20 @@ fn child_reads(db: &Database, rows: &[Row], ids: &Ids<'_>, span: Option<u32>) {
         elapsed.as_secs_f64() * 1e6 / count,
         num(u64::try_from(gets).unwrap_or(0)) / count,
     );
+    let trace = build_trace(
+        rows,
+        ids,
+        &expected,
+        (
+            env_usize("MTXDB_EL_TRACE_READS", 20_000),
+            env_usize("MTXDB_EL_HOT_STARTS", 10),
+        ),
+    );
+    if let Some(path) = std::env::var_os("MTXDB_EL_TRACE").filter(|_| span.is_none()) {
+        let lines: Vec<String> = trace.iter().map(u32::to_string).collect();
+        std::fs::write(path, lines.join("\n")).expect("write trace");
+    }
+    replay_trace(store.as_ref(), &trace, &expected, span);
 }
 
 fn main() {
