@@ -70,18 +70,20 @@ fn breakdown(dir: &Path, events: usize) {
     let mut kinds: BTreeMap<&'static str, KindTotals> = BTreeMap::new();
     for pack in &packs {
         let len = std::fs::metadata(pack).expect("stat pack").len();
-        let records: Vec<(u64, mtxdb::packfile::Record)> = mtxdb::packfile::scan_records_iter(pack)
+        // One record of lookahead gives each frame its end offset without
+        // holding the pack's payloads in memory.
+        let mut records = mtxdb::packfile::scan_records_iter(pack)
             .expect("scan")
             .map(|item| item.expect("record"))
-            .collect();
-        for (i, (offset, record)) in records.iter().enumerate() {
-            let end = records.get(i.saturating_add(1)).map_or(len, |next| next.0);
+            .peekable();
+        while let Some((offset, record)) = records.next() {
+            let end = records.peek().map_or(len, |next| next.0);
             let totals = kinds.entry(kind_of(&record.data)).or_default();
             totals.records = totals.records.saturating_add(1);
             totals.payload = totals
                 .payload
                 .saturating_add(u64::try_from(record.data.len()).unwrap_or(u64::MAX));
-            totals.frames = totals.frames.saturating_add(end.saturating_sub(*offset));
+            totals.frames = totals.frames.saturating_add(end.saturating_sub(offset));
         }
     }
     println!("  pack frames by kind ({events} events):");

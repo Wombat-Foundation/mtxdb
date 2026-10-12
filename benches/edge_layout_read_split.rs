@@ -222,7 +222,9 @@ fn proto_layers(
     let entries = raw
         .get(8..10)
         .and_then(|count| count.try_into().ok())
-        .map_or(1, |count| usize::from(u16::from_be_bytes(count)).clamp(1, 8));
+        .map_or(1, |count| {
+            usize::from(u16::from_be_bytes(count)).clamp(1, 8)
+        });
     layer("decode only", reps, n, |i| {
         format::key_at(&raw, i % entries).is_ok()
     });

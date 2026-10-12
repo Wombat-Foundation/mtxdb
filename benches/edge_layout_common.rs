@@ -315,6 +315,9 @@ pub(crate) struct Ids<'a> {
     pub(crate) keys: Vec<&'a str>,
     pub(crate) lists: Vec<IdLists>,
     pub(crate) children: Vec<Vec<u32>>,
+    /// `(parent, child)` pairs already listed, so duplicate suppression does
+    /// not scan a hot parent's whole child list for every new event.
+    child_pairs: std::collections::HashSet<(u32, u32)>,
 }
 
 impl<'a> Ids<'a> {
@@ -420,9 +423,8 @@ pub(crate) fn assign_batch<'a>(
         dirty.insert(locate(owner as usize).0);
         if include_children {
             for parent in ids.lists[owner as usize].1.clone() {
-                let children = &mut ids.children[parent as usize];
-                if !children.contains(&owner) {
-                    children.push(owner);
+                if ids.child_pairs.insert((parent, owner)) {
+                    ids.children[parent as usize].push(owner);
                     dirty_children.insert(locate(parent as usize).0);
                 }
             }
