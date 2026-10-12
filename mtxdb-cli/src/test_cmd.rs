@@ -4747,3 +4747,123 @@ fn remove_rejects_a_malformed_id_before_touching_the_store() {
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The room export the Continuwuity exporter writes, with every verdict the
+/// importer must carry: a soft-fail code, a rejection code and a redaction.
+fn continuwuity_room_export() -> String {
+    let pdu = |id: &str, kind: &str, prev: &str| {
+        format!(
+            "{{\"room_id\":\"!room:example.org\",\"event_id\":\"{id}\",\"type\":\"{kind}\",\
+             \"sender\":\"@alice:example.org\",\"state_key\":\"\",\"prev_events\":[{prev}],\
+             \"auth_events\":[],\"content\":{{\"room_version\":\"10\"}}}}"
+        )
+    };
+    let event = |id: &str, kind: &str, prev: &str, flags: &str| {
+        format!(
+            "{{\"t\":\"event\",\"event_id\":\"{id}\",\"prev_events\":[{prev}],\
+             \"auth_events\":[],\"outlier\":false,{flags},\"pdu\":{}}}\n",
+            pdu(id, kind, prev)
+        )
+    };
+    let mut out = String::from(
+        "{\"t\":\"header\",\"format\":\"mtxdb-export/v1\",\"server\":\"example.org\",\
+         \"room_id\":\"!room:example.org\"}\n",
+    );
+    out += &event("$create", "m.room.create", "", "\"soft_failed\":false,\"rejected\":false");
+    out += &event(
+        "$soft",
+        "m.room.name",
+        "\"$create\"",
+        "\"soft_failed\":true,\"soft_fail_code\":2,\"rejected\":false",
+    );
+    out += &event(
+        "$rejected",
+        "m.room.topic",
+        "\"$soft\"",
+        "\"soft_failed\":false,\"rejected\":true,\"rejection_code\":7",
+    );
+    out += &event(
+        "$redacted",
+        "m.room.avatar",
+        "\"$rejected\"",
+        "\"soft_failed\":false,\"rejected\":false,\"redacted_by\":\"$redaction\"",
+    );
+    out += "{\"t\":\"end\",\"events\":4}\n";
+    out
+}
+
+#[test]
+fn imported_room_export_records_each_verdict_for_its_event() {
+    use crate::interchange::{event_metadata_namespace, EventMetadata};
+    use mtxdb::auxiliary::AuxiliaryIndex;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
+    let input = root.join("room.jsonl");
+    std::fs::write(&input, continuwuity_room_export()).unwrap();
+    let template = default_matrix_import_template();
+    let mut established = HashSet::new();
+    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+
+    let index = AuxiliaryIndex::open(store.as_ref(), &event_metadata_namespace("!room:example.org"));
+    let recorded = |id: &str| index.get(id.as_bytes()).unwrap();
+    assert_eq!(
+        recorded("$soft").unwrap(),
+        EventMetadata { soft_failed: true, soft_fail_code: Some(2), ..EventMetadata::default() }
+            .encode()
+    );
+    assert_eq!(
+        recorded("$rejected").unwrap(),
+        EventMetadata { rejected: true, rejection_code: Some(7), ..EventMetadata::default() }
+            .encode()
+    );
+    assert_eq!(
+        recorded("$redacted").unwrap(),
+        EventMetadata { redacted_by: Some("$redaction".to_owned()), ..EventMetadata::default() }
+            .encode()
+    );
+    assert!(recorded("$create").is_none(), "a clean event needs no record");
+}
+
+#[test]
+fn imported_keys_export_keeps_every_kind_and_payload_byte() {
+    use crate::interchange::{key_record_key, KeyKind, SERVER_KEYS_NAMESPACE};
+    use mtxdb::auxiliary::AuxiliaryIndex;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let store = db.event_dag();
+    let input = root.join("keys.jsonl");
+    // Payload shapes as the exporter writes them: JSON for historical,
+    // provisional and corroborated, the raw notary document for notary.
+    let payloads: [(KeyKind, &[u8]); 4] = [
+        (KeyKind::Historical, br#"{"server_name":"a.org","verify_keys":{},"old_verify_keys":{},"valid_until_ts":1}"#),
+        (KeyKind::Provisional, br#"["ed25519:abc"]"#),
+        (KeyKind::Corroborated, br#"["ed25519:abc","ed25519:def"]"#),
+        (KeyKind::Notary, br#"{"server_name":"a.org","verify_keys":{"ed25519:abc":{"key":"AA"}}}"#),
+    ];
+    let mut export = String::new();
+    for (kind, payload) in payloads {
+        export += &format!(
+            "{{\"t\":\"server_keys\",\"origin\":\"a.org\",\"kind\":\"{}\",\"payload\":\"{}\"}}\n",
+            kind.as_str(),
+            base64::engine::general_purpose::STANDARD.encode(payload)
+        );
+    }
+    std::fs::write(&input, export).unwrap();
+    let template = default_matrix_import_template();
+    let mut established = HashSet::new();
+    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+
+    let keys_store = db.pool(mtxdb::ShardType::ServerInfo);
+    let index = AuxiliaryIndex::open(keys_store.as_ref(), SERVER_KEYS_NAMESPACE);
+    for (kind, payload) in payloads {
+        assert_eq!(
+            index.get(&key_record_key(kind, "a.org")).unwrap().as_deref(),
+            Some(payload),
+            "{} payload must come back byte for byte",
+            kind.as_str()
+        );
+    }
+}
