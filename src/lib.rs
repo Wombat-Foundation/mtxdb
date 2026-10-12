@@ -78,8 +78,6 @@ pub mod dag;
 /// Root-level handle that opens every pool behind one shared WAL fence.
 #[path = "engine/database.rs"]
 pub mod database;
-/// Wire schema of the `mtxdb-export/v1` interchange: record tags, field names
-/// and the numbered verdict codes.
 #[path = "matrix/export_schema.rs"]
 pub mod export_schema;
 /// Frontier tracking for nodes awaiting their dependencies before being writable.
