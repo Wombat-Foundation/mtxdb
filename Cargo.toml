@@ -2,7 +2,7 @@
 name = "mtxdb"
 version.workspace = true
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.88"
 publish = false
 # Without this, Cargo auto-discovers benches/*.rs as this package's own bench
 # targets purely by their being physically under benches/ (which is now
@@ -52,7 +52,7 @@ resolver = "2"
 # parses every member's graph plus the shared lock for every command -- so a
 # member there would drag the whole workspace's floor up to 1.85. Keeping it
 # out (like benches/, which has its own `[workspace]` table)
-# preserves the library's 1.90 MSRV. Build/lint/test it with
+# preserves the library's 1.88 MSRV. Build/lint/test it with
 # `--manifest-path mtxdb-cli/Cargo.toml`.
 members = []
 

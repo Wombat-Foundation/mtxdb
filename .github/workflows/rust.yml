@@ -27,11 +27,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - rust: "1.90.0"
+          - rust: "1.88.0"
             label: "MSRV (default features)"
           # The CLI lives in its own workspace (see mtxdb-cli/Cargo.toml) and
-          # depends on the library, so it uses the library's 1.90 MSRV.
-          - rust: "1.90.0"
+          # depends on the library, so it uses the library's 1.88 MSRV.
+          - rust: "1.88.0"
             label: "cli feature"
           # The cross-process read-committed overlay (`multi-reader`) has its
           # own submodule (`packfile::storage::read_journal`) gated out of the
@@ -39,7 +39,7 @@ jobs:
           # row rather than relying on the `all-features` job below to catch
           # a break here -- `--all-features` compiling says nothing about
           # `--no-default-features --features multi-reader` compiling.
-          - rust: "1.90.0"
+          - rust: "1.88.0"
             label: "multi-reader feature"
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,7 @@ jobs:
           rustc --version
           cargo --version
 
-      # 1.90.0 is the library and CLI MSRV. The CLI remains in its own
+      # 1.88.0 is the library and CLI MSRV. The CLI remains in its own
       # workspace so its lockfile and dependency graph stay isolated.
       - name: Lint (default features)
         if: matrix.label == 'MSRV (default features)'
@@ -105,7 +105,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.90.0", "1.92.0", "1.98.1", "stable", "nightly"]
+        rust: ["1.88.0", "1.92.0", "1.98.1", "stable", "nightly"]
     steps:
       - uses: actions/checkout@v4
         with:
