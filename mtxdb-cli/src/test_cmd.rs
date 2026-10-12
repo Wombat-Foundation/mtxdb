@@ -4692,9 +4692,15 @@ fn remove_hides_records_and_tombstones_reports_them() {
         Commands::Tombstones {
             collection: collection_hex.clone(),
             keys: true,
+            detail: true,
         },
     );
-    cmd_tombstones(&report, &collection_hex, true).unwrap();
+    // Counts only (index), counts plus frame totals, and the key listing.
+    cmd_tombstones(&report, &collection_hex, false, false).unwrap();
+    cmd_tombstones(&report, &collection_hex, false, true).unwrap();
+    cmd_tombstones(&report, &collection_hex, true, true).unwrap();
+    // An unknown collection is an error, not an empty report.
+    assert!(cmd_tombstones(&report, &format_id(&[0x77u8; 16]), false, false).is_err());
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

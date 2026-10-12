@@ -177,6 +177,7 @@ pub(crate) enum Commands {
     Tombstones {
         collection: String,
         keys: bool,
+        detail: bool,
     },
     Remove {
         collection: String,
@@ -894,10 +895,11 @@ fn sub_tombstones() -> Command {
     Command::new("tombstones")
         .about("Report removed keys and reclaimable space for a collection")
         .long_about(
-            "Count live keys, keys whose newest version is a removal marker, and the \
-             bytes a repack could give back, computed from the packs. Read-only; \
-             coexists with a running writer. Journal entries not yet materialized into \
-             a pack are not counted.",
+            "Count live keys and keys whose newest version is a removal marker, from \
+             the index alone. With --detail or --keys it also reads every frame, to \
+             report frame and byte totals or list the removed ids. Read-only; coexists \
+             with a running writer. Journal entries not yet materialized into a pack \
+             are not counted.",
         )
         .arg(
             Arg::new("collection")
@@ -906,10 +908,16 @@ fn sub_tombstones() -> Command {
                 .help("Namespace ID to inspect"),
         )
         .arg(
+            Arg::new("detail")
+                .long("detail")
+                .action(ArgAction::SetTrue)
+                .help("Also report frame counts, superseded versions and reclaimable bytes (reads every frame)"),
+        )
+        .arg(
             Arg::new("keys")
                 .long("keys")
                 .action(ArgAction::SetTrue)
-                .help("List the removed keys"),
+                .help("List the removed keys (reads every frame)"),
         )
 }
 
@@ -1285,6 +1293,7 @@ fn parse_cli() -> Cli {
         Some(("tombstones", m)) => Commands::Tombstones {
             collection: m.get_one::<String>("collection").unwrap().clone(),
             keys: m.get_flag("keys"),
+            detail: m.get_flag("detail"),
         },
         Some(("remove", m)) => Commands::Remove {
             collection: m.get_one::<String>("collection").unwrap().clone(),

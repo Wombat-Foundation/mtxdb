@@ -554,9 +554,13 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             cli.require_single_dir("delete")?;
             cmd_delete(cli, collections, *yes)
         }
-        Commands::Tombstones { collection, keys } => {
+        Commands::Tombstones {
+            collection,
+            keys,
+            detail,
+        } => {
             cli.require_single_dir("tombstones")?;
-            cmd_tombstones(cli, collection, *keys)
+            cmd_tombstones(cli, collection, *keys, *detail)
         }
         Commands::Remove {
             collection,
@@ -5491,8 +5495,9 @@ fn format_delta_operation(operation: &mtxdb::index::delta::DeltaOperation) -> St
                     pack_id,
                     offset,
                     record_len,
+                    removed,
                 } => format!(
-                    "op=set hash=0x{} pack_id={pack_id} offset={offset} record_len={record_len}",
+                    "op=set hash=0x{} pack_id={pack_id} offset={offset} record_len={record_len} removed={removed}",
                     hex::encode(full_hash)
                 ),
                 RedoOp::CollectionTombstone => "op=collection_tombstone".to_owned(),
@@ -11925,18 +11930,23 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
     Ok(())
 }
 
-fn cmd_tombstones(cli: &Cli, collection: &str, keys: bool) -> anyhow::Result<()> {
+fn cmd_tombstones(cli: &Cli, collection: &str, keys: bool, detail: bool) -> anyhow::Result<()> {
     let collection_id = parse_collection_id(collection)?;
     let store = open_store_read_only(cli)?;
-    let stats = store.removal_stats(&collection_id)?;
+    let counts = store
+        .removal_counts(&collection_id)
+        .ok_or_else(|| anyhow::anyhow!("no such collection: {}", format_id(&collection_id)))?;
     println!("collection:        {}", format_id(&collection_id));
-    println!("live keys:         {}", stats.live_keys);
-    println!("removed keys:      {}", stats.removed_keys);
-    println!("frames:            {}", stats.frames);
-    println!("  removal markers: {}", stats.marker_frames);
-    println!("  superseded:      {}", stats.superseded_frames);
-    println!("total bytes:       {}", stats.total_bytes);
-    println!("reclaimable bytes: {}", stats.reclaimable_bytes);
+    println!("live keys:         {}", counts.live_keys);
+    println!("removed keys:      {}", counts.removed_keys);
+    if detail {
+        let stats = store.removal_stats(&collection_id)?;
+        println!("frames:            {}", stats.frames);
+        println!("  removal markers: {}", stats.marker_frames);
+        println!("  superseded:      {}", stats.superseded_frames);
+        println!("total bytes:       {}", stats.total_bytes);
+        println!("reclaimable bytes: {}", stats.reclaimable_bytes);
+    }
     if keys {
         for key in store.removed_keys(&collection_id)? {
             println!("removed {}", format_id(&key));
