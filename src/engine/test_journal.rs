@@ -3441,3 +3441,70 @@ fn stale_expectations_reject_the_publish_without_appending() {
         "a rejected publish must not advance the clock"
     );
 }
+
+// ---- Removal mutation framing and the downgrade boundary ----
+//
+// A build that predates `Mutation::RemoveRecord` reads kind byte 3 as an
+// unknown kind. These tests pin what that looks like on the decode side: a
+// frame with valid checksums but an unrecognized or malformed kind is an
+// error, never silently skipped, so an older binary refuses the journal
+// instead of dropping committed removals.
+
+fn framed(lsn: u64, mutation: &Mutation) -> Vec<u8> {
+    let mut buf = Vec::new();
+    super::encode_mutation(lsn, crate::layout::ShardType::State, mutation, &mut buf).unwrap();
+    buf
+}
+
+/// Overwrite the frame's kind byte and recompute its trailing checksum so only
+/// the kind is wrong.
+fn with_kind_and_valid_crc(mut frame: Vec<u8>, kind: u8) -> Vec<u8> {
+    frame[super::MF_KIND.start] = kind;
+    let body_end = frame.len().saturating_sub(super::FRAME_TRAILER_LEN);
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&frame[..body_end]);
+    frame[body_end..].copy_from_slice(&crc.finalize().to_le_bytes());
+    frame
+}
+
+fn removal(collection: u8, node: u8) -> Mutation {
+    Mutation::RemoveRecord {
+        collection_id: [collection; 16],
+        node_id: [node; 16],
+    }
+}
+
+#[test]
+fn a_removal_mutation_round_trips_through_encode_and_decode() {
+    let frame = framed(7, &removal(0x11, 0x22));
+    let entries = super::decode_mutations(&frame, 7, 1, 0).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].mutation, removal(0x11, 0x22));
+    assert_eq!(entries[0].pool, crate::layout::ShardType::State);
+}
+
+#[test]
+fn a_checksummed_frame_with_an_unknown_kind_is_rejected_not_skipped() {
+    let frame = with_kind_and_valid_crc(framed(7, &removal(0x11, 0x22)), 9);
+    let error = super::decode_mutations(&frame, 7, 1, 0).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown or malformed"),
+        "an unrecognized kind must fail the decode: {error}"
+    );
+}
+
+#[test]
+fn a_removal_frame_must_carry_a_node_id_and_no_payload() {
+    // Kind 3 with a zero node id is malformed.
+    let zero_node = with_kind_and_valid_crc(framed(7, &removal(0x11, 0x00)), 3);
+    assert!(super::decode_mutations(&zero_node, 7, 1, 0).is_err());
+
+    // A Put frame relabelled as kind 3 carries a payload, which a removal must not.
+    let put = Mutation::Put {
+        collection_id: [0x11; 16],
+        node_id: [0x22; 16],
+        payload: b"payload".to_vec(),
+    };
+    let relabelled = with_kind_and_valid_crc(framed(7, &put), 3);
+    assert!(super::decode_mutations(&relabelled, 7, 1, 0).is_err());
+}

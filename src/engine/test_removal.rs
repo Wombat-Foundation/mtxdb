@@ -977,3 +977,152 @@ fn batch_repack_of_several_collections_keeps_each_removal() {
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ------------------------------------------------------------ change feed ---
+
+/// A committed removal reaches replay consumers as its own `RemoveRecord`
+/// mutation, so a replica does not mistake it for a missing record. A removal
+/// of an absent key emits nothing, and a snapshot scan taken before the
+/// removal still holds the key: snapshot plus feed reproduce the live state.
+#[test]
+fn the_change_feed_carries_a_removal_as_its_own_mutation() {
+    use crate::journal::Mutation as JournalMutation;
+    let root = test_root("change_feed");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0x91; 16];
+    let pool = ShardType::State;
+    put_committed(&db, pool, collection, node(1), b"v");
+    put_committed(&db, pool, collection, node(2), b"keep");
+
+    let (scan, cursor, lease) = db
+        .pool(pool)
+        .scan_collection_at_snapshot(&collection)
+        .unwrap();
+
+    let txn = db.begin_transaction();
+    txn.remove(pool, collection, node(1)).unwrap();
+    txn.remove(pool, collection, node(77)).unwrap(); // never existed: no mutation
+    txn.commit().unwrap();
+
+    let snapshot: Vec<NodeId> = scan.map(|entry| entry.unwrap().0).collect();
+    assert!(
+        snapshot.contains(&node(1)),
+        "the snapshot taken before the removal still holds the key"
+    );
+
+    db.coordinator().sync().unwrap();
+    let page = db.coordinator().changes_since(&cursor, 16).unwrap();
+    let mutations: Vec<&JournalMutation> = page
+        .groups
+        .iter()
+        .flat_map(|group| group.entries.iter())
+        .map(|entry| &entry.mutation)
+        .collect();
+    assert_eq!(
+        mutations,
+        vec![&JournalMutation::RemoveRecord {
+            collection_id: collection,
+            node_id: node(1),
+        }],
+        "exactly one RemoveRecord, none for the absent key"
+    );
+    assert!(!page.has_more);
+    drop(lease);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A snapshot scan taken before a removal keeps yielding the key's older
+/// value even after repack retires the shards and drops the marker: the scan
+/// pins its shards, so the repack cannot pull the bytes out from under it.
+#[test]
+fn a_snapshot_scan_survives_a_repack_that_drops_the_marker() {
+    let root = test_root("snapshot_repack");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0x92; 16];
+    let pool = ShardType::State;
+    put_committed(&db, pool, collection, node(1), b"v");
+    put_committed(&db, pool, collection, node(2), b"keep");
+    db.pool(pool).sync_all().unwrap();
+
+    let (scan, _cursor, lease) = db
+        .pool(pool)
+        .scan_collection_at_snapshot(&collection)
+        .unwrap();
+
+    remove_committed(&db, pool, collection, node(1));
+    db.pool(pool).sync_all().unwrap();
+    db.pool(pool)
+        .repack_collection_reachable(&collection, |_, _| Vec::new())
+        .unwrap();
+    db.pool(pool).sync_all().unwrap();
+
+    let during: HashMap<NodeId, Vec<u8>> = scan
+        .map(|entry| {
+            let (id, data) = entry.expect("a pinned snapshot must not lose its bytes");
+            (id, data.bytes.to_vec())
+        })
+        .collect();
+    assert_eq!(during.get(&node(1)), Some(&b"v".to_vec()));
+    assert_eq!(during.get(&node(2)), Some(&b"keep".to_vec()));
+    drop(lease);
+    assert_eq!(
+        live(&db, pool, collection, node(1)),
+        None,
+        "the live view stays removed"
+    );
+    assert_eq!(
+        scanned(&db, pool, collection).get(&node(1)),
+        None,
+        "a scan taken after the repack does not see the key"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Removals page like any other mutation: a page size of one splits two
+/// removal groups across pages, `has_more` is true until the last, and the
+/// next cursor resumes with the second removal.
+#[test]
+fn removals_page_across_a_page_boundary_in_order() {
+    use crate::journal::Mutation as JournalMutation;
+    let root = test_root("change_feed_paging");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0x93; 16];
+    let pool = ShardType::State;
+    put_committed(&db, pool, collection, node(1), b"a");
+    put_committed(&db, pool, collection, node(2), b"b");
+
+    let (scan, cursor, lease) = db
+        .pool(pool)
+        .scan_collection_at_snapshot(&collection)
+        .unwrap();
+    drop(scan);
+    remove_committed(&db, pool, collection, node(1));
+    remove_committed(&db, pool, collection, node(2));
+    db.coordinator().sync().unwrap();
+
+    let removed_ids = |page: &crate::journal::JournalChangesPage| -> Vec<NodeId> {
+        page.groups
+            .iter()
+            .flat_map(|group| group.entries.iter())
+            .filter_map(|entry| match &entry.mutation {
+                JournalMutation::RemoveRecord { node_id, .. } => Some(*node_id),
+                _ => None,
+            })
+            .collect()
+    };
+    let first = db.coordinator().changes_since(&cursor, 1).unwrap();
+    assert_eq!(removed_ids(&first), vec![node(1)]);
+    assert!(first.has_more, "a second removal group follows");
+
+    let second = db
+        .coordinator()
+        .changes_since(&first.next_cursor, 1)
+        .unwrap();
+    assert_eq!(removed_ids(&second), vec![node(2)]);
+    assert!(!second.has_more);
+    drop(lease);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
