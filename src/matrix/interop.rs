@@ -412,6 +412,59 @@ pub fn encode_edges(edges: &[&[u8]]) -> Result<Vec<u8>, StorageError> {
     Ok(out)
 }
 
+/// Record id of the per-room auth short-id counter (big-endian `u32`).
+#[must_use]
+pub fn auth_counter_record_id() -> [u8; 16] { derive_id(b"authchain:counter", b"") }
+
+/// Record id of an event's forward short-id record in the room auth collection.
+#[must_use]
+pub fn auth_forward_record_id(event_id: &[u8]) -> [u8; 16] {
+    derive_id(b"authchain:fwd", event_id)
+}
+
+/// Record id of a short id's reverse record (the event id).
+#[must_use]
+pub fn auth_reverse_record_id(short: u32) -> [u8; 16] {
+    derive_id(b"authchain:rev", &short.to_be_bytes())
+}
+
+/// Record id of a short id's closure bitmap.
+#[must_use]
+pub fn auth_closure_record_id(short: u32) -> [u8; 16] {
+    derive_id(b"authchain:closure", &short.to_be_bytes())
+}
+
+/// Forward short-id record: `[u32 BE short][event id]`. The event id lets a
+/// reader reject a record that merely shares the 128-bit key.
+#[must_use]
+pub fn encode_auth_forward(short: u32, event_id: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(event_id.len().saturating_add(4));
+    out.extend_from_slice(&short.to_be_bytes());
+    out.extend_from_slice(event_id);
+    out
+}
+
+/// Decode a forward short-id record.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] for a record shorter than its prefix.
+pub fn decode_auth_forward(bytes: &[u8]) -> Result<(u32, &[u8]), StorageError> {
+    let (short, event) = bytes.split_first_chunk::<4>().ok_or_else(|| {
+        StorageError::Corrupt("malformed auth short-id record".to_owned())
+    })?;
+    Ok((u32::from_be_bytes(*short), event))
+}
+
+/// Decode the per-room short-id counter.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] unless the record is exactly four bytes.
+pub fn decode_auth_counter(bytes: &[u8]) -> Result<u32, StorageError> {
+    <[u8; 4]>::try_from(bytes)
+        .map(u32::from_be_bytes)
+        .map_err(|_| StorageError::Corrupt("malformed auth counter".to_owned()))
+}
+
 /// Decode an edge list written by [`encode_edges`].
 ///
 /// # Errors

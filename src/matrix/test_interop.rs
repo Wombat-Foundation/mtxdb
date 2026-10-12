@@ -210,3 +210,35 @@ fn outlier_flag_is_part_of_the_verdict_record() {
             .outlier
     );
 }
+
+#[test]
+fn auth_chain_records_are_pinned_and_round_trip() {
+    assert_eq!(
+        hex(&auth_counter_record_id()),
+        "107eed6ef642cc6e219edd8a43cafaad"
+    );
+    assert_eq!(
+        hex(&auth_forward_record_id(b"$e:x")),
+        "16a53f37238f9d0c2adbba80aa84661f"
+    );
+    assert_eq!(
+        hex(&auth_reverse_record_id(7)),
+        "a80ce9b45f60f10d32afb99f79d8cafe"
+    );
+    assert_eq!(
+        hex(&auth_closure_record_id(7)),
+        "4d225a7b56f203a482578ff4b59b82b6"
+    );
+    assert_ne!(auth_reverse_record_id(7), auth_closure_record_id(7));
+    assert_ne!(auth_reverse_record_id(7), auth_reverse_record_id(8));
+
+    let forward = encode_auth_forward(0x0102_0304, b"$e:x");
+    assert_eq!(forward, [&[1, 2, 3, 4][..], b"$e:x"].concat());
+    assert_eq!(decode_auth_forward(&forward).unwrap(), (0x0102_0304, &b"$e:x"[..]));
+    for cut in 0..4 {
+        assert!(decode_auth_forward(&forward[..cut]).is_err(), "cut at {cut}");
+    }
+    assert_eq!(decode_auth_counter(&9_u32.to_be_bytes()).unwrap(), 9);
+    assert!(decode_auth_counter(&[0, 0, 9]).is_err());
+    assert!(decode_auth_counter(&[0, 0, 0, 0, 9]).is_err());
+}
