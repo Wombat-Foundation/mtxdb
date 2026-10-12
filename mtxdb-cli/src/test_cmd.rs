@@ -1,7 +1,7 @@
 use super::{
     build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import, cmd_import_file,
-    cmd_info, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
-    collection_canonical_id, compile_import_template, compute_state_groups_partial,
+    cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
+    cmd_tombstones, collection_canonical_id, compile_import_template, compute_state_groups_partial,
     decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
     derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
     export_envelope_line, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
@@ -915,6 +915,7 @@ fn export_envelope_carries_exact_bytes_and_frame_metadata() {
         digest_algorithm: DigestAlgorithm::Blake3,
         role: Some(b"event".to_vec()),
         last_write_lsn: None,
+        removed: false,
         unknown: vec![(0x7f, vec![0xDE, 0xAD])],
     };
     // Deliberately non-canonical JSON (spaces) so a reserialized payload
@@ -4625,4 +4626,118 @@ fn merges_with_a_gap_in_the_auth_closure_fall_back_and_refuse_to_cache() {
         Some("$topic-a"),
         "the fallback keeps the first parent, as the retired merge did"
     );
+}
+
+fn state_cli(dir: &std::path::Path, command: Commands) -> Cli {
+    Cli {
+        dirs: vec![dir.to_path_buf()],
+        shard_type: Some(ShardType::State),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command,
+    }
+}
+
+#[test]
+fn remove_hides_records_and_tombstones_reports_them() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
+    let collection = [0x31u8; 16];
+    let kept = [0x01u8; 16];
+    let gone = [0x02u8; 16];
+    {
+        let store = PackfileStorage::open(state_dir.clone()).unwrap();
+        for id in [kept, gone] {
+            store
+                .put(
+                    &collection,
+                    &id,
+                    &NodeData::new(Bytes::from_static(b"value")),
+                )
+                .unwrap();
+        }
+        store.sync().unwrap();
+    }
+
+    let collection_hex = format_id(&collection);
+    let cli = state_cli(
+        &dir,
+        Commands::Remove {
+            collection: collection_hex.clone(),
+            ids: vec![format_id(&gone), format_id(&[0x7fu8; 16])],
+            yes: true,
+        },
+    );
+    // The second id was never live: it is skipped, not an error.
+    cmd_remove(
+        &cli,
+        &collection_hex,
+        &[format_id(&gone), format_id(&[0x7fu8; 16])],
+        true,
+    )
+    .unwrap();
+
+    let store = PackfileStorage::open_read_only(state_dir.clone()).unwrap();
+    assert!(store.get(&collection, &gone).unwrap().is_none());
+    assert!(store.get(&collection, &kept).unwrap().is_some());
+    let stats = store.removal_stats(&collection).unwrap();
+    assert_eq!(stats.live_keys, 1);
+    assert_eq!(stats.removed_keys, 1);
+    assert_eq!(store.removed_keys(&collection).unwrap(), vec![gone]);
+    drop(store);
+
+    let report = state_cli(
+        &dir,
+        Commands::Tombstones {
+            collection: collection_hex.clone(),
+            keys: true,
+        },
+    );
+    cmd_tombstones(&report, &collection_hex, true).unwrap();
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn remove_rejects_a_malformed_id_before_touching_the_store() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let state_dir = layout.pool_dir(ShardType::State).unwrap();
+    let collection = [0x32u8; 16];
+    let id = [0x01u8; 16];
+    {
+        let store = PackfileStorage::open(state_dir.clone()).unwrap();
+        store
+            .put(
+                &collection,
+                &id,
+                &NodeData::new(Bytes::from_static(b"value")),
+            )
+            .unwrap();
+        store.sync().unwrap();
+    }
+    let collection_hex = format_id(&collection);
+    let cli = state_cli(
+        &dir,
+        Commands::Remove {
+            collection: collection_hex.clone(),
+            ids: vec![format_id(&id), "not-hex".to_owned()],
+            yes: true,
+        },
+    );
+    assert!(cmd_remove(
+        &cli,
+        &collection_hex,
+        &[format_id(&id), "not-hex".to_owned()],
+        true
+    )
+    .is_err());
+    let store = PackfileStorage::open_read_only(state_dir).unwrap();
+    assert!(
+        store.get(&collection, &id).unwrap().is_some(),
+        "a bad id must fail the whole command before any record is removed"
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

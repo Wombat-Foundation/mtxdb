@@ -174,6 +174,15 @@ pub(crate) enum Commands {
         collections: Vec<String>,
         yes: bool,
     },
+    Tombstones {
+        collection: String,
+        keys: bool,
+    },
+    Remove {
+        collection: String,
+        ids: Vec<String>,
+        yes: bool,
+    },
     Completions {
         shell: String,
     },
@@ -261,6 +270,8 @@ fn build_cli() -> Command {
         .subcommand(sub_scan())
         .subcommand(sub_info())
         .subcommand(sub_delete())
+        .subcommand(sub_tombstones())
+        .subcommand(sub_remove())
         .subcommand(sub_put())
         .subcommand(sub_get())
         .subcommand(sub_init())
@@ -879,6 +890,58 @@ fn sub_delete() -> Command {
         )
 }
 
+fn sub_tombstones() -> Command {
+    Command::new("tombstones")
+        .about("Report removed keys and reclaimable space for a collection")
+        .long_about(
+            "Count live keys, keys whose newest version is a removal marker, and the \
+             bytes a repack could give back, computed from the packs. Read-only; \
+             coexists with a running writer. Journal entries not yet materialized into \
+             a pack are not counted.",
+        )
+        .arg(
+            Arg::new("collection")
+                .required(true)
+                .value_name("COLLECTION")
+                .help("Namespace ID to inspect"),
+        )
+        .arg(
+            Arg::new("keys")
+                .long("keys")
+                .action(ArgAction::SetTrue)
+                .help("List the removed keys"),
+        )
+}
+
+fn sub_remove() -> Command {
+    Command::new("remove")
+        .about("Remove one or more records from a collection")
+        .long_about(
+            "Append a removal marker for each key. Reads, scans and counts then treat the \
+             key as absent; the space comes back at the next repack. A key that is not \
+             live is skipped and writes nothing.",
+        )
+        .arg(
+            Arg::new("collection")
+                .required(true)
+                .value_name("COLLECTION")
+                .help("Namespace ID holding the records"),
+        )
+        .arg(
+            Arg::new("id")
+                .required(true)
+                .num_args(1..)
+                .value_name("ID")
+                .help("Record IDs to remove"),
+        )
+        .arg(
+            Arg::new("yes")
+                .long("yes")
+                .action(ArgAction::SetTrue)
+                .help("Skip confirmation prompt"),
+        )
+}
+
 fn sub_put() -> Command {
     Command::new("put")
         .about("Insert a record")
@@ -1217,6 +1280,15 @@ fn parse_cli() -> Cli {
                 .unwrap()
                 .cloned()
                 .collect(),
+            yes: m.get_flag("yes"),
+        },
+        Some(("tombstones", m)) => Commands::Tombstones {
+            collection: m.get_one::<String>("collection").unwrap().clone(),
+            keys: m.get_flag("keys"),
+        },
+        Some(("remove", m)) => Commands::Remove {
+            collection: m.get_one::<String>("collection").unwrap().clone(),
+            ids: m.get_many::<String>("id").unwrap().cloned().collect(),
             yes: m.get_flag("yes"),
         },
         Some(("completions", m)) => Commands::Completions {

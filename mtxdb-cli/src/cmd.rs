@@ -372,6 +372,8 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Get { .. } => "get",
         Commands::Scan { .. } => "scan",
         Commands::Delete { .. } => "delete",
+        Commands::Tombstones { .. } => "tombstones",
+        Commands::Remove { .. } => "remove",
         Commands::Shards { .. } => "shards",
         Commands::Collections { .. } => "collections",
         Commands::Info { .. } => "info",
@@ -551,6 +553,18 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Delete { collections, yes } => {
             cli.require_single_dir("delete")?;
             cmd_delete(cli, collections, *yes)
+        }
+        Commands::Tombstones { collection, keys } => {
+            cli.require_single_dir("tombstones")?;
+            cmd_tombstones(cli, collection, *keys)
+        }
+        Commands::Remove {
+            collection,
+            ids,
+            yes,
+        } => {
+            cli.require_single_dir("remove")?;
+            cmd_remove(cli, collection, ids, *yes)
         }
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         // `-t all` means every pool, same as `sync --all`.
@@ -5259,6 +5273,14 @@ fn format_mutation(mutation: &mtxdb::journal::Mutation, decode: Option<&str>) ->
             }
             line
         }
+        mtxdb::journal::Mutation::RemoveRecord {
+            collection_id,
+            node_id,
+        } => format!(
+            "kind=remove_record collection=0x{} node=0x{}",
+            hex::encode(collection_id),
+            hex::encode(node_id)
+        ),
         mtxdb::journal::Mutation::DeleteCollection { collection_id } => format!(
             "kind=delete_collection collection=0x{}",
             hex::encode(collection_id)
@@ -7983,7 +8005,8 @@ fn scan_payload_suffix(data: &[u8]) -> Option<String> {
         return None;
     }
     Some(match data.len() {
-        0 => "0 bytes [TOMBSTONE - GC'd ON REPACK]".to_owned(),
+        0 => "0 bytes [empty payload: a removal marker or an empty value; see `mtxdb tombstones`]"
+            .to_owned(),
         _ => match data.get(0..4) {
             Some(magic) => format!(
                 "{} bytes (undecodable, magic=0x{:08x})",
@@ -11899,6 +11922,68 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
             format_id(&collection_id)
         );
     }
+    Ok(())
+}
+
+fn cmd_tombstones(cli: &Cli, collection: &str, keys: bool) -> anyhow::Result<()> {
+    let collection_id = parse_collection_id(collection)?;
+    let store = open_store_read_only(cli)?;
+    let stats = store.removal_stats(&collection_id)?;
+    println!("collection:        {}", format_id(&collection_id));
+    println!("live keys:         {}", stats.live_keys);
+    println!("removed keys:      {}", stats.removed_keys);
+    println!("frames:            {}", stats.frames);
+    println!("  removal markers: {}", stats.marker_frames);
+    println!("  superseded:      {}", stats.superseded_frames);
+    println!("total bytes:       {}", stats.total_bytes);
+    println!("reclaimable bytes: {}", stats.reclaimable_bytes);
+    if keys {
+        for key in store.removed_keys(&collection_id)? {
+            println!("removed {}", format_id(&key));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_remove(cli: &Cli, collection: &str, ids: &[String], yes: bool) -> anyhow::Result<()> {
+    let collection_id = parse_collection_id(collection)?;
+    let mut node_ids: Vec<[u8; 16]> = ids
+        .iter()
+        .map(|id| parse_node_id(id))
+        .collect::<anyhow::Result<_>>()?;
+    node_ids.sort_unstable();
+    node_ids.dedup();
+
+    if !yes {
+        println!(
+            "This will remove {} record(s) from collection {}:",
+            node_ids.len(),
+            format_id(&collection_id)
+        );
+        for node_id in &node_ids {
+            println!("  {}", format_id(node_id));
+        }
+        if !confirm("Remove these records?")? {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
+    let store = open_store(cli)?;
+    let mut removed = 0usize;
+    for node_id in &node_ids {
+        if store.remove_record(&collection_id, node_id)? {
+            removed = removed.saturating_add(1);
+        } else {
+            eprintln!("skipped {}: not a live record", format_id(node_id));
+        }
+    }
+    store.sync()?;
+    println!(
+        "removed {removed} of {} record(s) from collection {}",
+        node_ids.len(),
+        format_id(&collection_id)
+    );
     Ok(())
 }
 
