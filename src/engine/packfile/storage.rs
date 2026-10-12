@@ -949,13 +949,19 @@ type ScannedShard = (u16, Vec<([u8; 16], u64)>);
 
 /// Deduplicated live-location map for one collection during a repack scan.
 type RepackRecordMap = HashMap<[u8; 16], (u16, u64)>;
+/// Live records and removal markers found for each collection by a batch scan.
+type BatchRepackRecordMaps = HashMap<[u8; 16], (RepackRecordMap, RepackRecordMap)>;
 /// Replacement index entries produced while copying one repack collection.
 type RepackOffsets = Vec<([u8; 16], u16, u64)>;
 type RepackCopiedRecord = ([u8; 16], u16, u64, u64);
-/// Return type of [`PackfileStorage::repack_scan_incremental`]: the merged
-/// live-location map and (on the incremental path) the previous cursor state
-/// that the adjacency helpers need to skip re-reading already-seen nodes.
-type RepackScanResult = (RepackRecordMap, Option<RepackIncrementalState>);
+/// Return type of [`PackfileStorage::repack_scan_incremental`]: live records,
+/// removal markers that still suppress an older copy in a retained shard, and
+/// (on the incremental path) the cursor state used by adjacency helpers.
+type RepackScanResult = (
+    RepackRecordMap,
+    RepackRecordMap,
+    Option<RepackIncrementalState>,
+);
 
 /// One scanned record's `(slot, hash, offset, pack_id)`, as accumulated per
 /// collection during `PackfileStorage::open_with_options`'s initial scan.
@@ -2726,6 +2732,51 @@ impl PackfileStorage {
         Ok(store)
     }
 
+    /// Find the latest physical frame for every hash in a collection.
+    fn latest_records_for_collection(
+        records: &[ShardRecord],
+        shards: &ShardPool,
+    ) -> Result<Vec<ShardRecord>, StorageError> {
+        let mut latest_records: HashMap<[u8; 16], (ShardRecord, Option<u64>)> = HashMap::new();
+        for record @ (slot, hash, offset, _) in records {
+            let shard = shards
+                .get_shard(*slot)
+                .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?;
+            let frame = shards.read_at(&shard, *offset, true)?;
+            let lsn = frame.metadata.and_then(|metadata| metadata.last_write_lsn);
+            let replace =
+                if let Some(((old_slot, _, old_offset, _), old_lsn)) = latest_records.get(hash) {
+                    let old_shard = shards.get_shard(*old_slot).ok_or_else(|| {
+                        StorageError::Corrupt(format!("missing shard slot {old_slot}"))
+                    })?;
+                    Self::repack_record_is_newer(
+                        lsn,
+                        &shard,
+                        *offset,
+                        *old_lsn,
+                        &old_shard,
+                        *old_offset,
+                    )
+                } else {
+                    true
+                };
+            if replace {
+                latest_records.insert(*hash, (*record, lsn));
+            }
+        }
+        let mut latest: Vec<ShardRecord> = latest_records
+            .into_values()
+            .map(|(record, _)| record)
+            .collect();
+        latest.sort_unstable_by_key(|(slot, hash, offset, _)| {
+            let creation_seq = shards
+                .get_shard(*slot)
+                .map_or(0, |shard| shard.creation_seq);
+            (creation_seq, *offset, *hash)
+        });
+        Ok(latest)
+    }
+
     /// Builds one collection's index, cache, and shard-directory contribution
     /// from its scanned records, and inserts all three into `out` — the
     /// per-collection body of `open_with_options`'s phase 2, factored out to
@@ -2739,18 +2790,12 @@ impl PackfileStorage {
         index_config: crate::index::IndexConfig,
         out: &mut RoomScanOutput,
     ) -> Result<(), StorageError> {
-        // Seed each collection's home shard from the scan: the shard of its
-        // last-scanned record is a best-effort proxy for "most recent"
-        // (shards are scanned in ascending ID order, and IDs generally
-        // increase over time via rotation) — not exact chronology across
-        // shards, but enough to keep a resumed collection's writes landing near
-        // its existing data instead of restarting at whatever the pool's
-        // active shard happens to be.
-        if let Some(&(last_slot, _, _, _)) = records.last() {
-            shards.set_collection_home(collection_id, last_slot);
+        let index_records = Self::latest_records_for_collection(records, shards)?;
+        if let Some((last_slot, _, _, _)) = index_records.last() {
+            shards.set_collection_home(collection_id, *last_slot);
         }
         let index = LossyIndex::with_config(
-            records
+            index_records
                 .len()
                 .saturating_mul(2)
                 .max(NEW_COLLECTION_INDEX_FLOOR),
@@ -2758,7 +2803,7 @@ impl PackfileStorage {
         );
         let mut failed = 0usize;
         let mut first_failure: Option<(u64, InsertError)> = None;
-        for (slot, hash, offset, _pack_id) in records {
+        for (slot, hash, offset, _pack_id) in &index_records {
             check_index_offset(*slot, hash, *offset)?;
             if let Err(error) = index.insert(hash, *slot, *offset) {
                 failed = failed.saturating_add(1);
@@ -2769,7 +2814,7 @@ impl PackfileStorage {
             return Err(StorageError::Corrupt(format!(
                 "index rebuild dropped {failed} of {} scanned records (first at offset {offset}: {error}); \
                  indexed {}",
-                records.len(),
+                index_records.len(),
                 index.len(),
             )));
         }
@@ -4647,20 +4692,24 @@ impl PackfileStorage {
     fn scan_collection_record_maps(
         &self,
         collection_ids: &[[u8; 16]],
-    ) -> Result<HashMap<[u8; 16], RepackRecordMap>, StorageError> {
+    ) -> Result<BatchRepackRecordMaps, StorageError> {
         let wanted: HashSet<[u8; 16]> = collection_ids.iter().copied().collect();
-        let mut maps: HashMap<[u8; 16], RepackRecordMap> = wanted
+        let mut maps: BatchRepackRecordMaps = wanted
             .iter()
             .copied()
-            .map(|collection_id| (collection_id, HashMap::new()))
+            .map(|collection_id| (collection_id, (HashMap::new(), HashMap::new())))
             .collect();
         for (slot, shard) in self.shards.all_shards() {
             for (collection_id, hash, offset) in packfile::scan_packfile(&shard.path)? {
                 if wanted.contains(&collection_id) {
-                    maps.entry(collection_id)
-                        .or_default()
-                        .insert(hash, (slot, offset));
+                    let (live, removed) = maps.entry(collection_id).or_default();
+                    self.update_repack_record_map(live, removed, hash, slot, offset)?;
                 }
+            }
+        }
+        for collection_id in &wanted {
+            if let Some((live, removed)) = maps.get_mut(collection_id) {
+                self.finalize_repack_record_maps(live, removed)?;
             }
         }
         Ok(maps)
@@ -7147,17 +7196,20 @@ impl PackfileStorage {
             if pack_changed {
                 let scanned = self.scan_collection_records(collection_id)?;
                 let mut map = HashMap::new();
+                let mut removed = HashMap::new();
                 for (slot, entries) in scanned {
                     for (hash, offset) in entries {
-                        self.update_repack_record_map(&mut map, hash, slot, offset)?;
+                        self.update_repack_record_map(&mut map, &mut removed, hash, slot, offset)?;
                     }
                 }
-                return Ok((map, None));
+                self.finalize_repack_record_maps(&mut map, &mut removed)?;
+                return Ok((map, removed, None));
             }
 
             // Scan only bytes appended since the last repack, merging into
             // the stolen live_map in-place — O(delta) work, not O(total).
             let mut map = prev.live_map.clone();
+            let mut removed = HashMap::new();
             for (slot, shard) in shards {
                 let start = prev
                     .scan_offsets
@@ -7168,30 +7220,32 @@ impl PackfileStorage {
                     packfile::scan_packfile_from(&shard.path, start).map_err(StorageError::Io)?;
                 for (rid, hash, offset) in entries {
                     if rid == *collection_id {
-                        self.update_repack_record_map(&mut map, hash, slot, offset)?;
+                        self.update_repack_record_map(&mut map, &mut removed, hash, slot, offset)?;
                     }
                 }
             }
-            Ok((map, Some(prev)))
+            self.finalize_repack_record_maps(&mut map, &mut removed)?;
+            Ok((map, removed, Some(prev)))
         } else {
             // First repack: full scan of every shard.
             let scanned = self.scan_collection_records(collection_id)?;
             let mut map = HashMap::new();
+            let mut removed = HashMap::new();
             for (slot, entries) in &scanned {
                 for (hash, offset) in entries {
-                    self.update_repack_record_map(&mut map, *hash, *slot, *offset)?;
+                    self.update_repack_record_map(&mut map, &mut removed, *hash, *slot, *offset)?;
                 }
             }
-            Ok((map, None))
+            self.finalize_repack_record_maps(&mut map, &mut removed)?;
+            Ok((map, removed, None))
         }
     }
 
-    /// Make a new frame for a key authoritative in the repack candidate map.
-    /// A removed frame deletes the key from that map; an ordinary frame
-    /// replaces its previous locator.
+    /// Keep the newest scanned live frame and removal frame independently.
     fn update_repack_record_map(
         &self,
         map: &mut RepackRecordMap,
+        removed: &mut RepackRecordMap,
         hash: NodeId,
         slot: u16,
         offset: u64,
@@ -7206,14 +7260,104 @@ impl PackfileStorage {
             offset,
             self.shards.checksum_policy().verifies_reads(),
         )?;
-        if record
+        let is_removed = record
             .metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.removed)
-        {
-            map.remove(&hash);
+            .is_some_and(|metadata| metadata.removed);
+        let new_lsn = record.metadata.and_then(|metadata| metadata.last_write_lsn);
+        let target = if is_removed { removed } else { map };
+        let replace = if let Some(&(old_slot, old_offset)) = target.get(&hash) {
+            let old_shard = self.shards.get_shard(old_slot).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "repack candidate references missing shard {old_slot}"
+                ))
+            })?;
+            let old = self.read_at(
+                &old_shard,
+                old_offset,
+                self.shards.checksum_policy().verifies_reads(),
+            )?;
+            let old_lsn = old.metadata.and_then(|metadata| metadata.last_write_lsn);
+            Self::repack_record_is_newer(new_lsn, &shard, offset, old_lsn, &old_shard, old_offset)
         } else {
-            map.insert(hash, (slot, offset));
+            true
+        };
+        if replace {
+            target.insert(hash, (slot, offset));
+        }
+        Ok(())
+    }
+
+    /// Compare record versions by immutable pack creation order and frame
+    /// offset, using LSNs only to break a physical-position tie.
+    fn repack_record_is_newer(
+        new_lsn: Option<u64>,
+        new_shard: &Shard,
+        new_offset: u64,
+        old_lsn: Option<u64>,
+        old_shard: &Shard,
+        old_offset: u64,
+    ) -> bool {
+        match (new_shard.creation_seq, new_offset).cmp(&(old_shard.creation_seq, old_offset)) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => new_lsn >= old_lsn,
+        }
+    }
+
+    /// Resolve the latest live and removed candidates independent of shard
+    /// slot order. Slots can be recycled, while frame LSNs preserve write order.
+    fn finalize_repack_record_maps(
+        &self,
+        live: &mut RepackRecordMap,
+        removed: &mut RepackRecordMap,
+    ) -> Result<(), StorageError> {
+        removed.retain(|hash, _| live.contains_key(hash));
+        let hashes: Vec<_> = live.keys().chain(removed.keys()).copied().collect();
+        for hash in hashes {
+            let (Some(&(live_slot, live_offset)), Some(&(removed_slot, removed_offset))) =
+                (live.get(&hash), removed.get(&hash))
+            else {
+                continue;
+            };
+            let live_shard = self.shards.get_shard(live_slot).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "repack candidate references missing shard {live_slot}"
+                ))
+            })?;
+            let removed_shard = self.shards.get_shard(removed_slot).ok_or_else(|| {
+                StorageError::Corrupt(format!(
+                    "repack candidate references missing shard {removed_slot}"
+                ))
+            })?;
+            let live_record = self.read_at(
+                &live_shard,
+                live_offset,
+                self.shards.checksum_policy().verifies_reads(),
+            )?;
+            let removed_record = self.read_at(
+                &removed_shard,
+                removed_offset,
+                self.shards.checksum_policy().verifies_reads(),
+            )?;
+            let live_lsn = live_record
+                .metadata
+                .and_then(|metadata| metadata.last_write_lsn);
+            let removed_lsn = removed_record
+                .metadata
+                .and_then(|metadata| metadata.last_write_lsn);
+            if Self::repack_record_is_newer(
+                live_lsn,
+                &live_shard,
+                live_offset,
+                removed_lsn,
+                &removed_shard,
+                removed_offset,
+            ) {
+                removed.remove(&hash);
+            } else {
+                live.remove(&hash);
+            }
         }
         Ok(())
     }
@@ -7415,7 +7559,7 @@ impl PackfileStorage {
         let saved_state = self.repack_incremental.read().get(collection_id).cloned();
         let result = self
             .repack_scan_incremental(collection_id)
-            .and_then(|(map, _)| {
+            .and_then(|(map, _, _)| {
                 self.plan_collection_repack_from_map(collection_id, &map, &extract_edges)
             });
         let mut states = self.repack_incremental.write();
@@ -7504,7 +7648,7 @@ impl PackfileStorage {
         collection_ids
             .iter()
             .map(|collection_id| {
-                let map = maps.get(collection_id).ok_or_else(|| {
+                let (map, _) = maps.get(collection_id).ok_or_else(|| {
                     StorageError::Corrupt("repack batch scan lost requested collection".to_owned())
                 })?;
                 self.plan_collection_repack_from_map(collection_id, map, &extract_edges)
@@ -7675,12 +7819,18 @@ impl PackfileStorage {
         // collection between the flush and the scan.
         self.shards.flush_all()?;
 
-        let (hash_to_shard_offset, prev_state) = self.repack_scan_incremental(collection_id)?;
+        let (hash_to_shard_offset, removed_markers, prev_state) =
+            self.repack_scan_incremental(collection_id)?;
 
         // Pin every shard this call could possibly read from before any
         // writes happen — see pin_shards' doc for why this must come
         // first.
-        let pinned = self.pin_shards(hash_to_shard_offset.values().map(|&(id, _)| id));
+        let pinned = self.pin_shards(
+            hash_to_shard_offset
+                .values()
+                .chain(removed_markers.values())
+                .map(|&(id, _)| id),
+        );
 
         let roots = self.live_roots.read().get(collection_id).cloned();
 
@@ -7785,6 +7935,7 @@ impl PackfileStorage {
         // them.
         let source_shards: HashSet<u16> = hash_to_shard_offset
             .values()
+            .chain(removed_markers.values())
             .map(|&(slot, _)| slot)
             .collect();
         self.shards
@@ -7812,6 +7963,24 @@ impl PackfileStorage {
 
         let kept = new_offsets.len();
 
+        // Preserve a marker while a previous live version may remain in a
+        // shard retained by another collection. On the next repack, the full
+        // scan can drop it once that older copy has gone away.
+        let mut removed_ids: Vec<_> = removed_markers.keys().copied().collect();
+        removed_ids.sort_unstable();
+        for hash in removed_ids {
+            let (old_slot, old_offset) = removed_markers[&hash];
+            if let Some((hash, slot, offset, disk_bytes)) =
+                self.copy_record_to_shard(collection_id, &pinned, old_slot, old_offset)?
+            {
+                if let Some(shard) = self.shards.get_shard(slot) {
+                    let total = new_disk_bytes.entry(shard.pack_id).or_insert(0_u64);
+                    *total = (*total).saturating_add(disk_bytes);
+                }
+                new_offsets.push((hash, slot, offset));
+            }
+        }
+
         let index = Self::build_index(&new_offsets, self.index_config)?;
         self.replace_collection_disk_bytes(collection_id, &new_disk_bytes);
         self.replace_collection_shard_counts(
@@ -7833,7 +8002,18 @@ impl PackfileStorage {
             .or_insert(1);
 
         let current_roots: Vec<[u8; 16]> = roots.as_deref().unwrap_or(&[]).to_vec();
-        self.repack_save_incremental_state(collection_id, &new_offsets, adjacency, &current_roots);
+        if removed_markers.is_empty() {
+            self.repack_save_incremental_state(
+                collection_id,
+                &new_offsets,
+                adjacency,
+                &current_roots,
+            );
+        } else {
+            // The carried tombstone must be observed in a full shard scan next
+            // time so it can be retired once no older copy remains.
+            self.repack_incremental.write().remove(collection_id);
+        }
 
         // Fsync the shards this repack just wrote into and persist the
         // updated stats snapshot as part of finishing the repack, rather
@@ -7938,12 +8118,13 @@ impl PackfileStorage {
     fn copy_repack_batch_collection(
         &self,
         collection_id: &[u8; 16],
-        hash_to_shard_offset: &RepackRecordMap,
+        record_maps: &(RepackRecordMap, RepackRecordMap),
         pinned: &HashMap<u16, Arc<Shard>>,
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
         output_progress: &mut impl FnMut(Option<[u8; 16]>, u16, u16, usize, bool),
         output_state: &mut (u16, usize),
     ) -> Result<(RepackOffsets, usize, HashMap<PackId, u64>), StorageError> {
+        let (hash_to_shard_offset, removed_markers) = record_maps;
         let roots = self.live_roots.read().get(collection_id).cloned();
         let (live_hashes, adjacency) = match roots {
             Some(roots) if !roots.is_empty() => Self::bfs_live_set(
@@ -7983,7 +8164,7 @@ impl PackfileStorage {
             )));
         }
 
-        let mut new_offsets = Vec::with_capacity(topo.len());
+        let mut new_offsets = Vec::with_capacity(topo.len().saturating_add(removed_markers.len()));
         let mut new_disk_bytes = HashMap::new();
         for &local in &topo {
             let hash = csr
@@ -7992,6 +8173,30 @@ impl PackfileStorage {
             let Some(&(old_slot, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
+            if let Some((hash, slot, offset, disk_bytes)) =
+                self.copy_record_to_shard(collection_id, pinned, old_slot, old_offset)?
+            {
+                output_state.1 = output_state.1.saturating_add(1);
+                let current_active_shard = self.shards.active_shard().slot;
+                Self::report_repack_output_rotation(
+                    output_progress,
+                    &mut output_state.0,
+                    current_active_shard,
+                    collection_id,
+                    output_state.1,
+                );
+                if let Some(shard) = self.shards.get_shard(slot) {
+                    let total = new_disk_bytes.entry(shard.pack_id).or_insert(0_u64);
+                    *total = (*total).saturating_add(disk_bytes);
+                }
+                new_offsets.push((hash, slot, offset));
+            }
+        }
+
+        let mut removed_ids: Vec<_> = removed_markers.keys().copied().collect();
+        removed_ids.sort_unstable();
+        for hash in removed_ids {
+            let (old_slot, old_offset) = removed_markers[&hash];
             if let Some((hash, slot, offset, disk_bytes)) =
                 self.copy_record_to_shard(collection_id, pinned, old_slot, old_offset)?
             {
@@ -8058,7 +8263,9 @@ impl PackfileStorage {
         let maps = self.scan_collection_record_maps(&collection_ids)?;
         let source_shards: HashSet<u16> = maps
             .values()
-            .flat_map(|map| map.values().map(|&(slot, _)| slot))
+            .flat_map(|(live, removed)| {
+                live.values().chain(removed.values()).map(|&(slot, _)| slot)
+            })
             .collect();
         let pinned = self.pin_shards(source_shards.iter().copied());
 
@@ -8071,12 +8278,13 @@ impl PackfileStorage {
         let mut results = Vec::with_capacity(collection_ids.len());
         let mut output_state = (self.shards.active_shard().slot, 0usize);
         for collection_id in &collection_ids {
-            let hash_to_shard_offset = maps.get(collection_id).ok_or_else(|| {
+            let record_maps = maps.get(collection_id).ok_or_else(|| {
                 StorageError::Corrupt("repack batch scan lost requested collection".to_owned())
             })?;
+            let (_, removed_markers) = record_maps;
             let (new_offsets, dropped, new_disk_bytes) = self.copy_repack_batch_collection(
                 collection_id,
-                hash_to_shard_offset,
+                record_maps,
                 &pinned,
                 &extract_edges,
                 &mut output_progress,
@@ -8100,12 +8308,16 @@ impl PackfileStorage {
                 .get(collection_id)
                 .cloned()
                 .unwrap_or_default();
-            self.repack_save_incremental_state(
-                collection_id,
-                &new_offsets,
-                HashMap::new(),
-                &batch_roots,
-            );
+            if removed_markers.is_empty() {
+                self.repack_save_incremental_state(
+                    collection_id,
+                    &new_offsets,
+                    HashMap::new(),
+                    &batch_roots,
+                );
+            } else {
+                self.repack_incremental.write().remove(collection_id);
+            }
 
             self.repack_count.fetch_add(1, Ordering::Relaxed);
             self.repack_kept_total

@@ -779,3 +779,201 @@ fn repack_keeps_a_value_that_was_re_added_after_removal() {
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A carried marker must keep suppressing the older value across further
+/// repacks, not just the first one, while the older shard is still retained.
+#[test]
+fn a_carried_marker_survives_a_second_repack_and_a_rebuild() {
+    let dir = test_root("repack_twice");
+    std::fs::create_dir_all(&dir).unwrap();
+    let collection = [0x86; 16];
+    let bystander = [0x87; 16];
+    let victim = node(204);
+    {
+        let store = open_small(&dir);
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"old"))
+            .unwrap();
+        store
+            .put(&bystander, &node(1), &NodeData::from_slice(b"keep"))
+            .unwrap();
+        fill(&store, &collection, 0, 120);
+        remove_directly(&store, collection, victim, 1);
+        fill(&store, &collection, 1000, 120);
+        store.sync_all().unwrap();
+        for round in 0..3u32 {
+            store
+                .repack_collection_reachable(&collection, |_, _| Vec::new())
+                .unwrap();
+            assert!(
+                !visible(&store, &collection, &victim),
+                "absent after repack {round}"
+            );
+            // New writes between repacks move shard layout around.
+            fill(&store, &collection, 5000 + round * 10, 10);
+            store.sync_all().unwrap();
+        }
+    }
+    drop_index_sidecars(&dir);
+    let store = open_small(&dir);
+    assert!(!visible(&store, &collection, &victim));
+    assert!(!scan_has(&store, &collection, &victim));
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Re-adding a removed key after its marker was carried must win over the
+/// carried marker, including after a rebuild from shards.
+#[test]
+fn a_key_re_added_after_a_carried_marker_stays_live() {
+    let dir = test_root("repack_readd_carried");
+    std::fs::create_dir_all(&dir).unwrap();
+    let collection = [0x88; 16];
+    let bystander = [0x89; 16];
+    let victim = node(205);
+    {
+        let store = open_small(&dir);
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"old"))
+            .unwrap();
+        store
+            .put(&bystander, &node(1), &NodeData::from_slice(b"keep"))
+            .unwrap();
+        fill(&store, &collection, 0, 120);
+        remove_directly(&store, collection, victim, 1);
+        fill(&store, &collection, 1000, 120);
+        store.sync_all().unwrap();
+        store
+            .repack_collection_reachable(&collection, |_, _| Vec::new())
+            .unwrap();
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"new"))
+            .unwrap();
+        store.sync_all().unwrap();
+        store
+            .repack_collection_reachable(&collection, |_, _| Vec::new())
+            .unwrap();
+        store.sync_all().unwrap();
+    }
+    drop_index_sidecars(&dir);
+    let store = open_small(&dir);
+    assert_eq!(
+        payload(store.get(&collection, &victim).unwrap()),
+        Some(b"new".to_vec())
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Repack must be invisible to version tokens: a record version read before
+/// the repack still matches after it, for a live key and a removed one.
+#[test]
+fn repack_does_not_change_record_version_tokens() {
+    let root = test_root("repack_tokens");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0x8a; 16];
+    let bystander = [0x8b; 16];
+    put_committed(&db, ShardType::State, bystander, node(1), b"keep");
+    put_committed(&db, ShardType::State, collection, node(1), b"live");
+    put_committed(&db, ShardType::State, collection, node(2), b"gone");
+    remove_committed(&db, ShardType::State, collection, node(2));
+    let pool = db.pool(ShardType::State);
+    let tokens = |pool: &PackfileStorage| {
+        pool.get_with_record_versions(&collection, &[node(1), node(2)])
+            .unwrap()
+            .1
+    };
+    let before = tokens(pool);
+    assert!(before.iter().all(|version| *version > 0));
+    pool.sync_all().unwrap();
+    pool.repack_collection_reachable(&collection, |_, _| Vec::new())
+        .unwrap();
+    pool.sync_all().unwrap();
+    assert_eq!(before, tokens(pool), "repack must not move version tokens");
+    assert_eq!(live(&db, ShardType::State, collection, node(2)), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The batch repack path must carry markers like the single-collection one:
+/// a collection repacked alone while a bystander keeps the older shard alive.
+#[test]
+fn batch_repack_with_a_retained_older_shard_does_not_resurrect_a_removed_key() {
+    let dir = test_root("batch_retained");
+    std::fs::create_dir_all(&dir).unwrap();
+    let collection = [0x8c; 16];
+    let bystander = [0x8d; 16];
+    let victim = node(206);
+    {
+        let store = open_small(&dir);
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"old"))
+            .unwrap();
+        store
+            .put(&bystander, &node(1), &NodeData::from_slice(b"keep"))
+            .unwrap();
+        fill(&store, &collection, 0, 120);
+        remove_directly(&store, collection, victim, 1);
+        fill(&store, &collection, 1000, 120);
+        store.sync_all().unwrap();
+        for _ in 0..2 {
+            store
+                .repack_collections_reachable(&[collection], |_, _| Vec::new())
+                .unwrap();
+            assert!(!visible(&store, &collection, &victim));
+            assert!(visible(&store, &bystander, &node(1)));
+            store.sync_all().unwrap();
+        }
+    }
+    drop_index_sidecars(&dir);
+    let store = open_small(&dir);
+    assert!(
+        !visible(&store, &collection, &victim),
+        "batch repack must not let a retained older shard bring the key back"
+    );
+    assert!(!scan_has(&store, &collection, &victim));
+    assert!(visible(&store, &bystander, &node(1)));
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A batch that repacks several collections at once keeps each one's removal.
+#[test]
+fn batch_repack_of_several_collections_keeps_each_removal() {
+    let dir = test_root("batch_several");
+    std::fs::create_dir_all(&dir).unwrap();
+    let first = [0x8e; 16];
+    let second = [0x8f; 16];
+    let bystander = [0x90; 16];
+    let victim = node(207);
+    {
+        let store = open_small(&dir);
+        for collection in [first, second] {
+            store
+                .put(&collection, &victim, &NodeData::from_slice(b"old"))
+                .unwrap();
+        }
+        store
+            .put(&bystander, &node(1), &NodeData::from_slice(b"keep"))
+            .unwrap();
+        fill(&store, &first, 0, 60);
+        fill(&store, &second, 0, 60);
+        remove_directly(&store, first, victim, 1);
+        remove_directly(&store, second, victim, 1);
+        fill(&store, &first, 1000, 60);
+        fill(&store, &second, 1000, 60);
+        store.sync_all().unwrap();
+        store
+            .repack_collections_reachable(&[first, second], |_, _| Vec::new())
+            .unwrap();
+        store.sync_all().unwrap();
+    }
+    drop_index_sidecars(&dir);
+    let store = open_small(&dir);
+    for collection in [first, second] {
+        assert!(!visible(&store, &collection, &victim));
+        assert!(!scan_has(&store, &collection, &victim));
+    }
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}

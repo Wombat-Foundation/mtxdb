@@ -212,6 +212,7 @@ impl AppendPolicy {
 
 /// Scanned `(collection_id, hash, offset)` entry from a shard file.
 pub type ShardEntry = ([u8; 16], [u8; 16], u64);
+type DiscoveredPack = (packfile::PackId, PathBuf, u32);
 
 /// A single global shard file shared across all collections.
 pub struct Shard {
@@ -222,6 +223,9 @@ pub struct Shard {
     /// pool-local `pack_id`, this is stable across pools/hosts, so an adopted
     /// (imported/extracted) pack keeps its identity wherever it lands.
     pub pack_id: packfile::PackId,
+    /// Immutable pack creation order, used to resolve unversioned duplicate
+    /// frames when runtime shard slots have been recycled.
+    pub creation_seq: u32,
     /// The open file handle backing this shard.
     pub file: File,
     /// Filesystem path to this shard's file.
@@ -432,10 +436,18 @@ impl ShardStats {
 }
 
 impl Shard {
-    fn new(slot: u16, pack_id: packfile::PackId, file: File, path: PathBuf, file_len: u64) -> Self {
+    fn new(
+        slot: u16,
+        pack_id: packfile::PackId,
+        creation_seq: u32,
+        file: File,
+        path: PathBuf,
+        file_len: u64,
+    ) -> Self {
         Self {
             slot,
             pack_id,
+            creation_seq,
             file,
             path,
             mmap: RwLock::new(None),
@@ -962,9 +974,7 @@ impl ShardPool {
     /// `MAX_SHARDS` capacity bound. Returns the next pool-local creation
     /// sequence along with the sorted paths so opening a pool does not reread
     /// every header.
-    fn discover_pack_files_sorted(
-        base_dir: &Path,
-    ) -> io::Result<(Vec<(packfile::PackId, PathBuf)>, u32)> {
+    fn discover_pack_files_sorted(base_dir: &Path) -> io::Result<(Vec<DiscoveredPack>, u32)> {
         let pack_files = Self::discover_pack_files(base_dir)?;
         if pack_files.len() > MAX_SHARDS {
             return Err(io::Error::new(
@@ -985,7 +995,10 @@ impl ShardPool {
         let mut next_creation_seq = 1;
         for (address, path, header) in pack_files {
             next_creation_seq = next_creation_seq.max(header.creation_seq.saturating_add(1));
-            ordered.push((Self::pack_order_key(&header, address), (address, path)));
+            ordered.push((
+                Self::pack_order_key(&header, address),
+                (address, path, header.creation_seq),
+            ));
         }
         ordered.sort_by_cached_key(|(key, _)| *key);
         Ok((
@@ -1000,7 +1013,7 @@ impl ShardPool {
     /// recovery_calls, packfile_open_time, packfile_open_calls)`.
     fn recover_and_open_packs(
         writable: bool,
-        pack_files: Vec<(packfile::PackId, PathBuf)>,
+        pack_files: Vec<(packfile::PackId, PathBuf, u32)>,
         shards: &mut [Option<Arc<Shard>>],
         next_slot: &mut u16,
     ) -> io::Result<(Duration, u64, Duration, u64)> {
@@ -1008,7 +1021,7 @@ impl ShardPool {
         let mut recovery_calls: u64 = 0;
         let mut packfile_open_time = Duration::ZERO;
         let mut packfile_open_calls: u64 = 0;
-        for (pack_id, path) in pack_files {
+        for (pack_id, path, creation_seq) in pack_files {
             if writable {
                 let recovery_started = Instant::now();
                 // Only the safety of appending matters here (every frame and CRC
@@ -1040,7 +1053,14 @@ impl ShardPool {
             let file_len = file.metadata()?.len();
             let slot = *next_slot;
             *next_slot = next_slot.saturating_add(1);
-            let shard = Arc::new(Shard::new(slot, pack_id, file, path, file_len));
+            let shard = Arc::new(Shard::new(
+                slot,
+                pack_id,
+                creation_seq,
+                file,
+                path,
+                file_len,
+            ));
             shards[slot as usize] = Some(shard);
         }
         Ok((
@@ -1566,7 +1586,7 @@ impl ShardPool {
             .unwrap_or(1);
         self.next_creation_seq
             .fetch_max(discovered_next_seq, Ordering::Relaxed);
-        for (pack_id, path, _) in sorted_files {
+        for (pack_id, path, header) in sorted_files {
             if existing.contains(&pack_id) {
                 continue;
             }
@@ -1581,7 +1601,12 @@ impl ShardPool {
             let slot = u16::try_from(slot)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid shard slot"))?;
             shards[usize::from(slot)] = Some(std::sync::Arc::new(Shard::new(
-                slot, pack_id, file, path, file_len,
+                slot,
+                pack_id,
+                header.creation_seq,
+                file,
+                path,
+                file_len,
             )));
         }
         Ok(())
@@ -1967,7 +1992,14 @@ impl ShardPool {
         let (file, path, pack_id) =
             Self::create_packfile_atomically(&self.base_dir, &[], creation_seq)?;
         let file_len = file.metadata()?.len();
-        let shard = Arc::new(Shard::new(slot, pack_id, file, path, file_len));
+        let shard = Arc::new(Shard::new(
+            slot,
+            pack_id,
+            creation_seq,
+            file,
+            path,
+            file_len,
+        ));
         sync_directory(&self.base_dir)?;
         self.shards.write()[slot as usize] = Some(Arc::clone(&shard));
         Ok(shard)
@@ -2793,7 +2825,12 @@ impl ShardPool {
                     Self::create_packfile_atomically(&self.base_dir, &sibling_ids, creation_seq)?;
                 let file_len = file.metadata()?.len();
                 shards[candidate as usize] = Some(Arc::new(Shard::new(
-                    candidate, pack_id, file, path, file_len,
+                    candidate,
+                    pack_id,
+                    creation_seq,
+                    file,
+                    path,
+                    file_len,
                 )));
                 drop(shards);
                 *self.active_write.lock() = candidate;

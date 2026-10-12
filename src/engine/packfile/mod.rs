@@ -308,8 +308,8 @@ pub struct ShardHeader {
 pub const FLAG_COMPRESSED: u8 = 0x01;
 
 /// Per-frame flag: this version removes its logical record key. Readers that
-/// do not understand removal reject the frame through [`KNOWN_FLAGS`] rather
-/// than interpreting the marker payload as a live value.
+/// do not understand removal reject the frame through the known-flags check
+/// rather than interpreting the marker payload as a live value.
 pub const FLAG_REMOVED: u8 = 0x08;
 
 /// Per-frame flag: a versioned, length-delimited metadata area follows the
