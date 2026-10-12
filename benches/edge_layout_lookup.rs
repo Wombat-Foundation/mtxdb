@@ -54,6 +54,7 @@ use mtxdb::storage::StorageEngine;
 #[path = "edge_layout_common.rs"]
 mod common;
 
+use common::format;
 use common::{
     baseline_scope, evict_cold, key_hash, len_f64, load, locate, mib, num, per, record_rows, sizes,
     spread, write_chunked, PutStats, Row, Variant, WriteStats, AUTH, CHUNK_COLLECTION,
@@ -63,7 +64,6 @@ use common::{
 /// A key's three edge lists as target ids: prev, auth, relations.
 type Edges = [Vec<u32>; 3];
 /// Bytes of one prototype run entry: 16-byte key hash and a big-endian id.
-const RUN_ENTRY: usize = 20;
 const MICROS: f64 = 1_000_000.0;
 
 /// What a layout can do. A single read passes a slice of one.
@@ -168,22 +168,6 @@ fn be32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes(raw))
 }
 
-/// The id of `hash` in a run record's entries, by binary search.
-fn search_run(entries: &[u8], hash: &[u8; 16]) -> Option<u32> {
-    let (mut lo, mut hi) = (0_usize, entries.len() / RUN_ENTRY);
-    while lo < hi {
-        let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
-        let at = mid.saturating_mul(RUN_ENTRY);
-        let entry = entries.get(at..at.saturating_add(RUN_ENTRY))?;
-        match entry[..16].cmp(&hash[..]) {
-            std::cmp::Ordering::Equal => return be32(entry, 16),
-            std::cmp::Ordering::Less => lo = mid.saturating_add(1),
-            std::cmp::Ordering::Greater => hi = mid,
-        }
-    }
-    None
-}
-
 /// The three lists at `pos` in an edge-list chunk record.
 fn edges_at(chunk: &[u8], pos: usize) -> Option<Edges> {
     let count = usize::from(u16::from_be_bytes(chunk.get(8..10)?.try_into().ok()?));
@@ -231,7 +215,11 @@ impl Proto {
         let mut all = Vec::new();
         for run in 0..self.runs {
             let record = self.fetch(KIND_RUN, run).expect("run record");
-            for entry in record.get(8..).unwrap_or_default().chunks_exact(RUN_ENTRY) {
+            for entry in record
+                .get(8..)
+                .unwrap_or_default()
+                .chunks_exact(format::RUN_ENTRY)
+            {
                 let hash: [u8; 16] = entry[..16].try_into().expect("hash");
                 all.push((hash, be32(entry, 16).expect("id")));
             }
@@ -240,30 +228,21 @@ impl Proto {
         all
     }
 
-    /// Candidate ids for key hashes, before the key check.
-    fn candidates(&self, hashes: &[[u8; 16]]) -> Vec<Option<u32>> {
+    /// Every candidate id per key hash, before the key check. A later run may
+    /// hold a different key with the same hash, so every run is read.
+    fn candidates(&self, hashes: &[[u8; 16]]) -> Vec<Vec<u32>> {
         if let Some(merged) = &self.merged {
             return hashes
                 .iter()
-                .map(|hash| {
-                    merged
-                        .binary_search_by(|entry| entry.0.cmp(hash))
-                        .ok()
-                        .map(|i| merged[i].1)
-                })
+                .map(|hash| format::merged_candidates(merged, hash))
                 .collect();
         }
-        let mut out = vec![None; hashes.len()];
-        for run in (0..self.runs).rev() {
-            if out.iter().all(Option::is_some) {
-                break;
-            }
+        let mut out = vec![Vec::new(); hashes.len()];
+        for run in 0..self.runs {
             let record = self.fetch(KIND_RUN, run).expect("run record");
             let entries = record.get(8..).unwrap_or_default();
-            for (slot, hash) in out.iter_mut().zip(hashes) {
-                if slot.is_none() {
-                    *slot = search_run(entries, hash);
-                }
+            for (found, hash) in out.iter_mut().zip(hashes) {
+                found.extend(format::run_candidates(entries, hash));
             }
         }
         out
@@ -288,7 +267,7 @@ impl Proto {
                 continue;
             };
             for (slot, pos) in members {
-                out[slot] = common::format::key_at(&record, pos)
+                out[slot] = format::key_at(&record, pos)
                     .ok()
                     .map(|k| String::from_utf8_lossy(k).into_owned());
             }
@@ -302,20 +281,30 @@ impl Layout for Proto {
         let hashes: Vec<[u8; 16]> = keys.iter().map(|k| key_hash(k)).collect();
         let found = self.candidates(&hashes);
         if !self.confirm {
-            return found;
+            return found.iter().map(|ids| ids.first().copied()).collect();
         }
-        let confirmed = self.keys_of(&found);
+        // One batched read of every candidate's key chunk, then confirm each key
+        // against all of its candidates. An unreadable candidate is an error.
+        let flat: Vec<Option<u32>> = found.iter().flatten().copied().map(Some).collect();
+        let mut stored = self.keys_of(&flat).into_iter();
         found
             .iter()
-            .zip(&confirmed)
             .zip(keys)
-            .map(|((id, stored), key)| match (id, stored) {
-                (Some(id), Some(stored)) if stored == key => Some(*id),
-                (Some(_), _) => {
-                    self.rejected.set(self.rejected.get().saturating_add(1));
-                    None
-                }
-                _ => None,
+            .map(|(ids, key)| {
+                let mut taken: Vec<Option<String>> = stored.by_ref().take(ids.len()).collect();
+                let mut next = ids.iter().zip(taken.iter_mut());
+                let hit = format::confirm(ids, key, &mut |id| {
+                    next.find(|(candidate, _)| **candidate == id)
+                        .and_then(|(_, key)| key.take())
+                })
+                .unwrap_or_else(|why| panic!("lookup failed closed: {why:?}"));
+                self.rejected.set(
+                    self.rejected.get().saturating_add(
+                        u64::try_from(ids.len().saturating_sub(usize::from(hit.is_some())))
+                            .unwrap_or(u64::MAX),
+                    ),
+                );
+                hit
             })
             .collect()
     }

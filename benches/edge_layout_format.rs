@@ -108,3 +108,88 @@ pub(crate) fn key_at(chunk: &[u8], pos: usize) -> Result<&[u8], FormatError> {
         .get(start..start.saturating_add(len))
         .ok_or(FormatError::Truncated)
 }
+
+/// Bytes of one forward-run entry: 16-byte key hash and a big-endian id.
+pub(crate) const RUN_ENTRY: usize = 20;
+
+/// A 128-bit key hash. It selects candidates; it never establishes identity.
+pub(crate) type KeyHash = [u8; 16];
+
+/// A forward run record: every `(hash, id)` pair, sorted by hash then id. Equal
+/// hashes are kept, not deduplicated; they form a contiguous collision bucket.
+pub(crate) fn encode_run(entries: &mut [(KeyHash, u32)]) -> Vec<u8> {
+    entries.sort_unstable();
+    let mut out = b"PFWD".to_vec();
+    out.extend_from_slice(&u32::try_from(entries.len()).expect("run").to_be_bytes());
+    for (hash, id) in entries.iter() {
+        out.extend_from_slice(hash);
+        out.extend_from_slice(&id.to_be_bytes());
+    }
+    out
+}
+
+/// Every id stored under `hash` in a run record's entries (the bytes after its
+/// 8-byte header), in id order.
+pub(crate) fn run_candidates(entries: &[u8], hash: &KeyHash) -> Vec<u32> {
+    let count = entries.len() / RUN_ENTRY;
+    let hash_at = |i: usize| entries.get(i.saturating_mul(RUN_ENTRY)..).map(|e| &e[..16]);
+    let (mut lo, mut hi) = (0_usize, count);
+    while lo < hi {
+        let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
+        if hash_at(mid).is_some_and(|h| h < &hash[..]) {
+            lo = mid.saturating_add(1);
+        } else {
+            hi = mid;
+        }
+    }
+    let mut out = Vec::new();
+    for i in lo..count {
+        let at = i.saturating_mul(RUN_ENTRY);
+        let Some(entry) = entries.get(at..at.saturating_add(RUN_ENTRY)) else {
+            break;
+        };
+        if entry[..16] != hash[..] {
+            break;
+        }
+        out.push(u32::from_be_bytes([
+            entry[16], entry[17], entry[18], entry[19],
+        ]));
+    }
+    out
+}
+
+/// Every id stored under `hash` in all runs merged into one sorted vector.
+pub(crate) fn merged_candidates(sorted: &[(KeyHash, u32)], hash: &KeyHash) -> Vec<u32> {
+    let from = sorted.partition_point(|entry| entry.0 < *hash);
+    sorted[from..]
+        .iter()
+        .take_while(|entry| entry.0 == *hash)
+        .map(|entry| entry.1)
+        .collect()
+}
+
+/// Why a lookup could not give an answer. Both fail closed: neither is a miss.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LookupError {
+    /// A candidate's key could not be read, so it cannot be ruled out.
+    KeyUnreadable(u32),
+    /// Two candidates carry the same full key.
+    DuplicateKey,
+}
+
+/// Confirm `candidates` against `key`: exactly one stored key must match. A miss
+/// is returned only after every candidate was read successfully.
+pub(crate) fn confirm(
+    candidates: &[u32],
+    key: &str,
+    key_of: &mut dyn FnMut(u32) -> Option<String>,
+) -> Result<Option<u32>, LookupError> {
+    let mut found = None;
+    for id in candidates {
+        let stored = key_of(*id).ok_or(LookupError::KeyUnreadable(*id))?;
+        if stored == key && found.replace(*id).is_some() {
+            return Err(LookupError::DuplicateKey);
+        }
+    }
+    Ok(found)
+}

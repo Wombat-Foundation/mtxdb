@@ -6,7 +6,8 @@ mod format;
 #[cfg(test)]
 mod tests {
     use super::format::{
-        chunk_bounds, encode_key_chunk, key_at, locate, FormatError, KEY_HEADER, MAX_CHUNK, MAX_KEY,
+        chunk_bounds, confirm, encode_key_chunk, encode_run, key_at, locate, merged_candidates,
+        run_candidates, FormatError, KeyHash, LookupError, KEY_HEADER, MAX_CHUNK, MAX_KEY,
     };
 
     #[test]
@@ -88,5 +89,150 @@ mod tests {
         far[KEY_HEADER..KEY_HEADER + 2].copy_from_slice(&u16::MAX.to_be_bytes());
         assert_eq!(key_at(&far, 0), Err(FormatError::Truncated));
         assert_eq!(key_at(&good, 2), Err(FormatError::PositionOutOfRange));
+    }
+
+    /// Injected hash: every key starting with `$c` collides; others are distinct.
+    fn hash(key: &str) -> KeyHash {
+        if key.starts_with("$c") {
+            [7; 16]
+        } else {
+            let mut h = [0_u8; 16];
+            for (slot, byte) in h.iter_mut().zip(key.bytes()) {
+                *slot = byte;
+            }
+            h
+        }
+    }
+
+    /// Ids are positions in `keys`; key chunks hold four ids; runs are the
+    /// batches the keys arrived in.
+    struct Index {
+        chunks: Vec<Option<Vec<u8>>>,
+        runs: Vec<Vec<u8>>,
+    }
+
+    impl Index {
+        fn build(batches: &[&[&str]]) -> Self {
+            let keys: Vec<String> = batches
+                .iter()
+                .flat_map(|b| b.iter())
+                .map(|k| (*k).to_owned())
+                .collect();
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let chunks = refs
+                .chunks(4)
+                .enumerate()
+                .map(|(n, c)| Some(encode_key_chunk(c, u32::try_from(n).unwrap()).unwrap()))
+                .collect();
+            let mut next = 0_u32;
+            let runs = batches
+                .iter()
+                .map(|batch| {
+                    let mut entries: Vec<(KeyHash, u32)> = batch
+                        .iter()
+                        .map(|k| {
+                            let id = next;
+                            next = next.saturating_add(1);
+                            (hash(k), id)
+                        })
+                        .collect();
+                    let mut out = encode_run(&mut entries);
+                    out.drain(..8);
+                    out
+                })
+                .collect();
+            Self { chunks, runs }
+        }
+
+        fn candidates(&self, key: &str) -> Vec<u32> {
+            self.runs
+                .iter()
+                .flat_map(|r| run_candidates(r, &hash(key)))
+                .collect()
+        }
+
+        fn key_of(&self, id: u32) -> Option<String> {
+            let (chunk, pos) = locate(id as usize, 4);
+            let record = self.chunks.get(chunk)?.as_ref()?;
+            key_at(record, pos)
+                .ok()
+                .map(|k| String::from_utf8_lossy(k).into_owned())
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<u32>, LookupError> {
+            confirm(&self.candidates(key), key, &mut |id| self.key_of(id))
+        }
+    }
+
+    #[test]
+    fn colliding_keys_in_one_run_resolve_to_their_own_ids() {
+        let index = Index::build(&[&["$a", "$c1", "$c2", "$b"]]);
+        assert_eq!(index.candidates("$c1"), vec![1, 2]);
+        assert_eq!(index.lookup("$c1"), Ok(Some(1)));
+        assert_eq!(index.lookup("$c2"), Ok(Some(2)));
+        assert_eq!(index.lookup("$a"), Ok(Some(0)));
+    }
+
+    #[test]
+    fn colliding_keys_in_different_runs_both_resolve() {
+        let index = Index::build(&[&["$c1", "$a"], &["$b", "$c2"], &["$c3"]]);
+        assert_eq!(index.candidates("$c2").len(), 3);
+        for (key, id) in [("$c1", 0), ("$c2", 3), ("$c3", 4)] {
+            assert_eq!(index.lookup(key), Ok(Some(id)), "{key}");
+        }
+    }
+
+    #[test]
+    fn an_uninserted_key_in_a_full_bucket_is_a_miss_after_checking_every_candidate() {
+        let index = Index::build(&[&["$c1", "$c2"], &["$c3"]]);
+        assert_eq!(index.candidates("$cmissing").len(), 3);
+        assert_eq!(index.lookup("$cmissing"), Ok(None));
+    }
+
+    #[test]
+    fn a_hash_absent_from_every_run_is_a_miss() {
+        let index = Index::build(&[&["$c1", "$a"]]);
+        assert!(index.candidates("$zzz").is_empty());
+        assert_eq!(index.lookup("$zzz"), Ok(None));
+    }
+
+    #[test]
+    fn merging_the_runs_gives_the_same_candidates() {
+        let index = Index::build(&[&["$c1", "$a"], &["$b", "$c2"]]);
+        let mut merged: Vec<(KeyHash, u32)> = Vec::new();
+        for run in &index.runs {
+            for entry in run.chunks_exact(20) {
+                let id = u32::from_be_bytes(entry[16..20].try_into().unwrap());
+                merged.push((entry[..16].try_into().unwrap(), id));
+            }
+        }
+        merged.sort_unstable();
+        for key in ["$c1", "$c2", "$a", "$b", "$zzz"] {
+            let mut want = index.candidates(key);
+            want.sort_unstable();
+            assert_eq!(merged_candidates(&merged, &hash(key)), want, "{key}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_candidate_is_an_error_never_a_miss_or_another_keys_id() {
+        let mut index = Index::build(&[&["$c1", "$c2", "$c3", "$c4", "$c5"]]);
+        // Lose the chunk holding ids 4..: "$c5" cannot be ruled out.
+        index.chunks[1] = None;
+        assert_eq!(index.lookup("$c1"), Err(LookupError::KeyUnreadable(4)));
+        assert_eq!(
+            index.lookup("$cmissing"),
+            Err(LookupError::KeyUnreadable(4))
+        );
+        // A corrupt chunk fails the same way.
+        index.chunks[1] = Some(vec![0; 3]);
+        assert_eq!(index.lookup("$c1"), Err(LookupError::KeyUnreadable(4)));
+    }
+
+    #[test]
+    fn the_same_full_key_under_two_ids_is_corruption() {
+        let index = Index::build(&[&["$c1", "$c2"], &["$c1"]]);
+        assert_eq!(index.lookup("$c1"), Err(LookupError::DuplicateKey));
+        assert_eq!(index.lookup("$c2"), Ok(Some(1)));
     }
 }

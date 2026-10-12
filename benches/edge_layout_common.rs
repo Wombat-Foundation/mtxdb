@@ -397,17 +397,6 @@ fn encode_key_chunk(ids: &Ids<'_>, chunk: usize) -> Vec<u8> {
         .expect("key chunk encodes")
 }
 
-fn encode_run(entries: &mut [([u8; 16], u32)]) -> Vec<u8> {
-    entries.sort_unstable();
-    let mut out = b"PFWD".to_vec();
-    out.extend_from_slice(&u32::try_from(entries.len()).expect("run").to_be_bytes());
-    for (hash, id) in entries.iter() {
-        out.extend_from_slice(hash);
-        out.extend_from_slice(&id.to_be_bytes());
-    }
-    out
-}
-
 /// Allocate ids for one batch of rows and fill in their edge lists; returns the
 /// chunks whose edge lists changed (including chunks of earlier ids whose list
 /// is only filled in now, because the id was first seen as another event's edge).
@@ -620,7 +609,7 @@ impl<'a> Writer<'a> {
             store,
             (&mut self.stats.runs, &mut self.latest),
             spread(KIND_RUN, self.batches),
-            &encode_run(&mut run),
+            &format::encode_run(&mut run),
         );
         self.batches = self.batches.saturating_add(1);
         for chunk in dirty {
