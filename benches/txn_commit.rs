@@ -84,6 +84,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use mtxdb::journal::{Journal, MAX_TXN_STAGE_BYTES};
 use mtxdb::layout::ShardType;
+use mtxdb::packfile::storage::SyncTimings;
 use mtxdb::packfile::ChecksumPolicy;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{Database, PoolPolicies, PoolPolicy};
@@ -325,6 +326,50 @@ fn configs(records: usize, batch: usize, sweep: &[usize], single_durable: usize)
 
 // ── One run ─────────────────────────────────────────────────────────
 
+/// Where the time of a run's `sync()` barriers went, summed over every
+/// barrier of the run (the engine's own `SyncTimings`, one per barrier).
+#[derive(Clone, Copy, Default)]
+struct Phases {
+    /// Barriers that reported timings.
+    barriers: u64,
+    pack_flush: Duration,
+    pack_fsync: Duration,
+    sidecar: Duration,
+    delta_log: Duration,
+    checkpoint: Duration,
+    reclaim: Duration,
+    remediation: Duration,
+    wal: Duration,
+}
+
+impl Phases {
+    fn add(&mut self, timings: &SyncTimings) {
+        self.barriers = self.barriers.saturating_add(1);
+        self.pack_flush += timings.pack_flush;
+        self.pack_fsync += timings.pack_fsync;
+        self.sidecar += timings.sidecar;
+        self.delta_log += timings.delta_log;
+        self.checkpoint += timings.checkpoint;
+        self.reclaim += timings.reclaim;
+        self.remediation += timings.remediation;
+        self.wal += timings.wal;
+    }
+
+    /// The named phases, in the order they are reported.
+    fn fields(&self) -> [(&'static str, Duration); 8] {
+        [
+            ("pack_flush", self.pack_flush),
+            ("pack_fsync", self.pack_fsync),
+            ("sidecar", self.sidecar),
+            ("delta_log", self.delta_log),
+            ("checkpoint", self.checkpoint),
+            ("reclaim", self.reclaim),
+            ("remediation", self.remediation),
+            ("wal", self.wal),
+        ]
+    }
+}
+
 #[derive(Clone)]
 struct Sample {
     stage: Duration,
@@ -332,6 +377,7 @@ struct Sample {
     sync: Duration,
     ryw: Duration,
     total: Duration,
+    phases: Phases,
     /// Journal groups and WAL bytes at the final scan. `None` when a
     /// per-boundary sync reclaimed the segment, so the count is meaningless.
     wal: Option<(u64, u64)>,
@@ -341,10 +387,17 @@ struct Sample {
     staged_peak: u64,
 }
 
-fn sync_pool(db: &Database) -> Duration {
+/// One durability barrier. Its phase breakdown, as the engine measured it, is
+/// added to `phases`.
+fn sync_pool(db: &Database, phases: &mut Phases) -> Duration {
+    let pool = db.pool(SHARD);
     let started = Instant::now();
-    db.pool(SHARD).sync().expect("pool sync");
-    started.elapsed()
+    pool.sync().expect("pool sync");
+    let elapsed = started.elapsed();
+    if let Some(timings) = pool.sync_timings() {
+        phases.add(&timings);
+    }
+    elapsed
 }
 
 fn run_once(
@@ -366,6 +419,7 @@ fn run_once(
     let mut ryw = Duration::ZERO;
     let mut ryw_reads = 0_u64;
     let mut staged_peak = 0_usize;
+    let mut phases = Phases::default();
 
     let stats_before = db.coordinator().durability_stats();
     let started = Instant::now();
@@ -378,7 +432,7 @@ fn run_once(
                 db.pool(SHARD).put(&collection, id, &data).expect("put");
                 stage += timer.elapsed();
                 if cfg.durable {
-                    sync += sync_pool(&db);
+                    sync += sync_pool(&db, &mut phases);
                 }
             }
         }
@@ -394,7 +448,7 @@ fn run_once(
                     .expect("put_many");
                 stage += timer.elapsed();
                 if cfg.durable {
-                    sync += sync_pool(&db);
+                    sync += sync_pool(&db, &mut phases);
                 }
             }
         }
@@ -411,7 +465,7 @@ fn run_once(
             txn.commit().expect("commit");
             commit += timer.elapsed();
             if cfg.durable {
-                sync += sync_pool(&db);
+                sync += sync_pool(&db, &mut phases);
             }
         }
         Kind::TxnBatched | Kind::TxnRyw => {
@@ -444,7 +498,7 @@ fn run_once(
                 txn.commit().expect("commit");
                 commit += timer.elapsed();
                 if cfg.durable {
-                    sync += sync_pool(&db);
+                    sync += sync_pool(&db, &mut phases);
                 }
             }
         }
@@ -468,7 +522,7 @@ fn run_once(
 
     // One closing sync makes everything durable and pays the fsync the
     // non-durable runs were deferring.
-    sync += sync_pool(&db);
+    sync += sync_pool(&db, &mut phases);
     let total = started.elapsed();
     let stats_after = db.coordinator().durability_stats();
 
@@ -496,6 +550,7 @@ fn run_once(
         sync,
         ryw,
         total,
+        phases,
         wal,
         fsyncs: stats_after.commits.saturating_sub(stats_before.commits),
         durable_records: stats_after
@@ -520,6 +575,17 @@ fn reduce(samples: &[Sample]) -> Sample {
     reduced.sync = median(|s| s.sync);
     reduced.ryw = median(|s| s.ryw);
     reduced.total = median(|s| s.total);
+    reduced.phases = Phases {
+        barriers: reduced.phases.barriers,
+        pack_flush: median(|s| s.phases.pack_flush),
+        pack_fsync: median(|s| s.phases.pack_fsync),
+        sidecar: median(|s| s.phases.sidecar),
+        delta_log: median(|s| s.phases.delta_log),
+        checkpoint: median(|s| s.phases.checkpoint),
+        reclaim: median(|s| s.phases.reclaim),
+        remediation: median(|s| s.phases.remediation),
+        wal: median(|s| s.phases.wal),
+    };
     reduced
 }
 
@@ -580,6 +646,28 @@ fn probe_stage_budget(payload: usize) {
 }
 
 // ── Report ──────────────────────────────────────────────────────────
+
+/// Where a durable run's barriers spent their time, in the engine's own phases:
+/// each phase's total over the run, and per barrier. The phases can overlap
+/// (the checkpoint, for one, contains other work), so they need not add up to
+/// the run's sync time. Printed for humans only; it is not on the `bench:` line.
+fn print_phases(sample: &Sample) {
+    let barriers = sample.phases.barriers;
+    if barriers == 0 {
+        return;
+    }
+    use std::fmt::Write as _;
+    let mut line = format!("      {barriers} barriers, ms total (per barrier):");
+    for (name, total) in sample.phases.fields() {
+        let total_ms = total.as_secs_f64() * 1e3;
+        let _ = write!(
+            line,
+            " {name} {total_ms:.1} ({:.2})",
+            total_ms / barriers as f64
+        );
+    }
+    println!("{line}");
+}
 
 fn print_row(label: &str, records: usize, sample: &Sample) {
     let wal_groups = sample
@@ -742,6 +830,9 @@ fn main() {
     for (cfg, runs) in selected.iter().zip(samples.iter()) {
         let sample = reduce(runs);
         print_row(&cfg.name, cfg.records(records), &sample);
+        if cfg.durable {
+            print_phases(&sample);
+        }
     }
     println!("═══════════════════════════════════════════════════════════════");
 
