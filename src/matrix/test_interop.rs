@@ -183,8 +183,8 @@ fn edge_encoding_is_pinned_and_round_trips() {
         decode_edges(&bytes).unwrap(),
         vec![b"$a".to_vec(), b"$bc".to_vec()]
     );
-    assert!(encode_edges(&[]).unwrap().is_empty());
-    assert!(decode_edges(&[]).unwrap().is_empty());
+    assert_eq!(encode_edges(&[]).unwrap(), Vec::<u8>::new());
+    assert_eq!(decode_edges(&[]).unwrap(), Vec::<Vec<u8>>::new());
     for cut in [1, 3, 5, 8] {
         assert!(decode_edges(&bytes[..cut]).is_err(), "cut at {cut}");
     }
