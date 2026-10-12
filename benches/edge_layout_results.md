@@ -136,13 +136,13 @@ Warm single calls, µs/op, by ids per chunk. 32 is the range of 3 runs; 256 is
 one run. Cold is not reported: the stores are mmapped (see Cold reads), and
 only the zstd prototype's evicted cleanly.
 
-| operation                  | 32 ids    | 256 ids | baseline  |
-| -------------------------- | --------- | ------- | --------- |
-| key → id hit (confirmed)   | 5.2–5.5   | 14–16   | 1.45–1.83 |
-| key → id miss              | 0.29–0.33 | -       | 0.90      |
-| id → key                   | 4.6–4.8   | 14–16   | 1.4–1.6   |
-| edge lists (all 3 families)| 5.0–5.4   | 13.8    | 3.7–4.2   |
-| key → id hit (hash-only)\* | 0.33–0.41 | -       | -         |
+| operation                   | 32 ids    | 256 ids | baseline  |
+| --------------------------- | --------- | ------- | --------- |
+| key → id hit (confirmed)    | 5.2–5.5   | 14–16   | 1.45–1.83 |
+| key → id miss               | 0.29–0.33 | -       | 0.90      |
+| id → key                    | 4.6–4.8   | 14–16   | 1.4–1.6   |
+| edge lists (all 3 families) | 5.0–5.4   | 13.8    | 3.7–4.2   |
+| key → id hit (hash-only)\*  | 0.33–0.41 | -       | -         |
 
 \*hash-only is **not collision-safe**; it prices the confirming read only.
 
