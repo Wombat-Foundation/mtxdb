@@ -809,10 +809,14 @@ fn bench_layout(
 }
 
 fn main() {
-    let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
+    let Some(tsv) = std::env::var_os("MTXDB_EL_TSV").map(PathBuf::from) else {
+        eprintln!("edge_layout_lookup: MTXDB_EL_TSV not set; skipping");
+        return;
+    };
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     let n = env_usize("MTXDB_EL_OPS", 20_000);
-    let cold_n = env_usize("MTXDB_EL_COLD", 1_000);
+    // Cold calls index into the same sample as the warm ones.
+    let cold_n = env_usize("MTXDB_EL_COLD", 1_000).min(n);
     let rows = load(&tsv, env_usize("MTXDB_EL_EVENTS", usize::MAX));
     println!(
         "{} events, {n} sampled ops, {cold_n} cold ops, {} ids per chunk",
@@ -861,7 +865,8 @@ fn main() {
 
     let picks = sample(rows.len(), n);
     let misses: Vec<String> = picks.iter().map(|i| format!("{}~", rows[*i].id)).collect();
-    let batch = env_usize("MTXDB_EL_BATCH", 100);
+    // A zero batch would never advance.
+    let batch = env_usize("MTXDB_EL_BATCH", 100).max(1);
     let layouts: [(&str, &Path, Open<'_>); 4] = [
         (
             "baseline",

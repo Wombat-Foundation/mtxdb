@@ -601,7 +601,14 @@ impl<'a> Writer<'a> {
         let first_new = self.ids.keys.len();
         let (mut dirty, dirty_children) = assign_batch(&mut self.ids, batch, include_children);
         let tail = self.ids.keys.len().div_ceil(chunk_size());
-        dirty.extend(locate(first_new).0..tail);
+        // A batch that allocated no ids leaves the partial tail chunk
+        // untouched, so it is neither an edge nor a key rewrite.
+        let new_chunks = if first_new < self.ids.keys.len() {
+            locate(first_new).0..tail
+        } else {
+            0..0
+        };
+        dirty.extend(new_chunks.clone());
         let mut run: Vec<([u8; 16], u32)> = (first_new..self.ids.keys.len())
             .map(|i| (key_hash(self.ids.keys[i]), u32::try_from(i).expect("id")))
             .collect();
@@ -626,7 +633,7 @@ impl<'a> Writer<'a> {
                 &encode_edge_chunk(&self.ids, chunk),
             );
         }
-        for chunk in locate(first_new).0..tail {
+        for chunk in new_chunks {
             let number = u32::try_from(chunk).expect("chunk");
             let bucket = if self.seen_key.insert(chunk) {
                 &mut self.stats.key_new

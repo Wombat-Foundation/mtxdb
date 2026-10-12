@@ -180,7 +180,10 @@ fn chunked(base: &Path, rows: &[Row]) {
 }
 
 fn main() {
-    let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
+    let Some(tsv) = std::env::var_os("MTXDB_EL_TSV").map(PathBuf::from) else {
+        eprintln!("edge_layout_measure: MTXDB_EL_TSV not set; skipping");
+        return;
+    };
     let limit = std::env::var("MTXDB_EL_EVENTS")
         .ok()
         .and_then(|v| v.parse().ok())

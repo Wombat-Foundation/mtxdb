@@ -4,6 +4,8 @@ SHELL=/bin/bash
 MAKEFLAGS += --no-print-directory
 
 CARGO ?= cargo
+# The bench crate needs a newer compiler than the library's pinned MSRV.
+BENCH_TOOLCHAIN ?= 1.90.0
 
 .PHONY: _help
 _help:
@@ -41,7 +43,7 @@ check: ##H Cargo check (core) and code dupe
 .PHONY: macro
 macro: ##H See macro expansion costs
 	set -o pipefail; \
-	$(CARGO) +nightly rustc -- -Zmacro-stats 2>&1 | awk -f scripts/macro_totals.awk
+	RUSTUP_TOOLCHAIN=nightly $(CARGO) rustc -- -Zmacro-stats 2>&1 | awk -f scripts/macro_totals.awk
 
 
 .PHONY: lint
@@ -105,7 +107,7 @@ cov: ##H Run code coverage and generate HTML report
 
 .PHONY: bench
 bench: ##H Run benchmarks and append results to the CSV history in benches/csv/
-	set -o pipefail; $(CARGO) bench --manifest-path benches/Cargo.toml --benches --all-targets | tee benches/csv/latest.txt
+	set -o pipefail; RUSTUP_TOOLCHAIN=$(BENCH_TOOLCHAIN) $(CARGO) bench --manifest-path benches/Cargo.toml --benches --all-targets | tee benches/csv/latest.txt
 	python3 scripts/compare_bench.py --current benches/csv/latest.txt \
 		--best benches/csv/best.json --out benches/csv/best.json \
 		--machine "$$(cat benches/csv/machine.txt 2>/dev/null || hostname)" \

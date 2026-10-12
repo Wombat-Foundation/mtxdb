@@ -573,7 +573,10 @@ fn child_reads(db: &Database, rows: &[Row], ids: &Ids<'_>, span: Option<u32>) {
 }
 
 fn main() {
-    let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
+    let Some(tsv) = std::env::var_os("MTXDB_EL_TSV").map(PathBuf::from) else {
+        eprintln!("edge_layout_sithnapse: MTXDB_EL_TSV not set; skipping");
+        return;
+    };
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     let loaded = load(&tsv, usize::MAX);
     // Sithnapse's auth-chain store is specifically auth adjacency in both
@@ -592,7 +595,13 @@ fn main() {
     let sync_every = env_usize("MTXDB_EL_SYNC_EVERY", 20);
     let batches: Vec<usize> = std::env::var("MTXDB_EL_BATCHES").map_or_else(
         |_| vec![1, 2, 10, 100],
-        |v| v.split(',').filter_map(|s| s.parse().ok()).collect(),
+        |v| {
+            // `chunks(0)` panics, so a zero batch size is dropped.
+            v.split(',')
+                .filter_map(|s| s.parse().ok())
+                .filter(|&size| size > 0)
+                .collect()
+        },
     );
     let rows = &rows[..preload.saturating_add(append)];
     println!(

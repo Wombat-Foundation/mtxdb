@@ -216,10 +216,15 @@ fn proto_layers(
         "    record read per lookup: {} bytes (decoded payload)",
         raw.len()
     );
-    // Positions cycle through the chunk's first eight entries; the offset
-    // table makes the position irrelevant to decode cost.
+    // Positions cycle through the chunk's first eight entries (fewer when the
+    // chunk holds fewer); the offset table makes the position irrelevant to
+    // decode cost.
+    let entries = raw
+        .get(8..10)
+        .and_then(|count| count.try_into().ok())
+        .map_or(1, |count| usize::from(u16::from_be_bytes(count)).clamp(1, 8));
     layer("decode only", reps, n, |i| {
-        format::key_at(&raw, i & 7).is_ok()
+        format::key_at(&raw, i % entries).is_ok()
     });
     layer("fetch only", reps, n, |i| {
         fetch(&db, located[i].0).is_some()
@@ -316,7 +321,10 @@ fn baseline_floor(
 }
 
 fn main() {
-    let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
+    let Some(tsv) = std::env::var_os("MTXDB_EL_TSV").map(PathBuf::from) else {
+        eprintln!("edge_layout_read_split: MTXDB_EL_TSV not set; skipping");
+        return;
+    };
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     let n = env_usize("MTXDB_EL_OPS", 20_000);
     let reps = env_usize("MTXDB_EL_REPS", 3);

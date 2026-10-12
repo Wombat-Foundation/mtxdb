@@ -204,7 +204,10 @@ fn csv_line(case: &Case) -> String {
 }
 
 fn main() {
-    let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
+    let Some(tsv) = std::env::var_os("MTXDB_EL_TSV").map(PathBuf::from) else {
+        eprintln!("edge_layout_batches: MTXDB_EL_TSV not set; skipping");
+        return;
+    };
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     let rows = load(&tsv, usize::MAX);
     let preload = env_usize("MTXDB_EL_PRELOAD", 60_000).min(rows.len());
