@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use mtxdb::packfile::scan_packfile_iter;
+use mtxdb::packfile::{scan_packfile_iter, PackId};
 use mtxdb::storage::{NodeData, StorageEngine};
 use mtxdb::{DatabaseLayout, PackfileStorage, ShardPool, ShardType};
 
@@ -184,7 +184,7 @@ fn run_scan_bench_inner(config: &ScanBenchConfig, max_shard_bytes: Option<u64>) 
 
     // ── Collection-filtered shard set ───────────────────────────────
     let target_collection = collection_id(0);
-    let collection_packs: Option<HashSet<u64>> =
+    let collection_packs: Option<HashSet<PackId>> =
         PackfileStorage::collection_shards_from_disk(&pool_dir)
             .and_then(|mut cols| cols.remove(&target_collection))
             .map(|packs| packs.into_iter().collect());

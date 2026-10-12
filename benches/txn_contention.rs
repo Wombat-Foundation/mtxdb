@@ -5,7 +5,7 @@
 //! latency when `MTXDB_CT_WRITERS` threads each stage `MTXDB_CT_BATCH` records
 //! and commit, `MTXDB_CT_COMMITS` times, while the committer fsyncs every
 //! `MTXDB_CT_INTERVAL_MS`. It reports per-commit latency percentiles and where
-//! the commits spent their time (`SharedDatabase::commit_phase_stats`), so a
+//! the commits spent their time (`Database::commit_phase_stats`), so a
 //! slow commit can be attributed to publish, lock waits or materialization.
 //!
 //! ```text
@@ -30,11 +30,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use mtxdb::journal::JournalCoordinator;
 use mtxdb::layout::ShardType;
-use bytes::Bytes;
 use mtxdb::storage::{NodeData, NodeId};
-use mtxdb::{GroupCommitConfig, PhaseTiming, SharedDatabase};
+use mtxdb::{Database, GroupCommitConfig, PhaseTiming};
 
 const COLLECTION: [u8; 16] = [0xA5; 16];
 
@@ -84,7 +84,7 @@ fn main() {
     let root = base.join(format!("mtxdb_bench_txn_contention_{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
 
-    let db = Arc::new(SharedDatabase::open(root.clone()).expect("open shared database"));
+    let db = Arc::new(Database::open(root.clone()).expect("open shared database"));
     let coordinator: Arc<JournalCoordinator> = Arc::clone(db.coordinator());
     coordinator
         .start_background_committer(GroupCommitConfig::with_interval(interval))
@@ -117,7 +117,9 @@ fn main() {
         .flat_map(|h| h.join().expect("writer thread"))
         .collect();
     let wall = started.elapsed();
-    coordinator.stop_background_committer().expect("stop committer");
+    coordinator
+        .stop_background_committer()
+        .expect("stop committer");
 
     all.sort();
     let stats = db.commit_phase_stats();

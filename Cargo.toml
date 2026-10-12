@@ -2,7 +2,7 @@
 name = "mtxdb"
 version.workspace = true
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.87"
 publish = false
 # Without this, Cargo auto-discovers benches/*.rs as this package's own bench
 # targets purely by their being physically under benches/ (which is now
@@ -52,7 +52,7 @@ resolver = "2"
 # parses every member's graph plus the shared lock for every command -- so a
 # member there would drag the whole workspace's floor up to 1.85. Keeping it
 # out (like benches/, which has its own `[workspace]` table)
-# preserves the library's 1.81 MSRV. Build/lint/test it with
+# preserves the library's 1.90 MSRV. Build/lint/test it with
 # `--manifest-path mtxdb-cli/Cargo.toml`.
 members = []
 
@@ -99,33 +99,48 @@ verbose_file_reads = "warn"
 path = "src/lib.rs"
 
 [features]
-default = ["zstd"]
+default = ["zstd", "bitmaps"]
 # Record-payload compression. On by default, so stores keep writing and reading
 # zstd frames; disable (with `default-features = false`) for builds that must
 # not carry zstd. A build without it always
 # writes raw frames and refuses to read compressed ones.
 zstd = ["dep:zstd", "dep:zstd-sys"]
 
-# Cross-process write-ahead journal + read-committed overlay, for a
-# single-writer/multi-reader deployment where separate OS processes need to
-# read a live writer's committed-but-not-yet-checkpointed data (e.g. a
-# Synapse worker deployment). Off by default: a genuinely single-process
-# embedded deployment never needs this, and it costs real code (journal.rs,
-# the read-journal overlay, the refresh-on-miss read path) that a
-# single-process build shouldn't have to carry. See docs/TODO.txt's
-# "process model" entries for the deployment-shape reasoning.
+# Cross-process read-committed workers. Always available: `Database`, the
+# shared WAL, transactions, record-version compare-and-set and recovery, the
+# in-process read journal and `open_read_committed` for read-only use, and the
+# writer's publish signal and replay cursors (single-process repack uses them).
+# This feature adds only the API for attaching another OS process to a live
+# shared WAL (`PackfileStorage::open_read_committed_shared` and
+# `enable_read_journal_shared`) and the process-level tests. It never swaps in
+# different behavior: without it those APIs are simply absent, and there are no
+# alternate CAS or version paths.
 multi-reader = []
+
+# Domain-tagged bitmap sets and Matrix auth-closure APIs. This remains
+# switchable for minimal builds, while staying enabled by default for
+# compatibility with the public graph and Matrix APIs.
+bitmaps = ["dep:rezzy-recon"]
+
+# MSC4521 set reconciliation over the persisted event population (owner log,
+# sorted runs, resident kernel): element hashing, kernels and the `Population`
+# trait come from `rezzy-recon`. Off by default; carries that dependency.
+reconcile = ["dep:rezzy-recon"]
 
 [dependencies]
 arc-swap = "1"
-blake3 = "=1.5.5"
+blake3 = "1.8.7"
 bytes = "1.5"
 crc32fast = "1.4"
 fs2 = "0.4"
+# Substring search for the search-pack scan loop (`memmem::Finder`). Reused
+# across records, so one `Finder` is built per query term, not per record.
+memchr = "2.7"
 memmap2 = "0.9.11"
-parking_lot = "0.12"
-sha2 = "0.10"
-zstd = { version = "0.13", default-features = false, optional = true }
+parking_lot = { version = "0.12", features = ["arc_lock"] }
+rezzy-recon = { git = "https://gitlab.com/gamesguru/rezzy.git", branch = "alpha", version = "0.6.0-rc.1", optional = true }
+sha2 = "0.11"
+zstd = { version = "0.14", default-features = false, optional = true }
 
 # `zstd`/`zstd-safe` don't forward a "pkg-config"/"vendored" feature of their
 # own, so reach `zstd-sys` directly at the same version zstd-safe resolves to
@@ -143,8 +158,8 @@ zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
 
 # INTEGRATION TESTS. Ungated files are folded into one `tests/unit/main.rs`
 # target so `cargo test` links a single binary for them (see that file's
-# header). Feature-gated suites keep their own target with `required-features`,
-# so the default build neither compiles nor links them.
+# header). A suite that needs a feature keeps its own target with
+# `required-features`, so a build without it neither compiles nor links it.
 [[test]]
 name = "unit"
 path = "tests/unit/main.rs"

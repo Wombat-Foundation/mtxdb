@@ -4,6 +4,8 @@ SHELL=/bin/bash
 MAKEFLAGS += --no-print-directory
 
 CARGO ?= cargo
+# The bench crate needs a newer compiler than the library's pinned MSRV.
+BENCH_TOOLCHAIN ?= 1.90.0
 
 .PHONY: _help
 _help:
@@ -36,6 +38,13 @@ check-cargo-sort:
 check: ##H Cargo check (core) and code dupe
 	$(CARGO) check  --workspace --all-targets --all-features
 	jscpd $$(git ls-files '*.rs')
+
+
+.PHONY: macro
+macro: ##H See macro expansion costs
+	set -o pipefail; \
+	RUSTUP_TOOLCHAIN=nightly $(CARGO) rustc -- -Zmacro-stats 2>&1 | awk -f scripts/macro_totals.awk
+
 
 .PHONY: lint
 lint: ##H Run clippy lints across the workspace crates
@@ -98,7 +107,7 @@ cov: ##H Run code coverage and generate HTML report
 
 .PHONY: bench
 bench: ##H Run benchmarks and append results to the CSV history in benches/csv/
-	set -o pipefail; $(CARGO) bench --manifest-path benches/Cargo.toml --benches --all-targets | tee benches/csv/latest.txt
+	set -o pipefail; RUSTUP_TOOLCHAIN=$(BENCH_TOOLCHAIN) $(CARGO) bench --manifest-path benches/Cargo.toml --benches --all-targets | tee benches/csv/latest.txt
 	python3 scripts/compare_bench.py --current benches/csv/latest.txt \
 		--best benches/csv/best.json --out benches/csv/best.json \
 		--machine "$$(cat benches/csv/machine.txt 2>/dev/null || hostname)" \
@@ -146,3 +155,12 @@ PROJECT_CRATES ?= mtxdb-cli/
 sub:	##H Run a command for each crate (set c)
 	@test -n "${c}" || (echo "error: set c=<command>"; exit 1)
 	@for d in $(PROJECT_CRATES); do echo "--- $$d ---"; (cd $$d && ${c}) || exit 1; done
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Extras
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.PHONY: extras/cloc
+extras/cloc:	##H Count lines of code for the HEAD revision
+	cloc --git HEAD --fmt=2

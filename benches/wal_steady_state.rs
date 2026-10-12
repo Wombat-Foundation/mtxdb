@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use mtxdb::layout::ShardType;
 use mtxdb::storage::{NodeData, NodeId};
-use mtxdb::SharedDatabase;
+use mtxdb::Database;
 
 const COLLECTION: [u8; 16] = [7; 16];
 /// A quarter of the 256 MiB segment cap, the default `RECLAIM_TRIGGER_LEN` in
@@ -58,7 +58,7 @@ fn main() {
     let root = base.join(format!("mtxdb_bench_wal_steady_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
-    let db = SharedDatabase::open(root.clone()).expect("open shared database");
+    let db = Database::open(root.clone()).expect("open shared database");
     let pack_budget = std::env::var("MTXDB_WS_PACK_BUDGET_MB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -77,7 +77,10 @@ fn main() {
     let mut peak = 0u64;
     println!(
         "rounds={rounds} commits/round={commits} batch={batch} payload={payload} pack_budget={}",
-        pack_budget.map_or_else(|| "default".to_owned(), |bytes| format!("{} MiB", bytes >> 20))
+        pack_budget.map_or_else(
+            || "default".to_owned(),
+            |bytes| format!("{} MiB", bytes >> 20)
+        )
     );
     for round in 0..rounds {
         for _ in 0..commits {
@@ -113,7 +116,8 @@ fn main() {
     }
 
     delta_syncs.sort_by(f64::total_cmp);
-    if let (Some(median), Some(max)) = (delta_syncs.get(delta_syncs.len() / 2), delta_syncs.last()) {
+    if let (Some(median), Some(max)) = (delta_syncs.get(delta_syncs.len() / 2), delta_syncs.last())
+    {
         println!(
             "delta syncs: {} samples, median {median:.0} ms, max {max:.0} ms",
             delta_syncs.len()

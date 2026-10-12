@@ -3,14 +3,14 @@
 use mtxdb::matrix_policy::*;
 
 #[test]
-#[cfg(feature = "multi-reader")]
 fn matrix_pool_policies_skips_state_compression() {
+    use mtxdb::ShardType;
     let policies = matrix_pool_policies();
-    assert!(!policies.state.compress);
-    assert!(policies.event_dag.compress);
-    assert!(policies.edges.compress);
+    assert!(!policies.for_shard(ShardType::State).compress);
+    assert!(policies.for_shard(ShardType::EventDag).compress);
+    assert!(policies.for_shard(ShardType::Edges).compress);
     assert_eq!(
-        policies.state.checksum_policy,
+        policies.for_shard(ShardType::State).checksum_policy,
         mtxdb::packfile::ChecksumPolicy::Full
     );
 }

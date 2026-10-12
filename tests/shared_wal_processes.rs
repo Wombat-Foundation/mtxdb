@@ -1,6 +1,6 @@
 //! Two real OS processes, one shared WAL.
 //!
-//! The parent test is the writer: it opens a [`SharedDatabase`] (which holds
+//! The parent test is the writer: it opens a [`Database`] (which holds
 //! the root writer lock for the process's lifetime) and commits a record to
 //! the shared segment. It then re-executes this test binary as a *separate*
 //! process whose only job is to open the same root read-only and read the
@@ -10,7 +10,6 @@
 //! takes no writer lock, never touches the writer's handle, and must observe
 //! a committed record the writer produced in another process.
 
-#![cfg(feature = "multi-reader")]
 // Integration tests are test code by construction; this file has no non-test
 // items to wrap in a `#[cfg(test)]` module.
 #![allow(clippy::tests_outside_test_module)]
@@ -18,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mtxdb::{NodeData, PackfileStorage, ShardType, SharedDatabase, StorageEngine};
+use mtxdb::{Database, NodeData, PackfileStorage, ShardType, StorageEngine};
 
 const COLLECTION: [u8; 16] = [0x5a; 16];
 const NODE: [u8; 16] = [0x33; 16];
@@ -220,7 +219,7 @@ fn wait_for(path: &Path, timeout: Duration) {
 #[test]
 fn a_reader_process_sees_a_live_writers_committed_record() {
     let root = TempRoot::new("procs");
-    let db = SharedDatabase::open(root.path().to_path_buf()).expect("writer opens the shared root");
+    let db = Database::open(root.path().to_path_buf()).expect("writer opens the shared root");
     let state = db.pool(ShardType::State);
     state
         .put(
@@ -247,7 +246,7 @@ fn a_reader_process_sees_a_live_writers_committed_record() {
 #[test]
 fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
     let root = TempRoot::new("published");
-    let db = SharedDatabase::open(root.path().to_path_buf()).expect("writer opens the shared root");
+    let db = Database::open(root.path().to_path_buf()).expect("writer opens the shared root");
     let state = db.pool(ShardType::State);
 
     // Start the worker while the store is still empty, so its index snapshot
@@ -301,7 +300,7 @@ fn a_stale_worker_sees_a_published_but_not_yet_durable_record() {
 #[test]
 fn a_reader_process_sees_a_transaction_only_after_commit() {
     let root = TempRoot::new("transaction-visibility");
-    let db = SharedDatabase::open(root.path().to_path_buf()).unwrap();
+    let db = Database::open(root.path().to_path_buf()).unwrap();
     let mut reader = spawn_reader_entry(
         "transaction_reader_process_reads_before_during_and_after_commit",
         TRANSACTION_READER_ENV,

@@ -96,7 +96,7 @@ fn payload(kind: PayloadKind, len: usize, seed: usize) -> Vec<u8> {
     bytes
 }
 
-/// Mirrors the non-zstd work in `packfile::write_record`: v3/v4 record
+/// Mirrors the non-zstd work in `packfile::write_record`: record
 /// framing, allocation, and CRC, but deliberately stores plaintext payloads.
 /// Keeping this here lets the benchmark identify the marginal cost of the
 /// current unconditional compressor call without exposing a test-only raw

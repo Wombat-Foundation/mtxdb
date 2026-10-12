@@ -65,8 +65,12 @@
     clippy::uninlined_format_args
 )]
 
+#[path = "support/bench_cache.rs"]
+mod bench_cache;
+use bench_cache::mount_fstype;
+
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -76,7 +80,7 @@ use mtxdb::journal::{Journal, MAX_TXN_STAGE_BYTES};
 use mtxdb::layout::ShardType;
 use mtxdb::packfile::ChecksumPolicy;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb::{PoolPolicies, PoolPolicy, SharedDatabase};
+use mtxdb::{Database, PoolPolicies, PoolPolicy};
 
 /// One fixed collection, so every run fights the same index/shard layout.
 const COLLECTION: [u8; 16] = [0xA5; 16];
@@ -138,7 +142,12 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 fn env_flag(key: &str) -> bool {
     std::env::var(key)
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -148,8 +157,8 @@ fn bench_root() -> PathBuf {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     static RUN: AtomicU64 = AtomicU64::new(0);
     ROOT.get_or_init(|| {
-        let base = std::env::var_os("MTXDB_BENCH_ROOT")
-            .map_or_else(std::env::temp_dir, PathBuf::from);
+        let base =
+            std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
         fs::create_dir_all(&base).unwrap();
         loop {
             let token = RUN.fetch_add(1, Ordering::Relaxed);
@@ -169,28 +178,6 @@ fn bench_root() -> PathBuf {
     .clone()
 }
 
-/// Filesystem type of the mount holding `path`, from `/proc/mounts`. Used only
-/// to label the report, so a run against tmpfs is not mistaken for a cold one.
-fn mount_fstype(path: &Path) -> Option<String> {
-    let canonical = path.canonicalize().ok()?;
-    let mounts = fs::read_to_string("/proc/mounts").ok()?;
-    let mut best: Option<(usize, String)> = None;
-    for line in mounts.lines() {
-        let mut fields = line.split(' ');
-        let _dev = fields.next()?;
-        let mount_point = fields.next()?;
-        let fstype = fields.next()?;
-        let mount_path = Path::new(mount_point);
-        if canonical.starts_with(mount_path) {
-            let depth = mount_path.components().count();
-            if best.as_ref().map_or(true, |(d, _)| depth >= *d) {
-                best = Some((depth, fstype.to_owned()));
-            }
-        }
-    }
-    best.map(|(_, fstype)| fstype)
-}
-
 fn fmt_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = bytes as f64;
@@ -208,18 +195,13 @@ fn fmt_bytes(bytes: u64) -> String {
 
 /// Open one fresh shared-WAL database root, with per-pool compression chosen
 /// by `MTXDB_TXN_COMPRESS`.
-fn open_db(dir: PathBuf, compress: bool) -> SharedDatabase {
+fn open_db(dir: PathBuf, compress: bool) -> Database {
     let policy = PoolPolicy {
         compress,
         checksum_policy: ChecksumPolicy::Full,
     };
-    let policies = PoolPolicies {
-        state: policy,
-        event_dag: policy,
-        edges: policy,
-        server_info: policy,
-    };
-    SharedDatabase::open_with_policies(dir, policies).expect("open shared database")
+    let policies = PoolPolicies::uniform(policy);
+    Database::open_with_policies(dir, policies).expect("open shared database")
 }
 
 // ── Run definitions ─────────────────────────────────────────────────
@@ -252,14 +234,44 @@ struct RunConfig {
 fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
     let batch = batch.max(1);
     let mut configs = vec![
-        RunConfig { name: "plain-single".to_owned(), kind: Kind::PlainSingle, batch: 1, durable: false },
-        RunConfig { name: "plain-single-durable".to_owned(), kind: Kind::PlainSingle, batch: 1, durable: true },
-        RunConfig { name: "plain-many".to_owned(), kind: Kind::PlainMany, batch, durable: false },
-        RunConfig { name: "plain-many-durable".to_owned(), kind: Kind::PlainMany, batch, durable: true },
+        RunConfig {
+            name: "plain-single".to_owned(),
+            kind: Kind::PlainSingle,
+            batch: 1,
+            durable: false,
+        },
+        RunConfig {
+            name: "plain-single-durable".to_owned(),
+            kind: Kind::PlainSingle,
+            batch: 1,
+            durable: true,
+        },
+        RunConfig {
+            name: "plain-many".to_owned(),
+            kind: Kind::PlainMany,
+            batch,
+            durable: false,
+        },
+        RunConfig {
+            name: "plain-many-durable".to_owned(),
+            kind: Kind::PlainMany,
+            batch,
+            durable: true,
+        },
         // `txn-whole` is listed unconditionally; `main` drops it when the whole
         // dataset would exceed the stage budget, which depends on the payload.
-        RunConfig { name: "txn-whole".to_owned(), kind: Kind::TxnWhole, batch: records, durable: false },
-        RunConfig { name: "txn-whole-durable".to_owned(), kind: Kind::TxnWhole, batch: records, durable: true },
+        RunConfig {
+            name: "txn-whole".to_owned(),
+            kind: Kind::TxnWhole,
+            batch: records,
+            durable: false,
+        },
+        RunConfig {
+            name: "txn-whole-durable".to_owned(),
+            kind: Kind::TxnWhole,
+            batch: records,
+            durable: true,
+        },
     ];
     for &size in sweep {
         let size = size.clamp(1, records.max(1));
@@ -303,7 +315,7 @@ struct Sample {
     staged_peak: u64,
 }
 
-fn sync_pool(db: &SharedDatabase) -> Duration {
+fn sync_pool(db: &Database) -> Duration {
     let started = Instant::now();
     db.pool(SHARD).sync().expect("pool sync");
     started.elapsed()
@@ -441,7 +453,11 @@ fn run_once(
             .get(&collection, id)
             .expect("live get")
             .expect("live record must exist");
-        assert_eq!(value.bytes.as_ref(), bytes.as_ref());
+        assert_eq!(
+            value.bytes.as_ref(),
+            bytes.as_ref(),
+            "committed value must match the bytes staged for this record"
+        );
     }
 
     drop(db);
@@ -507,13 +523,22 @@ fn probe_stage_budget(payload: usize) {
         }
     };
     println!();
-    println!("── stage-budget probe (payload {}) ──", fmt_bytes(payload as u64));
-    println!("  budget:            {}", fmt_bytes(MAX_TXN_STAGE_BYTES as u64));
+    println!(
+        "── stage-budget probe (payload {}) ──",
+        fmt_bytes(payload as u64)
+    );
+    println!(
+        "  budget:            {}",
+        fmt_bytes(MAX_TXN_STAGE_BYTES as u64)
+    );
     println!("  accounting:        payload + per-mutation framing (~64 B each),");
     println!("                     so refusal lands below the budget in payload bytes");
     match failure {
         Some((count, bytes, message)) => {
-            println!("  refused at:        {count} records ({} payload)", fmt_bytes(bytes as u64));
+            println!(
+                "  refused at:        {count} records ({} payload)",
+                fmt_bytes(bytes as u64)
+            );
             println!("  error:             {message}");
             println!("  abort after:       ok (a partially-staged transaction still aborts)");
         }
@@ -583,7 +608,9 @@ fn main() {
     let sweep: Vec<usize> = std::env::var("MTXDB_TXN_BATCHES").map_or_else(
         |_| {
             let mut sizes = vec![batch / 4, batch, batch.saturating_mul(4)];
-            sizes.iter_mut().for_each(|size| *size = (*size).clamp(1, records));
+            sizes
+                .iter_mut()
+                .for_each(|size| *size = (*size).clamp(1, records));
             sizes.sort_unstable();
             sizes.dedup();
             sizes
@@ -603,8 +630,15 @@ fn main() {
     println!("  TXN vs PLAIN WRITE BENCHMARK (shared WAL)");
     println!("═══════════════════════════════════════════════════════════════");
     println!("  records:      {records}");
-    println!("  payload:      {} ({})", payload, fmt_bytes((records * payload) as u64));
-    println!("  batch (B):    {batch}  -> {} groups/boundaries", records.div_ceil(batch));
+    println!(
+        "  payload:      {} ({})",
+        payload,
+        fmt_bytes((records * payload) as u64)
+    );
+    println!(
+        "  batch (B):    {batch}  -> {} groups/boundaries",
+        records.div_ceil(batch)
+    );
     println!("  txn sweep:    {sweep:?}");
     println!("  passes:       {passes} (median of stage/commit/sync/ryw/total)");
     println!("  compression:  {}", if compress { "on" } else { "off" });
