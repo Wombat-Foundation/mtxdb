@@ -668,9 +668,10 @@ fn sub_import() -> Command {
             "Import Matrix federation events from a JSON document or JSONL event stream, or an \
              `mtxdb-export/v1` JSONL export, which this command detects from the first line. An \
              export is either a room export (`header`, `event`*, `end` records) or a `server_keys` \
-             export (one `server_keys` record per line); a room export's verdicts and redaction \
-             bookkeeping are stored beside its events, and its `server_keys` records go to the \
-             server-info pool. A JSON document must contain a `pdus` array, an `auth_chain` array, \
+             export (one `server_keys` record per line); an export is written in the \
+             layout a server reads (events, locators, prev/auth edges, verdicts, signing keys), \
+             and a run of exports only ends by committing the import marker; without it the \
+             database is incomplete. A JSON document must contain a `pdus` array, an `auth_chain` array, \
              or both; a `.jsonl` file contains one event per line. Each imported event needs an \
              `event_id`. The collection identity comes from `collection_id` unless --collection \
              is supplied.",
