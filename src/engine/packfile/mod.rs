@@ -740,6 +740,22 @@ fn invalid_data(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
 
+/// The frame length for a record, refusing any a reader would reject: a frame
+/// the writer emits must be one [`read_record`] accepts, so the bound is the
+/// reader's [`MAX_FRAME_LEN`], not the prefix's `u32::MAX`.
+pub(crate) fn checked_frame_len(metadata_len: u32, data_len: u32) -> io::Result<u32> {
+    FRAME_FIXED_LEN
+        .checked_add(metadata_len)
+        .and_then(|len| len.checked_add(data_len))
+        .filter(|len| *len <= MAX_FRAME_LEN)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "record frame exceeds the maximum frame length",
+            )
+        })
+}
+
 /// Largest frame length a reader accepts: a frame lives wholly inside one
 /// shard, and shard offsets are bounded by `IndexEntry::MAX_OFFSET`, so a
 /// longer prefix can only be corruption. This is a sanity ceiling, not a
@@ -959,12 +975,7 @@ pub(crate) fn encode_record_with_options(
     })?;
     // The frame length prefix is a u32; return an input error rather than
     // panicking when the payload and metadata cannot fit in it.
-    FRAME_FIXED_LEN
-        .checked_add(metadata_len)
-        .and_then(|len| len.checked_add(uncompressed_len))
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "record frame exceeds u32::MAX")
-        })?;
+    checked_frame_len(metadata_len, uncompressed_len)?;
 
     #[cfg(feature = "zstd")]
     let compressed = compress

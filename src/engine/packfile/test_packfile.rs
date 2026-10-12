@@ -1346,3 +1346,21 @@ fn test_open_packfile_never_creates_or_initializes() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The writer must refuse exactly the frames the reader would reject, so a
+/// record can never be written that cannot be read back.
+#[test]
+fn frame_length_bound_matches_the_reader() {
+    let room = MAX_FRAME_LEN - FRAME_FIXED_LEN;
+    assert_eq!(checked_frame_len(0, room).unwrap(), MAX_FRAME_LEN);
+    assert_eq!(checked_frame_len(room, 0).unwrap(), MAX_FRAME_LEN);
+    assert_eq!(
+        checked_frame_len(0, room + 1).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        checked_frame_len(1, room).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(checked_frame_len(u32::MAX, u32::MAX).is_err());
+}
