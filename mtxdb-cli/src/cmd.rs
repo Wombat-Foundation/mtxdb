@@ -9355,14 +9355,6 @@ impl ImportContext<'_> {
         validate_establishment_room_version(&events)?;
         export_import::clear_marker(self.db)?;
         let written = export_import::write_room(self.db, export, export_import::BATCH_BYTES)?;
-        let outliers = export
-            .events
-            .iter()
-            .filter(|event| event.metadata.outlier)
-            .count();
-        if outliers > 0 {
-            eprintln!("  outliers: {outliers} (the server has no outlier record; not stored)");
-        }
         eprintln!("  imported {written} events");
         eprintln!("  exported by {}", export.server);
         Ok(written)

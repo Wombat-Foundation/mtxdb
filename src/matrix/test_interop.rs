@@ -13,6 +13,7 @@ fn verdicts_round_trip_and_reject_truncation() {
         rejection: Some(3),
         soft_fail: Some(7),
         redacted_by: Some(b"$redact:example.com".to_vec()),
+        outlier: true,
     };
     let bytes = encode_verdict(b"$event:example.com", &verdict).unwrap();
     let (event_id, decoded) = decode_verdict(&bytes).unwrap();
@@ -187,4 +188,25 @@ fn edge_encoding_is_pinned_and_round_trips() {
     for cut in [1, 3, 5, 8] {
         assert!(decode_edges(&bytes[..cut]).is_err(), "cut at {cut}");
     }
+}
+
+#[test]
+fn outlier_flag_is_part_of_the_verdict_record() {
+    let outlier = Verdict {
+        outlier: true,
+        ..Verdict::default()
+    };
+    assert!(!outlier.is_empty(), "an outlier needs a record");
+    let bytes = encode_verdict(b"$e:x", &outlier).unwrap();
+    // version, flags (outlier = bit 3), u32 length, event id
+    assert_eq!(bytes, [&[1, 0b1000, 4, 0, 0, 0][..], b"$e:x"].concat());
+    assert_eq!(decode_verdict(&bytes).unwrap().1, outlier);
+    let timeline = Verdict::default();
+    assert!(timeline.is_empty());
+    assert!(
+        !decode_verdict(&encode_verdict(b"$e:x", &timeline).unwrap())
+            .unwrap()
+            .1
+            .outlier
+    );
 }

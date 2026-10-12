@@ -4829,13 +4829,42 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
             verdict
         })
     };
-    assert_eq!(verdict("soft").unwrap(), Verdict { soft_fail: Some(2), ..Verdict::default() });
-    assert_eq!(verdict("rejected").unwrap(), Verdict { rejection: Some(7), ..Verdict::default() });
+    assert_eq!(verdict("soft").unwrap(), Verdict { soft_fail: Some(2), outlier: true, ..Verdict::default() });
+    assert_eq!(verdict("rejected").unwrap(), Verdict { rejection: Some(7), outlier: true, ..Verdict::default() });
     assert_eq!(
         verdict("redacted").unwrap(),
         Verdict { redacted_by: Some(b"$redaction:test.conduwuit.local".to_vec()), ..Verdict::default() }
     );
-    assert!(verdict("ok").is_none(), "a clean event needs no verdict record");
+    assert!(verdict("ok").is_none(), "a clean timeline event needs no verdict record");
+}
+
+#[test]
+fn outliers_are_emitted_and_rejected_or_soft_failed_events_never_reach_the_timeline() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    // The exporter marks `$ok` an outlier; `$redacted` stays on the timeline.
+    let content = ROOM_EXPORT_FIXTURE.replace(
+        "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":false",
+        "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":true",
+    );
+    assert_ne!(content, ROOM_EXPORT_FIXTURE, "the fixture line this test edits moved");
+    import_inputs(&db, &root, &[("room.jsonl", &content)]);
+
+    let outlier = |name: &str| {
+        let id = format!("${name}:test.conduwuit.local");
+        let record = mtxdb::interop::event_record_id(id.as_bytes());
+        stored(
+            &db,
+            mtxdb::interop::EVENT_POOL,
+            mtxdb::interop::event_verdict_collection_id(&record),
+            record,
+        )
+        .map(|bytes| mtxdb::interop::decode_verdict(&bytes).unwrap().1.outlier)
+    };
+    assert_eq!(outlier("ok"), Some(true), "an exported outlier stays visible");
+    assert_eq!(outlier("soft"), Some(true), "a soft-failed event is not on the timeline");
+    assert_eq!(outlier("rejected"), Some(true), "a rejected event is not on the timeline");
+    assert_eq!(outlier("redacted"), Some(false), "a redacted timeline event is not an outlier");
 }
 
 #[test]

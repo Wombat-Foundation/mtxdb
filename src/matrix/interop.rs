@@ -53,6 +53,7 @@ pub const VERDICT_VERSION: u8 = 1;
 const HAS_REJECTION: u8 = 1;
 const HAS_SOFT_FAIL: u8 = 1 << 1;
 const HAS_REDACTION: u8 = 1 << 2;
+const IS_OUTLIER: u8 = 1 << 3;
 
 /// Everything recorded about an event beyond its body and edges.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -63,13 +64,20 @@ pub struct Verdict {
     pub soft_fail: Option<u8>,
     /// Event id of the redaction that redacted this event.
     pub redacted_by: Option<Vec<u8>>,
+    /// The event is stored but not on the room's timeline. There is no
+    /// pending state: an event is on the timeline or it is an outlier, and a
+    /// rejected or soft-failed event is never on the timeline.
+    pub outlier: bool,
 }
 
 impl Verdict {
     /// Whether there is nothing worth recording.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rejection.is_none() && self.soft_fail.is_none() && self.redacted_by.is_none()
+        self.rejection.is_none()
+            && self.soft_fail.is_none()
+            && self.redacted_by.is_none()
+            && !self.outlier
     }
 }
 
@@ -98,6 +106,9 @@ pub fn event_verdict_collection_id(node: &[u8; 16]) -> [u8; 16] {
 pub fn encode_verdict(event_id: &[u8], verdict: &Verdict) -> Result<Vec<u8>, StorageError> {
     let too_large = || StorageError::Corrupt("verdict field is too large".to_owned());
     let mut flags = 0_u8;
+    if verdict.outlier {
+        flags |= IS_OUTLIER;
+    }
     if verdict.rejection.is_some() {
         flags |= HAS_REJECTION;
     }
@@ -157,7 +168,10 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(&[u8], Verdict), StorageError> {
     }
     let (event_id, mut rest) = rest.split_at(length);
 
-    let mut verdict = Verdict::default();
+    let mut verdict = Verdict {
+        outlier: flags & IS_OUTLIER != 0,
+        ..Verdict::default()
+    };
     if flags & HAS_REJECTION != 0 {
         let (&code, tail) = rest.split_first().ok_or_else(malformed)?;
         verdict.rejection = Some(code);

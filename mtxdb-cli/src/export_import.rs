@@ -127,6 +127,13 @@ fn verdict_of(metadata: &EventMetadata) -> Verdict {
             .redacted_by
             .as_ref()
             .map(|redactor| redactor.as_bytes().to_vec()),
+        // The server has no pending state: an event is on the timeline or an
+        // outlier, and one the server rejected or soft-failed is never on it.
+        outlier: metadata.outlier
+            || metadata.rejected
+            || metadata.rejection_code.is_some()
+            || metadata.soft_failed
+            || metadata.soft_fail_code.is_some(),
     }
 }
 
