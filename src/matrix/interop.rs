@@ -414,7 +414,9 @@ pub fn encode_edges(edges: &[&[u8]]) -> Result<Vec<u8>, StorageError> {
 
 /// Record id of the per-room auth short-id counter (big-endian `u32`).
 #[must_use]
-pub fn auth_counter_record_id() -> [u8; 16] { derive_id(b"authchain:counter", b"") }
+pub fn auth_counter_record_id() -> [u8; 16] {
+    derive_id(b"authchain:counter", b"")
+}
 
 /// Record id of an event's forward short-id record in the room auth collection.
 #[must_use]
@@ -449,9 +451,9 @@ pub fn encode_auth_forward(short: u32, event_id: &[u8]) -> Vec<u8> {
 /// # Errors
 /// Returns [`StorageError::Corrupt`] for a record shorter than its prefix.
 pub fn decode_auth_forward(bytes: &[u8]) -> Result<(u32, &[u8]), StorageError> {
-    let (short, event) = bytes.split_first_chunk::<4>().ok_or_else(|| {
-        StorageError::Corrupt("malformed auth short-id record".to_owned())
-    })?;
+    let (short, event) = bytes
+        .split_first_chunk::<4>()
+        .ok_or_else(|| StorageError::Corrupt("malformed auth short-id record".to_owned()))?;
     Ok((u32::from_be_bytes(*short), event))
 }
 

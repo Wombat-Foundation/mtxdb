@@ -234,9 +234,15 @@ fn auth_chain_records_are_pinned_and_round_trip() {
 
     let forward = encode_auth_forward(0x0102_0304, b"$e:x");
     assert_eq!(forward, [&[1, 2, 3, 4][..], b"$e:x"].concat());
-    assert_eq!(decode_auth_forward(&forward).unwrap(), (0x0102_0304, &b"$e:x"[..]));
+    assert_eq!(
+        decode_auth_forward(&forward).unwrap(),
+        (0x0102_0304, &b"$e:x"[..])
+    );
     for cut in 0..4 {
-        assert!(decode_auth_forward(&forward[..cut]).is_err(), "cut at {cut}");
+        assert!(
+            decode_auth_forward(&forward[..cut]).is_err(),
+            "cut at {cut}"
+        );
     }
     assert_eq!(decode_auth_counter(&9_u32.to_be_bytes()).unwrap(), 9);
     assert!(decode_auth_counter(&[0, 0, 9]).is_err());
