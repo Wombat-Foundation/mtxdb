@@ -11073,3 +11073,114 @@ fn repack_scan_keeps_a_re_added_key_live_in_a_misordered_layout() {
     drop(store);
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// The repack scanner's removal flag must agree with a direct frame read and
+/// with the raw on-disk flags byte for every frame in a pack that mixes
+/// plain, compressed, metadata-bearing and removal-marker frames, under both
+/// checksum modes.
+#[test]
+fn repack_scan_removal_flag_matches_a_direct_frame_read() {
+    use std::io::{Read, Seek, SeekFrom};
+    let dir = test_dir("scan_removal_flag_matches");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let collection = [0x5Au8; 16];
+    let plain = distinct_id(1);
+    let compressed = distinct_id(2);
+    let verified = distinct_id(3);
+    let marker_only = distinct_id(4);
+
+    store
+        .put(&collection, &plain, &NodeData::from_slice(b"plain frame"))
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &compressed,
+            &NodeData::from_slice(&[0u8; 4096]),
+        )
+        .unwrap();
+    let payload = b"metadata bearing frame";
+    store
+        .put_verified(
+            &collection,
+            &verified,
+            &NodeData::from_slice(payload),
+            &[0x71u8; 32],
+            DigestAlgorithm::Sha256,
+            &crate::storage::content_digest(DigestAlgorithm::Sha256, payload),
+            Some(b"event"),
+        )
+        .unwrap();
+    store
+        .apply_transaction_mutation(
+            &JournalMutation::RemoveRecord {
+                collection_id: collection,
+                node_id: plain,
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .apply_transaction_mutation(
+            &JournalMutation::RemoveRecord {
+                collection_id: collection,
+                node_id: marker_only,
+            },
+            2,
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let mut saw_removed = false;
+    let mut saw_compressed = false;
+    let mut saw_metadata = false;
+    let mut saw_plain = false;
+    for (slot, shard) in store.shards.all_shards() {
+        let mut raw = fs::File::open(&shard.path).unwrap();
+        for verify in [true, false] {
+            let entries = packfile::scan_packfile_with_removal(&shard.path, verify).unwrap();
+            assert!(!entries.is_empty(), "slot {slot} must hold frames");
+            assert_eq!(
+                entries,
+                packfile::scan_packfile_from_with_removal(&shard.path, 0, verify).unwrap(),
+                "the incremental entry point agrees at offset 0"
+            );
+            for entry in &entries {
+                let record = store.read_at(&shard, entry.offset, true).unwrap();
+                let read_removed = record
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.removed);
+                assert_eq!(
+                    entry.removed, read_removed,
+                    "slot {slot} offset {}: scanner vs read_at",
+                    entry.offset
+                );
+
+                raw.seek(SeekFrom::Start(entry.offset)).unwrap();
+                let mut head = [0u8; 5];
+                raw.read_exact(&mut head).unwrap();
+                let flags = head[4];
+                assert_eq!(
+                    entry.removed,
+                    flags & packfile::FLAG_REMOVED != 0,
+                    "slot {slot} offset {}: scanner vs flags byte {flags:#04x}",
+                    entry.offset
+                );
+                saw_removed |= flags & packfile::FLAG_REMOVED != 0;
+                saw_compressed |= flags & packfile::FLAG_COMPRESSED != 0;
+                saw_metadata |= flags & packfile::FLAG_METADATA != 0;
+                saw_plain |= flags == 0;
+            }
+        }
+    }
+    assert!(saw_removed, "the pack must contain a removal marker");
+    assert!(saw_compressed, "the pack must contain a compressed frame");
+    assert!(
+        saw_metadata,
+        "the pack must contain a metadata-bearing frame"
+    );
+    assert!(saw_plain, "the pack must contain a plain frame");
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
