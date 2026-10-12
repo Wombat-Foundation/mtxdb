@@ -3508,3 +3508,99 @@ fn a_removal_frame_must_carry_a_node_id_and_no_payload() {
     let relabelled = with_kind_and_valid_crc(framed(7, &put), 3);
     assert!(super::decode_mutations(&relabelled, 7, 1, 0).is_err());
 }
+
+/// The segment rewrite renames the rebuilt file over the journal and then syncs
+/// the directory. A failed directory sync after the rename leaves the new
+/// segment in place with its rename possibly not durable, so the handle must
+/// refuse further appends rather than acknowledge writes it cannot place.
+#[test]
+fn a_failed_directory_sync_after_the_rewrite_poisons_the_journal() {
+    let dir = ReplayTestDir::new("rewrite_dirsync");
+    let path = dir.journal_path();
+    let (mut journal, _) = Journal::open(&path).unwrap();
+    let first = journal.commit_group(&[put(1, 1, b"first")]).unwrap();
+    let second = journal.commit_group(&[put(1, 2, b"second")]).unwrap();
+
+    crate::shard::fail_directory_sync_after(&dir.0, 0);
+    journal
+        .reclaim_through(first.last_lsn)
+        .expect_err("the rewrite reports the failed directory sync");
+    crate::shard::clear_directory_sync_failure(&dir.0);
+
+    journal
+        .commit_group(&[put(1, 3, b"third")])
+        .expect_err("a poisoned handle acknowledges nothing");
+    assert!(!path.with_extension("rotate").exists(), "no temp file left");
+    drop(journal);
+
+    // Whichever segment the crash leaves, it opens, and the group the rewrite
+    // retained is intact.
+    let (_journal, scan) = Journal::open(&path).unwrap();
+    assert_eq!(scan.groups.len(), 1);
+    assert_eq!(scan.groups[0].last_lsn, second.last_lsn);
+}
+
+/// A crash after the temp file is written but before it is renamed leaves the
+/// old segment authoritative and a stray temp file. Opening must ignore the
+/// temp, and the next rewrite must replace it.
+#[test]
+fn a_stray_rewrite_temp_file_does_not_disturb_the_segment() {
+    let dir = ReplayTestDir::new("rewrite_stray_temp");
+    let path = dir.journal_path();
+    let (mut journal, _) = Journal::open(&path).unwrap();
+    let first = journal.commit_group(&[put(1, 1, b"first")]).unwrap();
+    let second = journal.commit_group(&[put(1, 2, b"second")]).unwrap();
+    drop(journal);
+
+    fs::write(
+        path.with_extension("rotate"),
+        b"half-written rebuilt segment",
+    )
+    .unwrap();
+
+    let (mut journal, scan) = Journal::open(&path).unwrap();
+    assert_eq!(scan.groups.len(), 2, "the old segment is whole");
+    assert_eq!(scan.groups[1].last_lsn, second.last_lsn);
+
+    journal.reclaim_through(first.last_lsn).unwrap();
+    assert!(
+        !path.with_extension("rotate").exists(),
+        "the rewrite replaced the stray temp file"
+    );
+    drop(journal);
+    let (_journal, scan) = Journal::open(&path).unwrap();
+    assert_eq!(scan.groups.len(), 1);
+}
+
+/// A crash between the rename and the directory sync leaves either the old or
+/// the new segment on disk. Both must open, and numbering must continue from
+/// the same point either way, so no LSN is handed out twice.
+#[test]
+fn either_segment_a_rewrite_crash_leaves_opens_and_numbers_consistently() {
+    let dir = ReplayTestDir::new("rewrite_either");
+    let path = dir.journal_path();
+    let (mut journal, _) = Journal::open(&path).unwrap();
+    let first = journal.commit_group(&[put(1, 1, b"first")]).unwrap();
+    let second = journal.commit_group(&[put(1, 2, b"second")]).unwrap();
+    let old_image = fs::read(&path).unwrap();
+
+    journal.reclaim_through(first.last_lsn).unwrap();
+    drop(journal);
+    let new_image = fs::read(&path).unwrap();
+    assert_ne!(old_image, new_image, "the rewrite changed the file");
+
+    let mut next_lsns = Vec::new();
+    for (name, image, groups) in [("old", &old_image, 2), ("new", &new_image, 1)] {
+        fs::write(&path, image).unwrap();
+        let (mut journal, scan) = Journal::open(&path).unwrap();
+        assert_eq!(scan.groups.len(), groups, "{name} segment");
+        assert_eq!(scan.groups.last().unwrap().last_lsn, second.last_lsn);
+        let third = journal.commit_group(&[put(1, 3, b"third")]).unwrap();
+        next_lsns.push(third.first_lsn);
+    }
+    assert_eq!(
+        next_lsns[0], next_lsns[1],
+        "numbering continues identically"
+    );
+    assert_eq!(next_lsns[0], second.last_lsn.saturating_add(1));
+}
