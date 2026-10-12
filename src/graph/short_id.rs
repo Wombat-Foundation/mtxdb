@@ -308,13 +308,21 @@ fn decode_counter(bytes: &[u8]) -> Result<ScopeCounters, StorageError> {
     if body.len() != 20 {
         return Err(StorageError::Corrupt("short-id counter length".to_owned()));
     }
-    Ok(ScopeCounters {
+    let counters = ScopeCounters {
         next_id: read_u32(&body[..4], "counter")?,
         next_owner_seq: read_u32(&body[4..8], "counter")?,
         log_epoch: read_u32(&body[8..12], "counter")?,
         log_epoch_start_seq: read_u32(&body[12..16], "counter")?,
         manifest_version: read_u32(&body[16..20], "counter")?,
-    })
+    };
+    // Ids and owner sequence numbers start at 1, so a counter naming 0 would
+    // allocate a number the scope never hands out and `verify` never visits.
+    if counters.next_id == 0 || counters.next_owner_seq == 0 || counters.log_epoch_start_seq == 0 {
+        return Err(StorageError::Corrupt(
+            "short-id counter names a zero id or sequence".to_owned(),
+        ));
+    }
+    Ok(counters)
 }
 
 fn encode_forward(short_id: u32, owner: bool, key: &[u8]) -> Vec<u8> {
@@ -1412,4 +1420,35 @@ struct Attempt {
     recorded: RecordedEvent,
     ids: Vec<u32>,
     commit_needed: bool,
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    #[test]
+    fn counters_that_name_zero_are_corrupt() {
+        let valid = ScopeCounters::default();
+        assert_eq!(decode_counter(&encode_counter(valid)).unwrap(), valid);
+        for broken in [
+            ScopeCounters {
+                next_id: 0,
+                ..valid
+            },
+            ScopeCounters {
+                next_owner_seq: 0,
+                ..valid
+            },
+            ScopeCounters {
+                log_epoch_start_seq: 0,
+                ..valid
+            },
+        ] {
+            let error = decode_counter(&encode_counter(broken)).unwrap_err();
+            assert!(
+                matches!(error, StorageError::Corrupt(_)),
+                "{broken:?}: {error:?}"
+            );
+        }
+    }
 }
