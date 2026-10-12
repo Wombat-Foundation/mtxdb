@@ -263,38 +263,79 @@ impl DatabaseTransaction<'_> {
         collection_id: [u8; 16],
         node_id: NodeId,
     ) -> io::Result<()> {
+        self.remove_many(pool, collection_id, std::slice::from_ref(&node_id))
+    }
+
+    /// Stage removal of many records in one collection. Same semantics as
+    /// [`Self::remove`] per key, but the liveness read, the staged-mutation
+    /// scan and the budget accounting happen once for the whole batch instead
+    /// of once per key, so a sweep removing N keys costs O(N) rather than
+    /// O(N²). Duplicate keys are removed once.
+    ///
+    /// # Errors
+    /// Returns an error if the transaction is inactive, staging exceeds its
+    /// configured limit, or the read needed to establish liveness fails.
+    /// Nothing is staged when the budget check fails.
+    pub fn remove_many(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_ids: &[NodeId],
+    ) -> io::Result<()> {
         let _lifecycle = self.lifecycle.lock();
         if self.stage.state() != TxnStageState::Active {
             return Err(io::Error::other("transaction stage is not active"));
         }
-        if matches!(
-            self.stage.lookup(pool, &collection_id, &node_id),
-            StagedLookup::Deleted
-        ) {
+        let mut seen = std::collections::HashSet::with_capacity(node_ids.len());
+        let unique: Vec<NodeId> = node_ids
+            .iter()
+            .copied()
+            .filter(|node_id| seen.insert(*node_id))
+            .collect();
+        if unique.is_empty() {
             return Ok(());
         }
 
-        // Read the live value and its version together. The version
-        // precondition closes the race between this existence check and WAL
+        // Keys this transaction already removed (or whose collection it
+        // deleted) need no further work.
+        let staged = self.stage.lookup_many(pool, &collection_id, &unique);
+        let pending: Vec<NodeId> = unique
+            .iter()
+            .zip(staged)
+            .filter(|(_, lookup)| !matches!(lookup, StagedLookup::Deleted))
+            .map(|(node_id, _)| *node_id)
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // Read the live values and their versions together. The version
+        // preconditions close the race between this existence check and WAL
         // publication; a concurrent writer makes this transaction stale.
         let (live, versions) = self
             .database
             .pool(pool)
-            .get_with_record_versions(&collection_id, std::slice::from_ref(&node_id))
+            .get_with_record_versions(&collection_id, &pending)
             .map_err(|error| io::Error::other(error.to_string()))?;
-        self.stage
-            .stage_record_expectation(pool, collection_id, node_id, versions[0])?;
-
-        // Normalize any earlier staged put for this key. If the live key was
-        // absent, put-then-remove becomes a genuine no-op. Otherwise the
-        // removal marker replaces it directly.
-        self.stage
-            .forget_staged_record(pool, collection_id, node_id)?;
-        if live[0].is_some() {
+        for (node_id, version) in pending.iter().zip(&versions) {
             self.stage
-                .stage_remove_record(pool, collection_id, node_id)?;
+                .stage_record_expectation(pool, collection_id, *node_id, *version)?;
         }
-        Ok(())
+
+        // Normalize any earlier staged put for these keys. A key that was
+        // absent live becomes a genuine no-op after put-then-remove; a live
+        // key gets the removal marker directly.
+        let forget: std::collections::HashSet<NodeId> = pending.iter().copied().collect();
+        self.stage
+            .forget_staged_records(pool, collection_id, &forget)?;
+        let live_ids: Vec<NodeId> = pending
+            .iter()
+            .zip(&live)
+            .filter(|(_, value)| value.is_some())
+            .map(|(node_id, _)| *node_id)
+            .collect();
+        self.stage
+            .stage_remove_records(pool, collection_id, &live_ids)
     }
 
     /// Stage a collection-version precondition. [`Self::commit`] rejects the

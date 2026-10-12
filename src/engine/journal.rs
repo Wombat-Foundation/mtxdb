@@ -671,6 +671,51 @@ impl TxnStage {
         Ok(())
     }
 
+    /// Add per-record removals for many keys at once, charging the stage
+    /// budget in one step. Same contract as [`Self::stage_remove_record`]: the
+    /// caller has already established that each key is live.
+    ///
+    /// # Errors
+    /// Returns an error if the stage is inactive or the batch would exceed its
+    /// size limit; on error nothing is staged.
+    pub fn stage_remove_records(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_ids: &[[u8; 16]],
+    ) -> io::Result<()> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        let charge = node_ids.len().checked_mul(64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction stage size overflow",
+            )
+        })?;
+        let total = data.bytes.checked_add(charge).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction stage size overflow",
+            )
+        })?;
+        if total > self.limit_bytes {
+            return Err(stage_too_large_with_limit(total, self.limit_bytes));
+        }
+        let index = pool_index(pool);
+        data.pools[index].extend(node_ids.iter().map(|node_id| Mutation::RemoveRecord {
+            collection_id,
+            node_id: *node_id,
+        }));
+        data.applied[index].extend(vec![false; node_ids.len()]);
+        data.bytes = total;
+        Ok(())
+    }
+
     /// Remove staged point mutations for a key whose live value is absent.
     /// Used to normalize `put` then `remove` into a true no-op before publish.
     ///
@@ -682,29 +727,50 @@ impl TxnStage {
         collection_id: [u8; 16],
         node_id: [u8; 16],
     ) -> io::Result<()> {
+        self.forget_staged_records(pool, collection_id, &HashSet::from([node_id]))
+    }
+
+    /// Drop every staged put or removal for the given keys in one pass over
+    /// the pool's staged mutations, releasing exactly the budget they held.
+    ///
+    /// # Errors
+    /// Returns an error if the stage is inactive.
+    pub fn forget_staged_records(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_ids: &HashSet<[u8; 16]>,
+    ) -> io::Result<()> {
         let mut data = self.data.lock();
         if self.state.load(Ordering::Acquire) != Self::ACTIVE {
             return Err(io::Error::other("transaction stage is not active"));
         }
         let index = pool_index(pool);
+        let mut released = 0usize;
         data.pools[index].retain(|mutation| {
-            !matches!(mutation,
-                Mutation::Put { collection_id: c, node_id: n, .. }
-                    | Mutation::RemoveRecord { collection_id: c, node_id: n }
-                    if *c == collection_id && *n == node_id)
+            let (c, node, charge) = match mutation {
+                Mutation::Put {
+                    collection_id: c,
+                    node_id,
+                    payload,
+                } => (c, node_id, payload.len().saturating_add(64)),
+                Mutation::RemoveRecord {
+                    collection_id: c,
+                    node_id,
+                } => (c, node_id, 64),
+                Mutation::DeleteCollection { .. } => return true,
+            };
+            if *c == collection_id && node_ids.contains(node) {
+                released = released.saturating_add(charge);
+                false
+            } else {
+                true
+            }
         });
         // This helper only runs while the stage is active, before publication;
         // no mutation can have been applied yet.
         data.applied[index] = vec![false; data.pools[index].len()];
-        data.bytes = data
-            .pools
-            .iter()
-            .flatten()
-            .map(|mutation| match mutation {
-                Mutation::Put { payload, .. } => payload.len().saturating_add(64),
-                Mutation::RemoveRecord { .. } | Mutation::DeleteCollection { .. } => 64,
-            })
-            .sum();
+        data.bytes = data.bytes.saturating_sub(released);
         Ok(())
     }
 

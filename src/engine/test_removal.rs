@@ -1126,3 +1126,201 @@ fn removals_page_across_a_page_boundary_in_order() {
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ----------------------------------------------------------- batch removal ---
+
+fn limited_txn(db: &Database, limit_bytes: usize) -> DatabaseTransaction<'_> {
+    DatabaseTransaction {
+        database: super::DatabaseRef::Borrowed(db),
+        stage: Arc::new(crate::journal::TxnStage::with_limit(limit_bytes)),
+        lifecycle: parking_lot::Mutex::new(()),
+    }
+}
+
+/// A batch removes the live keys, ignores absent and duplicate ones, and
+/// leaves every other key and the version of untouched collections alone.
+#[test]
+fn remove_many_removes_live_keys_and_ignores_absent_and_duplicate_ones() {
+    let root = test_root("remove_many_basic");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xa1; 16];
+    let pool = ShardType::State;
+    for id in 1..=5u8 {
+        put_committed(&db, pool, collection, node(id), b"v");
+    }
+
+    let txn = db.begin_transaction();
+    txn.remove_many(
+        pool,
+        collection,
+        &[node(1), node(2), node(2), node(50), node(4)],
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    for gone in [1u8, 2, 4] {
+        assert_eq!(live(&db, pool, collection, node(gone)), None);
+    }
+    for kept in [3u8, 5] {
+        assert_eq!(live(&db, pool, collection, node(kept)), Some(b"v".to_vec()));
+    }
+    assert_eq!(live(&db, pool, collection, node(50)), None);
+    drop(txn);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A batch of only absent keys writes nothing and keeps the version, exactly
+/// like repeated single removes.
+#[test]
+fn remove_many_of_only_absent_keys_does_not_advance_the_version() {
+    let root = test_root("remove_many_absent");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xa2; 16];
+    let pool = ShardType::State;
+    put_committed(&db, pool, collection, node(1), b"v");
+    let (_, before) = db
+        .pool(pool)
+        .get_with_collection_version(&collection, &[node(1)])
+        .unwrap();
+
+    let txn = db.begin_transaction();
+    txn.remove_many(pool, collection, &[node(8), node(9)])
+        .unwrap();
+    txn.commit().unwrap();
+
+    let (_, after) = db
+        .pool(pool)
+        .get_with_collection_version(&collection, &[node(1)])
+        .unwrap();
+    assert_eq!(before, after);
+    drop(txn);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Staged puts are normalized per key, as with single removes: put-then-remove
+/// of a never-live key is a no-op, of a live key a removal.
+#[test]
+fn remove_many_normalizes_earlier_staged_puts() {
+    let root = test_root("remove_many_staged");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xa3; 16];
+    let pool = ShardType::State;
+    put_committed(&db, pool, collection, node(1), b"old");
+
+    let txn = db.begin_transaction();
+    txn.put(pool, collection, node(1), &data(b"new")).unwrap(); // live key
+    txn.put(pool, collection, node(2), &data(b"new")).unwrap(); // never live
+    txn.remove_many(pool, collection, &[node(1), node(2)])
+        .unwrap();
+    txn.commit().unwrap();
+
+    assert_eq!(live(&db, pool, collection, node(1)), None);
+    assert_eq!(live(&db, pool, collection, node(2)), None);
+    drop(txn);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The whole batch is resolved with one staged-mutation scan, not one per key.
+#[test]
+fn remove_many_scans_the_stage_once_for_the_whole_batch() {
+    let root = test_root("remove_many_scan_once");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xa4; 16];
+    let pool = ShardType::State;
+    let ids: Vec<NodeId> = (0..=255u8).map(node).collect();
+    for id in &ids {
+        put_committed(&db, pool, collection, *id, b"v");
+    }
+    let txn = db.begin_transaction();
+    let before = txn.stage.lookup_many_calls();
+    txn.remove_many(pool, collection, &ids).unwrap();
+    assert_eq!(txn.stage.lookup_many_calls() - before, 1);
+    txn.commit().unwrap();
+    for id in &ids {
+        assert_eq!(live(&db, pool, collection, *id), None);
+    }
+    drop(txn);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Normalizing a staged put releases exactly the budget it held, so repeating
+/// put-then-remove does not exhaust the stage.
+#[test]
+fn remove_many_releases_the_budget_of_the_puts_it_forgets() {
+    let root = test_root("remove_many_budget");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xa5; 16];
+    let pool = ShardType::State;
+    let txn = limited_txn(&db, 1000);
+    for _ in 0..200 {
+        txn.put(pool, collection, node(1), &data(b"x")).unwrap();
+        txn.remove_many(pool, collection, &[node(1)]).unwrap();
+    }
+    drop(txn);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A batch that does not fit the budget stages nothing, and a smaller batch
+/// still fits afterwards.
+#[test]
+fn an_oversized_remove_many_stages_nothing() {
+    let root = test_root("remove_many_oversized");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xa6; 16];
+    let pool = ShardType::State;
+    let ids: Vec<NodeId> = (1..=5u8).map(node).collect();
+    for id in &ids {
+        put_committed(&db, pool, collection, *id, b"v");
+    }
+    // Room for three removals (64 bytes each), not five.
+    let txn = limited_txn(&db, 64 * 3);
+    assert!(txn.remove_many(pool, collection, &ids).is_err());
+    let seen = txn.get(pool, &collection, &ids).unwrap();
+    assert!(
+        seen.iter().all(Option::is_some),
+        "a rejected batch must not hide any key from its own transaction"
+    );
+    txn.remove_many(pool, collection, &ids[..3]).unwrap();
+    txn.commit().unwrap();
+    for id in &ids[..3] {
+        assert_eq!(live(&db, pool, collection, *id), None);
+    }
+    for id in &ids[3..] {
+        assert_eq!(live(&db, pool, collection, *id), Some(b"v".to_vec()));
+    }
+    drop(txn);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Removing many keys loses to a concurrent write of any one of them.
+#[test]
+fn remove_many_is_stale_if_any_key_changed_concurrently() {
+    let root = test_root("remove_many_stale");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xa7; 16];
+    let pool = ShardType::State;
+    put_committed(&db, pool, collection, node(1), b"v1");
+    put_committed(&db, pool, collection, node(2), b"v1");
+
+    let remover = db.begin_transaction();
+    remover
+        .remove_many(pool, collection, &[node(1), node(2)])
+        .unwrap();
+    put_committed(&db, pool, collection, node(2), b"v2");
+
+    assert!(matches!(
+        remover.commit(),
+        Err(StorageError::StaleRead { .. })
+    ));
+    assert_eq!(live(&db, pool, collection, node(1)), Some(b"v1".to_vec()));
+    assert_eq!(live(&db, pool, collection, node(2)), Some(b"v2".to_vec()));
+    drop(remover);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
