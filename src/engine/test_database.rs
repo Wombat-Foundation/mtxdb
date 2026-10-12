@@ -1031,6 +1031,86 @@ fn concurrent_reads_see_every_finished_commit() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// One transaction writes nodes and the root that names them, across two
+/// pools and two collections. A reader that observes a root must also observe
+/// every node the root names: the root is never visible before its nodes, even
+/// while the commit is part-way through materializing.
+#[test]
+fn a_reader_never_sees_a_root_before_its_nodes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const ROUNDS: u8 = 200;
+    let root = test_root("root_after_nodes");
+    let db = Arc::new(Database::open(root.clone()).unwrap());
+    let nodes_collection = [0x7a; 16];
+    let sibling_collection = [0x7b; 16];
+    let roots_collection = [0x7c; 16];
+    let done = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let db = Arc::clone(&db);
+        let done = Arc::clone(&done);
+        std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(move || {
+                for seq in 1..=ROUNDS {
+                    let txn = db.begin_transaction();
+                    txn.put(
+                        ShardType::State,
+                        nodes_collection,
+                        node(seq),
+                        &data(b"node"),
+                    )
+                    .unwrap();
+                    txn.put(
+                        ShardType::State,
+                        sibling_collection,
+                        node(seq),
+                        &data(b"sib"),
+                    )
+                    .unwrap();
+                    txn.put(
+                        ShardType::EventDag,
+                        roots_collection,
+                        node(0),
+                        &NodeData::new(bytes::Bytes::copy_from_slice(&[seq])),
+                    )
+                    .unwrap();
+                    txn.commit().unwrap();
+                }
+                done.store(true, Ordering::Release);
+            })
+            .unwrap()
+    };
+    let state = Arc::clone(db.pool(ShardType::State));
+    let roots = Arc::clone(db.pool(ShardType::EventDag));
+    let mut last_seen = 0u8;
+    while !done.load(Ordering::Acquire) {
+        let read = roots
+            .get_read_committed(&roots_collection, &[node(0)])
+            .unwrap();
+        let Some(published) = read[0].as_ref() else {
+            continue;
+        };
+        let seq = published.bytes[0];
+        assert!(
+            seq >= last_seen,
+            "root went backwards: {seq} after {last_seen}"
+        );
+        last_seen = seq;
+        for collection in [nodes_collection, sibling_collection] {
+            let nodes = state.get_read_committed(&collection, &[node(seq)]).unwrap();
+            assert!(
+                nodes[0].is_some(),
+                "root {seq} was visible before its node in collection {collection:?}"
+            );
+        }
+    }
+    writer.join().unwrap();
+    drop(state);
+    drop(roots);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// While a transaction overlay is active, a read of a key the overlay does
 /// not hold must fall through to the live index once, not bounce between
 /// the overlay path and the durable path until the stack overflows.
