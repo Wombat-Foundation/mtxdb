@@ -296,20 +296,12 @@ fn estimate(event: &RoomEvent, room_id: &str, verdict: &Verdict, edges: usize) -
         .saturating_add(verdict_bytes)
 }
 
-/// Write a room's events, edges, locators and verdicts in capped batches.
+/// Write a room's events, edges, locators and verdicts in capped batches,
+/// also returning what the room's edges said about events that could not be
+/// authorized, for the caller to report.
 ///
 /// All of one event's records share a transaction. Returns how many event
 /// records were written. The marker is the caller's to commit.
-pub(crate) fn write_room(
-    db: &Database,
-    export: &RoomExport,
-    batch_bytes: usize,
-) -> anyhow::Result<u64> {
-    write_room_with_findings(db, export, batch_bytes).map(|(written, _)| written)
-}
-
-/// [`write_room`], also returning what the room's edges said about events that
-/// could not be authorized, for the caller to report.
 pub(crate) fn write_room_with_findings(
     db: &Database,
     export: &RoomExport,

@@ -5114,7 +5114,8 @@ fn a_room_import_in_capped_batches_writes_every_event() {
 
     // Room for about two events per batch, so the room takes several commits.
     let cap = largest.saturating_mul(2).saturating_add(2048);
-    assert_eq!(export_import::write_room(&db, &export, cap).unwrap(), 5);
+    let (written, _) = export_import::write_room_with_findings(&db, &export, cap).unwrap();
+    assert_eq!(written, 5);
     for event in &export.events {
         let record = event_record_id(event.event_id.as_bytes());
         assert!(
@@ -5131,7 +5132,7 @@ fn a_room_import_in_capped_batches_writes_every_event() {
     }
 
     // One event larger than a batch is an error, not a silent overrun.
-    let error = export_import::write_room(&db, &export, 64)
+    let error = export_import::write_room_with_findings(&db, &export, 64)
         .unwrap_err()
         .to_string();
     assert!(error.contains("batch limit"), "{error}");
