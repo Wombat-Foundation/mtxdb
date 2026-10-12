@@ -1048,3 +1048,7 @@ fn stale_read_from_publish(error: std::io::Error) -> StorageError {
 #[cfg(test)]
 #[path = "test_database.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "test_removal.rs"]
+mod removal_tests;
