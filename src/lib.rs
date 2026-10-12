@@ -4,6 +4,34 @@
 //! physical reclamation happens during background repack, which rewrites only
 //! reachable data in traversal order.
 //!
+//! # Removal
+//!
+//! Removing a key (`DatabaseTransaction::remove` / `remove_many`) appends a new
+//! version of the record: an empty frame carrying `FLAG_REMOVED`. It is not a
+//! tombstone in the index or the redo/delta logs; the index entry simply points
+//! at the newest version, and every read, scan and count of live records treats
+//! a removed version as absent. An empty payload alone is an ordinary live
+//! value. Removing a key that is not live writes nothing and leaves the
+//! collection version unchanged, and a later put of the same key supersedes the
+//! removal.
+//!
+//! Space comes back only at repack. A repack drops a removal marker once no
+//! older copy of the key can survive, and carries it forward while a retained
+//! shard (one another collection still references) may still hold the older
+//! value, so a rebuild from the shards never brings the key back. The order of
+//! versions is the pack's creation sequence and the frame's offset, never the
+//! runtime shard slot or a journal LSN.
+//!
+//! # Compatibility
+//!
+//! Removal is a one-way format addition. A pack that holds a removal frame sets
+//! a frame flag that builds without removal support reject (an unknown frame
+//! flag is an error, never skipped), and a journal group that holds a removal
+//! uses a mutation kind those builds reject as malformed. Either way an older
+//! build refuses to open the store rather than ignore a removal or read the
+//! older value; it does not truncate the journal. A store that has never
+//! recorded a removal remains readable by older builds.
+//!
 //! Licensed under either of MIT or Apache-2.0, at your option. See
 //! `LICENSE-MIT` and `LICENSE-APACHE`.
 //!
