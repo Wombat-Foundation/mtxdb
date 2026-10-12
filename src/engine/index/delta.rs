@@ -1158,10 +1158,10 @@ pub fn append_batch_with_durability(
     appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
     if durable {
         file.sync_data()?;
-        if write_header {
-            if let Some(parent) = path.parent() {
-                crate::shard::sync_directory(parent)?;
-            }
+        // Always, not only with the header: an earlier non-durable batch may
+        // have created the file, and this batch's claim rests on it existing.
+        if let Some(parent) = path.parent() {
+            crate::shard::sync_directory(parent)?;
         }
     }
     Ok(appended)

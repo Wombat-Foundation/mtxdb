@@ -11580,3 +11580,44 @@ fn one_pools_undurable_checkpoint_keeps_the_shared_wal_for_the_other_directory()
     );
     crate::shard::clear_directory_sync_failure(&dir_b);
 }
+
+/// A log created by an earlier non-durable batch is not durable as a directory
+/// entry. A later coverage batch must sync the directory too, and if it cannot,
+/// no claim is made.
+#[test]
+fn a_coverage_batch_syncs_the_directory_of_a_log_an_earlier_batch_created() {
+    let dir = test_dir("delta_dirsync");
+    let wal = dir.join("wal.bin");
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    let put = |i: u8| {
+        writer
+            .put(
+                &[0x4Du8; 16],
+                &[i; 16],
+                &NodeData::new(bytes::Bytes::from(vec![i; 16])),
+            )
+            .unwrap();
+    };
+    put(1);
+    writer.sync().unwrap();
+    put(2);
+    writer.sync().unwrap();
+    assert!(fs::read_dir(&dir).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("index.delta.")
+    }));
+    let before = writer.durable_coverage();
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+    crate::shard::fail_directory_sync_after(&dir, 0);
+    put(3);
+    let _ = writer.sync();
+    assert_eq!(
+        writer.durable_coverage(),
+        before,
+        "claimed coverage without a durable log entry"
+    );
+    crate::shard::clear_directory_sync_failure(&dir);
+}
