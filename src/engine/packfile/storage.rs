@@ -11941,7 +11941,9 @@ fn write_journal_lsn_file(
         .and_then(|file| file.sync_all())
         .map_err(StorageError::Io)?;
     fs::rename(&tmp, &path).map_err(StorageError::Io)?;
-    let _ = crate::shard::sync_directory(base_dir);
+    // The coverage this file records is what the journal may drop, so the
+    // rename must be durable before the coverage is acknowledged.
+    crate::shard::sync_directory(base_dir).map_err(StorageError::Io)?;
     durable_coverage.fetch_max(lsn, Ordering::AcqRel);
     Ok(())
 }
@@ -12062,12 +12064,19 @@ impl CheckpointTail {
         .map_err(StorageError::Io)?;
         done.write = write_started.elapsed();
         done.checkpoint_bytes = fs::metadata(&path).map_or(0, |meta| meta.len());
-        // The rename is only durable once the directory is synced. Best-effort:
-        // a crash before it either observes the rename or falls back to the
-        // still-valid predecessor checkpoint, never a torn one.
+        // The rename is only durable once the directory is synced. Without a
+        // coverage claim this is best-effort: a crash before it either observes
+        // the rename or falls back to the still-valid predecessor checkpoint,
+        // never a torn one. A coverage claim lets the journal drop the WAL
+        // behind it, including the collection versions only the checkpoint
+        // carries, so the claim must not be made on a rename that may not be
+        // durable: a failure here abandons the checkpoint and keeps the WAL.
         let directory_started = std::time::Instant::now();
-        let _ = crate::shard::sync_directory(&self.base_dir);
+        let directory_synced = crate::shard::sync_directory(&self.base_dir);
         done.directory_sync = directory_started.elapsed();
+        if self.journal.is_some() && self.covered_lsn.is_some() {
+            directory_synced.map_err(StorageError::Io)?;
+        }
         // The image is durable; record the LSN it covers so a reopen replays only
         // what follows, and let the journal drop what the packs now cover. The
         // pack fsync happened before the handoff, so everything through the LSN

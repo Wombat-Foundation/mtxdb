@@ -11186,3 +11186,131 @@ fn repack_scan_removal_flag_matches_a_direct_frame_read() {
     drop(store);
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// A checkpoint that reports WAL coverage claims the journal can drop what the
+/// packs and the checkpoint now hold. The checkpoint's rename is durable only
+/// once its directory is synced, so a failed directory sync must stop the
+/// claim: the WAL stays whole until a later checkpoint is durable.
+#[test]
+fn a_failed_checkpoint_directory_sync_does_not_reclaim_the_wal() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("dirsync_wal");
+    let store_dir = test_dir("dirsync_store");
+    let wal = wal_dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(7),
+            &NodeData::new(bytes::Bytes::from_static(b"acknowledged")),
+        )
+        .unwrap();
+    coordinator.sync().unwrap();
+
+    crate::shard::fail_directory_sync_after(&store_dir, 0);
+    let _ = store.sync_all();
+    assert_eq!(
+        Journal::scan_read_only(&wal).unwrap().groups.len(),
+        1,
+        "the WAL group was reclaimed although the checkpoint's directory sync failed"
+    );
+
+    // Once the directory can be synced the next checkpoint covers and reclaims.
+    crate::shard::clear_directory_sync_failure(&store_dir);
+    store.sync_all().unwrap();
+    assert_eq!(
+        Journal::scan_read_only(&wal).unwrap().groups.len(),
+        0,
+        "a durable checkpoint reclaims the covered group"
+    );
+    drop(store);
+    drop(coordinator);
+}
+
+/// The checkpoint is durable and the WAL rewrite's rename is lost in a crash,
+/// so the old, longer WAL comes back beside the new checkpoint. The groups it
+/// still holds are already in the packs: replaying them must neither lose nor
+/// duplicate a record, and the collection version must not move backwards.
+#[test]
+fn a_lost_wal_rewrite_beside_a_durable_checkpoint_recovers_cleanly() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("lost_rewrite_wal");
+    let store_dir = test_dir("lost_rewrite_store");
+    let wal = wal_dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    for i in 0..5_u8 {
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(i),
+                &NodeData::new(bytes::Bytes::from(vec![i; 8])),
+            )
+            .unwrap();
+    }
+    coordinator.sync().unwrap();
+    let expected_version = coordinator.collection_version(ShardType::State, &TEST_COLLECTION);
+    let old_wal = std::fs::read(&wal).unwrap();
+
+    // The checkpoint becomes durable and the journal is rewritten.
+    store.sync_all().unwrap();
+    assert!(
+        Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
+        "the covered groups were reclaimed"
+    );
+    drop(store);
+    drop(coordinator);
+
+    // The crash: the checkpoint is on disk, the rewrite's rename is not.
+    std::fs::write(&wal, &old_wal).unwrap();
+
+    let (journal, scan) = Journal::open_shared(&wal).unwrap();
+    assert!(
+        !scan.groups.is_empty(),
+        "the old segment still holds its groups"
+    );
+    let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+    let reopened = PackfileStorage::open(store_dir.clone()).unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+        .unwrap();
+    for i in 0..5_u8 {
+        assert_eq!(
+            reopened
+                .get(&TEST_COLLECTION, &distinct_id(i))
+                .unwrap()
+                .expect("acknowledged record survives")
+                .bytes
+                .as_ref(),
+            vec![i; 8].as_slice(),
+            "record {i}"
+        );
+    }
+    assert_eq!(
+        reopened.collection_len(&TEST_COLLECTION).unwrap(),
+        Some(5),
+        "replaying already-materialized groups must not duplicate records"
+    );
+    assert!(
+        recovered.collection_version(ShardType::State, &TEST_COLLECTION) >= expected_version,
+        "the collection version never moves backwards"
+    );
+    drop(reopened);
+}

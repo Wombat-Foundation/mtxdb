@@ -88,6 +88,10 @@ pub(crate) fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
 /// which persists the directory's entries — the same approach `SQLite`'s Win32
 /// VFS uses. `custom_flags` is safe, so this needs no FFI or new dependency.
 pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = injected_directory_sync_failure(dir) {
+        return Err(error);
+    }
     #[cfg(unix)]
     {
         File::open(dir)?.sync_all()
@@ -111,6 +115,40 @@ pub(crate) fn sync_directory(dir: &Path) -> io::Result<()> {
             "directory sync is unsupported on this platform",
         ))
     }
+}
+
+/// Test-only: directories whose `sync_directory` fails, with the number of
+/// calls to let through first. Keyed by path so parallel tests do not see each
+/// other's injections.
+#[cfg(test)]
+static DIRECTORY_SYNC_FAILURES: parking_lot::Mutex<Vec<(std::path::PathBuf, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Test-only: make `sync_directory(dir)` fail once `allow` calls have passed.
+#[cfg(test)]
+pub(crate) fn fail_directory_sync_after(dir: &Path, allow: usize) {
+    let mut failures = DIRECTORY_SYNC_FAILURES.lock();
+    failures.retain(|(path, _)| path != dir);
+    failures.push((dir.to_path_buf(), allow));
+}
+
+/// Test-only: stop injecting failures for `dir`.
+#[cfg(test)]
+pub(crate) fn clear_directory_sync_failure(dir: &Path) {
+    DIRECTORY_SYNC_FAILURES
+        .lock()
+        .retain(|(path, _)| path != dir);
+}
+
+#[cfg(test)]
+fn injected_directory_sync_failure(dir: &Path) -> Option<io::Error> {
+    let mut failures = DIRECTORY_SYNC_FAILURES.lock();
+    let (_, allow) = failures.iter_mut().find(|(path, _)| path == dir)?;
+    if *allow > 0 {
+        *allow = allow.saturating_sub(1);
+        return None;
+    }
+    Some(io::Error::other("injected directory sync failure"))
 }
 
 /// Maximum number of shards in the pool.
