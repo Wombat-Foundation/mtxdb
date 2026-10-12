@@ -1,12 +1,21 @@
 //! Removal inspection and a standalone removal for one pool.
 //!
-//! [`PackfileStorage::removal_stats`] reports, from the packs themselves, how
-//! many keys a collection holds live, how many have been removed, and how many
-//! bytes a repack could give back. It is computed on demand from the same
-//! ordering repack uses (pack creation sequence, then offset), so it cannot
-//! drift from the data after a crash. [`PackfileStorage::remove_record`] is the
-//! pool-level counterpart of `DatabaseTransaction::remove` for tooling that
-//! works on one pool directory.
+//! Two levels of inspection, so a cheap question never pays for an expensive
+//! one:
+//!
+//! - [`PackfileStorage::removal_counts`] answers "how many keys are live and
+//!   how many are removed" from the in-memory index alone (the removed bit in
+//!   each entry). No pack is read.
+//! - [`PackfileStorage::removal_stats`] and [`PackfileStorage::removed_keys`]
+//!   read the packs: frame counts, superseded versions and the bytes a repack
+//!   could give back, or the removed ids themselves. The index keeps neither
+//!   frame sizes, nor superseded-version totals, nor complete 128-bit ids, so
+//!   these cannot be derived from it. They use the same ordering repack uses
+//!   (pack creation sequence, then offset), so they cannot drift from the data
+//!   after a crash.
+//!
+//! [`PackfileStorage::remove_record`] is the pool-level counterpart of
+//! `DatabaseTransaction::remove` for tooling that works on one pool directory.
 
 use super::*;
 
@@ -30,6 +39,15 @@ pub struct RemovalStats {
     /// collection still references is retained, and a marker is carried
     /// forward while an older copy may survive there.
     pub reclaimable_bytes: u64,
+}
+
+/// Live and removed key counts taken from the index alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemovalCounts {
+    /// Indexed keys whose newest version is a live value.
+    pub live_keys: usize,
+    /// Indexed keys whose newest version is a removal marker.
+    pub removed_keys: usize,
 }
 
 struct Newest {
@@ -103,6 +121,27 @@ impl PackfileStorage {
         let lsn = self.publish_mutation(|| mutation.clone())?.unwrap_or(0);
         self.apply_transaction_mutation(&mutation, lsn)?;
         Ok(true)
+    }
+
+    /// Live and removed key counts from the in-memory index, with no pack
+    /// reads. `None` if the collection is not loaded.
+    ///
+    /// These count indexed ids, so they include any genesis metadata record,
+    /// and they reflect what this handle's index holds (a read-only handle can
+    /// lag a writer). [`Self::removal_stats`] gives the same two numbers from
+    /// the packs, plus frame and byte totals.
+    #[must_use]
+    pub fn removal_counts(&self, collection_id: &[u8; 16]) -> Option<RemovalCounts> {
+        self.collections_read()
+            .get(collection_id)
+            .map(|generation| {
+                let loaded = generation.load();
+                let removed = loaded.index.removed_count();
+                RemovalCounts {
+                    live_keys: loaded.index.len().saturating_sub(removed),
+                    removed_keys: removed,
+                }
+            })
     }
 
     /// How many of the collection's index entries point at an explicit removal

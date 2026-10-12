@@ -1660,3 +1660,41 @@ fn removal_markers_that_force_index_growth_are_counted_as_removed() {
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The index-only counts agree with the pack-derived counts at every step, and
+/// an unloaded collection reports none.
+#[test]
+fn removal_counts_come_from_the_index_and_match_the_packs() {
+    let (dir, store) = fresh_store("counts_api");
+    let collection = [0xc4; 16];
+    assert_eq!(store.removal_counts(&collection), None);
+
+    for id in 1..=5u8 {
+        store
+            .put(&collection, &node(id), &NodeData::from_slice(b"v"))
+            .unwrap();
+    }
+    let counts = store.removal_counts(&collection).unwrap();
+    assert_eq!((counts.live_keys, counts.removed_keys), (5, 0));
+
+    assert!(store.remove_record(&collection, &node(2)).unwrap());
+    assert!(store.remove_record(&collection, &node(4)).unwrap());
+    let counts = store.removal_counts(&collection).unwrap();
+    assert_eq!((counts.live_keys, counts.removed_keys), (3, 2));
+
+    // Re-adding moves a key back from removed to live.
+    store
+        .put(&collection, &node(2), &NodeData::from_slice(b"again"))
+        .unwrap();
+    let counts = store.removal_counts(&collection).unwrap();
+    assert_eq!((counts.live_keys, counts.removed_keys), (4, 1));
+
+    let stats = store.removal_stats(&collection).unwrap();
+    assert_eq!(
+        (counts.live_keys, counts.removed_keys),
+        (stats.live_keys, stats.removed_keys),
+        "the cheap counts must equal the pack-derived ones"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}

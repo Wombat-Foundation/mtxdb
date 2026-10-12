@@ -34,7 +34,7 @@ mod read_journal;
 use read_journal::ReadJournal;
 pub use read_journal::ReadSnapshot;
 mod removal;
-pub use removal::RemovalStats;
+pub use removal::{RemovalCounts, RemovalStats};
 
 thread_local! {
     /// Suppresses journal publication while a committed transaction applies
