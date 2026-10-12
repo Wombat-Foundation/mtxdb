@@ -2732,49 +2732,38 @@ impl PackfileStorage {
         Ok(store)
     }
 
-    /// Find the latest physical frame for every hash in a collection.
-    fn latest_records_for_collection(
+    /// Find the latest physical frame for every hash in a collection, by pack
+    /// creation order then offset. Reads no frames: the scan already carries
+    /// everything the ordering needs.
+    pub(crate) fn latest_records_for_collection(
         records: &[ShardRecord],
         shards: &ShardPool,
     ) -> Result<Vec<ShardRecord>, StorageError> {
-        let mut latest_records: HashMap<[u8; 16], (ShardRecord, Option<u64>)> = HashMap::new();
+        let mut creation_seq: HashMap<u16, u32> = HashMap::new();
+        let mut order_of = |slot: u16| -> Result<u32, StorageError> {
+            if let Some(&seq) = creation_seq.get(&slot) {
+                return Ok(seq);
+            }
+            let seq = shards
+                .get_shard(slot)
+                .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?
+                .creation_seq;
+            creation_seq.insert(slot, seq);
+            Ok(seq)
+        };
+        let mut latest_records: HashMap<[u8; 16], (ShardRecord, (u32, u64))> = HashMap::new();
         for record @ (slot, hash, offset, _) in records {
-            let shard = shards
-                .get_shard(*slot)
-                .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?;
-            let frame = shards.read_at(&shard, *offset, true)?;
-            let lsn = frame.metadata.and_then(|metadata| metadata.last_write_lsn);
-            let replace =
-                if let Some(((old_slot, _, old_offset, _), old_lsn)) = latest_records.get(hash) {
-                    let old_shard = shards.get_shard(*old_slot).ok_or_else(|| {
-                        StorageError::Corrupt(format!("missing shard slot {old_slot}"))
-                    })?;
-                    Self::repack_record_is_newer(
-                        lsn,
-                        &shard,
-                        *offset,
-                        *old_lsn,
-                        &old_shard,
-                        *old_offset,
-                    )
-                } else {
-                    true
-                };
+            let position = (order_of(*slot)?, *offset);
+            let replace = latest_records
+                .get(hash)
+                .is_none_or(|(_, old_position)| position >= *old_position);
             if replace {
-                latest_records.insert(*hash, (*record, lsn));
+                latest_records.insert(*hash, (*record, position));
             }
         }
-        let mut latest: Vec<ShardRecord> = latest_records
-            .into_values()
-            .map(|(record, _)| record)
-            .collect();
-        latest.sort_unstable_by_key(|(slot, hash, offset, _)| {
-            let creation_seq = shards
-                .get_shard(*slot)
-                .map_or(0, |shard| shard.creation_seq);
-            (creation_seq, *offset, *hash)
-        });
-        Ok(latest)
+        let mut latest: Vec<(ShardRecord, (u32, u64))> = latest_records.into_values().collect();
+        latest.sort_unstable_by_key(|((_, hash, _, _), position)| (*position, *hash));
+        Ok(latest.into_iter().map(|(record, _)| record).collect())
     }
 
     /// Builds one collection's index, cache, and shard-directory contribution
@@ -2812,7 +2801,7 @@ impl PackfileStorage {
         }
         if let Some((offset, error)) = first_failure {
             return Err(StorageError::Corrupt(format!(
-                "index rebuild dropped {failed} of {} scanned records (first at offset {offset}: {error}); \
+                "index rebuild dropped {failed} of {} indexed candidates (first at offset {offset}: {error}); \
                  indexed {}",
                 index_records.len(),
                 index.len(),
@@ -7264,7 +7253,6 @@ impl PackfileStorage {
             .metadata
             .as_ref()
             .is_some_and(|metadata| metadata.removed);
-        let new_lsn = record.metadata.and_then(|metadata| metadata.last_write_lsn);
         let target = if is_removed { removed } else { map };
         let replace = if let Some(&(old_slot, old_offset)) = target.get(&hash) {
             let old_shard = self.shards.get_shard(old_slot).ok_or_else(|| {
@@ -7272,13 +7260,7 @@ impl PackfileStorage {
                     "repack candidate references missing shard {old_slot}"
                 ))
             })?;
-            let old = self.read_at(
-                &old_shard,
-                old_offset,
-                self.shards.checksum_policy().verifies_reads(),
-            )?;
-            let old_lsn = old.metadata.and_then(|metadata| metadata.last_write_lsn);
-            Self::repack_record_is_newer(new_lsn, &shard, offset, old_lsn, &old_shard, old_offset)
+            Self::repack_record_is_newer(&shard, offset, &old_shard, old_offset)
         } else {
             true
         };
@@ -7288,32 +7270,29 @@ impl PackfileStorage {
         Ok(())
     }
 
-    /// Compare record versions by immutable pack creation order and frame
-    /// offset, using LSNs only to break a physical-position tie.
+    /// Whether a frame at `(new_shard, new_offset)` was written no earlier than
+    /// one at `(old_shard, old_offset)`: immutable pack creation order, then
+    /// offset within the pack. Runtime slots can be recycled and journal LSNs
+    /// are absent from unjournaled writes, so neither is consulted.
     fn repack_record_is_newer(
-        new_lsn: Option<u64>,
         new_shard: &Shard,
         new_offset: u64,
-        old_lsn: Option<u64>,
         old_shard: &Shard,
         old_offset: u64,
     ) -> bool {
-        match (new_shard.creation_seq, new_offset).cmp(&(old_shard.creation_seq, old_offset)) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => new_lsn >= old_lsn,
-        }
+        (new_shard.creation_seq, new_offset) >= (old_shard.creation_seq, old_offset)
     }
 
     /// Resolve the latest live and removed candidates independent of shard
-    /// slot order. Slots can be recycled, while frame LSNs preserve write order.
+    /// slot order. A marker survives only when it is newer than the newest
+    /// live frame; otherwise the key was written again after its removal.
     fn finalize_repack_record_maps(
         &self,
         live: &mut RepackRecordMap,
         removed: &mut RepackRecordMap,
     ) -> Result<(), StorageError> {
         removed.retain(|hash, _| live.contains_key(hash));
-        let hashes: Vec<_> = live.keys().chain(removed.keys()).copied().collect();
+        let hashes: Vec<_> = removed.keys().copied().collect();
         for hash in hashes {
             let (Some(&(live_slot, live_offset)), Some(&(removed_slot, removed_offset))) =
                 (live.get(&hash), removed.get(&hash))
@@ -7330,27 +7309,9 @@ impl PackfileStorage {
                     "repack candidate references missing shard {removed_slot}"
                 ))
             })?;
-            let live_record = self.read_at(
-                &live_shard,
-                live_offset,
-                self.shards.checksum_policy().verifies_reads(),
-            )?;
-            let removed_record = self.read_at(
-                &removed_shard,
-                removed_offset,
-                self.shards.checksum_policy().verifies_reads(),
-            )?;
-            let live_lsn = live_record
-                .metadata
-                .and_then(|metadata| metadata.last_write_lsn);
-            let removed_lsn = removed_record
-                .metadata
-                .and_then(|metadata| metadata.last_write_lsn);
             if Self::repack_record_is_newer(
-                live_lsn,
                 &live_shard,
                 live_offset,
-                removed_lsn,
                 &removed_shard,
                 removed_offset,
             ) {

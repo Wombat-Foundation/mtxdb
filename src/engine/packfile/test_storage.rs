@@ -10827,3 +10827,179 @@ fn init_collection_from_scan_fails_closed_when_the_table_rejects_an_insert() {
         "the rebuild must account for the record's disk bytes"
     );
 }
+
+// ---- Removal markers when runtime slot order disagrees with write order ----
+//
+// A live pool recycles shard slots, so after the allocator wraps a newer pack
+// can sit in a lower slot than an older one. A fresh open assigns slots in
+// creation order, so these tests reproduce the layout by swapping two slots.
+
+fn incompressible_payload(seed: u32) -> Vec<u8> {
+    let mut state = u64::from(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+fn fill_incompressible(store: &PackfileStorage, collection: &[u8; 16], start: u32, count: u32) {
+    let entries: Vec<(NodeId, NodeData)> = (start..start.saturating_add(count))
+        .map(|index| {
+            let mut id = [0u8; 16];
+            id[..4].copy_from_slice(&index.to_le_bytes());
+            id[8..12].copy_from_slice(&index.wrapping_mul(2_654_435_761).to_le_bytes());
+            (id, NodeData::from_slice(&incompressible_payload(index)))
+        })
+        .collect();
+    store.put_many(collection, &entries).unwrap();
+}
+
+/// The two slots holding frames for `hash`, as `(older_pack_slot, newer_pack_slot)`
+/// before any swap.
+fn two_slots_for(store: &PackfileStorage, collection: &[u8; 16], hash: &NodeId) -> (u16, u16) {
+    let mut slots: Vec<u16> = store
+        .scan_collection_records(collection)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, entries)| entries.iter().any(|(entry, _)| entry == hash))
+        .map(|(slot, _)| slot)
+        .collect();
+    slots.sort_unstable();
+    assert!(slots.len() >= 2, "the key needs frames in two packs");
+    (slots[0], *slots.last().unwrap())
+}
+
+fn frame_is_removed(store: &PackfileStorage, slot: u16, offset: u64) -> bool {
+    let shard = store.shards.get_shard(slot).unwrap();
+    store
+        .read_at(&shard, offset, true)
+        .unwrap()
+        .metadata
+        .is_some_and(|metadata| metadata.removed)
+}
+
+/// Older value in a low pack, removal marker in a later pack, then the two
+/// packs' slots swapped so the marker's pack has the LOWER slot.
+/// With `readd`, the key is written again after the marker.
+fn marker_in_lower_slot(
+    name: &str,
+    readd: bool,
+) -> (PathBuf, PackfileStorage, [u8; 16], NodeId, u16, u16) {
+    let dir = test_dir(name);
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 48 * 1024).unwrap();
+    let collection = [0xA1u8; 16];
+    let victim = distinct_id(250);
+    store
+        .put(&collection, &victim, &NodeData::from_slice(b"old"))
+        .unwrap();
+    fill_incompressible(&store, &collection, 0, 120);
+    store
+        .apply_transaction_mutation(
+            &JournalMutation::RemoveRecord {
+                collection_id: collection,
+                node_id: victim,
+            },
+            1,
+        )
+        .unwrap();
+    fill_incompressible(&store, &collection, 1000, 20);
+    if readd {
+        // Enough writes that the re-add lands in a third pack, after the marker's.
+        fill_incompressible(&store, &collection, 2000, 120);
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"new"))
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    let (value_slot, marker_slot) = two_slots_for(&store, &collection, &victim);
+    assert_ne!(value_slot, marker_slot);
+    store
+        .shards
+        .swap_slots_for_test(value_slot, marker_slot)
+        .unwrap();
+    // After the swap the marker's pack is at `value_slot` (lower) and the
+    // older value's pack is at `marker_slot` (higher).
+    (dir, store, collection, victim, value_slot, marker_slot)
+}
+
+/// The open-time rebuild picks the newest physical frame per key, not the
+/// frame in the highest slot.
+#[test]
+fn open_time_rebuild_picks_the_marker_when_it_sits_in_a_lower_slot() {
+    let (dir, store, collection, victim, marker_slot, value_slot) =
+        marker_in_lower_slot("lower_slot_rebuild", false);
+    let mut records: Vec<ShardRecord> = Vec::new();
+    for (slot, entries) in store.scan_collection_records(&collection).unwrap() {
+        let pack_id = store.shards.get_shard(slot).unwrap().pack_id;
+        for (hash, offset) in entries {
+            records.push((slot, hash, offset, pack_id));
+        }
+    }
+    // The scan visits the lower slot (the marker) before the higher (the value).
+    let marker_pos = records
+        .iter()
+        .position(|(slot, hash, _, _)| *hash == victim && *slot == marker_slot)
+        .unwrap();
+    let value_pos = records
+        .iter()
+        .position(|(slot, hash, _, _)| *hash == victim && *slot == value_slot)
+        .unwrap();
+    assert!(marker_pos < value_pos, "the layout must be misordered");
+
+    let latest = PackfileStorage::latest_records_for_collection(&records, &store.shards).unwrap();
+    let chosen: Vec<_> = latest
+        .iter()
+        .filter(|(_, hash, _, _)| *hash == victim)
+        .collect();
+    assert_eq!(chosen.len(), 1, "one frame per key");
+    let (slot, _, offset, _) = *chosen[0];
+    assert!(
+        frame_is_removed(&store, slot, offset),
+        "the newest frame is the removal marker, whatever the slot order"
+    );
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Repack scanning resolves the same layout to "removed": the older live
+/// value is not a candidate and the marker is carried.
+#[test]
+fn repack_scan_treats_a_marker_in_a_lower_slot_as_the_latest_version() {
+    let (dir, store, collection, victim, _marker_slot, _value_slot) =
+        marker_in_lower_slot("lower_slot_repack", false);
+    let (live, removed, _) = store.repack_scan_incremental(&collection).unwrap();
+    assert!(
+        !live.contains_key(&victim),
+        "the older value must not survive as a live candidate"
+    );
+    let (slot, offset) = removed[&victim];
+    assert!(frame_is_removed(&store, slot, offset));
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A key written again after its removal stays live in the same layout.
+#[test]
+fn repack_scan_keeps_a_re_added_key_live_in_a_misordered_layout() {
+    let (dir, store, collection, victim, _marker_slot, _value_slot) =
+        marker_in_lower_slot("lower_slot_readd", true);
+    let (live, removed, _) = store.repack_scan_incremental(&collection).unwrap();
+    let (slot, offset) = live[&victim];
+    let shard = store.shards.get_shard(slot).unwrap();
+    let frame = store.read_at(&shard, offset, true).unwrap();
+    assert_eq!(
+        frame.data.as_ref(),
+        b"new",
+        "the re-added value, not the older one in the highest slot, is the live candidate"
+    );
+    assert!(
+        !removed.contains_key(&victim),
+        "a marker older than the re-add is dropped"
+    );
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}

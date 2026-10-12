@@ -1896,6 +1896,36 @@ impl ShardPool {
         self.shards.read().get(slot as usize)?.clone()
     }
 
+    /// Exchange the packs held in two slots, keeping each pack's creation
+    /// sequence. This reproduces a recycled slot layout (a newer pack in a
+    /// lower slot) that a live pool reaches only after the allocator wraps.
+    ///
+    /// # Errors
+    /// Returns an error if either slot is empty or a file handle cannot be
+    /// duplicated.
+    #[cfg(test)]
+    pub(crate) fn swap_slots_for_test(&self, first: u16, second: u16) -> io::Result<()> {
+        let mut shards = self.shards.write();
+        let missing = || io::Error::other("swap_slots_for_test: empty slot");
+        let a = shards[usize::from(first)].take().ok_or_else(missing)?;
+        let b = shards[usize::from(second)].take().ok_or_else(missing)?;
+        let rebuild = |slot: u16, from: &Shard| -> io::Result<Arc<Shard>> {
+            let file = from.file.try_clone()?;
+            let len = file.metadata()?.len();
+            Ok(Arc::new(Shard::new(
+                slot,
+                from.pack_id,
+                from.creation_seq,
+                file,
+                from.path.clone(),
+                len,
+            )))
+        };
+        shards[usize::from(first)] = Some(rebuild(first, &b)?);
+        shards[usize::from(second)] = Some(rebuild(second, &a)?);
+        Ok(())
+    }
+
     /// Get IO/sync stats for a single shard by ID.
     #[must_use]
     pub fn stats(&self, slot: u16) -> Option<ShardStats> {
