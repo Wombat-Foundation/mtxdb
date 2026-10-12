@@ -22,7 +22,7 @@
 //!   cargo +1.90.0 bench --manifest-path benches/Cargo.toml --bench edge_layout_sithnapse
 //! ```
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -77,6 +77,10 @@ struct State<'a> {
     puts: u64,
     largest: usize,
     sync: Duration,
+    /// `Some(span)`: children are stored in one record per `(parent, child id
+    /// range of span)`, so an append rewrites only the newest range. `None`:
+    /// sithnapse's one whole list per parent.
+    span: Option<u32>,
 }
 
 impl State<'_> {
@@ -97,6 +101,64 @@ impl State<'_> {
         db.edges().sync_all().expect("sync");
         self.sync = self.sync.saturating_add(started.elapsed());
     }
+}
+
+impl State<'_> {
+    /// Add `new` children to `parent`'s stored list(s), deduplicating.
+    fn append_children(&mut self, store: &dyn StorageEngine, parent: u32, new: Vec<u32>) {
+        let mut by_record: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for child in new {
+            let range = self
+                .span
+                .map_or(0, |span| child.checked_div(span).unwrap_or(0));
+            by_record.entry(range).or_default().push(child);
+        }
+        for (range, kids) in by_record {
+            let id = child_record(parent, range, self.span);
+            let mut children = store
+                .get(&CHUNK_COLLECTION, &id)
+                .expect("get")
+                .map(|d| decode(&d.bytes))
+                .unwrap_or_default();
+            let mut seen: HashSet<u32> = children.iter().copied().collect();
+            let before = children.len();
+            children.extend(kids.into_iter().filter(|c| seen.insert(*c)));
+            if children.len() != before {
+                self.put(store, id, encode(&children));
+            }
+        }
+    }
+}
+
+/// The record holding `parent`'s children in id `range`.
+fn child_record(parent: u32, range: u32, span: Option<u32>) -> [u8; 16] {
+    match span {
+        None => spread(KIND_CHILD, parent),
+        Some(_) => key_hash(&format!("child:{parent}:{range}")),
+    }
+}
+
+/// Read all of `parent`'s children; returns them and the number of gets.
+fn children_of(
+    store: &dyn StorageEngine,
+    parent: u32,
+    (max_id, span): (u32, Option<u32>),
+) -> (Vec<u32>, usize) {
+    let ranges = span.map_or(0..=0, |span| {
+        parent.checked_div(span).unwrap_or(0)..=max_id.checked_div(span).unwrap_or(0)
+    });
+    let mut out = Vec::new();
+    let mut gets = 0_usize;
+    for range in ranges {
+        gets = gets.saturating_add(1);
+        if let Some(data) = store
+            .get(&CHUNK_COLLECTION, &child_record(parent, range, span))
+            .expect("get")
+        {
+            out.extend(decode(&data.bytes));
+        }
+    }
+    (out, gets)
 }
 
 impl<'a> State<'a> {
@@ -149,18 +211,7 @@ impl<'a> State<'a> {
                 }
             }
             for (parent, new) in by_parent {
-                let id = spread(KIND_CHILD, parent);
-                let mut children = store
-                    .get(&CHUNK_COLLECTION, &id)
-                    .expect("get")
-                    .map(|d| decode(&d.bytes))
-                    .unwrap_or_default();
-                let mut seen: HashSet<u32> = children.iter().copied().collect();
-                let before = children.len();
-                children.extend(new.into_iter().filter(|c| seen.insert(*c)));
-                if children.len() != before {
-                    self.put(store.as_ref(), id, encode(&children));
-                }
+                self.append_children(store.as_ref(), parent, new);
             }
             if n.saturating_add(1).checked_rem(sync_every) == Some(0) {
                 self.sync(db);
@@ -169,12 +220,20 @@ impl<'a> State<'a> {
     }
 }
 
-fn case(base: &std::path::Path, rows: &[Row], preload: usize, (batch, sync_every): (usize, usize)) {
+fn case(
+    base: &std::path::Path,
+    rows: &[Row],
+    preload: usize,
+    (batch, sync_every, span): (usize, usize, Option<u32>),
+) {
     let dir = base.join(format!("mtxdb_bench_sithnapse_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let db = Database::open(dir.clone()).expect("open");
     let (head, tail) = rows.split_at(preload);
-    let mut state = State::default();
+    let mut state = State {
+        span,
+        ..State::default()
+    };
     state.append(&db, head, (1_000, 20));
     state.sync(&db);
     let before = sizes(&dir).total();
@@ -185,10 +244,11 @@ fn case(base: &std::path::Path, rows: &[Row], preload: usize, (batch, sync_every
     let wall = started.elapsed();
     state.sync(&db);
     let after = sizes(&dir);
+    let label = span.map_or_else(|| "whole-list".to_owned(), |s| format!("range-{s}"));
     let events = len_f64(tail.len().max(1));
     let (took, settled) = compact_latest(&state.latest, &dir.with_extension("compact"));
     println!(
-        "  batch {batch:>3}: {:>9.1} us/event | growth {:>8.1} B/event | put {:>8.1} B/event, {} puts, largest {:.1} KiB | sync {:.0} ms",
+        "  {label} batch {batch:>3}: {:>9.1} us/event | growth {:>8.1} B/event | put {:>8.1} B/event, {} puts, largest {:.1} KiB | sync {:.0} ms",
         wall.as_secs_f64() * 1e6 / events,
         num(after.total().saturating_sub(before)) / events,
         num(state.put_bytes.saturating_sub(bytes0)) / events,
@@ -203,6 +263,7 @@ fn case(base: &std::path::Path, rows: &[Row], preload: usize, (batch, sync_every
         100.0 * (1.0 - mib(settled.packs) / mib(after.packs).max(f64::MIN_POSITIVE)),
         took.as_secs_f64() * 1e3,
     );
+    child_reads(&db, rows, &state.ids, span);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -270,6 +331,48 @@ fn chunked_case(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Read cost of a child list after the appends: the busiest parent, and a sample
+/// of parents drawn from the events' auth lists (so busy parents weigh in as
+/// often as they are named).
+fn child_reads(db: &Database, rows: &[Row], ids: &Ids<'_>, span: Option<u32>) {
+    let store = db.edges();
+    let max_id = u32::try_from(ids.keys.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for parent in rows.iter().flat_map(|row| &row.auth) {
+        let seen = counts.entry(parent.as_str()).or_default();
+        *seen = seen.saturating_add(1);
+    }
+    let Some((hot, _)) = counts.iter().max_by_key(|(key, n)| (**n, **key)) else {
+        return;
+    };
+    let timed = |parent: u32, reps: usize| {
+        let started = Instant::now();
+        let mut shape = (0, 0);
+        for _ in 0..reps {
+            let (children, gets) = children_of(store.as_ref(), parent, (max_id, span));
+            shape = (children.len(), gets);
+        }
+        (started.elapsed().as_secs_f64() * 1e6 / len_f64(reps), shape)
+    };
+    let (hot_us, (hot_children, hot_gets)) = timed(ids.by_key[*hot], 20);
+    let sample: Vec<u32> = rows
+        .iter()
+        .flat_map(|row| &row.auth)
+        .step_by(37)
+        .filter_map(|key| ids.by_key.get(key.as_str()).copied())
+        .take(2_000)
+        .collect();
+    let started = Instant::now();
+    let gets = sample.iter().fold(0_usize, |acc, parent| {
+        acc.saturating_add(children_of(store.as_ref(), *parent, (max_id, span)).1)
+    });
+    let typical = started.elapsed().as_secs_f64() * 1e6 / len_f64(sample.len().max(1));
+    println!(
+        "      child reads: busiest parent {hot_us:.0} us ({hot_children} children, {hot_gets} gets); sampled parents {typical:.1} us ({:.1} gets)",
+        num(u64::try_from(gets).unwrap_or(0)) / len_f64(sample.len().max(1)),
+    );
+}
+
 fn main() {
     let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
@@ -296,8 +399,11 @@ fn main() {
     println!(
         "sithnapse-shaped writes: {preload} events preloaded (batches of 1000), {append} appended, sync every {sync_every} batches"
     );
+    let span = env_usize("MTXDB_EL_SPAN", 2_048);
+    let span = u32::try_from(span).ok().filter(|s| *s > 0);
     for batch in batches {
-        case(&base, rows, preload, (batch, sync_every));
+        case(&base, rows, preload, (batch, sync_every, None));
+        case(&base, rows, preload, (batch, sync_every, span));
         chunked_case(&base, rows, preload, (batch, sync_every));
     }
 }
