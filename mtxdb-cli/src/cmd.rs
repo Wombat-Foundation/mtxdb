@@ -25,6 +25,7 @@ use mtxdb::{
 };
 use rezzy::json::{self, Object, Value as OwnedValue};
 
+use crate::interchange::{self, KeyKind, KeyRecord, RoomEvent, RoomExport};
 use crate::state_policy::{resolution_policy, ResolutionPolicy, StateView};
 use crate::state_resolve::{resolve_parents, LeanEventContext, StateEntries};
 use crate::{Cli, Commands, PacksAction};
@@ -8056,11 +8057,12 @@ fn cmd_import(
     let state_store: &PackfileStorage = db.pool(ShardType::State);
     state_store.set_read_plan_policy(cli.read_plan);
     let mut failures = 0_usize;
+    let mut server_keys_imported = false;
     for (index, path) in paths.iter().enumerate() {
         if index != 0 {
             eprintln!();
         }
-        if let Err(error) = cmd_import_file(
+        match cmd_import_file(
             &db,
             store,
             state_store,
@@ -8069,8 +8071,13 @@ fn cmd_import(
             &import_template,
             &mut established_collections,
         ) {
-            eprintln!("{}: {error:#}", path.display());
-            failures = failures.saturating_add(1);
+            Ok(outcome) => {
+                server_keys_imported = server_keys_imported || outcome.server_keys;
+            }
+            Err(error) => {
+                eprintln!("{}: {error:#}", path.display());
+                failures = failures.saturating_add(1);
+            }
         }
     }
     store
@@ -8085,6 +8092,11 @@ fn cmd_import(
         db.pool(ShardType::Edges)
             .sync_all()
             .context("persisting auth adjacency and edges summaries")?;
+    }
+    if server_keys_imported {
+        db.pool(ShardType::ServerInfo)
+            .sync_all()
+            .context("persisting imported signing keys")?;
     }
     if failures != 0 {
         bail!("import completed with {failures} failed input file(s)");
@@ -8996,10 +9008,17 @@ fn pack_dump_line(
     json_compact_object(&fields)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the file-level import orchestration intentionally handles several import phases"
-)]
+/// What one input file contributed, so the batch can finish only the pools it
+/// actually wrote to.
+#[derive(Debug, Default)]
+struct ImportOutcome {
+    /// A `server_keys` file wrote records into the server-info pool, which the
+    /// batch must sync once: that pool is otherwise outside `cmd_import`'s
+    /// default sync set.
+    server_keys: bool,
+}
+
+/// Import one input file through the state the batch shares with its readers.
 fn cmd_import_file(
     db: &Database,
     store: &PackfileStorage,
@@ -9008,219 +9027,468 @@ fn cmd_import_file(
     collection_override: Option<&str>,
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
-) -> anyhow::Result<()> {
-    let content = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let is_jsonl = path
-        .extension()
-        .is_some_and(|extension| extension == "jsonl");
+) -> anyhow::Result<ImportOutcome> {
+    let mut context = ImportContext {
+        db,
+        store,
+        state_store,
+        template,
+        established_collections,
+    };
+    context.import(path, collection_override)
+}
 
-    if is_jsonl {
+/// The state every reader of one input file works against.
+///
+/// Splitting it out is what lets each input format be a small reader of its
+/// own instead of one function that handles every format in sequence.
+/// `established_collections` is the part that carries across files: a create
+/// event seen in an earlier file leaves its collection established for the
+/// rest of the batch.
+struct ImportContext<'a> {
+    db: &'a Database,
+    store: &'a PackfileStorage,
+    state_store: &'a PackfileStorage,
+    template: &'a CollectionTemplate,
+    established_collections: &'a mut HashSet<[u8; 16]>,
+}
+
+impl ImportContext<'_> {
+    /// Import one file, choosing a reader by what its first line says.
+    fn import(
+        &mut self,
+        path: &Path,
+        collection_override: Option<&str>,
+    ) -> anyhow::Result<ImportOutcome> {
+        let content = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        // An export carries its own framing, and a room export is a `.jsonl`
+        // file whose lines are records rather than events, so it has to be
+        // recognized before any reader of raw Matrix events sees it.
+        if let Some(input_format) = interchange::detect(&content) {
+            return self.import_export(path, input_format, &content, collection_override);
+        }
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            return self.import_jsonl(path, &content, collection_override);
+        }
+        self.import_federation(path, &content, collection_override)
+    }
+
+    /// An `mtxdb-export/v1` file: a room export, or a `server_keys` export.
+    fn import_export(
+        &mut self,
+        path: &Path,
+        input_format: interchange::InputFormat,
+        content: &[u8],
+        collection_override: Option<&str>,
+    ) -> anyhow::Result<ImportOutcome> {
+        match input_format {
+            interchange::InputFormat::Room => {
+                let export = interchange::parse_room(content)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                self.import_room_export(path, &export, collection_override)?;
+                Ok(ImportOutcome::default())
+            }
+            interchange::InputFormat::Keys => {
+                let records = interchange::parse_keys(content)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                self.import_keys_export(path, &records)?;
+                Ok(ImportOutcome { server_keys: true })
+            }
+        }
+    }
+
+    /// A `.jsonl` file: one event per line, or a federation document for the
+    /// DAG exports that carry a `.jsonl` name despite being one document.
+    fn import_jsonl(
+        &mut self,
+        path: &Path,
+        content: &[u8],
+        collection_override: Option<&str>,
+    ) -> anyhow::Result<ImportOutcome> {
         let (events, detected_collection, raw_adjacency) =
-            parse_jsonl_events(&content).or_else(|jsonl_error| {
-                // Some existing DAG exports carry a `.jsonl` suffix despite
-                // being a pretty-printed federation JSON document.
-                parse_federation_events(&content).map(|(events, collection)| (events, collection, Vec::new())).map_err(|federation_error| {
-                    anyhow!(
-                        "{jsonl_error}; also not a valid Matrix federation document: {federation_error}"
-                    )
-                })
+            parse_jsonl_events(content).or_else(|jsonl_error| {
+                parse_federation_events(content)
+                    .map(|(events, collection)| (events, collection, Vec::new()))
+                    .map_err(|federation_error| {
+                        anyhow!(
+                            "{jsonl_error}; also not a valid Matrix federation document: \
+                             {federation_error}"
+                        )
+                    })
             })?;
         if events.is_empty() {
             bail!("no events found in {}", path.display());
         }
         import_pdu_events_with_raw(
-            db,
-            store,
-            state_store,
+            self.db,
+            self.store,
+            self.state_store,
             path,
             &events,
             &[],
             Some(&raw_adjacency),
             detected_collection.as_deref(),
             collection_override,
-            template,
-            established_collections,
-        )
-    } else {
-        let federation = parse_federation_input(&content)?;
+            self.template,
+            self.established_collections,
+            EventPayload::Redacted,
+        )?;
+        Ok(ImportOutcome::default())
+    }
+
+    /// A federation response document: its PDUs through the event DAG, its
+    /// auth chain through the edges pool.
+    fn import_federation(
+        &mut self,
+        path: &Path,
+        content: &[u8],
+        collection_override: Option<&str>,
+    ) -> anyhow::Result<ImportOutcome> {
+        let federation = parse_federation_input(content)?;
+        // `parse_federation_input` validates the document shape; this check
+        // separately rejects a well-shaped but event-empty response.
+        if federation.pdus.is_empty() && federation.auth_chain.is_empty() {
+            bail!("no events found in {}", path.display());
+        }
         let detected_collection = federation
             .pdus
             .iter()
             .chain(federation.auth_chain.iter())
             .find_map(event_room_id)
             .map(str::to_owned);
-        // `parse_federation_input` validates the document shape; this check
-        // separately rejects a well-shaped but event-empty response.
-        if federation.pdus.is_empty() && federation.auth_chain.is_empty() {
-            bail!("no events found in {}", path.display());
-        }
-
-        // Verify auth chain edges: every auth_events reference must point
-        // to a known event_id in either pdus or auth_chain.
+        // Every `auth_events` reference must point at an event_id in either
+        // `pdus` or `auth_chain`; dangling ones are imported but reported.
         let dangling = verify_auth_chain_edges(&federation.pdus, &federation.auth_chain);
-        if !dangling.is_empty() {
-            for (source, target) in &dangling {
-                eprintln!("warning: auth_events dangling reference: {source} -> {target}");
-            }
+        for (source, target) in &dangling {
+            eprintln!("warning: auth_events dangling reference: {source} -> {target}");
         }
-
-        // Import PDUs through the normal event-DAG path.
-        let pdu_count = if federation.pdus.is_empty() {
-            0
-        } else {
-            import_pdu_events(
-                db,
-                store,
-                state_store,
+        if !federation.pdus.is_empty() {
+            self.import_pdus(
                 path,
                 &federation.pdus,
                 &federation.auth_chain,
                 detected_collection.as_deref(),
                 collection_override,
-                template,
-                established_collections,
             )?;
-            // Re-count: import_pdu_events already printed its summary.
-            // We just need the count for the auth chain summary below.
-            federation
-                .pdus
-                .iter()
-                .filter(|ev| event_id(ev).is_some())
-                .count() as u64
-        };
-
-        // Import auth chain events into the edges shard pool.
-        if !federation.auth_chain.is_empty() {
-            // The auth chain's event records go to the edges pool, through the same
-            // database as the rest of the import.
-            let auth_store: &PackfileStorage = db.edges();
-            // Carry the caller's `--read-plan` choice over from the event store.
-            auth_store.set_read_plan_policy(store.read_plan_policy());
-            // Record the derived adjacency before writing any auth events, so a
-            // structural conflict rejects the import before the edges pool is
-            // mutated.
-            record_matrix_adjacency(db, template, &federation.auth_chain)?;
-            let mut auth_count = 0u64;
-            let mut auth_skipped = 0u64;
-            // Auth-chain events may span multiple rooms (collections). Group
-            // them, then batch-probe each group with `get_many` and insert
-            // only the missing records via `put_many` — one read plan and one
-            // index/pack generation per collection instead of N individual
-            // `put` round trips.
-            let mut by_collection: HashMap<([u8; 16], String), Vec<ImportBatchEntry>> =
-                HashMap::new();
-            for ev in &federation.auth_chain {
-                let Some(incoming_event_id) = event_id(ev) else {
-                    auth_skipped = auth_skipped.saturating_add(1);
-                    continue;
-                };
-                let Some(id_bytes) = template_node_id(template, ev)? else {
-                    auth_skipped = auth_skipped.saturating_add(1);
-                    continue;
-                };
-                let room_id_str = event_room_id(ev)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        if matrix_create_event_id(ev).is_some() {
-                            establishment_identity(ev)
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| detected_collection.clone());
-                let Some(room_id) = room_id_str else {
-                    auth_skipped = auth_skipped.saturating_add(1);
-                    continue;
-                };
-                let collection_id =
-                    derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
-                let event_bytes = ev.encode().into_bytes();
-                by_collection
-                    .entry((collection_id, room_id))
-                    .or_default()
-                    .push((
-                        id_bytes,
-                        incoming_event_id.to_owned(),
-                        NodeData::new(bytes::Bytes::from(event_bytes)),
-                    ));
-            }
-            for ((collection_id, room_id), entries) in by_collection {
-                // Same dedup rule as the PDU path: the 128-bit node ID is a
-                // truncated hash, so two distinct event IDs mapping to one key
-                // is a collision to reject, not collapse; a repeat with the
-                // same event_id is the same logical event.
-                let mut first: Vec<ImportBatchEntry> = Vec::with_capacity(entries.len());
-                let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(entries.len());
-                for (id_bytes, incoming_event_id, data) in entries {
-                    if let Some(first_event_id) = seen_ids.get(&id_bytes) {
-                        if first_event_id != &incoming_event_id {
-                            bail!(
-                                "node ID {} maps to multiple event IDs in the input; refusing to merge them",
-                                format_id(&id_bytes)
-                            );
-                        }
-                        continue;
-                    }
-                    seen_ids.insert(id_bytes, incoming_event_id.clone());
-                    first.push((id_bytes, incoming_event_id, data));
-                }
-                let probe_ids: Vec<[u8; 16]> = first.iter().map(|(id, _, _)| *id).collect();
-                let existing = auth_store.get_many(&collection_id, &probe_ids)?;
-                let mut to_write: Vec<([u8; 16], NodeData)> = Vec::new();
-                for ((id_bytes, incoming_event_id, data), existing_opt) in
-                    first.into_iter().zip(existing)
-                {
-                    if let Some(existing_record) = existing_opt {
-                        reject_cross_record_collision(
-                            &id_bytes,
-                            &incoming_event_id,
-                            &existing_record,
-                        )?;
-                    } else {
-                        to_write.push((id_bytes, data));
-                    }
-                }
-                if !to_write.is_empty() {
-                    let auth_metadata = CollectionMetadata {
-                        member_namespace: Some(mtxdb::MEMBER_NAMESPACE_AUTH),
-                        collection_canonical_id: room_id.into_bytes(),
-                        record_id_rule: template.record_id_rule.clone(),
-                        payload: template.payload.clone(),
-                        extension: None,
-                        role: Some("auth_chain".to_owned()),
-                        schema: Some("matrix.event.v1".to_owned()),
-                    };
-                    auth_store.create_or_put_established(
-                        &collection_id,
-                        &auth_metadata,
-                        &to_write,
-                    )?;
-                    // Deliberate semantic change from the pre-batching loop,
-                    // which counted every accepted input event including ones
-                    // already on disk: `auth_count` now reports only genuinely
-                    // newly-written edges events, so "imported N" means
-                    // records actually appended, and a reimport reports 0.
-                    auth_count = auth_count.saturating_add(to_write.len() as u64);
-                }
-            }
-            auth_store.sync_all()?;
-            eprintln!(
-                "imported {auth_count} edges events ({} dangling references)",
-                dangling.len()
-            );
-            if auth_skipped > 0 {
-                eprintln!("skipped {auth_skipped} edges events (missing event_id)");
-            }
         }
+        if !federation.auth_chain.is_empty() {
+            self.import_auth_chain(
+                &federation.auth_chain,
+                &dangling,
+                detected_collection.as_deref(),
+            )?;
+        }
+        Ok(ImportOutcome::default())
+    }
 
-        let _ = pdu_count;
+    /// A federation document's PDUs through the ordinary event-DAG path.
+    fn import_pdus(
+        &mut self,
+        path: &Path,
+        pdus: &[OwnedValue],
+        auth_chain: &[OwnedValue],
+        detected_collection: Option<&str>,
+        collection_override: Option<&str>,
+    ) -> anyhow::Result<()> {
+        import_pdu_events(
+            self.db,
+            self.store,
+            self.state_store,
+            path,
+            pdus,
+            auth_chain,
+            detected_collection,
+            collection_override,
+            self.template,
+            self.established_collections,
+        )
+    }
+
+    /// A federation document's auth chain, into the edges pool.
+    ///
+    /// Auth-chain events may span several rooms, so they are grouped first
+    /// and then probed and written one batch per room rather than one round
+    /// trip per event.
+    fn import_auth_chain(
+        &self,
+        auth_chain: &[OwnedValue],
+        dangling: &[(String, String)],
+        detected_collection: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // The auth chain's event records go to the edges pool, through the
+        // same database as the rest of the import.
+        let auth_store: &PackfileStorage = self.db.edges();
+        // Carry the caller's `--read-plan` choice over from the event store.
+        auth_store.set_read_plan_policy(self.store.read_plan_policy());
+        // Record the derived adjacency before writing any auth events, so a
+        // structural conflict rejects the import before the edges pool is
+        // mutated.
+        record_matrix_adjacency(self.db, self.template, auth_chain)?;
+        let (by_collection, skipped) =
+            group_auth_chain(auth_chain, self.template, detected_collection)?;
+        let mut written = 0_u64;
+        for ((collection_id, room_id), entries) in by_collection {
+            written = written.saturating_add(write_auth_collection(
+                auth_store,
+                self.template,
+                collection_id,
+                room_id,
+                entries,
+            )?);
+        }
+        auth_store.sync_all()?;
+        eprintln!(
+            "imported {written} edges events ({} dangling references)",
+            dangling.len()
+        );
+        if skipped > 0 {
+            eprintln!("skipped {skipped} edges events (missing event_id)");
+        }
         Ok(())
     }
+
+    /// Import one `mtxdb-export/v1` room file.
+    ///
+    /// The events go through the ordinary PDU path — that is what rebuilds
+    /// locators, short ids, auth closures, and state groups — while the
+    /// record's verdicts and the untouched PDU bytes take the two routes they
+    /// need: the verdicts into the room's metadata index, the bytes into the
+    /// store.
+    fn import_room_export(
+        &mut self,
+        path: &Path,
+        export: &RoomExport,
+        collection_override: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let events: Vec<OwnedValue> = export
+            .events
+            .iter()
+            .map(|event| event.annotated(&export.room_id))
+            .collect();
+        let payloads: Vec<bytes::Bytes> = export
+            .events
+            .iter()
+            .map(|event| event.pdu_bytes.clone())
+            .collect();
+        import_pdu_events_with_raw(
+            self.db,
+            self.store,
+            self.state_store,
+            path,
+            &events,
+            &[],
+            None,
+            Some(export.room_id.as_str()),
+            collection_override,
+            self.template,
+            self.established_collections,
+            EventPayload::Verbatim(&payloads),
+        )?;
+        let outliers = export
+            .events
+            .iter()
+            .filter(|event| event.metadata.outlier)
+            .count() as u64;
+        if outliers > 0 {
+            eprintln!("  outliers: {outliers}");
+        }
+        let recorded = write_event_metadata(self.store, &export.room_id, &export.events)?;
+        if recorded > 0 {
+            eprintln!("  event metadata: {recorded} records");
+        }
+        eprintln!("  exported by {}", export.server);
+        Ok(())
+    }
+
+    /// Import one `server_keys` export into the server-info pool.
+    ///
+    /// Key records are few and read together, so they share one index keyed
+    /// by kind and origin. The payload bytes are stored as the export
+    /// decoded them: they are slipstream-encoded JSON the federation layer
+    /// decodes itself, and re-encoding them here would invent a second
+    /// on-disk format for no reader.
+    fn import_keys_export(&self, path: &Path, records: &[KeyRecord]) -> anyhow::Result<()> {
+        let keys_store: &PackfileStorage = self.db.pool(ShardType::ServerInfo);
+        // Carry the caller's `--read-plan` choice over from the event store.
+        keys_store.set_read_plan_policy(self.store.read_plan_policy());
+        let entries: Vec<(Vec<u8>, bytes::Bytes)> = records
+            .iter()
+            .map(|record| {
+                (
+                    interchange::key_record_key(record.kind, &record.origin),
+                    record.payload.clone(),
+                )
+            })
+            .collect();
+        let borrowed: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(key, payload)| (key.as_slice(), payload.as_ref()))
+            .collect();
+        let index = AuxiliaryIndex::open(keys_store, interchange::SERVER_KEYS_NAMESPACE);
+        index
+            .put_many(&borrowed)
+            .with_context(|| format!("importing signing keys from {}", path.display()))?;
+        let mut summary = Vec::with_capacity(KeyKind::ALL.len());
+        for kind in KeyKind::ALL {
+            let count = records.iter().filter(|record| record.kind == kind).count();
+            if count > 0 {
+                summary.push(format!("{count} {}", kind.as_str()));
+            }
+        }
+        eprintln!(
+            "imported {} signing-key records ({})",
+            records.len(),
+            summary.join(", ")
+        );
+        Ok(())
+    }
+}
+
+/// Record one room's per-event metadata in its own auxiliary index.
+///
+/// Returns how many records were written. An event with a clear verdict that
+/// was never redacted and is not an outlier needs no record, so a clean room
+/// gets no index at all.
+fn write_event_metadata(
+    store: &PackfileStorage,
+    room_id: &str,
+    events: &[RoomEvent],
+) -> anyhow::Result<u64> {
+    let records: Vec<(&str, Vec<u8>)> = events
+        .iter()
+        .filter(|event| !event.metadata.is_empty())
+        .map(|event| (event.event_id.as_str(), event.metadata.encode()))
+        .collect();
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let entries: Vec<(&[u8], &[u8])> = records
+        .iter()
+        .map(|(event_id, value)| (event_id.as_bytes(), value.as_slice()))
+        .collect();
+    let index = AuxiliaryIndex::open(store, &interchange::event_metadata_namespace(room_id));
+    index
+        .put_many(&entries)
+        .with_context(|| format!("recording event metadata for room {room_id}"))?;
+    Ok(records.len() as u64)
+}
+
+/// Group an auth chain's events by the collection each one belongs to.
+///
+/// Returns the entries to write per collection, and how many events had no
+/// usable identity to group them by.
+fn group_auth_chain(
+    auth_chain: &[OwnedValue],
+    template: &CollectionTemplate,
+    detected_collection: Option<&str>,
+) -> anyhow::Result<(AuthChainCollections, u64)> {
+    let mut by_collection: AuthChainCollections = HashMap::new();
+    let mut skipped = 0_u64;
+    for event in auth_chain {
+        let Some(incoming_event_id) = event_id(event) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        let Some(id_bytes) = template_node_id(template, event)? else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        let room_id = event_room_id(event)
+            .map(str::to_owned)
+            .or_else(|| {
+                if matrix_create_event_id(event).is_some() {
+                    establishment_identity(event)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| detected_collection.map(str::to_owned));
+        let Some(room_id) = room_id else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        let collection_id =
+            derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
+        let event_bytes = event.encode().into_bytes();
+        by_collection
+            .entry((collection_id, room_id))
+            .or_default()
+            .push((
+                id_bytes,
+                incoming_event_id.to_owned(),
+                NodeData::new(bytes::Bytes::from(event_bytes)),
+            ));
+    }
+    Ok((by_collection, skipped))
+}
+
+/// Write one collection's worth of auth-chain events with a single probe and
+/// write, returning how many records were appended.
+///
+/// Same dedup rule as the PDU path: the 128-bit node ID is a truncated hash,
+/// so two distinct event IDs mapping to one key is a collision to reject, not
+/// collapse; a repeat with the same `event_id` is the same logical event.
+fn write_auth_collection(
+    auth_store: &PackfileStorage,
+    template: &CollectionTemplate,
+    collection_id: [u8; 16],
+    room_id: String,
+    entries: Vec<ImportBatchEntry>,
+) -> anyhow::Result<u64> {
+    let mut first: Vec<ImportBatchEntry> = Vec::with_capacity(entries.len());
+    let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(entries.len());
+    for (id_bytes, incoming_event_id, data) in entries {
+        if let Some(first_event_id) = seen_ids.get(&id_bytes) {
+            if first_event_id != &incoming_event_id {
+                bail!(
+                    "node ID {} maps to multiple event IDs in the input; refusing to merge them",
+                    format_id(&id_bytes)
+                );
+            }
+            continue;
+        }
+        seen_ids.insert(id_bytes, incoming_event_id.clone());
+        first.push((id_bytes, incoming_event_id, data));
+    }
+    let probe_ids: Vec<[u8; 16]> = first.iter().map(|(id, _, _)| *id).collect();
+    let existing = auth_store.get_many(&collection_id, &probe_ids)?;
+    let mut to_write: Vec<([u8; 16], NodeData)> = Vec::new();
+    for ((id_bytes, incoming_event_id, data), existing_opt) in first.into_iter().zip(existing) {
+        if let Some(existing_record) = existing_opt {
+            reject_cross_record_collision(&id_bytes, &incoming_event_id, &existing_record)?;
+        } else {
+            to_write.push((id_bytes, data));
+        }
+    }
+    if to_write.is_empty() {
+        return Ok(0);
+    }
+    let auth_metadata = CollectionMetadata {
+        member_namespace: Some(mtxdb::MEMBER_NAMESPACE_AUTH),
+        collection_canonical_id: room_id.into_bytes(),
+        record_id_rule: template.record_id_rule.clone(),
+        payload: template.payload.clone(),
+        extension: None,
+        role: Some("auth_chain".to_owned()),
+        schema: Some("matrix.event.v1".to_owned()),
+    };
+    auth_store.create_or_put_established(&collection_id, &auth_metadata, &to_write)?;
+    // Deliberate semantic change from the pre-batching loop, which counted
+    // every accepted input event including ones already on disk: this counts
+    // only genuinely newly-written edges records, so "imported N" means
+    // records actually appended, and a reimport reports 0.
+    Ok(to_write.len() as u64)
 }
 
 /// A decoded import entry keyed by node ID, retaining the source event ID for
 /// collision validation before the record is written.
 type ImportBatchEntry = ([u8; 16], String, NodeData);
+
+/// Auth-chain entries grouped by the collection each event belongs to.
+type AuthChainCollections = HashMap<([u8; 16], String), Vec<ImportBatchEntry>>;
 
 /// An already-present record under the same node ID must carry the same
 /// `event_id` as the incoming event, or the two genuinely differ and
@@ -9283,6 +9551,18 @@ fn import_room_version(
     })
 }
 
+/// Where the stored bytes of one imported event come from.
+#[derive(Clone, Copy)]
+enum EventPayload<'a> {
+    /// Redact the analyzed event under the room version — every input format
+    /// that hands the importer a raw Matrix event and nothing more.
+    Redacted,
+    /// These exact bytes, one per input event in order. An `mtxdb-export/v1`
+    /// event line already carries the PDU as the source stored it, so the
+    /// store receives those bytes rather than a re-encoding of them.
+    Verbatim(&'a [bytes::Bytes]),
+}
+
 /// Import PDU events through the normal event-DAG path.
 #[allow(
     clippy::too_many_arguments,
@@ -9316,6 +9596,7 @@ fn import_pdu_events(
         collection_override,
         template,
         established_collections,
+        EventPayload::Redacted,
     )
 }
 
@@ -9339,9 +9620,20 @@ fn import_pdu_events_with_raw(
     collection_override: Option<&str>,
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
+    payload: EventPayload<'_>,
 ) -> anyhow::Result<()> {
     if events.is_empty() {
         bail!("no events found in {}", path.display());
+    }
+    if let EventPayload::Verbatim(payloads) = payload {
+        if payloads.len() != events.len() {
+            bail!(
+                "{} carries {} payloads for {} events",
+                path.display(),
+                payloads.len(),
+                events.len()
+            );
+        }
     }
     let mut event_count = 0u64;
     let mut skipped = 0u64;
@@ -9363,7 +9655,7 @@ fn import_pdu_events_with_raw(
     let first: Vec<([u8; 16], String, NodeData)> = {
         let mut first = Vec::with_capacity(events.len());
         let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(events.len());
-        for ev in events {
+        for (index, ev) in events.iter().enumerate() {
             let Some(incoming_event_id) = event_id(ev) else {
                 skipped = skipped.saturating_add(1);
                 continue;
@@ -9387,7 +9679,14 @@ fn import_pdu_events_with_raw(
                 continue;
             }
             seen_ids.insert(id_bytes, incoming_event_id.to_owned());
-            let event_bytes = redacted_event_bytes(ev, &room_version)?;
+            let event_bytes = match payload {
+                EventPayload::Redacted => redacted_event_bytes(ev, &room_version)?,
+                EventPayload::Verbatim(payloads) => {
+                    payloads.get(index).cloned().with_context(|| {
+                        format!("missing stored bytes for event {incoming_event_id}")
+                    })?
+                }
+            };
             first.push((
                 id_bytes,
                 incoming_event_id.to_owned(),

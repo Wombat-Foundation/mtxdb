@@ -1,6 +1,7 @@
 //! CLI for the mtxdb content-addressed storage engine.
 
 mod cmd;
+mod interchange;
 mod state_hamt;
 mod state_policy;
 mod state_resolve;
@@ -661,19 +662,27 @@ fn sub_info() -> Command {
 
 fn sub_import() -> Command {
     Command::new("import")
-        .about("Import Matrix federation events from JSON or JSONL")
+        .about("Import Matrix events, federation documents, or mtxdb exports")
         .long_about(
-            "Import Matrix federation events from a JSON document or JSONL event stream. A JSON \
-             document must contain a `pdus` array, an `auth_chain` array, or both; a `.jsonl` \
-             file contains one event per line. Each imported event needs an `event_id`. The \
-             collection identity comes from `collection_id` unless --collection is supplied.",
+            "Import Matrix federation events from a JSON document or JSONL event stream, or an \
+             `mtxdb-export/v1` JSONL export, which this command detects from the first line. An \
+             export is either a room export (`header`, `event`*, `end` records) or a `server_keys` \
+             export (one `server_keys` record per line); a room export's verdicts and redaction \
+             bookkeeping are stored beside its events, and its `server_keys` records go to the \
+             server-info pool. A JSON document must contain a `pdus` array, an `auth_chain` array, \
+             or both; a `.jsonl` file contains one event per line. Each imported event needs an \
+             `event_id`. The collection identity comes from `collection_id` unless --collection \
+             is supplied.",
         )
         .arg(
             Arg::new("path")
                 .required(true)
                 .num_args(1..)
                 .value_name("FILE")
-                .help("Matrix federation JSON documents or JSONL event streams"),
+                .help(
+                    "Matrix federation JSON documents, JSONL event streams, or mtxdb-export/v1 \
+                     files",
+                ),
         )
         .arg(
             Arg::new("collection")
