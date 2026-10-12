@@ -2271,6 +2271,17 @@ pub fn extract_packfile_collection(
 /// Returns `io::Error` on read or truncate failure.
 pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let mut entries = Vec::new();
+    recover_packfile_with(path, |entry| {
+        entries.push((entry.collection_id, entry.hash, entry.offset));
+    })?;
+    Ok(entries)
+}
+
+/// Recovery scan variant that also returns each frame's explicit removal bit.
+pub(crate) fn scan_and_recover_packfile_with_removal(
+    path: &Path,
+) -> io::Result<Vec<ScanEntryWithRemoval>> {
+    let mut entries = Vec::new();
     recover_packfile_with(path, |entry| entries.push(entry))?;
     Ok(entries)
 }
@@ -2321,7 +2332,7 @@ impl<R: Read> Read for CountingReader<R> {
 /// valid one, and truncates a torn tail.
 fn recover_packfile_with(
     path: &Path,
-    mut on_record: impl FnMut(ScanEntry),
+    mut on_record: impl FnMut(ScanEntryWithRemoval),
 ) -> io::Result<PackRecovery> {
     let file = File::open(path)?;
     let mut reader = CountingReader {
@@ -2344,7 +2355,12 @@ fn recover_packfile_with(
         let offset = reader.position;
         match read_record_metadata_scratch(&mut reader, &mut scratch) {
             Ok(Some(meta)) => {
-                on_record((meta.collection_id, meta.hash, offset));
+                on_record(ScanEntryWithRemoval {
+                    collection_id: meta.collection_id,
+                    hash: meta.hash,
+                    offset,
+                    removed: meta.metadata.as_ref().is_some_and(|frame| frame.removed),
+                });
                 recovery.records = recovery.records.saturating_add(1);
                 recovery.valid_len = reader.position;
             }

@@ -11,7 +11,7 @@
 //! ```text
 //!   0..16    collection_id
 //!  16        op                1 = set, 2 = collection tombstone
-//!  17        flags             must be zero
+//!  17        flags             bit 0 = explicit removed version; others zero
 //!  18..20    reserved          must be zero
 //!  20..36    full_hash         zero for a tombstone
 //!  36..52    pack_id           16-byte global pack identity, zero for a tombstone
@@ -45,6 +45,8 @@ pub enum RedoOp {
         offset: u64,
         /// Expected on-disk length of the frame.
         record_len: u32,
+        /// Whether the frame is an explicit removed version.
+        removed: bool,
     },
     /// Drop the whole collection. The native index has no per-key delete.
     CollectionTombstone,
@@ -141,6 +143,7 @@ impl RedoRecord {
                 pack_id,
                 offset,
                 record_len,
+                removed,
             } => {
                 if offset > IndexEntry::MAX_OFFSET {
                     return Err(RedoError::OffsetTooLarge(offset));
@@ -152,6 +155,7 @@ impl RedoRecord {
                     return Err(RedoError::ZeroPackId);
                 }
                 put(&mut buf, 16, &[OP_SET]);
+                put(&mut buf, 17, &[u8::from(removed)]);
                 put(&mut buf, 20, &full_hash);
                 put(&mut buf, 36, pack_id.as_bytes());
                 put(&mut buf, 52, &offset.to_le_bytes());
@@ -174,7 +178,7 @@ impl RedoRecord {
         if bytes.len() != REDO_RECORD_LEN {
             return Err(RedoError::BadLength(bytes.len()));
         }
-        if bytes[17..20].iter().any(|b| *b != 0) {
+        if bytes[17] & !1 != 0 || bytes[18..20].iter().any(|b| *b != 0) {
             return Err(RedoError::NonzeroReserved);
         }
         let op_byte = bytes.get(16).copied().unwrap_or(0);
@@ -198,9 +202,13 @@ impl RedoRecord {
                     pack_id,
                     offset,
                     record_len,
+                    removed: bytes[17] & 1 != 0,
                 }
             }
             OP_COLLECTION_TOMBSTONE => {
+                if bytes[17] != 0 {
+                    return Err(RedoError::NonzeroReserved);
+                }
                 if full_hash != [0; 16]
                     || pack_id != PackId([0; crate::packfile::PACK_ID_LEN])
                     || offset != 0
@@ -254,6 +262,7 @@ mod tests {
                 pack_id: PackId([0; 16]),
                 offset: 0,
                 record_len: 1,
+                removed: false,
             },
             delta_seq: 1,
             base_generation: 0,
@@ -273,6 +282,7 @@ mod tests {
             pack_id: PackId([3; 16]),
             offset: 0,
             record_len: 1,
+            removed: false,
         };
         let mut encoded = record.encode().unwrap();
         encoded[36..52].fill(0);

@@ -387,10 +387,10 @@ pub trait StorageEngine: Send + Sync {
     /// does not change the count. It includes the genesis metadata record
     /// (`COLLECTION_METADATA_RECORD_ID`) written by
     /// [`Self::ensure_collection_metadata`], so a collection with N application
-    /// records reports N + 1. This is the number of indexed node IDs, so a key
-    /// whose latest frame is an explicit removal version remains counted until
-    /// repack drops that index entry. Empty payloads remain ordinary live
-    /// values. The count reflects what this handle can see, so a read-only or
+    /// records reports N + 1. Keys whose latest frame is an explicit removal
+    /// version are excluded even though their index entries remain until
+    /// repack. Empty payloads remain ordinary live values. The count reflects
+    /// what this handle can see, so a read-only or
     /// checkpoint-backed handle can lag the writer until its index refreshes.
     ///
     /// # Errors

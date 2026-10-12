@@ -9160,6 +9160,7 @@ fn applying_redo_sets_is_idempotent_and_order_convergent() {
                 pack_id: PackId([7; crate::packfile::PACK_ID_LEN]),
                 offset: 1_000 + u64::from(id) * 64,
                 record_len: 61,
+                removed: false,
             },
             delta_seq: seq,
             base_generation: 1,
@@ -9174,6 +9175,7 @@ fn applying_redo_sets_is_idempotent_and_order_convergent() {
                 pack_id: PackId([7; crate::packfile::PACK_ID_LEN]),
                 offset: 500_000 + u64::from(id) * 64,
                 record_len: 61,
+                removed: false,
             },
             delta_seq: seq,
             base_generation: 1,
@@ -10799,11 +10801,11 @@ fn build_index_fails_closed_when_the_table_rejects_an_insert() {
     // the sized table cannot satisfy makes the first insert fail; the build
     // must surface that as `Corrupt`, not return an index silently missing the
     // record (the pre-`insert_or_corrupt` code discarded the error).
-    let offsets: Vec<([u8; 16], u16, u64)> = (0..3u64)
+    let offsets: Vec<([u8; 16], u16, u64, bool)> = (0..3u64)
         .map(|seq| {
             let mut hash = [0u8; 16];
             hash[..8].copy_from_slice(&seq.to_be_bytes());
-            (hash, 0u16, 64 + seq * 64)
+            (hash, 0u16, 64 + seq * 64, false)
         })
         .collect();
     let starved = crate::index::IndexConfig {
@@ -10852,7 +10854,13 @@ fn init_collection_from_scan_fails_closed_when_the_table_rejects_an_insert() {
         }
         for (collection, hash, offset) in ShardPool::scan_shard(&path).unwrap() {
             if collection == TEST_COLLECTION {
-                records.push((0, hash, offset, PackId([0u8; crate::packfile::PACK_ID_LEN])));
+                records.push((
+                    0,
+                    hash,
+                    offset,
+                    PackId([0u8; crate::packfile::PACK_ID_LEN]),
+                    false,
+                ));
             }
         }
     }
@@ -10935,8 +10943,8 @@ fn two_slots_for(store: &PackfileStorage, collection: &[u8; 16], hash: &NodeId) 
         .scan_collection_records(collection)
         .unwrap()
         .into_iter()
-        .filter(|(_, entries)| entries.iter().any(|(entry, _)| entry == hash))
-        .map(|(slot, _)| slot)
+        .filter(|(_, entry, _, _, _)| entry == hash)
+        .map(|(slot, _, _, _, _)| slot)
         .collect();
     slots.sort_unstable();
     assert!(slots.len() >= 2, "the key needs frames in two packs");
@@ -11003,30 +11011,25 @@ fn open_time_rebuild_picks_the_marker_when_it_sits_in_a_lower_slot() {
     let (dir, store, collection, victim, marker_slot, value_slot) =
         marker_in_lower_slot("lower_slot_rebuild", false);
     let mut records: Vec<ShardRecord> = Vec::new();
-    for (slot, entries) in store.scan_collection_records(&collection).unwrap() {
-        let pack_id = store.shards.get_shard(slot).unwrap().pack_id;
-        for (hash, offset) in entries {
-            records.push((slot, hash, offset, pack_id));
-        }
-    }
+    records.extend(store.scan_collection_records(&collection).unwrap());
     // The scan visits the lower slot (the marker) before the higher (the value).
     let marker_pos = records
         .iter()
-        .position(|(slot, hash, _, _)| *hash == victim && *slot == marker_slot)
+        .position(|(slot, hash, _, _, _)| *hash == victim && *slot == marker_slot)
         .unwrap();
     let value_pos = records
         .iter()
-        .position(|(slot, hash, _, _)| *hash == victim && *slot == value_slot)
+        .position(|(slot, hash, _, _, _)| *hash == victim && *slot == value_slot)
         .unwrap();
     assert!(marker_pos < value_pos, "the layout must be misordered");
 
     let latest = PackfileStorage::latest_records_for_collection(&records, &store.shards).unwrap();
     let chosen: Vec<_> = latest
         .iter()
-        .filter(|(_, hash, _, _)| *hash == victim)
+        .filter(|(_, hash, _, _, _)| *hash == victim)
         .collect();
     assert_eq!(chosen.len(), 1, "one frame per key");
-    let (slot, _, offset, _) = *chosen[0];
+    let (slot, _, offset, _, _) = *chosen[0];
     assert!(
         frame_is_removed(&store, slot, offset),
         "the newest frame is the removal marker, whatever the slot order"

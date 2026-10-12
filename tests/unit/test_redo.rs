@@ -12,6 +12,7 @@ fn set(seq: u64) -> RedoRecord {
             pack_id: PackId([7; PACK_ID_LEN]),
             offset: 4096,
             record_len: 61,
+            removed: false,
         },
         delta_seq: seq,
         base_generation: 3,
@@ -62,7 +63,7 @@ fn unknown_operations_and_nonzero_reserved_bytes_are_rejected() {
         bytes[16] = op;
         assert_eq!(RedoRecord::decode(&bytes), Err(RedoError::UnknownOp(op)));
     }
-    for at in [17usize, 18, 19] {
+    for at in [18usize, 19] {
         let mut bytes = good;
         bytes[at] = 1;
         assert_eq!(
@@ -71,6 +72,37 @@ fn unknown_operations_and_nonzero_reserved_bytes_are_rejected() {
             "byte {at}"
         );
     }
+    let mut unknown_flags = good;
+    unknown_flags[17] = 0x80;
+    assert_eq!(
+        RedoRecord::decode(&unknown_flags),
+        Err(RedoError::NonzeroReserved)
+    );
+}
+
+#[test]
+fn removed_set_flag_round_trips_in_v1_flags_byte() {
+    let mut record = set(3);
+    let RedoOp::Set {
+        full_hash,
+        pack_id,
+        offset,
+        record_len,
+        ..
+    } = record.op
+    else {
+        unreachable!()
+    };
+    record.op = RedoOp::Set {
+        full_hash,
+        pack_id,
+        offset,
+        record_len,
+        removed: true,
+    };
+    let encoded = record.encode().unwrap();
+    assert_eq!(encoded[17], 1);
+    assert_eq!(RedoRecord::decode(&encoded), Ok(record));
 }
 
 #[test]
@@ -82,6 +114,7 @@ fn an_offset_above_the_index_maximum_is_rejected_both_ways() {
         pack_id: PackId([1; PACK_ID_LEN]),
         offset: too_far,
         record_len: 61,
+        removed: false,
     };
     assert_eq!(record.encode(), Err(RedoError::OffsetTooLarge(too_far)));
     let mut bytes = set(1).encode().unwrap();
@@ -97,6 +130,7 @@ fn an_offset_above_the_index_maximum_is_rejected_both_ways() {
         pack_id: PackId([1; PACK_ID_LEN]),
         offset: IndexEntry::MAX_OFFSET,
         record_len: 61,
+        removed: false,
     };
     assert_eq!(RedoRecord::decode(&ok.encode().unwrap()), Ok(ok));
 }

@@ -55,6 +55,43 @@ fn candidates(index: &LossyIndex, hash: &[u8; 16]) -> Vec<(u16, u64)> {
     found
 }
 
+#[test]
+fn removed_bit_survives_overwrite_checkpoint_growth_and_slot_remap() {
+    let removed_hash = test_hash(0x31);
+    let live_hash = test_hash(0x32);
+    let index = LossyIndex::with_config(64, IndexConfig::default());
+
+    index
+        .insert_tracked_with_removed(&removed_hash, 2, 128, true)
+        .unwrap();
+    index.insert(&live_hash, 4, 256).unwrap();
+    assert_eq!(index.lookup_removed(&removed_hash), Some(true));
+    assert_eq!(index.removed_count(), 1);
+    assert_eq!(index.live_count(), 1);
+    assert_eq!(index.slot_counts().get(&2), Some(&1));
+
+    let checkpoint = index.serialize();
+    let restored = LossyIndex::deserialize(&checkpoint).unwrap();
+    assert_eq!(restored.lookup_removed(&removed_hash), Some(true));
+    assert_eq!(restored.removed_count(), 1);
+
+    let grown = restored.grow().expect("hydrated checkpoint can grow");
+    assert_eq!(grown.lookup_removed(&removed_hash), Some(true));
+    assert_eq!(grown.removed_count(), 1);
+    assert_eq!(grown.live_count(), 1);
+
+    let mut remapped = grown;
+    assert!(remapped.remap_slots(&HashMap::from([(2, 3), (4, 5)])));
+    assert_eq!(remapped.lookup(&removed_hash), Some((3, 128)));
+    assert_eq!(remapped.lookup_removed(&removed_hash), Some(true));
+    assert_eq!(remapped.slot_counts().get(&3), Some(&1));
+
+    remapped.insert(&removed_hash, 6, 512).unwrap();
+    assert_eq!(remapped.lookup_removed(&removed_hash), Some(false));
+    assert_eq!(remapped.removed_count(), 0);
+    assert_eq!(remapped.live_count(), 2);
+}
+
 /// Whether a checkpoint-loaded index grows from its persisted `homes` and
 /// `tails`: build a live index, persist and load it, and check (a) a fully
 /// hydrated load has complete

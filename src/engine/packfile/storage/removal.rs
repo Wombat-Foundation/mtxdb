@@ -105,6 +105,17 @@ impl PackfileStorage {
         Ok(true)
     }
 
+    /// How many of the collection's index entries point at an explicit removal
+    /// version, counted from the in-memory index alone (no pack reads). With
+    /// the collection's `len`, this gives the live count: `len - removed`.
+    /// `None` if the collection is not loaded.
+    #[must_use]
+    pub fn indexed_removed_count(&self, collection_id: &[u8; 16]) -> Option<usize> {
+        self.collections_read()
+            .get(collection_id)
+            .map(|generation| generation.load().index.removed_count())
+    }
+
     fn newest_versions(
         &self,
         collection_id: &[u8; 16],

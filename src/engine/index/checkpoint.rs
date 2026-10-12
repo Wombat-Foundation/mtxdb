@@ -561,6 +561,15 @@ pub fn read_checkpoint_with_policy(
         if region.checked_add(slots_len)? > buf.len() {
             return None;
         }
+        for slot_bytes in buf
+            .get(region..region.checked_add(slots_len)?)?
+            .chunks_exact(8)
+        {
+            let raw = u64::from_le_bytes(slot_bytes.try_into().ok()?);
+            if !super::IndexEntry::valid_raw_slot(raw) {
+                return None;
+            }
+        }
         let has_homes_tails = header.homes_bytes > 0 && header.tails_bytes > 0;
         let homes_region = if has_homes_tails {
             let r = slot_base.checked_add(usize::try_from(entry.homes_offset).ok()?)?;

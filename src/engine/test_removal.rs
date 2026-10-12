@@ -1526,3 +1526,137 @@ fn a_batch_removal_loses_to_a_concurrent_re_put_of_identical_content() {
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ------------------------------------- index-only counts across load paths ---
+//
+// The index carries a removed bit so live and removed counts need no pack
+// reads. These tests hold it to the packs: after every kind of load or
+// rewrite, the index's counts must equal the counts derived from the newest
+// frame of each key.
+
+fn assert_index_matches_packs(store: &PackfileStorage, collection: &[u8; 16], stage: &str) {
+    let stats = store.removal_stats(collection).unwrap();
+    let (len, _, _) = store
+        .collection_index_info(collection)
+        .unwrap_or_else(|| panic!("{stage}: collection is not loaded"));
+    let removed = store
+        .indexed_removed_count(collection)
+        .unwrap_or_else(|| panic!("{stage}: collection is not loaded"));
+    assert_eq!(
+        removed, stats.removed_keys,
+        "{stage}: index removed count differs from the packs"
+    );
+    assert_eq!(
+        len.saturating_sub(removed),
+        stats.live_keys,
+        "{stage}: index live count differs from the packs"
+    );
+}
+
+/// Puts, removals, re-adds, and a repack that carries markers past a retained
+/// shard, then the same counts after a checkpoint reopen, a checkpoint plus
+/// delta replay, and a rebuild from the shards alone.
+#[test]
+fn index_counts_match_the_packs_after_every_load_path() {
+    let dir = test_root("index_counts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let collection = [0xc1; 16];
+    let bystander = [0xc2; 16];
+    let victims: Vec<NodeId> = (0..12u8).map(|i| node(100 + i)).collect();
+
+    {
+        let store = open_small(&dir);
+        // The first victims share the oldest shard with the bystander, so a
+        // later repack must carry their markers.
+        for victim in victims.iter().take(6) {
+            store
+                .put(&collection, victim, &NodeData::from_slice(b"old"))
+                .unwrap();
+        }
+        store
+            .put(&bystander, &node(1), &NodeData::from_slice(b"keep"))
+            .unwrap();
+        fill(&store, &collection, 0, 60);
+        for victim in victims.iter().skip(6) {
+            store
+                .put(&collection, victim, &NodeData::from_slice(b"old"))
+                .unwrap();
+        }
+        fill(&store, &collection, 1000, 60);
+        assert_index_matches_packs(&store, &collection, "after puts");
+
+        for victim in victims.iter().take(10) {
+            assert!(store.remove_record(&collection, victim).unwrap());
+        }
+        assert_index_matches_packs(&store, &collection, "after removals");
+
+        // Re-add three removed keys: removed -> live.
+        for victim in victims.iter().take(3) {
+            store
+                .put(&collection, victim, &NodeData::from_slice(b"new"))
+                .unwrap();
+        }
+        assert_index_matches_packs(&store, &collection, "after re-adds");
+
+        store.sync_all().unwrap();
+        store
+            .repack_collection_reachable(&collection, |_, _| Vec::new())
+            .unwrap();
+        store.sync_all().unwrap();
+        assert_index_matches_packs(&store, &collection, "after repack");
+        assert!(
+            store.indexed_removed_count(&collection).unwrap() > 0,
+            "the retained bystander shard should force carried markers"
+        );
+    }
+
+    // Checkpoint reopen.
+    {
+        let store = open_small(&dir);
+        assert_index_matches_packs(&store, &collection, "after checkpoint reopen");
+
+        // More mutations after the checkpoint, flushed as a delta only.
+        for victim in victims.iter().skip(10) {
+            assert!(store.remove_record(&collection, victim).unwrap());
+        }
+        store
+            .put(&collection, &victims[4], &NodeData::from_slice(b"again"))
+            .unwrap();
+        assert_index_matches_packs(&store, &collection, "after post-checkpoint writes");
+        store.sync().unwrap();
+    }
+
+    // Checkpoint plus delta replay.
+    {
+        let store = open_small(&dir);
+        assert_index_matches_packs(&store, &collection, "after checkpoint + delta replay");
+    }
+
+    // Rebuild from the shards alone.
+    drop_index_sidecars(&dir);
+    let store = open_small(&dir);
+    assert_index_matches_packs(&store, &collection, "after rebuild from shards");
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A removal marker for a key the index does not hold yet (as when recovery
+/// replays a removal) takes a fresh entry, so enough of them make the table
+/// grow. Every one must still be indexed as removed.
+#[test]
+fn removal_markers_that_force_index_growth_are_counted_as_removed() {
+    let dir = test_root("index_growth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let collection = [0xc3; 16];
+    let store = open_small(&dir);
+    for index in 0..600u32 {
+        remove_directly(&store, collection, filler_id(index), u64::from(index) + 1);
+        if index % 150 == 0 {
+            assert_index_matches_packs(&store, &collection, "during growth");
+        }
+    }
+    assert_index_matches_packs(&store, &collection, "after growth");
+    assert_eq!(store.indexed_removed_count(&collection), Some(600));
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}

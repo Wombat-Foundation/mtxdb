@@ -76,12 +76,9 @@ fn mix(x: u64) -> u64 {
 /// Layout: `[16-bit tag | 16-bit slot | 32-bit offset]` packed into a `u64`.
 ///
 /// - **tag** (high 16 bits): truncated fingerprint for fast rejection.
-/// - **`slot`** (next 16 bits): which shard file this record lives in. The
-///   field is a full 16 bits, but live shard IDs only ever reach
-///   `crate::shard::MAX_SHARDS` (4096), so the top 4 bits of this field are
-///   reserved — `IndexEntry::new` rejects a slot that is not a valid live ID.
-///   They are *not* reclaimed as extra offset bits: `slot()` still decodes
-///   all 16, and widening the offset would change the on-disk encoding.
+/// - **`slot`** (next 16 bits): low 12 bits identify the shard (the pool has
+///   4096 slots); bit 15 marks an explicit removed version. Bits 12..14 are
+///   reserved and must remain zero.
 /// - **offset** (low 32 bits): byte offset within the shard, stored as
 ///   `offset + 1` so that the all-zeros encoding is reserved as the empty
 ///   sentinel. Actual offset 0 is stored as 1, and `offset()` subtracts 1
@@ -104,6 +101,11 @@ impl IndexEntry {
     const TAG_SHIFT: u64 = 48; // SHARD_BITS + OFFSET_BITS
     const SHARD_SHIFT: u64 = 32; // OFFSET_BITS
     const OFFSET_MASK: u64 = 0xFFFF_FFFF;
+    // Preserve the three currently-reserved bits in slot() so existing
+    // MAX_SHARDS validation rejects malformed encodings instead of masking
+    // them into a valid slot. Only the removal bit is excluded.
+    const SLOT_MASK: u16 = 0x7FFF;
+    const REMOVED_MASK: u16 = 0x8000;
 
     /// Create a new entry from its components.
     ///
@@ -117,6 +119,16 @@ impl IndexEntry {
     /// [`Self::MAX_OFFSET`].
     #[must_use]
     pub fn new(tag: u32, slot: u16, offset: u64) -> Self {
+        Self::new_with_removed(tag, slot, offset, false)
+    }
+
+    /// Create an entry with the explicit removed-version bit set when
+    /// `removed` is true.
+    ///
+    /// # Panics
+    /// Panics under the same invalid component conditions as [`Self::new`].
+    #[must_use]
+    pub fn new_with_removed(tag: u32, slot: u16, offset: u64, removed: bool) -> Self {
         assert!(tag <= 0xFFFF, "tag must fit in 16 bits");
         assert!(
             usize::from(slot) < crate::shard::MAX_SHARDS,
@@ -128,7 +140,8 @@ impl IndexEntry {
         );
         Self(
             (u64::from(tag) << Self::TAG_SHIFT)
-                | (u64::from(slot) << Self::SHARD_SHIFT)
+                | (u64::from(slot | if removed { Self::REMOVED_MASK } else { 0 })
+                    << Self::SHARD_SHIFT)
                 | ((offset.wrapping_add(1)) & Self::OFFSET_MASK),
         )
     }
@@ -151,10 +164,48 @@ impl IndexEntry {
         ((self.0 >> Self::TAG_SHIFT) & 0xFFFF) as u32
     }
 
-    /// The 16-bit shard ID stored in this entry.
+    /// The shard ID stored in this entry, excluding the removal flag.
+    ///
+    /// # Panics
+    /// Never panics: the packed field is masked to 16 bits before conversion.
     #[must_use]
     pub fn slot(self) -> u16 {
-        ((self.0 >> Self::SHARD_SHIFT) & 0xFFFF) as u16
+        (u16::try_from((self.0 >> Self::SHARD_SHIFT) & 0xFFFF)
+            .expect("masked slot field fits in u16"))
+            & Self::SLOT_MASK
+    }
+
+    /// Whether this entry points to an explicit removed record version.
+    ///
+    /// # Panics
+    /// Never panics: the packed field is masked to 16 bits before conversion.
+    #[must_use]
+    pub fn is_removed(self) -> bool {
+        (u16::try_from((self.0 >> Self::SHARD_SHIFT) & 0xFFFF)
+            .expect("masked slot field fits in u16")
+            & Self::REMOVED_MASK)
+            != 0
+    }
+
+    /// Whether the packed slot contains reserved bits that are not defined.
+    ///
+    /// # Panics
+    /// Never panics: the packed field is masked to 16 bits before conversion.
+    #[must_use]
+    pub fn has_invalid_slot_bits(self) -> bool {
+        (u16::try_from((self.0 >> Self::SHARD_SHIFT) & 0xFFFF)
+            .expect("masked slot field fits in u16")
+            & 0x7000)
+            != 0
+    }
+
+    /// Validate the persisted slot portion without constructing an index.
+    #[must_use]
+    pub fn valid_raw_slot(raw: u64) -> bool {
+        let entry = Self(raw);
+        entry.is_empty()
+            || (!entry.has_invalid_slot_bits()
+                && usize::from(entry.slot()) < crate::shard::MAX_SHARDS)
     }
 
     /// The byte offset within the shard stored in this entry.
@@ -172,7 +223,8 @@ impl IndexEntry {
 ///
 /// Design decisions (from docs):
 /// - Partition by collection: ~8KB per 1000-node collection, 100 active collections < 1MB.
-/// - Empty entry terminates probe (write-once, no tombstones needed).
+/// - Empty entry terminates probe. Removed versions remain occupied entries,
+///   so removal never breaks a probe chain.
 /// - Tag collisions coexist in the probe chain; a tag is only a candidate
 ///   filter and never an overwrite/equality proof.
 /// - Owned indexes keep `homes` and `tails` identity side tables: two
@@ -492,6 +544,22 @@ impl LossyIndex {
             .map(|(bucket, value, _undo)| (bucket, value))
     }
 
+    /// Like [`Self::insert_tracked`], preserving whether the located frame is
+    /// an explicit removed version in the packed index entry.
+    ///
+    /// # Errors
+    /// Returns [`InsertError::TableFull`] if the table cannot accept a new key.
+    pub fn insert_tracked_with_removed(
+        &self,
+        hash: &[u8; 16],
+        slot: u16,
+        offset: u64,
+        removed: bool,
+    ) -> Result<(u32, u64), InsertError> {
+        self.insert_undoable_with_removed(hash, slot, offset, removed)
+            .map(|(bucket, value, _undo)| (bucket, value))
+    }
+
     /// Like [`Self::insert_tracked`], but also returns a [`EntryUndo`]
     /// capturing the entry's prior contents, so a caller that needs to
     /// mutate the live (not cloned) index for a multi-record batch can
@@ -509,6 +577,26 @@ impl LossyIndex {
         hash: &[u8; 16],
         slot: u16,
         offset: u64,
+    ) -> Result<(u32, u64, EntryUndo), InsertError> {
+        self.insert_undoable_with_removed(hash, slot, offset, false)
+    }
+
+    /// As [`Self::insert_undoable`], with an explicit removed-version bit.
+    ///
+    /// # Errors
+    /// Returns [`InsertError::TableFull`] if the table cannot accept a new key,
+    /// or [`InsertError::NeedsIdentity`] when a matching checkpoint candidate
+    /// needs its full identity hydrated before it can be safely overwritten.
+    ///
+    /// # Panics
+    /// Never panics in practice: `hash` is exactly 16 bytes, so the fixed-size
+    /// conversions used to derive its home and tail cannot fail.
+    pub fn insert_undoable_with_removed(
+        &self,
+        hash: &[u8; 16],
+        slot: u16,
+        offset: u64,
+        removed: bool,
     ) -> Result<(u32, u64, EntryUndo), InsertError> {
         let tag = self.tag(hash);
         let raw_home = u64::from_be_bytes(hash[..8].try_into().unwrap());
@@ -541,7 +629,7 @@ impl LossyIndex {
                 // empty entry or a complete record location.
                 self.homes.lock()[bucket] = home;
                 self.tails.lock()[bucket] = Self::tail(hash);
-                let value = IndexEntry::new(tag, slot, offset).0;
+                let value = IndexEntry::new_with_removed(tag, slot, offset, removed).0;
                 slots[bucket].store(value, Ordering::Release);
                 self.len.fetch_add(1, Ordering::Relaxed);
                 let undo = EntryUndo {
@@ -570,7 +658,7 @@ impl LossyIndex {
                 if self.homes.lock()[bucket] == home && tail == Self::tail(hash) {
                     let old_entry = entry.0;
                     let old_home = self.homes.lock()[bucket];
-                    let value = IndexEntry::new(tag, slot, offset).0;
+                    let value = IndexEntry::new_with_removed(tag, slot, offset, removed).0;
                     slots[bucket].store(value, Ordering::Release);
                     let undo = EntryUndo {
                         bucket: bucket_wire,
@@ -678,7 +766,9 @@ impl LossyIndex {
             // `referenced_slot_ids` and friends skip `id >= MAX_SHARDS` — so
             // the record would silently vanish from recovery.
             let decoded = IndexEntry(frame.slot);
-            if usize::from(decoded.slot()) >= crate::shard::MAX_SHARDS {
+            if decoded.has_invalid_slot_bits()
+                || usize::from(decoded.slot()) >= crate::shard::MAX_SHARDS
+            {
                 return Err(DeltaReplayError::SlotOutOfRange {
                     bucket: frame.bucket,
                     slot: decoded.slot(),
@@ -762,12 +852,17 @@ impl LossyIndex {
             if entry.is_empty() {
                 continue;
             }
-            locations.push((entry.slot(), entry.offset(), entry.tag()));
+            locations.push((
+                entry.slot(),
+                entry.offset(),
+                entry.tag(),
+                entry.is_removed(),
+            ));
         }
-        locations.sort_unstable_by_key(|(slot, offset, _)| (*slot, *offset));
+        locations.sort_unstable_by_key(|(slot, offset, _, _)| (*slot, *offset));
 
         let grown = Self::with_config((self.capacity as usize).saturating_mul(2), self.config);
-        for (slot, offset, slot_tag) in locations {
+        for (slot, offset, slot_tag, removed) in locations {
             let hash = hash_at(slot, offset, slot_tag)?;
             // A doubled table is at most 37.5% full because insertion only
             // requests growth at 75%, so TableFull should be unreachable —
@@ -775,7 +870,10 @@ impl LossyIndex {
             // `max_occupied`), and a silently dropped insert here would
             // publish a grown index missing entries. Fail the growth closed
             // instead: `Ok(None)` sends the caller to its pack-scan rebuild.
-            if grown.insert(&hash, slot, offset).is_err() {
+            if grown
+                .insert_tracked_with_removed(&hash, slot, offset, removed)
+                .is_err()
+            {
                 return Ok(None);
             }
         }
@@ -785,13 +883,67 @@ impl LossyIndex {
     /// Look up a hash in the index.
     /// Returns `(slot, offset)` if found, `None` if absent.
     ///
-    /// An empty entry terminates the probe — this is correct because:
-    /// 1. Class A tables are write-once with no deletes (no tombstones needed).
-    /// 2. An empty entry means the key was never inserted.
+    /// An empty entry terminates the probe because removed versions remain
+    /// occupied entries; an empty entry means the key was never inserted.
     #[inline]
     #[must_use]
     pub fn lookup(&self, hash: &[u8; 16]) -> Option<(u16, u64)> {
         self.lookup_all(hash).next()
+    }
+
+    /// Whether the indexed latest version of `hash` is explicitly removed.
+    /// Returns `None` when no matching identity is present.
+    ///
+    /// # Panics
+    /// Never panics in practice: `hash` is exactly 16 bytes, so the fixed-size
+    /// conversion used to derive its home cannot fail.
+    #[must_use]
+    pub fn lookup_removed(&self, hash: &[u8; 16]) -> Option<bool> {
+        let tag = self.tag(hash);
+        let bucket = self.bucket(hash);
+        let raw_home = u64::from_be_bytes(hash[..8].try_into().expect("16-byte hash"));
+        let mixed_home = self.mix_home(raw_home);
+        let expected_tail = Self::tail(hash);
+        for step in 0..self.capacity as usize {
+            let current = bucket.wrapping_add(step) & self.mask as usize;
+            let entry = IndexEntry(self.entry_at(current));
+            if entry.is_empty() {
+                return None;
+            }
+            if entry.tag() != tag {
+                continue;
+            }
+            let tails = self.tails.lock();
+            let tail = tails.get(current).copied().unwrap_or(0);
+            drop(tails);
+            if tail == 0 {
+                continue;
+            }
+            let homes = self.homes.lock();
+            let home = homes.get(current).copied().unwrap_or(0);
+            drop(homes);
+            if home == mixed_home && tail == expected_tail {
+                return Some(entry.is_removed());
+            }
+        }
+        None
+    }
+
+    /// Count explicit removed versions without reading pack frames.
+    #[must_use]
+    pub fn removed_count(&self) -> usize {
+        (0..self.capacity as usize)
+            .filter(|&index| {
+                let entry = IndexEntry(self.entry_at(index));
+                !entry.is_empty() && entry.is_removed()
+            })
+            .count()
+    }
+
+    /// Count indexed keys whose latest record version is live.
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.len().saturating_sub(self.removed_count())
     }
 
     /// Look up all candidate offsets for a hash, yielding tag collisions.
@@ -998,7 +1150,13 @@ impl LossyIndex {
             if new_slot == entry.slot() {
                 continue;
             }
-            let remapped = IndexEntry::new(entry.tag(), new_slot, entry.offset()).0;
+            let remapped = IndexEntry::new_with_removed(
+                entry.tag(),
+                new_slot,
+                entry.offset(),
+                entry.is_removed(),
+            )
+            .0;
             cell.store(remapped, Ordering::Relaxed);
         }
         true
@@ -1099,6 +1257,9 @@ impl LossyIndex {
             let offset = 8_usize.wrapping_add(i.wrapping_mul(8));
             let val = u64::from_le_bytes(data[offset..offset.wrapping_add(8)].try_into().unwrap());
             let entry = IndexEntry(val);
+            if !IndexEntry::valid_raw_slot(val) {
+                return Err(DeserializationError::InvalidSlot);
+            }
             if !entry.is_empty() {
                 len = len.wrapping_add(1);
             }
@@ -1325,6 +1486,8 @@ pub enum DeserializationError {
     TooShort,
     /// The header declared a capacity that is not a valid power of two.
     InvalidCapacity,
+    /// An occupied entry has invalid reserved slot bits or names no shard.
+    InvalidSlot,
 }
 
 impl std::fmt::Display for DeserializationError {
@@ -1334,6 +1497,7 @@ impl std::fmt::Display for DeserializationError {
             Self::InvalidCapacity => {
                 write!(f, "capacity must be a power of two and >= 16")
             }
+            Self::InvalidSlot => write!(f, "index entry has invalid slot bits"),
         }
     }
 }
