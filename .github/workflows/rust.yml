@@ -63,6 +63,13 @@ jobs:
         if: matrix.label == 'MSRV (default features)'
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Export fixtures match their manifest
+        env:
+          # Optional: raw URL of the peer repo's SHA256SUMS, set under
+          # /settings/variables/actions, to also compare the two repos.
+          EXPORT_FIXTURES_PEER: ${{ vars.EXPORT_FIXTURES_PEER_URL }}
+        run: scripts/check-export-fixtures.sh
+
       - name: Test (default features)
         if: matrix.label == 'MSRV (default features)'
         run: cargo test --locked --lib --tests
