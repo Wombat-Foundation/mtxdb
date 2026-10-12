@@ -442,7 +442,16 @@ impl WriteStats {
     }
 }
 
-fn timed_put(store: &dyn StorageEngine, stats: &mut PutStats, id: [u8; 16], bytes: &[u8]) {
+/// The newest payload put under each record id: what compaction would keep.
+pub(crate) type Latest = HashMap<[u8; 16], Vec<u8>>;
+
+fn timed_put(
+    store: &dyn StorageEngine,
+    (stats, latest): (&mut PutStats, &mut Latest),
+    id: [u8; 16],
+    bytes: &[u8],
+) {
+    latest.insert(id, bytes.to_vec());
     let started = Instant::now();
     store
         .put(&CHUNK_COLLECTION, &id, &NodeData::from_slice(bytes))
@@ -463,6 +472,8 @@ fn timed_put(store: &dyn StorageEngine, stats: &mut PutStats, id: [u8; 16], byte
 pub(crate) struct Writer<'a> {
     pub(crate) ids: Ids<'a>,
     pub(crate) stats: WriteStats,
+    /// Newest payload per record id, for the live-bytes and compaction measures.
+    pub(crate) latest: Latest,
     seen_edge: HashSet<usize>,
     seen_key: HashSet<usize>,
     batches: u32,
@@ -485,6 +496,33 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// Payload bytes compaction would keep: the newest version of every record.
+    pub(crate) fn live_bytes(&self) -> u64 {
+        self.latest.values().fold(0_u64, |acc, v| {
+            acc.saturating_add(u64::try_from(v.len()).unwrap_or(u64::MAX))
+        })
+    }
+
+    /// Simulated compaction: write only the newest version of every record into
+    /// a fresh store at `dir` and sync. Not the engine's compaction path; it
+    /// prices the copy and shows the size a compacted store settles at.
+    pub(crate) fn simulate_compaction(&self, dir: &Path) -> (Duration, Sizes) {
+        let _ = std::fs::remove_dir_all(dir);
+        let db = Database::open(dir.to_path_buf()).expect("open");
+        let started = Instant::now();
+        for (id, bytes) in &self.latest {
+            db.edges()
+                .put(&CHUNK_COLLECTION, id, &NodeData::from_slice(bytes))
+                .expect("put");
+        }
+        db.edges().sync_all().expect("sync");
+        let took = started.elapsed();
+        drop(db);
+        let after = sizes(dir);
+        let _ = std::fs::remove_dir_all(dir);
+        (took, after)
+    }
+
     pub(crate) fn sync(&mut self, db: &Database) {
         let started = Instant::now();
         db.edges().sync_all().expect("sync");
@@ -501,7 +539,7 @@ impl<'a> Writer<'a> {
             .collect();
         timed_put(
             store,
-            &mut self.stats.runs,
+            (&mut self.stats.runs, &mut self.latest),
             spread(KIND_RUN, self.batches),
             &encode_run(&mut run),
         );
@@ -515,7 +553,7 @@ impl<'a> Writer<'a> {
             };
             timed_put(
                 store,
-                bucket,
+                (bucket, &mut self.latest),
                 spread(KIND_EDGE_CHUNK, number),
                 &encode_edge_chunk(&self.ids, chunk),
             );
@@ -529,7 +567,7 @@ impl<'a> Writer<'a> {
             };
             timed_put(
                 store,
-                bucket,
+                (bucket, &mut self.latest),
                 spread(KIND_KEY_CHUNK, number),
                 &encode_key_chunk(&self.ids, chunk),
             );

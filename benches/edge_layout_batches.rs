@@ -9,7 +9,9 @@
 //! durable. Per case (`MTXDB_EL_REPS`, default 3, fresh stores each) it prints wall time, on-disk growth (packs +
 //! checkpoint + delta, no forced checkpoint) and, for the prototype, payload
 //! bytes put, the share that rewrites an earlier chunk, puts and sync time, then
-//! a CSV (also written to `MTXDB_EL_CSV` when set).
+//! the garbage left by rewritten chunks (live = newest payload per record id,
+//! against pack bytes; compaction is simulated by copying the live records into
+//! a fresh store, not the engine's path), then a CSV (also written to `MTXDB_EL_CSV` when set).
 //!
 //! ```text
 //! MTXDB_EL_TSV=room.tsv MTXDB_BENCH_ROOT=/run/media/shane/shane4tb-ent/bench-scratch \
@@ -25,7 +27,7 @@ use mtxdb::database::Database;
 mod common;
 
 use common::{
-    len_f64, load, num, record_rows_in, record_rows_in_measured, sizes, Row, Variant, Writer,
+    len_f64, load, mib, num, record_rows_in, record_rows_in_measured, sizes, Row, Variant, Writer,
     BATCH, SYNC_EVERY,
 };
 
@@ -83,6 +85,18 @@ struct Case {
     sync_ms: f64,
     /// Prototype only: payload bytes put per event, rewrite share (%), puts.
     proto: Option<(f64, f64, u64)>,
+    /// Prototype only: garbage after the append phase.
+    garbage: Option<Garbage>,
+}
+
+/// Dead chunk versions after the append phase, measured over the whole store
+/// (preload included). "Live" is the newest payload per record id.
+struct Garbage {
+    put_mib: f64,
+    live_mib: f64,
+    packs_mib: f64,
+    compact_ms: f64,
+    compacted_packs_mib: f64,
 }
 
 fn baseline(
@@ -114,6 +128,7 @@ fn baseline(
         growth_per_event: num(growth) / len_f64(tail.len().max(1)),
         sync_ms: sync.as_secs_f64() * 1e3,
         proto: None,
+        garbage: None,
     }
 }
 
@@ -144,7 +159,16 @@ fn prototype(
     let started = Instant::now();
     writer.sync(&db);
     let final_sync = started.elapsed();
-    let growth = sizes(&dir).total().saturating_sub(before);
+    let after = sizes(&dir);
+    let growth = after.total().saturating_sub(before);
+    let (compact, compacted) = writer.simulate_compaction(&dir.with_extension("compact"));
+    let garbage = Garbage {
+        put_mib: mib(writer.stats.payload_bytes()),
+        live_mib: mib(writer.live_bytes()),
+        packs_mib: mib(after.packs),
+        compact_ms: compact.as_secs_f64() * 1e3,
+        compacted_packs_mib: mib(compacted.packs),
+    };
     let put = writer.stats.payload_bytes().saturating_sub(put0);
     let rewrite = rewrite_bytes(&writer.stats).saturating_sub(rewrite0);
     let put_count = writer.stats.total_puts().saturating_sub(start_puts);
@@ -167,6 +191,7 @@ fn prototype(
             100.0 * num(rewrite) / num(put.max(1)),
             put_count,
         )),
+        garbage: Some(garbage),
     }
 }
 
@@ -217,6 +242,17 @@ fn main() {
                     )
                     ),
                 );
+                if let Some(g) = &case.garbage {
+                    println!(
+                        "      payload: {:.2} MiB put, {:.2} live | packs: {:.2} MiB, {:.2} after simulated compaction ({:.0}% dead), copy {:.0} ms",
+                        g.put_mib,
+                        g.live_mib,
+                        g.packs_mib,
+                        g.compacted_packs_mib,
+                        100.0 * (1.0 - g.compacted_packs_mib / g.packs_mib.max(f64::MIN_POSITIVE)),
+                        g.compact_ms,
+                    );
+                }
                 lines.push(csv_line(&case));
             }
         }
