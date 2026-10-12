@@ -4,10 +4,12 @@ Benchmark-only comparison of the current `ShortIdIndex` edge store (the
 **baseline**) against a **chunked prototype** layout, on one real Matrix room.
 Nothing here is a production format.
 
-Scope, stated once: **one room** (77,454 events, 77,653 ids), **one machine**,
-20,000 sampled operations per measurement, **no concurrency**, and compaction
-of the prototype's rewritten chunks **not measured**. Numbers are workload- and
-hardware-specific.
+Scope: the core layout and lookup tables use one room (77,454 events, 77,653
+ids), one machine, and 20,000 sampled operations per lookup measurement, with
+no concurrency. The later sithnapse-shaped write comparison uses a different
+room and is labeled separately below. Rewritten-record garbage is measured by
+simulated compaction where stated; the engine's own compaction path is not
+measured. All figures are workload- and hardware-specific.
 
 ## Storage size
 
@@ -185,10 +187,81 @@ earlier room (1 rep), batch 1 took 33.5 ms/event (baseline) vs 39.8 ms
 (prototype): that run measured fsync latency, not chunk rewrites, and is a worst
 case.
 
-**Whether sithnapse benefits is not shown.** Sithnapse does not use
-`ShortIdIndex`; its live edge write is one event at a time (the lazy backfill in
-`_fetch_direct_edges`), preceded by a resolve and a SQL fetch, and it writes both
-the outbound auth list and the child list. The prototype stores only out-edges.
+## Sithnapse-shaped bidirectional auth writes
+
+This follow-up compares the modeled record-per-list layout (outbound auth list
+per event plus read-modify-write child lists per auth parent) with the chunked
+prototype storing both directions. It uses the aria-net.org v6 room fixture
+(75,377 events, 77,653 distinct ids), not the room used by the preceding
+tables. Each case preloads 60,000 events in batches of 1,000, then appends
+2,000 events at the stated batch size, syncing every 20 batches. These are
+single-run results. The replay uses the same mtxdb `Database` settings but is
+not sithnapse's engine or full ingest path: exact node-id derivation, SQL work,
+short-id lookup cost, and closure-cache behavior are outside this measurement.
+
+| batch | record layout µs/event | chunked µs/event | record growth B/event | chunked growth B/event | record payload B/event | chunked payload B/event |
+| ----- | ----------------------: | --------------: | --------------------: | ---------------------: | ---------------------: | ----------------------: |
+| 1     | 13,595                  | 16,600          | 167,107               | 177,765                | 275,201                | 361,040                 |
+| 2     | 11,491                  | 11,244          | 85,638                | 88,974                 | 142,095                | 180,731                 |
+| 10    | 1,959                   | 1,977           | 17,684                | 17,817                 | 31,053                 | 36,375                  |
+| 100   | 172                     | 109             | 2,750                 | 1,921                  | 3,635                  | 3,786                   |
+
+The wall times include periodic syncs. Pack sizes below are for the entire
+preload-plus-append store; "after simulated compaction" copies the newest
+payload per record id into a fresh store and is not the engine's compaction
+implementation.
+
+| batch | record-layout packs | record after compaction | record dead | chunked packs | chunked after compaction | chunked dead |
+| ----- | ------------------: | ----------------------: | ----------: | ------------: | -----------------------: | -----------: |
+| 1     | 347.35 MiB          | 17.66 MiB               | 95%         | 351.17 MiB    | 4.89 MiB                 | 99%          |
+| 2     | 191.91 MiB          | 17.66 MiB               | 91%         | 181.80 MiB    | 4.82 MiB                 | 97%          |
+| 10    | 62.17 MiB           | 17.66 MiB               | 72%         | 46.27 MiB     | 4.77 MiB                 | 90%          |
+| 100   | 30.09 MiB           | 17.66 MiB               | 41%         | 15.64 MiB     | 4.76 MiB                 | 70%          |
+
+This does **not** show a chunked win for one-event-at-a-time ingest: at batch 1
+it is slower and grows slightly more; batches 2 and 10 are effectively tied in
+wall time and have similar growth. At batch 100, chunking is faster and has
+less growth. In both layouts, hot auth parents make the child list grow with
+the room and force repeated whole-list writes. The chunked prototype still
+rewrites the child chunk containing that parent on each append, so chunking
+does not solve the hot-parent write amplification. The measured 242 KiB
+hot-parent child list fits the prototype child-chunk encoding: child counts and
+offsets are `u32`; the separate `u8` lengths in the edge chunk apply to
+outbound per-event lists, whose maximum auth-list length in this fixture is 5.
+
+These results point toward segmented or append-friendly child lists (for
+example, immutable child segments plus a small delta), not rewriting one
+ever-growing parent list. That is a design direction, not implemented here.
+
+## Sithnapse's two-direction auth edges
+
+Sithnapse does not use `ShortIdIndex`. `edge_layout_sithnapse.rs` replays its
+write shape on the aria-net v6 room (60,000 preloaded, 2,000 appended, sync every
+20 batches, 1 rep, auth adjacency only): per event an outbound auth record and the
+id records, plus a read-modify-write of the whole child-list record of every auth
+parent. It is a replay through `Database`, not sithnapse's engine or node ids. The
+chunked column stores the same two directions in chunk 32 records.
+
+| batch | layout     | us/event | growth B/event | dead packs | compacted packs |
+| ----- | ---------- | -------- | -------------- | ---------- | --------------- |
+| 1     | sithnapse  | 16,383   | 167,107        | 95%        | 17.66 MiB       |
+| 1     | chunked    | 15,041   | 177,765        | 99%        | 4.89 MiB        |
+| 2     | sithnapse  | 10,342   | 85,638         | 91%        | 17.66 MiB       |
+| 2     | chunked    | 8,462    | 88,974         | 97%        | 4.82 MiB        |
+| 10    | sithnapse  | 2,358    | 17,684         | 72%        | 17.66 MiB       |
+| 10    | chunked    | 1,546    | 17,817         | 90%        | 4.77 MiB        |
+| 100   | sithnapse  | 154      | 2,750          | 41%        | 17.66 MiB       |
+| 100   | chunked    | 131      | 1,921          | 70%        | 4.76 MiB        |
+
+(chunked batch 1 and 100 wall times are from a second run; the first run gave
+19,650 and 130.7 us/event, so single runs vary by about 30% at batch 1.)
+
+The hot parents (create, power levels) are auth parents of nearly every event, so
+their child lists grow with the room (largest record 242 KiB) and are rewritten
+whole on every append. That is the dominant cost in **both** layouts: growth is
+about 170 KB per event at batch 1, and 95-99% of pack bytes are dead versions.
+Chunking does not fix it. It does shrink the compacted store 3.6x. A fix needs an
+append-friendly child layout, which is a design decision.
 
 ## What this does and does not show
 
@@ -205,9 +278,13 @@ the outbound auth list and the child list. The prototype stores only out-edges.
 
 - Cold reads for the uncompressed prototype, baseline, and merged/hash-only
   stores (eviction failed, skipped by the harness).
-- Garbage from rewritten chunks until compaction.
+- Real compaction cost and scheduling; the reported compaction is a copy-based
+  simulation, not the engine's reclaim path.
 - Concurrent readers and writers.
 - Rooms larger than 77k events.
+- Real sithnapse ingest-path cost beyond the modeled records (SQL fetch,
+  resolves, engine integration, and closure-cache effects).
+- Collision-safe production lookup and atomic publication of a chunked index.
 - Whether disabling zstd improves real lookup performance (the warm data says
   it would; the cold data cannot confirm because the uncompressed store's
   eviction is broken).

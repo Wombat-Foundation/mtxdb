@@ -207,6 +207,16 @@ fn case(base: &std::path::Path, rows: &[Row], preload: usize, (batch, sync_every
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Bytes put so far that replaced an earlier version of a chunk.
+fn rewrite_bytes(writer: &Writer<'_>) -> u64 {
+    writer
+        .stats
+        .edge_rewrite
+        .bytes
+        .saturating_add(writer.stats.key_rewrite.bytes)
+        .saturating_add(writer.stats.child_rewrite.bytes)
+}
+
 fn chunked_case(
     base: &std::path::Path,
     rows: &[Row],
@@ -229,6 +239,7 @@ fn chunked_case(
         writer.stats.total_puts(),
         writer.stats.sync_time,
     );
+    let rewritten0 = rewrite_bytes(&writer);
     let started = Instant::now();
     writer.append_bidirectional(&db, tail, (batch, sync_every));
     let wall = started.elapsed();
@@ -236,12 +247,7 @@ fn chunked_case(
     let after = sizes(&dir);
     let events = len_f64(tail.len().max(1));
     let new_payload = writer.stats.payload_bytes().saturating_sub(bytes0);
-    let rewrites = writer
-        .stats
-        .edge_rewrite
-        .bytes
-        .saturating_add(writer.stats.key_rewrite.bytes)
-        .saturating_add(writer.stats.child_rewrite.bytes);
+    let replaced = rewrite_bytes(&writer).saturating_sub(rewritten0);
     let sync = writer.stats.sync_time.saturating_sub(sync0);
     let (took, settled) = writer.simulate_compaction(&dir.with_extension("compact"));
     println!(
@@ -249,7 +255,7 @@ fn chunked_case(
         wall.as_secs_f64() * 1e6 / events,
         num(after.total().saturating_sub(before)) / events,
         num(new_payload) / events,
-        100.0 * num(rewrites) / num(new_payload.max(1)),
+        100.0 * num(replaced) / num(new_payload.max(1)),
         writer.stats.total_puts().saturating_sub(puts0),
         sync.as_secs_f64() * 1e3,
     );
