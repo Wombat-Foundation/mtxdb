@@ -1,26 +1,26 @@
 use super::{
-    finish_import, import_data, ImportRun,
-    build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import, cmd_import_file,
-    cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
-    cmd_tombstones, collection_canonical_id, compile_import_template, compute_state_groups_partial,
+    CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt,
+    MATRIX_ROOM_MEMBER_NAMESPACE, MatrixRoomExtension, MetaReport, PackIdentity,
+    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE, StateGroupLoad, StateSet, build_event_dag,
+    canonical_column_width, cmd_collections, cmd_get, cmd_import, cmd_import_file, cmd_info,
+    cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync, cmd_tombstones,
+    collection_canonical_id, compile_import_template, compute_state_groups_partial,
     decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
     derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
-    export_envelope_line, extract_pointer_string, fmt_disk_megabytes, fmt_megabytes,
-    format_canonical_display, format_id, glob_pack_files, import_pdu_events,
+    export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
+    format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
     interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
     matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
     meta_pools, meta_raw, pack_identity, parse_federation_input, parse_pack_id_selector,
     parse_pack_selectors, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
     resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
     template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate, JsonValueExt,
-    MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
-    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    verify_auth_chain_edges,
 };
-use crate::{export_import, Cli, Commands};
+use crate::{Cli, Commands, export_import};
 use bytes::Bytes;
-use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::packfile::PackId;
+use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::room_auth::RoomAuth;
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
@@ -28,8 +28,8 @@ use mtxdb::template::{
     CollectionKeyRule, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
 };
 use mtxdb::{
-    content_digest, derive_collection_id, Database, DatabaseLayout, DigestAlgorithm,
-    MatrixRoomVersion, ShardType,
+    Database, DatabaseLayout, DigestAlgorithm, MatrixRoomVersion, ShardType, content_digest,
+    derive_collection_id,
 };
 use rezzy::json::Value as OwnedValue;
 use std::collections::HashSet;
@@ -271,18 +271,24 @@ fn checkpoint_pack_comparison_excludes_noncanonical_pack_but_checks_valid_set() 
     .unwrap();
     let mut report = MetaReport::default();
     meta_checkpoints(&root, &mut report);
-    assert!(report
-        .lines
-        .iter()
-        .any(|line| line.contains("foreign.pack") && line.starts_with("[NOTE]")));
-    assert!(report
-        .lines
-        .iter()
-        .any(|line| line.contains("fingerprint mismatch") && line.starts_with("[WARN]")));
-    assert!(!report
-        .lines
-        .iter()
-        .any(|line| line.contains("fingerprint comparison skipped")));
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.contains("foreign.pack") && line.starts_with("[NOTE]"))
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint mismatch") && line.starts_with("[WARN]"))
+    );
+    assert!(
+        !report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint comparison skipped"))
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -306,10 +312,12 @@ fn checkpoint_pack_comparison_is_quiet_when_packs_match() {
     meta_checkpoints(&root, &mut report);
     assert_eq!(report.warn_count, 0);
     assert_eq!(report.note_count, 1);
-    assert!(report
-        .lines
-        .iter()
-        .any(|line| line.contains("foreign.pack")));
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.contains("foreign.pack"))
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -331,18 +339,24 @@ fn checkpoint_pack_comparison_skips_invalid_pack_with_explicit_note() {
     .unwrap();
     let mut report = MetaReport::default();
     meta_checkpoints(&root, &mut report);
-    assert!(report
-        .lines
-        .iter()
-        .any(|line| line.contains("fingerprint comparison skipped")));
-    assert!(report
-        .lines
-        .iter()
-        .any(|line| line.starts_with("[WARN]") && line.contains("pack_0000000000000001.pack")));
-    assert!(!report
-        .lines
-        .iter()
-        .any(|line| line.contains("fingerprint mismatch")));
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint comparison skipped"))
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|line| line.starts_with("[WARN]") && line.contains("pack_0000000000000001.pack"))
+    );
+    assert!(
+        !report
+            .lines
+            .iter()
+            .any(|line| line.contains("fingerprint mismatch"))
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -760,12 +774,14 @@ fn info_selector_32_hex_disambiguation() {
     // `--collection` never falls back to a pack: an address with no such
     // collection errors, even though it is a live pack.
     let no_collection = format!("0x{}", "ee".repeat(mtxdb::packfile::PACK_ID_LEN));
-    assert!(super::classify_info_selector_explicit(
-        &cli,
-        &no_collection,
-        Some(super::InfoTarget::Collection)
-    )
-    .is_err());
+    assert!(
+        super::classify_info_selector_explicit(
+            &cli,
+            &no_collection,
+            Some(super::InfoTarget::Collection)
+        )
+        .is_err()
+    );
     // The deliberately-created colliding collection *does* resolve under
     // `--collection` for the pack's address — that is the point of the flag.
     assert_eq!(
@@ -2044,11 +2060,13 @@ fn pack_selectors_accept_only_pack_ids_and_deduplicate() {
         "ranges are not pack IDs"
     );
     // Anything longer than the full address is rejected.
-    assert!(parse_pack_id_selector(&format!(
-        "0x{}",
-        "a".repeat(mtxdb::packfile::PACK_ID_LEN * 2 + 2)
-    ))
-    .is_err());
+    assert!(
+        parse_pack_id_selector(&format!(
+            "0x{}",
+            "a".repeat(mtxdb::packfile::PACK_ID_LEN * 2 + 2)
+        ))
+        .is_err()
+    );
     // A short prefix and a full 32-hex address are both accepted, and
     // exact duplicates are collapsed.
     let full = "ab".repeat(mtxdb::packfile::PACK_ID_LEN);
@@ -2241,9 +2259,11 @@ fn import_admission_rejects_an_unestablished_room_before_writing() {
     let template = default_matrix_import_template();
     let error = resolve_import_collection(&[message], None, None, &template, &HashSet::new())
         .expect_err("a room without a batch or persisted create must be rejected");
-    assert!(error
-        .to_string()
-        .contains("no valid m.room.create event is in this input or already on disk"));
+    assert!(
+        error
+            .to_string()
+            .contains("no valid m.room.create event is in this input or already on disk")
+    );
 }
 
 #[test]
@@ -2334,8 +2354,8 @@ fn import_admission_reuses_v12_create_identity_for_followup_events() {
 /// redacted canonical event; it produces an id with the correct alphabet
 /// so the sigil-normalization path is exercised with realistic data.
 fn v12_reference_event_id(event: &OwnedValue) -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let digest = content_digest(DigestAlgorithm::Sha256, &event.encode().into_bytes());
     format!("${}", URL_SAFE_NO_PAD.encode(digest))
 }
@@ -3189,10 +3209,12 @@ fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
         .expect("an unrepresentable relation must not fail the import");
 
     for event in ["$reply", "$long"] {
-        assert!(adjacency
-            .relation_of(&db, event, &visible)
-            .unwrap()
-            .is_none());
+        assert!(
+            adjacency
+                .relation_of(&db, event, &visible)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             adjacency.prev_of(&db, event).unwrap(),
             Some(vec!["$p".to_owned()]),
@@ -4381,8 +4403,10 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
 
     let missing = format_id(&[0x99; 16]);
     assert!(
-        cmd_scan(&cli_scan, &missing, false, false, None, 10, None, None, false, None, false)
-            .is_err()
+        cmd_scan(
+            &cli_scan, &missing, false, false, None, 10, None, None, false, None, false
+        )
+        .is_err()
     );
 
     std::fs::remove_dir_all(&dir1).ok();
@@ -4733,13 +4757,15 @@ fn remove_rejects_a_malformed_id_before_touching_the_store() {
             yes: true,
         },
     );
-    assert!(cmd_remove(
-        &cli,
-        &collection_hex,
-        &[format_id(&id), "not-hex".to_owned()],
-        true
-    )
-    .is_err());
+    assert!(
+        cmd_remove(
+            &cli,
+            &collection_hex,
+            &[format_id(&id), "not-hex".to_owned()],
+            true
+        )
+        .is_err()
+    );
     let store = PackfileStorage::open_read_only(state_dir).unwrap();
     assert!(
         store.get(&collection, &id).unwrap().is_some(),
@@ -4771,12 +4797,28 @@ fn import_inputs(db: &Database, root: &std::path::Path, inputs: &[(&str, &str)])
         .collect();
     let store = db.event_dag();
     let template = default_matrix_import_template();
-    import_data(db, store, store, &paths, None, &template, &mut HashSet::new())
+    import_data(
+        db,
+        store,
+        store,
+        &paths,
+        None,
+        &template,
+        &mut HashSet::new(),
+    )
 }
 
-fn stored(db: &Database, pool: mtxdb::ShardType, collection: [u8; 16], node: [u8; 16]) -> Option<Vec<u8>> {
+fn stored(
+    db: &Database,
+    pool: mtxdb::ShardType,
+    collection: [u8; 16],
+    node: [u8; 16],
+) -> Option<Vec<u8>> {
     use mtxdb::storage::StorageEngine as _;
-    db.pool(pool).get(&collection, &node).unwrap().map(|data| data.bytes.to_vec())
+    db.pool(pool)
+        .get(&collection, &node)
+        .unwrap()
+        .map(|data| data.bytes.to_vec())
 }
 
 #[test]
@@ -4787,7 +4829,10 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
     let run = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
-    assert_eq!((run.failures, run.all_exports, run.exported_events), (0, true, 5));
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 5)
+    );
     finish_import(&db, &run).unwrap();
 
     // The exporter's fixture: `$soft` is soft-failed with code 2 (Manual),
@@ -4802,11 +4847,28 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
         let record = event_record_id(id);
 
         // The body is the export's PDU, byte for byte.
-        let body = stored(&db, EVENT_POOL, room_event_collection_id(room_bytes), record).expect("event body");
-        assert_eq!(body, event.pdu_bytes.as_ref(), "{} must keep the export's bytes", event.event_id);
+        let body = stored(
+            &db,
+            EVENT_POOL,
+            room_event_collection_id(room_bytes),
+            record,
+        )
+        .expect("event body");
+        assert_eq!(
+            body,
+            event.pdu_bytes.as_ref(),
+            "{} must keep the export's bytes",
+            event.event_id
+        );
 
         // The locator maps the event back to its room.
-        let locator = stored(&db, EVENT_POOL, event_locator_collection_id(&record), record).expect("locator");
+        let locator = stored(
+            &db,
+            EVENT_POOL,
+            event_locator_collection_id(&record),
+            record,
+        )
+        .expect("locator");
         assert_eq!(decode_event_locator(&locator).unwrap(), (id, room_bytes));
 
         // Edges come from the record's own lists.
@@ -4814,32 +4876,68 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
             decode_edges(&stored(&db, EDGE_POOL, collection, record).expect("edge record")).unwrap()
         };
         let listed = |value: &OwnedValue| -> Vec<Vec<u8>> {
-            value.as_array().unwrap().iter().map(|id| id.as_str().unwrap().as_bytes().to_vec()).collect()
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap().as_bytes().to_vec())
+                .collect()
         };
-        assert_eq!(edges(room_prev_collection_id(room_bytes)), listed(&event.prev_events));
-        assert_eq!(edges(room_auth_collection_id(room_bytes)), listed(&event.auth_events));
+        assert_eq!(
+            edges(room_prev_collection_id(room_bytes)),
+            listed(&event.prev_events)
+        );
+        assert_eq!(
+            edges(room_auth_collection_id(room_bytes)),
+            listed(&event.auth_events)
+        );
     }
 
     let verdict = |name: &str| {
         let id = format!("${name}:test.conduwuit.local");
         let record = event_record_id(id.as_bytes());
-        stored(&db, EVENT_POOL, event_verdict_collection_id(&record), record).map(|bytes| {
+        stored(
+            &db,
+            EVENT_POOL,
+            event_verdict_collection_id(&record),
+            record,
+        )
+        .map(|bytes| {
             let (event, verdict) = decode_verdict(&bytes).unwrap();
             assert_eq!(event, id.as_bytes());
             verdict
         })
     };
-    assert_eq!(verdict("soft").unwrap(), Verdict { soft_fail: Some(2), outlier: true, ..Verdict::default() });
-    assert_eq!(verdict("rejected").unwrap(), Verdict { rejection: Some(7), outlier: true, ..Verdict::default() });
+    assert_eq!(
+        verdict("soft").unwrap(),
+        Verdict {
+            soft_fail: Some(2),
+            ..Verdict::default()
+        }
+    );
+    assert_eq!(
+        verdict("rejected").unwrap(),
+        Verdict {
+            rejection: Some(7),
+            outlier: true,
+            ..Verdict::default()
+        }
+    );
     assert_eq!(
         verdict("redacted").unwrap(),
-        Verdict { redacted_by: Some(b"$redaction:test.conduwuit.local".to_vec()), ..Verdict::default() }
+        Verdict {
+            redacted_by: Some(b"$redaction:test.conduwuit.local".to_vec()),
+            ..Verdict::default()
+        }
     );
-    assert!(verdict("ok").is_none(), "a clean timeline event needs no verdict record");
+    assert!(
+        verdict("ok").is_none(),
+        "a clean timeline event needs no verdict record"
+    );
 }
 
 #[test]
-fn outliers_are_emitted_and_rejected_or_soft_failed_events_never_reach_the_timeline() {
+fn outlier_is_independent_of_soft_fail_and_redaction_status() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
     // The exporter marks `$ok` an outlier; `$redacted` stays on the timeline.
@@ -4847,7 +4945,10 @@ fn outliers_are_emitted_and_rejected_or_soft_failed_events_never_reach_the_timel
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":false",
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":true",
     );
-    assert_ne!(content, ROOM_EXPORT_FIXTURE, "the fixture line this test edits moved");
+    assert_ne!(
+        content, ROOM_EXPORT_FIXTURE,
+        "the fixture line this test edits moved"
+    );
     import_inputs(&db, &root, &[("room.jsonl", &content)]);
 
     let outlier = |name: &str| {
@@ -4861,10 +4962,26 @@ fn outliers_are_emitted_and_rejected_or_soft_failed_events_never_reach_the_timel
         )
         .map(|bytes| mtxdb::interop::decode_verdict(&bytes).unwrap().1.outlier)
     };
-    assert_eq!(outlier("ok"), Some(true), "an exported outlier stays visible");
-    assert_eq!(outlier("soft"), Some(true), "a soft-failed event is not on the timeline");
-    assert_eq!(outlier("rejected"), Some(true), "a rejected event is not on the timeline");
-    assert_eq!(outlier("redacted"), Some(false), "a redacted timeline event is not an outlier");
+    assert_eq!(
+        outlier("ok"),
+        Some(true),
+        "an exported outlier stays visible"
+    );
+    assert_eq!(
+        outlier("soft"),
+        Some(false),
+        "soft-failed does not imply outlier"
+    );
+    assert_eq!(
+        outlier("rejected"),
+        Some(true),
+        "a rejected event is not on the timeline"
+    );
+    assert_eq!(
+        outlier("redacted"),
+        Some(false),
+        "a redacted timeline event is not an outlier"
+    );
 }
 
 #[test]
@@ -4875,7 +4992,10 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
     let run = import_inputs(&db, &root, &[("keys.jsonl", KEYS_EXPORT_FIXTURE)]);
-    assert_eq!((run.failures, run.all_exports, run.exported_events), (0, true, 0));
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 0)
+    );
 
     let mut seen = Vec::new();
     for line in KEYS_EXPORT_FIXTURE.lines() {
@@ -4901,7 +5021,11 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
         );
         seen.push(kind);
     }
-    assert_eq!(seen.len(), KeyKind::ALL.len(), "the fixture has one record of each kind");
+    assert_eq!(
+        seen.len(),
+        KeyKind::ALL.len(),
+        "the fixture has one record of each kind"
+    );
 }
 
 fn marker(db: &Database) -> Option<mtxdb::interop::ImportMarker> {
@@ -4921,7 +5045,10 @@ fn an_import_stopped_before_the_marker_is_visibly_incomplete() {
     finish_import(&db, &run).unwrap();
     assert_eq!(
         marker(&db),
-        Some(mtxdb::interop::ImportMarker { data_format: mtxdb::interop::DATA_FORMAT, events: 5 })
+        Some(mtxdb::interop::ImportMarker {
+            data_format: mtxdb::interop::DATA_FORMAT,
+            events: 5
+        })
     );
 }
 
@@ -4938,7 +5065,11 @@ fn a_new_run_withdraws_the_previous_marker_until_it_finishes() {
     let second = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
     assert_eq!(marker(&db), None);
     finish_import(&db, &second).unwrap();
-    assert_eq!(marker(&db).unwrap().events, 5, "the count is this run's, not a running total");
+    assert_eq!(
+        marker(&db).unwrap().events,
+        5,
+        "the count is this run's, not a running total"
+    );
 }
 
 #[test]
@@ -4950,13 +5081,20 @@ fn a_failed_input_means_no_marker() {
         &root,
         &[
             ("room.jsonl", ROOM_EXPORT_FIXTURE),
-            ("broken.jsonl", "{\"t\":\"header\",\"format\":\"mtxdb-export/v1\""),
+            (
+                "broken.jsonl",
+                "{\"t\":\"header\",\"format\":\"mtxdb-export/v1\"",
+            ),
         ],
     );
     assert_eq!(run.failures, 1);
     assert!(!run.all_exports);
     finish_import(&db, &run).unwrap();
-    assert_eq!(marker(&db), None, "a run with a failed input is never marked complete");
+    assert_eq!(
+        marker(&db),
+        None,
+        "a run with a failed input is never marked complete"
+    );
 }
 
 #[test]
@@ -4967,7 +5105,12 @@ fn a_room_import_in_capped_batches_writes_every_event() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
     let export = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
-    let largest = export.events.iter().map(|e| e.pdu_bytes.len()).max().unwrap();
+    let largest = export
+        .events
+        .iter()
+        .map(|e| e.pdu_bytes.len())
+        .max()
+        .unwrap();
 
     // Room for about two events per batch, so the room takes several commits.
     let cap = largest.saturating_mul(2).saturating_add(2048);
@@ -4975,14 +5118,22 @@ fn a_room_import_in_capped_batches_writes_every_event() {
     for event in &export.events {
         let record = event_record_id(event.event_id.as_bytes());
         assert!(
-            stored(&db, EVENT_POOL, room_event_collection_id(FIXTURE_ROOM.as_bytes()), record).is_some(),
+            stored(
+                &db,
+                EVENT_POOL,
+                room_event_collection_id(FIXTURE_ROOM.as_bytes()),
+                record
+            )
+            .is_some(),
             "{} must be committed",
             event.event_id
         );
     }
 
     // One event larger than a batch is an error, not a silent overrun.
-    let error = export_import::write_room(&db, &export, 64).unwrap_err().to_string();
+    let error = export_import::write_room(&db, &export, 64)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("batch limit"), "{error}");
 }
 

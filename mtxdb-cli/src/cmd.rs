@@ -9354,8 +9354,12 @@ impl ImportContext<'_> {
         }
         validate_establishment_room_version(&events)?;
         export_import::clear_marker(self.db)?;
-        let written = export_import::write_room(self.db, export, export_import::BATCH_BYTES)?;
+        let (written, findings) =
+            export_import::write_room_with_findings(self.db, export, export_import::BATCH_BYTES)?;
         eprintln!("  imported {written} events");
+        for warning in findings.warnings() {
+            eprintln!("  warning: {warning}");
+        }
         eprintln!("  exported by {}", export.server);
         Ok(written)
     }

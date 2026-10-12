@@ -64,9 +64,8 @@ pub struct Verdict {
     pub soft_fail: Option<u8>,
     /// Event id of the redaction that redacted this event.
     pub redacted_by: Option<Vec<u8>>,
-    /// The event is stored but not on the room's timeline. There is no
-    /// pending state: an event is on the timeline or it is an outlier, and a
-    /// rejected or soft-failed event is never on the timeline.
+    /// Whether the event is stored as an outlier. This is independent of its
+    /// rejection and soft-fail verdicts.
     pub outlier: bool,
 }
 
