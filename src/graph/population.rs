@@ -401,6 +401,10 @@ type PublishHook = Box<dyn FnMut()>;
 
 #[cfg(test)]
 thread_local! {
+    /// Runs once, on the compacting thread, after it read the counters and
+    /// before it queues its run for deletion.
+    pub(crate) static BEFORE_QUEUE: std::cell::RefCell<Option<PublishHook>> =
+        const { std::cell::RefCell::new(None) };
     pub(crate) static BEFORE_PUBLISH: std::cell::RefCell<Option<PublishHook>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -863,6 +867,14 @@ impl ShortIdIndex {
         // collection that garbage collection removes. The publish takes the
         // entry off the list.
         let run_collection = self.run_collection(&run);
+        #[cfg(test)]
+        BEFORE_QUEUE.with(|hook| {
+            // Take it out first: the hook may compact, and so re-enter here.
+            let taken = hook.borrow_mut().take();
+            if let Some(mut hook) = taken {
+                hook();
+            }
+        });
         self.queue_garbage(db, &[(run_collection, now_ms.saturating_add(grace_ms))])?;
         self.write_run(db, &run, &carry)?;
         kept.push(run);
@@ -998,6 +1010,10 @@ impl ShortIdIndex {
         if garbage.len() == queued {
             return Ok(Published::Superseded);
         }
+        // A superseded compactor can have queued a run that another compactor
+        // went on to publish. When that run is retired now it must get this
+        // grace period, not the earlier deadline of the stale entry.
+        garbage.retain(|(collection, _)| !plan.retired.contains(collection));
         let deadline = plan.now_ms.saturating_add(plan.grace_ms);
         let retired_collections = plan.retired.len();
         garbage.extend(
