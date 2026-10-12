@@ -231,8 +231,22 @@ pub(crate) fn record_rows_in(
     variant: Variant,
     (batch, sync_every): (usize, usize),
 ) -> usize {
+    let (edge_count, _) = record_rows_in_measured(db, rows, variant, (batch, sync_every));
+    db.edges().sync_all().expect("sync");
+    edge_count
+}
+
+/// Record rows with the requested periodic sync cadence, but without a final
+/// sync. Returns elapsed time spent in the periodic syncs.
+pub(crate) fn record_rows_in_measured(
+    db: &Database,
+    rows: &[Row],
+    variant: Variant,
+    (batch, sync_every): (usize, usize),
+) -> (usize, Duration) {
     let scope = baseline_scope();
     let mut edge_count = 0_usize;
+    let mut sync_time = Duration::ZERO;
     for (n, chunk) in rows.chunks(batch).enumerate() {
         let lists: Vec<Lists<'_>> = chunk.iter().map(|row| lists_for(row, variant)).collect();
         let fams: Vec<Vec<FamilyEdges<'_>>> = lists.iter().map(families).collect();
@@ -253,11 +267,12 @@ pub(crate) fn record_rows_in(
             .collect();
         scope.record_events(db, &events).expect("record");
         if n.saturating_add(1).checked_rem(sync_every) == Some(0) {
+            let started = Instant::now();
             db.edges().sync_all().expect("sync");
+            sync_time = sync_time.saturating_add(started.elapsed());
         }
     }
-    db.edges().sync_all().expect("sync");
-    edge_count
+    (edge_count, sync_time)
 }
 
 /// A spread 16-byte record id for a prototype record, so ids do not share a prefix.

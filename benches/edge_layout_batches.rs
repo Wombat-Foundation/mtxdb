@@ -24,9 +24,27 @@ use mtxdb::database::Database;
 #[path = "edge_layout_common.rs"]
 mod common;
 
-use common::{len_f64, load, num, record_rows_in, sizes, Row, Variant, Writer, BATCH, SYNC_EVERY};
+use common::{
+    len_f64, load, num, record_rows_in, record_rows_in_measured, sizes, Row, Variant, Writer,
+    BATCH, SYNC_EVERY,
+};
 
 const BATCH_SIZES: [usize; 4] = [1, 2, 10, 100];
+
+/// Batch sizes to run, from `MTXDB_EL_BATCHES` (comma-separated), or all.
+fn batch_sizes() -> Vec<usize> {
+    std::env::var("MTXDB_EL_BATCHES").map_or_else(
+        |_| BATCH_SIZES.to_vec(),
+        |v| v.split(',').filter_map(|s| s.parse().ok()).collect(),
+    )
+}
+
+/// Sync-every-N-batches during the append phase, from `MTXDB_EL_SYNC_EVERY`.
+/// Default 1 (sync after every batch). Larger values model a caller that
+/// commits without fsyncing each time.
+fn append_sync_every() -> usize {
+    env_usize("MTXDB_EL_SYNC_EVERY", 1)
+}
 const ALL: Variant = Variant {
     label: "all",
     prev: true,
@@ -62,18 +80,29 @@ struct Case {
     rep: usize,
     wall_us: f64,
     growth_per_event: f64,
-    /// Prototype only: payload bytes put per event, rewrite share (%), puts, sync ms.
-    proto: Option<(f64, f64, u64, f64)>,
+    sync_ms: f64,
+    /// Prototype only: payload bytes put per event, rewrite share (%), puts.
+    proto: Option<(f64, f64, u64)>,
 }
 
-fn baseline(base: &Path, rows: &[Row], preload: usize, (batch, rep): (usize, usize)) -> Case {
+fn baseline(
+    base: &Path,
+    rows: &[Row],
+    preload: usize,
+    (batch, rep, sync_every): (usize, usize, usize),
+) -> Case {
     let (dir, db) = fresh(base, "baseline");
     let (head, tail) = rows.split_at(preload);
     record_rows_in(&db, head, ALL, (BATCH, SYNC_EVERY));
     let before = sizes(&dir).total();
     let started = Instant::now();
-    record_rows_in(&db, tail, ALL, (batch, 1));
+    let (_, periodic_sync) = record_rows_in_measured(&db, tail, ALL, (batch, sync_every));
     let wall = started.elapsed();
+    // Separate the final durability barrier from the append timing, matching
+    // the prototype path below.
+    let started = Instant::now();
+    db.edges().sync_all().expect("final sync");
+    let sync = periodic_sync.saturating_add(started.elapsed());
     let growth = sizes(&dir).total().saturating_sub(before);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
@@ -83,6 +112,7 @@ fn baseline(base: &Path, rows: &[Row], preload: usize, (batch, rep): (usize, usi
         rep,
         wall_us: per_event_us(wall, tail.len()),
         growth_per_event: num(growth) / len_f64(tail.len().max(1)),
+        sync_ms: sync.as_secs_f64() * 1e3,
         proto: None,
     }
 }
@@ -94,7 +124,12 @@ fn rewrite_bytes(stats: &common::WriteStats) -> u64 {
         .saturating_add(stats.key_rewrite.bytes)
 }
 
-fn prototype(base: &Path, rows: &[Row], preload: usize, (batch, rep): (usize, usize)) -> Case {
+fn prototype(
+    base: &Path,
+    rows: &[Row],
+    preload: usize,
+    (batch, rep, sync_every): (usize, usize, usize),
+) -> Case {
     let (dir, db) = fresh(base, "prototype");
     let (head, tail) = rows.split_at(preload);
     let mut writer = Writer::default();
@@ -104,13 +139,20 @@ fn prototype(base: &Path, rows: &[Row], preload: usize, (batch, rep): (usize, us
     let (put0, rewrite0) = (writer.stats.payload_bytes(), rewrite_bytes(&writer.stats));
     let (start_puts, start_sync) = (writer.stats.total_puts(), writer.stats.sync_time);
     let started = Instant::now();
-    writer.append(&db, tail, (batch, 1));
+    writer.append(&db, tail, (batch, sync_every));
     let wall = started.elapsed();
+    let started = Instant::now();
+    writer.sync(&db);
+    let final_sync = started.elapsed();
     let growth = sizes(&dir).total().saturating_sub(before);
     let put = writer.stats.payload_bytes().saturating_sub(put0);
     let rewrite = rewrite_bytes(&writer.stats).saturating_sub(rewrite0);
     let put_count = writer.stats.total_puts().saturating_sub(start_puts);
-    let sync = writer.stats.sync_time.saturating_sub(start_sync);
+    let sync = writer
+        .stats
+        .sync_time
+        .saturating_sub(start_sync)
+        .saturating_add(final_sync);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
     Case {
@@ -119,20 +161,20 @@ fn prototype(base: &Path, rows: &[Row], preload: usize, (batch, rep): (usize, us
         rep,
         wall_us: per_event_us(wall, tail.len()),
         growth_per_event: num(growth) / len_f64(tail.len().max(1)),
+        sync_ms: sync.as_secs_f64() * 1e3,
         proto: Some((
             num(put) / len_f64(tail.len().max(1)),
             100.0 * num(rewrite) / num(put.max(1)),
             put_count,
-            sync.as_secs_f64() * 1e3,
         )),
     }
 }
 
 fn csv_line(case: &Case) -> String {
-    let (put, share, puts, sync) = case.proto.unwrap_or((0.0, 0.0, 0, 0.0));
+    let (put, share, puts) = case.proto.unwrap_or((0.0, 0.0, 0));
     format!(
-        "{},{},{},{:.1},{:.1},{put:.1},{share:.1},{puts},{sync:.1}",
-        case.layout, case.batch, case.rep, case.wall_us, case.growth_per_event
+        "{},{},{},{:.1},{:.1},{put:.1},{share:.1},{puts},{:.1}",
+        case.layout, case.batch, case.rep, case.wall_us, case.growth_per_event, case.sync_ms
     )
 }
 
@@ -143,20 +185,22 @@ fn main() {
     let preload = env_usize("MTXDB_EL_PRELOAD", 60_000).min(rows.len());
     let append = env_usize("MTXDB_EL_APPEND", 2_000).min(rows.len().saturating_sub(preload));
     let reps = env_usize("MTXDB_EL_REPS", 3);
+    let sync_every = append_sync_every();
+    let batches = batch_sizes();
     let rows = &rows[..preload.saturating_add(append)];
     println!(
-        "{preload} events preloaded in batches of {BATCH}, then {append} appended, sync after every batch; chunk {} ids, {reps} reps",
+        "{preload} events preloaded in batches of {BATCH}, then {append} appended, sync every {sync_every} batches; chunk {} ids, {reps} reps, batches {batches:?}",
         common::chunk_size()
     );
     let mut lines = vec![
         "layout,batch,rep,wall_us_per_event,growth_b_per_event,payload_b_per_event,rewrite_pct,puts,sync_ms"
             .to_owned(),
     ];
-    for batch in BATCH_SIZES {
+    for batch in batches {
         for rep in 0..reps {
             for case in [
-                baseline(&base, rows, preload, (batch, rep)),
-                prototype(&base, rows, preload, (batch, rep)),
+                baseline(&base, rows, preload, (batch, rep, sync_every)),
+                prototype(&base, rows, preload, (batch, rep, sync_every)),
             ] {
                 println!(
                     "  {:<9} batch {:>4} rep {}: {:>9.1} us/event | growth {:>7.1} B/event{}",
@@ -165,9 +209,13 @@ fn main() {
                     case.rep,
                     case.wall_us,
                     case.growth_per_event,
-                    case.proto.map_or_else(String::new, |(put, share, puts, sync)| format!(
-                        " | put {put:.1} B/event, rewrites {share:.0}%, {puts} puts, sync {sync:.0} ms"
-                    )),
+                    case.proto.map_or_else(
+                        || format!(" | sync {:.1} ms", case.sync_ms),
+                        |(put, share, puts)| format!(
+                        " | put {put:.1} B/event, rewrites {share:.0}%, {puts} puts, sync {:.1} ms",
+                        case.sync_ms
+                    )
+                    ),
                 );
                 lines.push(csv_line(&case));
             }
