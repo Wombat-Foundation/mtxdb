@@ -1465,3 +1465,64 @@ fn remove_record_publishes_to_an_enabled_journal() {
     drop(store);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The HAMT re-emits an unchanged node under a new root: a put of the same key
+/// with identical bytes. A sweep that staged the node's removal before that
+/// put must go stale rather than delete a node a new root now references.
+#[test]
+fn a_removal_loses_to_a_concurrent_re_put_of_identical_content() {
+    let root = test_root("stale_identical");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xa8; 16];
+    let pool = ShardType::State;
+    put_committed(&db, pool, collection, node(1), b"same");
+
+    let sweep = db.begin_transaction();
+    sweep.remove(pool, collection, node(1)).unwrap();
+    put_committed(&db, pool, collection, node(1), b"same");
+
+    assert!(matches!(
+        sweep.commit(),
+        Err(StorageError::StaleRead { .. })
+    ));
+    assert_eq!(
+        live(&db, pool, collection, node(1)),
+        Some(b"same".to_vec()),
+        "the republished node must survive the stale sweep"
+    );
+    drop(sweep);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Same, through the batch path a sweep actually uses.
+#[test]
+fn a_batch_removal_loses_to_a_concurrent_re_put_of_identical_content() {
+    let root = test_root("stale_identical_batch");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xa9; 16];
+    let pool = ShardType::State;
+    for id in 1..=3u8 {
+        put_committed(&db, pool, collection, node(id), b"same");
+    }
+
+    let sweep = db.begin_transaction();
+    sweep
+        .remove_many(pool, collection, &[node(1), node(2), node(3)])
+        .unwrap();
+    put_committed(&db, pool, collection, node(2), b"same");
+
+    assert!(matches!(
+        sweep.commit(),
+        Err(StorageError::StaleRead { .. })
+    ));
+    for id in 1..=3u8 {
+        assert_eq!(
+            live(&db, pool, collection, node(id)),
+            Some(b"same".to_vec())
+        );
+    }
+    drop(sweep);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
