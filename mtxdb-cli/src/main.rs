@@ -1,6 +1,7 @@
 //! CLI for the mtxdb content-addressed storage engine.
 
 mod cmd;
+mod export_import;
 mod interchange;
 mod state_hamt;
 mod state_policy;

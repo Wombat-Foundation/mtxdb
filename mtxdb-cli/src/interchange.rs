@@ -47,13 +47,6 @@ use rezzy::json::{self, Object, Value as OwnedValue};
 /// The export format this importer accepts, as written on the `header` line.
 pub(crate) use mtxdb::export_schema::EXPORT_FORMAT;
 
-/// Prefix of the auxiliary index holding one room's per-event metadata. The
-/// room id is appended, which is what routes each room to its own index.
-const EVENT_METADATA_NAMESPACE_PREFIX: &str = "sys:room-event-metadata:v1";
-
-/// Auxiliary index holding imported federation signing keys.
-pub(crate) const SERVER_KEYS_NAMESPACE: &str = "sys:server-keys:v1";
-
 /// What an input's first tagged line declares.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputFormat {
@@ -82,72 +75,6 @@ pub(crate) struct EventMetadata {
     pub(crate) soft_fail_code: Option<u8>,
     /// The event that redacted this one, when the source recorded one.
     pub(crate) redacted_by: Option<String>,
-}
-
-impl EventMetadata {
-    /// Version of the record layout written by [`Self::encode`].
-    const VERSION: u8 = 1;
-
-    const FLAG_REJECTED: u8 = 1 << 0;
-    const FLAG_SOFT_FAILED: u8 = 1 << 1;
-    const FLAG_OUTLIER: u8 = 1 << 2;
-    const FLAG_REJECTION_CODE: u8 = 1 << 3;
-    const FLAG_SOFT_FAIL_CODE: u8 = 1 << 4;
-    const FLAG_REDACTED_BY: u8 = 1 << 5;
-
-    /// Whether there is nothing worth recording — an event whose verdicts are
-    /// all clear and which was never redacted needs no record at all.
-    pub(crate) fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-
-    /// Encode the record for an auxiliary index value.
-    ///
-    /// Layout: a version byte, a flags byte, the codes for the flags that are
-    /// set, then a `u32`-length-prefixed UTF-8 `redacted_by`. The prefix keeps
-    /// later fields unambiguous behind new flag bits.
-    ///
-    /// Nothing reads these records yet — state resolution over an imported
-    /// room is what will — so the layout is pinned by its encoded bytes in the
-    /// tests below rather than by a reader of its own.
-    pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut flags = 0u8;
-        if self.rejected {
-            flags |= Self::FLAG_REJECTED;
-        }
-        if self.soft_failed {
-            flags |= Self::FLAG_SOFT_FAILED;
-        }
-        if self.outlier {
-            flags |= Self::FLAG_OUTLIER;
-        }
-        if self.rejection_code.is_some() {
-            flags |= Self::FLAG_REJECTION_CODE;
-        }
-        if self.soft_fail_code.is_some() {
-            flags |= Self::FLAG_SOFT_FAIL_CODE;
-        }
-        let redacted_by = self.redacted_by.as_deref();
-        if redacted_by.is_some() {
-            flags |= Self::FLAG_REDACTED_BY;
-        }
-        let mut record = Vec::with_capacity(6usize.saturating_add(redacted_by.map_or(0, str::len)));
-        record.push(Self::VERSION);
-        record.push(flags);
-        if let Some(code) = self.rejection_code {
-            record.push(code);
-        }
-        if let Some(code) = self.soft_fail_code {
-            record.push(code);
-        }
-        if let Some(redacted_by) = redacted_by {
-            let length =
-                u32::try_from(redacted_by.len()).expect("an event id fits in a u32 length");
-            record.extend_from_slice(&length.to_le_bytes());
-            record.extend_from_slice(redacted_by.as_bytes());
-        }
-        record
-    }
 }
 
 /// One `event` record: the PDU as the source stored it, plus what the record
@@ -219,31 +146,6 @@ pub(crate) struct KeyRecord {
     pub(crate) kind: KeyKind,
     /// The payload bytes the export base64-encoded, decoded.
     pub(crate) payload: Bytes,
-}
-
-/// The auxiliary key for one signing-key record: its lifecycle kind, then a
-/// NUL, then its origin. Sorting by kind keeps an origin's records together.
-pub(crate) fn key_record_key(kind: KeyKind, origin: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(
-        kind.as_str()
-            .len()
-            .saturating_add(1)
-            .saturating_add(origin.len()),
-    );
-    key.extend_from_slice(kind.as_str().as_bytes());
-    key.push(0);
-    key.extend_from_slice(origin.as_bytes());
-    key
-}
-
-/// The auxiliary index that holds one room's per-event metadata.
-///
-/// Keyed by room id — the identity the export header carries — rather than by
-/// collection id: the id is what a reader already knows about the room, and
-/// one index per room is what bounds a write to records a reader will ask for
-/// together.
-pub(crate) fn event_metadata_namespace(room_id: &str) -> String {
-    format!("{EVENT_METADATA_NAMESPACE_PREFIX}:{room_id}")
 }
 
 /// Classify an input by its first tagged line, without reading the rest.
@@ -648,7 +550,7 @@ mod tests {
         assert_eq!(create.event_id, "$create");
         assert!(create.metadata.outlier);
         assert!(!create.metadata.rejected);
-        assert!(!create.metadata.is_empty(), "the outlier flag is metadata");
+        assert!(create.metadata.outlier, "the outlier flag is metadata");
 
         let message = &export.events[1];
         assert_eq!(message.metadata.rejection_code, Some(3));
@@ -834,88 +736,6 @@ mod tests {
     }
 
     #[test]
-    fn event_metadata_encode_pins_the_record_layout() {
-        assert_eq!(
-            EventMetadata::default().encode(),
-            vec![EventMetadata::VERSION, 0],
-            "a clear record is a version and an empty flags byte"
-        );
-        assert_eq!(
-            EventMetadata {
-                outlier: true,
-                ..EventMetadata::default()
-            }
-            .encode(),
-            vec![EventMetadata::VERSION, EventMetadata::FLAG_OUTLIER]
-        );
-        assert_eq!(
-            EventMetadata {
-                outlier: true,
-                rejected: true,
-                soft_failed: true,
-                rejection_code: Some(3),
-                soft_fail_code: Some(7),
-                redacted_by: Some("$r".to_owned()),
-            }
-            .encode(),
-            vec![
-                EventMetadata::VERSION,
-                EventMetadata::FLAG_REJECTED
-                    | EventMetadata::FLAG_SOFT_FAILED
-                    | EventMetadata::FLAG_OUTLIER
-                    | EventMetadata::FLAG_REJECTION_CODE
-                    | EventMetadata::FLAG_SOFT_FAIL_CODE
-                    | EventMetadata::FLAG_REDACTED_BY,
-                3,
-                7,
-                2,
-                0,
-                0,
-                0,
-                b'$',
-                b'r',
-            ],
-            "a code follows the flag that names it, and `redacted_by` is length-prefixed"
-        );
-    }
-
-    #[test]
-    fn event_metadata_is_empty_only_when_the_record_is_clear() {
-        assert!(EventMetadata::default().is_empty());
-        for metadata in [
-            EventMetadata {
-                outlier: true,
-                ..EventMetadata::default()
-            },
-            EventMetadata {
-                rejected: true,
-                ..EventMetadata::default()
-            },
-            EventMetadata {
-                soft_failed: true,
-                ..EventMetadata::default()
-            },
-            EventMetadata {
-                rejection_code: Some(1),
-                ..EventMetadata::default()
-            },
-            EventMetadata {
-                soft_fail_code: Some(1),
-                ..EventMetadata::default()
-            },
-            EventMetadata {
-                redacted_by: Some("$r".to_owned()),
-                ..EventMetadata::default()
-            },
-        ] {
-            assert!(
-                !metadata.is_empty(),
-                "anything the reader must see gets a record"
-            );
-        }
-    }
-
-    #[test]
     fn parse_keys_reads_every_kind_and_decodes_the_payload() {
         let mut export = String::new();
         for kind in KeyKind::ALL {
@@ -966,25 +786,5 @@ mod tests {
                 "error {message:?} must mention {expected:?}"
             );
         }
-    }
-
-    #[test]
-    fn auxiliary_names_route_each_room_and_each_kind() {
-        let room = event_metadata_namespace("!room:example.org");
-        assert_eq!(room, "sys:room-event-metadata:v1:!room:example.org");
-        assert_ne!(
-            room,
-            event_metadata_namespace("!other:example.org"),
-            "one index per room is what bounds a write to that room"
-        );
-        let notary = key_record_key(KeyKind::Notary, "example.org");
-        let historical = key_record_key(KeyKind::Historical, "example.org");
-        assert!(notary.starts_with(b"notary\0"));
-        assert_ne!(notary, historical, "an origin's kinds stay distinct");
-        assert_eq!(
-            key_record_key(KeyKind::Notary, "a"),
-            key_record_key(KeyKind::Notary, "a"),
-            "keys are pure"
-        );
     }
 }

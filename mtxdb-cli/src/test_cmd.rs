@@ -1,4 +1,5 @@
 use super::{
+    finish_import, import_data, ImportRun,
     build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import, cmd_import_file,
     cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
     cmd_tombstones, collection_canonical_id, compile_import_template, compute_state_groups_partial,
@@ -16,7 +17,7 @@ use super::{
     MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
     MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
-use crate::{Cli, Commands};
+use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
 use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::packfile::PackId;
@@ -4756,97 +4757,216 @@ const ROOM_EXPORT_FIXTURE: &str = include_str!("../tests/fixtures/mtxdb-export/r
 const KEYS_EXPORT_FIXTURE: &str =
     include_str!("../tests/fixtures/mtxdb-export/server-keys-v1.jsonl");
 
+const FIXTURE_ROOM: &str = "!export:test.conduwuit.local";
+
+/// Import `inputs` the way `mtxdb import` does, minus the final phase.
+fn import_inputs(db: &Database, root: &std::path::Path, inputs: &[(&str, &str)]) -> ImportRun {
+    let paths: Vec<PathBuf> = inputs
+        .iter()
+        .map(|(name, content)| {
+            let path = root.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        })
+        .collect();
+    let store = db.event_dag();
+    let template = default_matrix_import_template();
+    import_data(db, store, store, &paths, None, &template, &mut HashSet::new())
+}
+
+fn stored(db: &Database, pool: mtxdb::ShardType, collection: [u8; 16], node: [u8; 16]) -> Option<Vec<u8>> {
+    use mtxdb::storage::StorageEngine as _;
+    db.pool(pool).get(&collection, &node).unwrap().map(|data| data.bytes.to_vec())
+}
+
 #[test]
-fn imported_room_export_records_each_verdict_for_its_event() {
-    use crate::interchange::{event_metadata_namespace, parse_room, EventMetadata};
-    use mtxdb::auxiliary::AuxiliaryIndex;
+fn imported_room_export_is_readable_in_the_servers_layout() {
+    use crate::interchange::parse_room;
+    use mtxdb::interop::*;
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    let store = db.event_dag();
-    let input = root.join("room.jsonl");
-    std::fs::write(&input, ROOM_EXPORT_FIXTURE).unwrap();
-    let template = default_matrix_import_template();
-    let mut established = HashSet::new();
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    let run = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
+    assert_eq!((run.failures, run.all_exports, run.exported_events), (0, true, 5));
+    finish_import(&db, &run).unwrap();
 
     // The exporter's fixture: `$soft` is soft-failed with code 2 (Manual),
     // `$rejected` is rejected with code 7 (AuthCheckFailed), `$redacted` was
     // redacted by `$redaction`, and `$ok` carries no verdict.
-    let room_id = "!export:test.conduwuit.local";
-    let index = AuxiliaryIndex::open(store.as_ref(), &event_metadata_namespace(room_id));
-    let recorded = |name: &str| index.get(format!("${name}:test.conduwuit.local").as_bytes()).unwrap();
-    assert_eq!(
-        recorded("soft").unwrap(),
-        EventMetadata { soft_failed: true, soft_fail_code: Some(2), ..EventMetadata::default() }
-            .encode()
-    );
-    assert_eq!(
-        recorded("rejected").unwrap(),
-        EventMetadata { rejected: true, rejection_code: Some(7), ..EventMetadata::default() }
-            .encode()
-    );
-    assert_eq!(
-        recorded("redacted").unwrap(),
-        EventMetadata {
-            redacted_by: Some("$redaction:test.conduwuit.local".to_owned()),
-            ..EventMetadata::default()
-        }
-        .encode()
-    );
-    assert!(recorded("ok").is_none(), "a clean event needs no record");
-
-    // Every imported event keeps the exact PDU bytes the export wrote.
     let parsed = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    assert_eq!(parsed.room_id, FIXTURE_ROOM);
     assert_eq!(parsed.events.len(), 5);
-    let collection_id = matrix_room_collection_id(room_id);
+    let room_bytes = FIXTURE_ROOM.as_bytes();
     for event in &parsed.events {
-        let node_id = template_node_id(&template, &event.annotated(&parsed.room_id))
-            .unwrap()
-            .expect("event has a node id under the default template");
-        let stored = store.get(&collection_id, &node_id).unwrap().expect("imported event");
-        assert_eq!(
-            stored.bytes, event.pdu_bytes,
-            "{} must be stored as the export wrote it, not re-encoded",
-            event.event_id
-        );
+        let id = event.event_id.as_bytes();
+        let record = event_record_id(id);
+
+        // The body is the export's PDU, byte for byte.
+        let body = stored(&db, EVENT_POOL, room_event_collection_id(room_bytes), record).expect("event body");
+        assert_eq!(body, event.pdu_bytes.as_ref(), "{} must keep the export's bytes", event.event_id);
+
+        // The locator maps the event back to its room.
+        let locator = stored(&db, EVENT_POOL, event_locator_collection_id(&record), record).expect("locator");
+        assert_eq!(decode_event_locator(&locator).unwrap(), (id, room_bytes));
+
+        // Edges come from the record's own lists.
+        let edges = |collection| {
+            decode_edges(&stored(&db, EDGE_POOL, collection, record).expect("edge record")).unwrap()
+        };
+        let listed = |value: &OwnedValue| -> Vec<Vec<u8>> {
+            value.as_array().unwrap().iter().map(|id| id.as_str().unwrap().as_bytes().to_vec()).collect()
+        };
+        assert_eq!(edges(room_prev_collection_id(room_bytes)), listed(&event.prev_events));
+        assert_eq!(edges(room_auth_collection_id(room_bytes)), listed(&event.auth_events));
     }
+
+    let verdict = |name: &str| {
+        let id = format!("${name}:test.conduwuit.local");
+        let record = event_record_id(id.as_bytes());
+        stored(&db, EVENT_POOL, event_verdict_collection_id(&record), record).map(|bytes| {
+            let (event, verdict) = decode_verdict(&bytes).unwrap();
+            assert_eq!(event, id.as_bytes());
+            verdict
+        })
+    };
+    assert_eq!(verdict("soft").unwrap(), Verdict { soft_fail: Some(2), ..Verdict::default() });
+    assert_eq!(verdict("rejected").unwrap(), Verdict { rejection: Some(7), ..Verdict::default() });
+    assert_eq!(
+        verdict("redacted").unwrap(),
+        Verdict { redacted_by: Some(b"$redaction:test.conduwuit.local".to_vec()), ..Verdict::default() }
+    );
+    assert!(verdict("ok").is_none(), "a clean event needs no verdict record");
 }
 
 #[test]
-fn imported_keys_export_keeps_every_kind_and_payload_byte() {
-    use crate::interchange::{key_record_key, KeyKind, SERVER_KEYS_NAMESPACE};
-    use mtxdb::auxiliary::AuxiliaryIndex;
+fn imported_keys_export_is_readable_in_the_servers_layout() {
+    use crate::interchange::KeyKind;
+    use mtxdb::interop::*;
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    let store = db.event_dag();
-    let input = root.join("keys.jsonl");
-    std::fs::write(&input, KEYS_EXPORT_FIXTURE).unwrap();
-    let template = default_matrix_import_template();
-    let mut established = HashSet::new();
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    let run = import_inputs(&db, &root, &[("keys.jsonl", KEYS_EXPORT_FIXTURE)]);
+    assert_eq!((run.failures, run.all_exports, run.exported_events), (0, true, 0));
 
-    let keys_store = db.pool(mtxdb::ShardType::ServerInfo);
-    let index = AuxiliaryIndex::open(keys_store.as_ref(), SERVER_KEYS_NAMESPACE);
     let mut seen = Vec::new();
     for line in KEYS_EXPORT_FIXTURE.lines() {
         let record = owned_value(line);
-        let kind = KeyKind::ALL
-            .into_iter()
-            .find(|kind| json_str(&record, "kind").as_deref() == Some(kind.as_str()))
+        let kind = KeyKind::parse(&json_str(&record, "kind").unwrap())
             .expect("the exporter writes only kinds the importer knows");
         let origin = json_str(&record, "origin").unwrap();
         let payload = base64::engine::general_purpose::STANDARD
             .decode(json_str(&record, "payload").unwrap())
             .unwrap();
+        let bytes = stored(
+            &db,
+            SERVER_INFO_POOL,
+            server_keys_collection_id(),
+            server_key_record_id(kind, origin.as_bytes()),
+        )
+        .expect("key record");
         assert_eq!(
-            index.get(&key_record_key(kind, &origin)).unwrap().as_deref(),
-            Some(payload.as_slice()),
+            decode_server_key(&bytes).unwrap(),
+            (origin.as_bytes(), payload.as_slice()),
             "{} payload must come back byte for byte",
             kind.as_str()
         );
         seen.push(kind);
     }
     assert_eq!(seen.len(), KeyKind::ALL.len(), "the fixture has one record of each kind");
+}
+
+fn marker(db: &Database) -> Option<mtxdb::interop::ImportMarker> {
+    export_import::read_marker(db).unwrap()
+}
+
+#[test]
+fn an_import_stopped_before_the_marker_is_visibly_incomplete() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let run = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
+
+    // Every event is committed, and the run stops before its last step.
+    assert_eq!(run.exported_events, 5);
+    assert_eq!(marker(&db), None, "no marker until the final phase commits");
+
+    finish_import(&db, &run).unwrap();
+    assert_eq!(
+        marker(&db),
+        Some(mtxdb::interop::ImportMarker { data_format: mtxdb::interop::DATA_FORMAT, events: 5 })
+    );
+}
+
+#[test]
+fn a_new_run_withdraws_the_previous_marker_until_it_finishes() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let first = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
+    finish_import(&db, &first).unwrap();
+    assert!(marker(&db).is_some());
+
+    // A second run that is interrupted after its data must not be vouched for
+    // by the first run's marker.
+    let second = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
+    assert_eq!(marker(&db), None);
+    finish_import(&db, &second).unwrap();
+    assert_eq!(marker(&db).unwrap().events, 5, "the count is this run's, not a running total");
+}
+
+#[test]
+fn a_failed_input_means_no_marker() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let run = import_inputs(
+        &db,
+        &root,
+        &[
+            ("room.jsonl", ROOM_EXPORT_FIXTURE),
+            ("broken.jsonl", "{\"t\":\"header\",\"format\":\"mtxdb-export/v1\""),
+        ],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(!run.all_exports);
+    finish_import(&db, &run).unwrap();
+    assert_eq!(marker(&db), None, "a run with a failed input is never marked complete");
+}
+
+#[test]
+fn a_room_import_in_capped_batches_writes_every_event() {
+    use crate::interchange::parse_room;
+    use mtxdb::interop::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let export = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    let largest = export.events.iter().map(|e| e.pdu_bytes.len()).max().unwrap();
+
+    // Room for about two events per batch, so the room takes several commits.
+    let cap = largest.saturating_mul(2).saturating_add(2048);
+    assert_eq!(export_import::write_room(&db, &export, cap).unwrap(), 5);
+    for event in &export.events {
+        let record = event_record_id(event.event_id.as_bytes());
+        assert!(
+            stored(&db, EVENT_POOL, room_event_collection_id(FIXTURE_ROOM.as_bytes()), record).is_some(),
+            "{} must be committed",
+            event.event_id
+        );
+    }
+
+    // One event larger than a batch is an error, not a silent overrun.
+    let error = export_import::write_room(&db, &export, 64).unwrap_err().to_string();
+    assert!(error.contains("batch limit"), "{error}");
+}
+
+#[test]
+fn a_room_export_without_a_create_event_is_refused() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let without_create = ROOM_EXPORT_FIXTURE
+        .lines()
+        .filter(|line| !line.contains("m.room.create"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let run = import_inputs(&db, &root, &[("room.jsonl", &without_create)]);
+    assert_eq!(run.failures, 1, "{run:?}");
+    assert_eq!(run.exported_events, 0);
 }

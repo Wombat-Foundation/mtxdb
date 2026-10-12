@@ -25,7 +25,8 @@ use mtxdb::{
 };
 use rezzy::json::{self, Object, Value as OwnedValue};
 
-use crate::interchange::{self, KeyKind, KeyRecord, RoomEvent, RoomExport};
+use crate::export_import;
+use crate::interchange::{self, KeyKind, KeyRecord, RoomExport};
 use crate::state_policy::{resolution_policy, ResolutionPolicy, StateView};
 use crate::state_resolve::{resolve_parents, LeanEventContext, StateEntries};
 use crate::{Cli, Commands, PacksAction};
@@ -8056,30 +8057,16 @@ fn cmd_import(
     // State-group mappings belong in the State pool, not the event pool.
     let state_store: &PackfileStorage = db.pool(ShardType::State);
     state_store.set_read_plan_policy(cli.read_plan);
-    let mut failures = 0_usize;
-    let mut server_keys_imported = false;
-    for (index, path) in paths.iter().enumerate() {
-        if index != 0 {
-            eprintln!();
-        }
-        match cmd_import_file(
-            &db,
-            store,
-            state_store,
-            path,
-            collection_override,
-            &import_template,
-            &mut established_collections,
-        ) {
-            Ok(outcome) => {
-                server_keys_imported = server_keys_imported || outcome.server_keys;
-            }
-            Err(error) => {
-                eprintln!("{}: {error:#}", path.display());
-                failures = failures.saturating_add(1);
-            }
-        }
-    }
+    let run = import_data(
+        &db,
+        store,
+        state_store,
+        paths,
+        collection_override,
+        &import_template,
+        &mut established_collections,
+    );
+    let (failures, server_keys_imported) = (run.failures, run.server_keys);
     store
         .sync_all()
         .context("persisting import shard and collection summaries")?;
@@ -8098,9 +8085,90 @@ fn cmd_import(
             .sync_all()
             .context("persisting imported signing keys")?;
     }
+    finish_import(&db, &run)?;
     if failures != 0 {
         bail!("import completed with {failures} failed input file(s)");
     }
+    Ok(())
+}
+
+/// What the inputs of one `mtxdb import` run amounted to.
+#[derive(Debug)]
+struct ImportRun {
+    /// Inputs that failed.
+    failures: usize,
+    /// A keys export wrote into the server-info pool.
+    server_keys: bool,
+    /// Event records written through mtxdb exports.
+    exported_events: u64,
+    /// Every input was an mtxdb export that imported cleanly. The marker
+    /// vouches only for such a run: anything else leaves records the server
+    /// cannot read, or data that did not all arrive.
+    all_exports: bool,
+}
+
+/// The data phase of a run: import every input. Commits no marker, so a run
+/// that stops after this leaves the database visibly incomplete.
+fn import_data(
+    db: &Database,
+    store: &PackfileStorage,
+    state_store: &PackfileStorage,
+    paths: &[std::path::PathBuf],
+    collection_override: Option<&str>,
+    template: &CollectionTemplate,
+    established_collections: &mut HashSet<[u8; 16]>,
+) -> ImportRun {
+    let mut run = ImportRun {
+        failures: 0,
+        server_keys: false,
+        exported_events: 0,
+        all_exports: !paths.is_empty(),
+    };
+    for (index, path) in paths.iter().enumerate() {
+        if index != 0 {
+            eprintln!();
+        }
+        match cmd_import_file(
+            db,
+            store,
+            state_store,
+            path,
+            collection_override,
+            template,
+            established_collections,
+        ) {
+            Ok(outcome) => {
+                run.server_keys = run.server_keys || outcome.server_keys;
+                match outcome.exported {
+                    Some(events) => {
+                        run.exported_events = run.exported_events.saturating_add(events);
+                    }
+                    None => run.all_exports = false,
+                }
+            }
+            Err(error) => {
+                eprintln!("{}: {error:#}", path.display());
+                run.failures = run.failures.saturating_add(1);
+                run.all_exports = false;
+            }
+        }
+    }
+    run
+}
+
+/// The final phase of a run: make the data durable, then commit the marker in
+/// a transaction of its own. Does nothing unless the whole run was clean
+/// mtxdb exports.
+fn finish_import(db: &Database, run: &ImportRun) -> anyhow::Result<()> {
+    if !run.all_exports {
+        return Ok(());
+    }
+    export_import::sync_data(db)?;
+    export_import::write_marker(db, run.exported_events)?;
+    db.pool(ShardType::ServerInfo)
+        .sync_all()
+        .context("persisting the import marker")?;
+    eprintln!("import complete: {} events", run.exported_events);
     Ok(())
 }
 
@@ -9016,6 +9084,10 @@ struct ImportOutcome {
     /// batch must sync once: that pool is otherwise outside `cmd_import`'s
     /// default sync set.
     server_keys: bool,
+    /// The input was an `mtxdb-export` file, written in the server's layout;
+    /// holds the event records it wrote (zero for a keys export). Only a run
+    /// whose every input did this can be vouched for by the marker.
+    exported: Option<u64>,
 }
 
 /// Import one input file through the state the batch shares with its readers.
@@ -9088,14 +9160,16 @@ impl ImportContext<'_> {
             interchange::InputFormat::Room => {
                 let export = interchange::parse_room(content)
                     .with_context(|| format!("reading {}", path.display()))?;
-                self.import_room_export(path, &export, collection_override)?;
-                Ok(ImportOutcome::default())
+                let events = self
+                    .import_room_export(&export, collection_override)
+                    .with_context(|| format!("importing {}", path.display()))?;
+                Ok(ImportOutcome { server_keys: false, exported: Some(events) })
             }
             interchange::InputFormat::Keys => {
                 let records = interchange::parse_keys(content)
                     .with_context(|| format!("reading {}", path.display()))?;
                 self.import_keys_export(path, &records)?;
-                Ok(ImportOutcome { server_keys: true })
+                Ok(ImportOutcome { server_keys: true, exported: Some(0) })
             }
         }
     }
@@ -9134,7 +9208,6 @@ impl ImportContext<'_> {
             collection_override,
             self.template,
             self.established_collections,
-            EventPayload::Redacted,
         )?;
         Ok(ImportOutcome::default())
     }
@@ -9259,77 +9332,49 @@ impl ImportContext<'_> {
     /// store.
     fn import_room_export(
         &mut self,
-        path: &Path,
         export: &RoomExport,
         collection_override: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
+        if collection_override.is_some() {
+            bail!("--collection does not apply to an mtxdb export: the server's layout derives the room's collections itself");
+        }
         let events: Vec<OwnedValue> = export
             .events
             .iter()
             .map(|event| event.annotated(&export.room_id))
             .collect();
-        let payloads: Vec<bytes::Bytes> = export
-            .events
+        if !events
             .iter()
-            .map(|event| event.pdu_bytes.clone())
-            .collect();
-        import_pdu_events_with_raw(
-            self.db,
-            self.store,
-            self.state_store,
-            path,
-            &events,
-            &[],
-            None,
-            Some(export.room_id.as_str()),
-            collection_override,
-            self.template,
-            self.established_collections,
-            EventPayload::Verbatim(&payloads),
-        )?;
+            .any(|event| matrix_create_event_id(event).is_some())
+        {
+            bail!(
+                "refusing to import events for {}: no valid m.room.create event is in this export",
+                export.room_id
+            );
+        }
+        validate_establishment_room_version(&events)?;
+        export_import::clear_marker(self.db)?;
+        let written = export_import::write_room(self.db, export, export_import::BATCH_BYTES)?;
         let outliers = export
             .events
             .iter()
             .filter(|event| event.metadata.outlier)
-            .count() as u64;
+            .count();
         if outliers > 0 {
-            eprintln!("  outliers: {outliers}");
+            eprintln!("  outliers: {outliers} (the server has no outlier record; not stored)");
         }
-        let recorded = write_event_metadata(self.store, &export.room_id, &export.events)?;
-        if recorded > 0 {
-            eprintln!("  event metadata: {recorded} records");
-        }
+        eprintln!("  imported {written} events");
         eprintln!("  exported by {}", export.server);
-        Ok(())
+        Ok(written)
     }
 
-    /// Import one `server_keys` export into the server-info pool.
-    ///
-    /// Key records are few and read together, so they share one index keyed
-    /// by kind and origin. The payload bytes are stored as the export
+    /// Import one `server_keys` export into the server-info pool, in the
+    /// layout the server reads. The payload bytes are stored as the export
     /// decoded them: they are slipstream-encoded JSON the federation layer
-    /// decodes itself, and re-encoding them here would invent a second
-    /// on-disk format for no reader.
+    /// decodes itself.
     fn import_keys_export(&self, path: &Path, records: &[KeyRecord]) -> anyhow::Result<()> {
-        let keys_store: &PackfileStorage = self.db.pool(ShardType::ServerInfo);
-        // Carry the caller's `--read-plan` choice over from the event store.
-        keys_store.set_read_plan_policy(self.store.read_plan_policy());
-        let entries: Vec<(Vec<u8>, bytes::Bytes)> = records
-            .iter()
-            .map(|record| {
-                (
-                    interchange::key_record_key(record.kind, &record.origin),
-                    record.payload.clone(),
-                )
-            })
-            .collect();
-        let borrowed: Vec<(&[u8], &[u8])> = entries
-            .iter()
-            .map(|(key, payload)| (key.as_slice(), payload.as_ref()))
-            .collect();
-        let index = AuxiliaryIndex::open(keys_store, interchange::SERVER_KEYS_NAMESPACE);
-        index
-            .put_many(&borrowed)
+        export_import::clear_marker(self.db)?;
+        export_import::write_keys(self.db, records)
             .with_context(|| format!("importing signing keys from {}", path.display()))?;
         let mut summary = Vec::with_capacity(KeyKind::ALL.len());
         for kind in KeyKind::ALL {
@@ -9345,35 +9390,6 @@ impl ImportContext<'_> {
         );
         Ok(())
     }
-}
-
-/// Record one room's per-event metadata in its own auxiliary index.
-///
-/// Returns how many records were written. An event with a clear verdict that
-/// was never redacted and is not an outlier needs no record, so a clean room
-/// gets no index at all.
-fn write_event_metadata(
-    store: &PackfileStorage,
-    room_id: &str,
-    events: &[RoomEvent],
-) -> anyhow::Result<u64> {
-    let records: Vec<(&str, Vec<u8>)> = events
-        .iter()
-        .filter(|event| !event.metadata.is_empty())
-        .map(|event| (event.event_id.as_str(), event.metadata.encode()))
-        .collect();
-    if records.is_empty() {
-        return Ok(0);
-    }
-    let entries: Vec<(&[u8], &[u8])> = records
-        .iter()
-        .map(|(event_id, value)| (event_id.as_bytes(), value.as_slice()))
-        .collect();
-    let index = AuxiliaryIndex::open(store, &interchange::event_metadata_namespace(room_id));
-    index
-        .put_many(&entries)
-        .with_context(|| format!("recording event metadata for room {room_id}"))?;
-    Ok(records.len() as u64)
 }
 
 /// Group an auth chain's events by the collection each one belongs to.
@@ -9551,18 +9567,6 @@ fn import_room_version(
     })
 }
 
-/// Where the stored bytes of one imported event come from.
-#[derive(Clone, Copy)]
-enum EventPayload<'a> {
-    /// Redact the analyzed event under the room version — every input format
-    /// that hands the importer a raw Matrix event and nothing more.
-    Redacted,
-    /// These exact bytes, one per input event in order. An `mtxdb-export/v1`
-    /// event line already carries the PDU as the source stored it, so the
-    /// store receives those bytes rather than a re-encoding of them.
-    Verbatim(&'a [bytes::Bytes]),
-}
-
 /// Import PDU events through the normal event-DAG path.
 #[allow(
     clippy::too_many_arguments,
@@ -9596,7 +9600,6 @@ fn import_pdu_events(
         collection_override,
         template,
         established_collections,
-        EventPayload::Redacted,
     )
 }
 
@@ -9620,20 +9623,9 @@ fn import_pdu_events_with_raw(
     collection_override: Option<&str>,
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
-    payload: EventPayload<'_>,
 ) -> anyhow::Result<()> {
     if events.is_empty() {
         bail!("no events found in {}", path.display());
-    }
-    if let EventPayload::Verbatim(payloads) = payload {
-        if payloads.len() != events.len() {
-            bail!(
-                "{} carries {} payloads for {} events",
-                path.display(),
-                payloads.len(),
-                events.len()
-            );
-        }
     }
     let mut event_count = 0u64;
     let mut skipped = 0u64;
@@ -9655,7 +9647,7 @@ fn import_pdu_events_with_raw(
     let first: Vec<([u8; 16], String, NodeData)> = {
         let mut first = Vec::with_capacity(events.len());
         let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(events.len());
-        for (index, ev) in events.iter().enumerate() {
+        for ev in events {
             let Some(incoming_event_id) = event_id(ev) else {
                 skipped = skipped.saturating_add(1);
                 continue;
@@ -9679,14 +9671,7 @@ fn import_pdu_events_with_raw(
                 continue;
             }
             seen_ids.insert(id_bytes, incoming_event_id.to_owned());
-            let event_bytes = match payload {
-                EventPayload::Redacted => redacted_event_bytes(ev, &room_version)?,
-                EventPayload::Verbatim(payloads) => {
-                    payloads.get(index).cloned().with_context(|| {
-                        format!("missing stored bytes for event {incoming_event_id}")
-                    })?
-                }
-            };
+            let event_bytes = redacted_event_bytes(ev, &room_version)?;
             first.push((
                 id_bytes,
                 incoming_event_id.to_owned(),
