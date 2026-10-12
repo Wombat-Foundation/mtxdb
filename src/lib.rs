@@ -84,6 +84,10 @@ pub mod frontier;
 /// Lossy, append-only index mapping content hashes to packfile locations.
 #[path = "engine/index/mod.rs"]
 pub mod index;
+/// Shared on-disk layouts for the server/importer boundary: verdicts,
+/// signing keys, and the import marker.
+#[path = "matrix/interop.rs"]
+pub mod interop;
 /// Checksummed append-only journal primitives for durable group commits.
 ///
 /// This module itself stays always-on: the write-ahead journal
@@ -183,6 +187,13 @@ pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
 };
 pub use index::LossyIndex;
+pub use interop::{
+    decode_import_marker, decode_server_key, decode_verdict, encode_import_marker,
+    encode_server_key, encode_verdict, event_record_id, event_verdict_collection_id,
+    import_marker_collection_id, import_marker_node_id, server_key_record_id,
+    server_keys_collection_id, ImportMarker, KeyRecordKind, Verdict, DATA_FORMAT,
+    KEY_RECORD_VERSION, MARKER_VERSION, VERDICT_BUCKETS, VERDICT_VERSION,
+};
 pub use journal::SharedWalLock;
 pub use journal::{CollectionExpectation, StagedLookup, TxnStage, TxnStageState};
 pub use journal::{

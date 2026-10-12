@@ -356,6 +356,24 @@ fn test_storage_error_source() {
 }
 
 #[test]
+fn test_storage_error_kind_predicates() {
+    assert!(StorageError::NotFound([0; 16]).is_not_found());
+    assert!(!StorageError::Corrupt("x".into()).is_not_found());
+    assert!(!StorageError::Io(std::io::Error::other("x")).is_not_found());
+
+    assert!(StorageError::Corrupt("x".into()).is_corrupt());
+    assert!(StorageError::VerificationFailed([0; 16]).is_corrupt());
+    assert!(!StorageError::NotFound([0; 16]).is_corrupt());
+    assert!(!StorageError::Internal("x".into()).is_corrupt());
+
+    assert!(StorageError::Io(std::io::Error::other("x")).is_io());
+    assert!(StorageError::WouldBlock("busy".into()).is_io());
+    assert!(!StorageError::NotFound([0; 16]).is_io());
+    assert!(!StorageError::Corrupt("x".into()).is_io());
+    assert!(!StorageError::Unsupported("no".into()).is_io());
+}
+
+#[test]
 fn test_storage_error_from_io() {
     let io = std::io::Error::other("y");
     let e: StorageError = io.into();

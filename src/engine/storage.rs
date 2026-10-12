@@ -664,6 +664,37 @@ impl StorageError {
     pub fn is_exhausted(&self) -> bool {
         matches!(self, Self::Exhausted(_))
     }
+
+    /// Whether the requested node (or collection) is absent.
+    ///
+    /// Callers that treat absence as a normal miss — a probe for a record
+    /// that may not exist yet — match this rather than string-matching the
+    /// error or converting to [`std::io::Error`] first. Corruption and I/O
+    /// failure are never absences and must not be swallowed by this check.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
+
+    /// Whether the stored bytes failed an integrity or format check.
+    ///
+    /// Distinct from [`Self::NotFound`]: the record is present but its
+    /// content cannot be trusted. Callers must not substitute a default.
+    #[must_use]
+    pub fn is_corrupt(&self) -> bool {
+        matches!(self, Self::Corrupt(_) | Self::VerificationFailed(_))
+    }
+
+    /// Whether the failure came from the OS and may be transient.
+    ///
+    /// Includes an explicit [`Self::Io`] and [`Self::WouldBlock`], which the
+    /// engine surfaces separately because it is always retryable. Absence,
+    /// corruption, unsupported operations and version conflicts are not
+    /// transient I/O: retrying or re-reading cannot turn them into success.
+    #[must_use]
+    pub fn is_io(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::WouldBlock(_))
+    }
 }
 
 pub(crate) fn collect_missing_established_records<F>(
