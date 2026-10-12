@@ -115,3 +115,72 @@ fn marker_collections_are_stable() {
     assert_ne!(import_marker_collection_id(), server_keys_collection_id());
     assert_ne!(import_marker_node_id(), event_record_id(b"marker"));
 }
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Every id below is read by a server adapter; the golden values pin them so
+/// a refactor cannot silently orphan stored records. The server's own tests
+/// check the same values against its key derivations.
+#[test]
+fn event_collection_ids_are_pinned() {
+    let room = b"!room:example.com";
+    let node = event_record_id(b"$event:example.com");
+    assert_eq!(hex(&node), "f4f315ab8b948ccb0355c85e9d609ccd");
+    assert_eq!(
+        hex(&room_event_collection_id(room)),
+        "9507be45c492c4382edb18fc074477cc"
+    );
+    assert_eq!(
+        hex(&room_prev_collection_id(room)),
+        "fea9a58f0ab869317d696093fd7c6173"
+    );
+    assert_eq!(
+        hex(&room_auth_collection_id(room)),
+        "4842a2eff3cf511f9e48406350253c77"
+    );
+    assert_eq!(
+        hex(&event_locator_collection_id(&node)),
+        "9d34360b21fa7f1ad961f46fb7b25857"
+    );
+    assert_ne!(
+        room_event_collection_id(room),
+        room_event_collection_id(b"!other:example.com")
+    );
+}
+
+#[test]
+fn locator_encoding_is_pinned_and_round_trips() {
+    let bytes = encode_event_locator(b"$e:x", b"!r:x").unwrap();
+    assert_eq!(bytes, [&[1, 4, 0, 0, 0][..], b"$e:x", b"!r:x"].concat());
+    assert_eq!(
+        decode_event_locator(&bytes).unwrap(),
+        (&b"$e:x"[..], &b"!r:x"[..])
+    );
+    for cut in 0..5 {
+        assert!(decode_event_locator(&bytes[..cut]).is_err(), "cut at {cut}");
+    }
+    assert!(decode_event_locator(&[1, 255, 0, 0, 0, 1]).is_err());
+    assert!(decode_event_locator(&[9, 0, 0, 0, 0]).is_err());
+    // The unversioned legacy value, a bare room id, is refused.
+    assert!(decode_event_locator(b"!room:example.com").is_err());
+}
+
+#[test]
+fn edge_encoding_is_pinned_and_round_trips() {
+    let bytes = encode_edges(&[b"$a", b"$bc"]).unwrap();
+    assert_eq!(
+        bytes,
+        [&[2, 0, 0, 0][..], b"$a", &[3, 0, 0, 0], b"$bc"].concat()
+    );
+    assert_eq!(
+        decode_edges(&bytes).unwrap(),
+        vec![b"$a".to_vec(), b"$bc".to_vec()]
+    );
+    assert!(encode_edges(&[]).unwrap().is_empty());
+    assert!(decode_edges(&[]).unwrap().is_empty());
+    for cut in [1, 3, 5, 8] {
+        assert!(decode_edges(&bytes[..cut]).is_err(), "cut at {cut}");
+    }
+}

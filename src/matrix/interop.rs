@@ -13,7 +13,10 @@
 //! are written by the server adapters and must stay stable for databases
 //! that already exist; changing the hash would orphan every stored record.
 
-use crate::storage::StorageError;
+use crate::{
+    derive_group_full_id, derive_member_collection_id_from_group, storage::StorageError, ShardType,
+    MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT, MEMBER_NAMESPACE_PREV,
+};
 
 /// Version of the export/import data contract the marker vouches for. Bump
 /// it when a stored layout below changes incompatibly, so an older database
@@ -286,6 +289,132 @@ pub fn decode_server_key(bytes: &[u8]) -> Result<(&[u8], &[u8]), StorageError> {
         return Err(malformed());
     }
     Ok(rest.split_at(length))
+}
+
+/// Pool holding event bodies, event locators and verdicts.
+pub const EVENT_POOL: ShardType = ShardType::EventDag;
+
+/// Pool holding the prev and auth edge records.
+pub const EDGE_POOL: ShardType = ShardType::Edges;
+
+/// Pool holding signing keys and the import marker.
+pub const SERVER_INFO_POOL: ShardType = ShardType::ServerInfo;
+
+/// Number of bucketed event-locator collections. Fixed for the life of a
+/// database, like [`VERDICT_BUCKETS`].
+pub const EVENT_LOCATOR_BUCKETS: u32 = 256;
+
+/// Version byte of the event-locator value encoding.
+pub const LOCATOR_VERSION: u8 = 1;
+
+fn room_member_collection(namespace: [u8; 4], room_id: &[u8]) -> [u8; 16] {
+    derive_member_collection_id_from_group(namespace, derive_group_full_id(room_id))
+        .expect("event, prev and auth are valid member namespaces")
+}
+
+/// Derive the collection holding a room's event bodies.
+#[must_use]
+pub fn room_event_collection_id(room_id: &[u8]) -> [u8; 16] {
+    room_member_collection(MEMBER_NAMESPACE_EVNT, room_id)
+}
+
+/// Derive the collection holding a room's prev-event edge lists.
+#[must_use]
+pub fn room_prev_collection_id(room_id: &[u8]) -> [u8; 16] {
+    room_member_collection(MEMBER_NAMESPACE_PREV, room_id)
+}
+
+/// Derive the collection holding a room's auth-event edge lists.
+#[must_use]
+pub fn room_auth_collection_id(room_id: &[u8]) -> [u8; 16] {
+    room_member_collection(MEMBER_NAMESPACE_AUTH, room_id)
+}
+
+/// Derive the event-locator collection holding `node`.
+///
+/// The locator maps an event id to its room across all rooms, bucketed for
+/// the same reason as [`event_verdict_collection_id`].
+#[must_use]
+pub fn event_locator_collection_id(node: &[u8; 16]) -> [u8; 16] {
+    let bucket = u32::from_le_bytes([node[0], node[1], node[2], node[3]]) % EVENT_LOCATOR_BUCKETS;
+    derive_id(b"sys", format!("event-locator:{bucket}").as_bytes())
+}
+
+/// Encode an event locator: `[version][u32 LE length][event id][room id]`.
+///
+/// The full event id rides along because the record id is only 128 bits.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] if the event id does not fit its length
+/// prefix.
+pub fn encode_event_locator(event_id: &[u8], room_id: &[u8]) -> Result<Vec<u8>, StorageError> {
+    let length = u32::try_from(event_id.len())
+        .map_err(|_| StorageError::Corrupt("event id is too large".to_owned()))?;
+    let mut out = Vec::with_capacity(
+        1_usize
+            .saturating_add(4)
+            .saturating_add(event_id.len())
+            .saturating_add(room_id.len()),
+    );
+    out.push(LOCATOR_VERSION);
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend_from_slice(event_id);
+    out.extend_from_slice(room_id);
+    Ok(out)
+}
+
+/// Decode an event locator into `(event id, room id)`.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] for a truncated record or an unknown
+/// version.
+pub fn decode_event_locator(bytes: &[u8]) -> Result<(&[u8], &[u8]), StorageError> {
+    let malformed = || StorageError::Corrupt("malformed event locator".to_owned());
+    let (&version, rest) = bytes.split_first().ok_or_else(malformed)?;
+    if version != LOCATOR_VERSION {
+        return Err(StorageError::Corrupt(
+            "unknown event locator version".to_owned(),
+        ));
+    }
+    let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(malformed)?;
+    let length = usize::try_from(u32::from_le_bytes(*length)).map_err(|_| malformed())?;
+    if rest.len() < length {
+        return Err(malformed());
+    }
+    Ok(rest.split_at(length))
+}
+
+/// Encode an edge list (prev or auth) as repeated `[u32 LE length][event id]`.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] if an id does not fit its length prefix.
+pub fn encode_edges(edges: &[&[u8]]) -> Result<Vec<u8>, StorageError> {
+    let too_large = || StorageError::Corrupt("event edge is too large".to_owned());
+    let mut out = Vec::new();
+    for edge in edges {
+        let length = u32::try_from(edge.len()).map_err(|_| too_large())?;
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(edge);
+    }
+    Ok(out)
+}
+
+/// Decode an edge list written by [`encode_edges`].
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] for a truncated record.
+pub fn decode_edges(bytes: &[u8]) -> Result<Vec<Vec<u8>>, StorageError> {
+    let malformed = || StorageError::Corrupt("malformed event edge record".to_owned());
+    let mut edges = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (length, tail) = rest.split_first_chunk::<4>().ok_or_else(malformed)?;
+        let length = usize::try_from(u32::from_le_bytes(*length)).map_err(|_| malformed())?;
+        let (edge, tail) = tail.split_at_checked(length).ok_or_else(malformed)?;
+        edges.push(edge.to_vec());
+        rest = tail;
+    }
+    Ok(edges)
 }
 
 /// Version byte of the import-marker value encoding.
