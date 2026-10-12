@@ -9687,6 +9687,76 @@ fn scan_collection_at_snapshot_replays_later_durable_groups() {
 }
 
 #[test]
+fn changes_since_includes_removals_and_pages_across_groups() {
+    let dir = test_dir("changes_since_removal");
+    let wal = dir.join("wal.bin");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.enable_journal(&wal).unwrap();
+
+    let collection = [0x95u8; 16];
+    let victim = distinct_id(0x51);
+    let after = distinct_id(0x52);
+    store
+        .put(
+            &collection,
+            &victim,
+            &NodeData::new(bytes::Bytes::from_static(b"to remove")),
+        )
+        .unwrap();
+    let (_scan, cursor, _lease) = store.scan_collection_at_snapshot(&collection).unwrap();
+
+    // Publish the removal as its own group, followed by a put group. This
+    // checks that changes_since decodes kind 3 and advances over groups at
+    // the normal page boundary.
+    let removal = JournalMutation::RemoveRecord {
+        collection_id: collection,
+        node_id: victim,
+    };
+    let removal_lsn = store
+        .publish_mutation(|| removal.clone())
+        .unwrap()
+        .expect("journal is enabled");
+    store
+        .apply_transaction_mutation(&removal, removal_lsn)
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &after,
+            &NodeData::new(bytes::Bytes::from_static(b"after removal")),
+        )
+        .unwrap();
+
+    let journal = store.journal().unwrap();
+    journal.sync().unwrap();
+
+    let first = journal.changes_since(&cursor, 1).unwrap();
+    assert_eq!(first.groups.len(), 1);
+    assert!(first.has_more, "the following put group should remain");
+    assert!(matches!(
+        first.groups[0].entries[0].mutation,
+        JournalMutation::RemoveRecord {
+            collection_id,
+            node_id,
+        } if collection_id == collection && node_id == victim
+    ));
+
+    let second = journal.changes_since(&first.next_cursor, 1).unwrap();
+    assert_eq!(second.groups.len(), 1);
+    assert!(!second.has_more);
+    assert!(matches!(
+        &second.groups[0].entries[0].mutation,
+        JournalMutation::Put {
+            collection_id,
+            node_id,
+            payload,
+        } if *collection_id == collection && *node_id == after && payload == b"after removal"
+    ));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scan_collection_at_snapshot_requires_a_journal() {
     let dir = test_dir("scan_collection_replay_without_wal");
     let store = PackfileStorage::open(dir.clone()).unwrap();
