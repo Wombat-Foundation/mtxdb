@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BITMAP_SET_FORMAT_VERSION","BITMAP_SET_MAGIC"],"struct":["BitmapSet","DomainTag"]};

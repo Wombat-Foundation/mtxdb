@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PACK_INDEX_COLLECTION_ENTRY_LEN","PACK_INDEX_FANOUT_LEN","PACK_INDEX_HEADER_LEN","PACK_INDEX_MAGIC"],"enum":["PackIndexError","PackIndexOpenError"],"struct":["MappedPackIndex","PackIndex","PackIndexIdentity","PackIndexInput"]};

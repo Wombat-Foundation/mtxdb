@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CLOSURE_FORMAT_VERSION"],"enum":["ClosureCoverage"],"struct":["ClosureCoverageBuilder","ClosureCoverageSet","ClosureHead","ClosureSnapshot","ClosureStore","ClosureVerifyReport","GenerationBuilder"]};

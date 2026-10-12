@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["AUTH","KNOWN_RELATION_TYPES","PREV","RELATIONS"],"struct":["AdjacencyVerifyReport","AlwaysVisible","EventRecord","MatrixAdjacency","Relation","RelationRef"],"trait":["EventVisibility"]};

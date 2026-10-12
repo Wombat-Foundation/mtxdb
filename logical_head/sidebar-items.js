@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["LOGICAL_HEAD_MAGIC","LOGICAL_HEAD_VERSION"],"fn":["decode_logical_head","encode_logical_head"],"struct":["LogicalHead","LogicalHeadRead","LogicalHeadValue"]};

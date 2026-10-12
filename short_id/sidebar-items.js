@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SHORT_ID_FORMAT_VERSION","SHORT_ID_MAX"],"struct":["BatchEvent","Edge","EdgeFamily","EdgeKey","FamilyEdges","OwnerLogEntry","RecordedEvent","ScopeCounters","ShortIdIndex","ShortIdVerifyReport"]};

@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"mod":["auxiliary","cache","csr","dag","frontier","index","journal","layout","matrix_policy","packfile","shard","storage","template"]};
+window.SIDEBAR_ITEMS = {"mod":["auth_closure","auxiliary","bitmap_set","cache","closure_store","csr","dag","database","export_schema","frontier","index","interop","journal","layout","logical_head","matrix_adjacency","matrix_policy","packfile","record_class","room_auth","search","shard","short_id","state_group","storage","template","timeline"]};

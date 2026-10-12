@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["TIMELINE_CURSOR_MAGIC","TIMELINE_FORMAT_VERSION","TIMELINE_HEAD_ID","TIMELINE_HEAD_MAGIC","TIMELINE_LEAF_CAP","TIMELINE_LEAF_MAGIC","TIMELINE_ROOT_MAGIC"],"fn":["timeline_collection_id"],"struct":["TimelineCursor","TimelineEntry","TimelineIndex","TimelinePage"],"type":["EventRef"]};
