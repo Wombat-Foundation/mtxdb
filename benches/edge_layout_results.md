@@ -173,12 +173,12 @@ Garbage (1 rep, the same runs): dead share is the part of pack bytes that
 a **simulated** compaction removes (copy only the newest version of each record
 into a fresh store; not the engine's compaction path).
 
-| batch | packs | after compaction | dead | copy time |
-| ----- | ----- | ---------------- | ---- | --------- |
-| 1     | 6.12 MiB | 4.33 MiB | 29% | 485 ms |
-| 2     | 5.17 MiB | 4.27 MiB | 17% | 575 ms |
-| 10    | 4.43 MiB | 4.21 MiB | 5%  | 435 ms |
-| 100   | 4.27 MiB | 4.20 MiB | 2%  | 479 ms |
+| batch | packs    | after compaction | dead | copy time |
+| ----- | -------- | ---------------- | ---- | --------- |
+| 1     | 6.12 MiB | 4.33 MiB         | 29%  | 485 ms    |
+| 2     | 5.17 MiB | 4.27 MiB         | 17%  | 575 ms    |
+| 10    | 4.43 MiB | 4.21 MiB         | 5%   | 435 ms    |
+| 100   | 4.27 MiB | 4.20 MiB         | 2%   | 479 ms    |
 
 Baseline garbage is not measured. With a sync after **every** batch on the
 earlier room (1 rep), batch 1 took 33.5 ms/event (baseline) vs 39.8 ms

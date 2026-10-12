@@ -608,12 +608,7 @@ impl<'a> Writer<'a> {
         self.stats.sync_time = self.stats.sync_time.saturating_add(started.elapsed());
     }
 
-    fn write_batch(
-        &mut self,
-        store: &dyn StorageEngine,
-        batch: &'a [Row],
-        include_children: bool,
-    ) {
+    fn write_batch(&mut self, store: &dyn StorageEngine, batch: &'a [Row], include_children: bool) {
         let first_new = self.ids.keys.len();
         let (mut dirty, dirty_children) = assign_batch(&mut self.ids, batch, include_children);
         let tail = self.ids.keys.len().div_ceil(chunk_size());

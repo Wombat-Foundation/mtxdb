@@ -8,8 +8,9 @@
 //! grows with the room and is rewritten whole on every append.
 //!
 //! This is a benchmark-only replay of that write shape through the same
-//! `Database` and policies as the other `edge_layout_*` benches. It is not
-//! sithnapse's engine, its short-id lookups, SQL fetches or closure cache. It
+//! `Database` and policies as the other `edge_layout_*` benches. It includes
+//! forward/reverse id records and the allocation counter, but is not
+//! sithnapse's exact node-id derivation, lookup path, SQL fetches or closure cache. It
 //! preloads `MTXDB_EL_PRELOAD` events in batches of 1,000, then appends
 //! `MTXDB_EL_APPEND` in batches of 1, 2, 10 and 100 (`MTXDB_EL_BATCHES`), syncing
 //! every `MTXDB_EL_SYNC_EVERY` batches (default 20), and reports wall time,
@@ -32,12 +33,14 @@ use mtxdb::storage::{NodeData, StorageEngine};
 mod common;
 
 use common::{
-    assign_batch, compact_latest, len_f64, load, mib, num, sizes, spread, Ids, Latest, Row,
-    CHUNK_COLLECTION,
+    assign_batch, compact_latest, key_hash, len_f64, load, mib, num, sizes, spread, Ids, Latest,
+    Row, Writer, CHUNK_COLLECTION,
 };
 
+const KIND_COUNTER: u8 = 3;
 const KIND_OUT: u8 = 4;
 const KIND_CHILD: u8 = 5;
+const KIND_REVERSE: u8 = 6;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -102,7 +105,40 @@ impl<'a> State<'a> {
     fn append(&mut self, db: &Database, rows: &'a [Row], (batch, sync_every): (usize, usize)) {
         let store = db.edges();
         for (n, chunk) in rows.chunks(batch).enumerate() {
-            assign_batch(&mut self.ids, chunk);
+            let first_new = self.ids.keys.len();
+            let _ = assign_batch(&mut self.ids, chunk, false);
+            let new_keys: Vec<(u32, String)> = self.ids.keys[first_new..]
+                .iter()
+                .enumerate()
+                .map(|(offset, key)| {
+                    (
+                        u32::try_from(first_new.saturating_add(offset)).expect("short id"),
+                        (*key).to_owned(),
+                    )
+                })
+                .collect();
+            for (short_id, key) in new_keys {
+                self.put(
+                    store.as_ref(),
+                    key_hash(&key),
+                    short_id.to_be_bytes().to_vec(),
+                );
+                self.put(
+                    store.as_ref(),
+                    spread(KIND_REVERSE, short_id),
+                    key.into_bytes(),
+                );
+            }
+            if self.ids.keys.len() > first_new {
+                self.put(
+                    store.as_ref(),
+                    spread(KIND_COUNTER, 0),
+                    u32::try_from(self.ids.keys.len())
+                        .expect("counter")
+                        .to_be_bytes()
+                        .to_vec(),
+                );
+            }
             let mut by_parent: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
             for row in chunk {
                 let owner = self.ids.by_key[row.id.as_str()];
@@ -171,10 +207,78 @@ fn case(base: &std::path::Path, rows: &[Row], preload: usize, (batch, sync_every
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn chunked_case(
+    base: &std::path::Path,
+    rows: &[Row],
+    preload: usize,
+    (batch, sync_every): (usize, usize),
+) {
+    let dir = base.join(format!(
+        "mtxdb_bench_sithnapse_chunked_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = Database::open(dir.clone()).expect("open");
+    let (head, tail) = rows.split_at(preload);
+    let mut writer = Writer::default();
+    writer.append_bidirectional(&db, head, (1_000, 20));
+    writer.sync(&db);
+    let before = sizes(&dir).total();
+    let (bytes0, puts0, sync0) = (
+        writer.stats.payload_bytes(),
+        writer.stats.total_puts(),
+        writer.stats.sync_time,
+    );
+    let started = Instant::now();
+    writer.append_bidirectional(&db, tail, (batch, sync_every));
+    let wall = started.elapsed();
+    writer.sync(&db);
+    let after = sizes(&dir);
+    let events = len_f64(tail.len().max(1));
+    let new_payload = writer.stats.payload_bytes().saturating_sub(bytes0);
+    let rewrites = writer
+        .stats
+        .edge_rewrite
+        .bytes
+        .saturating_add(writer.stats.key_rewrite.bytes)
+        .saturating_add(writer.stats.child_rewrite.bytes);
+    let sync = writer.stats.sync_time.saturating_sub(sync0);
+    let (took, settled) = writer.simulate_compaction(&dir.with_extension("compact"));
+    println!(
+        "  chunked batch {batch:>3}: {:>9.1} us/event | growth {:>8.1} B/event | payload {:>8.1} B/event, rewrites {:>5.1}%, {} puts | sync {:.0} ms",
+        wall.as_secs_f64() * 1e6 / events,
+        num(after.total().saturating_sub(before)) / events,
+        num(new_payload) / events,
+        100.0 * num(rewrites) / num(new_payload.max(1)),
+        writer.stats.total_puts().saturating_sub(puts0),
+        sync.as_secs_f64() * 1e3,
+    );
+    println!(
+        "      packs {:.2} MiB, {:.2} after simulated compaction ({:.0}% dead), copy {:.0} ms",
+        mib(after.packs),
+        mib(settled.packs),
+        100.0 * (1.0 - mib(settled.packs) / mib(after.packs).max(f64::MIN_POSITIVE)),
+        took.as_secs_f64() * 1e3,
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn main() {
     let tsv = PathBuf::from(std::env::var_os("MTXDB_EL_TSV").expect("set MTXDB_EL_TSV"));
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
-    let rows = load(&tsv, usize::MAX);
+    let loaded = load(&tsv, usize::MAX);
+    // Sithnapse's auth-chain store is specifically auth adjacency in both
+    // directions; omit prev and relation payloads from this comparison.
+    let rows: Vec<Row> = loaded
+        .into_iter()
+        .map(|row| Row {
+            id: row.id,
+            prev: Vec::new(),
+            auth: row.auth,
+            rel: None,
+        })
+        .collect();
     let preload = env_usize("MTXDB_EL_PRELOAD", 60_000).min(rows.len());
     let append = env_usize("MTXDB_EL_APPEND", 2_000).min(rows.len().saturating_sub(preload));
     let sync_every = env_usize("MTXDB_EL_SYNC_EVERY", 20);
@@ -188,5 +292,6 @@ fn main() {
     );
     for batch in batches {
         case(&base, rows, preload, (batch, sync_every));
+        chunked_case(&base, rows, preload, (batch, sync_every));
     }
 }
