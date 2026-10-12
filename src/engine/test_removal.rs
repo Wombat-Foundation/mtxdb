@@ -1324,3 +1324,144 @@ fn remove_many_is_stale_if_any_key_changed_concurrently() {
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ------------------------------------------------------ removal statistics ---
+
+fn fresh_store(name: &str) -> (PathBuf, PackfileStorage) {
+    let dir = test_root(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = open_small(&dir);
+    (dir, store)
+}
+
+#[test]
+fn removal_stats_count_live_and_removed_keys_and_reclaimable_bytes() {
+    let (dir, store) = fresh_store("stats_basic");
+    let collection = [0xb1; 16];
+    for id in 1..=3u8 {
+        store
+            .put(&collection, &node(id), &NodeData::from_slice(b"value"))
+            .unwrap();
+    }
+    let before = store.removal_stats(&collection).unwrap();
+    assert_eq!(before.live_keys, 3);
+    assert_eq!(before.removed_keys, 0);
+    assert_eq!(before.superseded_frames, 0);
+    assert_eq!(before.reclaimable_bytes, 0);
+    assert_eq!(before.frames, 3);
+
+    assert!(store.remove_record(&collection, &node(2)).unwrap());
+    let after = store.removal_stats(&collection).unwrap();
+    assert_eq!(after.live_keys, 2);
+    assert_eq!(after.removed_keys, 1);
+    assert_eq!(after.marker_frames, 1);
+    assert_eq!(
+        after.superseded_frames, 1,
+        "the removed value is superseded"
+    );
+    assert_eq!(after.frames, 4);
+    assert!(after.reclaimable_bytes > 0);
+    assert!(after.reclaimable_bytes < after.total_bytes);
+    assert_eq!(store.removed_keys(&collection).unwrap(), vec![node(2)]);
+
+    // Removing a key that is no longer live writes nothing.
+    assert!(!store.remove_record(&collection, &node(2)).unwrap());
+    assert!(!store.remove_record(&collection, &node(99)).unwrap());
+    assert_eq!(store.removal_stats(&collection).unwrap(), after);
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_re_added_key_is_live_again_and_its_old_versions_are_superseded() {
+    let (dir, store) = fresh_store("stats_readd");
+    let collection = [0xb2; 16];
+    store
+        .put(&collection, &node(1), &NodeData::from_slice(b"one"))
+        .unwrap();
+    assert!(store.remove_record(&collection, &node(1)).unwrap());
+    store
+        .put(&collection, &node(1), &NodeData::from_slice(b"two"))
+        .unwrap();
+    let stats = store.removal_stats(&collection).unwrap();
+    assert_eq!(stats.live_keys, 1);
+    assert_eq!(stats.removed_keys, 0);
+    assert_eq!(stats.superseded_frames, 2, "the first value and the marker");
+    assert!(store.removed_keys(&collection).unwrap().is_empty());
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Repack gives the space back: the frame count and the total fall, and a
+/// further repack drops the marker too once no older copy remains.
+#[test]
+fn repack_reduces_what_removal_stats_report() {
+    let (dir, store) = fresh_store("stats_repack");
+    let collection = [0xb3; 16];
+    fill(&store, &collection, 0, 60);
+    let victim = node(210);
+    store
+        .put(&collection, &victim, &NodeData::from_slice(b"old"))
+        .unwrap();
+    assert!(store.remove_record(&collection, &victim).unwrap());
+    store.sync_all().unwrap();
+    let before = store.removal_stats(&collection).unwrap();
+    assert_eq!(before.removed_keys, 1);
+
+    for _ in 0..2 {
+        store
+            .repack_collection_reachable(&collection, |_, _| Vec::new())
+            .unwrap();
+        store.sync_all().unwrap();
+    }
+    let after = store.removal_stats(&collection).unwrap();
+    assert_eq!(after.live_keys, before.live_keys);
+    assert_eq!(
+        after.removed_keys, 0,
+        "the marker is gone once nothing older remains"
+    );
+    assert_eq!(after.superseded_frames, 0);
+    assert!(after.total_bytes < before.total_bytes);
+    assert!(!visible(&store, &collection, &victim));
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// With a journal enabled the standalone removal is published, so the change
+/// feed carries it like a transactional one.
+#[test]
+fn remove_record_publishes_to_an_enabled_journal() {
+    use crate::journal::Mutation as JournalMutation;
+    let dir = test_root("remove_record_journal");
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.enable_journal(dir.join("wal.bin")).unwrap();
+    let collection = [0xb4; 16];
+    store
+        .put(&collection, &node(1), &NodeData::from_slice(b"v"))
+        .unwrap();
+    let (scan, cursor, lease) = store.scan_collection_at_snapshot(&collection).unwrap();
+    drop(scan);
+
+    assert!(store.remove_record(&collection, &node(1)).unwrap());
+    let journal = store.journal().unwrap();
+    journal.sync().unwrap();
+    let page = journal.changes_since(&cursor, 8).unwrap();
+    let mutations: Vec<&JournalMutation> = page
+        .groups
+        .iter()
+        .flat_map(|group| group.entries.iter())
+        .map(|entry| &entry.mutation)
+        .collect();
+    assert_eq!(
+        mutations,
+        vec![&JournalMutation::RemoveRecord {
+            collection_id: collection,
+            node_id: node(1),
+        }]
+    );
+    assert!(!visible(&store, &collection, &node(1)));
+    drop(lease);
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
