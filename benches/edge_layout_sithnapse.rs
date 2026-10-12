@@ -122,12 +122,36 @@ impl State<'_> {
                 .unwrap_or_default();
             let mut seen: HashSet<u32> = children.iter().copied().collect();
             let before = children.len();
+            let created = children.is_empty();
             children.extend(kids.into_iter().filter(|c| seen.insert(*c)));
             if children.len() != before {
                 self.put(store, id, encode(&children));
             }
+            if created && self.span.is_some() {
+                self.note_range(store, parent, range);
+            }
         }
     }
+
+    /// Record that `parent` has children in `range`, so reads probe only the
+    /// ranges that exist. Written once per (parent, range), when it first appears.
+    fn note_range(&mut self, store: &dyn StorageEngine, parent: u32, range: u32) {
+        let id = meta_record(parent);
+        let mut ranges = store
+            .get(&CHUNK_COLLECTION, &id)
+            .expect("get")
+            .map(|d| decode(&d.bytes))
+            .unwrap_or_default();
+        if let Err(at) = ranges.binary_search(&range) {
+            ranges.insert(at, range);
+            self.put(store, id, encode(&ranges));
+        }
+    }
+}
+
+/// The record listing the id ranges in which `parent` has children.
+fn meta_record(parent: u32) -> [u8; 16] {
+    key_hash(&format!("child-ranges:{parent}"))
 }
 
 /// The record holding `parent`'s children in id `range`.
@@ -138,25 +162,24 @@ fn child_record(parent: u32, range: u32, span: Option<u32>) -> [u8; 16] {
     }
 }
 
-/// Read all of `parent`'s children; returns them and the number of gets.
-fn children_of(
-    store: &dyn StorageEngine,
-    parent: u32,
-    (max_id, span): (u32, Option<u32>),
-) -> (Vec<u32>, usize) {
-    let ranges = span.map_or(0..=0, |span| {
-        parent.checked_div(span).unwrap_or(0)..=max_id.checked_div(span).unwrap_or(0)
-    });
+/// Read all of `parent`'s children; returns them and the number of gets. A
+/// segmented layout reads the parent's range list, then only those ranges.
+fn children_of(store: &dyn StorageEngine, parent: u32, span: Option<u32>) -> (Vec<u32>, usize) {
+    let get = |id: [u8; 16]| {
+        store
+            .get(&CHUNK_COLLECTION, &id)
+            .expect("get")
+            .map(|d| decode(&d.bytes))
+    };
+    let Some(span) = span else {
+        return (get(child_record(parent, 0, None)).unwrap_or_default(), 1);
+    };
+    let ranges = get(meta_record(parent)).unwrap_or_default();
+    let mut gets = 1_usize;
     let mut out = Vec::new();
-    let mut gets = 0_usize;
     for range in ranges {
         gets = gets.saturating_add(1);
-        if let Some(data) = store
-            .get(&CHUNK_COLLECTION, &child_record(parent, range, span))
-            .expect("get")
-        {
-            out.extend(decode(&data.bytes));
-        }
+        out.extend(get(child_record(parent, range, Some(span))).unwrap_or_default());
     }
     (out, gets)
 }
@@ -333,28 +356,40 @@ fn chunked_case(
 
 /// Read cost of a child list after the appends: the busiest parent, and a sample
 /// of parents drawn from the events' auth lists (so busy parents weigh in as
-/// often as they are named).
+/// often as they are named). Every list read is checked against the source rows.
 fn child_reads(db: &Database, rows: &[Row], ids: &Ids<'_>, span: Option<u32>) {
     let store = db.edges();
-    let max_id = u32::try_from(ids.keys.len().saturating_sub(1)).unwrap_or(u32::MAX);
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for parent in rows.iter().flat_map(|row| &row.auth) {
-        let seen = counts.entry(parent.as_str()).or_default();
-        *seen = seen.saturating_add(1);
+    let mut expected: HashMap<u32, Vec<u32>> = HashMap::new();
+    for row in rows {
+        let child = ids.by_key[row.id.as_str()];
+        for parent in &row.auth {
+            expected
+                .entry(ids.by_key[parent.as_str()])
+                .or_default()
+                .push(child);
+        }
     }
-    let Some((hot, _)) = counts.iter().max_by_key(|(key, n)| (**n, **key)) else {
+    let Some((hot, _)) = expected.iter().max_by_key(|(id, kids)| (kids.len(), **id)) else {
         return;
     };
-    let timed = |parent: u32, reps: usize| {
-        let started = Instant::now();
-        let mut shape = (0, 0);
-        for _ in 0..reps {
-            let (children, gets) = children_of(store.as_ref(), parent, (max_id, span));
-            shape = (children.len(), gets);
-        }
-        (started.elapsed().as_secs_f64() * 1e6 / len_f64(reps), shape)
+    let mut bad = 0_usize;
+    let mut check = |parent: u32, got: &mut Vec<u32>| {
+        got.sort_unstable();
+        let mut want = expected.get(&parent).cloned().unwrap_or_default();
+        want.sort_unstable();
+        want.dedup();
+        bad = bad.saturating_add(usize::from(*got != want));
     };
-    let (hot_us, (hot_children, hot_gets)) = timed(ids.by_key[*hot], 20);
+    let started = Instant::now();
+    let reps = 20_usize;
+    let mut shape = (Vec::new(), 0);
+    for _ in 0..reps {
+        shape = children_of(store.as_ref(), *hot, span);
+    }
+    let hot_us = started.elapsed().as_secs_f64() * 1e6 / len_f64(reps);
+    let (mut hot_children, hot_gets) = shape;
+    let hot_len = hot_children.len();
+    check(*hot, &mut hot_children);
     let sample: Vec<u32> = rows
         .iter()
         .flat_map(|row| &row.auth)
@@ -362,14 +397,20 @@ fn child_reads(db: &Database, rows: &[Row], ids: &Ids<'_>, span: Option<u32>) {
         .filter_map(|key| ids.by_key.get(key.as_str()).copied())
         .take(2_000)
         .collect();
-    let started = Instant::now();
-    let gets = sample.iter().fold(0_usize, |acc, parent| {
-        acc.saturating_add(children_of(store.as_ref(), *parent, (max_id, span)).1)
-    });
-    let typical = started.elapsed().as_secs_f64() * 1e6 / len_f64(sample.len().max(1));
+    let mut gets = 0_usize;
+    let mut elapsed = Duration::ZERO;
+    for parent in &sample {
+        let started = Instant::now();
+        let (mut got, n) = children_of(store.as_ref(), *parent, span);
+        elapsed = elapsed.saturating_add(started.elapsed());
+        gets = gets.saturating_add(n);
+        check(*parent, &mut got);
+    }
+    let count = len_f64(sample.len().max(1));
     println!(
-        "      child reads: busiest parent {hot_us:.0} us ({hot_children} children, {hot_gets} gets); sampled parents {typical:.1} us ({:.1} gets)",
-        num(u64::try_from(gets).unwrap_or(0)) / len_f64(sample.len().max(1)),
+        "      child reads: busiest parent {hot_us:.0} us ({hot_len} children, {hot_gets} gets); sampled parents {:.1} us ({:.1} gets); mismatches {bad}",
+        elapsed.as_secs_f64() * 1e6 / count,
+        num(u64::try_from(gets).unwrap_or(0)) / count,
     );
 }
 
@@ -399,11 +440,23 @@ fn main() {
     println!(
         "sithnapse-shaped writes: {preload} events preloaded (batches of 1000), {append} appended, sync every {sync_every} batches"
     );
-    let span = env_usize("MTXDB_EL_SPAN", 2_048);
-    let span = u32::try_from(span).ok().filter(|s| *s > 0);
+    let spans: Vec<u32> = std::env::var("MTXDB_EL_SPANS").map_or_else(
+        |_| vec![1_024, 2_048, 8_192],
+        |v| {
+            v.split(',')
+                .filter_map(|s| s.parse().ok())
+                .filter(|s| *s > 0)
+                .collect()
+        },
+    );
+    let chunked = env_usize("MTXDB_EL_CHUNKED", 1) != 0;
     for batch in batches {
         case(&base, rows, preload, (batch, sync_every, None));
-        case(&base, rows, preload, (batch, sync_every, span));
-        chunked_case(&base, rows, preload, (batch, sync_every));
+        for span in &spans {
+            case(&base, rows, preload, (batch, sync_every, Some(*span)));
+        }
+        if chunked {
+            chunked_case(&base, rows, preload, (batch, sync_every));
+        }
     }
 }
