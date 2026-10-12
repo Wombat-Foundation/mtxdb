@@ -11,6 +11,12 @@
 //! - **plain-single** — one `put` per record, each publishing its own journal
 //!   group (autocommit). No fsync until the end.
 //! - **plain-single-durable** — the same, with a `sync()` after every record.
+//!   Each `sync()` is a full barrier (WAL fsync, shard fsync, index delta or
+//!   checkpoint, lag remediation), so this run is capped at
+//!   `MTXDB_TXN_SINGLE_DURABLE_RECORDS` records (default 100) and reports
+//!   that count in its `records` column. Each barrier costs the same however
+//!   many precede it, so a small sample is enough; an uncapped run is hours
+//!   on a spinning disk.
 //! - **plain-many(B)** — one `put_many` of `B` records. Note this still emits
 //!   one journal group per **record**, not per call: `put_many` publishes
 //!   through the same per-entry path as `put`. The group count is therefore
@@ -226,12 +232,23 @@ struct RunConfig {
     batch: usize,
     /// `sync()` after every group instead of once at the end.
     durable: bool,
+    /// Write only the first `limit` records. Used by the run that pays one
+    /// fsync per record, whose cost is per record and so needs no more.
+    limit: Option<usize>,
+}
+
+impl RunConfig {
+    /// How many records this run writes out of `total`.
+    fn records(&self, total: usize) -> usize {
+        self.limit.map_or(total, |limit| limit.min(total))
+    }
 }
 
 /// The run set. `sweep` gives several transaction sizes for `txn-batched`, so
 /// the practical batch size is visible from one run; `batch` is the base size
 /// used by the plain-many, durable, and read-your-writes runs.
-fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
+/// `single_durable` caps the one-fsync-per-record run.
+fn configs(records: usize, batch: usize, sweep: &[usize], single_durable: usize) -> Vec<RunConfig> {
     let batch = batch.max(1);
     let mut configs = vec![
         RunConfig {
@@ -239,24 +256,28 @@ fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
             kind: Kind::PlainSingle,
             batch: 1,
             durable: false,
+            limit: None,
         },
         RunConfig {
             name: "plain-single-durable".to_owned(),
             kind: Kind::PlainSingle,
             batch: 1,
             durable: true,
+            limit: Some(single_durable.max(1)),
         },
         RunConfig {
             name: "plain-many".to_owned(),
             kind: Kind::PlainMany,
             batch,
             durable: false,
+            limit: None,
         },
         RunConfig {
             name: "plain-many-durable".to_owned(),
             kind: Kind::PlainMany,
             batch,
             durable: true,
+            limit: None,
         },
         // `txn-whole` is listed unconditionally; `main` drops it when the whole
         // dataset would exceed the stage budget, which depends on the payload.
@@ -265,12 +286,14 @@ fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
             kind: Kind::TxnWhole,
             batch: records,
             durable: false,
+            limit: None,
         },
         RunConfig {
             name: "txn-whole-durable".to_owned(),
             kind: Kind::TxnWhole,
             batch: records,
             durable: true,
+            limit: None,
         },
     ];
     for &size in sweep {
@@ -280,6 +303,7 @@ fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
             kind: Kind::TxnBatched,
             batch: size,
             durable: false,
+            limit: None,
         });
     }
     configs.push(RunConfig {
@@ -287,12 +311,14 @@ fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
         kind: Kind::TxnBatched,
         batch,
         durable: true,
+        limit: None,
     });
     configs.push(RunConfig {
         name: format!("txn-ryw-B{batch}"),
         kind: Kind::TxnRyw,
         batch,
         durable: false,
+        limit: None,
     });
     configs
 }
@@ -327,6 +353,7 @@ fn run_once(
     payload: usize,
     compress: bool,
 ) -> Sample {
+    let entries = &entries[..cfg.records(entries.len())];
     let dir = bench_root().join(cfg.name.as_str());
     let _ = fs::remove_dir_all(&dir);
     let db = open_db(dir.clone(), compress);
@@ -602,6 +629,7 @@ fn main() {
     let passes = env_usize("MTXDB_TXN_PASSES", 3).max(1);
     let compress = std::env::var("MTXDB_BENCH_COMPRESS").as_deref() != Ok("0");
     let filter = std::env::var("MTXDB_TXN_RUNS").ok();
+    let single_durable = env_usize("MTXDB_TXN_SINGLE_DURABLE_RECORDS", 100).max(1);
     let whole_fits = (records as u128 * payload as u128) <= MAX_TXN_STAGE_BYTES as u128;
     // Transaction sizes to sweep. Default: a quarter, the base, and four times
     // the base, clamped to the dataset.
@@ -651,7 +679,7 @@ fn main() {
         );
     }
 
-    let selected: Vec<RunConfig> = configs(records, batch, &sweep)
+    let selected: Vec<RunConfig> = configs(records, batch, &sweep, single_durable)
         .into_iter()
         .filter(|cfg| whole_fits || cfg.kind != Kind::TxnWhole)
         .filter(|cfg| match &filter {
@@ -704,7 +732,7 @@ fn main() {
         for index in order {
             let cfg = &selected[index];
             let sample = run_once(cfg, &entries, payload, compress);
-            print_row(&cfg.name, records, &sample);
+            print_row(&cfg.name, cfg.records(records), &sample);
             samples[index].push(sample);
         }
     }
@@ -713,7 +741,7 @@ fn main() {
     println!("  ── medians ──");
     for (cfg, runs) in selected.iter().zip(samples.iter()) {
         let sample = reduce(runs);
-        print_row(&cfg.name, records, &sample);
+        print_row(&cfg.name, cfg.records(records), &sample);
     }
     println!("═══════════════════════════════════════════════════════════════");
 
@@ -725,7 +753,7 @@ fn main() {
              RECORDS_PER_FSYNC={:.1} DURABLE_RECORDS={} GROUPS={} WAL_BYTES={} \
              RYW_READS={} RYW_US={:.3} STAGED_BYTES={}",
             cfg.name,
-            records,
+            cfg.records(records),
             payload,
             cfg.batch,
             passes,
@@ -734,7 +762,7 @@ fn main() {
             sample.sync.as_secs_f64() * 1e3,
             sample.total.as_secs_f64() * 1e3,
             sample.fsyncs,
-            sample.records_per_fsync(records),
+            sample.records_per_fsync(cfg.records(records)),
             sample.durable_records,
             sample.wal.map_or(0, |(groups, _)| groups),
             sample.wal.map_or(0, |(_, bytes)| bytes),
