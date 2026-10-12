@@ -339,7 +339,11 @@ struct Phases {
     checkpoint: Duration,
     reclaim: Duration,
     remediation: Duration,
+    /// Time around the journal commit. It includes `journal_lock_wait` and
+    /// `journal_fsync`, which are measured separately inside it.
     wal: Duration,
+    journal_lock_wait: Duration,
+    journal_fsync: Duration,
 }
 
 impl Phases {
@@ -353,10 +357,12 @@ impl Phases {
         self.reclaim += timings.reclaim;
         self.remediation += timings.remediation;
         self.wal += timings.wal;
+        self.journal_lock_wait += timings.journal_lock_wait;
+        self.journal_fsync += timings.journal_fsync;
     }
 
     /// The named phases, in the order they are reported.
-    fn fields(&self) -> [(&'static str, Duration); 8] {
+    fn fields(&self) -> [(&'static str, Duration); 10] {
         [
             ("pack_flush", self.pack_flush),
             ("pack_fsync", self.pack_fsync),
@@ -366,6 +372,8 @@ impl Phases {
             ("reclaim", self.reclaim),
             ("remediation", self.remediation),
             ("wal", self.wal),
+            ("wal.lock_wait", self.journal_lock_wait),
+            ("wal.fsync", self.journal_fsync),
         ]
     }
 }
@@ -585,6 +593,8 @@ fn reduce(samples: &[Sample]) -> Sample {
         reclaim: median(|s| s.phases.reclaim),
         remediation: median(|s| s.phases.remediation),
         wal: median(|s| s.phases.wal),
+        journal_lock_wait: median(|s| s.phases.journal_lock_wait),
+        journal_fsync: median(|s| s.phases.journal_fsync),
     };
     reduced
 }
@@ -649,8 +659,9 @@ fn probe_stage_budget(payload: usize) {
 
 /// Where a durable run's barriers spent their time, in the engine's own phases:
 /// each phase's total over the run, and per barrier. The phases can overlap
-/// (the checkpoint, for one, contains other work), so they need not add up to
-/// the run's sync time. Printed for humans only; it is not on the `bench:` line.
+/// (the checkpoint, for one, contains other work, and `wal.lock_wait` and
+/// `wal.fsync` are measured inside `wal`), so they need not add up to the run's
+/// sync time. Printed for humans only; it is not on the `bench:` line.
 fn print_phases(sample: &Sample) {
     let barriers = sample.phases.barriers;
     if barriers == 0 {
