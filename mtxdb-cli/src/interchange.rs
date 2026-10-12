@@ -41,10 +41,11 @@
 use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
 use bytes::Bytes;
+use mtxdb::export_schema::{field, tag};
 use rezzy::json::{self, Object, Value as OwnedValue};
 
 /// The export format this importer accepts, as written on the `header` line.
-pub(crate) const EXPORT_FORMAT: &str = "mtxdb-export/v1";
+pub(crate) use mtxdb::export_schema::EXPORT_FORMAT;
 
 /// Prefix of the auxiliary index holding one room's per-event metadata. The
 /// room id is appended, which is what routes each room to its own index.
@@ -62,49 +63,9 @@ pub(crate) enum InputFormat {
     Keys,
 }
 
-/// Which of an origin's signing-key records one `server_keys` line carries.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum KeyKind {
-    /// Keys the origin published earlier (its long-lived signing keys).
-    Historical,
-    /// Keys the origin has published but no other server has confirmed.
-    Provisional,
-    /// Keys another server confirmed for the origin.
-    Corroborated,
-    /// Keys the origin's notary relayed.
-    Notary,
-}
-
-impl KeyKind {
-    /// Every kind, in the order a keys-import summary reports them.
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Historical,
-        Self::Provisional,
-        Self::Corroborated,
-        Self::Notary,
-    ];
-
-    /// The `kind` written on a `server_keys` line.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Historical => "historical",
-            Self::Provisional => "provisional",
-            Self::Corroborated => "corroborated",
-            Self::Notary => "notary",
-        }
-    }
-
-    /// Parse the `kind` of a `server_keys` line, or `None` for an unknown kind.
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "historical" => Some(Self::Historical),
-            "provisional" => Some(Self::Provisional),
-            "corroborated" => Some(Self::Corroborated),
-            "notary" => Some(Self::Notary),
-            _ => None,
-        }
-    }
-}
+/// Which of an origin's signing-key records one `server_keys` line carries:
+/// the layout crate's kind, whose tags are the wire `kind` values.
+pub(crate) use mtxdb::interop::KeyRecordKind as KeyKind;
 
 /// Everything an `event` record says about an event beyond the PDU itself.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -297,9 +258,9 @@ pub(crate) fn detect(content: &[u8]) -> Option<InputFormat> {
             continue;
         }
         let value = OwnedValue::parse_bytes(line.as_bytes()).ok()?;
-        return match value.get("t").and_then(OwnedValue::as_str) {
-            Some("header") => Some(InputFormat::Room),
-            Some("server_keys") => Some(InputFormat::Keys),
+        return match value.get(field::T).and_then(OwnedValue::as_str) {
+            Some(tag::HEADER) => Some(InputFormat::Room),
+            Some(tag::SERVER_KEYS) => Some(InputFormat::Keys),
             _ => None,
         };
     }
@@ -323,17 +284,17 @@ pub(crate) fn parse_room(content: &[u8]) -> anyhow::Result<RoomExport> {
         .next()
         .ok_or_else(|| anyhow!("empty input; a room export starts with a `header` record"))?;
     let header = record_object(header_line, &header_value)?;
-    if record_tag(header_line, header)? != "header" {
+    if record_tag(header_line, header)? != tag::HEADER {
         bail!("line {header_line}: a room export starts with a `header` record");
     }
-    let format = require_string(header_line, header, "format")?;
+    let format = require_string(header_line, header, field::FORMAT)?;
     if format != EXPORT_FORMAT {
         bail!(
             "line {header_line}: unsupported export format `{format}`; expected `{EXPORT_FORMAT}`"
         );
     }
-    let server = require_string(header_line, header, "server")?.to_owned();
-    let room_id = require_string(header_line, header, "room_id")?.to_owned();
+    let server = require_string(header_line, header, field::SERVER)?.to_owned();
+    let room_id = require_string(header_line, header, field::ROOM_ID)?.to_owned();
 
     let mut events = Vec::new();
     let mut end = None;
@@ -343,9 +304,9 @@ pub(crate) fn parse_room(content: &[u8]) -> anyhow::Result<RoomExport> {
             bail!("line {line}: no record may follow the `end` record");
         }
         match record_tag(line, object)? {
-            "event" => events.push(parse_event(line, object, raw, &room_id)?),
-            "end" => end = Some((line, require_number(line, object, "events")?)),
-            "header" => bail!("line {line}: a room export carries exactly one `header` record"),
+            tag::EVENT => events.push(parse_event(line, object, raw, &room_id)?),
+            tag::END => end = Some((line, require_number(line, object, field::EVENTS)?)),
+            tag::HEADER => bail!("line {line}: a room export carries exactly one `header` record"),
             other => bail!("line {line}: unknown record tag `{other}`"),
         }
     }
@@ -373,18 +334,18 @@ pub(crate) fn parse_keys(content: &[u8]) -> anyhow::Result<Vec<KeyRecord>> {
     let mut records = Vec::new();
     for (line, value, _) in tagged_lines(content)? {
         let object = record_object(line, &value)?;
-        if record_tag(line, object)? != "server_keys" {
+        if record_tag(line, object)? != tag::SERVER_KEYS {
             bail!("line {line}: a keys export carries only `server_keys` records");
         }
-        let origin = require_string(line, object, "origin")?.to_owned();
+        let origin = require_string(line, object, field::ORIGIN)?.to_owned();
         if origin.is_empty() {
             bail!("line {line}: `origin` is empty");
         }
-        let kind_tag = require_string(line, object, "kind")?;
+        let kind_tag = require_string(line, object, field::KIND)?;
         let Some(kind) = KeyKind::parse(kind_tag) else {
             bail!("line {line}: unknown signing-key kind `{kind_tag}`");
         };
-        let payload = require_string(line, object, "payload")?;
+        let payload = require_string(line, object, field::PAYLOAD)?;
         let payload = base64::engine::general_purpose::STANDARD
             .decode(payload)
             .map_err(|error| anyhow!("line {line}: `payload` is not base64: {error}"))?;
@@ -432,19 +393,19 @@ fn parse_event(
     raw: &[u8],
     room_id: &str,
 ) -> anyhow::Result<RoomEvent> {
-    let event_id = require_string(line, object, "event_id")?.to_owned();
+    let event_id = require_string(line, object, field::EVENT_ID)?.to_owned();
     if event_id.is_empty() {
         bail!("line {line}: `event_id` is empty");
     }
-    let prev_events = require_array(line, object, "prev_events")?.clone();
-    let auth_events = require_array(line, object, "auth_events")?.clone();
+    let prev_events = require_array(line, object, field::PREV_EVENTS)?.clone();
+    let auth_events = require_array(line, object, field::AUTH_EVENTS)?.clone();
     let metadata = EventMetadata {
-        outlier: require_bool(line, object, "outlier")?,
-        rejected: require_bool(line, object, "rejected")?,
-        soft_failed: require_bool(line, object, "soft_failed")?,
-        rejection_code: optional_code(line, object, "rejection_code")?,
-        soft_fail_code: optional_code(line, object, "soft_fail_code")?,
-        redacted_by: match object.get("redacted_by") {
+        outlier: require_bool(line, object, field::OUTLIER)?,
+        rejected: require_bool(line, object, field::REJECTED)?,
+        soft_failed: require_bool(line, object, field::SOFT_FAILED)?,
+        rejection_code: optional_code(line, object, field::REJECTION_CODE)?,
+        soft_fail_code: optional_code(line, object, field::SOFT_FAIL_CODE)?,
+        redacted_by: match object.get(field::REDACTED_BY) {
             None => None,
             Some(value) => {
                 let text = value
@@ -457,7 +418,7 @@ fn parse_event(
             }
         },
     };
-    let pdu = match object.get("pdu") {
+    let pdu = match object.get(field::PDU) {
         Some(OwnedValue::Object(pdu)) => pdu,
         Some(_) => bail!("line {line}: `pdu` must be a JSON object"),
         None => bail!("line {line}: record is missing `pdu`"),
@@ -510,7 +471,7 @@ fn raw_pdu(line_number: usize, raw: &[u8]) -> anyhow::Result<Bytes> {
     members
         .into_iter()
         .rev()
-        .find(|member| member.key.as_ref() == "pdu")
+        .find(|member| member.key.as_ref() == field::PDU)
         .map(|member| Bytes::copy_from_slice(member.raw_value))
         .ok_or_else(|| anyhow!("line {line_number}: record is missing `pdu`"))
 }
@@ -543,7 +504,7 @@ fn record_object(line: usize, value: &OwnedValue) -> anyhow::Result<&Object> {
 
 /// A record's `t` tag.
 fn record_tag(line: usize, object: &Object) -> anyhow::Result<&str> {
-    match object.get("t") {
+    match object.get(field::T) {
         Some(OwnedValue::String(tag)) => Ok(tag),
         Some(_) => bail!("line {line}: `t` must be a string"),
         None => bail!("line {line}: record is missing its `t` tag"),
