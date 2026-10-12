@@ -4794,14 +4794,15 @@ fn continuwuity_room_export() -> String {
 
 #[test]
 fn imported_room_export_records_each_verdict_for_its_event() {
-    use crate::interchange::{event_metadata_namespace, EventMetadata};
+    use crate::interchange::{event_metadata_namespace, parse_room, EventMetadata};
     use mtxdb::auxiliary::AuxiliaryIndex;
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
     let store = db.event_dag();
     let input = root.join("room.jsonl");
-    std::fs::write(&input, continuwuity_room_export()).unwrap();
+    let export_text = continuwuity_room_export();
+    std::fs::write(&input, &export_text).unwrap();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
     cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
@@ -4824,6 +4825,20 @@ fn imported_room_export_records_each_verdict_for_its_event() {
             .encode()
     );
     assert!(recorded("$create").is_none(), "a clean event needs no record");
+
+    let parsed = parse_room(export_text.as_bytes()).unwrap();
+    let collection_id = matrix_room_collection_id("!room:example.org");
+    for event in &parsed.events {
+        let node_id = template_node_id(&template, &event.annotated(&parsed.room_id))
+            .unwrap()
+            .expect("event has a node id under the default template");
+        let stored = store.get(&collection_id, &node_id).unwrap().expect("imported event");
+        assert_eq!(
+            stored.bytes, event.pdu_bytes,
+            "{} must be stored as the export wrote it, not re-encoded",
+            event.event_id
+        );
+    }
 }
 
 #[test]
