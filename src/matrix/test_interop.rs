@@ -8,6 +8,49 @@ fn derive_id_separates_domains_and_is_stable() {
 }
 
 #[test]
+fn state_root_handle_v1_has_the_servers_pinned_layout() {
+    let handle = StateRootHandleV1 {
+        codec_version: 1,
+        routing_version: 2,
+        routing_params: [3, 4, 5, 6],
+        structural_hash: [7; 32],
+        state_group_id: [8; 32],
+    };
+    let bytes = encode_state_root_handle_v1(handle);
+    assert_eq!(bytes.len(), STATE_ROOT_HANDLE_V1_LEN);
+    assert_eq!(&bytes[..6], &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(&bytes[6..38], &[7; 32]);
+    assert_eq!(&bytes[38..70], &[8; 32]);
+    assert_eq!(decode_state_root_handle_v1(&bytes).unwrap(), handle);
+    assert!(decode_state_root_handle_v1(&bytes[..69]).is_err());
+    assert!(decode_state_root_handle_v1(&[&bytes[..], &[0]].concat()).is_err());
+}
+
+#[test]
+fn state_layout_ids_match_the_server_pinned_layout() {
+    let room = b"!room:example.com";
+    let event = b"$event:example.com";
+    let structural_hash = [0xAB; 32];
+    assert_eq!(
+        hex(&room_state_collection_id(room)),
+        "e560c7dd2ceee5d7d31ca9d56e6e9e9f"
+    );
+    assert_eq!(
+        hex(&room_roots_collection_id(room)),
+        "7abdfe381bda1791ba9c6ca5e67117ad"
+    );
+    assert_eq!(state_hamt_node_id(&structural_hash), [0xAB; 16]);
+    assert_eq!(
+        hex(&room_state_root_node_id()),
+        "0463880c2405d3407f4c3e12f7858b65"
+    );
+    assert_eq!(
+        hex(&event_state_root_node_id(event)),
+        "161f86168f7cce258d2bdb7c6eade04f"
+    );
+}
+
+#[test]
 fn verdicts_round_trip_and_reject_truncation() {
     let verdict = Verdict {
         rejection: Some(3),

@@ -15,8 +15,113 @@
 
 use crate::{
     derive_group_full_id, derive_member_collection_id_from_group, storage::StorageError, ShardType,
-    MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT, MEMBER_NAMESPACE_PREV,
+    MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT, MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT,
+    MEMBER_NAMESPACE_STGP,
 };
+
+/// Serialized `rezzy::hamt::RootHandle` length used by the server's state
+/// adapter. Field order is codec version, routing version, routing parameters,
+/// structural hash, then state-group id.
+pub const STATE_ROOT_HANDLE_V1_LEN: usize = 70;
+
+/// The byte-level root handle shared by the importer and the Matrix server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateRootHandleV1 {
+    /// HAMT node codec version.
+    pub codec_version: u8,
+    /// HAMT routing version.
+    pub routing_version: u8,
+    /// Parameters for the selected routing version.
+    pub routing_params: [u8; 4],
+    /// Full content-addressed structural hash of the root node.
+    pub structural_hash: [u8; 32],
+    /// Cross-server state-group identity derived from the state's `LtHash`.
+    pub state_group_id: [u8; 32],
+}
+
+/// Encode the server's fixed-width state root handle.
+#[must_use]
+pub fn encode_state_root_handle_v1(handle: StateRootHandleV1) -> [u8; STATE_ROOT_HANDLE_V1_LEN] {
+    let mut out = [0; STATE_ROOT_HANDLE_V1_LEN];
+    out[0] = handle.codec_version;
+    out[1] = handle.routing_version;
+    out[2..6].copy_from_slice(&handle.routing_params);
+    out[6..38].copy_from_slice(&handle.structural_hash);
+    out[38..70].copy_from_slice(&handle.state_group_id);
+    out
+}
+
+/// Decode the server's fixed-width state root handle.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] unless `bytes` has the exact v1 length.
+pub fn decode_state_root_handle_v1(bytes: &[u8]) -> Result<StateRootHandleV1, StorageError> {
+    if bytes.len() != STATE_ROOT_HANDLE_V1_LEN {
+        return Err(StorageError::Corrupt(format!(
+            "malformed state root handle: expected {STATE_ROOT_HANDLE_V1_LEN} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let malformed = || StorageError::Corrupt("malformed state root handle".to_owned());
+    let (codec_version, fields) = bytes.split_first().ok_or_else(malformed)?;
+    let (routing_version, fields) = fields.split_first().ok_or_else(malformed)?;
+    let (routing_params, fields) = fields
+        .split_first_chunk::<4>()
+        .ok_or_else(|| StorageError::Corrupt("malformed state root handle".to_owned()))?;
+    let (structural_hash, fields) = fields
+        .split_first_chunk::<32>()
+        .ok_or_else(|| StorageError::Corrupt("malformed state root handle".to_owned()))?;
+    let (state_group_id, _) = fields.split_first_chunk::<32>().ok_or_else(malformed)?;
+    Ok(StateRootHandleV1 {
+        codec_version: *codec_version,
+        routing_version: *routing_version,
+        routing_params: *routing_params,
+        structural_hash: *structural_hash,
+        state_group_id: *state_group_id,
+    })
+}
+
+/// Derive the room's STAT collection for HAMT nodes.
+///
+/// # Panics
+/// The fixed STAT namespace is valid, so this cannot panic unless the engine's
+/// namespace validation changes without updating this function.
+#[must_use]
+pub fn room_state_collection_id(room_id: &[u8]) -> [u8; 16] {
+    derive_member_collection_id_from_group(MEMBER_NAMESPACE_STAT, derive_group_full_id(room_id))
+        .expect("known state namespace")
+}
+
+/// Derive the room's STGP collection for room and event root handles.
+///
+/// # Panics
+/// The fixed STGP namespace is valid, so this cannot panic unless the engine's
+/// namespace validation changes without updating this function.
+#[must_use]
+pub fn room_roots_collection_id(room_id: &[u8]) -> [u8; 16] {
+    derive_member_collection_id_from_group(MEMBER_NAMESPACE_STGP, derive_group_full_id(room_id))
+        .expect("known state-group namespace")
+}
+
+/// Derive the stored node id from a full 256-bit HAMT structural hash.
+#[must_use]
+pub fn state_hamt_node_id(structural_hash: &[u8; 32]) -> [u8; 16] {
+    let mut node_id = [0; 16];
+    node_id.copy_from_slice(&structural_hash[..16]);
+    node_id
+}
+
+/// Derive the node id holding a room's current state root.
+#[must_use]
+pub fn room_state_root_node_id() -> [u8; 16] {
+    derive_id(b"root", b"current")
+}
+
+/// Derive the node id holding an event's resolved state root.
+#[must_use]
+pub fn event_state_root_node_id(event_id: &[u8]) -> [u8; 16] {
+    derive_id(b"event-root", event_id)
+}
 
 /// Version of the export/import data contract the marker vouches for. Bump
 /// it when a stored layout below changes incompatibly, so an older database
