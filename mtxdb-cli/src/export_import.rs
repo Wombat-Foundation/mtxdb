@@ -422,8 +422,6 @@ struct ClosureWriter<'a> {
     collection: [u8; 16],
     batch_bytes: usize,
     counter: u32,
-    /// Shorts already known, committed or staged, by event id.
-    shorts: HashMap<Vec<u8>, u32>,
 }
 
 impl ClosureWriter<'_> {
@@ -435,9 +433,6 @@ impl ClosureWriter<'_> {
         tx: &mtxdb::DatabaseTransaction<'_>,
         id: &[u8],
     ) -> anyhow::Result<(u32, usize)> {
-        if let Some(&short) = self.shorts.get(id) {
-            return Ok((short, 0));
-        }
         let forward = tx
             .get(EDGE_POOL, &self.collection, &[auth_forward_record_id(id)])?
             .into_iter()
@@ -475,7 +470,6 @@ impl ClosureWriter<'_> {
                 .saturating_add(RECORD_OVERHEAD.saturating_mul(2));
             short
         };
-        self.shorts.insert(id.to_vec(), short);
         Ok((short, staged))
     }
 
@@ -636,7 +630,6 @@ fn write_auth_closures(
         collection,
         batch_bytes,
         counter,
-        shorts: HashMap::new(),
     };
     let mut has_closure = vec![false; events.len()];
     let mut staged_bytes = 0_usize;
