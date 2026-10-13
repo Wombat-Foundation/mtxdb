@@ -909,7 +909,7 @@ impl ShortIdIndex {
         &self,
         _txn: &DatabaseTransaction<'_>,
         _counters: &ScopeCounters,
-        _problems: &mut Vec<String>,
+        _problems: &mut [String],
     ) {
     }
 

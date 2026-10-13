@@ -183,7 +183,9 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
     let slots = blob.get(8..slots_end).unwrap_or(&[]);
     u32::try_from(
         slots
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .filter(|slot| **slot != [0u8; 8])
             .count(),
     )
@@ -563,9 +565,10 @@ pub fn read_checkpoint_with_policy(
         }
         for slot_bytes in buf
             .get(region..region.checked_add(slots_len)?)?
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
         {
-            let raw = u64::from_le_bytes(slot_bytes.try_into().ok()?);
+            let raw = u64::from_le_bytes(*slot_bytes);
             if !super::IndexEntry::valid_raw_slot(raw) {
                 return None;
             }

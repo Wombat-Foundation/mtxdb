@@ -8101,6 +8101,8 @@ struct ImportRun {
     server_keys: bool,
     /// Event records written through mtxdb exports.
     exported_events: u64,
+    /// Auth closures written through mtxdb exports.
+    exported_closures: u64,
     /// Every input was an mtxdb export that imported cleanly. The marker
     /// vouches only for such a run: anything else leaves records the server
     /// cannot read, or data that did not all arrive.
@@ -8122,6 +8124,7 @@ fn import_data(
         failures: 0,
         server_keys: false,
         exported_events: 0,
+        exported_closures: 0,
         all_exports: !paths.is_empty(),
     };
     for (index, path) in paths.iter().enumerate() {
@@ -8140,8 +8143,10 @@ fn import_data(
             Ok(outcome) => {
                 run.server_keys = run.server_keys || outcome.server_keys;
                 match outcome.exported {
-                    Some(events) => {
-                        run.exported_events = run.exported_events.saturating_add(events);
+                    Some(counts) => {
+                        run.exported_events = run.exported_events.saturating_add(counts.events);
+                        run.exported_closures =
+                            run.exported_closures.saturating_add(counts.closures);
                     }
                     None => run.all_exports = false,
                 }
@@ -8164,11 +8169,20 @@ fn finish_import(db: &Database, run: &ImportRun) -> anyhow::Result<()> {
         return Ok(());
     }
     export_import::sync_data(db)?;
-    export_import::write_marker(db, run.exported_events)?;
+    export_import::write_marker(
+        db,
+        export_import::ImportCounts {
+            events: run.exported_events,
+            closures: run.exported_closures,
+        },
+    )?;
     db.pool(ShardType::ServerInfo)
         .sync_all()
         .context("persisting the import marker")?;
-    eprintln!("import complete: {} events", run.exported_events);
+    eprintln!(
+        "import complete: {} events, {} auth closures",
+        run.exported_events, run.exported_closures
+    );
     Ok(())
 }
 
@@ -9087,7 +9101,7 @@ struct ImportOutcome {
     /// The input was an `mtxdb-export` file, written in the server's layout;
     /// holds the event records it wrote (zero for a keys export). Only a run
     /// whose every input did this can be vouched for by the marker.
-    exported: Option<u64>,
+    exported: Option<export_import::ImportCounts>,
 }
 
 /// Import one input file through the state the batch shares with its readers.
@@ -9163,13 +9177,19 @@ impl ImportContext<'_> {
                 let events = self
                     .import_room_export(&export, collection_override)
                     .with_context(|| format!("importing {}", path.display()))?;
-                Ok(ImportOutcome { server_keys: false, exported: Some(events) })
+                Ok(ImportOutcome {
+                    server_keys: false,
+                    exported: Some(events),
+                })
             }
             interchange::InputFormat::Keys => {
                 let records = interchange::parse_keys(content)
                     .with_context(|| format!("reading {}", path.display()))?;
                 self.import_keys_export(path, &records)?;
-                Ok(ImportOutcome { server_keys: true, exported: Some(0) })
+                Ok(ImportOutcome {
+                    server_keys: true,
+                    exported: Some(export_import::ImportCounts::default()),
+                })
             }
         }
     }
@@ -9334,7 +9354,7 @@ impl ImportContext<'_> {
         &mut self,
         export: &RoomExport,
         collection_override: Option<&str>,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<export_import::ImportCounts> {
         if collection_override.is_some() {
             bail!("--collection does not apply to an mtxdb export: the server's layout derives the room's collections itself");
         }
@@ -9356,7 +9376,10 @@ impl ImportContext<'_> {
         export_import::clear_marker(self.db)?;
         let (written, findings) =
             export_import::write_room_with_findings(self.db, export, export_import::BATCH_BYTES)?;
-        eprintln!("  imported {written} events");
+        eprintln!(
+            "  imported {} events, {} auth closures",
+            written.events, written.closures
+        );
         for warning in findings.warnings() {
             eprintln!("  warning: {warning}");
         }

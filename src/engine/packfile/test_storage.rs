@@ -11186,3 +11186,444 @@ fn repack_scan_removal_flag_matches_a_direct_frame_read() {
     drop(store);
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// A checkpoint that reports WAL coverage claims the journal can drop what the
+/// packs and the checkpoint now hold. The checkpoint's rename is durable only
+/// once its directory is synced, so a failed directory sync must stop the
+/// claim: the WAL stays whole until a later checkpoint is durable.
+#[test]
+fn a_failed_checkpoint_directory_sync_does_not_reclaim_the_wal() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("dirsync_wal");
+    let store_dir = test_dir("dirsync_store");
+    let wal = wal_dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(7),
+            &NodeData::new(bytes::Bytes::from_static(b"acknowledged")),
+        )
+        .unwrap();
+    coordinator.sync().unwrap();
+
+    crate::shard::fail_directory_sync_after(&store_dir, 0);
+    let _ = store.sync_all();
+    assert_eq!(
+        Journal::scan_read_only(&wal).unwrap().groups.len(),
+        1,
+        "the WAL group was reclaimed although the checkpoint's directory sync failed"
+    );
+
+    // Once the directory can be synced the next checkpoint covers and reclaims.
+    crate::shard::clear_directory_sync_failure(&store_dir);
+    store.sync_all().unwrap();
+    assert_eq!(
+        Journal::scan_read_only(&wal).unwrap().groups.len(),
+        0,
+        "a durable checkpoint reclaims the covered group"
+    );
+    drop(store);
+    drop(coordinator);
+}
+
+/// The checkpoint is durable and the WAL rewrite's rename is lost in a crash,
+/// so the old, longer WAL comes back beside the new checkpoint. The groups it
+/// still holds are already in the packs: replaying them must neither lose nor
+/// duplicate a record, and the collection version must not move backwards.
+#[test]
+fn a_lost_wal_rewrite_beside_a_durable_checkpoint_recovers_cleanly() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("lost_rewrite_wal");
+    let store_dir = test_dir("lost_rewrite_store");
+    let wal = wal_dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    for i in 0..5_u8 {
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(i),
+                &NodeData::new(bytes::Bytes::from(vec![i; 8])),
+            )
+            .unwrap();
+    }
+    coordinator.sync().unwrap();
+    let expected_version = coordinator.collection_version(ShardType::State, &TEST_COLLECTION);
+    let old_wal = std::fs::read(&wal).unwrap();
+
+    // The checkpoint becomes durable and the journal is rewritten.
+    store.sync_all().unwrap();
+    assert!(
+        Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
+        "the covered groups were reclaimed"
+    );
+    drop(store);
+    drop(coordinator);
+
+    // The crash: the checkpoint is on disk, the rewrite's rename is not.
+    std::fs::write(&wal, &old_wal).unwrap();
+
+    let (journal, scan) = Journal::open_shared(&wal).unwrap();
+    assert!(
+        !scan.groups.is_empty(),
+        "the old segment still holds its groups"
+    );
+    let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+    let reopened = PackfileStorage::open(store_dir.clone()).unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+        .unwrap();
+    for i in 0..5_u8 {
+        assert_eq!(
+            reopened
+                .get(&TEST_COLLECTION, &distinct_id(i))
+                .unwrap()
+                .expect("acknowledged record survives")
+                .bytes
+                .as_ref(),
+            vec![i; 8].as_slice(),
+            "record {i}"
+        );
+    }
+    assert_eq!(
+        reopened.collection_len(&TEST_COLLECTION).unwrap(),
+        Some(5),
+        "replaying already-materialized groups must not duplicate records"
+    );
+    assert!(
+        recovered.collection_version(ShardType::State, &TEST_COLLECTION) >= expected_version,
+        "the collection version never moves backwards"
+    );
+    drop(reopened);
+}
+
+/// Copy a store directory, as a power cut would leave it if every file held
+/// exactly what had been written so far. Lock files are process-lifetime
+/// markers, not durable state, and Windows refuses to copy a file another
+/// handle holds exclusively, so they are left behind.
+fn copy_store(from: &std::path::Path, label: &str) -> PathBuf {
+    let to = test_dir(label);
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name == ".mtxdb.lock" || name == ".mtxdb.wal.lock" {
+            continue;
+        }
+        fs::copy(entry.path(), to.join(name)).unwrap();
+    }
+    to
+}
+
+/// The file classes whose directory entry or contents move at a sync.
+const CRASH_CLASSES: [&str; 4] = ["wal.bin", "journal.lsn", "index.checkpoint", "index.delta."];
+
+fn in_class(name: &str, class: &str) -> bool {
+    if class.ends_with(['.', '_']) {
+        name.starts_with(class)
+    } else {
+        name == class
+    }
+}
+
+/// Power loss that keeps every fsynced byte but may lose any rename or file
+/// creation not yet made durable by a directory sync: after each acknowledged
+/// sync, every subset of {WAL, LSN sidecar, index checkpoint, delta log} is put
+/// back to the version from one sync earlier (or removed, if it did not exist),
+/// and the store must reopen and serve every acknowledged record. Combinations
+/// that need the WAL to be newer than the checkpoint side are listed apart:
+/// they are exactly what the checkpoint-before-WAL ordering rules out.
+#[test]
+fn power_loss_images_lose_no_acknowledged_record() {
+    let dir = test_dir("power_loss_live");
+    let wal = dir.join("wal.bin");
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+
+    let mut images: Vec<PathBuf> = vec![copy_store(&dir, "power_loss_img0")];
+    let records: u8 = 7;
+    for index in 1..=records {
+        writer
+            .put(
+                &[0x4Du8; 16],
+                &[index; 16],
+                &NodeData::new(bytes::Bytes::from(vec![index; 16])),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        images.push(copy_store(&dir, &format!("power_loss_img{index}")));
+    }
+
+    let mut failures = Vec::new();
+    for step in 1..images.len() {
+        for mask in 0_u8..16 {
+            let candidate = copy_store(&images[step], "power_loss_try");
+            for (bit, class) in CRASH_CLASSES.iter().enumerate() {
+                if mask & (1 << bit) == 0 {
+                    continue;
+                }
+                for entry in fs::read_dir(&candidate).unwrap() {
+                    let name = entry.unwrap().file_name().into_string().unwrap();
+                    if in_class(&name, class) {
+                        fs::remove_file(candidate.join(&name)).unwrap();
+                    }
+                }
+                for entry in fs::read_dir(&images[step - 1]).unwrap() {
+                    let name = entry.unwrap().file_name().into_string().unwrap();
+                    if in_class(&name, class) {
+                        fs::copy(images[step - 1].join(&name), candidate.join(&name)).unwrap();
+                    }
+                }
+            }
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let reopened = PackfileStorage::open(candidate.clone()).unwrap();
+                reopened.enable_journal(candidate.join("wal.bin")).unwrap();
+                reopened.replay_journal().unwrap();
+                (1..=u8::try_from(step).unwrap()).all(|index| {
+                    reopened
+                        .get(&[0x4Du8; 16], &[index; 16])
+                        .unwrap()
+                        .map(|data| data.bytes.to_vec())
+                        == Some(vec![index; 16])
+                })
+            }));
+            if !matches!(outcome, Ok(true)) {
+                let lost: Vec<&str> = CRASH_CLASSES
+                    .iter()
+                    .enumerate()
+                    .filter(|(bit, _)| mask & (1 << bit) != 0)
+                    .map(|(_, class)| *class)
+                    .collect();
+                failures.push(format!("step {step}, reverted {lost:?}: {outcome:?}"));
+            }
+            let _ = fs::remove_dir_all(&candidate);
+        }
+    }
+    drop(writer);
+    for image in images {
+        let _ = fs::remove_dir_all(image);
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        failures.is_empty(),
+        "{} images lost data:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// Power loss in the middle of an unacknowledged write: the WAL and the delta
+/// log each keep their fsynced prefix and any prefix of the bytes after it,
+/// with a garbage tail on top. Every acknowledged record must survive, and the
+/// unacknowledged one is either whole or absent.
+#[test]
+fn a_torn_unacknowledged_tail_never_costs_an_acknowledged_record() {
+    let dir = test_dir("torn_tail_live");
+    let wal = dir.join("wal.bin");
+    let writer = writer_with_coverage_steps(&dir, &wal, 4);
+    let synced_wal = fs::metadata(&wal).unwrap().len();
+    let delta_name = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .find(|n| n.starts_with("index.delta."))
+        .expect("a coverage step leaves a delta log");
+    let synced_delta = fs::metadata(dir.join(&delta_name)).unwrap().len();
+
+    // The unacknowledged write reaches the WAL (and the pack) but is never synced.
+    writer
+        .put(
+            &[0x4Du8; 16],
+            &[5; 16],
+            &NodeData::new(bytes::Bytes::from(vec![5; 16])),
+        )
+        .unwrap();
+    let full_wal = fs::metadata(&wal).unwrap().len();
+    let image = copy_store(&dir, "torn_tail_img");
+    drop(writer);
+
+    let check = |candidate: &std::path::Path, what: &str| {
+        let reopened = PackfileStorage::open(candidate.to_path_buf()).unwrap();
+        reopened.enable_journal(candidate.join("wal.bin")).unwrap();
+        reopened.replay_journal().unwrap();
+        for index in 1..=4_u8 {
+            assert_eq!(
+                reopened
+                    .get(&[0x4Du8; 16], &[index; 16])
+                    .unwrap()
+                    .map(|d| d.bytes.to_vec()),
+                Some(vec![index; 16]),
+                "{what}: acknowledged record {index} lost"
+            );
+        }
+        if let Some(extra) = reopened.get(&[0x4Du8; 16], &[5; 16]).unwrap() {
+            assert_eq!(
+                extra.bytes.to_vec(),
+                vec![5; 16],
+                "{what}: torn record surfaced"
+            );
+        }
+    };
+
+    for cut in synced_wal..=full_wal {
+        let candidate = copy_store(&image, "torn_tail_try");
+        let bytes = fs::read(image.join("wal.bin")).unwrap();
+        let mut torn = bytes[..usize::try_from(cut).unwrap().min(bytes.len())].to_vec();
+        torn.extend_from_slice(&[0xA5; 37]);
+        fs::write(candidate.join("wal.bin"), torn).unwrap();
+        check(&candidate, &format!("wal cut at {cut}"));
+        let _ = fs::remove_dir_all(&candidate);
+    }
+    for cut in 0..=8_u64 {
+        let candidate = copy_store(&image, "torn_tail_delta");
+        let path = candidate.join(&delta_name);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.truncate(
+            usize::try_from(synced_delta.saturating_add(cut))
+                .unwrap()
+                .min(bytes.len()),
+        );
+        bytes.extend_from_slice(&[0xA5; 23]);
+        fs::write(&path, bytes).unwrap();
+        check(&candidate, &format!("delta garbage after +{cut}"));
+        let _ = fs::remove_dir_all(&candidate);
+    }
+    let _ = fs::remove_dir_all(&image);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Two pools share one WAL and keep their checkpoints in different
+/// directories. Pool B's checkpoint directory cannot be synced, so its
+/// checkpoint is not durable and the WAL must keep B's group even though A's
+/// checkpoint is durable and covers A's. After a crash that loses B's
+/// checkpoint, B's acknowledged record comes back from the WAL.
+#[test]
+fn one_pools_undurable_checkpoint_keeps_the_shared_wal_for_the_other_directory() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("xdir_wal");
+    let dir_a = test_dir("xdir_a");
+    let dir_b = test_dir("xdir_b");
+    let wal = wal_dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store_a = PackfileStorage::open(dir_a.clone()).unwrap();
+    store_a
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    let store_b = PackfileStorage::open(dir_b.clone()).unwrap();
+    store_b
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::Edges)
+        .unwrap();
+    for (store, tag) in [(&store_a, 1_u8), (&store_b, 2_u8)] {
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(tag),
+                &NodeData::new(bytes::Bytes::from(vec![tag; 8])),
+            )
+            .unwrap();
+    }
+    coordinator.sync().unwrap();
+
+    crate::shard::fail_directory_sync_after(&dir_b, 0);
+    store_a.sync_all().unwrap();
+    let _ = store_b.sync_all();
+    let kept = Journal::scan_read_only(&wal).unwrap();
+    assert!(
+        !kept.groups.is_empty(),
+        "the WAL was reclaimed although pool B's checkpoint is not durable"
+    );
+
+    // Power cut: B's checkpoint and sidecar never reached the disk.
+    let image_b = copy_store(&dir_b, "xdir_b_img");
+    for entry in fs::read_dir(&image_b).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if in_class(&name, "index.checkpoint") || in_class(&name, "journal.lsn") {
+            fs::remove_file(image_b.join(name)).unwrap();
+        }
+    }
+    drop(store_a);
+    drop(store_b);
+    drop(coordinator);
+
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let reopened = PackfileStorage::open(image_b).unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::Edges)
+        .unwrap();
+    reopened.replay_journal().unwrap();
+    assert_eq!(
+        reopened
+            .get(&TEST_COLLECTION, &distinct_id(2))
+            .unwrap()
+            .map(|d| d.bytes.to_vec()),
+        Some(vec![2; 8]),
+        "pool B's acknowledged record was lost"
+    );
+    crate::shard::clear_directory_sync_failure(&dir_b);
+}
+
+/// A log created by an earlier non-durable batch is not durable as a directory
+/// entry. A later coverage batch must sync the directory too, and if it cannot,
+/// no claim is made.
+#[test]
+fn a_coverage_batch_syncs_the_directory_of_a_log_an_earlier_batch_created() {
+    let dir = test_dir("delta_dirsync");
+    let wal = dir.join("wal.bin");
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    let put = |i: u8| {
+        writer
+            .put(
+                &[0x4Du8; 16],
+                &[i; 16],
+                &NodeData::new(bytes::Bytes::from(vec![i; 16])),
+            )
+            .unwrap();
+    };
+    put(1);
+    writer.sync().unwrap();
+    put(2);
+    writer.sync().unwrap();
+    assert!(fs::read_dir(&dir).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("index.delta.")
+    }));
+    let before = writer.durable_coverage();
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+    crate::shard::fail_directory_sync_after(&dir, 0);
+    put(3);
+    let _ = writer.sync();
+    assert_eq!(
+        writer.durable_coverage(),
+        before,
+        "claimed coverage without a durable log entry"
+    );
+    crate::shard::clear_directory_sync_failure(&dir);
+}

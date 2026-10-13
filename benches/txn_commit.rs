@@ -11,6 +11,12 @@
 //! - **plain-single** — one `put` per record, each publishing its own journal
 //!   group (autocommit). No fsync until the end.
 //! - **plain-single-durable** — the same, with a `sync()` after every record.
+//!   Each `sync()` commits the WAL and persists index state; pack fsyncs are
+//!   budgeted, and index work may be a delta or full checkpoint. Barrier costs
+//!   vary with checkpoint, reclaim, and remediation work, but the run is capped
+//!   at `MTXDB_TXN_SINGLE_DURABLE_RECORDS` records (default 100) and reports
+//!   that count in its `records` column. An uncapped run is hours on a spinning
+//!   disk.
 //! - **plain-many(B)** — one `put_many` of `B` records. Note this still emits
 //!   one journal group per **record**, not per call: `put_many` publishes
 //!   through the same per-entry path as `put`. The group count is therefore
@@ -78,6 +84,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use mtxdb::journal::{Journal, MAX_TXN_STAGE_BYTES};
 use mtxdb::layout::ShardType;
+use mtxdb::packfile::storage::SyncTimings;
 use mtxdb::packfile::ChecksumPolicy;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{Database, PoolPolicies, PoolPolicy};
@@ -226,12 +233,25 @@ struct RunConfig {
     batch: usize,
     /// `sync()` after every group instead of once at the end.
     durable: bool,
+    /// Write only the first `limit` records. Used by the run that pays one
+    /// fsync per record, whose cost is per record and so needs no more.
+    limit: Option<usize>,
+}
+
+impl RunConfig {
+    /// How many records this run writes out of `total`.
+    fn records(&self, total: usize) -> usize {
+        self.limit.map_or(total, |limit| limit.min(total))
+    }
 }
 
 /// The run set. `sweep` gives several transaction sizes for `txn-batched`, so
 /// the practical batch size is visible from one run; `batch` is the base size
 /// used by the plain-many, durable, and read-your-writes runs.
-fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
+/// `single_durable` caps the run that calls `sync()` after every record.
+/// `batch` and `single_durable` are at least one; sweep sizes are clamped to
+/// `1..=records.max(1)`. Whole-dataset runs are included regardless of stage budget.
+fn configs(records: usize, batch: usize, sweep: &[usize], single_durable: usize) -> Vec<RunConfig> {
     let batch = batch.max(1);
     let mut configs = vec![
         RunConfig {
@@ -239,24 +259,28 @@ fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
             kind: Kind::PlainSingle,
             batch: 1,
             durable: false,
+            limit: None,
         },
         RunConfig {
             name: "plain-single-durable".to_owned(),
             kind: Kind::PlainSingle,
             batch: 1,
             durable: true,
+            limit: Some(single_durable.max(1)),
         },
         RunConfig {
             name: "plain-many".to_owned(),
             kind: Kind::PlainMany,
             batch,
             durable: false,
+            limit: None,
         },
         RunConfig {
             name: "plain-many-durable".to_owned(),
             kind: Kind::PlainMany,
             batch,
             durable: true,
+            limit: None,
         },
         // `txn-whole` is listed unconditionally; `main` drops it when the whole
         // dataset would exceed the stage budget, which depends on the payload.
@@ -265,12 +289,14 @@ fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
             kind: Kind::TxnWhole,
             batch: records,
             durable: false,
+            limit: None,
         },
         RunConfig {
             name: "txn-whole-durable".to_owned(),
             kind: Kind::TxnWhole,
             batch: records,
             durable: true,
+            limit: None,
         },
     ];
     for &size in sweep {
@@ -280,6 +306,7 @@ fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
             kind: Kind::TxnBatched,
             batch: size,
             durable: false,
+            limit: None,
         });
     }
     configs.push(RunConfig {
@@ -287,17 +314,73 @@ fn configs(records: usize, batch: usize, sweep: &[usize]) -> Vec<RunConfig> {
         kind: Kind::TxnBatched,
         batch,
         durable: true,
+        limit: None,
     });
     configs.push(RunConfig {
         name: format!("txn-ryw-B{batch}"),
         kind: Kind::TxnRyw,
         batch,
         durable: false,
+        limit: None,
     });
     configs
 }
 
 // ── One run ─────────────────────────────────────────────────────────
+
+/// Where the time of a run's `sync()` barriers went, summed over every
+/// barrier of the run (the engine's own `SyncTimings`, one per barrier).
+#[derive(Clone, Copy, Default)]
+struct Phases {
+    /// Barriers that reported timings.
+    barriers: u64,
+    pack_flush: Duration,
+    pack_fsync: Duration,
+    sidecar: Duration,
+    delta_log: Duration,
+    checkpoint: Duration,
+    reclaim: Duration,
+    remediation: Duration,
+    /// Time around the journal commit. It includes `journal_lock_wait` and
+    /// `journal_fsync`, which are measured separately inside it.
+    wal: Duration,
+    journal_lock_wait: Duration,
+    journal_fsync: Duration,
+}
+
+impl Phases {
+    /// Accumulate one barrier's phase durations and increment the count of
+    /// barriers with timings, saturating that count at `u64::MAX`.
+    fn add(&mut self, timings: &SyncTimings) {
+        self.barriers = self.barriers.saturating_add(1);
+        self.pack_flush += timings.pack_flush;
+        self.pack_fsync += timings.pack_fsync;
+        self.sidecar += timings.sidecar;
+        self.delta_log += timings.delta_log;
+        self.checkpoint += timings.checkpoint;
+        self.reclaim += timings.reclaim;
+        self.remediation += timings.remediation;
+        self.wal += timings.wal;
+        self.journal_lock_wait += timings.journal_lock_wait;
+        self.journal_fsync += timings.journal_fsync;
+    }
+
+    /// The named phases, in the order they are reported.
+    fn fields(&self) -> [(&'static str, Duration); 10] {
+        [
+            ("pack_flush", self.pack_flush),
+            ("pack_fsync", self.pack_fsync),
+            ("sidecar", self.sidecar),
+            ("delta_log", self.delta_log),
+            ("checkpoint", self.checkpoint),
+            ("reclaim", self.reclaim),
+            ("remediation", self.remediation),
+            ("wal", self.wal),
+            ("wal.lock_wait", self.journal_lock_wait),
+            ("wal.fsync", self.journal_fsync),
+        ]
+    }
+}
 
 #[derive(Clone)]
 struct Sample {
@@ -306,6 +389,7 @@ struct Sample {
     sync: Duration,
     ryw: Duration,
     total: Duration,
+    phases: Phases,
     /// Journal groups and WAL bytes at the final scan. `None` when a
     /// per-boundary sync reclaimed the segment, so the count is meaningless.
     wal: Option<(u64, u64)>,
@@ -315,18 +399,42 @@ struct Sample {
     staged_peak: u64,
 }
 
-fn sync_pool(db: &Database) -> Duration {
+/// One durability barrier. Its phase breakdown, as the engine measured it, is
+/// added to `phases` when available. Returns the elapsed time of the EventDag
+/// pool's `sync()` call, excluding timing collection.
+///
+/// # Panics
+/// Panics if the pool's `sync()` returns an error.
+fn sync_pool(db: &Database, phases: &mut Phases) -> Duration {
+    let pool = db.pool(SHARD);
     let started = Instant::now();
-    db.pool(SHARD).sync().expect("pool sync");
-    started.elapsed()
+    pool.sync().expect("pool sync");
+    let elapsed = started.elapsed();
+    if let Some(timings) = pool.sync_timings() {
+        phases.add(&timings);
+    }
+    elapsed
 }
 
+/// Run the configured writes on the first `cfg.records(entries.len())` entries
+/// in a fresh scratch database, with per-record compression set by `compress`.
+/// `payload` is the bytes per record used to estimate peak staged payload bytes.
+/// Returns write, commit, sync, and read-your-writes timings and counters;
+/// `fsyncs` counts WAL durability commits. Every run includes a closing sync,
+/// and durable runs also sync after each write group. WAL sizes are collected
+/// only for runs without per-group sync. Scratch cleanup is best effort.
+///
+/// # Panics
+/// Panics if no entries are selected, scratch-root creation or database opening
+/// fails, a storage, transaction, or WAL scan operation fails, or a checked
+/// record is missing or differs from its input payload.
 fn run_once(
     cfg: &RunConfig,
     entries: &[(NodeId, Bytes)],
     payload: usize,
     compress: bool,
 ) -> Sample {
+    let entries = &entries[..cfg.records(entries.len())];
     let dir = bench_root().join(cfg.name.as_str());
     let _ = fs::remove_dir_all(&dir);
     let db = open_db(dir.clone(), compress);
@@ -339,6 +447,7 @@ fn run_once(
     let mut ryw = Duration::ZERO;
     let mut ryw_reads = 0_u64;
     let mut staged_peak = 0_usize;
+    let mut phases = Phases::default();
 
     let stats_before = db.coordinator().durability_stats();
     let started = Instant::now();
@@ -351,7 +460,7 @@ fn run_once(
                 db.pool(SHARD).put(&collection, id, &data).expect("put");
                 stage += timer.elapsed();
                 if cfg.durable {
-                    sync += sync_pool(&db);
+                    sync += sync_pool(&db, &mut phases);
                 }
             }
         }
@@ -367,7 +476,7 @@ fn run_once(
                     .expect("put_many");
                 stage += timer.elapsed();
                 if cfg.durable {
-                    sync += sync_pool(&db);
+                    sync += sync_pool(&db, &mut phases);
                 }
             }
         }
@@ -384,7 +493,7 @@ fn run_once(
             txn.commit().expect("commit");
             commit += timer.elapsed();
             if cfg.durable {
-                sync += sync_pool(&db);
+                sync += sync_pool(&db, &mut phases);
             }
         }
         Kind::TxnBatched | Kind::TxnRyw => {
@@ -417,7 +526,7 @@ fn run_once(
                 txn.commit().expect("commit");
                 commit += timer.elapsed();
                 if cfg.durable {
-                    sync += sync_pool(&db);
+                    sync += sync_pool(&db, &mut phases);
                 }
             }
         }
@@ -441,7 +550,7 @@ fn run_once(
 
     // One closing sync makes everything durable and pays the fsync the
     // non-durable runs were deferring.
-    sync += sync_pool(&db);
+    sync += sync_pool(&db, &mut phases);
     let total = started.elapsed();
     let stats_after = db.coordinator().durability_stats();
 
@@ -469,6 +578,7 @@ fn run_once(
         sync,
         ryw,
         total,
+        phases,
         wal,
         fsyncs: stats_after.commits.saturating_sub(stats_before.commits),
         durable_records: stats_after
@@ -479,8 +589,12 @@ fn run_once(
     }
 }
 
-/// Median of a sample's duration fields, with counters taken from the last
-/// (deterministic) sample.
+/// Independent medians of the duration fields, including sync phases, with
+/// counters and WAL sizes taken from the last sample. For an even number of
+/// samples, uses the upper middle duration.
+///
+/// # Panics
+/// Panics if `samples` is empty.
 fn reduce(samples: &[Sample]) -> Sample {
     let median = |pick: fn(&Sample) -> Duration| -> Duration {
         let mut all: Vec<Duration> = samples.iter().map(pick).collect();
@@ -493,6 +607,19 @@ fn reduce(samples: &[Sample]) -> Sample {
     reduced.sync = median(|s| s.sync);
     reduced.ryw = median(|s| s.ryw);
     reduced.total = median(|s| s.total);
+    reduced.phases = Phases {
+        barriers: reduced.phases.barriers,
+        pack_flush: median(|s| s.phases.pack_flush),
+        pack_fsync: median(|s| s.phases.pack_fsync),
+        sidecar: median(|s| s.phases.sidecar),
+        delta_log: median(|s| s.phases.delta_log),
+        checkpoint: median(|s| s.phases.checkpoint),
+        reclaim: median(|s| s.phases.reclaim),
+        remediation: median(|s| s.phases.remediation),
+        wal: median(|s| s.phases.wal),
+        journal_lock_wait: median(|s| s.phases.journal_lock_wait),
+        journal_fsync: median(|s| s.phases.journal_fsync),
+    };
     reduced
 }
 
@@ -554,6 +681,37 @@ fn probe_stage_budget(payload: usize) {
 
 // ── Report ──────────────────────────────────────────────────────────
 
+/// Where a durable run's barriers spent their time, in the engine's own phases:
+/// each phase's total over the run, and per barrier. The phases can overlap
+/// (the checkpoint, for one, contains other work, and `wal.lock_wait` and
+/// `wal.fsync` are measured inside `wal`), so they need not add up to the run's
+/// sync time. Printed for humans only; it is not on the `bench:` line.
+fn print_phases(sample: &Sample) {
+    let barriers = sample.phases.barriers;
+    if barriers == 0 {
+        return;
+    }
+    use std::fmt::Write as _;
+    // Two different counts: `sync()` calls (one per group, plus the closing
+    // one) and WAL durability commits (what the coordinator counted). A
+    // `sync()` with nothing new to commit adds no commit, and callers that
+    // coalesce share one. Neither is a count of fsync syscalls; the figure
+    // for those is `wal.fsync` below, which is a time, not a count.
+    let mut line = format!(
+        "      {barriers} sync() calls, {} WAL commits; ms total (per sync() call):",
+        sample.fsyncs
+    );
+    for (name, total) in sample.phases.fields() {
+        let total_ms = total.as_secs_f64() * 1e3;
+        let _ = write!(
+            line,
+            " {name} {total_ms:.1} ({:.2})",
+            total_ms / barriers as f64
+        );
+    }
+    println!("{line}");
+}
+
 fn print_row(label: &str, records: usize, sample: &Sample) {
     let wal_groups = sample
         .wal
@@ -595,6 +753,16 @@ impl Sample {
     }
 }
 
+/// Run the benchmark passes selected by the environment and print each pass,
+/// median timings, durable sync phases, and `bench:` records to stdout.
+/// `MTXDB_TXN_SINGLE_DURABLE_RECORDS` caps `plain-single-durable` at 100 records
+/// by default; zero becomes one and the cap cannot exceed the dataset size.
+/// Whole-dataset runs are skipped when their payload exceeds the stage budget.
+/// Scratch data is created under `MTXDB_BENCH_ROOT` or the temp directory and
+/// removed on completion on a best-effort basis.
+///
+/// Exits with status 2 if the run filter matches nothing. Benchmark operation
+/// or verification failures panic.
 fn main() {
     let records = env_usize("MTXDB_TXN_RECORDS", 100_000).max(1);
     let payload = env_usize("MTXDB_TXN_PAYLOAD", 256).max(1);
@@ -602,6 +770,7 @@ fn main() {
     let passes = env_usize("MTXDB_TXN_PASSES", 3).max(1);
     let compress = std::env::var("MTXDB_BENCH_COMPRESS").as_deref() != Ok("0");
     let filter = std::env::var("MTXDB_TXN_RUNS").ok();
+    let single_durable = env_usize("MTXDB_TXN_SINGLE_DURABLE_RECORDS", 100).max(1);
     let whole_fits = (records as u128 * payload as u128) <= MAX_TXN_STAGE_BYTES as u128;
     // Transaction sizes to sweep. Default: a quarter, the base, and four times
     // the base, clamped to the dataset.
@@ -651,7 +820,7 @@ fn main() {
         );
     }
 
-    let selected: Vec<RunConfig> = configs(records, batch, &sweep)
+    let selected: Vec<RunConfig> = configs(records, batch, &sweep, single_durable)
         .into_iter()
         .filter(|cfg| whole_fits || cfg.kind != Kind::TxnWhole)
         .filter(|cfg| match &filter {
@@ -664,10 +833,16 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Build the record set once; only the ids and payload bytes are reused,
-    // and clones are cheap `Bytes` refcount bumps.
+    // Build the record set once, only as large as the widest selected run
+    // needs; only the ids and payload bytes are reused, and clones are cheap
+    // `Bytes` refcount bumps.
+    let needed = selected
+        .iter()
+        .map(|cfg| cfg.records(records))
+        .max()
+        .unwrap_or(records);
     let mut payload_gen = PayloadGen::new(0xDEAD_BEEF);
-    let entries: Vec<(NodeId, Bytes)> = (0..records)
+    let entries: Vec<(NodeId, Bytes)> = (0..needed)
         .map(|index| {
             let bytes = Bytes::from(payload_gen.bytes(payload));
             (node_id(index), bytes)
@@ -704,7 +879,7 @@ fn main() {
         for index in order {
             let cfg = &selected[index];
             let sample = run_once(cfg, &entries, payload, compress);
-            print_row(&cfg.name, records, &sample);
+            print_row(&cfg.name, cfg.records(records), &sample);
             samples[index].push(sample);
         }
     }
@@ -713,7 +888,10 @@ fn main() {
     println!("  ── medians ──");
     for (cfg, runs) in selected.iter().zip(samples.iter()) {
         let sample = reduce(runs);
-        print_row(&cfg.name, records, &sample);
+        print_row(&cfg.name, cfg.records(records), &sample);
+        if cfg.durable {
+            print_phases(&sample);
+        }
     }
     println!("═══════════════════════════════════════════════════════════════");
 
@@ -725,7 +903,7 @@ fn main() {
              RECORDS_PER_FSYNC={:.1} DURABLE_RECORDS={} GROUPS={} WAL_BYTES={} \
              RYW_READS={} RYW_US={:.3} STAGED_BYTES={}",
             cfg.name,
-            records,
+            cfg.records(records),
             payload,
             cfg.batch,
             passes,
@@ -734,7 +912,7 @@ fn main() {
             sample.sync.as_secs_f64() * 1e3,
             sample.total.as_secs_f64() * 1e3,
             sample.fsyncs,
-            sample.records_per_fsync(records),
+            sample.records_per_fsync(cfg.records(records)),
             sample.durable_records,
             sample.wal.map_or(0, |(groups, _)| groups),
             sample.wal.map_or(0, |(_, bytes)| bytes),
