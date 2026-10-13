@@ -75,9 +75,15 @@ pub(crate) fn clear_marker(db: &Database) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Commit the marker, last and alone. `events` counts the event records this
-/// run wrote.
-pub(crate) fn write_marker(db: &Database, events: u64) -> anyhow::Result<()> {
+/// What a run wrote, per class.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ImportCounts {
+    pub(crate) events: u64,
+    pub(crate) closures: u64,
+}
+
+/// Commit the marker, last and alone, with the counts of this run's writes.
+pub(crate) fn write_marker(db: &Database, counts: ImportCounts) -> anyhow::Result<()> {
     let tx = db.begin_transaction();
     tx.put(
         SERVER_INFO_POOL,
@@ -85,7 +91,8 @@ pub(crate) fn write_marker(db: &Database, events: u64) -> anyhow::Result<()> {
         import_marker_node_id(),
         &node(encode_import_marker(ImportMarker {
             data_format: DATA_FORMAT,
-            events,
+            events: counts.events,
+            closures: counts.closures,
         })),
     )?;
     tx.commit().context("committing the import marker")?;
@@ -311,7 +318,7 @@ pub(crate) fn write_room_with_findings(
     db: &Database,
     export: &RoomExport,
     batch_bytes: usize,
-) -> anyhow::Result<(u64, AuthFindings)> {
+) -> anyhow::Result<(ImportCounts, AuthFindings)> {
     let findings = auth_findings(export)?;
     let room = export.room_id.as_bytes();
     let event_collection = room_event_collection_id(room);
@@ -403,8 +410,8 @@ pub(crate) fn write_room_with_findings(
         written = written.saturating_add(1);
     }
     tx.commit().context("committing an import batch")?;
-    write_auth_closures(db, export, batch_bytes)?;
-    Ok((written, findings))
+    let closures = write_auth_closures(db, export, batch_bytes)?;
+    Ok((ImportCounts { events: written, closures }, findings))
 }
 
 /// One room's auth short ids and closures, staged into capped batches.
@@ -575,7 +582,7 @@ fn write_auth_closures(
     db: &Database,
     export: &RoomExport,
     batch_bytes: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     let events = &export.events;
     let index: HashMap<&[u8], usize> = events
         .iter()
@@ -630,7 +637,8 @@ fn write_auth_closures(
             staged_bytes = 0;
         }
     }
-    writer.commit(&tx)
+    writer.commit(&tx)?;
+    Ok(u64::try_from(has_closure.iter().filter(|wrote| **wrote).count()).unwrap_or(u64::MAX))
 }
 
 /// Write a keys export in one transaction: a handful of records, far under

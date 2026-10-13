@@ -495,6 +495,8 @@ pub struct ImportMarker {
     pub data_format: u8,
     /// Events imported. Zero for a fresh install.
     pub events: u64,
+    /// Auth closure bitmaps written. Zero for a fresh install.
+    pub closures: u64,
 }
 
 /// Derive the collection holding the import-complete marker.
@@ -514,6 +516,7 @@ pub fn import_marker_node_id() -> [u8; 16] {
 pub fn encode_import_marker(marker: ImportMarker) -> Vec<u8> {
     let mut out = vec![MARKER_VERSION, marker.data_format];
     out.extend_from_slice(&marker.events.to_le_bytes());
+    out.extend_from_slice(&marker.closures.to_le_bytes());
     out
 }
 
@@ -531,10 +534,12 @@ pub fn decode_import_marker(bytes: &[u8]) -> Result<ImportMarker, StorageError> 
         ));
     }
     let (&data_format, rest) = rest.split_first().ok_or_else(malformed)?;
-    let (events, _) = rest.split_first_chunk::<8>().ok_or_else(malformed)?;
+    let (events, rest) = rest.split_first_chunk::<8>().ok_or_else(malformed)?;
+    let (closures, _) = rest.split_first_chunk::<8>().ok_or_else(malformed)?;
     Ok(ImportMarker {
         data_format,
         events: u64::from_le_bytes(*events),
+        closures: u64::from_le_bytes(*closures),
     })
 }
 

@@ -101,12 +101,15 @@ fn import_marker_round_trips_and_rejects_truncation() {
     let marker = ImportMarker {
         data_format: DATA_FORMAT,
         events: 42,
+        closures: 40,
     };
     let bytes = encode_import_marker(marker);
     assert_eq!(decode_import_marker(&bytes).unwrap(), marker);
 
     assert!(decode_import_marker(&[]).is_err());
     assert!(decode_import_marker(&[MARKER_VERSION, 1, 0, 0]).is_err());
+    // Events present, closures count cut short.
+    assert!(decode_import_marker(&bytes[..bytes.len() - 1]).is_err());
     assert!(decode_import_marker(&[9, 1, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
 }
 

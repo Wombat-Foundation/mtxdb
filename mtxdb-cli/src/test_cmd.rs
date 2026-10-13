@@ -5047,7 +5047,8 @@ fn an_import_stopped_before_the_marker_is_visibly_incomplete() {
         marker(&db),
         Some(mtxdb::interop::ImportMarker {
             data_format: mtxdb::interop::DATA_FORMAT,
-            events: 5
+            events: 5,
+            closures: 5,
         })
     );
 }
@@ -5115,7 +5116,7 @@ fn a_room_import_in_capped_batches_writes_every_event() {
     // Room for about two events per batch, so the room takes several commits.
     let cap = largest.saturating_mul(2).saturating_add(2048);
     let (written, _) = export_import::write_room_with_findings(&db, &export, cap).unwrap();
-    assert_eq!(written, 5);
+    assert_eq!((written.events, written.closures), (5, 5));
     for event in &export.events {
         let record = event_record_id(event.event_id.as_bytes());
         assert!(
