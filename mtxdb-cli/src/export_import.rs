@@ -320,6 +320,7 @@ pub(crate) fn write_room_with_findings(
     batch_bytes: usize,
 ) -> anyhow::Result<(ImportCounts, AuthFindings)> {
     let findings = auth_findings(export)?;
+    let plan = closure_plan(export)?;
     let room = export.room_id.as_bytes();
     let event_collection = room_event_collection_id(room);
     let prev_collection = room_prev_collection_id(room);
@@ -410,7 +411,7 @@ pub(crate) fn write_room_with_findings(
         written = written.saturating_add(1);
     }
     tx.commit().context("committing an import batch")?;
-    let closures = write_auth_closures(db, export, batch_bytes)?;
+    let closures = write_auth_closures(db, export, plan, batch_bytes)?;
     Ok((ImportCounts { events: written, closures }, findings))
 }
 
@@ -570,19 +571,17 @@ fn parents_first(auth: &[Vec<&[u8]>], index: &HashMap<&[u8], usize>) -> Result<V
     }
 }
 
-/// Write the room's auth short ids and closure bitmaps in the server's layout.
-///
-/// Events are visited parents-first. Each event and each cited auth event gets
-/// a short id (existing ones are reused, so a re-import keeps them), and an
-/// event's closure is the union of its auth events' shorts and closures, written
-/// only when every auth event has a closure. An event citing an auth event
-/// outside the export therefore gets none, and neither do its dependents; the
-/// server falls back to walking edges for them. An auth cycle fails the room.
-fn write_auth_closures(
-    db: &Database,
-    export: &RoomExport,
-    batch_bytes: usize,
-) -> anyhow::Result<u64> {
+/// Each event's distinct auth ids, the position of every event id, and the
+/// parents-first visiting order.
+struct ClosurePlan<'a> {
+    index: HashMap<&'a [u8], usize>,
+    auth: Vec<Vec<&'a [u8]>>,
+    order: Vec<usize>,
+}
+
+/// Plan a room's closures, failing on an auth cycle. Run before any event is
+/// written, so a refused room leaves nothing behind.
+fn closure_plan(export: &RoomExport) -> anyhow::Result<ClosurePlan<'_>> {
     let events = &export.events;
     let index: HashMap<&[u8], usize> = events
         .iter()
@@ -598,11 +597,30 @@ fn write_auth_closures(
     }
     let order = parents_first(&auth, &index).map_err(|stuck| {
         anyhow!(
-            "{}: auth events form a cycle (through {}); refusing to build closures",
+            "{}: auth events form a cycle (through {}); refusing to import the room",
             export.room_id,
             events[stuck].event_id
         )
     })?;
+    Ok(ClosurePlan { index, auth, order })
+}
+
+/// Write the room's auth short ids and closure bitmaps in the server's layout.
+///
+/// Events are visited parents-first. Each event and each cited auth event gets
+/// a short id (existing ones are reused, so a re-import keeps them), and an
+/// event's closure is the union of its auth events' shorts and closures, written
+/// only when every auth event has a closure. An event citing an auth event
+/// outside the export therefore gets none, and neither do its dependents; the
+/// server falls back to walking edges for them. An auth cycle fails the room.
+fn write_auth_closures(
+    db: &Database,
+    export: &RoomExport,
+    plan: ClosurePlan<'_>,
+    batch_bytes: usize,
+) -> anyhow::Result<u64> {
+    let events = &export.events;
+    let ClosurePlan { index, auth, order } = plan;
 
     let collection = room_auth_collection_id(export.room_id.as_bytes());
     let mut tx = db.begin_transaction();
@@ -824,6 +842,18 @@ mod auth_findings_tests {
         (Database::open(dir.clone()).unwrap(), dir)
     }
 
+    fn read_pool(
+        db: &Database,
+        pool: mtxdb::ShardType,
+        collection: [u8; 16],
+        record: [u8; 16],
+    ) -> Option<Vec<u8>> {
+        db.pool(pool)
+            .get(&collection, &record)
+            .unwrap()
+            .map(|data| data.bytes.to_vec())
+    }
+
     fn read(db: &Database, collection: [u8; 16], record: [u8; 16]) -> Option<Vec<u8>> {
         db.pool(EDGE_POOL)
             .get(&collection, &record)
@@ -984,6 +1014,20 @@ mod auth_findings_tests {
     }
 
     #[test]
+    fn closure_counts_fall_short_of_event_counts_when_auth_is_missing() {
+        let (db, dir) = db();
+        let room = export(vec![
+            event("$create", "m.room.create", &[], &[]),
+            event("$orphan", "m.room.member", &[], &["$create", "$gone"]),
+            event("$child", "m.room.message", &[], &["$orphan"]),
+            event("$fine", "m.room.message", &[], &["$create"]),
+        ]);
+        let (counts, _) = write_room_with_findings(&db, &room, BATCH_BYTES).unwrap();
+        assert_eq!((counts.events, counts.closures), (4, 2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn an_auth_cycle_fails_the_room() {
         let (db, dir) = db();
         let room = export(vec![
@@ -995,6 +1039,12 @@ mod auth_findings_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("cycle"), "{error}");
+        let record = event_record_id(b"$create");
+        assert!(
+            read_pool(&db, EVENT_POOL, room_event_collection_id(room.room_id.as_bytes()), record)
+                .is_none(),
+            "a refused room leaves no event behind"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
