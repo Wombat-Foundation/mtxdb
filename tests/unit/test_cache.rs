@@ -1,6 +1,8 @@
 #![allow(clippy::tests_outside_test_module)]
 
 use mtxdb::cache::*;
+use std::hash::{Hash, Hasher};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use mtxdb::storage::{NodeData, NodeId};
@@ -138,4 +140,69 @@ fn test_generic_lru_zero_capacity_and_stats() {
     assert_eq!(cache.hits(), 0);
     assert_eq!(cache.misses(), 1);
     assert!(cache.hit_rate() < f64::EPSILON);
+}
+
+struct MaybePanicCloneKey {
+    value: u8,
+    panic_on_clone: bool,
+}
+
+impl Clone for MaybePanicCloneKey {
+    fn clone(&self) -> Self {
+        assert!(!self.panic_on_clone, "test clone panic");
+        Self {
+            value: self.value,
+            panic_on_clone: self.panic_on_clone,
+        }
+    }
+}
+
+impl PartialEq for MaybePanicCloneKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for MaybePanicCloneKey {}
+
+impl Hash for MaybePanicCloneKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
+
+#[test]
+fn test_generic_lru_panic_during_key_clone_is_transactional() {
+    let cache = LruCache::new(1);
+    let resident = MaybePanicCloneKey {
+        value: 1,
+        panic_on_clone: false,
+    };
+    cache.insert(resident, 10);
+
+    let panicking = MaybePanicCloneKey {
+        value: 2,
+        panic_on_clone: true,
+    };
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| cache.insert(panicking, 20)));
+    assert!(result.is_err());
+    assert_eq!(cache.len(), 1);
+    assert_eq!(
+        cache.get(&MaybePanicCloneKey {
+            value: 1,
+            panic_on_clone: false
+        }),
+        Some(10)
+    );
+}
+
+#[test]
+fn test_generic_lru_hit_rate_preserves_small_positive_values() {
+    let cache = LruCache::new(1);
+    cache.insert(1, 1);
+    assert_eq!(cache.get(&1), Some(1));
+    for key in 2..=10_001 {
+        assert_eq!(cache.get(&key), None);
+    }
+    assert!(cache.hit_rate() > 0.0);
 }

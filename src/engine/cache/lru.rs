@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -10,7 +9,7 @@ type LinkIdx = u32;
 const NIL: LinkIdx = u32::MAX;
 
 struct Entry<K, V> {
-    key: K,
+    key: Option<K>,
     value: Option<V>,
     prev: LinkIdx,
     next: LinkIdx,
@@ -22,6 +21,8 @@ struct State<K, V> {
     head: LinkIdx,
     tail: LinkIdx,
     free: LinkIdx,
+    hits: u64,
+    misses: u64,
 }
 
 impl<K, V> State<K, V>
@@ -35,6 +36,8 @@ where
             head: NIL,
             tail: NIL,
             free: NIL,
+            hits: 0,
+            misses: 0,
         }
     }
 
@@ -70,7 +73,7 @@ where
         }
         let index = self.tail;
         let prev = self.entries[index as usize].prev;
-        self.map.remove(&self.entries[index as usize].key);
+        self.map.retain(|_, &mut entry_index| entry_index != index);
         if prev != NIL {
             self.entries[prev as usize].next = NIL;
         }
@@ -79,12 +82,17 @@ where
             self.head = NIL;
         }
         self.entries[index as usize].value = None;
+        self.entries[index as usize].key = None;
         self.entries[index as usize].next = self.free;
         self.free = index;
     }
 }
 
-/// A thread-safe, bounded LRU cache with O(1) lookup, insertion, and eviction.
+/// A thread-safe, bounded LRU cache with O(1) lookup and recency updates.
+///
+/// Eviction scans the key index when recycling a slot. That small tradeoff
+/// keeps the commit path independent of caller-supplied key hashing/equality,
+/// which is important for panic safety.
 ///
 /// A successful [`Self::get`] refreshes the entry's recency. Values are cloned
 /// on lookup, which permits callers to store cheap handles such as `Arc`s as
@@ -92,8 +100,6 @@ where
 pub struct LruCache<K, V> {
     state: RwLock<State<K, V>>,
     capacity: usize,
-    hits: AtomicU64,
-    misses: AtomicU64,
 }
 
 impl<K, V> LruCache<K, V>
@@ -106,24 +112,27 @@ where
         Self {
             state: RwLock::new(State::new()),
             capacity,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
         }
     }
 
     /// Looks up `key`, refreshing its recency when present.
+    ///
+    /// Exact global LRU ordering requires an exclusive lock for hits, so
+    /// concurrent hits serialize briefly. Callers with highly parallel,
+    /// read-heavy workloads should use multiple caches (for example, one per
+    /// shard) when approximate global recency is acceptable.
     pub fn get(&self, key: &K) -> Option<V>
     where
         V: Clone,
     {
         let mut state = self.state.write();
         let Some(&index) = state.map.get(key) else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            state.misses = state.misses.saturating_add(1);
             return None;
         };
         let value = state.entries[index as usize].value.as_ref()?.clone();
         state.move_to_head(index);
-        self.hits.fetch_add(1, Ordering::Relaxed);
+        state.hits = state.hits.saturating_add(1);
         Some(value)
     }
 
@@ -143,32 +152,66 @@ where
             state.move_to_head(index);
             return;
         }
-        if state.map.len() >= self.capacity {
-            state.evict_tail();
-        }
-        let index = if state.free == NIL {
-            let index =
-                LinkIdx::try_from(state.entries.len()).expect("LRU cache exceeds u32::MAX entries");
-            let head = state.head;
-            state.entries.push(Entry {
-                key,
-                value: Some(value),
-                prev: NIL,
-                next: head,
-            });
-            index
+
+        // Clone before touching the cache. Besides supplying the separate map
+        // and entry keys, this is the preflight phase: a caller-controlled
+        // Clone panic cannot evict an existing entry or leave a new entry
+        // linked without its map index.
+        let map_key = key.clone();
+        let was_full = state.map.len() >= self.capacity;
+        let free_index = state.free;
+        let next_free = if free_index == NIL {
+            NIL
         } else {
-            let index = state.free;
-            state.free = state.entries[index as usize].next;
-            let head = state.head;
-            state.entries[index as usize] = Entry {
-                key,
-                value: Some(value),
-                prev: NIL,
-                next: head,
-            };
-            index
+            state.entries[free_index as usize].next
         };
+
+        // Install the map entry before linking the slot. Hash/Eq panics leave
+        // the LRU list untouched; the standard HashMap operation remains
+        // panic-safe and no eviction has happened yet.
+        let index = if was_full || free_index == NIL {
+            assert!(
+                state.entries.len() < NIL as usize,
+                "LRU cache cannot allocate the sentinel entry index"
+            );
+            LinkIdx::try_from(state.entries.len()).expect("LRU cache exceeds u32::MAX entries")
+        } else {
+            free_index
+        };
+        state.map.insert(map_key, index);
+
+        if was_full {
+            // The map temporarily contains the new entry, so remove the old
+            // tail before publishing the new list links.
+            let victim = state.tail;
+            state.evict_tail();
+            if index == free_index {
+                // The candidate slot was on the free list before eviction.
+                // Keep the newly freed victim slot while removing the
+                // candidate from that list before reusing it.
+                let victim_next = state.entries[victim as usize].next;
+                state.entries[victim as usize].next = next_free;
+                state.free = victim;
+                debug_assert_eq!(
+                    victim_next, free_index,
+                    "evicted slot must precede the candidate free slot"
+                );
+            }
+        }
+        let reuse_slot = index == free_index && free_index != NIL;
+        let head = state.head;
+        let entry = Entry {
+            key: Some(key),
+            value: Some(value),
+            prev: NIL,
+            next: head,
+        };
+        if reuse_slot {
+            state.free = next_free;
+            state.entries[index as usize] = entry;
+        } else {
+            state.entries.push(entry);
+        }
         if state.head != NIL {
             let head = state.head as usize;
             state.entries[head].prev = index;
@@ -177,8 +220,6 @@ where
         if state.tail == NIL {
             state.tail = index;
         }
-        let key = state.entries[index as usize].key.clone();
-        state.map.insert(key, index);
     }
 
     /// Removes `key` and returns its value if present.
@@ -202,6 +243,7 @@ where
             state.tail = prev;
         }
         let value = state.entries[index as usize].value.take();
+        state.entries[index as usize].key = None;
         state.entries[index as usize].next = state.free;
         state.free = index;
         value
@@ -210,7 +252,11 @@ where
     /// Removes all entries. Hit/miss counters are retained.
     pub fn clear(&self) {
         let mut state = self.state.write();
+        let hits = state.hits;
+        let misses = state.misses;
         *state = State::new();
+        state.hits = hits;
+        state.misses = misses;
     }
 
     /// Number of resident entries.
@@ -231,25 +277,29 @@ where
 
     /// Number of successful lookups.
     pub fn hits(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
+        self.state.read().hits
     }
 
     /// Number of unsuccessful lookups.
     pub fn misses(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
+        self.state.read().misses
     }
 
     /// Successful lookups divided by all lookups.
+    ///
+    /// The counters are read under the same lock used by lookups, so both
+    /// values come from one coherent snapshot.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn hit_rate(&self) -> f64 {
-        let hits = self.hits();
-        let misses = self.misses();
-        let total = hits.saturating_add(misses);
-        hits.checked_mul(10_000)
-            .and_then(|scaled| scaled.checked_div(total))
-            .map_or(0.0, |scaled| {
-                let scaled = u32::try_from(scaled).unwrap_or(u32::MAX);
-                f64::from(scaled) / 10_000.0
-            })
+        let state = self.state.read();
+        let hits = state.hits as f64;
+        let misses = state.misses as f64;
+        let total = hits + misses;
+        if total == 0.0 {
+            0.0
+        } else {
+            hits / total
+        }
     }
 }
