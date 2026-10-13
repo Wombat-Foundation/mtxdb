@@ -11316,12 +11316,18 @@ fn a_lost_wal_rewrite_beside_a_durable_checkpoint_recovers_cleanly() {
 }
 
 /// Copy a store directory, as a power cut would leave it if every file held
-/// exactly what had been written so far.
+/// exactly what had been written so far. Lock files are process-lifetime
+/// markers, not durable state, and Windows refuses to copy a file another
+/// handle holds exclusively, so they are left behind.
 fn copy_store(from: &std::path::Path, label: &str) -> PathBuf {
     let to = test_dir(label);
     for entry in fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
-        fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        let name = entry.file_name();
+        if name == ".mtxdb.lock" || name == ".mtxdb.wal.lock" {
+            continue;
+        }
+        fs::copy(entry.path(), to.join(name)).unwrap();
     }
     to
 }
