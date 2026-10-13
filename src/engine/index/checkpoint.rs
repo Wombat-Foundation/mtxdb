@@ -568,7 +568,7 @@ pub fn read_checkpoint_with_policy(
             .as_chunks::<8>()
             .0
         {
-            let raw = u64::from_le_bytes(slot_bytes.try_into().ok()?);
+            let raw = u64::from_le_bytes(*slot_bytes);
             if !super::IndexEntry::valid_raw_slot(raw) {
                 return None;
             }
