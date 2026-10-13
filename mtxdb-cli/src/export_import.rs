@@ -15,17 +15,17 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::interop::{
-    DATA_FORMAT, EDGE_POOL, EVENT_POOL, ImportMarker, SERVER_INFO_POOL, Verdict,
-    auth_closure_record_id, auth_counter_record_id, auth_forward_record_id,
-    auth_reverse_record_id, decode_auth_counter, decode_auth_forward, decode_event_locator,
-    decode_import_marker, encode_auth_forward, encode_edges, encode_event_locator,
-    encode_import_marker, encode_server_key, encode_verdict, event_locator_collection_id,
-    event_record_id, event_verdict_collection_id, import_marker_collection_id,
-    import_marker_node_id, room_auth_collection_id, room_event_collection_id,
-    room_prev_collection_id, server_key_record_id, server_keys_collection_id,
+    auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
+    decode_auth_counter, decode_auth_forward, decode_event_locator, decode_import_marker,
+    encode_auth_forward, encode_edges, encode_event_locator, encode_import_marker,
+    encode_server_key, encode_verdict, event_locator_collection_id, event_record_id,
+    event_verdict_collection_id, import_marker_collection_id, import_marker_node_id,
+    room_auth_collection_id, room_event_collection_id, room_prev_collection_id,
+    server_key_record_id, server_keys_collection_id, ImportMarker, Verdict, DATA_FORMAT, EDGE_POOL,
+    EVENT_POOL, SERVER_INFO_POOL,
 };
 use mtxdb::storage::StorageEngine as _;
 use mtxdb::{Database, NodeData};
@@ -412,7 +412,13 @@ pub(crate) fn write_room_with_findings(
     }
     tx.commit().context("committing an import batch")?;
     let closures = write_auth_closures(db, export, plan, batch_bytes)?;
-    Ok((ImportCounts { events: written, closures }, findings))
+    Ok((
+        ImportCounts {
+            events: written,
+            closures,
+        },
+        findings,
+    ))
 }
 
 /// One room's auth short ids and closures, staged into capped batches.
@@ -507,7 +513,11 @@ impl ClosureWriter<'_> {
                 continue;
             }
             let stored = tx
-                .get(EDGE_POOL, &self.collection, &[auth_closure_record_id(short)])?
+                .get(
+                    EDGE_POOL,
+                    &self.collection,
+                    &[auth_closure_record_id(short)],
+                )?
                 .into_iter()
                 .next()
                 .flatten()
@@ -581,11 +591,11 @@ fn closure_plan(export: &RoomExport) -> anyhow::Result<ClosurePlan<'_>> {
     for (position, event) in events.iter().enumerate() {
         let id = event.event_id.as_bytes();
         if index.insert(id, position).is_some() {
-            anyhow!(
+            return Err(anyhow!(
                 "{}: event {} appears more than once; refusing to import the room",
                 export.room_id,
                 event.event_id
-            );
+            ));
         }
     }
     let mut auth: Vec<Vec<&[u8]>> = Vec::with_capacity(events.len());
@@ -642,7 +652,12 @@ fn write_auth_closures(
     for &position in &order {
         let cited: Vec<(&[u8], bool)> = auth[position]
             .iter()
-            .map(|id| (*id, index.get(*id).is_some_and(|&parent| has_closure[parent])))
+            .map(|id| {
+                (
+                    *id,
+                    index.get(*id).is_some_and(|&parent| has_closure[parent]),
+                )
+            })
             .collect();
         let (wrote, staged) =
             writer.stage_event(&tx, events[position].event_id.as_bytes(), &cited)?;
@@ -1040,8 +1055,13 @@ mod auth_findings_tests {
         assert!(error.contains("cycle"), "{error}");
         let record = event_record_id(b"$create");
         assert!(
-            read_pool(&db, EVENT_POOL, room_event_collection_id(room.room_id.as_bytes()), record)
-                .is_none(),
+            read_pool(
+                &db,
+                EVENT_POOL,
+                room_event_collection_id(room.room_id.as_bytes()),
+                record
+            )
+            .is_none(),
             "a refused room leaves no event behind"
         );
         let _ = std::fs::remove_dir_all(dir);
