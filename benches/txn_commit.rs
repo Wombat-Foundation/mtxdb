@@ -799,10 +799,16 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Build the record set once; only the ids and payload bytes are reused,
-    // and clones are cheap `Bytes` refcount bumps.
+    // Build the record set once, only as large as the widest selected run
+    // needs; only the ids and payload bytes are reused, and clones are cheap
+    // `Bytes` refcount bumps.
+    let needed = selected
+        .iter()
+        .map(|cfg| cfg.records(records))
+        .max()
+        .unwrap_or(records);
     let mut payload_gen = PayloadGen::new(0xDEAD_BEEF);
-    let entries: Vec<(NodeId, Bytes)> = (0..records)
+    let entries: Vec<(NodeId, Bytes)> = (0..needed)
         .map(|index| {
             let bytes = Bytes::from(payload_gen.bytes(payload));
             (node_id(index), bytes)
