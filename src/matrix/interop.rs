@@ -88,8 +88,7 @@ pub fn decode_state_root_handle_v1(bytes: &[u8]) -> Result<StateRootHandleV1, St
 /// namespace validation changes without updating this function.
 #[must_use]
 pub fn room_state_collection_id(room_id: &[u8]) -> [u8; 16] {
-    derive_member_collection_id_from_group(MEMBER_NAMESPACE_STAT, derive_group_full_id(room_id))
-        .expect("known state namespace")
+    room_member_collection(MEMBER_NAMESPACE_STAT, room_id)
 }
 
 /// Derive the room's STGP collection for room and event root handles.
@@ -99,8 +98,7 @@ pub fn room_state_collection_id(room_id: &[u8]) -> [u8; 16] {
 /// namespace validation changes without updating this function.
 #[must_use]
 pub fn room_roots_collection_id(room_id: &[u8]) -> [u8; 16] {
-    derive_member_collection_id_from_group(MEMBER_NAMESPACE_STGP, derive_group_full_id(room_id))
-        .expect("known state-group namespace")
+    room_member_collection(MEMBER_NAMESPACE_STGP, room_id)
 }
 
 /// Derive the stored node id from a full 256-bit HAMT structural hash.
