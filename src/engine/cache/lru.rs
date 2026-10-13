@@ -228,7 +228,9 @@ where
             next: head,
         };
         if reuse_slot {
-            state.free = next_free;
+            if !was_full {
+                state.free = next_free;
+            }
             state.entries[index as usize] = entry;
         } else {
             state.entries.push(entry);
