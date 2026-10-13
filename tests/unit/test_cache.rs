@@ -117,3 +117,25 @@ fn test_remove() {
     assert!(cache.get(&id).is_none());
     assert!(cache.is_empty());
 }
+
+#[test]
+fn test_generic_lru_eviction_and_refresh() {
+    let cache = LruCache::new(2);
+    cache.insert("a", 1);
+    cache.insert("b", 2);
+    assert_eq!(cache.get(&"a"), Some(1));
+    cache.insert("c", 3);
+    assert_eq!(cache.get(&"b"), None);
+    assert_eq!(cache.get(&"a"), Some(1));
+    assert_eq!(cache.get(&"c"), Some(3));
+}
+
+#[test]
+fn test_generic_lru_zero_capacity_and_stats() {
+    let cache = LruCache::<u8, u8>::new(0);
+    cache.insert(1, 1);
+    assert_eq!(cache.get(&1), None);
+    assert_eq!(cache.hits(), 0);
+    assert_eq!(cache.misses(), 1);
+    assert!(cache.hit_rate() < f64::EPSILON);
+}

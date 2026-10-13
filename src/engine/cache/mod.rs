@@ -6,6 +6,10 @@ use parking_lot::RwLock;
 
 use crate::storage::{NodeData, NodeId};
 
+mod lru;
+
+pub use lru::LruCache;
+
 /// Maximum number of entries in the node cache.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
