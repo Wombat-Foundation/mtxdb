@@ -190,7 +190,7 @@ where
         // Install the map entry before linking the slot. Hash/Eq panics leave
         // the LRU list untouched; the standard HashMap operation remains
         // panic-safe and no eviction has happened yet.
-        let index = if was_full || free_index == NIL {
+        let index = if free_index == NIL {
             assert!(
                 state.entries.len() < NIL as usize,
                 "LRU cache cannot allocate the sentinel entry index"
@@ -228,6 +228,11 @@ where
             next: head,
         };
         if reuse_slot {
+            // When the cache was already full, `evict_tail` prepended the
+            // victim to the free list. The candidate was its next link, so
+            // leave the victim as the free-list head and unlink only the
+            // candidate being reused. Otherwise consume the ordinary free
+            // list head.
             if !was_full {
                 state.free = next_free;
             }
@@ -320,5 +325,23 @@ where
         } else {
             hits / total
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LruCache;
+
+    #[test]
+    fn full_cache_with_free_slot_reuses_slots() {
+        let cache = LruCache::new(2);
+
+        for key in 0..100u32 {
+            cache.insert(key, key);
+            assert!(cache.len() <= cache.capacity());
+            assert!(cache.state.read().entries.len() <= cache.capacity() + 1);
+        }
+
+        assert_eq!(cache.state.read().entries.len(), cache.capacity() + 1);
     }
 }
