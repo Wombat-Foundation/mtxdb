@@ -30,7 +30,9 @@ fn state_root_handle_v1_has_the_servers_pinned_layout() {
 fn state_layout_ids_match_the_server_pinned_layout() {
     let room = b"!room:example.com";
     let event = b"$event:example.com";
-    let structural_hash = [0xAB; 32];
+    let mut structural_hash = [0_u8; 32];
+    structural_hash[..16].fill(0x11);
+    structural_hash[16..].fill(0x22);
     assert_eq!(
         hex(&room_state_collection_id(room)),
         "e560c7dd2ceee5d7d31ca9d56e6e9e9f"
@@ -39,7 +41,7 @@ fn state_layout_ids_match_the_server_pinned_layout() {
         hex(&room_roots_collection_id(room)),
         "7abdfe381bda1791ba9c6ca5e67117ad"
     );
-    assert_eq!(state_hamt_node_id(&structural_hash), [0xAB; 16]);
+    assert_eq!(state_hamt_node_id(&structural_hash), [0x11; 16]);
     assert_eq!(
         hex(&room_state_root_node_id()),
         "0463880c2405d3407f4c3e12f7858b65"
