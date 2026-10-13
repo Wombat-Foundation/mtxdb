@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 type LinkIdx = u32;
 const NIL: LinkIdx = u32::MAX;
@@ -21,8 +21,6 @@ struct State<K, V> {
     head: LinkIdx,
     tail: LinkIdx,
     free: LinkIdx,
-    hits: u64,
-    misses: u64,
 }
 
 impl<K, V> State<K, V>
@@ -36,8 +34,6 @@ where
             head: NIL,
             tail: NIL,
             free: NIL,
-            hits: 0,
-            misses: 0,
         }
     }
 
@@ -100,6 +96,13 @@ where
 pub struct LruCache<K, V> {
     state: RwLock<State<K, V>>,
     capacity: usize,
+    stats: Mutex<Stats>,
+}
+
+#[derive(Default)]
+struct Stats {
+    hits: u64,
+    misses: u64,
 }
 
 impl<K, V> LruCache<K, V>
@@ -112,28 +115,46 @@ where
         Self {
             state: RwLock::new(State::new()),
             capacity,
+            stats: Mutex::new(Stats::default()),
         }
     }
 
     /// Looks up `key`, refreshing its recency when present.
     ///
-    /// Exact global LRU ordering requires an exclusive lock for hits, so
-    /// concurrent hits serialize briefly. Callers with highly parallel,
-    /// read-heavy workloads should use multiple caches (for example, one per
-    /// shard) when approximate global recency is acceptable.
+    /// A hit clones its value under a shared lock and only takes the exclusive
+    /// lock for the recency refresh. Misses never take the cache write lock.
+    /// Exact global LRU ordering still makes the refresh phase contend briefly;
+    /// callers with highly parallel workloads can use multiple caches when
+    /// approximate global recency is acceptable.
     pub fn get(&self, key: &K) -> Option<V>
     where
         V: Clone,
     {
-        let mut state = self.state.write();
+        let state = self.state.read();
         let Some(&index) = state.map.get(key) else {
-            state.misses = state.misses.saturating_add(1);
+            drop(state);
+            self.record_miss();
             return None;
         };
         let value = state.entries[index as usize].value.as_ref()?.clone();
-        state.move_to_head(index);
-        state.hits = state.hits.saturating_add(1);
+        drop(state);
+
+        let mut state = self.state.write();
+        if state.map.get(key).copied() == Some(index) {
+            state.move_to_head(index);
+        }
+        self.record_hit();
         Some(value)
+    }
+
+    fn record_hit(&self) {
+        let mut stats = self.stats.lock();
+        stats.hits = stats.hits.saturating_add(1);
+    }
+
+    fn record_miss(&self) {
+        let mut stats = self.stats.lock();
+        stats.misses = stats.misses.saturating_add(1);
     }
 
     /// Inserts or replaces an entry, making it the most recently used entry.
@@ -252,11 +273,7 @@ where
     /// Removes all entries. Hit/miss counters are retained.
     pub fn clear(&self) {
         let mut state = self.state.write();
-        let hits = state.hits;
-        let misses = state.misses;
         *state = State::new();
-        state.hits = hits;
-        state.misses = misses;
     }
 
     /// Number of resident entries.
@@ -277,24 +294,24 @@ where
 
     /// Number of successful lookups.
     pub fn hits(&self) -> u64 {
-        self.state.read().hits
+        self.stats.lock().hits
     }
 
     /// Number of unsuccessful lookups.
     pub fn misses(&self) -> u64 {
-        self.state.read().misses
+        self.stats.lock().misses
     }
 
     /// Successful lookups divided by all lookups.
     ///
-    /// The counters are read under the same lock used by lookups, so both
-    /// values come from one coherent snapshot.
+    /// The counters are read under the same lock used by lookup updates, so
+    /// both values come from one coherent snapshot.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn hit_rate(&self) -> f64 {
-        let state = self.state.read();
-        let hits = state.hits as f64;
-        let misses = state.misses as f64;
+        let stats = self.stats.lock();
+        let hits = stats.hits as f64;
+        let misses = stats.misses as f64;
         let total = hits + misses;
         if total == 0.0 {
             0.0

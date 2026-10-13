@@ -3,7 +3,8 @@
 use mtxdb::cache::*;
 use std::hash::{Hash, Hasher};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use mtxdb::storage::{NodeData, NodeId};
 
@@ -205,4 +206,70 @@ fn test_generic_lru_hit_rate_preserves_small_positive_values() {
         assert_eq!(cache.get(&key), None);
     }
     assert!(cache.hit_rate() > 0.0);
+}
+
+#[test]
+fn test_generic_lru_remove_and_reinsert() {
+    let cache = LruCache::new(2);
+    cache.insert("a", 1);
+    cache.insert("b", 2);
+
+    assert_eq!(cache.remove(&"a"), Some(1));
+    assert_eq!(cache.get(&"a"), None);
+    assert_eq!(cache.len(), 1);
+
+    cache.insert("a", 3);
+    assert_eq!(cache.get(&"a"), Some(3));
+    assert_eq!(cache.len(), 2);
+}
+
+#[test]
+fn test_generic_lru_clear() {
+    let cache = LruCache::new(2);
+    cache.insert("a", 1);
+    cache.insert("b", 2);
+    cache.clear();
+
+    assert!(cache.is_empty());
+    assert_eq!(cache.get(&"a"), None);
+    assert_eq!(cache.get(&"b"), None);
+}
+
+#[test]
+fn test_generic_lru_replacement_refreshes_recency() {
+    let cache = LruCache::new(2);
+    cache.insert("a", 1);
+    cache.insert("b", 2);
+    cache.insert("a", 10);
+    cache.insert("c", 3);
+
+    assert_eq!(cache.get(&"a"), Some(10));
+    assert_eq!(cache.get(&"b"), None);
+    assert_eq!(cache.get(&"c"), Some(3));
+}
+
+#[test]
+fn test_generic_lru_concurrent_access() {
+    const THREADS: usize = 8;
+    const ITEMS_PER_THREAD: usize = 64;
+    let cache = Arc::new(LruCache::new(THREADS * ITEMS_PER_THREAD));
+    let ready = Arc::new(Barrier::new(THREADS));
+
+    thread::scope(|scope| {
+        for thread_id in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            let ready = Arc::clone(&ready);
+            scope.spawn(move || {
+                ready.wait();
+                for offset in 0..ITEMS_PER_THREAD {
+                    let key = thread_id * ITEMS_PER_THREAD + offset;
+                    cache.insert(key, key * 2);
+                    assert_eq!(cache.get(&key), Some(key * 2));
+                    assert_eq!(cache.remove(&key), Some(key * 2));
+                }
+            });
+        }
+    });
+
+    assert!(cache.is_empty());
 }
