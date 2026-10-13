@@ -1,10 +1,7 @@
 use super::{
-    CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt,
-    MATRIX_ROOM_MEMBER_NAMESPACE, MatrixRoomExtension, MetaReport, PackIdentity,
-    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE, StateGroupLoad, StateSet, build_event_dag,
-    canonical_column_width, cmd_collections, cmd_get, cmd_import, cmd_import_file, cmd_info,
-    cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync, cmd_tombstones,
-    collection_canonical_id, compile_import_template, compute_state_groups_partial,
+    build_event_dag, canonical_column_width, cmd_collections, cmd_get, cmd_import, cmd_import_file,
+    cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
+    cmd_tombstones, collection_canonical_id, compile_import_template, compute_state_groups_partial,
     decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
     derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
     export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
@@ -15,12 +12,14 @@ use super::{
     parse_pack_selectors, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
     resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
     template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-    verify_auth_chain_edges,
+    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
+    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
+    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
-use crate::{Cli, Commands, export_import};
+use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
-use mtxdb::packfile::PackId;
 use mtxdb::packfile::storage::PackfileStorage;
+use mtxdb::packfile::PackId;
 use mtxdb::room_auth::RoomAuth;
 use mtxdb::shard::ShardPool;
 use mtxdb::storage::{NodeData, StorageEngine};
@@ -28,8 +27,8 @@ use mtxdb::template::{
     CollectionKeyRule, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
 };
 use mtxdb::{
-    Database, DatabaseLayout, DigestAlgorithm, MatrixRoomVersion, ShardType, content_digest,
-    derive_collection_id,
+    content_digest, derive_collection_id, Database, DatabaseLayout, DigestAlgorithm,
+    MatrixRoomVersion, ShardType,
 };
 use rezzy::json::Value as OwnedValue;
 use std::collections::HashSet;
@@ -271,24 +270,18 @@ fn checkpoint_pack_comparison_excludes_noncanonical_pack_but_checks_valid_set() 
     .unwrap();
     let mut report = MetaReport::default();
     meta_checkpoints(&root, &mut report);
-    assert!(
-        report
-            .lines
-            .iter()
-            .any(|line| line.contains("foreign.pack") && line.starts_with("[NOTE]"))
-    );
-    assert!(
-        report
-            .lines
-            .iter()
-            .any(|line| line.contains("fingerprint mismatch") && line.starts_with("[WARN]"))
-    );
-    assert!(
-        !report
-            .lines
-            .iter()
-            .any(|line| line.contains("fingerprint comparison skipped"))
-    );
+    assert!(report
+        .lines
+        .iter()
+        .any(|line| line.contains("foreign.pack") && line.starts_with("[NOTE]")));
+    assert!(report
+        .lines
+        .iter()
+        .any(|line| line.contains("fingerprint mismatch") && line.starts_with("[WARN]")));
+    assert!(!report
+        .lines
+        .iter()
+        .any(|line| line.contains("fingerprint comparison skipped")));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -312,12 +305,10 @@ fn checkpoint_pack_comparison_is_quiet_when_packs_match() {
     meta_checkpoints(&root, &mut report);
     assert_eq!(report.warn_count, 0);
     assert_eq!(report.note_count, 1);
-    assert!(
-        report
-            .lines
-            .iter()
-            .any(|line| line.contains("foreign.pack"))
-    );
+    assert!(report
+        .lines
+        .iter()
+        .any(|line| line.contains("foreign.pack")));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -339,24 +330,18 @@ fn checkpoint_pack_comparison_skips_invalid_pack_with_explicit_note() {
     .unwrap();
     let mut report = MetaReport::default();
     meta_checkpoints(&root, &mut report);
-    assert!(
-        report
-            .lines
-            .iter()
-            .any(|line| line.contains("fingerprint comparison skipped"))
-    );
-    assert!(
-        report
-            .lines
-            .iter()
-            .any(|line| line.starts_with("[WARN]") && line.contains("pack_0000000000000001.pack"))
-    );
-    assert!(
-        !report
-            .lines
-            .iter()
-            .any(|line| line.contains("fingerprint mismatch"))
-    );
+    assert!(report
+        .lines
+        .iter()
+        .any(|line| line.contains("fingerprint comparison skipped")));
+    assert!(report
+        .lines
+        .iter()
+        .any(|line| line.starts_with("[WARN]") && line.contains("pack_0000000000000001.pack")));
+    assert!(!report
+        .lines
+        .iter()
+        .any(|line| line.contains("fingerprint mismatch")));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -774,14 +759,12 @@ fn info_selector_32_hex_disambiguation() {
     // `--collection` never falls back to a pack: an address with no such
     // collection errors, even though it is a live pack.
     let no_collection = format!("0x{}", "ee".repeat(mtxdb::packfile::PACK_ID_LEN));
-    assert!(
-        super::classify_info_selector_explicit(
-            &cli,
-            &no_collection,
-            Some(super::InfoTarget::Collection)
-        )
-        .is_err()
-    );
+    assert!(super::classify_info_selector_explicit(
+        &cli,
+        &no_collection,
+        Some(super::InfoTarget::Collection)
+    )
+    .is_err());
     // The deliberately-created colliding collection *does* resolve under
     // `--collection` for the pack's address — that is the point of the flag.
     assert_eq!(
@@ -2060,13 +2043,11 @@ fn pack_selectors_accept_only_pack_ids_and_deduplicate() {
         "ranges are not pack IDs"
     );
     // Anything longer than the full address is rejected.
-    assert!(
-        parse_pack_id_selector(&format!(
-            "0x{}",
-            "a".repeat(mtxdb::packfile::PACK_ID_LEN * 2 + 2)
-        ))
-        .is_err()
-    );
+    assert!(parse_pack_id_selector(&format!(
+        "0x{}",
+        "a".repeat(mtxdb::packfile::PACK_ID_LEN * 2 + 2)
+    ))
+    .is_err());
     // A short prefix and a full 32-hex address are both accepted, and
     // exact duplicates are collapsed.
     let full = "ab".repeat(mtxdb::packfile::PACK_ID_LEN);
@@ -2259,11 +2240,9 @@ fn import_admission_rejects_an_unestablished_room_before_writing() {
     let template = default_matrix_import_template();
     let error = resolve_import_collection(&[message], None, None, &template, &HashSet::new())
         .expect_err("a room without a batch or persisted create must be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains("no valid m.room.create event is in this input or already on disk")
-    );
+    assert!(error
+        .to_string()
+        .contains("no valid m.room.create event is in this input or already on disk"));
 }
 
 #[test]
@@ -2354,8 +2333,8 @@ fn import_admission_reuses_v12_create_identity_for_followup_events() {
 /// redacted canonical event; it produces an id with the correct alphabet
 /// so the sigil-normalization path is exercised with realistic data.
 fn v12_reference_event_id(event: &OwnedValue) -> String {
-    use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
     let digest = content_digest(DigestAlgorithm::Sha256, &event.encode().into_bytes());
     format!("${}", URL_SAFE_NO_PAD.encode(digest))
 }
@@ -3209,12 +3188,10 @@ fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
         .expect("an unrepresentable relation must not fail the import");
 
     for event in ["$reply", "$long"] {
-        assert!(
-            adjacency
-                .relation_of(&db, event, &visible)
-                .unwrap()
-                .is_none()
-        );
+        assert!(adjacency
+            .relation_of(&db, event, &visible)
+            .unwrap()
+            .is_none());
         assert_eq!(
             adjacency.prev_of(&db, event).unwrap(),
             Some(vec!["$p".to_owned()]),
@@ -4403,10 +4380,8 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
 
     let missing = format_id(&[0x99; 16]);
     assert!(
-        cmd_scan(
-            &cli_scan, &missing, false, false, None, 10, None, None, false, None, false
-        )
-        .is_err()
+        cmd_scan(&cli_scan, &missing, false, false, None, 10, None, None, false, None, false)
+            .is_err()
     );
 
     std::fs::remove_dir_all(&dir1).ok();
@@ -4757,15 +4732,13 @@ fn remove_rejects_a_malformed_id_before_touching_the_store() {
             yes: true,
         },
     );
-    assert!(
-        cmd_remove(
-            &cli,
-            &collection_hex,
-            &[format_id(&id), "not-hex".to_owned()],
-            true
-        )
-        .is_err()
-    );
+    assert!(cmd_remove(
+        &cli,
+        &collection_hex,
+        &[format_id(&id), "not-hex".to_owned()],
+        true
+    )
+    .is_err());
     let store = PackfileStorage::open_read_only(state_dir).unwrap();
     assert!(
         store.get(&collection, &id).unwrap().is_some(),
