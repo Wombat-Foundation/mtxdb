@@ -573,15 +573,21 @@ struct ClosurePlan<'a> {
     order: Vec<usize>,
 }
 
-/// Plan a room's closures, failing on an auth cycle. Run before any event is
-/// written, so a refused room leaves nothing behind.
+/// Plan a room's closures, failing on an auth cycle or a repeated event id.
+/// Run before any event is written, so a refused room leaves nothing behind.
 fn closure_plan(export: &RoomExport) -> anyhow::Result<ClosurePlan<'_>> {
     let events = &export.events;
-    let index: HashMap<&[u8], usize> = events
-        .iter()
-        .enumerate()
-        .map(|(position, event)| (event.event_id.as_bytes(), position))
-        .collect();
+    let mut index: HashMap<&[u8], usize> = HashMap::with_capacity(events.len());
+    for (position, event) in events.iter().enumerate() {
+        let id = event.event_id.as_bytes();
+        if index.insert(id, position).is_some() {
+            anyhow!(
+                "{}: event {} appears more than once; refusing to import the room",
+                export.room_id,
+                event.event_id
+            );
+        }
+    }
     let mut auth: Vec<Vec<&[u8]>> = Vec::with_capacity(events.len());
     for event in events {
         let mut ids = id_list(event, "auth_events")?;
