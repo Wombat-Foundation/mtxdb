@@ -1158,10 +1158,10 @@
 <a href=#1158 id=1158 data-nosnippet>1158</a>    appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
 <a href=#1159 id=1159 data-nosnippet>1159</a>    <span class="kw">if </span>durable {
 <a href=#1160 id=1160 data-nosnippet>1160</a>        file.sync_data()<span class="question-mark">?</span>;
-<a href=#1161 id=1161 data-nosnippet>1161</a>        <span class="kw">if </span>write_header {
-<a href=#1162 id=1162 data-nosnippet>1162</a>            <span class="kw">if let </span><span class="prelude-val">Some</span>(parent) = path.parent() {
-<a href=#1163 id=1163 data-nosnippet>1163</a>                <span class="kw">crate</span>::shard::sync_directory(parent)<span class="question-mark">?</span>;
-<a href=#1164 id=1164 data-nosnippet>1164</a>            }
+<a href=#1161 id=1161 data-nosnippet>1161</a>        <span class="comment">// Always, not only with the header: an earlier non-durable batch may
+<a href=#1162 id=1162 data-nosnippet>1162</a>        // have created the file, and this batch's claim rests on it existing.
+<a href=#1163 id=1163 data-nosnippet>1163</a>        </span><span class="kw">if let </span><span class="prelude-val">Some</span>(parent) = path.parent() {
+<a href=#1164 id=1164 data-nosnippet>1164</a>            <span class="kw">crate</span>::shard::sync_directory(parent)<span class="question-mark">?</span>;
 <a href=#1165 id=1165 data-nosnippet>1165</a>        }
 <a href=#1166 id=1166 data-nosnippet>1166</a>    }
 <a href=#1167 id=1167 data-nosnippet>1167</a>    <span class="prelude-val">Ok</span>(appended)

@@ -669,7 +669,7 @@
 <a href=#669 id=669 data-nosnippet>669</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(corrupt());
 <a href=#670 id=670 data-nosnippet>670</a>    }
 <a href=#671 id=671 data-nosnippet>671</a>    <span class="kw">let </span><span class="kw-2">mut </span>runs: Vec&lt;(u32, u32)&gt; = Vec::with_capacity(body.len() / RUN_LEN);
-<a href=#672 id=672 data-nosnippet>672</a>    <span class="kw">for </span>chunk <span class="kw">in </span>body.chunks_exact(RUN_LEN) {
+<a href=#672 id=672 data-nosnippet>672</a>    <span class="kw">for </span>chunk <span class="kw">in </span>body.as_chunks::&lt;RUN_LEN&gt;().<span class="number">0 </span>{
 <a href=#673 id=673 data-nosnippet>673</a>        <span class="kw">let </span>start = u32::from_be_bytes([chunk[<span class="number">0</span>], chunk[<span class="number">1</span>], chunk[<span class="number">2</span>], chunk[<span class="number">3</span>]]);
 <a href=#674 id=674 data-nosnippet>674</a>        <span class="kw">let </span>stored = u32::from_be_bytes([chunk[<span class="number">4</span>], chunk[<span class="number">5</span>], chunk[<span class="number">6</span>], chunk[<span class="number">7</span>]]);
 <a href=#675 id=675 data-nosnippet>675</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(end) = start.checked_add(stored) <span class="kw">else </span>{

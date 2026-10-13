@@ -176,7 +176,7 @@
 <a href=#176 id=176 data-nosnippet>176</a>        }
 <a href=#177 id=177 data-nosnippet>177</a>        <span class="kw">let </span>byte_len = digits.len() / <span class="number">2</span>;
 <a href=#178 id=178 data-nosnippet>178</a>        <span class="kw">let </span><span class="kw-2">mut </span>bytes = <span class="macro">vec!</span>[<span class="number">0u8</span>; byte_len];
-<a href=#179 id=179 data-nosnippet>179</a>        <span class="kw">for </span>(index, chunk) <span class="kw">in </span>digits.as_bytes().chunks_exact(<span class="number">2</span>).enumerate() {
+<a href=#179 id=179 data-nosnippet>179</a>        <span class="kw">for </span>(index, chunk) <span class="kw">in </span>digits.as_bytes().as_chunks::&lt;<span class="number">2</span>&gt;().<span class="number">0</span>.iter().enumerate() {
 <a href=#180 id=180 data-nosnippet>180</a>            <span class="kw">let </span>hi = hex_value(chunk[<span class="number">0</span>])<span class="question-mark">?</span>;
 <a href=#181 id=181 data-nosnippet>181</a>            <span class="kw">let </span>lo = hex_value(chunk[<span class="number">1</span>])<span class="question-mark">?</span>;
 <a href=#182 id=182 data-nosnippet>182</a>            bytes[index] = (hi &lt;&lt; <span class="number">4</span>) | lo;
@@ -199,7 +199,7 @@
 <a href=#199 id=199 data-nosnippet>199</a>            <span class="kw">return </span><span class="prelude-val">None</span>;
 <a href=#200 id=200 data-nosnippet>200</a>        }
 <a href=#201 id=201 data-nosnippet>201</a>        <span class="kw">let </span><span class="kw-2">mut </span>bytes = [<span class="number">0u8</span>; PACK_ID_LEN];
-<a href=#202 id=202 data-nosnippet>202</a>        <span class="kw">for </span>(index, chunk) <span class="kw">in </span>hex.as_bytes().chunks_exact(<span class="number">2</span>).enumerate() {
+<a href=#202 id=202 data-nosnippet>202</a>        <span class="kw">for </span>(index, chunk) <span class="kw">in </span>hex.as_bytes().as_chunks::&lt;<span class="number">2</span>&gt;().<span class="number">0</span>.iter().enumerate() {
 <a href=#203 id=203 data-nosnippet>203</a>            <span class="kw">let </span>hi = hex_value(chunk[<span class="number">0</span>])<span class="question-mark">?</span>;
 <a href=#204 id=204 data-nosnippet>204</a>            <span class="kw">let </span>lo = hex_value(chunk[<span class="number">1</span>])<span class="question-mark">?</span>;
 <a href=#205 id=205 data-nosnippet>205</a>            bytes[index] = (hi &lt;&lt; <span class="number">4</span>) | lo;
