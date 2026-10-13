@@ -9177,13 +9177,19 @@ impl ImportContext<'_> {
                 let events = self
                     .import_room_export(&export, collection_override)
                     .with_context(|| format!("importing {}", path.display()))?;
-                Ok(ImportOutcome { server_keys: false, exported: Some(events) })
+                Ok(ImportOutcome {
+                    server_keys: false,
+                    exported: Some(events),
+                })
             }
             interchange::InputFormat::Keys => {
                 let records = interchange::parse_keys(content)
                     .with_context(|| format!("reading {}", path.display()))?;
                 self.import_keys_export(path, &records)?;
-                Ok(ImportOutcome { server_keys: true, exported: Some(export_import::ImportCounts::default()) })
+                Ok(ImportOutcome {
+                    server_keys: true,
+                    exported: Some(export_import::ImportCounts::default()),
+                })
             }
         }
     }
