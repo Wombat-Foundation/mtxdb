@@ -248,7 +248,9 @@ impl RunConfig {
 /// The run set. `sweep` gives several transaction sizes for `txn-batched`, so
 /// the practical batch size is visible from one run; `batch` is the base size
 /// used by the plain-many, durable, and read-your-writes runs.
-/// `single_durable` caps the one-fsync-per-record run.
+/// `single_durable` caps the run that calls `sync()` after every record.
+/// `batch` and `single_durable` are at least one; sweep sizes are clamped to
+/// `1..=records.max(1)`. Whole-dataset runs are included regardless of stage budget.
 fn configs(records: usize, batch: usize, sweep: &[usize], single_durable: usize) -> Vec<RunConfig> {
     let batch = batch.max(1);
     let mut configs = vec![
@@ -347,6 +349,8 @@ struct Phases {
 }
 
 impl Phases {
+    /// Accumulate one barrier's phase durations and increment the count of
+    /// barriers with timings, saturating that count at `u64::MAX`.
     fn add(&mut self, timings: &SyncTimings) {
         self.barriers = self.barriers.saturating_add(1);
         self.pack_flush += timings.pack_flush;
@@ -396,7 +400,11 @@ struct Sample {
 }
 
 /// One durability barrier. Its phase breakdown, as the engine measured it, is
-/// added to `phases`.
+/// added to `phases` when available. Returns the elapsed time of the EventDag
+/// pool's `sync()` call, excluding timing collection.
+///
+/// # Panics
+/// Panics if the pool's `sync()` returns an error.
 fn sync_pool(db: &Database, phases: &mut Phases) -> Duration {
     let pool = db.pool(SHARD);
     let started = Instant::now();
@@ -408,6 +416,18 @@ fn sync_pool(db: &Database, phases: &mut Phases) -> Duration {
     elapsed
 }
 
+/// Run the configured writes on the first `cfg.records(entries.len())` entries
+/// in a fresh scratch database, with per-record compression set by `compress`.
+/// `payload` is the bytes per record used to estimate peak staged payload bytes.
+/// Returns write, commit, sync, and read-your-writes timings and counters;
+/// `fsyncs` counts WAL durability commits. Every run includes a closing sync,
+/// and durable runs also sync after each write group. WAL sizes are collected
+/// only for runs without per-group sync. Scratch cleanup is best effort.
+///
+/// # Panics
+/// Panics if no entries are selected, scratch-root creation or database opening
+/// fails, a storage, transaction, or WAL scan operation fails, or a checked
+/// record is missing or differs from its input payload.
 fn run_once(
     cfg: &RunConfig,
     entries: &[(NodeId, Bytes)],
@@ -569,8 +589,12 @@ fn run_once(
     }
 }
 
-/// Median of a sample's duration fields, with counters taken from the last
-/// (deterministic) sample.
+/// Independent medians of the duration fields, including sync phases, with
+/// counters and WAL sizes taken from the last sample. For an even number of
+/// samples, uses the upper middle duration.
+///
+/// # Panics
+/// Panics if `samples` is empty.
 fn reduce(samples: &[Sample]) -> Sample {
     let median = |pick: fn(&Sample) -> Duration| -> Duration {
         let mut all: Vec<Duration> = samples.iter().map(pick).collect();
@@ -729,6 +753,16 @@ impl Sample {
     }
 }
 
+/// Run the benchmark passes selected by the environment and print each pass,
+/// median timings, durable sync phases, and `bench:` records to stdout.
+/// `MTXDB_TXN_SINGLE_DURABLE_RECORDS` caps `plain-single-durable` at 100 records
+/// by default; zero becomes one and the cap cannot exceed the dataset size.
+/// Whole-dataset runs are skipped when their payload exceeds the stage budget.
+/// Scratch data is created under `MTXDB_BENCH_ROOT` or the temp directory and
+/// removed on completion on a best-effort basis.
+///
+/// Exits with status 2 if the run filter matches nothing. Benchmark operation
+/// or verification failures panic.
 fn main() {
     let records = env_usize("MTXDB_TXN_RECORDS", 100_000).max(1);
     let payload = env_usize("MTXDB_TXN_PAYLOAD", 256).max(1);
