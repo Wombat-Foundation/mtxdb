@@ -11,12 +11,12 @@
 //! - **plain-single** — one `put` per record, each publishing its own journal
 //!   group (autocommit). No fsync until the end.
 //! - **plain-single-durable** — the same, with a `sync()` after every record.
-//!   Each `sync()` is a full barrier (WAL fsync, shard fsync, index delta or
-//!   checkpoint, lag remediation), so this run is capped at
-//!   `MTXDB_TXN_SINGLE_DURABLE_RECORDS` records (default 100) and reports
-//!   that count in its `records` column. Each barrier costs the same however
-//!   many precede it, so a small sample is enough; an uncapped run is hours
-//!   on a spinning disk.
+//!   Each `sync()` commits the WAL and persists index state; pack fsyncs are
+//!   budgeted, and index work may be a delta or full checkpoint. Barrier costs
+//!   vary with checkpoint, reclaim, and remediation work, but the run is capped
+//!   at `MTXDB_TXN_SINGLE_DURABLE_RECORDS` records (default 100) and reports
+//!   that count in its `records` column. An uncapped run is hours on a spinning
+//!   disk.
 //! - **plain-many(B)** — one `put_many` of `B` records. Note this still emits
 //!   one journal group per **record**, not per call: `put_many` publishes
 //!   through the same per-entry path as `put`. The group count is therefore
