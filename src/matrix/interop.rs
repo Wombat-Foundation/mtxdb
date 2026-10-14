@@ -451,78 +451,6 @@ pub fn room_auth_collection_id(room_id: &[u8]) -> [u8; 16] {
     room_member_collection(MEMBER_NAMESPACE_AUTH, room_id)
 }
 
-/// Stable record ids used by the persisted auth-closure index in a room's
-/// auth collection. Closure payloads are rezzy `Bitmap::encode()` bytes; the
-/// forward value is `[u32 BE short id][event id]`, reverse values are raw
-/// event ids, and the counter is one `u32 BE`.
-#[must_use]
-pub fn auth_closure_counter_node_id() -> [u8; 16] {
-    derive_id(b"authchain:counter", b"")
-}
-
-/// Encode the room-local auth-closure short-id counter as `u32 BE`.
-#[must_use]
-pub const fn encode_auth_closure_counter(value: u32) -> [u8; 4] {
-    value.to_be_bytes()
-}
-
-/// Decode the room-local auth-closure short-id counter.
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] unless the value is exactly four bytes.
-pub fn decode_auth_closure_counter(bytes: &[u8]) -> Result<u32, StorageError> {
-    let value = <[u8; 4]>::try_from(bytes)
-        .map_err(|_| StorageError::Corrupt("malformed auth-closure counter".to_owned()))?;
-    Ok(u32::from_be_bytes(value))
-}
-
-/// Forward mapping from event id to the room-local short id.
-#[must_use]
-pub fn auth_closure_forward_node_id(event_id: &[u8]) -> [u8; 16] {
-    derive_id(b"authchain:fwd", event_id)
-}
-
-/// Reverse mapping from room-local short id to the raw event id.
-#[must_use]
-pub fn auth_closure_reverse_node_id(short_id: u32) -> [u8; 16] {
-    derive_id(b"authchain:rev", &short_id.to_be_bytes())
-}
-
-/// Persisted transitive-closure bitmap for a room-local short id.
-#[must_use]
-pub fn auth_closure_bitmap_node_id(short_id: u32) -> [u8; 16] {
-    derive_id(b"authchain:closure", &short_id.to_be_bytes())
-}
-
-/// Encode a persisted auth-closure forward mapping as `[u32 BE][event id]`.
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] if the length cannot be represented.
-pub fn encode_auth_closure_forward(
-    short_id: u32,
-    event_id: &[u8],
-) -> Result<Vec<u8>, StorageError> {
-    let capacity = event_id
-        .len()
-        .checked_add(4)
-        .ok_or_else(|| StorageError::Corrupt("auth event id is too large".to_owned()))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    bytes.extend_from_slice(&short_id.to_be_bytes());
-    bytes.extend_from_slice(event_id);
-    Ok(bytes)
-}
-
-/// Decode a persisted auth-closure forward mapping.
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] for a value shorter than the 4-byte id.
-pub fn decode_auth_closure_forward(bytes: &[u8]) -> Result<(u32, &[u8]), StorageError> {
-    let (short, event_id) = bytes.split_first_chunk::<4>().ok_or_else(|| {
-        StorageError::Corrupt("malformed auth-closure forward mapping".to_owned())
-    })?;
-    Ok((u32::from_be_bytes(*short), event_id))
-}
-
 /// Derive the event-locator collection holding `node`.
 ///
 /// The locator maps an event id to its room across all rooms, bucketed for
@@ -647,6 +575,12 @@ pub fn decode_auth_counter(bytes: &[u8]) -> Result<u32, StorageError> {
         .map_err(|_| StorageError::Corrupt("malformed auth counter".to_owned()))
 }
 
+/// Encode the per-room short-id counter as big-endian `u32`.
+#[must_use]
+pub const fn encode_auth_counter(value: u32) -> [u8; 4] {
+    value.to_be_bytes()
+}
+
 /// Decode an edge list written by [`encode_edges`].
 ///
 /// # Errors
@@ -729,39 +663,6 @@ mod tests;
 
 /// Pool holding HAMT nodes and state roots.
 pub const STATE_POOL: ShardType = ShardType::State;
-
-/// Derive the collection holding a room's content-addressed HAMT nodes.
-#[must_use]
-pub fn room_state_collection_id(room_id: &[u8]) -> [u8; 16] {
-    room_member_collection(MEMBER_NAMESPACE_STAT, room_id)
-}
-
-/// Derive the collection holding a room's current root and per-event roots.
-#[must_use]
-pub fn room_roots_collection_id(room_id: &[u8]) -> [u8; 16] {
-    room_member_collection(MEMBER_NAMESPACE_STGP, room_id)
-}
-
-/// Node id of a HAMT node: the first 16 bytes of its structural hash. Readers
-/// must verify the full 32-byte hash, since the id is only 128 bits.
-#[must_use]
-pub fn hamt_node_id(structural_hash: &[u8; 32]) -> [u8; 16] {
-    let mut id = [0_u8; 16];
-    id.copy_from_slice(&structural_hash[..16]);
-    id
-}
-
-/// Node id of a room's current state root in its roots collection.
-#[must_use]
-pub fn room_root_node_id() -> [u8; 16] {
-    derive_id(b"root", b"current")
-}
-
-/// Node id of an event's state root in its room's roots collection.
-#[must_use]
-pub fn event_root_node_id(event_id: &[u8]) -> [u8; 16] {
-    derive_id(b"event-root", event_id)
-}
 
 /// Default charged staging budget per state batch, including per-put framing.
 pub const STATE_BATCH_BYTES: usize = 48 << 20;

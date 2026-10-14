@@ -293,25 +293,9 @@ fn auth_chain_records_are_pinned_and_round_trip() {
         );
     }
     assert_eq!(decode_auth_counter(&9_u32.to_be_bytes()).unwrap(), 9);
+    assert_eq!(decode_auth_counter(&encode_auth_counter(9)).unwrap(), 9);
     assert!(decode_auth_counter(&[0, 0, 9]).is_err());
     assert!(decode_auth_counter(&[0, 0, 0, 0, 9]).is_err());
-}
-
-#[test]
-fn state_ids_are_stable_and_separate_nodes_from_roots() {
-    let room = b"!room:example.com";
-    assert_ne!(
-        room_state_collection_id(room),
-        room_roots_collection_id(room)
-    );
-    assert_ne!(
-        room_state_collection_id(room),
-        room_state_collection_id(b"!other:example.com")
-    );
-    assert_ne!(room_root_node_id(), event_root_node_id(b"current"));
-    let mut hash = [0_u8; 32];
-    hash[..16].copy_from_slice(&[7; 16]);
-    assert_eq!(hamt_node_id(&hash), [7; 16]);
 }
 
 #[test]
@@ -332,16 +316,16 @@ fn state_batches_split_under_the_budget_and_read_back() {
         .map(|(i, bytes)| {
             let mut hash = [0_u8; 32];
             hash[0] = u8::try_from(i).unwrap();
-            (stat, hamt_node_id(&hash), bytes.as_slice())
+            (stat, state_hamt_node_id(&hash), bytes.as_slice())
         })
         .collect();
     let root_bytes = [0xAA_u8; 50];
     let event_root = (
         roots,
-        event_root_node_id(b"$e:example.com"),
+        event_state_root_node_id(b"$e:example.com"),
         root_bytes.as_slice(),
     );
-    let room_root = (roots, room_root_node_id(), root_bytes.as_slice());
+    let room_root = (roots, room_state_root_node_id(), root_bytes.as_slice());
 
     // 10 nodes charge 164 bytes each: 250-byte batches hold one, so 10 batches, then 1 for roots.
     let committed =
@@ -357,37 +341,4 @@ fn state_batches_split_under_the_budget_and_read_back() {
     }
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn persisted_auth_closure_ids_and_forward_records_match_the_server_layout() {
-    let event = b"$event:example.com";
-    let short = 0x0102_0304;
-    assert_eq!(
-        auth_closure_counter_node_id(),
-        derive_id(b"authchain:counter", b"")
-    );
-    assert_eq!(
-        auth_closure_forward_node_id(event),
-        derive_id(b"authchain:fwd", event)
-    );
-    assert_eq!(
-        auth_closure_reverse_node_id(short),
-        derive_id(b"authchain:rev", &short.to_be_bytes())
-    );
-    assert_eq!(
-        auth_closure_bitmap_node_id(short),
-        derive_id(b"authchain:closure", &short.to_be_bytes())
-    );
-    assert_eq!(
-        decode_auth_closure_counter(&encode_auth_closure_counter(short)).unwrap(),
-        short
-    );
-    assert!(decode_auth_closure_counter(&[1, 2, 3]).is_err());
-    let encoded = encode_auth_closure_forward(short, event).unwrap();
-    assert_eq!(
-        decode_auth_closure_forward(&encoded).unwrap(),
-        (short, event.as_slice())
-    );
-    assert!(decode_auth_closure_forward(&encoded[..3]).is_err());
 }

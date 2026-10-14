@@ -190,16 +190,16 @@ pub use database::{
 };
 pub use index::LossyIndex;
 pub use interop::{
-    auth_closure_bitmap_node_id, auth_closure_counter_node_id, auth_closure_forward_node_id,
-    auth_closure_reverse_node_id, commit_state_batches, decode_auth_closure_counter,
-    decode_auth_closure_forward, decode_import_marker, decode_server_key, decode_verdict,
-    encode_auth_closure_counter, encode_auth_closure_forward, encode_import_marker,
-    encode_server_key, encode_verdict, event_record_id, event_root_node_id,
-    event_verdict_collection_id, hamt_node_id, import_marker_collection_id, import_marker_node_id,
-    room_root_node_id, room_roots_collection_id, room_state_collection_id, server_key_record_id,
-    server_keys_collection_id, ImportMarker, KeyRecordKind, Verdict, DATA_FORMAT,
-    KEY_RECORD_VERSION, MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL, VERDICT_BUCKETS,
-    VERDICT_VERSION,
+    auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
+    commit_state_batches, decode_auth_counter, decode_auth_forward, decode_import_marker,
+    decode_server_key, decode_state_root_handle_v1, decode_verdict, encode_auth_counter,
+    encode_auth_forward, encode_import_marker, encode_server_key, encode_state_root_handle_v1,
+    encode_verdict, event_record_id, event_state_root_node_id, event_verdict_collection_id,
+    import_marker_collection_id, import_marker_node_id, room_roots_collection_id,
+    room_state_collection_id, room_state_root_node_id, server_key_record_id,
+    server_keys_collection_id, state_hamt_node_id, ImportMarker, KeyRecordKind, StateRootHandleV1,
+    Verdict, DATA_FORMAT, KEY_RECORD_VERSION, MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL,
+    STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS, VERDICT_VERSION,
 };
 pub use journal::SharedWalLock;
 pub use journal::{CollectionExpectation, StagedLookup, TxnStage, TxnStageState};
