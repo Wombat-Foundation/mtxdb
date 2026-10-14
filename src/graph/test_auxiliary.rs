@@ -125,6 +125,36 @@ fn staged_remove_many_is_stale_if_a_key_changes_concurrently() {
 }
 
 #[test]
+fn staged_remove_many_rejects_a_different_database_pool() {
+    let first_root = test_root("remove_wrong_pool_index");
+    let second_root = test_root("remove_wrong_pool_transaction");
+    let first_db = Database::open(first_root.clone()).unwrap();
+    let second_db = Database::open(second_root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(first_db.event_dag().as_ref(), "remove_wrong_pool");
+    let unrelated = AuxiliaryIndex::open(second_db.event_dag().as_ref(), "remove_wrong_pool");
+    index.put(b"key", b"first database").unwrap();
+    unrelated.put(b"key", b"second database").unwrap();
+    let transaction = second_db.begin_transaction();
+
+    assert!(matches!(
+        index.stage_remove_many(&transaction, ShardType::EventDag, &[b"key"]),
+        Err(StorageError::Internal(message))
+            if message.contains("different storage pools")
+    ));
+    transaction.commit().unwrap();
+    assert_eq!(
+        unrelated.get(b"key").unwrap(),
+        Some(b"second database".to_vec())
+    );
+    assert_eq!(index.get(b"key").unwrap(), Some(b"first database".to_vec()));
+
+    drop(second_db);
+    drop(first_db);
+    let _ = std::fs::remove_dir_all(first_root);
+    let _ = std::fs::remove_dir_all(second_root);
+}
+
+#[test]
 fn envelope_retains_full_key_digest() {
     let engine = InMemoryStorage::new();
     let index = AuxiliaryIndex::open(&engine, "test");

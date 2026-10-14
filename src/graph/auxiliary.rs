@@ -295,6 +295,13 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
         pool: ShardType,
         keys: &[&[u8]],
     ) -> Result<usize, StorageError> {
+        let engine_identity = std::ptr::from_ref(self.engine).cast::<()>() as usize;
+        if engine_identity != transaction.pool_identity(pool) {
+            return Err(StorageError::Internal(
+                "auxiliary index and transaction use different storage pools".to_owned(),
+            ));
+        }
+
         let mut ids = Vec::with_capacity(keys.len());
         let mut digests_by_id: HashMap<NodeId, AuxiliaryKeyDigest> =
             HashMap::with_capacity(keys.len());
