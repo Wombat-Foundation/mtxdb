@@ -486,11 +486,15 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             }
         }
 
-        if inserted == 0 && old_root_id.is_some() {
+        if inserted == 0 {
             if let Some(root_id) = old_root_id {
                 return Ok(root_id);
             }
         }
+
+        transaction
+            .expect_record_version(pool, self.collection_id, TIMELINE_HEAD_ID, head_version)
+            .map_err(StorageError::Io)?;
 
         for (leaf_id, payload) in pending_leaf_records {
             self.stage_record(transaction, pool, &leaf_id, payload)?;
