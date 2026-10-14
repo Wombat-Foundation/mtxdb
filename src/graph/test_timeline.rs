@@ -255,7 +255,7 @@ fn transactional_append_uses_head_cas_and_can_be_retried() {
 fn all_duplicates_append_does_not_bump_head_version() {
     let db_path = test_root("append_dupes");
     let db = Database::open(db_path.clone()).unwrap();
-    let room_id = [6u8; 16];
+    let room_id = [7u8; 16];
     let index = TimelineIndex::open(db.event_dag().as_ref(), "append_dupes");
     let entry = full(room_id, 1, 1, 1);
     index.build(&[entry]).unwrap();
