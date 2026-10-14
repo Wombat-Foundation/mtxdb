@@ -50,6 +50,8 @@
 
 use bytes::Bytes;
 
+use crate::database::{Database, DatabaseTransaction};
+use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{
     derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
@@ -347,20 +349,163 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         Ok(root_id)
     }
 
-    /// Insert entries into the current index, preserving older roots for
-    /// cursors that already reference them. Only leaves whose key ranges are
-    /// touched by `entries` are read and rewritten; untouched leaf records are
-    /// reused. The root manifest is rewritten because it lists every leaf.
+    /// Append entries in one optimistic transaction. The caller supplies the
+    /// database and pool that back this index. The head's record version is
+    /// checked at commit, so concurrent appends cannot silently overwrite one
+    /// another.
+    ///
+    /// This convenience method opens and commits its own transaction. Use
+    /// [`Self::stage_append`] to combine the index update with other writes.
+    ///
+    /// # Errors
+    /// Propagates storage errors, including [`StorageError::StaleRead`] if
+    /// another writer changes the head before commit.
+    pub fn append(
+        &self,
+        database: &Database,
+        pool: ShardType,
+        new_entries: &[TimelineEntry],
+    ) -> Result<NodeId, StorageError> {
+        let transaction = database.begin_transaction();
+        let root_id = self.stage_append(&transaction, pool, new_entries)?;
+        transaction.commit()?;
+        Ok(root_id)
+    }
+
+    /// Stage entries into the current index in `transaction`, preserving old
+    /// roots for existing cursors. Only leaves whose key ranges are touched by
+    /// `new_entries` are read and rewritten; untouched leaf records are reused.
+    /// The root manifest is rewritten because it lists every leaf.
     ///
     /// Duplicate entries are ignored, both within the input and against the
-    /// existing index. Calling this with an empty index is equivalent to
-    /// [`Self::build`].
+    /// existing index. The caller must commit the transaction to publish the
+    /// leaves, new root, and head together.
     ///
     /// # Errors
     /// Propagates backend errors, or returns [`StorageError::Corrupt`] for
     /// malformed existing records and [`StorageError::Internal`] if the
     /// resulting entry count cannot be represented.
-    pub fn append(&self, new_entries: &[TimelineEntry]) -> Result<NodeId, StorageError> {
+    pub fn stage_append(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        new_entries: &[TimelineEntry],
+    ) -> Result<NodeId, StorageError> {
+        let engine_identity = std::ptr::from_ref(self.engine).cast::<()>() as usize;
+        if engine_identity != transaction.pool_identity(pool) {
+            return Err(StorageError::Internal(
+                "timeline index and transaction use different storage pools".to_owned(),
+            ));
+        }
+        self.ensure_metadata()?;
+        let (head_records, head_versions) =
+            transaction.get_with_record_versions(pool, &self.collection_id, &[TIMELINE_HEAD_ID])?;
+        let head_record = head_records.first().ok_or_else(|| {
+            StorageError::Internal("timeline head read returned no slot".to_owned())
+        })?;
+        let head_version = *head_versions.first().ok_or_else(|| {
+            StorageError::Internal("timeline head read returned no version".to_owned())
+        })?;
+        let (old_root_id, old_count, manifest) = if let Some(head) = head_record {
+            let (root_id, count) = decode_head(&head.bytes)?;
+            let root_records = transaction.get(pool, &self.collection_id, &[root_id])?;
+            let root_record = root_records
+                .first()
+                .and_then(Option::as_ref)
+                .ok_or(StorageError::NotFound(root_id))?;
+            (Some(root_id), count, decode_root(&root_record.bytes)?)
+        } else {
+            (None, 0, Vec::new())
+        };
+        if new_entries.is_empty() && old_root_id.is_some() {
+            return old_root_id
+                .ok_or_else(|| StorageError::Internal("timeline head disappeared".to_owned()));
+        }
+        transaction
+            .expect_record_version(pool, self.collection_id, TIMELINE_HEAD_ID, head_version)
+            .map_err(StorageError::Io)?;
+
+        let mut pending = new_entries.to_vec();
+        pending.sort_unstable();
+        pending.dedup();
+        let mut assigned = vec![Vec::new(); manifest.len().max(1)];
+        for entry in pending {
+            let index = if manifest.is_empty() {
+                0
+            } else {
+                manifest
+                    .partition_point(|(first, _)| *first <= entry)
+                    .saturating_sub(1)
+            };
+            assigned[index].push(entry);
+        }
+
+        let mut next_manifest = Vec::with_capacity(
+            manifest
+                .len()
+                .saturating_add(new_entries.len() / TIMELINE_LEAF_CAP)
+                .saturating_add(1),
+        );
+        let mut inserted = 0u64;
+        if manifest.is_empty() {
+            self.stage_merged_leaves(
+                transaction,
+                pool,
+                &[],
+                &assigned[0],
+                &mut next_manifest,
+                &mut inserted,
+            )?;
+        } else {
+            for (index, (_, leaf_id)) in manifest.iter().enumerate() {
+                if assigned[index].is_empty() {
+                    next_manifest.push(manifest[index]);
+                    continue;
+                }
+                let leaf_records = transaction.get(pool, &self.collection_id, &[*leaf_id])?;
+                let leaf_record = leaf_records
+                    .first()
+                    .and_then(Option::as_ref)
+                    .ok_or(StorageError::NotFound(*leaf_id))?;
+                let old_leaf = decode_leaf(&leaf_record.bytes)?;
+                self.stage_merged_leaves(
+                    transaction,
+                    pool,
+                    &old_leaf,
+                    &assigned[index],
+                    &mut next_manifest,
+                    &mut inserted,
+                )?;
+            }
+        }
+
+        let count = old_count
+            .checked_add(inserted)
+            .ok_or_else(|| StorageError::Internal("timeline entry count overflow".to_owned()))?;
+        let root_payload = encode_root(&next_manifest, count)?;
+        let root_id = content_id(&root_payload);
+        self.stage_record(transaction, pool, &root_id, root_payload)?;
+        self.stage_record(
+            transaction,
+            pool,
+            &TIMELINE_HEAD_ID,
+            encode_head(&root_id, count),
+        )?;
+        Ok(root_id)
+    }
+
+    /// Unconditionally append through the raw storage engine. This utility is
+    /// useful for single-writer maintenance and in-memory tests; concurrent
+    /// writers should use [`Self::append`] or [`Self::stage_append`].
+    ///
+    /// # Errors
+    /// Propagates backend errors, or returns [`StorageError::Corrupt`] for
+    /// malformed existing records and [`StorageError::Internal`] if the
+    /// resulting entry count cannot be represented.
+    pub fn append_untransactional(
+        &self,
+        new_entries: &[TimelineEntry],
+    ) -> Result<NodeId, StorageError> {
         self.ensure_metadata()?;
         let Some((old_root_id, old_count)) = self.head()? else {
             return self.build(new_entries);
@@ -474,6 +619,73 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             manifest.push((first, id));
         }
         Ok(())
+    }
+
+    fn stage_merged_leaves(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        existing: &[TimelineEntry],
+        incoming: &[TimelineEntry],
+        manifest: &mut Vec<(TimelineEntry, NodeId)>,
+        inserted: &mut u64,
+    ) -> Result<(), StorageError> {
+        let mut merged = Vec::with_capacity(existing.len().saturating_add(incoming.len()));
+        let (mut left, mut right) = (0, 0);
+        while left < existing.len() || right < incoming.len() {
+            let take_existing = right == incoming.len()
+                || (left < existing.len() && existing[left] <= incoming[right]);
+            let entry = if take_existing {
+                let entry = existing[left];
+                left = left.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("timeline merge offset overflow".to_owned())
+                })?;
+                if right < incoming.len() && incoming[right] == entry {
+                    right = right.checked_add(1).ok_or_else(|| {
+                        StorageError::Internal("timeline merge offset overflow".to_owned())
+                    })?;
+                }
+                entry
+            } else {
+                let entry = incoming[right];
+                right = right.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("timeline merge offset overflow".to_owned())
+                })?;
+                *inserted = inserted.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("timeline entry count overflow".to_owned())
+                })?;
+                entry
+            };
+            merged.push(entry);
+        }
+
+        for chunk in merged.chunks(TIMELINE_LEAF_CAP) {
+            let payload = encode_leaf(chunk)?;
+            let id = content_id(&payload);
+            self.stage_record(transaction, pool, &id, payload)?;
+            let first = *chunk
+                .first()
+                .ok_or_else(|| StorageError::Internal("empty timeline leaf".to_owned()))?;
+            manifest.push((first, id));
+        }
+        Ok(())
+    }
+
+    fn stage_record(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        id: &NodeId,
+        payload: Vec<u8>,
+    ) -> Result<(), StorageError> {
+        transaction
+            .put(
+                pool,
+                self.collection_id,
+                *id,
+                &NodeData::new(Bytes::from(payload)),
+            )
+            .map_err(StorageError::Io)
     }
 
     /// The current head's `(root_id, entry_count)`, if the index was built.

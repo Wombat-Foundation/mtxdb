@@ -1,5 +1,14 @@
 use super::*;
-use crate::storage::InMemoryStorage;
+use crate::database::Database;
+use crate::layout::ShardType;
+use crate::storage::{InMemoryStorage, StorageEngine};
+use std::path::PathBuf;
+
+fn test_root(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("mtxdb-timeline-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
 
 fn entry(room_id: [u8; 16], order: i64, seed: u8) -> TimelineEntry {
     let mut node_id = [0u8; 16];
@@ -21,8 +30,8 @@ fn sorted_reference(entries: &[TimelineEntry], room_id: &[u8; 16]) -> Vec<Timeli
     reference
 }
 
-fn collect(
-    index: &TimelineIndex<'_, InMemoryStorage>,
+fn collect<S: StorageEngine + ?Sized>(
+    index: &TimelineIndex<'_, S>,
     room_id: &[u8; 16],
     forward: bool,
     limit: usize,
@@ -169,7 +178,7 @@ fn append_inserts_into_existing_ranges_and_ignores_duplicates() {
         full(room, 401, 1001, 242),
         original[100], // already present
     ];
-    index.append(&inserted).unwrap();
+    index.append_untransactional(&inserted).unwrap();
 
     let mut expected = original;
     expected.extend(inserted);
@@ -192,12 +201,139 @@ fn append_to_empty_index_and_empty_append_are_well_defined() {
     let index = TimelineIndex::open(&engine, "append_empty");
     let entries = [full(room, 2, 4, 1), full(room, 1, 3, 2)];
 
-    index.append(&entries).unwrap();
+    index.append_untransactional(&entries).unwrap();
     let mut expected = entries.to_vec();
     expected.sort_unstable();
     assert_eq!(collect(&index, &room, true, 10), expected);
     let root_id = index.head().unwrap().unwrap().0;
-    assert_eq!(index.append(&[]).unwrap(), root_id);
+    assert_eq!(index.append_untransactional(&[]).unwrap(), root_id);
+}
+
+#[test]
+fn transactional_append_uses_head_cas_and_can_be_retried() {
+    let db_path = test_root("append_cas");
+    let db = Database::open(db_path.clone()).unwrap();
+    let room_id = [4u8; 16];
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_cas");
+    index.build(&[full(room_id, 1, 1, 1)]).unwrap();
+
+    let first_entry = full(room_id, 2, 2, 2);
+    let second_entry = full(room_id, 3, 3, 3);
+    let first = db.begin_transaction();
+    let second = db.begin_transaction();
+    index
+        .stage_append(&first, ShardType::EventDag, &[first_entry])
+        .unwrap();
+    index
+        .stage_append(&second, ShardType::EventDag, &[second_entry])
+        .unwrap();
+
+    first.commit().unwrap();
+    assert!(matches!(
+        second.commit(),
+        Err(crate::storage::StorageError::StaleRead { .. })
+    ));
+    assert_eq!(
+        collect(&index, &room_id, true, 10),
+        vec![full(room_id, 1, 1, 1), first_entry]
+    );
+
+    let retry = db.begin_transaction();
+    index
+        .stage_append(&retry, ShardType::EventDag, &[second_entry])
+        .unwrap();
+    retry.commit().unwrap();
+    assert_eq!(
+        collect(&index, &room_id, true, 10),
+        vec![full(room_id, 1, 1, 1), first_entry, second_entry]
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&db_path);
+}
+
+#[test]
+fn concurrent_first_appends_use_absent_head_cas() {
+    let db_path = test_root("append_first_cas");
+    let db = Database::open(db_path.clone()).unwrap();
+    let room_id = [5u8; 16];
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_first_cas");
+    let first_entry = full(room_id, 1, 1, 1);
+    let second_entry = full(room_id, 2, 2, 2);
+    let first = db.begin_transaction();
+    let second = db.begin_transaction();
+
+    index
+        .stage_append(&first, ShardType::EventDag, &[first_entry])
+        .unwrap();
+    index
+        .stage_append(&second, ShardType::EventDag, &[second_entry])
+        .unwrap();
+    first.commit().unwrap();
+    assert!(matches!(
+        second.commit(),
+        Err(crate::storage::StorageError::StaleRead { .. })
+    ));
+    assert_eq!(collect(&index, &room_id, true, 10), vec![first_entry]);
+
+    let retry = db.begin_transaction();
+    index
+        .stage_append(&retry, ShardType::EventDag, &[second_entry])
+        .unwrap();
+    retry.commit().unwrap();
+    assert_eq!(
+        collect(&index, &room_id, true, 10),
+        vec![first_entry, second_entry]
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&db_path);
+}
+
+#[test]
+fn empty_transactional_append_does_not_register_a_head_expectation() {
+    let db_path = test_root("append_empty_transaction");
+    let db = Database::open(db_path.clone()).unwrap();
+    let room_id = [6u8; 16];
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_empty_transaction");
+    index.build(&[full(room_id, 1, 1, 1)]).unwrap();
+
+    let empty = db.begin_transaction();
+    let writer = db.begin_transaction();
+    assert_eq!(
+        index
+            .stage_append(&empty, ShardType::EventDag, &[])
+            .unwrap(),
+        index.head().unwrap().unwrap().0
+    );
+    index
+        .stage_append(&writer, ShardType::EventDag, &[full(room_id, 2, 2, 2)])
+        .unwrap();
+    writer.commit().unwrap();
+    empty.commit().unwrap();
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&db_path);
+}
+
+#[test]
+fn transactional_append_rejects_a_different_database_pool() {
+    let first_path = test_root("append_wrong_pool_index");
+    let second_path = test_root("append_wrong_pool_transaction");
+    let first_db = Database::open(first_path.clone()).unwrap();
+    let second_db = Database::open(second_path.clone()).unwrap();
+    let index = TimelineIndex::open(first_db.event_dag().as_ref(), "append_wrong_pool");
+    let transaction = second_db.begin_transaction();
+
+    assert!(matches!(
+        index.stage_append(&transaction, ShardType::EventDag, &[]),
+        Err(crate::storage::StorageError::Internal(message))
+            if message.contains("different storage pools")
+    ));
+
+    drop(transaction);
+    drop(second_db);
+    drop(first_db);
+    let _ = std::fs::remove_dir_all(first_path);
+    let _ = std::fs::remove_dir_all(second_path);
 }
 
 fn full(room: [u8; 16], topological: i64, stream: i64, seed: u8) -> TimelineEntry {

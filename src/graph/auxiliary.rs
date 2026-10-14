@@ -260,23 +260,22 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
         self.engine.put_many(&self.collection_id, &physical)
     }
 
-    /// Remove a value by its logical key. Returns `true` if a value existed.
-    /// The full digest envelope is checked before removal, so a truncated-id
-    /// collision cannot delete another key's value.
+    /// Stage removal of one value by logical key. Returns `true` if a value
+    /// was present in the transaction's read snapshot. The caller must commit
+    /// the transaction to publish the removal.
     ///
     /// # Errors
     /// Returns [`StorageError::Collision`] for a digest collision,
     /// [`StorageError::Corrupt`] for a malformed value, or propagates a
-    /// storage error.
-    pub fn remove(&self, key: &[u8]) -> Result<bool, StorageError> {
-        let digest = auxiliary_key_digest(key);
-        let id = physical_id(&digest);
-        if let Some(record) = self.engine.get(&self.collection_id, &id)? {
-            decode_value(&digest, &record.bytes)?;
-            self.engine.remove(&self.collection_id, &id)
-        } else {
-            Ok(false)
-        }
+    /// storage error. A concurrent change is reported as
+    /// [`StorageError::StaleRead`] when the transaction is committed.
+    pub fn remove(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        key: &[u8],
+    ) -> Result<bool, StorageError> {
+        Ok(self.stage_remove_many(transaction, pool, &[key])? != 0)
     }
 
     /// Stage several removals in one database transaction, returning the

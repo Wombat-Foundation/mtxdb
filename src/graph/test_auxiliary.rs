@@ -87,7 +87,39 @@ fn remove_and_staged_remove_many_delete_values_and_are_idempotent() {
     assert_eq!(index.get(b"second").unwrap(), Some(b"two".to_vec()));
     transaction.commit().unwrap();
     assert_eq!(index.get(b"second").unwrap(), None);
-    assert!(!index.remove(b"second").unwrap());
+    let transaction = db.begin_transaction();
+    assert!(!index
+        .remove(&transaction, ShardType::EventDag, b"second")
+        .unwrap());
+    transaction.commit().unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn staged_remove_many_is_stale_if_a_key_changes_concurrently() {
+    let root = test_root("remove_stale");
+    let db = Database::open(root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(db.event_dag().as_ref(), "remove_stale");
+    index.put(b"key", b"v1").unwrap();
+
+    let remover = db.begin_transaction();
+    assert_eq!(
+        index
+            .stage_remove_many(&remover, ShardType::EventDag, &[b"key"])
+            .unwrap(),
+        1
+    );
+
+    // Concurrent writer replaces the value after the envelope check.
+    index.put(b"key", b"v2").unwrap();
+
+    assert!(matches!(
+        remover.commit(),
+        Err(StorageError::StaleRead { .. })
+    ));
+    // The removal was not published; the concurrent write survived.
+    assert_eq!(index.get(b"key").unwrap(), Some(b"v2".to_vec()));
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

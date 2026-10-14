@@ -223,6 +223,14 @@ pub struct DatabaseTransaction<'a> {
 }
 
 impl DatabaseTransaction<'_> {
+    /// Return the address identity of a pool used by this transaction.
+    ///
+    /// This is intended for adapters that also hold a direct engine reference
+    /// and must ensure their transactional writes target that same engine.
+    pub(crate) fn pool_identity(&self, pool: ShardType) -> usize {
+        Arc::as_ptr(self.database.pool(pool)) as usize
+    }
+
     /// Stage a record for `pool` without changing its live pack or index.
     ///
     /// # Errors
