@@ -335,6 +335,28 @@ pub trait StorageEngine: Send + Sync {
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError>;
 
+    /// Remove one record from a collection. Missing records are a no-op.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on storage failure.
+    fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError>;
+
+    /// Remove multiple records from a collection. The default implementation
+    /// removes them one at a time; engines with batch transaction support may
+    /// override it.
+    ///
+    /// # Errors
+    /// Returns `StorageError::Io` on storage failure.
+    fn remove_many(&self, collection_id: &[u8; 16], ids: &[NodeId]) -> Result<usize, StorageError> {
+        let mut removed: usize = 0;
+        for id in ids {
+            removed = removed
+                .checked_add(usize::from(self.remove(collection_id, id)?))
+                .ok_or_else(|| StorageError::Internal("remove count overflow".to_owned()))?;
+        }
+        Ok(removed)
+    }
+
     /// Delete all nodes for a given collection (range delete).
     ///
     /// # Errors
@@ -1124,6 +1146,14 @@ impl StorageEngine for InMemoryStorage {
             collection.insert(*id, data.clone());
         }
         Ok(entries.len())
+    }
+
+    fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError> {
+        Ok(self
+            .collections
+            .write()
+            .get_mut(collection_id)
+            .is_some_and(|collection| collection.remove(id).is_some()))
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {

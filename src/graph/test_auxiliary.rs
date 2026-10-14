@@ -59,6 +59,25 @@ fn get_many_rejects_a_corrupt_envelope() {
 }
 
 #[test]
+fn remove_and_remove_many_delete_values_and_are_idempotent() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "remove_values");
+    index.put(b"first", b"one").unwrap();
+    index.put(b"second", b"two").unwrap();
+
+    assert!(index.remove(b"first").unwrap());
+    assert!(!index.remove(b"first").unwrap());
+    assert_eq!(index.get(b"first").unwrap(), None);
+    assert_eq!(
+        index
+            .remove_many(&[b"second", b"missing", b"second"])
+            .unwrap(),
+        1
+    );
+    assert_eq!(index.get(b"second").unwrap(), None);
+}
+
+#[test]
 fn envelope_retains_full_key_digest() {
     let engine = InMemoryStorage::new();
     let index = AuxiliaryIndex::open(&engine, "test");

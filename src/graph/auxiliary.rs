@@ -257,6 +257,59 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
         }
         self.engine.put_many(&self.collection_id, &physical)
     }
+
+    /// Remove a value by its logical key. Returns `true` if a value existed.
+    /// The full digest envelope is checked before removal, so a truncated-id
+    /// collision cannot delete another key's value.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Collision`] for a digest collision,
+    /// [`StorageError::Corrupt`] for a malformed value, or propagates a
+    /// storage error.
+    pub fn remove(&self, key: &[u8]) -> Result<bool, StorageError> {
+        Ok(self.remove_many(&[key])? != 0)
+    }
+
+    /// Remove several values by logical key, returning the number removed.
+    /// Duplicate keys are removed once. Existing envelopes are validated
+    /// before the storage engine is asked to remove any records.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Collision`] for a digest collision,
+    /// [`StorageError::Corrupt`] for a malformed value, or propagates a
+    /// storage error.
+    pub fn remove_many(&self, keys: &[&[u8]]) -> Result<usize, StorageError> {
+        let mut ids = Vec::with_capacity(keys.len());
+        let mut digests_by_id: HashMap<NodeId, AuxiliaryKeyDigest> =
+            HashMap::with_capacity(keys.len());
+        for key in keys {
+            let digest = auxiliary_key_digest(key);
+            let id = physical_id(&digest);
+            if let Some(previous) = digests_by_id.insert(id, digest) {
+                if previous != digest {
+                    return Err(StorageError::Collision(
+                        "auxiliary-index key digest collision".to_owned(),
+                    ));
+                }
+            } else {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let existing = self.engine.get_many(&self.collection_id, &ids)?;
+        for (id, record) in ids.iter().zip(&existing) {
+            if let Some(record) = record {
+                let digest = digests_by_id.get(id).ok_or_else(|| {
+                    StorageError::Internal("auxiliary digest lookup failed".to_owned())
+                })?;
+                decode_value(digest, &record.bytes)?;
+            }
+        }
+        self.engine.remove_many(&self.collection_id, &ids)
+    }
 }
 
 fn decode_value(

@@ -9860,6 +9860,10 @@ impl StorageEngine for PackfileStorage {
         self.put_many_internal(collection_id, entries, None)
     }
 
+    fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError> {
+        self.remove_record(collection_id, id)
+    }
+
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
         let _snapshot_gate = self.read_snapshot_gate.lock();
         // Acquire the collection's put mutex to serialize with any in-flight put,
