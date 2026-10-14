@@ -653,27 +653,27 @@ fn encode_record_id_rule(rule: &RecordIdentityRule) -> Vec<u8> {
 }
 
 fn decode_record_id_rule(bytes: &[u8]) -> Option<RecordIdentityRule> {
-    let mut rule = RecordIdentityRule {
-        policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
-        digest_algorithm: DigestAlgorithm::Sha256,
-    };
-    let mut has_digest_algorithm = false;
-    let mut has_policy = false;
+    let mut digest_algorithm = None;
+    let mut policy = None;
     let mut reader = TlvReader::new(bytes);
     while let Some((tag, value)) = reader.next() {
         match tag {
             IDENTITY_TAG_DIGEST_ALGORITHM => {
-                rule.digest_algorithm = DigestAlgorithm::from_id(*value.first()?);
-                has_digest_algorithm = true;
+                digest_algorithm = Some(DigestAlgorithm::from_id(*value.first()?));
             }
             IDENTITY_TAG_POLICY => {
-                rule.policy = decode_frame_id_policy(value)?;
-                has_policy = true;
+                policy = Some(decode_frame_id_policy(value)?);
             }
             _ => {}
         }
     }
-    (reader.is_exhausted() && has_digest_algorithm && has_policy).then_some(rule)
+    if !reader.is_exhausted() {
+        return None;
+    }
+    Some(RecordIdentityRule {
+        policy: policy?,
+        digest_algorithm: digest_algorithm?,
+    })
 }
 
 fn encode_payload(payload: &PayloadPolicy) -> Vec<u8> {
@@ -825,7 +825,7 @@ impl CollectionMetadata {
             collection_canonical_id: Vec::new(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
-                digest_algorithm: DigestAlgorithm::Sha256,
+                digest_algorithm: DigestAlgorithm::Blake3,
             },
             payload: PayloadPolicy::Source,
             extension: None,

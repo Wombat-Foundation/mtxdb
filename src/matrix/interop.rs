@@ -130,7 +130,7 @@ pub fn event_state_root_node_id(event_id: &[u8]) -> [u8; 16] {
 /// Version of the export/import data contract the marker vouches for. Bump
 /// it when a stored layout below changes incompatibly, so an older database
 /// is refused instead of misread.
-pub const DATA_FORMAT: u8 = 1;
+pub const DATA_FORMAT: u8 = 2;
 
 /// Derive a 128-bit BLAKE3 identifier from a domain and logical identifier.
 ///
