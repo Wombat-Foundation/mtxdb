@@ -252,6 +252,40 @@ fn transactional_append_uses_head_cas_and_can_be_retried() {
 }
 
 #[test]
+fn all_duplicates_append_does_not_bump_head_version() {
+    let db_path = test_root("append_dupes");
+    let db = Database::open(db_path.clone()).unwrap();
+    let room_id = [6u8; 16];
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_dupes");
+    let entry = full(room_id, 1, 1, 1);
+    index.build(&[entry]).unwrap();
+
+    let (_, before) = db
+        .event_dag()
+        .get_with_record_versions(&index.collection_id(), &[TIMELINE_HEAD_ID])
+        .unwrap();
+
+    // Stage an append whose entries are all already present.
+    let txn = db.begin_transaction();
+    index
+        .stage_append(&txn, ShardType::EventDag, &[entry, entry])
+        .unwrap();
+    txn.commit().unwrap();
+
+    let (_, after) = db
+        .event_dag()
+        .get_with_record_versions(&index.collection_id(), &[TIMELINE_HEAD_ID])
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "an all-duplicates append must not bump the head version"
+    );
+    assert_eq!(collect(&index, &room_id, true, 10), vec![entry]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&db_path);
+}
+
+#[test]
 fn concurrent_first_appends_use_absent_head_cas() {
     let db_path = test_root("append_first_cas");
     let db = Database::open(db_path.clone()).unwrap();
