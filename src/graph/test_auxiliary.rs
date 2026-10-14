@@ -1,6 +1,15 @@
 use super::*;
+use crate::database::Database;
+use crate::layout::ShardType;
 use crate::storage::{InMemoryStorage, StorageEngine};
 use crate::template::MEMBER_NAMESPACE_INTL;
+use std::path::PathBuf;
+
+fn test_root(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("mtxdb-aux-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
 
 #[test]
 fn named_indexes_share_storage_but_have_distinct_collections() {
@@ -59,22 +68,28 @@ fn get_many_rejects_a_corrupt_envelope() {
 }
 
 #[test]
-fn remove_and_remove_many_delete_values_and_are_idempotent() {
-    let engine = InMemoryStorage::new();
-    let index = AuxiliaryIndex::open(&engine, "remove_values");
-    index.put(b"first", b"one").unwrap();
+fn remove_and_staged_remove_many_delete_values_and_are_idempotent() {
+    let root = test_root("remove_values");
+    let db = Database::open(root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(db.event_dag().as_ref(), "remove_values");
     index.put(b"second", b"two").unwrap();
-
-    assert!(index.remove(b"first").unwrap());
-    assert!(!index.remove(b"first").unwrap());
-    assert_eq!(index.get(b"first").unwrap(), None);
+    let transaction = db.begin_transaction();
     assert_eq!(
         index
-            .remove_many(&[b"second", b"missing", b"second"])
+            .stage_remove_many(
+                &transaction,
+                ShardType::EventDag,
+                &[b"second", b"missing", b"second"],
+            )
             .unwrap(),
         1
     );
+    assert_eq!(index.get(b"second").unwrap(), Some(b"two".to_vec()));
+    transaction.commit().unwrap();
     assert_eq!(index.get(b"second").unwrap(), None);
+    assert!(!index.remove(b"second").unwrap());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

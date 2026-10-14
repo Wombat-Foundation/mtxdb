@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 
+use crate::database::DatabaseTransaction;
+use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{
     derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
@@ -267,18 +269,33 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     /// [`StorageError::Corrupt`] for a malformed value, or propagates a
     /// storage error.
     pub fn remove(&self, key: &[u8]) -> Result<bool, StorageError> {
-        Ok(self.remove_many(&[key])? != 0)
+        let digest = auxiliary_key_digest(key);
+        let id = physical_id(&digest);
+        if let Some(record) = self.engine.get(&self.collection_id, &id)? {
+            decode_value(&digest, &record.bytes)?;
+            self.engine.remove(&self.collection_id, &id)
+        } else {
+            Ok(false)
+        }
     }
 
-    /// Remove several values by logical key, returning the number removed.
-    /// Duplicate keys are removed once. Existing envelopes are validated
-    /// before the storage engine is asked to remove any records.
+    /// Stage several removals in one database transaction, returning the
+    /// number of values present in the transaction's read snapshot. The caller
+    /// must commit `transaction` to publish the removals. Duplicate keys are
+    /// removed once. Record-version preconditions protect the envelope checks
+    /// from concurrent replacement between validation and commit.
     ///
     /// # Errors
     /// Returns [`StorageError::Collision`] for a digest collision,
     /// [`StorageError::Corrupt`] for a malformed value, or propagates a
-    /// storage error.
-    pub fn remove_many(&self, keys: &[&[u8]]) -> Result<usize, StorageError> {
+    /// storage error. A concurrent change is reported as
+    /// [`StorageError::StaleRead`] when the transaction is committed.
+    pub fn stage_remove_many(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        keys: &[&[u8]],
+    ) -> Result<usize, StorageError> {
         let mut ids = Vec::with_capacity(keys.len());
         let mut digests_by_id: HashMap<NodeId, AuxiliaryKeyDigest> =
             HashMap::with_capacity(keys.len());
@@ -299,16 +316,27 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
             return Ok(0);
         }
 
-        let existing = self.engine.get_many(&self.collection_id, &ids)?;
-        for (id, record) in ids.iter().zip(&existing) {
+        let (existing, versions) =
+            transaction.get_with_record_versions(pool, &self.collection_id, &ids)?;
+        let mut present = 0usize;
+        for ((id, record), version) in ids.iter().zip(&existing).zip(versions) {
             if let Some(record) = record {
                 let digest = digests_by_id.get(id).ok_or_else(|| {
                     StorageError::Internal("auxiliary digest lookup failed".to_owned())
                 })?;
                 decode_value(digest, &record.bytes)?;
+                present = present.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("auxiliary removal count overflow".to_owned())
+                })?;
             }
+            transaction
+                .expect_record_version(pool, self.collection_id, *id, version)
+                .map_err(StorageError::Io)?;
         }
-        self.engine.remove_many(&self.collection_id, &ids)
+        transaction
+            .remove_many(pool, self.collection_id, &ids)
+            .map_err(StorageError::Io)?;
+        Ok(present)
     }
 }
 
