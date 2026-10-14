@@ -378,13 +378,20 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// The root manifest is rewritten because it lists every leaf.
     ///
     /// Duplicate entries are ignored, both within the input and against the
-    /// existing index. The caller must commit the transaction to publish the
-    /// leaves, new root, and head together.
+    /// existing index. If every entry is a duplicate, the current root is
+    /// returned without changing the head. Collection metadata is ensured
+    /// through the index's storage engine before staging, so that idempotent
+    /// metadata write is outside this transaction. The caller must commit the
+    /// transaction to publish the leaves, new root, and head together.
     ///
     /// # Errors
     /// Propagates backend errors, or returns [`StorageError::Corrupt`] for
     /// malformed existing records and [`StorageError::Internal`] if the
     /// resulting entry count cannot be represented.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "staging is one atomic merge operation"
+    )]
     pub fn stage_append(
         &self,
         transaction: &DatabaseTransaction<'_>,
@@ -417,13 +424,11 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         } else {
             (None, 0, Vec::new())
         };
-        if new_entries.is_empty() && old_root_id.is_some() {
-            return old_root_id
-                .ok_or_else(|| StorageError::Internal("timeline head disappeared".to_owned()));
+        if new_entries.is_empty() {
+            if let Some(root_id) = old_root_id {
+                return Ok(root_id);
+            }
         }
-        transaction
-            .expect_record_version(pool, self.collection_id, TIMELINE_HEAD_ID, head_version)
-            .map_err(StorageError::Io)?;
 
         let mut pending = new_entries.to_vec();
         pending.sort_unstable();
@@ -447,14 +452,14 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
                 .saturating_add(1),
         );
         let mut inserted = 0u64;
+        let mut pending_leaf_records = Vec::new();
         if manifest.is_empty() {
-            self.stage_merged_leaves(
-                transaction,
-                pool,
+            Self::stage_merged_leaves(
                 &[],
                 &assigned[0],
                 &mut next_manifest,
                 &mut inserted,
+                &mut pending_leaf_records,
             )?;
         } else {
             for (index, (_, leaf_id)) in manifest.iter().enumerate() {
@@ -468,15 +473,28 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
                     .and_then(Option::as_ref)
                     .ok_or(StorageError::NotFound(*leaf_id))?;
                 let old_leaf = decode_leaf(&leaf_record.bytes)?;
-                self.stage_merged_leaves(
-                    transaction,
-                    pool,
+                Self::stage_merged_leaves(
                     &old_leaf,
                     &assigned[index],
                     &mut next_manifest,
                     &mut inserted,
+                    &mut pending_leaf_records,
                 )?;
             }
+        }
+
+        if inserted == 0 {
+            if let Some(root_id) = old_root_id {
+                return Ok(root_id);
+            }
+        }
+
+        transaction
+            .expect_record_version(pool, self.collection_id, TIMELINE_HEAD_ID, head_version)
+            .map_err(StorageError::Io)?;
+
+        for (leaf_id, payload) in pending_leaf_records {
+            self.stage_record(transaction, pool, &leaf_id, payload)?;
         }
 
         let count = old_count
@@ -622,13 +640,11 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     }
 
     fn stage_merged_leaves(
-        &self,
-        transaction: &DatabaseTransaction<'_>,
-        pool: ShardType,
         existing: &[TimelineEntry],
         incoming: &[TimelineEntry],
         manifest: &mut Vec<(TimelineEntry, NodeId)>,
         inserted: &mut u64,
+        pending_records: &mut Vec<(NodeId, Vec<u8>)>,
     ) -> Result<(), StorageError> {
         let mut merged = Vec::with_capacity(existing.len().saturating_add(incoming.len()));
         let (mut left, mut right) = (0, 0);
@@ -662,11 +678,11 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         for chunk in merged.chunks(TIMELINE_LEAF_CAP) {
             let payload = encode_leaf(chunk)?;
             let id = content_id(&payload);
-            self.stage_record(transaction, pool, &id, payload)?;
             let first = *chunk
                 .first()
                 .ok_or_else(|| StorageError::Internal("empty timeline leaf".to_owned()))?;
             manifest.push((first, id));
+            pending_records.push((id, payload));
         }
         Ok(())
     }

@@ -336,6 +336,47 @@ fn transactional_append_rejects_a_different_database_pool() {
     let _ = std::fs::remove_dir_all(second_path);
 }
 
+#[test]
+fn transactional_append_of_duplicates_does_not_rewrite_the_head() {
+    let db_path = test_root("append_duplicate_transaction");
+    let db = Database::open(db_path.clone()).unwrap();
+    let room_id = [7u8; 16];
+    let existing = full(room_id, 1, 1, 1);
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_duplicate_transaction");
+    let old_root = index.build(&[existing]).unwrap();
+
+    let observer = db.begin_transaction();
+    let (_, versions) = observer
+        .get_with_record_versions(
+            ShardType::EventDag,
+            &index.collection_id(),
+            &[TIMELINE_HEAD_ID],
+        )
+        .unwrap();
+    observer
+        .expect_record_version(
+            ShardType::EventDag,
+            index.collection_id(),
+            TIMELINE_HEAD_ID,
+            versions[0],
+        )
+        .unwrap();
+
+    let duplicate = db.begin_transaction();
+    assert_eq!(
+        index
+            .stage_append(&duplicate, ShardType::EventDag, &[existing])
+            .unwrap(),
+        old_root
+    );
+    duplicate.commit().unwrap();
+    observer.commit().unwrap();
+    assert_eq!(index.head().unwrap().unwrap().0, old_root);
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
 fn full(room: [u8; 16], topological: i64, stream: i64, seed: u8) -> TimelineEntry {
     let mut node_id = [0u8; 16];
     node_id[0] = seed;
