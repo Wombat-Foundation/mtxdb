@@ -8,10 +8,11 @@
 //! and node derivations, and the data-format version the import marker
 //! vouches for.
 //!
-//! Identity note: collection and node ids here use SHA-256 with explicit
-//! domain separation, not mtxdb's BLAKE3 collection derivation. These ids
-//! are written by the server adapters and must stay stable for databases
-//! that already exist; changing the hash would orphan every stored record.
+//! Identity note: room collection ids use mtxdb's BLAKE3 group derivation
+//! plus a namespace bias. Other interop ids use BLAKE3-128; where multiple
+//! logical ids share a collection, their derivation uses a NUL-separated
+//! domain tag. Event record ids deliberately match the Matrix template's
+//! BLAKE3-128 of the complete event id.
 //!
 //! State HAMT construction and state derivation are deliberately not
 //! implemented here. The server and offline importer must use the same
@@ -131,7 +132,7 @@ pub fn event_state_root_node_id(event_id: &[u8]) -> [u8; 16] {
 /// is refused instead of misread.
 pub const DATA_FORMAT: u8 = 1;
 
-/// Derive a 128-bit identifier from a domain and logical identifier.
+/// Derive a 128-bit BLAKE3 identifier from a domain and logical identifier.
 ///
 /// The domain is length-delimited by a NUL separator, so identifiers from
 /// different domains cannot share an input stream. Callers that need
@@ -139,15 +140,13 @@ pub const DATA_FORMAT: u8 = 1;
 /// derived id — 128 bits is not enough to rule out a collision by itself.
 #[must_use]
 pub fn derive_id(domain: &[u8], identifier: &[u8]) -> [u8; 16] {
-    use sha2::{Digest as _, Sha256};
-
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(identifier);
 
     let mut id = [0_u8; 16];
-    id.copy_from_slice(&hasher.finalize()[..16]);
+    id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     id
 }
 
@@ -191,7 +190,10 @@ impl Verdict {
 /// Derive an event record id from an event id.
 #[must_use]
 pub fn event_record_id(event_id: &[u8]) -> [u8; 16] {
-    derive_id(b"event", event_id)
+    let digest = blake3::hash(event_id);
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    id
 }
 
 /// Derive the per-event verdict collection holding `node`.

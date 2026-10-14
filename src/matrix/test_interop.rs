@@ -5,6 +5,11 @@ fn derive_id_separates_domains_and_is_stable() {
     assert_eq!(derive_id(b"event", b"x"), derive_id(b"event", b"x"));
     assert_ne!(derive_id(b"event", b"x"), derive_id(b"root", b"x"));
     assert_ne!(derive_id(b"event", b"x"), derive_id(b"event", b"y"));
+    let event_digest = crate::storage::DigestAlgorithm::Blake3.digest(b"$event:example.com");
+    assert_eq!(
+        &event_record_id(b"$event:example.com")[..],
+        &event_digest[..16]
+    );
 }
 
 #[test]
@@ -44,11 +49,11 @@ fn state_layout_ids_match_the_server_pinned_layout() {
     assert_eq!(state_hamt_node_id(&structural_hash), [0x11; 16]);
     assert_eq!(
         hex(&room_state_root_node_id()),
-        "0463880c2405d3407f4c3e12f7858b65"
+        "3fa8ef6f8d891872b0e4a05165972dfe"
     );
     assert_eq!(
         hex(&event_state_root_node_id(event)),
-        "161f86168f7cce258d2bdb7c6eade04f"
+        "97ef9503cbbf4df387c4dd8eb3d7ccfa"
     );
 }
 
@@ -180,7 +185,7 @@ fn hex(bytes: &[u8]) -> String {
 fn event_collection_ids_are_pinned() {
     let room = b"!room:example.com";
     let node = event_record_id(b"$event:example.com");
-    assert_eq!(hex(&node), "f4f315ab8b948ccb0355c85e9d609ccd");
+    assert_eq!(hex(&node), "d3930850aae2d72b92a1d07108dcaa7f");
     assert_eq!(
         hex(&room_event_collection_id(room)),
         "9507be45c492c4382edb18fc074477cc"
@@ -195,7 +200,7 @@ fn event_collection_ids_are_pinned() {
     );
     assert_eq!(
         hex(&event_locator_collection_id(&node)),
-        "9d34360b21fa7f1ad961f46fb7b25857"
+        "8630e25f0c7e1a94558485e7176a1bda"
     );
     assert_ne!(
         room_event_collection_id(room),
@@ -263,19 +268,19 @@ fn outlier_flag_is_part_of_the_verdict_record() {
 fn auth_chain_records_are_pinned_and_round_trip() {
     assert_eq!(
         hex(&auth_counter_record_id()),
-        "107eed6ef642cc6e219edd8a43cafaad"
+        "82f29a189df9d4f1ce570f12c1d2c503"
     );
     assert_eq!(
         hex(&auth_forward_record_id(b"$e:x")),
-        "16a53f37238f9d0c2adbba80aa84661f"
+        "a4bcb32a1124a90417ed80a8e041c52e"
     );
     assert_eq!(
         hex(&auth_reverse_record_id(7)),
-        "a80ce9b45f60f10d32afb99f79d8cafe"
+        "1c1be185af0d4bceb68f842fb6203b27"
     );
     assert_eq!(
         hex(&auth_closure_record_id(7)),
-        "4d225a7b56f203a482578ff4b59b82b6"
+        "9f23b01a4899ca947d360350824645da"
     );
     assert_ne!(auth_reverse_record_id(7), auth_closure_record_id(7));
     assert_ne!(auth_reverse_record_id(7), auth_reverse_record_id(8));
