@@ -151,6 +151,55 @@ fn empty_index_pages_nothing() {
     assert!(index.head().unwrap().is_some());
 }
 
+#[test]
+fn append_inserts_into_existing_ranges_and_ignores_duplicates() {
+    let room = [1u8; 16];
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "append_ranges");
+    let original: Vec<_> = (0..300u16)
+        .map(|n| full(room, i64::from(n * 2), i64::from(n), (n % 251) as u8))
+        .collect();
+    index.build(&original).unwrap();
+
+    let before = index.page(&room, None, true, 3).unwrap();
+    let old_cursor = before.next_cursor.unwrap();
+    let inserted = [
+        full(room, -1, -1, 240),
+        full(room, 199, 1000, 241),
+        full(room, 401, 1001, 242),
+        original[100], // already present
+    ];
+    index.append(&inserted).unwrap();
+
+    let mut expected = original;
+    expected.extend(inserted);
+    expected.sort_unstable();
+    expected.dedup();
+    assert_eq!(collect(&index, &room, true, 17), expected);
+
+    // The cursor continues to read the root that was current before append.
+    let old_page = index.page(&room, Some(&old_cursor), true, 5).unwrap();
+    assert!(old_page
+        .entries
+        .iter()
+        .all(|entry| !inserted.contains(entry)));
+}
+
+#[test]
+fn append_to_empty_index_and_empty_append_are_well_defined() {
+    let room = [3u8; 16];
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "append_empty");
+    let entries = [full(room, 2, 4, 1), full(room, 1, 3, 2)];
+
+    index.append(&entries).unwrap();
+    let mut expected = entries.to_vec();
+    expected.sort_unstable();
+    assert_eq!(collect(&index, &room, true, 10), expected);
+    let root_id = index.head().unwrap().unwrap().0;
+    assert_eq!(index.append(&[]).unwrap(), root_id);
+}
+
 fn full(room: [u8; 16], topological: i64, stream: i64, seed: u8) -> TimelineEntry {
     let mut node_id = [0u8; 16];
     node_id[0] = seed;

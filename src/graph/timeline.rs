@@ -347,6 +347,135 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         Ok(root_id)
     }
 
+    /// Insert entries into the current index, preserving older roots for
+    /// cursors that already reference them. Only leaves whose key ranges are
+    /// touched by `entries` are read and rewritten; untouched leaf records are
+    /// reused. The root manifest is rewritten because it lists every leaf.
+    ///
+    /// Duplicate entries are ignored, both within the input and against the
+    /// existing index. Calling this with an empty index is equivalent to
+    /// [`Self::build`].
+    ///
+    /// # Errors
+    /// Propagates backend errors, or returns [`StorageError::Corrupt`] for
+    /// malformed existing records and [`StorageError::Internal`] if the
+    /// resulting entry count cannot be represented.
+    pub fn append(&self, new_entries: &[TimelineEntry]) -> Result<NodeId, StorageError> {
+        self.ensure_metadata()?;
+        let Some((old_root_id, old_count)) = self.head()? else {
+            return self.build(new_entries);
+        };
+        if new_entries.is_empty() {
+            return Ok(old_root_id);
+        }
+
+        let root_bytes = self
+            .engine
+            .get(&self.collection_id, &old_root_id)?
+            .ok_or(StorageError::NotFound(old_root_id))?;
+        let manifest = decode_root(&root_bytes.bytes)?;
+        let mut pending = new_entries.to_vec();
+        pending.sort_unstable();
+        pending.dedup();
+
+        // Assign each incoming key to the leaf whose range it overlaps.
+        // Entries before the first leaf or after the last leaf are merged
+        // into the nearest edge leaf, keeping the manifest compact.
+        let mut assigned = vec![Vec::new(); manifest.len().max(1)];
+        for entry in pending {
+            let index = if manifest.is_empty() {
+                0
+            } else {
+                manifest
+                    .partition_point(|(first, _)| *first <= entry)
+                    .saturating_sub(1)
+            };
+            assigned[index].push(entry);
+        }
+
+        let mut next_manifest = Vec::with_capacity(
+            manifest
+                .len()
+                .saturating_add(new_entries.len() / TIMELINE_LEAF_CAP)
+                .saturating_add(1),
+        );
+        let mut inserted = 0u64;
+        if manifest.is_empty() {
+            self.write_merged_leaves(&[], &assigned[0], &mut next_manifest, &mut inserted)?;
+        } else {
+            for (index, (_, leaf_id)) in manifest.iter().enumerate() {
+                if assigned[index].is_empty() {
+                    next_manifest.push(manifest[index]);
+                    continue;
+                }
+                let old_leaf = self.load_leaf(leaf_id)?;
+                self.write_merged_leaves(
+                    &old_leaf,
+                    &assigned[index],
+                    &mut next_manifest,
+                    &mut inserted,
+                )?;
+            }
+        }
+
+        let count = old_count
+            .checked_add(inserted)
+            .ok_or_else(|| StorageError::Internal("timeline entry count overflow".to_owned()))?;
+        let root_payload = encode_root(&next_manifest, count)?;
+        let root_id = content_id(&root_payload);
+        self.write_record(&root_id, root_payload)?;
+        self.write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, count))?;
+        Ok(root_id)
+    }
+
+    fn write_merged_leaves(
+        &self,
+        existing: &[TimelineEntry],
+        incoming: &[TimelineEntry],
+        manifest: &mut Vec<(TimelineEntry, NodeId)>,
+        inserted: &mut u64,
+    ) -> Result<(), StorageError> {
+        let mut merged = Vec::with_capacity(existing.len().saturating_add(incoming.len()));
+        let (mut left, mut right) = (0, 0);
+        while left < existing.len() || right < incoming.len() {
+            let take_existing = right == incoming.len()
+                || (left < existing.len() && existing[left] <= incoming[right]);
+            let entry = if take_existing {
+                let entry = existing[left];
+                left = left.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("timeline merge offset overflow".to_owned())
+                })?;
+                if right < incoming.len() && incoming[right] == entry {
+                    right = right.checked_add(1).ok_or_else(|| {
+                        StorageError::Internal("timeline merge offset overflow".to_owned())
+                    })?;
+                }
+                entry
+            } else {
+                let entry = incoming[right];
+                right = right.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("timeline merge offset overflow".to_owned())
+                })?;
+                *inserted = inserted.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("timeline entry count overflow".to_owned())
+                })?;
+                entry
+            };
+            merged.push(entry);
+        }
+
+        for chunk in merged.chunks(TIMELINE_LEAF_CAP) {
+            let payload = encode_leaf(chunk)?;
+            let id = content_id(&payload);
+            self.write_record(&id, payload)?;
+            let first = *chunk
+                .first()
+                .ok_or_else(|| StorageError::Internal("empty timeline leaf".to_owned()))?;
+            manifest.push((first, id));
+        }
+        Ok(())
+    }
+
     /// The current head's `(root_id, entry_count)`, if the index was built.
     ///
     /// # Errors
