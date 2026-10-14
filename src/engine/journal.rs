@@ -173,6 +173,10 @@ pub struct RecordExpectation {
 /// Kept below the journal's 256 MiB group limit to leave room for framing and
 /// other transactions sharing the process.
 pub const MAX_TXN_STAGE_BYTES: usize = 64 << 20;
+/// Bytes charged to a staged put for journal and mutation framing, in addition
+/// to its payload. Kept public so bounded batch builders can size transactions
+/// using the same accounting as [`TxnStage::stage_put`].
+pub const TXN_STAGE_PUT_OVERHEAD_BYTES: usize = 64;
 
 /// A transaction staged more than its configured stage limit.
 ///
@@ -610,7 +614,7 @@ impl TxnStage {
         node_id: [u8; 16],
         payload: Vec<u8>,
     ) -> io::Result<()> {
-        let charge = payload.len().saturating_add(64);
+        let charge = payload.len().saturating_add(TXN_STAGE_PUT_OVERHEAD_BYTES);
         let mut data = self.data.lock();
         if self.state.load(Ordering::Acquire) != Self::ACTIVE {
             return Err(io::Error::other("transaction stage is not active"));

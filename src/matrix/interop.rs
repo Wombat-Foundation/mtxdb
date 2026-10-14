@@ -12,6 +12,11 @@
 //! domain separation, not mtxdb's BLAKE3 collection derivation. These ids
 //! are written by the server adapters and must stay stable for databases
 //! that already exist; changing the hash would orphan every stored record.
+//!
+//! State HAMT construction and state derivation are deliberately not
+//! implemented here. The server and offline importer must use the same
+//! `rezzy` HAMT builder and encoding; this module owns only stable mtxdb
+//! collection/node identities and bounded publication helpers.
 
 use crate::{
     derive_group_full_id, derive_member_collection_id_from_group, storage::StorageError, ShardType,
@@ -425,7 +430,7 @@ pub const LOCATOR_VERSION: u8 = 1;
 
 fn room_member_collection(namespace: [u8; 4], room_id: &[u8]) -> [u8; 16] {
     derive_member_collection_id_from_group(namespace, derive_group_full_id(room_id))
-        .expect("event, prev and auth are valid member namespaces")
+        .expect("Matrix member namespace is registered")
 }
 
 /// Derive the collection holding a room's event bodies.
@@ -444,6 +449,78 @@ pub fn room_prev_collection_id(room_id: &[u8]) -> [u8; 16] {
 #[must_use]
 pub fn room_auth_collection_id(room_id: &[u8]) -> [u8; 16] {
     room_member_collection(MEMBER_NAMESPACE_AUTH, room_id)
+}
+
+/// Stable record ids used by the persisted auth-closure index in a room's
+/// auth collection. Closure payloads are rezzy `Bitmap::encode()` bytes; the
+/// forward value is `[u32 BE short id][event id]`, reverse values are raw
+/// event ids, and the counter is one `u32 BE`.
+#[must_use]
+pub fn auth_closure_counter_node_id() -> [u8; 16] {
+    derive_id(b"authchain:counter", b"")
+}
+
+/// Encode the room-local auth-closure short-id counter as `u32 BE`.
+#[must_use]
+pub const fn encode_auth_closure_counter(value: u32) -> [u8; 4] {
+    value.to_be_bytes()
+}
+
+/// Decode the room-local auth-closure short-id counter.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] unless the value is exactly four bytes.
+pub fn decode_auth_closure_counter(bytes: &[u8]) -> Result<u32, StorageError> {
+    let value = <[u8; 4]>::try_from(bytes)
+        .map_err(|_| StorageError::Corrupt("malformed auth-closure counter".to_owned()))?;
+    Ok(u32::from_be_bytes(value))
+}
+
+/// Forward mapping from event id to the room-local short id.
+#[must_use]
+pub fn auth_closure_forward_node_id(event_id: &[u8]) -> [u8; 16] {
+    derive_id(b"authchain:fwd", event_id)
+}
+
+/// Reverse mapping from room-local short id to the raw event id.
+#[must_use]
+pub fn auth_closure_reverse_node_id(short_id: u32) -> [u8; 16] {
+    derive_id(b"authchain:rev", &short_id.to_be_bytes())
+}
+
+/// Persisted transitive-closure bitmap for a room-local short id.
+#[must_use]
+pub fn auth_closure_bitmap_node_id(short_id: u32) -> [u8; 16] {
+    derive_id(b"authchain:closure", &short_id.to_be_bytes())
+}
+
+/// Encode a persisted auth-closure forward mapping as `[u32 BE][event id]`.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] if the length cannot be represented.
+pub fn encode_auth_closure_forward(
+    short_id: u32,
+    event_id: &[u8],
+) -> Result<Vec<u8>, StorageError> {
+    let capacity = event_id
+        .len()
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Corrupt("auth event id is too large".to_owned()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(&short_id.to_be_bytes());
+    bytes.extend_from_slice(event_id);
+    Ok(bytes)
+}
+
+/// Decode a persisted auth-closure forward mapping.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] for a value shorter than the 4-byte id.
+pub fn decode_auth_closure_forward(bytes: &[u8]) -> Result<(u32, &[u8]), StorageError> {
+    let (short, event_id) = bytes.split_first_chunk::<4>().ok_or_else(|| {
+        StorageError::Corrupt("malformed auth-closure forward mapping".to_owned())
+    })?;
+    Ok((u32::from_be_bytes(*short), event_id))
 }
 
 /// Derive the event-locator collection holding `node`.
@@ -649,3 +726,121 @@ pub fn decode_import_marker(bytes: &[u8]) -> Result<ImportMarker, StorageError> 
 #[cfg(test)]
 #[path = "test_interop.rs"]
 mod tests;
+
+/// Pool holding HAMT nodes and state roots.
+pub const STATE_POOL: ShardType = ShardType::State;
+
+/// Derive the collection holding a room's content-addressed HAMT nodes.
+#[must_use]
+pub fn room_state_collection_id(room_id: &[u8]) -> [u8; 16] {
+    room_member_collection(MEMBER_NAMESPACE_STAT, room_id)
+}
+
+/// Derive the collection holding a room's current root and per-event roots.
+#[must_use]
+pub fn room_roots_collection_id(room_id: &[u8]) -> [u8; 16] {
+    room_member_collection(MEMBER_NAMESPACE_STGP, room_id)
+}
+
+/// Node id of a HAMT node: the first 16 bytes of its structural hash. Readers
+/// must verify the full 32-byte hash, since the id is only 128 bits.
+#[must_use]
+pub fn hamt_node_id(structural_hash: &[u8; 32]) -> [u8; 16] {
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&structural_hash[..16]);
+    id
+}
+
+/// Node id of a room's current state root in its roots collection.
+#[must_use]
+pub fn room_root_node_id() -> [u8; 16] {
+    derive_id(b"root", b"current")
+}
+
+/// Node id of an event's state root in its room's roots collection.
+#[must_use]
+pub fn event_root_node_id(event_id: &[u8]) -> [u8; 16] {
+    derive_id(b"event-root", event_id)
+}
+
+/// Default charged staging budget per state batch, including per-put framing.
+pub const STATE_BATCH_BYTES: usize = 48 << 20;
+
+/// Stage HAMT nodes, then roots, into bounded transactions of at most
+/// `batch_bytes` charged bytes, committing each before the next begins.
+///
+/// All nodes are committed before any root, so a reader that finds a root
+/// always finds the nodes beneath it, even across batches. An interrupted run
+/// leaves only unreferenced nodes, which are content-addressed and safe to
+/// rewrite. `nodes` and `roots` are `(collection, node id, bytes)`; the caller
+/// derives ids with the functions above. Returns the number of transactions
+/// committed.
+///
+/// # Errors
+/// Returns the first staging or commit error; earlier batches stay committed.
+/// Rejects a zero or over-engine-limit budget and any single record that
+/// cannot fit in the requested budget.
+///
+/// This is not an atomic migration across batches. The caller must publish its
+/// import-complete marker only after this function succeeds; on failure,
+/// already-committed nodes/roots remain visible, with nodes always committed
+/// before roots.
+pub fn commit_state_batches<'a>(
+    db: &crate::Database,
+    nodes: impl IntoIterator<Item = ([u8; 16], [u8; 16], &'a [u8])>,
+    roots: impl IntoIterator<Item = ([u8; 16], [u8; 16], &'a [u8])>,
+    batch_bytes: usize,
+) -> Result<usize, StorageError> {
+    if batch_bytes == 0 || batch_bytes > crate::journal::MAX_TXN_STAGE_BYTES {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "state batch budget must be in 1..={} bytes",
+                crate::journal::MAX_TXN_STAGE_BYTES
+            ),
+        )));
+    }
+    let mut committed = 0_usize;
+    for records in [
+        nodes.into_iter().collect::<Vec<_>>(),
+        roots.into_iter().collect(),
+    ] {
+        let mut txn = db.begin_transaction();
+        let mut staged = 0_usize;
+        for (collection, node, bytes) in records {
+            let charge = bytes
+                .len()
+                .checked_add(crate::journal::TXN_STAGE_PUT_OVERHEAD_BYTES)
+                .ok_or_else(|| {
+                    StorageError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "state record staging size overflow",
+                    ))
+                })?;
+            if charge > batch_bytes {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "one state record exceeds the transaction staging budget",
+                )));
+            }
+            if staged > 0 && staged.saturating_add(charge) > batch_bytes {
+                txn.commit()?;
+                committed = committed.saturating_add(1);
+                txn = db.begin_transaction();
+                staged = 0;
+            }
+            txn.put(
+                STATE_POOL,
+                collection,
+                node,
+                &crate::storage::NodeData::new(bytes::Bytes::copy_from_slice(bytes)),
+            )?;
+            staged = staged.saturating_add(charge);
+        }
+        if staged > 0 {
+            txn.commit()?;
+            committed = committed.saturating_add(1);
+        }
+    }
+    Ok(committed)
+}
