@@ -221,6 +221,8 @@ pub use packfile::{
     FrameMetadata, Record,
 };
 pub use record_class::{Durability, OrderingPolicy, RecordClass, Retention};
+#[cfg(feature = "reconcile")]
+pub use rezzy_recon as recon;
 pub use search::{SearchDocument, SearchIndexes, SearchQuery};
 pub use shard::{LockHolderInfo, ShardPool};
 pub use state_group::{

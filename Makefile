@@ -148,8 +148,8 @@ clean: ##H Clean build artifacts
 # Execute command for reach submodule
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-PROJECT_CRATES ?= mtxdb-cli/
-# PROJECT_CRATES ?= mtxdb-cli/ benches/
+# PROJECT_CRATES ?= mtxdb-cli/
+PROJECT_CRATES ?= mtxdb-cli/ benches/
 
 .PHONY: sub
 sub:	##H Run a command for each crate (set c)

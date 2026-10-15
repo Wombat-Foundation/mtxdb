@@ -31,8 +31,8 @@ use base64::Engine as _;
 use mtxdb::database::Database;
 use mtxdb::layout::ShardType;
 use mtxdb::population::encode_owner_payload;
+use mtxdb::recon::{ElementHash, EventIdFormat, SortedPopulation};
 use mtxdb::short_id::{BatchEvent, ShortIdIndex};
-use rezzy_recon::{ElementHash, EventIdFormat, SortedPopulation};
 
 const SCOPE: [u8; 16] = [0x62; 16];
 const BATCH: u32 = 1000;
