@@ -766,7 +766,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/Wombat-Foundation/rezzy.git?branch=master#eff47137753ea20249d45d1b8c48a56da7c773a3"
+source = "git+https://gitlab.com/Wombat-Foundation/rezzy.git?branch=dev#139ade17fe8ca8cf3baa9d13f2668cdf873f1688"
 dependencies = [
  "base64 0.23.1",
  "sha2",
