@@ -330,7 +330,9 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
                 let digest = digests_by_id.get(id).ok_or_else(|| {
                     StorageError::Internal("auxiliary digest lookup failed".to_owned())
                 })?;
-                decode_value(digest, &record.bytes)?;
+                if !record.bytes.is_empty() {
+                    decode_value(digest, &record.bytes)?;
+                }
                 present = present.checked_add(1).ok_or_else(|| {
                     StorageError::Internal("auxiliary removal count overflow".to_owned())
                 })?;
