@@ -140,7 +140,7 @@ fn test_generic_lru_zero_capacity_and_stats() {
     assert_eq!(cache.get(&1), None);
     assert_eq!(cache.hits(), 0);
     assert_eq!(cache.misses(), 1);
-    assert!(cache.hit_rate() < f64::EPSILON);
+    assert_eq!(cache.hit_rate(), 0.0);
 }
 
 struct MaybePanicCloneKey {
