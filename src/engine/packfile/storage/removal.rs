@@ -105,7 +105,7 @@ impl PackfileStorage {
     ///
     /// The liveness check, the publication and the application all run under
     /// the collection's put lock (and the snapshot gate), in the same lock
-    /// order [`Self::put_internal`] uses. Serializing with a concurrent put on
+    /// order `put_internal` uses. Serializing with a concurrent put on
     /// the same collection is what keeps the live index and WAL replay in
     /// agreement: without it, a put could publish a later LSN and apply first,
     /// and this removal would then apply its older tombstone last, leaving the
