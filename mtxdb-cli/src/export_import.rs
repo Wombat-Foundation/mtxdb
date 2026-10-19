@@ -46,6 +46,10 @@ fn node(bytes: Vec<u8>) -> NodeData {
 }
 
 /// Whether the database holds a marker, and what it says.
+///
+/// Production code only needs presence (see [`clear_marker`]); reading the
+/// counts back is for tests and diagnostics.
+#[allow(dead_code)] // read-side counterpart of `write_marker`, used by tests
 pub(crate) fn read_marker(db: &Database) -> anyhow::Result<Option<ImportMarker>> {
     let record = db
         .pool(SERVER_INFO_POOL)
@@ -61,8 +65,16 @@ pub(crate) fn read_marker(db: &Database) -> anyhow::Result<Option<ImportMarker>>
 ///
 /// Without this, a run interrupted on top of a complete import would still
 /// look complete: the old marker would vouch for data it no longer describes.
+///
+/// Presence is checked on the raw record, not by decoding: a marker written by
+/// an older data format must still be clearable, or the re-import that
+/// migrates it could never start.
 pub(crate) fn clear_marker(db: &Database) -> anyhow::Result<()> {
-    if read_marker(db)?.is_none() {
+    let present = db
+        .pool(SERVER_INFO_POOL)
+        .get(&import_marker_collection_id(), &import_marker_node_id())
+        .context("reading the import marker")?;
+    if present.is_none() {
         return Ok(());
     }
     let tx = db.begin_transaction();

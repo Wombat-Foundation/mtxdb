@@ -157,10 +157,15 @@ fn import_marker_round_trips_and_rejects_truncation() {
     assert_eq!(decode_import_marker(&bytes).unwrap(), marker);
 
     assert!(decode_import_marker(&[]).is_err());
-    assert!(decode_import_marker(&[MARKER_VERSION, 1, 0, 0]).is_err());
+    assert!(decode_import_marker(&[MARKER_VERSION, DATA_FORMAT, 0, 0]).is_err());
     // Events present, closures count cut short.
     assert!(decode_import_marker(&bytes[..bytes.len() - 1]).is_err());
     assert!(decode_import_marker(&[9, 1, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    // A well-formed marker from an older data contract is refused, not misread.
+    let mut legacy = vec![MARKER_VERSION, 1];
+    legacy.extend_from_slice(&42u64.to_le_bytes());
+    legacy.extend_from_slice(&40u64.to_le_bytes());
+    assert!(decode_import_marker(&legacy).is_err());
 }
 
 #[test]

@@ -130,7 +130,7 @@ pub fn event_state_root_node_id(event_id: &[u8]) -> [u8; 16] {
 /// Version of the export/import data contract the marker vouches for. Bump
 /// it when a stored layout below changes incompatibly, so an older database
 /// is refused instead of misread.
-pub const DATA_FORMAT: u8 = 1;
+pub const DATA_FORMAT: u8 = 2;
 
 /// Derive a 128-bit BLAKE3 identifier from a domain and logical identifier.
 ///
@@ -639,8 +639,8 @@ pub fn encode_import_marker(marker: ImportMarker) -> Vec<u8> {
 /// Decode a stored import marker.
 ///
 /// # Errors
-/// Returns [`StorageError::Corrupt`] for a truncated record or an unknown
-/// version.
+/// Returns [`StorageError::Corrupt`] for a truncated record, an unknown
+/// version, or a data format this build does not read.
 pub fn decode_import_marker(bytes: &[u8]) -> Result<ImportMarker, StorageError> {
     let malformed = || StorageError::Corrupt("malformed import marker".to_owned());
     let (&version, rest) = bytes.split_first().ok_or_else(malformed)?;
@@ -652,6 +652,11 @@ pub fn decode_import_marker(bytes: &[u8]) -> Result<ImportMarker, StorageError> 
     let (&data_format, rest) = rest.split_first().ok_or_else(malformed)?;
     let (events, rest) = rest.split_first_chunk::<8>().ok_or_else(malformed)?;
     let (closures, _) = rest.split_first_chunk::<8>().ok_or_else(malformed)?;
+    if data_format != DATA_FORMAT {
+        return Err(StorageError::Corrupt(
+            "unsupported import data format".to_owned(),
+        ));
+    }
     Ok(ImportMarker {
         data_format,
         events: u64::from_le_bytes(*events),
