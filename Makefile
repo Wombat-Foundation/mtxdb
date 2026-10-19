@@ -154,7 +154,14 @@ PROJECT_CRATES ?= mtxdb-cli/ benches/
 .PHONY: sub
 sub:	##H Run a command for each crate (set c)
 	@test -n "${c}" || (echo "error: set c=<command>"; exit 1)
-	@for d in $(PROJECT_CRATES); do echo "--- $$d ---"; (cd $$d && ${c}) || exit 1; done
+	@for d in $(PROJECT_CRATES); do \
+		echo "--- $$d ---"; \
+		if [ "$$d" = "benches/" ]; then \
+			(cd $$d && RUSTUP_TOOLCHAIN=$(BENCH_TOOLCHAIN) ${c}) || exit 1; \
+		else \
+			(cd $$d && ${c}) || exit 1; \
+		fi; \
+	done
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
