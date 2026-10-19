@@ -69,7 +69,8 @@ const RUN_SCOPE: &[u8] = b"short-id-run";
 /// One element as the runs store it, ordered `(h64, q3, h128)`.
 type Entry = (u64, u64, u128);
 
-/// The owner-log payload that adds `hash` to the population.
+/// Encode the owner-log payload for `hash` as 32 bytes: `h64`, `q3`, then
+/// `h128`, all big-endian.
 #[must_use]
 pub fn encode_owner_payload(hash: ElementHash) -> [u8; OWNER_PAYLOAD_LEN] {
     let mut payload = [0_u8; OWNER_PAYLOAD_LEN];
@@ -79,6 +80,11 @@ pub fn encode_owner_payload(hash: ElementHash) -> [u8; OWNER_PAYLOAD_LEN] {
     payload
 }
 
+/// Decode a big-endian `(h64, q3, h128)` entry.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] unless `bytes` is exactly 32 bytes long;
+/// `what` identifies the record in the error message.
 fn decode_entry(what: &str, bytes: &[u8]) -> Result<Entry, StorageError> {
     let corrupt = || StorageError::Corrupt(format!("{what} entry is not 32 bytes"));
     let (h64, rest) = bytes.split_first_chunk::<8>().ok_or_else(corrupt)?;
@@ -91,6 +97,7 @@ fn decode_entry(what: &str, bytes: &[u8]) -> Result<Entry, StorageError> {
     ))
 }
 
+/// Reconstruct an element hash from all three stored columns.
 fn element((h64, q3, h128): Entry) -> ElementHash {
     ElementHash { h64, q3, h128 }
 }
@@ -197,6 +204,11 @@ impl Manifest {
     }
 }
 
+/// Encode a run chunk with its header, big-endian count, and 32-byte entries
+/// in the supplied order.
+///
+/// # Errors
+/// Returns [`StorageError::Internal`] if the entry count exceeds `u32::MAX`.
 fn encode_chunk(entries: &[Entry]) -> Result<Vec<u8>, StorageError> {
     let mut out = header(RUN_CHUNK_MAGIC);
     let count = u32::try_from(entries.len())
@@ -357,7 +369,7 @@ impl PopulationSnapshot {
     /// The room kernel at the ceiling: the manifest's kernel plus the tail.
     ///
     /// # Errors
-    /// Returns an error if the element count overflows.
+    /// Returns [`StorageError::Internal`] if the element count overflows.
     pub fn kernel(&self) -> Result<ResidentKernel, StorageError> {
         let mut kernel = self.base.kernel.clone();
         for ((&h64, &h128), &q3) in self

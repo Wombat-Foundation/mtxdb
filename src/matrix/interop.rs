@@ -45,7 +45,9 @@ pub struct StateRootHandleV1 {
     pub state_group_id: [u8; 32],
 }
 
-/// Encode the server's fixed-width state root handle.
+/// Encode the server's fixed-width state root handle as 70 bytes, ordered as
+/// codec version, routing version, routing parameters, structural hash, and
+/// state-group ID. Field values are copied without validation.
 #[must_use]
 pub fn encode_state_root_handle_v1(handle: StateRootHandleV1) -> [u8; STATE_ROOT_HANDLE_V1_LEN] {
     let mut out = [0; STATE_ROOT_HANDLE_V1_LEN];
@@ -58,6 +60,8 @@ pub fn encode_state_root_handle_v1(handle: StateRootHandleV1) -> [u8; STATE_ROOT
 }
 
 /// Decode the server's fixed-width state root handle.
+///
+/// Version and routing-parameter values are preserved without validation.
 ///
 /// # Errors
 /// Returns [`StorageError::Corrupt`] unless `bytes` has the exact v1 length.
@@ -107,7 +111,7 @@ pub fn room_roots_collection_id(room_id: &[u8]) -> [u8; 16] {
     room_member_collection(MEMBER_NAMESPACE_STGP, room_id)
 }
 
-/// Derive the stored node id from a full 256-bit HAMT structural hash.
+/// Return the first 16 bytes of a HAMT structural hash as its stored node id.
 #[must_use]
 pub fn state_hamt_node_id(structural_hash: &[u8; 32]) -> [u8; 16] {
     let mut node_id = [0; 16];
@@ -116,6 +120,8 @@ pub fn state_hamt_node_id(structural_hash: &[u8; 32]) -> [u8; 16] {
 }
 
 /// Derive the node id holding a room's current state root.
+///
+/// This fixed id is shared across rooms, each in its own roots collection.
 #[must_use]
 pub fn room_state_root_node_id() -> [u8; 16] {
     derive_id(b"root", b"current")
@@ -134,10 +140,11 @@ pub const DATA_FORMAT: u8 = 1;
 
 /// Derive a 128-bit BLAKE3 identifier from a domain and logical identifier.
 ///
-/// The domain is length-delimited by a NUL separator, so identifiers from
-/// different domains cannot share an input stream. Callers that need
-/// collision detection must retain the original identifier beside the
-/// derived id — 128 bits is not enough to rule out a collision by itself.
+/// Hashes `domain`, a NUL separator, then `identifier`, taking the first
+/// 16 digest bytes. Domains must exclude NUL bytes for unambiguous separation.
+/// Callers that need collision detection must retain the original identifier
+/// beside the derived id — 128 bits is not enough to rule out a collision by
+/// itself.
 #[must_use]
 pub fn derive_id(domain: &[u8], identifier: &[u8]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
@@ -187,7 +194,8 @@ impl Verdict {
     }
 }
 
-/// Derive an event record id from an event id.
+/// Derive an event record id as the first 16 bytes of the BLAKE3 hash of the
+/// complete event id, including any leading `$` and server name.
 #[must_use]
 pub fn event_record_id(event_id: &[u8]) -> [u8; 16] {
     let digest = blake3::hash(event_id);
@@ -430,6 +438,10 @@ pub const EVENT_LOCATOR_BUCKETS: u32 = 256;
 /// Version byte of the event-locator value encoding.
 pub const LOCATOR_VERSION: u8 = 1;
 
+/// Derive a room member collection from the room ID and namespace.
+///
+/// # Panics
+/// Panics if `namespace` is not a registered member namespace.
 fn room_member_collection(namespace: [u8; 4], room_id: &[u8]) -> [u8; 16] {
     derive_member_collection_id_from_group(namespace, derive_group_full_id(room_id))
         .expect("Matrix member namespace is registered")
@@ -672,17 +684,20 @@ pub const STATE_BATCH_BYTES: usize = 48 << 20;
 /// Stage HAMT nodes, then roots, into bounded transactions of at most
 /// `batch_bytes` charged bytes, committing each before the next begins.
 ///
-/// All nodes are committed before any root, so a reader that finds a root
-/// always finds the nodes beneath it, even across batches. An interrupted run
-/// leaves only unreferenced nodes, which are content-addressed and safe to
-/// rewrite. `nodes` and `roots` are `(collection, node id, bytes)`; the caller
-/// derives ids with the functions above. Returns the number of transactions
-/// committed.
+/// All supplied nodes are committed before any root. The caller must supply
+/// every node needed by the roots that is not already stored; references and
+/// content hashes are not validated. An interrupted run can leave unreferenced
+/// nodes and already-committed roots. `nodes` and `roots` are
+/// `(collection, node id, bytes)` stored in [`STATE_POOL`]; the caller derives
+/// ids with the functions above. The budget includes payload bytes plus
+/// [`crate::journal::TXN_STAGE_PUT_OVERHEAD_BYTES`] per record. Returns the
+/// number of transactions committed, or zero if both inputs are empty.
 ///
 /// # Errors
 /// Returns the first staging or commit error; earlier batches stay committed.
-/// Rejects a zero or over-engine-limit budget and any single record that
-/// cannot fit in the requested budget.
+/// Returns [`StorageError::Io`] with [`std::io::ErrorKind::InvalidInput`] for
+/// a zero or over-engine-limit budget, staging-size overflow, or a single
+/// record that cannot fit in the requested budget.
 ///
 /// This is not an atomic migration across batches. The caller must publish its
 /// import-complete marker only after this function succeeds; on failure,
