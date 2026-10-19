@@ -699,20 +699,12 @@ pub fn commit_state_batches<'a>(
     roots: impl IntoIterator<Item = ([u8; 16], [u8; 16], &'a [u8])>,
     batch_bytes: usize,
 ) -> Result<usize, StorageError> {
-    if batch_bytes == 0 || batch_bytes > crate::journal::MAX_TXN_STAGE_BYTES {
-        return Err(StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "state batch budget must be in 1..={} bytes",
-                crate::journal::MAX_TXN_STAGE_BYTES
-            ),
-        )));
-    }
-    let mut committed = 0_usize;
-    for records in [
-        nodes.into_iter().collect::<Vec<_>>(),
-        roots.into_iter().collect(),
-    ] {
+    fn commit_records<'a>(
+        db: &crate::Database,
+        records: impl IntoIterator<Item = ([u8; 16], [u8; 16], &'a [u8])>,
+        batch_bytes: usize,
+        committed: &mut usize,
+    ) -> Result<(), StorageError> {
         let mut txn = db.begin_transaction();
         let mut staged = 0_usize;
         for (collection, node, bytes) in records {
@@ -733,7 +725,7 @@ pub fn commit_state_batches<'a>(
             }
             if staged > 0 && staged.saturating_add(charge) > batch_bytes {
                 txn.commit()?;
-                committed = committed.saturating_add(1);
+                *committed = committed.saturating_add(1);
                 txn = db.begin_transaction();
                 staged = 0;
             }
@@ -747,8 +739,21 @@ pub fn commit_state_batches<'a>(
         }
         if staged > 0 {
             txn.commit()?;
-            committed = committed.saturating_add(1);
+            *committed = committed.saturating_add(1);
         }
+        Ok(())
     }
+    if batch_bytes == 0 || batch_bytes > crate::journal::MAX_TXN_STAGE_BYTES {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "state batch budget must be in 1..={} bytes",
+                crate::journal::MAX_TXN_STAGE_BYTES
+            ),
+        )));
+    }
+    let mut committed = 0_usize;
+    commit_records(db, nodes, batch_bytes, &mut committed)?;
+    commit_records(db, roots, batch_bytes, &mut committed)?;
     Ok(committed)
 }
