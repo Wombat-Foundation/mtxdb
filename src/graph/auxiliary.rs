@@ -281,8 +281,9 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     /// Stage several removals in one database transaction, returning the
     /// number of values present in the transaction's read snapshot. The caller
     /// must commit `transaction` to publish the removals. Duplicate keys are
-    /// removed once. Record-version preconditions protect the envelope checks
-    /// from concurrent replacement between validation and commit.
+    /// removed once. The staged removals carry record-version preconditions
+    /// read from the live store, so a concurrent replacement between this
+    /// validation and commit surfaces as [`StorageError::StaleRead`].
     ///
     /// # Errors
     /// Returns [`StorageError::Collision`] for a digest collision,
@@ -322,10 +323,14 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
             return Ok(0);
         }
 
-        let (existing, versions) =
-            transaction.get_with_record_versions(pool, &self.collection_id, &ids)?;
+        // Validate the transaction's view of each record before staging the
+        // removals. Version preconditions are registered by `remove_many`
+        // from its own live-only read: a record this transaction already
+        // staged reports the synthetic token `0` here, which must never
+        // become a live precondition.
+        let existing = transaction.get(pool, &self.collection_id, &ids)?;
         let mut present = 0usize;
-        for ((id, record), version) in ids.iter().zip(&existing).zip(versions) {
+        for (id, record) in ids.iter().zip(&existing) {
             if let Some(record) = record {
                 let digest = digests_by_id.get(id).ok_or_else(|| {
                     StorageError::Internal("auxiliary digest lookup failed".to_owned())
@@ -337,9 +342,6 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
                     StorageError::Internal("auxiliary removal count overflow".to_owned())
                 })?;
             }
-            transaction
-                .expect_record_version(pool, self.collection_id, *id, version)
-                .map_err(StorageError::Io)?;
         }
         transaction
             .remove_many(pool, self.collection_id, &ids)
