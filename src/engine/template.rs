@@ -652,6 +652,11 @@ fn encode_record_id_rule(rule: &RecordIdentityRule) -> Vec<u8> {
     out
 }
 
+/// Decode an identity rule from its TLV encoding.
+///
+/// Returns `None` for a truncated encoding, a missing or malformed required
+/// field, or incomplete TLV data. Unrecognized tags are ignored; unknown
+/// digest IDs are preserved.
 fn decode_record_id_rule(bytes: &[u8]) -> Option<RecordIdentityRule> {
     let mut digest_algorithm = None;
     let mut policy = None;
@@ -659,7 +664,8 @@ fn decode_record_id_rule(bytes: &[u8]) -> Option<RecordIdentityRule> {
     while let Some((tag, value)) = reader.next() {
         match tag {
             IDENTITY_TAG_DIGEST_ALGORITHM => {
-                digest_algorithm = Some(DigestAlgorithm::from_id(*value.first()?));
+                let [id] = value else { return None };
+                digest_algorithm = Some(DigestAlgorithm::from_id(*id));
             }
             IDENTITY_TAG_POLICY => {
                 policy = Some(decode_frame_id_policy(value)?);

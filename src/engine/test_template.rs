@@ -599,6 +599,20 @@ fn record_id_rule_decode_requires_both_fields_and_no_trailing_bytes() {
     );
     assert!(decode_record_id_rule(&only_digest).is_none());
 
+    // A digest field with trailing bytes is malformed, not silently truncated.
+    let mut padded_digest = Vec::new();
+    push_tlv(
+        &mut padded_digest,
+        IDENTITY_TAG_DIGEST_ALGORITHM,
+        &[DigestAlgorithm::Sha256.id(), 0],
+    );
+    push_tlv(
+        &mut padded_digest,
+        IDENTITY_TAG_POLICY,
+        &encode_frame_id_policy(&rule.policy),
+    );
+    assert!(decode_record_id_rule(&padded_digest).is_none());
+
     let mut trailing = encode_record_id_rule(&rule);
     trailing.push(0x00);
     assert!(decode_record_id_rule(&trailing).is_none());
