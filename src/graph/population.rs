@@ -2,7 +2,7 @@
 //! compacted runs.
 //!
 //! The owner log holds one entry per event the room's holder owns, each with
-//! the 24-byte payload from [`encode_owner_payload`]. Compaction folds the
+//! the 32-byte payload from [`encode_owner_payload`]. Compaction folds the
 //! log into immutable sorted *runs* and publishes them under a *manifest*; the
 //! counter record carries `(log_epoch, log_epoch_start_seq, manifest_version)`
 //! together, so one read yields a manifest and the log tail it pairs with.
@@ -53,7 +53,7 @@ pub const COMPACT_TRIGGER: u32 = 2000;
 /// the snapshot materializes, so peak memory tracks the population and not the
 /// log's record overhead.
 const READ_CHUNK: u32 = 4096;
-/// Chunk records written per transaction (24 MB, under the staging budget).
+/// Chunk records written per transaction (32 MB, under the staging budget).
 const CHUNKS_PER_TXN: usize = 500;
 /// Chunk records read per call.
 const CHUNKS_PER_READ: u32 = 50;
@@ -698,7 +698,7 @@ impl ShortIdIndex {
             }
             base
         };
-        let tail = self
+        let mut tail = self
             .read_tail(
                 db,
                 counters.log_epoch,
@@ -706,6 +706,10 @@ impl ShortIdIndex {
                 counters.next_owner_seq,
             )
             .map_err(|error| self.expired_if_superseded(db, &counters, error))?;
+        // `read_tail` sorts by the whole `(h64, q3, h128)` entry, but
+        // `SortedPopulation` re-sorts by `(h64, h128)`; match its order so
+        // `tail_q3` stays aligned with the stored columns.
+        tail.sort_unstable_by_key(|&(h64, _, h128)| (h64, h128));
         let tail_q3 = tail.iter().map(|&(_, q3, _)| q3).collect();
         Ok(PopulationSnapshot {
             base,
