@@ -411,6 +411,34 @@ fn transactional_append_of_duplicates_does_not_rewrite_the_head() {
     let _ = std::fs::remove_dir_all(db_path);
 }
 
+#[test]
+fn duplicate_only_append_survives_a_head_moved_before_its_commit() {
+    let db_path = test_root("append_duplicate_then_head_moves");
+    let db = Database::open(db_path.clone()).unwrap();
+    let room_id = [8u8; 16];
+    let existing = full(room_id, 1, 1, 1);
+    let moved = full(room_id, 2, 2, 2);
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_duplicate_then_head_moves");
+    index.build(&[existing]).unwrap();
+
+    let duplicate = db.begin_transaction();
+    index
+        .stage_append(&duplicate, ShardType::EventDag, &[existing])
+        .unwrap();
+
+    let writer = db.begin_transaction();
+    index
+        .stage_append(&writer, ShardType::EventDag, &[moved])
+        .unwrap();
+    writer.commit().unwrap();
+
+    duplicate.commit().unwrap();
+    assert_eq!(collect(&index, &room_id, true, 10), vec![existing, moved]);
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&db_path);
+}
+
 fn full(room: [u8; 16], topological: i64, stream: i64, seed: u8) -> TimelineEntry {
     let mut node_id = [0u8; 16];
     node_id[0] = seed;

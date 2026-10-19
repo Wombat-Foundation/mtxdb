@@ -350,9 +350,9 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     }
 
     /// Append entries in one optimistic transaction. The caller supplies the
-    /// database and pool that back this index. The head's record version is
-    /// checked at commit, so concurrent appends cannot silently overwrite one
-    /// another.
+    /// database and pool that back this index. The collection's logical
+    /// version is checked at commit, so concurrent appends cannot silently
+    /// overwrite one another.
     ///
     /// This convenience method opens and commits its own transaction. Use
     /// [`Self::stage_append`] to combine the index update with other writes.
@@ -383,6 +383,8 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// through the index's storage engine before staging, so that idempotent
     /// metadata write is outside this transaction. The caller must commit the
     /// transaction to publish the leaves, new root, and head together.
+    /// Repeated calls in one transaction compose: each observes the staged
+    /// head and reuses the same collection-version precondition.
     ///
     /// # Errors
     /// Propagates backend errors, or returns [`StorageError::Corrupt`] for
@@ -405,13 +407,13 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             ));
         }
         self.ensure_metadata()?;
-        let (head_records, head_versions) =
-            transaction.get_with_record_versions(pool, &self.collection_id, &[TIMELINE_HEAD_ID])?;
+        let (head_records, collection_version) = transaction.get_with_collection_version(
+            pool,
+            &self.collection_id,
+            &[TIMELINE_HEAD_ID],
+        )?;
         let head_record = head_records.first().ok_or_else(|| {
             StorageError::Internal("timeline head read returned no slot".to_owned())
-        })?;
-        let head_version = *head_versions.first().ok_or_else(|| {
-            StorageError::Internal("timeline head read returned no version".to_owned())
         })?;
         let (old_root_id, old_count, manifest) = if let Some(head) = head_record {
             let (root_id, count) = decode_head(&head.bytes)?;
@@ -429,9 +431,6 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
                 return Ok(root_id);
             }
         }
-        transaction
-            .expect_record_version(pool, self.collection_id, TIMELINE_HEAD_ID, head_version)
-            .map_err(StorageError::Io)?;
 
         let mut pending = new_entries.to_vec();
         pending.sort_unstable();
@@ -492,8 +491,16 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             }
         }
 
+        // The precondition is the collection's logical version rather than
+        // the head's record token: a record token read through the
+        // transaction is the synthetic `0` for a head an earlier
+        // `stage_append` in this transaction already staged, while the
+        // collection version is live and immune to this transaction's own
+        // staged writes. Repeated calls therefore reuse the same
+        // precondition, and a concurrent writer still makes the commit
+        // stale.
         transaction
-            .expect_record_version(pool, self.collection_id, TIMELINE_HEAD_ID, head_version)
+            .expect_collection_version(pool, self.collection_id, collection_version)
             .map_err(StorageError::Io)?;
 
         for (leaf_id, payload) in pending_leaf_records {
