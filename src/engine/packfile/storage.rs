@@ -10806,6 +10806,36 @@ impl PackfileStorage {
         })
     }
 
+    /// Apply an already-published `RemoveRecord` under a collection lock the
+    /// caller already holds, writing the removal marker through
+    /// [`Self::put_internal_locked`] (which assumes the snapshot gate and the
+    /// collection lock are held, so it does not re-acquire them). Publication
+    /// is suppressed because the caller published the mutation to the journal
+    /// itself before applying it.
+    fn apply_remove_record_locked(
+        &self,
+        collection_id: &[u8; 16],
+        node_id: &NodeId,
+        write_lsn: u64,
+    ) -> Result<(), StorageError> {
+        JOURNAL_SUPPRESSED.with(|suppressed| {
+            let previous = suppressed.replace(true);
+            let metadata = FrameMetadata {
+                last_write_lsn: Some(write_lsn),
+                removed: true,
+                ..FrameMetadata::default()
+            };
+            let result = self.put_internal_locked(
+                collection_id,
+                node_id,
+                &NodeData::new(bytes::Bytes::new()),
+                Some(metadata),
+            );
+            suppressed.set(previous);
+            result
+        })
+    }
+
     fn record_published_mutation(&self, started: std::time::Instant) {
         self.publish_calls.fetch_add(1, Ordering::Relaxed);
         self.publish_time_ns.fetch_add(
