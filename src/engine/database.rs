@@ -331,11 +331,14 @@ impl DatabaseTransaction<'_> {
         // Keys this transaction already removed (or whose collection it
         // deleted) need no further work.
         let staged = self.stage.lookup_many(pool, &collection_id, &unique);
-        let pending: Vec<(NodeId, StagedLookup)> = unique
+        // Keep only whether nothing is staged; a staged put's payload is not
+        // needed here and would otherwise stay alive for the whole call.
+        let pending: Vec<(NodeId, bool)> = unique
             .iter()
             .copied()
             .zip(staged)
             .filter(|(_, lookup)| !matches!(lookup, StagedLookup::Deleted))
+            .map(|(node_id, lookup)| (node_id, matches!(lookup, StagedLookup::Absent)))
             .collect();
         if pending.is_empty() {
             return Ok(());
@@ -373,11 +376,9 @@ impl DatabaseTransaction<'_> {
         let preconditions: Vec<(NodeId, u64)> = pending
             .iter()
             .zip(versions)
-            .map(|((node_id, staged), live_version)| {
-                let expected = match (observed_versions, staged) {
-                    (Some(_), StagedLookup::Absent) => {
-                        observed_by_id.get(node_id).copied().unwrap_or(live_version)
-                    }
+            .map(|((node_id, unstaged), live_version)| {
+                let expected = match (observed_versions, unstaged) {
+                    (Some(_), true) => observed_by_id.get(node_id).copied().unwrap_or(live_version),
                     _ => live_version,
                 };
                 (*node_id, expected)

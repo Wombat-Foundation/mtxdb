@@ -4369,23 +4369,29 @@ impl PackfileStorage {
         let capture_boundary =
             || -> Result<(crate::journal::JournalCursor, JournalReplayLease), StorageError> {
                 // Reclaim can pass the covered LSN between reading it and
-                // pinning the cursor. Re-read and retry: a fresh checkpoint
-                // coverage is newer than the reclaimed prefix.
+                // pinning the cursor. Shared reclaim may also have passed an
+                // idle pool's recorded coverage, which never advances on its
+                // own, so a re-read alone would rebuild the same expired
+                // cursor. Every mutation in the reclaimed prefix is covered
+                // by its contributing pool; if this pool's watermark is older
+                // than that prefix, it contributed no mutations there. Its
+                // pack scan is therefore complete through the retained floor.
                 let mut attempts = 0_u32;
                 loop {
                     journal.sync().map_err(StorageError::Io)?;
                     let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
-                    let cursor = journal
+                    let mut cursor = journal
                         .replay_cursor(covered_lsn)
                         .map_err(StorageError::Io)?;
+                    if cursor.is_behind_retained_history() {
+                        cursor = journal
+                            .replay_cursor(cursor.retained_floor_lsn())
+                            .map_err(StorageError::Io)?;
+                    }
                     match journal.pin_replay_cursor(&cursor) {
                         Ok(lease) => return Ok((cursor, lease)),
                         Err(error)
-                            if attempts < 64
-                                && error.kind() == std::io::ErrorKind::InvalidData
-                                && error
-                                    .to_string()
-                                    .starts_with("journal cursor expired at LSN ") =>
+                            if attempts < 64 && crate::journal::is_cursor_expired(&error) =>
                         {
                             attempts = attempts.saturating_add(1);
                             std::thread::yield_now();

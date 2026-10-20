@@ -243,6 +243,29 @@ struct TxnStageData {
     receipt: Option<CommitReceipt>,
 }
 
+/// Message prefix of the `InvalidData` error reported when reclaim has passed
+/// a cursor's LSN. Match it through [`is_cursor_expired`].
+const CURSOR_EXPIRED_PREFIX: &str = "journal cursor expired at LSN ";
+
+/// Message of the `InvalidData` error reported when a reclaim rewrite lands
+/// while a page is being read. Match it through [`is_segment_reclaimed`].
+const SEGMENT_RECLAIMED_MESSAGE: &str =
+    "journal segment was reclaimed while reading changes; retry from the cursor";
+
+/// Whether `error` reports that reclaim already passed a replay cursor.
+#[must_use]
+pub fn is_cursor_expired(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidData
+        && error.to_string().starts_with(CURSOR_EXPIRED_PREFIX)
+}
+
+/// Whether `error` reports a reclaim rewrite racing a page read; the read can
+/// be retried from the same cursor.
+#[must_use]
+pub fn is_segment_reclaimed(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidData && error.to_string() == SEGMENT_RECLAIMED_MESSAGE
+}
+
 /// What a transaction's staged mutations say about one record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StagedLookup {
@@ -1735,6 +1758,16 @@ impl JournalCursor {
     pub const fn lsn(&self) -> u64 {
         self.lsn
     }
+
+    /// Whether reclaim had already passed this cursor when it was created.
+    pub(crate) const fn is_behind_retained_history(&self) -> bool {
+        self.lsn.saturating_add(1) < self.base_lsn
+    }
+
+    /// Newest LSN no longer retained, the lowest LSN a cursor can start at.
+    pub(crate) const fn retained_floor_lsn(&self) -> u64 {
+        self.base_lsn.saturating_sub(1)
+    }
 }
 
 /// RAII pin that prevents journal reclaim from passing a replay cursor.
@@ -2853,7 +2886,7 @@ impl JournalCoordinator {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "journal cursor expired at LSN {}; retained history starts at {}",
+                    "{CURSOR_EXPIRED_PREFIX}{}; retained history starts at {}",
                     cursor.lsn, journal.base_lsn
                 ),
             ));
@@ -3006,7 +3039,7 @@ impl JournalCoordinator {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "journal cursor expired at LSN {}; retained history starts at {}",
+                    "{CURSOR_EXPIRED_PREFIX}{}; retained history starts at {}",
                     cursor.lsn, journal.base_lsn
                 ),
             ));
@@ -3108,14 +3141,14 @@ impl JournalCoordinator {
         if scan.base_lsn != window.base_lsn {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "journal segment was reclaimed while reading changes; retry from the cursor",
+                SEGMENT_RECLAIMED_MESSAGE,
             ));
         }
         if cursor.lsn.saturating_add(1) < scan.base_lsn {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "journal cursor expired at LSN {}; retained history starts at {}",
+                    "{CURSOR_EXPIRED_PREFIX}{}; retained history starts at {}",
                     cursor.lsn, scan.base_lsn
                 ),
             ));
