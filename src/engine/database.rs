@@ -112,11 +112,6 @@ pub struct Database {
     _lock: SharedWalLock,
 }
 
-/// The pre-`Database` name, kept for existing callers. The shared WAL it was
-/// named for is now simply how every `Database` works.
-#[deprecated(note = "use Database instead")]
-pub type SharedDatabase = Database;
-
 /// Total time and call count for one commit phase.
 #[derive(Default)]
 struct PhaseTimer {
