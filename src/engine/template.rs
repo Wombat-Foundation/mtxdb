@@ -652,7 +652,8 @@ fn encode_record_id_rule(rule: &RecordIdentityRule) -> Vec<u8> {
     out
 }
 
-/// Decode an identity rule from its TLV encoding.
+/// Decode an identity rule from its TLV encoding, with explicit
+/// digest-algorithm and policy fields.
 ///
 /// Returns `None` for a truncated encoding, a missing or malformed required
 /// field, or incomplete TLV data. Unrecognized tags are ignored; unknown
@@ -824,6 +825,10 @@ impl CollectionMetadata {
     /// Decode a TLV block. Unrecognized tags are ignored: this record is
     /// write-once and never re-encoded, so there is nothing to preserve them
     /// for.
+    ///
+    /// Returns `None` for incomplete TLV data, invalid recognized fields, a
+    /// missing or empty canonical ID, or a missing record identity rule. The
+    /// identity rule must explicitly include both a digest algorithm and a policy.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut meta = Self {

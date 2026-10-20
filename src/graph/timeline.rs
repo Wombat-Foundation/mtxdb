@@ -354,12 +354,16 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// version is checked at commit, so concurrent appends cannot silently
     /// overwrite one another.
     ///
+    /// Returns the resulting root id. Entries are sorted and deduplicated by
+    /// the full key; an empty input or only duplicates leaves an existing head
+    /// unchanged. An index without a head is initialized even for empty input.
     /// This convenience method opens and commits its own transaction. Use
     /// [`Self::stage_append`] to combine the index update with other writes.
     ///
     /// # Errors
-    /// Propagates storage errors, including [`StorageError::StaleRead`] if
-    /// another writer changes the head before commit.
+    /// Propagates errors from [`Self::stage_append`] and transaction commit,
+    /// including [`StorageError::StaleRead`] if another writer changes a head
+    /// guarded by this transaction before commit.
     pub fn append(
         &self,
         database: &Database,
@@ -375,12 +379,15 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// Stage entries into the current index in `transaction`, preserving old
     /// roots for existing cursors. Only leaves whose key ranges are touched by
     /// `new_entries` are read and rewritten; untouched leaf records are reused.
-    /// The root manifest is rewritten because it lists every leaf.
+    /// The root manifest is rewritten because it lists every leaf. `pool`
+    /// must select the engine backing this index.
     ///
-    /// Duplicate entries are ignored, both within the input and against the
-    /// existing index. If every entry is a duplicate, the current root is
-    /// returned without changing the head. Collection metadata is ensured
-    /// through the index's storage engine before staging, so that idempotent
+    /// Duplicate entries are ignored by the full key, both within the input
+    /// and against the existing index. If every entry is a duplicate, the
+    /// current root is returned without changing the head. Empty input also
+    /// returns an existing root; without a head, an empty index is staged.
+    /// Returns the resulting root id. Collection metadata is ensured through
+    /// the index's storage engine before staging, so that idempotent
     /// metadata write is outside this transaction. The caller must commit the
     /// transaction to publish the leaves, new root, and head together.
     /// Repeated calls in one transaction compose: each observes the staged
@@ -388,8 +395,11 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     ///
     /// # Errors
     /// Propagates backend errors, or returns [`StorageError::Corrupt`] for
-    /// malformed existing records and [`StorageError::Internal`] if the
-    /// resulting entry count cannot be represented.
+    /// malformed existing records, [`StorageError::NotFound`] for a missing
+    /// referenced root or touched leaf, and [`StorageError::Internal`] if the
+    /// pool differs from this index's engine or a count exceeds the layout.
+    /// A concurrent head change can cause [`StorageError::StaleRead`] when
+    /// the caller commits the transaction.
     #[allow(
         clippy::too_many_lines,
         reason = "staging is one atomic merge operation"
@@ -526,9 +536,15 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// useful for single-writer maintenance and in-memory tests; concurrent
     /// writers should use [`Self::append`] or [`Self::stage_append`].
     ///
+    /// Returns the resulting root id, sorting and deduplicating entries by the
+    /// full key. Empty input preserves an existing head; without a head, this
+    /// builds an index even for empty input. Writes are published as they occur,
+    /// so an error can leave new records stored before the head is updated.
+    ///
     /// # Errors
     /// Propagates backend errors, or returns [`StorageError::Corrupt`] for
-    /// malformed existing records and [`StorageError::Internal`] if the
+    /// malformed existing records, [`StorageError::NotFound`] for a missing
+    /// referenced root or touched leaf, and [`StorageError::Internal`] if the
     /// resulting entry count cannot be represented.
     pub fn append_untransactional(
         &self,
@@ -601,6 +617,13 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         Ok(root_id)
     }
 
+    /// Merge sorted, unique inputs, write the resulting leaves immediately,
+    /// and append their first keys and IDs to `manifest`. Adds the number of
+    /// entries absent from `existing` to `inserted`.
+    ///
+    /// # Errors
+    /// Propagates write errors or returns [`StorageError::Internal`] on count
+    /// or offset overflow. Earlier writes and output updates remain on error.
     fn write_merged_leaves(
         &self,
         existing: &[TimelineEntry],
@@ -649,6 +672,13 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         Ok(())
     }
 
+    /// Merge sorted, unique inputs into encoded leaves in `pending_records`
+    /// and append their first keys and IDs to `manifest`, without writing to
+    /// storage. Adds entries absent from `existing` to the `inserted` count.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Internal`] on count or offset overflow;
+    /// earlier output updates remain on error.
     fn stage_merged_leaves(
         existing: &[TimelineEntry],
         incoming: &[TimelineEntry],
@@ -697,6 +727,11 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         Ok(())
     }
 
+    /// Stage a record in this index's collection for publication on commit.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Io`] if the transaction is inactive or its
+    /// staging budget is exceeded.
     fn stage_record(
         &self,
         transaction: &DatabaseTransaction<'_>,

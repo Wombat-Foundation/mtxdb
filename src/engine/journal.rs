@@ -603,6 +603,9 @@ impl TxnStage {
 
     /// Add an immutable put to this attempt's pool-ordered journal batch.
     ///
+    /// Charges the payload length plus [`TXN_STAGE_PUT_OVERHEAD_BYTES`] against
+    /// the staging budget.
+    ///
     /// # Errors
     /// Returns `InvalidInput` if adding the payload would exceed the stage
     /// limit, or another error if the stage has already been discarded or

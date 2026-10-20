@@ -335,10 +335,11 @@ pub trait StorageEngine: Send + Sync {
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError>;
 
-    /// Remove one record from a collection. Missing records are a no-op.
+    /// Remove one record from a collection, returning whether it was present.
+    /// Missing records are a no-op and return `false`.
     ///
     /// # Errors
-    /// Returns `StorageError::Io` on storage failure.
+    /// Propagates storage errors from reading or removing the record.
     fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError>;
 
     /// Delete all nodes for a given collection (range delete).

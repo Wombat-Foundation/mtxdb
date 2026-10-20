@@ -261,14 +261,16 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     }
 
     /// Stage removal of one value by logical key. Returns `true` if a value
-    /// was present in the transaction's read snapshot. The caller must commit
-    /// the transaction to publish the removal.
+    /// was present in the transaction's view, including earlier staged writes.
+    /// A missing key returns `false`. The caller must commit the transaction to
+    /// publish the removal. `pool` must select the engine backing this index.
     ///
     /// # Errors
     /// Returns [`StorageError::Collision`] for a digest collision,
-    /// [`StorageError::Corrupt`] for a malformed value, or propagates a
-    /// storage error. A concurrent change is reported as
-    /// [`StorageError::StaleRead`] when the transaction is committed.
+    /// [`StorageError::Corrupt`] for a malformed nonempty envelope,
+    /// [`StorageError::Internal`] if the transaction's pool differs from this
+    /// index's engine, or propagates a storage or staging error. A concurrent
+    /// change is reported as [`StorageError::StaleRead`] on commit.
     pub fn remove(
         &self,
         transaction: &DatabaseTransaction<'_>,
@@ -279,17 +281,20 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     }
 
     /// Stage several removals in one database transaction, returning the
-    /// number of values present in the transaction's read snapshot. The caller
-    /// must commit `transaction` to publish the removals. Duplicate keys are
-    /// removed once. The staged removals carry record-version preconditions
-    /// read from the live store, so a concurrent replacement between this
-    /// validation and commit surfaces as [`StorageError::StaleRead`].
+    /// number of values present in the transaction's view, including earlier
+    /// staged writes. Missing keys do not count. `pool` must select the engine
+    /// backing this index. The caller must commit `transaction` to publish the
+    /// removals. Duplicate keys are removed once. The staged removals carry
+    /// record-version preconditions read from the live store, so a concurrent
+    /// replacement between this validation and commit surfaces as
+    /// [`StorageError::StaleRead`].
     ///
     /// # Errors
     /// Returns [`StorageError::Collision`] for a digest collision,
-    /// [`StorageError::Corrupt`] for a malformed value, or propagates a
-    /// storage error. A concurrent change is reported as
-    /// [`StorageError::StaleRead`] when the transaction is committed.
+    /// [`StorageError::Corrupt`] for a malformed nonempty envelope,
+    /// [`StorageError::Internal`] if the transaction's pool differs from this
+    /// index's engine, or propagates a storage or staging error. A concurrent
+    /// change is reported as [`StorageError::StaleRead`] on commit.
     pub fn stage_remove_many(
         &self,
         transaction: &DatabaseTransaction<'_>,
