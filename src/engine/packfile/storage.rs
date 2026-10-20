@@ -4371,7 +4371,7 @@ impl PackfileStorage {
                 // Reclaim can pass the covered LSN between reading it and
                 // pinning the cursor. Re-read and retry: a fresh checkpoint
                 // coverage is newer than the reclaimed prefix.
-                let mut attempts = 0;
+                let mut attempts = 0_u32;
                 loop {
                     journal.sync().map_err(StorageError::Io)?;
                     let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
@@ -4387,7 +4387,7 @@ impl PackfileStorage {
                                     .to_string()
                                     .starts_with("journal cursor expired at LSN ") =>
                         {
-                            attempts += 1;
+                            attempts = attempts.saturating_add(1);
                             std::thread::yield_now();
                         }
                         Err(error) => return Err(StorageError::Io(error)),
