@@ -284,10 +284,12 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
     /// number of values present in the transaction's view, including earlier
     /// staged writes. Missing keys do not count. `pool` must select the engine
     /// backing this index. The caller must commit `transaction` to publish the
-    /// removals. Duplicate keys are removed once. The staged removals carry
-    /// record-version preconditions read from the live store, so a concurrent
-    /// replacement between this validation and commit surfaces as
-    /// [`StorageError::StaleRead`].
+    /// removals. Duplicate keys are removed once. Record-version
+    /// preconditions for records read from the live store come from the same
+    /// transaction-view read that validates their envelopes, so a concurrent
+    /// replacement after validation surfaces as [`StorageError::StaleRead`]
+    /// on commit. A record already staged in this transaction uses its live
+    /// version because its staged read has only a synthetic version token.
     ///
     /// # Errors
     /// Returns [`StorageError::Collision`] for a digest collision,
@@ -328,12 +330,10 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
             return Ok(0);
         }
 
-        // Validate the transaction's view of each record before staging the
-        // removals. Version preconditions are registered by `remove_many`
-        // from its own live-only read: a record this transaction already
-        // staged reports the synthetic token `0` here, which must never
-        // become a live precondition.
-        let existing = transaction.get(pool, &self.collection_id, &ids)?;
+        // Validate the transaction's view and retain the matching versions
+        // for the removal preconditions.
+        let (existing, versions) =
+            transaction.get_with_record_versions(pool, &self.collection_id, &ids)?;
         let mut present = 0usize;
         for (id, record) in ids.iter().zip(&existing) {
             if let Some(record) = record {
@@ -349,7 +349,7 @@ impl<'a, S: StorageEngine + ?Sized> AuxiliaryIndex<'a, S> {
             }
         }
         transaction
-            .remove_many(pool, self.collection_id, &ids)
+            .remove_many_with_record_versions(pool, self.collection_id, &ids, &versions)
             .map_err(StorageError::Io)?;
         Ok(present)
     }

@@ -125,6 +125,45 @@ fn staged_remove_many_is_stale_if_a_key_changes_concurrently() {
 }
 
 #[test]
+fn staged_remove_many_uses_the_version_from_envelope_validation() {
+    let root = test_root("remove_validated_version");
+    let db = Database::open(root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(db.event_dag().as_ref(), "remove_validated_version");
+    index.put(b"key", b"v1").unwrap();
+
+    let id = physical_id(&auxiliary_key_digest(b"key"));
+    let remover = db.begin_transaction();
+    let (records, versions) = remover
+        .get_with_record_versions(ShardType::EventDag, &index.collection_id(), &[id])
+        .unwrap();
+    decode_value(
+        &auxiliary_key_digest(b"key"),
+        &records[0].as_ref().unwrap().bytes,
+    )
+    .unwrap();
+
+    // Replacing the record after validation must not let removal capture the
+    // replacement's newer version as its commit precondition.
+    index.put(b"key", b"v2").unwrap();
+    remover
+        .remove_many_with_record_versions(
+            ShardType::EventDag,
+            index.collection_id(),
+            &[id],
+            &versions,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        remover.commit(),
+        Err(StorageError::StaleRead { .. })
+    ));
+    assert_eq!(index.get(b"key").unwrap(), Some(b"v2".to_vec()));
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn staged_remove_many_rejects_a_different_database_pool() {
     let first_root = test_root("remove_wrong_pool_index");
     let second_root = test_root("remove_wrong_pool_transaction");

@@ -285,6 +285,35 @@ impl DatabaseTransaction<'_> {
         collection_id: [u8; 16],
         node_ids: &[NodeId],
     ) -> io::Result<()> {
+        self.remove_many_inner(pool, collection_id, node_ids, None)
+    }
+
+    /// Stage removals with versions observed alongside a transaction-view
+    /// read. Synthetic version zero for a staged put is replaced by a live
+    /// version read here, as staged writes have no published version.
+    pub(crate) fn remove_many_with_record_versions(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_ids: &[NodeId],
+        observed_versions: &[u64],
+    ) -> io::Result<()> {
+        if node_ids.len() != observed_versions.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "record version count does not match removal key count",
+            ));
+        }
+        self.remove_many_inner(pool, collection_id, node_ids, Some(observed_versions))
+    }
+
+    fn remove_many_inner(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_ids: &[NodeId],
+        observed_versions: Option<&[u64]>,
+    ) -> io::Result<()> {
         let _lifecycle = self.lifecycle.lock();
         if self.stage.state() != TxnStageState::Active {
             return Err(io::Error::other("transaction stage is not active"));
@@ -302,15 +331,26 @@ impl DatabaseTransaction<'_> {
         // Keys this transaction already removed (or whose collection it
         // deleted) need no further work.
         let staged = self.stage.lookup_many(pool, &collection_id, &unique);
-        let pending: Vec<NodeId> = unique
+        let pending: Vec<(NodeId, StagedLookup)> = unique
             .iter()
+            .copied()
             .zip(staged)
             .filter(|(_, lookup)| !matches!(lookup, StagedLookup::Deleted))
-            .map(|(node_id, _)| *node_id)
             .collect();
         if pending.is_empty() {
             return Ok(());
         }
+
+        let observed_by_id: std::collections::HashMap<NodeId, u64> = observed_versions
+            .map(|versions| {
+                node_ids
+                    .iter()
+                    .copied()
+                    .zip(versions.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pending_ids: Vec<NodeId> = pending.iter().map(|(node_id, _)| *node_id).collect();
 
         // Read the live values and their versions together. The version
         // preconditions close the race between this existence check and WAL
@@ -318,19 +358,31 @@ impl DatabaseTransaction<'_> {
         let (live, versions) = self
             .database
             .pool(pool)
-            .get_with_record_versions(&collection_id, &pending)
+            .get_with_record_versions(&collection_id, &pending_ids)
             .map_err(|error| io::Error::other(error.to_string()))?;
         // Normalize any earlier staged put for these keys. A key that was
         // absent live becomes a genuine no-op after put-then-remove; a live
         // key gets the removal marker directly. The budget is checked before
         // anything changes, so a refused batch leaves the transaction as it was.
-        let live_ids: Vec<NodeId> = pending
+        let live_ids: Vec<NodeId> = pending_ids
             .iter()
             .zip(&live)
             .filter(|(_, value)| value.is_some())
             .map(|(node_id, _)| *node_id)
             .collect();
-        let preconditions: Vec<(NodeId, u64)> = pending.iter().copied().zip(versions).collect();
+        let preconditions: Vec<(NodeId, u64)> = pending
+            .iter()
+            .zip(versions)
+            .map(|((node_id, staged), live_version)| {
+                let expected = match (observed_versions, staged) {
+                    (Some(_), StagedLookup::Absent) => {
+                        observed_by_id.get(node_id).copied().unwrap_or(live_version)
+                    }
+                    _ => live_version,
+                };
+                (*node_id, expected)
+            })
+            .collect();
         self.stage
             .stage_removals_normalized(pool, collection_id, &preconditions, &live_ids)
     }
