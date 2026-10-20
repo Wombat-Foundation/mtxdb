@@ -4368,15 +4368,31 @@ impl PackfileStorage {
 
         let capture_boundary =
             || -> Result<(crate::journal::JournalCursor, JournalReplayLease), StorageError> {
-                journal.sync().map_err(StorageError::Io)?;
-                let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
-                let cursor = journal
-                    .replay_cursor(covered_lsn)
-                    .map_err(StorageError::Io)?;
-                let lease = journal
-                    .pin_replay_cursor(&cursor)
-                    .map_err(StorageError::Io)?;
-                Ok((cursor, lease))
+                // Reclaim can pass the covered LSN between reading it and
+                // pinning the cursor. Re-read and retry: a fresh checkpoint
+                // coverage is newer than the reclaimed prefix.
+                let mut attempts = 0;
+                loop {
+                    journal.sync().map_err(StorageError::Io)?;
+                    let covered_lsn = self.checkpoint_covered_lsn().unwrap_or(0);
+                    let cursor = journal
+                        .replay_cursor(covered_lsn)
+                        .map_err(StorageError::Io)?;
+                    match journal.pin_replay_cursor(&cursor) {
+                        Ok(lease) => return Ok((cursor, lease)),
+                        Err(error)
+                            if attempts < 64
+                                && error.kind() == std::io::ErrorKind::InvalidData
+                                && error
+                                    .to_string()
+                                    .starts_with("journal cursor expired at LSN ") =>
+                        {
+                            attempts += 1;
+                            std::thread::yield_now();
+                        }
+                        Err(error) => return Err(StorageError::Io(error)),
+                    }
+                }
             };
 
         let (cursor, lease) = {
