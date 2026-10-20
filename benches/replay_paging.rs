@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use mtxdb::journal::{Journal, JournalCoordinator, JournalReplayLease};
 use mtxdb::layout::ShardType;
-use mtxdb::storage::{NodeData, NodeId, StorageEngine};
+use mtxdb::storage::{NodeData, NodeId, StorageEngine, StorageError};
 use mtxdb::PackfileStorage;
 
 const POOLS: [ShardType; 4] = [
@@ -264,9 +264,23 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
             loop {
                 let done_before_read = done.load(Ordering::Acquire);
                 let started = Instant::now();
-                let page = journal
-                    .changes_since(&cursor, page_size)
-                    .expect("read replay page");
+                let mut replay_retries = 0;
+                let page = loop {
+                    match journal.changes_since(&cursor, page_size) {
+                        Ok(page) => break page,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::InvalidData
+                                && error.to_string().starts_with(
+                                    "journal segment was reclaimed while reading changes; retry from the cursor",
+                                )
+                                && replay_retries < 16 =>
+                        {
+                            replay_retries += 1;
+                            std::thread::yield_now();
+                        }
+                        Err(error) => panic!("read replay page: {error}"),
+                    }
+                };
                 if !page.groups.is_empty() {
                     local_pages.push(started.elapsed());
                     groups.fetch_add(page.groups.len(), Ordering::Relaxed);
@@ -323,9 +337,26 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
     let mut snapshot_samples = Vec::new();
     for width in [1, 2, 4, 8] {
         let started = Instant::now();
-        let (scans, _, lease) = db.stores[1]
-            .scan_collections_at_snapshot(&db.collections[..width])
-            .expect("take concurrent multi-collection snapshot");
+        let mut snapshot_retries = 0;
+        let (scans, _, lease) = loop {
+            match db.stores[1].scan_collections_at_snapshot(&db.collections[..width]) {
+                Ok(snapshot) => break snapshot,
+                Err(StorageError::Io(error))
+                    if error.kind() == std::io::ErrorKind::InvalidData
+                        && error
+                            .to_string()
+                            .starts_with("journal cursor expired at LSN ")
+                        && snapshot_retries < 16 =>
+                {
+                    // Reclaim can advance between cursor capture and lease
+                    // installation. The snapshot API documents this race as
+                    // retryable; measure the successful attempt end to end.
+                    snapshot_retries += 1;
+                    std::thread::yield_now();
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         let count: usize = scans
             .into_iter()
             .map(|(_, scan)| scan.map(Result::unwrap).count())
