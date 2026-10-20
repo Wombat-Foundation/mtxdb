@@ -27,7 +27,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use mtxdb::journal::{is_cursor_expired, is_segment_reclaimed, Journal, JournalCoordinator, JournalReplayLease};
+use mtxdb::journal::{
+    is_cursor_expired, is_segment_reclaimed, Journal, JournalCoordinator, JournalReplayLease,
+};
 use mtxdb::layout::ShardType;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine, StorageError};
 use mtxdb::PackfileStorage;
@@ -270,9 +272,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
                 let page = loop {
                     match journal.changes_since(&cursor, page_size) {
                         Ok(page) => break page,
-                        Err(error)
-                            if is_segment_reclaimed(&error) && replay_retries < 16 =>
-                        {
+                        Err(error) if is_segment_reclaimed(&error) && replay_retries < 16 => {
                             replay_retries += 1;
                             replay_retry_total.fetch_add(1, Ordering::Relaxed);
                             std::thread::yield_now();
@@ -334,7 +334,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
 
     // Vary the number of locked collections while the pool's writers are live.
     let mut snapshot_samples = Vec::new();
-    let mut snapshot_retry_total = 0_u64;
+    let snapshot_retry_total = AtomicU64::new(0);
     for width in [1, 2, 4, 8] {
         let started = Instant::now();
         let mut snapshot_retries = 0;
@@ -348,7 +348,7 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
                     // installation. The snapshot API documents this race as
                     // retryable; measure the successful attempt end to end.
                     snapshot_retries += 1;
-                    snapshot_retry_total += 1;
+                    snapshot_retry_total.fetch_add(1, Ordering::Relaxed);
                     std::thread::yield_now();
                 }
                 Err(error) => return Err(error.into()),
@@ -414,8 +414,9 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
     );
     println!("replay_path resumed_pages={resumed} full_scan_fallbacks={fallbacks}");
     println!(
-        "reclaim_race_retries replay={} snapshot={snapshot_retry_total}",
-        replay_retry_total.load(Ordering::Relaxed)
+        "reclaim_race_retries replay={} snapshot={}",
+        replay_retry_total.load(Ordering::Relaxed),
+        snapshot_retry_total.load(Ordering::Relaxed)
     );
     if !page_latencies.is_empty() {
         println!(
