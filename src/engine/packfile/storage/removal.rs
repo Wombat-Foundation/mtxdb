@@ -129,8 +129,9 @@ impl PackfileStorage {
             collection_id: *collection_id,
             node_id: *node_id,
         };
-        let lsn = self.publish_mutation(|| mutation.clone())?.unwrap_or(0);
-        self.apply_remove_record_locked(collection_id, node_id, lsn)?;
+        let published_lsn = self.publish_mutation(|| mutation.clone())?;
+        self.apply_remove_record_locked(collection_id, node_id, published_lsn.unwrap_or(0))?;
+        self.note_published_materialized(published_lsn);
         Ok(true)
     }
 
