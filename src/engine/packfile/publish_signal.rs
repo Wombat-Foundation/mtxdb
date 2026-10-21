@@ -365,6 +365,12 @@ mod tests {
         // Sample only once the writer is reopening, so the loop below always
         // overlaps at least one restart however the threads are scheduled.
         while !started.load(Ordering::Acquire) {
+            if reopens.is_finished() {
+                // The worker died before its first reopen; surface its panic
+                // instead of waiting forever.
+                let panic = reopens.join().expect_err("worker exited before starting");
+                std::panic::resume_unwind(panic);
+            }
             std::thread::yield_now();
         }
 

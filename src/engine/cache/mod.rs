@@ -279,7 +279,8 @@ impl NodeCache {
     /// Hit rate as a fraction [0.0, 1.0].
     ///
     /// The relaxed atomic loads form an approximate snapshot while accesses
-    /// are concurrent; the result is exact once the counters stop changing.
+    /// are concurrent. Large counters are scaled down, so the result can
+    /// remain approximate even after the counters stop changing.
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let h = self.hits.load(Ordering::Relaxed);
