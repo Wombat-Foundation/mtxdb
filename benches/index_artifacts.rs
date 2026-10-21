@@ -13,9 +13,9 @@
 //!    manifest, and loads the `.idx`, never reading the pack. `digest` shows what
 //!    verifying the pack's bytes at reopen would cost instead.
 //! 5. `sidecar`: the real [`mtxdb::index::packidx`] v1 index built from the same
-//!    scan, with its exact size, the projected size of a truncated-id and a
-//!    sparse variant, whether frames are physically in id order (the precondition
-//!    for a sparse index), and its resident set once mapped and touched.
+//!    scan, with its exact size, lower-bound size projections for truncated-id
+//!    and sparse variants, frame order in this synthetic arrival-order pack,
+//!    and mapped RSS after a small random-access probe using `MADV_RANDOM`.
 //!
 //! The `.idx` here is a prototype of the layout, one collection only (ids are the
 //! frame hashes); it is not crash-ordering-safe, it measures cost. The question it
@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use mtxdb::index::packidx::{
     PackIndex, PackIndexIdentity, PackIndexInput, PACK_INDEX_COLLECTION_ENTRY_LEN,
-    PACK_INDEX_FANOUT_LEN, PACK_INDEX_HEADER_LEN,
+    PACK_INDEX_FANOUT_LEN, PACK_INDEX_HEADER_LEN, PACK_INDEX_SECTION_ENTRY_LEN,
 };
 use mtxdb::packfile::{read_header, scan_and_recover_packfile};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
@@ -47,10 +47,12 @@ use mtxdb::PackfileStorage;
 
 const COLLECTION: [u8; 16] = [0xE7; 16];
 const MAGIC: &[u8; 8] = b"MTXIDX01";
-/// Section bytes per locator in v1: a 16-byte id plus a `u32` offset.
-const SECTION_ENTRY_BYTES: u64 = 20;
 /// A truncated id keeps only the 8 bytes after the fanout byte, plus the offset.
 const TRUNCATED_ENTRY_BYTES: u64 = 8 + 4;
+/// Sample one entry in ten in the sparse lower-bound projection.
+const SPARSE_STRIDE: u64 = 10;
+/// Keep the RSS probe small relative to the number of pages in the sidecar.
+const RSS_PROBES: u64 = 64;
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -222,7 +224,7 @@ fn build_pack_index(
     let (index, build_t) = timed(|| PackIndex::build(identity, inputs).expect("build PackIndex"));
     let bytes = u64::try_from(index.as_bytes().len()).expect("PackIndex length fits u64");
     let path = dir.join("pack.mtxidx");
-    let (_, write_t) = timed(|| {
+    let ((), write_t) = timed(|| {
         index.write_atomic(&path).expect("write PackIndex");
     });
     (path, identity, bytes, build_t, write_t)
@@ -237,6 +239,7 @@ fn report_pack_index(
     write: Duration,
 ) {
     let count = u64::try_from(entries.len()).expect("entry count fits u64");
+    assert!(count > 0, "sidecar report needs at least one record");
     let mut collection_ids: Vec<[u8; 16]> = entries.iter().map(|entry| entry.0).collect();
     collection_ids.sort_unstable();
     collection_ids.dedup();
@@ -250,8 +253,19 @@ fn report_pack_index(
     ))
     .expect("PackIndex overhead fits u64");
     let truncated = overhead.saturating_add(count.saturating_mul(TRUNCATED_ENTRY_BYTES));
-    let sparse_count = count.saturating_add(9) / 10;
+    let sparse_count = count.saturating_add(SPARSE_STRIDE - 1) / SPARSE_STRIDE;
     let sparse = overhead.saturating_add(sparse_count.saturating_mul(TRUNCATED_ENTRY_BYTES));
+    let dense_projection =
+        overhead.saturating_add(count.saturating_mul(PACK_INDEX_SECTION_ENTRY_LEN as u64));
+    assert_eq!(
+        bytes, dense_projection,
+        "v1 layout projection matches encoding"
+    );
+    assert!(
+        truncated < bytes,
+        "truncated-id projection should be smaller"
+    );
+    assert!(sparse < truncated, "sparse projection should be smaller");
     println!(
         "  PackIndex sidecar {:.2} MiB ({:.2} B/record over {count} records, {collections} collection(s)); \
          build {:.0} ms, write+fsync {:.0} ms",
@@ -262,7 +276,7 @@ fn report_pack_index(
     );
     println!(
         "    layout: {PACK_INDEX_HEADER_LEN} B header + {PACK_INDEX_COLLECTION_ENTRY_LEN} B/collection \
-         directory + {PACK_INDEX_FANOUT_LEN} B/collection fanout + {SECTION_ENTRY_BYTES} B/record \
+         directory + {PACK_INDEX_FANOUT_LEN} B/collection fanout + {PACK_INDEX_SECTION_ENTRY_LEN} B/record \
          (CRC is in the header)"
     );
     println!(
@@ -272,7 +286,8 @@ fn report_pack_index(
         100.0 * to_f64(truncated) / to_f64(bytes),
     );
     println!(
-        "    sparse + truncated (1 in 10): {:.2} MiB ({:.2} B/record, {:.0}% of dense)",
+        "    sparse + truncated (1 in {SPARSE_STRIDE}, lower bound; omits scan-bound metadata): \
+         {:.2} MiB ({:.2} B/record, {:.0}% of dense)",
         mib_f64(sparse),
         to_f64(sparse) / to_f64(count),
         100.0 * to_f64(sparse) / to_f64(bytes),
@@ -292,16 +307,19 @@ fn report_pack_index(
     }
     let pairs = ordered.len().saturating_sub(1);
     println!(
-        "  frames in logical-id order: {} ({backwards} of {pairs} adjacent pairs go backwards, \
-         worst back-jump {worst_jump} B); a sparse index needs this",
+        "  synthetic arrival-order pack frames in logical-id order: {} ({backwards} of {pairs} \
+         adjacent pairs go backwards, worst back-jump {worst_jump} B)",
         if backwards == 0 { "yes" } else { "no" },
     );
 
     // `open_mmap` validates metadata and the directory without reading the
-    // complete body. Random lookups then fault in the pages they actually use.
+    // complete body. Random advice limits sequential readahead, though RSS can
+    // still include kernel fault-around and shared page-cache pages.
     let mapped = PackIndex::open_mmap(path, identity).expect("mmap PackIndex");
+    #[cfg(unix)]
+    mapped.advise_random().expect("advise random mmap access");
     let before = mapped_rss_bytes(path);
-    let probes = 1_000_u64.min(count);
+    let probes = RSS_PROBES.min(count);
     for i in 0..probes {
         let seq = sample_index(i ^ 0x5041_434b, count);
         assert!(
@@ -317,8 +335,8 @@ fn report_pack_index(
         )
     };
     println!(
-        "  PackIndex mmap is demand-paged; mapped RSS before lookups {}, after {probes} random lookups {} \
-         (Linux smaps; not total page-cache use)",
+        "  PackIndex mmap: mapped RSS before {probes} random lookups {}, after {} \
+         (Linux smaps; shared/reclaimable pages; probe result, not a memory-cost estimate)",
         show(before),
         show(after),
     );

@@ -5,6 +5,18 @@
 //! its pack. This module defines the format and I/O primitives; pack sealing
 //! and store-open integration are separate work.
 //!
+//! The `index_artifacts` benchmark writes frames in arrival order; it does not
+//! measure repacked packs. Repacking rewrites a collection's live frames in
+//! topological order ([`crate::packfile::storage::PackfileStorage::repack_collection_reachable`]
+//! copies in `topo_order()`). Neither order sorts by logical id, so sparse
+//! sampling cannot scan between sampled ids in these layouts. Supporting that
+//! would require an id-ordered write path and would trade away the locality
+//! repack creates. Truncated ids (drop the trailing bytes, then verify the full
+//! id from the frame header and probe adjacent equal prefixes) project to about
+//! 40% less sidecar data, before accounting for any additional lookup metadata;
+//! this format has no production mmap loader yet. Today only tests and the
+//! `index_artifacts` bench call [`PackIndex::open_mmap`].
+//!
 //! Version 1 is little-endian:
 //!
 //! ```text
@@ -41,6 +53,8 @@ pub const PACK_INDEX_HEADER_LEN: usize = 64;
 pub const PACK_INDEX_COLLECTION_ENTRY_LEN: usize = 20;
 /// Cumulative first-byte fanout table length in bytes.
 pub const PACK_INDEX_FANOUT_LEN: usize = 256 * 4;
+/// Bytes per locator in a collection section: a 16-byte id and a `u32` offset.
+pub const PACK_INDEX_SECTION_ENTRY_LEN: usize = 20;
 const CRC_RANGE: std::ops::Range<usize> = 60..64;
 const MAX_FILE_LEN: u64 = 0xFFFF_FFFF;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -395,7 +409,8 @@ fn encoded_file_len(groups: &[CollectionRange]) -> Result<usize, PackIndexError>
         .iter()
         .try_fold(0_usize, |total, group| {
             let count = group.end.checked_sub(group.start)?;
-            let section_len = PACK_INDEX_FANOUT_LEN.checked_add(count.checked_mul(20)?)?;
+            let section_len = PACK_INDEX_FANOUT_LEN
+                .checked_add(count.checked_mul(PACK_INDEX_SECTION_ENTRY_LEN)?)?;
             total.checked_add(section_len)
         })
         .ok_or(PackIndexError::TooLarge)?;
@@ -522,6 +537,18 @@ impl MappedPackIndex {
     #[must_use]
     pub fn get(&self, collection_id: &[u8; 16], logical_id: &[u8; 16]) -> Option<u32> {
         lookup(&self.map, &self.collections, collection_id, logical_id)
+    }
+
+    /// Tell the operating system that lookups will access the mapping randomly.
+    ///
+    /// This can reduce sequential readahead for scattered lookups. It is only
+    /// a hint; the mapping remains correct if the operating system ignores it.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the operating system cannot apply the advice.
+    #[cfg(unix)]
+    pub fn advise_random(&self) -> io::Result<()> {
+        self.map.advise(memmap2::Advice::Random)
     }
 
     /// Verify CRC, sorted ids, exact fanout values, and every frame offset.
