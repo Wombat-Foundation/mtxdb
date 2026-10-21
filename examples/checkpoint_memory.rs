@@ -140,6 +140,7 @@ fn main() {
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let build = put_range(&store, 0, records);
     store.sync_all().unwrap();
+    let mut live = records;
     let built = records as f64 / build.as_secs_f64();
     println!(
         "build: {:.2}s ({:.0} records/s), delta epoch bytes: {:.1} MiB",
@@ -165,18 +166,21 @@ fn main() {
 
     // 2. Reopen from the identity checkpoint and measure put cost there.
     drop(store);
+    let rss_before = rss_bytes();
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let (heap, mapped, logical) = store.index_memory_detail();
     println!(
-        "reopen (identities): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss {:.1} MiB",
+        "reopen (identities): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
         mib(heap as u64),
         heap as f64 / records as f64,
         mib(mapped as u64),
         logical as f64 / records as f64,
-        mib(rss_bytes())
+        mib(rss_bytes().saturating_sub(rss_before)),
+        mib(rss_before)
     );
     let before = store.stats().index_identity_reads;
-    let append_ids = put_range(&store, records, 50_000);
+    let append_ids = put_range(&store, live, 50_000);
+    live += 50_000;
     let append_identity = store.stats().index_identity_reads - before;
     let before = store.stats().index_identity_reads;
     let rewrite_ids = put_range(&store, 0, 20_000);
@@ -187,6 +191,11 @@ fn main() {
         append_ids.as_secs_f64() * 1e6 / 50_000.0,
         rewrite_ids.as_secs_f64() * 1e3,
         rewrite_ids.as_secs_f64() * 1e6 / 20_000.0,
+    );
+    store.sync_all().unwrap();
+    println!(
+        "delta after 70k post-reopen writes (identities): {:.1} MiB",
+        mib(delta_bytes(&dir))
     );
     drop(store);
 
@@ -203,34 +212,37 @@ fn main() {
     println!(
         "checkpoint slots-only:      {:.1} MiB ({:.2} B/rec), write {:.0} ms, has_homes_tails={slots_has_tables}",
         mib(slots_bytes),
-        slots_bytes as f64 / records as f64,
+        slots_bytes as f64 / live as f64,
         slots_ms
     );
     let (heap, _mapped, logical) = store.index_memory_detail();
     println!(
         "live writer index (unchanged by the toggle): heap {:.1} MiB ({:.2} B/rec), logical {:.2} B/rec",
         mib(heap as u64),
-        heap as f64 / records as f64,
-        logical as f64 / records as f64
+        heap as f64 / live as f64,
+        logical as f64 / live as f64
     );
     drop(store);
 
     // 4. Reopen from the slots-only checkpoint.
+    let rss_before = rss_bytes();
     let started = Instant::now();
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let open_ms = started.elapsed().as_secs_f64() * 1e3;
     let (heap, mapped, logical) = store.index_memory_detail();
     println!(
-        "reopen (slots-only): {:.0} ms, heap {:.2} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss {:.1} MiB",
+        "reopen (slots-only): {:.0} ms, heap {:.2} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
         open_ms,
         mib(heap as u64),
-        heap as f64 / records as f64,
+        heap as f64 / live as f64,
         mib(mapped as u64),
-        logical as f64 / records as f64,
-        mib(rss_bytes())
+        logical as f64 / live as f64,
+        mib(rss_bytes().saturating_sub(rss_before)),
+        mib(rss_before)
     );
     let before = store.stats().index_identity_reads;
-    let append_slots = put_range(&store, records + 50_000, 50_000);
+    let append_slots = put_range(&store, live, 50_000);
+    live += 50_000;
     let append_identity = store.stats().index_identity_reads - before;
     let before = store.stats().index_identity_reads;
     let rewrite_slots = put_range(&store, 0, 20_000);
@@ -241,6 +253,11 @@ fn main() {
         append_slots.as_secs_f64() * 1e6 / 50_000.0,
         rewrite_slots.as_secs_f64() * 1e3,
         rewrite_slots.as_secs_f64() * 1e6 / 20_000.0,
+    );
+    store.sync_all().unwrap();
+    println!(
+        "delta after 70k post-reopen writes (slots-only): {:.1} MiB",
+        mib(delta_bytes(&dir))
     );
     drop(store);
 
@@ -261,7 +278,7 @@ fn main() {
         mib(baseline),
         mib(peak.saturating_sub(baseline)),
         mib(heap as u64),
-        heap as f64 / records as f64
+        heap as f64 / live as f64
     );
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
