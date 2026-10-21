@@ -9395,19 +9395,19 @@ impl ImportContext<'_> {
         export_import::clear_marker(self.db)?;
         export_import::write_keys(self.db, records)
             .with_context(|| format!("importing signing keys from {}", path.display()))?;
-        let (mut provisional, mut corroborated, mut notary) = (0_usize, 0_usize, 0_usize);
+        let (mut provisional, mut permanent, mut notary) = (0_usize, 0_usize, 0_usize);
         for record in records {
             match record {
                 KeyRecord::Key { key, .. } if key.tier == KeyTier::Provisional => {
                     provisional = provisional.saturating_add(1);
                 }
-                KeyRecord::Key { .. } => corroborated = corroborated.saturating_add(1),
+                KeyRecord::Key { .. } => permanent = permanent.saturating_add(1),
                 KeyRecord::Notary { .. } => notary = notary.saturating_add(1),
             }
         }
         eprintln!(
             "imported {} signing-key records ({provisional} provisional, \
-             {corroborated} corroborated, {notary} notary)",
+             {permanent} permanent, {notary} notary)",
             records.len()
         );
         Ok(())

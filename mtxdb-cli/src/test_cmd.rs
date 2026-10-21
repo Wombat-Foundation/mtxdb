@@ -4984,7 +4984,9 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
                 json_str(&record, "key_id").unwrap().into_bytes(),
                 decode("key"),
                 json_str(&record, "source").unwrap().into_bytes(),
-                kind == "corroborated",
+                kind == "permanent",
+                record.get("expired_ts").and_then(OwnedValue::as_u64),
+                record.get("promote_by_ms").and_then(OwnedValue::as_u64).unwrap_or(0),
             )),
         }
     }
@@ -4997,7 +4999,9 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
                 key.key_id.clone(),
                 key.key.clone(),
                 key.source.clone(),
-                key.tier == KeyTier::Corroborated,
+                key.tier == KeyTier::Permanent,
+                key.expired_ts,
+                key.promote_by_ms,
             )
         })
         .collect();

@@ -5,7 +5,7 @@
 //! agree on what each verdict code number means, so those live here once. The
 //! module is pure: names, numbers and tag conversions, no JSON library and no
 //! I/O. A `server_keys` record is one signing key of an origin, tagged by
-//! [`key_kind::PROVISIONAL`] or [`key_kind::CORROBORATED`], or the origin's
+//! [`key_kind::PROVISIONAL`] or [`key_kind::PERMANENT`], or the origin's
 //! verbatim self-signed payload, tagged [`key_kind::NOTARY`].
 //!
 //! Each line is one JSON object tagged by [`field::T`]:
@@ -38,7 +38,7 @@ pub mod key_kind {
     /// A key seen only through a notary so far.
     pub const PROVISIONAL: &str = "provisional";
     /// A key observed by a direct fetch from its origin.
-    pub const CORROBORATED: &str = "corroborated";
+    pub const PERMANENT: &str = "permanent";
     /// The origin's self-signed payload, kept verbatim.
     pub const NOTARY: &str = "notary";
 }
@@ -94,6 +94,12 @@ pub mod field {
     /// `server_keys` key: who first supplied the key.
     pub const SOURCE: &str = "source";
     /// `server_keys` key: millisecond timestamp the key was last seen.
+    /// `provisional`, optional: the last millisecond a direct fetch may still
+    /// override the key; absent is `0`.
+    pub const PROMOTE_BY_MS: &str = "promote_by_ms";
+    /// `provisional` or `permanent`, optional: when the key was retired.
+    pub const EXPIRED_TS: &str = "expired_ts";
+    /// `provisional` or `permanent`: millisecond timestamp the key was last seen.
     pub const TS_ADDED_MS: &str = "ts_added_ms";
 }
 

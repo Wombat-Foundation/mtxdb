@@ -12,9 +12,10 @@
 //! * `end` — the event count. A file without it was truncated.
 //!
 //! A keys export drops the framing: every line is a `server_keys` record with
-//! an `origin` and a `kind`. A `provisional` or `corroborated` line is one
+//! an `origin` and a `kind`. A `provisional` or `permanent` line is one
 //! signing key (`key_id`, base64 `key`, `valid_until_ts`, `source`,
-//! `ts_added_ms`); a `notary` line is the origin's self-signed payload, base64
+//! `ts_added_ms`, and optionally `expired_ts` and, for a provisional key,
+//! `promote_by_ms`); a `notary` line is the origin's self-signed payload, base64
 //! of its exact bytes.
 //!
 //! # What the importer derives from this
@@ -259,7 +260,7 @@ pub(crate) fn parse_keys(content: &[u8]) -> anyhow::Result<Vec<KeyRecord>> {
                 origin,
                 payload: Bytes::from(require_base64(line, object, field::PAYLOAD)?),
             },
-            kind @ (key_kind::PROVISIONAL | key_kind::CORROBORATED) => {
+            kind @ (key_kind::PROVISIONAL | key_kind::PERMANENT) => {
                 let key_id = require_string(line, object, field::KEY_ID)?;
                 if key_id.is_empty() {
                     bail!("line {line}: `key_id` is empty");
@@ -267,7 +268,7 @@ pub(crate) fn parse_keys(content: &[u8]) -> anyhow::Result<Vec<KeyRecord>> {
                 let tier = if kind == key_kind::PROVISIONAL {
                     KeyTier::Provisional
                 } else {
-                    KeyTier::Corroborated
+                    KeyTier::Permanent
                 };
                 KeyRecord::Key {
                     origin,
@@ -280,6 +281,9 @@ pub(crate) fn parse_keys(content: &[u8]) -> anyhow::Result<Vec<KeyRecord>> {
                             .to_vec(),
                         ts_added_ms: require_number(line, object, field::TS_ADDED_MS)?,
                         tier,
+                        expired_ts: optional_number(line, object, field::EXPIRED_TS)?,
+                        promote_by_ms: optional_number(line, object, field::PROMOTE_BY_MS)?
+                            .unwrap_or(0),
                     },
                 }
             }
@@ -490,6 +494,18 @@ fn require_number(line: usize, object: &Object, field: &str) -> anyhow::Result<u
             .ok_or_else(|| anyhow!("line {line}: `{field}` must be a non-negative integer")),
         None => bail!("line {line}: record is missing `{field}`"),
     }
+}
+
+/// An optional non-negative integer field of a record.
+fn optional_number(line: usize, object: &Object, field: &str) -> anyhow::Result<Option<u64>> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("line {line}: `{field}` must be a non-negative integer"))
+        })
+        .transpose()
 }
 
 /// An optional verdict code: absent, or an integer from 0 to 255.
@@ -781,8 +797,8 @@ mod tests {
     fn parse_keys_reads_keys_and_the_verbatim_notary_payload() {
         let notary = "{\"t\":\"server_keys\",\"origin\":\"example.org\",\"kind\":\"notary\",\
                       \"payload\":\"eyJrZXlzIjp7fX0=\"}\n";
-        let corroborated = KEY_LINE.replace("provisional", "corroborated");
-        let export = format!("{KEY_LINE}{corroborated}{notary}");
+        let permanent = KEY_LINE.replace("provisional", "permanent");
+        let export = format!("{KEY_LINE}{permanent}{notary}");
         let records = parse_keys(export.as_bytes()).expect("keys export must parse");
         assert_eq!(records.len(), 3);
         let KeyRecord::Key { origin, key } = &records[0] else {
@@ -799,7 +815,7 @@ mod tests {
         let KeyRecord::Key { key, .. } = &records[1] else {
             panic!("the second line is a key");
         };
-        assert_eq!(key.tier, KeyTier::Corroborated);
+        assert_eq!(key.tier, KeyTier::Permanent);
         let KeyRecord::Notary { payload, .. } = &records[2] else {
             panic!("the third line is the notary payload");
         };
