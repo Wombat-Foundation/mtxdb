@@ -343,7 +343,10 @@ mod tests {
                 let state = cache.state.read();
                 for expected in [key - 1, key] {
                     let index = state.map.get(&expected).expect("expected key to remain");
-                    assert_eq!(state.entries[*index as usize].value.as_ref(), Some(&expected));
+                    assert_eq!(
+                        state.entries[*index as usize].value.as_ref(),
+                        Some(&expected)
+                    );
                 }
             }
             if key >= 2 {
