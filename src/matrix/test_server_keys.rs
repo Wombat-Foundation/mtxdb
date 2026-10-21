@@ -744,3 +744,37 @@ fn a_response_over_the_ceilings_or_with_a_long_key_id_is_rejected() {
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn concurrent_inserts_cannot_overrun_the_digest_cap() {
+    let (db, root) = open("cap-race");
+    let db = Arc::new(db);
+    let limits = KeyLimits {
+        digest_cap: 5,
+        ..KeyLimits::default()
+    };
+    let workers: Vec<_> = (0..4_u8)
+        .map(|worker| {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                for round in 0..10_u8 {
+                    let keys = [observed(
+                        &format!("ed25519:{worker}-{round}"),
+                        &[worker, round],
+                        1,
+                    )];
+                    let batch =
+                        with_limits(update("o", KeySighting::Direct, "d", &keys, 1), limits);
+                    update_server_keys(&db, &batch).unwrap();
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let all = read_server_keys(db.server_info(), b"o").unwrap();
+    assert_eq!(all.len(), 5, "the cap holds exactly under racing inserts");
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}

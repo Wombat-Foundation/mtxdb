@@ -719,10 +719,10 @@ fn stored_ids(db: &Database, collection: &[u8; 16]) -> Result<Vec<[u8; 16]>, Sto
 /// update that meets a new key id, also reads the origin's remaining records:
 /// that is what retires keys a direct snapshot omits, counts the digest
 /// buckets, and enforces the retired-key ceiling by evicting key bytes while
-/// keeping the digest binding. The scan that finds those records is not
-/// versioned, so a record created during it can be missed; the records read are
-/// version-checked, so an overlapping writer fails the commit and the whole
-/// read-resolve-write is re-run on fresh data.
+/// keeping the digest binding. That read pins the origin's whole collection
+/// version, and every other read is version-checked per record, so an
+/// overlapping writer, including one that inserts a record the scan missed,
+/// fails the commit and the whole read-resolve-write is re-run on fresh data.
 ///
 /// When a body collision, a conflicting `expired_ts` or a refused key was
 /// rejected, the Notary payload is not stored, so what is served stays
@@ -786,6 +786,10 @@ fn try_update(
     }
     let seen: BTreeSet<[u8; 16]> = ids.iter().copied().collect();
     let tx = db.begin_transaction();
+    // Sampled before any data is read, so it can only be older than what the
+    // scan below sees: a write that lands later makes the commit stale, and a
+    // write the scan already saw only costs a retry.
+    let (_, version) = tx.get_with_collection_version(SERVER_INFO_POOL, &collection, &[])?;
     let mut current: BTreeMap<[u8; 16], ServerKey> = BTreeMap::new();
     load(&tx, collection, update.origin, &ids, &mut current)?;
     // An evicted key whose body returns competes for a retention slot again,
@@ -799,6 +803,9 @@ fn try_update(
             .filter(|id| !seen.contains(id))
             .collect();
         load(&tx, collection, update.origin, &rest, &mut current)?;
+        // The scan is not versioned record by record, so pin the whole
+        // collection: any insert it could have missed fails the commit.
+        tx.expect_collection_version(SERVER_INFO_POOL, collection, version)?;
     }
     let stored = current.clone();
     let bucket = |tier: KeyTier, records: &BTreeMap<[u8; 16], ServerKey>| {
