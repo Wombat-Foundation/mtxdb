@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"struct":["CommitPhaseStats","Database","DatabaseTransaction","PhaseTiming","PoolPolicies","PoolPolicy"],"type":["SharedDatabase"]};
+window.SIDEBAR_ITEMS = {"struct":["CommitPhaseStats","Database","DatabaseTransaction","PhaseTiming","PoolPolicies","PoolPolicy"]};
