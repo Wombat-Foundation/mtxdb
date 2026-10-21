@@ -1233,10 +1233,37 @@ impl LossyIndex {
         let homes = self.homes.lock();
         let tails = self.tails.lock();
         for index in 0..cap {
-            buf.extend_from_slice(&homes[index].to_le_bytes());
+            // A slots-only load leaves the identity tables empty; widen it to
+            // an explicit zero table rather than indexing past the end.
+            buf.extend_from_slice(&homes.get(index).copied().unwrap_or(0).to_le_bytes());
         }
         for index in 0..cap {
-            buf.extend_from_slice(&tails[index].to_le_bytes());
+            buf.extend_from_slice(&tails.get(index).copied().unwrap_or(0).to_le_bytes());
+        }
+        buf
+    }
+
+    /// Length of [`Self::serialize_slots_only`]'s output, `8 + capacity * 8`.
+    #[must_use]
+    pub fn serialized_slots_only_len(&self) -> usize {
+        (self.capacity as usize).saturating_mul(8).saturating_add(8)
+    }
+
+    /// Serialize the capacity and packed slots without the `homes`/`tails`
+    /// identity tables.
+    ///
+    /// A reader loads this as an index with incomplete identity: a same-tag
+    /// probe resolves the candidate from its frame header
+    /// ([`InsertError::NeedsIdentity`]) and growth recovers hashes from the
+    /// packs (`grow_by_recovering_hashes`). In exchange the blob is a
+    /// third the size.
+    #[must_use]
+    pub fn serialize_slots_only(&self) -> Vec<u8> {
+        let cap = self.capacity as usize;
+        let mut buf = Vec::with_capacity(self.serialized_slots_only_len());
+        buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
+        for index in 0..cap {
+            buf.extend_from_slice(&self.entry_at(index).to_le_bytes());
         }
         buf
     }

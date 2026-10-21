@@ -11683,3 +11683,171 @@ fn a_coverage_batch_syncs_the_directory_of_a_log_an_earlier_batch_created() {
     );
     crate::shard::clear_directory_sync_failure(&dir);
 }
+
+#[test]
+fn slots_only_reopen_counts_identity_reads_for_a_tag_collision() {
+    let dir = test_dir("slots_only_identity_reads");
+    let collection = [0x7Au8; 16];
+
+    // Equal bucket bytes (0..8) and equal tag bytes (8..12): the lossy index
+    // cannot tell these two apart without reading the frame header. Only the
+    // bytes it does not inspect (12..16, plus the tail it does) differ.
+    let mut first = [0u8; 16];
+    first[..8].copy_from_slice(&[0x11; 8]);
+    first[8..12].copy_from_slice(&[0x22; 4]);
+    first[12..].copy_from_slice(&[0x33; 4]);
+    let mut second = first;
+    second[12..].copy_from_slice(&[0x44; 4]);
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.set_checkpoint_slots_only(true);
+    store.force_index_checkpoint().unwrap();
+    drop(store);
+
+    // The durable checkpoint really is slots-only, so the reopened index has
+    // no identity tables to decide the collision with.
+    let checkpoint =
+        crate::index::checkpoint::read_checkpoint(&PackfileStorage::index_checkpoint_path(&dir))
+            .expect("forced checkpoint is readable");
+    assert!(
+        checkpoint
+            .collections
+            .iter()
+            .any(|loaded| loaded.collection_id == collection && !loaded.has_homes_tails),
+        "the forced checkpoint must omit homes/tails for this collection"
+    );
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        store.stats().index_identity_reads,
+        0,
+        "opening does not read identities"
+    );
+
+    store
+        .put(
+            &collection,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.stats().index_identity_reads,
+        1,
+        "a same-tag probe against a slots-only index must hydrate from the frame"
+    );
+    assert_eq!(
+        store
+            .get(&collection, &first)
+            .unwrap()
+            .map(|node| node.bytes),
+        Some(bytes::Bytes::from_static(b"first")),
+        "the colliding predecessor must still resolve"
+    );
+    assert_eq!(
+        store
+            .get(&collection, &second)
+            .unwrap()
+            .map(|node| node.bytes),
+        Some(bytes::Bytes::from_static(b"second"))
+    );
+}
+
+#[test]
+fn slots_only_delta_snapshot_is_short_and_replays() {
+    let dir = test_dir("slots_only_delta_snapshot");
+    let collection = [0x6Du8; 16];
+    let ids: Vec<[u8; 16]> = (0..200u8).map(distinct_id).collect();
+    let entries: Vec<([u8; 16], NodeData)> = ids
+        .iter()
+        .map(|id| (*id, NodeData::from_slice(b"payload")))
+        .collect();
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.put_many(&collection, &entries).unwrap();
+    // Baseline full checkpoint gives the delta log a continuable base.
+    store.sync_all().unwrap();
+
+    // Promote the collection to a whole-index snapshot in the delta log and
+    // write it with the slots-only toggle on.
+    store.set_checkpoint_slots_only(true);
+    store.invalidate_delta_log(&collection);
+    // A write marks the checkpoint dirty so the next sync takes the delta
+    // path; the snapshot serialized at sync time includes this record.
+    let extra = distinct_id(0xFE);
+    store
+        .put(
+            &collection,
+            &extra,
+            &NodeData::new(bytes::Bytes::from_static(b"extra")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let (len, _memory, capacity) = store
+        .collection_index_info(&collection)
+        .expect("collection");
+    assert_eq!(len, ids.len() + 1);
+    let capacity_bytes = u64::from(capacity);
+    let short_blob = 8 + capacity_bytes * 8;
+    let full_blob = 8 + capacity_bytes * 24;
+    let delta_bytes: u64 = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(crate::index::delta::INDEX_DELTA_FILE)
+        })
+        .map(|entry| entry.metadata().map(|m| m.len()).unwrap_or(0))
+        .sum();
+    assert!(
+        delta_bytes > short_blob,
+        "the batch must carry the snapshot: {delta_bytes} bytes"
+    );
+    assert!(
+        delta_bytes < full_blob,
+        "the snapshot must use the short form: {delta_bytes} bytes, full form is {full_blob}"
+    );
+    drop(store);
+
+    // Replay must accept the short snapshot and keep every record.
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    for id in ids.iter().chain(std::iter::once(&extra)) {
+        assert!(
+            store.get(&collection, id).unwrap().is_some(),
+            "replayed snapshot lost a record"
+        );
+    }
+    assert_eq!(
+        store.stats().index_identity_reads,
+        0,
+        "opening must not read identities"
+    );
+
+    // The replayed collection is slots-only, so an overwrite hydrates from the
+    // frame exactly as a short checkpoint does.
+    let before = store.stats().index_identity_reads;
+    store
+        .put(
+            &collection,
+            &ids[0],
+            &NodeData::new(bytes::Bytes::from_static(b"again")),
+        )
+        .unwrap();
+    assert_eq!(
+        store.stats().index_identity_reads,
+        before + 1,
+        "a replayed slots-only snapshot must hydrate on the first overwrite"
+    );
+}
