@@ -8,7 +8,7 @@
 //! one exception: it lives beside the keys as verbatim bytes, since any
 //! re-encoding would invalidate its signature.
 //!
-//! [`update_server_keys`] is the write path. It reads the records of the keys
+//! [`update_server_keys`](crate::server_keys::update_server_keys) is the write path. It reads the records of the keys
 //! it was handed (their ids are derived from the key id), applies the MSC4499
 //! binding rules, and commits the changed records, and the Notary payload when
 //! one is given, in one transaction guarded by per-record version checks. A
@@ -729,7 +729,7 @@ fn stored_ids(db: &Database, collection: &[u8; 16]) -> Result<Vec<[u8; 16]>, Sto
 /// consistent with what is bound.
 ///
 /// # Errors
-/// Returns an error if the update is invalid (see [`validate`]), if a stored
+/// Returns an error if the update fails validation, if a stored
 /// record is corrupt, if the pool cannot be read or written, or the stale-read
 /// error if every attempt lost a race.
 pub fn update_server_keys(db: &Database, update: &KeyUpdate<'_>) -> Result<KeyMerge, StorageError> {
