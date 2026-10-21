@@ -346,7 +346,8 @@ pub fn put_notary_payload(
 /// * A key id seen for the first time is bound: the first one seen wins. A
 ///   direct fetch binds it corroborated, a notary provisionally.
 /// * The same key body again refreshes only the validity time and
-///   `ts_added_ms`; the original source stays. A direct fetch of a provisional
+///   `ts_added_ms`; the original source stays. The validity time is replaced
+///   exactly, as Synapse's upsert does, not only moved forward. A direct fetch of a provisional
 ///   key also corroborates it.
 /// * A different body replaces the stored one only when a direct fetch meets a
 ///   provisional binding; the new binding is corroborated and takes the new
@@ -400,6 +401,7 @@ pub fn update_server_keys(
     db: &Database,
     update: &KeyUpdate<'_>,
 ) -> Result<Vec<ServerKey>, StorageError> {
+    validate(update)?;
     if update.observed.is_empty() && update.notary.is_none() {
         return Ok(Vec::new());
     }
@@ -413,6 +415,30 @@ pub fn update_server_keys(
             result => return result,
         }
     }
+}
+
+/// Reject input that could not be stored faithfully, before anything is read
+/// or staged: an empty origin, key id or key body, or two distinct key ids
+/// that derive the same record id.
+fn validate(update: &KeyUpdate<'_>) -> Result<(), StorageError> {
+    let invalid = |what: &str| StorageError::Corrupt(format!("invalid server key update: {what}"));
+    if update.origin.is_empty() {
+        return Err(invalid("empty origin"));
+    }
+    let mut seen: BTreeMap<[u8; 16], &[u8]> = BTreeMap::new();
+    for observed in update.observed {
+        if observed.key_id.is_empty() {
+            return Err(invalid("empty key id"));
+        }
+        if observed.key.is_empty() {
+            return Err(invalid("empty key bytes"));
+        }
+        let id = origin_key_record_id(&observed.key_id);
+        if *seen.entry(id).or_insert(&observed.key_id) != observed.key_id.as_slice() {
+            return Err(invalid("key ids share a record id"));
+        }
+    }
+    Ok(())
 }
 
 fn try_update(

@@ -121,6 +121,35 @@ fn the_same_body_refreshes_times_and_keeps_the_source() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Pins the current choice: a same-body sighting replaces `valid_until_ts`
+/// exactly, even with an earlier time. Revisit if the MSC requires monotonic.
+#[test]
+fn the_same_body_replaces_validity_exactly_even_backwards() {
+    let (db, root) = open("validity");
+    let keys = [observed("ed25519:a", b"AAAA", 900)];
+    update_server_keys(&db, &update("o", KeySighting::Direct, "d", &keys, 1)).unwrap();
+    let keys = [observed("ed25519:a", b"AAAA", 100)];
+    let again = update_server_keys(&db, &update("o", KeySighting::Direct, "d", &keys, 2)).unwrap();
+    assert_eq!(again[0].valid_until_ts, 100);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn invalid_updates_are_rejected_before_any_write() {
+    let (db, root) = open("invalid");
+    let good = observed("ed25519:a", b"AAAA", 1);
+    for bad in [observed("", b"AAAA", 1), observed("ed25519:b", b"", 1)] {
+        let keys = [good.clone(), bad];
+        assert!(update_server_keys(&db, &update("o", KeySighting::Direct, "d", &keys, 1)).is_err());
+    }
+    let keys = [good.clone()];
+    assert!(update_server_keys(&db, &update("", KeySighting::Direct, "d", &keys, 1)).is_err());
+    assert!(read_server_keys(db.server_info(), b"o").unwrap().is_empty());
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn a_direct_fetch_corroborates_the_same_provisional_key() {
     let (db, root) = open("corroborate");
