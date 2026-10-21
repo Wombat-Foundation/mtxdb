@@ -3607,16 +3607,17 @@ impl PackfileStorage {
                         capacity_bytes.try_into().unwrap_or([0; 8]),
                     ))
                     .unwrap_or(usize::MAX);
-                    let Some(expected_blob_len) =
-                        capacity.checked_mul(24).and_then(|b| b.checked_add(8))
-                    else {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
-                        timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
-                        return None;
-                    };
-                    if expected_blob_len != index_blob.len() {
+                    // A snapshot may be the full slots+homes+tails blob or the
+                    // slots-only form; `deserialize_with_config` accepts both,
+                    // so accept either exact length here and reject anything
+                    // else.
+                    let slots_len = capacity
+                        .checked_mul(8)
+                        .and_then(|bytes| bytes.checked_add(8));
+                    let full_len = capacity
+                        .checked_mul(24)
+                        .and_then(|bytes| bytes.checked_add(8));
+                    if Some(index_blob.len()) != slots_len && Some(index_blob.len()) != full_len {
                         if writable {
                             let _ = std::fs::remove_file(&delta_path);
                         }
@@ -6137,6 +6138,14 @@ impl PackfileStorage {
         (cap, budget, projected)
     }
 
+    fn serialize_snapshot_index(&self, index: &LossyIndex) -> (usize, Vec<u8>) {
+        if self.checkpoint_slots_only.load(Ordering::Relaxed) {
+            (index.serialized_slots_only_len(), index.serialize_slots_only())
+        } else {
+            (index.serialized_len(), index.serialize())
+        }
+    }
+
     fn build_v1_pending_batch(
         &self,
         state: &DeltaLogState,
@@ -6188,13 +6197,15 @@ impl PackfileStorage {
                 PendingDelta::Snapshot => {
                     if let Some(room) = collections.get(&collection_id) {
                         let generation = arc_swap::ArcSwapAny::load_full(room);
+                        // The v1 payload is self-describing by length, and the
+                        // reader accepts either form, so slots-only stores
+                        // must use the short form here too.
+                        let (blob_len, index_blob) =
+                            self.serialize_snapshot_index(&generation.index);
                         let frame_len =
-                            delta::v1_snapshot_frame_len(generation.index.serialized_len())
-                                .ok_or_else(|| {
-                                    StorageError::Io(std::io::Error::other(
-                                        "v1 batch size overflow",
-                                    ))
-                                })?;
+                            delta::v1_snapshot_frame_len(blob_len).ok_or_else(|| {
+                                StorageError::Io(std::io::Error::other("v1 batch size overflow"))
+                            })?;
                         projected = projected.saturating_add(frame_len);
                         if u64::try_from(projected).unwrap_or(u64::MAX) > budget {
                             return Err(too_large(projected));
@@ -6211,7 +6222,7 @@ impl PackfileStorage {
                             collection_id,
                             generation: generation.generation,
                             order_key,
-                            index_blob: generation.index.serialize(),
+                            index_blob,
                         });
                         generation_updates.push((collection_id, generation.generation));
                         order_updates.push((collection_id, order_key));

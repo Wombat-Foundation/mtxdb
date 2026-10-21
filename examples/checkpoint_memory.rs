@@ -134,6 +134,16 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let checkpoint = dir.join(INDEX_CHECKPOINT_FILE);
 
+    if let Ok(mode) = std::env::var("MTXDB_MEASURE_MODE") {
+        let slots_only = match mode.as_str() {
+            "identities" => false,
+            "slots" => true,
+            other => panic!("MTXDB_MEASURE_MODE must be identities|slots, got {other}"),
+        };
+        run_cold_rewrite(&dir, records, slots_only);
+        return;
+    }
+
     println!("records={records} dir={}", dir.display());
     println!("rss at start: {:.1} MiB", mib(rss_bytes()));
 
@@ -282,4 +292,84 @@ fn main() {
     );
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Best-effort page-cache eviction via `vmtouch -e`, reporting what it did.
+fn evict_dir(dir: &Path) -> String {
+    match std::process::Command::new("vmtouch")
+        .arg("-e")
+        .arg(dir)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines()
+                .rev()
+                .find(|line| line.contains("Evicted"))
+                .unwrap_or("evicted")
+                .trim()
+                .to_owned()
+        }
+        Ok(out) => format!(
+            "vmtouch failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(error) => format!("vmtouch unavailable: {error}"),
+    }
+}
+
+/// One configuration per process: build, write that mode's checkpoint,
+/// reopen, optionally evict the page cache, then rewrite existing keys twice.
+fn run_cold_rewrite(dir: &Path, records: u64, slots_only: bool) {
+    let label = if slots_only {
+        "slots-only"
+    } else {
+        "identities"
+    };
+    let store = PackfileStorage::open(dir.to_path_buf()).unwrap();
+    let build = put_range(&store, 0, records);
+    store.sync_all().unwrap();
+    store.set_checkpoint_slots_only(slots_only);
+    store.force_index_checkpoint().unwrap();
+    let checkpoint = file_len(&dir.join(INDEX_CHECKPOINT_FILE));
+    let loaded = mtxdb::index::checkpoint::read_checkpoint(&dir.join(INDEX_CHECKPOINT_FILE))
+        .expect("checkpoint");
+    let has_tables = loaded.collections.iter().any(|c| c.has_homes_tails);
+    drop(loaded);
+    println!(
+        "[{label}] build {:.1}s, checkpoint {:.1} MiB ({:.2} B/rec), has_homes_tails={has_tables}",
+        build.as_secs_f64(),
+        mib(checkpoint),
+        checkpoint as f64 / records as f64,
+    );
+    drop(store);
+
+    let reopened = PackfileStorage::open(dir.to_path_buf()).unwrap();
+    let (heap, mapped, _logical) = reopened.index_memory_detail();
+    let evicted = if std::env::var("MTXDB_MEASURE_EVICT").as_deref() == Ok("1") {
+        evict_dir(dir)
+    } else {
+        "not requested".to_owned()
+    };
+    println!(
+        "[{label}] reopen heap {:.2} MiB, mapped {:.1} MiB; eviction: {evicted}",
+        mib(heap as u64),
+        mib(mapped as u64),
+    );
+
+    let before = reopened.stats().index_identity_reads;
+    let first = put_range(&reopened, 0, 20_000);
+    let first_reads = reopened.stats().index_identity_reads - before;
+    let before = reopened.stats().index_identity_reads;
+    let second = put_range(&reopened, 0, 20_000);
+    let second_reads = reopened.stats().index_identity_reads - before;
+    println!(
+        "[{label}] rewrite 20k: first {:.1} ms ({:.3} us/rec) identity_reads={first_reads}; second {:.1} ms ({:.3} us/rec) identity_reads={second_reads}",
+        first.as_secs_f64() * 1e3,
+        first.as_secs_f64() * 1e6 / 20_000.0,
+        second.as_secs_f64() * 1e3,
+        second.as_secs_f64() * 1e6 / 20_000.0,
+    );
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(dir);
 }

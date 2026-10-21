@@ -140,8 +140,10 @@ pub enum DeltaOperation {
         generation: u64,
         /// Stable position in `collection_order`.
         order_key: u64,
-        /// `LossyIndex::serialize()` bytes; semantic validation occurs during
-        /// replay, where the configured index policy is available.
+        /// `LossyIndex::serialize()` or `serialize_slots_only()` bytes. The
+        /// payload is self-describing by length and both forms decode through
+        /// `deserialize_with_config`; semantic validation occurs during replay,
+        /// where the configured index policy is available.
         index_blob: Vec<u8>,
     },
     /// Remove a collection from the replayed checkpoint state.
