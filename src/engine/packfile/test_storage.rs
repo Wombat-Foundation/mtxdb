@@ -76,6 +76,108 @@ fn read_committed_overlay_sees_a_committed_but_unflushed_group() {
     );
 }
 
+#[test]
+fn read_committed_frame_metadata_sees_metadata_from_unflushed_group() {
+    let dir = test_dir("read_committed_metadata_unflushed");
+    let wal = dir.join("wal.bin");
+    let collection = [0x42u8; 16];
+    let node = [0x07u8; 16];
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &[0x99u8; 16],
+        &[0x99u8; 16],
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+
+    let expected = FrameMetadata {
+        role: Some(b"event-edge".to_vec()),
+        ..FrameMetadata::default()
+    };
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[JournalMutation::PutWithMetadata {
+            collection_id: collection,
+            node_id: node,
+            payload: b"unflushed payload".to_vec(),
+            metadata: expected.clone(),
+        }])
+        .unwrap();
+    drop(journal);
+
+    let store = PackfileStorage::open_read_only(dir).unwrap();
+    store.enable_read_journal(&wal).unwrap();
+    let metadata = store.get_many_frame_metadata(&collection, &[node]).unwrap();
+    let mut expected = expected;
+    expected.last_write_lsn = Some(1);
+    assert_eq!(metadata, vec![Some(expected)]);
+    let combined = store.get_many_with_metadata(&collection, &[node]).unwrap();
+    assert_eq!(
+        combined[0]
+            .as_ref()
+            .map(|record| record.data.bytes.as_ref()),
+        Some(&b"unflushed payload"[..])
+    );
+    assert_eq!(
+        combined[0]
+            .as_ref()
+            .and_then(|record| record.metadata.as_ref()),
+        metadata.first().and_then(Option::as_ref)
+    );
+}
+
+#[test]
+fn put_with_metadata_persists_and_reads_frame_metadata() {
+    let dir = test_dir("put_with_metadata");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let metadata = FrameMetadata {
+        role: Some(b"event-edge".to_vec()),
+        unknown: vec![(0x7f, b"future-field".to_vec())],
+        ..FrameMetadata::default()
+    };
+    let id = distinct_id(44);
+    store
+        .put_with_metadata(
+            &TEST_COLLECTION,
+            &id,
+            &NodeData::new(bytes::Bytes::from_static(b"payload")),
+            &metadata,
+        )
+        .unwrap();
+
+    let actual = store
+        .get_many_frame_metadata(&TEST_COLLECTION, &[id])
+        .unwrap();
+    assert_eq!(actual[0].as_ref().unwrap().role, metadata.role);
+    assert_eq!(actual[0].as_ref().unwrap().unknown, metadata.unknown);
+    let combined = store
+        .get_many_with_metadata(&TEST_COLLECTION, &[id])
+        .unwrap();
+    assert_eq!(
+        combined[0]
+            .as_ref()
+            .map(|record| record.data.bytes.as_ref()),
+        Some(&b"payload"[..])
+    );
+    assert_eq!(
+        combined[0]
+            .as_ref()
+            .and_then(|record| record.metadata.as_ref())
+            .and_then(|metadata| metadata.role.as_deref()),
+        Some(&b"event-edge"[..])
+    );
+    store.sync().unwrap();
+    drop(store);
+    let reopened = PackfileStorage::open(dir).unwrap();
+    let replayed = reopened
+        .get_many_frame_metadata(&TEST_COLLECTION, &[id])
+        .unwrap();
+    assert_eq!(replayed[0].as_ref().unwrap().role, metadata.role);
+    assert_eq!(replayed[0].as_ref().unwrap().unknown, metadata.unknown);
+}
+
 /// Journal state for a writer-restart scenario: LSN 1 is durable and LSN 2
 /// is visible but never reached the disk. Returns the segment length that
 /// covers only LSN 1, so a test can cut the file back to what a crash would
@@ -9897,7 +9999,8 @@ fn scan_collections_at_snapshot_binds_one_boundary() {
         .iter()
         .flat_map(|group| group.entries.iter())
         .filter_map(|entry| match &entry.mutation {
-            JournalMutation::Put { node_id, .. } => Some(*node_id),
+            JournalMutation::Put { node_id, .. }
+            | JournalMutation::PutWithMetadata { node_id, .. } => Some(*node_id),
             JournalMutation::RemoveRecord { .. } | JournalMutation::DeleteCollection { .. } => None,
         })
         .collect();

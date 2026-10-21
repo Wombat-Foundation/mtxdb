@@ -8766,10 +8766,19 @@ impl PackfileStorage {
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
-        let receipt_lsn = self.publish_mutation(|| JournalMutation::Put {
-            collection_id: *collection_id,
-            node_id: *id,
-            payload: data.bytes.to_vec(),
+        let journal_metadata = metadata.clone();
+        let receipt_lsn = self.publish_mutation(|| match journal_metadata {
+            Some(metadata) => JournalMutation::PutWithMetadata {
+                collection_id: *collection_id,
+                node_id: *id,
+                payload: data.bytes.to_vec(),
+                metadata,
+            },
+            None => JournalMutation::Put {
+                collection_id: *collection_id,
+                node_id: *id,
+                payload: data.bytes.to_vec(),
+            },
         })?;
         let metadata = Self::stamp_last_write_lsn(metadata, receipt_lsn);
         let record = Record {
@@ -8882,10 +8891,19 @@ impl PackfileStorage {
         // reopen), and the frame materializes it. A frame write that fails after
         // publication is recovered by `replay_journal`, which stamps the same
         // LSN, so the mutation never becomes an orphan.
-        let receipt_lsn = self.publish_mutation(|| JournalMutation::Put {
-            collection_id: *collection_id,
-            node_id: *id,
-            payload: data.bytes.to_vec(),
+        let journal_metadata = metadata.clone();
+        let receipt_lsn = self.publish_mutation(|| match journal_metadata {
+            Some(metadata) => JournalMutation::PutWithMetadata {
+                collection_id: *collection_id,
+                node_id: *id,
+                payload: data.bytes.to_vec(),
+                metadata,
+            },
+            None => JournalMutation::Put {
+                collection_id: *collection_id,
+                node_id: *id,
+                payload: data.bytes.to_vec(),
+            },
         })?;
         let metadata = Self::stamp_last_write_lsn(metadata, receipt_lsn);
         let record = Record {
@@ -9929,6 +9947,22 @@ impl StorageEngine for PackfileStorage {
         self.put_internal(collection_id, id, data, None)
     }
 
+    fn put_with_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        metadata: &FrameMetadata,
+    ) -> Result<(), StorageError> {
+        if metadata.removed {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "put metadata cannot mark a frame as removed",
+            )));
+        }
+        self.put_internal(collection_id, id, data, Some(metadata.clone()))
+    }
+
     fn put_many(
         &self,
         collection_id: &[u8; 16],
@@ -9940,6 +9974,47 @@ impl StorageEngine for PackfileStorage {
             OperationTimer::disabled()
         };
         self.put_many_internal(collection_id, entries, None)
+    }
+
+    fn put_many_with_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData, Option<FrameMetadata>)],
+    ) -> Result<usize, StorageError> {
+        if entries
+            .iter()
+            .any(|(_, _, metadata)| metadata.as_ref().is_some_and(|value| value.removed))
+        {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "put metadata cannot mark a frame as removed",
+            )));
+        }
+        let plain_entries: Vec<(NodeId, NodeData)> = entries
+            .iter()
+            .map(|(id, data, _)| (*id, data.clone()))
+            .collect();
+        let metadatas: Vec<Option<FrameMetadata>> = entries
+            .iter()
+            .map(|(_, _, metadata)| metadata.clone())
+            .collect();
+        self.put_many_internal(collection_id, &plain_entries, Some(&metadatas))
+    }
+
+    fn get_many_frame_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<FrameMetadata>>, StorageError> {
+        self.read_many_frame_metadata(collection_id, ids)
+    }
+
+    fn get_many_with_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<crate::storage::RecordWithMetadata>>, StorageError> {
+        self.get_read_committed_with_metadata(collection_id, ids)
     }
 
     fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError> {
@@ -10006,6 +10081,135 @@ impl StorageEngine for PackfileStorage {
 }
 
 impl PackfileStorage {
+    pub(super) fn read_many_with_metadata_durable(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<crate::storage::RecordWithMetadata>>, StorageError> {
+        loop {
+            let gen_guard = self.generation(collection_id);
+            let Some(generation) = gen_guard.as_deref() else {
+                return Ok(vec![None; ids.len()]);
+            };
+            let candidates: Vec<Vec<(u16, u64)>> = ids
+                .iter()
+                .map(|id| generation.index.lookup_all(id).collect())
+                .collect();
+            let pinned = self.pin_shards(
+                candidates
+                    .iter()
+                    .flat_map(|matches| matches.iter().map(|&(slot, _)| slot)),
+            );
+            let current = self.generation(collection_id);
+            if !Self::same_generation(current.as_ref(), gen_guard.as_ref().unwrap()) {
+                continue;
+            }
+            let mut results = Vec::with_capacity(ids.len());
+            for (id, matches) in ids.iter().zip(&candidates) {
+                let mut resolved = None;
+                let mut last_error = None;
+                for &(slot, offset) in matches {
+                    let Some(shard) = pinned.get(&slot) else {
+                        continue;
+                    };
+                    match self.read_at(
+                        shard,
+                        offset,
+                        self.shards.checksum_policy().verifies_reads(),
+                    ) {
+                        Ok(record)
+                            if record.collection_id == *collection_id && record.hash == *id =>
+                        {
+                            let removed = record
+                                .metadata
+                                .as_ref()
+                                .is_some_and(|metadata| metadata.removed);
+                            if !removed {
+                                resolved = Some(crate::storage::RecordWithMetadata {
+                                    data: NodeData::new(record.data),
+                                    metadata: record.metadata,
+                                });
+                            }
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                if let Some(value) = resolved {
+                    results.push(Some(value));
+                } else if let Some(error) = last_error {
+                    return Err(error);
+                } else {
+                    results.push(None);
+                }
+            }
+            return Ok(results);
+        }
+    }
+
+    fn read_many_frame_metadata(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<FrameMetadata>>, StorageError> {
+        self.get_read_committed_frame_metadata(collection_id, ids)
+    }
+
+    pub(super) fn read_many_frame_metadata_durable(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<FrameMetadata>>, StorageError> {
+        loop {
+            let gen_guard = self.generation(collection_id);
+            let Some(generation) = gen_guard.as_deref() else {
+                return Ok(vec![None; ids.len()]);
+            };
+            let candidates: Vec<Vec<(u16, u64)>> = ids
+                .iter()
+                .map(|id| generation.index.lookup_all(id).collect())
+                .collect();
+            let pinned = self.pin_shards(
+                candidates
+                    .iter()
+                    .flat_map(|matches| matches.iter().map(|&(slot, _)| slot)),
+            );
+            let current = self.generation(collection_id);
+            if !Self::same_generation(current.as_ref(), gen_guard.as_ref().unwrap()) {
+                continue;
+            }
+            let mut results = Vec::with_capacity(ids.len());
+            for (id, matches) in ids.iter().zip(&candidates) {
+                let mut resolved = None;
+                let mut last_error = None;
+                for &(slot, offset) in matches {
+                    let Some(shard) = pinned.get(&slot) else {
+                        continue;
+                    };
+                    match self.shards.record_metadata_at(shard, offset) {
+                        Ok(record)
+                            if record.collection_id == *collection_id && record.hash == *id =>
+                        {
+                            resolved = Some(record.metadata.filter(|metadata| !metadata.removed));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                if let Some(metadata) = resolved {
+                    results.push(metadata);
+                } else if let Some(error) = last_error {
+                    return Err(error);
+                } else {
+                    results.push(None);
+                }
+            }
+            return Ok(results);
+        }
+    }
+
     /// Check collection existence using the historical boolean API.
     ///
     /// Call [`Self::try_collection_exists`] when storage errors must be
@@ -10565,6 +10769,17 @@ impl PackfileStorage {
                             let data = NodeData::new(bytes::Bytes::from(payload.clone()));
                             self.put_internal(collection_id, node_id, &data, Some(metadata))?;
                         }
+                        JournalMutation::PutWithMetadata {
+                            collection_id,
+                            node_id,
+                            payload,
+                            metadata: stored_metadata,
+                        } => {
+                            let mut metadata = stored_metadata.clone();
+                            metadata.last_write_lsn = Some(group.last_lsn);
+                            let data = NodeData::new(bytes::Bytes::from(payload.clone()));
+                            self.put_internal(collection_id, node_id, &data, Some(metadata))?;
+                        }
                         JournalMutation::RemoveRecord {
                             collection_id,
                             node_id,
@@ -10856,6 +11071,21 @@ impl PackfileStorage {
                         last_write_lsn: Some(write_lsn),
                         ..FrameMetadata::default()
                     };
+                    self.put_internal(
+                        collection_id,
+                        node_id,
+                        &NodeData::new(bytes::Bytes::from(payload.clone())),
+                        Some(metadata),
+                    )
+                }
+                JournalMutation::PutWithMetadata {
+                    collection_id,
+                    node_id,
+                    payload,
+                    metadata: stored_metadata,
+                } => {
+                    let mut metadata = stored_metadata.clone();
+                    metadata.last_write_lsn = Some(write_lsn);
                     self.put_internal(
                         collection_id,
                         node_id,

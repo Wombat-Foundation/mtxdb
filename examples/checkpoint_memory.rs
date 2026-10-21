@@ -125,6 +125,44 @@ fn put_range(store: &PackfileStorage, start: u64, count: u64) -> Duration {
     started.elapsed()
 }
 
+/// Deterministic, non-contiguous sample of `count` distinct keys below `records`.
+///
+/// Scattering the rewritten keys is the point: the first `count` ids sit in
+/// adjacent frames, so a page-cache drop only faults in a handful of pack
+/// pages and readahead hides the rest.
+fn spread_sample(records: u64, count: u64) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
+    let count = usize::try_from(count).expect("sample count exceeds address space");
+    let mut out = Vec::with_capacity(count);
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    while out.len() < count {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let index = z % records;
+        if seen.insert(index) {
+            out.push(index);
+        }
+    }
+    out
+}
+
+/// Overwrite an explicit set of existing keys.
+fn put_indices(store: &PackfileStorage, indices: &[u64]) -> Duration {
+    let started = Instant::now();
+    let batch = usize::try_from(BATCH).expect("batch size exceeds address space");
+    for chunk in indices.chunks(batch) {
+        let entries: Vec<([u8; 16], NodeData)> = chunk
+            .iter()
+            .map(|index| (id_for(*index), NodeData::from_slice(&payload(*index))))
+            .collect();
+        store.put_many(&COLLECTION, &entries).unwrap();
+    }
+    started.elapsed()
+}
+
 fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let running = Arc::new(AtomicBool::new(true));
     let peak = Arc::new(AtomicU64::new(rss_bytes()));
@@ -147,9 +185,14 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4_000_000);
-    let dir: PathBuf = match std::env::var("MTXDB_MEASURE_DIR") {
-        Ok(value) => PathBuf::from(value),
-        Err(_) => std::env::temp_dir().join(format!("mtxdb_measure_{}", std::process::id())),
+    let dir: PathBuf = if let Ok(value) = std::env::var("MTXDB_MEASURE_DIR") {
+        PathBuf::from(value)
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("mtxdb_measure_{}_{nanos}", std::process::id()))
     };
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -378,14 +421,24 @@ fn run_cold_rewrite(dir: &Path, records: u64, slots_only: bool) {
         mib(mapped as u64),
     );
 
+    let sample_size = 20_000u64;
+    let first_keys = match std::env::var("MTXDB_MEASURE_SAMPLE").as_deref() {
+        Ok("first") => (0..sample_size).map(|index| index % records).collect(),
+        _ => spread_sample(records, sample_size),
+    };
+    let sample_label = if std::env::var("MTXDB_MEASURE_SAMPLE").as_deref() == Ok("first") {
+        "first-20k"
+    } else {
+        "spread"
+    };
     let before = reopened.stats().index_identity_reads;
-    let first = put_range(&reopened, 0, 20_000);
+    let first = put_indices(&reopened, &first_keys);
     let first_reads = reopened.stats().index_identity_reads - before;
     let before = reopened.stats().index_identity_reads;
-    let second = put_range(&reopened, 0, 20_000);
+    let second = put_indices(&reopened, &first_keys);
     let second_reads = reopened.stats().index_identity_reads - before;
     println!(
-        "[{label}] rewrite 20k: first {:.1} ms ({:.3} us/rec) identity_reads={first_reads}; second {:.1} ms ({:.3} us/rec) identity_reads={second_reads}",
+        "[{label}] rewrite 20k ({sample_label} sample): first {:.1} ms ({:.3} us/rec) identity_reads={first_reads}; second {:.1} ms ({:.3} us/rec) identity_reads={second_reads}",
         first.as_secs_f64() * 1e3,
         first.as_secs_f64() * 1e6 / 20_000.0,
         second.as_secs_f64() * 1e3,

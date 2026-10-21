@@ -2646,6 +2646,51 @@ impl ShardPool {
         unreachable!("record_identity_at remap-retry is bounded to two iterations")
     }
 
+    /// Read a frame's metadata block without materializing or checksumming its
+    /// node payload. Framing and TLV lengths are still validated.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the shard cannot be mapped, or `Corrupt` if the
+    /// frame header or metadata block is malformed.
+    pub fn record_metadata_at(
+        &self,
+        shard: &Arc<Shard>,
+        offset: u64,
+    ) -> Result<packfile::RecordMetadata, crate::storage::StorageError> {
+        use crate::storage::StorageError;
+        if offset >= shard.file_len() {
+            self.flush_shard(shard).map_err(StorageError::Io)?;
+        }
+        for attempt in 0..2 {
+            let guard = shard.mmap().map_err(StorageError::Io)?;
+            let Some(mapping) = guard.as_ref().cloned() else {
+                return Err(StorageError::Unsupported(
+                    "shard could not be mapped".to_owned(),
+                ));
+            };
+            drop(guard);
+            let mem = mapping.as_ref();
+            let offset = usize::try_from(offset)
+                .map_err(|_| StorageError::Corrupt("record offset exceeds address space".into()))?;
+            let file_len = usize::try_from(shard.file_len()).unwrap_or(usize::MAX);
+            let end = file_len.min(mem.len());
+            if offset >= end {
+                if attempt == 0 {
+                    Self::remap_shard(shard)?;
+                    continue;
+                }
+                return Err(StorageError::Corrupt("truncated record header".into()));
+            }
+            let mut cursor = std::io::Cursor::new(&mem[offset..end]);
+            return packfile::read_record_metadata_skip_payload(&mut cursor)
+                .map_err(|error| StorageError::Corrupt(format!("frame metadata: {error}")))
+                .and_then(|metadata| {
+                    metadata.ok_or_else(|| StorageError::Corrupt("missing record frame".into()))
+                });
+        }
+        unreachable!("record_metadata_at remap-retry is bounded to two iterations")
+    }
+
     /// Read a record whose offset is already committed to disk (e.g. from
     /// `scan_packfile`, whose offsets are by construction within the file).
     /// Unlike [`Self::read_at`] this does not flush anything: a virtual
