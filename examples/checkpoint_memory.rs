@@ -1,0 +1,268 @@
+//! Measure the slots-only checkpoint prototype.
+//!
+//! Reports, separately: full-checkpoint bytes with and without identity
+//! tables, delta-epoch bytes, reopened index heap / mapped slot bytes /
+//! process RSS, put-path cost and identity-read counts, and the peak RSS of a
+//! checkpoint-less full-scan open.
+//!
+//! ```text
+//! MTXDB_MEASURE_RECORDS=4000000 cargo run --release --example checkpoint_memory
+//! ```
+
+// A measurement harness: byte counts and ratios are printed, never used for
+// control flow, and the phases are intentionally linear.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    clippy::too_many_lines
+)]
+
+use mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE;
+use mtxdb::index::delta::INDEX_DELTA_FILE;
+use mtxdb::storage::{NodeData, StorageEngine};
+use mtxdb::PackfileStorage;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const COLLECTION: [u8; 16] = [0xC1; 16];
+const BATCH: u64 = 8192;
+
+fn rss_bytes() -> u64 {
+    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    let pages: u64 = statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    pages.saturating_mul(4096)
+}
+
+fn id_for(seq: u64) -> [u8; 16] {
+    let mut state = seq.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&next().to_le_bytes());
+    id[8..].copy_from_slice(&next().to_le_bytes());
+    id
+}
+
+/// A 16-byte payload, incompressible enough that shard size tracks records.
+fn payload(seq: u64) -> [u8; 16] {
+    let mut state = seq.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1;
+    let mut out = [0u8; 16];
+    for chunk in out.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        chunk.copy_from_slice(&state.to_le_bytes());
+    }
+    out
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn delta_bytes(dir: &Path) -> u64 {
+    let prefix = format!("{INDEX_DELTA_FILE}.");
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                .map(|entry| entry.metadata().map(|m| m.len()).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn put_range(store: &PackfileStorage, start: u64, count: u64) -> Duration {
+    let started = Instant::now();
+    let end = start.saturating_add(count);
+    let mut seq = start;
+    while seq < end {
+        let n = (end - seq).min(BATCH);
+        let entries: Vec<([u8; 16], NodeData)> = (seq..seq + n)
+            .map(|i| (id_for(i), NodeData::from_slice(&payload(i))))
+            .collect();
+        store.put_many(&COLLECTION, &entries).unwrap();
+        seq += n;
+    }
+    started.elapsed()
+}
+
+fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let running = Arc::new(AtomicBool::new(true));
+    let peak = Arc::new(AtomicU64::new(rss_bytes()));
+    let flag = Arc::clone(&running);
+    let seen = Arc::clone(&peak);
+    let sampler = std::thread::spawn(move || {
+        while flag.load(Ordering::Relaxed) {
+            seen.fetch_max(rss_bytes(), Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    let out = f();
+    running.store(false, Ordering::Relaxed);
+    let _ = sampler.join();
+    (out, peak.load(Ordering::Relaxed))
+}
+
+fn main() {
+    let records: u64 = std::env::var("MTXDB_MEASURE_RECORDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_000_000);
+    let dir: PathBuf = match std::env::var("MTXDB_MEASURE_DIR") {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => std::env::temp_dir().join(format!("mtxdb_measure_{}", std::process::id())),
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let checkpoint = dir.join(INDEX_CHECKPOINT_FILE);
+
+    println!("records={records} dir={}", dir.display());
+    println!("rss at start: {:.1} MiB", mib(rss_bytes()));
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let build = put_range(&store, 0, records);
+    store.sync_all().unwrap();
+    let built = records as f64 / build.as_secs_f64();
+    println!(
+        "build: {:.2}s ({:.0} records/s), delta epoch bytes: {:.1} MiB",
+        build.as_secs_f64(),
+        built,
+        mib(delta_bytes(&dir))
+    );
+
+    // 1. Full checkpoint with identity tables.
+    let started = Instant::now();
+    store.force_index_checkpoint().unwrap();
+    let identity_ms = started.elapsed().as_secs_f64() * 1e3;
+    let identity_bytes = file_len(&checkpoint);
+    let loaded = mtxdb::index::checkpoint::read_checkpoint(&checkpoint).expect("checkpoint");
+    let identity_has_tables = loaded.collections.iter().any(|c| c.has_homes_tails);
+    drop(loaded);
+    println!(
+        "checkpoint with identities: {:.1} MiB ({:.2} B/rec), write {:.0} ms, has_homes_tails={identity_has_tables}",
+        mib(identity_bytes),
+        identity_bytes as f64 / records as f64,
+        identity_ms
+    );
+
+    // 2. Reopen from the identity checkpoint and measure put cost there.
+    drop(store);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let (heap, mapped, logical) = store.index_memory_detail();
+    println!(
+        "reopen (identities): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss {:.1} MiB",
+        mib(heap as u64),
+        heap as f64 / records as f64,
+        mib(mapped as u64),
+        logical as f64 / records as f64,
+        mib(rss_bytes())
+    );
+    let before = store.stats().index_identity_reads;
+    let append_ids = put_range(&store, records, 50_000);
+    let append_identity = store.stats().index_identity_reads - before;
+    let before = store.stats().index_identity_reads;
+    let rewrite_ids = put_range(&store, 0, 20_000);
+    let rewrite_identity = store.stats().index_identity_reads - before;
+    println!(
+        "put cost (identities): append 50k {:.0} ms ({:.2} us/rec), rewrite 20k {:.0} ms ({:.2} us/rec), identity reads append/rewrite {append_identity}/{rewrite_identity}",
+        append_ids.as_secs_f64() * 1e3,
+        append_ids.as_secs_f64() * 1e6 / 50_000.0,
+        rewrite_ids.as_secs_f64() * 1e3,
+        rewrite_ids.as_secs_f64() * 1e6 / 20_000.0,
+    );
+    drop(store);
+
+    // 3. Full checkpoint without identity tables, from the same live state.
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.set_checkpoint_slots_only(true);
+    let started = Instant::now();
+    store.force_index_checkpoint().unwrap();
+    let slots_ms = started.elapsed().as_secs_f64() * 1e3;
+    let slots_bytes = file_len(&checkpoint);
+    let loaded = mtxdb::index::checkpoint::read_checkpoint(&checkpoint).expect("checkpoint");
+    let slots_has_tables = loaded.collections.iter().any(|c| c.has_homes_tails);
+    drop(loaded);
+    println!(
+        "checkpoint slots-only:      {:.1} MiB ({:.2} B/rec), write {:.0} ms, has_homes_tails={slots_has_tables}",
+        mib(slots_bytes),
+        slots_bytes as f64 / records as f64,
+        slots_ms
+    );
+    let (heap, _mapped, logical) = store.index_memory_detail();
+    println!(
+        "live writer index (unchanged by the toggle): heap {:.1} MiB ({:.2} B/rec), logical {:.2} B/rec",
+        mib(heap as u64),
+        heap as f64 / records as f64,
+        logical as f64 / records as f64
+    );
+    drop(store);
+
+    // 4. Reopen from the slots-only checkpoint.
+    let started = Instant::now();
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let open_ms = started.elapsed().as_secs_f64() * 1e3;
+    let (heap, mapped, logical) = store.index_memory_detail();
+    println!(
+        "reopen (slots-only): {:.0} ms, heap {:.2} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss {:.1} MiB",
+        open_ms,
+        mib(heap as u64),
+        heap as f64 / records as f64,
+        mib(mapped as u64),
+        logical as f64 / records as f64,
+        mib(rss_bytes())
+    );
+    let before = store.stats().index_identity_reads;
+    let append_slots = put_range(&store, records + 50_000, 50_000);
+    let append_identity = store.stats().index_identity_reads - before;
+    let before = store.stats().index_identity_reads;
+    let rewrite_slots = put_range(&store, 0, 20_000);
+    let rewrite_identity = store.stats().index_identity_reads - before;
+    println!(
+        "put cost (slots-only): append 50k {:.0} ms ({:.2} us/rec), rewrite 20k {:.0} ms ({:.2} us/rec), identity reads append/rewrite {append_identity}/{rewrite_identity}",
+        append_slots.as_secs_f64() * 1e3,
+        append_slots.as_secs_f64() * 1e6 / 50_000.0,
+        rewrite_slots.as_secs_f64() * 1e3,
+        rewrite_slots.as_secs_f64() * 1e6 / 20_000.0,
+    );
+    drop(store);
+
+    // 5. Full-scan open peak, after losing the persisted index.
+    for entry in std::fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(INDEX_CHECKPOINT_FILE) || name.starts_with(INDEX_DELTA_FILE) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let baseline = rss_bytes();
+    let (store, peak) = peak_rss_during(|| PackfileStorage::open(dir.clone()).unwrap());
+    let (heap, _mapped, _logical) = store.index_memory_detail();
+    println!(
+        "full-scan open: peak rss {:.1} MiB (from {:.1} MiB, +{:.1}), final heap {:.1} MiB ({:.2} B/rec)",
+        mib(peak),
+        mib(baseline),
+        mib(peak.saturating_sub(baseline)),
+        mib(heap as u64),
+        heap as f64 / records as f64
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}

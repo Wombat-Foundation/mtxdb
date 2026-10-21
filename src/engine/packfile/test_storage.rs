@@ -11683,3 +11683,81 @@ fn a_coverage_batch_syncs_the_directory_of_a_log_an_earlier_batch_created() {
     );
     crate::shard::clear_directory_sync_failure(&dir);
 }
+
+#[test]
+fn slots_only_reopen_counts_identity_reads_for_a_tag_collision() {
+    let dir = test_dir("slots_only_identity_reads");
+    let collection = [0x7Au8; 16];
+
+    // Equal bucket bytes (0..8) and equal tag bytes (8..12): the lossy index
+    // cannot tell these two apart without reading the frame header. Only the
+    // bytes it does not inspect (12..16, plus the tail it does) differ.
+    let mut first = [0u8; 16];
+    first[..8].copy_from_slice(&[0x11; 8]);
+    first[8..12].copy_from_slice(&[0x22; 4]);
+    first[12..].copy_from_slice(&[0x33; 4]);
+    let mut second = first;
+    second[12..].copy_from_slice(&[0x44; 4]);
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.set_checkpoint_slots_only(true);
+    store.force_index_checkpoint().unwrap();
+    drop(store);
+
+    // The durable checkpoint really is slots-only, so the reopened index has
+    // no identity tables to decide the collision with.
+    let checkpoint =
+        crate::index::checkpoint::read_checkpoint(&PackfileStorage::index_checkpoint_path(&dir))
+            .expect("forced checkpoint is readable");
+    assert!(
+        checkpoint
+            .collections
+            .iter()
+            .any(|loaded| loaded.collection_id == collection && !loaded.has_homes_tails),
+        "the forced checkpoint must omit homes/tails for this collection"
+    );
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        store.stats().index_identity_reads,
+        0,
+        "opening does not read identities"
+    );
+
+    store
+        .put(
+            &collection,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.stats().index_identity_reads,
+        1,
+        "a same-tag probe against a slots-only index must hydrate from the frame"
+    );
+    assert_eq!(
+        store
+            .get(&collection, &first)
+            .unwrap()
+            .map(|node| node.bytes),
+        Some(bytes::Bytes::from_static(b"first")),
+        "the colliding predecessor must still resolve"
+    );
+    assert_eq!(
+        store
+            .get(&collection, &second)
+            .unwrap()
+            .map(|node| node.bytes),
+        Some(bytes::Bytes::from_static(b"second"))
+    );
+}

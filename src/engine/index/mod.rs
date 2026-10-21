@@ -1223,10 +1223,12 @@ impl LossyIndex {
         let homes = self.homes.lock();
         let tails = self.tails.lock();
         for index in 0..cap {
-            buf.extend_from_slice(&homes[index].to_le_bytes());
+            // A slots-only load leaves the identity tables empty; widen it to
+            // an explicit zero table rather than indexing past the end.
+            buf.extend_from_slice(&homes.get(index).copied().unwrap_or(0).to_le_bytes());
         }
         for index in 0..cap {
-            buf.extend_from_slice(&tails[index].to_le_bytes());
+            buf.extend_from_slice(&tails.get(index).copied().unwrap_or(0).to_le_bytes());
         }
         buf
     }

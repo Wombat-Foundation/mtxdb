@@ -949,3 +949,80 @@ fn the_load_threshold_does_not_overflow_for_large_tables() {
         "the old u32 arithmetic is what produced the premature TableFull"
     );
 }
+
+#[test]
+fn slots_only_blob_round_trips_every_locator_without_identities() {
+    let index = LossyIndex::with_config(1024, IndexConfig::default());
+    let mut expected = Vec::new();
+    for seq in 0..400u64 {
+        let hash = spread_hash(seq);
+        let slot = u16::try_from(seq % 32).unwrap();
+        let offset = seq.saturating_mul(13).saturating_add(1);
+        index.insert(&hash, slot, offset).unwrap();
+        expected.push((hash, slot, offset));
+    }
+
+    let blob = index.serialize_slots_only();
+    assert_eq!(blob.len(), index.serialized_slots_only_len());
+    assert_eq!(blob.len(), 8 + index.capacity as usize * 8);
+
+    let loaded = LossyIndex::deserialize(&blob).expect("slots-only blob must decode");
+    assert_eq!(loaded.len(), expected.len());
+    assert_eq!(loaded.capacity, index.capacity);
+    assert!(
+        !identities_complete(&loaded),
+        "a slots-only load carries no identity side tables"
+    );
+    assert!(
+        loaded.grow().is_none(),
+        "growth must go through pack-recovered hashes, not the empty tables"
+    );
+    for (hash, slot, offset) in expected {
+        let found = candidates(&loaded, &hash);
+        assert!(
+            found.contains(&(slot, offset)),
+            "slots-only load lost the locator {slot}:{offset}"
+        );
+    }
+
+    // The wide form must still be producible from a slots-only load: an empty
+    // identity table widens to zeros instead of panicking on an out-of-bounds
+    // index. It stays non-growable because the identities are not real.
+    let widened = loaded.serialize();
+    assert_eq!(widened.len(), loaded.serialized_len());
+    let widened = LossyIndex::deserialize(&widened).expect("widened blob must decode");
+    assert_eq!(widened.len(), index.len());
+    assert!(!identities_complete(&widened));
+}
+
+#[test]
+fn slots_only_load_grows_by_recovering_hashes() {
+    let index = LossyIndex::with_config(512, IndexConfig::default());
+    let mut by_locator = HashMap::new();
+    for seq in 0..300u64 {
+        let hash = spread_hash(seq);
+        let slot = u16::try_from(seq % 16).unwrap();
+        let offset = seq.saturating_mul(3).saturating_add(1);
+        index.insert(&hash, slot, offset).unwrap();
+        by_locator.insert((slot, offset), hash);
+    }
+
+    let loaded = LossyIndex::deserialize(&index.serialize_slots_only()).expect("decode");
+    assert!(loaded.grow().is_none());
+
+    let grown = loaded
+        .grow_by_recovering_hashes(|slot, offset, _slot_tag| {
+            Ok::<_, ()>(by_locator[&(slot, offset)])
+        })
+        .expect("recovery is infallible in this test")
+        .expect("the table has room to grow");
+    assert!(grown.capacity > loaded.capacity);
+    assert_eq!(grown.len(), by_locator.len());
+    assert!(identities_complete(&grown));
+    for ((slot, offset), hash) in by_locator {
+        assert!(
+            candidates(&grown, &hash).contains(&(slot, offset)),
+            "growth lost the locator {slot}:{offset}"
+        );
+    }
+}

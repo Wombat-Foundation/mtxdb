@@ -4062,6 +4062,31 @@ impl PackfileStorage {
         })
     }
 
+    /// Actual memory held by the collection indexes, split three ways.
+    ///
+    /// Unlike [`LossyIndex::memory_usage`] (a logical footprint used by
+    /// `stats().index_bytes`), this reports what is actually allocated:
+    /// `heap` excludes mmap-backed slot pages, `mapped` counts the slot array
+    /// a checkpoint-loaded index borrows, and `logical` is the existing
+    /// `memory_usage` sum, kept for comparison.
+    ///
+    /// Because mmap-backed slots are not heap, a slots-only checkpoint index
+    /// reports near-zero heap here while still occupying resident pages once
+    /// touched; process RSS is the only metric that shows that.
+    pub fn index_memory_detail(&self) -> (usize, usize, usize) {
+        let tables = self.index_tables.read();
+        let mut heap = 0usize;
+        let mut mapped = 0usize;
+        let mut logical = 0usize;
+        for generation in tables.collections.values() {
+            let loaded = generation.load();
+            heap = heap.saturating_add(loaded.index.heap_bytes());
+            mapped = mapped.saturating_add(loaded.index.mapped_slot_bytes());
+            logical = logical.saturating_add(loaded.index.memory_usage());
+        }
+        (heap, mapped, logical)
+    }
+
     /// `(collection_id, entry count, memory usage in bytes, index capacity)`
     /// for every known collection, sorted by collection ID, in a single pass
     /// over the collection map.
