@@ -285,7 +285,9 @@ impl NodeCache {
         let h = self.hits.load(Ordering::Relaxed);
         let m = self.misses.load(Ordering::Relaxed);
         // Scale both counters down together until they fit in 32 bits so the
-        // ratio needs no lossy casts; exact below 2^32 lookups.
+        // ratio needs no lossy casts. Below 2^32 lookups the counters are
+        // converted exactly; above it, truncation can round a tiny hit count
+        // down to zero (1 hit in 2^32 misses reports 0.0).
         let excess = u32::BITS.saturating_sub(h.max(m).leading_zeros());
         let narrow = |count: u64| f64::from(u32::try_from(count >> excess).unwrap_or(u32::MAX));
         let (h, m) = (narrow(h), narrow(m));
@@ -366,5 +368,30 @@ impl PinnedNodes {
 impl Default for PinnedNodes {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hit_rate_scaling_boundary() {
+        let cache = NodeCache::new(1);
+        cache.hits.store(1, Ordering::Relaxed);
+        cache
+            .misses
+            .store(u64::from(u32::MAX) - 1, Ordering::Relaxed);
+        let exact = 1.0 / f64::from(u32::MAX);
+        assert!((cache.hit_rate() - exact).abs() < exact * 1.0e-12);
+
+        // Past 2^32 the counters are scaled; a lone hit is rounded away.
+        cache.misses.store(1 << 32, Ordering::Relaxed);
+        assert!(cache.hit_rate().abs() < f64::EPSILON);
+
+        // Large balanced counters keep their ratio.
+        cache.hits.store(1 << 40, Ordering::Relaxed);
+        cache.misses.store(3 << 40, Ordering::Relaxed);
+        assert!((cache.hit_rate() - 0.25).abs() < 1.0e-9);
     }
 }
