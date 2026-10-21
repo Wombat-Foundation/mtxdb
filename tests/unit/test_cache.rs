@@ -1,6 +1,7 @@
 #![allow(clippy::tests_outside_test_module)]
 
 use mtxdb::cache::*;
+use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Barrier};
@@ -73,7 +74,7 @@ fn test_hit_rate() {
 
     assert_eq!(cache.hits(), 2);
     assert_eq!(cache.misses(), 1);
-    assert!((cache.hit_rate() - 0.666).abs() < 0.01);
+    assert_eq!(cache.hit_rate().total_cmp(&0.6666), Ordering::Equal);
 }
 
 #[test]
@@ -140,7 +141,7 @@ fn test_generic_lru_zero_capacity_and_stats() {
     assert_eq!(cache.get(&1), None);
     assert_eq!(cache.hits(), 0);
     assert_eq!(cache.misses(), 1);
-    assert_eq!(cache.hit_rate(), 0.0);
+    assert_eq!(cache.hit_rate().total_cmp(&0.0), Ordering::Equal);
 }
 
 struct MaybePanicCloneKey {
