@@ -20,12 +20,11 @@ use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::interop::{
     auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
     decode_auth_counter, decode_auth_forward, decode_event_locator, decode_import_marker,
-    encode_auth_forward, encode_edges, encode_event_locator, encode_import_marker,
-    encode_verdict, event_locator_collection_id, event_record_id,
-    event_verdict_collection_id, import_marker_collection_id, import_marker_node_id,
-    room_auth_collection_id, room_event_collection_id, room_prev_collection_id,
-    ImportMarker, Verdict, DATA_FORMAT, EDGE_POOL,
-    EVENT_POOL, SERVER_INFO_POOL,
+    encode_auth_forward, encode_edges, encode_event_locator, encode_import_marker, encode_verdict,
+    event_locator_collection_id, event_record_id, event_verdict_collection_id,
+    import_marker_collection_id, import_marker_node_id, room_auth_collection_id,
+    room_event_collection_id, room_prev_collection_id, ImportMarker, Verdict, DATA_FORMAT,
+    EDGE_POOL, EVENT_POOL, SERVER_INFO_POOL,
 };
 use mtxdb::server_keys;
 use mtxdb::storage::StorageEngine as _;

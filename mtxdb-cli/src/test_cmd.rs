@@ -4982,11 +4982,16 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
             "notary" => expected_notary = Some(decode("payload")),
             kind => expected_keys.push((
                 json_str(&record, "key_id").unwrap().into_bytes(),
-                decode("key"),
+                record.get("key").map_or_else(Vec::new, |_| decode("key")),
                 json_str(&record, "source").unwrap().into_bytes(),
                 kind == "permanent",
                 record.get("expired_ts").and_then(OwnedValue::as_u64),
-                record.get("promote_by_ms").and_then(OwnedValue::as_u64).unwrap_or(0),
+                record
+                    .get("promote_by_ms")
+                    .and_then(OwnedValue::as_u64)
+                    .unwrap_or(0),
+                record.get("digest").is_some(),
+                matches!(record.get("corroborated"), Some(OwnedValue::Bool(true))),
             )),
         }
     }
@@ -5002,6 +5007,8 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
                 key.tier == KeyTier::Permanent,
                 key.expired_ts,
                 key.promote_by_ms,
+                key.is_evicted(),
+                key.corroborated,
             )
         })
         .collect();

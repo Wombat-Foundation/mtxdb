@@ -94,6 +94,21 @@ pub mod field {
     /// `server_keys` key: who first supplied the key.
     pub const SOURCE: &str = "source";
     /// `server_keys` key: millisecond timestamp the key was last seen.
+    /// `provisional` or `permanent`, optional: base64 SHA-256 of the key body.
+    /// A key whose bytes were evicted carries this and no `key`.
+    pub const DIGEST: &str = "digest";
+    /// `provisional` or `permanent`, optional: when the receiver first bound
+    /// the key id; absent is `ts_added_ms`.
+    pub const FIRST_SEEN_MS: &str = "first_seen_ms";
+    /// `provisional` or `permanent`, optional: when the key was last seen
+    /// active; absent is `ts_added_ms`.
+    pub const LAST_ACTIVE_MS: &str = "last_active_ms";
+    /// `provisional` or `permanent`, optional: whether the receiver observed
+    /// the key active; absent is false.
+    pub const CORROBORATED: &str = "corroborated";
+    /// `provisional` or `permanent`, optional: whether the key vanished from
+    /// the origin's responses without an `expired_ts`; absent is false.
+    pub const INFERRED_RETIRED: &str = "inferred_retired";
     /// `provisional`, optional: the last millisecond a direct fetch may still
     /// override the key; absent is `0`.
     pub const PROMOTE_BY_MS: &str = "promote_by_ms";

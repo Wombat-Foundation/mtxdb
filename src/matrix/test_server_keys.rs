@@ -49,6 +49,8 @@ fn update<'a>(
         now_ms,
         notary: None,
         promotion_window_ms: WINDOW,
+        snapshot: false,
+        limits: KeyLimits::default(),
     }
 }
 
@@ -68,6 +70,11 @@ fn key_record_round_trips_and_rejects_damage() {
         tier: KeyTier::Provisional,
         expired_ts: Some(7),
         promote_by_ms: 99,
+        digest: key_digest(&[7; 32]),
+        first_seen_ms: 5,
+        last_active_ms: 6,
+        corroborated: true,
+        inferred_retired: true,
     };
     let bytes = encode_server_key_record(b"a.example", &key).unwrap();
     assert_eq!(
@@ -88,7 +95,7 @@ fn key_record_round_trips_and_rejects_damage() {
     let mut bad_tier = bytes.clone();
     bad_tier[1] = 9;
     let mut bad_flag = bytes.clone();
-    bad_flag[2] = 2;
+    bad_flag[2] = 0x80;
     assert!(decode_server_key_record(&bad_flag).is_err());
     assert!(decode_server_key_record(&bad_tier).is_err());
     let mut bad_version = bytes;
@@ -322,6 +329,11 @@ fn a_record_in_the_wrong_slot_is_rejected() {
         tier: KeyTier::Permanent,
         expired_ts: None,
         promote_by_ms: 0,
+        digest: key_digest(b"AAAA"),
+        first_seen_ms: 1,
+        last_active_ms: 1,
+        corroborated: false,
+        inferred_retired: false,
     };
     // A record written under `one`'s collection that names another origin.
     let tx = db.begin_transaction();
@@ -508,4 +520,227 @@ fn a_rejected_collision_leaves_the_served_payload_alone() {
     drop((db, db2));
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(root2);
+}
+
+fn with_limits(mut batch: KeyUpdate<'_>, limits: KeyLimits) -> KeyUpdate<'_> {
+    batch.limits = limits;
+    batch
+}
+
+fn snapshot(mut batch: KeyUpdate<'_>) -> KeyUpdate<'_> {
+    batch.snapshot = true;
+    batch
+}
+
+#[test]
+fn a_direct_snapshot_retires_the_keys_it_leaves_out() {
+    let (db, root) = open("inferred");
+    let both = [
+        observed("ed25519:a", b"AAAA", 9_000),
+        observed("ed25519:b", b"BBBB", 9_000),
+    ];
+    merge(&db, &update("o", KeySighting::Direct, "d", &both, 100)).unwrap();
+
+    // A notary snapshot that omits `a` retires nothing: only the origin's
+    // own responses do.
+    let only_b = [observed("ed25519:b", b"BBBB", 9_000)];
+    merge(
+        &db,
+        &snapshot(update("o", KeySighting::Notary, "n", &only_b, 200)),
+    )
+    .unwrap();
+    let a = read_server_key(db.server_info(), b"o", b"ed25519:a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.retirement_ts(), None);
+
+    merge(
+        &db,
+        &snapshot(update("o", KeySighting::Direct, "d", &only_b, 300)),
+    )
+    .unwrap();
+    let a = read_server_key(db.server_info(), b"o", b"ed25519:a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        a.retirement_ts(),
+        Some(100),
+        "retired when last seen active"
+    );
+    assert!(a.corroborated);
+
+    // Seeing it active again undoes the inference.
+    merge(&db, &update("o", KeySighting::Direct, "d", &both, 400)).unwrap();
+    let a = read_server_key(db.server_info(), b"o", b"ed25519:a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.retirement_ts(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn retired_keys_are_evicted_in_the_msc_order_and_keep_their_digest() {
+    let (db, root) = open("evict");
+    let limits = KeyLimits {
+        retired_retained: 2,
+        ..KeyLimits::default()
+    };
+    // Active once, so corroborated, then retired at 100.
+    let active = [observed("ed25519:c", b"CCCC", 9_000)];
+    merge(&db, &update("o", KeySighting::Direct, "d", &active, 50)).unwrap();
+    let old = [
+        retired("ed25519:c", b"CCCC", 9_000, 100),
+        // Never seen active: uncorroborated, though retired later.
+        retired("ed25519:u", b"UUUU", 9_000, 900),
+        retired("ed25519:z", b"ZZZZ", 9_000, 500),
+        retired("ed25519:y", b"YYYY", 9_000, 500),
+    ];
+    let merged = update_server_keys(
+        &db,
+        &with_limits(update("o", KeySighting::Direct, "d", &old, 1_000), limits),
+    )
+    .unwrap();
+    // Corroborated `c` first; then the later retirement `u`; `y` and `z` tie
+    // on time and sort by key id, but only one slot is left after `c` and `u`.
+    let kept: Vec<_> = read_server_keys(db.server_info(), b"o")
+        .unwrap()
+        .into_iter()
+        .filter(|key| !key.is_evicted())
+        .map(|key| key.key_id)
+        .collect();
+    assert_eq!(kept, [b"ed25519:c".to_vec(), b"ed25519:u".to_vec()]);
+    let kinds: Vec<_> = merged.issues.iter().map(|issue| issue.kind).collect();
+    assert_eq!(kinds, [KeyIssueKind::Evicted; 2]);
+
+    // The evicted key id still collides with a different body.
+    let clash = [retired("ed25519:y", b"XXXX", 9_000, 500)];
+    let again = update_server_keys(
+        &db,
+        &with_limits(update("o", KeySighting::Direct, "d", &clash, 1_100), limits),
+    )
+    .unwrap();
+    assert_eq!(again.issues[0].kind, KeyIssueKind::Collision);
+    assert!(again.keys[0].is_evicted());
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn evicting_a_corroborated_key_is_flagged() {
+    let (db, root) = open("flood");
+    let limits = KeyLimits {
+        retired_retained: 1,
+        ..KeyLimits::default()
+    };
+    let active = [
+        observed("ed25519:a", b"AAAA", 9_000),
+        observed("ed25519:b", b"BBBB", 9_000),
+    ];
+    merge(&db, &update("o", KeySighting::Direct, "d", &active, 10)).unwrap();
+    let old = [
+        retired("ed25519:a", b"AAAA", 9_000, 20),
+        retired("ed25519:b", b"BBBB", 9_000, 30),
+    ];
+    let merged = update_server_keys(
+        &db,
+        &with_limits(update("o", KeySighting::Direct, "d", &old, 40), limits),
+    )
+    .unwrap();
+    assert_eq!(merged.issues.len(), 1);
+    assert_eq!(merged.issues[0].key_id, b"ed25519:a");
+    assert_eq!(merged.issues[0].kind, KeyIssueKind::EvictedCorroborated);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_evicted_key_that_returns_competes_for_a_slot_again() {
+    let (db, root) = open("return");
+    let limits = KeyLimits {
+        retired_retained: 1,
+        ..KeyLimits::default()
+    };
+    let old = [
+        retired("ed25519:a", b"AAAA", 9_000, 10),
+        retired("ed25519:b", b"BBBB", 9_000, 20),
+    ];
+    merge(
+        &db,
+        &with_limits(update("o", KeySighting::Direct, "d", &old, 30), limits),
+    )
+    .unwrap();
+    let again = [retired("ed25519:a", b"AAAA", 9_000, 10)];
+    let merged = update_server_keys(
+        &db,
+        &with_limits(update("o", KeySighting::Direct, "d", &again, 40), limits),
+    )
+    .unwrap();
+    assert!(merged.keys[0].is_evicted(), "it still sorts below `b`");
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_digest_cap_refuses_new_key_ids_per_bucket_and_promotion_moves_one() {
+    let (db, root) = open("cap");
+    let limits = KeyLimits {
+        digest_cap: 1,
+        ..KeyLimits::default()
+    };
+    let capped = |sighting, keys, now| with_limits(update("o", sighting, "s", keys, now), limits);
+
+    let a = [observed("ed25519:a", b"AAAA", 9_000)];
+    merge(&db, &capped(KeySighting::Notary, &a, 1)).unwrap();
+    let b = [observed("ed25519:b", b"BBBB", 9_000)];
+    let refused = update_server_keys(&db, &capped(KeySighting::Notary, &b, 2)).unwrap();
+    assert_eq!(refused.issues[0].kind, KeyIssueKind::DigestCapReached);
+    assert!(refused.keys.is_empty(), "no digest binding, no key");
+
+    // The direct bucket is separate, so a notary flood does not block it.
+    let direct = merge(&db, &capped(KeySighting::Direct, &b, 3)).unwrap();
+    assert_eq!(direct[0].key, b"BBBB");
+
+    // Promotion moves `a` to the direct bucket even though that is full.
+    let promoted = merge(&db, &capped(KeySighting::Direct, &a, 4)).unwrap();
+    assert_eq!(promoted[0].tier, KeyTier::Permanent);
+
+    // And it freed the notary bucket.
+    let c = [observed("ed25519:c", b"CCCC", 9_000)];
+    let fresh = update_server_keys(&db, &capped(KeySighting::Notary, &c, 5)).unwrap();
+    assert!(fresh.issues.is_empty());
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_response_over_the_ceilings_or_with_a_long_key_id_is_rejected() {
+    let (db, root) = open("ceilings");
+    let limits = KeyLimits {
+        active_per_response: 1,
+        retired_per_response: 1,
+        ..KeyLimits::default()
+    };
+    let two_active = [
+        observed("ed25519:a", b"AAAA", 1),
+        observed("ed25519:b", b"BBBB", 1),
+    ];
+    let two_retired = [
+        retired("ed25519:a", b"AAAA", 1, 1),
+        retired("ed25519:b", b"BBBB", 1, 1),
+    ];
+    for keys in [&two_active[..], &two_retired[..]] {
+        assert!(update_server_keys(
+            &db,
+            &with_limits(update("o", KeySighting::Direct, "d", keys, 1), limits)
+        )
+        .is_err());
+    }
+    let long = [observed(&"k".repeat(256), b"AAAA", 1)];
+    assert!(update_server_keys(&db, &update("o", KeySighting::Direct, "d", &long, 1)).is_err());
+    let edge = [observed(&"k".repeat(255), b"AAAA", 1)];
+    assert!(update_server_keys(&db, &update("o", KeySighting::Direct, "d", &edge, 1)).is_ok());
+    assert_eq!(read_server_keys(db.server_info(), b"o").unwrap().len(), 1);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
 }

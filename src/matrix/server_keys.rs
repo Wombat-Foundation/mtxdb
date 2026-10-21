@@ -8,16 +8,24 @@
 //! one exception: it lives beside the keys as verbatim bytes, since any
 //! re-encoding would invalidate its signature.
 //!
-//! [`update_server_keys`] is the write path. It reads only the records of the
-//! keys it was handed (their ids are derived from the key id), applies the
-//! MSC4499 binding rules, and commits the changed records, and the Notary
-//! payload when one is given, in one transaction guarded by per-record version
-//! checks. A concurrent writer that touched any of those records makes the
-//! commit fail with a stale read, and the whole read-resolve-write is retried.
+//! [`update_server_keys`] is the write path. It reads the records of the keys
+//! it was handed (their ids are derived from the key id), applies the MSC4499
+//! binding rules, and commits the changed records, and the Notary payload when
+//! one is given, in one transaction guarded by per-record version checks. A
+//! snapshot, or a key id new to the origin, also reads the origin's other
+//! records, since retiring omitted keys, the digest-cap buckets and the
+//! retired-key ceiling are judged across them. A concurrent writer that touched
+//! any record read makes the commit fail with a stale read, and the whole
+//! read-resolve-write is retried.
+//!
+//! A key's record is also its digest binding: evicting a retired key clears
+//! its bytes and keeps the record, so a later body for the key id still
+//! collides.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use crate::database::{Database, DatabaseTransaction};
 use crate::interop::{
@@ -32,7 +40,7 @@ pub const SERVER_KEY_VERSION: u8 = 1;
 
 /// How many times [`update_server_keys`] re-runs after losing a race before it
 /// returns the stale-read error.
-const UPDATE_ATTEMPTS: usize = 8;
+const UPDATE_ATTEMPTS: usize = 32;
 
 /// How firmly a key is bound to its origin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,14 +90,79 @@ pub struct ServerKey {
     pub source: Vec<u8>,
     /// Millisecond timestamp the key was last seen.
     pub ts_added_ms: u64,
-    /// Whether a direct fetch has confirmed the binding.
+    /// Whether a direct fetch has confirmed the binding. The tier also names
+    /// the digest-cap bucket the key counts against: permanent is the direct
+    /// bucket, provisional the notary one.
     pub tier: KeyTier,
+    /// SHA-256 of the key body. It is the digest binding: it outlives the key
+    /// bytes when they are evicted, so a later body for the key id is still a
+    /// collision.
+    pub digest: [u8; 32],
+    /// When this receiver first bound the key id.
+    pub first_seen_ms: u64,
+    /// The last time the key was seen active; `0` if it never was.
+    pub last_active_ms: u64,
+    /// Whether this receiver itself observed the key active. It changes the
+    /// retired-key eviction order and nothing else.
+    pub corroborated: bool,
+    /// The key vanished from the origin's responses without an `expired_ts`, so
+    /// it counts as retired at `last_active_ms`.
+    pub inferred_retired: bool,
     /// When the key was retired: the first `expired_ts` observed for it, kept
     /// for good. `None` while no sane `expired_ts` has been seen.
     pub expired_ts: Option<u64>,
     /// The last millisecond a direct fetch may still override a provisional
     /// binding, fixed when the binding was made; `0` once it is permanent.
     pub promote_by_ms: u64,
+}
+
+impl ServerKey {
+    /// Whether the key bytes were evicted, leaving only the digest binding.
+    #[must_use]
+    pub fn is_evicted(&self) -> bool {
+        self.key.is_empty()
+    }
+
+    /// The effective retirement timestamp: the first `expired_ts`, else the
+    /// last time an inferred-retired key was seen active, else `None` for a
+    /// key still current.
+    #[must_use]
+    pub fn retirement_ts(&self) -> Option<u64> {
+        self.expired_ts
+            .or_else(|| self.inferred_retired.then_some(self.last_active_ms))
+    }
+}
+
+/// The SHA-256 digest of a key body, as a [`ServerKey::digest`].
+#[must_use]
+pub fn key_digest(key: &[u8]) -> [u8; 32] {
+    Sha256::digest(key).into()
+}
+
+/// The ceilings of MSC4499.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyLimits {
+    /// Most active keys one response may carry; more rejects the response.
+    pub active_per_response: usize,
+    /// Most retired keys one response may carry; more rejects the response.
+    pub retired_per_response: usize,
+    /// Most retired keys, with key bytes, kept per origin. The rest are
+    /// evicted to their digest binding.
+    pub retired_retained: usize,
+    /// Most digest bindings per origin and bucket; a new key id past it is
+    /// refused, never made room for.
+    pub digest_cap: usize,
+}
+
+impl Default for KeyLimits {
+    fn default() -> Self {
+        Self {
+            active_per_response: 50,
+            retired_per_response: 3_000,
+            retired_retained: 3_000,
+            digest_cap: 30_000,
+        }
+    }
 }
 
 /// A key as one response presented it.
@@ -123,6 +196,11 @@ pub struct KeyUpdate<'a> {
     pub notary: Option<&'a [u8]>,
     /// How long a new provisional binding stays open to a direct override.
     pub promotion_window_ms: u64,
+    /// Whether `observed` is the origin's whole key set. A direct snapshot
+    /// retires every stored active key it leaves out.
+    pub snapshot: bool,
+    /// The ceilings to enforce.
+    pub limits: KeyLimits,
 }
 
 /// How far ahead of `now_ms` an `expired_ts` may be before it is malformed.
@@ -140,6 +218,12 @@ pub enum KeyIssueKind {
     /// The entry's `expired_ts` was too far in the future; the entry was
     /// dropped and nothing about it stored.
     FutureExpiredTs,
+    /// A new key id was refused because its bucket is at the digest cap.
+    DigestCapReached,
+    /// A retired key fell below the retention floor; its bytes were evicted.
+    Evicted,
+    /// Like [`Self::Evicted`], but the key was corroborated: the flood signal.
+    EvictedCorroborated,
 }
 
 /// One [`KeyIssueKind`] and the key id it concerns.
@@ -207,9 +291,11 @@ fn take_field<'a>(rest: &mut &'a [u8], what: &str) -> Result<&'a [u8], StorageEr
     )
 }
 
-/// Encode one key record: version, tier, an `expired_ts` presence byte,
-/// `valid_until_ts`, `ts_added_ms`, `promote_by_ms` and `expired_ts` (zero when
-/// absent), then the length-prefixed origin, key id, key bytes and source.
+/// Encode one key record: version, tier, a flags byte (`expired_ts` present,
+/// corroborated, inferred retired), the numbers `valid_until_ts`,
+/// `ts_added_ms`, `promote_by_ms`, `expired_ts` (zero when absent),
+/// `first_seen_ms` and `last_active_ms`, the key digest, then the
+/// length-prefixed origin, key id, key bytes (empty once evicted) and source.
 ///
 /// The origin rides along so a read can reject a record that landed in the
 /// wrong origin's collection, which a 128-bit collection id alone cannot rule
@@ -218,19 +304,21 @@ fn take_field<'a>(rest: &mut &'a [u8], what: &str) -> Result<&'a [u8], StorageEr
 /// # Errors
 /// Returns [`StorageError::Corrupt`] if a field does not fit its length prefix.
 pub fn encode_server_key_record(origin: &[u8], key: &ServerKey) -> Result<Vec<u8>, StorageError> {
-    let mut out = vec![
-        SERVER_KEY_VERSION,
-        key.tier.tag(),
-        u8::from(key.expired_ts.is_some()),
-    ];
+    let flags = u8::from(key.expired_ts.is_some())
+        | u8::from(key.corroborated) << 1
+        | u8::from(key.inferred_retired) << 2;
+    let mut out = vec![SERVER_KEY_VERSION, key.tier.tag(), flags];
     for number in [
         key.valid_until_ts,
         key.ts_added_ms,
         key.promote_by_ms,
         key.expired_ts.unwrap_or(0),
+        key.first_seen_ms,
+        key.last_active_ms,
     ] {
         out.extend_from_slice(&number.to_le_bytes());
     }
+    out.extend_from_slice(&key.digest);
     for field in [origin, &key.key_id, &key.key, &key.source] {
         push_field(&mut out, field)?;
     }
@@ -250,11 +338,11 @@ pub fn decode_server_key_record(bytes: &[u8]) -> Result<(Vec<u8>, ServerKey), St
         ));
     }
     let tier = KeyTier::from_tag(take(&mut rest, 1, "tier")?[0]).ok_or_else(|| corrupt("tier"))?;
-    let has_expired = match take(&mut rest, 1, "expired_ts flag")?[0] {
-        0 => false,
-        1 => true,
-        _ => return Err(corrupt("expired_ts flag")),
-    };
+    let flags = take(&mut rest, 1, "flags")?[0];
+    if flags & !0b111 != 0 {
+        return Err(corrupt("flags"));
+    }
+    let has_expired = flags & 1 != 0;
     let valid_until_ts = take_u64(&mut rest, "valid_until_ts")?;
     let ts_added_ms = take_u64(&mut rest, "ts_added_ms")?;
     let promote_by_ms = take_u64(&mut rest, "promote_by_ms")?;
@@ -262,12 +350,20 @@ pub fn decode_server_key_record(bytes: &[u8]) -> Result<(Vec<u8>, ServerKey), St
     if !has_expired && expired != 0 {
         return Err(corrupt("expired_ts without its flag"));
     }
+    let first_seen_ms = take_u64(&mut rest, "first_seen_ms")?;
+    let last_active_ms = take_u64(&mut rest, "last_active_ms")?;
+    let digest: [u8; 32] = take(&mut rest, 32, "digest")?
+        .try_into()
+        .map_err(|_| corrupt("digest"))?;
     let origin = take_field(&mut rest, "origin")?.to_vec();
     let key_id = take_field(&mut rest, "key id")?.to_vec();
     let key = take_field(&mut rest, "key")?.to_vec();
     let source = take_field(&mut rest, "source")?.to_vec();
     if !rest.is_empty() {
         return Err(corrupt("trailing bytes"));
+    }
+    if !key.is_empty() && key_digest(&key) != digest {
+        return Err(corrupt("digest does not match the key"));
     }
     Ok((
         origin,
@@ -280,6 +376,11 @@ pub fn decode_server_key_record(bytes: &[u8]) -> Result<(Vec<u8>, ServerKey), St
             tier,
             expired_ts: has_expired.then_some(expired),
             promote_by_ms,
+            digest,
+            first_seen_ms,
+            last_active_ms,
+            corroborated: flags & 0b10 != 0,
+            inferred_retired: flags & 0b100 != 0,
         },
     ))
 }
@@ -416,7 +517,9 @@ fn overridable(stored: &ServerKey, now_ms: u64) -> bool {
     stored.tier == KeyTier::Provisional
         && now_ms <= stored.promote_by_ms
         && stored.valid_until_ts >= now_ms
-        && stored.expired_ts.is_none_or(|expired| expired > now_ms)
+        && stored
+            .retirement_ts()
+            .is_none_or(|retired| retired > now_ms)
 }
 
 /// Apply the MSC4499 binding rules to one observed key, returning the binding
@@ -425,10 +528,14 @@ fn overridable(stored: &ServerKey, now_ms: u64) -> bool {
 /// * A key id seen for the first time is bound: the first one seen wins. A
 ///   direct fetch binds it permanent, a notary provisionally with its own
 ///   promotion deadline.
-/// * The same key body again refreshes only the validity time and
-///   `ts_added_ms`; the original source stays. The validity time is replaced
-///   exactly, as Synapse's upsert does, not only moved forward. A direct fetch
-///   of a provisional key also makes it permanent.
+/// * The same key body (compared by digest, so an evicted key matches too)
+///   refreshes only the validity time and `ts_added_ms`; the original source
+///   stays. The validity time is replaced exactly, as Synapse's upsert does,
+///   not only moved forward. A direct fetch of a provisional key also makes it
+///   permanent, moving it to the direct digest bucket. An evicted key whose
+///   body returns gets its bytes back.
+/// * Seeing a key active records the observation: it is corroborated, its
+///   last-active time moves, and an inferred retirement is undone.
 /// * `expired_ts` is first-assignment-wins: the first one seen is kept, and a
 ///   different later one is reported and ignored.
 /// * A different body replaces the stored one only when a direct fetch meets
@@ -440,6 +547,8 @@ fn bind(
     update: &KeyUpdate<'_>,
 ) -> (ServerKey, Option<KeyIssueKind>) {
     let direct = update.sighting == KeySighting::Direct;
+    let active = observed.expired_ts.is_none();
+    let digest = key_digest(&observed.key);
     let fresh = |tier| ServerKey {
         key_id: observed.key_id.clone(),
         key: observed.key.clone(),
@@ -447,6 +556,11 @@ fn bind(
         source: update.source.to_vec(),
         ts_added_ms: update.now_ms,
         tier,
+        digest,
+        first_seen_ms: update.now_ms,
+        last_active_ms: if active { update.now_ms } else { 0 },
+        corroborated: active,
+        inferred_retired: false,
         expired_ts: observed.expired_ts,
         promote_by_ms: match tier {
             KeyTier::Provisional => update.now_ms.saturating_add(update.promotion_window_ms),
@@ -462,10 +576,16 @@ fn bind(
             }),
             None,
         ),
-        Some(stored) if stored.key == observed.key => {
+        Some(stored) if stored.digest == digest => {
             let mut key = stored.clone();
+            key.key.clone_from(&observed.key);
             key.valid_until_ts = observed.valid_until_ts;
             key.ts_added_ms = update.now_ms;
+            if active {
+                key.corroborated = true;
+                key.last_active_ms = update.now_ms;
+                key.inferred_retired = false;
+            }
             let mut issue = None;
             match (stored.expired_ts, observed.expired_ts) {
                 (None, Some(expired)) => key.expired_ts = Some(expired),
@@ -488,17 +608,31 @@ fn bind(
 }
 
 /// Reject input that could not be stored faithfully, before anything is read
-/// or staged: an empty origin, key id or key body, or two distinct key ids
-/// that derive the same record id.
+/// or staged: an empty origin, key id or key body, a key id past the 255-byte
+/// digest-binding limit, more keys than a response may carry, or two distinct
+/// key ids that derive the same record id.
 fn validate(update: &KeyUpdate<'_>) -> Result<(), StorageError> {
     let invalid = |what: &str| StorageError::Corrupt(format!("invalid server key update: {what}"));
     if update.origin.is_empty() {
         return Err(invalid("empty origin"));
     }
+    let retired = update
+        .observed
+        .iter()
+        .filter(|observed| observed.expired_ts.is_some())
+        .count();
+    if retired > update.limits.retired_per_response
+        || update.observed.len().saturating_sub(retired) > update.limits.active_per_response
+    {
+        return Err(invalid("too many keys in one response"));
+    }
     let mut seen: BTreeMap<[u8; 16], &[u8]> = BTreeMap::new();
     for observed in update.observed {
         if observed.key_id.is_empty() {
             return Err(invalid("empty key id"));
+        }
+        if observed.key_id.len() > MAX_KEY_ID_BYTES {
+            return Err(invalid("key id is too long"));
         }
         if observed.key.is_empty() {
             return Err(invalid("empty key bytes"));
@@ -511,19 +645,88 @@ fn validate(update: &KeyUpdate<'_>) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Longest key id a digest binding may carry.
+pub const MAX_KEY_ID_BYTES: usize = 255;
+
+/// Retire every stored key a direct snapshot left out, then evict retired keys
+/// below the retention floor.
+///
+/// The order is corroborated before uncorroborated, then retirement timestamp
+/// descending, then `algorithm:key_id` ascending. Evicting clears the key bytes
+/// and keeps the digest binding. Returns the issues for the keys evicted now.
+fn retire_and_evict(
+    current: &mut BTreeMap<[u8; 16], ServerKey>,
+    seen: &BTreeSet<[u8; 16]>,
+    update: &KeyUpdate<'_>,
+) -> Vec<KeyIssue> {
+    if update.snapshot && update.sighting == KeySighting::Direct {
+        for (id, key) in current.iter_mut() {
+            if !seen.contains(id) && key.retirement_ts().is_none() {
+                key.inferred_retired = true;
+            }
+        }
+    }
+    let mut retained: Vec<&ServerKey> = current
+        .values()
+        .filter(|key| key.retirement_ts().is_some() && !key.is_evicted())
+        .collect();
+    retained.sort_by(|a, b| {
+        b.corroborated
+            .cmp(&a.corroborated)
+            .then(b.retirement_ts().cmp(&a.retirement_ts()))
+            .then(a.key_id.cmp(&b.key_id))
+    });
+    let evicted: Vec<(Vec<u8>, bool)> = retained
+        .into_iter()
+        .skip(update.limits.retired_retained)
+        .map(|key| (key.key_id.clone(), key.corroborated))
+        .collect();
+    let mut issues = Vec::new();
+    for (key_id, corroborated) in evicted {
+        if let Some(key) = current.get_mut(&origin_key_record_id(&key_id)) {
+            key.key.clear();
+        }
+        issues.push(KeyIssue {
+            key_id,
+            kind: if corroborated {
+                KeyIssueKind::EvictedCorroborated
+            } else {
+                KeyIssueKind::Evicted
+            },
+        });
+    }
+    issues
+}
+
+/// The record ids of every key stored for `origin`, from a scan.
+fn stored_ids(db: &Database, collection: &[u8; 16]) -> Result<Vec<[u8; 16]>, StorageError> {
+    let mut ids = Vec::new();
+    for item in db.server_info().scan_collection(collection)? {
+        ids.push(item?.0);
+    }
+    Ok(ids)
+}
+
 /// Merge `update` into its origin's records in one transaction and return the
 /// authoritative key for each distinct key id it carried, in first-seen order,
 /// with the issues the caller should log.
 ///
-/// Reads the stored records of the carried key ids, applies the binding rules
-/// in order (a key id repeated in `observed` sees the earlier result), and
-/// commits every changed record and the Notary payload together. An entry whose
-/// `expired_ts` is more than [`EXPIRED_TS_SKEW_MS`] ahead is dropped without
-/// touching its slot. When a body collision or a conflicting `expired_ts` was
+/// Reads the stored records of the carried key ids and applies the binding
+/// rules in order (a key id repeated in `observed` sees the earlier result).
+/// An entry whose `expired_ts` is more than [`EXPIRED_TS_SKEW_MS`] ahead is
+/// dropped without touching its slot. A key id new to its digest bucket is
+/// refused once the bucket is at [`KeyLimits::digest_cap`]. A snapshot, or any
+/// update that meets a new key id, also reads the origin's remaining records:
+/// that is what retires keys a direct snapshot omits, counts the digest
+/// buckets, and enforces the retired-key ceiling by evicting key bytes while
+/// keeping the digest binding. The scan that finds those records is not
+/// versioned, so a record created during it can be missed; the records read are
+/// version-checked, so an overlapping writer fails the commit and the whole
+/// read-resolve-write is re-run on fresh data.
+///
+/// When a body collision, a conflicting `expired_ts` or a refused key was
 /// rejected, the Notary payload is not stored, so what is served stays
-/// consistent with what is bound. Each stored record is version-checked, so an
-/// overlapping writer fails the commit and the whole read-resolve-write is
-/// re-run on fresh data.
+/// consistent with what is bound.
 ///
 /// # Errors
 /// Returns an error if the update is invalid (see [`validate`]), if a stored
@@ -531,7 +734,7 @@ fn validate(update: &KeyUpdate<'_>) -> Result<(), StorageError> {
 /// error if every attempt lost a race.
 pub fn update_server_keys(db: &Database, update: &KeyUpdate<'_>) -> Result<KeyMerge, StorageError> {
     validate(update)?;
-    if update.observed.is_empty() && update.notary.is_none() {
+    if update.observed.is_empty() && update.notary.is_none() && !update.snapshot {
         return Ok(KeyMerge {
             keys: Vec::new(),
             issues: Vec::new(),
@@ -543,10 +746,29 @@ pub fn update_server_keys(db: &Database, update: &KeyUpdate<'_>) -> Result<KeyMe
         match try_update(db, update, collection) {
             Err(error) if error.is_stale_read() && attempt < UPDATE_ATTEMPTS => {
                 attempt = attempt.saturating_add(1);
+                std::thread::yield_now();
             }
             result => return result,
         }
     }
+}
+
+/// Read `ids` through `tx`, version-checking each, into `current`.
+fn load(
+    tx: &DatabaseTransaction<'_>,
+    collection: [u8; 16],
+    origin: &[u8],
+    ids: &[[u8; 16]],
+    current: &mut BTreeMap<[u8; 16], ServerKey>,
+) -> Result<(), StorageError> {
+    let (records, versions) = tx.get_with_record_versions(SERVER_INFO_POOL, &collection, ids)?;
+    for ((id, record), version) in ids.iter().zip(&records).zip(&versions) {
+        tx.expect_record_version(SERVER_INFO_POOL, collection, *id, *version)?;
+        if let Some(data) = record {
+            current.insert(*id, decode_for(origin, None, &data.bytes)?);
+        }
+    }
+    Ok(())
 }
 
 fn try_update(
@@ -562,16 +784,26 @@ fn try_update(
             ids.push(id);
         }
     }
+    let seen: BTreeSet<[u8; 16]> = ids.iter().copied().collect();
     let tx = db.begin_transaction();
-    let (records, versions) = tx.get_with_record_versions(SERVER_INFO_POOL, &collection, &ids)?;
     let mut current: BTreeMap<[u8; 16], ServerKey> = BTreeMap::new();
-    for ((id, record), version) in ids.iter().zip(&records).zip(&versions) {
-        tx.expect_record_version(SERVER_INFO_POOL, collection, *id, *version)?;
-        if let Some(data) = record {
-            current.insert(*id, decode_for(update.origin, None, &data.bytes)?);
-        }
+    load(&tx, collection, update.origin, &ids, &mut current)?;
+    // An evicted key whose body returns competes for a retention slot again,
+    // which only a full read can rank.
+    if update.snapshot
+        || ids.iter().any(|id| !current.contains_key(id))
+        || current.values().any(ServerKey::is_evicted)
+    {
+        let rest: Vec<[u8; 16]> = stored_ids(db, &collection)?
+            .into_iter()
+            .filter(|id| !seen.contains(id))
+            .collect();
+        load(&tx, collection, update.origin, &rest, &mut current)?;
     }
     let stored = current.clone();
+    let bucket = |tier: KeyTier, records: &BTreeMap<[u8; 16], ServerKey>| {
+        records.values().filter(|key| key.tier == tier).count()
+    };
     let mut order = Vec::with_capacity(ids.len());
     let mut issues = Vec::new();
     let mut rejected = false;
@@ -586,6 +818,17 @@ fn try_update(
             continue;
         }
         let id = origin_key_record_id(&observed.key_id);
+        if !current.contains_key(&id) {
+            let tier = match update.sighting {
+                KeySighting::Direct => KeyTier::Permanent,
+                KeySighting::Notary => KeyTier::Provisional,
+            };
+            if bucket(tier, &current) >= update.limits.digest_cap {
+                issues.push(issue(KeyIssueKind::DigestCapReached));
+                rejected = true;
+                continue;
+            }
+        }
         let (bound, kind) = bind(current.get(&id), observed, update);
         if let Some(kind) = kind {
             rejected |= kind != KeyIssueKind::Displaced;
@@ -596,8 +839,8 @@ fn try_update(
             order.push(id);
         }
     }
-    for id in &order {
-        let key = &current[id];
+    issues.extend(retire_and_evict(&mut current, &seen, update));
+    for (id, key) in &current {
         if stored.get(id) != Some(key) {
             put_server_key(&tx, update.origin, key)?;
         }

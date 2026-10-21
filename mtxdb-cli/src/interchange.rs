@@ -14,8 +14,10 @@
 //! A keys export drops the framing: every line is a `server_keys` record with
 //! an `origin` and a `kind`. A `provisional` or `permanent` line is one
 //! signing key (`key_id`, base64 `key`, `valid_until_ts`, `source`,
-//! `ts_added_ms`, and optionally `expired_ts` and, for a provisional key,
-//! `promote_by_ms`); a `notary` line is the origin's self-signed payload, base64
+//! `ts_added_ms`, and optionally `expired_ts`, `first_seen_ms`,
+//! `last_active_ms`, `corroborated`, `inferred_retired` and, for a provisional
+//! key, `promote_by_ms`; a key whose bytes were evicted carries a base64
+//! `digest` and no `key`); a `notary` line is the origin's self-signed payload, base64
 //! of its exact bytes.
 //!
 //! # What the importer derives from this
@@ -48,7 +50,7 @@ use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
 use bytes::Bytes;
 use mtxdb::export_schema::{field, key_kind, tag};
-use mtxdb::server_keys::{KeyTier, ServerKey};
+use mtxdb::server_keys::{key_digest, KeyTier, ServerKey};
 use rezzy::json::{self, Object, Value as OwnedValue};
 
 /// The export format this importer accepts, as written on the `header` line.
@@ -62,7 +64,6 @@ pub(crate) enum InputFormat {
     /// A keys export: `server_keys` records only.
     Keys,
 }
-
 
 /// Everything an `event` record says about an event beyond the PDU itself.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -270,17 +271,26 @@ pub(crate) fn parse_keys(content: &[u8]) -> anyhow::Result<Vec<KeyRecord>> {
                 } else {
                     KeyTier::Permanent
                 };
+                let ts_added_ms = require_number(line, object, field::TS_ADDED_MS)?;
+                let (key, digest) = key_and_digest(line, object)?;
                 KeyRecord::Key {
                     origin,
                     key: ServerKey {
                         key_id: key_id.as_bytes().to_vec(),
-                        key: require_base64(line, object, field::KEY)?,
+                        key,
                         valid_until_ts: require_number(line, object, field::VALID_UNTIL_TS)?,
                         source: require_string(line, object, field::SOURCE)?
                             .as_bytes()
                             .to_vec(),
-                        ts_added_ms: require_number(line, object, field::TS_ADDED_MS)?,
+                        ts_added_ms,
                         tier,
+                        digest,
+                        first_seen_ms: optional_number(line, object, field::FIRST_SEEN_MS)?
+                            .unwrap_or(ts_added_ms),
+                        last_active_ms: optional_number(line, object, field::LAST_ACTIVE_MS)?
+                            .unwrap_or(ts_added_ms),
+                        corroborated: optional_bool(line, object, field::CORROBORATED)?,
+                        inferred_retired: optional_bool(line, object, field::INFERRED_RETIRED)?,
                         expired_ts: optional_number(line, object, field::EXPIRED_TS)?,
                         promote_by_ms: optional_number(line, object, field::PROMOTE_BY_MS)?
                             .unwrap_or(0),
@@ -493,6 +503,42 @@ fn require_number(line: usize, object: &Object, field: &str) -> anyhow::Result<u
             .as_u64()
             .ok_or_else(|| anyhow!("line {line}: `{field}` must be a non-negative integer")),
         None => bail!("line {line}: record is missing `{field}`"),
+    }
+}
+
+/// The key bytes and digest of a key record: `key`, `digest`, or both. With
+/// only a digest the bytes were evicted; with both they must agree.
+fn key_and_digest(line: usize, object: &Object) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
+    let digest = match object.get(field::DIGEST) {
+        Some(_) => Some(require_base64(line, object, field::DIGEST)?),
+        None => None,
+    };
+    let key = match object.get(field::KEY) {
+        Some(_) => require_base64(line, object, field::KEY)?,
+        None if digest.is_some() => Vec::new(),
+        None => bail!("line {line}: record is missing `{}`", field::KEY),
+    };
+    let computed = key_digest(&key);
+    let digest = match digest {
+        Some(bytes) => <[u8; 32]>::try_from(bytes)
+            .map_err(|_| anyhow!("line {line}: `{}` is not 32 bytes", field::DIGEST))?,
+        None => computed,
+    };
+    if !key.is_empty() && digest != computed {
+        bail!(
+            "line {line}: `{}` does not match `{}`",
+            field::DIGEST,
+            field::KEY
+        );
+    }
+    Ok((key, digest))
+}
+
+/// An optional boolean field of a record, false when absent.
+fn optional_bool(line: usize, object: &Object, field: &str) -> anyhow::Result<bool> {
+    match object.get(field) {
+        None => Ok(false),
+        Some(_) => require_bool(line, object, field),
     }
 }
 
@@ -789,7 +835,8 @@ mod tests {
         );
     }
 
-    const KEY_LINE: &str = "{\"t\":\"server_keys\",\"origin\":\"example.org\",\"kind\":\"provisional\",\
+    const KEY_LINE: &str =
+        "{\"t\":\"server_keys\",\"origin\":\"example.org\",\"kind\":\"provisional\",\
         \"key_id\":\"ed25519:A\",\"key\":\"AQID\",\"valid_until_ts\":99,\
         \"source\":\"notary.example\",\"ts_added_ms\":7}\n";
 
@@ -827,6 +874,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_keys_reads_an_evicted_key_by_its_digest() {
+        let digest = base64::engine::general_purpose::STANDARD.encode(key_digest(&[1, 2, 3]));
+        let line = KEY_LINE.replace("\"key\":\"AQID\"", &format!("\"digest\":\"{digest}\""));
+        let records = parse_keys(line.as_bytes()).expect("a digest alone is a key");
+        let KeyRecord::Key { key, .. } = &records[0] else {
+            panic!("a key");
+        };
+        assert!(key.key.is_empty(), "the bytes were evicted");
+        assert_eq!(key.digest, key_digest(&[1, 2, 3]));
+
+        let both = KEY_LINE.replace("\"key\"", &format!("\"digest\":\"{digest}\",\"key\""));
+        assert!(parse_keys(both.as_bytes()).is_ok(), "digest and key agree");
+        let wrong = both.replace("AQID", "AQIE");
+        assert!(parse_keys(wrong.as_bytes())
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+        let neither = KEY_LINE.replace("\"key\":\"AQID\",", "");
+        assert!(parse_keys(neither.as_bytes()).is_err());
+    }
+
+    #[test]
     fn parse_keys_rejects_a_bad_record() {
         let without = |field: &str| {
             let members = [
@@ -847,17 +916,17 @@ mod tests {
         };
         let cases: Vec<(String, &str)> = vec![
             (String::new(), "no `server_keys` records"),
-            ("{\"t\":\"header\"}\n".to_owned(), "carries only `server_keys`"),
+            (
+                "{\"t\":\"header\"}\n".to_owned(),
+                "carries only `server_keys`",
+            ),
             (
                 KEY_LINE.replace("provisional", "historical"),
                 "unknown signing-key kind",
             ),
             (KEY_LINE.replace("AQID", "!!"), "not base64"),
             (KEY_LINE.replace("\"AQID\"", "\"\""), "`key` is empty"),
-            (
-                KEY_LINE.replace("example.org", ""),
-                "`origin` is empty",
-            ),
+            (KEY_LINE.replace("example.org", ""), "`origin` is empty"),
             (KEY_LINE.replace("ed25519:A", ""), "`key_id` is empty"),
             (without("key"), "missing `key`"),
             (without("valid_until_ts"), "missing `valid_until_ts`"),
