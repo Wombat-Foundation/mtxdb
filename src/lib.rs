@@ -129,6 +129,10 @@ pub mod room_auth;
 /// Rebuildable full-text and field secondary indexes.
 #[path = "search.rs"]
 pub mod search;
+/// Federation signing keys: per-key records, the MSC4499 binding rules, and
+/// the verbatim Notary payload.
+#[path = "matrix/server_keys.rs"]
+pub mod server_keys;
 /// Fixed-size shard file pool that packfiles are written into.
 #[path = "engine/shard.rs"]
 pub mod shard;
@@ -190,14 +194,14 @@ pub use index::LossyIndex;
 pub use interop::{
     auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
     commit_state_batches, decode_auth_counter, decode_auth_forward, decode_import_marker,
-    decode_server_key, decode_state_root_handle_v1, decode_verdict, encode_auth_counter,
-    encode_auth_forward, encode_import_marker, encode_server_key, encode_state_root_handle_v1,
-    encode_verdict, event_record_id, event_state_root_node_id, event_verdict_collection_id,
-    import_marker_collection_id, import_marker_node_id, room_roots_collection_id,
-    room_state_collection_id, room_state_root_node_id, server_key_record_id,
-    server_keys_collection_id, state_hamt_node_id, ImportMarker, KeyRecordKind, StateRootHandleV1,
-    Verdict, DATA_FORMAT, KEY_RECORD_VERSION, MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL,
-    STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS, VERDICT_VERSION,
+    decode_server_key, decode_server_key_entries, decode_state_root_handle_v1, decode_verdict,
+    encode_auth_counter, encode_auth_forward, encode_import_marker, encode_server_key,
+    encode_server_key_entries, encode_state_root_handle_v1, encode_verdict, event_record_id,
+    event_state_root_node_id, event_verdict_collection_id, import_marker_collection_id,
+    import_marker_node_id, notary_record_id, room_roots_collection_id, room_state_collection_id,
+    room_state_root_node_id, server_keys_collection_id, state_hamt_node_id, ImportMarker,
+    ServerKeyEntry, StateRootHandleV1, Verdict, DATA_FORMAT, KEY_RECORD_VERSION, MARKER_VERSION,
+    STATE_BATCH_BYTES, STATE_POOL, STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS, VERDICT_VERSION,
 };
 pub use journal::SharedWalLock;
 pub use journal::{CollectionExpectation, StagedLookup, TxnStage, TxnStageState};

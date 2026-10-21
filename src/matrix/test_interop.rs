@@ -126,24 +126,10 @@ fn server_keys_round_trip_and_reject_truncation() {
 }
 
 #[test]
-fn server_key_record_ids_are_distinct_per_kind_and_origin() {
-    let historical = server_key_record_id(KeyRecordKind::Historical, b"a.example");
-    let provisional = server_key_record_id(KeyRecordKind::Provisional, b"a.example");
-    let other = server_key_record_id(KeyRecordKind::Historical, b"b.example");
-    assert_ne!(historical, provisional);
-    assert_ne!(historical, other);
-    assert_eq!(
-        historical,
-        server_key_record_id(KeyRecordKind::Historical, b"a.example")
-    );
-}
-
-#[test]
-fn key_record_kinds_parse_their_tags() {
-    for kind in KeyRecordKind::ALL {
-        assert_eq!(KeyRecordKind::parse(kind.as_str()), Some(kind));
-    }
-    assert_eq!(KeyRecordKind::parse("wat"), None);
+fn notary_record_ids_are_distinct_per_origin() {
+    let one = notary_record_id(b"a.example");
+    assert_ne!(one, notary_record_id(b"b.example"));
+    assert_eq!(one, notary_record_id(b"a.example"));
 }
 
 #[test]

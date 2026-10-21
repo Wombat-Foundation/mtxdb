@@ -4,8 +4,9 @@
 //! reads it. Both sides must spell every record tag and field the same way and
 //! agree on what each verdict code number means, so those live here once. The
 //! module is pure: names, numbers and tag conversions, no JSON library and no
-//! I/O. The `kind` of a `server_keys` record is
-//! [`crate::interop::KeyRecordKind::as_str`].
+//! I/O. A `server_keys` record is one signing key of an origin, tagged by
+//! [`key_kind::PROVISIONAL`] or [`key_kind::CORROBORATED`], or the origin's
+//! verbatim self-signed payload, tagged [`key_kind::NOTARY`].
 //!
 //! Each line is one JSON object tagged by [`field::T`]:
 //!
@@ -30,6 +31,16 @@ pub mod tag {
     pub const END: &str = "end";
     /// One signing-key record of a keys export.
     pub const SERVER_KEYS: &str = "server_keys";
+}
+
+/// The `kind` of a `server_keys` record.
+pub mod key_kind {
+    /// A key seen only through a notary so far.
+    pub const PROVISIONAL: &str = "provisional";
+    /// A key observed by a direct fetch from its origin.
+    pub const CORROBORATED: &str = "corroborated";
+    /// The origin's self-signed payload, kept verbatim.
+    pub const NOTARY: &str = "notary";
 }
 
 /// Field names, by record.
@@ -70,10 +81,20 @@ pub mod field {
 
     /// `server_keys`: the server the keys belong to.
     pub const ORIGIN: &str = "origin";
-    /// `server_keys`: the record kind, a `KeyRecordKind` tag.
+    /// `server_keys`: the record kind, a [`super::key_kind`] tag.
     pub const KIND: &str = "kind";
-    /// `server_keys`: base64 of the record's payload bytes.
+    /// `server_keys` notary: base64 of the self-signed payload's exact bytes.
     pub const PAYLOAD: &str = "payload";
+    /// `server_keys` key: the key's id, for example `ed25519:abc`.
+    pub const KEY_ID: &str = "key_id";
+    /// `server_keys` key: base64 of the public key bytes.
+    pub const KEY: &str = "key";
+    /// `server_keys` key: millisecond timestamp the key is valid until.
+    pub const VALID_UNTIL_TS: &str = "valid_until_ts";
+    /// `server_keys` key: who first supplied the key.
+    pub const SOURCE: &str = "source";
+    /// `server_keys` key: millisecond timestamp the key was last seen.
+    pub const TS_ADDED_MS: &str = "ts_added_ms";
 }
 
 /// Why an event was rejected: the server refused it outright.

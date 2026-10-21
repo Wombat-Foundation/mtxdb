@@ -4959,8 +4959,7 @@ fn outlier_is_independent_of_soft_fail_and_redaction_status() {
 
 #[test]
 fn imported_keys_export_is_readable_in_the_servers_layout() {
-    use crate::interchange::KeyKind;
-    use mtxdb::interop::*;
+    use mtxdb::server_keys::{read_notary_payload, read_server_keys, KeyTier};
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
@@ -4970,35 +4969,48 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
         (0, true, 0)
     );
 
-    let mut seen = Vec::new();
+    let mut expected_keys = Vec::new();
+    let mut expected_notary = None;
     for line in KEYS_EXPORT_FIXTURE.lines() {
         let record = owned_value(line);
-        let kind = KeyKind::parse(&json_str(&record, "kind").unwrap())
-            .expect("the exporter writes only kinds the importer knows");
-        let origin = json_str(&record, "origin").unwrap();
-        let payload = base64::engine::general_purpose::STANDARD
-            .decode(json_str(&record, "payload").unwrap())
-            .unwrap();
-        let bytes = stored(
-            &db,
-            SERVER_INFO_POOL,
-            server_keys_collection_id(),
-            server_key_record_id(kind, origin.as_bytes()),
-        )
-        .expect("key record");
-        assert_eq!(
-            decode_server_key(&bytes).unwrap(),
-            (origin.as_bytes(), payload.as_slice()),
-            "{} payload must come back byte for byte",
-            kind.as_str()
-        );
-        seen.push(kind);
+        let decode = |field: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(json_str(&record, field).unwrap())
+                .unwrap()
+        };
+        match json_str(&record, "kind").unwrap().as_str() {
+            "notary" => expected_notary = Some(decode("payload")),
+            kind => expected_keys.push((
+                json_str(&record, "key_id").unwrap().into_bytes(),
+                decode("key"),
+                json_str(&record, "source").unwrap().into_bytes(),
+                kind == "corroborated",
+            )),
+        }
     }
+
+    let stored = read_server_keys(db.server_info(), b"keys.example.org").unwrap();
+    let actual: Vec<_> = stored
+        .iter()
+        .map(|key| {
+            (
+                key.key_id.clone(),
+                key.key.clone(),
+                key.source.clone(),
+                key.tier == KeyTier::Corroborated,
+            )
+        })
+        .collect();
+    expected_keys.sort();
+    assert_eq!(actual, expected_keys, "each key comes back field for field");
     assert_eq!(
-        seen.len(),
-        KeyKind::ALL.len(),
-        "the fixture has one record of each kind"
+        read_notary_payload(db.server_info(), b"keys.example.org").unwrap(),
+        expected_notary,
+        "the notary payload must come back byte for byte"
     );
+    assert!(read_server_keys(db.server_info(), b"other.example.org")
+        .unwrap()
+        .is_empty());
 }
 
 fn marker(db: &Database) -> Option<mtxdb::interop::ImportMarker> {

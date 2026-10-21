@@ -310,78 +310,21 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(&[u8], Verdict), StorageError> {
 /// Version byte of the signing-key record value encoding.
 pub const KEY_RECORD_VERSION: u8 = 1;
 
-/// Which of an origin's signing-key records.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KeyRecordKind {
-    /// Cumulative `verify_keys` and `old_verify_keys` ever seen.
-    Historical,
-    /// Key ids bound only through a notary so far.
-    Provisional,
-    /// Key ids observed as currently active by a direct fetch.
-    Corroborated,
-    /// The last verbatim self-signed payload, re-served by the notary.
-    Notary,
-}
-
-impl KeyRecordKind {
-    /// Every kind, for scan and summary paths.
-    pub const ALL: [Self; 4] = [
-        Self::Historical,
-        Self::Provisional,
-        Self::Corroborated,
-        Self::Notary,
-    ];
-
-    /// The kind tag written into the record-id pre-image.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Historical => "historical",
-            Self::Provisional => "provisional",
-            Self::Corroborated => "corroborated",
-            Self::Notary => "notary",
-        }
-    }
-
-    /// Parse a kind tag, or `None` for an unknown tag.
-    #[must_use]
-    pub fn parse(tag: &str) -> Option<Self> {
-        match tag {
-            "historical" => Some(Self::Historical),
-            "provisional" => Some(Self::Provisional),
-            "corroborated" => Some(Self::Corroborated),
-            "notary" => Some(Self::Notary),
-            _ => None,
-        }
-    }
-
-    fn as_bytes(self) -> &'static [u8] {
-        self.as_str().as_bytes()
-    }
-}
-
 /// Derive the collection holding every origin's signing-key records.
 #[must_use]
 pub fn server_keys_collection_id() -> [u8; 16] {
     derive_id(b"sys", b"server-keys")
 }
 
-/// Derive the record id of one signing-key record of `origin`.
+/// Derive the record id of `origin`'s Notary record, the verbatim self-signed
+/// payload the notary endpoint re-serves. Its keys live in per-origin
+/// collections; see [`crate::server_keys`].
 #[must_use]
-pub fn server_key_record_id(kind: KeyRecordKind, origin: &[u8]) -> [u8; 16] {
-    let mut identifier = Vec::with_capacity(
-        kind.as_bytes()
-            .len()
-            .saturating_add(origin.len())
-            .saturating_add(1),
-    );
-    identifier.extend_from_slice(kind.as_bytes());
-    identifier.push(0);
-    identifier.extend_from_slice(origin);
-    derive_id(b"server-key", &identifier)
+pub fn notary_record_id(origin: &[u8]) -> [u8; 16] {
+    derive_id(b"server-key-notary", origin)
 }
 
-/// Encode one signing-key record for storage.
+/// Encode a Notary record for storage: the origin, then the payload verbatim.
 ///
 /// # Errors
 /// Returns [`StorageError::Corrupt`] if the origin does not fit its length
@@ -401,7 +344,7 @@ pub fn encode_server_key(origin: &[u8], payload: &[u8]) -> Result<Vec<u8>, Stora
     Ok(out)
 }
 
-/// Decode a stored signing-key record into its origin and payload.
+/// Decode a stored Notary record into its origin and payload.
 ///
 /// # Errors
 /// Returns [`StorageError::Corrupt`] for a truncated record or an unknown
@@ -420,6 +363,124 @@ pub fn decode_server_key(bytes: &[u8]) -> Result<(&[u8], &[u8]), StorageError> {
         return Err(malformed());
     }
     Ok(rest.split_at(length))
+}
+
+/// One signing key stored in a Historical, Provisional, or Corroborated record.
+/// Notary records are deliberately opaque and must not use this codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerKeyEntry {
+    /// Matrix key identifier (for example, `ed25519:abc`).
+    pub key_id: Vec<u8>,
+    /// Millisecond timestamp at which this key stops being valid.
+    pub valid_until_ts: u64,
+    /// Raw public key bytes.
+    pub key: Vec<u8>,
+    /// Original source which supplied this key.
+    pub source: Vec<u8>,
+    /// Millisecond timestamp when this entry was added.
+    pub ts_added_ms: u64,
+}
+
+/// Encode a sorted map of signing-key entries for a server-key record.
+///
+/// The format is versioned and length-delimited. Entries are sorted by key id
+/// on write, so equivalent maps have one canonical representation.
+///
+/// # Errors
+/// Returns `StorageError::Corrupt` for a duplicate key id or a field too
+/// large for its length prefix.
+pub fn encode_server_key_entries(entries: &[ServerKeyEntry]) -> Result<Vec<u8>, StorageError> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+    if sorted
+        .windows(2)
+        .any(|pair| pair[0].key_id == pair[1].key_id)
+    {
+        return Err(StorageError::Corrupt("duplicate signing key id".to_owned()));
+    }
+    let count = u32::try_from(sorted.len())
+        .map_err(|_| StorageError::Corrupt("too many signing keys".to_owned()))?;
+    let mut out = vec![1];
+    out.extend_from_slice(&count.to_le_bytes());
+    for entry in sorted {
+        for field in [&entry.key_id, &entry.key, &entry.source] {
+            let len = u32::try_from(field.len())
+                .map_err(|_| StorageError::Corrupt("signing-key field too large".to_owned()))?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(field);
+            if std::ptr::eq(field, &raw const entry.key_id) {
+                out.extend_from_slice(&entry.valid_until_ts.to_le_bytes());
+            } else if std::ptr::eq(field, &raw const entry.source) {
+                out.extend_from_slice(&entry.ts_added_ms.to_le_bytes());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decode the binary map used by Historical, Provisional, and Corroborated
+/// records. Notary payloads remain opaque.
+///
+/// # Errors
+/// Returns `StorageError::Corrupt` if the bytes are not a well-formed map.
+pub fn decode_server_key_entries(bytes: &[u8]) -> Result<Vec<ServerKeyEntry>, StorageError> {
+    let malformed = || StorageError::Corrupt("malformed signing-key map".to_owned());
+    if bytes.first() != Some(&1) {
+        return Err(malformed());
+    }
+    let mut rest = bytes.get(1..).ok_or_else(malformed)?;
+    let count_bytes: [u8; 4] = rest
+        .get(..4)
+        .ok_or_else(malformed)?
+        .try_into()
+        .map_err(|_| malformed())?;
+    let count = u32::from_le_bytes(count_bytes) as usize;
+    rest = &rest[4..];
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let read_field = |rest: &mut &[u8]| -> Result<Vec<u8>, StorageError> {
+            let len_bytes: [u8; 4] = rest
+                .get(..4)
+                .ok_or_else(malformed)?
+                .try_into()
+                .map_err(|_| malformed())?;
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            *rest = &rest[4..];
+            let field = rest.get(..len).ok_or_else(malformed)?.to_vec();
+            *rest = &rest[len..];
+            Ok(field)
+        };
+        let key_id = read_field(&mut rest)?;
+        let valid: [u8; 8] = rest
+            .get(..8)
+            .ok_or_else(malformed)?
+            .try_into()
+            .map_err(|_| malformed())?;
+        rest = &rest[8..];
+        let key = read_field(&mut rest)?;
+        let source = read_field(&mut rest)?;
+        let added: [u8; 8] = rest
+            .get(..8)
+            .ok_or_else(malformed)?
+            .try_into()
+            .map_err(|_| malformed())?;
+        rest = &rest[8..];
+        entries.push(ServerKeyEntry {
+            key_id,
+            valid_until_ts: u64::from_le_bytes(valid),
+            key,
+            source,
+            ts_added_ms: u64::from_le_bytes(added),
+        });
+    }
+    if !rest.is_empty()
+        || entries
+            .windows(2)
+            .any(|pair| pair[0].key_id >= pair[1].key_id)
+    {
+        return Err(malformed());
+    }
+    Ok(entries)
 }
 
 /// Pool holding event bodies, event locators and verdicts.

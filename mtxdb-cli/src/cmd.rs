@@ -14,6 +14,7 @@ use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, Collectio
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
+use mtxdb::server_keys::KeyTier;
 use mtxdb::shard::ShardPool;
 use mtxdb::state_group::{StateGroupDerivation, StateGroupTrust};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
@@ -26,7 +27,7 @@ use mtxdb::{
 use rezzy::json::{self, Object, Value as OwnedValue};
 
 use crate::export_import;
-use crate::interchange::{self, KeyKind, KeyRecord, RoomExport};
+use crate::interchange::{self, KeyRecord, RoomExport};
 use crate::state_policy::{resolution_policy, ResolutionPolicy, StateView};
 use crate::state_resolve::{resolve_parents, LeanEventContext, StateEntries};
 use crate::{Cli, Commands, PacksAction};
@@ -9388,24 +9389,26 @@ impl ImportContext<'_> {
     }
 
     /// Import one `server_keys` export into the server-info pool, in the
-    /// layout the server reads. The payload bytes are stored as the export
-    /// decoded them: they are slipstream-encoded JSON the federation layer
-    /// decodes itself.
+    /// layout the server reads: one record per key in its origin's collection,
+    /// and each notary payload stored as the export decoded it.
     fn import_keys_export(&self, path: &Path, records: &[KeyRecord]) -> anyhow::Result<()> {
         export_import::clear_marker(self.db)?;
         export_import::write_keys(self.db, records)
             .with_context(|| format!("importing signing keys from {}", path.display()))?;
-        let mut summary = Vec::with_capacity(KeyKind::ALL.len());
-        for kind in KeyKind::ALL {
-            let count = records.iter().filter(|record| record.kind == kind).count();
-            if count > 0 {
-                summary.push(format!("{count} {}", kind.as_str()));
+        let (mut provisional, mut corroborated, mut notary) = (0_usize, 0_usize, 0_usize);
+        for record in records {
+            match record {
+                KeyRecord::Key { key, .. } if key.tier == KeyTier::Provisional => {
+                    provisional = provisional.saturating_add(1);
+                }
+                KeyRecord::Key { .. } => corroborated = corroborated.saturating_add(1),
+                KeyRecord::Notary { .. } => notary = notary.saturating_add(1),
             }
         }
         eprintln!(
-            "imported {} signing-key records ({})",
-            records.len(),
-            summary.join(", ")
+            "imported {} signing-key records ({provisional} provisional, \
+             {corroborated} corroborated, {notary} notary)",
+            records.len()
         );
         Ok(())
     }
