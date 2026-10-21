@@ -284,26 +284,16 @@ impl NodeCache {
     pub fn hit_rate(&self) -> f64 {
         let h = self.hits.load(Ordering::Relaxed);
         let m = self.misses.load(Ordering::Relaxed);
-        let total = h.saturating_add(m);
-        if total == 0 {
-            return 0.0;
+        // Scale both counters down together until they fit in 32 bits so the
+        // ratio needs no lossy casts; exact below 2^32 lookups.
+        let excess = u32::BITS.saturating_sub(h.max(m).leading_zeros());
+        let narrow = |count: u64| f64::from(u32::try_from(count >> excess).unwrap_or(u32::MAX));
+        let (h, m) = (narrow(h), narrow(m));
+        if h + m == 0.0 {
+            0.0
+        } else {
+            h / (h + m)
         }
-
-        // Convert the ratio using binary long division so the full u64 range
-        // is supported without lossy integer-to-float casts.
-        let denominator = u128::from(total);
-        let mut remainder = u128::from(h);
-        let mut fraction = 0.0;
-        let mut place = 0.5;
-        for _ in 0..64 {
-            remainder = remainder.saturating_mul(2);
-            if remainder >= denominator {
-                remainder = remainder.saturating_sub(denominator);
-                fraction += place;
-            }
-            place *= 0.5;
-        }
-        fraction
     }
 
     /// Clear all entries.
