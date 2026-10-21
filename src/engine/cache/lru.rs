@@ -27,6 +27,7 @@ impl<K, V> State<K, V>
 where
     K: Eq + Hash,
 {
+    /// Creates an empty state with no reusable slots.
     fn new() -> Self {
         Self {
             map: HashMap::new(),
@@ -37,6 +38,7 @@ where
         }
     }
 
+    /// Marks the occupied slot at `index` as most recently used.
     fn move_to_head(&mut self, index: LinkIdx) {
         if self.head == index {
             return;
@@ -63,6 +65,8 @@ where
         }
     }
 
+    /// Removes the least recently used entry and makes its slot reusable.
+    /// Does nothing when empty; panics from dropping keys or values propagate.
     fn evict_tail(&mut self) {
         if self.tail == NIL {
             return;
@@ -110,6 +114,7 @@ where
     K: Clone + Eq + Hash,
 {
     /// Creates an empty cache with room for at most `capacity` entries.
+    /// A capacity of zero disables storage; lookups record misses.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -119,13 +124,19 @@ where
         }
     }
 
-    /// Looks up `key`, refreshing its recency when present.
+    /// Returns a clone of the value for `key`, or `None` if absent.
+    ///
+    /// Records a hit when returning a value and a miss when the key is absent.
+    /// Refreshes recency if the key still maps to the same slot after cloning.
+    /// Concurrent removal, eviction, or replacement can occur before the
+    /// refresh; the cloned value is still returned and counted as a hit.
     ///
     /// A hit clones its value under a shared lock and only takes the exclusive
     /// lock for the recency refresh. Misses never take the cache write lock.
-    /// Exact global LRU ordering still makes the refresh phase contend briefly;
-    /// callers with highly parallel workloads can use multiple caches when
-    /// approximate global recency is acceptable.
+    ///
+    /// # Panics
+    ///
+    /// Panics from key hashing or equality, or from cloning the value, propagate.
     pub fn get(&self, key: &K) -> Option<V>
     where
         V: Clone,
@@ -147,11 +158,13 @@ where
         Some(value)
     }
 
+    /// Increments the hit count, saturating at `u64::MAX`.
     fn record_hit(&self) {
         let mut stats = self.stats.lock();
         stats.hits = stats.hits.saturating_add(1);
     }
 
+    /// Increments the miss count, saturating at `u64::MAX`.
     fn record_miss(&self) {
         let mut stats = self.stats.lock();
         stats.misses = stats.misses.saturating_add(1);
@@ -159,10 +172,17 @@ where
 
     /// Inserts or replaces an entry, making it the most recently used entry.
     ///
+    /// Inserting a new key into a full cache evicts the least recently used
+    /// entry. A capacity of zero drops the supplied key and value without
+    /// storing them. Hit/miss counters are unchanged.
+    ///
     /// # Panics
     ///
-    /// Panics if the cache grows beyond `u32::MAX` entries, which is
-    /// impractical for an in-process cache.
+    /// Panics if a new slot is needed after `u32::MAX` slots have been allocated.
+    /// Panics from cloning, hashing, or comparing keys, or from dropping keys
+    /// or values, propagate. A key clone, hash, or equality panic occurs before
+    /// eviction; a panic while dropping an entry can leave the cache partially
+    /// updated.
     pub fn insert(&self, key: K, value: V) {
         if self.capacity == 0 {
             return;
@@ -251,6 +271,12 @@ where
     }
 
     /// Removes `key` and returns its value if present.
+    /// Hit/miss counters are unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics from key hashing, equality, or destruction propagate. A panic
+    /// while dropping a key can leave the cache partially updated.
     pub fn remove(&self, key: &K) -> Option<V> {
         let mut state = self.state.write();
         let index = state.map.remove(key)?;
@@ -278,6 +304,10 @@ where
     }
 
     /// Removes all entries. Hit/miss counters are retained.
+    ///
+    /// # Panics
+    ///
+    /// Panics from dropping keys or values propagate.
     pub fn clear(&self) {
         let mut state = self.state.write();
         *state = State::new();
@@ -300,16 +330,20 @@ where
     }
 
     /// Number of successful lookups.
+    /// The count saturates at `u64::MAX` and is retained by [`Self::clear`].
     pub fn hits(&self) -> u64 {
         self.stats.lock().hits
     }
 
     /// Number of unsuccessful lookups.
+    /// The count saturates at `u64::MAX` and is retained by [`Self::clear`].
     pub fn misses(&self) -> u64 {
         self.stats.lock().misses
     }
 
     /// Successful lookups divided by all lookups.
+    ///
+    /// Returns a fraction in `[0.0, 1.0]`, or `0.0` before any lookups.
     ///
     /// The counters are read under the same lock used by lookup updates, so
     /// both values come from one coherent snapshot.
