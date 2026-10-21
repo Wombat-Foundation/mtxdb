@@ -344,21 +344,29 @@ mod tests {
         let reader = PublishSignal::reader(&segment).unwrap().unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
         let reopens = {
             let stop = Arc::clone(&stop);
+            let started = Arc::clone(&started);
             let segment = segment.clone();
-            std::thread::spawn(move || {
-                let mut last = None;
-                while !stop.load(Ordering::Relaxed) {
-                    let writer = PublishSignal::writer(&segment).unwrap();
-                    for _ in 0..8 {
-                        writer.bump();
-                    }
-                    last = Some(writer.snapshot());
+            std::thread::spawn(move || loop {
+                let writer = PublishSignal::writer(&segment).unwrap();
+                for _ in 0..8 {
+                    writer.bump();
                 }
-                last.expect("at least one reopen")
+                let last = writer.snapshot();
+                started.store(true, Ordering::Release);
+                if stop.load(Ordering::Relaxed) {
+                    break last;
+                }
             })
         };
+
+        // Sample only once the writer is reopening, so the loop below always
+        // overlaps at least one restart however the threads are scheduled.
+        while !started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
 
         for _ in 0..100_000 {
             assert_ne!(reader.snapshot().0, 0, "a live epoch is never zero");
