@@ -308,7 +308,7 @@ fn all_openers_accept_the_v1_tagged_format() {
 }
 
 #[test]
-fn open_modes_share_the_current_format() {
+fn open_modes_share_the_v1_format() {
     let path = temp_path("version_mismatch");
     let _ = fs::remove_file(&path);
     Journal::open(&path).unwrap();
@@ -424,36 +424,6 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
     );
     assert_eq!(stage.state(), TxnStageState::JournalPublished);
     fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn transaction_stage_lookup_preserves_frame_metadata() {
-    use crate::layout::ShardType;
-
-    let stage = TxnStage::new();
-    let collection = [0x31; 16];
-    let node = [0x32; 16];
-    let metadata = crate::packfile::FrameMetadata {
-        role: Some(b"event-edge".to_vec()),
-        ..crate::packfile::FrameMetadata::default()
-    };
-    stage
-        .stage_put_with_metadata(
-            ShardType::Edges,
-            collection,
-            node,
-            b"payload".to_vec(),
-            metadata.clone(),
-        )
-        .unwrap();
-
-    assert_eq!(
-        stage.lookup(ShardType::Edges, &collection, &node),
-        super::StagedLookup::PutWithMetadata {
-            payload: b"payload".to_vec(),
-            metadata,
-        }
-    );
 }
 
 #[test]

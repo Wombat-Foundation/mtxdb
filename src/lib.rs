@@ -234,8 +234,7 @@ pub use state_group::{
     STATE_GROUP_DOMAIN_PREFIX, STATE_GROUP_RECORD_MAGIC, STATE_GROUP_RECORD_VERSION,
 };
 pub use storage::{
-    content_digest, Digest32, DigestAlgorithm, DigestHasher, NodeData, NodeId, RecordWithMetadata,
-    StorageEngine,
+    content_digest, Digest32, DigestAlgorithm, DigestHasher, NodeData, NodeId, StorageEngine,
 };
 pub use template::{
     derive_collection_id, derive_group_full_id, derive_group_member_collection_id,

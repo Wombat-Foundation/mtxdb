@@ -119,8 +119,6 @@ type ReadJournalValue = (bytes::Bytes, u64);
 type ReadJournalCollection = HashMap<[u8; 16], ReadJournalValue>;
 /// Committed puts keyed `collection_id -> node_id`.
 type ReadJournalPuts = HashMap<[u8; 16], ReadJournalCollection>;
-/// Custom frame metadata for committed puts, keyed like [`ReadJournalPuts`].
-type ReadJournalMetadata = HashMap<[u8; 16], HashMap<[u8; 16], crate::packfile::FrameMetadata>>;
 
 /// Outcome of refreshing the overlay against the writer's segment.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -229,8 +227,6 @@ pub(super) struct ReadJournal {
     tail_scratch: Vec<u8>,
     /// Committed puts as `(payload, lsn)`, keyed `collection_id -> node_id`.
     pub(super) puts: ReadJournalPuts,
-    /// Metadata carried by journaled puts, when the mutation supplied it.
-    pub(super) metadata_puts: ReadJournalMetadata,
     /// Committed per-record removals, keyed `collection_id -> node_id`.
     pub(super) removes: HashMap<[u8; 16], HashMap<NodeId, u64>>,
     /// Highest committed delete LSN per collection. This is a persistent
@@ -316,7 +312,6 @@ impl ReadJournal {
             tail_resets: 0,
             tail_scratch: Vec::new(),
             puts: HashMap::new(),
-            metadata_puts: HashMap::new(),
             removes: HashMap::new(),
             delete_lsn: HashMap::new(),
             transaction: false,
@@ -326,7 +321,6 @@ impl ReadJournal {
     /// Drop all applied state so the next refresh rebuilds from the segment.
     pub(super) fn reset_overlay(&mut self) {
         self.puts.clear();
-        self.metadata_puts.clear();
         self.removes.clear();
         self.delete_lsn.clear();
         self.observed_lsn = 0;
@@ -359,13 +353,6 @@ impl ReadJournal {
             entries.retain(|_, (_, lsn)| *lsn > covered);
             !entries.is_empty()
         });
-        self.metadata_puts.retain(|collection_id, entries| {
-            let Some(puts) = self.puts.get(collection_id) else {
-                return false;
-            };
-            entries.retain(|node_id, _| puts.contains_key(node_id));
-            !entries.is_empty()
-        });
         self.removes.retain(|_, entries| {
             entries.retain(|_, lsn| *lsn > covered);
             !entries.is_empty()
@@ -385,35 +372,6 @@ impl ReadJournal {
                     .entry(*collection_id)
                     .or_default()
                     .insert(*node_id, (bytes::Bytes::copy_from_slice(payload), lsn));
-                if let Some(entries) = self.metadata_puts.get_mut(collection_id) {
-                    entries.remove(node_id);
-                    if entries.is_empty() {
-                        self.metadata_puts.remove(collection_id);
-                    }
-                }
-                if let Some(removes) = self.removes.get_mut(collection_id) {
-                    removes.remove(node_id);
-                    if removes.is_empty() {
-                        self.removes.remove(collection_id);
-                    }
-                }
-            }
-            JournalMutation::PutWithMetadata {
-                collection_id,
-                node_id,
-                payload,
-                metadata,
-            } => {
-                self.puts
-                    .entry(*collection_id)
-                    .or_default()
-                    .insert(*node_id, (bytes::Bytes::copy_from_slice(payload), lsn));
-                let mut metadata = metadata.clone();
-                metadata.last_write_lsn = Some(lsn);
-                self.metadata_puts
-                    .entry(*collection_id)
-                    .or_default()
-                    .insert(*node_id, metadata);
                 if let Some(removes) = self.removes.get_mut(collection_id) {
                     removes.remove(node_id);
                     if removes.is_empty() {
@@ -431,12 +389,6 @@ impl ReadJournal {
                         self.puts.remove(collection_id);
                     }
                 }
-                if let Some(metadata) = self.metadata_puts.get_mut(collection_id) {
-                    metadata.remove(node_id);
-                    if metadata.is_empty() {
-                        self.metadata_puts.remove(collection_id);
-                    }
-                }
                 self.removes
                     .entry(*collection_id)
                     .or_default()
@@ -444,7 +396,6 @@ impl ReadJournal {
             }
             JournalMutation::DeleteCollection { collection_id } => {
                 self.puts.remove(collection_id);
-                self.metadata_puts.remove(collection_id);
                 self.removes.remove(collection_id);
                 self.delete_lsn
                     .entry(*collection_id)
@@ -1179,84 +1130,6 @@ impl PackfileStorage {
             .map(|(data, _)| data)
     }
 
-    pub(super) fn get_read_committed_frame_metadata(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<crate::packfile::FrameMetadata>>, StorageError> {
-        let guard = self.refresh_read_journal()?;
-        let Some(overlay) = guard.as_ref() else {
-            drop(guard);
-            let _fallback = FallbackReadGuard::enter();
-            return self.read_many_frame_metadata_durable(collection_id, ids);
-        };
-        let mut results = vec![None; ids.len()];
-        let Some(unresolved) =
-            Self::overlay_metadata_lookup(overlay, collection_id, ids, &mut results)
-        else {
-            return Ok(results);
-        };
-        drop(guard);
-        if unresolved.is_empty() {
-            return Ok(results);
-        }
-        let durable_ids: Vec<NodeId> = unresolved.iter().map(|&index| ids[index]).collect();
-        let _fallback = FallbackReadGuard::enter();
-        let durable = self.read_many_frame_metadata_durable(collection_id, &durable_ids)?;
-        for (index, metadata) in unresolved.into_iter().zip(durable) {
-            results[index] = metadata;
-        }
-        Ok(results)
-    }
-
-    pub(super) fn get_read_committed_with_metadata(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<crate::storage::RecordWithMetadata>>, StorageError> {
-        let guard = self.refresh_read_journal()?;
-        let Some(overlay) = guard.as_ref() else {
-            drop(guard);
-            let _fallback = FallbackReadGuard::enter();
-            return self.read_many_with_metadata_durable(collection_id, ids);
-        };
-        let mut results = vec![None; ids.len()];
-        let puts = overlay.puts.get(collection_id);
-        let custom = overlay.metadata_puts.get(collection_id);
-        let removes = overlay.removes.get(collection_id);
-        let deleted = overlay.delete_lsn.contains_key(collection_id);
-        let mut unresolved = Vec::new();
-        for (index, id) in ids.iter().enumerate() {
-            if let Some((payload, lsn)) = puts.and_then(|entries| entries.get(id)) {
-                let metadata = custom
-                    .and_then(|entries| entries.get(id))
-                    .cloned()
-                    .unwrap_or_else(|| crate::packfile::FrameMetadata {
-                        last_write_lsn: Some(*lsn),
-                        ..crate::packfile::FrameMetadata::default()
-                    });
-                results[index] = Some(crate::storage::RecordWithMetadata {
-                    data: NodeData::new(payload.clone()),
-                    metadata: Some(metadata),
-                });
-            } else if removes.is_some_and(|entries| entries.contains_key(id)) || deleted {
-                // A removal or collection delete shadows any durable version.
-            } else {
-                unresolved.push(index);
-            }
-        }
-        drop(guard);
-        if !unresolved.is_empty() {
-            let durable_ids: Vec<NodeId> = unresolved.iter().map(|&index| ids[index]).collect();
-            let _fallback = FallbackReadGuard::enter();
-            let durable = self.read_many_with_metadata_durable(collection_id, &durable_ids)?;
-            for (index, value) in unresolved.into_iter().zip(durable) {
-                results[index] = value;
-            }
-        }
-        Ok(results)
-    }
-
     /// Like [`Self::get_read_committed`], also returning the visibility
     /// boundary of the returned data: the highest LSN whose groups are fully
     /// reflected in the result (from the overlay if unmaterialized, otherwise
@@ -1366,43 +1239,6 @@ impl PackfileStorage {
                         unresolved.push(index);
                     }
                 }
-            }
-        }
-        if overlay.delete_lsn.contains_key(collection_id) {
-            None
-        } else {
-            Some(unresolved)
-        }
-    }
-
-    fn overlay_metadata_lookup(
-        overlay: &ReadJournal,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-        results: &mut [Option<crate::packfile::FrameMetadata>],
-    ) -> Option<Vec<usize>> {
-        let committed = overlay.puts.get(collection_id);
-        let custom = overlay.metadata_puts.get(collection_id);
-        let removed = overlay.removes.get(collection_id);
-        let mut unresolved = Vec::new();
-        for (index, id) in ids.iter().enumerate() {
-            if let Some((_, lsn)) = committed.and_then(|entries| entries.get(id)) {
-                let metadata = custom
-                    .and_then(|entries| entries.get(id))
-                    .cloned()
-                    .unwrap_or_else(|| crate::packfile::FrameMetadata {
-                        last_write_lsn: Some(*lsn),
-                        ..crate::packfile::FrameMetadata::default()
-                    });
-                if !metadata.removed {
-                    results[index] = Some(metadata);
-                }
-            } else if removed.is_some_and(|entries| entries.contains_key(id)) {
-                // A removed record resolves to no live metadata.
-            } else if overlay.delete_lsn.contains_key(collection_id) {
-                // The durable index may still hold records predating the delete.
-            } else {
-                unresolved.push(index);
             }
         }
         if overlay.delete_lsn.contains_key(collection_id) {

@@ -17,7 +17,7 @@ use std::time::Duration;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::layout::ShardType;
-use crate::packfile::{publish_signal::PublishSignal, FrameMetadata};
+use crate::packfile::publish_signal::PublishSignal;
 
 use crc32fast::Hasher;
 
@@ -25,9 +25,8 @@ const FILE_MAGIC: &[u8; 8] = b"MTXWAL01";
 const GROUP_MAGIC: &[u8; 4] = b"MWG1";
 const GROUP_COMMIT_MAGIC: &[u8; 4] = b"CMIT";
 
-/// The current on-disk journal format version. Tag 4 adds `PutWithMetadata`
-/// within v1; every mutation carries its physical pool tag, even when a
-/// journal currently serves only one pool.
+/// The sole on-disk journal format version. Every mutation carries its
+/// physical pool tag, even when a journal currently serves only one pool.
 const JOURNAL_VERSION: u32 = 1;
 
 // File header field byte ranges. `FILE_HEADER_LEN` is the sum of the fields.
@@ -113,18 +112,6 @@ pub enum Mutation {
         node_id: [u8; 16],
         /// Encoded record payload.
         payload: Vec<u8>,
-    },
-    /// Insert a record with caller-provided per-frame metadata. The metadata
-    /// travels in the journal so replay materializes the same frame header.
-    PutWithMetadata {
-        /// Collection containing the record.
-        collection_id: [u8; 16],
-        /// Record identity.
-        node_id: [u8; 16],
-        /// Encoded record payload.
-        payload: Vec<u8>,
-        /// Metadata written in the frame header.
-        metadata: FrameMetadata,
     },
     /// Append a removed version for one record identity.
     RemoveRecord {
@@ -284,21 +271,12 @@ pub fn is_segment_reclaimed(error: &io::Error) -> bool {
 pub enum StagedLookup {
     /// The newest staged mutation for the record is a put of this payload.
     Put(Vec<u8>),
-    /// The newest staged mutation for the record is a put with frame metadata.
-    PutWithMetadata {
-        /// Encoded record payload.
-        payload: Vec<u8>,
-        /// Metadata to materialize with the frame.
-        metadata: FrameMetadata,
-    },
     /// A staged collection delete hides the record, and nothing newer puts it
     /// back.
     Deleted,
     /// Nothing staged names the record; the live store decides.
     Absent,
 }
-
-type StagedPayloadRef<'a> = (&'a Vec<u8>, Option<&'a FrameMetadata>);
 
 /// A collection-version precondition staged on a transaction.
 ///
@@ -459,8 +437,7 @@ impl TxnStage {
             return vec![StagedLookup::Absent; node_ids.len()];
         }
         let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
-        let mut newest_put: HashMap<[u8; 16], (usize, Option<StagedPayloadRef<'_>>)> =
-            HashMap::new();
+        let mut newest_put: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
         let mut last_delete: Option<usize> = None;
         for (position, mutation) in data.pools[pool_index(pool)].iter().enumerate() {
             match mutation {
@@ -469,15 +446,7 @@ impl TxnStage {
                     node_id,
                     payload,
                 } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, Some((payload, None))));
-                }
-                Mutation::PutWithMetadata {
-                    collection_id: staged_collection,
-                    node_id,
-                    payload,
-                    metadata,
-                } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, Some((payload, Some(metadata)))));
+                    newest_put.insert(*node_id, (position, Some(payload)));
                 }
                 Mutation::RemoveRecord {
                     collection_id: staged_collection,
@@ -496,11 +465,7 @@ impl TxnStage {
             .map(|node_id| match (newest_put.get(node_id), last_delete) {
                 // A put older than the delete is hidden by it.
                 (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
-                (Some((_, Some((payload, None)))), _) => StagedLookup::Put((*payload).clone()),
-                (Some((_, Some((payload, Some(metadata))))), _) => StagedLookup::PutWithMetadata {
-                    payload: (*payload).clone(),
-                    metadata: (*metadata).clone(),
-                },
+                (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
                 (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
                 (None, None) => StagedLookup::Absent,
             })
@@ -693,54 +658,6 @@ impl TxnStage {
             collection_id,
             node_id,
             payload,
-        });
-        data.applied[pool_index(pool)].push(false);
-        data.bytes = total;
-        Ok(())
-    }
-
-    /// Add a put whose frame metadata must survive journal replay.
-    ///
-    /// # Errors
-    /// Returns `InvalidInput` if metadata marks the frame removed, or if the
-    /// transaction's bounded staging budget is exhausted.
-    pub fn stage_put_with_metadata(
-        &self,
-        pool: ShardType,
-        collection_id: [u8; 16],
-        node_id: [u8; 16],
-        payload: Vec<u8>,
-        metadata: FrameMetadata,
-    ) -> io::Result<()> {
-        if metadata.removed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "put metadata cannot mark a frame as removed",
-            ));
-        }
-        let metadata_bytes = metadata.encode()?;
-        let charge = payload
-            .len()
-            .saturating_add(metadata_bytes.len())
-            .saturating_add(TXN_STAGE_PUT_OVERHEAD_BYTES);
-        let mut data = self.data.lock();
-        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
-            return Err(io::Error::other("transaction stage is not active"));
-        }
-        let total = data.bytes.checked_add(charge).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transaction stage size overflow",
-            )
-        })?;
-        if total > self.limit_bytes {
-            return Err(stage_too_large_with_limit(total, self.limit_bytes));
-        }
-        data.pools[pool_index(pool)].push(Mutation::PutWithMetadata {
-            collection_id,
-            node_id,
-            payload,
-            metadata,
         });
         data.applied[pool_index(pool)].push(false);
         data.bytes = total;
@@ -940,19 +857,6 @@ impl TxnStage {
                     node_id,
                     payload,
                 } => (c, node_id, payload.len().saturating_add(64)),
-                Mutation::PutWithMetadata {
-                    collection_id: c,
-                    node_id,
-                    payload,
-                    metadata,
-                } => (
-                    c,
-                    node_id,
-                    payload
-                        .len()
-                        .saturating_add(metadata.encode().map_or(0, |bytes| bytes.len()))
-                        .saturating_add(64),
-                ),
                 Mutation::RemoveRecord {
                     collection_id: c,
                     node_id,
@@ -2276,11 +2180,6 @@ impl JournalCoordinator {
                 let pool = entry.pool;
                 match &entry.mutation {
                     Mutation::Put {
-                        collection_id,
-                        node_id,
-                        ..
-                    }
-                    | Mutation::PutWithMetadata {
                         collection_id,
                         node_id,
                         ..
@@ -3721,11 +3620,6 @@ impl JournalCoordinator {
             for mutation in *mutations {
                 match mutation {
                     Mutation::Put {
-                        collection_id,
-                        node_id,
-                        ..
-                    }
-                    | Mutation::PutWithMetadata {
                         collection_id,
                         node_id,
                         ..
@@ -5564,35 +5458,6 @@ fn encode_mutation(
 ) -> io::Result<()> {
     // The flag byte is always the pool tag.
     let pool_byte = pool_tag(pool);
-    let metadata_payload = if let Mutation::PutWithMetadata {
-        payload, metadata, ..
-    } = mutation
-    {
-        let encoded_metadata = metadata.encode()?;
-        let metadata_len = u32::try_from(encoded_metadata.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "metadata exceeds u32"))?;
-        let total_len = 4usize
-            .checked_add(encoded_metadata.len())
-            .and_then(|len| len.checked_add(payload.len()))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "mutation length overflow")
-            })?;
-        let total_len = u32::try_from(total_len).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
-        })?;
-        let mut encoded = Vec::with_capacity(usize::try_from(total_len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "mutation payload exceeds address space",
-            )
-        })?);
-        encoded.extend_from_slice(&metadata_len.to_le_bytes());
-        encoded.extend_from_slice(&encoded_metadata);
-        encoded.extend_from_slice(payload);
-        Some(encoded)
-    } else {
-        None
-    };
 
     let start = into.len();
     // Zeroed fixed area; `MF_FLAGS` and the DeleteCollection-only fields stay
@@ -5605,7 +5470,6 @@ fn encode_mutation(
             Mutation::Put { .. } => [1],
             Mutation::DeleteCollection { .. } => [2],
             Mutation::RemoveRecord { .. } => [3],
-            Mutation::PutWithMetadata { .. } => [4],
         });
         frame[MF_POOL].copy_from_slice(&[pool_byte]);
         frame[MF_LSN].copy_from_slice(&lsn.to_le_bytes());
@@ -5617,20 +5481,6 @@ fn encode_mutation(
             } => {
                 frame[MF_COLLECTION].copy_from_slice(collection_id);
                 frame[MF_NODE].copy_from_slice(node_id);
-                let payload_len = u32::try_from(payload.len()).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
-                })?;
-                frame[MF_PAYLOAD_LEN].copy_from_slice(&payload_len.to_le_bytes());
-                payload.as_slice()
-            }
-            Mutation::PutWithMetadata {
-                collection_id,
-                node_id,
-                ..
-            } => {
-                frame[MF_COLLECTION].copy_from_slice(collection_id);
-                frame[MF_NODE].copy_from_slice(node_id);
-                let payload = metadata_payload.as_ref().expect("encoded metadata payload");
                 let payload_len = u32::try_from(payload.len()).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
                 })?;
@@ -5914,7 +5764,6 @@ fn scan_groups_from(
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn decode_mutations(
     payload: &[u8],
     first_lsn: u64,
@@ -5981,28 +5830,6 @@ fn decode_mutations(
                 node_id,
                 payload: data.to_vec(),
             },
-            4 if payload_len >= 4 => {
-                let metadata_len = usize::try_from(u32::from_le_bytes(
-                    data[..4].try_into().expect("metadata length prefix"),
-                ))
-                .map_err(|_| invalid_data("journal metadata length exceeds address space"))?;
-                let metadata_end = 4usize
-                    .checked_add(metadata_len)
-                    .ok_or_else(|| invalid_data("journal metadata length overflow"))?;
-                let metadata_bytes = data
-                    .get(4..metadata_end)
-                    .ok_or_else(|| invalid_data("journal metadata exceeds mutation payload"))?;
-                let (metadata, consumed) = FrameMetadata::decode(metadata_bytes)?;
-                if consumed != metadata_bytes.len() {
-                    return Err(invalid_data("extra bytes after journal metadata"));
-                }
-                Mutation::PutWithMetadata {
-                    collection_id,
-                    node_id,
-                    payload: data[metadata_end..].to_vec(),
-                    metadata,
-                }
-            }
             2 if payload_len == 0 && node_id == [0; 16] => {
                 Mutation::DeleteCollection { collection_id }
             }

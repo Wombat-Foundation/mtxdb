@@ -206,19 +206,6 @@ impl NodeData {
     }
 }
 
-/// A live record and its optional per-frame metadata.
-///
-/// The outer `Option` in batch-read results distinguishes a missing or
-/// removed record. `metadata: None` means the record is present but its frame
-/// has no metadata block.
-#[derive(Debug, Clone)]
-pub struct RecordWithMetadata {
-    /// Record payload and any decoded child references.
-    pub data: NodeData,
-    /// Per-frame metadata, absent on legacy or plain frames.
-    pub metadata: Option<crate::packfile::FrameMetadata>,
-}
-
 /// A reference to a node that may be resident in cache or need disk fetch.
 ///
 /// This is the swizzling enum inspired by `LeanStore`:
@@ -327,81 +314,6 @@ pub trait StorageEngine: Send + Sync {
         id: &NodeId,
         data: &NodeData,
     ) -> Result<(), StorageError>;
-
-    /// Store a record with caller-supplied per-frame metadata. Engines that do
-    /// not persist frame headers may return [`StorageError::Unsupported`].
-    ///
-    /// # Errors
-    /// Returns `Unsupported` when frame metadata is not supported, or an
-    /// engine-specific error if the write fails.
-    fn put_with_metadata(
-        &self,
-        collection_id: &[u8; 16],
-        id: &NodeId,
-        data: &NodeData,
-        metadata: &crate::packfile::FrameMetadata,
-    ) -> Result<(), StorageError> {
-        let _ = (collection_id, id, data, metadata);
-        Err(StorageError::Unsupported(
-            "per-record frame metadata is not supported by this storage engine".to_owned(),
-        ))
-    }
-
-    /// Store a batch with optional per-record frame metadata aligned with each
-    /// entry. The whole batch has the same atomicity as [`Self::put_many`].
-    ///
-    /// # Errors
-    /// Returns `Unsupported` when frame metadata is not supported, or an
-    /// engine-specific error if the batch fails.
-    fn put_many_with_metadata(
-        &self,
-        collection_id: &[u8; 16],
-        entries: &[(NodeId, NodeData, Option<crate::packfile::FrameMetadata>)],
-    ) -> Result<usize, StorageError> {
-        let _ = (collection_id, entries);
-        Err(StorageError::Unsupported(
-            "per-record frame metadata is not supported by this storage engine".to_owned(),
-        ))
-    }
-
-    /// Read frame metadata for several keys without materializing their node
-    /// payloads. Results follow input order; removed or absent records return
-    /// `None`. Packfile readers validate framing and TLVs but skip the payload
-    /// and its CRC, since the request is specifically for header data.
-    ///
-    /// # Errors
-    /// Returns `Unsupported` when frame metadata reads are not supported, or
-    /// an engine-specific error if reading the headers fails.
-    fn get_many_frame_metadata(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<crate::packfile::FrameMetadata>>, StorageError> {
-        let _ = (collection_id, ids);
-        Err(StorageError::Unsupported(
-            "frame metadata reads are not supported by this storage engine".to_owned(),
-        ))
-    }
-
-    /// Read payloads and their frame metadata through one record resolution.
-    /// Implementations should avoid a second locator lookup when both values
-    /// are needed. Results follow input order; absent or removed records are
-    /// `None`.
-    ///
-    /// # Errors
-    /// Returns `Unsupported` when combined reads are not supported, or an
-    /// engine-specific error if reading a record fails.
-    fn get_many_with_metadata(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<RecordWithMetadata>>, StorageError> {
-        let _ = (collection_id, ids);
-        Err(StorageError::Unsupported(
-            "combined payload and frame metadata reads are not supported by this storage engine"
-                .to_owned(),
-        ))
-    }
 
     /// Store multiple new nodes in a single batch within a collection.
     ///

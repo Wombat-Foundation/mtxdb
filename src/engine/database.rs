@@ -243,32 +243,6 @@ impl DatabaseTransaction<'_> {
             .stage_put(pool, collection_id, node_id, data.bytes.to_vec())
     }
 
-    /// Stage a record and its per-frame metadata in the same journal group.
-    ///
-    /// The metadata is persisted with the frame header and is included in the
-    /// journal mutation, so crash replay preserves it.
-    ///
-    /// # Errors
-    /// Returns an error if the metadata marks the record as removed, the
-    /// transaction exceeds its staging budget, or it is no longer active.
-    pub fn put_with_metadata(
-        &self,
-        pool: ShardType,
-        collection_id: [u8; 16],
-        node_id: [u8; 16],
-        data: &crate::storage::NodeData,
-        metadata: &crate::packfile::FrameMetadata,
-    ) -> io::Result<()> {
-        let _lifecycle = self.lifecycle.lock();
-        self.stage.stage_put_with_metadata(
-            pool,
-            collection_id,
-            node_id,
-            data.bytes.to_vec(),
-            metadata.clone(),
-        )
-    }
-
     /// Stage removal of a collection.
     ///
     /// # Errors
@@ -488,11 +462,9 @@ impl DatabaseTransaction<'_> {
         let mut live_ids = Vec::new();
         for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
             match lookup {
-                StagedLookup::Put(payload) | StagedLookup::PutWithMetadata { payload, .. } => {
-                    results.push(Some(crate::storage::NodeData::new(bytes::Bytes::from(
-                        payload,
-                    ))));
-                }
+                StagedLookup::Put(payload) => results.push(Some(crate::storage::NodeData::new(
+                    bytes::Bytes::from(payload),
+                ))),
                 StagedLookup::Deleted => results.push(None),
                 StagedLookup::Absent => {
                     results.push(None);
@@ -506,61 +478,6 @@ impl DatabaseTransaction<'_> {
                 .database
                 .pool(pool)
                 .get_many(collection_id, &live_ids)?;
-            for (slot, value) in live_slots.into_iter().zip(live) {
-                results[slot] = value;
-            }
-        }
-        Ok(results)
-    }
-
-    /// Read payloads and frame metadata through this transaction's staged
-    /// writes first, then the live pool. Staged writes retain their supplied
-    /// metadata; live records are resolved through the storage engine's
-    /// combined read path.
-    ///
-    /// # Errors
-    /// Returns an error if the live pool cannot read payloads or frame
-    /// metadata.
-    pub fn get_many_with_metadata(
-        &self,
-        pool: ShardType,
-        collection_id: &[u8; 16],
-        node_ids: &[NodeId],
-    ) -> Result<Vec<Option<crate::storage::RecordWithMetadata>>, StorageError> {
-        let staged = {
-            let _lifecycle = self.lifecycle.lock();
-            self.stage.lookup_many(pool, collection_id, node_ids)
-        };
-        let mut results = Vec::with_capacity(node_ids.len());
-        let mut live_slots = Vec::new();
-        let mut live_ids = Vec::new();
-        for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
-            match lookup {
-                StagedLookup::Put(payload) => {
-                    results.push(Some(crate::storage::RecordWithMetadata {
-                        data: crate::storage::NodeData::new(bytes::Bytes::from(payload)),
-                        metadata: None,
-                    }));
-                }
-                StagedLookup::PutWithMetadata { payload, metadata } => {
-                    results.push(Some(crate::storage::RecordWithMetadata {
-                        data: crate::storage::NodeData::new(bytes::Bytes::from(payload)),
-                        metadata: Some(metadata),
-                    }));
-                }
-                StagedLookup::Deleted => results.push(None),
-                StagedLookup::Absent => {
-                    results.push(None);
-                    live_slots.push(slot);
-                    live_ids.push(*node_id);
-                }
-            }
-        }
-        if !live_ids.is_empty() {
-            let live = self
-                .database
-                .pool(pool)
-                .get_many_with_metadata(collection_id, &live_ids)?;
             for (slot, value) in live_slots.into_iter().zip(live) {
                 results[slot] = value;
             }
@@ -594,7 +511,7 @@ impl DatabaseTransaction<'_> {
         let mut live_ids = Vec::new();
         for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
             match lookup {
-                StagedLookup::Put(payload) | StagedLookup::PutWithMetadata { payload, .. } => {
+                StagedLookup::Put(payload) => {
                     results.push(Some(crate::storage::NodeData::new(bytes::Bytes::from(
                         payload,
                     ))));
@@ -642,7 +559,7 @@ impl DatabaseTransaction<'_> {
         let mut live_ids = Vec::new();
         for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
             match lookup {
-                StagedLookup::Put(payload) | StagedLookup::PutWithMetadata { payload, .. } => {
+                StagedLookup::Put(payload) => {
                     results.push(Some(crate::storage::NodeData::new(bytes::Bytes::from(
                         payload,
                     ))));
