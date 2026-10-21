@@ -1,6 +1,15 @@
 use super::*;
+use crate::database::Database;
+use crate::layout::ShardType;
 use crate::storage::{InMemoryStorage, StorageEngine};
 use crate::template::MEMBER_NAMESPACE_INTL;
+use std::path::PathBuf;
+
+fn test_root(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("mtxdb-aux-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
 
 #[test]
 fn named_indexes_share_storage_but_have_distinct_collections() {
@@ -56,6 +65,132 @@ fn get_many_rejects_a_corrupt_envelope() {
         .unwrap();
 
     assert!(index.get_many(&[b"bad"]).is_err());
+}
+
+#[test]
+fn remove_and_staged_remove_many_delete_values_and_are_idempotent() {
+    let root = test_root("remove_values");
+    let db = Database::open(root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(db.event_dag().as_ref(), "remove_values");
+    index.put(b"second", b"two").unwrap();
+    let transaction = db.begin_transaction();
+    assert_eq!(
+        index
+            .stage_remove_many(
+                &transaction,
+                ShardType::EventDag,
+                &[b"second", b"missing", b"second"],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(index.get(b"second").unwrap(), Some(b"two".to_vec()));
+    transaction.commit().unwrap();
+    assert_eq!(index.get(b"second").unwrap(), None);
+    let transaction = db.begin_transaction();
+    assert!(!index
+        .remove(&transaction, ShardType::EventDag, b"second")
+        .unwrap());
+    transaction.commit().unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn staged_remove_many_is_stale_if_a_key_changes_concurrently() {
+    let root = test_root("remove_stale");
+    let db = Database::open(root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(db.event_dag().as_ref(), "remove_stale");
+    index.put(b"key", b"v1").unwrap();
+
+    let remover = db.begin_transaction();
+    assert_eq!(
+        index
+            .stage_remove_many(&remover, ShardType::EventDag, &[b"key"])
+            .unwrap(),
+        1
+    );
+
+    // Concurrent writer replaces the value after the envelope check.
+    index.put(b"key", b"v2").unwrap();
+
+    assert!(matches!(
+        remover.commit(),
+        Err(StorageError::StaleRead { .. })
+    ));
+    // The removal was not published; the concurrent write survived.
+    assert_eq!(index.get(b"key").unwrap(), Some(b"v2".to_vec()));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn staged_remove_many_uses_the_version_from_envelope_validation() {
+    let root = test_root("remove_validated_version");
+    let db = Database::open(root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(db.event_dag().as_ref(), "remove_validated_version");
+    index.put(b"key", b"v1").unwrap();
+
+    let id = physical_id(&auxiliary_key_digest(b"key"));
+    let remover = db.begin_transaction();
+    let (records, versions) = remover
+        .get_with_record_versions(ShardType::EventDag, &index.collection_id(), &[id])
+        .unwrap();
+    decode_value(
+        &auxiliary_key_digest(b"key"),
+        &records[0].as_ref().unwrap().bytes,
+    )
+    .unwrap();
+
+    // Replacing the record after validation must not let removal capture the
+    // replacement's newer version as its commit precondition.
+    index.put(b"key", b"v2").unwrap();
+    remover
+        .remove_many_with_record_versions(
+            ShardType::EventDag,
+            index.collection_id(),
+            &[id],
+            &versions,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        remover.commit(),
+        Err(StorageError::StaleRead { .. })
+    ));
+    assert_eq!(index.get(b"key").unwrap(), Some(b"v2".to_vec()));
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn staged_remove_many_rejects_a_different_database_pool() {
+    let first_root = test_root("remove_wrong_pool_index");
+    let second_root = test_root("remove_wrong_pool_transaction");
+    let first_db = Database::open(first_root.clone()).unwrap();
+    let second_db = Database::open(second_root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(first_db.event_dag().as_ref(), "remove_wrong_pool");
+    let unrelated = AuxiliaryIndex::open(second_db.event_dag().as_ref(), "remove_wrong_pool");
+    index.put(b"key", b"first database").unwrap();
+    unrelated.put(b"key", b"second database").unwrap();
+    let transaction = second_db.begin_transaction();
+
+    assert!(matches!(
+        index.stage_remove_many(&transaction, ShardType::EventDag, &[b"key"]),
+        Err(StorageError::Internal(message))
+            if message.contains("different storage pools")
+    ));
+    transaction.commit().unwrap();
+    assert_eq!(
+        unrelated.get(b"key").unwrap(),
+        Some(b"second database".to_vec())
+    );
+    assert_eq!(index.get(b"key").unwrap(), Some(b"first database".to_vec()));
+
+    drop(second_db);
+    drop(first_db);
+    let _ = std::fs::remove_dir_all(first_root);
+    let _ = std::fs::remove_dir_all(second_root);
 }
 
 #[test]

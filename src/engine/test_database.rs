@@ -2047,6 +2047,31 @@ fn versioned_read_retries_when_publication_is_not_materialized() {
 }
 
 #[test]
+fn versioned_read_after_a_journaled_removal_is_not_left_pending() {
+    let root = test_root("versioned_read_after_removal");
+    let db = Database::open(root.clone()).unwrap();
+    let pool = ShardType::Edges;
+    let collection = [0x76; 16];
+    let key = node(1);
+
+    let seed = db.begin_transaction();
+    seed.put(pool, collection, key, &data(b"live")).unwrap();
+    seed.commit().unwrap();
+
+    assert!(db.pool(pool).remove_record(&collection, &key).unwrap());
+    // The removal published an LSN and applied it; the read must see that LSN
+    // as materialized instead of waiting for a later write to advance it.
+    let (records, _) = db
+        .pool(pool)
+        .get_with_collection_version(&collection, &[key])
+        .unwrap();
+    assert!(records[0].is_none());
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn versioned_point_reads_match_their_token_during_concurrent_publication() {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};

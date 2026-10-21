@@ -2,7 +2,7 @@
 //! compacted runs.
 //!
 //! The owner log holds one entry per event the room's holder owns, each with
-//! the 24-byte payload from [`encode_owner_payload`]. Compaction folds the
+//! the 32-byte payload from [`encode_owner_payload`]. Compaction folds the
 //! log into immutable sorted *runs* and publishes them under a *manifest*; the
 //! counter record carries `(log_epoch, log_epoch_start_seq, manifest_version)`
 //! together, so one read yields a manifest and the log tail it pairs with.
@@ -41,8 +41,8 @@ use crate::short_id::{
 use crate::storage::{NodeData, NodeId, StorageError};
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
-/// Length of an owner-log payload: `h64` then `h128`, both big-endian.
-pub const OWNER_PAYLOAD_LEN: usize = 24;
+/// Length of an owner-log payload: `h64`, `q3`, then `h128`, all big-endian.
+pub const OWNER_PAYLOAD_LEN: usize = 32;
 /// Entries per run chunk record.
 pub const RUN_CHUNK_ENTRIES: usize = 2000;
 /// Log entries since the last compaction at which [`ShortIdIndex::compact`]
@@ -53,7 +53,7 @@ pub const COMPACT_TRIGGER: u32 = 2000;
 /// the snapshot materializes, so peak memory tracks the population and not the
 /// log's record overhead.
 const READ_CHUNK: u32 = 4096;
-/// Chunk records written per transaction (24 MB, under the staging budget).
+/// Chunk records written per transaction (32 MB, under the staging budget).
 const CHUNKS_PER_TXN: usize = 500;
 /// Chunk records read per call.
 const CHUNKS_PER_READ: u32 = 50;
@@ -66,27 +66,40 @@ const RUN_CHUNK_PREFIX: [u8; 8] = *b"MTXSIDK\0";
 const GC_ID: NodeId = *b"MTXD-SID-GCLS-v1";
 const RUN_SCOPE: &[u8] = b"short-id-run";
 
-/// One element as the runs store it, ordered `(h64, h128)`.
-type Entry = (u64, u128);
+/// One element as the runs store it, ordered `(h64, q3, h128)`.
+type Entry = (u64, u64, u128);
 
-/// The owner-log payload that adds `hash` to the population.
+/// Encode the owner-log payload for `hash` as 32 bytes: `h64`, `q3`, then
+/// `h128`, all big-endian.
 #[must_use]
 pub fn encode_owner_payload(hash: ElementHash) -> [u8; OWNER_PAYLOAD_LEN] {
     let mut payload = [0_u8; OWNER_PAYLOAD_LEN];
     payload[..8].copy_from_slice(&hash.h64.to_be_bytes());
-    payload[8..].copy_from_slice(&hash.h128.to_be_bytes());
+    payload[8..16].copy_from_slice(&hash.q3.to_be_bytes());
+    payload[16..].copy_from_slice(&hash.h128.to_be_bytes());
     payload
 }
 
+/// Decode a big-endian `(h64, q3, h128)` entry.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] unless `bytes` is exactly 32 bytes long;
+/// `what` identifies the record in the error message.
 fn decode_entry(what: &str, bytes: &[u8]) -> Result<Entry, StorageError> {
-    let corrupt = || StorageError::Corrupt(format!("{what} entry is not 24 bytes"));
+    let corrupt = || StorageError::Corrupt(format!("{what} entry is not 32 bytes"));
     let (h64, rest) = bytes.split_first_chunk::<8>().ok_or_else(corrupt)?;
+    let (q3, rest) = rest.split_first_chunk::<8>().ok_or_else(corrupt)?;
     let h128 = <&[u8; 16]>::try_from(rest).map_err(|_| corrupt())?;
-    Ok((u64::from_be_bytes(*h64), u128::from_be_bytes(*h128)))
+    Ok((
+        u64::from_be_bytes(*h64),
+        u64::from_be_bytes(*q3),
+        u128::from_be_bytes(*h128),
+    ))
 }
 
-fn element((h64, h128): Entry) -> ElementHash {
-    ElementHash { h64, h128 }
+/// Reconstruct an element hash from all three stored columns.
+fn element((h64, q3, h128): Entry) -> ElementHash {
+    ElementHash { h64, q3, h128 }
 }
 
 fn algebraic(error: AlgebraicError) -> StorageError {
@@ -191,13 +204,19 @@ impl Manifest {
     }
 }
 
+/// Encode a run chunk with its header, big-endian count, and 32-byte entries
+/// in the supplied order.
+///
+/// # Errors
+/// Returns [`StorageError::Internal`] if the entry count exceeds `u32::MAX`.
 fn encode_chunk(entries: &[Entry]) -> Result<Vec<u8>, StorageError> {
     let mut out = header(RUN_CHUNK_MAGIC);
     let count = u32::try_from(entries.len())
         .map_err(|_| StorageError::Internal("run chunk length".to_owned()))?;
     out.extend_from_slice(&count.to_be_bytes());
-    for &(h64, h128) in entries {
+    for &(h64, q3, h128) in entries {
         out.extend_from_slice(&h64.to_be_bytes());
+        out.extend_from_slice(&q3.to_be_bytes());
         out.extend_from_slice(&h128.to_be_bytes());
     }
     Ok(out)
@@ -315,6 +334,9 @@ impl PopulationBase {
 pub struct PopulationSnapshot {
     base: Arc<PopulationBase>,
     tail: SortedPopulation,
+    /// The `q3` column for the tail, aligned with `tail`. `SortedPopulation`
+    /// does not store `q3`, but kernel reconstruction needs it for strata.
+    tail_q3: Vec<u64>,
     owner_seq_ceiling: u32,
 }
 
@@ -347,12 +369,18 @@ impl PopulationSnapshot {
     /// The room kernel at the ceiling: the manifest's kernel plus the tail.
     ///
     /// # Errors
-    /// Returns an error if the element count overflows.
+    /// Returns [`StorageError::Internal`] if the element count overflows.
     pub fn kernel(&self) -> Result<ResidentKernel, StorageError> {
         let mut kernel = self.base.kernel.clone();
-        for (&h64, &h128) in self.tail.h64s().iter().zip(self.tail.h128s()) {
+        for ((&h64, &h128), &q3) in self
+            .tail
+            .h64s()
+            .iter()
+            .zip(self.tail.h128s())
+            .zip(&self.tail_q3)
+        {
             kernel
-                .insert(ElementHash { h64, h128 })
+                .insert(ElementHash { h64, q3, h128 })
                 .map_err(algebraic)?;
         }
         Ok(kernel)
@@ -682,7 +710,7 @@ impl ShortIdIndex {
             }
             base
         };
-        let tail = self
+        let mut tail = self
             .read_tail(
                 db,
                 counters.log_epoch,
@@ -690,9 +718,15 @@ impl ShortIdIndex {
                 counters.next_owner_seq,
             )
             .map_err(|error| self.expired_if_superseded(db, &counters, error))?;
+        // `read_tail` sorts by the whole `(h64, q3, h128)` entry, but
+        // `SortedPopulation` re-sorts by `(h64, h128)`; match its order so
+        // `tail_q3` stays aligned with the stored columns.
+        tail.sort_unstable_by_key(|&(h64, _, h128)| (h64, h128));
+        let tail_q3 = tail.iter().map(|&(_, q3, _)| q3).collect();
         Ok(PopulationSnapshot {
             base,
             tail: SortedPopulation::new(tail.into_iter().map(element).collect()),
+            tail_q3,
             owner_seq_ceiling: counters.next_owner_seq,
         })
     }

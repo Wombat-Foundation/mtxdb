@@ -7662,6 +7662,62 @@ fn shared_reclaim_waits_for_every_pool_then_truncates() {
     );
 }
 
+#[test]
+fn multi_collection_snapshot_uses_retained_floor_for_idle_pool() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let root = test_dir("shared_idle_snapshot_root");
+    let active_dir = test_dir("shared_idle_snapshot_active");
+    let idle_dir = test_dir("shared_idle_snapshot_idle");
+    let wal = root.join("wal.bin");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+
+    let active = PackfileStorage::open(active_dir.clone()).unwrap();
+    let idle = PackfileStorage::open(idle_dir.clone()).unwrap();
+    active
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    idle.enable_shared_journal(coordinator, ShardType::EventDag)
+        .unwrap();
+
+    active
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(0xA1),
+            &NodeData::new(bytes::Bytes::from_static(b"active")),
+        )
+        .unwrap();
+    active.sync_all().unwrap();
+
+    let retained = Journal::scan_read_only(&wal).unwrap();
+    assert!(
+        retained.base_lsn > 1,
+        "active pool should reclaim its group"
+    );
+    let (scans, cursor, lease) = idle
+        .scan_collections_at_snapshot(&[TEST_COLLECTION])
+        .unwrap();
+    assert_eq!(cursor.lsn().saturating_add(1), retained.base_lsn);
+    assert_eq!(
+        scans
+            .into_iter()
+            .map(|(_, scan)| scan.map(Result::unwrap).count())
+            .sum::<usize>(),
+        0
+    );
+    drop(lease);
+
+    drop(idle);
+    drop(active);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(active_dir);
+    let _ = fs::remove_dir_all(idle_dir);
+}
+
 #[cfg(feature = "multi-reader")]
 /// End-to-end: three interleaved pool groups, independent per-pool
 /// checkpoints, shared reclaim, then a read-only reopen. The state reader's

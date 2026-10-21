@@ -31,8 +31,8 @@ use base64::Engine as _;
 use mtxdb::database::Database;
 use mtxdb::layout::ShardType;
 use mtxdb::population::encode_owner_payload;
+use mtxdb::recon::{ElementHash, EventIdFormat, SortedPopulation};
 use mtxdb::short_id::{BatchEvent, ShortIdIndex};
-use rezzy_recon::{ElementHash, EventIdFormat, SortedPopulation};
 
 const SCOPE: [u8; 16] = [0x62; 16];
 const BATCH: u32 = 1000;
@@ -134,7 +134,7 @@ fn build_store(dir: &Path, owners: u32) -> Database {
     while next < owners {
         let end = next.saturating_add(BATCH).min(owners);
         let keys: Vec<Vec<u8>> = (next..end).map(event_id).collect();
-        let payloads: Vec<[u8; 24]> = (next..end)
+        let payloads: Vec<[u8; 32]> = (next..end)
             .map(|i| encode_owner_payload(ElementHash::from_digest32(digest(i))))
             .collect();
         let events: Vec<BatchEvent<'_>> = keys
@@ -250,10 +250,12 @@ fn read_runs(db: &Database, owners: u32) -> usize {
             .get_with_record_versions(ShardType::Edges, &RUN_COLLECTION, &ids)
             .expect("read runs");
         for record in found.into_iter().flatten() {
-            for chunk in record.bytes.chunks_exact(24) {
-                let (h64, h128) = chunk.split_at(8);
+            for chunk in record.bytes.chunks_exact(32) {
+                let (h64, rest) = chunk.split_at(8);
+                let (q3, h128) = rest.split_at(8);
                 hashes.push(ElementHash {
                     h64: u64::from_be_bytes(h64.try_into().expect("8 bytes")),
+                    q3: u64::from_be_bytes(q3.try_into().expect("8 bytes")),
                     h128: u128::from_be_bytes(h128.try_into().expect("16 bytes")),
                 });
             }
@@ -272,7 +274,7 @@ fn sync_scaling(db: &Database, dir: &Path, owners: u32) {
         let start = owners.saturating_add(round.saturating_mul(BATCH));
         let end = start.saturating_add(BATCH);
         let keys: Vec<Vec<u8>> = (start..end).map(event_id).collect();
-        let payloads: Vec<[u8; 24]> = (start..end)
+        let payloads: Vec<[u8; 32]> = (start..end)
             .map(|i| encode_owner_payload(ElementHash::from_digest32(digest(i))))
             .collect();
         let events: Vec<BatchEvent<'_>> = keys

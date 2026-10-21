@@ -5,6 +5,56 @@ fn derive_id_separates_domains_and_is_stable() {
     assert_eq!(derive_id(b"event", b"x"), derive_id(b"event", b"x"));
     assert_ne!(derive_id(b"event", b"x"), derive_id(b"root", b"x"));
     assert_ne!(derive_id(b"event", b"x"), derive_id(b"event", b"y"));
+    let event_digest = crate::storage::DigestAlgorithm::Blake3.digest(b"$event:example.com");
+    assert_eq!(
+        &event_record_id(b"$event:example.com")[..],
+        &event_digest[..16]
+    );
+}
+
+#[test]
+fn state_root_handle_v1_has_the_servers_pinned_layout() {
+    let handle = StateRootHandleV1 {
+        codec_version: 1,
+        routing_version: 2,
+        routing_params: [3, 4, 5, 6],
+        structural_hash: [7; 32],
+        state_group_id: [8; 32],
+    };
+    let bytes = encode_state_root_handle_v1(handle);
+    assert_eq!(bytes.len(), STATE_ROOT_HANDLE_V1_LEN);
+    assert_eq!(&bytes[..6], &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(&bytes[6..38], &[7; 32]);
+    assert_eq!(&bytes[38..70], &[8; 32]);
+    assert_eq!(decode_state_root_handle_v1(&bytes).unwrap(), handle);
+    assert!(decode_state_root_handle_v1(&bytes[..69]).is_err());
+    assert!(decode_state_root_handle_v1(&[&bytes[..], &[0]].concat()).is_err());
+}
+
+#[test]
+fn state_layout_ids_match_the_server_pinned_layout() {
+    let room = b"!room:example.com";
+    let event = b"$event:example.com";
+    let mut structural_hash = [0_u8; 32];
+    structural_hash[..16].fill(0x11);
+    structural_hash[16..].fill(0x22);
+    assert_eq!(
+        hex(&room_state_collection_id(room)),
+        "e560c7dd2ceee5d7d31ca9d56e6e9e9f"
+    );
+    assert_eq!(
+        hex(&room_roots_collection_id(room)),
+        "7abdfe381bda1791ba9c6ca5e67117ad"
+    );
+    assert_eq!(state_hamt_node_id(&structural_hash), [0x11; 16]);
+    assert_eq!(
+        hex(&room_state_root_node_id()),
+        "3fa8ef6f8d891872b0e4a05165972dfe"
+    );
+    assert_eq!(
+        hex(&event_state_root_node_id(event)),
+        "97ef9503cbbf4df387c4dd8eb3d7ccfa"
+    );
 }
 
 #[test]
@@ -107,10 +157,15 @@ fn import_marker_round_trips_and_rejects_truncation() {
     assert_eq!(decode_import_marker(&bytes).unwrap(), marker);
 
     assert!(decode_import_marker(&[]).is_err());
-    assert!(decode_import_marker(&[MARKER_VERSION, 1, 0, 0]).is_err());
+    assert!(decode_import_marker(&[MARKER_VERSION, DATA_FORMAT, 0, 0]).is_err());
     // Events present, closures count cut short.
     assert!(decode_import_marker(&bytes[..bytes.len() - 1]).is_err());
     assert!(decode_import_marker(&[9, 1, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    // A well-formed marker from an older data contract is refused, not misread.
+    let mut legacy = vec![MARKER_VERSION, 1];
+    legacy.extend_from_slice(&42u64.to_le_bytes());
+    legacy.extend_from_slice(&40u64.to_le_bytes());
+    assert!(decode_import_marker(&legacy).is_err());
 }
 
 #[test]
@@ -135,7 +190,7 @@ fn hex(bytes: &[u8]) -> String {
 fn event_collection_ids_are_pinned() {
     let room = b"!room:example.com";
     let node = event_record_id(b"$event:example.com");
-    assert_eq!(hex(&node), "f4f315ab8b948ccb0355c85e9d609ccd");
+    assert_eq!(hex(&node), "d3930850aae2d72b92a1d07108dcaa7f");
     assert_eq!(
         hex(&room_event_collection_id(room)),
         "9507be45c492c4382edb18fc074477cc"
@@ -150,7 +205,7 @@ fn event_collection_ids_are_pinned() {
     );
     assert_eq!(
         hex(&event_locator_collection_id(&node)),
-        "9d34360b21fa7f1ad961f46fb7b25857"
+        "8630e25f0c7e1a94558485e7176a1bda"
     );
     assert_ne!(
         room_event_collection_id(room),
@@ -218,19 +273,19 @@ fn outlier_flag_is_part_of_the_verdict_record() {
 fn auth_chain_records_are_pinned_and_round_trip() {
     assert_eq!(
         hex(&auth_counter_record_id()),
-        "107eed6ef642cc6e219edd8a43cafaad"
+        "82f29a189df9d4f1ce570f12c1d2c503"
     );
     assert_eq!(
         hex(&auth_forward_record_id(b"$e:x")),
-        "16a53f37238f9d0c2adbba80aa84661f"
+        "a4bcb32a1124a90417ed80a8e041c52e"
     );
     assert_eq!(
         hex(&auth_reverse_record_id(7)),
-        "a80ce9b45f60f10d32afb99f79d8cafe"
+        "1c1be185af0d4bceb68f842fb6203b27"
     );
     assert_eq!(
         hex(&auth_closure_record_id(7)),
-        "4d225a7b56f203a482578ff4b59b82b6"
+        "9f23b01a4899ca947d360350824645da"
     );
     assert_ne!(auth_reverse_record_id(7), auth_closure_record_id(7));
     assert_ne!(auth_reverse_record_id(7), auth_reverse_record_id(8));
@@ -248,6 +303,52 @@ fn auth_chain_records_are_pinned_and_round_trip() {
         );
     }
     assert_eq!(decode_auth_counter(&9_u32.to_be_bytes()).unwrap(), 9);
+    assert_eq!(decode_auth_counter(&encode_auth_counter(9)).unwrap(), 9);
     assert!(decode_auth_counter(&[0, 0, 9]).is_err());
     assert!(decode_auth_counter(&[0, 0, 0, 0, 9]).is_err());
+}
+
+#[test]
+fn state_batches_split_under_the_budget_and_read_back() {
+    let dir = std::env::temp_dir().join(format!("mtxdb-interop-state-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = crate::Database::open(dir.clone()).unwrap();
+    let room = b"!room:example.com";
+    let (stat, roots) = (
+        room_state_collection_id(room),
+        room_roots_collection_id(room),
+    );
+
+    let payloads: Vec<Vec<u8>> = (0..10_u8).map(|i| vec![i; 100]).collect();
+    let nodes: Vec<_> = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            let mut hash = [0_u8; 32];
+            hash[0] = u8::try_from(i).unwrap();
+            (stat, state_hamt_node_id(&hash), bytes.as_slice())
+        })
+        .collect();
+    let root_bytes = [0xAA_u8; 50];
+    let event_root = (
+        roots,
+        event_state_root_node_id(b"$e:example.com"),
+        root_bytes.as_slice(),
+    );
+    let room_root = (roots, room_state_root_node_id(), root_bytes.as_slice());
+
+    // 10 nodes charge 164 bytes each: 250-byte batches hold one, so 10 batches, then 1 for roots.
+    let committed =
+        commit_state_batches(&db, nodes.iter().copied(), [event_root, room_root], 250).unwrap();
+    assert_eq!(committed, 11);
+
+    for (collection, node, bytes) in nodes.iter().copied().chain([event_root, room_root]) {
+        let got = db
+            .begin_transaction()
+            .get(STATE_POOL, &collection, &[node])
+            .unwrap();
+        assert_eq!(got[0].as_ref().unwrap().bytes.as_ref(), bytes);
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

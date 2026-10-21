@@ -183,18 +183,21 @@ pub use auxiliary::{
 #[cfg(feature = "bitmaps")]
 pub use bitmap_set::{BitmapSet, DomainTag, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
 pub use cache::{LruCache, NodeCache};
-#[allow(deprecated)]
-pub use database::SharedDatabase;
 pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
 };
 pub use index::LossyIndex;
 pub use interop::{
-    decode_import_marker, decode_server_key, decode_verdict, encode_import_marker,
-    encode_server_key, encode_verdict, event_record_id, event_verdict_collection_id,
-    import_marker_collection_id, import_marker_node_id, server_key_record_id,
-    server_keys_collection_id, ImportMarker, KeyRecordKind, Verdict, DATA_FORMAT,
-    KEY_RECORD_VERSION, MARKER_VERSION, VERDICT_BUCKETS, VERDICT_VERSION,
+    auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
+    commit_state_batches, decode_auth_counter, decode_auth_forward, decode_import_marker,
+    decode_server_key, decode_state_root_handle_v1, decode_verdict, encode_auth_counter,
+    encode_auth_forward, encode_import_marker, encode_server_key, encode_state_root_handle_v1,
+    encode_verdict, event_record_id, event_state_root_node_id, event_verdict_collection_id,
+    import_marker_collection_id, import_marker_node_id, room_roots_collection_id,
+    room_state_collection_id, room_state_root_node_id, server_key_record_id,
+    server_keys_collection_id, state_hamt_node_id, ImportMarker, KeyRecordKind, StateRootHandleV1,
+    Verdict, DATA_FORMAT, KEY_RECORD_VERSION, MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL,
+    STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS, VERDICT_VERSION,
 };
 pub use journal::SharedWalLock;
 pub use journal::{CollectionExpectation, StagedLookup, TxnStage, TxnStageState};
@@ -216,6 +219,8 @@ pub use packfile::{
     FrameMetadata, Record,
 };
 pub use record_class::{Durability, OrderingPolicy, RecordClass, Retention};
+#[cfg(feature = "reconcile")]
+pub use rezzy_recon as recon;
 pub use search::{SearchDocument, SearchIndexes, SearchQuery};
 pub use shard::{LockHolderInfo, ShardPool};
 pub use state_group::{

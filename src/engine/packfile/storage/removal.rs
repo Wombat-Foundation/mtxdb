@@ -103,6 +103,14 @@ impl PackfileStorage {
     /// [`StorageEngine::put`]. Single-pool maintenance only: a transaction
     /// spanning pools uses `DatabaseTransaction::remove`.
     ///
+    /// The liveness check, the publication and the application all run under
+    /// the collection's put lock (and the snapshot gate), in the same lock
+    /// order `put_internal` uses. Serializing with a concurrent put on
+    /// the same collection is what keeps the live index and WAL replay in
+    /// agreement: without it, a put could publish a later LSN and apply first,
+    /// and this removal would then apply its older tombstone last, leaving the
+    /// index saying removed while replay (LSN order) restored the record live.
+    ///
     /// # Errors
     /// Returns [`StorageError`] if the liveness read, the journal publish or
     /// the write fails.
@@ -111,6 +119,9 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         node_id: &NodeId,
     ) -> Result<bool, StorageError> {
+        let _snapshot_gate = self.read_snapshot_gate.lock();
+        let collection_arc = self.put_mutex(collection_id);
+        let _collection_guard = collection_arc.lock();
         if self.get(collection_id, node_id)?.is_none() {
             return Ok(false);
         }
@@ -118,8 +129,9 @@ impl PackfileStorage {
             collection_id: *collection_id,
             node_id: *node_id,
         };
-        let lsn = self.publish_mutation(|| mutation.clone())?.unwrap_or(0);
-        self.apply_transaction_mutation(&mutation, lsn)?;
+        let published_lsn = self.publish_mutation(|| mutation.clone())?;
+        self.apply_remove_record_locked(collection_id, node_id, published_lsn.unwrap_or(0))?;
+        self.note_published_materialized(published_lsn);
         Ok(true)
     }
 

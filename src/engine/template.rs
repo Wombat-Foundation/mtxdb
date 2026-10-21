@@ -652,28 +652,35 @@ fn encode_record_id_rule(rule: &RecordIdentityRule) -> Vec<u8> {
     out
 }
 
+/// Decode an identity rule from its TLV encoding, with explicit
+/// digest-algorithm and policy fields.
+///
+/// Returns `None` for a truncated encoding, a missing or malformed required
+/// field, or incomplete TLV data. Unrecognized tags are ignored; unknown
+/// digest IDs are preserved.
 fn decode_record_id_rule(bytes: &[u8]) -> Option<RecordIdentityRule> {
-    let mut rule = RecordIdentityRule {
-        policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
-        digest_algorithm: DigestAlgorithm::Sha256,
-    };
-    let mut has_digest_algorithm = false;
-    let mut has_policy = false;
+    let mut digest_algorithm = None;
+    let mut policy = None;
     let mut reader = TlvReader::new(bytes);
     while let Some((tag, value)) = reader.next() {
         match tag {
             IDENTITY_TAG_DIGEST_ALGORITHM => {
-                rule.digest_algorithm = DigestAlgorithm::from_id(*value.first()?);
-                has_digest_algorithm = true;
+                let [id] = value else { return None };
+                digest_algorithm = Some(DigestAlgorithm::from_id(*id));
             }
             IDENTITY_TAG_POLICY => {
-                rule.policy = decode_frame_id_policy(value)?;
-                has_policy = true;
+                policy = Some(decode_frame_id_policy(value)?);
             }
             _ => {}
         }
     }
-    (reader.is_exhausted() && has_digest_algorithm && has_policy).then_some(rule)
+    if !reader.is_exhausted() {
+        return None;
+    }
+    Some(RecordIdentityRule {
+        policy: policy?,
+        digest_algorithm: digest_algorithm?,
+    })
 }
 
 fn encode_payload(payload: &PayloadPolicy) -> Vec<u8> {
@@ -818,6 +825,10 @@ impl CollectionMetadata {
     /// Decode a TLV block. Unrecognized tags are ignored: this record is
     /// write-once and never re-encoded, so there is nothing to preserve them
     /// for.
+    ///
+    /// Returns `None` for incomplete TLV data, invalid recognized fields, a
+    /// missing or empty canonical ID, or a missing record identity rule. The
+    /// identity rule must explicitly include both a digest algorithm and a policy.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let mut meta = Self {
@@ -825,7 +836,7 @@ impl CollectionMetadata {
             collection_canonical_id: Vec::new(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
-                digest_algorithm: DigestAlgorithm::Sha256,
+                digest_algorithm: DigestAlgorithm::Blake3,
             },
             payload: PayloadPolicy::Source,
             extension: None,
