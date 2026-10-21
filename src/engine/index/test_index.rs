@@ -755,34 +755,32 @@ fn replay_rejects_a_frame_carrying_the_empty_sentinel() {
 }
 
 #[test]
-fn replay_rejects_a_frame_naming_a_slot_above_max_shards() {
+fn replay_reads_the_former_reserved_bit_as_a_disposition_flag() {
     let mut hash = [0u8; 16];
     hash[15] = 1;
 
     let checkpoint_source = LossyIndex::new(16);
     let (bucket, _slot) = checkpoint_source.insert_tracked(&hash, 0, 100).unwrap();
     let checkpoint = LossyIndex::deserialize(&checkpoint_source.serialize()).unwrap();
-    let occupied_before = checkpoint.len();
 
-    // A frame whose packed entry decodes to a slot at MAX_SHARDS names no
-    // live shard; a writer can never emit one (`IndexEntry::new` rejects
-    // it), so replay must reject the whole log instead of installing an
-    // entry no shard scan can resolve.
-    let out_of_range = u16::try_from(crate::shard::MAX_SHARDS).unwrap();
-    let bad_entry = IndexEntry::new(0, 0, 0).0 | (u64::from(out_of_range) << 32);
-    let err = checkpoint
+    // The shard field is exactly 12 bits, so a slot id at or above
+    // `MAX_SHARDS` is not representable at all any more. The bit that used to
+    // be the first "out of range" marker (bit 12 of the slot field) is now
+    // disposition flag bit 0: the same raw value names shard 0 with flags 1.
+    let former_reserved = 1u64 << (32 + 12);
+    let raw = IndexEntry::new(0, 0, 0).0 | former_reserved;
+    checkpoint
         .replay_frames(&[DeltaFrame {
             collection_id: [0; 16],
             bucket,
             generation: 0,
-            slot: bad_entry,
+            slot: raw,
         }])
-        .unwrap_err();
-    assert!(
-        matches!(err, DeltaReplayError::SlotOutOfRange { bucket: b, slot } if b == bucket && slot == out_of_range)
-    );
-    assert_eq!(checkpoint.len(), occupied_before);
-    assert_eq!(checkpoint.lookup(&hash), Some((0, 100)));
+        .unwrap();
+
+    let entry = IndexEntry(checkpoint.entry_at(bucket as usize));
+    assert_eq!(entry.slot(), 0);
+    assert_eq!(entry.flags(), 1);
 }
 
 #[test]
@@ -1025,4 +1023,91 @@ fn slots_only_load_grows_by_recovering_hashes() {
             "growth lost the locator {slot}:{offset}"
         );
     }
+}
+
+#[test]
+fn entry_flags_are_three_bits_independent_of_the_shard_id() {
+    let slot = 0x0F0F_u16 % u16::try_from(crate::shard::MAX_SHARDS).unwrap();
+    for flags in 0..=7u8 {
+        let entry = IndexEntry::new_with_flags(0xABCD, slot, 0x1234_5678, false, flags);
+        assert_eq!(entry.flags(), flags);
+        assert_eq!(entry.slot(), slot, "flags must not leak into the shard id");
+        assert_eq!(entry.offset(), 0x1234_5678);
+        assert_eq!(entry.tag(), 0xABCD);
+        assert!(!entry.is_removed());
+
+        let removed = IndexEntry::new_with_flags(0xABCD, slot, 0x1234_5678, true, flags);
+        assert!(removed.is_removed());
+        assert_eq!(removed.flags(), flags);
+        assert_eq!(removed.slot(), slot);
+    }
+
+    let top = IndexEntry::new_with_flags(
+        0,
+        u16::try_from(crate::shard::MAX_SHARDS - 1).unwrap(),
+        0,
+        false,
+        7,
+    );
+    assert!(usize::from(top.slot()) < crate::shard::MAX_SHARDS);
+    assert_eq!(top.flags(), 7);
+    assert!(IndexEntry::valid_raw_slot(top.0));
+}
+
+#[test]
+fn slot_accounting_ignores_disposition_flag_bits() {
+    let index = LossyIndex::with_config(1024, IndexConfig::default());
+    let hash = spread_hash(1);
+    let slot = 2000u16;
+    index
+        .insert_undoable_with_flags(&hash, slot, 7, false, 0b111)
+        .unwrap();
+
+    let counts = index.slot_counts();
+    assert_eq!(counts.get(&slot).copied(), Some(1));
+    assert!(counts
+        .keys()
+        .all(|id| usize::from(*id) < crate::shard::MAX_SHARDS));
+    assert!(index.references_slot(slot));
+    assert!(index.referenced_slot_ids()[slot as usize]);
+}
+
+#[test]
+fn remap_slots_preserves_disposition_flags() {
+    let mut index = LossyIndex::with_config(1024, IndexConfig::default());
+    let hash = spread_hash(2);
+    index
+        .insert_undoable_with_flags(&hash, 5, 42, false, 0b101)
+        .unwrap();
+
+    let mut remap = HashMap::new();
+    remap.insert(5u16, 9u16);
+    assert!(index.remap_slots(&remap));
+
+    let entry = (0..index.capacity as usize)
+        .map(|bucket| IndexEntry(index.entry_at(bucket)))
+        .find(|entry| !entry.is_empty())
+        .expect("one live entry");
+    assert_eq!(entry.slot(), 9);
+    assert_eq!(entry.flags(), 0b101);
+    assert_eq!(entry.offset(), 42);
+    assert_eq!(entry.tag(), index.tag(&hash));
+}
+
+#[test]
+fn disposition_flags_survive_a_slots_only_round_trip() {
+    let index = LossyIndex::with_config(1024, IndexConfig::default());
+    let hash = spread_hash(3);
+    index
+        .insert_undoable_with_flags(&hash, 11, 99, false, 0b010)
+        .unwrap();
+
+    let loaded = LossyIndex::deserialize(&index.serialize_slots_only()).expect("decode");
+    let entry = (0..loaded.capacity as usize)
+        .map(|bucket| IndexEntry(loaded.entry_at(bucket)))
+        .find(|entry| !entry.is_empty())
+        .expect("one live entry");
+    assert_eq!(entry.flags(), 0b010);
+    assert_eq!(entry.slot(), 11);
+    assert_eq!(entry.offset(), 99);
 }

@@ -101,11 +101,17 @@ impl IndexEntry {
     const TAG_SHIFT: u64 = 48; // SHARD_BITS + OFFSET_BITS
     const SHARD_SHIFT: u64 = 32; // OFFSET_BITS
     const OFFSET_MASK: u64 = 0xFFFF_FFFF;
-    // Preserve the three currently-reserved bits in slot() so existing
-    // MAX_SHARDS validation rejects malformed encodings instead of masking
-    // them into a valid slot. Only the removal bit is excluded.
-    const SLOT_MASK: u16 = 0x7FFF;
+    /// Low 12 bits of the packed slot field: the shard id
+    /// (`crate::shard::MAX_SHARDS` = 4096).
+    const SLOT_MASK: u16 = 0x0FFF;
+    /// Bits 12..15 of the packed slot field: three generic record-disposition
+    /// bits (`0..=7`). These were reserved and required to be zero before the
+    /// disposition bits were defined; nothing else may use them.
+    const FLAGS_MASK: u16 = 0x7000;
+    /// Bit 15 of the packed slot field: an explicit removed version.
     const REMOVED_MASK: u16 = 0x8000;
+    /// Right shift from the packed slot field to [`Self::flags`].
+    const FLAGS_SHIFT: u32 = 12;
 
     /// Create a new entry from its components.
     ///
@@ -129,6 +135,20 @@ impl IndexEntry {
     /// Panics under the same invalid component conditions as [`Self::new`].
     #[must_use]
     pub fn new_with_removed(tag: u32, slot: u16, offset: u64, removed: bool) -> Self {
+        Self::new_with_flags(tag, slot, offset, removed, 0)
+    }
+
+    /// Create an entry with an explicit removal bit and disposition flags.
+    ///
+    /// `flags` is a 3-bit field (`0..=7`); core assigns no meaning to it.
+    /// The bits ride inside the packed slot, so they persist through the
+    /// slots-only checkpoint and `DeltaFrame` with no format change.
+    ///
+    /// # Panics
+    /// Panics under the same invalid component conditions as [`Self::new`],
+    /// or if `flags` exceeds 3 bits.
+    #[must_use]
+    pub fn new_with_flags(tag: u32, slot: u16, offset: u64, removed: bool, flags: u8) -> Self {
         assert!(tag <= 0xFFFF, "tag must fit in 16 bits");
         assert!(
             usize::from(slot) < crate::shard::MAX_SHARDS,
@@ -138,10 +158,13 @@ impl IndexEntry {
             offset <= Self::MAX_OFFSET,
             "offset must fit in 32 bits minus 1 (reserved for empty sentinel)"
         );
+        assert!(flags & !0x07 == 0, "flags must fit in 3 bits");
+        let slot_field = slot
+            | (u16::from(flags) << Self::FLAGS_SHIFT)
+            | if removed { Self::REMOVED_MASK } else { 0 };
         Self(
             (u64::from(tag) << Self::TAG_SHIFT)
-                | (u64::from(slot | if removed { Self::REMOVED_MASK } else { 0 })
-                    << Self::SHARD_SHIFT)
+                | (u64::from(slot_field) << Self::SHARD_SHIFT)
                 | ((offset.wrapping_add(1)) & Self::OFFSET_MASK),
         )
     }
@@ -164,7 +187,8 @@ impl IndexEntry {
         ((self.0 >> Self::TAG_SHIFT) & 0xFFFF) as u32
     }
 
-    /// The shard ID stored in this entry, excluding the removal flag.
+    /// The shard ID stored in this entry, excluding the removal bit and the
+    /// three disposition flag bits.
     ///
     /// # Panics
     /// Never panics: the packed field is masked to 16 bits before conversion.
@@ -173,6 +197,22 @@ impl IndexEntry {
         (u16::try_from((self.0 >> Self::SHARD_SHIFT) & 0xFFFF)
             .expect("masked slot field fits in u16"))
             & Self::SLOT_MASK
+    }
+
+    /// The three generic disposition bits stored in this entry (`0..=7`).
+    ///
+    /// Core assigns no meaning to these bits; the storage layer and its
+    /// callers define them. They persist through the slots-only checkpoint and
+    /// `DeltaFrame` because they live inside the packed entry itself.
+    ///
+    /// # Panics
+    /// Never panics: the packed field is masked to 16 bits before conversion.
+    #[must_use]
+    pub fn flags(self) -> u8 {
+        let slot_field =
+            u16::try_from((self.0 >> Self::SHARD_SHIFT) & 0xFFFF).expect("masked fits in u16");
+        u8::try_from((slot_field & Self::FLAGS_MASK) >> Self::FLAGS_SHIFT)
+            .expect("three bits fit in u8")
     }
 
     /// Whether this entry points to an explicit removed record version.
@@ -189,14 +229,17 @@ impl IndexEntry {
 
     /// Whether the packed slot contains reserved bits that are not defined.
     ///
+    /// All three bits that were reserved before disposition flags were defined
+    /// now carry [`Self::flags`], so every slot-field bit is accounted for and
+    /// this is always `false`. It is kept as the single validation hook so a
+    /// future reserved field has one place to land.
+    ///
     /// # Panics
-    /// Never panics: the packed field is masked to 16 bits before conversion.
+    /// Never panics.
     #[must_use]
     pub fn has_invalid_slot_bits(self) -> bool {
-        (u16::try_from((self.0 >> Self::SHARD_SHIFT) & 0xFFFF)
-            .expect("masked slot field fits in u16")
-            & 0x7000)
-            != 0
+        let _ = self;
+        false
     }
 
     /// Validate the persisted slot portion without constructing an index.
@@ -602,6 +645,28 @@ impl LossyIndex {
         offset: u64,
         removed: bool,
     ) -> Result<(u32, u64, EntryUndo), InsertError> {
+        self.insert_undoable_with_flags(hash, slot, offset, removed, 0)
+    }
+
+    /// As [`Self::insert_undoable_with_removed`], storing `flags` in the entry.
+    ///
+    /// The disposition bits are written through to the packed entry, so a
+    /// later checkpoint or `DeltaFrame` carries them; core assigns them no
+    /// meaning.
+    ///
+    /// # Errors
+    /// The same as [`Self::insert_undoable_with_removed`].
+    ///
+    /// # Panics
+    /// Panics if `flags` exceeds 3 bits.
+    pub fn insert_undoable_with_flags(
+        &self,
+        hash: &[u8; 16],
+        slot: u16,
+        offset: u64,
+        removed: bool,
+        flags: u8,
+    ) -> Result<(u32, u64, EntryUndo), InsertError> {
         let tag = self.tag(hash);
         let raw_home = u64::from_be_bytes(hash[..8].try_into().unwrap());
         let home = self.mix_home(raw_home);
@@ -633,7 +698,7 @@ impl LossyIndex {
                 // empty entry or a complete record location.
                 self.homes.lock()[bucket] = home;
                 self.tails.lock()[bucket] = Self::tail(hash);
-                let value = IndexEntry::new_with_removed(tag, slot, offset, removed).0;
+                let value = IndexEntry::new_with_flags(tag, slot, offset, removed, flags).0;
                 slots[bucket].store(value, Ordering::Release);
                 self.len.fetch_add(1, Ordering::Relaxed);
                 let undo = EntryUndo {
@@ -662,7 +727,7 @@ impl LossyIndex {
                 if self.homes.lock()[bucket] == home && tail == Self::tail(hash) {
                     let old_entry = entry.0;
                     let old_home = self.homes.lock()[bucket];
-                    let value = IndexEntry::new_with_removed(tag, slot, offset, removed).0;
+                    let value = IndexEntry::new_with_flags(tag, slot, offset, removed, flags).0;
                     slots[bucket].store(value, Ordering::Release);
                     let undo = EntryUndo {
                         bucket: bucket_wire,
@@ -1189,11 +1254,12 @@ impl LossyIndex {
             if new_slot == entry.slot() {
                 continue;
             }
-            let remapped = IndexEntry::new_with_removed(
+            let remapped = IndexEntry::new_with_flags(
                 entry.tag(),
                 new_slot,
                 entry.offset(),
                 entry.is_removed(),
+                entry.flags(),
             )
             .0;
             cell.store(remapped, Ordering::Relaxed);
