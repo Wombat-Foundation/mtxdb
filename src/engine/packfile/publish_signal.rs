@@ -339,26 +339,59 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
 
+        fn surface_worker_exit<T>(worker: std::thread::JoinHandle<T>, phase: &str) -> ! {
+            match worker.join() {
+                Ok(_) => panic!("writer worker exited before {phase}"),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+
         let segment = temp_segment("reopen_stress");
         let _ = PublishSignal::writer(&segment).unwrap();
         let reader = PublishSignal::reader(&segment).unwrap().unwrap();
 
         let stop = Arc::new(AtomicBool::new(false));
         let started = Arc::new(AtomicBool::new(false));
+        let sampling_started = Arc::new(AtomicBool::new(false));
+        let sampling_reopen_completed = Arc::new(AtomicBool::new(false));
         let reopens = {
             let stop = Arc::clone(&stop);
             let started = Arc::clone(&started);
+            let sampling_started = Arc::clone(&sampling_started);
+            let sampling_reopen_completed = Arc::clone(&sampling_reopen_completed);
             let segment = segment.clone();
-            std::thread::spawn(move || loop {
+            std::thread::spawn(move || {
                 let writer = PublishSignal::writer(&segment).unwrap();
                 for _ in 0..8 {
                     writer.bump();
                 }
-                let last = writer.snapshot();
+                let _ = writer.snapshot();
+                drop(writer);
                 started.store(true, Ordering::Release);
-                if stop.load(Ordering::Relaxed) {
-                    break last;
+
+                // Wait until sampling has begun before opening the next
+                // writer. This makes the second reopen part of the sampling
+                // phase, rather than merely an earlier readiness signal.
+                while !sampling_started.load(Ordering::Acquire) {
+                    std::thread::yield_now();
                 }
+
+                let writer = PublishSignal::writer(&segment).unwrap();
+                for _ in 0..8 {
+                    writer.bump();
+                }
+                let mut last = writer.snapshot();
+                drop(writer);
+                sampling_reopen_completed.store(true, Ordering::Release);
+
+                while !stop.load(Ordering::Relaxed) {
+                    let writer = PublishSignal::writer(&segment).unwrap();
+                    for _ in 0..8 {
+                        writer.bump();
+                    }
+                    last = writer.snapshot();
+                }
+                last
             })
         };
 
@@ -368,14 +401,22 @@ mod tests {
             if reopens.is_finished() {
                 // The worker died before its first reopen; surface its panic
                 // instead of waiting forever.
-                let panic = reopens.join().expect_err("worker exited before starting");
-                std::panic::resume_unwind(panic);
+                surface_worker_exit(reopens, "starting");
             }
             std::thread::yield_now();
         }
 
-        for _ in 0..100_000 {
+        for sample in 0..100_000 {
             assert_ne!(reader.snapshot().0, 0, "a live epoch is never zero");
+            if sample == 0 {
+                sampling_started.store(true, Ordering::Release);
+                while !sampling_reopen_completed.load(Ordering::Acquire) {
+                    if reopens.is_finished() {
+                        surface_worker_exit(reopens, "completing a reopen during sampling");
+                    }
+                    std::thread::yield_now();
+                }
+            }
         }
         stop.store(true, Ordering::Relaxed);
         let final_pair = reopens.join().unwrap();
