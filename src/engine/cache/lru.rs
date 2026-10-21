@@ -339,6 +339,16 @@ mod tests {
         for key in 0..100u32 {
             cache.insert(key, key);
             assert!(cache.len() <= cache.capacity());
+            if key >= 1 {
+                let state = cache.state.read();
+                for expected in [key - 1, key] {
+                    let index = state.map.get(&expected).expect("expected key to remain");
+                    assert_eq!(state.entries[*index as usize].value.as_ref(), Some(&expected));
+                }
+            }
+            if key >= 2 {
+                assert!(!cache.state.read().map.contains_key(&(key - 2)));
+            }
             assert!(cache.state.read().entries.len() <= cache.capacity() + 1);
         }
 
