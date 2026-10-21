@@ -277,17 +277,33 @@ impl NodeCache {
     }
 
     /// Hit rate as a fraction [0.0, 1.0].
+    ///
+    /// The relaxed atomic loads form an approximate snapshot while accesses
+    /// are concurrent; the result is exact once the counters stop changing.
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let h = self.hits.load(Ordering::Relaxed);
         let m = self.misses.load(Ordering::Relaxed);
         let total = h.saturating_add(m);
-        h.checked_mul(10_000)
-            .and_then(|v| v.checked_div(total))
-            .map_or(0.0, |scaled| {
-                let clamped = u32::try_from(scaled).unwrap_or(u32::MAX);
-                f64::from(clamped) / 10_000.0
-            })
+        if total == 0 {
+            return 0.0;
+        }
+
+        // Convert the ratio using binary long division so the full u64 range
+        // is supported without lossy integer-to-float casts.
+        let denominator = u128::from(total);
+        let mut remainder = u128::from(h);
+        let mut fraction = 0.0;
+        let mut place = 0.5;
+        for _ in 0..64 {
+            remainder = remainder.saturating_mul(2);
+            if remainder >= denominator {
+                remainder = remainder.saturating_sub(denominator);
+                fraction += place;
+            }
+            place *= 0.5;
+        }
+        fraction
     }
 
     /// Clear all entries.

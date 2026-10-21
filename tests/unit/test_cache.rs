@@ -36,6 +36,34 @@ fn test_lru_eviction() {
 }
 
 #[test]
+fn test_lru_reuses_slots_without_mixing_keys_and_values() {
+    let cache = NodeCache::new(2);
+
+    for i in 0..20u8 {
+        let id = [i; 16];
+        cache.insert(id, test_data(&format!("node {i}")));
+
+        if i >= 1 {
+            let previous_id = [i - 1; 16];
+            let previous = cache.get(&previous_id).unwrap();
+            assert_eq!(
+                previous.bytes,
+                bytes::Bytes::copy_from_slice(format!("node {}", i - 1).as_bytes())
+            );
+        }
+        if i >= 2 {
+            assert!(cache.get(&[i - 2; 16]).is_none());
+        }
+        let current = cache.get(&id).unwrap();
+        assert_eq!(
+            current.bytes,
+            bytes::Bytes::copy_from_slice(format!("node {i}").as_bytes())
+        );
+        assert_eq!(cache.len(), 2.min(usize::from(i) + 1));
+    }
+}
+
+#[test]
 fn test_lru_access_refreshes() {
     let cache = NodeCache::new(3);
     let a = [1u8; 16];
@@ -71,6 +99,30 @@ fn test_hit_rate() {
     assert_eq!(cache.hits(), 2);
     assert_eq!(cache.misses(), 1);
     assert!((cache.hit_rate() - 0.666).abs() < 0.01);
+}
+
+#[test]
+fn test_hit_rate_preserves_small_positive_values() {
+    let cache = NodeCache::new(1);
+    let id = [0x01u8; 16];
+    cache.insert(id, test_data("data"));
+    cache.get(&id);
+    for i in 0..10_000u32 {
+        let mut miss = [0u8; 16];
+        miss[..4].copy_from_slice(&(i + 2).to_le_bytes());
+        cache.get(&miss);
+    }
+
+    let expected = 1.0 / 10_001.0;
+    assert!((cache.hit_rate() - expected).abs() < expected * 1.0e-12);
+}
+
+#[test]
+fn test_hit_rate_is_zero_without_hits() {
+    let cache = NodeCache::new(1);
+    cache.get(&[0x02u8; 16]);
+
+    assert!(cache.hit_rate().abs() < f64::EPSILON);
 }
 
 #[test]
