@@ -1171,6 +1171,35 @@ impl LossyIndex {
             .saturating_add(8)
     }
 
+    /// Heap bytes this index owns (allocated capacity, not just used length).
+    ///
+    /// Unlike [`Self::memory_usage`], mmap-backed slot pages are excluded here
+    /// and counted by [`Self::mapped_slot_bytes`] instead: they are resident
+    /// when touched but are not heap allocations, and a slots-only index has
+    /// no identity tables at all.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        let slots = match &self.slots {
+            EntryStorage::Owned(slots) => slots.capacity().saturating_mul(8),
+            EntryStorage::Mmap { .. } => 0,
+        };
+        let homes = self.homes.lock().capacity().saturating_mul(8);
+        let tails = self.tails.lock().capacity().saturating_mul(8);
+        slots
+            .saturating_add(homes)
+            .saturating_add(tails)
+            .saturating_add(std::mem::size_of::<Self>())
+    }
+
+    /// Bytes of checkpoint mapping this index borrows for its slot array.
+    #[must_use]
+    pub fn mapped_slot_bytes(&self) -> usize {
+        match &self.slots {
+            EntryStorage::Owned(_) => 0,
+            EntryStorage::Mmap { .. } => (self.capacity as usize).saturating_mul(8),
+        }
+    }
+
     /// Serialize the index to bytes for persistence.
     ///
     /// Format (all little-endian):
@@ -1198,6 +1227,31 @@ impl LossyIndex {
         }
         for index in 0..cap {
             buf.extend_from_slice(&tails[index].to_le_bytes());
+        }
+        buf
+    }
+
+    /// Length of [`Self::serialize_slots_only`]'s output, `8 + capacity * 8`.
+    #[must_use]
+    pub fn serialized_slots_only_len(&self) -> usize {
+        (self.capacity as usize).saturating_mul(8).saturating_add(8)
+    }
+
+    /// Serialize the capacity and packed slots without the `homes`/`tails`
+    /// identity tables.
+    ///
+    /// A reader loads this as an index with incomplete identity: a same-tag
+    /// probe resolves the candidate from its frame header
+    /// ([`InsertError::NeedsIdentity`]) and growth recovers hashes from the
+    /// packs (`grow_by_recovering_hashes`). In exchange the blob is a
+    /// third the size.
+    #[must_use]
+    pub fn serialize_slots_only(&self) -> Vec<u8> {
+        let cap = self.capacity as usize;
+        let mut buf = Vec::with_capacity(self.serialized_slots_only_len());
+        buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
+        for index in 0..cap {
+            buf.extend_from_slice(&self.entry_at(index).to_le_bytes());
         }
         buf
     }

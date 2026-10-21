@@ -1928,6 +1928,11 @@ pub struct PackfileStorage {
     index_grow_count: AtomicU64,
     /// Fallback `rebuild_index` calls (full pack scan).
     index_rebuild_count: AtomicU64,
+    /// Frame-header reads that resolved a same-tag probe candidate whose
+    /// identity the index did not hold (slots-only checkpoint indexes).
+    index_identity_reads: AtomicU64,
+    /// Write checkpoints without the `homes`/`tails` identity tables.
+    checkpoint_slots_only: AtomicBool,
     /// `invalidate_delta_log` calls — structural changes represented by a
     /// whole-collection snapshot in the v1 log.
     delta_invalidations: AtomicU64,
@@ -3023,6 +3028,8 @@ impl PackfileStorage {
             index_clone_time_ns: AtomicU64::new(0),
             index_grow_count: AtomicU64::new(0),
             index_rebuild_count: AtomicU64::new(0),
+            index_identity_reads: AtomicU64::new(0),
+            checkpoint_slots_only: AtomicBool::new(false),
             delta_invalidations: AtomicU64::new(0),
             sync_calls: AtomicU64::new(0),
             checkpoint_writes: AtomicU64::new(0),
@@ -5633,7 +5640,10 @@ impl PackfileStorage {
         // reads the live table. Pending frames were cleared by the rotation and
         // no put is mid-flight, so clearing the flag now loses nothing; a put
         // after the locks drop sets it again, and a failed tail sets it back.
-        let blobs = Self::serialize_snapshots(&snapshots);
+        let blobs = Self::serialize_snapshots(
+            &snapshots,
+            self.checkpoint_slots_only.load(Ordering::Relaxed),
+        );
         breakdown.serialize = serialize_started.elapsed();
         self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         drop(guards);
@@ -5708,11 +5718,17 @@ impl PackfileStorage {
     /// Serialize every snapshot's index into an owned checkpoint blob.
     fn serialize_snapshots(
         snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
+        slots_only: bool,
     ) -> Vec<([u8; 16], u64, Vec<u8>)> {
         snapshots
             .iter()
             .map(|(collection_id, generation, room)| {
-                (*collection_id, *generation, room.index.serialize())
+                let blob = if slots_only {
+                    room.index.serialize_slots_only()
+                } else {
+                    room.index.serialize()
+                };
+                (*collection_id, *generation, blob)
             })
             .collect()
     }
@@ -5825,6 +5841,16 @@ impl PackfileStorage {
     /// Block until any background checkpoint has finished.
     pub fn wait_for_checkpoint(&self) {
         self.finish_checkpoint_worker(true);
+    }
+
+    /// Write index checkpoints without the `homes`/`tails` identity tables.
+    ///
+    /// A third the size on disk, and a reopened index starts with no heap
+    /// identity tables; same-tag probes then read the candidate's frame header
+    /// (counted in [`RuntimeStats::index_identity_reads`]) and growth recovers
+    /// hashes from the packs. Off by default.
+    pub fn set_checkpoint_slots_only(&self, enabled: bool) {
+        self.checkpoint_slots_only.store(enabled, Ordering::Relaxed);
     }
 
     /// Let a sync that needs a full checkpoint hand its tail (write, fsync,
@@ -6866,6 +6892,7 @@ impl PackfileStorage {
                     })?;
                     let (found_collection, found_hash) =
                         self.shards.record_identity_at(&shard, offset)?;
+                    self.index_identity_reads.fetch_add(1, Ordering::Relaxed);
                     if &found_collection != collection_id
                         || !index.hydrate_slot_identity(bucket, &found_hash)
                     {
@@ -11530,6 +11557,7 @@ impl PackfileStorage {
             ),
             index_grow_count: self.index_grow_count.load(Ordering::Relaxed),
             index_rebuild_count: self.index_rebuild_count.load(Ordering::Relaxed),
+            index_identity_reads: self.index_identity_reads.load(Ordering::Relaxed),
             delta_invalidations: self.delta_invalidations.load(Ordering::Relaxed),
             checkpoint_writes: self.checkpoint_writes.load(Ordering::Relaxed),
             checkpoint_tails_started: self.checkpoint_tails_started.load(Ordering::Relaxed),
@@ -11683,6 +11711,7 @@ impl PackfileStorage {
             &self.index_clone_time_ns,
             &self.index_grow_count,
             &self.index_rebuild_count,
+            &self.index_identity_reads,
             &self.delta_invalidations,
             &self.checkpoint_writes,
             &self.checkpoint_skips,
@@ -11845,6 +11874,8 @@ pub struct RuntimeStats {
     pub index_grow_count: u64,
     /// Fallback full-scan `rebuild_index` calls.
     pub index_rebuild_count: u64,
+    /// Frame-header reads that resolved a same-tag probe candidate.
+    pub index_identity_reads: u64,
     /// Collection structural changes that promote pending slots to snapshot or
     /// tombstone operations; this does not imply a checkpoint rewrite.
     pub delta_invalidations: u64,
@@ -12217,6 +12248,7 @@ impl Default for RuntimeStats {
             index_clone_time: std::time::Duration::ZERO,
             index_grow_count: 0,
             index_rebuild_count: 0,
+            index_identity_reads: 0,
             delta_invalidations: 0,
             checkpoint_writes: 0,
             checkpoint_tails_started: 0,
