@@ -4057,7 +4057,7 @@ impl PackfileStorage {
             let g = gen.load();
             (
                 g.index.len(),
-                g.index.heap_bytes(),
+                g.index.resident_bytes(),
                 g.index.mapped_bytes(),
                 g.index.capacity(),
             )

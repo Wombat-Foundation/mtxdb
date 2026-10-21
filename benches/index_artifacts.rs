@@ -873,7 +873,7 @@ fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
         "owned after build",
         fresh_index.len(),
         fresh_index.capacity(),
-        fresh_index.heap_bytes(),
+        fresh_index.resident_bytes(),
         fresh_index.mapped_bytes(),
     );
     let (post_grow_index, post_grow_build) =
@@ -886,7 +886,7 @@ fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
         "owned immediately after doubling",
         post_grow_index.len(),
         post_grow_index.capacity(),
-        post_grow_index.heap_bytes(),
+        post_grow_index.resident_bytes(),
         post_grow_index.mapped_bytes(),
     );
     drop((fresh_index, post_grow_index));

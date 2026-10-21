@@ -999,30 +999,29 @@ impl LossyIndex {
         self.len.load(Ordering::Acquire) == 0
     }
 
-    /// Bytes of private heap held by this table: its struct and allocated
-    /// capacities of the owned entry array and `homes`/`tails` side tables.
-    /// The entry array is absent when slots are mapped from a checkpoint;
-    /// identity tables are empty when that checkpoint lacks them.
+    /// Bytes of private heap currently occupied by this table: its struct,
+    /// initialized owned entry slots, and initialized `homes`/`tails` entries.
+    /// Uses vector lengths rather than capacities. The entry array is absent
+    /// when slots are mapped from a checkpoint; identity tables are empty when
+    /// that checkpoint lacks them.
     #[must_use]
-    pub fn heap_bytes(&self) -> usize {
+    pub fn resident_bytes(&self) -> usize {
         let word = std::mem::size_of::<u64>();
         let slots = match &self.slots {
-            EntryStorage::Owned(slots) => slots.capacity().saturating_mul(word),
+            EntryStorage::Owned(slots) => slots.len().saturating_mul(word),
             EntryStorage::Mmap { .. } => 0,
         };
-        let homes_capacity = self.homes.lock().capacity();
-        let tails_capacity = self.tails.lock().capacity();
-        let identities = homes_capacity
-            .saturating_add(tails_capacity)
-            .saturating_mul(word);
+        let homes_len = self.homes.lock().len();
+        let tails_len = self.tails.lock().len();
+        let identities = homes_len.saturating_add(tails_len).saturating_mul(word);
         std::mem::size_of::<Self>()
             .saturating_add(slots)
             .saturating_add(identities)
     }
 
-    /// Bytes of the entry array borrowed from a checkpoint mapping. This is
-    /// reclaimable file-backed memory, not private heap; zero once the table
-    /// has been written to and cloned into owned slots.
+    /// Extent in bytes of the entry array borrowed from a checkpoint mapping.
+    /// This is reclaimable file-backed address space, not RSS; zero once the
+    /// table has been written to and cloned into owned slots.
     #[must_use]
     pub fn mapped_bytes(&self) -> usize {
         match &self.slots {
@@ -1033,12 +1032,14 @@ impl LossyIndex {
         }
     }
 
-    /// Private heap bytes held by this index, including its fixed struct.
-    /// Checkpoint-mapped slots are excluded; use [`Self::mapped_bytes`] for
-    /// their file-backed extent.
+    /// Historical capacity-based estimate of memory usage. This charges every
+    /// slot as owned, including checkpoint-mapped slots; use
+    /// [`Self::resident_bytes`] and [`Self::mapped_bytes`] for the actual split.
     #[must_use]
     pub fn memory_usage(&self) -> usize {
-        self.heap_bytes()
+        (self.capacity as usize)
+            .wrapping_mul(LIVE_SLOT_BYTES)
+            .wrapping_add(std::mem::size_of::<Self>())
     }
 
     /// Slot-table capacity an index holding `entries` records would have
