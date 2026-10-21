@@ -66,14 +66,14 @@ where
     }
 
     /// Removes the least recently used entry and makes its slot reusable.
-    /// Does nothing when empty; panics from dropping keys or values propagate.
+    /// Does nothing when empty. Panics from dropping keys or values propagate
+    /// after the entry has been unlinked and its slot made reusable.
     fn evict_tail(&mut self) {
         if self.tail == NIL {
             return;
         }
         let index = self.tail;
         let prev = self.entries[index as usize].prev;
-        self.map.retain(|_, &mut entry_index| entry_index != index);
         if prev != NIL {
             self.entries[prev as usize].next = NIL;
         }
@@ -81,10 +81,25 @@ where
         if self.head == index {
             self.head = NIL;
         }
-        self.entries[index as usize].value = None;
-        self.entries[index as usize].key = None;
-        self.entries[index as usize].next = self.free;
+
+        // Remove the map entry while keeping its key alive until the cache is
+        // structurally consistent; a panic in `K::drop` must not strand a
+        // linked slot without a map entry.
+        let victim_key = self
+            .map
+            .extract_if(|_, &mut entry_index| entry_index == index)
+            .next()
+            .map(|(key, _)| key);
+
+        let entry = &mut self.entries[index as usize];
+        let entry_key = entry.key.take();
+        let entry_value = entry.value.take();
+        entry.next = self.free;
         self.free = index;
+
+        drop(victim_key);
+        drop(entry_key);
+        drop(entry_value);
     }
 }
 
@@ -180,9 +195,10 @@ where
     ///
     /// Panics if a new slot is needed after `u32::MAX` slots have been allocated.
     /// Panics from cloning, hashing, or comparing keys, or from dropping keys
-    /// or values, propagate. A key clone, hash, or equality panic occurs before
-    /// eviction; a panic while dropping an entry can leave the cache partially
-    /// updated.
+    /// or values, propagate. A key clone panic occurs before eviction; a hash
+    /// or equality panic while publishing the new map entry occurs after
+    /// eviction but before the new slot is linked. An evicted key or value is
+    /// dropped only after the cache has been made structurally consistent.
     pub fn insert(&self, key: K, value: V) {
         if self.capacity == 0 {
             return;
@@ -207,9 +223,6 @@ where
             state.entries[free_index as usize].next
         };
 
-        // Install the map entry before linking the slot. Hash/Eq panics leave
-        // the LRU list untouched; the standard HashMap operation remains
-        // panic-safe and no eviction has happened yet.
         let index = if free_index == NIL {
             assert!(
                 state.entries.len() < NIL as usize,
@@ -219,13 +232,21 @@ where
         } else {
             free_index
         };
-        state.map.insert(map_key, index);
 
-        if was_full {
-            // The map temporarily contains the new entry, so remove the old
-            // tail before publishing the new list links.
+        let victim = if was_full {
             let victim = state.tail;
             state.evict_tail();
+            Some(victim)
+        } else {
+            None
+        };
+
+        // Publish the new map entry only after eviction is complete. If
+        // dropping the evicted key or value panics, the map must not already
+        // point at a slot that has not been linked into the LRU list.
+        state.map.insert(map_key, index);
+
+        if let Some(victim) = victim {
             if index == free_index {
                 // The candidate slot was on the free list before eviction.
                 // Keep the newly freed victim slot while removing the
