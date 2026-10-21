@@ -4045,6 +4045,25 @@ impl PackfileStorage {
         Ok(results)
     }
 
+    /// A collection's `(entry count, private heap bytes, mapped bytes,
+    /// index capacity)`, if the collection exists. Unlike
+    /// [`Self::collection_index_info`], this separates the heap the table owns
+    /// from the checkpoint-mapped entry array, which is reclaimable.
+    pub fn collection_index_residency(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Option<(usize, usize, usize, u32)> {
+        self.collections_read().get(collection_id).map(|gen| {
+            let g = gen.load();
+            (
+                g.index.len(),
+                g.index.heap_bytes(),
+                g.index.mapped_bytes(),
+                g.index.capacity(),
+            )
+        })
+    }
+
     /// A collection's `(entry count, memory usage in bytes, index capacity)`,
     /// if the collection exists. `entry count / capacity` is the index's
     /// load factor.

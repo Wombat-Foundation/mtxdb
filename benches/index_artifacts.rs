@@ -41,6 +41,7 @@ use mtxdb::index::packidx::{
     PackIndex, PackIndexIdentity, PackIndexInput, PACK_INDEX_COLLECTION_ENTRY_LEN,
     PACK_INDEX_FANOUT_LEN, PACK_INDEX_HEADER_LEN, PACK_INDEX_SECTION_ENTRY_LEN,
 };
+use mtxdb::index::{IndexConfig, InsertError, LossyIndex};
 use mtxdb::packfile::{read_header, scan_and_recover_packfile};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::PackfileStorage;
@@ -340,6 +341,91 @@ fn report_pack_index(
         show(before),
         show(after),
     );
+}
+
+fn report_lossy_index(
+    label: &str,
+    entries: usize,
+    capacity: u32,
+    heap_bytes: usize,
+    mapped_bytes: usize,
+) {
+    let load = 100.0 * usize_f64(entries) / to_f64(u64::from(capacity));
+    let per_entry = |bytes: usize| usize_f64(bytes) / usize_f64(entries);
+    println!(
+        "  LossyIndex {label}: {entries} records / {capacity} slots ({load:.1}% load); \
+         private heap {:.2} MiB ({:.1} B/record), mapped slots {:.2} MiB ({:.1} B/record)",
+        mib_f64(u64::try_from(heap_bytes).expect("heap bytes fit u64")),
+        per_entry(heap_bytes),
+        mib_f64(u64::try_from(mapped_bytes).expect("mapped bytes fit u64")),
+        per_entry(mapped_bytes),
+    );
+}
+
+fn insert_or_grow(index: &mut LossyIndex, key: &[u8; 16], offset: u64) {
+    match index.insert(key, 0, offset) {
+        Ok(()) => {}
+        Err(InsertError::TableFull) => {
+            *index = index.grow().expect("complete owned index grows");
+            index.insert(key, 0, offset).expect("grown index has room");
+        }
+        Err(error) => panic!("unexpected index insert failure: {error}"),
+    }
+}
+
+/// Build an owned index with the same 64-slot floor and 75% growth threshold
+/// as `PackfileStorage`'s default collection index.
+fn build_lossy_index(entries: &[([u8; 16], [u8; 16], u64)]) -> LossyIndex {
+    let mut index = LossyIndex::with_config(64, IndexConfig::default());
+    for (_, id, offset) in entries {
+        insert_or_grow(&mut index, id, *offset);
+    }
+    index
+}
+
+/// Exercise the first insertion past a full table's load threshold so the
+/// resulting owned index is measured immediately after its doubling.
+fn build_post_grow_lossy_index(
+    entries: &[([u8; 16], [u8; 16], u64)],
+    final_capacity: u32,
+) -> LossyIndex {
+    let old_capacity = final_capacity / 2;
+    let threshold = usize::try_from(old_capacity)
+        .expect("capacity fits usize")
+        .checked_mul(75)
+        .and_then(|value| value.checked_div(100))
+        .expect("load threshold fits usize");
+    assert!(
+        threshold < entries.len(),
+        "workload has an entry to trigger growth"
+    );
+    let mut index = LossyIndex::with_config(
+        usize::try_from(old_capacity).expect("capacity fits usize"),
+        IndexConfig::default(),
+    );
+    for (_, id, offset) in &entries[..threshold] {
+        index
+            .insert(id, 0, *offset)
+            .expect("pre-growth index has room");
+    }
+    let (_, id, offset) = entries[threshold];
+    assert!(
+        matches!(index.insert(&id, 0, offset), Err(InsertError::TableFull)),
+        "the next insert crosses the old table's load threshold"
+    );
+    index = index.grow().expect("complete index grows at threshold");
+    index.insert(&id, 0, offset).expect("grown index has room");
+    assert_eq!(
+        index.len(),
+        threshold.checked_add(1).expect("entry count fits usize"),
+        "the triggering insert is included after growth"
+    );
+    assert_eq!(
+        index.capacity(),
+        final_capacity,
+        "growth doubles the old capacity"
+    );
+    index
 }
 
 fn sync_and_evict(dir: &Path) -> bool {
@@ -777,6 +863,58 @@ fn measure_end_to_end(pack: &Path, idx: &Idx, keys: &[[u8; 16]], lookups: usize)
     );
 }
 
+fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
+    let (fresh_index, fresh_build) = timed(|| build_lossy_index(entries));
+    println!(
+        "  LossyIndex owned build for memory report: {:.0} ms",
+        ms(fresh_build)
+    );
+    report_lossy_index(
+        "owned after build",
+        fresh_index.len(),
+        fresh_index.capacity(),
+        fresh_index.heap_bytes(),
+        fresh_index.mapped_bytes(),
+    );
+    let (post_grow_index, post_grow_build) =
+        timed(|| build_post_grow_lossy_index(entries, fresh_index.capacity()));
+    println!(
+        "  LossyIndex post-grow setup: {:.0} ms",
+        ms(post_grow_build)
+    );
+    report_lossy_index(
+        "owned immediately after doubling",
+        post_grow_index.len(),
+        post_grow_index.capacity(),
+        post_grow_index.heap_bytes(),
+        post_grow_index.mapped_bytes(),
+    );
+    drop((fresh_index, post_grow_index));
+
+    let checkpoint_store = PackfileStorage::open(PathBuf::from(dir))
+        .expect("open store before writing a clean checkpoint");
+    checkpoint_store
+        .force_index_checkpoint()
+        .expect("write clean index checkpoint");
+    drop(checkpoint_store);
+
+    let reopened = PackfileStorage::open(PathBuf::from(dir)).expect("reopen checkpoint for memory");
+    let (reopened_records, heap_bytes, mapped_bytes, capacity) = reopened
+        .collection_index_residency(&COLLECTION)
+        .expect("reopened collection index");
+    println!(
+        "  checkpoint reopen path: {:?}",
+        reopened.open_timings().map(|timings| timings.path)
+    );
+    report_lossy_index(
+        "after store reopen",
+        reopened_records,
+        capacity,
+        heap_bytes,
+        mapped_bytes,
+    );
+}
+
 fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
     let label = if mixed { "mixed 1-64 KiB" } else { "tiny 16 B" };
     let dir = base.join(format!("mtxdb_bench_idxart_{}_{mixed}", std::process::id()));
@@ -811,6 +949,8 @@ fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
 
     let entries = scan_and_recover_packfile(&pack).expect("scan");
     assert_eq!(entries.len() as u64, records, "scan saw every record");
+    report_lossy_index_cases(&dir, &entries);
+
     let (
         pack_index_path,
         pack_index_identity,

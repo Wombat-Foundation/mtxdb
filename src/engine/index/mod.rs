@@ -218,11 +218,15 @@ impl IndexEntry {
 /// A per-collection lossy fanout index for content-addressed records.
 ///
 /// Uses open addressing with linear probing on a power-of-two sized table.
-/// The index is mmap-able (flat `u64` array) and small enough to stay
-/// resident in RAM for active collections.
+/// The entry slots can be mmap-backed on checkpoint load; identity tables
+/// remain in private heap when present.
 ///
 /// Design decisions (from docs):
-/// - Partition by collection: ~8KB per 1000-node collection, 100 active collections < 1MB.
+/// - Partition by collection: an owned table uses 24 bytes per capacity slot
+///   (8 packed entry plus the 16-byte `homes`/`tails` side tables), about 32
+///   bytes per record at the 75% load ceiling and about 64 just after a
+///   doubling. A hydrated checkpoint-loaded table keeps 16 bytes per slot in
+///   private identity tables and maps 8 bytes per slot for entries.
 /// - Empty entry terminates probe. Removed versions remain occupied entries,
 ///   so removal never breaks a probe chain.
 /// - Tag collisions coexist in the probe chain; a tag is only a candidate
@@ -431,7 +435,7 @@ impl LossyIndex {
 
     /// This index's entry-table capacity (always a power of two).
     #[must_use]
-    pub(crate) fn capacity(&self) -> u32 {
+    pub const fn capacity(&self) -> u32 {
         self.capacity
     }
 
@@ -995,12 +999,46 @@ impl LossyIndex {
         self.len.load(Ordering::Acquire) == 0
     }
 
-    /// Estimated memory usage in bytes.
+    /// Bytes of private heap held by this table: its struct and allocated
+    /// capacities of the owned entry array and `homes`/`tails` side tables.
+    /// The entry array is absent when slots are mapped from a checkpoint;
+    /// identity tables are empty when that checkpoint lacks them.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        let word = std::mem::size_of::<u64>();
+        let slots = match &self.slots {
+            EntryStorage::Owned(slots) => slots.capacity().saturating_mul(word),
+            EntryStorage::Mmap { .. } => 0,
+        };
+        let homes_capacity = self.homes.lock().capacity();
+        let tails_capacity = self.tails.lock().capacity();
+        let identities = homes_capacity
+            .saturating_add(tails_capacity)
+            .saturating_mul(word);
+        std::mem::size_of::<Self>()
+            .saturating_add(slots)
+            .saturating_add(identities)
+    }
+
+    /// Bytes of the entry array borrowed from a checkpoint mapping. This is
+    /// reclaimable file-backed memory, not private heap; zero once the table
+    /// has been written to and cloned into owned slots.
+    #[must_use]
+    pub fn mapped_bytes(&self) -> usize {
+        match &self.slots {
+            EntryStorage::Owned(_) => 0,
+            EntryStorage::Mmap { .. } => {
+                (self.capacity as usize).saturating_mul(std::mem::size_of::<u64>())
+            }
+        }
+    }
+
+    /// Private heap bytes held by this index, including its fixed struct.
+    /// Checkpoint-mapped slots are excluded; use [`Self::mapped_bytes`] for
+    /// their file-backed extent.
     #[must_use]
     pub fn memory_usage(&self) -> usize {
-        (self.capacity as usize)
-            .wrapping_mul(LIVE_SLOT_BYTES)
-            .wrapping_add(std::mem::size_of::<Self>())
+        self.heap_bytes()
     }
 
     /// Slot-table capacity an index holding `entries` records would have
