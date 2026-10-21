@@ -1,0 +1,211 @@
+[package]
+name = "mtxdb-benches"
+version = "0.1.0-beta.1"
+edition = "2021"
+rust-version = "1.90"
+publish = false
+
+# Deliberately outside the root [workspace]'s `members` — same reasoning as
+# mtxdb-cli (see the root Cargo.toml's [workspace] comment): a
+# standalone `[workspace]` table here stops Cargo's upward search, so this
+# crate is its own workspace root. That means `cargo build/check/clippy
+# --workspace --all-targets --all-features` from the repo root never touches
+# benches/ (and never pulls in libmdbx/rusqlite/fjall) -- passing
+# `--all-features` there is no longer enough to reach these targets. To
+# build, check, or lint the benches, `cd benches` (or pass
+# `--manifest-path benches/Cargo.toml`) explicitly.
+[workspace]
+
+[dependencies]
+# rusqlite deliberately omits `bundled`: bundling compiles SQLite's C
+# amalgamation from source on every build, on top of libsqlite3-sys's own
+# bindgen run. Linking the system libsqlite3 (found via pkg-config) skips that
+# compile step; it costs requiring sqlite3 dev headers to be installed where
+# benches are run. Windows has neither a system libsqlite3 nor pkg-config, so
+# it overrides this with the `bundled` feature below.
+bytes = "1.5"
+crc32fast = "1.4"
+memmap2 = "0.9"
+fjall = "2.11.2"
+libmdbx = "0.6"
+base64 = "0.22"
+mtxdb = { path = "..", features = ["reconcile"] }
+rusqlite = "0.32"
+
+[target.'cfg(windows)'.dependencies]
+# No system SQLite and no pkg-config on Windows, so build and link the bundled
+# amalgamation instead (MSVC is available on the CI runner). Linux/macOS keep
+# the system library via the non-bundled dependency above.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# LINTS — mirrors the root workspace's [workspace.lints]; this crate no
+# longer shares that table since it's its own workspace root.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(coverage)",
+    "cfg(coverage_nightly)",
+    "cfg(tarpaulin)",
+] }
+elided_lifetimes_in_paths = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+arithmetic_side_effects = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+get_unwrap = "warn"
+mutex_atomic = "warn"
+missing_assert_message = "warn"
+str_to_string = "warn"
+tests_outside_test_module = "warn"
+verbose_file_reads = "warn"
+
+[[bench]]
+name = "population_build"
+path = "population_build.rs"
+harness = false
+
+[[bench]]
+name = "storage"
+path = "storage.rs"
+harness = false
+
+[[bench]]
+name = "locality"
+path = "locality.rs"
+harness = false
+
+[[bench]]
+name = "compression"
+path = "compression.rs"
+harness = false
+
+[[bench]]
+name = "repack_layout_measure"
+path = "repack_layout_measure.rs"
+harness = false
+
+# Four-way MDBX / SQLite / fjall / mtxdb comparison.
+[[bench]]
+name = "scan"
+path = "scan.rs"
+harness = false
+
+# Cold-cache off-vs-hdd comparison for get_many's merged read plan.
+[[bench]]
+name = "read_plan"
+path = "read_plan.rs"
+harness = false
+
+[[bench]]
+name = "compare_external"
+path = "compare_external.rs"
+harness = false
+
+# Matrix-shaped matched workload; semantic scenarios are added as native APIs
+# land, without changing the existing four-way synthetic comparison.
+[[bench]]
+name = "matrix_workload"
+path = "matrix_workload.rs"
+harness = false
+
+# Plain-autocommit vs staged-transaction writes through the shared WAL.
+[[bench]]
+name = "txn_commit"
+path = "txn_commit.rs"
+harness = false
+
+# Concurrent transaction commits with the background committer running.
+[[bench]]
+name = "txn_contention"
+path = "txn_contention.rs"
+harness = false
+
+# Concurrent writers while a reader catches up through bounded WAL replay pages.
+[[bench]]
+name = "replay_paging"
+path = "replay_paging.rs"
+harness = false
+
+# Long-running writes and syncs against one shared WAL: the segment must stay bounded.
+[[bench]]
+name = "wal_steady_state"
+path = "wal_steady_state.rs"
+harness = false
+
+# A pool that never reports coverage, at the real segment cap.
+[[bench]]
+name = "wal_lagging_pool"
+path = "wal_lagging_pool.rs"
+harness = false
+
+# Reopen time against index size and delta-log size.
+[[bench]]
+name = "reopen_cost"
+path = "reopen_cost.rs"
+harness = false
+
+# Where the time of a pack recovery scan goes.
+[[bench]]
+name = "pack_scan_profile"
+path = "pack_scan_profile.rs"
+harness = false
+
+# End-to-end search-pack cost (index + query shapes) on a real-data corpus.
+[[bench]]
+name = "search_scan"
+path = "search_scan.rs"
+harness = false
+
+# Reopen strategies for a sealed pack: checkpoint, scan, sorted .idx, trusted seal.
+[[bench]]
+name = "index_artifacts"
+path = "index_artifacts.rs"
+harness = false
+
+# Does a large store find every record after one clean reopen?
+[[bench]]
+name = "big_reopen_repro"
+path = "big_reopen_repro.rs"
+harness = false
+
+# What the short-id edge store costs on disk for a real room.
+[[bench]]
+name = "edge_layout_measure"
+path = "edge_layout_measure.rs"
+harness = false
+
+# Read and write cost of the chunked edge-layout prototype against the current store.
+[[bench]]
+name = "edge_layout_lookup"
+path = "edge_layout_lookup.rs"
+harness = false
+
+# Write cost of the chunked prototype when events arrive in small batches.
+[[bench]]
+name = "edge_layout_batches"
+path = "edge_layout_batches.rs"
+harness = false
+
+# Which layer of the prototype's id -> key read costs the time: decode, fetch, compression, CRC.
+[[bench]]
+name = "edge_layout_read_split"
+path = "edge_layout_read_split.rs"
+harness = false
+
+[[bench]]
+name = "edge_layout_sithnapse"
+path = "edge_layout_sithnapse.rs"
+harness = false

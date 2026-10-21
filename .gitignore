@@ -1,2 +1,33 @@
-/target
+# rust
+target/
+.coverage/
+lcov.info
+
+# IDEs
+.idea/
+.vscode/
+
+# test / in-repo db
+/pools
+
+# benchmark CSV history is committed; only the raw captures are transient
+/benches/csv/latest.txt
+/benches/csv/latest-external.txt
+
+# python
+__pycache__
+.pytest_cache
+.mypy_cache
+
+# git stuff
+*.diff
+*.patch
+
+# other stuff
+.env
 docs/*.md
+/*.txt
+.tmp/
+*.pack
+*.idx
+db.meta

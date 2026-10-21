@@ -1,0 +1,301 @@
+use super::*;
+use crate::database::Database;
+use crate::layout::ShardType;
+use crate::storage::{InMemoryStorage, StorageEngine};
+use crate::template::MEMBER_NAMESPACE_INTL;
+use std::path::PathBuf;
+
+fn test_root(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("mtxdb-aux-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
+
+#[test]
+fn named_indexes_share_storage_but_have_distinct_collections() {
+    let engine = InMemoryStorage::new();
+    let first = AuxiliaryIndex::open(&engine, "first");
+    let second = AuxiliaryIndex::open(&engine, "second");
+    assert_ne!(first.collection_id(), second.collection_id());
+    first.put(b"key", b"value").unwrap();
+    assert_eq!(first.get(b"key").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(second.get(b"key").unwrap(), None);
+}
+
+#[test]
+fn get_many_preserves_order_and_distinguishes_missing_and_empty_values() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "batch");
+    index.put(b"first", b"one").unwrap();
+    index.put(b"empty", b"").unwrap();
+
+    let values = index.get_many(&[b"empty", b"missing", b"first"]).unwrap();
+    assert_eq!(values[0], Some(Vec::new()));
+    assert_eq!(values[1], None);
+    assert_eq!(values[2], Some(b"one".to_vec()));
+}
+
+#[test]
+fn empty_put_many_establishes_metadata_for_a_fresh_index() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "empty_batch");
+    assert_eq!(index.put_many(&[]).unwrap(), 0);
+    assert_eq!(
+        engine
+            .get_collection_metadata(&index.collection_id())
+            .unwrap(),
+        Some(index.metadata())
+    );
+    index.put(b"key", b"value").unwrap();
+    assert_eq!(index.get(b"key").unwrap(), Some(b"value".to_vec()));
+}
+
+#[test]
+fn get_many_rejects_a_corrupt_envelope() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "corrupt");
+    let digest = auxiliary_key_digest(b"bad");
+    let node_id = physical_id(&digest);
+    engine
+        .put(
+            &index.collection_id(),
+            &node_id,
+            &NodeData::new(VALUE_MAGIC.to_vec().into()),
+        )
+        .unwrap();
+
+    assert!(index.get_many(&[b"bad"]).is_err());
+}
+
+#[test]
+fn remove_and_staged_remove_many_delete_values_and_are_idempotent() {
+    let root = test_root("remove_values");
+    let db = Database::open(root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(db.event_dag().as_ref(), "remove_values");
+    index.put(b"second", b"two").unwrap();
+    let transaction = db.begin_transaction();
+    assert_eq!(
+        index
+            .stage_remove_many(
+                &transaction,
+                ShardType::EventDag,
+                &[b"second", b"missing", b"second"],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(index.get(b"second").unwrap(), Some(b"two".to_vec()));
+    transaction.commit().unwrap();
+    assert_eq!(index.get(b"second").unwrap(), None);
+    let transaction = db.begin_transaction();
+    assert!(!index
+        .remove(&transaction, ShardType::EventDag, b"second")
+        .unwrap());
+    transaction.commit().unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn staged_remove_many_is_stale_if_a_key_changes_concurrently() {
+    let root = test_root("remove_stale");
+    let db = Database::open(root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(db.event_dag().as_ref(), "remove_stale");
+    index.put(b"key", b"v1").unwrap();
+
+    let remover = db.begin_transaction();
+    assert_eq!(
+        index
+            .stage_remove_many(&remover, ShardType::EventDag, &[b"key"])
+            .unwrap(),
+        1
+    );
+
+    // Concurrent writer replaces the value after the envelope check.
+    index.put(b"key", b"v2").unwrap();
+
+    assert!(matches!(
+        remover.commit(),
+        Err(StorageError::StaleRead { .. })
+    ));
+    // The removal was not published; the concurrent write survived.
+    assert_eq!(index.get(b"key").unwrap(), Some(b"v2".to_vec()));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn staged_remove_many_uses_the_version_from_envelope_validation() {
+    let root = test_root("remove_validated_version");
+    let db = Database::open(root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(db.event_dag().as_ref(), "remove_validated_version");
+    index.put(b"key", b"v1").unwrap();
+
+    let id = physical_id(&auxiliary_key_digest(b"key"));
+    let remover = db.begin_transaction();
+    let (records, versions) = remover
+        .get_with_record_versions(ShardType::EventDag, &index.collection_id(), &[id])
+        .unwrap();
+    decode_value(
+        &auxiliary_key_digest(b"key"),
+        &records[0].as_ref().unwrap().bytes,
+    )
+    .unwrap();
+
+    // Replacing the record after validation must not let removal capture the
+    // replacement's newer version as its commit precondition.
+    index.put(b"key", b"v2").unwrap();
+    remover
+        .remove_many_with_record_versions(
+            ShardType::EventDag,
+            index.collection_id(),
+            &[id],
+            &versions,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        remover.commit(),
+        Err(StorageError::StaleRead { .. })
+    ));
+    assert_eq!(index.get(b"key").unwrap(), Some(b"v2".to_vec()));
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn staged_remove_many_rejects_a_different_database_pool() {
+    let first_root = test_root("remove_wrong_pool_index");
+    let second_root = test_root("remove_wrong_pool_transaction");
+    let first_db = Database::open(first_root.clone()).unwrap();
+    let second_db = Database::open(second_root.clone()).unwrap();
+    let index = AuxiliaryIndex::open(first_db.event_dag().as_ref(), "remove_wrong_pool");
+    let unrelated = AuxiliaryIndex::open(second_db.event_dag().as_ref(), "remove_wrong_pool");
+    index.put(b"key", b"first database").unwrap();
+    unrelated.put(b"key", b"second database").unwrap();
+    let transaction = second_db.begin_transaction();
+
+    assert!(matches!(
+        index.stage_remove_many(&transaction, ShardType::EventDag, &[b"key"]),
+        Err(StorageError::Internal(message))
+            if message.contains("different storage pools")
+    ));
+    transaction.commit().unwrap();
+    assert_eq!(
+        unrelated.get(b"key").unwrap(),
+        Some(b"second database".to_vec())
+    );
+    assert_eq!(index.get(b"key").unwrap(), Some(b"first database".to_vec()));
+
+    drop(second_db);
+    drop(first_db);
+    let _ = std::fs::remove_dir_all(first_root);
+    let _ = std::fs::remove_dir_all(second_root);
+}
+
+#[test]
+fn envelope_retains_full_key_digest() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "test");
+    index.put(b"key", b"value").unwrap();
+    let digest = auxiliary_key_digest(b"key");
+    let node_id: NodeId = digest[..16].try_into().unwrap();
+    let raw = engine
+        .get(&index.collection_id(), &node_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&raw.bytes[..4], VALUE_MAGIC);
+    assert_eq!(&raw.bytes[4..36], &digest);
+}
+
+#[test]
+fn unwrapped_values_are_rejected_as_corrupt() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "unwrapped");
+    let digest = auxiliary_key_digest(b"key");
+    let node_id: NodeId = digest[..16].try_into().unwrap();
+    engine
+        .put(
+            &index.collection_id(),
+            &node_id,
+            &NodeData::new(bytes::Bytes::from_static(b"old")),
+        )
+        .unwrap();
+    assert!(matches!(index.get(b"key"), Err(StorageError::Corrupt(_))));
+}
+
+#[test]
+fn auxiliary_index_establishes_metadata_on_put() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "sys:matrix-state-groups");
+    index.put(b"event_1", b"state_group_1").unwrap();
+    let meta = engine
+        .get_collection_metadata(&index.collection_id())
+        .unwrap()
+        .expect("metadata must be established on put");
+    assert_eq!(meta.collection_canonical_id, b"sys:matrix-state-groups");
+    assert_eq!(meta.member_namespace, Some(MEMBER_NAMESPACE_INTL));
+    assert_eq!(meta.role.as_deref(), Some("system_auxiliary"));
+    assert_eq!(meta.record_id_rule.policy, FrameIdPolicy::Key);
+    assert!(meta.verify_collection_id(&index.collection_id()));
+
+    // Idempotent retry succeeds
+    index.put(b"event_1", b"state_group_1").unwrap();
+    assert_eq!(
+        index.get(b"event_1").unwrap(),
+        Some(b"state_group_1".to_vec())
+    );
+
+    // Same-key replacement succeeds and updates value
+    index.put(b"event_1", b"different_group").unwrap();
+    assert_eq!(
+        index.get(b"event_1").unwrap(),
+        Some(b"different_group".to_vec())
+    );
+}
+
+#[test]
+fn auxiliary_index_rejects_truncated_id_collision_without_corrupting() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "sys:test-collisions");
+    index.put(b"key_1", b"val_1").unwrap();
+    assert_eq!(index.get(b"key_1").unwrap(), Some(b"val_1".to_vec()));
+
+    let digest1 = auxiliary_key_digest(b"key_1");
+    let node_id1 = physical_id(&digest1);
+
+    // Fabricate a colliding key that has a different full digest but targets the same node_id
+    let mut colliding_digest = digest1;
+    colliding_digest[31] ^= 0xFF; // Different 32-byte digest, same first 16 bytes!
+    assert_eq!(&colliding_digest[..16], &node_id1[..]);
+
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(VALUE_MAGIC);
+    encoded.extend_from_slice(&colliding_digest);
+    encoded.extend_from_slice(b"colliding_val");
+    let colliding_data = NodeData::new(bytes::Bytes::from(encoded));
+
+    let mut validate = |existing: Option<&NodeData>| -> Result<(), StorageError> {
+        if let Some(existing) = existing {
+            if !existing.bytes.is_empty() {
+                decode_value(&colliding_digest, &existing.bytes)?;
+            }
+        }
+        Ok(())
+    };
+
+    let err = engine
+        .create_or_upsert_established_validated(
+            &index.collection_id(),
+            &index.metadata(),
+            &node_id1,
+            &colliding_data,
+            &mut validate,
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, StorageError::Collision(_)));
+
+    // Original key remains intact and uncorrupted:
+    assert_eq!(index.get(b"key_1").unwrap(), Some(b"val_1".to_vec()));
+}

@@ -1,0 +1,15 @@
+[alias]
+# mtxdb-cli is a separate workspace (see mtxdb-cli/Cargo.toml); reach it with
+# --manifest-path, as `make build`/`make test` also do.
+test-cli = "test --manifest-path mtxdb-cli/Cargo.toml"
+test-all = "!cargo test && cargo test-cli"
+
+[build]
+# target-dir = "target"
+rustc-wrapper = ".cargo/cargo-wrapper.sh"
+
+[env]
+# Left commented: cargo-wrapper.sh already wraps sccache itself
+# (sandbox-aware — skips it under Codex, where the sandbox can't reach the
+# host daemon). Setting this too would double-wrap rustc through sccache.
+# RUSTC_WRAPPER = { value = "sccache", force = false }
