@@ -2591,7 +2591,7 @@ impl ShardPool {
         &self,
         shard: &Arc<Shard>,
         offset: u64,
-    ) -> Result<([u8; 16], [u8; 16], u8), crate::storage::StorageError> {
+    ) -> Result<([u8; 16], [u8; 16]), crate::storage::StorageError> {
         use crate::storage::StorageError;
         if offset >= shard.file_len() {
             self.flush_shard(shard).map_err(StorageError::Io)?;
@@ -2650,8 +2650,7 @@ impl ShardPool {
                 & !(packfile::FLAG_COMPRESSED
                     | packfile::FLAG_CRC_DISABLED
                     | packfile::FLAG_METADATA
-                    | packfile::FLAG_REMOVED
-                    | packfile::FLAG_DISPOSITION_MASK)
+                    | packfile::FLAG_REMOVED)
                 != 0
             {
                 return Err(StorageError::Corrupt(format!(
@@ -2668,9 +2667,7 @@ impl ShardPool {
             collection_id.copy_from_slice(&mem[metadata_start..collection_end]);
             let mut hash = [0; 16];
             hash.copy_from_slice(&mem[collection_end..metadata_end]);
-            let disposition =
-                (flags & packfile::FLAG_DISPOSITION_MASK) >> packfile::FLAG_DISPOSITION_SHIFT;
-            return Ok((collection_id, hash, disposition));
+            return Ok((collection_id, hash));
         }
         unreachable!("record_identity_at remap-retry is bounded to two iterations")
     }
@@ -2782,8 +2779,7 @@ impl ShardPool {
             & !(packfile::FLAG_COMPRESSED
                 | packfile::FLAG_CRC_DISABLED
                 | packfile::FLAG_METADATA
-                | packfile::FLAG_REMOVED
-                | packfile::FLAG_DISPOSITION_MASK)
+                | packfile::FLAG_REMOVED)
             != 0
         {
             return Err(StorageError::Corrupt(format!(
@@ -2848,8 +2844,6 @@ impl ShardPool {
         Ok(Record {
             collection_id,
             hash,
-            disposition: (flags & packfile::FLAG_DISPOSITION_MASK)
-                >> packfile::FLAG_DISPOSITION_SHIFT,
             data,
             metadata,
         })

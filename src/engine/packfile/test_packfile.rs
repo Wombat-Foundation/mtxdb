@@ -7,7 +7,6 @@ fn test_record(collection_id: [u8; 16], hash: [u8; 16], data: &[u8]) -> Record {
     Record {
         collection_id,
         hash,
-        disposition: 0,
         data: Bytes::copy_from_slice(data),
         metadata: None,
     }
@@ -26,7 +25,6 @@ fn test_record_raw(hash: [u8; 16], data: &[u8]) -> Record {
     Record {
         collection_id: [0xAA; 16],
         hash,
-        disposition: 0,
         data: Bytes::copy_from_slice(data),
         metadata: None,
     }
@@ -108,7 +106,6 @@ fn test_metadata_roundtrip() {
     let record = Record {
         collection_id: [0xAA; 16],
         hash: [0xBB; 16],
-        disposition: 0,
         data: Bytes::from_static(b"hello metadata"),
         metadata: Some(metadata.clone()),
     };
@@ -185,7 +182,6 @@ fn test_metadata_with_crc_disabled() {
     let record = Record {
         collection_id: [0x01; 16],
         hash: [0x02; 16],
-        disposition: 0,
         data: Bytes::from_static(b"body"),
         metadata: Some(FrameMetadata {
             logical_id: Some([0x09; 32]),
@@ -637,7 +633,6 @@ fn test_record_serialized_len() {
     let r = Record {
         collection_id: [0u8; 16],
         hash: [0u8; 16],
-        disposition: 0,
         data: Bytes::from_static(b"hello"),
         metadata: None,
     };
@@ -649,7 +644,6 @@ fn test_write_record_larger_than_historical_pdu_limit() {
     let r = Record {
         collection_id: [0u8; 16],
         hash: [0u8; 16],
-        disposition: 0,
         data: Bytes::from(vec![0u8; 64 * 1024 + 1]),
         metadata: None,
     };
@@ -1096,7 +1090,6 @@ fn test_scan_rejects_oversized_frame_metadata() {
     let record = Record {
         collection_id: [0x01; 16],
         hash: [0xAA; 16],
-        disposition: 0,
         data: Bytes::from_static(b"payload"),
         metadata: Some(FrameMetadata {
             logical_id: Some([0x09; 32]),
@@ -1142,7 +1135,6 @@ fn test_extract_packfile_collection_slices_target_collection_verbatim() {
     let target_record_first = Record {
         collection_id: collection_a,
         hash: [0xA1; 16],
-        disposition: 0,
         data: Bytes::from_static(b"room A record 1"),
         metadata: Some(FrameMetadata {
             logical_id: Some([0xAA; 32]),
@@ -1159,7 +1151,6 @@ fn test_extract_packfile_collection_slices_target_collection_verbatim() {
     let other_collection_record = Record {
         collection_id: collection_b,
         hash: [0xB1; 16],
-        disposition: 0,
         data: Bytes::from_static(b"room B record 1"),
         metadata: Some(FrameMetadata {
             role: Some(b"state".to_vec()),
@@ -1171,7 +1162,6 @@ fn test_extract_packfile_collection_slices_target_collection_verbatim() {
     let target_record_second = Record {
         collection_id: collection_a,
         hash: [0xA2; 16],
-        disposition: 0,
         data: Bytes::from_static(b" { \"whitespace\" : true } "),
         metadata: None,
     };
@@ -1380,7 +1370,6 @@ fn disposition_bits_round_trip_in_the_fixed_frame_flags() {
     let record = Record {
         collection_id: [0x11; 16],
         hash: [0x22; 16],
-        disposition: 0,
         data: Bytes::from_static(b"payload"),
         metadata: None,
     };

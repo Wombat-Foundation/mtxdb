@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::journal::{Journal, Mutation as JournalMutation};
 use crate::packfile::publish_signal::PublishSignal;
-use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
+use crate::storage::{NodeData, NodeId, StorageError};
 
 use super::{OpenTimings, PackId, PackfileStorage, ReloadMode};
 
@@ -1146,64 +1146,6 @@ impl PackfileStorage {
     ) -> Result<Vec<Option<NodeData>>, StorageError> {
         self.get_read_committed_bounded(collection_id, ids, false)
             .map(|(data, _)| data)
-    }
-
-    /// Read records and their disposition from one visibility boundary.
-    ///
-    /// # Errors
-    /// Propagates journal refresh and durable read errors.
-    pub fn get_read_committed_with_disposition(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<(NodeData, u8)>>, StorageError> {
-        let guard = self.refresh_read_journal()?;
-        let Some(overlay) = guard.as_ref() else {
-            drop(guard);
-            let _fallback = FallbackReadGuard::enter();
-            return self.get_many_with_disposition(collection_id, ids);
-        };
-
-        let mut results = vec![None; ids.len()];
-        let mut unresolved = Vec::new();
-        if let Some(committed) = overlay.puts.get(collection_id) {
-            for (index, id) in ids.iter().enumerate() {
-                match committed.get(id) {
-                    Some((payload, _, disposition)) => {
-                        results[index] = Some((NodeData::new(payload.clone()), *disposition));
-                    }
-                    None if overlay
-                        .removes
-                        .get(collection_id)
-                        .is_some_and(|removed| removed.contains_key(id)) => {}
-                    None => unresolved.push(index),
-                }
-            }
-        } else {
-            for (index, id) in ids.iter().enumerate() {
-                if !overlay
-                    .removes
-                    .get(collection_id)
-                    .is_some_and(|removed| removed.contains_key(id))
-                {
-                    unresolved.push(index);
-                }
-            }
-        }
-        if overlay.delete_lsn.contains_key(collection_id) {
-            return Ok(results);
-        }
-        drop(guard);
-
-        if !unresolved.is_empty() {
-            let durable_ids: Vec<NodeId> = unresolved.iter().map(|&index| ids[index]).collect();
-            let _fallback = FallbackReadGuard::enter();
-            let durable = self.get_many_with_disposition(collection_id, &durable_ids)?;
-            for (index, value) in unresolved.into_iter().zip(durable) {
-                results[index] = value;
-            }
-        }
-        Ok(results)
     }
 
     /// Like [`Self::get_read_committed`], also returning the visibility
