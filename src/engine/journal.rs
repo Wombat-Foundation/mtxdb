@@ -113,22 +113,6 @@ pub enum Mutation {
         /// Encoded record payload.
         payload: Vec<u8>,
     },
-    /// Insert a record together with three generic disposition bits.
-    ///
-    /// Separate from [`Self::Put`] so the common mutation keeps its exact
-    /// encoding. The bits travel in the journal frame's reserved `MF_FLAGS`
-    /// byte (tag 4 in the v1 journal) and replay writes them into the fixed
-    /// frame flag byte the packfile reader exposes.
-    PutWithDisposition {
-        /// Collection containing the record.
-        collection_id: [u8; 16],
-        /// Record identity.
-        node_id: [u8; 16],
-        /// Encoded record payload.
-        payload: Vec<u8>,
-        /// Three generic disposition bits (`0..=7`).
-        disposition: u8,
-    },
     /// Append a removed version for one record identity.
     RemoveRecord {
         /// Collection containing the record.
@@ -872,12 +856,6 @@ impl TxnStage {
                     collection_id: c,
                     node_id,
                     payload,
-                }
-                | Mutation::PutWithDisposition {
-                    collection_id: c,
-                    node_id,
-                    payload,
-                    ..
                 } => (c, node_id, payload.len().saturating_add(64)),
                 Mutation::RemoveRecord {
                     collection_id: c,
@@ -2202,11 +2180,6 @@ impl JournalCoordinator {
                 let pool = entry.pool;
                 match &entry.mutation {
                     Mutation::Put {
-                        collection_id,
-                        node_id,
-                        ..
-                    }
-                    | Mutation::PutWithDisposition {
                         collection_id,
                         node_id,
                         ..
@@ -3647,11 +3620,6 @@ impl JournalCoordinator {
             for mutation in *mutations {
                 match mutation {
                     Mutation::Put {
-                        collection_id,
-                        node_id,
-                        ..
-                    }
-                    | Mutation::PutWithDisposition {
                         collection_id,
                         node_id,
                         ..
@@ -5502,7 +5470,6 @@ fn encode_mutation(
             Mutation::Put { .. } => [1],
             Mutation::DeleteCollection { .. } => [2],
             Mutation::RemoveRecord { .. } => [3],
-            Mutation::PutWithDisposition { .. } => [4],
         });
         frame[MF_POOL].copy_from_slice(&[pool_byte]);
         frame[MF_LSN].copy_from_slice(&lsn.to_le_bytes());
@@ -5514,21 +5481,6 @@ fn encode_mutation(
             } => {
                 frame[MF_COLLECTION].copy_from_slice(collection_id);
                 frame[MF_NODE].copy_from_slice(node_id);
-                let payload_len = u32::try_from(payload.len()).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
-                })?;
-                frame[MF_PAYLOAD_LEN].copy_from_slice(&payload_len.to_le_bytes());
-                payload.as_slice()
-            }
-            Mutation::PutWithDisposition {
-                collection_id,
-                node_id,
-                payload,
-                disposition,
-            } => {
-                frame[MF_COLLECTION].copy_from_slice(collection_id);
-                frame[MF_NODE].copy_from_slice(node_id);
-                frame[MF_FLAGS.start] = *disposition & 0x07;
                 let payload_len = u32::try_from(payload.len()).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
                 })?;
@@ -5833,15 +5785,7 @@ fn decode_mutations(
             .ok_or_else(|| invalid_data("truncated journal mutation frame"))?;
         let kind = frame[MF_KIND.start];
         let tag = frame[MF_POOL.start];
-        // `MF_FLAGS` is reserved zero except for kind 4, whose first byte is
-        // the three disposition bits and whose second stays zero.
-        let disposition = frame[MF_FLAGS.start];
-        let flags_ok = if kind == 4 {
-            disposition <= 0x07 && frame[MF_FLAGS.start + 1] == 0
-        } else {
-            frame[MF_FLAGS] == [0, 0]
-        };
-        if !flags_ok {
+        if frame[MF_FLAGS] != [0, 0] {
             return Err(invalid_data("unsupported journal mutation flags"));
         }
         let pool = pool_from_tag(tag)
@@ -5885,12 +5829,6 @@ fn decode_mutations(
                 collection_id,
                 node_id,
                 payload: data.to_vec(),
-            },
-            4 => Mutation::PutWithDisposition {
-                collection_id,
-                node_id,
-                payload: data.to_vec(),
-                disposition,
             },
             2 if payload_len == 0 && node_id == [0; 16] => {
                 Mutation::DeleteCollection { collection_id }

@@ -2144,20 +2144,7 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on write, flush, or rotation failure.
     pub fn put_record(&self, record: &Record) -> io::Result<(u16, u64)> {
-        self.put_record_with_disposition(record, 0)
-    }
-
-    /// As [`Self::put_record`], writing `disposition` into the fixed frame flag
-    /// byte. The value is the authoritative copy that rebuild and repack read.
-    ///
-    /// # Errors
-    /// Same as [`Self::put_record`].
-    pub fn put_record_with_disposition(
-        &self,
-        record: &Record,
-        disposition: u8,
-    ) -> io::Result<(u16, u64)> {
-        self.put_record_with_len_with_disposition(record, disposition)
+        self.put_record_with_len(record)
             .map(|(slot, offset, _)| (slot, offset))
     }
 
@@ -2167,18 +2154,6 @@ impl ShardPool {
     /// # Errors
     /// Returns an I/O or encoding error if the record cannot be appended.
     pub fn put_record_with_len(&self, record: &Record) -> io::Result<(u16, u64, u64)> {
-        self.put_record_with_len_with_disposition(record, 0)
-    }
-
-    /// As [`Self::put_record_with_len`], with an explicit 3-bit disposition.
-    ///
-    /// # Errors
-    /// Same as [`Self::put_record_with_len`].
-    pub fn put_record_with_len_with_disposition(
-        &self,
-        record: &Record,
-        disposition: u8,
-    ) -> io::Result<(u16, u64, u64)> {
         let mut shard = self.shard_for_collection(&record.collection_id)?;
         loop {
             if shard.is_poisoned() {
@@ -2241,11 +2216,10 @@ impl ShardPool {
                 continue;
             }
 
-            let frame = packfile::encode_record_with_options_and_disposition(
+            let frame = packfile::encode_record_with_options(
                 record,
                 self.compress,
                 self.checksum_policy.computes_checksum(),
-                disposition,
             )?;
             let frame_len = frame.len();
             let pending_start = {
