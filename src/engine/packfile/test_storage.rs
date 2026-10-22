@@ -4058,6 +4058,60 @@ fn test_rebuild_index_triggers_on_full_table() {
 }
 
 #[test]
+fn full_scan_rebuild_keeps_latest_cross_shard_tombstone() {
+    let dir = test_dir("streaming_rebuild_latest_tombstone");
+    let collection = [0xA7; 16];
+    let victim = distinct_id(251);
+    {
+        let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 48 * 1024).unwrap();
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"old"))
+            .unwrap();
+        fill_incompressible(&store, &collection, 10_000, 120);
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"new"))
+            .unwrap();
+        fill_incompressible(&store, &collection, 20_000, 120);
+        assert!(store.remove(&collection, &victim).unwrap());
+        store.sync_all().unwrap();
+
+        let versions: Vec<_> = store
+            .scan_collection_records(&collection)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, id, _, _, _)| *id == victim)
+            .collect();
+        assert_eq!(versions.len(), 3, "old, overwrite, and tombstone frames");
+        assert_eq!(
+            versions
+                .iter()
+                .map(|record| record.0)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "each version should land in a different shard"
+        );
+    }
+
+    // Removing both derived index files forces the next open to rebuild from
+    // pack frames rather than trusting a checkpoint or shard-count sidecar.
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    fs::remove_file(PackfileStorage::shard_collections_path(&dir)).unwrap();
+    let rebuilt = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(rebuilt.open_timings().unwrap().path, OpenPath::FullScan);
+    assert!(
+        rebuilt.get(&collection, &victim).unwrap().is_none(),
+        "the newest tombstone must win over both older values"
+    );
+    assert!(
+        !rebuilt.remove(&collection, &victim).unwrap(),
+        "lookup_removed must report the key as already removed"
+    );
+    drop(rebuilt);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn test_put_many_publishes_successive_batches() {
     // Regression coverage for successful copy-on-write batch publication:
     // every record remains readable across several batches that need no
@@ -11081,6 +11135,7 @@ fn open_time_rebuild_picks_the_marker_when_it_sits_in_a_lower_slot() {
     let latest = PackfileStorage::latest_records_for_collection(&records, &store.shards).unwrap();
     let chosen: Vec<_> = latest
         .iter()
+        .map(|&at| &records[at as usize])
         .filter(|(_, hash, _, _, _)| *hash == victim)
         .collect();
     assert_eq!(chosen.len(), 1, "one frame per key");

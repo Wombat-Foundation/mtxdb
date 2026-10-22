@@ -468,6 +468,16 @@ impl Iterator for PackfileScanner {
     type Item = io::Result<ScanEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_with_removal()
+            .map(|entry| entry.map(|entry| (entry.collection_id, entry.hash, entry.offset)))
+    }
+}
+
+impl PackfileScanner {
+    /// Read the next frame's identity and removal marker without retaining a
+    /// scan-sized vector. The ordinary iterator intentionally keeps its
+    /// historical `(collection_id, hash, offset)` item shape.
+    pub(crate) fn next_with_removal(&mut self) -> Option<io::Result<ScanEntryWithRemoval>> {
         if self.done {
             return None;
         }
@@ -484,7 +494,15 @@ impl Iterator for PackfileScanner {
             read_record_metadata_skip_payload_with_end(&mut self.reader, self.file_end)
         };
         match result {
-            Ok(Some(metadata)) => Some(Ok((metadata.collection_id, metadata.hash, offset))),
+            Ok(Some(metadata)) => Some(Ok(ScanEntryWithRemoval {
+                collection_id: metadata.collection_id,
+                hash: metadata.hash,
+                offset,
+                removed: metadata
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|frame| frame.removed),
+            })),
             Ok(None) => {
                 self.done = true;
                 None

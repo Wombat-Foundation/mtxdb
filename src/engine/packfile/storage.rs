@@ -2760,37 +2760,54 @@ impl PackfileStorage {
     }
 
     /// Find the latest physical frame for every hash in a collection, by pack
-    /// creation order then offset. Reads no frames: the scan already carries
-    /// everything the ordering needs.
+    /// creation order then offset, in that same order. Reads no frames: the scan
+    /// already carries everything the ordering needs.
+    ///
+    /// Returns indices into `records` rather than copies, and dedupes by sorting
+    /// those indices instead of hashing every record, so the transient cost is
+    /// 4 bytes per frame (plus 4 per surviving key) instead of a map entry per
+    /// key.
     pub(crate) fn latest_records_for_collection(
         records: &[ShardRecord],
         shards: &ShardPool,
-    ) -> Result<Vec<ShardRecord>, StorageError> {
-        let mut creation_seq: HashMap<u16, u32> = HashMap::new();
-        let mut order_of = |slot: u16| -> Result<u32, StorageError> {
-            if let Some(&seq) = creation_seq.get(&slot) {
-                return Ok(seq);
-            }
-            let seq = shards
-                .get_shard(slot)
-                .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?
-                .creation_seq;
-            creation_seq.insert(slot, seq);
-            Ok(seq)
-        };
-        let mut latest_records: HashMap<[u8; 16], (ShardRecord, (u32, u64))> = HashMap::new();
-        for record @ (slot, hash, offset, _, _) in records {
-            let position = (order_of(*slot)?, *offset);
-            let replace = latest_records
-                .get(hash)
-                .is_none_or(|(_, old_position)| position >= *old_position);
-            if replace {
-                latest_records.insert(*hash, (*record, position));
+    ) -> Result<Vec<u32>, StorageError> {
+        let too_many = || StorageError::Corrupt("collection scan exceeds u32::MAX frames".into());
+        let mut seq_by_slot = vec![0_u32; shard::MAX_SHARDS];
+        for (slot, ..) in records {
+            let cached = seq_by_slot
+                .get_mut(usize::from(*slot))
+                .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?;
+            if *cached == 0 {
+                // `creation_seq` is never zero, so zero means "not looked up".
+                *cached = shards
+                    .get_shard(*slot)
+                    .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?
+                    .creation_seq;
             }
         }
-        let mut latest: Vec<(ShardRecord, (u32, u64))> = latest_records.into_values().collect();
-        latest.sort_unstable_by_key(|((_, hash, _, _, _), position)| (*position, *hash));
-        Ok(latest.into_iter().map(|(record, _)| record).collect())
+        let position = |record: &ShardRecord| (seq_by_slot[usize::from(record.0)], record.2);
+        let mut order =
+            (0..u32::try_from(records.len()).map_err(|_| too_many())?).collect::<Vec<u32>>();
+        // Within a key, the last index is the newest frame.
+        order.sort_unstable_by(|&a, &b| {
+            let (a, b) = (&records[a as usize], &records[b as usize]);
+            a.1.cmp(&b.1).then_with(|| position(a).cmp(&position(b)))
+        });
+        let mut latest: Vec<u32> = Vec::new();
+        for (at, &index) in order.iter().enumerate() {
+            let is_last_for_key = order
+                .get(at.saturating_add(1))
+                .is_none_or(|&next| records[next as usize].1 != records[index as usize].1);
+            if is_last_for_key {
+                latest.push(index);
+            }
+        }
+        drop(order);
+        latest.sort_unstable_by_key(|&index| {
+            let record = &records[index as usize];
+            (position(record), record.1)
+        });
+        Ok(latest)
     }
 
     /// Builds one collection's index, cache, and shard-directory contribution
@@ -2807,8 +2824,8 @@ impl PackfileStorage {
         out: &mut RoomScanOutput,
     ) -> Result<(), StorageError> {
         let index_records = Self::latest_records_for_collection(records, shards)?;
-        if let Some((last_slot, _, _, _, _)) = index_records.last() {
-            shards.set_collection_home(collection_id, *last_slot);
+        if let Some(&last) = index_records.last() {
+            shards.set_collection_home(collection_id, records[last as usize].0);
         }
         let index = LossyIndex::with_config(
             index_records
@@ -2819,7 +2836,8 @@ impl PackfileStorage {
         );
         let mut failed = 0usize;
         let mut first_failure: Option<(u64, InsertError)> = None;
-        for (slot, hash, offset, _pack_id, removed) in &index_records {
+        for &at in &index_records {
+            let (slot, hash, offset, _pack_id, removed) = &records[at as usize];
             check_index_offset(*slot, hash, *offset)?;
             if let Err(error) = index.insert_tracked_with_removed(hash, *slot, *offset, *removed) {
                 failed = failed.saturating_add(1);
@@ -4726,6 +4744,9 @@ impl PackfileStorage {
         }
     }
 
+    /// Materialized scan of one collection, kept for tests that assert on
+    /// the raw frame list; `rebuild_index` streams instead.
+    #[cfg(test)]
     fn scan_collection_records(
         &self,
         collection_id: &[u8; 16],
@@ -6818,28 +6839,60 @@ impl PackfileStorage {
         // Full-fallback path: a batch that exhausted growth re-scans the
         // packfiles. Tracked so a heavy rebuild is visible in `stats()`.
         self.index_rebuild_count.fetch_add(1, Ordering::Relaxed);
-        // `scan_collection_records` traverses packfiles; any buffered frames
-        // (this collection's or any other's) are invisible to it, so a fresh
-        // flush guarantees the rebuilt index reflects every record that has
-        // actually been put. Callers only reach this path while holding the
-        // collection's put mutex, so nothing new can buffer for this
-        // collection between the flush and the scan.
+        // Any buffered frames (this collection's or any other's) are
+        // invisible to the file scanner, so a fresh flush guarantees the
+        // rebuilt index reflects every record that has actually been put.
+        // Callers only reach this path while holding the collection's put
+        // mutex, so nothing new can buffer for this collection between the
+        // flush and the scan.
         self.shards.flush_all()?;
-        let scanned = self.scan_collection_records(collection_id)?;
-        let latest = Self::latest_records_for_collection(&scanned, &self.shards)?;
-        let index = LossyIndex::with_config(
-            latest
-                .len()
-                .saturating_mul(2)
-                .max(NEW_COLLECTION_INDEX_FLOOR),
-            self.index_config,
-        );
-        for (slot, hash, offset, _, removed) in latest {
-            // `IndexEntry` can only represent offsets up to
-            // `PACK_INDEX_OFFSET_LIMIT`. Offsets an externally created
-            // oversized shard are rejected rather than silently skipped.
-            check_index_offset(slot, &hash, offset)?;
-            insert_or_corrupt_with_removed(&index, &hash, slot, offset, removed)?;
+        // Replay physical versions oldest to newest so insertion itself
+        // resolves duplicates. This avoids retaining a full scan vector and
+        // its sort indexes while rebuilding. `all_shards` is slot ordered;
+        // stable sorting preserves that tie-break if creation sequences ever
+        // repeat. The pack scanner returns each shard's frames in offset order.
+        let mut shards = self.shards.all_shards();
+        shards.sort_by_key(|(_, shard)| shard.creation_seq);
+        let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
+        for (slot, shard) in shards {
+            let mut scanner = packfile::scan_packfile_iter(
+                &shard.path,
+                self.shards.checksum_policy().verifies_reads(),
+            )?;
+            while let Some(record) = scanner.next_with_removal() {
+                let record = record?;
+                if record.collection_id != *collection_id {
+                    continue;
+                }
+                // `IndexEntry` can only represent offsets up to
+                // `PACK_INDEX_OFFSET_LIMIT`. Offsets an externally created
+                // oversized shard are rejected rather than silently skipped.
+                check_index_offset(slot, &record.hash, record.offset)?;
+                loop {
+                    match index.insert_tracked_with_removed(
+                        &record.hash,
+                        slot,
+                        record.offset,
+                        record.removed,
+                    ) {
+                        Ok(_) => break,
+                        Err(InsertError::TableFull) => {
+                            index = index.grow().ok_or_else(|| {
+                                StorageError::Corrupt(format!(
+                                    "index insert failed for the record at offset {} in shard {slot}: table cannot grow",
+                                    record.offset
+                                ))
+                            })?;
+                        }
+                        Err(error) => {
+                            return Err(StorageError::Corrupt(format!(
+                                "index insert failed for the record at offset {} in shard {slot}: {error}",
+                                record.offset
+                            )));
+                        }
+                    }
+                }
+            }
         }
         Ok(index)
     }
