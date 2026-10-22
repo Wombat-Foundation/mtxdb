@@ -195,6 +195,13 @@ fn mapped_rss_bytes(path: &Path) -> Option<u64> {
     found.then(|| rss_kib.saturating_mul(1024))
 }
 
+/// Whole-process resident set from `/proc/self/statm`, in bytes (Linux only).
+fn process_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_ascii_whitespace().nth(1)?.parse().ok()?;
+    Some(pages.saturating_mul(4096))
+}
+
 fn pack_index_identity(pack: &Path, pack_len: u64) -> PackIndexIdentity {
     let mut file = std::fs::File::open(pack).expect("open pack header");
     let header = read_header(&mut file)
@@ -918,6 +925,7 @@ fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
     // identity tables. Updating an existing id keeps the pack's record count
     // unchanged while measuring that representation transition.
     let first_id = entries.first().expect("benchmark pack has records").1;
+    let rss_before_write = process_rss_bytes();
     let first_write = [(first_id, NodeData::from_slice(&[0xA5; 16]))];
     let ((), write_time) = timed(|| {
         reopened
@@ -927,7 +935,19 @@ fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
     let (written_records, heap_bytes, mapped_bytes, capacity) = reopened
         .collection_index_residency(&COLLECTION)
         .expect("written collection index");
+    let rss_after_write = process_rss_bytes();
     println!("  first write after reopen: {:.1} ms", ms(write_time));
+    // Allocated heap above counts zeroed identity tables in full; process RSS
+    // shows how much of that the first write actually made resident. It also
+    // drops the released checkpoint mapping, so it is a net figure.
+    match (rss_before_write, rss_after_write) {
+        (Some(before), Some(after)) => println!(
+            "    process RSS across the first write: {:+.2} MiB (allocated private heap {:.2} MiB)",
+            to_f64(after) / 1_048_576.0 - to_f64(before) / 1_048_576.0,
+            mib_f64(u64::try_from(heap_bytes).expect("heap fits u64")),
+        ),
+        _ => println!("    process RSS unavailable"),
+    }
     report_lossy_index(
         "after reopen + one overwrite",
         written_records,
