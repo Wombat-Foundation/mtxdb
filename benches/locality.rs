@@ -401,6 +401,7 @@ fn compact_shard_intra(
             let record = packfile::Record {
                 collection_id: *collection_id,
                 hash: *hash,
+                disposition: 0,
                 data: data.bytes,
                 metadata: None,
             };

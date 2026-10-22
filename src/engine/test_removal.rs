@@ -84,6 +84,7 @@ fn removed_record(metadata: FrameMetadata) -> Record {
     Record {
         collection_id: [0x31; 16],
         hash: node(9),
+        disposition: 0,
         data: bytes::Bytes::new(),
         metadata: Some(metadata),
     }
@@ -134,6 +135,7 @@ fn an_empty_payload_alone_is_not_a_removal() {
     let record = Record {
         collection_id: [0x31; 16],
         hash: node(9),
+        disposition: 0,
         data: bytes::Bytes::new(),
         metadata: None,
     };

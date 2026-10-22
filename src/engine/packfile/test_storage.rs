@@ -76,6 +76,53 @@ fn read_committed_overlay_sees_a_committed_but_unflushed_group() {
     );
 }
 
+#[test]
+fn read_committed_disposition_overlay_observes_flags_and_plain_put_clears_them() {
+    let dir = test_dir("read_committed_disposition");
+    let wal = dir.join("wal.bin");
+    let collection = [0x52u8; 16];
+    let node = [0x17u8; 16];
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &[0x99; 16],
+        &[0x99; 16],
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[JournalMutation::PutWithDisposition {
+            collection_id: collection,
+            node_id: node,
+            payload: b"flagged-overlay".to_vec(),
+            disposition: 0b110,
+        }])
+        .unwrap();
+    journal
+        .append_group(&[JournalMutation::Put {
+            collection_id: collection,
+            node_id: node,
+            payload: b"plain-overlay".to_vec(),
+        }])
+        .unwrap();
+    drop(journal);
+
+    let store = PackfileStorage::open_read_only(dir).unwrap();
+    store.enable_read_journal(&wal).unwrap();
+    let observed = store
+        .get_read_committed_with_disposition(&collection, &[node])
+        .unwrap();
+    assert_eq!(
+        observed[0]
+            .as_ref()
+            .map(|(data, flags)| (data.bytes.as_ref(), *flags)),
+        Some((&b"plain-overlay"[..], 0))
+    );
+}
+
 /// Journal state for a writer-restart scenario: LSN 1 is durable and LSN 2
 /// is visible but never reached the disk. Returns the segment length that
 /// covers only LSN 1, so a test can cut the file back to what a crash would
@@ -1362,6 +1409,74 @@ fn reopened_index_keeps_distinct_same_tag_entries() {
         .unwrap();
     assert!(reopened.get(&TEST_COLLECTION, &first).unwrap().is_some());
     assert!(reopened.get(&TEST_COLLECTION, &second).unwrap().is_some());
+}
+
+#[test]
+fn disposition_reads_verify_full_identity_and_survive_repack() {
+    let dir = test_dir("disposition_repack_identity");
+    let mut flagged = [0u8; 16];
+    flagged[8] = 0x42;
+    flagged[15] = 1;
+    let mut unflagged = flagged;
+    unflagged[15] = 2;
+    let mut absent = flagged;
+    absent[15] = 3;
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put_with_disposition(
+            &TEST_COLLECTION,
+            &flagged,
+            &NodeData::new(bytes::Bytes::from_static(b"flagged")),
+            0b101,
+        )
+        .unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &unflagged,
+            &NodeData::new(bytes::Bytes::from_static(b"plain")),
+        )
+        .unwrap();
+    let got = store
+        .get_many_with_disposition(&TEST_COLLECTION, &[flagged, unflagged, absent])
+        .unwrap();
+    assert_eq!(got[0].as_ref().map(|(_, flags)| *flags), Some(0b101));
+    assert_eq!(got[1].as_ref().map(|(_, flags)| *flags), Some(0));
+    assert!(
+        got[2].is_none(),
+        "a tag collision must not create a false hit"
+    );
+
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    let after_repack = store
+        .get_many_disposition(&TEST_COLLECTION, &[flagged, unflagged, absent])
+        .unwrap();
+    assert_eq!(after_repack, vec![Some(0b101), Some(0), None]);
+    store.sync_all().unwrap();
+    drop(store);
+
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    let reopened = PackfileStorage::open(dir).unwrap();
+    let after_reopen = reopened
+        .get_many_disposition(&TEST_COLLECTION, &[flagged, unflagged, absent])
+        .unwrap();
+    assert_eq!(after_reopen, vec![Some(0b101), Some(0), None]);
+    reopened
+        .put(
+            &TEST_COLLECTION,
+            &flagged,
+            &NodeData::new(bytes::Bytes::from_static(b"cleared")),
+        )
+        .unwrap();
+    assert_eq!(
+        reopened
+            .get_many_disposition(&TEST_COLLECTION, &[flagged])
+            .unwrap(),
+        vec![Some(0)]
+    );
 }
 
 #[test]
@@ -3405,6 +3520,43 @@ fn journal_replays_post_checkpoint_mutations_on_reopen() {
     assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
 }
 
+#[test]
+fn journal_replay_preserves_disposition_after_checkpoint() {
+    let dir = test_dir("journal_replay_disposition");
+    let journal_path = dir.join("wal.bin");
+    let id = distinct_id(19);
+    {
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.enable_journal(&journal_path).unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(18),
+                &NodeData::new(bytes::Bytes::from_static(b"base")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        store
+            .put_with_disposition(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"wal disposition")),
+                0b011,
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+    }
+    let reopened = PackfileStorage::open(dir).unwrap();
+    reopened.enable_journal(&journal_path).unwrap();
+    assert!(reopened.replay_journal().unwrap() >= 1);
+    assert_eq!(
+        reopened
+            .get_many_disposition(&TEST_COLLECTION, &[id])
+            .unwrap(),
+        vec![Some(0b011)]
+    );
+}
+
 /// A single-pool journal may reclaim an older committed group while a
 /// later group remains in the segment. Reopening that same store must
 /// still replay the surviving suffix.
@@ -5108,6 +5260,7 @@ fn test_scan_existing_skips_malformed_filenames() {
         &packfile::Record {
             collection_id: [0x01; 16],
             hash: [0xAA; 16],
+            disposition: 0,
             data: bytes::Bytes::from_static(b"hello"),
             metadata: None,
         },
@@ -10857,11 +11010,11 @@ fn build_index_fails_closed_when_the_table_rejects_an_insert() {
     // the sized table cannot satisfy makes the first insert fail; the build
     // must surface that as `Corrupt`, not return an index silently missing the
     // record (the pre-`insert_or_corrupt` code discarded the error).
-    let offsets: Vec<([u8; 16], u16, u64, bool)> = (0..3u64)
+    let offsets: Vec<([u8; 16], u16, u64, bool, u8)> = (0..3u64)
         .map(|seq| {
             let mut hash = [0u8; 16];
             hash[..8].copy_from_slice(&seq.to_be_bytes());
-            (hash, 0u16, 64 + seq * 64, false)
+            (hash, 0u16, 64 + seq * 64, false, 0)
         })
         .collect();
     let starved = crate::index::IndexConfig {

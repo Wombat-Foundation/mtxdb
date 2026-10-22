@@ -286,13 +286,15 @@ pub fn is_segment_reclaimed(error: &io::Error) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StagedLookup {
     /// The newest staged mutation for the record is a put of this payload.
-    Put(Vec<u8>),
+    Put(Vec<u8>, u8),
     /// A staged collection delete hides the record, and nothing newer puts it
     /// back.
     Deleted,
     /// Nothing staged names the record; the live store decides.
     Absent,
 }
+
+type StagedPutRef<'a> = (usize, Option<(&'a Vec<u8>, u8)>);
 
 /// A collection-version precondition staged on a transaction.
 ///
@@ -453,7 +455,7 @@ impl TxnStage {
             return vec![StagedLookup::Absent; node_ids.len()];
         }
         let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
-        let mut newest_put: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
+        let mut newest_put: HashMap<[u8; 16], StagedPutRef<'_>> = HashMap::new();
         let mut last_delete: Option<usize> = None;
         for (position, mutation) in data.pools[pool_index(pool)].iter().enumerate() {
             match mutation {
@@ -462,7 +464,15 @@ impl TxnStage {
                     node_id,
                     payload,
                 } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, Some(payload)));
+                    newest_put.insert(*node_id, (position, Some((payload, 0))));
+                }
+                Mutation::PutWithDisposition {
+                    collection_id: staged_collection,
+                    node_id,
+                    payload,
+                    disposition,
+                } if staged_collection == collection_id && wanted.contains(node_id) => {
+                    newest_put.insert(*node_id, (position, Some((payload, *disposition))));
                 }
                 Mutation::RemoveRecord {
                     collection_id: staged_collection,
@@ -481,7 +491,9 @@ impl TxnStage {
             .map(|node_id| match (newest_put.get(node_id), last_delete) {
                 // A put older than the delete is hidden by it.
                 (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
-                (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
+                (Some((_, Some((payload, disposition)))), _) => {
+                    StagedLookup::Put((*payload).clone(), *disposition)
+                }
                 (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
                 (None, None) => StagedLookup::Absent,
             })
@@ -656,6 +668,28 @@ impl TxnStage {
         node_id: [u8; 16],
         payload: Vec<u8>,
     ) -> io::Result<()> {
+        self.stage_put_with_disposition(pool, collection_id, node_id, payload, 0)
+    }
+
+    /// Add a staged put with generic record disposition bits.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a disposition outside `0..=7`, or an error
+    /// if the staging budget is exhausted or the stage is no longer active.
+    pub fn stage_put_with_disposition(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_id: [u8; 16],
+        payload: Vec<u8>,
+        disposition: u8,
+    ) -> io::Result<()> {
+        if disposition > crate::packfile::MAX_DISPOSITION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "record disposition must fit in three bits",
+            ));
+        }
         let charge = payload.len().saturating_add(TXN_STAGE_PUT_OVERHEAD_BYTES);
         let mut data = self.data.lock();
         if self.state.load(Ordering::Acquire) != Self::ACTIVE {
@@ -670,11 +704,21 @@ impl TxnStage {
         if total > self.limit_bytes {
             return Err(stage_too_large_with_limit(total, self.limit_bytes));
         }
-        data.pools[pool_index(pool)].push(Mutation::Put {
-            collection_id,
-            node_id,
-            payload,
-        });
+        let mutation = if disposition == 0 {
+            Mutation::Put {
+                collection_id,
+                node_id,
+                payload,
+            }
+        } else {
+            Mutation::PutWithDisposition {
+                collection_id,
+                node_id,
+                payload,
+                disposition,
+            }
+        };
+        data.pools[pool_index(pool)].push(mutation);
         data.applied[pool_index(pool)].push(false);
         data.bytes = total;
         Ok(())

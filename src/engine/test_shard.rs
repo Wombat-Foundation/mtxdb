@@ -20,6 +20,7 @@ fn test_record(collection: u8, hash_byte: u8, data: &[u8]) -> Record {
     Record {
         collection_id,
         hash,
+        disposition: 0,
         data: bytes::Bytes::copy_from_slice(data),
         metadata: None,
     }
@@ -902,6 +903,7 @@ fn test_shard_pool_open_fails_on_old_layout_content() {
         &packfile::Record {
             collection_id: [0x22; 16],
             hash: [0x33; 16],
+            disposition: 0,
             data: bytes::Bytes::from_static(b"pre-cutover data"),
             metadata: None,
         },
@@ -1013,6 +1015,7 @@ fn test_scan_discovers_valid_shards_in_pack_id_order() {
         &packfile::Record {
             collection_id: [0x01; 16],
             hash: [0xAA; 16],
+            disposition: 0,
             data: bytes::Bytes::from_static(b"live data"),
             metadata: None,
         },
@@ -1030,6 +1033,7 @@ fn test_scan_discovers_valid_shards_in_pack_id_order() {
         &packfile::Record {
             collection_id: [0xFF; 16],
             hash: [0xBB; 16],
+            disposition: 0,
             data: bytes::Bytes::from_static(b"stale leftover"),
             metadata: None,
         },
@@ -1171,6 +1175,7 @@ fn test_scan_parses_pack_id_filename_format() {
                     r
                 },
                 hash: [0xAA; 16],
+                disposition: 0,
                 data: bytes::Bytes::from_static(b"payload"),
                 metadata: None,
             },

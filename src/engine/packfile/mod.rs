@@ -548,6 +548,8 @@ pub struct Record {
     pub collection_id: [u8; 16],
     /// The structural hash framed alongside the record (index-rebuild metadata only).
     pub hash: [u8; 16],
+    /// Generic three-bit disposition stored in the fixed frame flags byte.
+    pub disposition: u8,
     /// The opaque node payload.
     pub data: Bytes,
     /// Optional versioned per-record metadata (see [`FrameMetadata`]). `None`
@@ -1206,6 +1208,7 @@ pub fn read_record(reader: &mut impl Read) -> io::Result<Option<Record>> {
     Ok(Some(Record {
         collection_id,
         hash,
+        disposition: (flags & FLAG_DISPOSITION_MASK) >> FLAG_DISPOSITION_SHIFT,
         data,
         metadata,
     }))
