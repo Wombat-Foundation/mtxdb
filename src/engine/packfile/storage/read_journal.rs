@@ -113,8 +113,9 @@ fn file_stamp(_meta: &fs::Metadata) -> Option<FileStamp> {
     None
 }
 
-/// One committed value in the read-journal overlay: payload and its LSN.
-type ReadJournalValue = (bytes::Bytes, u64);
+/// One committed value in the read-journal overlay: payload, its LSN, and the
+/// three generic disposition bits the put carried.
+type ReadJournalValue = (bytes::Bytes, u64, u8);
 /// Values for one collection, keyed by node ID.
 type ReadJournalCollection = HashMap<[u8; 16], ReadJournalValue>;
 /// Committed puts keyed `collection_id -> node_id`.
@@ -350,7 +351,7 @@ impl ReadJournal {
             return;
         }
         self.puts.retain(|_, entries| {
-            entries.retain(|_, (_, lsn)| *lsn > covered);
+            entries.retain(|_, (_, lsn, _)| *lsn > covered);
             !entries.is_empty()
         });
         self.removes.retain(|_, entries| {
@@ -371,7 +372,24 @@ impl ReadJournal {
                 self.puts
                     .entry(*collection_id)
                     .or_default()
-                    .insert(*node_id, (bytes::Bytes::copy_from_slice(payload), lsn));
+                    .insert(*node_id, (bytes::Bytes::copy_from_slice(payload), lsn, 0));
+                if let Some(removes) = self.removes.get_mut(collection_id) {
+                    removes.remove(node_id);
+                    if removes.is_empty() {
+                        self.removes.remove(collection_id);
+                    }
+                }
+            }
+            JournalMutation::PutWithDisposition {
+                collection_id,
+                node_id,
+                payload,
+                disposition,
+            } => {
+                self.puts.entry(*collection_id).or_default().insert(
+                    *node_id,
+                    (bytes::Bytes::copy_from_slice(payload), lsn, *disposition),
+                );
                 if let Some(removes) = self.removes.get_mut(collection_id) {
                     removes.remove(node_id);
                     if removes.is_empty() {
@@ -1220,7 +1238,9 @@ impl PackfileStorage {
             Some(committed) => {
                 for (index, id) in ids.iter().enumerate() {
                     match committed.get(id) {
-                        Some((payload, _)) => results[index] = Some(NodeData::new(payload.clone())),
+                        Some((payload, _, _)) => {
+                            results[index] = Some(NodeData::new(payload.clone()));
+                        }
                         None if overlay
                             .removes
                             .get(collection_id)
@@ -1482,7 +1502,7 @@ impl PackfileStorage {
         if let Some(overlay) = overlay {
             if let Some(committed) = overlay.puts.get(collection_id) {
                 for (index, id) in ids.iter().enumerate() {
-                    if let Some((_, lsn)) = committed.get(id) {
+                    if let Some((_, lsn, _)) = committed.get(id) {
                         versions[index] = *lsn;
                     }
                 }

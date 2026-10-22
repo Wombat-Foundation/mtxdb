@@ -4535,7 +4535,9 @@ impl PackfileStorage {
                         .map(|committed| {
                             committed
                                 .iter()
-                                .map(|(id, (payload, _lsn))| (*id, NodeData::new(payload.clone())))
+                                .map(|(id, (payload, _lsn, _))| {
+                                    (*id, NodeData::new(payload.clone()))
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -6892,8 +6894,32 @@ impl PackfileStorage {
         offset: u64,
         removed: bool,
     ) -> Result<Result<(u32, u64, bool), InsertError>, StorageError> {
+        self.insert_index_with_flags(collection_id, index, hash, slot, offset, removed, 0)
+    }
+
+    /// As [`Self::insert_index`], storing `flags` in the slot's disposition
+    /// bits so a point check can read them without a frame access.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_index_with_flags(
+        &self,
+        collection_id: &[u8; 16],
+        index: &LossyIndex,
+        hash: &NodeId,
+        slot: u16,
+        offset: u64,
+        removed: bool,
+        flags: u8,
+    ) -> Result<Result<(u32, u64, bool), InsertError>, StorageError> {
         Ok(self
-            .insert_index_undoable(collection_id, index, hash, slot, offset, removed)?
+            .insert_index_undoable_with_flags(
+                collection_id,
+                index,
+                hash,
+                slot,
+                offset,
+                removed,
+                flags,
+            )?
             .map(|(bucket, slot, undo)| (bucket, slot, undo.was_empty())))
     }
 
@@ -6909,8 +6935,22 @@ impl PackfileStorage {
         offset: u64,
         removed: bool,
     ) -> Result<Result<(u32, u64, EntryUndo), InsertError>, StorageError> {
+        self.insert_index_undoable_with_flags(collection_id, index, hash, slot, offset, removed, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_index_undoable_with_flags(
+        &self,
+        collection_id: &[u8; 16],
+        index: &LossyIndex,
+        hash: &NodeId,
+        slot: u16,
+        offset: u64,
+        removed: bool,
+        flags: u8,
+    ) -> Result<Result<(u32, u64, EntryUndo), InsertError>, StorageError> {
         loop {
-            match index.insert_undoable_with_removed(hash, slot, offset, removed) {
+            match index.insert_undoable_with_flags(hash, slot, offset, removed, flags) {
                 Ok(written) => return Ok(Ok(written)),
                 Err(InsertError::TableFull) => return Ok(Err(InsertError::TableFull)),
                 Err(InsertError::NeedsIdentity {
@@ -8875,6 +8915,7 @@ impl PackfileStorage {
         id: &NodeId,
         data: &NodeData,
         metadata: Option<FrameMetadata>,
+        disposition: u8,
     ) -> Result<(u16, u64, u64, Option<u64>), StorageError> {
         // Publish the group before writing its frame so the frame can carry the
         // group's LSN as its record version. This mirrors the transaction path:
@@ -8882,10 +8923,22 @@ impl PackfileStorage {
         // reopen), and the frame materializes it. A frame write that fails after
         // publication is recovered by `replay_journal`, which stamps the same
         // LSN, so the mutation never becomes an orphan.
-        let receipt_lsn = self.publish_mutation(|| JournalMutation::Put {
-            collection_id: *collection_id,
-            node_id: *id,
-            payload: data.bytes.to_vec(),
+        let payload = data.bytes.to_vec();
+        let receipt_lsn = self.publish_mutation(|| {
+            if disposition == 0 {
+                JournalMutation::Put {
+                    collection_id: *collection_id,
+                    node_id: *id,
+                    payload,
+                }
+            } else {
+                JournalMutation::PutWithDisposition {
+                    collection_id: *collection_id,
+                    node_id: *id,
+                    payload,
+                    disposition,
+                }
+            }
         })?;
         let metadata = Self::stamp_last_write_lsn(metadata, receipt_lsn);
         let record = Record {
@@ -8894,7 +8947,9 @@ impl PackfileStorage {
             data: data.bytes.clone(),
             metadata,
         };
-        let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
+        let (slot, offset, disk_bytes) = self
+            .shards
+            .put_record_with_len_with_disposition(&record, disposition)?;
         Ok((slot, offset, disk_bytes, receipt_lsn))
     }
 
@@ -9143,10 +9198,21 @@ impl PackfileStorage {
         data: &NodeData,
         metadata: Option<FrameMetadata>,
     ) -> Result<(), StorageError> {
+        self.put_internal_with_disposition(collection_id, id, data, metadata, 0)
+    }
+
+    fn put_internal_with_disposition(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        metadata: Option<FrameMetadata>,
+        disposition: u8,
+    ) -> Result<(), StorageError> {
         let _snapshot_gate = self.read_snapshot_gate.lock();
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
-        self.put_internal_locked(collection_id, id, data, metadata)
+        self.put_internal_locked_with_disposition(collection_id, id, data, metadata, disposition)
     }
 
     fn recover_index_after_failed_insert(
@@ -9195,6 +9261,17 @@ impl PackfileStorage {
         data: &NodeData,
         metadata: Option<FrameMetadata>,
     ) -> Result<(), StorageError> {
+        self.put_internal_locked_with_disposition(collection_id, id, data, metadata, 0)
+    }
+
+    fn put_internal_locked_with_disposition(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        metadata: Option<FrameMetadata>,
+        disposition: u8,
+    ) -> Result<(), StorageError> {
         let removed = metadata.as_ref().is_some_and(|metadata| metadata.removed);
         self.put_calls.fetch_add(1, Ordering::Relaxed);
         self.put_bytes
@@ -9212,12 +9289,18 @@ impl PackfileStorage {
         };
 
         let (slot, offset, disk_bytes, receipt_lsn) =
-            self.append_put_record(collection_id, id, data, metadata)?;
+            self.append_put_record(collection_id, id, data, metadata, disposition)?;
         if let Some(gen) = self.generation(collection_id) {
             if !gen.index.is_mmap_backed() {
-                if let Ok((_bucket, _entry, inserted)) =
-                    self.insert_index(collection_id, &gen.index, id, slot, offset, removed)?
-                {
+                if let Ok((_bucket, _entry, inserted)) = self.insert_index_with_flags(
+                    collection_id,
+                    &gen.index,
+                    id,
+                    slot,
+                    offset,
+                    removed,
+                    disposition,
+                )? {
                     self.record_redo(
                         collection_id,
                         gen.generation,
@@ -10565,6 +10648,24 @@ impl PackfileStorage {
                             let data = NodeData::new(bytes::Bytes::from(payload.clone()));
                             self.put_internal(collection_id, node_id, &data, Some(metadata))?;
                         }
+                        JournalMutation::PutWithDisposition {
+                            collection_id,
+                            node_id,
+                            payload,
+                            disposition,
+                        } => {
+                            let metadata = FrameMetadata {
+                                last_write_lsn: Some(group.last_lsn),
+                                ..FrameMetadata::default()
+                            };
+                            self.put_internal_with_disposition(
+                                collection_id,
+                                node_id,
+                                &NodeData::new(bytes::Bytes::from(payload.clone())),
+                                Some(metadata),
+                                *disposition,
+                            )?;
+                        }
                         JournalMutation::RemoveRecord {
                             collection_id,
                             node_id,
@@ -10861,6 +10962,24 @@ impl PackfileStorage {
                         node_id,
                         &NodeData::new(bytes::Bytes::from(payload.clone())),
                         Some(metadata),
+                    )
+                }
+                JournalMutation::PutWithDisposition {
+                    collection_id,
+                    node_id,
+                    payload,
+                    disposition,
+                } => {
+                    let metadata = FrameMetadata {
+                        last_write_lsn: Some(write_lsn),
+                        ..FrameMetadata::default()
+                    };
+                    self.put_internal_with_disposition(
+                        collection_id,
+                        node_id,
+                        &NodeData::new(bytes::Bytes::from(payload.clone())),
+                        Some(metadata),
+                        *disposition,
                     )
                 }
                 JournalMutation::DeleteCollection { collection_id } => {

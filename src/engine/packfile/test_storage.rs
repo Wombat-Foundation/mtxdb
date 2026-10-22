@@ -9897,7 +9897,8 @@ fn scan_collections_at_snapshot_binds_one_boundary() {
         .iter()
         .flat_map(|group| group.entries.iter())
         .filter_map(|entry| match &entry.mutation {
-            JournalMutation::Put { node_id, .. } => Some(*node_id),
+            JournalMutation::Put { node_id, .. }
+            | JournalMutation::PutWithDisposition { node_id, .. } => Some(*node_id),
             JournalMutation::RemoveRecord { .. } | JournalMutation::DeleteCollection { .. } => None,
         })
         .collect();

@@ -47,7 +47,7 @@ fn value(overlay: &ReadJournal) -> Option<Vec<u8>> {
         .puts
         .get(&COLLECTION)
         .and_then(|nodes| nodes.get(&REUSED))
-        .map(|(bytes, _)| bytes.to_vec())
+        .map(|(bytes, _, _)| bytes.to_vec())
 }
 
 /// The quiet margin is what the fast path rests on: a change younger than it
@@ -133,7 +133,7 @@ fn same_file_appends_reuse_the_tail_descriptor() {
             .puts
             .get(&COLLECTION)
             .and_then(|nodes| nodes.get(&[0x04; 16]))
-            .map(|(bytes, _)| bytes.to_vec()),
+            .map(|(bytes, _, _)| bytes.to_vec()),
         Some(b"fourth".to_vec())
     );
 }
