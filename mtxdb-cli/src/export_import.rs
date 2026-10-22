@@ -20,8 +20,8 @@ use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::interop::{
     auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
     decode_auth_counter, decode_auth_forward, decode_event_locator, decode_import_marker,
-    encode_auth_forward, encode_edges, encode_event_locator, encode_import_marker, encode_verdict,
-    derive_id, event_locator_collection_id, event_record_id, event_verdict_collection_id,
+    derive_id, encode_auth_forward, encode_edges, encode_event_locator, encode_import_marker,
+    encode_verdict, event_locator_collection_id, event_record_id, event_verdict_collection_id,
     import_marker_collection_id, import_marker_node_id, room_auth_collection_id,
     room_event_collection_id, room_prev_collection_id, ImportMarker, Verdict, DATA_FORMAT,
     EDGE_POOL, EVENT_POOL, SERVER_INFO_POOL,
@@ -29,6 +29,7 @@ use mtxdb::interop::{
 use mtxdb::server_keys;
 use mtxdb::storage::StorageEngine as _;
 use mtxdb::{Database, NodeData};
+use rezzy::basespec::event_types::M_ROOM_CREATE;
 use rezzy::bitmap::Bitmap;
 use rezzy::json::Value as OwnedValue;
 
@@ -53,7 +54,7 @@ fn room_version_record(room_id: &str, events: &[RoomEvent]) -> anyhow::Result<Ve
     let version = events
         .iter()
         .find(|event| {
-            event.pdu.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
+            event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE)
                 && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
         })
         .and_then(|event| event.pdu.get("content"))
@@ -61,12 +62,66 @@ fn room_version_record(room_id: &str, events: &[RoomEvent]) -> anyhow::Result<Ve
         .and_then(OwnedValue::as_str)
         .ok_or_else(|| anyhow!("room {room_id} has no create-event room_version"))?;
     let room_len = u32::try_from(room_id.len()).context("room id is too long")?;
-    let mut record = Vec::with_capacity(8 + room_id.len() + version.len());
+    let capacity = 8usize
+        .saturating_add(room_id.len())
+        .saturating_add(version.len());
+    let mut record = Vec::with_capacity(capacity);
     record.extend_from_slice(ROOM_VERSION_MAGIC);
     record.extend_from_slice(&room_len.to_be_bytes());
     record.extend_from_slice(room_id.as_bytes());
     record.extend_from_slice(version.as_bytes());
     Ok(record)
+}
+
+/// Stage the room's immutable version record into `tx`, unless an identical
+/// one is already stored. Returns the bytes the record reserves in the batch
+/// budget.
+fn stage_room_version(
+    db: &Database,
+    tx: &mut mtxdb::DatabaseTransaction<'_>,
+    room_id: &str,
+    events: &[RoomEvent],
+    collection: [u8; 16],
+    node_id: [u8; 16],
+) -> anyhow::Result<usize> {
+    let record = room_version_record(room_id, events)?;
+    let (existing, collection_version) = db
+        .pool(SERVER_INFO_POOL)
+        .get_with_collection_version(&collection, &[node_id])
+        .context("reading room-version record")?;
+    match existing.into_iter().next().flatten() {
+        Some(existing) if existing.bytes.as_ref() == record.as_slice() => Ok(0),
+        Some(_) => bail!("room {room_id} has a conflicting immutable room-version record"),
+        None => {
+            tx.expect_collection_version(SERVER_INFO_POOL, collection, collection_version)
+                .context("guarding room-version record")?;
+            let staged = record.len().saturating_add(RECORD_OVERHEAD);
+            tx.put(SERVER_INFO_POOL, collection, node_id, &node(record))
+                .context("writing room-version record")?;
+            Ok(staged)
+        }
+    }
+}
+
+/// Refuse to overwrite a stored locator that names a different event.
+fn check_locator_collision(
+    tx: &mtxdb::DatabaseTransaction<'_>,
+    record: [u8; 16],
+    event_id: &str,
+) -> anyhow::Result<()> {
+    let collection = event_locator_collection_id(&record);
+    let existing = tx
+        .get(EVENT_POOL, &collection, &[record])?
+        .into_iter()
+        .next()
+        .flatten();
+    if let Some(existing) = existing {
+        let (stored, _) = decode_event_locator(&existing.bytes)?;
+        if stored != event_id.as_bytes() {
+            bail!("{event_id}: record id collides with a stored event; refusing to shadow it");
+        }
+    }
+    Ok(())
 }
 
 /// Whether the database holds a marker, and what it says.
@@ -312,7 +367,7 @@ pub(crate) fn auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings>
     }
 
     for (position, event) in events.iter().enumerate() {
-        let is_create = event.pdu.get("type").and_then(OwnedValue::as_str) == Some("m.room.create");
+        let is_create = event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE);
         if is_create && findings.forced[position].is_some() {
             bail!(
                 "refusing to import events for {}: its m.room.create event {} cannot be \
@@ -363,19 +418,6 @@ pub(crate) fn write_room_with_findings(
     let auth_collection = room_auth_collection_id(room);
     let version_collection = derive_id(ROOM_VERSION_DOMAIN, room);
     let version_node = derive_id(ROOM_VERSION_COLLECTION, ROOM_VERSION_NODE);
-    let version_record = room_version_record(&export.room_id, &export.events)?;
-    let (existing, version_collection_version) = db
-        .pool(SERVER_INFO_POOL)
-        .get_with_collection_version(&version_collection, &[version_node])
-        .context("reading room-version record")?;
-    let version_record = match existing.into_iter().next().flatten() {
-        Some(existing) if existing.bytes.as_ref() == version_record.as_slice() => None,
-        Some(_) => bail!(
-            "room {} has a conflicting immutable room-version record",
-            export.room_id
-        ),
-        None => Some(version_record),
-    };
 
     let mut written = 0_u64;
     let mut staged_bytes = 0_usize;
@@ -384,22 +426,14 @@ pub(crate) fn write_room_with_findings(
     // covered by reading the locator back through the transaction.
     let mut batch_ids: HashMap<[u8; 16], &str> = HashMap::new();
     let mut tx = db.begin_transaction();
-    if let Some(record) = version_record {
-        tx.expect_collection_version(
-            SERVER_INFO_POOL,
-            version_collection,
-            version_collection_version,
-        )
-        .context("guarding room-version record")?;
-        tx.put(
-            SERVER_INFO_POOL,
-            version_collection,
-            version_node,
-            &node(record.clone()),
-        )
-        .context("writing room-version record")?;
-        staged_bytes = record.len().saturating_add(RECORD_OVERHEAD);
-    }
+    staged_bytes = staged_bytes.saturating_add(stage_room_version(
+        db,
+        &mut tx,
+        &export.room_id,
+        &export.events,
+        version_collection,
+        version_node,
+    )?);
 
     for (position, event) in export.events.iter().enumerate() {
         let event_id = event.event_id.as_bytes();
@@ -437,20 +471,7 @@ pub(crate) fn write_room_with_findings(
             }
         }
         let locator_collection = event_locator_collection_id(&record);
-        let existing = tx
-            .get(EVENT_POOL, &locator_collection, &[record])?
-            .into_iter()
-            .next()
-            .flatten();
-        if let Some(existing) = existing {
-            let (stored, _) = decode_event_locator(&existing.bytes)?;
-            if stored != event_id {
-                bail!(
-                    "{}: record id collides with a stored event; refusing to shadow it",
-                    event.event_id
-                );
-            }
-        }
+        check_locator_collision(&tx, record, &event.event_id)?;
 
         tx.put(
             EVENT_POOL,
@@ -774,6 +795,15 @@ mod auth_findings_tests {
         };
         let mut fields = std::collections::BTreeMap::new();
         fields.insert("type".to_owned(), OwnedValue::String(kind.to_owned()));
+        if kind == M_ROOM_CREATE {
+            fields.insert("state_key".to_owned(), OwnedValue::String(String::new()));
+            let mut content = std::collections::BTreeMap::new();
+            content.insert(
+                "room_version".to_owned(),
+                OwnedValue::String("10".to_owned()),
+            );
+            fields.insert("content".to_owned(), OwnedValue::Object(content));
+        }
         RoomEvent {
             event_id: id.to_owned(),
             metadata: EventMetadata::default(),

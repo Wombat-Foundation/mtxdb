@@ -947,9 +947,7 @@ fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
     // resident; file RSS shows the released checkpoint mapping.
     match (rss_before_write, rss_after_write) {
         (Some((anon_before, file_before)), Some((anon_after, file_after))) => {
-            let delta = |after: u64, before: u64| {
-                (to_f64(after) - to_f64(before)) / 1_048_576.0
-            };
+            let delta = |after: u64, before: u64| (to_f64(after) - to_f64(before)) / 1_048_576.0;
             println!(
                 "    RSS across the first write: anonymous {:+.2} MiB, file-backed {:+.2} MiB \
                  (allocated private heap {:.2} MiB)",

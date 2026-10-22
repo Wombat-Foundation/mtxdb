@@ -337,7 +337,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "parking_lot",
- "rezzy-recon 0.6.0-rc.1 (git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev)",
+ "rezzy-recon",
  "sha2",
  "zstd",
  "zstd-sys",
@@ -410,31 +410,22 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/Wombat-Foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
 dependencies = [
  "base64",
  "blake3",
  "hashbrown",
  "rezzy-json",
- "rezzy-recon 0.6.0-rc.1 (git+https://gitlab.com/Wombat-Foundation/rezzy.git?branch=dev)",
+ "rezzy-recon",
  "sha2",
 ]
 
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/Wombat-Foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
 dependencies = [
  "ryu",
-]
-
-[[package]]
-name = "rezzy-recon"
-version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/Wombat-Foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
-dependencies = [
- "base64",
- "sha2",
 ]
 
 [[package]]
