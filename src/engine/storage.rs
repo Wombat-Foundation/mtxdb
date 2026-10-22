@@ -315,6 +315,35 @@ pub trait StorageEngine: Send + Sync {
         data: &NodeData,
     ) -> Result<(), StorageError>;
 
+    /// Store a record with three generic disposition bits attached to its
+    /// durable frame. A plain [`Self::put`] is equivalent to disposition zero.
+    /// Engines that do not persist frame dispositions may support only zero.
+    ///
+    /// # Errors
+    /// Returns an input error for values outside `0..=7`, or an unsupported
+    /// error when this engine cannot persist non-zero dispositions.
+    fn put_with_disposition(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        disposition: u8,
+    ) -> Result<(), StorageError> {
+        if disposition > crate::packfile::MAX_DISPOSITION {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "record disposition must fit in three bits",
+            )));
+        }
+        if disposition == 0 {
+            self.put(collection_id, id, data)
+        } else {
+            Err(StorageError::Unsupported(
+                "record dispositions are not supported by this storage engine".to_owned(),
+            ))
+        }
+    }
+
     /// Store multiple new nodes in a single batch within a collection.
     ///
     /// Returns the number of entries committed. A batch is **all-or-nothing**:
@@ -334,6 +363,36 @@ pub trait StorageEngine: Send + Sync {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
     ) -> Result<usize, StorageError>;
+
+    /// Batch form of [`Self::put_with_disposition`], with one disposition per
+    /// record. Implementations preserve the all-or-nothing contract of
+    /// [`Self::put_many`].
+    ///
+    /// # Errors
+    /// Returns an input error for values outside `0..=7`, or an unsupported
+    /// error when this engine cannot persist non-zero dispositions.
+    fn put_many_with_disposition(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData, u8)],
+    ) -> Result<usize, StorageError> {
+        let mut plain_entries = Vec::with_capacity(entries.len());
+        for (id, data, disposition) in entries {
+            if *disposition > crate::packfile::MAX_DISPOSITION {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "record disposition must fit in three bits",
+                )));
+            }
+            if *disposition != 0 {
+                return Err(StorageError::Unsupported(
+                    "record dispositions are not supported by this storage engine".to_owned(),
+                ));
+            }
+            plain_entries.push((*id, data.clone()));
+        }
+        self.put_many(collection_id, &plain_entries)
+    }
 
     /// Remove one record from a collection, returning whether it was present.
     /// Missing records are a no-op and return `false`.

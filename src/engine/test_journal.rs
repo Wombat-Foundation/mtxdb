@@ -3484,6 +3484,35 @@ fn a_removal_mutation_round_trips_through_encode_and_decode() {
 }
 
 #[test]
+fn a_put_with_disposition_round_trips_and_rejects_unknown_bits() {
+    let mutation = Mutation::PutWithDisposition {
+        collection_id: [0x11; 16],
+        node_id: [0x22; 16],
+        payload: b"payload".to_vec(),
+        disposition: 0b101,
+    };
+    let frame = framed(7, &mutation);
+    let entries = super::decode_mutations(&frame, 7, 1, 0).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].mutation, mutation);
+
+    let invalid = Mutation::PutWithDisposition {
+        collection_id: [0x11; 16],
+        node_id: [0x22; 16],
+        payload: b"payload".to_vec(),
+        disposition: 0b1000,
+    };
+    let error = super::encode_mutation(
+        7,
+        crate::layout::ShardType::State,
+        &invalid,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
 fn a_checksummed_frame_with_an_unknown_kind_is_rejected_not_skipped() {
     let frame = with_kind_and_valid_crc(framed(7, &removal(0x11, 0x22)), 9);
     let error = super::decode_mutations(&frame, 7, 1, 0).unwrap_err();

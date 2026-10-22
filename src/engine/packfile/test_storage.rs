@@ -10833,7 +10833,7 @@ fn a_rebuild_insert_into_a_full_table_fails_instead_of_dropping_the_record() {
         let mut hash = [0u8; 16];
         hash[..8].copy_from_slice(&seq.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
         hash[8..].copy_from_slice(&seq.to_be_bytes());
-        match insert_or_corrupt(&index, &hash, 0, 64 + seq) {
+        match insert_or_corrupt_with_flags(&index, &hash, 0, 64 + seq, false, 0) {
             Ok(()) => seq += 1,
             Err(error) => break error,
         }
@@ -10916,6 +10916,7 @@ fn init_collection_from_scan_fails_closed_when_the_table_rejects_an_insert() {
                     offset,
                     PackId([0u8; crate::packfile::PACK_ID_LEN]),
                     false,
+                    0,
                 ));
             }
         }
@@ -10999,8 +11000,8 @@ fn two_slots_for(store: &PackfileStorage, collection: &[u8; 16], hash: &NodeId) 
         .scan_collection_records(collection)
         .unwrap()
         .into_iter()
-        .filter(|(_, entry, _, _, _)| entry == hash)
-        .map(|(slot, _, _, _, _)| slot)
+        .filter(|(_, entry, _, _, _, _)| entry == hash)
+        .map(|(slot, _, _, _, _, _)| slot)
         .collect();
     slots.sort_unstable();
     assert!(slots.len() >= 2, "the key needs frames in two packs");
@@ -11071,21 +11072,21 @@ fn open_time_rebuild_picks_the_marker_when_it_sits_in_a_lower_slot() {
     // The scan visits the lower slot (the marker) before the higher (the value).
     let marker_pos = records
         .iter()
-        .position(|(slot, hash, _, _, _)| *hash == victim && *slot == marker_slot)
+        .position(|(slot, hash, _, _, _, _)| *hash == victim && *slot == marker_slot)
         .unwrap();
     let value_pos = records
         .iter()
-        .position(|(slot, hash, _, _, _)| *hash == victim && *slot == value_slot)
+        .position(|(slot, hash, _, _, _, _)| *hash == victim && *slot == value_slot)
         .unwrap();
     assert!(marker_pos < value_pos, "the layout must be misordered");
 
     let latest = PackfileStorage::latest_records_for_collection(&records, &store.shards).unwrap();
     let chosen: Vec<_> = latest
         .iter()
-        .filter(|(_, hash, _, _, _)| *hash == victim)
+        .filter(|(_, hash, _, _, _, _)| *hash == victim)
         .collect();
     assert_eq!(chosen.len(), 1, "one frame per key");
-    let (slot, _, offset, _, _) = *chosen[0];
+    let (slot, _, offset, _, _, _) = *chosen[0];
     assert!(
         frame_is_removed(&store, slot, offset),
         "the newest frame is the removal marker, whatever the slot order"

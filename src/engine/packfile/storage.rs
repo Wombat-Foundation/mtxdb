@@ -967,7 +967,8 @@ type RepackScanResult = (
 
 /// One scanned record's `(slot, hash, offset, pack_id)`, as accumulated per
 /// collection during `PackfileStorage::open_with_options`'s initial scan.
-type ShardRecord = (u16, [u8; 16], u64, PackId, bool);
+/// `(shard slot, hash, in-shard offset, pack id, removed, disposition)`.
+type ShardRecord = (u16, [u8; 16], u64, PackId, bool, u8);
 /// `(collection_id, entry count, index memory usage in bytes, index capacity)`.
 pub type CollectionSummary = ([u8; 16], usize, usize, u32);
 
@@ -1308,17 +1309,6 @@ fn plan_read_extents(
     extents
 }
 
-/// Insert into a freshly built or grown index, failing the operation instead of
-/// publishing an index that silently lacks the record.
-fn insert_or_corrupt(
-    index: &LossyIndex,
-    hash: &[u8; 16],
-    slot: u16,
-    offset: u64,
-) -> Result<(), StorageError> {
-    insert_or_corrupt_with_removed(index, hash, slot, offset, false)
-}
-
 fn insert_or_corrupt_with_removed(
     index: &LossyIndex,
     hash: &[u8; 16],
@@ -1328,6 +1318,24 @@ fn insert_or_corrupt_with_removed(
 ) -> Result<(), StorageError> {
     index
         .insert_tracked_with_removed(hash, slot, offset, removed)
+        .map(|_| ())
+        .map_err(|error| {
+            StorageError::Corrupt(format!(
+                "index insert failed for the record at offset {offset} in shard {slot}: {error}"
+            ))
+        })
+}
+
+fn insert_or_corrupt_with_flags(
+    index: &LossyIndex,
+    hash: &[u8; 16],
+    slot: u16,
+    offset: u64,
+    removed: bool,
+    flags: u8,
+) -> Result<(), StorageError> {
+    index
+        .insert_tracked_with_flags(hash, slot, offset, removed, flags)
         .map(|_| ())
         .map_err(|error| {
             StorageError::Corrupt(format!(
@@ -2706,6 +2714,7 @@ impl PackfileStorage {
                     offset,
                     shard_pack_id,
                     removed,
+                    entry.disposition,
                 ));
             }
         }
@@ -2779,7 +2788,7 @@ impl PackfileStorage {
             Ok(seq)
         };
         let mut latest_records: HashMap<[u8; 16], (ShardRecord, (u32, u64))> = HashMap::new();
-        for record @ (slot, hash, offset, _, _) in records {
+        for record @ (slot, hash, offset, _, _, _) in records {
             let position = (order_of(*slot)?, *offset);
             let replace = latest_records
                 .get(hash)
@@ -2789,7 +2798,7 @@ impl PackfileStorage {
             }
         }
         let mut latest: Vec<(ShardRecord, (u32, u64))> = latest_records.into_values().collect();
-        latest.sort_unstable_by_key(|((_, hash, _, _, _), position)| (*position, *hash));
+        latest.sort_unstable_by_key(|((_, hash, _, _, _, _), position)| (*position, *hash));
         Ok(latest.into_iter().map(|(record, _)| record).collect())
     }
 
@@ -2807,7 +2816,7 @@ impl PackfileStorage {
         out: &mut RoomScanOutput,
     ) -> Result<(), StorageError> {
         let index_records = Self::latest_records_for_collection(records, shards)?;
-        if let Some((last_slot, _, _, _, _)) = index_records.last() {
+        if let Some((last_slot, _, _, _, _, _)) = index_records.last() {
             shards.set_collection_home(collection_id, *last_slot);
         }
         let index = LossyIndex::with_config(
@@ -2819,9 +2828,11 @@ impl PackfileStorage {
         );
         let mut failed = 0usize;
         let mut first_failure: Option<(u64, InsertError)> = None;
-        for (slot, hash, offset, _pack_id, removed) in &index_records {
+        for (slot, hash, offset, _pack_id, removed, disposition) in &index_records {
             check_index_offset(*slot, hash, *offset)?;
-            if let Err(error) = index.insert_tracked_with_removed(hash, *slot, *offset, *removed) {
+            if let Err(error) =
+                index.insert_tracked_with_flags(hash, *slot, *offset, *removed, *disposition)
+            {
                 failed = failed.saturating_add(1);
                 first_failure.get_or_insert((*offset, error));
             }
@@ -2834,7 +2845,7 @@ impl PackfileStorage {
                 index.len(),
             )));
         }
-        for (slot, _hash, offset, pack_id, _) in records {
+        for (slot, _hash, offset, pack_id, _, _) in records {
             let shard = shards
                 .get_shard(*slot)
                 .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?;
@@ -2852,7 +2863,7 @@ impl PackfileStorage {
         // Build slot→pack_id lookup from the records for this collection.
         let slot_to_pack_id: HashMap<u16, PackId> = records
             .iter()
-            .map(|(slot, _, _, pack_id, _)| (*slot, *pack_id))
+            .map(|(slot, _, _, pack_id, _, _)| (*slot, *pack_id))
             .collect();
 
         for (&slot, &count) in &counts {
@@ -4739,7 +4750,14 @@ impl PackfileStorage {
                 self.shards.checksum_policy().verifies_reads(),
             )? {
                 if entry.collection_id == *collection_id {
-                    scanned.push((slot, entry.hash, entry.offset, shard.pack_id, entry.removed));
+                    scanned.push((
+                        slot,
+                        entry.hash,
+                        entry.offset,
+                        shard.pack_id,
+                        entry.removed,
+                        entry.disposition,
+                    ));
                 }
             }
         }
@@ -6836,12 +6854,12 @@ impl PackfileStorage {
                 .max(NEW_COLLECTION_INDEX_FLOOR),
             self.index_config,
         );
-        for (slot, hash, offset, _, removed) in latest {
+        for (slot, hash, offset, _, removed, disposition) in latest {
             // `IndexEntry` can only represent offsets up to
             // `PACK_INDEX_OFFSET_LIMIT`. Offsets an externally created
             // oversized shard are rejected rather than silently skipped.
             check_index_offset(slot, &hash, offset)?;
-            insert_or_corrupt_with_removed(&index, &hash, slot, offset, removed)?;
+            insert_or_corrupt_with_flags(&index, &hash, slot, offset, removed, disposition)?;
         }
         Ok(index)
     }
@@ -6885,19 +6903,7 @@ impl PackfileStorage {
     /// remaining hash bits. On the rare same-tag probe, recover that frame's
     /// metadata, hydrate the in-memory slot, and retry. Active indexes carry
     /// their identities already, so their ordinary inserts take no I/O path.
-    fn insert_index(
-        &self,
-        collection_id: &[u8; 16],
-        index: &LossyIndex,
-        hash: &NodeId,
-        slot: u16,
-        offset: u64,
-        removed: bool,
-    ) -> Result<Result<(u32, u64, bool), InsertError>, StorageError> {
-        self.insert_index_with_flags(collection_id, index, hash, slot, offset, removed, 0)
-    }
-
-    /// As [`Self::insert_index`], storing `flags` in the slot's disposition
+    /// Insert while storing `flags` in the slot's disposition
     /// bits so a point check can read them without a frame access.
     #[allow(clippy::too_many_arguments)]
     fn insert_index_with_flags(
@@ -6923,21 +6929,9 @@ impl PackfileStorage {
             .map(|(bucket, slot, undo)| (bucket, slot, undo.was_empty())))
     }
 
-    /// Like [`Self::insert_index`], but also returns the [`EntryUndo`]
+    /// Like [`Self::insert_index_with_flags`], but also returns the [`EntryUndo`]
     /// needed to reverse this one write, for callers mutating a still-live
     /// (not cloned) index across a multi-record batch.
-    fn insert_index_undoable(
-        &self,
-        collection_id: &[u8; 16],
-        index: &LossyIndex,
-        hash: &NodeId,
-        slot: u16,
-        offset: u64,
-        removed: bool,
-    ) -> Result<Result<(u32, u64, EntryUndo), InsertError>, StorageError> {
-        self.insert_index_undoable_with_flags(collection_id, index, hash, slot, offset, removed, 0)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn insert_index_undoable_with_flags(
         &self,
@@ -8797,19 +8791,34 @@ impl PackfileStorage {
 }
 
 impl PackfileStorage {
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn append_put_many_entry(
         &self,
         collection_id: &[u8; 16],
         id: &NodeId,
         data: &NodeData,
         metadata: Option<FrameMetadata>,
+        disposition: u8,
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
-        let receipt_lsn = self.publish_mutation(|| JournalMutation::Put {
-            collection_id: *collection_id,
-            node_id: *id,
-            payload: data.bytes.to_vec(),
+        let payload = data.bytes.to_vec();
+        let receipt_lsn = self.publish_mutation(|| {
+            if disposition == 0 {
+                JournalMutation::Put {
+                    collection_id: *collection_id,
+                    node_id: *id,
+                    payload,
+                }
+            } else {
+                JournalMutation::PutWithDisposition {
+                    collection_id: *collection_id,
+                    node_id: *id,
+                    payload,
+                    disposition,
+                }
+            }
         })?;
         let metadata = Self::stamp_last_write_lsn(metadata, receipt_lsn);
         let record = Record {
@@ -8818,7 +8827,9 @@ impl PackfileStorage {
             data: data.bytes.clone(),
             metadata,
         };
-        let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
+        let (slot, offset, disk_bytes) = self
+            .shards
+            .put_record_with_len_with_disposition(&record, disposition)?;
         progress.pending_materialized.push(receipt_lsn);
         if let Some(shard) = self.shards.get_shard(slot) {
             progress
@@ -8833,7 +8844,7 @@ impl PackfileStorage {
             offset,
             len: disk_bytes,
         };
-        self.index_put_many_entry(collection_id, id, old_gen, locator, progress)
+        self.index_put_many_entry(collection_id, id, old_gen, locator, disposition, progress)
     }
 
     fn index_put_many_entry(
@@ -8842,6 +8853,7 @@ impl PackfileStorage {
         id: &NodeId,
         old_gen: Option<&RoomGeneration>,
         locator: RecordLocator,
+        flags: u8,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
         let RecordLocator {
@@ -8857,8 +8869,15 @@ impl PackfileStorage {
                     .index
             }
         };
-        let insert_result =
-            self.insert_index_undoable(collection_id, live, id, slot, offset, false)?;
+        let insert_result = self.insert_index_undoable_with_flags(
+            collection_id,
+            live,
+            id,
+            slot,
+            offset,
+            false,
+            flags,
+        )?;
         let inserted = if let Ok((_bucket, _entry, undo)) = insert_result {
             let was_empty = undo.was_empty();
             progress
@@ -8897,7 +8916,7 @@ impl PackfileStorage {
                 u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            insert_or_corrupt(&grown, id, slot, offset)?;
+            insert_or_corrupt_with_flags(&grown, id, slot, offset, false, flags)?;
             progress.owned_index = Some(grown);
             true
         };
@@ -9093,12 +9112,25 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
         metadatas: Option<&[Option<FrameMetadata>]>,
+        dispositions: Option<&[u8]>,
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
         for (index, (id, data)) in entries.iter().enumerate() {
             let metadata = metadatas.and_then(|m| m.get(index)).cloned().flatten();
-            self.append_put_many_entry(collection_id, id, data, metadata, old_gen, progress)?;
+            let disposition = dispositions
+                .and_then(|values| values.get(index))
+                .copied()
+                .unwrap_or(0);
+            self.append_put_many_entry(
+                collection_id,
+                id,
+                data,
+                metadata,
+                disposition,
+                old_gen,
+                progress,
+            )?;
         }
 
         if progress.index_needs_rebuild {
@@ -9215,6 +9247,8 @@ impl PackfileStorage {
         self.put_internal_locked_with_disposition(collection_id, id, data, metadata, disposition)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn recover_index_after_failed_insert(
         &self,
         collection_id: &[u8; 16],
@@ -9223,24 +9257,25 @@ impl PackfileStorage {
         locator: RecordLocator,
         mut index: LossyIndex,
         removed: bool,
+        flags: u8,
     ) -> Result<LossyIndex, StorageError> {
         let RecordLocator { slot, offset, len } = locator;
         // Growth changes table shape, not logical redo semantics. Log the
         // boundary write as usual; replay will grow the table itself.
         if let Some(grown) = index.grow() {
-            insert_or_corrupt_with_removed(&grown, id, slot, offset, removed)?;
+            insert_or_corrupt_with_flags(&grown, id, slot, offset, removed, flags)?;
             index = grown;
             self.record_redo(collection_id, generation, id, locator, removed);
         } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
             // Recovering checkpoint identities is bounded by this collection,
             // unlike rebuilding it from all pack records.
-            insert_or_corrupt_with_removed(&grown, id, slot, offset, removed)?;
+            insert_or_corrupt_with_flags(&grown, id, slot, offset, removed, flags)?;
             index = grown;
             self.record_redo(collection_id, generation, id, locator, removed);
         } else {
             self.invalidate_delta_log(collection_id);
             index = self.rebuild_index(collection_id)?;
-            insert_or_corrupt_with_removed(&index, id, slot, offset, removed)?;
+            insert_or_corrupt_with_flags(&index, id, slot, offset, removed, flags)?;
         }
 
         // A rebuild re-derives shard distribution. The just-appended frame's
@@ -9264,6 +9299,8 @@ impl PackfileStorage {
         self.put_internal_locked_with_disposition(collection_id, id, data, metadata, 0)
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     fn put_internal_locked_with_disposition(
         &self,
         collection_id: &[u8; 16],
@@ -9346,7 +9383,15 @@ impl PackfileStorage {
                 // index's own smaller hard floor.
                 None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
             };
-            let inserted = self.insert_index(collection_id, &index, id, slot, offset, removed)?;
+            let inserted = self.insert_index_with_flags(
+                collection_id,
+                &index,
+                id,
+                slot,
+                offset,
+                removed,
+                disposition,
+            )?;
             if let Ok((_bucket, _entry, is_new)) = inserted {
                 self.record_redo(
                     collection_id,
@@ -9377,6 +9422,7 @@ impl PackfileStorage {
                     },
                     index,
                     removed,
+                    disposition,
                 )?;
             }
             let cache = match &old_gen {
@@ -9434,10 +9480,25 @@ impl PackfileStorage {
         entries: &[(NodeId, NodeData)],
         metadatas: Option<&[Option<FrameMetadata>]>,
     ) -> Result<usize, StorageError> {
+        self.put_many_internal_with_dispositions(collection_id, entries, metadatas, None)
+    }
+
+    fn put_many_internal_with_dispositions(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+        metadatas: Option<&[Option<FrameMetadata>]>,
+        dispositions: Option<&[u8]>,
+    ) -> Result<usize, StorageError> {
         let _snapshot_gate = self.read_snapshot_gate.lock();
         let collection_arc = self.put_mutex(collection_id);
         let _collection_guard = collection_arc.lock();
-        let written = self.put_many_internal_locked(collection_id, entries, metadatas)?;
+        let written = self.put_many_internal_locked_with_dispositions(
+            collection_id,
+            entries,
+            metadatas,
+            dispositions,
+        )?;
         if written > 0 {
             self.put_many_calls.fetch_add(1, Ordering::Relaxed);
             self.put_many_records
@@ -9459,12 +9520,39 @@ impl PackfileStorage {
         entries: &[(NodeId, NodeData)],
         metadatas: Option<&[Option<FrameMetadata>]>,
     ) -> Result<usize, StorageError> {
+        self.put_many_internal_locked_with_dispositions(collection_id, entries, metadatas, None)
+    }
+
+    fn put_many_internal_locked_with_dispositions(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+        metadatas: Option<&[Option<FrameMetadata>]>,
+        dispositions: Option<&[u8]>,
+    ) -> Result<usize, StorageError> {
         if let Some(metadatas) = metadatas {
             debug_assert_eq!(
                 metadatas.len(),
                 entries.len(),
                 "per-entry metadata must align with entries"
             );
+        }
+        if let Some(dispositions) = dispositions {
+            if dispositions.len() != entries.len() {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "per-record disposition count must match entries",
+                )));
+            }
+            if dispositions
+                .iter()
+                .any(|value| *value > packfile::MAX_DISPOSITION)
+            {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "record disposition must fit in three bits",
+                )));
+            }
         }
         if !Self::validate_put_many_inputs(collection_id, entries)? {
             return Ok(0);
@@ -9509,6 +9597,7 @@ impl PackfileStorage {
             collection_id,
             entries,
             metadatas,
+            dispositions,
             old_gen.as_deref().map(|generation| &**generation),
             &mut progress,
         ) {
@@ -10012,6 +10101,27 @@ impl StorageEngine for PackfileStorage {
         self.put_internal(collection_id, id, data, None)
     }
 
+    fn put_with_disposition(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+        disposition: u8,
+    ) -> Result<(), StorageError> {
+        if disposition > packfile::MAX_DISPOSITION {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "record disposition must fit in three bits",
+            )));
+        }
+        let _latency = if self.stats_enabled.load(Ordering::Relaxed) {
+            OperationTimer::new(&self.operation_timings.put)
+        } else {
+            OperationTimer::disabled()
+        };
+        self.put_internal_with_disposition(collection_id, id, data, None, disposition)
+    }
+
     fn put_many(
         &self,
         collection_id: &[u8; 16],
@@ -10023,6 +10133,38 @@ impl StorageEngine for PackfileStorage {
             OperationTimer::disabled()
         };
         self.put_many_internal(collection_id, entries, None)
+    }
+
+    fn put_many_with_disposition(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData, u8)],
+    ) -> Result<usize, StorageError> {
+        let _latency = if self.stats_enabled.load(Ordering::Relaxed) {
+            OperationTimer::new(&self.operation_timings.put_many)
+        } else {
+            OperationTimer::disabled()
+        };
+        if entries
+            .iter()
+            .any(|(_, _, disposition)| *disposition > packfile::MAX_DISPOSITION)
+        {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "record disposition must fit in three bits",
+            )));
+        }
+        let plain_entries: Vec<_> = entries
+            .iter()
+            .map(|(id, data, _)| (*id, data.clone()))
+            .collect();
+        let dispositions: Vec<_> = entries.iter().map(|(_, _, flags)| *flags).collect();
+        self.put_many_internal_with_dispositions(
+            collection_id,
+            &plain_entries,
+            None,
+            Some(&dispositions),
+        )
     }
 
     fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError> {
