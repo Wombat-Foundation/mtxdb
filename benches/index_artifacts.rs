@@ -913,6 +913,28 @@ fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
         heap_bytes,
         mapped_bytes,
     );
+
+    // The first mutation materializes mmap-backed slots and initializes the
+    // identity tables. Updating an existing id keeps the pack's record count
+    // unchanged while measuring that representation transition.
+    let first_id = entries.first().expect("benchmark pack has records").1;
+    let first_write = [(first_id, NodeData::from_slice(&[0xA5; 16]))];
+    let ((), write_time) = timed(|| {
+        reopened
+            .put_many(&COLLECTION, &first_write)
+            .expect("first write after checkpoint reopen");
+    });
+    let (written_records, heap_bytes, mapped_bytes, capacity) = reopened
+        .collection_index_residency(&COLLECTION)
+        .expect("written collection index");
+    println!("  first write after reopen: {:.1} ms", ms(write_time));
+    report_lossy_index(
+        "after reopen + one overwrite",
+        written_records,
+        capacity,
+        heap_bytes,
+        mapped_bytes,
+    );
 }
 
 fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
@@ -949,8 +971,6 @@ fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
 
     let entries = scan_and_recover_packfile(&pack).expect("scan");
     assert_eq!(entries.len() as u64, records, "scan saw every record");
-    report_lossy_index_cases(&dir, &entries);
-
     let (
         pack_index_path,
         pack_index_identity,
@@ -992,7 +1012,6 @@ fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
     );
     drop(idx_bytes);
     let manifest_len = pack_len;
-    drop(entries);
     let idx = load_idx(&idx_path);
 
     for cold in [false, true] {
@@ -1003,6 +1022,7 @@ fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
             measure_warm_lookups(&dir, &pack, &idx_path, &idx, records, lookups);
         }
     }
+    report_lossy_index_cases(&dir, &entries);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
