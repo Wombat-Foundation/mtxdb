@@ -900,7 +900,6 @@ fn post_repack_delta_epoch_replays_for_a_cold_reader() {
 
     let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
     reader.enable_read_journal(&wal).unwrap();
-
     let timings = reader
         .stats()
         .last_open_timings
@@ -4108,6 +4107,102 @@ fn full_scan_rebuild_keeps_latest_cross_shard_tombstone() {
         "lookup_removed must report the key as already removed"
     );
     drop(rebuilt);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn slots_only_reopen_resolves_removed_state_from_the_frame() {
+    let dir = test_dir("slots_only_lookup_removed");
+    let collection = [0xA8; 16];
+    let id = distinct_id(252);
+    {
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.set_checkpoint_slots_only(true);
+        store
+            .put(&collection, &id, &NodeData::from_slice(b"value"))
+            .unwrap();
+        assert!(store.remove(&collection, &id).unwrap());
+        store.sync_all().unwrap();
+    }
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let generation = reopened.generation(&collection).unwrap();
+    assert_eq!(
+        generation.index.lookup_removed(&id),
+        None,
+        "the slots-only index cannot prove identity before hydration"
+    );
+    assert_eq!(
+        reopened.durable_removed(&collection, &id).unwrap(),
+        Some(true),
+        "the storage fallback verifies the full key and removal bit in the frame header"
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn collection_len_overlay_handles_slots_only_tombstone_put_and_remove() {
+    let dir = test_dir("collection_len_slots_only_overlay_tombstone");
+    let wal = dir.join("wal.bin");
+    let collection = [0xA9; 16];
+    let tombstoned = distinct_id(250);
+    let live = distinct_id(251);
+    {
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store.set_checkpoint_slots_only(true);
+        store
+            .put(&collection, &tombstoned, &NodeData::from_slice(b"old"))
+            .unwrap();
+        assert!(store.remove(&collection, &tombstoned).unwrap());
+        store
+            .put(&collection, &live, &NodeData::from_slice(b"live"))
+            .unwrap();
+        store.sync_all().unwrap();
+    }
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[JournalMutation::Put {
+            collection_id: collection,
+            node_id: tombstoned,
+            payload: b"resurrected".to_vec(),
+        }])
+        .unwrap();
+    let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+    reader.enable_read_journal(&wal).unwrap();
+    assert_eq!(
+        reader.durable_removed(&collection, &tombstoned).unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        reader.generation(&collection).unwrap().index.live_count(),
+        1
+    );
+    assert_eq!(
+        reader
+            .get_read_committed(&collection, &[tombstoned])
+            .unwrap()[0]
+            .as_ref()
+            .map(|data| data.bytes.as_ref()),
+        Some(&b"resurrected"[..])
+    );
+    assert_eq!(reader.collection_len(&collection).unwrap(), Some(2));
+
+    journal
+        .append_group(&[JournalMutation::RemoveRecord {
+            collection_id: collection,
+            node_id: tombstoned,
+        }])
+        .unwrap();
+    assert_eq!(
+        reader.collection_len(&collection).unwrap(),
+        Some(1),
+        "overlay removal of an already-tombstoned durable key must not subtract twice"
+    );
+
+    drop(reader);
+    drop(journal);
     fs::remove_dir_all(dir).ok();
 }
 

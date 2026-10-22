@@ -125,6 +125,56 @@ fn put_range(store: &PackfileStorage, start: u64, count: u64) -> Duration {
     started.elapsed()
 }
 
+fn put_strided(store: &PackfileStorage, total_records: u64, count: u64) -> Duration {
+    assert!(
+        total_records > 0,
+        "strided writes need a non-empty key range"
+    );
+    let started = Instant::now();
+    let stride = spread_stride(total_records);
+    let mut done = 0u64;
+    while done < count {
+        let n = (count - done).min(BATCH);
+        let entries: Vec<([u8; 16], NodeData)> = (done..done + n)
+            .map(|i| {
+                let seq = i.wrapping_mul(stride) % total_records;
+                (
+                    id_for(seq),
+                    NodeData::from_slice(&payload(seq.wrapping_add(1))),
+                )
+            })
+            .collect();
+        store.put_many(&COLLECTION, &entries).unwrap();
+        done += n;
+    }
+    started.elapsed()
+}
+
+/// Pick a stride coprime to the record count so samples cover the full range.
+fn spread_stride(total_records: u64) -> u64 {
+    if total_records <= 1 {
+        return 1;
+    }
+    let mut stride = 199_999 % total_records;
+    if stride == 0 {
+        stride = 1;
+    }
+    while gcd(stride, total_records) != 1 {
+        stride = (stride + 1) % total_records;
+        if stride == 0 {
+            stride = 1;
+        }
+    }
+    stride
+}
+
+fn gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
 fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let running = Arc::new(AtomicBool::new(true));
     let peak = Arc::new(AtomicU64::new(rss_bytes()));
@@ -379,18 +429,19 @@ fn run_cold_rewrite(dir: &Path, records: u64, slots_only: bool) {
     );
 
     let before = reopened.stats().index_identity_reads;
-    let first = put_range(&reopened, 0, 20_000);
+    let first = put_strided(&reopened, records, 20_000);
     let first_reads = reopened.stats().index_identity_reads - before;
     let before = reopened.stats().index_identity_reads;
-    let second = put_range(&reopened, 0, 20_000);
+    let second = put_strided(&reopened, records, 20_000);
     let second_reads = reopened.stats().index_identity_reads - before;
     println!(
-        "[{label}] rewrite 20k: first {:.1} ms ({:.3} us/rec) identity_reads={first_reads}; second {:.1} ms ({:.3} us/rec) identity_reads={second_reads}",
+        "[{label}] strided rewrite 20k across {records} keys: first {:.1} ms ({:.3} us/rec) identity_reads={first_reads}; second {:.1} ms ({:.3} us/rec) identity_reads={second_reads}",
         first.as_secs_f64() * 1e3,
         first.as_secs_f64() * 1e6 / 20_000.0,
         second.as_secs_f64() * 1e3,
         second.as_secs_f64() * 1e6 / 20_000.0,
     );
+
     drop(reopened);
     let _ = std::fs::remove_dir_all(dir);
 }

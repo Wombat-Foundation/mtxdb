@@ -2552,6 +2552,8 @@ impl ShardPool {
     /// that needs to grow: its slots retain locations but not full hashes.
     /// It validates the frame's structural bounds but intentionally neither
     /// copies nor decompresses the payload (nor walks it to calculate CRC).
+    /// The returned flag is the frame's explicit removal marker, so callers
+    /// can resolve tombstone state without a second header read.
     ///
     /// # Errors
     /// Returns [`crate::storage::StorageError::Corrupt`] for malformed frames
@@ -2565,7 +2567,7 @@ impl ShardPool {
         &self,
         shard: &Arc<Shard>,
         offset: u64,
-    ) -> Result<([u8; 16], [u8; 16]), crate::storage::StorageError> {
+    ) -> Result<([u8; 16], [u8; 16], bool), crate::storage::StorageError> {
         use crate::storage::StorageError;
         if offset >= shard.file_len() {
             self.flush_shard(shard).map_err(StorageError::Io)?;
@@ -2641,7 +2643,8 @@ impl ShardPool {
             collection_id.copy_from_slice(&mem[metadata_start..collection_end]);
             let mut hash = [0; 16];
             hash.copy_from_slice(&mem[collection_end..metadata_end]);
-            return Ok((collection_id, hash));
+            let removed = flags & packfile::FLAG_REMOVED != 0;
+            return Ok((collection_id, hash, removed));
         }
         unreachable!("record_identity_at remap-retry is bounded to two iterations")
     }

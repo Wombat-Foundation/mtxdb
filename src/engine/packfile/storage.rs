@@ -967,13 +967,13 @@ type RepackScanResult = (
 
 /// One scanned record's `(slot, hash, offset, pack_id)`, as accumulated per
 /// collection during `PackfileStorage::open_with_options`'s initial scan.
+#[cfg(test)]
 type ShardRecord = (u16, [u8; 16], u64, PackId, bool);
 /// `(collection_id, entry count, index memory usage in bytes, index capacity)`.
 pub type CollectionSummary = ([u8; 16], usize, usize, u32);
 
-/// Accumulator for `PackfileStorage::open_with_options`'s phase 2 —
-/// bundles the three maps `init_collection_from_scan` fills in per collection, so
-/// that function takes one out-parameter instead of three.
+/// Accumulator for the collection generations and shard accounting assembled
+/// after either a checkpoint load or a full scan.
 #[derive(Default)]
 struct RoomScanOutput {
     collections: HashMap<[u8; 16], ArcSwap<RoomGeneration>>,
@@ -986,6 +986,130 @@ struct RoomScanOutput {
     /// The physical scan needed to rebuild the sidecar's byte metrics failed.
     /// Do not allow a sidecar containing zero-byte fallbacks to be persisted.
     sidecar_recovery_failed: bool,
+}
+
+/// State accumulated by the checkpoint-less open path. It retains each
+/// collection's current index and byte counters, but never stores a vector of
+/// every physical frame.
+struct StreamingOpenScan {
+    indexes: HashMap<[u8; 16], LossyIndex>,
+    collection_order: Vec<[u8; 16]>,
+    known_collections: HashSet<[u8; 16]>,
+    seen_collections: HashSet<[u8; 16]>,
+    collection_home: HashMap<[u8; 16], u16>,
+    collection_disk_bytes: HashMap<PackId, HashMap<[u8; 16], u64>>,
+}
+
+impl StreamingOpenScan {
+    fn new(collection_order: Vec<[u8; 16]>) -> Self {
+        let known_collections = collection_order.iter().copied().collect();
+        Self {
+            indexes: HashMap::new(),
+            collection_order,
+            known_collections,
+            seen_collections: HashSet::new(),
+            collection_home: HashMap::new(),
+            collection_disk_bytes: HashMap::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        entry: packfile::ScanEntryWithRemoval,
+        slot: u16,
+        pack_id: PackId,
+        deleted_collections: &HashSet<[u8; 16]>,
+        index_config: crate::index::IndexConfig,
+    ) -> Result<(), StorageError> {
+        let collection_id = entry.collection_id;
+        self.seen_collections.insert(collection_id);
+        if self.known_collections.insert(collection_id) {
+            self.collection_order.push(collection_id);
+        }
+        if deleted_collections.contains(&collection_id) {
+            return Ok(());
+        }
+
+        let bytes = self
+            .collection_disk_bytes
+            .entry(pack_id)
+            .or_default()
+            .entry(collection_id)
+            .or_default();
+        *bytes = bytes.saturating_add(entry.disk_bytes);
+        self.collection_home.insert(collection_id, slot);
+
+        let index = self
+            .indexes
+            .entry(collection_id)
+            .or_insert_with(|| LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, index_config));
+        check_index_offset(slot, &entry.hash, entry.offset)?;
+        loop {
+            match index.insert_tracked_with_removed(&entry.hash, slot, entry.offset, entry.removed)
+            {
+                Ok(_) => return Ok(()),
+                Err(InsertError::TableFull) => {
+                    *index = index.grow().ok_or_else(|| {
+                        StorageError::Corrupt(format!(
+                            "index insert failed for the record at offset {} in shard {slot}: table cannot grow",
+                            entry.offset
+                        ))
+                    })?;
+                }
+                Err(error) => {
+                    return Err(StorageError::Corrupt(format!(
+                        "index insert failed for the record at offset {} in shard {slot}: {error}",
+                        entry.offset
+                    )));
+                }
+            }
+        }
+    }
+
+    fn finish(
+        mut self,
+        shards: &ShardPool,
+        cache_capacity: usize,
+    ) -> (RoomScanOutput, Vec<[u8; 16]>) {
+        self.collection_order
+            .retain(|collection_id| self.seen_collections.contains(collection_id));
+        let slot_to_pack_id: HashMap<u16, PackId> = shards
+            .all_shards()
+            .into_iter()
+            .map(|(slot, shard)| (slot, shard.pack_id))
+            .collect();
+        let mut out = RoomScanOutput {
+            collection_disk_bytes: self.collection_disk_bytes,
+            ..RoomScanOutput::default()
+        };
+        for (collection_id, index) in self.indexes {
+            if let Some(&home) = self.collection_home.get(&collection_id) {
+                shards.set_collection_home(&collection_id, home);
+            }
+            for (slot, count) in index.slot_counts() {
+                let Some(&pack_id) = slot_to_pack_id.get(&slot) else {
+                    continue;
+                };
+                out.shard_collections
+                    .entry(pack_id)
+                    .or_default()
+                    .insert(collection_id, count);
+                out.collection_shards
+                    .entry(collection_id)
+                    .or_default()
+                    .insert(pack_id);
+            }
+            out.collections.insert(
+                collection_id,
+                ArcSwap::from_pointee(RoomGeneration {
+                    index,
+                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                    generation: 1,
+                }),
+            );
+        }
+        (out, self.collection_order)
+    }
 }
 
 /// Per-pack, per-collection on-disk bytes as `physical_layout` reports them
@@ -2582,16 +2706,14 @@ impl PackfileStorage {
             timings.shard_open_unattributed = shard_timings.unattributed;
         }
 
-        // Phase 1: accumulate all records per collection across every shard so
-        // the index can be sized once for the true total.
-        let mut collection_entries: HashMap<[u8; 16], Vec<ShardRecord>> = HashMap::new();
+        // Keep the persisted order before scanning. New collections are
+        // appended on first physical sight in the chronological scan below.
         let metadata_started = std::time::Instant::now();
         // Seed logical insertion order before scanning. A newly written collection
         // cannot appear in the sidecar until the next flush, so append it at
         // first physical sight below. A missing or unreadable sidecar yields no order and
         // therefore uses the same first-seen fallback for every collection.
-        let mut collection_order = persisted_collection_order(&base_dir).unwrap_or_default();
-        let mut known_collections: HashSet<[u8; 16]> = collection_order.iter().copied().collect();
+        let collection_order = persisted_collection_order(&base_dir).unwrap_or_default();
 
         // Collect open shard info (slot, pack_id, path, length) before the scan
         // loop so we don't hold the shards read-lock across the I/O-heavy scan.
@@ -2656,79 +2778,77 @@ impl PackfileStorage {
         }
 
         let scan_started = std::time::Instant::now();
-        for (slot, shard_pack_id, path, _file_len) in open_shards {
-            // A read-only open must never touch the file at all — the
-            // truncating recovery scan below is only safe when we're the
-            // sole writer (guaranteed by the writer lock); a read-only
-            // opener can run concurrently with an active writer (no lock
-            // taken at all — see ShardPool::open_read_only), so it must
-            // use the non-mutating scan_packfile, which just stops
-            // cleanly at a torn tail (indistinguishable from a writer's
-            // in-flight append) instead of truncating it away.
-            let entries = if writable {
-                // Recovery can safely truncate only a torn final frame. Any
-                // other failure (CRC mismatch, invalid framing, permissions)
-                // means this pack cannot be indexed faithfully; fail open
-                // rather than publish a store that silently omitted it.
-                packfile::scan_and_recover_packfile_with_removal(&path).map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!("recovery scan failed for pack {}: {error}", path.display()),
+        let mut scan_state = StreamingOpenScan::new(collection_order);
+        // The index must see physical versions in order so inserts naturally
+        // replace older values and removal markers. The open_shards snapshot
+        // remains slot ordered for fingerprinting; sort a separate list here.
+        let mut scan_shards = shards.all_shards();
+        scan_shards.sort_by_key(|(_, shard)| shard.creation_seq);
+        for (slot, shard) in scan_shards {
+            if writable {
+                // Recovery can safely truncate only a torn final frame. The
+                // visitor keeps no per-shard entry vector while preserving
+                // that repair behavior. A semantic insert error stops this
+                // scan immediately.
+                packfile::try_recover_packfile_with::<StorageError, _>(&shard.path, |entry| {
+                    scan_state.insert(
+                        entry,
+                        slot,
+                        shard.pack_id,
+                        &deleted_collections,
+                        index_config,
                     )
-                })?
+                })
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "recovery scan failed for pack {}: {error}",
+                        shard.path.display()
+                    ))
+                })?;
             } else {
-                // Read-only mode must not truncate a possibly in-flight tail,
-                // but it also cannot safely omit a shard.  Publishing a
-                // partial index after an I/O or corruption failure makes real
-                // records look deleted.  Surface the error and let the caller
-                // retry after the writer has finished or repair the pack.
-                packfile::scan_packfile_with_removal(&path, true).map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "read-only scan failed for shard {slot:02x} ({}): {error}",
-                            path.display()
-                        ),
+                // Read-only mode must not truncate a possibly in-flight tail.
+                let mut scan_error = None;
+                {
+                    let mut visit = |entry| {
+                        if scan_error.is_none() {
+                            if let Err(error) = scan_state.insert(
+                                entry,
+                                slot,
+                                shard.pack_id,
+                                &deleted_collections,
+                                index_config,
+                            ) {
+                                scan_error = Some(error);
+                            }
+                        }
+                    };
+                    packfile::scan_packfile_from_with_removal_visit(
+                        &shard.path,
+                        0,
+                        true,
+                        &mut visit,
                     )
-                })?
-            };
-            for entry in entries {
-                let collection_id = entry.collection_id;
-                let hash = entry.hash;
-                let offset = entry.offset;
-                let removed = entry.removed;
-                if known_collections.insert(collection_id) {
-                    collection_order.push(collection_id);
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "read-only scan failed for shard {slot:02x} ({}): {error}",
+                                shard.path.display()
+                            ),
+                        )
+                    })?;
                 }
-                collection_entries.entry(collection_id).or_default().push((
-                    slot,
-                    hash,
-                    offset,
-                    shard_pack_id,
-                    removed,
-                ));
+                if let Some(error) = scan_error {
+                    return Err(error.into());
+                }
             }
         }
-        collection_order.retain(|collection_id| collection_entries.contains_key(collection_id));
         timings.full_scan = scan_started.elapsed();
 
-        let mut scan_out = RoomScanOutput::default();
-
-        // Phase 2: build per-collection indexes sized to the true total.
+        // The frames themselves built the indexes; this final pass only turns
+        // them into the shared generation and shard-accounting structures.
         let materialization_started = std::time::Instant::now();
-        for collection_id in &collection_order {
-            if deleted_collections.contains(collection_id) {
-                continue;
-            }
-            Self::init_collection_from_scan(
-                collection_id,
-                &collection_entries[collection_id],
-                &shards,
-                cache_capacity,
-                index_config,
-                &mut scan_out,
-            )?;
-        }
+        let (scan_out, collection_order) = scan_state.finish(&shards, cache_capacity);
         timings.index_materialization = materialization_started.elapsed();
 
         let store = Self::assemble(
@@ -2767,6 +2887,7 @@ impl PackfileStorage {
     /// those indices instead of hashing every record, so the transient cost is
     /// 4 bytes per frame (plus 4 per surviving key) instead of a map entry per
     /// key.
+    #[cfg(test)]
     pub(crate) fn latest_records_for_collection(
         records: &[ShardRecord],
         shards: &ShardPool,
@@ -2815,6 +2936,7 @@ impl PackfileStorage {
     /// per-collection body of `open_with_options`'s phase 2, factored out to
     /// keep that function under the line-count lint rather than
     /// suppressing it.
+    #[cfg(test)]
     fn init_collection_from_scan(
         collection_id: &[u8; 16],
         records: &[ShardRecord],
@@ -3269,7 +3391,8 @@ impl PackfileStorage {
             };
             matches!(
                 shards.record_identity_at(&shard, offset),
-                Ok((collection, hash)) if collection == record.collection_id && hash == full_hash
+                Ok((collection, hash, _removed))
+                    if collection == record.collection_id && hash == full_hash
             )
         })
     }
@@ -6915,7 +7038,8 @@ impl PackfileStorage {
             let shard = self.shards.get_shard(slot).ok_or_else(|| {
                 StorageError::Corrupt(format!("checkpoint index refers to missing shard {slot}"))
             })?;
-            let (found_collection, hash) = self.shards.record_identity_at(&shard, offset)?;
+            let (found_collection, hash, _removed) =
+                self.shards.record_identity_at(&shard, offset)?;
             if &found_collection != collection_id {
                 return Err(StorageError::Corrupt(format!(
                     "checkpoint index offset {offset} in shard {slot} belongs to another collection"
@@ -6976,7 +7100,7 @@ impl PackfileStorage {
                             "index refers to missing shard {slot} while resolving a tag collision"
                         ))
                     })?;
-                    let (found_collection, found_hash) =
+                    let (found_collection, found_hash, _removed) =
                         self.shards.record_identity_at(&shard, offset)?;
                     self.index_identity_reads.fetch_add(1, Ordering::Relaxed);
                     if &found_collection != collection_id
@@ -10089,6 +10213,34 @@ impl PackfileStorage {
         Ok(self.generation(collection_id).is_some())
     }
 
+    /// Resolve whether `node_id` is explicitly removed in the durable
+    /// collection, verifying the full 16-byte identity of every tag candidate.
+    ///
+    /// `Ok(None)` means no candidate frame carries this identity. Unlike
+    /// [`LossyIndex::lookup_removed`], this is correct for a slots-only
+    /// checkpoint, whose index has no identity side tables and would report
+    /// every probe as unknown.
+    fn durable_removed(
+        &self,
+        collection_id: &[u8; 16],
+        node_id: &[u8; 16],
+    ) -> Result<Option<bool>, StorageError> {
+        let Some(generation) = self.generation(collection_id) else {
+            return Ok(None);
+        };
+        for (slot, offset) in generation.index.lookup_all(node_id) {
+            let Some(shard) = self.shards.get_shard(slot) else {
+                continue;
+            };
+            let (found_collection, found_hash, removed) =
+                self.shards.record_identity_at(&shard, offset)?;
+            if &found_collection == collection_id && &found_hash == node_id {
+                return Ok(Some(removed));
+            }
+        }
+        Ok(None)
+    }
+
     /// Return collection length at read-committed visibility.
     ///
     /// Explicitly removed keys are excluded from the count. Overlay puts and
@@ -10103,12 +10255,11 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
     ) -> Result<Option<usize>, StorageError> {
-        if self.transaction_overlay_users.load(Ordering::Acquire) == 0 {
-            return Ok(self
-                .generation(collection_id)
-                .map(|generation| generation.index.live_count()));
-        }
-
+        // Consult the overlay whenever one is installed, not only for an
+        // in-process transaction: a read-committed handle also stages WAL
+        // puts/removes that the durable index has not applied yet. With no
+        // overlay installed, `refresh_read_journal` returns immediately and
+        // the durable count below is the whole answer.
         let overlay_guard = self.refresh_read_journal()?;
         let Some(overlay) = overlay_guard.as_ref() else {
             return Ok(self
@@ -10128,23 +10279,32 @@ impl PackfileStorage {
                 .map(std::collections::HashMap::len));
         }
 
-        let removals = overlay
-            .removes
-            .get(collection_id)
-            .map_or(0, std::collections::HashMap::len);
+        let mut removals = 0usize;
+        if let Some(removed_ids) = overlay.removes.get(collection_id) {
+            for node_id in removed_ids.keys() {
+                // The durable index's live_count already excludes tombstones.
+                // Count only removals of keys that were durably live; a
+                // read-committed remove of an already-removed or absent key
+                // must not subtract from that count again.
+                if self.durable_removed(collection_id, node_id)? == Some(false) {
+                    removals = removals.saturating_add(1);
+                }
+            }
+        }
 
-        let additions = puts.map_or(0, |puts| {
-            puts.keys()
-                .filter(|node_id| {
-                    generation.as_ref().is_none_or(|generation| {
-                        match generation.index.lookup_removed(node_id) {
-                            Some(removed) => removed,
-                            None => generation.index.lookup_all(node_id).next().is_none(),
-                        }
-                    })
-                })
-                .count()
-        });
+        let mut additions = 0usize;
+        if let Some(puts) = puts {
+            for node_id in puts.keys() {
+                // Resolve against the authoritative frame. The packed index
+                // can be a lossy candidate (or lack identity tables after a
+                // slots-only checkpoint), so it cannot reliably distinguish
+                // a durable tombstone from a live key here.
+                let is_new = !matches!(self.durable_removed(collection_id, node_id)?, Some(false));
+                if is_new {
+                    additions = additions.saturating_add(1);
+                }
+            }
+        }
         let length = durable_len
             .saturating_sub(removals)
             .saturating_add(additions);

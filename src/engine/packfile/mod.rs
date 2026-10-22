@@ -416,6 +416,7 @@ pub(crate) struct ScanEntryWithRemoval {
     pub hash: [u8; 16],
     pub offset: u64,
     pub removed: bool,
+    pub disk_bytes: u64,
 }
 
 /// Streaming packfile metadata scanner.
@@ -489,12 +490,12 @@ impl PackfileScanner {
             }
         };
         let result = if self.verify_payload {
-            read_record_metadata(&mut self.reader)
+            read_record_metadata_with_len(&mut self.reader)
         } else {
-            read_record_metadata_skip_payload_with_end(&mut self.reader, self.file_end)
+            read_record_metadata_skip_payload_with_end_and_len(&mut self.reader, self.file_end)
         };
         match result {
-            Ok(Some(metadata)) => Some(Ok(ScanEntryWithRemoval {
+            Ok(Some((metadata, disk_bytes))) => Some(Ok(ScanEntryWithRemoval {
                 collection_id: metadata.collection_id,
                 hash: metadata.hash,
                 offset,
@@ -502,6 +503,7 @@ impl PackfileScanner {
                     .metadata
                     .as_ref()
                     .is_some_and(|frame| frame.removed),
+                disk_bytes,
             })),
             Ok(None) => {
                 self.done = true;
@@ -1375,9 +1377,24 @@ fn read_record_metadata_scratch(
     reader: &mut impl Read,
     discard: &mut [u8; SCAN_DISCARD_BUF_LEN],
 ) -> io::Result<Option<RecordMetadata>> {
+    read_record_metadata_scratch_with_len(reader, discard)
+        .map(|result| result.map(|(metadata, _)| metadata))
+}
+
+fn read_record_metadata_with_len(
+    reader: &mut impl Read,
+) -> io::Result<Option<(RecordMetadata, u64)>> {
+    read_record_metadata_scratch_with_len(reader, &mut [0u8; SCAN_DISCARD_BUF_LEN])
+}
+
+fn read_record_metadata_scratch_with_len(
+    reader: &mut impl Read,
+    discard: &mut [u8; SCAN_DISCARD_BUF_LEN],
+) -> io::Result<Option<(RecordMetadata, u64)>> {
     let Some(header) = read_frame_header(reader)? else {
         return Ok(None);
     };
+    let disk_bytes = u64::from(header.frame_len).saturating_add(8);
 
     let mut crc = if header.flags & FLAG_CRC_DISABLED == 0 {
         let mut crc = crc32fast::Hasher::new();
@@ -1425,11 +1442,14 @@ fn read_record_metadata_scratch(
         }
     }
 
-    Ok(Some(RecordMetadata {
-        collection_id: header.collection_id,
-        hash: header.hash,
-        metadata: header.metadata,
-    }))
+    Ok(Some((
+        RecordMetadata {
+            collection_id: header.collection_id,
+            hash: header.hash,
+            metadata: header.metadata,
+        },
+        disk_bytes,
+    )))
 }
 
 /// Read one frame's metadata and seek over its payload and CRC without
@@ -1458,9 +1478,18 @@ fn read_record_metadata_skip_payload_with_end(
     reader: &mut (impl Read + Seek),
     file_end: u64,
 ) -> io::Result<Option<RecordMetadata>> {
+    read_record_metadata_skip_payload_with_end_and_len(reader, file_end)
+        .map(|result| result.map(|(metadata, _)| metadata))
+}
+
+fn read_record_metadata_skip_payload_with_end_and_len(
+    reader: &mut (impl Read + Seek),
+    file_end: u64,
+) -> io::Result<Option<(RecordMetadata, u64)>> {
     let Some(header) = read_frame_header(reader)? else {
         return Ok(None);
     };
+    let disk_bytes = u64::from(header.frame_len).saturating_add(8);
 
     // The frame length excludes the four-byte CRC, while the fixed portion
     // includes the metadata and flags but not the node bytes or the
@@ -1485,11 +1514,14 @@ fn read_record_metadata_skip_payload_with_end(
         ));
     }
     reader.seek(io::SeekFrom::Start(frame_end))?;
-    Ok(Some(RecordMetadata {
-        collection_id: header.collection_id,
-        hash: header.hash,
-        metadata: header.metadata,
-    }))
+    Ok(Some((
+        RecordMetadata {
+            collection_id: header.collection_id,
+            hash: header.hash,
+            metadata: header.metadata,
+        },
+        disk_bytes,
+    )))
 }
 
 /// Write a new pack file's [`HEADER_LEN`]-byte reserved header: magic,
@@ -1966,11 +1998,27 @@ pub(crate) fn scan_packfile_from_with_removal(
     start_offset: u64,
     verify_checksum: bool,
 ) -> io::Result<Vec<ScanEntryWithRemoval>> {
+    let mut entries = Vec::new();
+    scan_packfile_from_with_removal_visit(path, start_offset, verify_checksum, |entry| {
+        entries.push(entry);
+    })?;
+    Ok(entries)
+}
+
+/// Streaming counterpart to [`scan_packfile_from_with_removal`]. The visitor
+/// is called once per complete frame, so callers can build indexes without
+/// retaining a vector proportional to a shard's record count.
+pub(crate) fn scan_packfile_from_with_removal_visit(
+    path: &Path,
+    start_offset: u64,
+    verify_checksum: bool,
+    mut visit: impl FnMut(ScanEntryWithRemoval),
+) -> io::Result<()> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     if start_offset == 0 {
         if read_header(&mut reader)?.is_none() {
-            return Ok(Vec::new());
+            return Ok(());
         }
     } else {
         use std::io::Seek;
@@ -1985,30 +2033,32 @@ pub(crate) fn scan_packfile_from_with_removal(
     }
 
     let file_end = reader.get_ref().metadata()?.len();
-    let mut entries = Vec::new();
     loop {
         let offset = reader.stream_position()?;
         let metadata = if verify_checksum {
-            read_record_metadata(&mut reader)
+            read_record_metadata_with_len(&mut reader)
         } else {
-            read_record_metadata_skip_payload_with_end(&mut reader, file_end)
+            read_record_metadata_skip_payload_with_end_and_len(&mut reader, file_end)
         };
         match metadata {
-            Ok(Some(metadata)) => entries.push(ScanEntryWithRemoval {
-                collection_id: metadata.collection_id,
-                hash: metadata.hash,
-                offset,
-                removed: metadata
-                    .metadata
-                    .as_ref()
-                    .is_some_and(|frame| frame.removed),
-            }),
+            Ok(Some((metadata, disk_bytes))) => {
+                visit(ScanEntryWithRemoval {
+                    collection_id: metadata.collection_id,
+                    hash: metadata.hash,
+                    offset,
+                    removed: metadata
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|frame| frame.removed),
+                    disk_bytes,
+                });
+            }
             Ok(None) => break,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(error) => return Err(error),
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
 /// Streaming reader yielding each frame's full [`Record`] — payload, identity,
@@ -2306,15 +2356,6 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     Ok(entries)
 }
 
-/// Recovery scan variant that also returns each frame's explicit removal bit.
-pub(crate) fn scan_and_recover_packfile_with_removal(
-    path: &Path,
-) -> io::Result<Vec<ScanEntryWithRemoval>> {
-    let mut entries = Vec::new();
-    recover_packfile_with(path, |entry| entries.push(entry))?;
-    Ok(entries)
-}
-
 /// What [`recover_packfile`] found in one pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackRecovery {
@@ -2363,7 +2404,27 @@ fn recover_packfile_with(
     path: &Path,
     mut on_record: impl FnMut(ScanEntryWithRemoval),
 ) -> io::Result<PackRecovery> {
-    let file = File::open(path)?;
+    try_recover_packfile_with(path, |entry| {
+        on_record(entry);
+        Ok(())
+    })
+}
+
+/// Fallible-visitor variant of [`recover_packfile_with`].
+///
+/// A caller that is building engine state directly from the scan (for example
+/// an index insert) must be able to abort on a semantic error without first
+/// materializing the whole pack. Returning `Err` stops the walk; a torn tail
+/// found before that point is not truncated, because the open fails anyway.
+pub(crate) fn try_recover_packfile_with<E, F>(
+    path: &Path,
+    mut on_record: F,
+) -> Result<PackRecovery, E>
+where
+    E: From<io::Error>,
+    F: FnMut(ScanEntryWithRemoval) -> Result<(), E>,
+{
+    let file = File::open(path).map_err(E::from)?;
     let mut reader = CountingReader {
         inner: BufReader::with_capacity(RECOVERY_BUFFER_BYTES, file),
         position: 0,
@@ -2374,7 +2435,7 @@ fn recover_packfile_with(
         truncated: false,
     };
 
-    if read_header(&mut reader)?.is_none() {
+    if read_header(&mut reader).map_err(E::from)?.is_none() {
         return Ok(recovery);
     }
 
@@ -2382,14 +2443,15 @@ fn recover_packfile_with(
     let mut scratch = [0u8; SCAN_DISCARD_BUF_LEN];
     loop {
         let offset = reader.position;
-        match read_record_metadata_scratch(&mut reader, &mut scratch) {
-            Ok(Some(meta)) => {
+        match read_record_metadata_scratch_with_len(&mut reader, &mut scratch) {
+            Ok(Some((meta, disk_bytes))) => {
                 on_record(ScanEntryWithRemoval {
                     collection_id: meta.collection_id,
                     hash: meta.hash,
                     offset,
                     removed: meta.metadata.as_ref().is_some_and(|frame| frame.removed),
-                });
+                    disk_bytes,
+                })?;
                 recovery.records = recovery.records.saturating_add(1);
                 recovery.valid_len = reader.position;
             }
@@ -2405,7 +2467,7 @@ fn recover_packfile_with(
                 // Real corruption (CRC mismatch, invalid length) — propagate
                 // without truncating. Later valid records may exist past the
                 // corrupt frame; truncating would lose them.
-                return Err(e);
+                return Err(E::from(e));
             }
         }
     }
@@ -2414,9 +2476,9 @@ fn recover_packfile_with(
     // or mid-file corruption (which was propagated as an error above).
     if recovery.truncated {
         drop(reader);
-        let file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(recovery.valid_len)?;
-        file.sync_all()?;
+        let file = OpenOptions::new().write(true).open(path).map_err(E::from)?;
+        file.set_len(recovery.valid_len).map_err(E::from)?;
+        file.sync_all().map_err(E::from)?;
     }
 
     Ok(recovery)
