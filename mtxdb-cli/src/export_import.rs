@@ -21,7 +21,7 @@ use mtxdb::interop::{
     auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
     decode_auth_counter, decode_auth_forward, decode_event_locator, decode_import_marker,
     encode_auth_forward, encode_edges, encode_event_locator, encode_import_marker, encode_verdict,
-    event_locator_collection_id, event_record_id, event_verdict_collection_id,
+    derive_id, event_locator_collection_id, event_record_id, event_verdict_collection_id,
     import_marker_collection_id, import_marker_node_id, room_auth_collection_id,
     room_event_collection_id, room_prev_collection_id, ImportMarker, Verdict, DATA_FORMAT,
     EDGE_POOL, EVENT_POOL, SERVER_INFO_POOL,
@@ -40,9 +40,33 @@ pub(crate) const BATCH_BYTES: usize = 32 << 20;
 
 /// Allowance per staged record for keys and framing, on top of its value.
 const RECORD_OVERHEAD: usize = 128;
+const ROOM_VERSION_DOMAIN: &[u8] = b"matrix-room-version-v1";
+const ROOM_VERSION_COLLECTION: &[u8] = b"matrix-room-version-record-v1";
+const ROOM_VERSION_NODE: &[u8] = b"room-version";
+const ROOM_VERSION_MAGIC: &[u8; 4] = b"MRV1";
 
 fn node(bytes: Vec<u8>) -> NodeData {
     NodeData::new(bytes::Bytes::from(bytes))
+}
+
+fn room_version_record(room_id: &str, events: &[RoomEvent]) -> anyhow::Result<Vec<u8>> {
+    let version = events
+        .iter()
+        .find(|event| {
+            event.pdu.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
+                && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
+        })
+        .and_then(|event| event.pdu.get("content"))
+        .and_then(|content| content.get("room_version"))
+        .and_then(OwnedValue::as_str)
+        .ok_or_else(|| anyhow!("room {room_id} has no create-event room_version"))?;
+    let room_len = u32::try_from(room_id.len()).context("room id is too long")?;
+    let mut record = Vec::with_capacity(8 + room_id.len() + version.len());
+    record.extend_from_slice(ROOM_VERSION_MAGIC);
+    record.extend_from_slice(&room_len.to_be_bytes());
+    record.extend_from_slice(room_id.as_bytes());
+    record.extend_from_slice(version.as_bytes());
+    Ok(record)
 }
 
 /// Whether the database holds a marker, and what it says.
@@ -337,6 +361,21 @@ pub(crate) fn write_room_with_findings(
     let event_collection = room_event_collection_id(room);
     let prev_collection = room_prev_collection_id(room);
     let auth_collection = room_auth_collection_id(room);
+    let version_collection = derive_id(ROOM_VERSION_DOMAIN, room);
+    let version_node = derive_id(ROOM_VERSION_COLLECTION, ROOM_VERSION_NODE);
+    let version_record = room_version_record(&export.room_id, &export.events)?;
+    let (existing, version_collection_version) = db
+        .pool(SERVER_INFO_POOL)
+        .get_with_collection_version(&version_collection, &[version_node])
+        .context("reading room-version record")?;
+    let version_record = match existing.into_iter().next().flatten() {
+        Some(existing) if existing.bytes.as_ref() == version_record.as_slice() => None,
+        Some(_) => bail!(
+            "room {} has a conflicting immutable room-version record",
+            export.room_id
+        ),
+        None => Some(version_record),
+    };
 
     let mut written = 0_u64;
     let mut staged_bytes = 0_usize;
@@ -345,6 +384,22 @@ pub(crate) fn write_room_with_findings(
     // covered by reading the locator back through the transaction.
     let mut batch_ids: HashMap<[u8; 16], &str> = HashMap::new();
     let mut tx = db.begin_transaction();
+    if let Some(record) = version_record {
+        tx.expect_collection_version(
+            SERVER_INFO_POOL,
+            version_collection,
+            version_collection_version,
+        )
+        .context("guarding room-version record")?;
+        tx.put(
+            SERVER_INFO_POOL,
+            version_collection,
+            version_node,
+            &node(record.clone()),
+        )
+        .context("writing room-version record")?;
+        staged_bytes = record.len().saturating_add(RECORD_OVERHEAD);
+    }
 
     for (position, event) in export.events.iter().enumerate() {
         let event_id = event.event_id.as_bytes();
