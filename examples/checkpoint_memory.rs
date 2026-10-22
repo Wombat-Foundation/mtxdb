@@ -191,7 +191,12 @@ fn put_indices(store: &PackfileStorage, indices: &[u64]) -> Duration {
     for chunk in indices.chunks(batch) {
         let entries: Vec<([u8; 16], NodeData)> = chunk
             .iter()
-            .map(|index| (id_for(*index), NodeData::from_slice(&payload(*index))))
+            .map(|index| {
+                (
+                    id_for(*index),
+                    NodeData::from_slice(&payload(index.wrapping_add(1))),
+                )
+            })
             .collect();
         store.put_many(&COLLECTION, &entries).unwrap();
     }
