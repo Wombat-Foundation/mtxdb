@@ -45,6 +45,7 @@ fn physical_layout_counts_cross_pack_spread_and_interleaved_runs() {
                 &Record {
                     collection_id,
                     hash: [u8::try_from(index).expect("fixture index fits in u8"); 16],
+                    disposition: 0,
                     data: Bytes::from_static(b"payload"),
                     metadata: None,
                 },

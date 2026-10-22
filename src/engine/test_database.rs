@@ -125,6 +125,30 @@ fn a_transaction_reads_its_own_writes_and_others_do_not() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn transaction_reads_its_own_disposition_write() {
+    let root = test_root("transaction_reads_disposition");
+    let database = Database::open(root.clone()).unwrap();
+    let collection = [0x37; 16];
+    let id = node(3);
+    let transaction = database.begin_transaction();
+    transaction
+        .put_with_disposition(ShardType::EventDag, collection, id, &data(b"staged"), 0b101)
+        .unwrap();
+    let got = transaction
+        .get_with_disposition(ShardType::EventDag, &collection, &[id])
+        .unwrap();
+    assert_eq!(
+        got[0]
+            .as_ref()
+            .map(|(payload, disposition)| (payload.bytes.as_ref(), *disposition)),
+        Some((&b"staged"[..], 0b101))
+    );
+    drop(transaction);
+    drop(database);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// The newest staged write wins, reads fall back to live data for records
 /// the transaction has not touched, and results keep the request order.
 #[test]
