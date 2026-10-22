@@ -8,6 +8,7 @@
 //!
 //! ```text
 //! MTXDB_MEASURE_RECORDS=4000000 cargo run --release --example checkpoint_memory
+//! MTXDB_MEASURE_SAMPLE=first MTXDB_MEASURE_MODE=slots cargo run --release --example checkpoint_memory
 //! ```
 
 // A measurement harness: byte counts and ratios are printed, never used for
@@ -126,54 +127,47 @@ fn put_range(store: &PackfileStorage, start: u64, count: u64) -> Duration {
     started.elapsed()
 }
 
-fn put_strided(store: &PackfileStorage, total_records: u64, count: u64) -> Duration {
-    assert!(
-        total_records > 0,
-        "strided writes need a non-empty key range"
-    );
+/// Deterministic, non-contiguous sample of `count` distinct keys below `records`.
+///
+/// The first keys occupy adjacent frames, so rewriting only those mostly
+/// measures page-cache readahead. This sample spreads writes across the pack.
+fn spread_sample(records: u64, count: u64) -> Vec<u64> {
+    assert!(records > 0, "spread sample needs a non-empty key range");
+    let count = usize::try_from(count).expect("sample count exceeds address space");
+    let mut seen = std::collections::HashSet::with_capacity(count);
+    let mut out = Vec::with_capacity(count);
+    let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+    while out.len() < count {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let index = z % records;
+        if seen.insert(index) {
+            out.push(index);
+        }
+    }
+    out
+}
+
+/// Overwrite an explicit sample of existing keys.
+fn put_indices(store: &PackfileStorage, indices: &[u64]) -> Duration {
     let started = Instant::now();
-    let stride = spread_stride(total_records);
-    let mut done = 0u64;
-    while done < count {
-        let n = (count - done).min(BATCH);
-        let entries: Vec<([u8; 16], NodeData)> = (done..done + n)
-            .map(|i| {
-                let seq = i.wrapping_mul(stride) % total_records;
+    let batch = usize::try_from(BATCH).expect("batch size exceeds address space");
+    for chunk in indices.chunks(batch) {
+        let entries: Vec<([u8; 16], NodeData)> = chunk
+            .iter()
+            .map(|index| {
                 (
-                    id_for(seq),
-                    NodeData::from_slice(&payload(seq.wrapping_add(1))),
+                    id_for(*index),
+                    NodeData::from_slice(&payload(index.wrapping_add(1))),
                 )
             })
             .collect();
         store.put_many(&COLLECTION, &entries).unwrap();
-        done += n;
     }
     started.elapsed()
-}
-
-/// Pick a stride coprime to the record count so samples cover the full range.
-fn spread_stride(total_records: u64) -> u64 {
-    if total_records <= 1 {
-        return 1;
-    }
-    let mut stride = 199_999 % total_records;
-    if stride == 0 {
-        stride = 1;
-    }
-    while gcd(stride, total_records) != 1 {
-        stride = (stride + 1) % total_records;
-        if stride == 0 {
-            stride = 1;
-        }
-    }
-    stride
-}
-
-fn gcd(mut left: u64, mut right: u64) -> u64 {
-    while right != 0 {
-        (left, right) = (right, left % right);
-    }
-    left
 }
 
 fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
@@ -356,18 +350,29 @@ fn run_cold_rewrite(dir: &Path, records: u64) {
         mib(mapped as u64),
     );
 
+    let sample_size = 20_000_u64.min(records);
+    let first_keys: Vec<u64> = match std::env::var("MTXDB_MEASURE_SAMPLE").as_deref() {
+        Ok("first") => (0..sample_size).collect(),
+        _ => spread_sample(records, sample_size),
+    };
+    let sample_label = if std::env::var("MTXDB_MEASURE_SAMPLE").as_deref() == Ok("first") {
+        "first"
+    } else {
+        "spread"
+    };
     let before = reopened.stats().index_identity_reads;
-    let first = put_strided(&reopened, records, 20_000);
+    let first = put_indices(&reopened, &first_keys);
     let first_reads = reopened.stats().index_identity_reads - before;
     let before = reopened.stats().index_identity_reads;
-    let second = put_strided(&reopened, records, 20_000);
+    let second = put_indices(&reopened, &first_keys);
     let second_reads = reopened.stats().index_identity_reads - before;
     println!(
-        "[{label}] strided rewrite 20k across {records} keys: first {:.1} ms ({:.3} us/rec) identity_reads={first_reads}; second {:.1} ms ({:.3} us/rec) identity_reads={second_reads}",
+        "[{label}] rewrite {} {sample_label} keys across {records}: first {:.1} ms ({:.3} us/rec) identity_reads={first_reads}; second {:.1} ms ({:.3} us/rec) identity_reads={second_reads}",
+        first_keys.len(),
         first.as_secs_f64() * 1e3,
-        first.as_secs_f64() * 1e6 / 20_000.0,
+        first.as_secs_f64() * 1e6 / first_keys.len() as f64,
         second.as_secs_f64() * 1e3,
-        second.as_secs_f64() * 1e6 / 20_000.0,
+        second.as_secs_f64() * 1e6 / first_keys.len() as f64,
     );
 
     drop(reopened);
