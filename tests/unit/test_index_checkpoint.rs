@@ -2,7 +2,6 @@
 
 use mtxdb::index::checkpoint::*;
 use mtxdb::index::format::{CheckpointHeader, CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN};
-use mtxdb::index::IndexConfig;
 use mtxdb::index::LossyIndex;
 use mtxdb::packfile::{PackId, PACK_ID_LEN};
 use std::io::Write;
@@ -109,24 +108,12 @@ fn checkpoint_round_trips_index_slots() {
         );
 
         // The mmap-backed index must find every hash the live index had.
-        let loaded_index = if loaded.has_homes_tails {
-            LossyIndex::from_mmap_slots_with_homes_tails(
-                Arc::clone(&mmap),
-                loaded.slots_offset,
-                loaded.homes_offset,
-                loaded.tails_offset,
-                loaded.capacity,
-                loaded.slot_count,
-                IndexConfig::default(),
-            )
-        } else {
-            LossyIndex::from_mmap_slots(
-                Arc::clone(&mmap),
-                loaded.slots_offset,
-                loaded.capacity,
-                loaded.slot_count,
-            )
-        };
+        let loaded_index = LossyIndex::from_mmap_slots(
+            Arc::clone(&mmap),
+            loaded.slots_offset,
+            loaded.capacity,
+            loaded.slot_count,
+        );
         let original_index = LossyIndex::deserialize(expected_blob).unwrap();
         for i in 0..*count {
             let hash = hash_for(*seed, i);

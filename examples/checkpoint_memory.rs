@@ -1,9 +1,10 @@
 //! Measure the slots-only checkpoint prototype.
 //!
-//! Reports, separately: full-checkpoint bytes with and without identity
-//! tables, delta-epoch bytes, reopened index heap / mapped slot bytes /
-//! process RSS, put-path cost and identity-read counts, and the peak RSS of a
-//! checkpoint-less full-scan open.
+//! Reports: checkpoint bytes (slots-only v1), delta-epoch bytes, reopened
+//! index heap / mapped slot bytes / process RSS, put-path cost and
+//! identity-read counts, and the peak RSS of a checkpoint-less full-scan
+//! open. Set `MTXDB_MEASURE_EVICT=1` to evict the page cache before the cold
+//! strided rewrite.
 //!
 //! ```text
 //! MTXDB_MEASURE_RECORDS=4000000 cargo run --release --example checkpoint_memory
@@ -206,12 +207,8 @@ fn main() {
     let checkpoint = dir.join(INDEX_CHECKPOINT_FILE);
 
     if let Ok(mode) = std::env::var("MTXDB_MEASURE_MODE") {
-        let slots_only = match mode.as_str() {
-            "identities" => false,
-            "slots" => true,
-            other => panic!("MTXDB_MEASURE_MODE must be identities|slots, got {other}"),
-        };
-        run_cold_rewrite(&dir, records, slots_only);
+        assert_eq!(mode, "slots", "MTXDB_MEASURE_MODE must be slots");
+        run_cold_rewrite(&dir, records);
         return;
     }
 
@@ -230,28 +227,27 @@ fn main() {
         mib(delta_bytes(&dir))
     );
 
-    // 1. Full checkpoint with identity tables.
+    // Checkpointing always writes only the packed locator slots.
     let started = Instant::now();
     store.force_index_checkpoint().unwrap();
-    let identity_ms = started.elapsed().as_secs_f64() * 1e3;
-    let identity_bytes = file_len(&checkpoint);
+    let checkpoint_ms = started.elapsed().as_secs_f64() * 1e3;
+    let checkpoint_bytes = file_len(&checkpoint);
     let loaded = mtxdb::index::checkpoint::read_checkpoint(&checkpoint).expect("checkpoint");
-    let identity_has_tables = loaded.collections.iter().any(|c| c.has_homes_tails);
     drop(loaded);
     println!(
-        "checkpoint with identities: {:.1} MiB ({:.2} B/rec), write {:.0} ms, has_homes_tails={identity_has_tables}",
-        mib(identity_bytes),
-        identity_bytes as f64 / records as f64,
-        identity_ms
+        "slots-only checkpoint: {:.1} MiB ({:.2} B/rec), write {:.0} ms",
+        mib(checkpoint_bytes),
+        checkpoint_bytes as f64 / records as f64,
+        checkpoint_ms
     );
 
-    // 2. Reopen from the identity checkpoint and measure put cost there.
+    // Reopen the slots-only checkpoint and measure write costs.
     drop(store);
     let rss_before = rss_bytes();
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let (heap, mapped, logical) = index_memory(&store);
     println!(
-        "reopen (identities): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
+        "reopen (slots-only): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
         mib(heap as u64),
         heap as f64 / records as f64,
         mib(mapped as u64),
@@ -267,7 +263,7 @@ fn main() {
     let rewrite_ids = put_range(&store, 0, 20_000);
     let rewrite_identity = store.stats().index_identity_reads - before;
     println!(
-        "put cost (identities): append 50k {:.0} ms ({:.2} us/rec), rewrite 20k {:.0} ms ({:.2} us/rec), identity reads append/rewrite {append_identity}/{rewrite_identity}",
+        "put cost: append 50k {:.0} ms ({:.2} us/rec), rewrite 20k {:.0} ms ({:.2} us/rec), identity reads append/rewrite {append_identity}/{rewrite_identity}",
         append_ids.as_secs_f64() * 1e3,
         append_ids.as_secs_f64() * 1e6 / 50_000.0,
         rewrite_ids.as_secs_f64() * 1e3,
@@ -275,74 +271,12 @@ fn main() {
     );
     store.sync_all().unwrap();
     println!(
-        "delta after 70k post-reopen writes (identities): {:.1} MiB",
+        "delta after 70k post-reopen writes: {:.1} MiB",
         mib(delta_bytes(&dir))
     );
     drop(store);
 
-    // 3. Full checkpoint without identity tables, from the same live state.
-    let store = PackfileStorage::open(dir.clone()).unwrap();
-    store.set_checkpoint_slots_only(true);
-    let started = Instant::now();
-    store.force_index_checkpoint().unwrap();
-    let slots_ms = started.elapsed().as_secs_f64() * 1e3;
-    let slots_bytes = file_len(&checkpoint);
-    let loaded = mtxdb::index::checkpoint::read_checkpoint(&checkpoint).expect("checkpoint");
-    let slots_has_tables = loaded.collections.iter().any(|c| c.has_homes_tails);
-    drop(loaded);
-    println!(
-        "checkpoint slots-only:      {:.1} MiB ({:.2} B/rec), write {:.0} ms, has_homes_tails={slots_has_tables}",
-        mib(slots_bytes),
-        slots_bytes as f64 / live as f64,
-        slots_ms
-    );
-    let (heap, _mapped, logical) = index_memory(&store);
-    println!(
-        "live writer index (unchanged by the toggle): heap {:.1} MiB ({:.2} B/rec), logical {:.2} B/rec",
-        mib(heap as u64),
-        heap as f64 / live as f64,
-        logical as f64 / live as f64
-    );
-    drop(store);
-
-    // 4. Reopen from the slots-only checkpoint.
-    let rss_before = rss_bytes();
-    let started = Instant::now();
-    let store = PackfileStorage::open(dir.clone()).unwrap();
-    let open_ms = started.elapsed().as_secs_f64() * 1e3;
-    let (heap, mapped, logical) = index_memory(&store);
-    println!(
-        "reopen (slots-only): {:.0} ms, heap {:.2} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
-        open_ms,
-        mib(heap as u64),
-        heap as f64 / live as f64,
-        mib(mapped as u64),
-        logical as f64 / live as f64,
-        mib(rss_bytes().saturating_sub(rss_before)),
-        mib(rss_before)
-    );
-    let before = store.stats().index_identity_reads;
-    let append_slots = put_range(&store, live, 50_000);
-    live += 50_000;
-    let append_identity = store.stats().index_identity_reads - before;
-    let before = store.stats().index_identity_reads;
-    let rewrite_slots = put_range(&store, 0, 20_000);
-    let rewrite_identity = store.stats().index_identity_reads - before;
-    println!(
-        "put cost (slots-only): append 50k {:.0} ms ({:.2} us/rec), rewrite 20k {:.0} ms ({:.2} us/rec), identity reads append/rewrite {append_identity}/{rewrite_identity}",
-        append_slots.as_secs_f64() * 1e3,
-        append_slots.as_secs_f64() * 1e6 / 50_000.0,
-        rewrite_slots.as_secs_f64() * 1e3,
-        rewrite_slots.as_secs_f64() * 1e6 / 20_000.0,
-    );
-    store.sync_all().unwrap();
-    println!(
-        "delta after 70k post-reopen writes (slots-only): {:.1} MiB",
-        mib(delta_bytes(&dir))
-    );
-    drop(store);
-
-    // 5. Full-scan open peak, after losing the persisted index.
+    // Full-scan open peak, after losing the persisted index.
     for entry in std::fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -391,24 +325,18 @@ fn evict_dir(dir: &Path) -> String {
 
 /// One configuration per process: build, write that mode's checkpoint,
 /// reopen, optionally evict the page cache, then rewrite existing keys twice.
-fn run_cold_rewrite(dir: &Path, records: u64, slots_only: bool) {
-    let label = if slots_only {
-        "slots-only"
-    } else {
-        "identities"
-    };
+fn run_cold_rewrite(dir: &Path, records: u64) {
+    let label = "slots-only";
     let store = PackfileStorage::open(dir.to_path_buf()).unwrap();
     let build = put_range(&store, 0, records);
     store.sync_all().unwrap();
-    store.set_checkpoint_slots_only(slots_only);
     store.force_index_checkpoint().unwrap();
     let checkpoint = file_len(&dir.join(INDEX_CHECKPOINT_FILE));
     let loaded = mtxdb::index::checkpoint::read_checkpoint(&dir.join(INDEX_CHECKPOINT_FILE))
         .expect("checkpoint");
-    let has_tables = loaded.collections.iter().any(|c| c.has_homes_tails);
     drop(loaded);
     println!(
-        "[{label}] build {:.1}s, checkpoint {:.1} MiB ({:.2} B/rec), has_homes_tails={has_tables}",
+        "[{label}] build {:.1}s, checkpoint {:.1} MiB ({:.2} B/rec)",
         build.as_secs_f64(),
         mib(checkpoint),
         checkpoint as f64 / records as f64,

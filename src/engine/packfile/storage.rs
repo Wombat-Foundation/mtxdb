@@ -964,11 +964,9 @@ type RepackScanResult = (
     RepackRecordMap,
     Option<RepackIncrementalState>,
 );
-
-/// One scanned record's `(slot, hash, offset, pack_id)`, as accumulated per
-/// collection during `PackfileStorage::open_with_options`'s initial scan.
 #[cfg(test)]
-type ShardRecord = (u16, [u8; 16], u64, PackId, bool);
+type TestScannedRecord = (u16, [u8; 16], u64, PackId, bool);
+
 /// `(collection_id, entry count, index memory usage in bytes, index capacity)`.
 pub type CollectionSummary = ([u8; 16], usize, usize, u32);
 
@@ -2055,8 +2053,6 @@ pub struct PackfileStorage {
     /// Frame-header reads that resolved a same-tag probe candidate whose
     /// identity the index did not hold (slots-only checkpoint indexes).
     index_identity_reads: AtomicU64,
-    /// Write checkpoints without the `homes`/`tails` identity tables.
-    checkpoint_slots_only: AtomicBool,
     /// `invalidate_delta_log` calls — structural changes represented by a
     /// whole-collection snapshot in the v1 log.
     delta_invalidations: AtomicU64,
@@ -2879,146 +2875,6 @@ impl PackfileStorage {
         Ok(store)
     }
 
-    /// Find the latest physical frame for every hash in a collection, by pack
-    /// creation order then offset, in that same order. Reads no frames: the scan
-    /// already carries everything the ordering needs.
-    ///
-    /// Returns indices into `records` rather than copies, and dedupes by sorting
-    /// those indices instead of hashing every record, so the transient cost is
-    /// 4 bytes per frame (plus 4 per surviving key) instead of a map entry per
-    /// key.
-    #[cfg(test)]
-    pub(crate) fn latest_records_for_collection(
-        records: &[ShardRecord],
-        shards: &ShardPool,
-    ) -> Result<Vec<u32>, StorageError> {
-        let too_many = || StorageError::Corrupt("collection scan exceeds u32::MAX frames".into());
-        let mut seq_by_slot = vec![0_u32; shard::MAX_SHARDS];
-        for (slot, ..) in records {
-            let cached = seq_by_slot
-                .get_mut(usize::from(*slot))
-                .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?;
-            if *cached == 0 {
-                // `creation_seq` is never zero, so zero means "not looked up".
-                *cached = shards
-                    .get_shard(*slot)
-                    .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?
-                    .creation_seq;
-            }
-        }
-        let position = |record: &ShardRecord| (seq_by_slot[usize::from(record.0)], record.2);
-        let mut order =
-            (0..u32::try_from(records.len()).map_err(|_| too_many())?).collect::<Vec<u32>>();
-        // Within a key, the last index is the newest frame.
-        order.sort_unstable_by(|&a, &b| {
-            let (a, b) = (&records[a as usize], &records[b as usize]);
-            a.1.cmp(&b.1).then_with(|| position(a).cmp(&position(b)))
-        });
-        let mut latest: Vec<u32> = Vec::new();
-        for (at, &index) in order.iter().enumerate() {
-            let is_last_for_key = order
-                .get(at.saturating_add(1))
-                .is_none_or(|&next| records[next as usize].1 != records[index as usize].1);
-            if is_last_for_key {
-                latest.push(index);
-            }
-        }
-        drop(order);
-        latest.sort_unstable_by_key(|&index| {
-            let record = &records[index as usize];
-            (position(record), record.1)
-        });
-        Ok(latest)
-    }
-
-    /// Builds one collection's index, cache, and shard-directory contribution
-    /// from its scanned records, and inserts all three into `out` — the
-    /// per-collection body of `open_with_options`'s phase 2, factored out to
-    /// keep that function under the line-count lint rather than
-    /// suppressing it.
-    #[cfg(test)]
-    fn init_collection_from_scan(
-        collection_id: &[u8; 16],
-        records: &[ShardRecord],
-        shards: &ShardPool,
-        cache_capacity: usize,
-        index_config: crate::index::IndexConfig,
-        out: &mut RoomScanOutput,
-    ) -> Result<(), StorageError> {
-        let index_records = Self::latest_records_for_collection(records, shards)?;
-        if let Some(&last) = index_records.last() {
-            shards.set_collection_home(collection_id, records[last as usize].0);
-        }
-        let index = LossyIndex::with_config(
-            index_records
-                .len()
-                .saturating_mul(2)
-                .max(NEW_COLLECTION_INDEX_FLOOR),
-            index_config,
-        );
-        let mut failed = 0usize;
-        let mut first_failure: Option<(u64, InsertError)> = None;
-        for &at in &index_records {
-            let (slot, hash, offset, _pack_id, removed) = &records[at as usize];
-            check_index_offset(*slot, hash, *offset)?;
-            if let Err(error) = index.insert_tracked_with_removed(hash, *slot, *offset, *removed) {
-                failed = failed.saturating_add(1);
-                first_failure.get_or_insert((*offset, error));
-            }
-        }
-        if let Some((offset, error)) = first_failure {
-            return Err(StorageError::Corrupt(format!(
-                "index rebuild dropped {failed} of {} indexed candidates (first at offset {offset}: {error}); \
-                 indexed {}",
-                index_records.len(),
-                index.len(),
-            )));
-        }
-        for (slot, _hash, offset, pack_id, _) in records {
-            let shard = shards
-                .get_shard(*slot)
-                .ok_or_else(|| StorageError::Corrupt(format!("missing shard slot {slot}")))?;
-            let bytes = ShardPool::record_disk_len_at(&shard, *offset)?;
-            let total = out
-                .collection_disk_bytes
-                .entry(*pack_id)
-                .or_default()
-                .entry(*collection_id)
-                .or_default();
-            *total = total.saturating_add(bytes);
-        }
-        let counts = index.slot_counts();
-
-        // Build slot→pack_id lookup from the records for this collection.
-        let slot_to_pack_id: HashMap<u16, PackId> = records
-            .iter()
-            .map(|(slot, _, _, pack_id, _)| (*slot, *pack_id))
-            .collect();
-
-        for (&slot, &count) in &counts {
-            let Some(&pack_id) = slot_to_pack_id.get(&slot) else {
-                continue;
-            };
-            out.shard_collections
-                .entry(pack_id)
-                .or_default()
-                .insert(*collection_id, count);
-            out.collection_shards
-                .entry(*collection_id)
-                .or_default()
-                .insert(pack_id);
-        }
-        out.collections.insert(
-            *collection_id,
-            ArcSwap::from_pointee(RoomGeneration {
-                index,
-                cache: Arc::new(NodeCache::new(cache_capacity)),
-                generation: 1,
-            }),
-        );
-        Ok(())
-    }
-
     /// Assemble a fully constructed store from the per-collection state both
     /// the rescan path and the checkpoint fast path produce, so the two share
     /// one field-for-field constructor.
@@ -3169,7 +3025,6 @@ impl PackfileStorage {
             index_grow_count: AtomicU64::new(0),
             index_rebuild_count: AtomicU64::new(0),
             index_identity_reads: AtomicU64::new(0),
-            checkpoint_slots_only: AtomicBool::new(false),
             delta_invalidations: AtomicU64::new(0),
             sync_calls: AtomicU64::new(0),
             checkpoint_writes: AtomicU64::new(0),
@@ -3405,9 +3260,11 @@ impl PackfileStorage {
     /// caller; identity is confirmed lazily by reads, which compare the record's
     /// hash.
     fn apply_redo_sets(
+        collection_id: &[u8; 16],
         index: LossyIndex,
         records: &[RedoRecord],
         pack_lookup: &HashMap<PackId, (u16, u64)>,
+        mut identity_at: impl FnMut(u16, u64) -> Option<([u8; 16], [u8; 16])>,
     ) -> Option<LossyIndex> {
         let mut index = if index.is_mmap_backed() {
             index.clone()
@@ -3417,7 +3274,14 @@ impl PackfileStorage {
         let target =
             LossyIndex::capacity_for_entries(index.len().saturating_add(records.len()), 0)?;
         while usize::try_from(index.capacity()).ok()? < target {
-            index = index.grow()?;
+            index = index.grow().or_else(|| {
+                index
+                    .grow_by_recovering_hashes(|slot, offset, _tag| {
+                        identity_at(slot, offset).map(|(_, hash)| hash).ok_or(())
+                    })
+                    .ok()
+                    .flatten()
+            })?;
         }
         for record in records {
             let RedoOp::Set {
@@ -3431,14 +3295,34 @@ impl PackfileStorage {
                 return None;
             };
             let (slot, _) = *pack_lookup.get(&pack_id)?;
-            if index
-                .insert_tracked_with_removed(&full_hash, slot, offset, removed)
-                .is_err()
-            {
-                index = index.grow()?;
-                index
-                    .insert_tracked_with_removed(&full_hash, slot, offset, removed)
-                    .ok()?;
+            loop {
+                match index.insert_undoable_with_removed(&full_hash, slot, offset, removed) {
+                    Ok(_) => break,
+                    Err(InsertError::TableFull) => {
+                        index = index.grow().or_else(|| {
+                            index
+                                .grow_by_recovering_hashes(|old_slot, old_offset, _tag| {
+                                    identity_at(old_slot, old_offset)
+                                        .map(|(_, hash)| hash)
+                                        .ok_or(())
+                                })
+                                .ok()
+                                .flatten()
+                        })?;
+                    }
+                    Err(InsertError::NeedsIdentity {
+                        bucket,
+                        slot: old_slot,
+                        offset: old_offset,
+                    }) => {
+                        let (found_collection, found_hash) = identity_at(old_slot, old_offset)?;
+                        if found_collection != *collection_id
+                            || !index.hydrate_slot_identity(bucket, &found_hash)
+                        {
+                            return None;
+                        }
+                    }
+                }
             }
         }
         Some(index)
@@ -3748,17 +3632,11 @@ impl PackfileStorage {
                         capacity_bytes.try_into().unwrap_or([0; 8]),
                     ))
                     .unwrap_or(usize::MAX);
-                    // A snapshot may be the full slots+homes+tails blob or the
-                    // slots-only form; `deserialize_with_config` accepts both,
-                    // so accept either exact length here and reject anything
-                    // else.
+                    // Delta snapshots use the canonical slots-only v1 form.
                     let slots_len = capacity
                         .checked_mul(8)
                         .and_then(|bytes| bytes.checked_add(8));
-                    let full_len = capacity
-                        .checked_mul(24)
-                        .and_then(|bytes| bytes.checked_add(8));
-                    if Some(index_blob.len()) != slots_len && Some(index_blob.len()) != full_len {
+                    if Some(index_blob.len()) != slots_len {
                         if writable {
                             let _ = std::fs::remove_file(&delta_path);
                         }
@@ -3883,25 +3761,13 @@ impl PackfileStorage {
             {
                 (index, generation)
             } else {
-                let mmap_index = if loaded.has_homes_tails {
-                    LossyIndex::from_mmap_slots_with_homes_tails(
-                        Arc::clone(&checkpoint.mmap),
-                        loaded.slots_offset,
-                        loaded.homes_offset,
-                        loaded.tails_offset,
-                        loaded.capacity,
-                        loaded.slot_count,
-                        index_config,
-                    )
-                } else {
-                    LossyIndex::from_mmap_slots_with_config(
-                        Arc::clone(&checkpoint.mmap),
-                        loaded.slots_offset,
-                        loaded.capacity,
-                        loaded.slot_count,
-                        index_config,
-                    )
-                };
+                let mmap_index = LossyIndex::from_mmap_slots_with_config(
+                    Arc::clone(&checkpoint.mmap),
+                    loaded.slots_offset,
+                    loaded.capacity,
+                    loaded.slot_count,
+                    index_config,
+                );
                 let index = if let Some(frames) = frames_by_collection.get(&loaded.collection_id) {
                     let owned = mmap_index.clone();
                     if owned.replay_frames(frames).is_err() {
@@ -3923,7 +3789,18 @@ impl PackfileStorage {
             }
             let index = match redo_by_collection.remove(&loaded.collection_id) {
                 Some(records) => {
-                    if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) {
+                    if let Some(index) = Self::apply_redo_sets(
+                        &loaded.collection_id,
+                        index,
+                        &records,
+                        &pack_lookup,
+                        |slot, offset| {
+                            let shard = shards.get_shard(slot)?;
+                            let (collection, hash, _) =
+                                shards.record_identity_at(&shard, offset).ok()?;
+                            Some((collection, hash))
+                        },
+                    ) {
                         index
                     } else {
                         timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
@@ -3957,7 +3834,18 @@ impl PackfileStorage {
             }
             let index = match redo_by_collection.remove(&collection_id) {
                 Some(records) => {
-                    if let Some(index) = Self::apply_redo_sets(index, &records, &pack_lookup) {
+                    if let Some(index) = Self::apply_redo_sets(
+                        &collection_id,
+                        index,
+                        &records,
+                        &pack_lookup,
+                        |slot, offset| {
+                            let shard = shards.get_shard(slot)?;
+                            let (collection, hash, _) =
+                                shards.record_identity_at(&shard, offset).ok()?;
+                            Some((collection, hash))
+                        },
+                    ) {
                         index
                     } else {
                         timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
@@ -4873,7 +4761,7 @@ impl PackfileStorage {
     fn scan_collection_records(
         &self,
         collection_id: &[u8; 16],
-    ) -> Result<Vec<ShardRecord>, StorageError> {
+    ) -> Result<Vec<TestScannedRecord>, StorageError> {
         let mut scanned = Vec::new();
         for (slot, shard) in self.shards.all_shards() {
             for entry in packfile::scan_packfile_with_removal(
@@ -5804,10 +5692,7 @@ impl PackfileStorage {
         // reads the live table. Pending frames were cleared by the rotation and
         // no put is mid-flight, so clearing the flag now loses nothing; a put
         // after the locks drop sets it again, and a failed tail sets it back.
-        let blobs = Self::serialize_snapshots(
-            &snapshots,
-            self.checkpoint_slots_only.load(Ordering::Relaxed),
-        );
+        let blobs = Self::serialize_snapshots(&snapshots);
         breakdown.serialize = serialize_started.elapsed();
         self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         drop(guards);
@@ -5882,17 +5767,11 @@ impl PackfileStorage {
     /// Serialize every snapshot's index into an owned checkpoint blob.
     fn serialize_snapshots(
         snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
-        slots_only: bool,
     ) -> Vec<([u8; 16], u64, Vec<u8>)> {
         snapshots
             .iter()
             .map(|(collection_id, generation, room)| {
-                let blob = if slots_only {
-                    room.index.serialize_slots_only()
-                } else {
-                    room.index.serialize()
-                };
-                (*collection_id, *generation, blob)
+                (*collection_id, *generation, room.index.serialize())
             })
             .collect()
     }
@@ -6005,16 +5884,6 @@ impl PackfileStorage {
     /// Block until any background checkpoint has finished.
     pub fn wait_for_checkpoint(&self) {
         self.finish_checkpoint_worker(true);
-    }
-
-    /// Write index checkpoints without the `homes`/`tails` identity tables.
-    ///
-    /// A third the size on disk, and a reopened index starts with no heap
-    /// identity tables; same-tag probes then read the candidate's frame header
-    /// (counted in [`RuntimeStats::index_identity_reads`]) and growth recovers
-    /// hashes from the packs. Off by default.
-    pub fn set_checkpoint_slots_only(&self, enabled: bool) {
-        self.checkpoint_slots_only.store(enabled, Ordering::Relaxed);
     }
 
     /// Let a sync that needs a full checkpoint hand its tail (write, fsync,
@@ -6276,15 +6145,8 @@ impl PackfileStorage {
         (cap, budget, projected)
     }
 
-    fn serialize_snapshot_index(&self, index: &LossyIndex) -> (usize, Vec<u8>) {
-        if self.checkpoint_slots_only.load(Ordering::Relaxed) {
-            (
-                index.serialized_slots_only_len(),
-                index.serialize_slots_only(),
-            )
-        } else {
-            (index.serialized_len(), index.serialize())
-        }
+    fn serialize_snapshot_index(index: &LossyIndex) -> (usize, Vec<u8>) {
+        (index.serialized_len(), index.serialize())
     }
 
     fn build_v1_pending_batch(
@@ -6338,11 +6200,9 @@ impl PackfileStorage {
                 PendingDelta::Snapshot => {
                     if let Some(room) = collections.get(&collection_id) {
                         let generation = arc_swap::ArcSwapAny::load_full(room);
-                        // The v1 payload is self-describing by length, and the
-                        // reader accepts either form, so slots-only stores
-                        // must use the short form here too.
+                        // The v1 payload is the canonical slots-only form.
                         let (blob_len, index_blob) =
-                            self.serialize_snapshot_index(&generation.index);
+                            Self::serialize_snapshot_index(&generation.index);
                         let frame_len =
                             delta::v1_snapshot_frame_len(blob_len).ok_or_else(|| {
                                 StorageError::Io(std::io::Error::other("v1 batch size overflow"))

@@ -602,6 +602,22 @@ impl LossyIndex {
         offset: u64,
         removed: bool,
     ) -> Result<(u32, u64, EntryUndo), InsertError> {
+        // A checkpoint-mapped index has no in-memory identity tables. Once a
+        // caller materializes it for writing, allocate zeroed tables so new
+        // entries can be recorded while existing candidates still request
+        // identity verification from storage.
+        {
+            let mut homes = self.homes.lock();
+            if homes.len() != self.capacity as usize {
+                homes.resize(self.capacity as usize, 0);
+            }
+        }
+        {
+            let mut tails = self.tails.lock();
+            if tails.len() != self.capacity as usize {
+                tails.resize(self.capacity as usize, 0);
+            }
+        }
         let tag = self.tag(hash);
         let raw_home = u64::from_be_bytes(hash[..8].try_into().unwrap());
         let home = self.mix_home(raw_home);
@@ -1201,13 +1217,11 @@ impl LossyIndex {
         true
     }
 
-    /// Length of [`Self::serialize`]'s output, `8 + capacity * 24` bytes, known
+    /// Length of [`Self::serialize`]'s output, `8 + capacity * 8` bytes, known
     /// without building it.
     #[must_use]
     pub fn serialized_len(&self) -> usize {
-        (self.capacity as usize)
-            .saturating_mul(24)
-            .saturating_add(8)
+        (self.capacity as usize).saturating_mul(8).saturating_add(8)
     }
 
     /// Serialize the index to bytes for persistence.
@@ -1216,54 +1230,18 @@ impl LossyIndex {
     /// ```text
     ///   [capacity: u64]
     ///   [slot_0: u64] ... [slot_{cap-1}: u64]     ← capacity × 8 B
-    ///   [home_0: u64] ... [home_{cap-1}: u64]     ← capacity × 8 B (0 if unhydrated)
-    ///   [tail_0: u64] ... [tail_{cap-1}: u64]     ← capacity × 8 B (0 if unhydrated)
     /// ```
-    /// Total: `8 + capacity * 24` bytes.
+    /// Total: `8 + capacity * 8` bytes. Identity tables are rebuilt in memory
+    /// as records are written or read.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let cap = self.capacity as usize;
-        let byte_len = 8_usize.wrapping_add(cap.wrapping_mul(24));
+        let byte_len = 8_usize.wrapping_add(cap.wrapping_mul(8));
         let mut buf = Vec::with_capacity(byte_len);
         buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
         for index in 0..cap {
             let entry = IndexEntry(self.entry_at(index));
             buf.extend_from_slice(&entry.0.to_le_bytes());
-        }
-        let homes = self.homes.lock();
-        let tails = self.tails.lock();
-        for index in 0..cap {
-            // A slots-only load leaves the identity tables empty; widen it to
-            // an explicit zero table rather than indexing past the end.
-            buf.extend_from_slice(&homes.get(index).copied().unwrap_or(0).to_le_bytes());
-        }
-        for index in 0..cap {
-            buf.extend_from_slice(&tails.get(index).copied().unwrap_or(0).to_le_bytes());
-        }
-        buf
-    }
-
-    /// Length of [`Self::serialize_slots_only`]'s output, `8 + capacity * 8`.
-    #[must_use]
-    pub fn serialized_slots_only_len(&self) -> usize {
-        (self.capacity as usize).saturating_mul(8).saturating_add(8)
-    }
-
-    /// Serialize the capacity and packed slots without the `homes`/`tails`
-    /// identity tables.
-    ///
-    /// A reader loads this as an index with incomplete identity: a same-tag
-    /// probe resolves the candidate from its frame header
-    /// ([`InsertError::NeedsIdentity`]) and growth recovers hashes from the
-    /// packs (`grow_by_recovering_hashes`). In exchange the blob is a
-    /// third the size.
-    #[must_use]
-    pub fn serialize_slots_only(&self) -> Vec<u8> {
-        let cap = self.capacity as usize;
-        let mut buf = Vec::with_capacity(self.serialized_slots_only_len());
-        buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
-        for index in 0..cap {
-            buf.extend_from_slice(&self.entry_at(index).to_le_bytes());
         }
         buf
     }
@@ -1283,9 +1261,8 @@ impl LossyIndex {
 
     /// Deserialize an index from bytes with a given config (providing seed).
     ///
-    /// Accepts both the slots-only format (`8 + cap*8` bytes) and the
-    /// slots+homes+tails format (`8 + cap*24` bytes). Homes and tails are
-    /// populated from the blob when present; zeroed otherwise.
+    /// Accepts the v1 slots-only format (`8 + cap*8` bytes). Homes and tails
+    /// are rebuilt in memory as the index is used.
     ///
     /// # Errors
     /// Returns `DeserializationError::TooShort` if the data is too short,
@@ -1311,11 +1288,9 @@ impl LossyIndex {
         }
 
         let slots_len = 8_usize.wrapping_add(capacity_usize.wrapping_mul(8));
-        let full_len = 8_usize.wrapping_add(capacity_usize.wrapping_mul(24));
-        if data.len() < slots_len {
+        if data.len() != slots_len {
             return Err(DeserializationError::TooShort);
         }
-        let has_homes_tails = data.len() >= full_len;
 
         let mut slots = Vec::with_capacity(capacity_usize);
         let mut len: u32 = 0;
@@ -1334,33 +1309,8 @@ impl LossyIndex {
 
         let shift = 64_u32.wrapping_sub(capacity.trailing_zeros());
 
-        let homes = if has_homes_tails {
-            let base = slots_len;
-            let mut h = Vec::with_capacity(capacity_usize);
-            for i in 0..capacity_usize {
-                let offset = base.wrapping_add(i.wrapping_mul(8));
-                h.push(u64::from_le_bytes(
-                    data[offset..offset.wrapping_add(8)].try_into().unwrap(),
-                ));
-            }
-            h
-        } else {
-            vec![0; capacity_usize]
-        };
-
-        let tails = if has_homes_tails {
-            let base = slots_len.wrapping_add(capacity_usize.wrapping_mul(8));
-            let mut t = Vec::with_capacity(capacity_usize);
-            for i in 0..capacity_usize {
-                let offset = base.wrapping_add(i.wrapping_mul(8));
-                t.push(u64::from_le_bytes(
-                    data[offset..offset.wrapping_add(8)].try_into().unwrap(),
-                ));
-            }
-            t
-        } else {
-            vec![0; capacity_usize]
-        };
+        let homes = vec![0; capacity_usize];
+        let tails = vec![0; capacity_usize];
 
         let slots = EntryStorage::Owned(slots);
         let can_grow = Self::identity_tables_complete(capacity, shift, &slots, &homes, &tails);
@@ -1406,68 +1356,6 @@ impl LossyIndex {
             homes: Mutex::new(Vec::new()),
             tails: Mutex::new(Vec::new()),
             can_grow: false,
-            len: AtomicU32::new(len),
-            max_probe_len: AtomicU32::new(0),
-        }
-    }
-
-    /// Build a read-only index directly over a validated checkpoint's raw
-    /// slots with a given config, loading pre-hydrated homes and tails from
-    /// the checkpoint mmap. This eliminates cold-start packfile reads for
-    /// tag-collision verification when the checkpoint carries identity data.
-    ///
-    /// The slots remain mmap-backed; homes and tails are copied into owned
-    /// `Vec<u64>` so they can be updated by `hydrate_slot_identity` if needed.
-    ///
-    /// # Panics
-    /// Panics if `[homes_offset, homes_offset + capacity*8)` or
-    /// `[tails_offset, tails_offset + capacity*8)` fall outside `mmap` —
-    /// callers must only pass offsets validated against a checkpoint's own
-    /// declared body length (see `checkpoint::read_checkpoint`).
-    #[must_use]
-    pub fn from_mmap_slots_with_homes_tails(
-        mmap: Arc<Mmap>,
-        slots_offset: usize,
-        homes_offset: usize,
-        tails_offset: usize,
-        capacity: u32,
-        len: u32,
-        config: IndexConfig,
-    ) -> Self {
-        let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
-        let mut homes = Vec::with_capacity(cap);
-        let mut tails = Vec::with_capacity(cap);
-        let buf: &[u8] = &mmap;
-        for i in 0..cap {
-            let h_off = homes_offset.wrapping_add(i.wrapping_mul(8));
-            let t_off = tails_offset.wrapping_add(i.wrapping_mul(8));
-            homes.push(u64::from_le_bytes(
-                buf[h_off..h_off.wrapping_add(8)].try_into().unwrap(),
-            ));
-            tails.push(u64::from_le_bytes(
-                buf[t_off..t_off.wrapping_add(8)].try_into().unwrap(),
-            ));
-        }
-        let slots = EntryStorage::Mmap {
-            mmap,
-            offset: slots_offset,
-        };
-        let can_grow = Self::identity_tables_complete(
-            capacity,
-            64_u32.wrapping_sub(capacity.trailing_zeros()),
-            &slots,
-            &homes,
-            &tails,
-        );
-        Self {
-            mask: capacity.wrapping_sub(1),
-            capacity,
-            shift: 64_u32.wrapping_sub(capacity.trailing_zeros()),
-            config,
-            slots,
-            homes: Mutex::new(homes),
-            tails: Mutex::new(tails),
-            can_grow,
             len: AtomicU32::new(len),
             max_probe_len: AtomicU32::new(0),
         }
