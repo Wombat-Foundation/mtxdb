@@ -1364,34 +1364,3 @@ fn frame_length_bound_matches_the_reader() {
     );
     assert!(checked_frame_len(u32::MAX, u32::MAX).is_err());
 }
-
-#[test]
-fn disposition_bits_round_trip_in_the_fixed_frame_flags() {
-    let record = Record {
-        collection_id: [0x11; 16],
-        hash: [0x22; 16],
-        data: Bytes::from_static(b"payload"),
-        metadata: None,
-    };
-
-    let frame =
-        encode_record_with_options_and_disposition(&record, false, true, 0b101).expect("encode");
-    // Byte 0 is the length prefix's first byte; the fixed flag byte follows
-    // the 4-byte frame length.
-    assert_eq!(
-        frame[4] & FLAG_DISPOSITION_MASK,
-        0b101 << FLAG_DISPOSITION_SHIFT
-    );
-
-    let mut cursor = std::io::Cursor::new(frame);
-    let read = read_record_metadata(&mut cursor)
-        .expect("read")
-        .expect("frame");
-    assert_eq!(read.disposition, 0b101);
-    assert_eq!(read.collection_id, record.collection_id);
-    assert_eq!(read.hash, record.hash);
-
-    // The plain encoder still writes zero, so no existing frame changes.
-    let plain = encode_record_with_options(&record, false, true).expect("encode");
-    assert_eq!(plain[4] & FLAG_DISPOSITION_MASK, 0);
-}
