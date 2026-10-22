@@ -4,7 +4,8 @@
 //! index heap / mapped slot bytes / process RSS, put-path cost and
 //! identity-read counts, and the peak RSS of a checkpoint-less full-scan
 //! open. Set `MTXDB_MEASURE_EVICT=1` to evict the page cache before the cold
-//! strided rewrite.
+//! rewrite. The cold rewrite uses a deterministic spread sample; set
+//! `MTXDB_MEASURE_SAMPLE=first` or `stride` to compare access patterns.
 //!
 //! ```text
 //! MTXDB_MEASURE_RECORDS=4000000 cargo run --release --example checkpoint_memory
@@ -74,20 +75,22 @@ fn payload(seq: u64) -> [u8; 16] {
 /// `logical` is `memory_usage` (the operator-facing capacity estimate);
 /// `heap` and `mapped` come from `collection_index_residency`, which separates
 /// private heap from the checkpoint-mapped slot array.
-fn index_memory(store: &PackfileStorage) -> (usize, usize, usize) {
+fn index_memory(store: &PackfileStorage) -> (usize, usize, usize, usize) {
     let mut heap = 0usize;
     let mut mapped = 0usize;
     let mut logical = 0usize;
+    let mut slots = 0usize;
     for (collection_id, _entries, memory, _capacity) in store.collection_summaries() {
         logical = logical.saturating_add(memory);
-        if let Some((_entries, resident, mapped_bytes, _capacity)) =
+        if let Some((_entries, resident, mapped_bytes, capacity)) =
             store.collection_index_residency(&collection_id)
         {
             heap = heap.saturating_add(resident);
             mapped = mapped.saturating_add(mapped_bytes);
+            slots = slots.saturating_add(capacity as usize);
         }
     }
-    (heap, mapped, logical)
+    (heap, mapped, logical, slots)
 }
 
 fn file_len(path: &Path) -> u64 {
@@ -126,31 +129,6 @@ fn put_range(store: &PackfileStorage, start: u64, count: u64) -> Duration {
     started.elapsed()
 }
 
-fn put_strided(store: &PackfileStorage, total_records: u64, count: u64) -> Duration {
-    assert!(
-        total_records > 0,
-        "strided writes need a non-empty key range"
-    );
-    let started = Instant::now();
-    let stride = spread_stride(total_records);
-    let mut done = 0u64;
-    while done < count {
-        let n = (count - done).min(BATCH);
-        let entries: Vec<([u8; 16], NodeData)> = (done..done + n)
-            .map(|i| {
-                let seq = i.wrapping_mul(stride) % total_records;
-                (
-                    id_for(seq),
-                    NodeData::from_slice(&payload(seq.wrapping_add(1))),
-                )
-            })
-            .collect();
-        store.put_many(&COLLECTION, &entries).unwrap();
-        done += n;
-    }
-    started.elapsed()
-}
-
 /// Pick a stride coprime to the record count so samples cover the full range.
 fn spread_stride(total_records: u64) -> u64 {
     if total_records <= 1 {
@@ -174,6 +152,50 @@ fn gcd(mut left: u64, mut right: u64) -> u64 {
         (left, right) = (right, left % right);
     }
     left
+}
+
+/// Deterministic, non-contiguous sample of `count` distinct keys below `records`.
+///
+/// Scattering the rewritten keys is the point: the first `count` ids sit in
+/// adjacent frames, so a page-cache drop only faults in a handful of pack
+/// pages and readahead hides the rest. A fixed stride is cheaper, but can
+/// alias shard and page boundaries; this sample avoids that.
+fn spread_sample(records: u64, count: u64) -> Vec<u64> {
+    assert!(records > 0, "spread sample needs a non-empty key range");
+    assert!(
+        count <= records,
+        "spread sample count {count} exceeds record count {records}"
+    );
+    let mut seen = std::collections::HashSet::new();
+    let count = usize::try_from(count).expect("sample count exceeds address space");
+    let mut out = Vec::with_capacity(count);
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    while out.len() < count {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let index = z % records;
+        if seen.insert(index) {
+            out.push(index);
+        }
+    }
+    out
+}
+
+/// Overwrite an explicit set of existing keys.
+fn put_indices(store: &PackfileStorage, indices: &[u64]) -> Duration {
+    let started = Instant::now();
+    let batch = usize::try_from(BATCH).expect("batch size exceeds address space");
+    for chunk in indices.chunks(batch) {
+        let entries: Vec<([u8; 16], NodeData)> = chunk
+            .iter()
+            .map(|index| (id_for(*index), NodeData::from_slice(&payload(*index))))
+            .collect();
+        store.put_many(&COLLECTION, &entries).unwrap();
+    }
+    started.elapsed()
 }
 
 fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
@@ -245,12 +267,13 @@ fn main() {
     drop(store);
     let rss_before = rss_bytes();
     let store = PackfileStorage::open(dir.clone()).unwrap();
-    let (heap, mapped, logical) = index_memory(&store);
+    let (heap, mapped, logical, slots) = index_memory(&store);
     println!(
-        "reopen (slots-only): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB, logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
+        "reopen (slots-only): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB ({:.2} B/slot), logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
         mib(heap as u64),
         heap as f64 / records as f64,
         mib(mapped as u64),
+        mapped as f64 / slots.max(1) as f64,
         logical as f64 / records as f64,
         mib(rss_bytes().saturating_sub(rss_before)),
         mib(rss_before)
@@ -286,7 +309,7 @@ fn main() {
     }
     let baseline = rss_bytes();
     let (store, peak) = peak_rss_during(|| PackfileStorage::open(dir.clone()).unwrap());
-    let (heap, _mapped, _logical) = index_memory(&store);
+    let (heap, _mapped, _logical, _slots) = index_memory(&store);
     println!(
         "full-scan open: peak rss {:.1} MiB (from {:.1} MiB, +{:.1}), final heap {:.1} MiB ({:.2} B/rec)",
         mib(peak),
@@ -344,30 +367,46 @@ fn run_cold_rewrite(dir: &Path, records: u64) {
     drop(store);
 
     let reopened = PackfileStorage::open(dir.to_path_buf()).unwrap();
-    let (heap, mapped, _logical) = index_memory(&reopened);
+    let (heap, mapped, _logical, slots) = index_memory(&reopened);
     let evicted = if std::env::var("MTXDB_MEASURE_EVICT").as_deref() == Ok("1") {
         evict_dir(dir)
     } else {
         "not requested".to_owned()
     };
     println!(
-        "[{label}] reopen heap {:.2} MiB, mapped {:.1} MiB; eviction: {evicted}",
-        mib(heap as u64),
+        "[{label}] reopen heap {heap} B ({:.6} B/rec), mapped {:.1} MiB ({:.2} B/slot); eviction: {evicted}",
+        heap as f64 / records as f64,
         mib(mapped as u64),
+        mapped as f64 / slots.max(1) as f64,
     );
 
+    let sample_size = 20_000u64.min(records);
+    let sample_mode = std::env::var("MTXDB_MEASURE_SAMPLE").unwrap_or_default();
+    let (first_keys, sample_label) = match sample_mode.as_str() {
+        "first" => (
+            (0..sample_size).map(|i| i % records).collect::<Vec<u64>>(),
+            "first-20k",
+        ),
+        "stride" => (
+            (0..sample_size)
+                .map(|i| i.wrapping_mul(spread_stride(records)) % records)
+                .collect::<Vec<u64>>(),
+            "stride",
+        ),
+        _ => (spread_sample(records, sample_size), "spread"),
+    };
     let before = reopened.stats().index_identity_reads;
-    let first = put_strided(&reopened, records, 20_000);
+    let first = put_indices(&reopened, &first_keys);
     let first_reads = reopened.stats().index_identity_reads - before;
     let before = reopened.stats().index_identity_reads;
-    let second = put_strided(&reopened, records, 20_000);
+    let second = put_indices(&reopened, &first_keys);
     let second_reads = reopened.stats().index_identity_reads - before;
     println!(
-        "[{label}] strided rewrite 20k across {records} keys: first {:.1} ms ({:.3} us/rec) identity_reads={first_reads}; second {:.1} ms ({:.3} us/rec) identity_reads={second_reads}",
+        "[{label}] rewrite 20k ({sample_label} sample) across {records} keys: first {:.1} ms ({:.3} us/rec) identity_reads={first_reads}; second {:.1} ms ({:.3} us/rec) identity_reads={second_reads}",
         first.as_secs_f64() * 1e3,
-        first.as_secs_f64() * 1e6 / 20_000.0,
+        first.as_secs_f64() * 1e6 / sample_size as f64,
         second.as_secs_f64() * 1e3,
-        second.as_secs_f64() * 1e6 / 20_000.0,
+        second.as_secs_f64() * 1e6 / sample_size as f64,
     );
 
     drop(reopened);
