@@ -322,9 +322,25 @@ pub const FLAG_REMOVED: u8 = 0x08;
 /// the byte layout differs from the flag's absence.
 pub const FLAG_METADATA: u8 = 0x04;
 
+/// Per-frame disposition bits: three generic record-status bits.
+///
+/// Core assigns no meaning to these bits; the storage layer and its callers
+/// define them. They are written into the fixed frame flag byte, so the
+/// authoritative copy costs no extra bytes and is covered by the frame CRC.
+/// A caller that puts the disposition somewhere else must not also set these,
+/// or rebuild and repack would read a different value than the live index.
+pub const FLAG_DISPOSITION_MASK: u8 = 0x70;
+
+/// Right shift from the fixed frame flag byte to the disposition value.
+pub const FLAG_DISPOSITION_SHIFT: u32 = 4;
+
+/// Largest disposition value representable in [`FLAG_DISPOSITION_MASK`].
+pub const MAX_DISPOSITION: u8 = 0x07;
+
 /// Any flag bit this reader understands. A frame carrying a bit outside this
 /// mask is rejected rather than misparsed.
-const KNOWN_FLAGS: u8 = FLAG_COMPRESSED | FLAG_CRC_DISABLED | FLAG_METADATA | FLAG_REMOVED;
+const KNOWN_FLAGS: u8 =
+    FLAG_COMPRESSED | FLAG_CRC_DISABLED | FLAG_METADATA | FLAG_REMOVED | FLAG_DISPOSITION_MASK;
 
 /// Version byte for the optional per-frame metadata area.
 pub const METADATA_VERSION: u8 = 0x01;
@@ -955,6 +971,22 @@ pub(crate) fn encode_record_with_options(
     compress: bool,
     write_checksum: bool,
 ) -> io::Result<Vec<u8>> {
+    encode_record_with_options_and_disposition(record, compress, write_checksum, 0)
+}
+
+/// [`encode_record_with_options`] with an explicit 3-bit disposition.
+///
+/// The value is written into the fixed frame flag byte, so `rebuild_index`
+/// and repack can recover it from the authoritative record.
+///
+/// # Errors
+/// Returns `io::Error` if the payload is too large to frame.
+pub(crate) fn encode_record_with_options_and_disposition(
+    record: &Record,
+    compress: bool,
+    write_checksum: bool,
+    disposition: u8,
+) -> io::Result<Vec<u8>> {
     let uncompressed_len = u32::try_from(record.data.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1005,6 +1037,7 @@ pub(crate) fn encode_record_with_options(
     {
         flags |= FLAG_REMOVED;
     }
+    flags |= (disposition & MAX_DISPOSITION) << FLAG_DISPOSITION_SHIFT;
 
     let frame_len = FRAME_FIXED_LEN
         .checked_add(metadata_len)
@@ -1179,6 +1212,8 @@ pub struct RecordMetadata {
     pub collection_id: [u8; 16],
     /// The structural hash framed alongside the record.
     pub hash: [u8; 16],
+    /// The three generic disposition bits stored in the frame flag byte.
+    pub disposition: u8,
     /// Optional per-record metadata. Removal alone may set this to `Some`
     /// without [`FLAG_METADATA`], because its state comes from [`FLAG_REMOVED`].
     pub metadata: Option<FrameMetadata>,
@@ -1199,6 +1234,8 @@ struct FrameHeader {
     len_buf: [u8; 4],
     frame_len: u32,
     flags: u8,
+    /// The three generic disposition bits from the frame flag byte.
+    disposition: u8,
     fixed: [u8; FRAME_FIXED_LEN as usize],
     collection_id: [u8; 16],
     hash: [u8; 16],
@@ -1252,6 +1289,7 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
     reader.read_exact(&mut fixed)?;
 
     let flags = fixed[0];
+    let disposition = (flags & FLAG_DISPOSITION_MASK) >> FLAG_DISPOSITION_SHIFT;
     if flags & !KNOWN_FLAGS != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1316,6 +1354,7 @@ fn read_frame_header(reader: &mut impl Read) -> io::Result<Option<FrameHeader>> 
         len_buf,
         frame_len,
         flags,
+        disposition,
         fixed,
         collection_id,
         hash,
@@ -1410,6 +1449,7 @@ fn read_record_metadata_scratch(
     Ok(Some(RecordMetadata {
         collection_id: header.collection_id,
         hash: header.hash,
+        disposition: header.disposition,
         metadata: header.metadata,
     }))
 }
@@ -1470,6 +1510,7 @@ fn read_record_metadata_skip_payload_with_end(
     Ok(Some(RecordMetadata {
         collection_id: header.collection_id,
         hash: header.hash,
+        disposition: header.disposition,
         metadata: header.metadata,
     }))
 }
