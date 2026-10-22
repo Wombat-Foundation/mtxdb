@@ -432,8 +432,6 @@ pub(crate) struct ScanEntryWithRemoval {
     pub hash: [u8; 16],
     pub offset: u64,
     pub removed: bool,
-    /// The three generic disposition bits from the frame flag byte.
-    pub disposition: u8,
 }
 
 /// Streaming packfile metadata scanner.
@@ -989,12 +987,6 @@ pub(crate) fn encode_record_with_options_and_disposition(
     write_checksum: bool,
     disposition: u8,
 ) -> io::Result<Vec<u8>> {
-    if disposition > MAX_DISPOSITION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "record disposition must fit in three bits",
-        ));
-    }
     let uncompressed_len = u32::try_from(record.data.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1045,7 +1037,7 @@ pub(crate) fn encode_record_with_options_and_disposition(
     {
         flags |= FLAG_REMOVED;
     }
-    flags |= disposition << FLAG_DISPOSITION_SHIFT;
+    flags |= (disposition & MAX_DISPOSITION) << FLAG_DISPOSITION_SHIFT;
 
     let frame_len = FRAME_FIXED_LEN
         .checked_add(metadata_len)
@@ -2033,7 +2025,6 @@ pub(crate) fn scan_packfile_from_with_removal(
                     .metadata
                     .as_ref()
                     .is_some_and(|frame| frame.removed),
-                disposition: metadata.disposition,
             }),
             Ok(None) => break,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -2421,7 +2412,6 @@ fn recover_packfile_with(
                     hash: meta.hash,
                     offset,
                     removed: meta.metadata.as_ref().is_some_and(|frame| frame.removed),
-                    disposition: meta.disposition,
                 });
                 recovery.records = recovery.records.saturating_add(1);
                 recovery.valid_len = reader.position;

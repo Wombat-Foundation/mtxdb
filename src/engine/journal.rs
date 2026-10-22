@@ -5488,12 +5488,6 @@ fn encode_mutation(
     mutation: &Mutation,
     into: &mut Vec<u8>,
 ) -> io::Result<()> {
-    if matches!(mutation, Mutation::PutWithDisposition { disposition, .. } if *disposition > 0x07) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "record disposition must fit in three bits",
-        ));
-    }
     // The flag byte is always the pool tag.
     let pool_byte = pool_tag(pool);
 
@@ -5534,7 +5528,7 @@ fn encode_mutation(
             } => {
                 frame[MF_COLLECTION].copy_from_slice(collection_id);
                 frame[MF_NODE].copy_from_slice(node_id);
-                frame[MF_FLAGS.start] = *disposition;
+                frame[MF_FLAGS.start] = *disposition & 0x07;
                 let payload_len = u32::try_from(payload.len()).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "mutation payload exceeds u32")
                 })?;

@@ -607,23 +607,6 @@ impl LossyIndex {
             .map(|(bucket, value, _undo)| (bucket, value))
     }
 
-    /// As [`Self::insert_tracked_with_removed`], storing `flags` in the
-    /// entry's three disposition bits.
-    ///
-    /// # Errors
-    /// The same as [`Self::insert_tracked_with_removed`].
-    pub fn insert_tracked_with_flags(
-        &self,
-        hash: &[u8; 16],
-        slot: u16,
-        offset: u64,
-        removed: bool,
-        flags: u8,
-    ) -> Result<(u32, u64), InsertError> {
-        self.insert_undoable_with_flags(hash, slot, offset, removed, flags)
-            .map(|(bucket, value, _undo)| (bucket, value))
-    }
-
     /// Like [`Self::insert_tracked`], but also returns a [`EntryUndo`]
     /// capturing the entry's prior contents, so a caller that needs to
     /// mutate the live (not cloned) index for a multi-record batch can
