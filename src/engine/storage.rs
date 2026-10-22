@@ -279,43 +279,6 @@ pub trait StorageEngine: Send + Sync {
         ids: &[NodeId],
     ) -> Result<Vec<Option<NodeData>>, StorageError>;
 
-    /// Fetch multiple records together with their generic disposition bits.
-    /// Implementations without disposition support return zero for present
-    /// records. Results preserve input order.
-    ///
-    /// # Errors
-    /// Propagates errors returned by [`Self::get_many`].
-    fn get_many_with_disposition(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<(NodeData, u8)>>, StorageError> {
-        self.get_many(collection_id, ids).map(|records| {
-            records
-                .into_iter()
-                .map(|record| record.map(|data| (data, 0)))
-                .collect()
-        })
-    }
-
-    /// Fetch only the generic disposition bits for multiple records.
-    ///
-    /// # Errors
-    /// Propagates errors returned by [`Self::get_many_with_disposition`].
-    fn get_many_disposition(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<u8>>, StorageError> {
-        self.get_many_with_disposition(collection_id, ids)
-            .map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| record.map(|(_, disposition)| disposition))
-                    .collect()
-            })
-    }
-
     /// Fetch multiple node payloads without retaining the [`NodeData`] wrapper.
     ///
     /// The returned [`bytes::Bytes`] values share the payload allocation from

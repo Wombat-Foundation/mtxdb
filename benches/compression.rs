@@ -156,7 +156,6 @@ fn run_case(kind: PayloadKind, payload_len: usize) {
         .map(|index| Record {
             collection_id: COLLECTION_ID,
             hash: record_id(index),
-            disposition: 0,
             data: Bytes::from(payload(kind, payload_len, index)),
             metadata: None,
         })

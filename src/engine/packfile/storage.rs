@@ -954,9 +954,8 @@ type RepackRecordMap = HashMap<[u8; 16], (u16, u64)>;
 /// Live records and removal markers found for each collection by a batch scan.
 type BatchRepackRecordMaps = HashMap<[u8; 16], (RepackRecordMap, RepackRecordMap)>;
 /// Replacement index entries produced while copying one repack collection.
-type RepackOffsets = Vec<([u8; 16], u16, u64, bool, u8)>;
-type RepackCopiedRecord = ([u8; 16], u16, u64, u64, u8);
-type ResolvedRecord = (NodeData, Option<u64>, bool, u8);
+type RepackOffsets = Vec<([u8; 16], u16, u64, bool)>;
+type RepackCopiedRecord = ([u8; 16], u16, u64, u64);
 /// Return type of [`PackfileStorage::repack_scan_incremental`]: live records,
 /// removal markers that still suppress an older copy in a retained shard, and
 /// (on the incremental path) the cursor state used by adjacency helpers.
@@ -1308,6 +1307,23 @@ fn plan_read_extents(
     // testable.
     extents.sort_unstable_by_key(|extent| (extent.slot, extent.start));
     extents
+}
+
+fn insert_or_corrupt_with_removed(
+    index: &LossyIndex,
+    hash: &[u8; 16],
+    slot: u16,
+    offset: u64,
+    removed: bool,
+) -> Result<(), StorageError> {
+    index
+        .insert_tracked_with_removed(hash, slot, offset, removed)
+        .map(|_| ())
+        .map_err(|error| {
+            StorageError::Corrupt(format!(
+                "index insert failed for the record at offset {offset} in shard {slot}: {error}"
+            ))
+        })
 }
 
 fn insert_or_corrupt_with_flags(
@@ -3246,8 +3262,7 @@ impl PackfileStorage {
             };
             matches!(
                 shards.record_identity_at(&shard, offset),
-                Ok((collection, hash, _disposition))
-                    if collection == record.collection_id && hash == full_hash
+                Ok((collection, hash)) if collection == record.collection_id && hash == full_hash
             )
         })
     }
@@ -4049,45 +4064,6 @@ impl PackfileStorage {
         Ok(results)
     }
 
-    /// Batched three-bit disposition for records that exist in `collection_id`.
-    ///
-    /// A `LossyIndex` slot is only a 16-bit tag candidate: the full 16-byte
-    /// record identity is verified against the frame header at its
-    /// `(shard, offset)` before that record's disposition is returned, so a
-    /// tag collision can never report another record's flags (nor turn an
-    /// absent key into `Some(0)`).
-    ///
-    /// Removed records report the disposition of their removal frame. Absent
-    /// records return `None`.
-    ///
-    /// # Errors
-    /// Propagates a corrupt frame or a shard-identity read failure.
-    pub fn get_many_disposition(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<u8>>, StorageError> {
-        let mut out = vec![None; ids.len()];
-        let Some(generation) = self.generation(collection_id) else {
-            return Ok(out);
-        };
-        for (index, id) in ids.iter().enumerate() {
-            let candidates: Vec<(u16, u64)> = generation.index.lookup_all(id).collect();
-            for (slot, offset) in candidates {
-                let Some(shard) = self.shards.get_shard(slot) else {
-                    continue;
-                };
-                let (found_collection, found_hash, disposition) =
-                    self.shards.record_identity_at(&shard, offset)?;
-                if &found_collection == collection_id && &found_hash == id {
-                    out[index] = Some(disposition);
-                    break;
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// A collection's `(entry count, private heap bytes, mapped bytes,
     /// index capacity)`, if the collection exists. Unlike
     /// [`Self::collection_index_info`], this separates the heap the table owns
@@ -4850,7 +4826,7 @@ impl PackfileStorage {
     }
 
     fn build_index(
-        offsets: &[([u8; 16], u16, u64, bool, u8)],
+        offsets: &[([u8; 16], u16, u64, bool)],
         index_config: crate::index::IndexConfig,
     ) -> Result<LossyIndex, StorageError> {
         let index = LossyIndex::with_config(
@@ -4860,9 +4836,9 @@ impl PackfileStorage {
                 .max(NEW_COLLECTION_INDEX_FLOOR),
             index_config,
         );
-        for (hash, slot, offset, removed, disposition) in offsets {
+        for (hash, slot, offset, removed) in offsets {
             check_index_offset(*slot, hash, *offset)?;
-            insert_or_corrupt_with_flags(&index, hash, *slot, *offset, *removed, *disposition)?;
+            insert_or_corrupt_with_removed(&index, hash, *slot, *offset, *removed)?;
         }
         Ok(index)
     }
@@ -6726,24 +6702,13 @@ impl PackfileStorage {
             return Ok(None);
         };
         let record = self.read_at(old_shard, old_offset, true)?;
-        let disposition = record.disposition;
-        let (new_slot, new_offset, disk_bytes) = self.shards.put_record_with_len_with_disposition(
-            &Record {
-                collection_id: *collection_id,
-                hash: record.hash,
-                disposition,
-                data: record.data,
-                metadata: record.metadata,
-            },
-            disposition,
-        )?;
-        Ok(Some((
-            record.hash,
-            new_slot,
-            new_offset,
-            disk_bytes,
-            disposition,
-        )))
+        let (new_slot, new_offset, disk_bytes) = self.shards.put_record_with_len(&Record {
+            collection_id: *collection_id,
+            hash: record.hash,
+            data: record.data,
+            metadata: record.metadata,
+        })?;
+        Ok(Some((record.hash, new_slot, new_offset, disk_bytes)))
     }
     fn swap_generation(
         &self,
@@ -6917,8 +6882,7 @@ impl PackfileStorage {
             let shard = self.shards.get_shard(slot).ok_or_else(|| {
                 StorageError::Corrupt(format!("checkpoint index refers to missing shard {slot}"))
             })?;
-            let (found_collection, hash, _disposition) =
-                self.shards.record_identity_at(&shard, offset)?;
+            let (found_collection, hash) = self.shards.record_identity_at(&shard, offset)?;
             if &found_collection != collection_id {
                 return Err(StorageError::Corrupt(format!(
                     "checkpoint index offset {offset} in shard {slot} belongs to another collection"
@@ -6993,7 +6957,7 @@ impl PackfileStorage {
                             "index refers to missing shard {slot} while resolving a tag collision"
                         ))
                     })?;
-                    let (found_collection, found_hash, _disposition) =
+                    let (found_collection, found_hash) =
                         self.shards.record_identity_at(&shard, offset)?;
                     self.index_identity_reads.fetch_add(1, Ordering::Relaxed);
                     if &found_collection != collection_id
@@ -7056,7 +7020,7 @@ impl PackfileStorage {
     ) -> Result<Option<NodeData>, StorageError> {
         Ok(self
             .resolve_with_lsn_from_pinned(id, candidates, pinned, track)?
-            .and_then(|(data, _, removed, _)| (!removed).then_some(data)))
+            .and_then(|(data, _, removed)| (!removed).then_some(data)))
     }
 
     /// Like [`Self::resolve_from_pinned`], also returning the decoded frame's
@@ -7069,7 +7033,7 @@ impl PackfileStorage {
         candidates: &[(u16, u64)],
         pinned: &HashMap<u16, Arc<Shard>>,
         track: bool,
-    ) -> Result<Option<ResolvedRecord>, StorageError> {
+    ) -> Result<Option<(NodeData, Option<u64>, bool)>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for &(slot, offset) in candidates {
             let Some(shard) = pinned.get(&slot) else {
@@ -7113,7 +7077,7 @@ impl PackfileStorage {
                     // The cache remains populated by writes and swizzling,
                     // where it stores work that cannot be recovered by a
                     // simple mmap range.
-                    return Ok(Some((data, last_write_lsn, removed, record.disposition)));
+                    return Ok(Some((data, last_write_lsn, removed)));
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -7146,7 +7110,7 @@ impl PackfileStorage {
         let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
         Ok(self
             .resolve_with_lsn_from_pinned(id, &candidates, &pinned, false)?
-            .and_then(|(_, lsn, _, _)| lsn))
+            .and_then(|(_, lsn, _)| lsn))
     }
 
     // repack_collection_rewrite and repack_collection_topo were retired: both scanned
@@ -7690,11 +7654,11 @@ impl PackfileStorage {
     fn repack_save_incremental_state(
         &self,
         collection_id: &[u8; 16],
-        new_offsets: &[([u8; 16], u16, u64, bool, u8)],
+        new_offsets: &[([u8; 16], u16, u64, bool)],
         adjacency: HashMap<[u8; 16], Vec<[u8; 16]>>,
         current_roots: &[[u8; 16]],
     ) {
-        let surviving: HashSet<[u8; 16]> = new_offsets.iter().map(|&(h, _, _, _, _)| h).collect();
+        let surviving: HashSet<[u8; 16]> = new_offsets.iter().map(|&(h, _, _, _)| h).collect();
 
         let mut scan_offsets = HashMap::new();
         for (slot, shard) in self.shards.all_shards() {
@@ -7702,7 +7666,7 @@ impl PackfileStorage {
         }
         let next_live_map: HashMap<[u8; 16], (u16, u64)> = new_offsets
             .iter()
-            .map(|&(hash, slot, offset, _, _)| (hash, (slot, offset)))
+            .map(|&(hash, slot, offset, _)| (hash, (slot, offset)))
             .collect();
         // Evict dropped nodes from the adjacency cache so they can't
         // re-enter the live set on a future incremental BFS pass.
@@ -8139,14 +8103,14 @@ impl PackfileStorage {
             let Some(&(old_slot, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
-            if let Some((hash, slot, offset, disk_bytes, disposition)) =
+            if let Some((hash, slot, offset, disk_bytes)) =
                 self.copy_record_to_shard(collection_id, &pinned, old_slot, old_offset)?
             {
                 if let Some(shard) = self.shards.get_shard(slot) {
                     let total = new_disk_bytes.entry(shard.pack_id).or_insert(0_u64);
                     *total = (*total).saturating_add(disk_bytes);
                 }
-                new_offsets.push((hash, slot, offset, false, disposition));
+                new_offsets.push((hash, slot, offset, false));
             }
         }
 
@@ -8159,14 +8123,14 @@ impl PackfileStorage {
         removed_ids.sort_unstable();
         for hash in removed_ids {
             let (old_slot, old_offset) = removed_markers[&hash];
-            if let Some((hash, slot, offset, disk_bytes, disposition)) =
+            if let Some((hash, slot, offset, disk_bytes)) =
                 self.copy_record_to_shard(collection_id, &pinned, old_slot, old_offset)?
             {
                 if let Some(shard) = self.shards.get_shard(slot) {
                     let total = new_disk_bytes.entry(shard.pack_id).or_insert(0_u64);
                     *total = (*total).saturating_add(disk_bytes);
                 }
-                new_offsets.push((hash, slot, offset, true, disposition));
+                new_offsets.push((hash, slot, offset, true));
             }
         }
 
@@ -8362,7 +8326,7 @@ impl PackfileStorage {
             let Some(&(old_slot, old_offset)) = hash_to_shard_offset.get(hash) else {
                 continue;
             };
-            if let Some((hash, slot, offset, disk_bytes, disposition)) =
+            if let Some((hash, slot, offset, disk_bytes)) =
                 self.copy_record_to_shard(collection_id, pinned, old_slot, old_offset)?
             {
                 output_state.1 = output_state.1.saturating_add(1);
@@ -8378,7 +8342,7 @@ impl PackfileStorage {
                     let total = new_disk_bytes.entry(shard.pack_id).or_insert(0_u64);
                     *total = (*total).saturating_add(disk_bytes);
                 }
-                new_offsets.push((hash, slot, offset, false, disposition));
+                new_offsets.push((hash, slot, offset, false));
             }
         }
 
@@ -8386,7 +8350,7 @@ impl PackfileStorage {
         removed_ids.sort_unstable();
         for hash in removed_ids {
             let (old_slot, old_offset) = removed_markers[&hash];
-            if let Some((hash, slot, offset, disk_bytes, disposition)) =
+            if let Some((hash, slot, offset, disk_bytes)) =
                 self.copy_record_to_shard(collection_id, pinned, old_slot, old_offset)?
             {
                 output_state.1 = output_state.1.saturating_add(1);
@@ -8402,7 +8366,7 @@ impl PackfileStorage {
                     let total = new_disk_bytes.entry(shard.pack_id).or_insert(0_u64);
                     *total = (*total).saturating_add(disk_bytes);
                 }
-                new_offsets.push((hash, slot, offset, true, disposition));
+                new_offsets.push((hash, slot, offset, true));
             }
         }
 
@@ -8860,7 +8824,6 @@ impl PackfileStorage {
         let record = Record {
             collection_id: *collection_id,
             hash: *id,
-            disposition,
             data: data.bytes.clone(),
             metadata,
         };
@@ -9000,7 +8963,6 @@ impl PackfileStorage {
         let record = Record {
             collection_id: *collection_id,
             hash: *id,
-            disposition,
             data: data.bytes.clone(),
             metadata,
         };
@@ -9138,7 +9100,6 @@ impl PackfileStorage {
             ShardPool::validate_record(&Record {
                 collection_id: *collection_id,
                 hash: *id,
-                disposition: 0,
                 data: data.bytes.clone(),
                 metadata: None,
             })?;
@@ -10122,46 +10083,6 @@ impl StorageEngine for PackfileStorage {
                 );
             }
 
-            return Ok(results);
-        }
-    }
-
-    fn get_many_with_disposition(
-        &self,
-        collection_id: &[u8; 16],
-        ids: &[NodeId],
-    ) -> Result<Vec<Option<(NodeData, u8)>>, StorageError> {
-        if self.overlay_reads_active() {
-            return self.get_read_committed_with_disposition(collection_id, ids);
-        }
-
-        loop {
-            let Some(gen_guard) = self.generation(collection_id) else {
-                return Ok(vec![None; ids.len()]);
-            };
-            let generation = gen_guard.as_ref();
-            let candidates: Vec<Vec<(u16, u64)>> = ids
-                .iter()
-                .map(|id| generation.index.lookup_all(id).collect())
-                .collect();
-            let pinned = self.pin_shards(
-                candidates
-                    .iter()
-                    .flat_map(|items| items.iter().map(|(slot, _)| *slot)),
-            );
-            let current = self.generation(collection_id);
-            if !Self::same_generation(current.as_ref(), &gen_guard) {
-                continue;
-            }
-            let mut results = Vec::with_capacity(ids.len());
-            for (id, candidates) in ids.iter().zip(&candidates) {
-                let found = self
-                    .resolve_with_lsn_from_pinned(id, candidates, &pinned, false)?
-                    .and_then(|(data, _, removed, disposition)| {
-                        (!removed).then_some((data, disposition))
-                    });
-                results.push(found);
-            }
             return Ok(results);
         }
     }

@@ -243,29 +243,6 @@ impl DatabaseTransaction<'_> {
             .stage_put(pool, collection_id, node_id, data.bytes.to_vec())
     }
 
-    /// Stage a record and its generic disposition bits for read-your-writes.
-    ///
-    /// # Errors
-    /// Returns an error if the disposition exceeds three bits or the
-    /// transaction's staging budget is exhausted.
-    pub fn put_with_disposition(
-        &self,
-        pool: ShardType,
-        collection_id: [u8; 16],
-        node_id: [u8; 16],
-        data: &crate::storage::NodeData,
-        disposition: u8,
-    ) -> io::Result<()> {
-        let _lifecycle = self.lifecycle.lock();
-        self.stage.stage_put_with_disposition(
-            pool,
-            collection_id,
-            node_id,
-            data.bytes.to_vec(),
-            disposition,
-        )
-    }
-
     /// Stage removal of a collection.
     ///
     /// # Errors
@@ -485,7 +462,7 @@ impl DatabaseTransaction<'_> {
         let mut live_ids = Vec::new();
         for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
             match lookup {
-                StagedLookup::Put(payload, _) => results.push(Some(crate::storage::NodeData::new(
+                StagedLookup::Put(payload) => results.push(Some(crate::storage::NodeData::new(
                     bytes::Bytes::from(payload),
                 ))),
                 StagedLookup::Deleted => results.push(None),
@@ -501,50 +478,6 @@ impl DatabaseTransaction<'_> {
                 .database
                 .pool(pool)
                 .get_many(collection_id, &live_ids)?;
-            for (slot, value) in live_slots.into_iter().zip(live) {
-                results[slot] = value;
-            }
-        }
-        Ok(results)
-    }
-
-    /// Read records and disposition through this transaction, preferring its
-    /// newest staged writes and then the live pool.
-    ///
-    /// # Errors
-    /// Returns an error if the live pool read fails.
-    pub fn get_with_disposition(
-        &self,
-        pool: ShardType,
-        collection_id: &[u8; 16],
-        node_ids: &[NodeId],
-    ) -> Result<Vec<Option<(crate::storage::NodeData, u8)>>, StorageError> {
-        let staged = {
-            let _lifecycle = self.lifecycle.lock();
-            self.stage.lookup_many(pool, collection_id, node_ids)
-        };
-        let mut results = Vec::with_capacity(node_ids.len());
-        let mut live_slots = Vec::new();
-        let mut live_ids = Vec::new();
-        for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
-            match lookup {
-                StagedLookup::Put(payload, disposition) => results.push(Some((
-                    crate::storage::NodeData::new(bytes::Bytes::from(payload)),
-                    disposition,
-                ))),
-                StagedLookup::Deleted => results.push(None),
-                StagedLookup::Absent => {
-                    results.push(None);
-                    live_slots.push(slot);
-                    live_ids.push(*node_id);
-                }
-            }
-        }
-        if !live_ids.is_empty() {
-            let live = self
-                .database
-                .pool(pool)
-                .get_many_with_disposition(collection_id, &live_ids)?;
             for (slot, value) in live_slots.into_iter().zip(live) {
                 results[slot] = value;
             }
@@ -578,7 +511,7 @@ impl DatabaseTransaction<'_> {
         let mut live_ids = Vec::new();
         for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
             match lookup {
-                StagedLookup::Put(payload, _) => {
+                StagedLookup::Put(payload) => {
                     results.push(Some(crate::storage::NodeData::new(bytes::Bytes::from(
                         payload,
                     ))));
@@ -626,7 +559,7 @@ impl DatabaseTransaction<'_> {
         let mut live_ids = Vec::new();
         for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
             match lookup {
-                StagedLookup::Put(payload, _) => {
+                StagedLookup::Put(payload) => {
                     results.push(Some(crate::storage::NodeData::new(bytes::Bytes::from(
                         payload,
                     ))));
