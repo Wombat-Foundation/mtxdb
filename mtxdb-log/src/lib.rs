@@ -232,7 +232,7 @@ mod subscriber {
         }
     }
 
-    #[cfg(all(test, feature = "logging"))]
+    #[cfg(test)]
     mod tests {
         use super::{level_enabled, parse_level};
         use tracing::level_filters::LevelFilter;

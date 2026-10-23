@@ -99,7 +99,7 @@ verbose_file_reads = "warn"
 path = "src/lib.rs"
 
 [features]
-default = ["zstd", "bitmaps"]
+default = ["zstd", "bitmaps", "logging"]
 # Optional tracing events and an opt-in compact stderr subscriber.
 logging = ["mtxdb-log/logging"]
 # Record-payload compression. On by default, so stores keep writing and reading
