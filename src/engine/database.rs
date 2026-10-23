@@ -829,7 +829,7 @@ impl Database {
             if let Some(Err(error)) =
                 storage.map(|storage| storage.force_index_checkpoint_detached())
             {
-                eprintln!("warning: checkpointing {pool:?} to unblock WAL reclaim failed: {error}");
+                mtxdb_log::warn!("checkpointing {pool:?} to unblock WAL reclaim failed: {error}");
             }
         });
 

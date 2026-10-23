@@ -2712,7 +2712,7 @@ impl JournalCoordinator {
             self.reclaim_stalls.fetch_add(1, Ordering::Relaxed);
         }
         if report || (already_reported && entered_emergency) {
-            eprintln!(
+            mtxdb_log::warn!(
                 "warning: shared WAL reclaim is stalled at {len} of {} bytes (trigger {}); \
                  waiting on pools {:?} to report coverage",
                 journal.segment_cap,
@@ -2739,7 +2739,7 @@ impl JournalCoordinator {
             reported: previous.is_some_and(|old| old.reported) || emergency,
         });
         if emergency && !previous.is_some_and(|old| old.reported) {
-            eprintln!(
+            mtxdb_log::warn!(
                 "warning: shared WAL reclaim is held by an active replay lease at {len} of {} bytes",
                 journal.segment_cap
             );

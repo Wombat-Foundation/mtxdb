@@ -212,11 +212,19 @@ dependencies = [
  "fs2",
  "memchr",
  "memmap2",
+ "mtxdb-log",
  "parking_lot",
  "rezzy-recon",
  "sha2",
  "zstd",
  "zstd-sys",
+]
+
+[[package]]
+name = "mtxdb-log"
+version = "0.1.0-beta.2"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

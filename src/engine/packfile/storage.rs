@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2277,7 +2276,7 @@ impl PackfileStorage {
                     .checked_rem(100)
                     .is_some_and(|remainder| remainder == 0);
                 if previous == 0 || periodic {
-                    eprintln!(
+                    mtxdb_log::warn!(
                         "warning: unable to observe post-refresh fingerprint (count={count}): {error}"
                     );
                 }
@@ -5320,7 +5319,7 @@ impl PackfileStorage {
                     .shard_collections_failure_logged
                     .swap(true, Ordering::Relaxed)
                 {
-                    eprintln!("mtxdb: failed to persist shard→collection directory: {e}");
+                    mtxdb_log::warn!("mtxdb: failed to persist shard→collection directory: {e}");
                 }
             }
         }
@@ -5816,11 +5815,11 @@ impl PackfileStorage {
         match worker.handle.join() {
             Ok(Ok(done)) => self.record_checkpoint(worker.breakdown, &done),
             Ok(Err(error)) => {
-                eprintln!("mtxdb: background checkpoint failed: {error}");
+                mtxdb_log::error!("mtxdb: background checkpoint failed: {error}");
                 self.abandon_checkpoint();
             }
             Err(_) => {
-                eprintln!("mtxdb: background checkpoint panicked");
+                mtxdb_log::error!("mtxdb: background checkpoint panicked");
                 self.abandon_checkpoint();
             }
         }
@@ -5858,7 +5857,7 @@ impl PackfileStorage {
             match self.append_index_delta() {
                 Ok(()) => self.shard_collections_stale.store(true, Ordering::Relaxed),
                 Err(error) => {
-                    eprintln!("mtxdb: delta append during a checkpoint failed: {error}");
+                    mtxdb_log::warn!("mtxdb: delta append during a checkpoint failed: {error}");
                 }
             }
         }
@@ -5901,7 +5900,7 @@ impl PackfileStorage {
             return;
         }
         if let Err(error) = self.start_checkpoint_worker() {
-            eprintln!("mtxdb: failed to persist index checkpoint: {error}");
+            mtxdb_log::warn!("mtxdb: failed to persist index checkpoint: {error}");
         }
     }
 
@@ -6339,7 +6338,9 @@ impl PackfileStorage {
                     .and_then(|file| file.sync_data())
                 {
                     Ok(()) => state.log_synced_bytes = state.log_bytes,
-                    Err(error) => eprintln!("mtxdb: delta log fsync failed: {error}"),
+                    Err(error) => {
+                        mtxdb_log::warn!("mtxdb: delta log fsync failed: {error}");
+                    }
                 }
             }
         }
@@ -6474,7 +6475,7 @@ impl PackfileStorage {
     /// authoritative, so a failed persist only costs the next open a rescan.
     fn persist_index_checkpoint_best_effort(&self) {
         if let Err(e) = self.persist_index_checkpoint() {
-            eprintln!("mtxdb: failed to persist index checkpoint: {e}");
+            mtxdb_log::warn!("mtxdb: failed to persist index checkpoint: {e}");
         }
     }
 
@@ -8063,11 +8064,7 @@ impl PackfileStorage {
             if let Some(gen) = self.generation(collection_id) {
                 for hash in hash_to_shard_offset.keys() {
                     if !live_set.contains(hash) {
-                        let mut hex = String::with_capacity(32);
-                        for b in hash {
-                            let _ = write!(hex, "{b:02x}");
-                        }
-                        eprintln!("  dropped: {hex}");
+                        mtxdb_log::debug!(hash = ?hash, "dropped unreachable cached hash during repack");
                         gen.cache.remove(hash);
                     }
                 }
@@ -11331,7 +11328,7 @@ impl PackfileStorage {
         let log_bytes = self.delta_state.lock().log_bytes;
         let rotating = log_bytes >= self.delta_log_rotate_bytes();
         if rotating {
-            eprintln!(
+            mtxdb_log::info!(
                 "mtxdb: delta log is at {log_bytes} of {} bytes, rewriting the checkpoint \
                  before it reaches the cap",
                 self.delta_log_cap()
@@ -11364,13 +11361,15 @@ impl PackfileStorage {
                 Ok(None) => {}
                 Err(error) if Self::delta_batch_too_large(&error).is_some() => {
                     if let Some(detail) = Self::delta_batch_too_large(&error) {
-                        eprintln!(
+                        mtxdb_log::info!(
                             "mtxdb: rotating the delta log: {detail}; rewriting the checkpoint"
                         );
                     }
                 }
                 Err(error) => {
-                    eprintln!("mtxdb: delta coverage batch failed, rewriting checkpoint: {error}");
+                    mtxdb_log::warn!(
+                        "mtxdb: delta coverage batch failed, rewriting checkpoint: {error}"
+                    );
                 }
             }
         }
@@ -11420,9 +11419,13 @@ impl PackfileStorage {
                 // rewrite rather than leaving the acceleration files stale until
                 // the next sync notices the gap.
                 if let Some(detail) = Self::delta_batch_too_large(&error) {
-                    eprintln!("mtxdb: rotating the delta log: {detail}; rewriting the checkpoint");
+                    mtxdb_log::info!(
+                        "mtxdb: rotating the delta log: {detail}; rewriting the checkpoint"
+                    );
                 } else {
-                    eprintln!("mtxdb: delta log append failed, rewriting checkpoint: {error}");
+                    mtxdb_log::warn!(
+                        "mtxdb: delta log append failed, rewriting checkpoint: {error}"
+                    );
                 }
                 let checkpoint_started = std::time::Instant::now();
                 self.persist_index_checkpoint_for_sync();
@@ -12178,7 +12181,7 @@ fn report_coverage_and_reclaim_via(
         None => match journal.reclaim_through(lsn) {
             Ok(reclaim) => Some(reclaim),
             Err(error) => {
-                eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
+                mtxdb_log::warn!("journal reclaim through LSN {lsn} failed: {error}");
                 None
             }
         },
@@ -12189,7 +12192,7 @@ fn report_coverage_and_reclaim_via(
             match journal.reclaim_shared() {
                 Ok(reclaim) => reclaim,
                 Err(error) => {
-                    eprintln!("warning: shared journal reclaim failed: {error}");
+                    mtxdb_log::warn!("shared journal reclaim failed: {error}");
                     None
                 }
             }
