@@ -2495,6 +2495,13 @@ impl JournalCoordinator {
         }
     }
 
+    /// Register a published group as pending until its apply completes. Its
+    /// first LSN holds [`Self::unmaterialized_floor`] below it, so no read
+    /// certifies data that does not yet include it.
+    pub(crate) fn note_publication_pending(&self, first_lsn: u64) {
+        self.unmaterialized.lock().insert(first_lsn);
+    }
+
     /// Record that the transaction group whose first frame is `first_lsn` has
     /// been fully written to the packs, so coverage may pass it.
     pub fn transaction_materialized(&self, first_lsn: u64) {

@@ -9934,13 +9934,14 @@ fn changes_since_includes_removals_and_pages_across_groups() {
         collection_id: collection,
         node_id: victim,
     };
-    let removal_lsn = store
+    let published = store
         .publish_mutation(|| removal.clone())
         .unwrap()
         .expect("journal is enabled");
     store
-        .apply_transaction_mutation(&removal, removal_lsn)
+        .apply_transaction_mutation(&removal, published.lsn)
         .unwrap();
+    store.note_published_materialized(Some(published));
     store
         .put(
             &collection,

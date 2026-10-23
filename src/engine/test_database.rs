@@ -2483,6 +2483,138 @@ fn versioned_read_drains_a_stranded_published_group() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// An autocommit write that published but whose apply never completed (an
+/// error or panic between the two) leaves the collection version ahead of the
+/// data. Nothing but a reopen used to finish it, so every versioned read of the
+/// collection blocked, including the read a conditional write needs first.
+#[test]
+fn versioned_read_finishes_a_stranded_autocommit_write() {
+    let root = test_root("stranded_autocommit");
+    let database = Database::open(root.clone()).unwrap();
+    let collection = [0x5du8; 16];
+    let pool = ShardType::State;
+    let store = database.pool(pool);
+
+    let published = store
+        .publish_mutation(|| crate::journal::Mutation::Put {
+            collection_id: collection,
+            node_id: node(9),
+            payload: b"stranded".to_vec(),
+        })
+        .unwrap();
+    assert!(published.is_some());
+    // The apply "fails": the guard is dropped without completing.
+    drop(published);
+
+    let (records, version) = store
+        .get_with_collection_version(&collection, &[node(9)])
+        .expect("the read must finish the stranded write instead of blocking");
+    assert!(version > 0);
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"stranded");
+    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One recovery call must clear stranded autocommit writes as well as stranded
+/// transaction groups, and leave their data readable.
+#[test]
+fn recover_pending_transactions_finishes_stranded_autocommit_writes() {
+    let root = test_root("recover_stranded_autocommit");
+    let database = Database::open(root.clone()).unwrap();
+    let collection = [0x5eu8; 16];
+    let pool = ShardType::State;
+    let store = database.pool(pool);
+
+    for id in 1..=3u8 {
+        let published = store
+            .publish_mutation(|| crate::journal::Mutation::Put {
+                collection_id: collection,
+                node_id: node(id),
+                payload: vec![id],
+            })
+            .unwrap();
+        drop(published);
+    }
+    assert!(database.coordinator().unmaterialized_floor() < u64::MAX);
+
+    database.recover_pending_transactions().unwrap();
+    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
+    for id in 1..=3u8 {
+        let (records, _) = store
+            .get_with_collection_version(&collection, &[node(id)])
+            .unwrap();
+        assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), &[id]);
+    }
+    // A second call has nothing left to do.
+    database.recover_pending_transactions().unwrap();
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Writers publish autocommit mutations and fail to apply a fraction of them
+/// while readers issue versioned reads. Reads must never certify data that
+/// lacks a published write, and after recovery nothing may stay pending.
+#[test]
+fn concurrent_autocommit_failures_never_pin_the_boundary() {
+    let root = test_root("concurrent_autocommit_failures");
+    let database = Arc::new(Database::open(root.clone()).unwrap());
+    let collection = [0x5fu8; 16];
+    let pool = ShardType::State;
+    let writers = 4u8;
+    let per_writer = 40u8;
+
+    let mut handles = Vec::new();
+    for writer in 0..writers {
+        let database = Arc::clone(&database);
+        handles.push(std::thread::spawn(move || {
+            let store = database.pool(pool);
+            for index in 0..per_writer {
+                let id = writer * per_writer + index;
+                let mutation = crate::journal::Mutation::Put {
+                    collection_id: collection,
+                    node_id: node(id),
+                    payload: vec![id],
+                };
+                let published = store.publish_mutation(|| mutation.clone()).unwrap();
+                if index % 4 == 0 {
+                    // The apply fails: the guard is dropped uncompleted.
+                    drop(published);
+                } else {
+                    let lsn = published.as_ref().map(|published| published.lsn).unwrap();
+                    store.apply_transaction_mutation(&mutation, lsn).unwrap();
+                    store.note_published_materialized(published);
+                }
+                // A versioned read may block briefly but must finish or fail
+                // loudly; it must never return data missing a published write.
+                if let Ok((records, _)) =
+                    store.get_with_collection_version(&collection, &[node(id)])
+                {
+                    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), &[id]);
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    database.recover_pending_transactions().unwrap();
+    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
+    let store = database.pool(pool);
+    for id in 0..writers * per_writer {
+        let (records, _) = store
+            .get_with_collection_version(&collection, &[node(id)])
+            .unwrap();
+        assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), &[id]);
+    }
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn published_transaction_is_visible_before_materialization() {
     let root = test_root("transaction_overlay");
