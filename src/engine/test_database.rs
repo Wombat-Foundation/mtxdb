@@ -2615,6 +2615,59 @@ fn concurrent_autocommit_failures_never_pin_the_boundary() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A cross-pool transaction is one journal group whose `last_lsn` is the last
+/// pool's last entry. Versions are seeded from the group's `last_lsn`, so after
+/// a restart each pool's read boundary must reach that LSN once its own entries
+/// are replayed, even when the group's trailing entries belong to another pool.
+/// The live path already does this (`finish_recovery_stage` notes the group's
+/// `last_lsn` for every touched pool).
+#[test]
+fn replayed_cross_pool_group_lifts_every_touched_pools_boundary() {
+    let root = test_root("replayed_cross_pool_boundary");
+    let event_collection = [0x70u8; 16];
+    let edge_collection = [0x71u8; 16];
+    {
+        let database = Database::open(root.clone()).unwrap();
+        let transaction = database.begin_transaction();
+        transaction
+            .put(
+                ShardType::EventDag,
+                event_collection,
+                node(1),
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+        for id in 1..=2u8 {
+            transaction
+                .put(
+                    ShardType::Edges,
+                    edge_collection,
+                    node(id),
+                    &NodeData::new(bytes::Bytes::from_static(b"edge")),
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(transaction);
+        drop(database);
+    }
+
+    let database = Database::open(root.clone()).unwrap();
+    for (pool, collection, id) in [
+        (ShardType::EventDag, event_collection, node(1)),
+        (ShardType::Edges, edge_collection, node(2)),
+    ] {
+        let (records, _) = database
+            .pool(pool)
+            .get_with_collection_version(&collection, &[id])
+            .expect("a replayed group must not leave the pool's boundary behind its version");
+        assert!(records[0].is_some());
+    }
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn published_transaction_is_visible_before_materialization() {
     let root = test_root("transaction_overlay");

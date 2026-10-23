@@ -10700,6 +10700,12 @@ impl PackfileStorage {
             // pools' mutations are replayed by their own stores.
             let pool = pool_from_tag(self.journal_pool.load(Ordering::Acquire));
             for group in &groups {
+                // Whether any entry of this pool is in the group, replayed or
+                // already covered by the pool's checkpoint.
+                let touches_pool = group
+                    .entries
+                    .iter()
+                    .any(|entry| pool.is_none_or(|pool| entry.pool == pool));
                 for entry in &group.entries {
                     if entry.lsn <= covered {
                         continue;
@@ -10747,6 +10753,15 @@ impl PackfileStorage {
                     // certify it.
                     self.note_materialized_lsn(entry.lsn);
                     replayed = replayed.saturating_add(1);
+                }
+                // Collection versions are seeded from the group's `last_lsn`,
+                // and the live path notes it for every pool the group touched.
+                // A cross-pool group's trailing entries belong to other pools,
+                // so without this the pool's boundary would stay behind its own
+                // collections' versions until the next write. That holds for
+                // entries the pool's checkpoint already covers as well.
+                if touches_pool {
+                    self.note_materialized_lsn(group.last_lsn);
                 }
             }
             Ok(replayed)
