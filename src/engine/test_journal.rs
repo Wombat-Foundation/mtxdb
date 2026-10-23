@@ -215,20 +215,14 @@ fn shared_reclaim_waits_for_a_staged_pools_frame() {
 
     // A transaction stages an event-DAG frame without going through
     // `publish`; it must still block reclaim until event-DAG checkpoints.
-    coordinator
+    let receipt = coordinator
         .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
-        .map(|receipt| {
-            coordinator.transaction_materialized(receipt.first_lsn);
-            receipt
-        })
         .unwrap();
-    coordinator
+    coordinator.transaction_materialized(receipt.first_lsn);
+    let receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| {
-            coordinator.transaction_materialized(receipt.first_lsn);
-            receipt.last_lsn
-        })
         .unwrap();
+    coordinator.transaction_materialized(receipt.first_lsn);
     coordinator.sync().unwrap();
     let committed = coordinator.committed_lsn();
     assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) > 0);

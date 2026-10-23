@@ -2050,9 +2050,7 @@ pub struct JournalCoordinator {
     /// Why a published group could not be applied to the packs and index, once
     /// one failed. Unlike `poisoned` this leaves the committer running, so
     /// groups already published still reach disk and a reopen replays them.
-    apply_failure: Mutex<Option<String>>,
-    /// Mirrors `apply_failure.is_some()` for lock-free checks.
-    apply_failed: AtomicBool,
+    apply_failure: std::sync::OnceLock<String>,
     /// Number of sync requests entering the coordinator.
     sync_calls: AtomicU64,
     /// Number of sync requests that found the journal mutex occupied.
@@ -2267,8 +2265,7 @@ impl JournalCoordinator {
             pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
-            apply_failure: Mutex::new(None),
-            apply_failed: AtomicBool::new(false),
+            apply_failure: std::sync::OnceLock::new(),
             sync_calls: AtomicU64::new(0),
             journal_waiters: AtomicU64::new(0),
             coalesced_syncs: AtomicU64::new(0),
@@ -2720,7 +2717,7 @@ impl JournalCoordinator {
             self.reclaim_stalls.fetch_add(1, Ordering::Relaxed);
         }
         if report || (already_reported && entered_emergency) {
-            mtxdb_log::warn!(
+            eprintln!(
                 "warning: shared WAL reclaim is stalled at {len} of {} bytes (trigger {}); \
                  waiting on pools {:?} to report coverage",
                 journal.segment_cap,
@@ -2747,7 +2744,7 @@ impl JournalCoordinator {
             reported: previous.is_some_and(|old| old.reported) || emergency,
         });
         if emergency && !previous.is_some_and(|old| old.reported) {
-            mtxdb_log::warn!(
+            eprintln!(
                 "warning: shared WAL reclaim is held by an active replay lease at {len} of {} bytes",
                 journal.segment_cap
             );
@@ -3315,22 +3312,14 @@ impl JournalCoordinator {
     /// reads that would wait for the group fail with `cause` until the database
     /// is reopened and the WAL replayed. Only the first cause is kept.
     pub(crate) fn fail_apply(&self, cause: String) {
-        let mut failure = self.apply_failure.lock();
-        if failure.is_none() {
-            *failure = Some(cause);
-        }
-        self.apply_failed.store(true, Ordering::Release);
-        drop(failure);
+        let _ = self.apply_failure.set(cause);
         // Wake reads waiting for the group so they see the failure.
         self.notify_materialized();
     }
 
     /// The reason a published group failed to apply, if one did.
-    pub(crate) fn apply_failure(&self) -> Option<String> {
-        if !self.apply_failed.load(Ordering::Acquire) {
-            return None;
-        }
-        self.apply_failure.lock().clone()
+    pub(crate) fn apply_failure(&self) -> Option<&str> {
+        self.apply_failure.get().map(String::as_str)
     }
 
     /// Fail if a published group could not be applied (see [`Self::fail_apply`]).

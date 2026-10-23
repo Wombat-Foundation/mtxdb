@@ -2987,7 +2987,7 @@ impl ShardPool {
             return;
         }
         if let Err(e) = self.persist_stats() {
-            mtxdb_log::warn!("mtxdb: failed to persist shard IO/sync stats: {e}");
+            eprintln!("mtxdb: failed to persist shard IO/sync stats: {e}");
         }
     }
 

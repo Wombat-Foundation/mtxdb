@@ -1639,7 +1639,7 @@ impl Drop for Published {
                 "autocommit group at lsn {} was published but its apply failed or panicked",
                 self.lsn
             );
-            mtxdb_log::error!("mtxdb: {cause}; failing the database until it is reopened");
+            eprintln!("mtxdb: {cause}; failing the database until it is reopened");
             journal.fail_apply(cause);
         }
     }
@@ -2081,20 +2081,6 @@ pub struct PackfileStorage {
     /// `put_many` (batch-granular; drives the steady-append scaler's
     /// resume-from-checkpoint cost).
     index_clone_time_ns: AtomicU64,
-    /// Cumulative nanoseconds `put_many` waited for `read_snapshot_gate`.
-    put_many_gate_wait_ns: AtomicU64,
-    /// Longest single `read_snapshot_gate` wait in `put_many`.
-    put_many_gate_wait_max_ns: AtomicU64,
-    /// Cumulative nanoseconds `put_many` waited for the collection put mutex.
-    put_many_collection_wait_ns: AtomicU64,
-    /// Cumulative nanoseconds `put_many` spent publishing journal mutations.
-    put_many_journal_ns: AtomicU64,
-    /// Cumulative nanoseconds `put_many` spent appending records to packs.
-    put_many_pack_ns: AtomicU64,
-    /// Cumulative nanoseconds `put_many` spent publishing index and cache state.
-    put_many_publish_ns: AtomicU64,
-    /// Longest single `put_many` call, gate wait included.
-    put_many_total_max_ns: AtomicU64,
     /// Index grow/rebuild events in `put_many` (each requests a v1 snapshot).
     index_grow_count: AtomicU64,
     /// Fallback `rebuild_index` calls (full pack scan).
@@ -2326,7 +2312,7 @@ impl PackfileStorage {
                     .checked_rem(100)
                     .is_some_and(|remainder| remainder == 0);
                 if previous == 0 || periodic {
-                    mtxdb_log::warn!(
+                    eprintln!(
                         "warning: unable to observe post-refresh fingerprint (count={count}): {error}"
                     );
                 }
@@ -3071,13 +3057,6 @@ impl PackfileStorage {
             put_many_fast_path_calls: AtomicU64::new(0),
             put_many_clone_path_calls: AtomicU64::new(0),
             index_clone_time_ns: AtomicU64::new(0),
-            put_many_gate_wait_ns: AtomicU64::new(0),
-            put_many_gate_wait_max_ns: AtomicU64::new(0),
-            put_many_collection_wait_ns: AtomicU64::new(0),
-            put_many_journal_ns: AtomicU64::new(0),
-            put_many_pack_ns: AtomicU64::new(0),
-            put_many_publish_ns: AtomicU64::new(0),
-            put_many_total_max_ns: AtomicU64::new(0),
             index_grow_count: AtomicU64::new(0),
             index_rebuild_count: AtomicU64::new(0),
             index_identity_reads: AtomicU64::new(0),
@@ -5376,7 +5355,7 @@ impl PackfileStorage {
                     .shard_collections_failure_logged
                     .swap(true, Ordering::Relaxed)
                 {
-                    mtxdb_log::warn!("mtxdb: failed to persist shard→collection directory: {e}");
+                    eprintln!("mtxdb: failed to persist shard→collection directory: {e}");
                 }
             }
         }
@@ -5872,11 +5851,11 @@ impl PackfileStorage {
         match worker.handle.join() {
             Ok(Ok(done)) => self.record_checkpoint(worker.breakdown, &done),
             Ok(Err(error)) => {
-                mtxdb_log::error!("mtxdb: background checkpoint failed: {error}");
+                eprintln!("mtxdb: background checkpoint failed: {error}");
                 self.abandon_checkpoint();
             }
             Err(_) => {
-                mtxdb_log::error!("mtxdb: background checkpoint panicked");
+                eprintln!("mtxdb: background checkpoint panicked");
                 self.abandon_checkpoint();
             }
         }
@@ -5914,7 +5893,7 @@ impl PackfileStorage {
             match self.append_index_delta() {
                 Ok(()) => self.shard_collections_stale.store(true, Ordering::Relaxed),
                 Err(error) => {
-                    mtxdb_log::warn!("mtxdb: delta append during a checkpoint failed: {error}");
+                    eprintln!("mtxdb: delta append during a checkpoint failed: {error}");
                 }
             }
         }
@@ -5957,7 +5936,7 @@ impl PackfileStorage {
             return;
         }
         if let Err(error) = self.start_checkpoint_worker() {
-            mtxdb_log::warn!("mtxdb: failed to persist index checkpoint: {error}");
+            eprintln!("mtxdb: failed to persist index checkpoint: {error}");
         }
     }
 
@@ -6395,9 +6374,7 @@ impl PackfileStorage {
                     .and_then(|file| file.sync_data())
                 {
                     Ok(()) => state.log_synced_bytes = state.log_bytes,
-                    Err(error) => {
-                        mtxdb_log::warn!("mtxdb: delta log fsync failed: {error}");
-                    }
+                    Err(error) => eprintln!("mtxdb: delta log fsync failed: {error}"),
                 }
             }
         }
@@ -6532,7 +6509,7 @@ impl PackfileStorage {
     /// authoritative, so a failed persist only costs the next open a rescan.
     fn persist_index_checkpoint_best_effort(&self) {
         if let Err(e) = self.persist_index_checkpoint() {
-            mtxdb_log::warn!("mtxdb: failed to persist index checkpoint: {e}");
+            eprintln!("mtxdb: failed to persist index checkpoint: {e}");
         }
     }
 
@@ -8121,7 +8098,6 @@ impl PackfileStorage {
             if let Some(gen) = self.generation(collection_id) {
                 for hash in hash_to_shard_offset.keys() {
                     if !live_set.contains(hash) {
-                        mtxdb_log::debug!(hash = ?hash, "dropped unreachable cached hash during repack");
                         gen.cache.remove(hash);
                     }
                 }
@@ -8857,15 +8833,12 @@ impl PackfileStorage {
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
-        let journal_started = std::time::Instant::now();
         let published = self.publish_mutation(|| JournalMutation::Put {
             collection_id: *collection_id,
             node_id: *id,
             payload: data.bytes.to_vec(),
         })?;
         let receipt_lsn = published.as_ref().map(|published| published.lsn);
-        self.put_many_journal_ns
-            .fetch_add(Self::elapsed_ns(journal_started), Ordering::Relaxed);
         let metadata = Self::stamp_last_write_lsn(metadata, receipt_lsn);
         let record = Record {
             collection_id: *collection_id,
@@ -8873,10 +8846,7 @@ impl PackfileStorage {
             data: data.bytes.clone(),
             metadata,
         };
-        let pack_started = std::time::Instant::now();
         let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
-        self.put_many_pack_ns
-            .fetch_add(Self::elapsed_ns(pack_started), Ordering::Relaxed);
         progress.pending_materialized.push(published);
         if let Some(shard) = self.shards.get_shard(slot) {
             progress
@@ -8977,13 +8947,13 @@ impl PackfileStorage {
         // Reject an unwritable record before publishing: a failure after
         // publication fails the whole database (see `Published`), and a bad
         // input is the caller's error, not a storage failure.
-        ShardPool::validate_record(&Record {
+        let mut record = Record {
             collection_id: *collection_id,
             hash: *id,
             data: data.bytes.clone(),
-            metadata: None,
-        })
-        .map_err(StorageError::Io)?;
+            metadata,
+        };
+        ShardPool::validate_record(&record).map_err(StorageError::Io)?;
         // Publish the group before writing its frame so the frame can carry the
         // group's LSN as its record version. This mirrors the transaction path:
         // the group is durable and visible from the WAL (and replayed on
@@ -8995,14 +8965,10 @@ impl PackfileStorage {
             node_id: *id,
             payload: data.bytes.to_vec(),
         })?;
-        let metadata =
-            Self::stamp_last_write_lsn(metadata, published.as_ref().map(|published| published.lsn));
-        let record = Record {
-            collection_id: *collection_id,
-            hash: *id,
-            data: data.bytes.clone(),
-            metadata,
-        };
+        record.metadata = Self::stamp_last_write_lsn(
+            record.metadata,
+            published.as_ref().map(|published| published.lsn),
+        );
         let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
         Ok((slot, offset, disk_bytes, published))
     }
@@ -9454,35 +9420,16 @@ impl PackfileStorage {
         cache.insert(*id, Arc::new(data_to_cache));
     }
 
-    fn load_duration(counter: &AtomicU64) -> std::time::Duration {
-        std::time::Duration::from_nanos(counter.load(Ordering::Relaxed))
-    }
-
-    fn elapsed_ns(started: std::time::Instant) -> u64 {
-        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
-    }
-
     fn put_many_internal(
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
         metadatas: Option<&[Option<FrameMetadata>]>,
     ) -> Result<usize, StorageError> {
-        let started = std::time::Instant::now();
         let _snapshot_gate = self.read_snapshot_gate.lock();
-        let gate_wait = Self::elapsed_ns(started);
-        self.put_many_gate_wait_ns
-            .fetch_add(gate_wait, Ordering::Relaxed);
-        self.put_many_gate_wait_max_ns
-            .fetch_max(gate_wait, Ordering::Relaxed);
         let collection_arc = self.put_mutex(collection_id);
-        let collection_started = std::time::Instant::now();
         let _collection_guard = collection_arc.lock();
-        self.put_many_collection_wait_ns
-            .fetch_add(Self::elapsed_ns(collection_started), Ordering::Relaxed);
         let written = self.put_many_internal_locked(collection_id, entries, metadatas)?;
-        self.put_many_total_max_ns
-            .fetch_max(Self::elapsed_ns(started), Ordering::Relaxed);
         if written > 0 {
             self.put_many_calls.fetch_add(1, Ordering::Relaxed);
             self.put_many_records
@@ -9559,14 +9506,11 @@ impl PackfileStorage {
         ) {
             rollback_and_fail!(error);
         }
-        let publish_started = std::time::Instant::now();
         if let Err(error) =
             self.publish_put_many_state(collection_id, entries, &cache, &mut progress)
         {
             rollback_and_fail!(error);
         }
-        self.put_many_publish_ns
-            .fetch_add(Self::elapsed_ns(publish_started), Ordering::Relaxed);
 
         Ok(entries.len())
     }
@@ -10701,6 +10645,7 @@ impl PackfileStorage {
             return Ok(0);
         }
         let covered = self.durable_coverage();
+        self.note_materialized_lsn(covered);
         let groups = self.journal_recovery.lock().clone();
         self.replaying.store(true, Ordering::SeqCst);
         let result = (|| -> Result<u64, StorageError> {
@@ -10955,12 +10900,12 @@ impl PackfileStorage {
     }
 
     /// Record that this handle's in-memory index now includes a published
-    /// mutation or transaction group through `lsn`.
+    /// mutation or transaction group through `lsn`. The caller then retires the
+    /// group in [`JournalCoordinator::transaction_materialized`], which removes
+    /// its floor from `unmaterialized` and wakes waiting readers once both the
+    /// watermark and the floor have advanced.
     pub(crate) fn note_materialized_lsn(&self, lsn: u64) {
         self.materialized_lsn.fetch_max(lsn, Ordering::Release);
-        if let Some(journal) = self.journal() {
-            journal.notify_materialized();
-        }
     }
 
     /// Publish one mutation to the journal, if enabled. Returns the assigned
@@ -11441,7 +11386,7 @@ impl PackfileStorage {
         let log_bytes = self.delta_state.lock().log_bytes;
         let rotating = log_bytes >= self.delta_log_rotate_bytes();
         if rotating {
-            mtxdb_log::info!(
+            eprintln!(
                 "mtxdb: delta log is at {log_bytes} of {} bytes, rewriting the checkpoint \
                  before it reaches the cap",
                 self.delta_log_cap()
@@ -11474,15 +11419,13 @@ impl PackfileStorage {
                 Ok(None) => {}
                 Err(error) if Self::delta_batch_too_large(&error).is_some() => {
                     if let Some(detail) = Self::delta_batch_too_large(&error) {
-                        mtxdb_log::info!(
+                        eprintln!(
                             "mtxdb: rotating the delta log: {detail}; rewriting the checkpoint"
                         );
                     }
                 }
                 Err(error) => {
-                    mtxdb_log::warn!(
-                        "mtxdb: delta coverage batch failed, rewriting checkpoint: {error}"
-                    );
+                    eprintln!("mtxdb: delta coverage batch failed, rewriting checkpoint: {error}");
                 }
             }
         }
@@ -11532,13 +11475,9 @@ impl PackfileStorage {
                 // rewrite rather than leaving the acceleration files stale until
                 // the next sync notices the gap.
                 if let Some(detail) = Self::delta_batch_too_large(&error) {
-                    mtxdb_log::info!(
-                        "mtxdb: rotating the delta log: {detail}; rewriting the checkpoint"
-                    );
+                    eprintln!("mtxdb: rotating the delta log: {detail}; rewriting the checkpoint");
                 } else {
-                    mtxdb_log::warn!(
-                        "mtxdb: delta log append failed, rewriting checkpoint: {error}"
-                    );
+                    eprintln!("mtxdb: delta log append failed, rewriting checkpoint: {error}");
                 }
                 let checkpoint_started = std::time::Instant::now();
                 self.persist_index_checkpoint_for_sync();
@@ -11777,13 +11716,6 @@ impl PackfileStorage {
             index_clone_time: std::time::Duration::from_nanos(
                 self.index_clone_time_ns.load(Ordering::Relaxed),
             ),
-            put_many_gate_wait: Self::load_duration(&self.put_many_gate_wait_ns),
-            put_many_gate_wait_max: Self::load_duration(&self.put_many_gate_wait_max_ns),
-            put_many_collection_wait: Self::load_duration(&self.put_many_collection_wait_ns),
-            put_many_journal: Self::load_duration(&self.put_many_journal_ns),
-            put_many_pack: Self::load_duration(&self.put_many_pack_ns),
-            put_many_publish: Self::load_duration(&self.put_many_publish_ns),
-            put_many_total_max: Self::load_duration(&self.put_many_total_max_ns),
             index_grow_count: self.index_grow_count.load(Ordering::Relaxed),
             index_rebuild_count: self.index_rebuild_count.load(Ordering::Relaxed),
             index_identity_reads: self.index_identity_reads.load(Ordering::Relaxed),
@@ -11938,13 +11870,6 @@ impl PackfileStorage {
             &self.put_many_fast_path_calls,
             &self.put_many_clone_path_calls,
             &self.index_clone_time_ns,
-            &self.put_many_gate_wait_ns,
-            &self.put_many_gate_wait_max_ns,
-            &self.put_many_collection_wait_ns,
-            &self.put_many_journal_ns,
-            &self.put_many_pack_ns,
-            &self.put_many_publish_ns,
-            &self.put_many_total_max_ns,
             &self.index_grow_count,
             &self.index_rebuild_count,
             &self.index_identity_reads,
@@ -12106,20 +12031,6 @@ pub struct RuntimeStats {
     pub put_many_clone_path_calls: u64,
     /// Cumulative time spent materializing/growing owned indexes in `put_many`.
     pub index_clone_time: std::time::Duration,
-    /// Cumulative time `put_many` waited for the engine-wide snapshot gate.
-    pub put_many_gate_wait: std::time::Duration,
-    /// Longest single snapshot-gate wait in `put_many`.
-    pub put_many_gate_wait_max: std::time::Duration,
-    /// Cumulative time `put_many` waited for the collection put mutex.
-    pub put_many_collection_wait: std::time::Duration,
-    /// Cumulative time `put_many` spent publishing journal mutations.
-    pub put_many_journal: std::time::Duration,
-    /// Cumulative time `put_many` spent appending records to packs.
-    pub put_many_pack: std::time::Duration,
-    /// Cumulative time `put_many` spent publishing index and cache state.
-    pub put_many_publish: std::time::Duration,
-    /// Longest single `put_many` call, snapshot-gate wait included.
-    pub put_many_total_max: std::time::Duration,
     /// Index grow events in `put_many`.
     pub index_grow_count: u64,
     /// Fallback full-scan `rebuild_index` calls.
@@ -12322,7 +12233,7 @@ fn report_coverage_and_reclaim_via(
         None => match journal.reclaim_through(lsn) {
             Ok(reclaim) => Some(reclaim),
             Err(error) => {
-                mtxdb_log::warn!("journal reclaim through LSN {lsn} failed: {error}");
+                eprintln!("warning: journal reclaim through LSN {lsn} failed: {error}");
                 None
             }
         },
@@ -12333,7 +12244,7 @@ fn report_coverage_and_reclaim_via(
             match journal.reclaim_shared() {
                 Ok(reclaim) => reclaim,
                 Err(error) => {
-                    mtxdb_log::warn!("shared journal reclaim failed: {error}");
+                    eprintln!("warning: shared journal reclaim failed: {error}");
                     None
                 }
             }
@@ -12496,13 +12407,6 @@ impl Default for RuntimeStats {
             put_many_fast_path_calls: 0,
             put_many_clone_path_calls: 0,
             index_clone_time: std::time::Duration::ZERO,
-            put_many_gate_wait: std::time::Duration::ZERO,
-            put_many_gate_wait_max: std::time::Duration::ZERO,
-            put_many_collection_wait: std::time::Duration::ZERO,
-            put_many_journal: std::time::Duration::ZERO,
-            put_many_pack: std::time::Duration::ZERO,
-            put_many_publish: std::time::Duration::ZERO,
-            put_many_total_max: std::time::Duration::ZERO,
             index_grow_count: 0,
             index_rebuild_count: 0,
             index_identity_reads: 0,

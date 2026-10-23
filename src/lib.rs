@@ -40,15 +40,6 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(clippy::module_name_repetitions)]
 
-/// Install mtxdb's compact stderr tracing subscriber when the `logging`
-/// feature is enabled. Applications can instead install their own subscriber.
-#[cfg(feature = "logging")]
-pub fn init_logging() {
-    mtxdb_log::init();
-}
-
-pub use mtxdb_log::{debug, error, info, trace, warn};
-
 // On disk the source is grouped by layer, with each module's tests beside it:
 //   engine/  the storage engine: packfiles, shards, journal, database, layout,
 //            the hash index, templates and record classes;

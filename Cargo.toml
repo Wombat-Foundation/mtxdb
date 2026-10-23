@@ -54,7 +54,7 @@ resolver = "2"
 # out (like benches/, which has its own `[workspace]` table)
 # preserves the library's 1.88 MSRV. Build/lint/test it with
 # `--manifest-path mtxdb-cli/Cargo.toml`.
-members = ["mtxdb-log"]
+members = []
 
 [workspace.package]
 version = "0.1.0-beta.2"
@@ -99,9 +99,7 @@ verbose_file_reads = "warn"
 path = "src/lib.rs"
 
 [features]
-default = ["zstd", "bitmaps", "logging"]
-# Optional tracing events and an opt-in compact stderr subscriber.
-logging = ["mtxdb-log/logging"]
+default = ["zstd", "bitmaps"]
 # Record-payload compression. On by default, so stores keep writing and reading
 # zstd frames; disable (with `default-features = false`) for builds that must
 # not carry zstd. A build without it always
@@ -139,7 +137,6 @@ fs2 = "0.4"
 # across records, so one `Finder` is built per query term, not per record.
 memchr = "2.7"
 memmap2 = "0.9.11"
-mtxdb-log = { path = "mtxdb-log", version = "0.1.0-beta.2" }
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", optional = true }
 sha2 = "0.11"

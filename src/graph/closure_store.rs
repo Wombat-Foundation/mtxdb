@@ -1357,7 +1357,7 @@ impl GenerationBuilder {
             Ok(validated) => validated,
             Err(error) => {
                 if let Err(cleanup) = self.discard_generation(db) {
-                    mtxdb_log::warn!(
+                    eprintln!(
                         "closure publish: could not discard the rejected generation: {cleanup}"
                     );
                 }
@@ -1389,9 +1389,7 @@ impl GenerationBuilder {
             ) {
                 drop(txn);
                 if let Err(cleanup) = self.discard_generation(db) {
-                    mtxdb_log::warn!(
-                        "closure publish: could not discard failed generation: {cleanup}"
-                    );
+                    eprintln!("closure publish: could not discard failed generation: {cleanup}");
                 }
                 return Err(StorageError::Io(error));
             }
@@ -1403,9 +1401,7 @@ impl GenerationBuilder {
         if let Err(error) = txn.commit() {
             if error.is_stale_read() {
                 if let Err(cleanup) = self.discard_generation(db) {
-                    mtxdb_log::warn!(
-                        "closure publish: could not discard stale generation: {cleanup}"
-                    );
+                    eprintln!("closure publish: could not discard stale generation: {cleanup}");
                 }
             }
             return Err(error);

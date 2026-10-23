@@ -582,9 +582,7 @@ impl AuthClosure {
             // replace it, or the caller loses the corrupt cycle that caused it.
             // There is no report to carry it on this path, so it is logged.
             if let Err(cleanup) = builder.abandon(db) {
-                mtxdb_log::warn!(
-                    "closure rebuild: could not abandon the reserved generation: {cleanup}"
-                );
+                eprintln!("closure rebuild: could not abandon the reserved generation: {cleanup}");
             }
             return Err(error);
         }
