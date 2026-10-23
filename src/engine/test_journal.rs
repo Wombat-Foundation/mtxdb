@@ -153,10 +153,10 @@ fn shared_committed_watermark_is_per_pool() {
     let coordinator = JournalCoordinator::new(journal, &scan);
 
     // Group one: state only. Only state's watermark may advance past zero.
-    coordinator
+    let state_receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(state_receipt.first_lsn);
     coordinator.sync().unwrap();
     let state_only = coordinator.committed_lsn();
     assert_eq!(
@@ -172,10 +172,10 @@ fn shared_committed_watermark_is_per_pool() {
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::Edges), 0);
 
     // Group two: event-DAG only. State's watermark must stay put.
-    coordinator
+    let event_receipt = coordinator
         .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(event_receipt.first_lsn);
     coordinator.sync().unwrap();
     assert_eq!(
         coordinator.committed_lsn_for_pool(ShardType::State),
@@ -217,10 +217,17 @@ fn shared_reclaim_waits_for_a_staged_pools_frame() {
     // `publish`; it must still block reclaim until event-DAG checkpoints.
     coordinator
         .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
+        .map(|receipt| {
+            coordinator.transaction_materialized(receipt.first_lsn);
+            receipt
+        })
         .unwrap();
     coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
+        .map(|receipt| {
+            coordinator.transaction_materialized(receipt.first_lsn);
+            receipt.last_lsn
+        })
         .unwrap();
     coordinator.sync().unwrap();
     let committed = coordinator.committed_lsn();
@@ -249,20 +256,20 @@ fn shared_reclaim_does_not_wait_for_an_idle_pool() {
     let coordinator = JournalCoordinator::new(journal, &scan);
 
     // State contributes only the first group, then goes idle.
-    coordinator
+    let state_receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(state_receipt.first_lsn);
     coordinator.sync().unwrap();
     let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
 
     // Event-DAG writes several later groups that never carry a state frame.
     let mut event_lsn = 0;
     for id in 0..4u8 {
-        coordinator
+        let receipt = coordinator
             .publish_group_tagged(ShardType::EventDag, &[put(2, id, b"event")])
-            .map(|receipt| receipt.last_lsn)
             .unwrap();
+        coordinator.transaction_materialized(receipt.first_lsn);
         coordinator.sync().unwrap();
         event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
     }
@@ -546,6 +553,8 @@ fn published_groups_are_visible_not_durable_until_one_fsync_covers_them() {
 
     // One sync makes both groups durable and promotes each pool.
     coordinator.sync_through(2).unwrap();
+    coordinator.transaction_materialized(first.first_lsn);
+    coordinator.transaction_materialized(second.first_lsn);
     assert_eq!(coordinator.committed_lsn(), 2);
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), 1);
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::EventDag), 2);

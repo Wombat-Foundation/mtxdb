@@ -1624,11 +1624,14 @@ pub(crate) struct Published {
 
 impl Published {
     fn complete(mut self, store: &PackfileStorage) {
-        self.mutation = None;
         store.note_materialized_lsn(self.lsn);
         if let Some(journal) = store.journal() {
             journal.transaction_materialized(self.lsn);
         }
+        // Keep the recovery payload until both watermarks have been updated.
+        // If unwinding happened earlier, Drop queues the idempotent mutation
+        // for recovery instead of leaving a pending LSN with no owner.
+        self.mutation = None;
     }
 }
 
@@ -10973,9 +10976,6 @@ impl PackfileStorage {
                 .map(|receipt| receipt.last_lsn),
         }
         .map_err(StorageError::Io)?;
-        // Track the group as pending until its apply completes, so the read
-        // boundary stays below it and a failed apply is attributable.
-        journal.note_publication_pending(result);
         self.record_published_mutation(started);
         let [mutation] = batch;
         Ok(Some(Published {
