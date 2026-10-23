@@ -524,10 +524,11 @@ impl DatabaseTransaction<'_> {
                 }
             }
         }
-        let (live, version) = self
-            .database
-            .pool(pool)
-            .get_with_collection_version(collection_id, &live_ids)?;
+        let (live, version) = self.database.heal_stalled_read(|| {
+            self.database
+                .pool(pool)
+                .get_with_collection_version(collection_id, &live_ids)
+        })?;
         for (slot, value) in live_slots.into_iter().zip(live) {
             results[slot] = value;
         }
@@ -573,10 +574,11 @@ impl DatabaseTransaction<'_> {
             }
         }
         if !live_ids.is_empty() {
-            let (live, live_versions) = self
-                .database
-                .pool(pool)
-                .get_with_record_versions(collection_id, &live_ids)?;
+            let (live, live_versions) = self.database.heal_stalled_read(|| {
+                self.database
+                    .pool(pool)
+                    .get_with_record_versions(collection_id, &live_ids)
+            })?;
             for ((slot, value), version) in live_slots.into_iter().zip(live).zip(live_versions) {
                 results[slot] = value;
                 versions[slot] = version;
@@ -705,12 +707,24 @@ impl DatabaseTransaction<'_> {
                 _ => return Ok(()),
             }
             let started = Instant::now();
-            let materialized = self.database.materialize_transaction(&self.stage);
+            // The group is already durable and visible through the overlay, so
+            // a failure here must not make the caller write it again. Retry
+            // once (applied mutations are skipped); if it still fails the stage
+            // stays queued for `recover_pending_transactions`.
+            let materialized = self
+                .database
+                .materialize_transaction(&self.stage)
+                .or_else(|_| self.database.materialize_transaction(&self.stage));
             self.database
                 .commit_phases
                 .materialize
                 .add(started.elapsed());
-            materialized?;
+            materialized.map_err(|error| {
+                StorageError::Internal(format!(
+                    "transaction is published but not yet materialized; do not \
+                     rewrite it, recover_pending_transactions will finish it: {error}"
+                ))
+            })?;
             self.stage.mark_published().map_err(StorageError::Io)?;
             self.database.finish_recovery_stage(&self.stage)?;
         }
@@ -1055,6 +1069,39 @@ impl Database {
     /// queued and its overlay remains active for a later retry.
     pub fn recover_pending_transactions(&self) -> Result<(), StorageError> {
         let _recovery_lifecycle = self.recovery_lifecycle.lock();
+        self.recover_pending_locked()
+    }
+
+    /// Run a versioned read; if its boundary is stuck behind a published
+    /// group, drain the recovery queue once and retry once. A drain that
+    /// itself fails is returned as the cause, so a group that cannot be
+    /// applied surfaces as an error instead of an endless `WouldBlock`.
+    fn heal_stalled_read<T>(
+        &self,
+        mut read: impl FnMut() -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        match read() {
+            Err(StorageError::WouldBlock(_)) => {
+                self.drain_for_stalled_read()?;
+                read()
+            }
+            other => other,
+        }
+    }
+
+    /// Drain the recovery queue on behalf of a read whose boundary is stuck
+    /// behind a published group. Never waits for `recovery_lifecycle`: a
+    /// committer or another recovery already holds it and is materializing,
+    /// which is what the read is waiting on. Returns the first materialization
+    /// error, which means the group cannot be applied right now.
+    fn drain_for_stalled_read(&self) -> Result<(), StorageError> {
+        let Some(_recovery_lifecycle) = self.recovery_lifecycle.try_lock() else {
+            return Ok(());
+        };
+        self.recover_pending_locked()
+    }
+
+    fn recover_pending_locked(&self) -> Result<(), StorageError> {
         let stages = self
             .recovery_queue
             .lock()

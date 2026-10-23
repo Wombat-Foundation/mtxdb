@@ -2441,6 +2441,48 @@ fn recovery_queue_reorder_does_not_let_later_group_pass_earlier() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A group that published but whose committer never materialized it (dropped
+/// or failed) pins the read boundary. A versioned read must drain the recovery
+/// queue itself instead of returning `WouldBlock` forever.
+#[test]
+fn versioned_read_drains_a_stranded_published_group() {
+    let root = test_root("stranded_group_read");
+    let database = Database::open(root.clone()).unwrap();
+    let collection = [0x5cu8; 16];
+    let pool = ShardType::State;
+
+    let stranded = database.begin_transaction();
+    stranded
+        .put(
+            pool,
+            collection,
+            node(7),
+            &NodeData::new(bytes::Bytes::from_static(b"stranded")),
+        )
+        .unwrap();
+    let mut overlay = Some(activate_for(&database, &stranded.stage));
+    database.publish_transaction(&stranded.stage).unwrap();
+    let receipt = stranded.stage.published_receipt().unwrap();
+    stranded.stage.begin_materialization().unwrap();
+    database
+        .register_new_recovery_stage(Arc::clone(&stranded.stage), receipt, &mut overlay)
+        .unwrap();
+    drop(stranded);
+    assert!(database.coordinator().unmaterialized_floor() < receipt.first_lsn);
+
+    let reader = database.begin_transaction();
+    let (records, version) = reader
+        .get_with_collection_version(pool, &collection, &[node(7)])
+        .expect("the read must drain the stranded group instead of blocking");
+    assert!(version >= receipt.first_lsn);
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"stranded");
+    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
+
+    drop(reader);
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn published_transaction_is_visible_before_materialization() {
     let root = test_root("transaction_overlay");
