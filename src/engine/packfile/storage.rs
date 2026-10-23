@@ -2045,6 +2045,20 @@ pub struct PackfileStorage {
     /// `put_many` (batch-granular; drives the steady-append scaler's
     /// resume-from-checkpoint cost).
     index_clone_time_ns: AtomicU64,
+    /// Cumulative nanoseconds `put_many` waited for `read_snapshot_gate`.
+    put_many_gate_wait_ns: AtomicU64,
+    /// Longest single `read_snapshot_gate` wait in `put_many`.
+    put_many_gate_wait_max_ns: AtomicU64,
+    /// Cumulative nanoseconds `put_many` waited for the collection put mutex.
+    put_many_collection_wait_ns: AtomicU64,
+    /// Cumulative nanoseconds `put_many` spent publishing journal mutations.
+    put_many_journal_ns: AtomicU64,
+    /// Cumulative nanoseconds `put_many` spent appending records to packs.
+    put_many_pack_ns: AtomicU64,
+    /// Cumulative nanoseconds `put_many` spent publishing index and cache state.
+    put_many_publish_ns: AtomicU64,
+    /// Longest single `put_many` call, gate wait included.
+    put_many_total_max_ns: AtomicU64,
     /// Index grow/rebuild events in `put_many` (each requests a v1 snapshot).
     index_grow_count: AtomicU64,
     /// Fallback `rebuild_index` calls (full pack scan).
@@ -3021,6 +3035,13 @@ impl PackfileStorage {
             put_many_fast_path_calls: AtomicU64::new(0),
             put_many_clone_path_calls: AtomicU64::new(0),
             index_clone_time_ns: AtomicU64::new(0),
+            put_many_gate_wait_ns: AtomicU64::new(0),
+            put_many_gate_wait_max_ns: AtomicU64::new(0),
+            put_many_collection_wait_ns: AtomicU64::new(0),
+            put_many_journal_ns: AtomicU64::new(0),
+            put_many_pack_ns: AtomicU64::new(0),
+            put_many_publish_ns: AtomicU64::new(0),
+            put_many_total_max_ns: AtomicU64::new(0),
             index_grow_count: AtomicU64::new(0),
             index_rebuild_count: AtomicU64::new(0),
             index_identity_reads: AtomicU64::new(0),
@@ -8800,11 +8821,14 @@ impl PackfileStorage {
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
+        let journal_started = std::time::Instant::now();
         let receipt_lsn = self.publish_mutation(|| JournalMutation::Put {
             collection_id: *collection_id,
             node_id: *id,
             payload: data.bytes.to_vec(),
         })?;
+        self.put_many_journal_ns
+            .fetch_add(Self::elapsed_ns(journal_started), Ordering::Relaxed);
         let metadata = Self::stamp_last_write_lsn(metadata, receipt_lsn);
         let record = Record {
             collection_id: *collection_id,
@@ -8812,7 +8836,10 @@ impl PackfileStorage {
             data: data.bytes.clone(),
             metadata,
         };
+        let pack_started = std::time::Instant::now();
         let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
+        self.put_many_pack_ns
+            .fetch_add(Self::elapsed_ns(pack_started), Ordering::Relaxed);
         progress.pending_materialized.push(receipt_lsn);
         if let Some(shard) = self.shards.get_shard(slot) {
             progress
@@ -9379,16 +9406,35 @@ impl PackfileStorage {
         cache.insert(*id, Arc::new(data_to_cache));
     }
 
+    fn load_duration(counter: &AtomicU64) -> std::time::Duration {
+        std::time::Duration::from_nanos(counter.load(Ordering::Relaxed))
+    }
+
+    fn elapsed_ns(started: std::time::Instant) -> u64 {
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
     fn put_many_internal(
         &self,
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
         metadatas: Option<&[Option<FrameMetadata>]>,
     ) -> Result<usize, StorageError> {
+        let started = std::time::Instant::now();
         let _snapshot_gate = self.read_snapshot_gate.lock();
+        let gate_wait = Self::elapsed_ns(started);
+        self.put_many_gate_wait_ns
+            .fetch_add(gate_wait, Ordering::Relaxed);
+        self.put_many_gate_wait_max_ns
+            .fetch_max(gate_wait, Ordering::Relaxed);
         let collection_arc = self.put_mutex(collection_id);
+        let collection_started = std::time::Instant::now();
         let _collection_guard = collection_arc.lock();
+        self.put_many_collection_wait_ns
+            .fetch_add(Self::elapsed_ns(collection_started), Ordering::Relaxed);
         let written = self.put_many_internal_locked(collection_id, entries, metadatas)?;
+        self.put_many_total_max_ns
+            .fetch_max(Self::elapsed_ns(started), Ordering::Relaxed);
         if written > 0 {
             self.put_many_calls.fetch_add(1, Ordering::Relaxed);
             self.put_many_records
@@ -9465,11 +9511,14 @@ impl PackfileStorage {
         ) {
             rollback_and_fail!(error);
         }
+        let publish_started = std::time::Instant::now();
         if let Err(error) =
             self.publish_put_many_state(collection_id, entries, &cache, &mut progress)
         {
             rollback_and_fail!(error);
         }
+        self.put_many_publish_ns
+            .fetch_add(Self::elapsed_ns(publish_started), Ordering::Relaxed);
 
         Ok(entries.len())
     }
@@ -11664,6 +11713,13 @@ impl PackfileStorage {
             index_clone_time: std::time::Duration::from_nanos(
                 self.index_clone_time_ns.load(Ordering::Relaxed),
             ),
+            put_many_gate_wait: Self::load_duration(&self.put_many_gate_wait_ns),
+            put_many_gate_wait_max: Self::load_duration(&self.put_many_gate_wait_max_ns),
+            put_many_collection_wait: Self::load_duration(&self.put_many_collection_wait_ns),
+            put_many_journal: Self::load_duration(&self.put_many_journal_ns),
+            put_many_pack: Self::load_duration(&self.put_many_pack_ns),
+            put_many_publish: Self::load_duration(&self.put_many_publish_ns),
+            put_many_total_max: Self::load_duration(&self.put_many_total_max_ns),
             index_grow_count: self.index_grow_count.load(Ordering::Relaxed),
             index_rebuild_count: self.index_rebuild_count.load(Ordering::Relaxed),
             index_identity_reads: self.index_identity_reads.load(Ordering::Relaxed),
@@ -11818,6 +11874,13 @@ impl PackfileStorage {
             &self.put_many_fast_path_calls,
             &self.put_many_clone_path_calls,
             &self.index_clone_time_ns,
+            &self.put_many_gate_wait_ns,
+            &self.put_many_gate_wait_max_ns,
+            &self.put_many_collection_wait_ns,
+            &self.put_many_journal_ns,
+            &self.put_many_pack_ns,
+            &self.put_many_publish_ns,
+            &self.put_many_total_max_ns,
             &self.index_grow_count,
             &self.index_rebuild_count,
             &self.index_identity_reads,
@@ -11979,6 +12042,20 @@ pub struct RuntimeStats {
     pub put_many_clone_path_calls: u64,
     /// Cumulative time spent materializing/growing owned indexes in `put_many`.
     pub index_clone_time: std::time::Duration,
+    /// Cumulative time `put_many` waited for the engine-wide snapshot gate.
+    pub put_many_gate_wait: std::time::Duration,
+    /// Longest single snapshot-gate wait in `put_many`.
+    pub put_many_gate_wait_max: std::time::Duration,
+    /// Cumulative time `put_many` waited for the collection put mutex.
+    pub put_many_collection_wait: std::time::Duration,
+    /// Cumulative time `put_many` spent publishing journal mutations.
+    pub put_many_journal: std::time::Duration,
+    /// Cumulative time `put_many` spent appending records to packs.
+    pub put_many_pack: std::time::Duration,
+    /// Cumulative time `put_many` spent publishing index and cache state.
+    pub put_many_publish: std::time::Duration,
+    /// Longest single `put_many` call, snapshot-gate wait included.
+    pub put_many_total_max: std::time::Duration,
     /// Index grow events in `put_many`.
     pub index_grow_count: u64,
     /// Fallback full-scan `rebuild_index` calls.
@@ -12355,6 +12432,13 @@ impl Default for RuntimeStats {
             put_many_fast_path_calls: 0,
             put_many_clone_path_calls: 0,
             index_clone_time: std::time::Duration::ZERO,
+            put_many_gate_wait: std::time::Duration::ZERO,
+            put_many_gate_wait_max: std::time::Duration::ZERO,
+            put_many_collection_wait: std::time::Duration::ZERO,
+            put_many_journal: std::time::Duration::ZERO,
+            put_many_pack: std::time::Duration::ZERO,
+            put_many_publish: std::time::Duration::ZERO,
+            put_many_total_max: std::time::Duration::ZERO,
             index_grow_count: 0,
             index_rebuild_count: 0,
             index_identity_reads: 0,

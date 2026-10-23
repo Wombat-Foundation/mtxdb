@@ -17,7 +17,9 @@
 //! [`PackfileStorage::remove_record`] is the pool-level counterpart of
 //! `DatabaseTransaction::remove` for tooling that works on one pool directory.
 
-use super::{PackfileStorage, StorageEngine, StorageError, NodeId, JournalMutation, HashMap, packfile};
+use super::{
+    packfile, HashMap, JournalMutation, NodeId, PackfileStorage, StorageEngine, StorageError,
+};
 
 /// What a collection's packs hold, split into live data and removals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
