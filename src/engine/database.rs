@@ -1124,11 +1124,6 @@ impl Database {
             stage.mark_published().map_err(StorageError::Io)?;
             self.finish_recovery_stage(&stage)?;
         }
-        // Autocommit writes that published but failed to apply are finished
-        // here too, so one recovery call clears every pending group.
-        for pool in ShardType::ALL {
-            self.pool(pool).retry_stranded_autocommits()?;
-        }
         Ok(())
     }
 

@@ -2483,138 +2483,6 @@ fn versioned_read_drains_a_stranded_published_group() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// An autocommit write that published but whose apply never completed (an
-/// error or panic between the two) leaves the collection version ahead of the
-/// data. Nothing but a reopen used to finish it, so every versioned read of the
-/// collection blocked, including the read a conditional write needs first.
-#[test]
-fn versioned_read_finishes_a_stranded_autocommit_write() {
-    let root = test_root("stranded_autocommit");
-    let database = Database::open(root.clone()).unwrap();
-    let collection = [0x5du8; 16];
-    let pool = ShardType::State;
-    let store = database.pool(pool);
-
-    let published = store
-        .publish_mutation(|| crate::journal::Mutation::Put {
-            collection_id: collection,
-            node_id: node(9),
-            payload: b"stranded".to_vec(),
-        })
-        .unwrap();
-    assert!(published.is_some());
-    // The apply "fails": the guard is dropped without completing.
-    drop(published);
-
-    let (records, version) = store
-        .get_with_collection_version(&collection, &[node(9)])
-        .expect("the read must finish the stranded write instead of blocking");
-    assert!(version > 0);
-    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"stranded");
-    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
-
-    drop(database);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// One recovery call must clear stranded autocommit writes as well as stranded
-/// transaction groups, and leave their data readable.
-#[test]
-fn recover_pending_transactions_finishes_stranded_autocommit_writes() {
-    let root = test_root("recover_stranded_autocommit");
-    let database = Database::open(root.clone()).unwrap();
-    let collection = [0x5eu8; 16];
-    let pool = ShardType::State;
-    let store = database.pool(pool);
-
-    for id in 1..=3u8 {
-        let published = store
-            .publish_mutation(|| crate::journal::Mutation::Put {
-                collection_id: collection,
-                node_id: node(id),
-                payload: vec![id],
-            })
-            .unwrap();
-        drop(published);
-    }
-    assert!(database.coordinator().unmaterialized_floor() < u64::MAX);
-
-    database.recover_pending_transactions().unwrap();
-    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
-    for id in 1..=3u8 {
-        let (records, _) = store
-            .get_with_collection_version(&collection, &[node(id)])
-            .unwrap();
-        assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), &[id]);
-    }
-    // A second call has nothing left to do.
-    database.recover_pending_transactions().unwrap();
-
-    drop(database);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Writers publish autocommit mutations and fail to apply a fraction of them
-/// while readers issue versioned reads. Reads must never certify data that
-/// lacks a published write, and after recovery nothing may stay pending.
-#[test]
-fn concurrent_autocommit_failures_never_pin_the_boundary() {
-    let root = test_root("concurrent_autocommit_failures");
-    let database = Arc::new(Database::open(root.clone()).unwrap());
-    let collection = [0x5fu8; 16];
-    let pool = ShardType::State;
-    let writers = 4u8;
-    let per_writer = 40u8;
-
-    let mut handles = Vec::new();
-    for writer in 0..writers {
-        let database = Arc::clone(&database);
-        handles.push(std::thread::spawn(move || {
-            let store = database.pool(pool);
-            for index in 0..per_writer {
-                let id = writer * per_writer + index;
-                let mutation = crate::journal::Mutation::Put {
-                    collection_id: collection,
-                    node_id: node(id),
-                    payload: vec![id],
-                };
-                let published = store.publish_mutation(|| mutation.clone()).unwrap();
-                if index % 4 == 0 {
-                    // The apply fails: the guard is dropped uncompleted.
-                    drop(published);
-                } else {
-                    let lsn = published.as_ref().map(|published| published.lsn).unwrap();
-                    store.apply_transaction_mutation(&mutation, lsn).unwrap();
-                    store.note_published_materialized(published);
-                }
-                // A versioned read may block briefly but must finish or fail
-                // loudly; it must never return data missing a published write.
-                if let Ok((records, _)) =
-                    store.get_with_collection_version(&collection, &[node(id)])
-                {
-                    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), &[id]);
-                }
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    database.recover_pending_transactions().unwrap();
-    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
-    let store = database.pool(pool);
-    for id in 0..writers * per_writer {
-        let (records, _) = store
-            .get_with_collection_version(&collection, &[node(id)])
-            .unwrap();
-        assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), &[id]);
-    }
-
-    drop(database);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 /// A cross-pool transaction is one journal group whose `last_lsn` is the last
 /// pool's last entry. Versions are seeded from the group's `last_lsn`, so after
 /// a restart each pool's read boundary must reach that LSN once its own entries
@@ -2662,6 +2530,120 @@ fn replayed_cross_pool_group_lifts_every_touched_pools_boundary() {
             .get_with_collection_version(&collection, &[id])
             .expect("a replayed group must not leave the pool's boundary behind its version");
         assert!(records[0].is_some());
+    }
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A published autocommit write whose apply never completes means the live
+/// index no longer matches the journal. The database must fail fast with the
+/// cause (no version left ahead of the data, nothing blocking forever), and a
+/// reopen must replay the write from the WAL.
+#[test]
+fn failed_autocommit_apply_fails_fast_and_reopen_replays_it() {
+    let root = test_root("autocommit_apply_failure");
+    let collection = [0x5du8; 16];
+    let pool = ShardType::State;
+    {
+        let database = Database::open(root.clone()).unwrap();
+        let store = database.pool(pool);
+        let published = store
+            .publish_mutation(|| crate::journal::Mutation::Put {
+                collection_id: collection,
+                node_id: node(9),
+                payload: b"published".to_vec(),
+            })
+            .unwrap();
+        assert!(published.is_some());
+        // The apply "fails": the guard is dropped without completing.
+        drop(published);
+
+        let error = store
+            .get_with_collection_version(&collection, &[node(9)])
+            .expect_err("a read must fail fast, not wait for a group that cannot apply");
+        assert!(
+            error.to_string().contains("failed to apply"),
+            "unexpected error: {error}"
+        );
+        let error = store
+            .put(
+                &collection,
+                &node(10),
+                &NodeData::new(bytes::Bytes::from_static(b"later")),
+            )
+            .expect_err("new writes must be rejected until a reopen");
+        assert!(error.to_string().contains("failed to apply"), "{error}");
+    }
+
+    let database = Database::open(root.clone()).unwrap();
+    let store = database.pool(pool);
+    let (records, _) = store
+        .get_with_collection_version(&collection, &[node(9)])
+        .unwrap();
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"published");
+    store
+        .put(
+            &collection,
+            &node(10),
+            &NodeData::new(bytes::Bytes::from_static(b"later")),
+        )
+        .unwrap();
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Writers race while one publishes and fails to apply. Everything after the
+/// failure must error promptly (no hang), and after a reopen every write that
+/// did publish must be readable.
+#[test]
+fn concurrent_writers_see_a_failed_apply_promptly_and_reopen_keeps_published() {
+    let root = test_root("concurrent_apply_failure");
+    let collection = [0x5fu8; 16];
+    let pool = ShardType::State;
+    let published_ids = std::sync::Mutex::new(Vec::<u8>::new());
+    {
+        let database = Arc::new(Database::open(root.clone()).unwrap());
+        std::thread::scope(|scope| {
+            for writer in 0..4u8 {
+                let database = Arc::clone(&database);
+                let published_ids = &published_ids;
+                scope.spawn(move || {
+                    let store = database.pool(pool);
+                    for index in 0..40u8 {
+                        let id = writer * 40 + index;
+                        let mutation = crate::journal::Mutation::Put {
+                            collection_id: collection,
+                            node_id: node(id),
+                            payload: vec![id],
+                        };
+                        let Ok(published) = store.publish_mutation(|| mutation.clone()) else {
+                            continue; // rejected after the failure
+                        };
+                        published_ids.lock().unwrap().push(id);
+                        if writer == 0 && index == 10 {
+                            drop(published); // the apply fails
+                        } else {
+                            let lsn = published.as_ref().map(|published| published.lsn).unwrap();
+                            store.apply_transaction_mutation(&mutation, lsn).unwrap();
+                            store.note_published_materialized(published);
+                        }
+                        let _ = store.get_with_collection_version(&collection, &[node(id)]);
+                    }
+                });
+            }
+        });
+        assert!(database.coordinator().apply_failure().is_some());
+    }
+
+    let database = Database::open(root.clone()).unwrap();
+    let store = database.pool(pool);
+    for id in published_ids.into_inner().unwrap() {
+        let (records, _) = store
+            .get_with_collection_version(&collection, &[node(id)])
+            .unwrap();
+        assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), &[id]);
     }
 
     drop(database);

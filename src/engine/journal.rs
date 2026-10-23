@@ -2047,6 +2047,12 @@ pub struct JournalCoordinator {
     /// Mirrors the journal's poison bit, so `publish` can reject without
     /// taking the `journal` mutex (which a sync holds across its fsync).
     poisoned: AtomicBool,
+    /// Why a published group could not be applied to the packs and index, once
+    /// one failed. Unlike `poisoned` this leaves the committer running, so
+    /// groups already published still reach disk and a reopen replays them.
+    apply_failure: Mutex<Option<String>>,
+    /// Mirrors `apply_failure.is_some()` for lock-free checks.
+    apply_failed: AtomicBool,
     /// Number of sync requests entering the coordinator.
     sync_calls: AtomicU64,
     /// Number of sync requests that found the journal mutex occupied.
@@ -2261,6 +2267,8 @@ impl JournalCoordinator {
             pending_promotions: Mutex::new(Vec::new()),
             recovered: scan.groups.clone(),
             poisoned: AtomicBool::new(false),
+            apply_failure: Mutex::new(None),
+            apply_failed: AtomicBool::new(false),
             sync_calls: AtomicU64::new(0),
             journal_waiters: AtomicU64::new(0),
             coalesced_syncs: AtomicU64::new(0),
@@ -3301,6 +3309,41 @@ impl JournalCoordinator {
         false
     }
 
+    /// Record that a published group could not be applied to the packs and
+    /// index. The WAL holds it, so the data is not lost, but this process's
+    /// index no longer matches the journal: new publications and versioned
+    /// reads that would wait for the group fail with `cause` until the database
+    /// is reopened and the WAL replayed. Only the first cause is kept.
+    pub(crate) fn fail_apply(&self, cause: String) {
+        let mut failure = self.apply_failure.lock();
+        if failure.is_none() {
+            *failure = Some(cause);
+        }
+        self.apply_failed.store(true, Ordering::Release);
+        drop(failure);
+        // Wake reads waiting for the group so they see the failure.
+        self.notify_materialized();
+    }
+
+    /// The reason a published group failed to apply, if one did.
+    pub(crate) fn apply_failure(&self) -> Option<String> {
+        if !self.apply_failed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.apply_failure.lock().clone()
+    }
+
+    /// Fail if a published group could not be applied (see [`Self::fail_apply`]).
+    fn reject_if_apply_failed(&self) -> io::Result<()> {
+        match self.apply_failure() {
+            Some(cause) => Err(io::Error::other(format!(
+                "a published group failed to apply; reopen the database to \
+                 replay the WAL: {cause}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Fail if a failed commit or append poisoned the journal.
     fn reject_if_poisoned(&self) -> io::Result<()> {
         if self.poisoned.load(Ordering::Acquire) {
@@ -3668,6 +3711,7 @@ impl JournalCoordinator {
     ) -> io::Result<Option<CommitReceipt>> {
         let _publication = self.publication.lock();
         self.validate_expectations(expectations, record_expectations)?;
+        self.reject_if_apply_failed()?;
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
                 "journal is poisoned after a failed append",

@@ -1611,34 +1611,36 @@ struct RecordLocator {
 
 /// An autocommit mutation that has been published to the journal (which bumps
 /// the collection version and registers it as pending) but whose apply to the
-/// packs and index has not completed. [`Self::complete`] retires it; dropping
-/// it any other way (an error or panic between publish and apply) strands the
-/// mutation so [`PackfileStorage::retry_stranded_autocommits`] can finish it.
-/// Without this a failed apply leaves the version ahead of the data until the
-/// next reopen, and every versioned read of the collection blocks.
+/// packs and index has not completed. [`Self::complete`] retires it. Dropping
+/// it any other way (an error or panic between publish and apply) means this
+/// process's index no longer matches the journal, so the coordinator is
+/// failed: new publications and reads that would wait on the group return the
+/// cause, and a reopen replays the WAL in LSN order. Without this a failed
+/// apply left the version ahead of the data and every versioned read of the
+/// collection blocked.
 pub(crate) struct Published {
     pub(crate) lsn: u64,
-    mutation: Option<JournalMutation>,
-    stranded: Arc<parking_lot::Mutex<Vec<(u64, JournalMutation)>>>,
+    journal: Option<Arc<JournalCoordinator>>,
 }
 
 impl Published {
     fn complete(mut self, store: &PackfileStorage) {
         store.note_materialized_lsn(self.lsn);
-        if let Some(journal) = store.journal() {
+        if let Some(journal) = self.journal.take() {
             journal.transaction_materialized(self.lsn);
         }
-        // Keep the recovery payload until both watermarks have been updated.
-        // If unwinding happened earlier, Drop queues the idempotent mutation
-        // for recovery instead of leaving a pending LSN with no owner.
-        self.mutation = None;
     }
 }
 
 impl Drop for Published {
     fn drop(&mut self) {
-        if let Some(mutation) = self.mutation.take() {
-            self.stranded.lock().push((self.lsn, mutation));
+        if let Some(journal) = self.journal.take() {
+            let cause = format!(
+                "autocommit group at lsn {} was published but its apply failed or panicked",
+                self.lsn
+            );
+            mtxdb_log::error!("mtxdb: {cause}; failing the database until it is reopened");
+            journal.fail_apply(cause);
         }
     }
 }
@@ -2197,8 +2199,6 @@ pub struct PackfileStorage {
     /// and overlay maintenance may rebuild that state while a direct write is
     /// in progress.
     read_snapshot_gate: Arc<parking_lot::Mutex<()>>,
-    /// Published autocommit mutations whose apply failed; see [`Published`].
-    stranded_autocommits: Arc<parking_lot::Mutex<Vec<(u64, JournalMutation)>>>,
     /// Number of in-process transactions whose published groups are still
     /// being materialized. While non-zero, ordinary reads consult the journal
     /// overlay before the live index.
@@ -3005,7 +3005,6 @@ impl PackfileStorage {
             replaying: AtomicBool::new(false),
             read_journal: Arc::new(parking_lot::Mutex::new(None)),
             read_snapshot_gate: Arc::new(parking_lot::Mutex::new(())),
-            stranded_autocommits: Arc::new(parking_lot::Mutex::new(Vec::new())),
             parked_transaction_overlay: parking_lot::Mutex::new(None),
             transaction_overlay_lifecycle: parking_lot::Mutex::new(()),
             transaction_overlay_users: AtomicU64::new(0),
@@ -8975,12 +8974,22 @@ impl PackfileStorage {
         data: &NodeData,
         metadata: Option<FrameMetadata>,
     ) -> Result<(u16, u64, u64, Option<Published>), StorageError> {
+        // Reject an unwritable record before publishing: a failure after
+        // publication fails the whole database (see `Published`), and a bad
+        // input is the caller's error, not a storage failure.
+        ShardPool::validate_record(&Record {
+            collection_id: *collection_id,
+            hash: *id,
+            data: data.bytes.clone(),
+            metadata: None,
+        })
+        .map_err(StorageError::Io)?;
         // Publish the group before writing its frame so the frame can carry the
         // group's LSN as its record version. This mirrors the transaction path:
         // the group is durable and visible from the WAL (and replayed on
         // reopen), and the frame materializes it. A frame write that fails after
-        // publication is recovered by `replay_journal`, which stamps the same
-        // LSN, so the mutation never becomes an orphan.
+        // publication fails the database until a reopen, when `replay_journal`
+        // stamps the same LSN, so the mutation never becomes an orphan.
         let published = self.publish_mutation(|| JournalMutation::Put {
             collection_id: *collection_id,
             node_id: *id,
@@ -10992,11 +11001,9 @@ impl PackfileStorage {
         }
         .map_err(StorageError::Io)?;
         self.record_published_mutation(started);
-        let [mutation] = batch;
         Ok(Some(Published {
             lsn: result,
-            mutation: Some(mutation),
-            stranded: Arc::clone(&self.stranded_autocommits),
+            journal: Some(journal),
         }))
     }
 
@@ -11007,34 +11014,6 @@ impl PackfileStorage {
         if let Some(published) = published {
             published.complete(self);
         }
-    }
-
-    /// Finish autocommit mutations that were published but whose apply failed
-    /// (see [`Published`]). The mutation is already in the journal, so it
-    /// would be replayed on reopen; completing it now keeps the live index and
-    /// the read boundary consistent with that. Stops at the first failure and
-    /// leaves the rest queued.
-    ///
-    /// # Errors
-    /// Returns the first apply error. On success, the number finished.
-    pub fn retry_stranded_autocommits(&self) -> Result<usize, StorageError> {
-        let mut pending = std::mem::take(&mut *self.stranded_autocommits.lock());
-        pending.sort_by_key(|(lsn, _)| *lsn);
-        let finished = pending.len();
-        let mut remaining = pending.into_iter();
-        while let Some((lsn, mutation)) = remaining.next() {
-            if let Err(error) = self.apply_transaction_mutation(&mutation, lsn) {
-                let mut queue = self.stranded_autocommits.lock();
-                queue.push((lsn, mutation));
-                queue.extend(remaining);
-                return Err(error);
-            }
-            self.note_materialized_lsn(lsn);
-            if let Some(journal) = self.journal() {
-                journal.transaction_materialized(lsn);
-            }
-        }
-        Ok(finished)
     }
 
     /// Apply a mutation staged by a database transaction without publishing

@@ -1334,34 +1334,31 @@ impl PackfileStorage {
             // is published and its materialization is what lifts the boundary.
             let version = journal.collection_version(pool, collection_id);
             let mut boundary = 0u64;
-            for pass in 0..2 {
-                for attempt in 0..ATTEMPTS {
-                    let (data, read_boundary) =
-                        self.get_read_committed_bounded(collection_id, ids, true)?;
-                    boundary = read_boundary;
-                    if boundary >= version {
-                        debug_assert!(
-                            boundary <= self.durable_read_boundary(),
-                            "certified read boundary {boundary} exceeds the materialized coverage"
-                        );
-                        return Ok((data, version));
-                    }
-                    // The boundary lags by an in-flight group whose materialization
-                    // runs on another thread. Yield first, then block on the
-                    // materialization signal so the read wakes as soon as that
-                    // thread finishes instead of polling; the timeout bounds a
-                    // missed wake.
-                    if attempt < 2 {
-                        std::thread::yield_now();
-                    } else {
-                        journal.wait_for_materialized(std::time::Duration::from_micros(50));
-                    }
+            for attempt in 0..ATTEMPTS {
+                let (data, read_boundary) =
+                    self.get_read_committed_bounded(collection_id, ids, true)?;
+                boundary = read_boundary;
+                if boundary >= version {
+                    debug_assert!(
+                        boundary <= self.durable_read_boundary(),
+                        "certified read boundary {boundary} exceeds the materialized coverage"
+                    );
+                    return Ok((data, version));
                 }
-                // A published autocommit write whose apply failed holds the
-                // boundary back and nothing else will finish it; do that now and
-                // wait once more before giving up.
-                if pass == 0 && self.retry_stranded_autocommits()? == 0 {
-                    break;
+                // The boundary lags by an in-flight group whose materialization
+                // runs on another thread. Yield first, then block on the
+                // materialization signal so the read wakes as soon as that
+                // thread finishes instead of polling; the timeout bounds a
+                // missed wake.
+                // A published group that failed to apply never materializes, so
+                // waiting for it would block until the caller times out.
+                if let Some(error) = apply_failed_error(&journal) {
+                    return Err(error);
+                }
+                if attempt < 2 {
+                    std::thread::yield_now();
+                } else {
+                    journal.wait_for_materialized(std::time::Duration::from_micros(50));
                 }
             }
             Err(StorageError::WouldBlock(stalled_boundary_message(
@@ -1406,31 +1403,31 @@ impl PackfileStorage {
             };
             let version = journal.collection_version(pool, collection_id);
             let mut boundary = 0u64;
-            for pass in 0..2 {
-                for attempt in 0..ATTEMPTS {
-                    let (data, read_boundary) =
-                        self.get_read_committed_bounded(collection_id, ids, true)?;
-                    boundary = read_boundary;
-                    if boundary >= version {
-                        if let Some(versions) = self.record_versions_for_read(
-                            &journal,
-                            pool,
-                            collection_id,
-                            ids,
-                            &data,
-                            boundary,
-                        )? {
-                            return Ok((data, versions));
-                        }
-                    }
-                    if attempt < 2 {
-                        std::thread::yield_now();
-                    } else {
-                        journal.wait_for_materialized(std::time::Duration::from_micros(50));
+            for attempt in 0..ATTEMPTS {
+                let (data, read_boundary) =
+                    self.get_read_committed_bounded(collection_id, ids, true)?;
+                boundary = read_boundary;
+                if boundary >= version {
+                    if let Some(versions) = self.record_versions_for_read(
+                        &journal,
+                        pool,
+                        collection_id,
+                        ids,
+                        &data,
+                        boundary,
+                    )? {
+                        return Ok((data, versions));
                     }
                 }
-                if pass == 0 && self.retry_stranded_autocommits()? == 0 {
-                    break;
+                // A published group that failed to apply never materializes, so
+                // waiting for it would block until the caller times out.
+                if let Some(error) = apply_failed_error(&journal) {
+                    return Err(error);
+                }
+                if attempt < 2 {
+                    std::thread::yield_now();
+                } else {
+                    journal.wait_for_materialized(std::time::Duration::from_micros(50));
                 }
             }
             Err(StorageError::WouldBlock(stalled_boundary_message(
@@ -1758,4 +1755,15 @@ fn stalled_boundary_message(
             floor.saturating_add(1)
         )
     }
+}
+
+/// The error a versioned read returns once a published group failed to apply,
+/// instead of waiting for a boundary that can no longer advance.
+fn apply_failed_error(journal: &crate::journal::JournalCoordinator) -> Option<StorageError> {
+    journal.apply_failure().map(|cause| {
+        StorageError::Internal(format!(
+            "a published group failed to apply; reopen the database to replay \
+             the WAL: {cause}"
+        ))
+    })
 }
