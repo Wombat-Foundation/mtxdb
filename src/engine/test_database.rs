@@ -2380,6 +2380,67 @@ fn unmaterialized_floor_pins_until_group_is_materialized() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `finish_recovery_stage` uses `swap_remove`, so finishing the first of three
+/// queued groups moves the last one into its slot. The read floor must still
+/// be pinned by the earliest unmaterialized group, whatever the queue order.
+#[test]
+fn recovery_queue_reorder_does_not_let_later_group_pass_earlier() {
+    let root = test_root("recovery_queue_reorder");
+    let database = Database::open(root.clone()).unwrap();
+    let collection = [0x5bu8; 16];
+    let pool = ShardType::State;
+
+    let mut staged = Vec::new();
+    for id in 1..=3u8 {
+        let txn = database.begin_transaction();
+        txn.put(
+            pool,
+            collection,
+            node(id),
+            &NodeData::new(bytes::Bytes::from_static(b"pending")),
+        )
+        .unwrap();
+        let mut overlay = Some(activate_for(&database, &txn.stage));
+        database.publish_transaction(&txn.stage).unwrap();
+        let receipt = txn.stage.published_receipt().unwrap();
+        txn.stage.begin_materialization().unwrap();
+        database
+            .register_new_recovery_stage(Arc::clone(&txn.stage), receipt, &mut overlay)
+            .unwrap();
+        staged.push((Arc::clone(&txn.stage), receipt));
+        drop(txn);
+    }
+    let finish = |index: usize| {
+        let (stage, _) = &staged[index];
+        database.materialize_transaction(stage).unwrap();
+        stage.mark_published().unwrap();
+        database.finish_recovery_stage(stage).unwrap();
+    };
+    let second_first_lsn = staged[1].1.first_lsn;
+
+    // Finish the first group; swap_remove moves the third into slot 0.
+    finish(0);
+    assert_eq!(
+        database.coordinator().unmaterialized_floor(),
+        second_first_lsn - 1,
+        "the second group must still pin the floor"
+    );
+    // The third group materializes ahead of the second.
+    finish(2);
+    assert_eq!(
+        database.coordinator().unmaterialized_floor(),
+        second_first_lsn - 1,
+        "a later group must not lift the floor past an earlier pending one"
+    );
+
+    database.recover_pending_transactions().unwrap();
+    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
+
+    drop(staged);
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn published_transaction_is_visible_before_materialization() {
     let root = test_root("transaction_overlay");
