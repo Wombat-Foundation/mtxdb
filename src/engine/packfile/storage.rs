@@ -11303,6 +11303,45 @@ impl PackfileStorage {
         self.delta_log_cap().saturating_div(4).saturating_mul(3)
     }
 
+    /// Compact the current epoch's covered prefix, if it has enough overwrite
+    /// redundancy to be worth rewriting. On success, updates the in-memory log
+    /// length so the caller can re-evaluate `rotating`. Best-effort: a failure
+    /// leaves the log untouched and lets the existing checkpoint path run.
+    fn try_compact_delta_log(&self) -> Option<u64> {
+        let (base_fingerprint, log_bytes) = {
+            let state = self.delta_state.lock();
+            (state.base_fingerprint?, state.log_bytes)
+        };
+        let path = Self::delta_path(&self.base_dir, base_fingerprint);
+        // The in-memory length is the append frontier. A mismatch means the
+        // file was touched outside this handle (or a test forced the counter),
+        // so leave it to the ordinary checkpoint path rather than rewrite a
+        // file whose extent we do not understand.
+        let on_disk = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if on_disk != log_bytes {
+            return None;
+        }
+        match delta::compact_delta_log(&path) {
+            Ok(Some(compacted_len)) => {
+                let mut state = self.delta_state.lock();
+                if state.base_fingerprint != Some(base_fingerprint) || state.log_bytes != log_bytes
+                {
+                    // Cannot happen while `index_persist_lock` is held, but do
+                    // not claim a length that no longer describes the file.
+                    return None;
+                }
+                state.log_bytes = compacted_len;
+                state.log_synced_bytes = compacted_len;
+                Some(compacted_len)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!("mtxdb: delta log compaction failed: {error}");
+                None
+            }
+        }
+    }
+
     /// The details of `error` if it is a delta batch that does not fit under the
     /// cap. That is a planned rotation, not a failure: the batch may carry
     /// whole-index snapshots, so it is refused by its projected length.
@@ -11383,8 +11422,18 @@ impl PackfileStorage {
         // the whole index: the packs are made durable, then the batch carrying
         // the claim is, and only then is the journal reclaimed.
         let mut coverage_batch_written = false;
-        let log_bytes = self.delta_state.lock().log_bytes;
-        let rotating = log_bytes >= self.delta_log_rotate_bytes();
+        let mut log_bytes = self.delta_state.lock().log_bytes;
+        let mut rotating = log_bytes >= self.delta_log_rotate_bytes();
+        if rotating {
+            // A rotation currently means rewriting the whole index. Try to
+            // compact the covered prefix of the delta log first: if enough of
+            // it is superseded, the log drops below the rotate threshold and a
+            // small delta batch can continue the same epoch instead.
+            if let Some(compacted_len) = self.try_compact_delta_log() {
+                log_bytes = compacted_len;
+                rotating = log_bytes >= self.delta_log_rotate_bytes();
+            }
+        }
         if rotating {
             eprintln!(
                 "mtxdb: delta log is at {log_bytes} of {} bytes, rewriting the checkpoint \

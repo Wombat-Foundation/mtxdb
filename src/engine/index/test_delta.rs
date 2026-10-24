@@ -51,6 +51,108 @@ fn v1_log(operations: &[DeltaOperation], tail_fingerprint: u64) -> Vec<u8> {
     log
 }
 
+fn redo_set(collection_id: [u8; 16], full_hash: [u8; 16], delta_seq: u64) -> DeltaOperation {
+    DeltaOperation::Redo(RedoRecord {
+        collection_id,
+        op: RedoOp::Set {
+            full_hash,
+            pack_id: crate::packfile::PackId([1; 16]),
+            offset: 4096,
+            record_len: 128,
+            removed: false,
+        },
+        delta_seq,
+        base_generation: 1,
+    })
+}
+
+#[test]
+fn compaction_keeps_the_newest_redo_and_the_final_coverage() {
+    let collection = [3; 16];
+    let redo_a = redo_set(collection, [1; 16], 1);
+    let redo_b = redo_set(collection, [2; 16], 2);
+    let redo_a_newer = redo_set(collection, [1; 16], 3);
+    let coverage = DeltaOperation::Coverage { covered_lsn: 42 };
+    let operations = vec![redo_a, redo_b, redo_a_newer, coverage.clone()];
+
+    let compacted = compact_operations(&operations);
+    assert_eq!(compacted.len(), 3);
+    assert_eq!(compacted[2], coverage);
+    match &compacted[1] {
+        DeltaOperation::Redo(record) => {
+            assert_eq!(
+                record.delta_seq, 3,
+                "only the newest set for a hash survives"
+            );
+            let RedoOp::Set { full_hash, .. } = record.op else {
+                panic!("expected a set");
+            };
+            assert_eq!(full_hash, [1; 16]);
+        }
+        other => panic!("expected redo, got {other:?}"),
+    }
+}
+
+#[test]
+fn compaction_drops_everything_before_a_collection_cut() {
+    let collection = [4; 16];
+    let operations = vec![
+        redo_set(collection, [1; 16], 1),
+        DeltaOperation::CollectionTombstone {
+            collection_id: collection,
+            generation: 2,
+        },
+        redo_set(collection, [2; 16], 2),
+        DeltaOperation::Coverage { covered_lsn: 9 },
+    ];
+
+    let compacted = compact_operations(&operations);
+    assert_eq!(compacted.len(), 3);
+    assert!(matches!(
+        compacted[0],
+        DeltaOperation::CollectionTombstone { .. }
+    ));
+    assert!(matches!(compacted[1], DeltaOperation::Redo(_)));
+    assert!(matches!(compacted[2], DeltaOperation::Coverage { .. }));
+}
+
+#[test]
+fn compact_delta_log_rewrites_in_place_and_preserves_the_claim() {
+    let dir = std::env::temp_dir().join(format!("mtxdb_delta_compact_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INDEX_DELTA_FILE);
+
+    let collection = [5; 16];
+    let operations = vec![
+        redo_set(collection, [1; 16], 1),
+        redo_set(collection, [2; 16], 2),
+        redo_set(collection, [1; 16], 3),
+        DeltaOperation::Coverage { covered_lsn: 77 },
+    ];
+    std::fs::write(&path, v1_log(&operations, 0x5151)).unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+
+    let after = compact_delta_log(&path)
+        .expect("compaction succeeds")
+        .expect("operations were redundant");
+    assert!(after < before, "compaction must shorten the log");
+
+    let decoded = read_delta_log(&path).expect("compacted log reads");
+    assert_eq!(decoded.base_fingerprint, 0xABC);
+    assert_eq!(decoded.tail_fingerprint, 0x5151);
+    assert_eq!(decoded.coverage, Some(77));
+    assert_eq!(decoded.operations.len(), 3);
+    assert!(matches!(
+        decoded.operations.last(),
+        Some(DeltaOperation::Coverage { covered_lsn: 77 })
+    ));
+
+    // A second pass has nothing left to remove.
+    assert_eq!(compact_delta_log(&path).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn v1_log_round_trips_operations() {
     let dir = std::env::temp_dir().join(format!("mtxdb_delta_v1_round_{}", std::process::id()));
