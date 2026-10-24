@@ -29,8 +29,10 @@
 //! while calculating CRC32 over the complete file. Each directory entry is a
 //! 16-byte collection id followed by a `u32` entry count. Its section starts
 //! immediately after the previous section and contains cumulative
-//! `fanout[256]`, sorted 16-byte logical ids, then parallel `u32` offsets.
-//! Duplicate `(collection_id, logical_id)` inputs keep the greatest offset.
+//! `fanout[256]`, sorted 16-byte logical ids, parallel `u32` offsets, then one
+//! flags byte per entry. Bit 0 marks a removal version; the offset still points
+//! at the removal frame, so append order decides which version wins. Duplicate
+//! `(collection_id, logical_id)` inputs keep the greatest offset.
 //!
 //! [`PackIndex::build`] sorts one flat input vector and is intended for
 //! in-memory construction. It does not implement external sorting; a bounded
@@ -55,6 +57,10 @@ pub const PACK_INDEX_COLLECTION_ENTRY_LEN: usize = 20;
 pub const PACK_INDEX_FANOUT_LEN: usize = 256 * 4;
 /// Bytes per locator in a collection section: a 16-byte id and a `u32` offset.
 pub const PACK_INDEX_SECTION_ENTRY_LEN: usize = 20;
+/// Bytes of per-entry flags in a collection section.
+pub const PACK_INDEX_FLAG_ENTRY_LEN: usize = 1;
+/// Flag bit marking a removal version.
+pub const PACK_INDEX_FLAG_REMOVED: u8 = 1;
 const CRC_RANGE: std::ops::Range<usize> = 60..64;
 const MAX_FILE_LEN: u64 = 0xFFFF_FFFF;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -68,6 +74,18 @@ pub struct PackIndexInput {
     pub logical_id: [u8; 16],
     /// Byte offset of the frame in the pack.
     pub offset: u64,
+    /// Whether the frame at `offset` is a removal version.
+    pub removed: bool,
+}
+
+/// What a locator names: a live frame or a removal version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackIndexLocator {
+    /// A live frame at this byte offset.
+    Frame(u32),
+    /// A removal version at this byte offset. The frame is present, but the key
+    /// is absent from the collection.
+    Removed(u32),
 }
 
 /// Expected identity and extent when opening an index for a pack.
@@ -117,6 +135,7 @@ struct CollectionView {
     fan_at: usize,
     ids_at: usize,
     offsets_at: usize,
+    flags_at: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -337,9 +356,26 @@ impl PackIndex {
         &self.bytes
     }
 
-    /// Resolve a key to its frame offset in this pack.
+    /// Resolve a key to a live frame offset in this pack.
+    ///
+    /// Returns `None` for a missing key and for a key whose newest version is a
+    /// removal. Use [`Self::get_locator`] when the difference matters.
     #[must_use]
     pub fn get(&self, collection_id: &[u8; 16], logical_id: &[u8; 16]) -> Option<u32> {
+        match lookup(&self.bytes, &self.collections, collection_id, logical_id)? {
+            PackIndexLocator::Frame(offset) => Some(offset),
+            PackIndexLocator::Removed(_) => None,
+        }
+    }
+
+    /// Resolve a key to the newest version recorded in this pack, including a
+    /// removal version.
+    #[must_use]
+    pub fn get_locator(
+        &self,
+        collection_id: &[u8; 16],
+        logical_id: &[u8; 16],
+    ) -> Option<PackIndexLocator> {
         lookup(&self.bytes, &self.collections, collection_id, logical_id)
     }
 
@@ -410,7 +446,8 @@ fn encoded_file_len(groups: &[CollectionRange]) -> Result<usize, PackIndexError>
         .try_fold(0_usize, |total, group| {
             let count = group.end.checked_sub(group.start)?;
             let section_len = PACK_INDEX_FANOUT_LEN
-                .checked_add(count.checked_mul(PACK_INDEX_SECTION_ENTRY_LEN)?)?;
+                .checked_add(count.checked_mul(PACK_INDEX_SECTION_ENTRY_LEN)?)?
+                .checked_add(count.checked_mul(PACK_INDEX_FLAG_ENTRY_LEN)?)?;
             total.checked_add(section_len)
         })
         .ok_or(PackIndexError::TooLarge)?;
@@ -507,6 +544,14 @@ fn encode_collection(
                 .to_le_bytes(),
         );
     }
+    let flags_at = bytes.len();
+    for input in &inputs[group.start..group.end] {
+        bytes.push(if input.removed {
+            PACK_INDEX_FLAG_REMOVED
+        } else {
+            0
+        });
+    }
     debug_assert_eq!(
         ids_at, expected_ids_at,
         "logical-id section must immediately follow the fanout table"
@@ -517,6 +562,7 @@ fn encode_collection(
         fan_at,
         ids_at,
         offsets_at,
+        flags_at,
     })
 }
 
@@ -533,9 +579,26 @@ impl MappedPackIndex {
         self.entry_count
     }
 
-    /// Resolve a key to its frame offset in this pack.
+    /// Resolve a key to a live frame offset in this pack.
+    ///
+    /// Returns `None` for a missing key and for a key whose newest version is a
+    /// removal. Use [`Self::get_locator`] when the difference matters.
     #[must_use]
     pub fn get(&self, collection_id: &[u8; 16], logical_id: &[u8; 16]) -> Option<u32> {
+        match lookup(&self.map, &self.collections, collection_id, logical_id)? {
+            PackIndexLocator::Frame(offset) => Some(offset),
+            PackIndexLocator::Removed(_) => None,
+        }
+    }
+
+    /// Resolve a key to the newest version recorded in this pack, including a
+    /// removal version.
+    #[must_use]
+    pub fn get_locator(
+        &self,
+        collection_id: &[u8; 16],
+        logical_id: &[u8; 16],
+    ) -> Option<PackIndexLocator> {
         lookup(&self.map, &self.collections, collection_id, logical_id)
     }
 
@@ -569,7 +632,7 @@ fn lookup(
     collections: &[CollectionView],
     collection_id: &[u8; 16],
     logical_id: &[u8; 16],
-) -> Option<u32> {
+) -> Option<PackIndexLocator> {
     let collection = collections
         .binary_search_by_key(collection_id, |view| view.id)
         .ok()
@@ -596,7 +659,14 @@ fn lookup(
             std::cmp::Ordering::Greater => right = middle,
             std::cmp::Ordering::Equal => {
                 let offset_at = collection.offsets_at.checked_add(middle.checked_mul(4)?)?;
-                return read_u32(bytes, offset_at);
+                let offset = read_u32(bytes, offset_at)?;
+                let flags_at = collection.flags_at.checked_add(middle)?;
+                let flags = *bytes.get(flags_at)?;
+                return Some(if flags & PACK_INDEX_FLAG_REMOVED != 0 {
+                    PackIndexLocator::Removed(offset)
+                } else {
+                    PackIndexLocator::Frame(offset)
+                });
             }
         }
     }
@@ -655,7 +725,9 @@ fn parse_layout(bytes: &[u8], verify_body: bool) -> Option<ParsedLayout> {
         let fan_at = section_at;
         let ids_at = fan_at.checked_add(PACK_INDEX_FANOUT_LEN)?;
         let offsets_at = ids_at.checked_add(count_usize.checked_mul(16)?)?;
-        let section_end = offsets_at.checked_add(count_usize.checked_mul(4)?)?;
+        let flags_at = offsets_at.checked_add(count_usize.checked_mul(4)?)?;
+        let section_end =
+            flags_at.checked_add(count_usize.checked_mul(PACK_INDEX_FLAG_ENTRY_LEN)?)?;
         if section_end > bytes.len() {
             return None;
         }
@@ -666,6 +738,7 @@ fn parse_layout(bytes: &[u8], verify_body: bool) -> Option<ParsedLayout> {
             fan_at,
             ids_at,
             offsets_at,
+            flags_at,
         });
         section_at = section_end;
     }
@@ -717,6 +790,10 @@ fn validate_body(bytes: &[u8], parsed: &ParsedLayout) -> Option<()> {
             *frequency = frequency.checked_add(1)?;
             let offset_at = collection.offsets_at.checked_add(i.checked_mul(4)?)?;
             let offset = u64::from(read_u32(bytes, offset_at)?);
+            let flags = *bytes.get(collection.flags_at.checked_add(i)?)?;
+            if flags & !PACK_INDEX_FLAG_REMOVED != 0 {
+                return None;
+            }
             if offset < min_offset || offset >= parsed.identity.pack_file_len {
                 return None;
             }

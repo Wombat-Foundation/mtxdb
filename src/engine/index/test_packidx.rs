@@ -25,27 +25,70 @@ fn sample_inputs() -> Vec<PackIndexInput> {
             collection_id: [2; 16],
             logical_id: [0x80; 16],
             offset: frame_offset(40),
+            removed: false,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0x10; 16],
             offset: frame_offset(20),
+            removed: false,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0x10; 16],
             offset: frame_offset(80),
+            removed: false,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0x20; 16],
             offset: frame_offset(60),
+            removed: false,
         },
     ]
 }
 
 fn sample_index() -> PackIndex {
     PackIndex::build(sample_identity(), sample_inputs()).unwrap()
+}
+
+#[test]
+fn tombstone_wins_only_when_it_is_the_newest_version() {
+    let collection = [9; 16];
+    let key = [7; 16];
+    let build = |versions: &[(u64, bool)]| {
+        PackIndex::build(
+            sample_identity(),
+            versions
+                .iter()
+                .map(|(offset, removed)| PackIndexInput {
+                    collection_id: collection,
+                    logical_id: key,
+                    offset: frame_offset(*offset),
+                    removed: *removed,
+                })
+                .collect(),
+        )
+        .unwrap()
+    };
+
+    let removed_last = build(&[(20, false), (40, true)]);
+    assert_eq!(
+        removed_last.get_locator(&collection, &key),
+        Some(PackIndexLocator::Removed(
+            u32::try_from(frame_offset(40)).unwrap()
+        ))
+    );
+    assert_eq!(removed_last.get(&collection, &key), None);
+
+    let re_added_last = build(&[(20, false), (40, true), (60, false)]);
+    assert_eq!(
+        re_added_last.get_locator(&collection, &key),
+        Some(PackIndexLocator::Frame(
+            u32::try_from(frame_offset(60)).unwrap()
+        ))
+    );
+    assert!(PackIndex::decode(re_added_last.as_bytes()).is_some());
 }
 
 #[test]
@@ -122,6 +165,7 @@ fn pack_index_rejects_offsets_before_frame_data() {
         collection_id: [1; 16],
         logical_id: [2; 16],
         offset: frame_offset(0).checked_sub(1).unwrap(),
+        removed: false,
     }];
     assert_eq!(
         PackIndex::build(
@@ -146,6 +190,7 @@ fn pack_index_rejects_offsets_at_pack_end_during_build_and_decode() {
         collection_id: [1; 16],
         logical_id: [2; 16],
         offset: end,
+        removed: false,
     };
     assert_eq!(
         PackIndex::build(
@@ -243,16 +288,19 @@ fn fanout_edges_and_equal_ids_are_isolated_by_collection() {
             collection_id: [1; 16],
             logical_id: [0x00; 16],
             offset: frame_offset(1),
+            removed: false,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0xff; 16],
             offset: frame_offset(2),
+            removed: false,
         },
         PackIndexInput {
             collection_id: [2; 16],
             logical_id: [0x00; 16],
             offset: frame_offset(3),
+            removed: false,
         },
     ];
     let index = PackIndex::build(
@@ -280,6 +328,7 @@ fn write_atomic_replaces_an_existing_complete_index() {
             collection_id: [1; 16],
             logical_id: [0x10; 16],
             offset: frame_offset(100),
+            removed: false,
         }],
     )
     .unwrap();

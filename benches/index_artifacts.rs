@@ -231,6 +231,7 @@ fn build_pack_index(
             collection_id: *collection_id,
             logical_id: *logical_id,
             offset: *offset,
+            removed: false,
         })
         .collect();
     let identity = pack_index_identity(pack, pack_len);
