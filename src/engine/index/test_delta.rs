@@ -154,6 +154,39 @@ fn compact_delta_log_rewrites_in_place_and_preserves_the_claim() {
 }
 
 #[test]
+fn compact_delta_log_skips_a_log_with_marginal_savings() {
+    let dir = std::env::temp_dir().join(format!(
+        "mtxdb_delta_compact_marginal_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INDEX_DELTA_FILE);
+
+    let collection = [6; 16];
+    let mut operations = Vec::new();
+    for index in 0..8u8 {
+        operations.push(redo_set(collection, [index; 16], u64::from(index)));
+    }
+    operations.push(redo_set(collection, [0; 16], 99));
+    operations.push(DeltaOperation::Coverage { covered_lsn: 100 });
+    std::fs::write(&path, v1_log(&operations, 0x6161)).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    assert_eq!(
+        compact_delta_log(&path).unwrap(),
+        None,
+        "a rewrite that frees less than the minimum margin is not published"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the log is unchanged"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn v1_log_round_trips_operations() {
     let dir = std::env::temp_dir().join(format!("mtxdb_delta_v1_round_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

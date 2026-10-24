@@ -11317,7 +11317,7 @@ impl PackfileStorage {
         // file was touched outside this handle (or a test forced the counter),
         // so leave it to the ordinary checkpoint path rather than rewrite a
         // file whose extent we do not understand.
-        let on_disk = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let on_disk = fs::metadata(&path).map_or(0, |meta| meta.len());
         if on_disk != log_bytes {
             return None;
         }

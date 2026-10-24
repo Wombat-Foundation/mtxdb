@@ -1162,6 +1162,11 @@ pub fn compact_operations(operations: &[DeltaOperation]) -> Vec<DeltaOperation> 
         .collect()
 }
 
+/// Minimum share of the log a compaction must release before it is worth the
+/// rewrite. Below this, the ordinary checkpoint path is cheaper than repeatedly
+/// compacting a working set that is genuinely growing.
+pub const MIN_COMPACTION_SAVINGS_PERCENT: u64 = 25;
+
 /// Rewrite a v1 delta log without the operations superseded inside its covered
 /// prefix. Returns the new on-disk length when a compaction was written.
 ///
@@ -1215,17 +1220,25 @@ pub fn compact_delta_log(path: &Path) -> io::Result<Option<u64>> {
             ));
         }
         let len = fs::metadata(&temp)?.len();
+        let original_len = fs::metadata(path)?.len();
+        // Avoid a compaction treadmill: a log that is mostly live keys gains
+        // little from a rewrite and would be back at the threshold after a few
+        // batches. Only publish when the freed fraction justifies it.
+        let required_max = original_len.saturating_mul(100 - MIN_COMPACTION_SAVINGS_PERCENT);
+        if len.saturating_mul(100) > required_max {
+            return Ok(None);
+        }
         fs::rename(&temp, path)?;
         if let Some(parent) = path.parent() {
             crate::shard::sync_directory(parent)?;
         }
-        Ok(len)
+        Ok(Some(len))
     })();
 
-    if result.is_err() {
+    if !matches!(result.as_ref(), Ok(Some(_))) {
         let _ = fs::remove_file(&temp);
     }
-    result.map(Some)
+    result
 }
 
 /// Append one batch (optional header, then a count-framed batch) to the delta
