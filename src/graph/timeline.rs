@@ -48,6 +48,8 @@
 //! paging returns keys strictly greater than the cursor, reverse strictly less,
 //! so resuming is exact and idempotent in both directions.
 
+use std::borrow::Cow;
+
 use bytes::Bytes;
 
 use crate::database::{Database, DatabaseTransaction};
@@ -266,18 +268,28 @@ fn room_end(room_id: &[u8; 16]) -> TimelineEntry {
 /// A persisted timeline index over an existing storage engine.
 pub struct TimelineIndex<'a, S: StorageEngine + ?Sized> {
     engine: &'a S,
-    name: String,
+    name: Cow<'a, str>,
     collection_id: [u8; 16],
 }
 
 impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// Open (or create) the named timeline index.
     #[must_use]
-    pub fn open(engine: &'a S, name: &str) -> Self {
+    pub fn open(engine: &'a S, name: &'a str) -> Self {
+        Self::with_collection_id(engine, Cow::Borrowed(name), timeline_collection_id(name))
+    }
+
+    /// Open with a pre-computed collection ID and pre-owned or borrowed name.
+    #[must_use]
+    pub fn with_collection_id(
+        engine: &'a S,
+        name: impl Into<Cow<'a, str>>,
+        collection_id: [u8; 16],
+    ) -> Self {
         Self {
             engine,
-            name: name.to_owned(),
-            collection_id: timeline_collection_id(name),
+            name: name.into(),
+            collection_id,
         }
     }
 
