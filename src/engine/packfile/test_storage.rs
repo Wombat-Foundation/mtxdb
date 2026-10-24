@@ -11880,7 +11880,7 @@ fn slots_only_delta_snapshot_is_short_and_replays() {
                 .to_string_lossy()
                 .starts_with(crate::index::delta::INDEX_DELTA_FILE)
         })
-        .map(|entry| entry.metadata().map(|m| m.len()).unwrap_or(0))
+        .map(|entry| entry.metadata().map_or(0, |m| m.len()))
         .sum();
     assert!(
         delta_bytes > short_blob,

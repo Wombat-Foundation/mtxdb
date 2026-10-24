@@ -2927,16 +2927,21 @@ impl ShardPool {
         let worker = std::thread::Builder::new()
             .name("mtxdb-pack-index".to_owned())
             .spawn(move || {
+                if !shard.is_current.load(Ordering::Acquire) {
+                    return;
+                }
                 let result = {
                     let _sync_guard = shard.sync_lock.lock();
                     shard.fsync_advancing_watermark(false)
                 }
                 .and_then(|()| packidx::build_and_write(&shard.path, true));
                 if let Err(error) = result {
-                    eprintln!(
-                        "mtxdb: pack index for {} could not be written: {error}",
-                        shard.path.display()
-                    );
+                    if shard.is_current.load(Ordering::Acquire) {
+                        eprintln!(
+                            "mtxdb: pack index for {} could not be written: {error}",
+                            shard.path.display()
+                        );
+                    }
                 }
             })?;
         let mut workers = self.seal_workers.lock();
@@ -2953,7 +2958,8 @@ impl ShardPool {
         Ok(())
     }
 
-    fn wait_for_seals(&self) {
+    /// Block until all in-flight background pack index sidecars have been written.
+    pub fn wait_for_seals(&self) {
         let workers = std::mem::take(&mut *self.seal_workers.lock());
         for worker in workers {
             let _ = worker.join();
@@ -3180,6 +3186,7 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_all(&self) -> io::Result<()> {
+        self.wait_for_seals();
         let flush_started = Instant::now();
         self.flush_all()?;
         let flush_elapsed = flush_started.elapsed();

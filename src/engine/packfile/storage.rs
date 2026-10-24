@@ -8752,6 +8752,7 @@ impl PackfileStorage {
                 self.shards.retire_slot(id);
             }
         }
+        self.shards.wait_for_seals();
         drop(collections);
         let mut tables = self.index_tables.write();
         let live_pack_ids: HashSet<PackId> = tables
