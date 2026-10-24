@@ -5116,6 +5116,17 @@ impl PackfileStorage {
             .retain(|_, collections| !collections.is_empty());
     }
 
+    /// Refresh physical byte accounting after compaction. A repack can write
+    /// replacement frames into a shard that still contains older frames, so
+    /// the bytes copied for the new index are not the same as bytes physically
+    /// present until that shard is retired.
+    fn refresh_collection_disk_bytes(&self) -> Result<(), StorageError> {
+        let physical =
+            crate::packfile::layout::physical_layout(&self.base_dir).map_err(StorageError::Io)?;
+        self.index_tables.write().collection_disk_bytes = disk_bytes_from_physical(&physical);
+        Ok(())
+    }
+
     /// Replaces `collection_id`'s entire contribution to `shard_collections` with
     /// `counts` (typically `LossyIndex::slot_counts()` converted to `pack_id` keys)
     /// — clears it out of any shard it no longer occupies and installs the fresh
@@ -8256,6 +8267,7 @@ impl PackfileStorage {
         // lose durability for data this repack itself just wrote, nor
         // leave the persisted stats stale relative to what's on disk.
         self.shards.sync_dirty()?;
+        self.refresh_collection_disk_bytes()?;
 
         // Release this collection's put_mutex before persisting the
         // checkpoint: persist_index_checkpoint acquires every collection's
@@ -8574,6 +8586,7 @@ impl PackfileStorage {
         drop(collection_guards);
         self.retire_empty_shards_after_batch();
         self.shards.sync_dirty()?;
+        self.refresh_collection_disk_bytes()?;
 
         // See the matching comment in repack_collection_reachable: retirement
         // above may have unlinked packs this batch's old index entries
