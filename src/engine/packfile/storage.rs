@@ -182,6 +182,8 @@ pub struct OpenTimings {
     pub packfile_open: std::time::Duration,
     /// Number of packfiles successfully opened.
     pub packfile_open_calls: u64,
+    /// Packfiles whose full-scan index build came from a sealed `.idx` sidecar.
+    pub pack_index_sidecars: u64,
     /// Restoring pool metadata and persisted shard statistics.
     pub metadata_restore: std::time::Duration,
     /// Restoring pool.meta header and reading next pack ID.
@@ -250,6 +252,7 @@ impl Default for OpenTimings {
             packfile_recovery_calls: 0,
             packfile_open: std::time::Duration::ZERO,
             packfile_open_calls: 0,
+            pack_index_sidecars: 0,
             metadata_restore: std::time::Duration::ZERO,
             pool_meta_restore: std::time::Duration::ZERO,
             persisted_stats_restore: std::time::Duration::ZERO,
@@ -1035,32 +1038,100 @@ impl StreamingOpenScan {
             .or_default();
         *bytes = bytes.saturating_add(entry.disk_bytes);
         self.collection_home.insert(collection_id, slot);
+        self.insert_locator(
+            collection_id,
+            &entry.hash,
+            entry.offset,
+            entry.removed,
+            slot,
+            index_config,
+        )
+    }
 
+    fn insert_locator(
+        &mut self,
+        collection_id: [u8; 16],
+        hash: &[u8; 16],
+        offset: u64,
+        removed: bool,
+        slot: u16,
+        index_config: crate::index::IndexConfig,
+    ) -> Result<(), StorageError> {
         let index = self
             .indexes
             .entry(collection_id)
             .or_insert_with(|| LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, index_config));
-        check_index_offset(slot, &entry.hash, entry.offset)?;
+        check_index_offset(slot, hash, offset)?;
         loop {
-            match index.insert_tracked_with_removed(&entry.hash, slot, entry.offset, entry.removed)
-            {
+            match index.insert_tracked_with_removed(hash, slot, offset, removed) {
                 Ok(_) => return Ok(()),
                 Err(InsertError::TableFull) => {
                     *index = index.grow().ok_or_else(|| {
                         StorageError::Corrupt(format!(
-                            "index insert failed for the record at offset {} in shard {slot}: table cannot grow",
-                            entry.offset
+                            "index insert failed for the record at offset {offset} in shard {slot}: table cannot grow"
                         ))
                     })?;
                 }
                 Err(error) => {
                     return Err(StorageError::Corrupt(format!(
-                        "index insert failed for the record at offset {} in shard {slot}: {error}",
-                        entry.offset
+                        "index insert failed for the record at offset {offset} in shard {slot}: {error}"
                     )));
                 }
             }
         }
+    }
+
+    /// Ingest a sealed pack's sorted locator sidecar instead of scanning its
+    /// raw frames. The sidecar's per-collection byte totals preserve the
+    /// physical accounting that a frame scan would have produced.
+    fn insert_sidecar(
+        &mut self,
+        sidecar: &crate::index::packidx::MappedPackIndex,
+        slot: u16,
+        pack_id: PackId,
+        deleted_collections: &HashSet<[u8; 16]>,
+        index_config: crate::index::IndexConfig,
+    ) -> Result<(), StorageError> {
+        let mut error = None;
+        sidecar.for_each_collection(|collection_id, disk_bytes| {
+            if error.is_some() {
+                return;
+            }
+            self.seen_collections.insert(collection_id);
+            if self.known_collections.insert(collection_id) {
+                self.collection_order.push(collection_id);
+            }
+            if deleted_collections.contains(&collection_id) {
+                return;
+            }
+            let bytes = self
+                .collection_disk_bytes
+                .entry(pack_id)
+                .or_default()
+                .entry(collection_id)
+                .or_default();
+            *bytes = bytes.saturating_add(disk_bytes);
+            self.collection_home.insert(collection_id, slot);
+            sidecar.for_each_entry_in_collection(&collection_id, |hash, locator| {
+                if error.is_some() {
+                    return;
+                }
+                let (offset, removed) = match locator {
+                    crate::index::packidx::PackIndexLocator::Frame(offset) => {
+                        (u64::from(offset), false)
+                    }
+                    crate::index::packidx::PackIndexLocator::Removed(offset) => {
+                        (u64::from(offset), true)
+                    }
+                };
+                if let Err(failure) =
+                    self.insert_locator(collection_id, &hash, offset, removed, slot, index_config)
+                {
+                    error = Some(failure);
+                }
+            });
+        });
+        error.map_or(Ok(()), Err)
     }
 
     fn finish(
@@ -2816,6 +2887,19 @@ impl PackfileStorage {
         let mut scan_shards = shards.all_shards();
         scan_shards.sort_by_key(|(_, shard)| shard.creation_seq);
         for (slot, shard) in scan_shards {
+            if shard.sealed.load(Ordering::Acquire) {
+                if let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) {
+                    scan_state.insert_sidecar(
+                        &sidecar,
+                        slot,
+                        shard.pack_id,
+                        &deleted_collections,
+                        index_config,
+                    )?;
+                    timings.pack_index_sidecars = timings.pack_index_sidecars.saturating_add(1);
+                    continue;
+                }
+            }
             if writable {
                 // Recovery can safely truncate only a torn final frame. The
                 // visitor keeps no per-shard entry vector while preserving

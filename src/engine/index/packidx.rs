@@ -51,8 +51,8 @@ use crate::packfile::{PackId, HEADER_LEN};
 pub const PACK_INDEX_MAGIC: [u8; 8] = *b"MTXIDX01";
 /// Fixed header length in bytes.
 pub const PACK_INDEX_HEADER_LEN: usize = 64;
-/// One collection directory entry in bytes.
-pub const PACK_INDEX_COLLECTION_ENTRY_LEN: usize = 20;
+/// One collection directory entry in bytes: id, entry count, disk bytes.
+pub const PACK_INDEX_COLLECTION_ENTRY_LEN: usize = 28;
 /// Cumulative first-byte fanout table length in bytes.
 pub const PACK_INDEX_FANOUT_LEN: usize = 256 * 4;
 /// Bytes per locator in a collection section: a 16-byte id and a `u32` offset.
@@ -76,6 +76,9 @@ pub struct PackIndexInput {
     pub offset: u64,
     /// Whether the frame at `offset` is a removal version.
     pub removed: bool,
+    /// Bytes this frame occupies on disk, used to preserve the physical byte
+    /// accounting when an open is served from the sidecar.
+    pub disk_bytes: u64,
 }
 
 /// What a locator names: a live frame or a removal version.
@@ -128,6 +131,7 @@ pub fn build_for_pack(pack_path: &Path, verify_checksum: bool) -> io::Result<Pac
                 logical_id: entry.hash,
                 offset: entry.offset,
                 removed: entry.removed,
+                disk_bytes: entry.disk_bytes,
             });
         },
     )?;
@@ -204,6 +208,7 @@ struct CollectionView {
     ids_at: usize,
     offsets_at: usize,
     flags_at: usize,
+    disk_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -339,7 +344,7 @@ impl PackIndex {
             collection_count,
             file_len,
         )?;
-        encode_directory(&mut bytes, &groups)?;
+        encode_directory(&mut bytes, &groups, inputs)?;
 
         let mut collections = Vec::with_capacity(groups.len());
         for group in groups {
@@ -454,6 +459,40 @@ impl PackIndex {
         for_each_entry_in(&self.bytes, &self.collections, &mut visit);
     }
 
+    /// Visit each collection and the bytes its frames occupy in this pack.
+    pub fn for_each_collection(&self, mut visit: impl FnMut([u8; 16], u64)) {
+        for collection in &self.collections {
+            visit(collection.id, collection.disk_bytes);
+        }
+    }
+
+    /// Bytes the collection's frames occupy in this pack, if present.
+    #[must_use]
+    pub fn collection_disk_bytes(&self, collection_id: &[u8; 16]) -> Option<u64> {
+        self.collections
+            .binary_search_by_key(collection_id, |view| view.id)
+            .ok()
+            .and_then(|index| self.collections.get(index))
+            .map(|view| view.disk_bytes)
+    }
+
+    /// Visit one collection's `(logical_id, locator)` entries.
+    pub fn for_each_entry_in_collection(
+        &self,
+        collection_id: &[u8; 16],
+        mut visit: impl FnMut([u8; 16], PackIndexLocator),
+    ) {
+        let Ok(index) = self
+            .collections
+            .binary_search_by_key(collection_id, |view| view.id)
+        else {
+            return;
+        };
+        if let Some(collection) = self.collections.get(index) {
+            for_each_in_collection(&self.bytes, collection, &mut visit);
+        }
+    }
+
     /// Atomically publish this index, syncing the file and parent directory where supported.
     ///
     /// Treat any error as an absent/disposable index: rename may have completed
@@ -563,18 +602,27 @@ fn encode_header(
     Ok(())
 }
 
-fn encode_directory(bytes: &mut Vec<u8>, groups: &[CollectionRange]) -> Result<(), PackIndexError> {
+fn encode_directory(
+    bytes: &mut Vec<u8>,
+    groups: &[CollectionRange],
+    inputs: &[PackIndexInput],
+) -> Result<(), PackIndexError> {
     for group in groups {
         let count = group
             .end
             .checked_sub(group.start)
             .ok_or(PackIndexError::Invalid)?;
+        let disk_bytes = inputs[group.start..group.end]
+            .iter()
+            .try_fold(0_u64, |total, input| total.checked_add(input.disk_bytes))
+            .ok_or(PackIndexError::TooLarge)?;
         bytes.extend_from_slice(&group.id);
         bytes.extend_from_slice(
             &u32::try_from(count)
                 .map_err(|_| PackIndexError::TooLarge)?
                 .to_le_bytes(),
         );
+        bytes.extend_from_slice(&disk_bytes.to_le_bytes());
     }
     Ok(())
 }
@@ -631,6 +679,10 @@ fn encode_collection(
         ids_at, expected_ids_at,
         "logical-id section must immediately follow the fanout table"
     );
+    let disk_bytes = inputs[group.start..group.end]
+        .iter()
+        .try_fold(0_u64, |total, input| total.checked_add(input.disk_bytes))
+        .ok_or(PackIndexError::TooLarge)?;
     Ok(CollectionView {
         id: group.id,
         count: count_u32,
@@ -638,6 +690,7 @@ fn encode_collection(
         ids_at,
         offsets_at,
         flags_at,
+        disk_bytes,
     })
 }
 
@@ -684,6 +737,40 @@ impl MappedPackIndex {
         for_each_entry_in(&self.map, &self.collections, &mut visit);
     }
 
+    /// Visit each collection and the bytes its frames occupy in this pack.
+    pub fn for_each_collection(&self, mut visit: impl FnMut([u8; 16], u64)) {
+        for collection in &self.collections {
+            visit(collection.id, collection.disk_bytes);
+        }
+    }
+
+    /// Bytes the collection's frames occupy in this pack, if present.
+    #[must_use]
+    pub fn collection_disk_bytes(&self, collection_id: &[u8; 16]) -> Option<u64> {
+        self.collections
+            .binary_search_by_key(collection_id, |view| view.id)
+            .ok()
+            .and_then(|index| self.collections.get(index))
+            .map(|view| view.disk_bytes)
+    }
+
+    /// Visit one collection's `(logical_id, locator)` entries.
+    pub fn for_each_entry_in_collection(
+        &self,
+        collection_id: &[u8; 16],
+        mut visit: impl FnMut([u8; 16], PackIndexLocator),
+    ) {
+        let Ok(index) = self
+            .collections
+            .binary_search_by_key(collection_id, |view| view.id)
+        else {
+            return;
+        };
+        if let Some(collection) = self.collections.get(index) {
+            for_each_in_collection(&self.map, collection, &mut visit);
+        }
+    }
+
     /// Tell the operating system that lookups will access the mapping randomly.
     ///
     /// This can reduce sequential readahead for scattered lookups. It is only
@@ -715,36 +802,46 @@ fn for_each_entry_in(
     visit: &mut impl FnMut([u8; 16], [u8; 16], PackIndexLocator),
 ) {
     for collection in collections {
-        let count = usize::try_from(collection.count).unwrap_or(0);
-        for index in 0..count {
-            let Some(id_at) = collection.ids_at.checked_add(index.saturating_mul(16)) else {
-                continue;
-            };
-            let Some(id) = bytes
-                .get(id_at..id_at.saturating_add(16))
-                .and_then(|id| <[u8; 16]>::try_from(id).ok())
-            else {
-                continue;
-            };
-            let Some(offset_at) = collection.offsets_at.checked_add(index.saturating_mul(4)) else {
-                continue;
-            };
-            let Some(offset) = read_u32(bytes, offset_at) else {
-                continue;
-            };
-            let Some(flags_at) = collection.flags_at.checked_add(index) else {
-                continue;
-            };
-            let Some(flags) = bytes.get(flags_at).copied() else {
-                continue;
-            };
-            let locator = if flags & PACK_INDEX_FLAG_REMOVED != 0 {
-                PackIndexLocator::Removed(offset)
-            } else {
-                PackIndexLocator::Frame(offset)
-            };
+        for_each_in_collection(bytes, collection, |id, locator| {
             visit(collection.id, id, locator);
-        }
+        });
+    }
+}
+
+fn for_each_in_collection(
+    bytes: &[u8],
+    collection: &CollectionView,
+    mut visit: impl FnMut([u8; 16], PackIndexLocator),
+) {
+    let count = usize::try_from(collection.count).unwrap_or(0);
+    for index in 0..count {
+        let Some(id_at) = collection.ids_at.checked_add(index.saturating_mul(16)) else {
+            continue;
+        };
+        let Some(id) = bytes
+            .get(id_at..id_at.saturating_add(16))
+            .and_then(|id| <[u8; 16]>::try_from(id).ok())
+        else {
+            continue;
+        };
+        let Some(offset_at) = collection.offsets_at.checked_add(index.saturating_mul(4)) else {
+            continue;
+        };
+        let Some(offset) = read_u32(bytes, offset_at) else {
+            continue;
+        };
+        let Some(flags_at) = collection.flags_at.checked_add(index) else {
+            continue;
+        };
+        let Some(flags) = bytes.get(flags_at).copied() else {
+            continue;
+        };
+        let locator = if flags & PACK_INDEX_FLAG_REMOVED != 0 {
+            PackIndexLocator::Removed(offset)
+        } else {
+            PackIndexLocator::Frame(offset)
+        };
+        visit(id, locator);
     }
 }
 
@@ -839,6 +936,7 @@ fn parse_layout(bytes: &[u8], verify_body: bool) -> Option<ParsedLayout> {
         }
         previous_id = Some(id);
         let count = read_u32(bytes, dir_at.checked_add(16)?)?;
+        let disk_bytes = read_u64(bytes, dir_at.checked_add(20)?)?;
         if count == 0 {
             return None;
         }
@@ -860,6 +958,7 @@ fn parse_layout(bytes: &[u8], verify_body: bool) -> Option<ParsedLayout> {
             ids_at,
             offsets_at,
             flags_at,
+            disk_bytes,
         });
         section_at = section_end;
     }

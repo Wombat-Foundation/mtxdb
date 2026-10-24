@@ -26,24 +26,28 @@ fn sample_inputs() -> Vec<PackIndexInput> {
             logical_id: [0x80; 16],
             offset: frame_offset(40),
             removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0x10; 16],
             offset: frame_offset(20),
             removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0x10; 16],
             offset: frame_offset(80),
             removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0x20; 16],
             offset: frame_offset(60),
             removed: false,
+            disk_bytes: 0,
         },
     ]
 }
@@ -66,6 +70,7 @@ fn tombstone_wins_only_when_it_is_the_newest_version() {
                     logical_id: key,
                     offset: frame_offset(*offset),
                     removed: *removed,
+                    disk_bytes: 0,
                 })
                 .collect(),
         )
@@ -166,6 +171,7 @@ fn pack_index_rejects_offsets_before_frame_data() {
         logical_id: [2; 16],
         offset: frame_offset(0).checked_sub(1).unwrap(),
         removed: false,
+        disk_bytes: 0,
     }];
     assert_eq!(
         PackIndex::build(
@@ -191,6 +197,7 @@ fn pack_index_rejects_offsets_at_pack_end_during_build_and_decode() {
         logical_id: [2; 16],
         offset: end,
         removed: false,
+        disk_bytes: 0,
     };
     assert_eq!(
         PackIndex::build(
@@ -289,18 +296,21 @@ fn fanout_edges_and_equal_ids_are_isolated_by_collection() {
             logical_id: [0x00; 16],
             offset: frame_offset(1),
             removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [1; 16],
             logical_id: [0xff; 16],
             offset: frame_offset(2),
             removed: false,
+            disk_bytes: 0,
         },
         PackIndexInput {
             collection_id: [2; 16],
             logical_id: [0x00; 16],
             offset: frame_offset(3),
             removed: false,
+            disk_bytes: 0,
         },
     ];
     let index = PackIndex::build(
@@ -329,6 +339,7 @@ fn write_atomic_replaces_an_existing_complete_index() {
             logical_id: [0x10; 16],
             offset: frame_offset(100),
             removed: false,
+            disk_bytes: 0,
         }],
     )
     .unwrap();
@@ -383,6 +394,10 @@ fn build_for_pack_round_trips_live_and_removed_records() {
     build_and_write(&pack, true).unwrap();
     let index = open_for_pack(&pack).expect("the sealed sidecar opens");
     assert!(!index.identity().pack_id.is_zero());
+    assert!(
+        index.collection_disk_bytes(&collection).unwrap_or(0) > 0,
+        "the sidecar preserves the pack's physical byte total"
+    );
     let mut live_seen = false;
     let mut removed_seen = false;
     index.for_each_entry(|collection_id, logical_id, locator| {

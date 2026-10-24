@@ -11979,3 +11979,42 @@ fn sealing_a_pack_writes_a_sidecar_and_open_skips_recovery() {
     drop(reopened);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn full_scan_uses_sealed_sidecars_instead_of_raw_frames() {
+    let dir = test_dir("packidx_full_scan");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAB;
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[u8::try_from(index % 256).unwrap(); 32]),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    // Remove the checkpoint so the next open takes the full-scan path. The
+    // sealed sidecars must still serve the indexes.
+    let _ = fs::remove_file(dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE));
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let timings = reopened.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert!(
+        timings.pack_index_sidecars > 0,
+        "the full scan ingested at least one sealed sidecar"
+    );
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAB;
+        assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
