@@ -5121,8 +5121,8 @@ impl PackfileStorage {
     /// the bytes copied for the new index are not the same as bytes physically
     /// present until that shard is retired.
     fn refresh_collection_disk_bytes(&self) -> Result<(), StorageError> {
-        let physical = crate::packfile::layout::physical_layout(&self.base_dir)
-            .map_err(StorageError::Io)?;
+        let physical =
+            crate::packfile::layout::physical_layout(&self.base_dir).map_err(StorageError::Io)?;
         self.index_tables.write().collection_disk_bytes = disk_bytes_from_physical(&physical);
         Ok(())
     }
@@ -6884,6 +6884,11 @@ impl PackfileStorage {
         shards.sort_by_key(|(_, shard)| shard.creation_seq);
         let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
         for (slot, shard) in shards {
+            // A retired shard has no live records; its pack may already be
+            // gone, leaving only a stale sidecar. Never let it contribute.
+            if !shard.is_current.load(Ordering::Acquire) {
+                continue;
+            }
             // A sealed pack's sidecar already holds every frame's newest
             // version, including removals. Use it instead of walking the raw
             // frames; a missing or stale sidecar falls back to the scanner.
