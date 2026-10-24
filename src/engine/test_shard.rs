@@ -500,6 +500,40 @@ fn test_shard_pool_rotation() {
     assert_eq!(slot, 1);
 }
 
+#[test]
+fn sealed_pack_index_skips_recovery_and_corruption_falls_back() {
+    let dir = test_dir("sealed_pack_index_recovery");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let record = test_record(1, 2, b"sealed record");
+    let (slot, offset) = pool.put_record(&record).unwrap();
+    let old = pool.get_shard(slot).unwrap();
+    pool.rotate().unwrap();
+    assert!(!old.sealed.load(Ordering::Acquire));
+    pool.rotate_collection_full_home(&record.collection_id, slot)
+        .unwrap();
+    assert!(old.sealed.load(Ordering::Acquire));
+    pool.wait_for_seals();
+    let sidecar_path = packidx::pack_index_path(&old.path);
+    assert!(sidecar_path.exists());
+    drop(old);
+    drop(pool);
+
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 1);
+    let old = pool.get_shard(slot).unwrap();
+    assert!(old.sealed.load(Ordering::Acquire));
+    assert_eq!(pool.read_at(&old, offset, true).unwrap().data, record.data);
+    drop(old);
+    drop(pool);
+
+    let mut sidecar = fs::read(&sidecar_path).unwrap();
+    let last = sidecar.len() - 1;
+    sidecar[last] ^= 0xff;
+    fs::write(&sidecar_path, sidecar).unwrap();
+    let pool = ShardPool::open(dir).unwrap();
+    assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 2);
+}
+
 /// Core fix: a collection's writes must stay on its own home shard even
 /// after *unrelated* activity rotates the pool's global active-write
 /// cursor far ahead. Before per-collection home routing, every collection simply

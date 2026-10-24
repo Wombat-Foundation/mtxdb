@@ -88,6 +88,74 @@ pub enum PackIndexLocator {
     Removed(u32),
 }
 
+/// On-disk sidecar path for a pack file.
+#[must_use]
+pub fn pack_index_path(pack_path: &Path) -> PathBuf {
+    pack_path.with_extension("idx")
+}
+
+/// Identity of a pack read from its header and current extent.
+fn pack_identity(pack_path: &Path) -> io::Result<PackIndexIdentity> {
+    let mut file = File::open(pack_path)?;
+    let header = crate::packfile::read_header(&mut file)?
+        .ok_or_else(|| io::Error::other("pack has no header"))?;
+    let pack_file_len = file.metadata()?.len();
+    Ok(PackIndexIdentity {
+        pack_id: header.pack_id,
+        creation_seq: u64::from(header.creation_seq),
+        pack_file_len,
+    })
+}
+
+/// Build an index for a sealed pack by scanning its frames.
+///
+/// The caller is responsible for ensuring the pack is not being appended to
+/// while this runs (seal-time generation holds the shard's append lock).
+///
+/// # Errors
+/// Returns an I/O error if the pack cannot be read or scanned, or if its
+/// records cannot be represented by the v1 sidecar format.
+pub fn build_for_pack(pack_path: &Path, verify_checksum: bool) -> io::Result<PackIndex> {
+    let identity = pack_identity(pack_path)?;
+    let mut inputs = Vec::new();
+    crate::packfile::scan_packfile_from_with_removal_visit(
+        pack_path,
+        0,
+        verify_checksum,
+        |entry| {
+            inputs.push(PackIndexInput {
+                collection_id: entry.collection_id,
+                logical_id: entry.hash,
+                offset: entry.offset,
+                removed: entry.removed,
+            });
+        },
+    )?;
+    PackIndex::build(identity, inputs).map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// Build and atomically publish a pack's sidecar index.
+///
+/// # Errors
+/// Returns an I/O error if scanning the pack, encoding the index, or writing
+/// the sidecar fails.
+pub fn build_and_write(pack_path: &Path, verify_checksum: bool) -> io::Result<()> {
+    let index = build_for_pack(pack_path, verify_checksum)?;
+    index.write_atomic(&pack_index_path(pack_path))
+}
+
+/// Open a pack's sidecar when it matches the pack's current header and extent.
+///
+/// Returns `None` for a missing, stale, or corrupt sidecar; callers fall back
+/// to scanning the pack.
+#[must_use]
+pub fn open_for_pack(pack_path: &Path) -> Option<MappedPackIndex> {
+    let identity = pack_identity(pack_path).ok()?;
+    let index = PackIndex::open_mmap(&pack_index_path(pack_path), identity).ok()?;
+    index.verify().ok()?;
+    Some(index)
+}
+
 /// Expected identity and extent when opening an index for a pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackIndexIdentity {
@@ -379,6 +447,13 @@ impl PackIndex {
         lookup(&self.bytes, &self.collections, collection_id, logical_id)
     }
 
+    /// Visit every `(collection_id, logical_id, locator)` in the index.
+    ///
+    /// The callback is invoked in collection order, then logical-id order.
+    pub fn for_each_entry(&self, mut visit: impl FnMut([u8; 16], [u8; 16], PackIndexLocator)) {
+        for_each_entry_in(&self.bytes, &self.collections, &mut visit);
+    }
+
     /// Atomically publish this index, syncing the file and parent directory where supported.
     ///
     /// Treat any error as an absent/disposable index: rename may have completed
@@ -602,6 +677,13 @@ impl MappedPackIndex {
         lookup(&self.map, &self.collections, collection_id, logical_id)
     }
 
+    /// Visit every `(collection_id, logical_id, locator)` in the index.
+    ///
+    /// The callback is invoked in collection order, then logical-id order.
+    pub fn for_each_entry(&self, mut visit: impl FnMut([u8; 16], [u8; 16], PackIndexLocator)) {
+        for_each_entry_in(&self.map, &self.collections, &mut visit);
+    }
+
     /// Tell the operating system that lookups will access the mapping randomly.
     ///
     /// This can reduce sequential readahead for scattered lookups. It is only
@@ -624,6 +706,45 @@ impl MappedPackIndex {
             .filter(|parsed| parsed.identity == self.identity)
             .map(|_| ())
             .ok_or(PackIndexError::Invalid)
+    }
+}
+
+fn for_each_entry_in(
+    bytes: &[u8],
+    collections: &[CollectionView],
+    visit: &mut impl FnMut([u8; 16], [u8; 16], PackIndexLocator),
+) {
+    for collection in collections {
+        let count = usize::try_from(collection.count).unwrap_or(0);
+        for index in 0..count {
+            let Some(id_at) = collection.ids_at.checked_add(index.saturating_mul(16)) else {
+                continue;
+            };
+            let Some(id) = bytes
+                .get(id_at..id_at.saturating_add(16))
+                .and_then(|id| <[u8; 16]>::try_from(id).ok())
+            else {
+                continue;
+            };
+            let Some(offset_at) = collection.offsets_at.checked_add(index.saturating_mul(4)) else {
+                continue;
+            };
+            let Some(offset) = read_u32(bytes, offset_at) else {
+                continue;
+            };
+            let Some(flags_at) = collection.flags_at.checked_add(index) else {
+                continue;
+            };
+            let Some(flags) = bytes.get(flags_at).copied() else {
+                continue;
+            };
+            let locator = if flags & PACK_INDEX_FLAG_REMOVED != 0 {
+                PackIndexLocator::Removed(offset)
+            } else {
+                PackIndexLocator::Frame(offset)
+            };
+            visit(collection.id, id, locator);
+        }
     }
 }
 

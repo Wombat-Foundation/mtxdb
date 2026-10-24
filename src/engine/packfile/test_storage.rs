@@ -11922,3 +11922,60 @@ fn slots_only_delta_snapshot_is_short_and_replays() {
         "a replayed slots-only snapshot must hydrate on the first overwrite"
     );
 }
+
+#[test]
+fn sealing_a_pack_writes_a_sidecar_and_open_skips_recovery() {
+    let dir = test_dir("packidx_seal");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAA;
+        let payload_byte = u8::try_from(index).expect("index is less than 200");
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[payload_byte; 32]),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    let (sidecars, packs) = fs::read_dir(&dir).unwrap().filter_map(Result::ok).fold(
+        (0_usize, 0_usize),
+        |(sidecars, packs), entry| {
+            let path = entry.path();
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("idx") => (sidecars + 1, packs),
+                Some("pack") => (sidecars, packs + 1),
+                _ => (sidecars, packs),
+            }
+        },
+    );
+    assert!(sidecars > 0, "rotation seals at least one pack index");
+    assert!(packs > sidecars, "the active pack is not sealed yet");
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        reopened.open_timings().unwrap().packfile_recovery_calls,
+        u64::try_from(packs - sidecars).unwrap(),
+        "only the active pack pays the recovery scan"
+    );
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAA;
+        assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+    let rebuilt = reopened.rebuild_index(&TEST_COLLECTION).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAA;
+        assert!(rebuilt.lookup(&id).is_some());
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}

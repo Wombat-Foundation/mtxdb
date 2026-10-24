@@ -6873,6 +6873,49 @@ impl PackfileStorage {
         shards.sort_by_key(|(_, shard)| shard.creation_seq);
         let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
         for (slot, shard) in shards {
+            // A sealed pack's sidecar already holds every frame's newest
+            // version, including removals. Use it instead of walking the raw
+            // frames; a missing or stale sidecar falls back to the scanner.
+            if shard.sealed.load(Ordering::Acquire) {
+                if let Some(sealed) = crate::index::packidx::open_for_pack(&shard.path) {
+                    let mut entries = Vec::new();
+                    sealed.for_each_entry(|collection, hash, locator| {
+                        if collection == *collection_id {
+                            entries.push((hash, locator));
+                        }
+                    });
+                    for (hash, locator) in entries {
+                        let (offset, removed) = match locator {
+                            crate::index::packidx::PackIndexLocator::Frame(offset) => {
+                                (u64::from(offset), false)
+                            }
+                            crate::index::packidx::PackIndexLocator::Removed(offset) => {
+                                (u64::from(offset), true)
+                            }
+                        };
+                        check_index_offset(slot, &hash, offset)?;
+                        loop {
+                            match index.insert_tracked_with_removed(&hash, slot, offset, removed) {
+                                Ok(_) => break,
+                                Err(InsertError::TableFull) => {
+                                    index = index.grow().ok_or_else(|| {
+                                    StorageError::Corrupt(format!(
+                                        "index insert failed for the record at offset {offset} in shard {slot}: table cannot grow"
+                                    ))
+                                })?;
+                                }
+                                Err(error) => {
+                                    return Err(StorageError::Corrupt(format!(
+                                    "index insert failed for the record at offset {offset} in shard {slot}: {error}"
+                                )));
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
             let mut scanner = packfile::scan_packfile_iter(
                 &shard.path,
                 self.shards.checksum_policy().verifies_reads(),

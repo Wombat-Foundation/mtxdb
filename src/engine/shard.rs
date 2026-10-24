@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
 
+use crate::index::packidx;
 use crate::packfile::{self, Record};
 
 // Linux `sync_file_range(2)`, declared directly rather than adding a `libc`
@@ -287,6 +288,8 @@ pub struct Shard {
     /// retired by the pool (all records reclaimed by repack). Drop
     /// deletes the file only when retired.
     pub(crate) is_current: AtomicBool,
+    /// A pack with a durable, validated locator sidecar is no longer writable.
+    pub(crate) sealed: AtomicBool,
     /// Current file length, tracked atomically for rotation decisions
     /// without a `metadata()` syscall on every put. This is the *committed*
     /// on-disk length — buffered records occupy `[file_len, file_len +
@@ -492,6 +495,7 @@ impl Shard {
             append_lock: parking_lot::Mutex::new(()),
             sync_lock: parking_lot::Mutex::new(()),
             is_current: AtomicBool::new(true),
+            sealed: AtomicBool::new(false),
             file_len: AtomicU64::new(file_len),
             pending: Mutex::new(Vec::new()),
             pending_records: AtomicU64::new(0),
@@ -591,6 +595,7 @@ impl Drop for Shard {
     fn drop(&mut self) {
         if !self.is_current.load(Ordering::Acquire) {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(packidx::pack_index_path(&self.path));
         }
     }
 }
@@ -650,6 +655,8 @@ pub struct ShardPool {
     bucket_seed: u64,
     /// Shard IDs written to since the last sync, for scoped fsync.
     dirty: parking_lot::Mutex<HashSet<u16>>,
+    /// Detached sidecar builders; joined on clean pool shutdown.
+    seal_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Total number of shards retired (garbage-collected after a repack)
     /// over the pool's lifetime.
     retired_count: AtomicU64,
@@ -1060,7 +1067,8 @@ impl ShardPool {
         let mut packfile_open_time = Duration::ZERO;
         let mut packfile_open_calls: u64 = 0;
         for (pack_id, path, creation_seq) in pack_files {
-            if writable {
+            let sealed = packidx::open_for_pack(&path).is_some();
+            if writable && !sealed {
                 let recovery_started = Instant::now();
                 // Only the safety of appending matters here (every frame and CRC
                 // validated, a torn tail cut off); the records are indexed from
@@ -1099,6 +1107,7 @@ impl ShardPool {
                 path,
                 file_len,
             ));
+            shard.sealed.store(sealed, Ordering::Release);
             shards[slot as usize] = Some(shard);
         }
         Ok((
@@ -1124,6 +1133,7 @@ impl ShardPool {
         shards
             .iter()
             .flatten()
+            .filter(|shard| !shard.sealed.load(Ordering::Acquire))
             .map(|shard| (shard.file_len() < max_shard_bytes, shard.slot))
             .max()
             .map_or_else(|| next_slot.saturating_sub(1), |(_, slot)| slot)
@@ -1249,6 +1259,7 @@ impl ShardPool {
             max_shard_bytes,
             bucket_seed,
             dirty: parking_lot::Mutex::new(HashSet::new()),
+            seal_workers: Mutex::new(Vec::new()),
             retired_count: AtomicU64::new(0),
             stats_snapshots: AtomicU64::new(0),
             collection_home: RwLock::new(HashMap::new()),
@@ -1690,6 +1701,7 @@ impl ShardPool {
         self.collection_home
             .write()
             .insert(*collection_id, shard.slot);
+        self.maybe_seal_pack(full_slot);
         Ok(shard)
     }
 
@@ -2052,7 +2064,9 @@ impl ShardPool {
                 .and_then(std::clone::Clone::clone)
         };
         if let Some(shard) = existing(self) {
-            return Ok(shard);
+            if !self.writable || !shard.sealed.load(Ordering::Acquire) {
+                return Ok(shard);
+            }
         }
         if !self.writable {
             return Err(io::Error::new(
@@ -2062,6 +2076,10 @@ impl ShardPool {
         }
         let _guard = self.rotation_lock.lock();
         if let Some(shard) = existing(self) {
+            if shard.sealed.load(Ordering::Acquire) {
+                self.rotate_locked()?;
+                return existing(self).ok_or_else(|| io::Error::other("rotated pack is missing"));
+            }
             return Ok(shard);
         }
         let slot = *self.active_write.lock();
@@ -2181,6 +2199,11 @@ impl ShardPool {
             // is provably the tail when the failed flush needs to retract
             // it.
             let append_guard = shard.append_lock.lock();
+            if shard.sealed.load(Ordering::Acquire) {
+                drop(append_guard);
+                shard = self.rotate_collection_full_home(&record.collection_id, shard.slot)?;
+                continue;
+            }
             // Re-check poison after acquiring the lock: the check above is
             // only a fast-path skip for the common case. A concurrent
             // put/flush can poison the shard between that check and here —
@@ -2889,6 +2912,76 @@ impl ShardPool {
         self.rotate_locked()
     }
 
+    /// Stop future appends before indexing the old pack. The sidecar is
+    /// disposable: an I/O or validation failure leaves recovery on the frame
+    /// scanner, while the newly selected pack continues accepting writes.
+    fn seal_pack(&self, shard: &Arc<Shard>) -> io::Result<()> {
+        {
+            let guard = shard.append_lock.lock();
+            if shard.sealed.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            self.flush_shard_with_guard(shard, &guard)?;
+        }
+        let shard = Arc::clone(shard);
+        let worker = std::thread::Builder::new()
+            .name("mtxdb-pack-index".to_owned())
+            .spawn(move || {
+                let result = {
+                    let _sync_guard = shard.sync_lock.lock();
+                    shard.fsync_advancing_watermark(false)
+                }
+                .and_then(|()| packidx::build_and_write(&shard.path, true));
+                if let Err(error) = result {
+                    eprintln!(
+                        "mtxdb: pack index for {} could not be written: {error}",
+                        shard.path.display()
+                    );
+                }
+            })?;
+        let mut workers = self.seal_workers.lock();
+        let mut pending = Vec::with_capacity(workers.len().saturating_add(1));
+        for existing in workers.drain(..) {
+            if existing.is_finished() {
+                let _ = existing.join();
+            } else {
+                pending.push(existing);
+            }
+        }
+        pending.push(worker);
+        *workers = pending;
+        Ok(())
+    }
+
+    fn wait_for_seals(&self) {
+        let workers = std::mem::take(&mut *self.seal_workers.lock());
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+
+    /// A pool rotation does not end the homes of unrelated collections. Seal
+    /// only once every collection has moved away from this pack.
+    fn maybe_seal_pack(&self, slot: u16) {
+        if *self.active_write.lock() == slot
+            || self
+                .collection_home
+                .read()
+                .values()
+                .any(|home| *home == slot)
+        {
+            return;
+        }
+        if let Some(shard) = self.get_shard(slot) {
+            if let Err(error) = self.seal_pack(&shard) {
+                eprintln!(
+                    "mtxdb: pack index for {} could not be sealed: {error}",
+                    shard.path.display()
+                );
+            }
+        }
+    }
+
     /// Rotate while `rotation_lock` is held by the caller.
     fn rotate_locked(&self) -> io::Result<()> {
         let current = *self.active_write.lock();
@@ -2915,6 +3008,7 @@ impl ShardPool {
                 )));
                 drop(shards);
                 *self.active_write.lock() = candidate;
+                self.maybe_seal_pack(current);
                 return Ok(());
             }
         }
@@ -3323,6 +3417,7 @@ impl Drop for ShardPool {
     /// a failed stats write on shutdown must never panic or mask the
     /// original error path the caller was already on.
     fn drop(&mut self) {
+        self.wait_for_seals();
         self.persist_stats_best_effort();
     }
 }

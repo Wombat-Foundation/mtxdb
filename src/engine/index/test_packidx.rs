@@ -353,6 +353,51 @@ fn pack_index_writer_publishes_a_decodable_file() {
     fs::remove_file(path).unwrap();
 }
 
+#[test]
+fn build_for_pack_round_trips_live_and_removed_records() {
+    use crate::storage::{NodeData, StorageEngine as _};
+    use crate::PackfileStorage;
+
+    let dir = std::env::temp_dir().join(format!("mtxdb-packidx-pack-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let collection = [0xAA; 16];
+    let live = [1; 16];
+    let removed = [2; 16];
+    store
+        .put(&collection, &live, &NodeData::from_slice(b"live"))
+        .unwrap();
+    store
+        .put(&collection, &removed, &NodeData::from_slice(b"gone"))
+        .unwrap();
+    store.remove(&collection, &removed).unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let pack = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .expect("the store wrote a pack");
+    build_and_write(&pack, true).unwrap();
+    let index = open_for_pack(&pack).expect("the sealed sidecar opens");
+    assert!(!index.identity().pack_id.is_zero());
+    let mut live_seen = false;
+    let mut removed_seen = false;
+    index.for_each_entry(|collection_id, logical_id, locator| {
+        assert_eq!(collection_id, collection);
+        if logical_id == live {
+            live_seen = matches!(locator, PackIndexLocator::Frame(_));
+        }
+        if logical_id == removed {
+            removed_seen = matches!(locator, PackIndexLocator::Removed(_));
+        }
+    });
+    assert!(live_seen && removed_seen);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn test_path() -> PathBuf {
     std::env::temp_dir().join(format!(
         "mtxdb-packidx-test-{}-{}.idx",
