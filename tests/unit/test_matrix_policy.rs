@@ -3,12 +3,13 @@
 use mtxdb::matrix_policy::*;
 
 #[test]
-fn matrix_pool_policies_skips_state_compression() {
+fn matrix_pool_policies_skips_compression_for_small_or_dense_pools() {
     use mtxdb::ShardType;
     let policies = matrix_pool_policies();
     assert!(!policies.for_shard(ShardType::State).compress);
     assert!(policies.for_shard(ShardType::EventDag).compress);
-    assert!(policies.for_shard(ShardType::Edges).compress);
+    assert!(!policies.for_shard(ShardType::Edges).compress);
+    assert!(!policies.for_shard(ShardType::ServerInfo).compress);
     assert_eq!(
         policies.for_shard(ShardType::State).checksum_policy,
         mtxdb::packfile::ChecksumPolicy::Full
