@@ -461,9 +461,7 @@ impl PackIndex {
 
     /// Visit each collection and the bytes its frames occupy in this pack.
     pub fn for_each_collection(&self, mut visit: impl FnMut([u8; 16], u64)) {
-        for collection in &self.collections {
-            visit(collection.id, collection.disk_bytes);
-        }
+        for_each_collection(&self.collections, &mut visit);
     }
 
     /// Bytes the collection's frames occupy in this pack, if present.
@@ -482,15 +480,7 @@ impl PackIndex {
         collection_id: &[u8; 16],
         mut visit: impl FnMut([u8; 16], PackIndexLocator),
     ) {
-        let Ok(index) = self
-            .collections
-            .binary_search_by_key(collection_id, |view| view.id)
-        else {
-            return;
-        };
-        if let Some(collection) = self.collections.get(index) {
-            for_each_in_collection(&self.bytes, collection, &mut visit);
-        }
+        for_each_entry_in_collection(&self.bytes, &self.collections, collection_id, &mut visit);
     }
 
     /// Atomically publish this index, syncing the file and parent directory where supported.
@@ -739,9 +729,7 @@ impl MappedPackIndex {
 
     /// Visit each collection and the bytes its frames occupy in this pack.
     pub fn for_each_collection(&self, mut visit: impl FnMut([u8; 16], u64)) {
-        for collection in &self.collections {
-            visit(collection.id, collection.disk_bytes);
-        }
+        for_each_collection(&self.collections, &mut visit);
     }
 
     /// Bytes the collection's frames occupy in this pack, if present.
@@ -760,15 +748,7 @@ impl MappedPackIndex {
         collection_id: &[u8; 16],
         mut visit: impl FnMut([u8; 16], PackIndexLocator),
     ) {
-        let Ok(index) = self
-            .collections
-            .binary_search_by_key(collection_id, |view| view.id)
-        else {
-            return;
-        };
-        if let Some(collection) = self.collections.get(index) {
-            for_each_in_collection(&self.map, collection, &mut visit);
-        }
+        for_each_entry_in_collection(&self.map, &self.collections, collection_id, &mut visit);
     }
 
     /// Tell the operating system that lookups will access the mapping randomly.
@@ -805,6 +785,26 @@ fn for_each_entry_in(
         for_each_in_collection(bytes, collection, |id, locator| {
             visit(collection.id, id, locator);
         });
+    }
+}
+
+fn for_each_collection(collections: &[CollectionView], visit: &mut impl FnMut([u8; 16], u64)) {
+    for collection in collections {
+        visit(collection.id, collection.disk_bytes);
+    }
+}
+
+fn for_each_entry_in_collection(
+    bytes: &[u8],
+    collections: &[CollectionView],
+    collection_id: &[u8; 16],
+    visit: &mut impl FnMut([u8; 16], PackIndexLocator),
+) {
+    let Ok(index) = collections.binary_search_by_key(collection_id, |view| view.id) else {
+        return;
+    };
+    if let Some(collection) = collections.get(index) {
+        for_each_in_collection(bytes, collection, visit);
     }
 }
 
