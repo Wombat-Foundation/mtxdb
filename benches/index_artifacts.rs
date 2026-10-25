@@ -39,7 +39,8 @@ use std::time::{Duration, Instant};
 
 use mtxdb::index::packidx::{
     PackIndex, PackIndexIdentity, PackIndexInput, PACK_INDEX_COLLECTION_ENTRY_LEN,
-    PACK_INDEX_FANOUT_LEN, PACK_INDEX_HEADER_LEN, PACK_INDEX_SECTION_ENTRY_LEN,
+    PACK_INDEX_FANOUT_LEN, PACK_INDEX_FLAG_ENTRY_LEN, PACK_INDEX_HEADER_LEN,
+    PACK_INDEX_SECTION_ENTRY_LEN,
 };
 use mtxdb::index::{IndexConfig, InsertError, LossyIndex};
 use mtxdb::packfile::{read_header, scan_and_recover_packfile};
@@ -270,8 +271,9 @@ fn report_pack_index(
     let truncated = overhead.saturating_add(count.saturating_mul(TRUNCATED_ENTRY_BYTES));
     let sparse_count = count.saturating_add(SPARSE_STRIDE - 1) / SPARSE_STRIDE;
     let sparse = overhead.saturating_add(sparse_count.saturating_mul(TRUNCATED_ENTRY_BYTES));
-    let dense_projection =
-        overhead.saturating_add(count.saturating_mul(PACK_INDEX_SECTION_ENTRY_LEN as u64));
+    let dense_projection = overhead.saturating_add(
+        count.saturating_mul((PACK_INDEX_SECTION_ENTRY_LEN + PACK_INDEX_FLAG_ENTRY_LEN) as u64),
+    );
     assert_eq!(
         bytes, dense_projection,
         "v1 layout projection matches encoding"
@@ -292,7 +294,7 @@ fn report_pack_index(
     println!(
         "    layout: {PACK_INDEX_HEADER_LEN} B header + {PACK_INDEX_COLLECTION_ENTRY_LEN} B/collection \
          directory + {PACK_INDEX_FANOUT_LEN} B/collection fanout + {PACK_INDEX_SECTION_ENTRY_LEN} B/record \
-         (CRC is in the header)"
+         locator + {PACK_INDEX_FLAG_ENTRY_LEN} B/record flags (CRC is in the header)"
     );
     println!(
         "    truncated id (8 B): {:.2} MiB ({:.2} B/record, {:.0}% of dense)",
