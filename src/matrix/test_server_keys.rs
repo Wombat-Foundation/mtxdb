@@ -173,7 +173,7 @@ fn invalid_updates_are_rejected_before_any_write() {
     }
     let keys = [good.clone()];
     assert!(merge(&db, &update("", KeySighting::Direct, "d", &keys, 1)).is_err());
-    assert!(read_server_keys(db.server_info(), b"o").unwrap().is_empty());
+    assert_eq!(read_server_keys(db.server_info(), b"o").unwrap().len(), 0);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -265,9 +265,10 @@ fn origins_are_isolated_and_reads_are_ordered_and_filterable() {
     let two = read_server_keys(db.server_info(), b"two").unwrap();
     assert_eq!(two.len(), 1);
     assert_eq!(two[0].key, b"CCCC");
-    assert!(read_server_keys(db.server_info(), b"three")
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        read_server_keys(db.server_info(), b"three").unwrap().len(),
+        0
+    );
 
     let single = read_server_key(db.server_info(), b"one", b"ed25519:a")
         .unwrap()
@@ -305,7 +306,7 @@ fn the_notary_payload_is_stored_verbatim_with_the_keys() {
     // A notary-only update publishes no keys.
     let mut only = update("o", KeySighting::Direct, "origin", &[], 2);
     only.notary = Some(b"{}");
-    assert!(merge(&db, &only).unwrap().is_empty());
+    assert_eq!(merge(&db, &only).unwrap().len(), 0);
     assert_eq!(
         read_notary_payload(db.server_info(), b"o")
             .unwrap()
@@ -468,7 +469,7 @@ fn the_first_expired_ts_wins_and_a_future_one_is_dropped() {
     let merged =
         update_server_keys(&db, &update("o", KeySighting::Direct, "d", &first, 1_000)).unwrap();
     assert_eq!(merged.keys[0].expired_ts, Some(900));
-    assert!(merged.issues.is_empty());
+    assert_eq!(merged.issues.len(), 0);
 
     // A different one, earlier or later, is reported and ignored.
     for other in [800, 950] {
@@ -708,7 +709,7 @@ fn the_digest_cap_refuses_new_key_ids_per_bucket_and_promotion_moves_one() {
     // And it freed the notary bucket.
     let c = [observed("ed25519:c", b"CCCC", 9_000)];
     let fresh = update_server_keys(&db, &capped(KeySighting::Notary, &c, 5)).unwrap();
-    assert!(fresh.issues.is_empty());
+    assert_eq!(fresh.issues.len(), 0);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
