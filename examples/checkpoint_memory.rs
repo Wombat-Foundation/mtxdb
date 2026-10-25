@@ -94,20 +94,19 @@ fn index_memory(store: &PackfileStorage) -> (usize, usize, usize, usize) {
 }
 
 fn file_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 fn delta_bytes(dir: &Path) -> u64 {
     let prefix = format!("{INDEX_DELTA_FILE}.");
     std::fs::read_dir(dir)
-        .map(|entries| {
+        .map_or(0, |entries| {
             entries
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-                .map(|entry| entry.metadata().map(|m| m.len()).unwrap_or(0))
+                .map(|entry| entry.metadata().map_or(0, |m| m.len()))
                 .sum()
         })
-        .unwrap_or(0)
 }
 
 fn mib(bytes: u64) -> f64 {

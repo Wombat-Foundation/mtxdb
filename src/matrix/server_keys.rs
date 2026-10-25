@@ -744,7 +744,10 @@ pub fn update_server_keys(db: &Database, update: &KeyUpdate<'_>) -> Result<KeyMe
     let mut attempt = 1;
     loop {
         match try_update(db, update, collection) {
-            Err(error) if error.is_stale_read() && attempt < UPDATE_ATTEMPTS => {
+            Err(error)
+                if (error.is_stale_read() || error.is_would_block())
+                    && attempt < UPDATE_ATTEMPTS =>
+            {
                 attempt = attempt.saturating_add(1);
                 std::thread::yield_now();
             }
