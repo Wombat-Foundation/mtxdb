@@ -39,6 +39,42 @@ use crate::interchange::{EventMetadata, KeyRecord, RoomEvent, RoomExport};
 /// estimate below can be rough.
 pub(crate) const BATCH_BYTES: usize = 32 << 20;
 
+/// Let the shared journal reclaim during a long import.
+///
+/// The journal is one 256 MiB segment shared by every pool, and it is only
+/// reclaimed once every pool the writer touched has synced and so reported
+/// coverage. An import that syncs only at the end fills the segment and every
+/// later commit fails with "journal segment is full". Once the segment passes
+/// `trigger` bytes, sync every pool, one after another; the last pool's
+/// coverage lets the journal shrink. Below `trigger` this does nothing.
+pub(crate) fn reclaim_journal_with(
+    segment_len: u64,
+    trigger: u64,
+    mut sync_pool: impl FnMut(mtxdb::ShardType) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if segment_len < trigger {
+        return Ok(());
+    }
+    for pool in mtxdb::ShardType::ALL {
+        sync_pool(pool)?;
+    }
+    Ok(())
+}
+
+/// [`reclaim_journal_with`] against the database's own journal and pools.
+pub(crate) fn reclaim_journal(db: &Database) -> anyhow::Result<()> {
+    let coordinator = db.coordinator();
+    reclaim_journal_with(
+        coordinator.segment_len(),
+        coordinator.reclaim_trigger_len(),
+        |pool| {
+            db.pool(pool)
+                .sync_all()
+                .with_context(|| format!("syncing the {pool:?} pool to reclaim the journal"))
+        },
+    )
+}
+
 /// Allowance per staged record for keys and framing, on top of its value.
 const RECORD_OVERHEAD: usize = 128;
 const ROOM_VERSION_DOMAIN: &[u8] = b"matrix-room-version-v1";
@@ -457,6 +493,7 @@ pub(crate) fn write_room_with_findings(
         }
         if staged_bytes.saturating_add(size) > batch_bytes && staged_bytes > 0 {
             tx.commit().context("committing an import batch")?;
+            reclaim_journal(db)?;
             tx = db.begin_transaction();
             staged_bytes = 0;
             batch_ids.clear();
@@ -499,6 +536,7 @@ pub(crate) fn write_room_with_findings(
         written = written.saturating_add(1);
     }
     tx.commit().context("committing an import batch")?;
+    reclaim_journal(db)?;
     let closures = write_auth_closures(db, export, plan, batch_bytes)?;
     Ok((
         ImportCounts {
@@ -577,6 +615,7 @@ impl ClosureWriter<'_> {
             &node(self.counter.to_be_bytes().to_vec()),
         )?;
         tx.commit().context("committing auth closures")?;
+        reclaim_journal(self.db)?;
         Ok(())
     }
 
@@ -1162,6 +1201,56 @@ mod auth_findings_tests {
             .is_none(),
             "a refused room leaves no event behind"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_journal_is_left_alone_below_the_reclaim_trigger() {
+        let mut synced = Vec::new();
+        reclaim_journal_with(10, 11, |pool| {
+            synced.push(pool);
+            Ok(())
+        })
+        .unwrap();
+        assert!(synced.is_empty());
+    }
+
+    #[test]
+    fn every_pool_syncs_once_the_journal_passes_the_trigger() {
+        for segment_len in [11, 12, u64::MAX] {
+            let mut synced = Vec::new();
+            reclaim_journal_with(segment_len, 11, |pool| {
+                synced.push(pool);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(synced, mtxdb::ShardType::ALL, "segment {segment_len}");
+        }
+    }
+
+    #[test]
+    fn a_failed_pool_sync_stops_the_import() {
+        let mut synced = Vec::new();
+        let error = reclaim_journal_with(100, 1, |pool| {
+            synced.push(pool);
+            if synced.len() == 2 {
+                anyhow::bail!("disk full");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("disk full"));
+        assert_eq!(synced.len(), 2, "no pool is synced after the failure");
+    }
+
+    #[test]
+    fn importing_a_room_reclaims_without_error_on_a_real_database() {
+        let (db, dir) = db();
+        let room = diamond();
+        // A tiny batch so there are several commits, each followed by the
+        // reclaim check against the real coordinator.
+        write_room_with_findings(&db, &room, 1200).unwrap();
+        reclaim_journal(&db).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 }
