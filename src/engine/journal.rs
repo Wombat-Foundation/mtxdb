@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
+use std::hash::BuildHasherDefault;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -227,9 +228,86 @@ pub enum TxnStageState {
     Published,
 }
 
+/// Hasher for keys made of 16-byte ids. Those ids are content hashes or
+/// derived from them, so they are already uniformly distributed and a
+/// multiply-mix is enough; `SipHash` dominated the cost of staged lookups.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0_u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
+                .wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    // The multiply leaves the low bits, which pick the table bucket, depending
+    // only on the low bits of the input; rotate the well-mixed high bits down.
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+}
+
+type IdBuildHasher = BuildHasherDefault<IdHasher>;
+
+/// Newest staged state per record for one pool, so a lookup costs the keys it
+/// asks about rather than a pass over every staged mutation.
+///
+/// The index folds in the pool's mutations lazily, from `indexed` onward, so
+/// the append paths need no bookkeeping of their own. Anything that removes or
+/// reorders staged mutations must call [`Self::reset`].
+#[derive(Debug, Default)]
+struct StageIndex {
+    /// Number of leading mutations already folded in.
+    indexed: usize,
+    /// Position of the newest staged put or removal per `(collection, node)`.
+    newest: HashMap<([u8; 16], [u8; 16]), usize, IdBuildHasher>,
+    /// Position of the newest staged delete per collection.
+    last_delete: HashMap<[u8; 16], usize, IdBuildHasher>,
+}
+
+impl StageIndex {
+    fn reset(&mut self) {
+        self.indexed = 0;
+        self.newest.clear();
+        self.last_delete.clear();
+    }
+
+    /// Fold in the mutations appended since the last call.
+    fn sync(&mut self, mutations: &[Mutation]) {
+        if self.indexed > mutations.len() {
+            self.reset();
+        }
+        for (position, mutation) in mutations.iter().enumerate().skip(self.indexed) {
+            match mutation {
+                Mutation::Put {
+                    collection_id,
+                    node_id,
+                    ..
+                }
+                | Mutation::RemoveRecord {
+                    collection_id,
+                    node_id,
+                } => {
+                    self.newest.insert((*collection_id, *node_id), position);
+                }
+                Mutation::DeleteCollection { collection_id } => {
+                    self.last_delete.insert(*collection_id, position);
+                }
+            }
+        }
+        self.indexed = mutations.len();
+    }
+}
+
 #[derive(Debug)]
 struct TxnStageData {
     pools: [Vec<Mutation>; ShardType::ALL.len()],
+    /// Lookup index over `pools`; see [`StageIndex`].
+    index: [StageIndex; ShardType::ALL.len()],
     applied: [Vec<bool>; ShardType::ALL.len()],
     /// Collection-version preconditions validated at publication.
     expectations: Vec<CollectionExpectation>,
@@ -366,6 +444,7 @@ impl TxnStage {
             state: std::sync::atomic::AtomicU8::new(Self::ACTIVE),
             data: Mutex::new(TxnStageData {
                 pools: std::array::from_fn(|_| Vec::new()),
+                index: std::array::from_fn(|_| StageIndex::default()),
                 applied: std::array::from_fn(|_| Vec::new()),
                 expectations: Vec::new(),
                 record_expectations: Vec::new(),
@@ -406,8 +485,7 @@ impl TxnStage {
     }
 
     /// Look several records up in the mutations staged for `pool`, in the order
-    /// of `node_ids`, taking the stage lock once and scanning the staged
-    /// mutations once however many records are asked for.
+    /// of `node_ids`, taking the stage lock once.
     ///
     /// This is what lets a transaction read its own uncommitted writes. The
     /// staged mutations are in append order, so the newest one that names a
@@ -418,10 +496,11 @@ impl TxnStage {
     /// begun, every record is `Absent` and the caller reads the live store,
     /// which by then serves the group through the transaction overlay.
     ///
-    /// The single pass keeps the newest put position for each wanted record
-    /// and the position of the last delete for the collection, so the cost is
-    /// the staged mutations plus the records asked for, not their product.
-    /// Payloads are cloned only for records that resolve to a put.
+    /// The stage keeps a per-pool [`StageIndex`] of the newest put or removal
+    /// for each record and the last delete for each collection. A call folds in
+    /// only the mutations staged since the previous one, so a transaction that
+    /// stages and looks up records in turn costs each mutation once, not once
+    /// per lookup. Payloads are cloned only for records that resolve to a put.
     #[must_use]
     pub fn lookup_many(
         &self,
@@ -432,42 +511,30 @@ impl TxnStage {
         #[cfg(test)]
         self.lookup_many_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let data = self.data.lock();
+        let mut guard = self.data.lock();
         if self.state.load(Ordering::Acquire) != Self::ACTIVE || node_ids.is_empty() {
             return vec![StagedLookup::Absent; node_ids.len()];
         }
-        let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
-        let mut newest_put: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
-        let mut last_delete: Option<usize> = None;
-        for (position, mutation) in data.pools[pool_index(pool)].iter().enumerate() {
-            match mutation {
-                Mutation::Put {
-                    collection_id: staged_collection,
-                    node_id,
-                    payload,
-                } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, Some(payload)));
-                }
-                Mutation::RemoveRecord {
-                    collection_id: staged_collection,
-                    node_id,
-                } if staged_collection == collection_id && wanted.contains(node_id) => {
-                    newest_put.insert(*node_id, (position, None));
-                }
-                Mutation::DeleteCollection {
-                    collection_id: staged_collection,
-                } if staged_collection == collection_id => last_delete = Some(position),
-                _ => {}
-            }
-        }
+        let data = &mut *guard;
+        let pool = pool_index(pool);
+        data.index[pool].sync(&data.pools[pool]);
+        let staged = &data.index[pool];
+        let mutations = &data.pools[pool];
+        let last_delete = staged.last_delete.get(collection_id).copied();
         node_ids
             .iter()
-            .map(|node_id| match (newest_put.get(node_id), last_delete) {
-                // A put older than the delete is hidden by it.
-                (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
-                (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
-                (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
-                (None, None) => StagedLookup::Absent,
+            .map(|node_id| {
+                let newest = staged.newest.get(&(*collection_id, *node_id)).copied();
+                match (newest, last_delete) {
+                    // A put older than the delete is hidden by it.
+                    (Some(position), Some(delete)) if position < delete => StagedLookup::Deleted,
+                    (Some(position), _) => match mutations.get(position) {
+                        Some(Mutation::Put { payload, .. }) => StagedLookup::Put(payload.clone()),
+                        _ => StagedLookup::Deleted,
+                    },
+                    (None, Some(_)) => StagedLookup::Deleted,
+                    (None, None) => StagedLookup::Absent,
+                }
             })
             .collect()
     }
@@ -488,6 +555,7 @@ impl TxnStage {
         let mut data = self.data.lock();
         if self.state.load(Ordering::Acquire) == Self::ACTIVE {
             data.pools.iter_mut().for_each(Vec::clear);
+            data.index.iter_mut().for_each(StageIndex::reset);
             data.applied.iter_mut().for_each(Vec::clear);
             data.expectations.clear();
             data.record_expectations.clear();
@@ -806,6 +874,7 @@ impl TxnStage {
             collection_id,
             node_id: *node_id,
         }));
+        data.index[index].reset();
         data.applied[index] = vec![false; data.pools[index].len()];
         data.bytes = total;
         for (node_id, expected) in pending {
@@ -872,6 +941,7 @@ impl TxnStage {
         });
         // This helper only runs while the stage is active, before publication;
         // no mutation can have been applied yet.
+        data.index[index].reset();
         data.applied[index] = vec![false; data.pools[index].len()];
         data.bytes = data.bytes.saturating_sub(released);
         Ok(())

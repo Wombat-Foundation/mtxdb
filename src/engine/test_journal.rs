@@ -3607,3 +3607,100 @@ fn either_segment_a_rewrite_crash_leaves_opens_and_numbers_consistently() {
     );
     assert_eq!(next_lsns[0], second.last_lsn.saturating_add(1));
 }
+
+/// The original lookup: one pass over every staged mutation. Kept as the
+/// reference the incremental index must agree with.
+fn scan_lookup(
+    mutations: &[Mutation],
+    collection_id: &[u8; 16],
+    node_ids: &[[u8; 16]],
+) -> Vec<super::StagedLookup> {
+    use super::StagedLookup;
+    use std::collections::{HashMap, HashSet};
+
+    let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
+    let mut newest: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
+    let mut last_delete: Option<usize> = None;
+    for (position, mutation) in mutations.iter().enumerate() {
+        match mutation {
+            Mutation::Put {
+                collection_id: staged,
+                node_id,
+                payload,
+            } if staged == collection_id && wanted.contains(node_id) => {
+                newest.insert(*node_id, (position, Some(payload)));
+            }
+            Mutation::RemoveRecord {
+                collection_id: staged,
+                node_id,
+            } if staged == collection_id && wanted.contains(node_id) => {
+                newest.insert(*node_id, (position, None));
+            }
+            Mutation::DeleteCollection {
+                collection_id: staged,
+            } if staged == collection_id => last_delete = Some(position),
+            _ => {}
+        }
+    }
+    node_ids
+        .iter()
+        .map(|node_id| match (newest.get(node_id), last_delete) {
+            (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
+            (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
+            (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
+            (None, None) => StagedLookup::Absent,
+        })
+        .collect()
+}
+
+#[test]
+fn staged_lookup_index_matches_a_full_scan() {
+    use crate::layout::ShardType;
+    use std::collections::HashSet;
+
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        usize::try_from(seed % u64::try_from(bound).unwrap()).unwrap()
+    };
+    let pool = ShardType::EventDag;
+    let pool_position = 1;
+    let ids: Vec<[u8; 16]> = (0..12_u8).map(|n| [n; 16]).collect();
+    let collections = [[0xa0_u8; 16], [0xb0_u8; 16]];
+    let stage = TxnStage::new();
+
+    for step in 0..600_u32 {
+        let collection = collections[next(2)];
+        let id = ids[next(12)];
+        match next(8) {
+            0..=2 => stage
+                .stage_put(pool, collection, id, step.to_le_bytes().to_vec())
+                .unwrap(),
+            3 => stage.stage_remove_record(pool, collection, id).unwrap(),
+            4 => stage.stage_delete_collection(pool, collection).unwrap(),
+            5 => stage
+                .stage_puts(pool, collection, &[(id, vec![1]), (ids[next(12)], vec![2])])
+                .unwrap(),
+            // These two rewrite the staged vector and must invalidate the index.
+            6 => stage
+                .forget_staged_records(pool, collection, &HashSet::from([id]))
+                .unwrap(),
+            _ => stage
+                .stage_removals_normalized(pool, collection, &[(id, 0)], &[id])
+                .unwrap(),
+        }
+        let mutations = stage.snapshot_mutations()[pool_position].clone();
+        for collection in &collections {
+            assert_eq!(
+                stage.lookup_many(pool, collection, &ids),
+                scan_lookup(&mutations, collection, &ids),
+                "step {step}"
+            );
+        }
+    }
+
+    stage.discard();
+    assert_eq!(stage.state(), TxnStageState::Discarded);
+}
