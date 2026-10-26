@@ -313,7 +313,16 @@ fn global_args(cmd: Command) -> Command {
             .env("MTXDB_SHARD_TYPE")
             .value_name("TYPE")
             .default_value("events")
-            .value_parser(["state", "event", "events", "event-dag", "edges", "all"])
+            .value_parser([
+                "state",
+                "event",
+                "events",
+                "event-dag",
+                "edges",
+                "server-info",
+                "server_info",
+                "all",
+            ])
             .hide_possible_values(true)
             .global(true)
             .help("Independent shard pool to operate on (use 'all' to target every pool)"),
@@ -1162,6 +1171,7 @@ fn parse_cli() -> Cli {
         "state" => Some(ShardType::State),
         "event" | "events" | "event-dag" => Some(ShardType::EventDag),
         "edges" => Some(ShardType::Edges),
+        "server-info" | "server_info" => Some(ShardType::ServerInfo),
         "all" => None,
         _ => unreachable!("clap validates shard type"),
     };

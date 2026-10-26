@@ -271,3 +271,16 @@ fn dir_expansion_drops_stray_files_from_a_glob() {
     assert_eq!(dirs, vec!["pid-1", "pid-2"]);
     assert_eq!(m.subcommand_name(), Some("collections"));
 }
+
+#[test]
+fn test_shard_type_flag_accepts_server_info() {
+    for val in ["server-info", "server_info"] {
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "-t", val, "collections"])
+            .unwrap();
+        assert_eq!(
+            m.get_one::<String>("shard_type").map(String::as_str),
+            Some(val)
+        );
+    }
+}

@@ -2563,15 +2563,6 @@ fn cmd_collections_in_dir(
             .collection_summaries(),
     };
     let collection_shards = PackfileStorage::collection_shards_from_disk(dir);
-    let canonical_ids: HashMap<[u8; 16], String> = if canonical {
-        PackfileStorage::open_read_only(dir.to_path_buf())
-            .ok()
-            .map_or_else(HashMap::new, |store| {
-                canonical_collection_ids(&store, &collections)
-            })
-    } else {
-        HashMap::new()
-    };
     let physical_needed = layout
         || sort.is_some_and(|column| {
             matches!(
@@ -2657,10 +2648,6 @@ fn cmd_collections_in_dir(
         };
         ordering.then_with(|| left.0.cmp(&right.0))
     });
-    let canonical_width = canonical_column_width(canonical_ids.values());
-    let role_width = canonical_role_width(canonical_ids.values());
-    let canonical_field_width = canonical_width.saturating_add(2).saturating_add(role_width);
-    print_collection_table_header(layout, canonical, canonical_width, role_width);
     let mut total_nodes = 0_usize;
     let mut total_memory = 0_usize;
     let mut total_disk_bytes = 0_u64;
@@ -2680,7 +2667,22 @@ fn cmd_collections_in_dir(
     } else {
         usize::try_from(limit).unwrap_or(usize::MAX)
     };
-    for (_, (collection_id, nodes, memory, capacity)) in ordered.into_iter().take(max_rows) {
+    let displayed: Vec<_> = ordered.into_iter().take(max_rows).collect();
+    let canonical_ids: HashMap<[u8; 16], String> = if canonical {
+        let displayed_summaries: Vec<_> = displayed.iter().map(|(_, s)| **s).collect();
+        PackfileStorage::open_read_only(dir.to_path_buf())
+            .ok()
+            .map_or_else(HashMap::new, |store| {
+                canonical_collection_ids(&store, &displayed_summaries)
+            })
+    } else {
+        HashMap::new()
+    };
+    let canonical_width = canonical_column_width(canonical_ids.values());
+    let role_width = canonical_role_width(canonical_ids.values());
+    let canonical_field_width = canonical_width.saturating_add(2).saturating_add(role_width);
+    print_collection_table_header(layout, canonical, canonical_width, role_width);
+    for (_, (collection_id, nodes, memory, capacity)) in displayed {
         let hex = format_id(collection_id);
         let canonical_id = canonical_ids
             .get(collection_id)
