@@ -21,13 +21,14 @@
 //!
 //! ```text
 //! [64-byte header]
-//! [collection directory: 20 bytes per collection]
+//! [collection directory: 28 bytes per collection]
 //! [collection sections in collection-id order]
 //! ```
 //!
 //! The `MTXIDX01` magic identifies the version. The header CRC field is zeroed
 //! while calculating CRC32 over the complete file. Each directory entry is a
-//! 16-byte collection id followed by a `u32` entry count. Its section starts
+//! 16-byte collection id followed by a `u32` entry count and a `u64` physical
+//! frame-byte total. Its section starts
 //! immediately after the previous section and contains cumulative
 //! `fanout[256]`, sorted 16-byte logical ids, parallel `u32` offsets, then one
 //! flags byte per entry. Bit 0 marks a removal version; the offset still points
@@ -216,6 +217,7 @@ struct CollectionRange {
     id: [u8; 16],
     start: usize,
     end: usize,
+    disk_bytes: u64,
 }
 
 /// Errors found while constructing or fully validating a pack index.
@@ -314,6 +316,16 @@ impl PackIndex {
             }
             u32::try_from(input.offset).map_err(|_| PackIndexError::TooLarge)?;
         }
+        let mut collection_disk_bytes: std::collections::HashMap<[u8; 16], u64> =
+            std::collections::HashMap::new();
+        for input in &inputs {
+            let total = collection_disk_bytes
+                .entry(input.collection_id)
+                .or_insert(0_u64);
+            *total = total
+                .checked_add(input.disk_bytes)
+                .ok_or(PackIndexError::TooLarge)?;
+        }
         inputs.sort_unstable_by(|left, right| {
             left.collection_id
                 .cmp(&right.collection_id)
@@ -323,15 +335,16 @@ impl PackIndex {
         inputs.dedup_by(|later, earlier| {
             later.collection_id == earlier.collection_id && later.logical_id == earlier.logical_id
         });
-        Self::encode_sorted(identity, &inputs)
+        Self::encode_sorted(identity, &inputs, &collection_disk_bytes)
     }
 
     #[allow(clippy::too_many_lines)]
     fn encode_sorted(
         identity: PackIndexIdentity,
         inputs: &[PackIndexInput],
+        collection_disk_bytes: &std::collections::HashMap<[u8; 16], u64>,
     ) -> Result<Self, PackIndexError> {
-        let groups = group_collections(inputs)?;
+        let groups = group_collections(inputs, collection_disk_bytes)?;
         let collection_count = u32::try_from(groups.len()).map_err(|_| PackIndexError::TooLarge)?;
         let entry_count = u64::try_from(inputs.len()).map_err(|_| PackIndexError::TooLarge)?;
         let file_len = encoded_file_len(&groups)?;
@@ -344,7 +357,7 @@ impl PackIndex {
             collection_count,
             file_len,
         )?;
-        encode_directory(&mut bytes, &groups, inputs)?;
+        encode_directory(&mut bytes, &groups)?;
 
         let mut collections = Vec::with_capacity(groups.len());
         for group in groups {
@@ -522,7 +535,10 @@ impl PackIndex {
     }
 }
 
-fn group_collections(inputs: &[PackIndexInput]) -> Result<Vec<CollectionRange>, PackIndexError> {
+fn group_collections(
+    inputs: &[PackIndexInput],
+    collection_disk_bytes: &std::collections::HashMap<[u8; 16], u64>,
+) -> Result<Vec<CollectionRange>, PackIndexError> {
     let mut groups = Vec::new();
     let mut cursor = 0_usize;
     while cursor < inputs.len() {
@@ -531,10 +547,12 @@ fn group_collections(inputs: &[PackIndexInput]) -> Result<Vec<CollectionRange>, 
         while cursor < inputs.len() && inputs[cursor].collection_id == id {
             cursor = cursor.checked_add(1).ok_or(PackIndexError::TooLarge)?;
         }
+        let disk_bytes = collection_disk_bytes.get(&id).copied().unwrap_or(0);
         groups.push(CollectionRange {
             id,
             start,
             end: cursor,
+            disk_bytes,
         });
     }
     Ok(groups)
@@ -592,27 +610,19 @@ fn encode_header(
     Ok(())
 }
 
-fn encode_directory(
-    bytes: &mut Vec<u8>,
-    groups: &[CollectionRange],
-    inputs: &[PackIndexInput],
-) -> Result<(), PackIndexError> {
+fn encode_directory(bytes: &mut Vec<u8>, groups: &[CollectionRange]) -> Result<(), PackIndexError> {
     for group in groups {
         let count = group
             .end
             .checked_sub(group.start)
             .ok_or(PackIndexError::Invalid)?;
-        let disk_bytes = inputs[group.start..group.end]
-            .iter()
-            .try_fold(0_u64, |total, input| total.checked_add(input.disk_bytes))
-            .ok_or(PackIndexError::TooLarge)?;
         bytes.extend_from_slice(&group.id);
         bytes.extend_from_slice(
             &u32::try_from(count)
                 .map_err(|_| PackIndexError::TooLarge)?
                 .to_le_bytes(),
         );
-        bytes.extend_from_slice(&disk_bytes.to_le_bytes());
+        bytes.extend_from_slice(&group.disk_bytes.to_le_bytes());
     }
     Ok(())
 }
@@ -669,10 +679,6 @@ fn encode_collection(
         ids_at, expected_ids_at,
         "logical-id section must immediately follow the fanout table"
     );
-    let disk_bytes = inputs[group.start..group.end]
-        .iter()
-        .try_fold(0_u64, |total, input| total.checked_add(input.disk_bytes))
-        .ok_or(PackIndexError::TooLarge)?;
     Ok(CollectionView {
         id: group.id,
         count: count_u32,
@@ -680,7 +686,7 @@ fn encode_collection(
         ids_at,
         offsets_at,
         flags_at,
-        disk_bytes,
+        disk_bytes: group.disk_bytes,
     })
 }
 

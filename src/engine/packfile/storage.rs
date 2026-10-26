@@ -2887,7 +2887,7 @@ impl PackfileStorage {
         let mut scan_shards = shards.all_shards();
         scan_shards.sort_by_key(|(_, shard)| shard.creation_seq);
         for (slot, shard) in scan_shards {
-            if shard.sealed.load(Ordering::Acquire) {
+            if shard.sealed.load(Ordering::Acquire) && !shards.checksum_policy().verifies_reads() {
                 if let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) {
                     scan_state.insert_sidecar(
                         &sidecar,
@@ -5179,36 +5179,21 @@ impl PackfileStorage {
         *bytes = bytes.saturating_add(disk_bytes);
     }
 
-    fn replace_collection_disk_bytes(
+    fn add_collection_disk_bytes(
         &self,
         collection_id: &[u8; 16],
         bytes_by_pack: &HashMap<PackId, u64>,
     ) {
         let mut tables = self.index_tables.write();
-        for collections in tables.collection_disk_bytes.values_mut() {
-            collections.remove(collection_id);
-        }
         for (&pack_id, &disk_bytes) in bytes_by_pack {
-            tables
+            let total = tables
                 .collection_disk_bytes
                 .entry(pack_id)
                 .or_default()
-                .insert(*collection_id, disk_bytes);
+                .entry(*collection_id)
+                .or_default();
+            *total = total.saturating_add(disk_bytes);
         }
-        tables
-            .collection_disk_bytes
-            .retain(|_, collections| !collections.is_empty());
-    }
-
-    /// Refresh physical byte accounting after compaction. A repack can write
-    /// replacement frames into a shard that still contains older frames, so
-    /// the bytes copied for the new index are not the same as bytes physically
-    /// present until that shard is retired.
-    fn refresh_collection_disk_bytes(&self) -> Result<(), StorageError> {
-        let physical =
-            crate::packfile::layout::physical_layout(&self.base_dir).map_err(StorageError::Io)?;
-        self.index_tables.write().collection_disk_bytes = disk_bytes_from_physical(&physical);
-        Ok(())
     }
 
     /// Replaces `collection_id`'s entire contribution to `shard_collections` with
@@ -6976,7 +6961,9 @@ impl PackfileStorage {
             // A sealed pack's sidecar already holds every frame's newest
             // version, including removals. Use it instead of walking the raw
             // frames; a missing or stale sidecar falls back to the scanner.
-            if shard.sealed.load(Ordering::Acquire) {
+            if shard.sealed.load(Ordering::Acquire)
+                && !self.shards.checksum_policy().verifies_reads()
+            {
                 if let Some(sealed) = crate::index::packidx::open_for_pack(&shard.path) {
                     let mut entries = Vec::new();
                     sealed.for_each_entry(|collection, hash, locator| {
@@ -8311,7 +8298,10 @@ impl PackfileStorage {
         }
 
         let index = Self::build_index(&new_offsets, self.index_config)?;
-        self.replace_collection_disk_bytes(collection_id, &new_disk_bytes);
+        // Repack writes additional physical frames. Keep accounting for old
+        // frames in packs that remain live; retirement prunes contributions
+        // for packs that are actually removed.
+        self.add_collection_disk_bytes(collection_id, &new_disk_bytes);
         self.replace_collection_shard_counts(
             collection_id,
             &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
@@ -8351,14 +8341,12 @@ impl PackfileStorage {
         // lose durability for data this repack itself just wrote, nor
         // leave the persisted stats stale relative to what's on disk.
         self.shards.sync_dirty()?;
-        self.refresh_collection_disk_bytes()?;
 
         // Release this collection's put_mutex before persisting the
         // checkpoint: persist_index_checkpoint acquires every collection's
         // put_mutex itself (parking_lot's Mutex is non-reentrant), and this
         // repack still holds this collection's.
         drop(collection_guard);
-
         // retire_empty_shards may have unlinked packs this collection's old
         // index entries pointed at. A reader that reloads from the
         // checkpoint after this point must see the new shard layout, not
@@ -8622,7 +8610,7 @@ impl PackfileStorage {
             )?;
             let kept = new_offsets.len();
             let index = Self::build_index(&new_offsets, self.index_config)?;
-            self.replace_collection_disk_bytes(collection_id, &new_disk_bytes);
+            self.add_collection_disk_bytes(collection_id, &new_disk_bytes);
             self.replace_collection_shard_counts(
                 collection_id,
                 &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
@@ -8670,7 +8658,6 @@ impl PackfileStorage {
         drop(collection_guards);
         self.retire_empty_shards_after_batch();
         self.shards.sync_dirty()?;
-        self.refresh_collection_disk_bytes()?;
 
         // See the matching comment in repack_collection_reachable: retirement
         // above may have unlinked packs this batch's old index entries

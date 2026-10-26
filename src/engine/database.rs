@@ -611,12 +611,13 @@ impl DatabaseTransaction<'_> {
             })
     }
 
-    /// Commit the staged mutations. Pack/index application is performed once;
-    /// journal publication can be retried if the post-commit callback fails.
+    /// Commit the transaction.
     ///
     /// # Errors
-    /// Returns an error if storage application or shared-WAL publication
-    /// fails. After storage application succeeds, retrying this method is safe.
+    /// Returns an error if validation or journal publication fails. If
+    /// publication succeeds but materialization fails,
+    /// returns [`StorageError::Internal`] with recovery guidance; the published
+    /// transaction cannot be rolled back and recovery will retry it.
     pub fn commit(&self) -> Result<(), StorageError> {
         let _lifecycle = self.lifecycle.lock();
         if self.stage.state() == TxnStageState::Active {

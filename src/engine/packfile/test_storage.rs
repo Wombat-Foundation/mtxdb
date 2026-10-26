@@ -11969,6 +11969,19 @@ fn sealing_a_pack_writes_a_sidecar_and_open_skips_recovery() {
         id[15] = 0xAA;
         assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
     }
+    let expected_disk_bytes = crate::packfile::layout::physical_layout(&dir)
+        .unwrap()
+        .collections
+        .get(&TEST_COLLECTION)
+        .map(|collection| collection.disk_bytes);
+    assert_eq!(
+        PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .unwrap()
+            .get(&TEST_COLLECTION)
+            .copied(),
+        expected_disk_bytes,
+        "reopened sidecar accounting matches physical pack bytes"
+    );
     let rebuilt = reopened.rebuild_index(&TEST_COLLECTION).unwrap();
     for index in 0..200u32 {
         let mut id = [0_u8; 16];
@@ -12002,7 +12015,12 @@ fn full_scan_uses_sealed_sidecars_instead_of_raw_frames() {
     // Remove the checkpoint so the next open takes the full-scan path. The
     // sealed sidecars must still serve the indexes.
     let _ = fs::remove_file(dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE));
-    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let reopened = PackfileStorage::open_with_policies(
+        dir.clone(),
+        true,
+        crate::packfile::ChecksumPolicy::Disabled,
+    )
+    .unwrap();
     let timings = reopened.open_timings().unwrap();
     assert_eq!(timings.path, OpenPath::FullScan);
     assert!(
@@ -12015,6 +12033,19 @@ fn full_scan_uses_sealed_sidecars_instead_of_raw_frames() {
         id[15] = 0xAB;
         assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
     }
+    let expected_disk_bytes = crate::packfile::layout::physical_layout(&dir)
+        .unwrap()
+        .collections
+        .get(&TEST_COLLECTION)
+        .map(|collection| collection.disk_bytes);
+    assert_eq!(
+        PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .unwrap()
+            .get(&TEST_COLLECTION)
+            .copied(),
+        expected_disk_bytes,
+        "full-scan sidecar accounting matches physical pack bytes"
+    );
     drop(reopened);
     let _ = fs::remove_dir_all(&dir);
 }

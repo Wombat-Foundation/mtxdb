@@ -327,12 +327,12 @@ pub struct RoomMetadata {
 /// - `State`: HAMT nodes, roots, and state-group sidecars are dense hashes that
 ///   do not benefit from zstd; compression is disabled to save CPU cycles on write and replay.
 /// - `EventDag`: Event JSON benefits significantly from zstd; compression is enabled.
-/// - `Edges`: Edge rows are tiny (a handful of 16-byte ids, or one id for a
-///   single prev/auth edge). An attempted zstd encode usually cannot shrink
-///   them and adds decompression cost to every adjacency lookup, so they are
-///   stored raw.
-/// - `ServerInfo`: signing-key records are small, mostly high-entropy blobs;
-///   they stay raw for the same reason.
+/// - `Edges`: edge rows use the default policy. The pack writer retains a
+///   compressed frame only when encoding shrinks it, so this skips ineffective
+///   encode attempts while preserving compression for larger, repetitive rows.
+/// - `ServerInfo`: signing-key records are small, mostly high-entropy blobs.
+///   Keeping them raw avoids spending write CPU on compression attempts that
+///   are unlikely to shrink them.
 #[must_use]
 pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
     use crate::database::{PoolPolicies, PoolPolicy};
@@ -343,7 +343,6 @@ pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
     };
     PoolPolicies::default()
         .with(ShardType::State, uncompressed)
-        .with(ShardType::Edges, uncompressed)
         .with(ShardType::ServerInfo, uncompressed)
 }
 

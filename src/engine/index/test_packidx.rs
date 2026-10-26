@@ -394,8 +394,15 @@ fn build_for_pack_round_trips_live_and_removed_records() {
     build_and_write(&pack, true).unwrap();
     let index = open_for_pack(&pack).expect("the sealed sidecar opens");
     assert!(!index.identity().pack_id.is_zero());
-    assert!(
-        index.collection_disk_bytes(&collection).unwrap_or(0) > 0,
+    let expected_disk_bytes: u64 = crate::packfile::scan_packfile_from_with_removal(&pack, 0, true)
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.collection_id == collection)
+        .map(|entry| entry.disk_bytes)
+        .sum();
+    assert_eq!(
+        index.collection_disk_bytes(&collection),
+        Some(expected_disk_bytes),
         "the sidecar preserves the pack's physical byte total"
     );
     let mut live_seen = false;

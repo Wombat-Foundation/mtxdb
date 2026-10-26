@@ -2072,8 +2072,8 @@ pub struct JournalCoordinator {
     /// at 0" observation match again. Unlike `collection_versions` it does not
     /// advance with later writes, so an absent record's token stays stable.
     version_floor: Mutex<HashMap<(ShardType, [u8; 16]), u64>>,
-    /// First LSNs of transaction groups that are published but whose writes are
-    /// not yet all in the packs. See [`Self::publish_groups`].
+    /// First LSNs of published groups, including autocommit groups, whose
+    /// writes are not yet all in the packs. See [`Self::publish_groups`].
     unmaterialized: Mutex<std::collections::BTreeSet<u64>>,
     /// Wakes versioned reads blocked until a published group reaches the packs.
     /// A read that cannot certify its boundary waits here instead of polling;
@@ -2540,8 +2540,8 @@ impl JournalCoordinator {
     #[must_use]
     pub fn committed_lsn_for_pool(&self, pool: ShardType) -> u64 {
         let committed = self.pool_committed.lock().get(&pool).copied().unwrap_or(0);
-        // A published transaction whose writes are not all in the packs yet
-        // holds coverage below its first frame.
+        // A published group, including an autocommit group, whose writes are
+        // not all in the packs yet holds coverage below its first frame.
         match self.unmaterialized.lock().first() {
             Some(first_lsn) => committed.min(first_lsn.saturating_sub(1)),
             None => committed,

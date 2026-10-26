@@ -20,10 +20,11 @@ use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::interop::{
     auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
     decode_auth_counter, decode_auth_forward, decode_event_locator, decode_import_marker,
-    derive_id, encode_auth_forward, encode_edges, encode_event_locator, encode_import_marker,
-    encode_verdict, event_locator_collection_id, event_record_id, event_verdict_collection_id,
-    import_marker_collection_id, import_marker_node_id, room_auth_collection_id,
-    room_event_collection_id, room_prev_collection_id, ImportMarker, Verdict, DATA_FORMAT,
+    encode_auth_forward, encode_edges, encode_event_locator, encode_import_marker,
+    encode_room_version_record, encode_verdict, event_locator_collection_id, event_record_id,
+    event_verdict_collection_id, import_marker_collection_id, import_marker_node_id,
+    room_auth_collection_id, room_event_collection_id, room_prev_collection_id,
+    room_version_collection_id, room_version_node_id, ImportMarker, Verdict, DATA_FORMAT,
     EDGE_POOL, EVENT_POOL, SERVER_INFO_POOL,
 };
 use mtxdb::server_keys;
@@ -77,11 +78,6 @@ pub(crate) fn reclaim_journal(db: &Database) -> anyhow::Result<()> {
 
 /// Allowance per staged record for keys and framing, on top of its value.
 const RECORD_OVERHEAD: usize = 128;
-const ROOM_VERSION_DOMAIN: &[u8] = b"matrix-room-version-v1";
-const ROOM_VERSION_COLLECTION: &[u8] = b"matrix-room-version-record-v1";
-const ROOM_VERSION_NODE: &[u8] = b"room-version";
-const ROOM_VERSION_MAGIC: &[u8; 4] = b"MRV1";
-
 fn node(bytes: Vec<u8>) -> NodeData {
     NodeData::new(bytes::Bytes::from(bytes))
 }
@@ -97,16 +93,7 @@ fn room_version_record(room_id: &str, events: &[RoomEvent]) -> anyhow::Result<Ve
         .and_then(|content| content.get("room_version"))
         .and_then(OwnedValue::as_str)
         .ok_or_else(|| anyhow!("room {room_id} has no create-event room_version"))?;
-    let room_len = u32::try_from(room_id.len()).context("room id is too long")?;
-    let capacity = 8usize
-        .saturating_add(room_id.len())
-        .saturating_add(version.len());
-    let mut record = Vec::with_capacity(capacity);
-    record.extend_from_slice(ROOM_VERSION_MAGIC);
-    record.extend_from_slice(&room_len.to_be_bytes());
-    record.extend_from_slice(room_id.as_bytes());
-    record.extend_from_slice(version.as_bytes());
-    Ok(record)
+    encode_room_version_record(room_id, version).context("encoding room-version record")
 }
 
 /// Stage the room's immutable version record into `tx`, unless an identical
@@ -452,8 +439,8 @@ pub(crate) fn write_room_with_findings(
     let event_collection = room_event_collection_id(room);
     let prev_collection = room_prev_collection_id(room);
     let auth_collection = room_auth_collection_id(room);
-    let version_collection = derive_id(ROOM_VERSION_DOMAIN, room);
-    let version_node = derive_id(ROOM_VERSION_COLLECTION, ROOM_VERSION_NODE);
+    let version_collection = room_version_collection_id(room);
+    let version_node = room_version_node_id();
 
     let mut written = 0_u64;
     let mut staged_bytes = 0_usize;

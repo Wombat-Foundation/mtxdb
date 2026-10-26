@@ -2576,8 +2576,17 @@ fn concurrent_writers_see_a_failed_apply_promptly_and_reopen_keeps_published() {
                             node_id: node(id),
                             payload: vec![id],
                         };
-                        let Ok(published) = store.publish_mutation(|| mutation.clone()) else {
-                            continue; // rejected after the failure
+                        let published = match store.publish_mutation(|| mutation.clone()) {
+                            Ok(published) => published,
+                            Err(error) => {
+                                assert!(
+                                    error
+                                        .to_string()
+                                        .contains("published group failed to apply"),
+                                    "unexpected publication failure after apply error: {error}"
+                                );
+                                continue;
+                            }
                         };
                         published_ids.lock().unwrap().push(id);
                         if writer == 0 && index == 10 {

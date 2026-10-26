@@ -13,6 +13,21 @@ fn derive_id_separates_domains_and_is_stable() {
 }
 
 #[test]
+fn room_version_record_round_trips_and_rejects_malformed_values() {
+    let encoded = encode_room_version_record("!room:example.com", "12").unwrap();
+    assert_eq!(
+        decode_room_version_record(&encoded).unwrap(),
+        ("!room:example.com", "12")
+    );
+    assert!(decode_room_version_record(&encoded[..7]).is_err());
+    assert!(decode_room_version_record(b"bad!").is_err());
+    assert_ne!(
+        room_version_collection_id(b"!a:example.com"),
+        room_version_collection_id(b"!b:example.com")
+    );
+}
+
+#[test]
 fn state_root_handle_v1_has_the_servers_pinned_layout() {
     let handle = StateRootHandleV1 {
         codec_version: 1,

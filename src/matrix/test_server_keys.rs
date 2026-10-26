@@ -3,6 +3,23 @@ use std::sync::Arc;
 
 use super::*;
 
+#[test]
+fn would_block_server_key_update_retries_after_backoff() {
+    let attempts = std::cell::Cell::new(0);
+    let result = retry_transient_update(|| {
+        attempts.set(attempts.get() + 1);
+        if attempts.get() == 1 {
+            Err(StorageError::WouldBlock(
+                "journal segment is full".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_ok());
+    assert_eq!(attempts.get(), 2);
+}
+
 fn test_root(name: &str) -> PathBuf {
     let path =
         std::env::temp_dir().join(format!("mtxdb-server-keys-{name}-{}", std::process::id()));

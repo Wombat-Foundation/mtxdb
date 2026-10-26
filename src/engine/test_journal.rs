@@ -3666,7 +3666,7 @@ fn staged_lookup_index_matches_a_full_scan() {
         usize::try_from(seed % u64::try_from(bound).unwrap()).unwrap()
     };
     let pool = ShardType::EventDag;
-    let pool_position = 1;
+    let pool_position = pool.index();
     let ids: Vec<[u8; 16]> = (0..12_u8).map(|n| [n; 16]).collect();
     let collections = [[0xa0_u8; 16], [0xb0_u8; 16]];
     let stage = TxnStage::new();

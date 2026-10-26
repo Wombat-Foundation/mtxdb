@@ -49,8 +49,8 @@ use mtxdb::PackfileStorage;
 
 const COLLECTION: [u8; 16] = [0xE7; 16];
 const MAGIC: &[u8; 8] = b"MTXIDX01";
-/// A truncated id keeps only the 8 bytes after the fanout byte, plus the offset.
-const TRUNCATED_ENTRY_BYTES: u64 = 8 + 4;
+/// A truncated id keeps 8 suffix bytes, the offset, and its removal flag.
+const TRUNCATED_ENTRY_BYTES: u64 = 8 + 4 + 1;
 /// Sample one entry in ten in the sparse lower-bound projection.
 const SPARSE_STRIDE: u64 = 10;
 /// Keep the RSS probe small relative to the number of pages in the sidecar.

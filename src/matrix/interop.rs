@@ -3,7 +3,8 @@
 //! mtxdb is the only store for events, verdicts, signing keys and state. A
 //! server writes those records through its adapters; an `mtxdb import`
 //! batch writes the same records from an export file. Both must agree on
-//! every byte, or a room that imported cleanly reads as empty after a
+//! every byte, including immutable room-version records, or a room that
+//! imported cleanly reads as empty after a
 //! restart. This module owns that agreement: the encodings, the collection
 //! and node derivations, and the data-format version the import marker
 //! vouches for.
@@ -137,6 +138,71 @@ pub fn event_state_root_node_id(event_id: &[u8]) -> [u8; 16] {
 /// it when a stored layout below changes incompatibly, so an older database
 /// is refused instead of misread.
 pub const DATA_FORMAT: u8 = 2;
+
+/// Stable domain tags for the importer's immutable room-version record.
+pub const ROOM_VERSION_DOMAIN: &[u8] = b"matrix-room-version-v1";
+/// Stable collection domain for immutable room-version records.
+pub const ROOM_VERSION_COLLECTION_DOMAIN: &[u8] = b"matrix-room-version-record-v1";
+/// Stable node identifier for immutable room-version records.
+pub const ROOM_VERSION_NODE: &[u8] = b"room-version";
+const ROOM_VERSION_MAGIC: &[u8; 4] = b"MRV1";
+
+/// Derive the collection holding a room's immutable version record.
+#[must_use]
+pub fn room_version_collection_id(room_id: &[u8]) -> [u8; 16] {
+    derive_id(ROOM_VERSION_DOMAIN, room_id)
+}
+
+/// Node id holding the room's immutable version record.
+#[must_use]
+pub fn room_version_node_id() -> [u8; 16] {
+    derive_id(ROOM_VERSION_COLLECTION_DOMAIN, ROOM_VERSION_NODE)
+}
+
+/// Encode the immutable room-version value as `MRV1`, a big-endian room-id
+/// byte length, the UTF-8 room id, then the UTF-8 room version.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] if the room id exceeds the format's
+/// `u32` length field.
+pub fn encode_room_version_record(room_id: &str, version: &str) -> Result<Vec<u8>, StorageError> {
+    let room_len = u32::try_from(room_id.len()).map_err(|_| {
+        StorageError::Corrupt("room id exceeds room-version record limit".to_owned())
+    })?;
+    let mut record = Vec::with_capacity(
+        8usize
+            .saturating_add(room_id.len())
+            .saturating_add(version.len()),
+    );
+    record.extend_from_slice(ROOM_VERSION_MAGIC);
+    record.extend_from_slice(&room_len.to_be_bytes());
+    record.extend_from_slice(room_id.as_bytes());
+    record.extend_from_slice(version.as_bytes());
+    Ok(record)
+}
+
+/// Decode a room-version value, returning borrowed room id and version text.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] for a bad magic, truncated room id, or
+/// invalid UTF-8.
+pub fn decode_room_version_record(bytes: &[u8]) -> Result<(&str, &str), StorageError> {
+    let malformed = || StorageError::Corrupt("malformed room-version record".to_owned());
+    let (magic, rest) = bytes.split_at_checked(4).ok_or_else(malformed)?;
+    if magic != ROOM_VERSION_MAGIC {
+        return Err(malformed());
+    }
+    let (length, rest) = rest.split_at_checked(4).ok_or_else(malformed)?;
+    let room_len = usize::try_from(u32::from_be_bytes(
+        length.try_into().map_err(|_| malformed())?,
+    ))
+    .map_err(|_| malformed())?;
+    let (room, version) = rest.split_at_checked(room_len).ok_or_else(malformed)?;
+    Ok((
+        std::str::from_utf8(room).map_err(|_| malformed())?,
+        std::str::from_utf8(version).map_err(|_| malformed())?,
+    ))
+}
 
 /// Derive a 128-bit BLAKE3 identifier from a domain and logical identifier.
 ///

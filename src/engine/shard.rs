@@ -2323,15 +2323,16 @@ impl ShardPool {
                 "record payload exceeds u32::MAX",
             )
         })?;
-        packfile::FRAME_FIXED_LEN
-            .checked_add(payload_len)
-            .filter(|&len| len <= packfile::MAX_FRAME_LEN)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "record frame length exceeds shard frame limit",
-                )
+        let metadata_len = record
+            .metadata
+            .as_ref()
+            .filter(|metadata| !metadata.is_empty())
+            .map_or(Ok(0), |metadata| {
+                u32::try_from(metadata.encode()?.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "frame metadata too large")
+                })
             })?;
+        packfile::checked_frame_len(metadata_len, payload_len)?;
         Ok(())
     }
 

@@ -329,7 +329,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
 
     /// Open with a pre-computed collection ID and pre-owned or borrowed name.
     #[must_use]
-    pub fn with_collection_id(
+    fn with_collection_id(
         engine: &'a S,
         name: impl Into<Cow<'a, str>>,
         collection_id: [u8; 16],

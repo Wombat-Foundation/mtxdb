@@ -1301,7 +1301,10 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Propagates read errors, including a fail-closed overlay gap, and returns
-    /// [`StorageError::WouldBlock`] if the version keeps advancing.
+    /// [`StorageError::WouldBlock`] if the read boundary remains behind the
+    /// sampled version after retries, including when no pending group can
+    /// advance the boundary. Returns [`StorageError::Internal`] immediately
+    /// when a published group has failed to apply.
     pub fn get_with_collection_version(
         &self,
         collection_id: &[u8; 16],
@@ -1379,7 +1382,10 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Propagates read errors, including a fail-closed overlay gap, and returns
-    /// [`StorageError::WouldBlock`] if the versions keep advancing.
+    /// [`StorageError::WouldBlock`] if the read boundary remains behind the
+    /// sampled versions after retries, including when no pending group can
+    /// advance the boundary. Returns [`StorageError::Internal`] immediately
+    /// when a published group has failed to apply.
     pub fn get_with_record_versions(
         &self,
         collection_id: &[u8; 16],

@@ -51,8 +51,8 @@ jobs:
         # rusqlite link (Windows CI bundles SQLite instead; see
         # benches/Cargo.toml).
         env:
-          # read_plan measures cold reads and refuses tmpfs. GitHub's runner
-          # temp directory is backed by the runner disk, unlike /tmp here.
+          # read_plan measures cold reads and refuses tmpfs. Use the runner's
+          # temporary directory so the benchmark follows the runner's storage layout.
           MTXDB_BENCH_ROOT: ${{ runner.temp }}/mtxdb-bench
         run: set -o pipefail; cargo bench --manifest-path benches/Cargo.toml --profile release --all-targets --benches 2>&1 | tee bench-output.txt
 

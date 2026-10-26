@@ -731,7 +731,8 @@ fn stored_ids(db: &Database, collection: &[u8; 16]) -> Result<Vec<[u8; 16]>, Sto
 /// # Errors
 /// Returns an error if the update fails validation, if a stored
 /// record is corrupt, if the pool cannot be read or written, or the stale-read
-/// error if every attempt lost a race.
+/// stale-read or `WouldBlock` error if every attempt failed because of a race
+/// or a full journal segment.
 pub fn update_server_keys(db: &Database, update: &KeyUpdate<'_>) -> Result<KeyMerge, StorageError> {
     validate(update)?;
     if update.observed.is_empty() && update.notary.is_none() && !update.snapshot {
@@ -741,15 +742,26 @@ pub fn update_server_keys(db: &Database, update: &KeyUpdate<'_>) -> Result<KeyMe
         });
     }
     let collection = origin_keys_collection_id(update.origin);
+    retry_transient_update(|| try_update(db, update, collection))
+}
+
+fn retry_transient_update<T>(
+    mut update: impl FnMut() -> Result<T, StorageError>,
+) -> Result<T, StorageError> {
     let mut attempt = 1;
     loop {
-        match try_update(db, update, collection) {
+        match update() {
             Err(error)
                 if (error.is_stale_read() || error.is_would_block())
                     && attempt < UPDATE_ATTEMPTS =>
             {
                 attempt = attempt.saturating_add(1);
-                std::thread::yield_now();
+                let backoff = std::time::Duration::from_micros(
+                    u64::try_from(attempt.min(16))
+                        .unwrap_or(16)
+                        .saturating_mul(50),
+                );
+                std::thread::sleep(backoff);
             }
             result => return result,
         }
