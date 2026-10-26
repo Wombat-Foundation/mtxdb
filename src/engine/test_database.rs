@@ -320,7 +320,7 @@ fn a_transaction_still_reads_its_writes_while_its_commit_is_part_way() {
 
 /// A large batch of reads against a large stage preserves request order
 /// and resolves every id. This is a correctness test for the batch
-/// layering; the single-pass complexity is implemented by `lookup_many`.
+/// layering; the indexed lookup is implemented by `lookup_many`.
 #[test]
 fn a_large_batch_read_preserves_order_and_values() {
     const RECORDS: u16 = 4000;

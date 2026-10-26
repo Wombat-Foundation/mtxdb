@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::hash::BuildHasherDefault;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -228,45 +227,24 @@ pub enum TxnStageState {
     Published,
 }
 
-/// Hasher for keys made of 16-byte ids. Those ids are content hashes or
-/// derived from them, so they are already uniformly distributed and a
-/// multiply-mix is enough; `SipHash` dominated the cost of staged lookups.
-#[derive(Default)]
-struct IdHasher(u64);
-
-impl std::hash::Hasher for IdHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0_u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
-                .wrapping_mul(0x517c_c1b7_2722_0a95);
-        }
-    }
-
-    // The multiply leaves the low bits, which pick the table bucket, depending
-    // only on the low bits of the input; rotate the well-mixed high bits down.
-    fn finish(&self) -> u64 {
-        self.0.rotate_left(26)
-    }
-}
-
-type IdBuildHasher = BuildHasherDefault<IdHasher>;
-
 /// Newest staged state per record for one pool, so a lookup costs the keys it
 /// asks about rather than a pass over every staged mutation.
 ///
 /// The index folds in the pool's mutations lazily, from `indexed` onward, so
 /// the append paths need no bookkeeping of their own. Anything that removes or
 /// reorders staged mutations must call [`Self::reset`].
+///
+/// `NodeId` is opaque and chosen by the caller (see `storage::NodeId`), so this
+/// deliberately uses the standard randomized hasher rather than assuming the
+/// ids are content hashes.
 #[derive(Debug, Default)]
 struct StageIndex {
     /// Number of leading mutations already folded in.
     indexed: usize,
     /// Position of the newest staged put or removal per `(collection, node)`.
-    newest: HashMap<([u8; 16], [u8; 16]), usize, IdBuildHasher>,
+    newest: HashMap<([u8; 16], [u8; 16]), usize>,
     /// Position of the newest staged delete per collection.
-    last_delete: HashMap<[u8; 16], usize, IdBuildHasher>,
+    last_delete: HashMap<[u8; 16], usize>,
 }
 
 impl StageIndex {
@@ -496,7 +474,7 @@ impl TxnStage {
     /// begun, every record is `Absent` and the caller reads the live store,
     /// which by then serves the group through the transaction overlay.
     ///
-    /// The stage keeps a per-pool [`StageIndex`] of the newest put or removal
+    /// The stage keeps a per-pool `StageIndex` of the newest put or removal
     /// for each record and the last delete for each collection. A call folds in
     /// only the mutations staged since the previous one, so a transaction that
     /// stages and looks up records in turn costs each mutation once, not once
