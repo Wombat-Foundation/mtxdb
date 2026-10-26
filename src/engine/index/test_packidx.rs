@@ -122,6 +122,16 @@ fn sorted_pack_index_roundtrips_and_keeps_newest_duplicate() {
 }
 
 #[test]
+fn dedup_accumulates_superseded_frame_disk_bytes() {
+    let mut inputs = sample_inputs();
+    inputs[1].disk_bytes = 25;
+    inputs[2].disk_bytes = 35;
+    let built = PackIndex::build(sample_identity(), inputs).unwrap();
+    let decoded = PackIndex::decode(built.as_bytes()).unwrap();
+    assert_eq!(decoded.collection_disk_bytes(&[1; 16]), Some(60));
+}
+
+#[test]
 fn empty_pack_index_is_valid() {
     let built = PackIndex::build(
         PackIndexIdentity {

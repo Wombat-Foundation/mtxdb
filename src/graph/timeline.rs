@@ -323,8 +323,10 @@ pub struct TimelineIndex<'a, S: StorageEngine + ?Sized> {
 impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// Open (or create) the named timeline index.
     #[must_use]
-    pub fn open(engine: &'a S, name: &'a str) -> Self {
-        Self::with_collection_id(engine, Cow::Borrowed(name), timeline_collection_id(name))
+    pub fn open(engine: &'a S, name: impl Into<Cow<'a, str>>) -> Self {
+        let name = name.into();
+        let collection_id = timeline_collection_id(name.as_ref());
+        Self::with_collection_id(engine, name, collection_id)
     }
 
     /// Open with a pre-computed collection ID and pre-owned or borrowed name.

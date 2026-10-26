@@ -316,16 +316,6 @@ impl PackIndex {
             }
             u32::try_from(input.offset).map_err(|_| PackIndexError::TooLarge)?;
         }
-        let mut collection_disk_bytes: std::collections::HashMap<[u8; 16], u64> =
-            std::collections::HashMap::new();
-        for input in &inputs {
-            let total = collection_disk_bytes
-                .entry(input.collection_id)
-                .or_insert(0_u64);
-            *total = total
-                .checked_add(input.disk_bytes)
-                .ok_or(PackIndexError::TooLarge)?;
-        }
         inputs.sort_unstable_by(|left, right| {
             left.collection_id
                 .cmp(&right.collection_id)
@@ -333,18 +323,24 @@ impl PackIndex {
                 .then_with(|| right.offset.cmp(&left.offset))
         });
         inputs.dedup_by(|later, earlier| {
-            later.collection_id == earlier.collection_id && later.logical_id == earlier.logical_id
+            if later.collection_id == earlier.collection_id
+                && later.logical_id == earlier.logical_id
+            {
+                earlier.disk_bytes = earlier.disk_bytes.saturating_add(later.disk_bytes);
+                true
+            } else {
+                false
+            }
         });
-        Self::encode_sorted(identity, &inputs, &collection_disk_bytes)
+        Self::encode_sorted(identity, &inputs)
     }
 
     #[allow(clippy::too_many_lines)]
     fn encode_sorted(
         identity: PackIndexIdentity,
         inputs: &[PackIndexInput],
-        collection_disk_bytes: &std::collections::HashMap<[u8; 16], u64>,
     ) -> Result<Self, PackIndexError> {
-        let groups = group_collections(inputs, collection_disk_bytes)?;
+        let groups = group_collections(inputs)?;
         let collection_count = u32::try_from(groups.len()).map_err(|_| PackIndexError::TooLarge)?;
         let entry_count = u64::try_from(inputs.len()).map_err(|_| PackIndexError::TooLarge)?;
         let file_len = encoded_file_len(&groups)?;
@@ -535,10 +531,7 @@ impl PackIndex {
     }
 }
 
-fn group_collections(
-    inputs: &[PackIndexInput],
-    collection_disk_bytes: &std::collections::HashMap<[u8; 16], u64>,
-) -> Result<Vec<CollectionRange>, PackIndexError> {
+fn group_collections(inputs: &[PackIndexInput]) -> Result<Vec<CollectionRange>, PackIndexError> {
     let mut groups = Vec::new();
     let mut cursor = 0_usize;
     while cursor < inputs.len() {
@@ -547,7 +540,10 @@ fn group_collections(
         while cursor < inputs.len() && inputs[cursor].collection_id == id {
             cursor = cursor.checked_add(1).ok_or(PackIndexError::TooLarge)?;
         }
-        let disk_bytes = collection_disk_bytes.get(&id).copied().unwrap_or(0);
+        let disk_bytes = inputs[start..cursor]
+            .iter()
+            .try_fold(0_u64, |total, input| total.checked_add(input.disk_bytes))
+            .ok_or(PackIndexError::TooLarge)?;
         groups.push(CollectionRange {
             id,
             start,

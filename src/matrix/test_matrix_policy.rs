@@ -1,6 +1,13 @@
 use super::*;
 
 #[test]
+fn edge_pool_uses_compression_with_the_raw_frame_fallback() {
+    let policies = matrix_pool_policies();
+    assert!(policies.for_shard(crate::layout::ShardType::Edges).compress);
+    assert!(!policies.for_shard(crate::layout::ShardType::State).compress);
+}
+
+#[test]
 fn presence_is_ephemeral_and_volatile() {
     let class = MatrixRecordClass::Presence.record_class();
     assert_eq!(class.retention, Retention::EphemeralLatest);

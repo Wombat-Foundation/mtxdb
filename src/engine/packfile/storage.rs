@@ -1633,6 +1633,9 @@ fn persisted_collection_order(base_dir: &std::path::Path) -> Option<Vec<[u8; 16]
     let records = read_persisted_shard_collections(base_dir)?.records;
     let mut orders: HashMap<[u8; 16], u64> = HashMap::new();
     for record in records {
+        if record.count == 0 {
+            continue;
+        }
         let order = record.insertion_order;
         orders
             .entry(record.collection_id)
@@ -3319,18 +3322,18 @@ impl PackfileStorage {
             let Some(slot) = pack_to_slot.get(&record.pack_id) else {
                 return (BookkeepingSource::SlotScan, counts);
             };
-            counts
-                .entry(record.collection_id)
-                .or_default()
-                .insert(*slot, record.count);
+            if record.count > 0 {
+                counts
+                    .entry(record.collection_id)
+                    .or_default()
+                    .insert(*slot, record.count);
+            }
         }
         for (collection_id, len) in current_len {
             if deleted_collections.contains(collection_id) {
                 continue;
             }
-            let Some(slot_counts) = counts.get(collection_id) else {
-                return (BookkeepingSource::SlotScan, counts);
-            };
+            let slot_counts = counts.entry(*collection_id).or_default();
             if slot_counts.values().copied().sum::<u64>() != u64::from(*len) {
                 return (BookkeepingSource::SlotScan, counts);
             }
@@ -4175,8 +4178,8 @@ impl PackfileStorage {
     /// collection's home shard (`ShardPool::collection_home`) — not necessarily the
     /// pool's single "main" shard, since homes are per-collection, not global.
     ///
-    /// Returns `(collection_id, kept, dropped)` for each collection repacked, in the
-    /// order `collections_referencing_shard` returned them. Does not itself
+    /// Returns `(collection_id, kept, dropped)` for each collection repacked,
+    /// sorted by collection ID. Does not itself
     /// guarantee the shard retires — a collection with `set_live_roots` never
     /// called preserves everything (nothing is provably garbage) and its
     /// repack is a no-op for this purpose.
@@ -4190,15 +4193,7 @@ impl PackfileStorage {
         extract_edges: impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
     ) -> Result<Vec<([u8; 16], usize, usize)>, StorageError> {
         let collections = self.collections_referencing_shard(slot)?;
-        let mut results = Vec::with_capacity(collections.len());
-        for collection_id in collections {
-            let (kept, dropped) = self
-                .repack_collection_reachable(&collection_id, |hash, data| {
-                    extract_edges(hash, data)
-                })?;
-            results.push((collection_id, kept, dropped));
-        }
-        Ok(results)
+        self.repack_collections_reachable(&collections, extract_edges)
     }
 
     /// A collection's `(entry count, private heap bytes, mapped bytes,
@@ -5255,8 +5250,10 @@ impl PackfileStorage {
         base_dir.join("shard_collections.bin")
     }
 
-    /// Persist the current `shard_collections` directory to disk: which collections
-    /// have live records in each shard, and how many. Read by
+    /// Persist per-(pack, collection) live counts and physical byte totals.
+    /// A zero count preserves bytes from superseded frames in a pack that is
+    /// still live for another collection; it does not imply live membership.
+    /// Read by
     /// [`Self::collection_directory_from_disk`] — a free function a separate,
     /// short-lived process (a `collections`-style CLI listing) can call without
     /// opening a full `PackfileStorage` (which would otherwise mean
@@ -5355,7 +5352,7 @@ impl PackfileStorage {
                         })
                 })
                 .collect::<Result<_, _>>()?;
-            let mut records = Vec::new();
+            let mut records = HashMap::new();
             for (pack_id, collections) in &tables.shard_collections {
                 for (collection_id, count) in collections {
                     let order = collection_order
@@ -5365,13 +5362,30 @@ impl PackfileStorage {
                     let disk_bytes = tables
                         .collection_disk_bytes
                         .get(pack_id)
-                        .and_then(|collections| collections.get(collection_id))
+                        .and_then(|by_collection| by_collection.get(collection_id))
                         .copied()
                         .unwrap_or(0);
-                    records.push((*pack_id, *collection_id, *count, order, disk_bytes));
+                    records.insert((*pack_id, *collection_id), (*count, order, disk_bytes));
+                }
+            }
+            for (pack_id, collections) in &tables.collection_disk_bytes {
+                for (collection_id, &disk_bytes) in collections {
+                    let order = collection_order
+                        .get(collection_id)
+                        .copied()
+                        .unwrap_or(u64::MAX);
+                    records
+                        .entry((*pack_id, *collection_id))
+                        .or_insert((0, order, disk_bytes));
                 }
             }
             records
+                .into_iter()
+                .filter(|(_, (count, _, disk_bytes))| *count > 0 || *disk_bytes > 0)
+                .map(|((pack_id, collection_id), (count, order, disk_bytes))| {
+                    (pack_id, collection_id, count, order, disk_bytes)
+                })
+                .collect::<Vec<_>>()
         };
         for (pack_id, collection_id, count, order, disk_bytes) in records {
             buf.extend_from_slice(pack_id.as_bytes());
@@ -6609,6 +6623,9 @@ impl PackfileStorage {
         };
         let mut totals: HashMap<[u8; 16], (u64, u64)> = HashMap::new();
         for record in records {
+            if record.count == 0 {
+                continue;
+            }
             let entry = totals
                 .entry(record.collection_id)
                 .or_insert((0, record.insertion_order));
@@ -6720,6 +6737,9 @@ impl PackfileStorage {
         let records = read_persisted_shard_collections(base_dir)?.records;
         let mut totals = HashMap::new();
         for record in records {
+            if record.count == 0 {
+                continue;
+            }
             let total = totals.entry(record.pack_id).or_insert(0_u64);
             *total = total.saturating_add(record.count);
         }
@@ -6739,6 +6759,9 @@ impl PackfileStorage {
         let records = read_persisted_shard_collections(base_dir)?.records;
         let mut totals = HashMap::new();
         for record in records {
+            if record.count == 0 {
+                continue;
+            }
             let count = totals.entry(record.pack_id).or_insert(0_u64);
             *count = count.saturating_add(1);
         }
@@ -6966,10 +6989,8 @@ impl PackfileStorage {
             {
                 if let Some(sealed) = crate::index::packidx::open_for_pack(&shard.path) {
                     let mut entries = Vec::new();
-                    sealed.for_each_entry(|collection, hash, locator| {
-                        if collection == *collection_id {
-                            entries.push((hash, locator));
-                        }
+                    sealed.for_each_entry_in_collection(collection_id, |hash, locator| {
+                        entries.push((hash, locator));
                     });
                     for (hash, locator) in entries {
                         let (offset, removed) = match locator {

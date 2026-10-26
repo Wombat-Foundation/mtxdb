@@ -47,13 +47,13 @@ pub(crate) const BATCH_BYTES: usize = 32 << 20;
 /// coverage. An import that syncs only at the end fills the segment and every
 /// later commit fails with "journal segment is full". Once the segment passes
 /// `trigger` bytes, sync every pool, one after another; the last pool's
-/// coverage lets the journal shrink. Below `trigger` this does nothing.
+/// coverage lets the journal shrink. At or below `trigger` this does nothing.
 pub(crate) fn reclaim_journal_with(
     segment_len: u64,
     trigger: u64,
     mut sync_pool: impl FnMut(mtxdb::ShardType) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    if segment_len < trigger {
+    if segment_len <= trigger {
         return Ok(());
     }
     for pool in mtxdb::ShardType::ALL {
@@ -1192,19 +1192,21 @@ mod auth_findings_tests {
     }
 
     #[test]
-    fn the_journal_is_left_alone_below_the_reclaim_trigger() {
+    fn the_journal_is_left_alone_at_or_below_the_reclaim_trigger() {
         let mut synced = Vec::new();
-        reclaim_journal_with(10, 11, |pool| {
-            synced.push(pool);
-            Ok(())
-        })
-        .unwrap();
+        for segment_len in [10, 11] {
+            reclaim_journal_with(segment_len, 11, |pool| {
+                synced.push(pool);
+                Ok(())
+            })
+            .unwrap();
+        }
         assert!(synced.is_empty());
     }
 
     #[test]
     fn every_pool_syncs_once_the_journal_passes_the_trigger() {
-        for segment_len in [11, 12, u64::MAX] {
+        for segment_len in [12, 13, u64::MAX] {
             let mut synced = Vec::new();
             reclaim_journal_with(segment_len, 11, |pool| {
                 synced.push(pool);
@@ -1231,13 +1233,15 @@ mod auth_findings_tests {
     }
 
     #[test]
-    fn importing_a_room_reclaims_without_error_on_a_real_database() {
+    fn importing_a_small_room_is_below_the_reclaim_trigger() {
         let (db, dir) = db();
         let room = diamond();
-        // A tiny batch so there are several commits, each followed by the
-        // reclaim check against the real coordinator.
         write_room_with_findings(&db, &room, 1200).unwrap();
+        let coordinator = db.coordinator();
+        let segment_len = coordinator.segment_len();
+        assert!(segment_len <= coordinator.reclaim_trigger_len());
         reclaim_journal(&db).unwrap();
+        assert_eq!(coordinator.segment_len(), segment_len);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

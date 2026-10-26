@@ -3530,6 +3530,9 @@ impl JournalCoordinator {
     /// separate: a later [`Self::sync_through`] or the background committer
     /// fsyncs every visible group at once, so many small groups still share
     /// one fsync.
+    /// A caller applying the mutations directly must call
+    /// [`Self::transaction_materialized`] with `receipt.first_lsn` after all
+    /// writes reach the packs; until then this group holds back WAL reclaim.
     ///
     /// # Errors
     /// Returns an error if the journal is poisoned, its LSN space is
@@ -3545,6 +3548,9 @@ impl JournalCoordinator {
     /// Like [`Self::publish_group`], tagging every mutation with `pool`.
     /// Required when the coordinator's segment is pool-tagged; the pool-less
     /// form would be rejected there.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after all writes reach the packs, or the group will
+    /// continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Same as [`Self::publish_group`].
@@ -3563,6 +3569,9 @@ impl JournalCoordinator {
     /// publication critical section. A mismatch rejects the commit with an
     /// [`io::ErrorKind::WouldBlock`] error wrapping a `StaleVersion` instead
     /// of appending, so no group is published.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after all writes reach the packs, or the group will
+    /// continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Returns a stale-version error if a collection's logical version differs
@@ -3585,6 +3594,9 @@ impl JournalCoordinator {
     /// This is the atomic publication boundary for a transaction that writes
     /// multiple pools through a shared coordinator. The caller must provide
     /// each pool at most once; empty batches are ignored.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after every batch's writes reach the packs, or the
+    /// group will continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Returns an error if the journal is poisoned or the group cannot be
@@ -3598,6 +3610,9 @@ impl JournalCoordinator {
 
     /// Like [`Self::publish_tagged_groups`], validating `expectations` inside
     /// the publication critical section before the group is appended.
+    /// The direct applier must call [`Self::transaction_materialized`] with
+    /// `receipt.first_lsn` after every batch's writes reach the packs, or the
+    /// group will continue to hold back WAL reclaim.
     ///
     /// # Errors
     /// Returns a stale-version error if a collection's logical version differs

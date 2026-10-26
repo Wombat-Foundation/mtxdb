@@ -70,7 +70,7 @@ fn cursor_encoding_roundtrips() {
 #[test]
 fn forward_pages_cover_a_room_in_order() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "test");
+    let index = TimelineIndex::open(&engine, String::from("test"));
     let mut entries = Vec::new();
     for seed in 0..40u8 {
         entries.push(entry([1u8; 16], i64::from(seed / 2), seed));

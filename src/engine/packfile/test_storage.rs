@@ -6795,6 +6795,78 @@ fn test_collection_disk_bytes_track_overwrite_reopen_and_repack() {
 }
 
 #[test]
+fn physical_only_collection_bytes_survive_reopen_without_live_shard_membership() {
+    let dir = test_dir("physical_only_collection_bytes");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let target = distinct_id(0x41);
+    let neighbor = distinct_id(0x42);
+    store
+        .put(&TEST_COLLECTION, &target, &NodeData::from_slice(b"target"))
+        .unwrap();
+    store
+        .put(
+            &SECOND_COLLECTION,
+            &neighbor,
+            &NodeData::from_slice(b"neighbor"),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let source_pack = *store
+        .index_tables
+        .read()
+        .collection_shards
+        .get(&TEST_COLLECTION)
+        .and_then(|packs| packs.iter().next())
+        .expect("target collection has a source pack");
+    assert!(
+        store
+            .index_tables
+            .read()
+            .collection_shards
+            .get(&SECOND_COLLECTION)
+            .is_some_and(|packs| packs.contains(&source_pack)),
+        "neighbor shares the target's source pack"
+    );
+
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let persisted = read_persisted_shard_collections(&dir).unwrap();
+    assert!(persisted.records.iter().any(|record| {
+        record.pack_id == source_pack
+            && record.collection_id == TEST_COLLECTION
+            && record.count == 0
+            && record.disk_bytes > 0
+    }));
+
+    let physical_bytes = crate::packfile::layout::physical_layout(&dir)
+        .unwrap()
+        .collections[&TEST_COLLECTION]
+        .disk_bytes;
+    drop(store);
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .unwrap()
+            .get(&TEST_COLLECTION),
+        Some(&physical_bytes),
+        "physical totals include old frames retained in the shared source pack"
+    );
+    assert!(!reopened
+        .index_tables
+        .read()
+        .shard_collections
+        .get(&source_pack)
+        .is_some_and(|collections| collections.contains_key(&TEST_COLLECTION)));
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_collection_summaries_from_disk_capacity_matches_new_collection_floor() {
     // A one-node collection's live index starts at
     // `NEW_COLLECTION_INDEX_FLOOR` (64), never `LossyIndex::new`'s own

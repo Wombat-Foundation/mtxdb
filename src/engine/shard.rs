@@ -3187,7 +3187,6 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_all(&self) -> io::Result<()> {
-        self.wait_for_seals();
         let flush_started = Instant::now();
         self.flush_all()?;
         let flush_elapsed = flush_started.elapsed();
