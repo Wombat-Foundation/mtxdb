@@ -106,7 +106,14 @@ impl RoomEvent {
     /// its own contents and cannot read the answer the exporting server
     /// already gave.
     pub(crate) fn unflagged(&self, room_id: &str) -> OwnedValue {
-        let mut event = self.annotated(room_id);
+        self.unflagged_from(&self.pdu, room_id)
+    }
+
+    /// [`Self::unflagged`] over `pdu` in place of the exported one, for an
+    /// auth check that must judge the event in a different form, such as its
+    /// redaction.
+    pub(crate) fn unflagged_from(&self, pdu: &OwnedValue, room_id: &str) -> OwnedValue {
+        let mut event = self.annotated_from(pdu, room_id);
         if let OwnedValue::Object(fields) = &mut event {
             set_flag(fields, "rejected", false);
             set_flag(fields, "soft_failed", false);
@@ -121,7 +128,11 @@ impl RoomEvent {
     /// Only the returned value is analyzed. [`Self::pdu_bytes`] is what gets
     /// stored, so these merged flags never reach the store.
     pub(crate) fn annotated(&self, room_id: &str) -> OwnedValue {
-        let mut event = self.pdu.clone();
+        self.annotated_from(&self.pdu, room_id)
+    }
+
+    fn annotated_from(&self, pdu: &OwnedValue, room_id: &str) -> OwnedValue {
+        let mut event = pdu.clone();
         let OwnedValue::Object(fields) = &mut event else {
             return event;
         };

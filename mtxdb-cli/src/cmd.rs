@@ -8118,8 +8118,7 @@ struct ImportRun {
 /// `paths` with every server-keys export first, the rest after them, each
 /// group in argument order.
 fn keys_first(paths: &[PathBuf]) -> Vec<&PathBuf> {
-    let (keys, rest): (Vec<_>, Vec<_>) =
-        paths.iter().partition(|path| is_server_keys_export(path));
+    let (keys, rest): (Vec<_>, Vec<_>) = paths.iter().partition(|path| is_server_keys_export(path));
     keys.into_iter().chain(rest).collect()
 }
 
@@ -8135,7 +8134,7 @@ fn input_export_format(path: &Path) -> Option<interchange::InputFormat> {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
             Ok(0) | Err(_) => return None,
-            Ok(_) if line.iter().all(u8::is_ascii_whitespace) => continue,
+            Ok(_) if line.iter().all(u8::is_ascii_whitespace) => {}
             Ok(_) => return interchange::detect(&line),
         }
     }
@@ -8182,12 +8181,19 @@ fn import_data(
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
 ) -> ImportRun {
+    // Clear the marker before reading any input: an input that fails to parse
+    // never reaches the importers that clear it, and must not leave the marker
+    // of an earlier run vouching for a store this run may have changed.
+    let marker_cleared = export_import::clear_marker(db);
+    if let Err(error) = &marker_cleared {
+        eprintln!("clearing the import marker: {error:#}");
+    }
     let mut run = ImportRun {
-        failures: 0,
+        failures: usize::from(marker_cleared.is_err()),
         server_keys: false,
         exported_events: 0,
         exported_closures: 0,
-        all_exports: !paths.is_empty(),
+        all_exports: !paths.is_empty() && marker_cleared.is_ok(),
         signature_keys_available: false,
     };
     let mut key_state_checked = false;
@@ -8195,9 +8201,7 @@ fn import_data(
         if index != 0 {
             eprintln!();
         }
-        if !key_state_checked
-            && input_export_format(path) == Some(interchange::InputFormat::Room)
-        {
+        if !key_state_checked && input_export_format(path) == Some(interchange::InputFormat::Room) {
             key_state_checked = true;
             match has_signing_key_material(db.server_info()) {
                 Ok(available) => run.signature_keys_available = available,
