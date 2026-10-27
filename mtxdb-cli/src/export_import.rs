@@ -13,7 +13,7 @@
 //! marker is committed last, in a transaction of its own. A run that stops
 //! anywhere earlier leaves the database visibly incomplete.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context};
 use mtxdb::export_schema::RejectionCode;
@@ -322,6 +322,14 @@ pub(crate) struct AuthFindings {
     pub(crate) signature_no_key: usize,
     /// Events without the origin, timestamp, or signature material to check.
     pub(crate) signature_no_material: usize,
+    /// Events that verified against a key after its cached
+    /// `valid_until_ts`. That value is a refresh deadline, not the key's
+    /// lifetime, so these are accepted but do not corroborate the key.
+    pub(crate) signature_verified_late: usize,
+    /// One record per event that verified after its key's cached deadline.
+    pub(crate) signature_late: Vec<SignatureAudit>,
+    /// Derived rejections by stored rejection code.
+    pub(crate) rejection_counts: BTreeMap<u8, usize>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -439,23 +447,34 @@ impl SignatureKeyCatalog {
                 continue;
             };
             let key = &record.key;
+            // Deliberately supersede the earlier both-bounds rule for retired
+            // keys: `expired_ts` alone is the hard signing boundary.
+            // `valid_until_ts` is a cache-refresh deadline, so a successful
+            // signature past it but before expiration is reported as late,
+            // whether or not the key has an `expired_ts`.
+            let past_cached_deadline = timestamp >= key.valid_until_ts;
             if key.key.is_empty()
-                || timestamp >= key.valid_until_ts
                 || key.expired_ts.is_some_and(|expired| timestamp >= expired)
             {
                 continue;
             }
-            candidates.push((record, key_id.as_str(), signature));
+            candidates.push((record, key_id.as_str(), signature, past_cached_deadline));
         }
         if candidates.is_empty() {
             return SignatureOutcome::NoKey;
         }
 
-        let mut last_error = String::from("no candidate signature verified");
-        for (record, key_id, _) in &candidates {
+        // Prefer an in-window signature if multiple keys are present. A
+        // verified late signature is useful migration evidence, but must not
+        // hide a usable in-window signature.
+        candidates.sort_by_key(|(_, _, _, late)| *late);
+        let mut in_window_failure = None;
+        let mut any_parsed_key = false;
+        for (record, key_id, _, late) in &candidates {
             let Some(parsed_key) = record.parsed_key.as_ref() else {
                 continue;
             };
+            any_parsed_key = true;
             let verifier = OneKeyVerifier {
                 origin: &record.origin,
                 key_id,
@@ -468,21 +487,28 @@ impl SignatureKeyCatalog {
                 &verifier,
             ) {
                 Ok(()) => {
-                    return SignatureOutcome::Verified(KeyBinding {
-                        origin: record.origin.as_bytes().to_vec(),
-                        key_id: record.key.key_id.clone(),
-                    });
+                    return if *late {
+                        SignatureOutcome::VerifiedLate
+                    } else {
+                        SignatureOutcome::Verified(KeyBinding {
+                            origin: record.origin.as_bytes().to_vec(),
+                            key_id: record.key.key_id.clone(),
+                        })
+                    };
                 }
-                Err(error) => last_error = error,
+                Err(error) if !*late => in_window_failure = Some(error),
+                Err(_) => {}
             }
         }
-        if candidates
-            .iter()
-            .all(|(record, _, _)| record.parsed_key.is_none())
-        {
+        if !any_parsed_key {
             return SignatureOutcome::NoMaterial;
         }
-        SignatureOutcome::Invalid(last_error)
+        if let Some(error) = in_window_failure {
+            return SignatureOutcome::Invalid(error);
+        }
+        // Late failures alone cannot distinguish a bad signature from a key
+        // rotated under the same ID, so they do not reject the event.
+        SignatureOutcome::NoKey
     }
 
     /// Why each of the origin's signature keys was or was not usable for the
@@ -516,16 +542,16 @@ impl SignatureKeyCatalog {
                     return format!("{key_id}: no key bytes");
                 }
                 match timestamp {
+                    Some(ts) if key.expired_ts.is_some_and(|expired| ts >= expired) => format!(
+                        "{key_id}: event after expired_ts {}",
+                        key.expired_ts.unwrap_or_default()
+                    ),
                     Some(ts) if ts >= key.valid_until_ts => {
                         format!(
                             "{key_id}: event after valid_until_ts {}",
                             key.valid_until_ts
                         )
                     }
-                    Some(ts) if key.expired_ts.is_some_and(|expired| ts >= expired) => format!(
-                        "{key_id}: event after expired_ts {}",
-                        key.expired_ts.unwrap_or_default()
-                    ),
                     _ => format!("{key_id}: in window"),
                 }
             })
@@ -567,6 +593,8 @@ enum SignatureOutcome {
     NoKey,
     NoMaterial,
     Verified(KeyBinding),
+    /// Verified, but after the key's cached `valid_until_ts`.
+    VerifiedLate,
     Invalid(String),
 }
 
@@ -800,7 +828,16 @@ fn auth_findings_seeded(export: &RoomExport, seeds: &[bool]) -> anyhow::Result<A
             );
         }
     }
+    refresh_rejection_counts(&mut findings);
     Ok(findings)
+}
+
+fn refresh_rejection_counts(findings: &mut AuthFindings) {
+    findings.rejection_counts.clear();
+    for code in findings.forced.iter().flatten() {
+        let count = findings.rejection_counts.entry(*code).or_insert(0);
+        *count = count.saturating_add(1);
+    }
 }
 
 /// The state an event's own `auth_events` describe, as rezzy's auth rules read
@@ -907,15 +944,14 @@ impl HashAudit {
     }
 }
 
-/// Audit record for one event whose signature did not verify, written to a
-/// JSONL sidecar.
+/// Audit record for one non-plain-verified event, written to a JSONL sidecar.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SignatureAudit {
     pub(crate) event_id: String,
     pub(crate) room_id: String,
     pub(crate) origin: String,
     pub(crate) origin_server_ts: Option<u64>,
-    /// `no_usable_key`, `no_signature_material` or `invalid`.
+    /// `no_usable_key`, `no_signature_material`, `invalid` or `verified_late`.
     pub(crate) outcome: &'static str,
     /// The verifier's error, if any, then one line per signing key.
     pub(crate) detail: Vec<String>,
@@ -1187,6 +1223,7 @@ fn apply_signature_outcomes(
     let mut verified: HashMap<KeyBinding, (u64, u64)> = HashMap::new();
     let mut no_key = 0_usize;
     let mut no_material = 0_usize;
+    let mut verified_late = 0_usize;
     let audit_positions: HashMap<_, _> = findings
         .hash_audit
         .iter()
@@ -1198,6 +1235,7 @@ fn apply_signature_outcomes(
             SignatureOutcome::NoKey => "no_usable_key",
             SignatureOutcome::NoMaterial => "no_signature_material",
             SignatureOutcome::Verified(_) => "verified",
+            SignatureOutcome::VerifiedLate => "verified_late",
             SignatureOutcome::Invalid(_) => "invalid",
         };
         if let Some(&audit_position) = audit_positions.get(&events[position].event_id) {
@@ -1209,7 +1247,7 @@ fn apply_signature_outcomes(
             if let SignatureOutcome::Invalid(reason) = outcome {
                 detail.insert(0, reason.clone());
             }
-            findings.signature_audit.push(SignatureAudit {
+            let row = SignatureAudit {
                 event_id: event.event_id.clone(),
                 room_id: room_id.to_owned(),
                 origin: event_origin(&event.pdu, room_version)
@@ -1221,13 +1259,19 @@ fn apply_signature_outcomes(
                     .and_then(OwnedValue::as_u64),
                 outcome: status,
                 detail,
-            });
+            };
+            if matches!(outcome, SignatureOutcome::VerifiedLate) {
+                findings.signature_late.push(row);
+            } else {
+                findings.signature_audit.push(row);
+            }
         }
     }
     for (position, outcome) in outcomes.into_iter().enumerate() {
         match outcome {
             SignatureOutcome::NoKey => no_key = no_key.saturating_add(1),
             SignatureOutcome::NoMaterial => no_material = no_material.saturating_add(1),
+            SignatureOutcome::VerifiedLate => verified_late = verified_late.saturating_add(1),
             SignatureOutcome::Verified(binding) => {
                 let timestamp = events[position]
                     .pdu
@@ -1254,6 +1298,7 @@ fn apply_signature_outcomes(
     }
     findings.signature_no_key = no_key;
     findings.signature_no_material = no_material;
+    findings.signature_verified_late = verified_late;
     findings.verified_keys = verified
         .into_iter()
         .map(
@@ -1342,6 +1387,7 @@ pub(crate) fn derived_auth_findings_with_keys(
             room_version,
         );
     }
+    refresh_rejection_counts(&mut findings);
     ensure_create_authorized(export, events, &findings)?;
     Ok(findings)
 }
@@ -1846,6 +1892,7 @@ mod auth_findings_tests {
         assert_eq!(forced(&findings, 1), Some(MISSING_AUTH));
         assert_eq!(findings.missing_auth, ["$a"]);
         assert!(findings.cascaded.is_empty());
+        assert_eq!(findings.rejection_counts.get(&MISSING_AUTH), Some(&1));
     }
 
     #[test]
@@ -1866,6 +1913,8 @@ mod auth_findings_tests {
         assert_eq!(forced(&findings, 4), None);
         assert_eq!(findings.missing_auth, ["$bad"]);
         assert_eq!(findings.cascaded, ["$child", "$grandchild"]);
+        assert_eq!(findings.rejection_counts.get(&MISSING_AUTH), Some(&1));
+        assert_eq!(findings.rejection_counts.get(&DEPENDS_ON_REJECTED), Some(&2));
     }
 
     #[test]
@@ -1974,6 +2023,7 @@ mod auth_findings_tests {
         ]))
         .unwrap();
         assert_eq!(forced(&findings, 1), Some(7));
+        assert_eq!(findings.rejection_counts.get(&7), Some(&1));
         assert_eq!(findings.fails_but_exported_accepted.len(), 1);
         let failure = &findings.fails_but_exported_accepted[0];
         assert_eq!(failure.event_id, "$msg");
@@ -2531,5 +2581,268 @@ mod auth_findings_tests {
         reclaim_journal(&db).unwrap();
         assert_eq!(coordinator.segment_len(), segment_len);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn derived_rejections_are_tallied_by_code() {
+        let findings = derived_auth_findings(&export(vec![
+            create_with_version("10"),
+            event("$msg", "m.room.message", &["$create"], &["$missing"]),
+        ]))
+        .unwrap();
+        assert_eq!(
+            findings
+                .rejection_counts
+                .get(&RejectionCode::MissingAuthEvent.to_u8()),
+            Some(&1)
+        );
+    }
+}
+
+#[cfg(test)]
+mod signature_window_tests {
+    use bytes::Bytes;
+    use mtxdb::server_keys::{key_digest, KeyTier, ServerKey};
+    use rezzy::signing::ed25519_zebra::SigningKey;
+
+    use super::*;
+
+    const ORIGIN: &str = "origin.example";
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from([seed; 32])
+    }
+
+    /// A key record for `sk` under `key_id`, with the given cached deadline and
+    /// optional retirement.
+    fn key_record(
+        sk: &SigningKey,
+        key_id: &str,
+        valid_until_ts: u64,
+        expired_ts: Option<u64>,
+    ) -> KeyRecord {
+        let bytes: Vec<u8> = AsRef::<[u8]>::as_ref(&sk.verification_key()).to_vec();
+        KeyRecord::Key {
+            origin: ORIGIN.to_owned(),
+            key: ServerKey {
+                key_id: key_id.as_bytes().to_vec(),
+                digest: key_digest(&bytes),
+                key: bytes,
+                valid_until_ts,
+                source: b"test".to_vec(),
+                ts_added_ms: 0,
+                tier: KeyTier::Permanent,
+                first_seen_ms: 0,
+                last_active_ms: 0,
+                corroborated: false,
+                inferred_retired: false,
+                expired_ts,
+                promote_by_ms: 0,
+            },
+        }
+    }
+
+    /// A message event at `ts`, signed under each `(key_id, signing key)`.
+    /// Signing a key that is not the registered one makes a bad signature.
+    fn signed_event(ts: u64, signers: &[(&str, &SigningKey)]) -> RoomEvent {
+        let fields = format!(
+            r#""type":"m.room.message","room_id":"!r:{ORIGIN}","sender":"@a:{ORIGIN}","origin_server_ts":{ts},"content":{{"body":"hi"}},"depth":1,"auth_events":[],"prev_events":[]"#
+        );
+        let unsigned = OwnedValue::parse_bytes(format!("{{{fields}}}").as_bytes()).unwrap();
+        let canonical = rezzy::try_canonical_redacted_json(&unsigned, "10").unwrap();
+        let signatures: Vec<String> = signers
+            .iter()
+            .map(|(key_id, sk)| {
+                use base64::Engine as _;
+                let signature = sk.sign(canonical.as_bytes());
+                let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
+                    .encode(signature.to_bytes());
+                format!(r#""{key_id}":"{encoded}""#)
+            })
+            .collect();
+        let signed = format!(
+            r#"{{{fields},"signatures":{{"{ORIGIN}":{{{}}}}}}}"#,
+            signatures.join(",")
+        );
+        RoomEvent {
+            event_id: "$m".to_owned(),
+            metadata: EventMetadata::default(),
+            prev_events: OwnedValue::Array(Vec::new()),
+            auth_events: OwnedValue::Array(Vec::new()),
+            pdu: OwnedValue::parse_bytes(signed.as_bytes()).unwrap(),
+            pdu_bytes: Bytes::new(),
+        }
+    }
+
+    fn catalog(records: &[KeyRecord]) -> SignatureKeyCatalog {
+        SignatureKeyCatalog::from_records(records)
+    }
+
+    #[test]
+    fn a_signature_inside_the_window_verifies() {
+        let sk = signing_key(1);
+        let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, None)]);
+        let outcome = keys.verify(&signed_event(1_000, &[("ed25519:a", &sk)]), "10");
+        assert!(matches!(outcome, SignatureOutcome::Verified(_)));
+    }
+
+    #[test]
+    fn an_unretired_key_past_its_cached_deadline_verifies_late() {
+        let sk = signing_key(1);
+        let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, None)]);
+        let outcome = keys.verify(&signed_event(3_000, &[("ed25519:a", &sk)]), "10");
+        assert!(matches!(outcome, SignatureOutcome::VerifiedLate));
+    }
+
+    #[test]
+    fn a_bad_signature_inside_the_window_is_invalid() {
+        let (signer, registered) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, None)]);
+        let outcome = keys.verify(&signed_event(1_000, &[("ed25519:a", &signer)]), "10");
+        assert!(matches!(outcome, SignatureOutcome::Invalid(_)));
+    }
+
+    #[test]
+    fn a_bad_signature_past_the_cached_deadline_is_not_a_rejection() {
+        let (signer, registered) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, None)]);
+        let outcome = keys.verify(&signed_event(3_000, &[("ed25519:a", &signer)]), "10");
+        assert!(matches!(outcome, SignatureOutcome::NoKey));
+    }
+
+    #[test]
+    fn a_late_success_wins_over_another_late_failure() {
+        let (good, wrong) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[
+            key_record(&wrong, "ed25519:bad", 1_000, None),
+            key_record(&good, "ed25519:good", 1_000, None),
+        ]);
+        let event = signed_event(3_000, &[("ed25519:bad", &good), ("ed25519:good", &good)]);
+
+        assert!(matches!(
+            keys.verify(&event, "10"),
+            SignatureOutcome::VerifiedLate
+        ));
+    }
+
+    #[test]
+    fn an_in_window_success_beats_a_late_failure() {
+        let (good, wrong) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[
+            // Late and wrong: registered key differs from the signer.
+            key_record(&wrong, "ed25519:late", 1_000, None),
+            key_record(&good, "ed25519:live", 5_000, None),
+        ]);
+        let event = signed_event(3_000, &[("ed25519:late", &good), ("ed25519:live", &good)]);
+        assert!(matches!(
+            keys.verify(&event, "10"),
+            SignatureOutcome::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn an_in_window_success_beats_a_late_success() {
+        let sk = signing_key(1);
+        let keys = catalog(&[
+            key_record(&sk, "ed25519:late", 1_000, None),
+            key_record(&sk, "ed25519:live", 5_000, None),
+        ]);
+        let event = signed_event(3_000, &[("ed25519:late", &sk), ("ed25519:live", &sk)]);
+        assert!(matches!(
+            keys.verify(&event, "10"),
+            SignatureOutcome::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn signature_rejections_are_included_in_the_rejection_tally() {
+        let (signer, registered) = (signing_key(1), signing_key(2));
+        let event = signed_event(1_000, &[("ed25519:a", &signer)]);
+        let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, None)]);
+        let mut findings = AuthFindings {
+            forced: vec![None],
+            ..AuthFindings::default()
+        };
+        let outcome = keys.verify(&event, "10");
+        apply_signature_outcomes(
+            &mut findings,
+            std::slice::from_ref(&event),
+            vec![outcome],
+            &keys,
+            "!r:origin.example",
+            "10",
+        );
+        refresh_rejection_counts(&mut findings);
+
+        assert_eq!(
+            findings
+                .rejection_counts
+                .get(&RejectionCode::SignatureVerificationFailed.to_u8()),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn a_retired_key_past_its_cached_deadline_verifies_late_until_expiry() {
+        let sk = signing_key(1);
+        let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, Some(5_000))]);
+        let outcome = keys.verify(&signed_event(3_000, &[("ed25519:a", &sk)]), "10");
+        assert!(
+            matches!(outcome, SignatureOutcome::VerifiedLate),
+            "the cached deadline is not the retired key's signing boundary"
+        );
+    }
+
+    #[test]
+    fn a_retired_key_before_both_timestamps_verifies_in_window() {
+        let sk = signing_key(1);
+        let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, Some(5_000))]);
+        let outcome = keys.verify(&signed_event(1_000, &[("ed25519:a", &sk)]), "10");
+        assert!(matches!(outcome, SignatureOutcome::Verified(_)));
+    }
+
+    #[test]
+    fn a_retired_key_has_no_signature_at_or_after_its_expiry() {
+        let sk = signing_key(1);
+        let keys = catalog(&[key_record(&sk, "ed25519:a", 9_000, Some(5_000))]);
+        for ts in [5_000, 6_000] {
+            let outcome = keys.verify(&signed_event(ts, &[("ed25519:a", &sk)]), "10");
+            assert!(matches!(outcome, SignatureOutcome::NoKey), "ts {ts}");
+        }
+    }
+
+    #[test]
+    fn late_events_reach_the_late_sidecar_and_not_the_failure_one() {
+        let sk = signing_key(1);
+        let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, None)]);
+        let events = vec![signed_event(3_000, &[("ed25519:a", &sk)])];
+        let mut findings = AuthFindings {
+            forced: vec![None; events.len()],
+            hash_audit: vec![HashAudit {
+                event_id: events[0].event_id.clone(),
+                room_id: "!r:origin.example".to_owned(),
+                room_version: "10".to_owned(),
+                stored: "stored".to_owned(),
+                computed: "computed".to_owned(),
+                content_matches_redaction: false,
+                signature_status: None,
+            }],
+            ..AuthFindings::default()
+        };
+        let outcomes = vec![SignatureOutcome::VerifiedLate];
+        apply_signature_outcomes(
+            &mut findings,
+            &events,
+            outcomes,
+            &keys,
+            "!r:origin.example",
+            "10",
+        );
+        assert_eq!(findings.signature_verified_late, 1);
+        assert_eq!(findings.signature_late.len(), 1);
+        assert_eq!(findings.signature_late[0].outcome, "verified_late");
+        assert!(findings.signature_audit.is_empty());
+        assert_eq!(findings.hash_audit[0].signature_status, Some("verified_late"));
+        assert!(findings.verified_keys.is_empty(), "late events do not corroborate");
     }
 }

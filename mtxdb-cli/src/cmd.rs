@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context};
 
 use mtxdb::auxiliary::AuxiliaryIndex;
+use mtxdb::export_schema::RejectionCode;
 use mtxdb::matrix_adjacency::EventRecord;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
@@ -8098,6 +8099,27 @@ fn cmd_import(
             signature_audit_path.display()
         );
     }
+    let signature_late_path = layout.root().join("signature-late.jsonl");
+    if let Err(error) = write_signature_audit(&signature_late_path, &run.signature_late) {
+        eprintln!("writing {}: {error:#}", signature_late_path.display());
+        run.failures = run.failures.saturating_add(1);
+        run.all_exports = false;
+    } else {
+        eprintln!(
+            "signature late: {} events verified after their key's cached valid_until_ts; details in {}",
+            run.signature_late.len(),
+            signature_late_path.display()
+        );
+    }
+    let rejected_total = run
+        .rejection_counts
+        .values()
+        .copied()
+        .fold(0_usize, usize::saturating_add);
+    eprintln!("derived rejections: {rejected_total} events");
+    for (code, count) in run.rejection_counts.iter().filter(|(_, count)| **count > 0) {
+        eprintln!("  {count:>8}  {}", RejectionCode::from_u8(*code).tag());
+    }
     let (failures, server_keys_imported) = (run.failures, run.server_keys);
     store
         .sync_all()
@@ -8153,12 +8175,19 @@ struct ImportRun {
     imported_key_bindings: HashSet<export_import::KeyBinding>,
     /// Verified time ranges observed across this run's room files.
     verified_keys: HashMap<export_import::KeyBinding, (u64, u64)>,
+    /// Events that verified after their key's cached deadline, written as a
+    /// separate JSONL sidecar.
+    signature_late: Vec<export_import::SignatureAudit>,
+    /// Derived rejections by stored rejection code, across the run.
+    rejection_counts: std::collections::BTreeMap<u8, usize>,
     /// Events with no usable in-window key for their signer.
     signature_no_key: usize,
     /// Events without the material needed to attempt signature verification.
     signature_no_material: usize,
     /// Events rejected because a usable key had a bad signature.
     signature_invalid: usize,
+    /// Events that verified after their key's cached `valid_until_ts`.
+    signature_verified_late: usize,
 }
 
 fn absorb_outcome(run: &mut ImportRun, outcome: ImportOutcome) {
@@ -8172,6 +8201,11 @@ fn absorb_outcome(run: &mut ImportRun, outcome: ImportOutcome) {
     }
     run.hash_audit.extend(outcome.hash_audit);
     run.signature_audit.extend(outcome.signature_audit);
+    run.signature_late.extend(outcome.signature_late);
+    for (code, count) in outcome.rejection_counts {
+        let total = run.rejection_counts.entry(code).or_insert(0);
+        *total = total.saturating_add(count);
+    }
     run.signature_no_key = run
         .signature_no_key
         .saturating_add(outcome.signature_no_key);
@@ -8181,6 +8215,9 @@ fn absorb_outcome(run: &mut ImportRun, outcome: ImportOutcome) {
     run.signature_invalid = run
         .signature_invalid
         .saturating_add(outcome.signature_invalid);
+    run.signature_verified_late = run
+        .signature_verified_late
+        .saturating_add(outcome.signature_verified_late);
     run.imported_key_bindings.extend(outcome.key_bindings);
     for observation in outcome.verified_keys {
         run.verified_keys
@@ -8319,6 +8356,9 @@ fn import_data(
         signature_no_key: 0,
         signature_no_material: 0,
         signature_invalid: 0,
+        signature_verified_late: 0,
+        signature_late: Vec::new(),
+        rejection_counts: std::collections::BTreeMap::new(),
     };
     let mut key_state_checked = false;
     let mut key_import_failed = false;
@@ -8452,10 +8492,11 @@ fn finish_import(db: &Database, run: &ImportRun) -> anyhow::Result<()> {
         .filter(|binding| run.imported_key_bindings.contains(*binding))
         .count();
     eprintln!(
-        "signature checks: {} events with no in-window key; {} without signature material; {} invalid signatures; {} of {} keys corroborated",
+        "signature checks: {} events with no usable key; {} without signature material; {} invalid signatures; {} verified late (past their key's cached valid_until_ts); {} of {} keys corroborated",
         run.signature_no_key,
         run.signature_no_material,
         run.signature_invalid,
+        run.signature_verified_late,
         corroborated,
         run.imported_key_bindings.len()
     );
@@ -9390,12 +9431,18 @@ struct ImportOutcome {
     key_bindings: Vec<export_import::KeyBinding>,
     /// Verified key observations found in this input's room export.
     verified_keys: Vec<export_import::VerifiedKeyObservation>,
+    /// Events that verified after their key's cached deadline.
+    signature_late: Vec<export_import::SignatureAudit>,
+    /// Derived rejections by stored rejection code, from this input.
+    rejection_counts: std::collections::BTreeMap<u8, usize>,
     /// Events with no usable in-window key for their signer.
     signature_no_key: usize,
     /// Events without the material needed to attempt signature verification.
     signature_no_material: usize,
     /// Events rejected because a usable key had a bad signature.
     signature_invalid: usize,
+    /// Events that verified after their key's cached `valid_until_ts`.
+    signature_verified_late: usize,
 }
 
 /// Import one input file through the state the batch shares with its readers.
@@ -9717,6 +9764,9 @@ impl ImportContext<'_> {
             signature_no_key: findings.signature_no_key,
             signature_no_material: findings.signature_no_material,
             signature_invalid: findings.signature_failures.len(),
+            signature_verified_late: findings.signature_verified_late,
+            signature_late: findings.signature_late,
+            rejection_counts: findings.rejection_counts,
             ..ImportOutcome::default()
         })
     }
