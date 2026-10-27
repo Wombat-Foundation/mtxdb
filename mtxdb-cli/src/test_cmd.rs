@@ -4813,9 +4813,7 @@ fn room_export_with_auth() -> String {
     const JOIN: &str = "$join:test.conduwuit.local";
 
     let join = format!(
-        r##"{{"auth_events":["{create}"],"event_id":"{join}","outlier":false,"prev_events":[],"pdu":{{"auth_events":["{create}"],"content":{{"membership":"join"}},"depth":1,"event_id":"{join}","origin_server_ts":123456789,"prev_events":[],"room_id":"!export:test.conduwuit.local","sender":"@alice:test.conduwuit.local","state_key":"@alice:test.conduwuit.local","type":"m.room.member"}},"rejected":false,"soft_failed":false,"t":"event"}}"##,
-        create = CREATE,
-        join = JOIN,
+        r#"{{"auth_events":["{CREATE}"],"event_id":"{JOIN}","outlier":false,"prev_events":[],"pdu":{{"auth_events":["{CREATE}"],"content":{{"membership":"join"}},"depth":1,"event_id":"{JOIN}","origin_server_ts":123456789,"prev_events":[],"room_id":"!export:test.conduwuit.local","sender":"@alice:test.conduwuit.local","state_key":"@alice:test.conduwuit.local","type":"m.room.member"}},"rejected":false,"soft_failed":false,"t":"event"}}"#,
     );
 
     let mut lines = Vec::new();

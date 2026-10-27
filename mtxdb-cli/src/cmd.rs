@@ -4011,7 +4011,7 @@ fn json_string_raw(text: &str) -> String {
 }
 
 /// A JSON string value including surrounding quotes.
-fn json_string(text: &str) -> String {
+pub(crate) fn json_string(text: &str) -> String {
     json_string_raw(text)
 }
 
@@ -8060,7 +8060,7 @@ fn cmd_import(
     // State-group mappings belong in the State pool, not the event pool.
     let state_store: &PackfileStorage = db.pool(ShardType::State);
     state_store.set_read_plan_policy(cli.read_plan);
-    let run = import_data(
+    let mut run = import_data(
         &db,
         store,
         state_store,
@@ -8069,6 +8069,18 @@ fn cmd_import(
         &import_template,
         &mut established_collections,
     );
+    let hash_audit_path = layout.root().join("content-hash-mismatches.jsonl");
+    if let Err(error) = write_hash_audit(&hash_audit_path, &run.hash_audit) {
+        eprintln!("writing {}: {error:#}", hash_audit_path.display());
+        run.failures = run.failures.saturating_add(1);
+        run.all_exports = false;
+    } else {
+        eprintln!(
+            "content-hash audit: {} rows in {}",
+            run.hash_audit.len(),
+            hash_audit_path.display()
+        );
+    }
     let (failures, server_keys_imported) = (run.failures, run.server_keys);
     store
         .sync_all()
@@ -8113,6 +8125,23 @@ struct ImportRun {
     /// Whether usable signing-key bytes were present after key inputs were
     /// processed, including keys already stored by an earlier import.
     signature_keys_available: bool,
+    /// Content-hash mismatches captured with the same redaction used to store
+    /// each event and written as a JSONL sidecar after the input pass.
+    hash_audit: Vec<export_import::HashAudit>,
+}
+
+/// Replace the run's content-hash audit sidecar, including an empty file when
+/// this run had no computable mismatches so stale rows cannot survive.
+fn write_hash_audit(path: &Path, rows: &[export_import::HashAudit]) -> anyhow::Result<()> {
+    let file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for row in rows {
+        writeln!(writer, "{}", row.json_line())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("flushing {}", path.display()))
 }
 
 /// `paths` with every server-keys export first, the rest after them, each
@@ -8195,6 +8224,7 @@ fn import_data(
         exported_closures: 0,
         all_exports: !paths.is_empty() && marker_cleared.is_ok(),
         signature_keys_available: false,
+        hash_audit: Vec::new(),
     };
     let mut key_state_checked = false;
     for (index, path) in keys_first(paths).into_iter().enumerate() {
@@ -8228,6 +8258,7 @@ fn import_data(
         ) {
             Ok(outcome) => {
                 run.server_keys = run.server_keys || outcome.server_keys;
+                run.hash_audit.extend(outcome.hash_audit);
                 match outcome.exported {
                     Some(counts) => {
                         run.exported_events = run.exported_events.saturating_add(counts.events);
@@ -8832,7 +8863,7 @@ fn export_envelope_line(
 
 /// Compact, single-line JSON object from pre-rendered fields. Keys are static
 /// ASCII literals, so only the values need escaping (done by the callers).
-fn json_compact_object(fields: &[(&str, String)]) -> String {
+pub(crate) fn json_compact_object(fields: &[(&str, String)]) -> String {
     let mut out = String::from("{");
     for (index, (key, value)) in fields.iter().enumerate() {
         if index > 0 {
@@ -9188,6 +9219,8 @@ struct ImportOutcome {
     /// holds the event records it wrote (zero for a keys export). Only a run
     /// whose every input did this can be vouched for by the marker.
     exported: Option<export_import::ImportCounts>,
+    /// Content-hash mismatches from the room export, if this was one.
+    hash_audit: Vec<export_import::HashAudit>,
 }
 
 /// Import one input file through the state the batch shares with its readers.
@@ -9260,12 +9293,13 @@ impl ImportContext<'_> {
             interchange::InputFormat::Room => {
                 let export = interchange::parse_room(content)
                     .with_context(|| format!("reading {}", path.display()))?;
-                let events = self
+                let (events, hash_audit) = self
                     .import_room_export(&export, collection_override)
                     .with_context(|| format!("importing {}", path.display()))?;
                 Ok(ImportOutcome {
                     server_keys: false,
                     exported: Some(events),
+                    hash_audit,
                 })
             }
             interchange::InputFormat::Keys => {
@@ -9275,6 +9309,7 @@ impl ImportContext<'_> {
                 Ok(ImportOutcome {
                     server_keys: true,
                     exported: Some(export_import::ImportCounts::default()),
+                    hash_audit: Vec::new(),
                 })
             }
         }
@@ -9439,7 +9474,7 @@ impl ImportContext<'_> {
         &mut self,
         export: &RoomExport,
         collection_override: Option<&str>,
-    ) -> anyhow::Result<export_import::ImportCounts> {
+    ) -> anyhow::Result<(export_import::ImportCounts, Vec<export_import::HashAudit>)> {
         if collection_override.is_some() {
             bail!("--collection does not apply to an mtxdb export: the server's layout derives the room's collections itself");
         }
@@ -9473,7 +9508,7 @@ impl ImportContext<'_> {
             eprintln!("  warning: {warning}");
         }
         eprintln!("  exported by {}", export.server);
-        Ok(written)
+        Ok((written, findings.hash_audit))
     }
 
     /// Import one `server_keys` export into the server-info pool, in the

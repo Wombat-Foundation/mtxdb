@@ -43,9 +43,10 @@
 //!   payload is stored beside them, byte for byte: re-encoding it would
 //!   invalidate its signature.
 //!
-//! The exported `pdu` bytes are stored exactly as written: redacting them again
-//! would lose whatever the source already redacted, and re-encoding the parsed
-//! JSON would not promise the same bytes back.
+//! The exported `pdu` bytes are retained as provenance. On a computed content
+//! hash mismatch, the importer stores the canonical redacted PDU instead, as
+//! required by Matrix event validation; all other PDUs keep their exported
+//! bytes.
 
 use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;

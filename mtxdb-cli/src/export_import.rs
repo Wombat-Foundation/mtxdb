@@ -306,6 +306,8 @@ pub(crate) struct AuthFindings {
     /// The redacted PDU to store for each event, by position in the export,
     /// when its content hash does not match. The export keeps the original.
     redacted_pdus: Vec<Option<Vec<u8>>>,
+    /// One audit record per hash-mismatched event.
+    pub(crate) hash_audit: Vec<HashAudit>,
 }
 
 /// An accepted event the first auth check refuted, and why.
@@ -512,7 +514,7 @@ fn create_room_version(events: &[RoomEvent]) -> Option<&str> {
 /// rejected for the mismatch. `None` when the hash matches, and when the hash
 /// cannot be judged: no `hashes.sha256`, a hash that cannot be computed, or a
 /// redaction that cannot be produced. Those events are checked as they are.
-fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<(OwnedValue, Vec<u8>)> {
+fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<HashMismatch> {
     let expected = pdu
         .get("hashes")
         .and_then(|hashes| hashes.get("sha256"))
@@ -525,7 +527,53 @@ fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<(OwnedValue
     }
     let redacted = rezzy::try_canonical_redacted_json(pdu, room_version).ok()?;
     let value = OwnedValue::parse_bytes(redacted.as_bytes()).ok()?;
-    Some((value, redacted.into_bytes()))
+    // Record whether canonical redaction leaves the PDU's content unchanged.
+    let content_matches_redaction = pdu.get("content") == value.get("content");
+    Some(HashMismatch {
+        value,
+        bytes: redacted.into_bytes(),
+        stored: expected.to_owned(),
+        computed,
+        content_matches_redaction,
+    })
+}
+
+/// An event whose content hash failed, and its canonical redaction.
+struct HashMismatch {
+    value: OwnedValue,
+    bytes: Vec<u8>,
+    stored: String,
+    computed: String,
+    /// Whether canonical redaction left the PDU's content unchanged.
+    content_matches_redaction: bool,
+}
+
+/// Audit record for one hash-mismatched event, written to a JSONL sidecar.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct HashAudit {
+    pub(crate) event_id: String,
+    pub(crate) room_id: String,
+    pub(crate) room_version: String,
+    pub(crate) stored: String,
+    pub(crate) computed: String,
+    pub(crate) content_matches_redaction: bool,
+}
+
+impl HashAudit {
+    /// Serialize one row with the CLI's JSON string escaping.
+    pub(crate) fn json_line(&self) -> String {
+        crate::cmd::json_compact_object(&[
+            ("event_id", crate::cmd::json_string(&self.event_id)),
+            ("room_id", crate::cmd::json_string(&self.room_id)),
+            ("stored_hash", crate::cmd::json_string(&self.stored)),
+            ("computed_hash", crate::cmd::json_string(&self.computed)),
+            (
+                "content_matches_redaction",
+                self.content_matches_redaction.to_string(),
+            ),
+            ("room_version", crate::cmd::json_string(&self.room_version)),
+        ])
+    }
 }
 
 /// [`auth_findings`] with the rejections derived from the events, not read
@@ -634,7 +682,7 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .map(|(position, event)| (event.event_id.as_bytes(), position))
         .collect();
     // An event whose content hash fails is judged in its redacted form.
-    let redacted: Vec<Option<(OwnedValue, Vec<u8>)>> = events
+    let redacted: Vec<Option<HashMismatch>> = events
         .iter()
         .map(|event| redacted_for_hash(&event.pdu, room_version))
         .collect();
@@ -643,7 +691,7 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .zip(&redacted)
         .map(|(event, redacted)| {
             let value = match redacted {
-                Some((pdu, _)) => event.unflagged_from(pdu, &export.room_id),
+                Some(mismatch) => event.unflagged_from(&mismatch.value, &export.room_id),
                 None => event.unflagged(&export.room_id),
             };
             lean_event(&value, &event.event_id)
@@ -691,9 +739,23 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .filter(|(_, redacted)| redacted.is_some())
         .map(|(event, _)| event.event_id.clone())
         .collect();
+    findings.hash_audit = events
+        .iter()
+        .zip(&redacted)
+        .filter_map(|(event, mismatch)| {
+            mismatch.as_ref().map(|m| HashAudit {
+                event_id: event.event_id.clone(),
+                room_id: export.room_id.clone(),
+                room_version: room_version.to_owned(),
+                stored: m.stored.clone(),
+                computed: m.computed.clone(),
+                content_matches_redaction: m.content_matches_redaction,
+            })
+        })
+        .collect();
     findings.redacted_pdus = redacted
         .into_iter()
-        .map(|redacted| redacted.map(|(_, bytes)| bytes))
+        .map(|redacted| redacted.map(|m| m.bytes))
         .collect();
     for (position, event) in events.iter().enumerate() {
         if !checked[position] {
@@ -1510,6 +1572,12 @@ mod auth_findings_tests {
         let create_pdu = create.pdu.clone();
         let findings = derived_auth_findings(&export(vec![create])).unwrap();
         assert_eq!(findings.hash_mismatched, ["$create"]);
+        let audit = &findings.hash_audit[0];
+        assert_eq!(audit.event_id, "$create");
+        assert_eq!(audit.stored, "not-the-hash");
+        assert_ne!(audit.computed, audit.stored);
+        assert!(audit.json_line().starts_with('{'));
+        assert!(audit.json_line().ends_with('}'));
         let expected = rezzy::try_canonical_redacted_json(&create_pdu, "10").unwrap();
         assert_eq!(
             findings.redacted_pdus[0].as_deref(),
@@ -1518,6 +1586,61 @@ mod auth_findings_tests {
         );
         assert_eq!(forced(&findings, 0), None, "a bad hash is not a rejection");
         assert!(findings.warnings().iter().any(|line| line.contains("hash")));
+    }
+
+    #[test]
+    fn the_audit_distinguishes_already_redacted_content() {
+        let create = with_hash(event("$create", M_ROOM_CREATE, &[], &[]), None);
+        let mut join = with_hash(
+            event("$join", "m.room.member", &[], &["$create"]),
+            Some("bad"),
+        );
+        let mut message = with_hash(
+            event("$msg", "m.room.message", &[], &["$create"]),
+            Some("bad"),
+        );
+        for event in [&mut join, &mut message] {
+            if let OwnedValue::Object(fields) = &mut event.pdu {
+                fields.insert(
+                    "sender".to_owned(),
+                    OwnedValue::String("@alice:example.org".to_owned()),
+                );
+            }
+        }
+        if let OwnedValue::Object(fields) = &mut join.pdu {
+            fields.insert(
+                "state_key".to_owned(),
+                OwnedValue::String("@alice:example.org".to_owned()),
+            );
+            let mut content = std::collections::BTreeMap::new();
+            content.insert(
+                "membership".to_owned(),
+                OwnedValue::String("join".to_owned()),
+            );
+            fields.insert("content".to_owned(), OwnedValue::Object(content));
+        }
+        if let OwnedValue::Object(fields) = &mut message.pdu {
+            let mut content = std::collections::BTreeMap::new();
+            content.insert("body".to_owned(), OwnedValue::String("hi".to_owned()));
+            fields.insert("content".to_owned(), OwnedValue::Object(content));
+        }
+
+        let findings = derived_auth_findings(&export(vec![create, join, message])).unwrap();
+        let audit = |id: &str| {
+            findings
+                .hash_audit
+                .iter()
+                .find(|audit| audit.event_id == id)
+                .expect("audit row")
+        };
+        assert!(audit("$join").content_matches_redaction);
+        assert!(audit("$join")
+            .json_line()
+            .contains("\"content_matches_redaction\":true"));
+        assert!(!audit("$msg").content_matches_redaction);
+        assert!(audit("$msg")
+            .json_line()
+            .contains("\"content_matches_redaction\":false"));
     }
 
     #[test]
