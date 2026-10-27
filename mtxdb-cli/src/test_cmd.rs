@@ -1970,7 +1970,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         None,
         &template,
         &mut established,
-        None,
+        false,
     )
     .unwrap();
     let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
@@ -1984,7 +1984,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         None,
         &template,
         &mut established,
-        None,
+        false,
     )
     .unwrap();
 
@@ -2039,7 +2039,7 @@ fn import_establishment_persists_the_matrix_extension() {
         None,
         &template,
         &mut established,
-        None,
+        false,
     )
     .unwrap();
 
@@ -2407,7 +2407,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         None,
         &template,
         &mut established,
-        None,
+        false,
     )
     .unwrap();
 
@@ -2442,7 +2442,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         None,
         &template,
         &mut established,
-        None,
+        false,
     )
     .unwrap();
 
@@ -2479,7 +2479,7 @@ fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         None,
         &template,
         &mut established,
-        None,
+        false,
     )
     .unwrap();
 
@@ -3333,7 +3333,7 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
         None,
         &template,
         &mut established,
-        None,
+        false,
     )
     .unwrap();
     db.edges().sync_all().unwrap();

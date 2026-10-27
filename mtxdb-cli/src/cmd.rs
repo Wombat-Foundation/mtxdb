@@ -8279,21 +8279,34 @@ fn import_data(
     };
     let mut key_state_checked = false;
     let mut key_import_failed = false;
-    let mut signature_catalog = None;
+    let mut signature_checks_enabled = false;
     for (index, path) in keys_first(paths).into_iter().enumerate() {
         if index != 0 {
             eprintln!();
         }
         if !key_state_checked && input_export_format(path) == Some(interchange::InputFormat::Room) {
             key_state_checked = true;
-            match has_signing_key_material(db.server_info()) {
-                Ok(available) => run.signature_keys_available = available,
-                Err(error) => {
+            let mut key_pool_ready = true;
+            if run.server_keys {
+                if let Err(error) = db.pool(ShardType::ServerInfo).sync_all() {
                     eprintln!(
-                        "signature checks off: unable to inspect the signing-key store: {error:#}"
+                        "signature checks off: unable to persist imported signing keys: {error:#}"
                     );
                     run.failures = run.failures.saturating_add(1);
                     run.all_exports = false;
+                    key_pool_ready = false;
+                }
+            }
+            if key_pool_ready {
+                match has_signing_key_material(db.server_info()) {
+                    Ok(available) => run.signature_keys_available = available,
+                    Err(error) => {
+                        eprintln!(
+                            "signature checks off: unable to inspect the signing-key store: {error:#}"
+                        );
+                        run.failures = run.failures.saturating_add(1);
+                        run.all_exports = false;
+                    }
                 }
             }
             if key_import_failed {
@@ -8301,16 +8314,8 @@ fn import_data(
             } else if !run.signature_keys_available {
                 eprintln!("signature checks off: no signing keys loaded");
             }
-            if run.signature_keys_available && !key_import_failed {
-                match export_import::SignatureKeyCatalog::read(db.server_info()) {
-                    Ok(catalog) => signature_catalog = Some(catalog),
-                    Err(error) => {
-                        eprintln!("signature checks off: unable to read signing keys: {error:#}");
-                        run.failures = run.failures.saturating_add(1);
-                        run.all_exports = false;
-                    }
-                }
-            }
+            signature_checks_enabled =
+                key_pool_ready && run.signature_keys_available && !key_import_failed;
         }
         let is_keys_input = input_export_format(path) == Some(interchange::InputFormat::Keys);
         match cmd_import_file(
@@ -8321,7 +8326,7 @@ fn import_data(
             collection_override,
             template,
             established_collections,
-            signature_catalog.as_ref(),
+            signature_checks_enabled,
         ) {
             Ok(outcome) => absorb_outcome(&mut run, outcome),
             Err(error) => {
@@ -9345,7 +9350,7 @@ fn cmd_import_file(
     collection_override: Option<&str>,
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
-    signature_keys: Option<&export_import::SignatureKeyCatalog>,
+    signature_checks_enabled: bool,
 ) -> anyhow::Result<ImportOutcome> {
     let mut context = ImportContext {
         db,
@@ -9353,7 +9358,7 @@ fn cmd_import_file(
         state_store,
         template,
         established_collections,
-        signature_keys,
+        signature_checks_enabled,
     };
     context.import(path, collection_override)
 }
@@ -9371,7 +9376,7 @@ struct ImportContext<'a> {
     state_store: &'a PackfileStorage,
     template: &'a CollectionTemplate,
     established_collections: &'a mut HashSet<[u8; 16]>,
-    signature_keys: Option<&'a export_import::SignatureKeyCatalog>,
+    signature_checks_enabled: bool,
 }
 
 impl ImportContext<'_> {
@@ -9409,7 +9414,20 @@ impl ImportContext<'_> {
             interchange::InputFormat::Room => {
                 let export = interchange::parse_room(content)
                     .with_context(|| format!("reading {}", path.display()))?;
-                self.import_room_export(&export, collection_override)
+                let signature_catalog = if self.signature_checks_enabled {
+                    Some(
+                        export_import::SignatureKeyCatalog::read_for_room(
+                            self.db.server_info(),
+                            &export,
+                        )
+                        .with_context(|| {
+                            format!("reading signing keys needed by {}", export.room_id)
+                        })?,
+                    )
+                } else {
+                    None
+                };
+                self.import_room_export(&export, collection_override, signature_catalog.as_ref())
                     .with_context(|| format!("importing {}", path.display()))
             }
             interchange::InputFormat::Keys => {
@@ -9586,6 +9604,7 @@ impl ImportContext<'_> {
         &mut self,
         export: &RoomExport,
         collection_override: Option<&str>,
+        signature_keys: Option<&export_import::SignatureKeyCatalog>,
     ) -> anyhow::Result<ImportOutcome> {
         if collection_override.is_some() {
             bail!("--collection does not apply to an mtxdb export: the server's layout derives the room's collections itself");
@@ -9610,7 +9629,7 @@ impl ImportContext<'_> {
             self.db,
             export,
             export_import::BATCH_BYTES,
-            self.signature_keys,
+            signature_keys,
         )?;
         eprintln!(
             "  {}",

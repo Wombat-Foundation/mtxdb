@@ -13,7 +13,7 @@
 //! marker is committed last, in a transaction of its own. A run that stops
 //! anywhere earlier leaves the database visibly incomplete.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context};
 use mtxdb::export_schema::RejectionCode;
@@ -349,29 +349,25 @@ pub(crate) struct SignatureKeyCatalog {
 }
 
 impl SignatureKeyCatalog {
-    pub(crate) fn read(store: &PackfileStorage) -> anyhow::Result<Self> {
+    pub(crate) fn read_for_room(
+        store: &PackfileStorage,
+        export: &RoomExport,
+    ) -> anyhow::Result<Self> {
         let mut catalog = Self::default();
-        for (collection, entries, _, _) in store.collection_summaries() {
-            if entries == 0 {
-                continue;
-            }
-            for item in store.scan_collection(&collection)? {
-                let (node_id, data) = item?;
-                let Ok((origin, key)) = server_keys::decode_server_key_record(&data.bytes) else {
-                    continue;
-                };
-                if server_keys::origin_keys_collection_id(&origin) != collection
-                    || server_keys::origin_key_record_id(&key.key_id) != node_id
-                {
-                    continue;
-                }
+        let Some(room_version) = create_room_version(&export.events) else {
+            return Ok(catalog);
+        };
+        let origins: HashSet<_> = export
+            .events
+            .iter()
+            .filter_map(|event| event_origin(&event.pdu, room_version))
+            .collect();
+        for origin in origins {
+            for key in server_keys::read_server_keys(store, origin.as_bytes())? {
                 catalog.records.insert(
-                    (
-                        String::from_utf8_lossy(&origin).to_ascii_lowercase(),
-                        key.key_id.clone(),
-                    ),
+                    (origin.to_ascii_lowercase(), key.key_id.clone()),
                     VerificationKeyRecord {
-                        origin: String::from_utf8_lossy(&origin).into_owned(),
+                        origin: origin.to_owned(),
                         parsed_key: VerificationKey::try_from(key.key.as_slice()).ok(),
                         key,
                     },
