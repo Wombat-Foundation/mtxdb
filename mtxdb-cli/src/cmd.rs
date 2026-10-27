@@ -8086,6 +8086,18 @@ fn cmd_import(
             hash_audit_path.display()
         );
     }
+    let signature_audit_path = layout.root().join("signature-findings.jsonl");
+    if let Err(error) = write_signature_audit(&signature_audit_path, &run.signature_audit) {
+        eprintln!("writing {}: {error:#}", signature_audit_path.display());
+        run.failures = run.failures.saturating_add(1);
+        run.all_exports = false;
+    } else {
+        eprintln!(
+            "signature audit: {} events did not verify; details in {}",
+            run.signature_audit.len(),
+            signature_audit_path.display()
+        );
+    }
     let (failures, server_keys_imported) = (run.failures, run.server_keys);
     store
         .sync_all()
@@ -8135,6 +8147,8 @@ struct ImportRun {
     /// Content-hash mismatches captured with the same redaction used to store
     /// each event and written as a JSONL sidecar after the input pass.
     hash_audit: Vec<export_import::HashAudit>,
+    /// Events whose signature did not verify, written as a JSONL sidecar.
+    signature_audit: Vec<export_import::SignatureAudit>,
     /// Newly imported bindings whose candidate timestamps must be reconciled.
     imported_key_bindings: HashSet<export_import::KeyBinding>,
     /// Verified time ranges observed across this run's room files.
@@ -8157,6 +8171,7 @@ fn absorb_outcome(run: &mut ImportRun, outcome: ImportOutcome) {
         }
     }
     run.hash_audit.extend(outcome.hash_audit);
+    run.signature_audit.extend(outcome.signature_audit);
     run.signature_no_key = run
         .signature_no_key
         .saturating_add(outcome.signature_no_key);
@@ -8188,6 +8203,23 @@ fn absorb_outcome(run: &mut ImportRun, outcome: ImportOutcome) {
 /// Replace the run's content-hash audit sidecar, including an empty file when
 /// this run had no computable mismatches so stale rows cannot survive.
 fn write_hash_audit(path: &Path, rows: &[export_import::HashAudit]) -> anyhow::Result<()> {
+    let file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for row in rows {
+        writeln!(writer, "{}", row.json_line())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("flushing {}", path.display()))
+}
+
+/// Replace the run's signature sidecar, including an empty file when every
+/// event verified so stale rows cannot survive.
+fn write_signature_audit(
+    path: &Path,
+    rows: &[export_import::SignatureAudit],
+) -> anyhow::Result<()> {
     let file = fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     for row in rows {
@@ -8281,6 +8313,7 @@ fn import_data(
         signature_keys_available: false,
         signature_catalog: None,
         hash_audit: Vec::new(),
+        signature_audit: Vec::new(),
         imported_key_bindings: HashSet::new(),
         verified_keys: HashMap::new(),
         signature_no_key: 0,
@@ -9342,7 +9375,7 @@ struct ImportOutcome {
     /// default sync set.
     server_keys: bool,
     /// Parsed key records, retained so each room can verify without scanning
-    /// the live ServerInfo pool during journal reclamation.
+    /// the live `ServerInfo` pool during journal reclamation.
     signature_catalog: Option<export_import::SignatureKeyCatalog>,
     /// The input was an `mtxdb-export` file, written in the server's layout;
     /// holds the event records it wrote (zero for a keys export). Only a run
@@ -9350,6 +9383,8 @@ struct ImportOutcome {
     exported: Option<export_import::ImportCounts>,
     /// Content-hash mismatches from the room export, if this was one.
     hash_audit: Vec<export_import::HashAudit>,
+    /// Events whose signature did not verify, from the room export.
+    signature_audit: Vec<export_import::SignatureAudit>,
     /// Key bindings written by this input, whose candidate observation times
     /// must be replaced by verified observations after all rooms are read.
     key_bindings: Vec<export_import::KeyBinding>,
@@ -9677,6 +9712,7 @@ impl ImportContext<'_> {
             server_keys: false,
             exported: Some(written),
             hash_audit: findings.hash_audit,
+            signature_audit: findings.signature_audit,
             verified_keys: findings.verified_keys,
             signature_no_key: findings.signature_no_key,
             signature_no_material: findings.signature_no_material,

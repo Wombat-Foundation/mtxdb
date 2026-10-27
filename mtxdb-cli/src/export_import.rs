@@ -316,6 +316,8 @@ pub(crate) struct AuthFindings {
     pub(crate) verified_keys: Vec<VerifiedKeyObservation>,
     /// Events rejected because a usable, in-window origin key had a bad signature.
     pub(crate) signature_failures: Vec<AuthFailure>,
+    /// One record per event whose signature did not verify, whatever the reason.
+    pub(crate) signature_audit: Vec<SignatureAudit>,
     /// Events with no in-window origin key for the signer.
     pub(crate) signature_no_key: usize,
     /// Events without the origin, timestamp, or signature material to check.
@@ -481,6 +483,53 @@ impl SignatureKeyCatalog {
             return SignatureOutcome::NoMaterial;
         }
         SignatureOutcome::Invalid(last_error)
+    }
+
+    /// Why each of the origin's signature keys was or was not usable for the
+    /// event, one line per key.
+    fn explain(&self, event: &RoomEvent, room_version: &str) -> Vec<String> {
+        let Some(origin) = event_origin(&event.pdu, room_version) else {
+            return vec!["no origin server".to_owned()];
+        };
+        let timestamp = event
+            .pdu
+            .get("origin_server_ts")
+            .and_then(OwnedValue::as_u64);
+        let Some(origin_signatures) = event
+            .pdu
+            .get("signatures")
+            .and_then(OwnedValue::as_object)
+            .and_then(|signatures| signatures.get(origin))
+            .and_then(OwnedValue::as_object)
+        else {
+            return vec![format!("no signatures from {origin}")];
+        };
+        origin_signatures.keys().map(|key_id| {
+                let Some(record) = self
+                    .records
+                    .get(&(origin.to_ascii_lowercase(), key_id.as_bytes().to_vec()))
+                else {
+                    return format!("{key_id}: not in key store");
+                };
+                let key = &record.key;
+                if key.key.is_empty() {
+                    return format!("{key_id}: no key bytes");
+                }
+                match timestamp {
+                    Some(ts) if ts >= key.valid_until_ts => {
+                        format!(
+                            "{key_id}: event after valid_until_ts {}",
+                            key.valid_until_ts
+                        )
+                    }
+                    Some(ts) if key.expired_ts.is_some_and(|expired| ts >= expired) => format!(
+                        "{key_id}: event after expired_ts {}",
+                        key.expired_ts.unwrap_or_default()
+                    ),
+                    _ => format!("{key_id}: in window"),
+                }
+            })
+            .collect()
     }
 }
 
@@ -847,6 +896,43 @@ impl HashAudit {
     }
 }
 
+/// Audit record for one event whose signature did not verify, written to a
+/// JSONL sidecar.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SignatureAudit {
+    pub(crate) event_id: String,
+    pub(crate) room_id: String,
+    pub(crate) origin: String,
+    pub(crate) origin_server_ts: Option<u64>,
+    /// `no_usable_key`, `no_signature_material` or `invalid`.
+    pub(crate) outcome: &'static str,
+    /// The verifier's error, if any, then one line per signing key.
+    pub(crate) detail: Vec<String>,
+}
+
+impl SignatureAudit {
+    /// Serialize one row with the CLI's JSON string escaping.
+    pub(crate) fn json_line(&self) -> String {
+        let detail: Vec<String> = self
+            .detail
+            .iter()
+            .map(|line| crate::cmd::json_string(line))
+            .collect();
+        crate::cmd::json_compact_object(&[
+            ("event_id", crate::cmd::json_string(&self.event_id)),
+            ("room_id", crate::cmd::json_string(&self.room_id)),
+            ("origin", crate::cmd::json_string(&self.origin)),
+            (
+                "origin_server_ts",
+                self.origin_server_ts
+                    .map_or_else(|| "null".to_owned(), |ts| ts.to_string()),
+            ),
+            ("outcome", crate::cmd::json_string(self.outcome)),
+            ("detail", format!("[{}]", detail.join(","))),
+        ])
+    }
+}
+
 /// [`auth_findings`] with the rejections derived from the events, not read
 /// from the export.
 ///
@@ -1083,6 +1169,9 @@ fn apply_signature_outcomes(
     findings: &mut AuthFindings,
     events: &[RoomEvent],
     outcomes: Vec<SignatureOutcome>,
+    keys: &SignatureKeyCatalog,
+    room_id: &str,
+    room_version: &str,
 ) {
     let mut verified: HashMap<KeyBinding, (u64, u64)> = HashMap::new();
     let mut no_key = 0_usize;
@@ -1102,6 +1191,26 @@ fn apply_signature_outcomes(
         };
         if let Some(&audit_position) = audit_positions.get(&events[position].event_id) {
             findings.hash_audit[audit_position].signature_status = Some(status);
+        }
+        if !matches!(outcome, SignatureOutcome::Verified(_)) {
+            let event = &events[position];
+            let mut detail = keys.explain(event, room_version);
+            if let SignatureOutcome::Invalid(reason) = outcome {
+                detail.insert(0, reason.clone());
+            }
+            findings.signature_audit.push(SignatureAudit {
+                event_id: event.event_id.clone(),
+                room_id: room_id.to_owned(),
+                origin: event_origin(&event.pdu, room_version)
+                    .unwrap_or_default()
+                    .to_owned(),
+                origin_server_ts: event
+                    .pdu
+                    .get("origin_server_ts")
+                    .and_then(OwnedValue::as_u64),
+                outcome: status,
+                detail,
+            });
         }
     }
     for (position, outcome) in outcomes.into_iter().enumerate() {
@@ -1212,8 +1321,15 @@ pub(crate) fn derived_auth_findings_with_keys(
         .map(|redacted| redacted.map(|m| m.bytes))
         .collect();
     apply_judgement(&mut findings, events, &judgement, &exported);
-    if let Some(outcomes) = signature_outcomes {
-        apply_signature_outcomes(&mut findings, events, outcomes);
+    if let (Some(outcomes), Some(keys)) = (signature_outcomes, keys) {
+        apply_signature_outcomes(
+            &mut findings,
+            events,
+            outcomes,
+            keys,
+            &export.room_id,
+            room_version,
+        );
     }
     ensure_create_authorized(export, events, &findings)?;
     Ok(findings)
