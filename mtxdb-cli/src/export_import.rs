@@ -30,11 +30,12 @@ use mtxdb::interop::{
 use mtxdb::server_keys;
 use mtxdb::storage::StorageEngine as _;
 use mtxdb::{Database, NodeData};
-use rezzy::auth::{check_auth, StateProvider};
+use rezzy::auth::{check_auth, AuthError, StateProvider};
 use rezzy::basespec::event_types::M_ROOM_CREATE;
+use rezzy::basespec::rezzy_types::is_acceptable_historical_mxid;
 use rezzy::bitmap::Bitmap;
 use rezzy::json::Value as OwnedValue;
-use rezzy::{LeanEvent, StateResVersion};
+use rezzy::{EventLike, LeanEvent, StateResVersion};
 
 use crate::interchange::{EventMetadata, KeyRecord, RoomEvent, RoomExport};
 use crate::state_resolve::lean_event;
@@ -307,14 +308,22 @@ pub(crate) struct AuthFindings {
     /// Events with a `prev_events` id that is not in the export. These keep
     /// their verdicts: a gap in history is not an authorization failure.
     pub(crate) missing_prev: Vec<String>,
-    /// Events whose exported rejection the auth check overturned: the event
-    /// passes against its own auth events, so its stored verdict is clear.
-    cleared: Vec<bool>,
-    /// Events the source exported as rejected that pass the auth check, by id.
-    /// Includes ones a rejected auth event still rejects.
+    /// Events the source exported as rejected that pass the first auth check,
+    /// by id. Their rejection is kept until the state-before-event check can
+    /// decide whether the export had another reason to reject them.
     pub(crate) passes_but_exported_rejected: Vec<String>,
-    /// Events the source exported as accepted that fail the auth check, by id.
-    pub(crate) fails_but_exported_accepted: Vec<String>,
+    /// Events the source exported as accepted that fail the auth check, with
+    /// the rule that refused them.
+    pub(crate) fails_but_exported_accepted: Vec<AuthFailure>,
+}
+
+/// An accepted event the first auth check refuted, and why.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AuthFailure {
+    /// The event the source exported as accepted.
+    pub(crate) event_id: String,
+    /// Rezzy's reason for refusing it.
+    pub(crate) reason: String,
 }
 
 impl AuthFindings {
@@ -341,12 +350,7 @@ impl AuthFindings {
             (
                 self.passes_but_exported_rejected.len(),
                 &self.passes_but_exported_rejected,
-                "were exported as rejected but pass the auth check against their auth events",
-            ),
-            (
-                self.fails_but_exported_accepted.len(),
-                &self.fails_but_exported_accepted,
-                "were exported as accepted but fail the auth check against their auth events (stored as rejected)",
+                "were exported as rejected but pass the first auth check (rejection kept until the state-before-event check exists)",
             ),
         ] {
             if count == 0 {
@@ -360,6 +364,43 @@ impl AuthFindings {
                 String::new()
             };
             lines.push(format!("{count} events {what}: {}{tail}", shown.join(", ")));
+        }
+        if !self.fails_but_exported_accepted.is_empty() {
+            let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+            for failure in &self.fails_but_exported_accepted {
+                if let Some((_, ids)) = groups
+                    .iter_mut()
+                    .find(|(reason, _)| *reason == failure.reason)
+                {
+                    ids.push(&failure.event_id);
+                } else {
+                    groups.push((failure.reason.as_str(), vec![&failure.event_id]));
+                }
+            }
+            let mut shown = 0;
+            let mut parts = Vec::new();
+            for (reason, ids) in groups {
+                let take = LISTED.saturating_sub(shown).min(ids.len());
+                let listed = ids.iter().take(take).copied().collect::<Vec<_>>().join(", ");
+                let suffix = if take < ids.len() { ", ..." } else { "" };
+                parts.push(format!("{reason} ({}): {listed}{suffix}", ids.len()));
+                shown += take;
+            }
+            let more = self
+                .fails_but_exported_accepted
+                .len()
+                .saturating_sub(shown);
+            let tail = if more > 0 {
+                format!(", and {more} more")
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "{} events were exported as accepted but fail the auth check against their auth \
+                 events (stored as rejected), grouped by reason: {}{tail}",
+                self.fails_but_exported_accepted.len(),
+                parts.join("; "),
+            ));
         }
         lines
     }
@@ -390,7 +431,6 @@ fn auth_findings_seeded(
         .collect();
     let mut findings = AuthFindings {
         forced: vec![None; events.len()],
-        cleared: vec![false; events.len()],
         ..AuthFindings::default()
     };
     let mut rejected: Vec<bool> = match seeds {
@@ -462,15 +502,18 @@ impl StateProvider<String, OwnedValue, LeanEvent<String>> for AuthState<'_> {
     }
 }
 
+/// The position of the room's create event, when the export has one.
+fn create_position(events: &[RoomEvent]) -> Option<usize> {
+    events.iter().position(|event| {
+        event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE)
+            && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
+    })
+}
+
 /// The room version the create event names, when the export has one.
 fn create_room_version(events: &[RoomEvent]) -> Option<&str> {
-    events
-        .iter()
-        .find(|event| {
-            event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE)
-                && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
-        })
-        .and_then(|event| event.pdu.get("content"))
+    create_position(events)
+        .and_then(|position| events[position].pdu.get("content"))
         .and_then(|content| content.get("room_version"))
         .and_then(OwnedValue::as_str)
 }
@@ -481,28 +524,25 @@ fn create_room_version(events: &[RoomEvent]) -> Option<&str> {
 /// Each event is checked with rezzy's auth rules against the state its own
 /// `auth_events` describe (the spec's first check). The exported `rejected`
 /// flag is not an input: it is stripped before the event is built, and an
-/// exported rejection the check does not support is dropped, while an
-/// exported accept the check refutes is stored as rejected. Both
-/// disagreements are reported. The cascade through rejected auth events and
-/// the `MissingAuthEvent` forcing are unchanged.
+/// exported accept the check refutes is stored as rejected.
 ///
-/// An event the check cannot judge keeps its exported verdict: an unknown
-/// room version, a v12+ room (where `auth_events` no longer carry the create
-/// event the rules read), an auth event missing from the export, or a PDU
-/// rezzy cannot read. Soft-fail is never derived. The state before the event
-/// (the spec's second check) and signature checks are not run here.
+/// An exported rejection is not overturned here. Passing the first check does
+/// not rule out a state-before-event rejection, which this pass cannot see
+/// yet; the disagreement is reported and the exported verdict is kept so the
+/// cascade through rejected auth events stays intact. The state before the
+/// event (the spec's second check) and signature checks are not run here.
+///
+/// A v12+ event's `auth_events` no longer cite `m.room.create`, so the room's
+/// create event is added to the auth state the rules read. An event the check
+/// still cannot judge keeps its exported verdict: an unknown room version, an
+/// auth event missing from the export, or a PDU rezzy cannot read. Soft-fail
+/// is never derived.
 pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let Some(version) = create_room_version(events).and_then(StateResVersion::from_room_version)
     else {
         return auth_findings(export);
     };
-    // v12+ removes `m.room.create` from `auth_events`, so the cited events no
-    // longer describe the state the auth rules read. Until the state before
-    // each event is rebuilt, these rooms keep their exported verdicts.
-    if version.is_v2_1_plus() {
-        return auth_findings(export);
-    }
     let index: HashMap<&[u8], usize> = events
         .iter()
         .enumerate()
@@ -512,6 +552,7 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .iter()
         .map(|event| lean_event(&event.unflagged(&export.room_id), &event.event_id))
         .collect();
+    let create = create_position(events).and_then(|position| lean[position].as_ref());
     let exported: Vec<bool> = events
         .iter()
         .map(|event| exported_rejection(&event.metadata))
@@ -521,10 +562,14 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
     // the rejection code when it did and the event failed.
     let mut checked = vec![false; events.len()];
     let mut refused: Vec<Option<u8>> = vec![None; events.len()];
+    let mut refusal_reason: Vec<Option<String>> = vec![None; events.len()];
     for (position, event) in events.iter().enumerate() {
         let Some(subject) = &lean[position] else {
             continue;
         };
+        let is_create = event.pdu.get("type").and_then(OwnedValue::as_str)
+            == Some(M_ROOM_CREATE)
+            && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("");
         let mut cited = Vec::new();
         let mut complete = true;
         for auth in id_list(event, "auth_events")? {
@@ -550,24 +595,54 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
             }
             entries.push((parent.event_type.as_str(), key, parent));
         }
-        checked[position] = true;
-        refused[position] = if duplicate {
+        if version.is_v2_1_plus() && !is_create {
+            // v12+ makes the create event implicit by removing it from
+            // `auth_events`. It is still part of the state the rules read, so
+            // supply it for every other event. If the create event is
+            // unreadable, leave the event unchecked so its exported verdict
+            // stands.
+            let Some(create) = create else {
+                continue;
+            };
+            if !entries
+                .iter()
+                .any(|(kind, key, _)| *kind == M_ROOM_CREATE && key.is_empty())
+            {
+                entries.push((M_ROOM_CREATE, "", create));
+            }
+        }
+        let refusal = if duplicate {
+            refusal_reason[position] =
+                Some("auth_events contains a duplicate (type, state_key) pair".to_owned());
             Some(RejectionCode::DuplicateAuthEventKey.to_u8())
         } else {
-            check_auth(subject, &AuthState(entries), version, None)
-                .err()
-                .map(|_| RejectionCode::AuthCheckFailed.to_u8())
+            match check_auth(subject, &AuthState(entries), version, None) {
+                Ok(()) => None,
+                Err(AuthError::InvalidSyntax(reason))
+                    if is_create
+                        && reason == "m.room.create sender must be a valid MXID"
+                        && is_acceptable_historical_mxid(subject.sender()) =>
+                {
+                    // rezzy still applies the strict MXID grammar to create
+                    // events. Historical IDs like @Milan:tchncs.de are valid
+                    // data; treat them as unjudgeable until the dependency is
+                    // bumped to a rezzy that uses its historical validator.
+                    continue;
+                }
+                Err(error) => {
+                    refusal_reason[position] = Some(error.to_string());
+                    Some(RejectionCode::AuthCheckFailed.to_u8())
+                }
+            }
         };
+        checked[position] = true;
+        refused[position] = refusal;
     }
 
+    // A kept exported rejection still seeds the cascade: an event citing it is
+    // rejected regardless of which check supplied the rejection.
     let seeds: Vec<bool> = (0..events.len())
-        .map(|position| {
-            if checked[position] {
-                refused[position].is_some()
-            } else {
-                exported[position]
-            }
-        })
+        .map(|position| refused[position].is_some() || exported[position])
         .collect();
     let mut findings = auth_findings_seeded(export, Some(&seeds))?;
     for (position, event) in events.iter().enumerate() {
@@ -578,18 +653,35 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
             (Some(code), false) => {
                 // The seed kept the cascade from assigning a code.
                 findings.forced[position] = Some(code);
-                findings
-                    .fails_but_exported_accepted
-                    .push(event.event_id.clone());
+                findings.fails_but_exported_accepted.push(AuthFailure {
+                    event_id: event.event_id.clone(),
+                    reason: refusal_reason[position]
+                        .take()
+                        .unwrap_or_else(|| "unknown auth-check failure".to_owned()),
+                });
             }
             (None, true) => {
+                // The first check cannot overturn a rejection on its own: the
+                // state-before-event check may be the reason the source
+                // rejected it. Report the disagreement and keep the verdict.
                 findings
                     .passes_but_exported_rejected
                     .push(event.event_id.clone());
-                // A rejected auth event still rejects it, with its own code.
-                findings.cleared[position] = findings.forced[position].is_none();
             }
             _ => {}
+        }
+    }
+    for (position, event) in events.iter().enumerate() {
+        let is_create = event.pdu.get("type").and_then(OwnedValue::as_str)
+            == Some(M_ROOM_CREATE)
+            && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("");
+        if is_create && findings.forced[position].is_some() {
+            bail!(
+                "refusing to import events for {}: its m.room.create event {} cannot be \
+                 authorized from this export",
+                export.room_id,
+                event.event_id
+            );
         }
     }
     Ok(findings)
@@ -660,12 +752,7 @@ pub(crate) fn write_room_with_findings(
         let auth = id_list(event, "auth_events")?;
         let prev_bytes = encode_edges(&prev)?;
         let auth_bytes = encode_edges(&auth)?;
-        let mut metadata = event.metadata.clone();
-        if findings.cleared[position] {
-            // The auth check overturned the exported rejection.
-            metadata.rejected = false;
-            metadata.rejection_code = None;
-        }
+        let metadata = event.metadata.clone();
         let verdict = verdict_of(&metadata, findings.forced[position]);
         let size = estimate(
             event,
@@ -1158,6 +1245,19 @@ mod auth_findings_tests {
         event
     }
 
+    fn create_with_version(version: &str) -> RoomEvent {
+        let mut create = event("$create", "m.room.create", &[], &[]);
+        if let OwnedValue::Object(fields) = &mut create.pdu {
+            let mut content = std::collections::BTreeMap::new();
+            content.insert(
+                "room_version".to_owned(),
+                OwnedValue::String(version.to_owned()),
+            );
+            fields.insert("content".to_owned(), OwnedValue::Object(content));
+        }
+        create
+    }
+
     fn member(id: &str, user: &str, auths: &[&str]) -> RoomEvent {
         let mut event = event(id, "m.room.member", &["$create"], auths);
         if let OwnedValue::Object(fields) = &mut event.pdu {
@@ -1204,11 +1304,21 @@ mod auth_findings_tests {
         ]))
         .unwrap();
         assert_eq!(forced(&findings, 1), Some(7));
-        assert_eq!(findings.fails_but_exported_accepted, ["$msg"]);
+        assert_eq!(findings.fails_but_exported_accepted.len(), 1);
+        let failure = &findings.fails_but_exported_accepted[0];
+        assert_eq!(failure.event_id, "$msg");
+        assert!(failure.reason.contains("not joined"), "{}", failure.reason);
+        assert!(
+            findings
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("not joined")),
+            "the warning must explain why the event failed"
+        );
     }
 
     #[test]
-    fn an_exported_rejection_that_passes_the_auth_check_is_cleared() {
+    fn an_exported_rejection_that_passes_the_first_check_is_reported_but_kept() {
         let mut rejected = message(&["$create", "$join"]);
         rejected.metadata.rejected = true;
         rejected.metadata.rejection_code = Some(7);
@@ -1219,7 +1329,6 @@ mod auth_findings_tests {
         ]))
         .unwrap();
         assert_eq!(forced(&findings, 2), None);
-        assert!(findings.cleared[2]);
         assert_eq!(findings.passes_but_exported_rejected, ["$msg"]);
         assert!(findings.fails_but_exported_accepted.is_empty());
     }
@@ -1234,7 +1343,10 @@ mod auth_findings_tests {
         ]))
         .unwrap();
         assert_eq!(forced(&findings, 3), Some(5));
-        assert_eq!(findings.fails_but_exported_accepted, ["$msg"]);
+        assert_eq!(findings.fails_but_exported_accepted.len(), 1);
+        let failure = &findings.fails_but_exported_accepted[0];
+        assert_eq!(failure.event_id, "$msg");
+        assert!(failure.reason.contains("duplicate"), "{}", failure.reason);
     }
 
     fn stored_rejection(db: &Database, id: &str) -> Option<u8> {
@@ -1264,39 +1376,71 @@ mod auth_findings_tests {
     }
 
     #[test]
-    fn a_v12_room_keeps_the_exported_verdicts_until_its_state_is_rebuilt() {
-        let mut create = event("$create", "m.room.create", &[], &[]);
-        if let OwnedValue::Object(fields) = &mut create.pdu {
-            let mut content = std::collections::BTreeMap::new();
-            content.insert(
-                "room_version".to_owned(),
-                OwnedValue::String("12".to_owned()),
-            );
-            fields.insert("content".to_owned(), OwnedValue::Object(content));
-        }
-        let mut rejected = event("$msg", "m.room.message", &["$create"], &["$create"]);
+    fn writing_keeps_an_exported_rejection_that_passes_the_first_check() {
+        let (db, dir) = db();
+        let mut rejected = message(&["$create", "$join"]);
         rejected.metadata.rejected = true;
-        let export = export(vec![create, rejected]);
-        assert_eq!(
-            derived_auth_findings(&export).unwrap(),
-            auth_findings(&export).unwrap()
+        rejected.metadata.rejection_code = Some(7);
+        let room = export(vec![
+            event("$create", "m.room.create", &[], &[]),
+            member("$join", "@alice:example.org", &["$create"]),
+            rejected,
+        ]);
+        write_room_with_findings(&db, &room, BATCH_BYTES).unwrap();
+        assert_eq!(stored_rejection(&db, "$msg"), Some(7));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_v12_room_judges_with_its_implicit_create_event() {
+        // v12 events do not cite m.room.create. Without supplying it from the
+        // room's create event the check would report MissingCreate; with it,
+        // this accepted-by-the-check event is judged and its exported
+        // rejection is reported as a disagreement.
+        let mut rejected = message(&["$join"]);
+        rejected.metadata.rejected = true;
+        rejected.metadata.rejection_code = Some(7);
+        let findings = derived_auth_findings(&export(vec![
+            create_with_version("12"),
+            member("$join", "@alice:example.org", &[]),
+            rejected,
+        ]))
+        .unwrap();
+        assert_eq!(forced(&findings, 2), None);
+        assert_eq!(findings.passes_but_exported_rejected, ["$msg"]);
+        assert!(findings.fails_but_exported_accepted.is_empty());
+    }
+
+    #[test]
+    fn a_historical_uppercase_create_sender_keeps_the_exported_accept() {
+        // rezzy's create rule still uses the strict MXID grammar. A
+        // historical ID must not turn the room's create into a rejection; the
+        // importer leaves it unjudged until the dependency uses its historical
+        // validator.
+        let create = with_field(
+            create_with_version("10"),
+            "sender",
+            "@Milan:tchncs.de",
         );
+        let findings = derived_auth_findings(&export(vec![create])).unwrap();
+        assert_eq!(forced(&findings, 0), None);
+        assert!(findings.fails_but_exported_accepted.is_empty());
+    }
+
+    #[test]
+    fn a_derived_create_failure_fails_the_room() {
+        let create = with_field(create_with_version("10"), "sender", "not-an-mxid");
+        let error = derived_auth_findings(&export(vec![create]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("m.room.create"), "{error}");
     }
 
     #[test]
     fn an_unknown_room_version_keeps_the_exported_verdicts() {
-        let mut create = event("$create", "m.room.create", &[], &[]);
-        if let OwnedValue::Object(fields) = &mut create.pdu {
-            let mut content = std::collections::BTreeMap::new();
-            content.insert(
-                "room_version".to_owned(),
-                OwnedValue::String("not-a-version".to_owned()),
-            );
-            fields.insert("content".to_owned(), OwnedValue::Object(content));
-        }
         let mut rejected = event("$msg", "m.room.message", &["$create"], &["$create"]);
         rejected.metadata.rejected = true;
-        let export = export(vec![create, rejected]);
+        let export = export(vec![create_with_version("not-a-version"), rejected]);
         assert_eq!(
             derived_auth_findings(&export).unwrap(),
             auth_findings(&export).unwrap()

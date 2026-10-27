@@ -4763,8 +4763,8 @@ const FIXTURE_ROOM: &str = "!export:test.conduwuit.local";
 /// event. The exporter's own fixture has empty auth lists, which is right for
 /// its byte-for-byte test but describes a room the auth rules refuse.
 ///
-/// Every event passes the auth check, so `$rejected`'s exported rejection is
-/// cleared by the derivation rather than being supported by it.
+/// Every event passes the first auth check, so `$rejected` is a deliberate
+/// disagreement: the exporter rejected it, but the first check does not.
 fn room_export_with_auth() -> String {
     const CREATE: &str = "$create:test.conduwuit.local";
     const JOIN: &str = "$join:test.conduwuit.local";
@@ -4854,9 +4854,9 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
     finish_import(&db, &run).unwrap();
 
     // The fixture with a creator membership: `$soft` is soft-failed with code
-    // 2 (Manual), `$rejected`'s exported rejection is cleared by the auth
-    // check, `$redacted` was redacted by `$redaction`, and `$ok` carries no
-    // verdict.
+    // 2 (Manual), `$rejected` keeps its exported rejection even though the
+    // first auth check passes, `$redacted` was redacted by `$redaction`, and
+    // `$ok` carries no verdict.
     let parsed = parse_room(content.as_bytes()).unwrap();
     assert_eq!(parsed.room_id, FIXTURE_ROOM);
     assert_eq!(parsed.events.len(), 6);
@@ -4934,9 +4934,14 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
             ..Verdict::default()
         }
     );
-    assert!(
-        verdict("rejected").is_none(),
-        "a rejection the auth check does not support is cleared"
+    assert_eq!(
+        verdict("rejected").unwrap(),
+        Verdict {
+            rejection: Some(7),
+            outlier: true,
+            ..Verdict::default()
+        },
+        "the first check cannot overturn an exported rejection"
     );
     assert_eq!(
         verdict("redacted").unwrap(),
@@ -4990,8 +4995,8 @@ fn outlier_is_independent_of_soft_fail_and_redaction_status() {
     );
     assert_eq!(
         outlier("rejected"),
-        None,
-        "a cleared rejection leaves no verdict and no outlier flag"
+        Some(true),
+        "a kept exported rejection stays an outlier"
     );
     assert_eq!(
         outlier("redacted"),
