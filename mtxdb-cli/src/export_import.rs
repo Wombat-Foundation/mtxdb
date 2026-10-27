@@ -303,6 +303,9 @@ pub(crate) struct AuthFindings {
     /// Events whose content hash does not match their contents. They are not
     /// rejected for it: the auth check ran on their redaction instead.
     pub(crate) hash_mismatched: Vec<String>,
+    /// The redacted PDU to store for each event, by position in the export,
+    /// when its content hash does not match. The export keeps the original.
+    redacted_pdus: Vec<Option<Vec<u8>>>,
 }
 
 /// An accepted event the first auth check refuted, and why.
@@ -509,7 +512,7 @@ fn create_room_version(events: &[RoomEvent]) -> Option<&str> {
 /// rejected for the mismatch. `None` when the hash matches, and when the hash
 /// cannot be judged: no `hashes.sha256`, a hash that cannot be computed, or a
 /// redaction that cannot be produced. Those events are checked as they are.
-fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<OwnedValue> {
+fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<(OwnedValue, Vec<u8>)> {
     let expected = pdu
         .get("hashes")
         .and_then(|hashes| hashes.get("sha256"))
@@ -521,7 +524,8 @@ fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<OwnedValue>
         return None;
     }
     let redacted = rezzy::try_canonical_redacted_json(pdu, room_version).ok()?;
-    OwnedValue::parse_bytes(redacted.as_bytes()).ok()
+    let value = OwnedValue::parse_bytes(redacted.as_bytes()).ok()?;
+    Some((value, redacted.into_bytes()))
 }
 
 /// [`auth_findings`] with the rejections derived from the events, not read
@@ -630,7 +634,7 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .map(|(position, event)| (event.event_id.as_bytes(), position))
         .collect();
     // An event whose content hash fails is judged in its redacted form.
-    let redacted: Vec<Option<OwnedValue>> = events
+    let redacted: Vec<Option<(OwnedValue, Vec<u8>)>> = events
         .iter()
         .map(|event| redacted_for_hash(&event.pdu, room_version))
         .collect();
@@ -639,7 +643,7 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .zip(&redacted)
         .map(|(event, redacted)| {
             let value = match redacted {
-                Some(pdu) => event.unflagged_from(pdu, &export.room_id),
+                Some((pdu, _)) => event.unflagged_from(pdu, &export.room_id),
                 None => event.unflagged(&export.room_id),
             };
             lean_event(&value, &event.event_id)
@@ -687,6 +691,10 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .filter(|(_, redacted)| redacted.is_some())
         .map(|(event, _)| event.event_id.clone())
         .collect();
+    findings.redacted_pdus = redacted
+        .into_iter()
+        .map(|redacted| redacted.map(|(_, bytes)| bytes))
+        .collect();
     for (position, event) in events.iter().enumerate() {
         if !checked[position] {
             continue;
@@ -727,7 +735,7 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
 }
 
 /// Bytes an event's records will stage, with margin.
-fn estimate(event: &RoomEvent, room_id: &str, verdict: &Verdict, edges: usize) -> usize {
+fn estimate(pdu_len: usize, event: &RoomEvent, room_id: &str, verdict: &Verdict, edges: usize) -> usize {
     let verdict_bytes = if verdict.is_empty() {
         0
     } else {
@@ -735,9 +743,7 @@ fn estimate(event: &RoomEvent, room_id: &str, verdict: &Verdict, edges: usize) -
             .saturating_add(event.event_id.len())
             .saturating_add(verdict.redacted_by.as_ref().map_or(0, Vec::len))
     };
-    event
-        .pdu_bytes
-        .len()
+    pdu_len
         .saturating_add(event.event_id.len().saturating_mul(2))
         .saturating_add(room_id.len())
         .saturating_add(edges)
@@ -792,7 +798,15 @@ pub(crate) fn write_room_with_findings(
         let prev_bytes = encode_edges(&prev)?;
         let auth_bytes = encode_edges(&auth)?;
         let verdict = verdict_of(&event.metadata, findings.forced[position]);
+        // A mismatched content hash means the effective event is its redaction;
+        // the export keeps the original bytes.
+        let stored: &[u8] = findings
+            .redacted_pdus
+            .get(position)
+            .and_then(Option::as_deref)
+            .unwrap_or(&event.pdu_bytes);
         let size = estimate(
+            stored.len(),
             event,
             &export.room_id,
             &verdict,
@@ -827,7 +841,7 @@ pub(crate) fn write_room_with_findings(
             EVENT_POOL,
             event_collection,
             record,
-            &node(event.pdu_bytes.to_vec()),
+            &node(stored.to_vec()),
         )?;
         tx.put(
             EVENT_POOL,
@@ -1483,6 +1497,7 @@ mod auth_findings_tests {
         let create = with_hash(event("$create", "m.room.create", &[], &[]), None);
         let findings = derived_auth_findings(&export(vec![create])).unwrap();
         assert!(findings.hash_mismatched.is_empty());
+        assert_eq!(findings.redacted_pdus, [None]);
     }
 
     #[test]
@@ -1491,8 +1506,15 @@ mod auth_findings_tests {
             event("$create", "m.room.create", &[], &[]),
             Some("not-the-hash"),
         );
+        let create_pdu = create.pdu.clone();
         let findings = derived_auth_findings(&export(vec![create])).unwrap();
         assert_eq!(findings.hash_mismatched, ["$create"]);
+        let expected = rezzy::try_canonical_redacted_json(&create_pdu, "10").unwrap();
+        assert_eq!(
+            findings.redacted_pdus[0].as_deref(),
+            Some(expected.as_bytes()),
+            "the redacted form is what gets stored"
+        );
         assert_eq!(forced(&findings, 0), None, "a bad hash is not a rejection");
         assert!(findings.warnings().iter().any(|line| line.contains("hash")));
     }
