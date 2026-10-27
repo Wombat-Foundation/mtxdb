@@ -8110,10 +8110,9 @@ struct ImportRun {
     /// vouches only for such a run: anything else leaves records the server
     /// cannot read, or data that did not all arrive.
     all_exports: bool,
-    /// A server-keys input failed to import. Room verdicts must not then be
-    /// derived from signatures: the keys they would be checked against are
-    /// missing or partial.
-    keys_failed: bool,
+    /// Whether usable signing-key bytes were present after key inputs were
+    /// processed, including keys already stored by an earlier import.
+    signature_keys_available: bool,
 }
 
 /// `paths` with every server-keys export first, the rest after them, each
@@ -8124,24 +8123,50 @@ fn keys_first(paths: &[PathBuf]) -> Vec<&PathBuf> {
     keys.into_iter().chain(rest).collect()
 }
 
-/// Whether an input's first tagged record identifies a server-keys export.
-/// Read only the first nonblank line so large room exports need not be loaded
-/// just to order the inputs. A read or parse failure is left to the normal
-/// import pass, which reports it with the input path.
-fn is_server_keys_export(path: &Path) -> bool {
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
+/// The tagged format declared by an input's first nonblank line. Read only
+/// that line so large room exports need not be loaded during input ordering.
+/// A read or parse failure is left to the normal import pass, which reports it
+/// with the input path.
+fn input_export_format(path: &Path) -> Option<interchange::InputFormat> {
+    let file = fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => return false,
+            Ok(0) | Err(_) => return None,
             Ok(_) if line.iter().all(u8::is_ascii_whitespace) => continue,
-            Ok(_) => return interchange::detect(&line) == Some(interchange::InputFormat::Keys),
+            Ok(_) => return interchange::detect(&line),
         }
     }
+}
+
+fn is_server_keys_export(path: &Path) -> bool {
+    input_export_format(path) == Some(interchange::InputFormat::Keys)
+}
+
+/// Whether the server-info pool contains at least one signing key with public
+/// key bytes. Notary payloads and evicted digest-only bindings do not enable
+/// signature verification.
+fn has_signing_key_material(store: &PackfileStorage) -> anyhow::Result<bool> {
+    for (collection, entries, _, _) in store.collection_summaries() {
+        if entries == 0 {
+            continue;
+        }
+        for item in store.scan_collection(&collection)? {
+            let (_, data) = item?;
+            let Ok((origin, key)) = mtxdb::server_keys::decode_server_key_record(&data.bytes)
+            else {
+                continue;
+            };
+            if mtxdb::server_keys::origin_keys_collection_id(&origin) == collection
+                && !key.key.is_empty()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// The data phase of a run: import every input. Server keys are imported
@@ -8163,19 +8188,30 @@ fn import_data(
         exported_events: 0,
         exported_closures: 0,
         all_exports: !paths.is_empty(),
-        keys_failed: false,
+        signature_keys_available: false,
     };
-    let mut announced = false;
+    let mut key_state_checked = false;
     for (index, path) in keys_first(paths).into_iter().enumerate() {
         if index != 0 {
             eprintln!();
         }
-        if run.keys_failed && !announced && !is_server_keys_export(path) {
-            eprintln!(
-                "signature checks off: signing keys failed to import, so room verdicts \
-                 keep the exported signature state"
-            );
-            announced = true;
+        if !key_state_checked
+            && input_export_format(path) == Some(interchange::InputFormat::Room)
+        {
+            key_state_checked = true;
+            match has_signing_key_material(db.server_info()) {
+                Ok(available) => run.signature_keys_available = available,
+                Err(error) => {
+                    eprintln!(
+                        "signature checks off: unable to inspect the signing-key store: {error:#}"
+                    );
+                    run.failures = run.failures.saturating_add(1);
+                    run.all_exports = false;
+                }
+            }
+            if !run.signature_keys_available {
+                eprintln!("signature checks off: no signing keys loaded");
+            }
         }
         match cmd_import_file(
             db,
@@ -8201,7 +8237,6 @@ fn import_data(
                 eprintln!("{}: {error:#}", path.display());
                 run.failures = run.failures.saturating_add(1);
                 run.all_exports = false;
-                run.keys_failed = run.keys_failed || is_server_keys_export(path);
             }
         }
     }

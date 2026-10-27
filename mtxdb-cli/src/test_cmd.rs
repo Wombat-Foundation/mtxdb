@@ -5193,13 +5193,43 @@ fn a_failed_keys_import_is_flagged_and_leaves_no_marker() {
         ],
     );
     assert_eq!(run.failures, 1);
-    assert!(run.keys_failed);
+    assert!(
+        !run.signature_keys_available,
+        "a failed key import into an empty store leaves signature keys unavailable"
+    );
     finish_import(&db, &run).unwrap();
     assert_eq!(marker(&db), None);
 }
 
 #[test]
-fn a_failed_room_import_does_not_flag_the_keys() {
+fn a_failed_key_import_keeps_previously_loaded_signing_keys_available() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let first = import_inputs(&db, &root, &[("keys.jsonl", KEYS_EXPORT_FIXTURE)]);
+    assert_eq!(first.failures, 0);
+
+    let run = import_inputs(
+        &db,
+        &root,
+        &[
+            ("room.jsonl", ROOM_EXPORT_FIXTURE),
+            (
+                "keys.jsonl",
+                "{\"kind\":\"bogus\",\"origin\":\"keys.example.org\",\"t\":\"server_keys\"}",
+            ),
+        ],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(
+        run.signature_keys_available,
+        "a failed new key input must not hide usable keys already stored"
+    );
+    finish_import(&db, &run).unwrap();
+    assert_eq!(marker(&db), None, "the failed input keeps the run unmarked");
+}
+
+#[test]
+fn a_failed_room_import_does_not_make_signing_keys_available() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
     let run = import_inputs(
@@ -5211,7 +5241,7 @@ fn a_failed_room_import_does_not_flag_the_keys() {
         )],
     );
     assert_eq!(run.failures, 1);
-    assert!(!run.keys_failed);
+    assert!(!run.signature_keys_available);
 }
 
 #[test]
