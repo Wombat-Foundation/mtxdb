@@ -4763,9 +4763,8 @@ const FIXTURE_ROOM: &str = "!export:test.conduwuit.local";
 /// event. The exporter's own fixture has empty auth lists, which is right for
 /// its byte-for-byte test but describes a room the auth rules refuse.
 ///
-/// `$rejected` keeps its exported rejection by having a sender who never
-/// joined, so the derived verdict agrees with the export. The other events
-/// pass the auth check.
+/// Every event passes the auth check, so `$rejected`'s exported rejection is
+/// cleared by the derivation rather than being supported by it.
 fn room_export_with_auth() -> String {
     const CREATE: &str = "$create:test.conduwuit.local";
     const JOIN: &str = "$join:test.conduwuit.local";
@@ -4797,13 +4796,7 @@ fn room_export_with_auth() -> String {
             continue;
         }
         let auth = format!("[\"{JOIN}\",\"{CREATE}\"]");
-        let mut line = line.replace("\"auth_events\":[]", &format!("\"auth_events\":{auth}"));
-        if line.contains("$rejected:") {
-            line = line.replace(
-                "@alice:test.conduwuit.local",
-                "@stranger:test.conduwuit.local",
-            );
-        }
+        let line = line.replace("\"auth_events\":[]", &format!("\"auth_events\":{auth}"));
         lines.push(line);
     }
     lines.join("\n")
@@ -4861,9 +4854,9 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
     finish_import(&db, &run).unwrap();
 
     // The fixture with a creator membership: `$soft` is soft-failed with code
-    // 2 (Manual), `$rejected` is rejected with code 7 (AuthCheckFailed) by a
-    // sender who never joined, `$redacted` was redacted by `$redaction`, and
-    // `$ok` carries no verdict.
+    // 2 (Manual), `$rejected`'s exported rejection is cleared by the auth
+    // check, `$redacted` was redacted by `$redaction`, and `$ok` carries no
+    // verdict.
     let parsed = parse_room(content.as_bytes()).unwrap();
     assert_eq!(parsed.room_id, FIXTURE_ROOM);
     assert_eq!(parsed.events.len(), 6);
@@ -4941,13 +4934,9 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
             ..Verdict::default()
         }
     );
-    assert_eq!(
-        verdict("rejected").unwrap(),
-        Verdict {
-            rejection: Some(7),
-            outlier: true,
-            ..Verdict::default()
-        }
+    assert!(
+        verdict("rejected").is_none(),
+        "a rejection the auth check does not support is cleared"
     );
     assert_eq!(
         verdict("redacted").unwrap(),
@@ -5001,8 +4990,8 @@ fn outlier_is_independent_of_soft_fail_and_redaction_status() {
     );
     assert_eq!(
         outlier("rejected"),
-        Some(true),
-        "a rejected event is not on the timeline"
+        None,
+        "a cleared rejection leaves no verdict and no outlier flag"
     );
     assert_eq!(
         outlier("redacted"),

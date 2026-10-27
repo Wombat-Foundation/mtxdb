@@ -487,15 +487,22 @@ fn create_room_version(events: &[RoomEvent]) -> Option<&str> {
 /// the `MissingAuthEvent` forcing are unchanged.
 ///
 /// An event the check cannot judge keeps its exported verdict: an unknown
-/// room version, an auth event missing from the export, or a PDU rezzy cannot
-/// read. Soft-fail is never derived. The state before the event (the spec's
-/// second check) and signature checks are not run here.
+/// room version, a v12+ room (where `auth_events` no longer carry the create
+/// event the rules read), an auth event missing from the export, or a PDU
+/// rezzy cannot read. Soft-fail is never derived. The state before the event
+/// (the spec's second check) and signature checks are not run here.
 pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let Some(version) = create_room_version(events).and_then(StateResVersion::from_room_version)
     else {
         return auth_findings(export);
     };
+    // v12+ removes `m.room.create` from `auth_events`, so the cited events no
+    // longer describe the state the auth rules read. Until the state before
+    // each event is rebuilt, these rooms keep their exported verdicts.
+    if version.is_v2_1_plus() {
+        return auth_findings(export);
+    }
     let index: HashMap<&[u8], usize> = events
         .iter()
         .enumerate()
@@ -1254,6 +1261,26 @@ mod auth_findings_tests {
         assert_eq!(stored_rejection(&db, "$msg"), Some(7));
         assert_eq!(stored_rejection(&db, "$create"), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_v12_room_keeps_the_exported_verdicts_until_its_state_is_rebuilt() {
+        let mut create = event("$create", "m.room.create", &[], &[]);
+        if let OwnedValue::Object(fields) = &mut create.pdu {
+            let mut content = std::collections::BTreeMap::new();
+            content.insert(
+                "room_version".to_owned(),
+                OwnedValue::String("12".to_owned()),
+            );
+            fields.insert("content".to_owned(), OwnedValue::Object(content));
+        }
+        let mut rejected = event("$msg", "m.room.message", &["$create"], &["$create"]);
+        rejected.metadata.rejected = true;
+        let export = export(vec![create, rejected]);
+        assert_eq!(
+            derived_auth_findings(&export).unwrap(),
+            auth_findings(&export).unwrap()
+        );
     }
 
     #[test]
