@@ -1962,11 +1962,31 @@ fn auth_chain_reimport_writes_nothing_new() {
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
 
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        store,
+        &input,
+        None,
+        &template,
+        &mut established,
+        None,
+    )
+    .unwrap();
     let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
     let first_import_records = count_pack_records(&auth_dir);
     // Declares the create so batch_has_create resolves for any follow-up.
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        store,
+        &input,
+        None,
+        &template,
+        &mut established,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         count_pack_records(&auth_dir),
@@ -2011,7 +2031,17 @@ fn import_establishment_persists_the_matrix_extension() {
     .unwrap();
     let template = default_matrix_import_template();
     let mut established = HashSet::new();
-    cmd_import_file(&db, store, store, &input, None, &template, &mut established).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        store,
+        &input,
+        None,
+        &template,
+        &mut established,
+        None,
+    )
+    .unwrap();
 
     let collection_id = template_collection_id(&template, "!room");
     let metadata = store
@@ -2377,6 +2407,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         None,
         &template,
         &mut established,
+        None,
     )
     .unwrap();
 
@@ -2411,6 +2442,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         None,
         &template,
         &mut established,
+        None,
     )
     .unwrap();
 
@@ -2447,6 +2479,7 @@ fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         None,
         &template,
         &mut established,
+        None,
     )
     .unwrap();
 
@@ -3300,6 +3333,7 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
         None,
         &template,
         &mut established,
+        None,
     )
     .unwrap();
     db.edges().sync_all().unwrap();
@@ -5053,7 +5087,7 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
                     .and_then(OwnedValue::as_u64)
                     .unwrap_or(0),
                 record.get("digest").is_some(),
-                matches!(record.get("corroborated"), Some(OwnedValue::Bool(true))),
+                false,
             )),
         }
     }

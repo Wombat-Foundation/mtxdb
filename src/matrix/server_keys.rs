@@ -490,6 +490,38 @@ pub fn put_server_key(
     Ok(())
 }
 
+/// Replace only the event-observation metadata after migration signature checks.
+/// The key binding, expiry claim, source, tier, and import timestamp are kept.
+/// `None` clears unverified exporter candidate timestamps.
+///
+/// # Errors
+/// Returns an error if the existing key record cannot be read, rewritten, or
+/// committed. Returns `Ok(false)` when the binding is not present.
+pub fn set_verified_observation(
+    db: &Database,
+    origin: &[u8],
+    key_id: &[u8],
+    observation: Option<(u64, u64)>,
+) -> Result<bool, StorageError> {
+    let store = db.server_info();
+    let Some(mut key) = read_server_key(store, origin, key_id)? else {
+        return Ok(false);
+    };
+    if let Some((first_seen_ms, last_active_ms)) = observation {
+        key.first_seen_ms = first_seen_ms;
+        key.last_active_ms = last_active_ms;
+        key.corroborated = true;
+    } else {
+        key.first_seen_ms = 0;
+        key.last_active_ms = 0;
+        key.corroborated = false;
+    }
+    let tx = db.begin_transaction();
+    put_server_key(&tx, origin, &key)?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Stage `payload` as `origin`'s Notary record, replacing any earlier one. The
 /// bytes are stored exactly as given.
 ///

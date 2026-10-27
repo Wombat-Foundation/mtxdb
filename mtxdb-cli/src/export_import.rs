@@ -29,11 +29,15 @@ use mtxdb::interop::{
 };
 use mtxdb::server_keys;
 use mtxdb::storage::StorageEngine as _;
-use mtxdb::{Database, NodeData};
+use mtxdb::{Database, NodeData, PackfileStorage};
 use rezzy::auth::{check_auth, StateProvider};
 use rezzy::basespec::event_types::M_ROOM_CREATE;
 use rezzy::bitmap::Bitmap;
 use rezzy::json::Value as OwnedValue;
+use rezzy::signing::{
+    ed25519_zebra::{Signature, VerificationKey},
+    verify_event_signatures_from_server, SignatureVerifier,
+};
 use rezzy::{LeanEvent, StateResVersion};
 
 use crate::interchange::{EventMetadata, KeyRecord, RoomEvent, RoomExport};
@@ -308,6 +312,196 @@ pub(crate) struct AuthFindings {
     redacted_pdus: Vec<Option<Vec<u8>>>,
     /// One audit record per hash-mismatched event.
     pub(crate) hash_audit: Vec<HashAudit>,
+    /// Key bindings corroborated by successfully verified historical events.
+    pub(crate) verified_keys: Vec<VerifiedKeyObservation>,
+    /// Events rejected because a usable, in-window origin key had a bad signature.
+    pub(crate) signature_failures: Vec<AuthFailure>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct KeyBinding {
+    pub(crate) origin: Vec<u8>,
+    pub(crate) key_id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedKeyObservation {
+    pub(crate) binding: KeyBinding,
+    pub(crate) first_seen_ms: u64,
+    pub(crate) last_active_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct VerificationKeyRecord {
+    origin: String,
+    key: mtxdb::server_keys::ServerKey,
+    parsed_key: Option<VerificationKey>,
+}
+
+/// The key records visible after the keys-first phase of one import run.
+#[derive(Default)]
+pub(crate) struct SignatureKeyCatalog {
+    records: HashMap<(String, Vec<u8>), VerificationKeyRecord>,
+}
+
+impl SignatureKeyCatalog {
+    pub(crate) fn read(store: &PackfileStorage) -> anyhow::Result<Self> {
+        let mut catalog = Self::default();
+        for (collection, entries, _, _) in store.collection_summaries() {
+            if entries == 0 {
+                continue;
+            }
+            for item in store.scan_collection(&collection)? {
+                let (node_id, data) = item?;
+                let Ok((origin, key)) = server_keys::decode_server_key_record(&data.bytes) else {
+                    continue;
+                };
+                if server_keys::origin_keys_collection_id(&origin) != collection
+                    || server_keys::origin_key_record_id(&key.key_id) != node_id
+                {
+                    continue;
+                }
+                catalog.records.insert(
+                    (
+                        String::from_utf8_lossy(&origin).to_ascii_lowercase(),
+                        key.key_id.clone(),
+                    ),
+                    VerificationKeyRecord {
+                        origin: String::from_utf8_lossy(&origin).into_owned(),
+                        parsed_key: VerificationKey::try_from(key.key.as_slice()).ok(),
+                        key,
+                    },
+                );
+            }
+        }
+        Ok(catalog)
+    }
+
+    fn verify(&self, event: &RoomEvent, room_version: &str) -> SignatureOutcome {
+        let Some(origin) = event_origin(&event.pdu, room_version) else {
+            return SignatureOutcome::Underivable;
+        };
+        let Some(timestamp) = event
+            .pdu
+            .get("origin_server_ts")
+            .and_then(OwnedValue::as_u64)
+        else {
+            return SignatureOutcome::Underivable;
+        };
+        let Some(signatures) = event.pdu.get("signatures").and_then(OwnedValue::as_object) else {
+            return SignatureOutcome::Underivable;
+        };
+        let Some(origin_signatures) = signatures.get(origin).and_then(OwnedValue::as_object) else {
+            return SignatureOutcome::Underivable;
+        };
+
+        let mut candidates = Vec::new();
+        for (key_id, signature) in origin_signatures {
+            let key_id_bytes = key_id.as_bytes();
+            let Some(record) = self
+                .records
+                .get(&(origin.to_ascii_lowercase(), key_id_bytes.to_vec()))
+            else {
+                continue;
+            };
+            let key = &record.key;
+            if key.key.is_empty()
+                || timestamp >= key.valid_until_ts
+                || key.expired_ts.is_some_and(|expired| timestamp >= expired)
+            {
+                continue;
+            }
+            candidates.push((record, key_id.as_str(), signature));
+        }
+        if candidates.is_empty() {
+            return SignatureOutcome::Underivable;
+        }
+
+        let mut last_error = String::from("no candidate signature verified");
+        for (record, key_id, _) in &candidates {
+            let Some(parsed_key) = record.parsed_key.as_ref() else {
+                continue;
+            };
+            let verifier = OneKeyVerifier {
+                origin: &record.origin,
+                key_id,
+                key: parsed_key,
+            };
+            match verify_event_signatures_from_server(
+                &event.pdu,
+                room_version,
+                &record.origin,
+                &verifier,
+            ) {
+                Ok(()) => {
+                    return SignatureOutcome::Verified(KeyBinding {
+                        origin: record.origin.as_bytes().to_vec(),
+                        key_id: record.key.key_id.clone(),
+                    });
+                }
+                Err(error) => last_error = error,
+            }
+        }
+        if candidates
+            .iter()
+            .all(|(record, _, _)| record.parsed_key.is_none())
+        {
+            return SignatureOutcome::Underivable;
+        }
+        SignatureOutcome::Invalid(last_error)
+    }
+}
+
+struct OneKeyVerifier<'a> {
+    origin: &'a str,
+    key_id: &'a str,
+    key: &'a VerificationKey,
+}
+
+impl SignatureVerifier for OneKeyVerifier<'_> {
+    fn has_key(&self, server_name: &str, key_id: &str) -> bool {
+        self.origin.eq_ignore_ascii_case(server_name) && self.key_id == key_id
+    }
+
+    fn verify(
+        &self,
+        server_name: &str,
+        key_id: &str,
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), String> {
+        if !self.has_key(server_name, key_id) {
+            return Err(format!("no public key for {server_name}/{key_id}"));
+        }
+        let signature: [u8; 64] = signature
+            .try_into()
+            .map_err(|_| String::from("signature must be 64 bytes"))?;
+        self.key
+            .verify(&Signature::from(signature), message)
+            .map_err(|error| format!("signature verification failed: {error:?}"))
+    }
+}
+
+enum SignatureOutcome {
+    Underivable,
+    Verified(KeyBinding),
+    Invalid(String),
+}
+
+fn event_origin<'a>(pdu: &'a OwnedValue, room_version: &str) -> Option<&'a str> {
+    if matches!(room_version, "1" | "2") {
+        return pdu
+            .get("event_id")?
+            .as_str()?
+            .strip_prefix('$')?
+            .split_once(':')
+            .map(|(_, server)| server);
+    }
+    pdu.get("sender")?
+        .as_str()?
+        .strip_prefix('@')?
+        .split_once(':')
+        .map(|(_, server)| server)
 }
 
 /// An accepted event the first auth check refuted, and why.
@@ -345,11 +539,6 @@ impl AuthFindings {
                 &self.passes_but_exported_rejected,
                 "were exported as rejected but pass the first auth check (stored accepted; the state-before-event check is not run yet)",
             ),
-            (
-                self.hash_mismatched.len(),
-                &self.hash_mismatched,
-                "fail their content hash (auth-checked in redacted form, not rejected for it)",
-            ),
         ] {
             if count == 0 {
                 continue;
@@ -362,6 +551,22 @@ impl AuthFindings {
                 String::new()
             };
             lines.push(format!("{count} events {what}: {}{tail}", shown.join(", ")));
+        }
+        // Most hash failures are already-redacted events; listing them is noise.
+        // The audit sidecar has every row, so the log names only the ones whose
+        // content the redaction would actually change.
+        let differs: Vec<&str> = self
+            .hash_audit
+            .iter()
+            .filter(|row| !row.content_matches_redaction)
+            .map(|row| row.event_id.as_str())
+            .collect();
+        if !differs.is_empty() {
+            lines.push(format!(
+                "{} hash-mismatched events have content that differs from their redaction: {}",
+                differs.len(),
+                differs.join(", ")
+            ));
         }
         if !self.fails_but_exported_accepted.is_empty() {
             let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -402,7 +607,33 @@ impl AuthFindings {
                 parts.join("; "),
             ));
         }
+        if let Some(warning) = self.signature_failure_warning(LISTED) {
+            lines.push(warning);
+        }
         lines
+    }
+
+    fn signature_failure_warning(&self, listed_limit: usize) -> Option<String> {
+        if self.signature_failures.is_empty() {
+            return None;
+        }
+        let shown = self
+            .signature_failures
+            .iter()
+            .take(listed_limit)
+            .map(|failure| failure.event_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = self.signature_failures.len().saturating_sub(listed_limit);
+        let tail = if more > 0 {
+            format!(", and {more} more")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "{} events have an invalid signature from an available in-window key (stored as rejected): {shown}{tail}",
+            self.signature_failures.len()
+        ))
     }
 }
 
@@ -807,7 +1038,15 @@ fn ensure_create_authorized(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings> {
+    derived_auth_findings_with_keys(export, None)
+}
+
+pub(crate) fn derived_auth_findings_with_keys(
+    export: &RoomExport,
+    keys: Option<&SignatureKeyCatalog>,
+) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let Some(room_version) = create_room_version(events) else {
         return auth_findings(export);
@@ -832,7 +1071,26 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
 
     // Only a derived refusal seeds the cascade. The exported verdicts are
     // compared below for the report and are never stored.
-    let seeds: Vec<bool> = judgement.refused.iter().map(Option::is_some).collect();
+    let signature_outcomes = keys.map(|keys| {
+        events
+            .iter()
+            .map(|event| keys.verify(event, room_version))
+            .collect::<Vec<_>>()
+    });
+    let seeds: Vec<bool> = judgement
+        .refused
+        .iter()
+        .enumerate()
+        .map(|(position, refusal)| {
+            refusal.is_some()
+                || matches!(
+                    signature_outcomes
+                        .as_ref()
+                        .and_then(|outcomes| outcomes.get(position)),
+                    Some(SignatureOutcome::Invalid(_))
+                )
+        })
+        .collect();
     let mut findings = auth_findings_seeded(export, &seeds)?;
     findings.hash_mismatched = events
         .iter()
@@ -846,6 +1104,46 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .map(|redacted| redacted.map(|m| m.bytes))
         .collect();
     apply_judgement(&mut findings, events, &judgement, &exported);
+    if let Some(outcomes) = signature_outcomes {
+        let mut verified: HashMap<KeyBinding, (u64, u64)> = HashMap::new();
+        for (position, outcome) in outcomes.into_iter().enumerate() {
+            match outcome {
+                SignatureOutcome::Underivable => {}
+                SignatureOutcome::Verified(binding) => {
+                    let timestamp = events[position]
+                        .pdu
+                        .get("origin_server_ts")
+                        .and_then(OwnedValue::as_u64)
+                        .expect("verified signatures require origin_server_ts");
+                    verified
+                        .entry(binding)
+                        .and_modify(|(first, last)| {
+                            *first = (*first).min(timestamp);
+                            *last = (*last).max(timestamp);
+                        })
+                        .or_insert((timestamp, timestamp));
+                }
+                SignatureOutcome::Invalid(reason) => {
+                    findings.forced[position] =
+                        Some(RejectionCode::SignatureVerificationFailed.to_u8());
+                    findings.signature_failures.push(AuthFailure {
+                        event_id: events[position].event_id.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+        findings.verified_keys = verified
+            .into_iter()
+            .map(
+                |(binding, (first_seen_ms, last_active_ms))| VerifiedKeyObservation {
+                    binding,
+                    first_seen_ms,
+                    last_active_ms,
+                },
+            )
+            .collect();
+    }
     ensure_create_authorized(export, events, &findings)?;
     Ok(findings)
 }
@@ -882,12 +1180,22 @@ fn estimate(
 ///
 /// Each rejection is derived by running the auth rules over the room's events
 /// (see [`derived_auth_findings`]); the export's rejections are not trusted.
+#[cfg(test)]
 pub(crate) fn write_room_with_findings(
     db: &Database,
     export: &RoomExport,
     batch_bytes: usize,
 ) -> anyhow::Result<(ImportCounts, AuthFindings)> {
-    let findings = derived_auth_findings(export)?;
+    write_room_with_signature_keys(db, export, batch_bytes, None)
+}
+
+pub(crate) fn write_room_with_signature_keys(
+    db: &Database,
+    export: &RoomExport,
+    batch_bytes: usize,
+    keys: Option<&SignatureKeyCatalog>,
+) -> anyhow::Result<(ImportCounts, AuthFindings)> {
+    let findings = derived_auth_findings_with_keys(export, keys)?;
     let plan = closure_plan(export)?;
     let room = export.room_id.as_bytes();
     let event_collection = room_event_collection_id(room);
@@ -1695,6 +2003,15 @@ mod auth_findings_tests {
         assert!(audit("$msg")
             .json_line()
             .contains("\"content_matches_redaction\":false"));
+        let warnings = findings.warnings().join("\n");
+        assert!(
+            !warnings.contains("$join"),
+            "already-redacted joins are not listed: {warnings}"
+        );
+        assert!(
+            warnings.contains("$msg"),
+            "content-differs are listed: {warnings}"
+        );
     }
 
     #[test]
