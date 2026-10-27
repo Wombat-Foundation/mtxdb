@@ -8130,6 +8130,8 @@ struct ImportRun {
     /// Whether usable signing-key bytes were present after key inputs were
     /// processed, including keys already stored by an earlier import.
     signature_keys_available: bool,
+    /// Keys imported from this run's keys export, when present.
+    signature_catalog: Option<export_import::SignatureKeyCatalog>,
     /// Content-hash mismatches captured with the same redaction used to store
     /// each event and written as a JSONL sidecar after the input pass.
     hash_audit: Vec<export_import::HashAudit>,
@@ -8147,6 +8149,13 @@ struct ImportRun {
 
 fn absorb_outcome(run: &mut ImportRun, outcome: ImportOutcome) {
     run.server_keys = run.server_keys || outcome.server_keys;
+    if let Some(catalog) = outcome.signature_catalog {
+        if let Some(existing) = &mut run.signature_catalog {
+            existing.extend(catalog);
+        } else {
+            run.signature_catalog = Some(catalog);
+        }
+    }
     run.hash_audit.extend(outcome.hash_audit);
     run.signature_no_key = run
         .signature_no_key
@@ -8270,6 +8279,7 @@ fn import_data(
         exported_closures: 0,
         all_exports: !paths.is_empty() && marker_cleared.is_ok(),
         signature_keys_available: false,
+        signature_catalog: None,
         hash_audit: Vec::new(),
         imported_key_bindings: HashSet::new(),
         verified_keys: HashMap::new(),
@@ -8298,14 +8308,18 @@ fn import_data(
                 }
             }
             if key_pool_ready {
-                match has_signing_key_material(db.server_info()) {
-                    Ok(available) => run.signature_keys_available = available,
-                    Err(error) => {
-                        eprintln!(
-                            "signature checks off: unable to inspect the signing-key store: {error:#}"
-                        );
-                        run.failures = run.failures.saturating_add(1);
-                        run.all_exports = false;
+                if let Some(catalog) = &run.signature_catalog {
+                    run.signature_keys_available = catalog.has_key_material();
+                } else {
+                    match has_signing_key_material(db.server_info()) {
+                        Ok(available) => run.signature_keys_available = available,
+                        Err(error) => {
+                            eprintln!(
+                                "signature checks off: unable to inspect the signing-key store: {error:#}"
+                            );
+                            run.failures = run.failures.saturating_add(1);
+                            run.all_exports = false;
+                        }
                     }
                 }
             }
@@ -8327,6 +8341,7 @@ fn import_data(
             template,
             established_collections,
             signature_checks_enabled,
+            run.signature_catalog.as_ref(),
         ) {
             Ok(outcome) => absorb_outcome(&mut run, outcome),
             Err(error) => {
@@ -8344,16 +8359,21 @@ fn import_data(
 }
 
 fn reconcile_verified_key_observations(db: &Database, run: &mut ImportRun) {
-    for binding in &run.imported_key_bindings {
-        let observation = run.verified_keys.get(binding).copied();
-        match mtxdb::server_keys::set_verified_observation(
-            db,
-            &binding.origin,
-            &binding.key_id,
-            observation,
-        ) {
-            Ok(true) => {}
-            Ok(false) => {
+    let bindings: Vec<_> = run.imported_key_bindings.iter().collect();
+    let updates: Vec<_> = bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.origin.as_slice(),
+                binding.key_id.as_slice(),
+                run.verified_keys.get(binding).copied(),
+            )
+        })
+        .collect();
+    match mtxdb::server_keys::set_verified_observations(db, &updates) {
+        Ok(missing) => {
+            for index in missing {
+                let binding = bindings[index];
                 eprintln!(
                     "updating verified signing-key metadata: {}/{} was not found",
                     String::from_utf8_lossy(&binding.origin),
@@ -8362,11 +8382,11 @@ fn reconcile_verified_key_observations(db: &Database, run: &mut ImportRun) {
                 run.failures = run.failures.saturating_add(1);
                 run.all_exports = false;
             }
-            Err(error) => {
-                eprintln!("updating verified signing-key metadata: {error}");
-                run.failures = run.failures.saturating_add(1);
-                run.all_exports = false;
-            }
+        }
+        Err(error) => {
+            eprintln!("updating verified signing-key metadata: {error}");
+            run.failures = run.failures.saturating_add(1);
+            run.all_exports = false;
         }
     }
 }
@@ -9321,6 +9341,9 @@ struct ImportOutcome {
     /// batch must sync once: that pool is otherwise outside `cmd_import`'s
     /// default sync set.
     server_keys: bool,
+    /// Parsed key records, retained so each room can verify without scanning
+    /// the live ServerInfo pool during journal reclamation.
+    signature_catalog: Option<export_import::SignatureKeyCatalog>,
     /// The input was an `mtxdb-export` file, written in the server's layout;
     /// holds the event records it wrote (zero for a keys export). Only a run
     /// whose every input did this can be vouched for by the marker.
@@ -9351,6 +9374,7 @@ fn cmd_import_file(
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
     signature_checks_enabled: bool,
+    signature_catalog: Option<&export_import::SignatureKeyCatalog>,
 ) -> anyhow::Result<ImportOutcome> {
     let mut context = ImportContext {
         db,
@@ -9359,6 +9383,7 @@ fn cmd_import_file(
         template,
         established_collections,
         signature_checks_enabled,
+        signature_catalog,
     };
     context.import(path, collection_override)
 }
@@ -9377,6 +9402,7 @@ struct ImportContext<'a> {
     template: &'a CollectionTemplate,
     established_collections: &'a mut HashSet<[u8; 16]>,
     signature_checks_enabled: bool,
+    signature_catalog: Option<&'a export_import::SignatureKeyCatalog>,
 }
 
 impl ImportContext<'_> {
@@ -9414,28 +9440,32 @@ impl ImportContext<'_> {
             interchange::InputFormat::Room => {
                 let export = interchange::parse_room(content)
                     .with_context(|| format!("reading {}", path.display()))?;
-                let signature_catalog = if self.signature_checks_enabled {
-                    Some(
-                        export_import::SignatureKeyCatalog::read_for_room(
-                            self.db.server_info(),
-                            &export,
-                        )
-                        .with_context(|| {
-                            format!("reading signing keys needed by {}", export.room_id)
-                        })?,
-                    )
+                if !self.signature_checks_enabled {
+                    self.import_room_export(&export, collection_override, None)
+                        .with_context(|| format!("importing {}", path.display()))
+                } else if let Some(catalog) = self.signature_catalog {
+                    self.import_room_export(&export, collection_override, Some(catalog))
+                        .with_context(|| format!("importing {}", path.display()))
                 } else {
-                    None
-                };
-                self.import_room_export(&export, collection_override, signature_catalog.as_ref())
-                    .with_context(|| format!("importing {}", path.display()))
+                    let catalog = export_import::SignatureKeyCatalog::read_for_room(
+                        self.db.server_info(),
+                        &export,
+                    )
+                    .with_context(|| {
+                        format!("reading signing keys needed by {}", export.room_id)
+                    })?;
+                    self.import_room_export(&export, collection_override, Some(&catalog))
+                        .with_context(|| format!("importing {}", path.display()))
+                }
             }
             interchange::InputFormat::Keys => {
                 let records = interchange::parse_keys(content)
                     .with_context(|| format!("reading {}", path.display()))?;
+                let signature_catalog = export_import::SignatureKeyCatalog::from_records(&records);
                 let key_bindings = self.import_keys_export(path, &records)?;
                 Ok(ImportOutcome {
                     server_keys: true,
+                    signature_catalog: Some(signature_catalog),
                     exported: Some(export_import::ImportCounts::default()),
                     hash_audit: Vec::new(),
                     key_bindings,

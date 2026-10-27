@@ -41,6 +41,9 @@ pub const SERVER_KEY_VERSION: u8 = 1;
 /// How many times [`update_server_keys`] re-runs after losing a race before it
 /// returns the stale-read error.
 const UPDATE_ATTEMPTS: usize = 32;
+/// Retry storage's explicitly transient read-committed reload failures.
+const OBSERVATION_RETRIES: usize = 8;
+const OBSERVATION_BATCH_SIZE: usize = 256;
 
 /// How firmly a key is bound to its origin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -490,6 +493,9 @@ pub fn put_server_key(
     Ok(())
 }
 
+/// One imported signing-key binding and its verified event-time range.
+pub type VerifiedObservationUpdate<'a> = (&'a [u8], &'a [u8], Option<(u64, u64)>);
+
 /// Replace only the event-observation metadata after migration signature checks.
 /// The key binding, expiry claim, source, tier, and import timestamp are kept.
 /// `None` clears unverified exporter candidate timestamps.
@@ -503,23 +509,72 @@ pub fn set_verified_observation(
     key_id: &[u8],
     observation: Option<(u64, u64)>,
 ) -> Result<bool, StorageError> {
+    let updates = [(origin, key_id, observation)];
+    Ok(set_verified_observations(db, &updates)?.is_empty())
+}
+
+/// Apply verified migration observations in bounded transactions. Each row is
+/// read from the stored key, changes only the observation fields, and is
+/// written through [`put_server_key`]. Missing bindings are returned by input
+/// index; transient read-committed reload failures are retried.
+///
+/// # Errors
+/// Returns an error if a key cannot be read, encoded, rewritten, or committed
+/// after retrying transient read-committed reload failures.
+pub fn set_verified_observations(
+    db: &Database,
+    updates: &[VerifiedObservationUpdate<'_>],
+) -> Result<Vec<usize>, StorageError> {
     let store = db.server_info();
-    let Some(mut key) = read_server_key(store, origin, key_id)? else {
-        return Ok(false);
-    };
-    if let Some((first_seen_ms, last_active_ms)) = observation {
-        key.first_seen_ms = first_seen_ms;
-        key.last_active_ms = last_active_ms;
-        key.corroborated = true;
-    } else {
-        key.first_seen_ms = 0;
-        key.last_active_ms = 0;
-        key.corroborated = false;
+    let mut missing = Vec::new();
+    for (batch_index, batch) in updates.chunks(OBSERVATION_BATCH_SIZE).enumerate() {
+        let first_index = batch_index.saturating_mul(OBSERVATION_BATCH_SIZE);
+        let mut attempt = 0;
+        loop {
+            let result: Result<Vec<usize>, StorageError> = (|| {
+                let tx = db.begin_transaction();
+                let mut batch_missing = Vec::new();
+                let mut changed = 0_usize;
+                for (offset, (origin, key_id, observation)) in batch.iter().enumerate() {
+                    let Some(mut key) = read_server_key(store, origin, key_id)? else {
+                        batch_missing.push(first_index.saturating_add(offset));
+                        continue;
+                    };
+                    if let Some((first_seen_ms, last_active_ms)) = observation {
+                        key.first_seen_ms = *first_seen_ms;
+                        key.last_active_ms = *last_active_ms;
+                        key.corroborated = true;
+                    } else {
+                        key.first_seen_ms = 0;
+                        key.last_active_ms = 0;
+                        key.corroborated = false;
+                    }
+                    put_server_key(&tx, origin, &key)?;
+                    changed = changed.saturating_add(1);
+                }
+                if changed != 0 {
+                    tx.commit()?;
+                }
+                Ok(batch_missing)
+            })();
+            match result {
+                Ok(batch_missing) => {
+                    missing.extend(batch_missing);
+                    break;
+                }
+                Err(error) if error.is_would_block() && attempt < OBSERVATION_RETRIES => {
+                    let delay = 5_u64
+                        .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
+                        .unwrap_or(250)
+                        .min(250);
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
-    let tx = db.begin_transaction();
-    put_server_key(&tx, origin, &key)?;
-    tx.commit()?;
-    Ok(true)
+    Ok(missing)
 }
 
 /// Stage `payload` as `origin`'s Notary record, replacing any earlier one. The

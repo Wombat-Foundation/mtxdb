@@ -343,12 +343,44 @@ struct VerificationKeyRecord {
 }
 
 /// The key records visible after the keys-first phase of one import run.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct SignatureKeyCatalog {
     records: HashMap<(String, Vec<u8>), VerificationKeyRecord>,
 }
 
 impl SignatureKeyCatalog {
+    pub(crate) fn from_records(records: &[KeyRecord]) -> Self {
+        let mut catalog = Self::default();
+        catalog.extend_from_records(records);
+        catalog
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.records.extend(other.records);
+    }
+
+    fn extend_from_records(&mut self, records: &[KeyRecord]) {
+        for record in records {
+            let KeyRecord::Key { origin, key } = record else {
+                continue;
+            };
+            self.records.insert(
+                (origin.to_ascii_lowercase(), key.key_id.clone()),
+                VerificationKeyRecord {
+                    origin: origin.clone(),
+                    parsed_key: VerificationKey::try_from(key.key.as_slice()).ok(),
+                    key: key.clone(),
+                },
+            );
+        }
+    }
+
+    pub(crate) fn has_key_material(&self) -> bool {
+        self.records
+            .values()
+            .any(|record| !record.key.key.is_empty())
+    }
+
     pub(crate) fn read_for_room(
         store: &PackfileStorage,
         export: &RoomExport,
