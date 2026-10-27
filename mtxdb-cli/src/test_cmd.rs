@@ -4763,6 +4763,44 @@ const KEYS_EXPORT_FIXTURE: &str =
 
 const FIXTURE_ROOM: &str = "!export:test.conduwuit.local";
 
+/// Replace the fixture's placeholder content hashes with the hashes its PDUs
+/// actually have. The exporter fixture uses `"sha256":"dummy"` because its
+/// byte-for-byte test does not run the hash check; the importer does, and a
+/// mismatch now stores the redacted form. The layout test wants the unchanged
+/// body, so make the hashes valid. The mismatch path has its own test.
+fn with_valid_content_hashes(content: &str) -> String {
+    let room_version = content
+        .lines()
+        .filter_map(|line| OwnedValue::parse_bytes(line.as_bytes()).ok())
+        .find_map(|value| {
+            let pdu = value.get("pdu")?;
+            (pdu.get("type")?.as_str()? == "m.room.create")
+                .then(|| {
+                    pdu.get("content")?
+                        .get("room_version")?
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+        .unwrap_or_else(|| "11".to_owned());
+
+    content
+        .lines()
+        .map(|line| {
+            if !line.contains("\"t\":\"event\"") {
+                return line.to_owned();
+            }
+            let value = OwnedValue::parse_bytes(line.as_bytes()).expect("valid fixture line");
+            let pdu = value.get("pdu").expect("fixture event has a pdu");
+            let hash = rezzy::compute_content_hash(pdu, &room_version)
+                .expect("fixture content hash is computable");
+            line.replacen("\"sha256\":\"dummy\"", &format!("\"sha256\":\"{hash}\""), 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The exporter fixture with the auth chain a real export carries: a member
 /// event for the creator, cited alongside the create event by every other
 /// event. The exporter's own fixture has empty auth lists, which is right for
@@ -4775,16 +4813,7 @@ fn room_export_with_auth() -> String {
     const JOIN: &str = "$join:test.conduwuit.local";
 
     let join = format!(
-        concat!(
-            "{{\"auth_events\":[\"{create}\"],\"event_id\":\"{join}\",\"outlier\":false,",
-            "\"prev_events\":[],\"pdu\":{{\"auth_events\":[\"{create}\"],",
-            "\"content\":{{\"membership\":\"join\"}},\"depth\":1,\"event_id\":\"{join}\",",
-            "\"hashes\":{{\"sha256\":\"dummy\"}},\"origin_server_ts\":123456789,",
-            "\"prev_events\":[],\"room_id\":\"!export:test.conduwuit.local\",",
-            "\"sender\":\"@alice:test.conduwuit.local\",",
-            "\"state_key\":\"@alice:test.conduwuit.local\",\"type\":\"m.room.member\"}},",
-            "\"rejected\":false,\"soft_failed\":false,\"t\":\"event\"}}"
-        ),
+        r##"{{"auth_events":["{create}"],"event_id":"{join}","outlier":false,"prev_events":[],"pdu":{{"auth_events":["{create}"],"content":{{"membership":"join"}},"depth":1,"event_id":"{join}","origin_server_ts":123456789,"prev_events":[],"room_id":"!export:test.conduwuit.local","sender":"@alice:test.conduwuit.local","state_key":"@alice:test.conduwuit.local","type":"m.room.member"}},"rejected":false,"soft_failed":false,"t":"event"}}"##,
         create = CREATE,
         join = JOIN,
     );
@@ -4804,7 +4833,7 @@ fn room_export_with_auth() -> String {
         let line = line.replace("\"auth_events\":[]", &format!("\"auth_events\":{auth}"));
         lines.push(line);
     }
-    lines.join("\n")
+    with_valid_content_hashes(&lines.join("\n"))
 }
 
 /// Import `inputs` the way `mtxdb import` does, minus the final phase.
@@ -4871,7 +4900,8 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
         let id = event.event_id.as_bytes();
         let record = event_record_id(id);
 
-        // The body is the export's PDU, byte for byte.
+        // The body is the export's PDU, byte for byte. The fixture's hashes are
+        // valid (or absent), so no event here takes the redaction path.
         let body = stored(
             &db,
             EVENT_POOL,

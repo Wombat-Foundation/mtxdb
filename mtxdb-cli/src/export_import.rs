@@ -735,7 +735,13 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
 }
 
 /// Bytes an event's records will stage, with margin.
-fn estimate(pdu_len: usize, event: &RoomEvent, room_id: &str, verdict: &Verdict, edges: usize) -> usize {
+fn estimate(
+    pdu_len: usize,
+    event: &RoomEvent,
+    room_id: &str,
+    verdict: &Verdict,
+    edges: usize,
+) -> usize {
     let verdict_bytes = if verdict.is_empty() {
         0
     } else {
@@ -837,12 +843,7 @@ pub(crate) fn write_room_with_findings(
         let locator_collection = event_locator_collection_id(&record);
         check_locator_collision(&tx, record, &event.event_id)?;
 
-        tx.put(
-            EVENT_POOL,
-            event_collection,
-            record,
-            &node(stored.to_vec()),
-        )?;
+        tx.put(EVENT_POOL, event_collection, record, &node(stored.to_vec()))?;
         tx.put(
             EVENT_POOL,
             locator_collection,
