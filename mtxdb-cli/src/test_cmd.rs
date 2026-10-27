@@ -4783,7 +4783,7 @@ fn with_valid_content_hashes(content: &str) -> String {
                 })
                 .flatten()
         })
-        .unwrap_or_else(|| "11".to_owned());
+        .expect("layout fixture create event has a room version");
 
     content
         .lines()
