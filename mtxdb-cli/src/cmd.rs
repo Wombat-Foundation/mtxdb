@@ -9379,6 +9379,7 @@ impl ImportContext<'_> {
         export_import::clear_marker(self.db)?;
         let (written, findings) =
             export_import::write_room_with_findings(self.db, export, export_import::BATCH_BYTES)?;
+        eprintln!("  {}", export_import::room_collections_line(&export.room_id));
         eprintln!(
             "  imported {} events, {} auth closures",
             written.events, written.closures

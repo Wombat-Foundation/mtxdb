@@ -279,6 +279,18 @@ fn exported_rejection(metadata: &EventMetadata) -> bool {
     metadata.rejected || metadata.rejection_code.is_some()
 }
 
+/// The room's id and the hex ids of its event, auth and prev collections, as
+/// `mtxdb info`/`get --collection` take them.
+pub(crate) fn room_collections_line(room_id: &str) -> String {
+    let room = room_id.as_bytes();
+    format!(
+        "room {room_id} (events 0x{}, auth 0x{}, prev 0x{})",
+        hex::encode_upper(room_event_collection_id(room)),
+        hex::encode_upper(room_auth_collection_id(room)),
+        hex::encode_upper(room_prev_collection_id(room)),
+    )
+}
+
 /// What a room's edges say about events the import cannot fully authorize.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct AuthFindings {
