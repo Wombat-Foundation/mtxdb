@@ -6,9 +6,10 @@
 //!   the first line, so the importer can tell this input apart from a plain
 //!   event stream before it reads anything else.
 //! * `event` — the `event_id`, the `pdu` as the source stored it, the
-//!   `prev_events` / `auth_events` lists, the `outlier` / `soft_failed` /
-//!   `rejected` verdicts, and verdict codes or `redacted_by` when the source
-//!   recorded them.
+//!   `prev_events` / `auth_events` lists, an optional `outlier` flag, and `redacted_by`
+//!   when the source recorded it. Verdicts are not part of an export: the
+//!   `rejected` / `soft_failed` flags and their codes are optional, read for
+//!   old files, and ignored by the importer, which derives rejections itself.
 //! * `end` — the event count. A file without it was truncated.
 //!
 //! A keys export drops the framing: every line is a `server_keys` record with
@@ -378,9 +379,9 @@ fn parse_event(
     let prev_events = require_array(line, object, field::PREV_EVENTS)?.clone();
     let auth_events = require_array(line, object, field::AUTH_EVENTS)?.clone();
     let metadata = EventMetadata {
-        outlier: require_bool(line, object, field::OUTLIER)?,
-        rejected: require_bool(line, object, field::REJECTED)?,
-        soft_failed: require_bool(line, object, field::SOFT_FAILED)?,
+        outlier: optional_bool(line, object, field::OUTLIER)?,
+        rejected: optional_bool(line, object, field::REJECTED)?,
+        soft_failed: optional_bool(line, object, field::SOFT_FAILED)?,
         rejection_code: optional_code(line, object, field::REJECTION_CODE)?,
         soft_fail_code: optional_code(line, object, field::SOFT_FAIL_CODE)?,
         redacted_by: match object.get(field::REDACTED_BY) {
