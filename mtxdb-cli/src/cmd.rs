@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8112,8 +8112,30 @@ struct ImportRun {
     all_exports: bool,
 }
 
-/// The data phase of a run: import every input. Commits no marker, so a run
-/// that stops after this leaves the database visibly incomplete.
+/// Whether an input's first tagged record identifies a server-keys export.
+/// Read only the first nonblank line so large room exports need not be loaded
+/// just to order the inputs. A read or parse failure is left to the normal
+/// import pass, which reports it with the input path.
+fn is_server_keys_export(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) if line.iter().all(u8::is_ascii_whitespace) => continue,
+            Ok(_) => return interchange::detect(&line) == Some(interchange::InputFormat::Keys),
+        }
+    }
+}
+
+/// The data phase of a run: import every input. Server keys are imported
+/// before room exports regardless of argument order, so later room verdict
+/// derivation can consult the imported keys. Commits no marker, so a run that
+/// stops after this leaves the database visibly incomplete.
 fn import_data(
     db: &Database,
     store: &PackfileStorage,
@@ -8130,7 +8152,16 @@ fn import_data(
         exported_closures: 0,
         all_exports: !paths.is_empty(),
     };
-    for (index, path) in paths.iter().enumerate() {
+    let mut key_paths = Vec::new();
+    let mut other_paths = Vec::new();
+    for path in paths {
+        if is_server_keys_export(path) {
+            key_paths.push(path);
+        } else {
+            other_paths.push(path);
+        }
+    }
+    for (index, path) in key_paths.iter().chain(other_paths.iter()).enumerate() {
         if index != 0 {
             eprintln!();
         }
