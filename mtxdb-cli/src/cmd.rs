@@ -8137,6 +8137,43 @@ struct ImportRun {
     imported_key_bindings: HashSet<export_import::KeyBinding>,
     /// Verified time ranges observed across this run's room files.
     verified_keys: HashMap<export_import::KeyBinding, (u64, u64)>,
+    /// Events with no usable in-window key for their signer.
+    signature_no_key: usize,
+    /// Events without the material needed to attempt signature verification.
+    signature_no_material: usize,
+    /// Events rejected because a usable key had a bad signature.
+    signature_invalid: usize,
+}
+
+fn absorb_outcome(run: &mut ImportRun, outcome: ImportOutcome) {
+    run.server_keys = run.server_keys || outcome.server_keys;
+    run.hash_audit.extend(outcome.hash_audit);
+    run.signature_no_key = run
+        .signature_no_key
+        .saturating_add(outcome.signature_no_key);
+    run.signature_no_material = run
+        .signature_no_material
+        .saturating_add(outcome.signature_no_material);
+    run.signature_invalid = run
+        .signature_invalid
+        .saturating_add(outcome.signature_invalid);
+    run.imported_key_bindings.extend(outcome.key_bindings);
+    for observation in outcome.verified_keys {
+        run.verified_keys
+            .entry(observation.binding)
+            .and_modify(|(first, last)| {
+                *first = (*first).min(observation.first_seen_ms);
+                *last = (*last).max(observation.last_active_ms);
+            })
+            .or_insert((observation.first_seen_ms, observation.last_active_ms));
+    }
+    match outcome.exported {
+        Some(counts) => {
+            run.exported_events = run.exported_events.saturating_add(counts.events);
+            run.exported_closures = run.exported_closures.saturating_add(counts.closures);
+        }
+        None => run.all_exports = false,
+    }
 }
 
 /// Replace the run's content-hash audit sidecar, including an empty file when
@@ -8236,6 +8273,9 @@ fn import_data(
         hash_audit: Vec::new(),
         imported_key_bindings: HashSet::new(),
         verified_keys: HashMap::new(),
+        signature_no_key: 0,
+        signature_no_material: 0,
+        signature_invalid: 0,
     };
     let mut key_state_checked = false;
     let mut key_import_failed = false;
@@ -8283,28 +8323,7 @@ fn import_data(
             established_collections,
             signature_catalog.as_ref(),
         ) {
-            Ok(outcome) => {
-                run.server_keys = run.server_keys || outcome.server_keys;
-                run.hash_audit.extend(outcome.hash_audit);
-                run.imported_key_bindings.extend(outcome.key_bindings);
-                for observation in outcome.verified_keys {
-                    run.verified_keys
-                        .entry(observation.binding)
-                        .and_modify(|(first, last)| {
-                            *first = (*first).min(observation.first_seen_ms);
-                            *last = (*last).max(observation.last_active_ms);
-                        })
-                        .or_insert((observation.first_seen_ms, observation.last_active_ms));
-                }
-                match outcome.exported {
-                    Some(counts) => {
-                        run.exported_events = run.exported_events.saturating_add(counts.events);
-                        run.exported_closures =
-                            run.exported_closures.saturating_add(counts.closures);
-                    }
-                    None => run.all_exports = false,
-                }
-            }
+            Ok(outcome) => absorb_outcome(&mut run, outcome),
             Err(error) => {
                 eprintln!("{}: {error:#}", path.display());
                 run.failures = run.failures.saturating_add(1);
@@ -8368,6 +8387,19 @@ fn finish_import(db: &Database, run: &ImportRun) -> anyhow::Result<()> {
     eprintln!(
         "import complete: {} events, {} auth closures",
         run.exported_events, run.exported_closures
+    );
+    let corroborated = run
+        .verified_keys
+        .keys()
+        .filter(|binding| run.imported_key_bindings.contains(*binding))
+        .count();
+    eprintln!(
+        "signature checks: {} events with no in-window key; {} without signature material; {} invalid signatures; {} of {} keys corroborated",
+        run.signature_no_key,
+        run.signature_no_material,
+        run.signature_invalid,
+        corroborated,
+        run.imported_key_bindings.len()
     );
     Ok(())
 }
@@ -9295,6 +9327,12 @@ struct ImportOutcome {
     key_bindings: Vec<export_import::KeyBinding>,
     /// Verified key observations found in this input's room export.
     verified_keys: Vec<export_import::VerifiedKeyObservation>,
+    /// Events with no usable in-window key for their signer.
+    signature_no_key: usize,
+    /// Events without the material needed to attempt signature verification.
+    signature_no_material: usize,
+    /// Events rejected because a usable key had a bad signature.
+    signature_invalid: usize,
 }
 
 /// Import one input file through the state the batch shares with its readers.
@@ -9371,16 +9409,8 @@ impl ImportContext<'_> {
             interchange::InputFormat::Room => {
                 let export = interchange::parse_room(content)
                     .with_context(|| format!("reading {}", path.display()))?;
-                let (events, hash_audit, verified_keys) = self
-                    .import_room_export(&export, collection_override)
-                    .with_context(|| format!("importing {}", path.display()))?;
-                Ok(ImportOutcome {
-                    server_keys: false,
-                    exported: Some(events),
-                    hash_audit,
-                    verified_keys,
-                    ..ImportOutcome::default()
-                })
+                self.import_room_export(&export, collection_override)
+                    .with_context(|| format!("importing {}", path.display()))
             }
             interchange::InputFormat::Keys => {
                 let records = interchange::parse_keys(content)
@@ -9556,11 +9586,7 @@ impl ImportContext<'_> {
         &mut self,
         export: &RoomExport,
         collection_override: Option<&str>,
-    ) -> anyhow::Result<(
-        export_import::ImportCounts,
-        Vec<export_import::HashAudit>,
-        Vec<export_import::VerifiedKeyObservation>,
-    )> {
+    ) -> anyhow::Result<ImportOutcome> {
         if collection_override.is_some() {
             bail!("--collection does not apply to an mtxdb export: the server's layout derives the room's collections itself");
         }
@@ -9598,7 +9624,16 @@ impl ImportContext<'_> {
             eprintln!("  warning: {warning}");
         }
         eprintln!("  exported by {}", export.server);
-        Ok((written, findings.hash_audit, findings.verified_keys))
+        Ok(ImportOutcome {
+            server_keys: false,
+            exported: Some(written),
+            hash_audit: findings.hash_audit,
+            verified_keys: findings.verified_keys,
+            signature_no_key: findings.signature_no_key,
+            signature_no_material: findings.signature_no_material,
+            signature_invalid: findings.signature_failures.len(),
+            ..ImportOutcome::default()
+        })
     }
 
     /// Import one `server_keys` export into the server-info pool, in the
