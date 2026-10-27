@@ -4758,6 +4758,57 @@ const KEYS_EXPORT_FIXTURE: &str =
 
 const FIXTURE_ROOM: &str = "!export:test.conduwuit.local";
 
+/// The exporter fixture with the auth chain a real export carries: a member
+/// event for the creator, cited alongside the create event by every other
+/// event. The exporter's own fixture has empty auth lists, which is right for
+/// its byte-for-byte test but describes a room the auth rules refuse.
+///
+/// `$rejected` keeps its exported rejection by having a sender who never
+/// joined, so the derived verdict agrees with the export. The other events
+/// pass the auth check.
+fn room_export_with_auth() -> String {
+    const CREATE: &str = "$create:test.conduwuit.local";
+    const JOIN: &str = "$join:test.conduwuit.local";
+
+    let join = format!(
+        concat!(
+            "{{\"auth_events\":[\"{create}\"],\"event_id\":\"{join}\",\"outlier\":false,",
+            "\"prev_events\":[],\"pdu\":{{\"auth_events\":[\"{create}\"],",
+            "\"content\":{{\"membership\":\"join\"}},\"depth\":1,\"event_id\":\"{join}\",",
+            "\"hashes\":{{\"sha256\":\"dummy\"}},\"origin_server_ts\":123456789,",
+            "\"prev_events\":[],\"room_id\":\"!export:test.conduwuit.local\",",
+            "\"sender\":\"@alice:test.conduwuit.local\",",
+            "\"state_key\":\"@alice:test.conduwuit.local\",\"type\":\"m.room.member\"}},",
+            "\"rejected\":false,\"soft_failed\":false,\"t\":\"event\"}}"
+        ),
+        create = CREATE,
+        join = JOIN,
+    );
+
+    let mut lines = Vec::new();
+    for line in ROOM_EXPORT_FIXTURE.lines() {
+        if line.starts_with("{\"events\":") {
+            lines.push(join.clone());
+            lines.push(line.replace("\"events\":5", "\"events\":6"));
+            continue;
+        }
+        if !line.contains("\"t\":\"event\"") || line.contains(CREATE) {
+            lines.push(line.to_owned());
+            continue;
+        }
+        let auth = format!("[\"{JOIN}\",\"{CREATE}\"]");
+        let mut line = line.replace("\"auth_events\":[]", &format!("\"auth_events\":{auth}"));
+        if line.contains("$rejected:") {
+            line = line.replace(
+                "@alice:test.conduwuit.local",
+                "@stranger:test.conduwuit.local",
+            );
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 /// Import `inputs` the way `mtxdb import` does, minus the final phase.
 fn import_inputs(db: &Database, root: &std::path::Path, inputs: &[(&str, &str)]) -> ImportRun {
     let paths: Vec<PathBuf> = inputs
@@ -4801,19 +4852,21 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    let run = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
+    let content = room_export_with_auth();
+    let run = import_inputs(&db, &root, &[("room.jsonl", &content)]);
     assert_eq!(
         (run.failures, run.all_exports, run.exported_events),
-        (0, true, 5)
+        (0, true, 6)
     );
     finish_import(&db, &run).unwrap();
 
-    // The exporter's fixture: `$soft` is soft-failed with code 2 (Manual),
-    // `$rejected` is rejected with code 7 (AuthCheckFailed), `$redacted` was
-    // redacted by `$redaction`, and `$ok` carries no verdict.
-    let parsed = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    // The fixture with a creator membership: `$soft` is soft-failed with code
+    // 2 (Manual), `$rejected` is rejected with code 7 (AuthCheckFailed) by a
+    // sender who never joined, `$redacted` was redacted by `$redaction`, and
+    // `$ok` carries no verdict.
+    let parsed = parse_room(content.as_bytes()).unwrap();
     assert_eq!(parsed.room_id, FIXTURE_ROOM);
-    assert_eq!(parsed.events.len(), 5);
+    assert_eq!(parsed.events.len(), 6);
     let room_bytes = FIXTURE_ROOM.as_bytes();
     for event in &parsed.events {
         let id = event.event_id.as_bytes();
@@ -4914,12 +4967,13 @@ fn outlier_is_independent_of_soft_fail_and_redaction_status() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
     // The exporter marks `$ok` an outlier; `$redacted` stays on the timeline.
-    let content = ROOM_EXPORT_FIXTURE.replace(
+    let content = room_export_with_auth().replace(
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":false",
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":true",
     );
     assert_ne!(
-        content, ROOM_EXPORT_FIXTURE,
+        content,
+        room_export_with_auth(),
         "the fixture line this test edits moved"
     );
     import_inputs(&db, &root, &[("room.jsonl", &content)]);

@@ -9348,11 +9348,10 @@ impl ImportContext<'_> {
 
     /// Import one `mtxdb-export/v1` room file.
     ///
-    /// The events go through the ordinary PDU path — that is what rebuilds
-    /// locators, short ids, auth closures, and state groups — while the
-    /// record's verdicts and the untouched PDU bytes take the two routes they
-    /// need: the verdicts into the room's metadata index, the bytes into the
-    /// store.
+    /// The untouched PDU bytes are stored as exported, and the edges, locators
+    /// and auth closures are rebuilt from them. Rejections are derived by
+    /// running the auth rules over the events; the export's own rejection
+    /// flags are not trusted. State groups are not built here yet.
     fn import_room_export(
         &mut self,
         export: &RoomExport,
@@ -9379,7 +9378,10 @@ impl ImportContext<'_> {
         export_import::clear_marker(self.db)?;
         let (written, findings) =
             export_import::write_room_with_findings(self.db, export, export_import::BATCH_BYTES)?;
-        eprintln!("  {}", export_import::room_collections_line(&export.room_id));
+        eprintln!(
+            "  {}",
+            export_import::room_collections_line(&export.room_id)
+        );
         eprintln!(
             "  imported {} events, {} auth closures",
             written.events, written.closures

@@ -211,7 +211,7 @@ fn referenced_ids(maps: &[RezzyState]) -> Vec<String> {
 /// Returns `None` when the value is not a usable event — no `type`, or not an
 /// object at all. The caller records that as a missing id rather than handing
 /// rezzy something it would unwrap.
-fn lean_event(value: &OwnedValue, event_id: &str) -> Option<LeanEvent<String>> {
+pub(crate) fn lean_event(value: &OwnedValue, event_id: &str) -> Option<LeanEvent<String>> {
     let event_type = event_string_field(value, "type")?;
     let disposition = event_disposition(value);
     Some(LeanEvent {

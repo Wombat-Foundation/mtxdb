@@ -101,6 +101,19 @@ pub(crate) struct RoomEvent {
 }
 
 impl RoomEvent {
+    /// [`Self::annotated`] without the source's verdicts: the `rejected` and
+    /// `soft_failed` flags are removed, so an auth check judges the event by
+    /// its own contents and cannot read the answer the exporting server
+    /// already gave.
+    pub(crate) fn unflagged(&self, room_id: &str) -> OwnedValue {
+        let mut event = self.annotated(room_id);
+        if let OwnedValue::Object(fields) = &mut event {
+            set_flag(fields, "rejected", false);
+            set_flag(fields, "soft_failed", false);
+        }
+        event
+    }
+
     /// The event as this importer's analysis path should see it: the PDU with
     /// the record's verdicts merged in and the identity fields supplied when
     /// the PDU carries none.

@@ -30,11 +30,14 @@ use mtxdb::interop::{
 use mtxdb::server_keys;
 use mtxdb::storage::StorageEngine as _;
 use mtxdb::{Database, NodeData};
+use rezzy::auth::{check_auth, StateProvider};
 use rezzy::basespec::event_types::M_ROOM_CREATE;
 use rezzy::bitmap::Bitmap;
 use rezzy::json::Value as OwnedValue;
+use rezzy::{LeanEvent, StateResVersion};
 
 use crate::interchange::{EventMetadata, KeyRecord, RoomEvent, RoomExport};
+use crate::state_resolve::lean_event;
 
 /// Bytes one batch may stage. Half the engine's per-transaction limit, so the
 /// estimate below can be rough.
@@ -304,6 +307,14 @@ pub(crate) struct AuthFindings {
     /// Events with a `prev_events` id that is not in the export. These keep
     /// their verdicts: a gap in history is not an authorization failure.
     pub(crate) missing_prev: Vec<String>,
+    /// Events whose exported rejection the auth check overturned: the event
+    /// passes against its own auth events, so its stored verdict is clear.
+    cleared: Vec<bool>,
+    /// Events the source exported as rejected that pass the auth check, by id.
+    /// Includes ones a rejected auth event still rejects.
+    pub(crate) passes_but_exported_rejected: Vec<String>,
+    /// Events the source exported as accepted that fail the auth check, by id.
+    pub(crate) fails_but_exported_accepted: Vec<String>,
 }
 
 impl AuthFindings {
@@ -326,6 +337,16 @@ impl AuthFindings {
                 self.missing_prev.len(),
                 &self.missing_prev,
                 "have a prev event that is not in the export (verdicts unchanged)",
+            ),
+            (
+                self.passes_but_exported_rejected.len(),
+                &self.passes_but_exported_rejected,
+                "were exported as rejected but pass the auth check against their auth events",
+            ),
+            (
+                self.fails_but_exported_accepted.len(),
+                &self.fails_but_exported_accepted,
+                "were exported as accepted but fail the auth check against their auth events (stored as rejected)",
             ),
         ] {
             if count == 0 {
@@ -352,6 +373,15 @@ impl AuthFindings {
 /// that already carries a rejection keeps it. The room fails as a whole when
 /// its `m.room.create` would be forced.
 pub(crate) fn auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings> {
+    auth_findings_seeded(export, None)
+}
+
+/// [`auth_findings`] with the rejections that start the cascade supplied by
+/// the caller. `None` seeds it from the exported verdicts.
+fn auth_findings_seeded(
+    export: &RoomExport,
+    seeds: Option<&[bool]>,
+) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let index: HashMap<&[u8], usize> = events
         .iter()
@@ -360,12 +390,16 @@ pub(crate) fn auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings>
         .collect();
     let mut findings = AuthFindings {
         forced: vec![None; events.len()],
+        cleared: vec![false; events.len()],
         ..AuthFindings::default()
     };
-    let mut rejected: Vec<bool> = events
-        .iter()
-        .map(|event| exported_rejection(&event.metadata))
-        .collect();
+    let mut rejected: Vec<bool> = match seeds {
+        Some(seeds) => seeds.to_vec(),
+        None => events
+            .iter()
+            .map(|event| exported_rejection(&event.metadata))
+            .collect(),
+    };
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); events.len()];
 
     for (position, event) in events.iter().enumerate() {
@@ -415,6 +449,145 @@ pub(crate) fn auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings>
     Ok(findings)
 }
 
+/// The state an event's own `auth_events` describe, as rezzy's auth rules read
+/// it: each cited event under its `(type, state_key)`.
+struct AuthState<'a>(Vec<(&'a str, &'a str, &'a LeanEvent<String>)>);
+
+impl StateProvider<String, OwnedValue, LeanEvent<String>> for AuthState<'_> {
+    fn get_event(&self, event_type: &str, state_key: &str) -> Option<&LeanEvent<String>> {
+        self.0
+            .iter()
+            .find(|(kind, key, _)| *kind == event_type && *key == state_key)
+            .map(|(_, _, event)| *event)
+    }
+}
+
+/// The room version the create event names, when the export has one.
+fn create_room_version(events: &[RoomEvent]) -> Option<&str> {
+    events
+        .iter()
+        .find(|event| {
+            event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE)
+                && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
+        })
+        .and_then(|event| event.pdu.get("content"))
+        .and_then(|content| content.get("room_version"))
+        .and_then(OwnedValue::as_str)
+}
+
+/// [`auth_findings`] with the rejections derived from the events, not read
+/// from the export.
+///
+/// Each event is checked with rezzy's auth rules against the state its own
+/// `auth_events` describe (the spec's first check). The exported `rejected`
+/// flag is not an input: it is stripped before the event is built, and an
+/// exported rejection the check does not support is dropped, while an
+/// exported accept the check refutes is stored as rejected. Both
+/// disagreements are reported. The cascade through rejected auth events and
+/// the `MissingAuthEvent` forcing are unchanged.
+///
+/// An event the check cannot judge keeps its exported verdict: an unknown
+/// room version, an auth event missing from the export, or a PDU rezzy cannot
+/// read. Soft-fail is never derived. The state before the event (the spec's
+/// second check) and signature checks are not run here.
+pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings> {
+    let events = &export.events;
+    let Some(version) = create_room_version(events).and_then(StateResVersion::from_room_version)
+    else {
+        return auth_findings(export);
+    };
+    let index: HashMap<&[u8], usize> = events
+        .iter()
+        .enumerate()
+        .map(|(position, event)| (event.event_id.as_bytes(), position))
+        .collect();
+    let lean: Vec<Option<LeanEvent<String>>> = events
+        .iter()
+        .map(|event| lean_event(&event.unflagged(&export.room_id), &event.event_id))
+        .collect();
+    let exported: Vec<bool> = events
+        .iter()
+        .map(|event| exported_rejection(&event.metadata))
+        .collect();
+
+    // `checked[i]` is whether the check could judge event `i`; `refused[i]` is
+    // the rejection code when it did and the event failed.
+    let mut checked = vec![false; events.len()];
+    let mut refused: Vec<Option<u8>> = vec![None; events.len()];
+    for (position, event) in events.iter().enumerate() {
+        let Some(subject) = &lean[position] else {
+            continue;
+        };
+        let mut cited = Vec::new();
+        let mut complete = true;
+        for auth in id_list(event, "auth_events")? {
+            match index.get(auth).and_then(|&parent| lean[parent].as_ref()) {
+                Some(parent) => cited.push(parent),
+                None => complete = false,
+            }
+        }
+        if !complete {
+            continue;
+        }
+        let mut entries: Vec<(&str, &str, &LeanEvent<String>)> = Vec::new();
+        let mut duplicate = false;
+        for parent in cited {
+            let Some(key) = parent.state_key.as_deref() else {
+                continue;
+            };
+            if entries
+                .iter()
+                .any(|(kind, existing, _)| *kind == parent.event_type && *existing == key)
+            {
+                duplicate = true;
+            }
+            entries.push((parent.event_type.as_str(), key, parent));
+        }
+        checked[position] = true;
+        refused[position] = if duplicate {
+            Some(RejectionCode::DuplicateAuthEventKey.to_u8())
+        } else {
+            check_auth(subject, &AuthState(entries), version, None)
+                .err()
+                .map(|_| RejectionCode::AuthCheckFailed.to_u8())
+        };
+    }
+
+    let seeds: Vec<bool> = (0..events.len())
+        .map(|position| {
+            if checked[position] {
+                refused[position].is_some()
+            } else {
+                exported[position]
+            }
+        })
+        .collect();
+    let mut findings = auth_findings_seeded(export, Some(&seeds))?;
+    for (position, event) in events.iter().enumerate() {
+        if !checked[position] {
+            continue;
+        }
+        match (refused[position], exported[position]) {
+            (Some(code), false) => {
+                // The seed kept the cascade from assigning a code.
+                findings.forced[position] = Some(code);
+                findings
+                    .fails_but_exported_accepted
+                    .push(event.event_id.clone());
+            }
+            (None, true) => {
+                findings
+                    .passes_but_exported_rejected
+                    .push(event.event_id.clone());
+                // A rejected auth event still rejects it, with its own code.
+                findings.cleared[position] = findings.forced[position].is_none();
+            }
+            _ => {}
+        }
+    }
+    Ok(findings)
+}
+
 /// Bytes an event's records will stage, with margin.
 fn estimate(event: &RoomEvent, room_id: &str, verdict: &Verdict, edges: usize) -> usize {
     let verdict_bytes = if verdict.is_empty() {
@@ -440,12 +613,15 @@ fn estimate(event: &RoomEvent, room_id: &str, verdict: &Verdict, edges: usize) -
 ///
 /// All of one event's records share a transaction. Returns how many event
 /// records were written. The marker is the caller's to commit.
+///
+/// Each rejection is derived by running the auth rules over the room's events
+/// (see [`derived_auth_findings`]); the export's rejections are not trusted.
 pub(crate) fn write_room_with_findings(
     db: &Database,
     export: &RoomExport,
     batch_bytes: usize,
 ) -> anyhow::Result<(ImportCounts, AuthFindings)> {
-    let findings = auth_findings(export)?;
+    let findings = derived_auth_findings(export)?;
     let plan = closure_plan(export)?;
     let room = export.room_id.as_bytes();
     let event_collection = room_event_collection_id(room);
@@ -477,7 +653,13 @@ pub(crate) fn write_room_with_findings(
         let auth = id_list(event, "auth_events")?;
         let prev_bytes = encode_edges(&prev)?;
         let auth_bytes = encode_edges(&auth)?;
-        let verdict = verdict_of(&event.metadata, findings.forced[position]);
+        let mut metadata = event.metadata.clone();
+        if findings.cleared[position] {
+            // The auth check overturned the exported rejection.
+            metadata.rejected = false;
+            metadata.rejection_code = None;
+        }
+        let verdict = verdict_of(&metadata, findings.forced[position]);
         let size = estimate(
             event,
             &export.room_id,
@@ -834,6 +1016,12 @@ mod auth_findings_tests {
         let mut fields = std::collections::BTreeMap::new();
         fields.insert("type".to_owned(), OwnedValue::String(kind.to_owned()));
         if kind == M_ROOM_CREATE {
+            // The auth rules authorize a create event by its sender alone, so
+            // it needs a valid one to pass the check.
+            fields.insert(
+                "sender".to_owned(),
+                OwnedValue::String("@alice:example.org".to_owned()),
+            );
             fields.insert("state_key".to_owned(), OwnedValue::String(String::new()));
             let mut content = std::collections::BTreeMap::new();
             content.insert(
@@ -954,6 +1142,138 @@ mod auth_findings_tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("m.room.create"), "{error}");
+    }
+
+    fn with_field(mut event: RoomEvent, key: &str, value: &str) -> RoomEvent {
+        if let OwnedValue::Object(fields) = &mut event.pdu {
+            fields.insert(key.to_owned(), OwnedValue::String(value.to_owned()));
+        }
+        event
+    }
+
+    fn member(id: &str, user: &str, auths: &[&str]) -> RoomEvent {
+        let mut event = event(id, "m.room.member", &["$create"], auths);
+        if let OwnedValue::Object(fields) = &mut event.pdu {
+            fields.insert("sender".to_owned(), OwnedValue::String(user.to_owned()));
+            fields.insert("state_key".to_owned(), OwnedValue::String(user.to_owned()));
+            let mut content = std::collections::BTreeMap::new();
+            content.insert(
+                "membership".to_owned(),
+                OwnedValue::String("join".to_owned()),
+            );
+            fields.insert("content".to_owned(), OwnedValue::Object(content));
+        }
+        event
+    }
+
+    fn message(auths: &[&str]) -> RoomEvent {
+        with_field(
+            with_field(
+                event("$msg", "m.room.message", &["$join"], auths),
+                "sender",
+                "@alice:example.org",
+            ),
+            "room_id",
+            "!room:example.org",
+        )
+    }
+
+    #[test]
+    fn an_exported_accept_that_fails_the_auth_check_is_stored_rejected() {
+        // The sender never joined, so the message cannot be authorized by an
+        // auth state that holds only the create event, whatever was exported.
+        let message = with_field(
+            with_field(
+                event("$msg", "m.room.message", &["$create"], &["$create"]),
+                "sender",
+                "@stranger:example.org",
+            ),
+            "room_id",
+            "!room:example.org",
+        );
+        let findings = derived_auth_findings(&export(vec![
+            event("$create", "m.room.create", &[], &[]),
+            message,
+        ]))
+        .unwrap();
+        assert_eq!(forced(&findings, 1), Some(7));
+        assert_eq!(findings.fails_but_exported_accepted, ["$msg"]);
+    }
+
+    #[test]
+    fn an_exported_rejection_that_passes_the_auth_check_is_cleared() {
+        let mut rejected = message(&["$create", "$join"]);
+        rejected.metadata.rejected = true;
+        rejected.metadata.rejection_code = Some(7);
+        let findings = derived_auth_findings(&export(vec![
+            event("$create", "m.room.create", &[], &[]),
+            member("$join", "@alice:example.org", &["$create"]),
+            rejected,
+        ]))
+        .unwrap();
+        assert_eq!(forced(&findings, 2), None);
+        assert!(findings.cleared[2]);
+        assert_eq!(findings.passes_but_exported_rejected, ["$msg"]);
+        assert!(findings.fails_but_exported_accepted.is_empty());
+    }
+
+    #[test]
+    fn two_auth_events_for_one_state_key_are_a_duplicate_rejection() {
+        let findings = derived_auth_findings(&export(vec![
+            event("$create", "m.room.create", &[], &[]),
+            member("$join", "@alice:example.org", &["$create"]),
+            member("$join2", "@alice:example.org", &["$create"]),
+            message(&["$create", "$join", "$join2"]),
+        ]))
+        .unwrap();
+        assert_eq!(forced(&findings, 3), Some(5));
+        assert_eq!(findings.fails_but_exported_accepted, ["$msg"]);
+    }
+
+    fn stored_rejection(db: &Database, id: &str) -> Option<u8> {
+        let record = event_record_id(id.as_bytes());
+        read_pool(db, EVENT_POOL, event_verdict_collection_id(&record), record)
+            .and_then(|bytes| mtxdb::interop::decode_verdict(&bytes).unwrap().1.rejection)
+    }
+
+    #[test]
+    fn writing_a_room_stores_derived_verdicts_not_exported_ones() {
+        let (db, dir) = db();
+        let stranger = with_field(
+            with_field(
+                event("$msg", "m.room.message", &["$create"], &["$create"]),
+                "sender",
+                "@stranger:example.org",
+            ),
+            "room_id",
+            "!room:example.org",
+        );
+        // Exported as accepted, but its auth state is just the create event.
+        let room = export(vec![event("$create", "m.room.create", &[], &[]), stranger]);
+        write_room_with_findings(&db, &room, BATCH_BYTES).unwrap();
+        assert_eq!(stored_rejection(&db, "$msg"), Some(7));
+        assert_eq!(stored_rejection(&db, "$create"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unknown_room_version_keeps_the_exported_verdicts() {
+        let mut create = event("$create", "m.room.create", &[], &[]);
+        if let OwnedValue::Object(fields) = &mut create.pdu {
+            let mut content = std::collections::BTreeMap::new();
+            content.insert(
+                "room_version".to_owned(),
+                OwnedValue::String("not-a-version".to_owned()),
+            );
+            fields.insert("content".to_owned(), OwnedValue::Object(content));
+        }
+        let mut rejected = event("$msg", "m.room.message", &["$create"], &["$create"]);
+        rejected.metadata.rejected = true;
+        let export = export(vec![create, rejected]);
+        assert_eq!(
+            derived_auth_findings(&export).unwrap(),
+            auth_findings(&export).unwrap()
+        );
     }
 
     #[test]
