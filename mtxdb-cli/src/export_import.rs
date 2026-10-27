@@ -595,10 +595,21 @@ pub(crate) struct AuthFailure {
     pub(crate) reason: String,
 }
 
+/// How many event ids each import warning names. `MTXDB_IMPORT_WARNING_LIMIT`
+/// overrides the default of 10; `all` names every id.
+fn warning_id_limit() -> usize {
+    const DEFAULT: usize = 10;
+    match std::env::var("MTXDB_IMPORT_WARNING_LIMIT") {
+        Ok(value) if value.eq_ignore_ascii_case("all") => usize::MAX,
+        Ok(value) => value.parse().unwrap_or(DEFAULT),
+        Err(_) => DEFAULT,
+    }
+}
+
 impl AuthFindings {
     /// Human-readable warnings, empty for a clean room.
     pub(crate) fn warnings(&self) -> Vec<String> {
-        const LISTED: usize = 10;
+        let id_limit = warning_id_limit();
         let mut lines = Vec::new();
         for (count, ids, what) in [
             (
@@ -625,7 +636,7 @@ impl AuthFindings {
             if count == 0 {
                 continue;
             }
-            let shown: Vec<&str> = ids.iter().take(LISTED).map(String::as_str).collect();
+            let shown: Vec<&str> = ids.iter().take(id_limit).map(String::as_str).collect();
             let more = count.saturating_sub(shown.len());
             let tail = if more > 0 {
                 format!(", and {more} more")
@@ -665,7 +676,7 @@ impl AuthFindings {
             let mut shown = 0;
             let mut parts = Vec::new();
             for (reason, ids) in groups {
-                let take = LISTED.saturating_sub(shown).min(ids.len());
+                let take = id_limit.saturating_sub(shown).min(ids.len());
                 let listed = ids
                     .iter()
                     .take(take)
@@ -689,7 +700,7 @@ impl AuthFindings {
                 parts.join("; "),
             ));
         }
-        if let Some(warning) = self.signature_failure_warning(LISTED) {
+        if let Some(warning) = self.signature_failure_warning(id_limit) {
             lines.push(warning);
         }
         lines
