@@ -668,6 +668,145 @@ fn judge_event_auth(
     }
 }
 
+/// The result of running the first auth check over every event.
+struct AuthJudgement {
+    /// Whether the check could judge the event.
+    checked: Vec<bool>,
+    /// The rejection code when the check judged and refused the event.
+    refused: Vec<Option<u8>>,
+    /// The rejection reason for a refused event.
+    reason: Vec<Option<String>>,
+}
+
+/// The canonical redaction of every event whose content hash fails.
+fn redactions_for_export(events: &[RoomEvent], room_version: &str) -> Vec<Option<HashMismatch>> {
+    events
+        .iter()
+        .map(|event| redacted_for_hash(&event.pdu, room_version))
+        .collect()
+}
+
+/// The auth-check input for each event, using its redacted form on mismatch.
+fn lean_redacted_events(
+    events: &[RoomEvent],
+    redacted: &[Option<HashMismatch>],
+    room_id: &str,
+) -> Vec<Option<LeanEvent<String>>> {
+    events
+        .iter()
+        .zip(redacted)
+        .map(|(event, redacted)| {
+            let value = match redacted {
+                Some(mismatch) => event.unflagged_from(&mismatch.value, room_id),
+                None => event.unflagged(room_id),
+            };
+            lean_event(&value, &event.event_id)
+        })
+        .collect()
+}
+
+fn judge_events(
+    events: &[RoomEvent],
+    lean: &[Option<LeanEvent<String>>],
+    index: &HashMap<&[u8], usize>,
+    create: Option<&LeanEvent<String>>,
+    version: StateResVersion,
+) -> anyhow::Result<AuthJudgement> {
+    let mut checked = vec![false; events.len()];
+    let mut refused: Vec<Option<u8>> = vec![None; events.len()];
+    let mut reasons: Vec<Option<String>> = vec![None; events.len()];
+    for (position, event) in events.iter().enumerate() {
+        match judge_event_auth(event, lean[position].as_ref(), index, lean, create, version)? {
+            EventAuthOutcome::Unchecked => {}
+            EventAuthOutcome::Passed => checked[position] = true,
+            EventAuthOutcome::Refused { code, reason } => {
+                checked[position] = true;
+                refused[position] = Some(code);
+                reasons[position] = Some(reason);
+            }
+        }
+    }
+    Ok(AuthJudgement {
+        checked,
+        refused,
+        reason: reasons,
+    })
+}
+
+fn audit_hash_mismatches(
+    events: &[RoomEvent],
+    redacted: &[Option<HashMismatch>],
+    room_id: &str,
+    room_version: &str,
+) -> Vec<HashAudit> {
+    events
+        .iter()
+        .zip(redacted)
+        .filter_map(|(event, mismatch)| {
+            mismatch.as_ref().map(|m| HashAudit {
+                event_id: event.event_id.clone(),
+                room_id: room_id.to_owned(),
+                room_version: room_version.to_owned(),
+                stored: m.stored.clone(),
+                computed: m.computed.clone(),
+                content_matches_redaction: m.content_matches_redaction,
+            })
+        })
+        .collect()
+}
+
+fn apply_judgement(
+    findings: &mut AuthFindings,
+    events: &[RoomEvent],
+    judgement: &AuthJudgement,
+    exported: &[bool],
+) {
+    for (position, event) in events.iter().enumerate() {
+        if !judgement.checked[position] {
+            continue;
+        }
+        if let Some(code) = judgement.refused[position] {
+            // The seed kept the cascade from assigning a code.
+            findings.forced[position] = Some(code);
+            if !exported[position] {
+                findings.fails_but_exported_accepted.push(AuthFailure {
+                    event_id: event.event_id.clone(),
+                    reason: judgement.reason[position]
+                        .clone()
+                        .unwrap_or_else(|| "unknown auth-check failure".to_owned()),
+                });
+            }
+        } else if exported[position] {
+            // Passing the first check does not rule out a state-before-event
+            // rejection, which this pass cannot see yet. The event is stored
+            // accepted; the disagreement is reported.
+            findings
+                .passes_but_exported_rejected
+                .push(event.event_id.clone());
+        }
+    }
+}
+
+fn ensure_create_authorized(
+    export: &RoomExport,
+    events: &[RoomEvent],
+    findings: &AuthFindings,
+) -> anyhow::Result<()> {
+    for (position, event) in events.iter().enumerate() {
+        let is_create = event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE)
+            && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("");
+        if is_create && findings.forced[position].is_some() {
+            bail!(
+                "refusing to import events for {}: its m.room.create event {} cannot be \
+                 authorized from this export",
+                export.room_id,
+                event.event_id
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let Some(room_version) = create_room_version(events) else {
@@ -682,56 +821,18 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .map(|(position, event)| (event.event_id.as_bytes(), position))
         .collect();
     // An event whose content hash fails is judged in its redacted form.
-    let redacted: Vec<Option<HashMismatch>> = events
-        .iter()
-        .map(|event| redacted_for_hash(&event.pdu, room_version))
-        .collect();
-    let lean: Vec<Option<LeanEvent<String>>> = events
-        .iter()
-        .zip(&redacted)
-        .map(|(event, redacted)| {
-            let value = match redacted {
-                Some(mismatch) => event.unflagged_from(&mismatch.value, &export.room_id),
-                None => event.unflagged(&export.room_id),
-            };
-            lean_event(&value, &event.event_id)
-        })
-        .collect();
+    let redacted = redactions_for_export(events, room_version);
+    let lean = lean_redacted_events(events, &redacted, &export.room_id);
     let create = create_position(events).and_then(|position| lean[position].as_ref());
     let exported: Vec<bool> = events
         .iter()
         .map(|event| exported_rejection(&event.metadata))
         .collect();
-
-    // `checked[i]` is whether the check could judge event `i`; `refused[i]` is
-    // the rejection code when it did and the event failed.
-    let mut checked = vec![false; events.len()];
-    let mut refused: Vec<Option<u8>> = vec![None; events.len()];
-    let mut refusal_reason: Vec<Option<String>> = vec![None; events.len()];
-    for (position, event) in events.iter().enumerate() {
-        match judge_event_auth(
-            event,
-            lean[position].as_ref(),
-            &index,
-            &lean,
-            create,
-            version,
-        )? {
-            EventAuthOutcome::Unchecked => {}
-            EventAuthOutcome::Passed => {
-                checked[position] = true;
-            }
-            EventAuthOutcome::Refused { code, reason } => {
-                checked[position] = true;
-                refused[position] = Some(code);
-                refusal_reason[position] = Some(reason);
-            }
-        }
-    }
+    let judgement = judge_events(events, &lean, &index, create, version)?;
 
     // Only a derived refusal seeds the cascade. The exported verdicts are
     // compared below for the report and are never stored.
-    let seeds: Vec<bool> = refused.iter().map(Option::is_some).collect();
+    let seeds: Vec<bool> = judgement.refused.iter().map(Option::is_some).collect();
     let mut findings = auth_findings_seeded(export, &seeds)?;
     findings.hash_mismatched = events
         .iter()
@@ -739,60 +840,13 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         .filter(|(_, redacted)| redacted.is_some())
         .map(|(event, _)| event.event_id.clone())
         .collect();
-    findings.hash_audit = events
-        .iter()
-        .zip(&redacted)
-        .filter_map(|(event, mismatch)| {
-            mismatch.as_ref().map(|m| HashAudit {
-                event_id: event.event_id.clone(),
-                room_id: export.room_id.clone(),
-                room_version: room_version.to_owned(),
-                stored: m.stored.clone(),
-                computed: m.computed.clone(),
-                content_matches_redaction: m.content_matches_redaction,
-            })
-        })
-        .collect();
+    findings.hash_audit = audit_hash_mismatches(events, &redacted, &export.room_id, room_version);
     findings.redacted_pdus = redacted
         .into_iter()
         .map(|redacted| redacted.map(|m| m.bytes))
         .collect();
-    for (position, event) in events.iter().enumerate() {
-        if !checked[position] {
-            continue;
-        }
-        if let Some(code) = refused[position] {
-            // The seed kept the cascade from assigning a code.
-            findings.forced[position] = Some(code);
-            if !exported[position] {
-                findings.fails_but_exported_accepted.push(AuthFailure {
-                    event_id: event.event_id.clone(),
-                    reason: refusal_reason[position]
-                        .take()
-                        .unwrap_or_else(|| "unknown auth-check failure".to_owned()),
-                });
-            }
-        } else if exported[position] {
-            // Passing the first check does not rule out a state-before-event
-            // rejection, which this pass cannot see yet. The event is stored
-            // accepted; the disagreement is reported.
-            findings
-                .passes_but_exported_rejected
-                .push(event.event_id.clone());
-        }
-    }
-    for (position, event) in events.iter().enumerate() {
-        let is_create = event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE)
-            && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("");
-        if is_create && findings.forced[position].is_some() {
-            bail!(
-                "refusing to import events for {}: its m.room.create event {} cannot be \
-                 authorized from this export",
-                export.room_id,
-                event.event_id
-            );
-        }
-    }
+    apply_judgement(&mut findings, events, &judgement, &exported);
+    ensure_create_authorized(export, events, &findings)?;
     Ok(findings)
 }
 
