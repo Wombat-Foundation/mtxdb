@@ -8110,6 +8110,18 @@ struct ImportRun {
     /// vouches only for such a run: anything else leaves records the server
     /// cannot read, or data that did not all arrive.
     all_exports: bool,
+    /// A server-keys input failed to import. Room verdicts must not then be
+    /// derived from signatures: the keys they would be checked against are
+    /// missing or partial.
+    keys_failed: bool,
+}
+
+/// `paths` with every server-keys export first, the rest after them, each
+/// group in argument order.
+fn keys_first(paths: &[PathBuf]) -> Vec<&PathBuf> {
+    let (keys, rest): (Vec<_>, Vec<_>) =
+        paths.iter().partition(|path| is_server_keys_export(path));
+    keys.into_iter().chain(rest).collect()
 }
 
 /// Whether an input's first tagged record identifies a server-keys export.
@@ -8151,19 +8163,19 @@ fn import_data(
         exported_events: 0,
         exported_closures: 0,
         all_exports: !paths.is_empty(),
+        keys_failed: false,
     };
-    let mut key_paths = Vec::new();
-    let mut other_paths = Vec::new();
-    for path in paths {
-        if is_server_keys_export(path) {
-            key_paths.push(path);
-        } else {
-            other_paths.push(path);
-        }
-    }
-    for (index, path) in key_paths.iter().chain(other_paths.iter()).enumerate() {
+    let mut announced = false;
+    for (index, path) in keys_first(paths).into_iter().enumerate() {
         if index != 0 {
             eprintln!();
+        }
+        if run.keys_failed && !announced && !is_server_keys_export(path) {
+            eprintln!(
+                "signature checks off: signing keys failed to import, so room verdicts \
+                 keep the exported signature state"
+            );
+            announced = true;
         }
         match cmd_import_file(
             db,
@@ -8189,6 +8201,7 @@ fn import_data(
                 eprintln!("{}: {error:#}", path.display());
                 run.failures = run.failures.saturating_add(1);
                 run.all_exports = false;
+                run.keys_failed = run.keys_failed || is_server_keys_export(path);
             }
         }
     }

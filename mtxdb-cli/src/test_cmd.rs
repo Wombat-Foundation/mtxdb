@@ -6,7 +6,8 @@ use super::{
     derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
     export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
     format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
-    interleaving_worth_noting, listing_shard_types, load_state_groups, matrix_batch_has_create,
+    interleaving_worth_noting, is_server_keys_export, keys_first, listing_shard_types,
+    load_state_groups, matrix_batch_has_create,
     matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
     meta_pools, meta_raw, pack_identity, parse_federation_input, parse_pack_id_selector,
     parse_pack_selectors, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
@@ -4517,23 +4518,27 @@ fn real_resolution_decides_a_fork_by_power_level_not_prev_order() {
     let create = owned_value(
         r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10","creator":"@admin:x"}}"#,
     );
+    let member = owned_value(
+        r#"{"event_id":"$admin-member","room_id":"!r:x","type":"m.room.member","state_key":"@admin:x","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"membership":"join"}}"#,
+    );
     let power_levels = owned_value(
-        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"users_default":0,"state_default":50,"events_default":0,"users":{"@admin:x":100}}}"#,
+        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$admin-member"],"auth_events":["$create","$admin-member"],"content":{"users_default":0,"state_default":50,"events_default":0,"users":{"@admin:x":100}}}"#,
     );
     let admin_topic = owned_value(
-        r#"{"event_id":"$topic-admin","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"kept"}}"#,
+        r#"{"event_id":"$topic-admin","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":4,"prev_events":["$pl"],"auth_events":["$create","$admin-member","$pl"],"content":{"topic":"kept"}}"#,
     );
     let nobody_topic = owned_value(
-        r#"{"event_id":"$topic-nobody","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@nobody:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"dropped"}}"#,
+        r#"{"event_id":"$topic-nobody","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@nobody:x","depth":4,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"dropped"}}"#,
     );
     let merge = |first: &str, second: &str, id: &str| {
         owned_value(&format!(
-            r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":4,"prev_events":["{first}","{second}"],"auth_events":["$create","$pl"],"content":{{}}}}"#
+            r#"{{"event_id":"{id}","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":5,"prev_events":["{first}","{second}"],"auth_events":["$create","$admin-member","$pl"],"content":{{}}}}"#
         ))
     };
     let batch = |first: &str, second: &str, id: &str| {
         vec![
             create.clone(),
+            member.clone(),
             power_levels.clone(),
             admin_topic.clone(),
             nobody_topic.clone(),
@@ -5077,6 +5082,20 @@ fn marker(db: &Database) -> Option<mtxdb::interop::ImportMarker> {
 }
 
 #[test]
+fn a_keys_export_is_detected_after_leading_blank_lines() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let room = root.join("room.jsonl");
+    let keys = root.join("keys.jsonl");
+    std::fs::write(&room, ROOM_EXPORT_FIXTURE).unwrap();
+    std::fs::write(&keys, format!("\n\n{KEYS_EXPORT_FIXTURE}")).unwrap();
+
+    assert!(is_server_keys_export(&keys));
+    assert!(!is_server_keys_export(&room));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn an_import_stopped_before_the_marker_is_visibly_incomplete() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
@@ -5140,6 +5159,59 @@ fn a_failed_input_means_no_marker() {
         None,
         "a run with a failed input is never marked complete"
     );
+}
+
+#[test]
+fn server_keys_are_imported_before_rooms_whatever_the_argument_order() {
+    let root = unique_temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let write = |name: &str, content: &str| {
+        let path = root.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    };
+    let room = write("a-room.jsonl", ROOM_EXPORT_FIXTURE);
+    let keys = write("z-keys.jsonl", KEYS_EXPORT_FIXTURE);
+    let other_room = write("b-room.jsonl", ROOM_EXPORT_FIXTURE);
+    let inputs = [room.clone(), keys.clone(), other_room.clone()];
+    assert_eq!(keys_first(&inputs), [&keys, &room, &other_room]);
+}
+
+#[test]
+fn a_failed_keys_import_is_flagged_and_leaves_no_marker() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let run = import_inputs(
+        &db,
+        &root,
+        &[
+            ("room.jsonl", ROOM_EXPORT_FIXTURE),
+            (
+                "keys.jsonl",
+                "{\"kind\":\"bogus\",\"origin\":\"keys.example.org\",\"t\":\"server_keys\"}",
+            ),
+        ],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(run.keys_failed);
+    finish_import(&db, &run).unwrap();
+    assert_eq!(marker(&db), None);
+}
+
+#[test]
+fn a_failed_room_import_does_not_flag_the_keys() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let run = import_inputs(
+        &db,
+        &root,
+        &[(
+            "broken.jsonl",
+            "{\"t\":\"header\",\"format\":\"mtxdb-export/v1\"",
+        )],
+    );
+    assert_eq!(run.failures, 1);
+    assert!(!run.keys_failed);
 }
 
 #[test]

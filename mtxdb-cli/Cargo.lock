@@ -387,6 +387,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
 name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -410,12 +416,13 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#3620bab03204f8d123cce20ff049a39119bff5e1"
 dependencies = [
  "base64",
  "blake3",
  "hashbrown",
  "rezzy-json",
+ "rezzy-log",
  "rezzy-recon",
  "sha2",
 ]
@@ -423,17 +430,26 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#3620bab03204f8d123cce20ff049a39119bff5e1"
 dependencies = [
  "ryu",
 ]
 
 [[package]]
+name = "rezzy-log"
+version = "0.6.0-rc.1"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#3620bab03204f8d123cce20ff049a39119bff5e1"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#87996819b463f94784069a96e4d35bddef5ada54"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#3620bab03204f8d123cce20ff049a39119bff5e1"
 dependencies = [
  "base64",
+ "rezzy-log",
  "sha2",
 ]
 
@@ -477,6 +493,22 @@ name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
+
+[[package]]
+name = "tracing"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
+dependencies = [
+ "pin-project-lite",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-core"
+version = "0.1.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 
 [[package]]
 name = "typenum"

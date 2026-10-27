@@ -30,12 +30,11 @@ use mtxdb::interop::{
 use mtxdb::server_keys;
 use mtxdb::storage::StorageEngine as _;
 use mtxdb::{Database, NodeData};
-use rezzy::auth::{check_auth, AuthError, StateProvider};
+use rezzy::auth::{check_auth, StateProvider};
 use rezzy::basespec::event_types::M_ROOM_CREATE;
-use rezzy::basespec::rezzy_types::is_acceptable_historical_mxid;
 use rezzy::bitmap::Bitmap;
 use rezzy::json::Value as OwnedValue;
-use rezzy::{EventLike, LeanEvent, StateResVersion};
+use rezzy::{LeanEvent, StateResVersion};
 
 use crate::interchange::{EventMetadata, KeyRecord, RoomEvent, RoomExport};
 use crate::state_resolve::lean_event;
@@ -618,17 +617,6 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
         } else {
             match check_auth(subject, &AuthState(entries), version, None) {
                 Ok(()) => None,
-                Err(AuthError::InvalidSyntax(reason))
-                    if is_create
-                        && reason == "m.room.create sender must be a valid MXID"
-                        && is_acceptable_historical_mxid(subject.sender()) =>
-                {
-                    // rezzy still applies the strict MXID grammar to create
-                    // events. Historical IDs like @Milan:tchncs.de are valid
-                    // data; treat them as unjudgeable until the dependency is
-                    // bumped to a rezzy that uses its historical validator.
-                    continue;
-                }
                 Err(error) => {
                     refusal_reason[position] = Some(error.to_string());
                     Some(RejectionCode::AuthCheckFailed.to_u8())
@@ -1412,11 +1400,9 @@ mod auth_findings_tests {
     }
 
     #[test]
-    fn a_historical_uppercase_create_sender_keeps_the_exported_accept() {
-        // rezzy's create rule still uses the strict MXID grammar. A
-        // historical ID must not turn the room's create into a rejection; the
-        // importer leaves it unjudged until the dependency uses its historical
-        // validator.
+    fn a_historical_uppercase_create_sender_is_not_rejected() {
+        // Existing rooms may have uppercase localparts. The create rule must
+        // accept them through rezzy's historical MXID validator.
         let create = with_field(
             create_with_version("10"),
             "sender",
