@@ -5614,3 +5614,99 @@ fn a_room_export_without_a_create_event_is_refused() {
     assert_eq!(run.failures, 1, "{run:?}");
     assert_eq!(run.exported_events, 0);
 }
+
+#[test]
+fn a_room_import_populates_timeline_index() {
+    use crate::interchange::parse_room;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let export = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 5);
+
+    let room_scope = room_scope_id(FIXTURE_ROOM.as_bytes());
+    let timeline_index =
+        TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), FIXTURE_ROOM);
+    let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
+    assert_eq!(page.entries.len(), 5);
+
+    for pair in page.entries.windows(2) {
+        assert!(pair[0] < pair[1]);
+    }
+}
+
+#[test]
+fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
+    use crate::interchange::parse_room;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!test_ordering:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#, "\n",
+            r#"{{"event_id":"$backfill:test","depth":10,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":10,"event_id":"$backfill:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#, "\n",
+            r#"{{"event_id":"$normal:test","depth":10,"stream_ordering":100,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":10,"event_id":"$normal:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
+            r#"{{"event_id":"$later:test","depth":11,"stream_ordering":101,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":11,"event_id":"$later:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
+            r#"{{"event_id":"$notimeline:test","depth":12,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":12,"event_id":"$notimeline:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
+            r#"{{"event_id":"$outlier:test","depth":13,"stream_ordering":200,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":13,"event_id":"$outlier:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":5000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
+            r#"{{"events":5,"t":"end"}}"#, "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    assert!(export.timeline);
+    assert_eq!(export.events.len(), 5);
+
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 5);
+
+    let room_scope = room_scope_id(room_id.as_bytes());
+    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
+
+    // Only the 3 timeline events should be present ($notimeline and $outlier excluded)
+    assert_eq!(page.entries.len(), 3);
+
+    // Verify ordering:
+    // 1. $backfill (depth: 10, stream: -5)
+    assert_eq!(page.entries[0].topological_ordering, 10);
+    assert_eq!(page.entries[0].stream_ordering, -5);
+
+    // 2. $normal (depth: 10, stream: 100)
+    assert_eq!(page.entries[1].topological_ordering, 10);
+    assert_eq!(page.entries[1].stream_ordering, 100);
+
+    // 3. $later (depth: 11, stream: 101)
+    assert_eq!(page.entries[2].topological_ordering, 11);
+    assert_eq!(page.entries[2].stream_ordering, 101);
+
+    // Verify re-import idempotence: re-importing the same export does not duplicate entries
+    let (written_again, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written_again.events, 5);
+    let page_after = timeline_index.page(&room_scope, None, true, 10).unwrap();
+    assert_eq!(page_after.entries.len(), 3);
+    assert_eq!(page.entries, page_after.entries);
+}
+
+#[test]
+fn evict_database_pages_succeeds_on_valid_store() {
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let export = crate::interchange::parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 5);
+    drop(db);
+
+    let (files, bytes) = crate::cmd::evict_database_pages(&root).unwrap();
+    assert!(files > 0);
+    assert!(bytes > 0);
+}

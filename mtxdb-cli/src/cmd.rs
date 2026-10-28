@@ -385,6 +385,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::ReclaimWal => "reclaim-wal",
         Commands::Stats { .. } => "stats",
         Commands::Memory { .. } => "memory",
+        Commands::Timeline { .. } => "timeline",
         Commands::Meta { .. } => "meta",
         Commands::Import { .. } => "import",
         Commands::Export { .. } => "export",
@@ -466,6 +467,11 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
         Commands::Memory { evict, evict_pages } => cmd_memory(cli, *evict, *evict_pages),
+        Commands::Timeline {
+            room,
+            limit,
+            reverse,
+        } => cmd_timeline(cli, room, *limit, *reverse),
         Commands::Meta {
             target,
             json,
@@ -3360,6 +3366,49 @@ fn evict_database_pages(root: &Path) -> anyhow::Result<(usize, u64)> {
         }
         Ok((files, bytes))
     }
+}
+
+fn cmd_timeline(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| cmd_timeline_single(sub_cli, room, limit, reverse))
+}
+
+fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let pool = pool_dir(&layout, ShardType::EventDag)?;
+    let store = PackfileStorage::open_read_only(pool).context("failed to open EventDag store")?;
+    let timeline_index = mtxdb::timeline::TimelineIndex::open(&store, room);
+    let room_scope = mtxdb::timeline::room_scope_id(room.as_bytes());
+    let limit_usize = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+    let page = timeline_index.page(&room_scope, None, !reverse, limit_usize)?;
+    if page.entries.is_empty() {
+        println!("No timeline entries found for room {room}");
+        return Ok(());
+    }
+    println!("{:<6} {:<12} {:<12} {:<34} {}", "idx", "depth", "stream", "node_id", "event_id");
+    println!("{}", "-".repeat(90));
+    for (idx, entry) in page.entries.iter().enumerate() {
+        let node_hex = hex::encode(entry.node_id);
+        let locator_col = mtxdb::interop::event_locator_collection_id(&entry.node_id);
+        let event_id_str = store
+            .get(&locator_col, &entry.node_id)?
+            .and_then(|data| {
+                let (eid, _) = mtxdb::interop::decode_event_locator(&data.bytes).ok()?;
+                std::str::from_utf8(eid).ok().map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "-".to_owned());
+        println!(
+            "{:<6} {:<12} {:<12} {:<34} {}",
+            idx.saturating_add(1),
+            entry.topological_ordering,
+            entry.stream_ordering,
+            node_hex,
+            event_id_str
+        );
+    }
+    if page.next_cursor.is_some() {
+        println!("\n(more events available)");
+    }
+    Ok(())
 }
 
 #[allow(

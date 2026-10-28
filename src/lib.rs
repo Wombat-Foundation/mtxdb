@@ -249,6 +249,6 @@ pub use template::{
     NAMESPACE_BIAS_INTL, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
 };
 pub use timeline::{
-    timeline_collection_id, EventRef, TimelineCursor, TimelineEntry, TimelineIndex, TimelinePage,
-    TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
+    event_id_ref, room_scope_id, timeline_collection_id, EventRef, TimelineCursor, TimelineEntry,
+    TimelineIndex, TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
 };

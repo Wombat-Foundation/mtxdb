@@ -100,6 +100,10 @@ pub(crate) struct RoomEvent {
     pub(crate) pdu: OwnedValue,
     /// The `pdu` value's exact bytes, stored verbatim.
     pub(crate) pdu_bytes: Bytes,
+    /// Caller-supplied stream ordering (negative for backfills).
+    pub(crate) stream_ordering: Option<i64>,
+    /// Caller-supplied topological ordering (depth).
+    pub(crate) depth: Option<i64>,
 }
 
 impl RoomEvent {
@@ -166,6 +170,8 @@ pub(crate) struct RoomExport {
     pub(crate) room_id: String,
     /// Every `event` record, in export order.
     pub(crate) events: Vec<RoomEvent>,
+    /// Whether the export guarantees timeline stream orderings.
+    pub(crate) timeline: bool,
 }
 
 /// One `server_keys` record.
@@ -236,6 +242,7 @@ pub(crate) fn parse_room(content: &[u8]) -> anyhow::Result<RoomExport> {
     }
     let server = require_string(header_line, header, field::SERVER)?.to_owned();
     let room_id = require_string(header_line, header, field::ROOM_ID)?.to_owned();
+    let timeline = optional_bool(header_line, header, "timeline")?;
 
     let mut events = Vec::new();
     let mut end = None;
@@ -262,6 +269,7 @@ pub(crate) fn parse_room(content: &[u8]) -> anyhow::Result<RoomExport> {
         server,
         room_id,
         events,
+        timeline,
     })
 }
 
@@ -428,6 +436,10 @@ fn parse_event(
             }
         }
     }
+    let stream_ordering = optional_signed_number(line, object, "stream_ordering")?;
+    let depth = optional_signed_number(line, object, "depth")?.or_else(|| {
+        pdu.get("depth").and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|d| d as i64)))
+    });
     Ok(RoomEvent {
         event_id,
         metadata,
@@ -435,6 +447,8 @@ fn parse_event(
         auth_events,
         pdu: OwnedValue::Object(pdu.clone()),
         pdu_bytes: raw_pdu(line, raw)?,
+        stream_ordering,
+        depth,
     })
 }
 
@@ -576,6 +590,23 @@ fn optional_number(line: usize, object: &Object, field: &str) -> anyhow::Result<
             value
                 .as_u64()
                 .ok_or_else(|| anyhow!("line {line}: `{field}` must be a non-negative integer"))
+        })
+        .transpose()
+}
+
+/// An optional signed integer field of a record.
+fn optional_signed_number(
+    line: usize,
+    object: &Object,
+    field: &str,
+) -> anyhow::Result<Option<i64>> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|d| d as i64))
+                .ok_or_else(|| anyhow!("line {line}: `{field}` must be an integer"))
         })
         .transpose()
 }
@@ -737,6 +768,8 @@ mod tests {
             auth_events: OwnedValue::Array(Vec::new()),
             pdu: OwnedValue::Object(fields),
             pdu_bytes: Bytes::new(),
+            stream_ordering: None,
+            depth: None,
         };
         event.metadata.rejected = false;
         let annotated = event.annotated("!room:example.org");

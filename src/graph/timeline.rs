@@ -60,6 +60,18 @@ use crate::template::{
     MEMBER_NAMESPACE_INTL,
 };
 
+/// Truncate or hash a room ID into a 16-byte scope for [`TimelineEntry`].
+#[must_use]
+pub fn room_scope_id(room_id: &[u8]) -> [u8; 16] {
+    crate::interop::derive_id(b"timeline-room-scope", room_id)
+}
+
+/// Hash full event ID into a 32-byte reference for [`TimelineEntry`].
+#[must_use]
+pub fn event_id_ref(event_id: &[u8]) -> EventRef {
+    *blake3::hash(event_id).as_bytes()
+}
+
 /// Version byte of every timeline record and the cursor encoding.
 pub const TIMELINE_FORMAT_VERSION: u8 = 0x01;
 /// Maximum entries per leaf record.

@@ -122,6 +122,11 @@ pub(crate) enum Commands {
         evict: bool,
         evict_pages: bool,
     },
+    Timeline {
+        room: String,
+        limit: i64,
+        reverse: bool,
+    },
     Meta {
         target: String,
         json: bool,
@@ -267,6 +272,7 @@ fn build_cli() -> Command {
         .subcommand(sub_collections())
         .subcommand(sub_stats())
         .subcommand(sub_memory())
+        .subcommand(sub_timeline())
         .subcommand(sub_meta())
         .subcommand(sub_sync())
         .subcommand(sub_reclaim_wal())
@@ -402,6 +408,32 @@ fn sub_memory() -> Command {
                 .action(ArgAction::SetTrue)
                 .conflicts_with("evict")
                 .help("Request eviction of clean filesystem pages for database files (Linux; best effort)"),
+        )
+}
+
+fn sub_timeline() -> Command {
+    Command::new("timeline")
+        .about("Page events in a room's timeline in topological and stream order")
+        .arg(
+            Arg::new("room")
+                .help("The room id (e.g. !room:example.org)")
+                .required(true)
+                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("limit")
+                .long("limit")
+                .short('l')
+                .help("Maximum number of events to show")
+                .default_value("20")
+                .value_parser(clap::value_parser!(i64)),
+        )
+        .arg(
+            Arg::new("reverse")
+                .long("reverse")
+                .short('r')
+                .action(ArgAction::SetTrue)
+                .help("Page timeline backwards from newest to oldest"),
         )
 }
 
@@ -1255,6 +1287,13 @@ fn parse_cli() -> Cli {
         Some(("memory", m)) => Commands::Memory {
             evict: m.get_flag("evict"),
             evict_pages: m.get_flag("evict-pages"),
+        },
+        Some(("timeline", m)) => Commands::Timeline {
+            room: m.get_one::<String>("room").unwrap().clone(),
+            limit: *m
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
+            reverse: m.get_flag("reverse"),
         },
         Some(("meta", m)) => Commands::Meta {
             target: m.get_one::<String>("target").unwrap().clone(),

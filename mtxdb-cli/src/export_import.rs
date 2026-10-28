@@ -1610,6 +1610,13 @@ pub(crate) fn write_room_with_signature_keys(
         version_node,
     )?);
 
+    let room_scope = mtxdb::timeline::room_scope_id(room);
+    let timeline_index = mtxdb::timeline::TimelineIndex::open(
+        db.pool(EVENT_POOL).as_ref(),
+        &export.room_id,
+    );
+    let mut batch_timeline_entries = Vec::new();
+
     for (position, event) in export.events.iter().enumerate() {
         let event_id = event.event_id.as_bytes();
         let record = event_record_id(event_id);
@@ -1639,6 +1646,12 @@ pub(crate) fn write_room_with_signature_keys(
             );
         }
         if staged_bytes.saturating_add(size) > batch_bytes && staged_bytes > 0 {
+            if !batch_timeline_entries.is_empty() {
+                timeline_index
+                    .stage_append(&tx, EVENT_POOL, &batch_timeline_entries)
+                    .context("staging room timeline index")?;
+                batch_timeline_entries.clear();
+            }
             tx.commit().context("committing an import batch")?;
             reclaim_journal(db)?;
             tx = db.begin_transaction();
@@ -1674,12 +1687,55 @@ pub(crate) fn write_room_with_signature_keys(
                 &node(encode_verdict(event_id, &verdict)?),
             )?;
         }
+
+        if !event.metadata.outlier {
+            let stream_opt = if export.timeline {
+                // When the export declares timeline contract, presence of
+                // stream_ordering is load-bearing: events without it are not
+                // timeline events (e.g. outliers or rejected events).
+                event.stream_ordering
+            } else {
+                // Legacy export fallback without explicit timeline metadata.
+                event.stream_ordering.or_else(|| {
+                    event
+                        .pdu
+                        .get("origin_server_ts")
+                        .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|d| d as i64)))
+                })
+            };
+
+            let depth_opt = event.depth.or_else(|| {
+                event
+                    .pdu
+                    .get("depth")
+                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|d| d as i64)))
+            });
+
+            if let (Some(stream_ordering), Some(topological_ordering)) = (stream_opt, depth_opt) {
+                let event_ref = mtxdb::timeline::event_id_ref(event_id);
+                batch_timeline_entries.push(mtxdb::timeline::TimelineEntry::new(
+                    room_scope,
+                    topological_ordering,
+                    stream_ordering,
+                    record,
+                    event_ref,
+                ));
+            }
+        }
+
         staged_bytes = staged_bytes.saturating_add(size);
         written = written.saturating_add(1);
+    }
+
+    if !batch_timeline_entries.is_empty() {
+        timeline_index
+            .stage_append(&tx, EVENT_POOL, &batch_timeline_entries)
+            .context("staging room timeline index")?;
     }
     tx.commit().context("committing an import batch")?;
     reclaim_journal(db)?;
     let closures = write_auth_closures(db, export, plan, batch_bytes)?;
+
     Ok((
         ImportCounts {
             events: written,
@@ -1998,6 +2054,8 @@ mod auth_findings_tests {
             auth_events: ids(auths),
             pdu: OwnedValue::Object(fields),
             pdu_bytes: Bytes::new(),
+            stream_ordering: None,
+            depth: None,
         }
     }
 
@@ -2006,6 +2064,7 @@ mod auth_findings_tests {
             server: "example.org".to_owned(),
             room_id: "!room:example.org".to_owned(),
             events,
+            timeline: false,
         }
     }
 
@@ -2844,6 +2903,8 @@ mod signature_window_tests {
             auth_events: OwnedValue::Array(Vec::new()),
             pdu: OwnedValue::parse_bytes(signed.as_bytes()).unwrap(),
             pdu_bytes: Bytes::new(),
+            stream_ordering: None,
+            depth: None,
         }
     }
 
@@ -2883,6 +2944,8 @@ mod signature_window_tests {
             auth_events: OwnedValue::Array(Vec::new()),
             pdu: OwnedValue::parse_bytes(signed.as_bytes()).unwrap(),
             pdu_bytes: Bytes::new(),
+            stream_ordering: None,
+            depth: None,
         }
     }
 
