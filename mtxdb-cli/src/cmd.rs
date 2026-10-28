@@ -7825,15 +7825,6 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
         return Ok(());
     }
 
-    println!(
-        "collection {}: {total_live} live record{} (indexed view; superseded frames omitted)",
-        format_id(&collection_id),
-        if total_live == 1 { "" } else { "s" },
-    );
-    if bounded && total_live > max_rows {
-        println!("note: showing first {max_rows}; use -l 0 to show all");
-    }
-
     let mut context = CollectionScanContext {
         collection_id,
         node_id: opts.node_id,
@@ -7859,6 +7850,20 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
     for (shard, offset, record) in rows.iter().take(max_rows) {
         context.frames = context.frames.saturating_add(1);
         print_collection_record_with_data(shard, record.hash, *offset, Some(record), &mut context);
+    }
+    let frames = context.frames;
+    if bounded && total_live > max_rows {
+        println!(
+            "collection {}: showing first {frames} live records (indexed view; superseded frames omitted)",
+            format_id(&collection_id),
+        );
+    } else {
+        println!(
+            "collection {}: {total_live} live record{} (indexed view; superseded frames omitted)",
+            format_id(&collection_id),
+            if total_live == 1 { "" } else { "s" },
+        );
+        print_scan_limit_note(total_live, max_rows);
     }
     Ok(())
 }
@@ -8036,17 +8041,6 @@ fn print_collection_record(
     offset: u64,
     context: &mut CollectionScanContext,
 ) -> anyhow::Result<()> {
-    if !context.header_printed {
-        if context.show_section_header {
-            if context.needs_section_spacing {
-                println!();
-                println!();
-            }
-            print_section_header(context.shard_type);
-        }
-        print_scan_table_header("PACK", scan_payload_label(context.shard_type));
-        context.header_printed = true;
-    }
     let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
     let need_record = should_decode || context.header || context.shard_type == ShardType::State;
     let data = need_record
@@ -8063,6 +8057,17 @@ fn print_collection_record_with_data(
     data: Option<&mtxdb::packfile::Record>,
     context: &mut CollectionScanContext,
 ) {
+    if !context.header_printed {
+        if context.show_section_header {
+            if context.needs_section_spacing {
+                println!();
+                println!();
+            }
+            print_section_header(context.shard_type);
+        }
+        print_scan_table_header("PACK", scan_payload_label(context.shard_type));
+        context.header_printed = true;
+    }
     let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
     let payload = data.map(|data| {
         if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
