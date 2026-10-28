@@ -438,12 +438,14 @@ impl SignatureKeyCatalog {
         };
 
         let mut candidates = Vec::new();
+        let mut unresolved = false;
         for (key_id, signature) in origin_signatures {
             let key_id_bytes = key_id.as_bytes();
             let Some(record) = self
                 .records
                 .get(&(origin.to_ascii_lowercase(), key_id_bytes.to_vec()))
             else {
+                unresolved = true;
                 continue;
             };
             let key = &record.key;
@@ -458,7 +460,11 @@ impl SignatureKeyCatalog {
                 room_version_uses_valid_until_ts(room_version) && timestamp > key.valid_until_ts;
             let late = key.expired_ts.is_none() && past_cached_deadline;
             let reject_failure = !past_cached_deadline;
-            if key.key.is_empty() || key.expired_ts.is_some_and(|expired| timestamp > expired) {
+            if key.key.is_empty() {
+                unresolved = true;
+                continue;
+            }
+            if key.expired_ts.is_some_and(|expired| timestamp > expired) {
                 continue;
             }
             candidates.push((record, key_id.as_str(), signature, late, reject_failure));
@@ -475,6 +481,7 @@ impl SignatureKeyCatalog {
         let mut any_parsed_key = false;
         for (record, key_id, _, late, reject_failure) in &candidates {
             let Some(parsed_key) = record.parsed_key.as_ref() else {
+                unresolved = true;
                 continue;
             };
             any_parsed_key = true;
@@ -504,7 +511,16 @@ impl SignatureKeyCatalog {
             }
         }
         if !any_parsed_key {
-            return SignatureOutcome::NoMaterial;
+            return if unresolved {
+                SignatureOutcome::NoKey
+            } else {
+                SignatureOutcome::NoMaterial
+            };
+        }
+        // A missing or malformed key is missing evidence, not proof that the
+        // event is invalid: the absent key may still verify.
+        if unresolved {
+            return SignatureOutcome::NoKey;
         }
         if let Some(error) = rejectable_failure {
             return SignatureOutcome::Invalid(error);
@@ -2757,6 +2773,24 @@ mod signature_window_tests {
         let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, None)]);
         let outcome = keys.verify(&signed_event(1_000, &[("ed25519:a", &signer)]), "10");
         assert!(matches!(outcome, SignatureOutcome::Invalid(_)));
+    }
+
+    #[test]
+    fn a_failure_with_another_missing_key_is_deferred() {
+        let (bad_signer, registered, missing_signer) =
+            (signing_key(1), signing_key(2), signing_key(3));
+        let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, None)]);
+        let event = signed_event(
+            1_000,
+            &[
+                ("ed25519:a", &bad_signer),
+                ("ed25519:missing", &missing_signer),
+            ],
+        );
+        assert!(
+            matches!(keys.verify(&event, "10"), SignatureOutcome::NoKey),
+            "an unresolved key could still verify, so the event is not Invalid yet"
+        );
     }
 
     #[test]
