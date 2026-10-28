@@ -382,6 +382,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Collections { .. } => "collections",
         Commands::Info { .. } => "info",
         Commands::Sync { .. } => "sync",
+        Commands::ReclaimWal => "reclaim-wal",
         Commands::Stats { .. } => "stats",
         Commands::Memory { .. } => "memory",
         Commands::Meta { .. } => "meta",
@@ -577,6 +578,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Completions { .. } => unreachable!("main emits completion scripts directly"),
         // `-t all` means every pool, same as `sync --all`.
         Commands::Sync { all } => cmd_sync(cli, *all || cli.shard_type.is_none()),
+        Commands::ReclaimWal => {
+            cli.require_single_dir("reclaim-wal")?;
+            cmd_reclaim_wal(cli)
+        }
         Commands::Init => {
             cli.require_single_dir("init")?;
             cmd_init(cli)
@@ -12707,6 +12712,34 @@ fn cmd_remove(cli: &Cli, collection: &str, ids: &[String], yes: bool) -> anyhow:
 /// on demand.
 fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
     run_multi_dir(cli, |sub_cli| cmd_sync_single(sub_cli, all))
+}
+
+/// Force a full checkpoint in every pool through the shared `Database`, so
+/// each pool reports coverage to the same journal coordinator and the WAL can
+/// reclaim through the oldest covered group.
+fn cmd_reclaim_wal(cli: &Cli) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let db = Database::open(layout.root().to_path_buf())
+        .context("opening the shared database to reclaim its WAL")?;
+    let before = db.coordinator().segment_len();
+
+    for shard in ShardType::ALL {
+        db.pool(shard)
+            .force_index_checkpoint()
+            .with_context(|| format!("checkpointing the {shard:?} pool to reclaim the WAL"))?;
+    }
+    for shard in ShardType::ALL {
+        db.pool(shard).wait_for_checkpoint();
+    }
+
+    let coordinator = db.coordinator();
+    let after = coordinator.segment_len();
+    println!("shared WAL: {before} -> {after} bytes");
+    let blockers = coordinator.reclaim_blockers();
+    if !blockers.is_empty() {
+        println!("reclaim still blocked by pools: {blockers:?}");
+    }
+    Ok(())
 }
 
 fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {

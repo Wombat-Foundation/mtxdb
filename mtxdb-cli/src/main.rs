@@ -192,6 +192,7 @@ pub(crate) enum Commands {
     Sync {
         all: bool,
     },
+    ReclaimWal,
     Init,
     /// Internal: write a test record and sync (for subprocess tests).
     SubprocessWriter {
@@ -265,6 +266,7 @@ fn build_cli() -> Command {
         .subcommand(sub_memory())
         .subcommand(sub_meta())
         .subcommand(sub_sync())
+        .subcommand(sub_reclaim_wal())
         .subcommand(sub_completions())
         .subcommand(sub_import())
         .subcommand(sub_export())
@@ -539,6 +541,11 @@ fn sub_sync() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Sync every independent pool, not just the selected `-t` one"),
         )
+}
+
+fn sub_reclaim_wal() -> Command {
+    Command::new("reclaim-wal")
+        .about("Checkpoint every pool and reclaim the shared write-ahead log")
 }
 
 fn sub_completions() -> Command {
@@ -1327,6 +1334,7 @@ fn parse_cli() -> Cli {
         Some(("sync", m)) => Commands::Sync {
             all: m.get_flag("all"),
         },
+        Some(("reclaim-wal", _)) => Commands::ReclaimWal,
         Some(("init", _)) => Commands::Init,
         Some(("subprocess-writer", m)) => Commands::SubprocessWriter {
             path: m.get_one::<String>("path").unwrap().clone(),
