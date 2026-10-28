@@ -455,7 +455,7 @@ impl SignatureKeyCatalog {
             // becoming a rejection, because the snapshot cannot refresh.
             // v1-v4 ignore `valid_until_ts` entirely.
             let past_cached_deadline =
-                room_version_uses_valid_until_ts(room_version) && timestamp >= key.valid_until_ts;
+                room_version_uses_valid_until_ts(room_version) && timestamp > key.valid_until_ts;
             let late = key.expired_ts.is_none() && past_cached_deadline;
             let reject_failure = !past_cached_deadline;
             if key.key.is_empty() || key.expired_ts.is_some_and(|expired| timestamp >= expired) {
@@ -555,7 +555,7 @@ impl SignatureKeyCatalog {
                     Some(ts)
                         if key.expired_ts.is_none()
                             && uses_valid_until
-                            && ts >= key.valid_until_ts =>
+                            && ts > key.valid_until_ts =>
                     {
                         format!(
                             "{key_id}: event after valid_until_ts {}",
@@ -2723,6 +2723,32 @@ mod signature_window_tests {
         let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, None)]);
         let outcome = keys.verify(&signed_event(3_000, &[("ed25519:a", &sk)]), "10");
         assert!(matches!(outcome, SignatureOutcome::VerifiedLate));
+    }
+
+    #[test]
+    fn equality_at_the_cached_deadline_is_in_window() {
+        let sk = signing_key(1);
+        let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, None)]);
+        assert!(
+            matches!(
+                keys.verify(&signed_event(2_000, &[("ed25519:a", &sk)]), "10"),
+                SignatureOutcome::Verified(_)
+            ),
+            "valid_until_ts >= T covers equality"
+        );
+    }
+
+    #[test]
+    fn equality_at_the_cached_deadline_still_rejects_a_bad_retired_signature() {
+        let (signer, registered) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, Some(5_000))]);
+        assert!(
+            matches!(
+                keys.verify(&signed_event(2_000, &[("ed25519:a", &signer)]), "10"),
+                SignatureOutcome::Invalid(_)
+            ),
+            "equality is inside the freshness window, not the stale-cache gap"
+        );
     }
 
     #[test]
