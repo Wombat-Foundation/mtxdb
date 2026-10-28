@@ -7281,8 +7281,7 @@ fn cmd_scan(
 ) -> anyhow::Result<()> {
     if cli.coalesce {
         return cmd_scan_coalesced(
-            cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
-            live,
+            cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse, live,
         );
     }
     run_multi_dir(cli, |sub_cli| {
@@ -7709,11 +7708,11 @@ fn cmd_scan_collection_in_pool(
 /// Unlike [`cmd_scan_collection`], this never walks frames that belong to
 /// other collections and never sees superseded versions or tombstones. It is
 /// the fast view for "what is in this collection" on a large packfile.
-fn cmd_scan_collection_live(
-    cli: &Cli,
-    selector: &str,
-    opts: &ScanOptions,
-) -> anyhow::Result<()> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "the live scan keeps its index resolution, ordering, and output modes in one place"
+)]
+fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow::Result<()> {
     let collection_id = parse_collection_selector(selector)?;
     let store = open_store_read_only(cli)?;
     let Some(locations) = store.collection_live_locations(&collection_id) else {
@@ -7724,8 +7723,8 @@ fn cmd_scan_collection_live(
         );
     };
     let shard_type = cli.require_shard_type()?;
-    let pool = ShardPool::open_read_only(selected_pool_dir(cli)?)
-        .context("failed to open shard store")?;
+    let pool =
+        ShardPool::open_read_only(selected_pool_dir(cli)?).context("failed to open shard store")?;
     let shards = pool.all_shards();
     let mut by_slot: HashMap<u16, Arc<mtxdb::shard::Shard>> = HashMap::new();
     for (slot, shard) in &shards {
@@ -7742,8 +7741,7 @@ fn cmd_scan_collection_live(
                 format_id(&collection_id)
             );
         };
-        let Some((slot, _)) = shards.iter().find(|(_, shard)| shard.pack_id == pack_id)
-        else {
+        let Some((slot, _)) = shards.iter().find(|(_, shard)| shard.pack_id == pack_id) else {
             bail!(
                 "pack {} for node {} is not open",
                 pack_id.filename_stem(),
@@ -7769,39 +7767,38 @@ fn cmd_scan_collection_live(
 
     // Payload sorting needs every candidate. Other modes read only the rows
     // that will be printed.
-    let rows: Vec<(Arc<mtxdb::shard::Shard>, u64, mtxdb::packfile::Record)> =
-        if opts.is_sorting() {
-            let mut rows = Vec::with_capacity(records.len());
-            for (shard, offset) in records {
-                let record = ShardPool::read_at_committed(&shard, offset, true)?;
-                if record.collection_id != collection_id {
-                    continue;
-                }
-                rows.push((shard, offset, record));
+    let rows: Vec<(Arc<mtxdb::shard::Shard>, u64, mtxdb::packfile::Record)> = if opts.is_sorting() {
+        let mut rows = Vec::with_capacity(records.len());
+        for (shard, offset) in records {
+            let record = ShardPool::read_at_committed(&shard, offset, true)?;
+            if record.collection_id != collection_id {
+                continue;
             }
-            if opts.sort == Some(SortColumn::Payload) {
-                rows.sort_by(|a, b| a.2.data.cmp(&b.2.data));
-            } else {
-                rows.sort_by_key(|(_, offset, _)| *offset);
-            }
-            if opts.reverse {
-                rows.reverse();
-            }
-            rows
+            rows.push((shard, offset, record));
+        }
+        if opts.sort == Some(SortColumn::Payload) {
+            rows.sort_by(|a, b| a.2.data.cmp(&b.2.data));
         } else {
-            let mut rows = Vec::with_capacity(records.len().min(max_rows));
-            for (shard, offset) in records {
-                if rows.len() >= max_rows {
-                    break;
-                }
-                let record = ShardPool::read_at_committed(&shard, offset, true)?;
-                if record.collection_id != collection_id {
-                    continue;
-                }
-                rows.push((shard, offset, record));
+            rows.sort_by_key(|(_, offset, _)| *offset);
+        }
+        if opts.reverse {
+            rows.reverse();
+        }
+        rows
+    } else {
+        let mut rows = Vec::with_capacity(records.len().min(max_rows));
+        for (shard, offset) in records {
+            if rows.len() >= max_rows {
+                break;
             }
-            rows
-        };
+            let record = ShardPool::read_at_committed(&shard, offset, true)?;
+            if record.collection_id != collection_id {
+                continue;
+            }
+            rows.push((shard, offset, record));
+        }
+        rows
+    };
 
     if opts.raw {
         let stdout = io::stdout();
@@ -7861,7 +7858,7 @@ fn cmd_scan_collection_live(
     };
     for (shard, offset, record) in rows.iter().take(max_rows) {
         context.frames = context.frames.saturating_add(1);
-        print_collection_record_with_data(shard, record.hash, *offset, Some(record), &mut context)?;
+        print_collection_record_with_data(shard, record.hash, *offset, Some(record), &mut context);
     }
     Ok(())
 }
@@ -8055,7 +8052,8 @@ fn print_collection_record(
     let data = need_record
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
-    print_collection_record_with_data(shard, record_id, offset, data.as_ref(), context)
+    print_collection_record_with_data(shard, record_id, offset, data.as_ref(), context);
+    Ok(())
 }
 
 fn print_collection_record_with_data(
@@ -8064,7 +8062,7 @@ fn print_collection_record_with_data(
     offset: u64,
     data: Option<&mtxdb::packfile::Record>,
     context: &mut CollectionScanContext,
-) -> anyhow::Result<()> {
+) {
     let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
     let payload = data.map(|data| {
         if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
@@ -8092,7 +8090,6 @@ fn print_collection_record_with_data(
             print_scan_payload(&data.data, context.decode.as_deref());
         }
     }
-    Ok(())
 }
 
 fn print_scan_record_header(record: &mtxdb::packfile::Record, collection_id: &[u8; 16]) {

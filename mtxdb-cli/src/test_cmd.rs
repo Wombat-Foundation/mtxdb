@@ -4494,12 +4494,10 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
     .unwrap();
 
     let missing = format_id(&[0x99; 16]);
-    assert!(
-        cmd_scan(
-            &cli_scan, &missing, false, false, None, 10, None, None, false, None, false, false
-        )
-        .is_err()
-    );
+    assert!(cmd_scan(
+        &cli_scan, &missing, false, false, None, 10, None, None, false, None, false, false
+    )
+    .is_err());
 
     std::fs::remove_dir_all(&dir1).ok();
     std::fs::remove_dir_all(&dir2).ok();
