@@ -31,7 +31,7 @@ use mtxdb::server_keys;
 use mtxdb::storage::StorageEngine as _;
 use mtxdb::{Database, NodeData, PackfileStorage};
 use rezzy::auth::{check_auth, StateProvider};
-use rezzy::basespec::event_types::M_ROOM_CREATE;
+use rezzy::basespec::event_types::{M_ROOM_CREATE, M_ROOM_MEMBER};
 use rezzy::bitmap::Bitmap;
 use rezzy::json::Value as OwnedValue;
 use rezzy::signing::{
@@ -314,11 +314,12 @@ pub(crate) struct AuthFindings {
     pub(crate) hash_audit: Vec<HashAudit>,
     /// Key bindings corroborated by successfully verified historical events.
     pub(crate) verified_keys: Vec<VerifiedKeyObservation>,
-    /// Events rejected because a usable, in-window origin key had a bad signature.
+    /// Events rejected because a usable, in-window required key had a bad
+    /// signature.
     pub(crate) signature_failures: Vec<AuthFailure>,
     /// One record per event whose signature did not verify, whatever the reason.
     pub(crate) signature_audit: Vec<SignatureAudit>,
-    /// Events with no in-window origin key for the signer.
+    /// Events with no in-window key for a required signer.
     pub(crate) signature_no_key: usize,
     /// Events without the origin, timestamp, or signature material to check.
     pub(crate) signature_no_material: usize,
@@ -399,17 +400,25 @@ impl SignatureKeyCatalog {
         let Some(room_version) = create_room_version(&export.events) else {
             return Ok(catalog);
         };
-        let origins: HashSet<_> = export
+        // Required signers are the event origin and, for a restricted join,
+        // the homeserver of `join_authorised_via_users_server`.
+        let mut servers: HashSet<String> = export
             .events
             .iter()
             .filter_map(|event| event_origin(&event.pdu, room_version))
+            .map(str::to_owned)
             .collect();
-        for origin in origins {
-            for key in server_keys::read_server_keys(store, origin.as_bytes())? {
+        for event in &export.events {
+            if let Some(server) = restricted_join_authoriser_server(&event.pdu) {
+                servers.insert(server.to_owned());
+            }
+        }
+        for server in servers {
+            for key in server_keys::read_server_keys(store, server.as_bytes())? {
                 catalog.records.insert(
-                    (origin.to_ascii_lowercase(), key.key_id.clone()),
+                    (server.to_ascii_lowercase(), key.key_id.clone()),
                     VerificationKeyRecord {
-                        origin: origin.to_owned(),
+                        origin: server.clone(),
                         parsed_key: VerificationKey::try_from(key.key.as_slice()).ok(),
                         key,
                     },
@@ -430,20 +439,56 @@ impl SignatureKeyCatalog {
         else {
             return SignatureOutcome::NoMaterial;
         };
+        let origin_outcome = self.verify_server(event, room_version, origin, timestamp);
+        if !matches!(
+            origin_outcome,
+            SignatureOutcome::Verified(_) | SignatureOutcome::VerifiedLate
+        ) {
+            return origin_outcome;
+        }
+
+        let Some(authoriser) = restricted_join_authoriser(&event.pdu) else {
+            return origin_outcome;
+        };
+        let Some(authoriser_server) = authoriser_server(authoriser) else {
+            // A malformed authorising user id leaves a required signer
+            // unresolved; it is missing evidence, not a bad signature.
+            return SignatureOutcome::NoKey;
+        };
+        if authoriser_server.eq_ignore_ascii_case(origin) {
+            return origin_outcome;
+        }
+        match self.verify_server(event, room_version, authoriser_server, timestamp) {
+            SignatureOutcome::Verified(_) | SignatureOutcome::VerifiedLate => origin_outcome,
+            SignatureOutcome::Invalid(reason) => {
+                SignatureOutcome::Invalid(format!("authoriser {authoriser_server}: {reason}"))
+            }
+            // A missing authoriser key or signature is missing evidence.
+            SignatureOutcome::NoKey | SignatureOutcome::NoMaterial => SignatureOutcome::NoKey,
+        }
+    }
+
+    fn verify_server(
+        &self,
+        event: &RoomEvent,
+        room_version: &str,
+        server: &str,
+        timestamp: u64,
+    ) -> SignatureOutcome {
         let Some(signatures) = event.pdu.get("signatures").and_then(OwnedValue::as_object) else {
             return SignatureOutcome::NoMaterial;
         };
-        let Some(origin_signatures) = signatures.get(origin).and_then(OwnedValue::as_object) else {
+        let Some(server_signatures) = signatures.get(server).and_then(OwnedValue::as_object) else {
             return SignatureOutcome::NoMaterial;
         };
 
         let mut candidates = Vec::new();
         let mut unresolved = false;
-        for (key_id, signature) in origin_signatures {
+        for (key_id, signature) in server_signatures {
             let key_id_bytes = key_id.as_bytes();
             let Some(record) = self
                 .records
-                .get(&(origin.to_ascii_lowercase(), key_id_bytes.to_vec()))
+                .get(&(server.to_ascii_lowercase(), key_id_bytes.to_vec()))
             else {
                 unresolved = true;
                 continue;
@@ -530,38 +575,55 @@ impl SignatureKeyCatalog {
         SignatureOutcome::NoKey
     }
 
-    /// Why each of the origin's signature keys was or was not usable for the
-    /// event, one line per key.
+    /// Why each required signer's keys were or were not usable for the event,
+    /// one line per key.
     fn explain(&self, event: &RoomEvent, room_version: &str) -> Vec<String> {
         let Some(origin) = event_origin(&event.pdu, room_version) else {
             return vec!["no origin server".to_owned()];
         };
-        let timestamp = event
-            .pdu
-            .get("origin_server_ts")
-            .and_then(OwnedValue::as_u64);
+        let mut lines = self.explain_server(&event.pdu, room_version, origin);
+        if let Some(authoriser) = restricted_join_authoriser(&event.pdu) {
+            let Some(server) = authoriser_server(authoriser) else {
+                lines.push(format!("authoriser {authoriser}: invalid user id"));
+                return lines;
+            };
+            if !server.eq_ignore_ascii_case(origin) {
+                lines.extend(
+                    self.explain_server(&event.pdu, room_version, server)
+                        .into_iter()
+                        .map(|line| format!("authoriser {line}")),
+                );
+            }
+        }
+        lines
+    }
+
+    fn explain_server(&self, pdu: &OwnedValue, room_version: &str, server: &str) -> Vec<String> {
+        let timestamp = pdu.get("origin_server_ts").and_then(OwnedValue::as_u64);
         let uses_valid_until = room_version_uses_valid_until_ts(room_version);
-        let Some(origin_signatures) = event
-            .pdu
+        let Some(server_signatures) = pdu
             .get("signatures")
             .and_then(OwnedValue::as_object)
-            .and_then(|signatures| signatures.get(origin))
+            .and_then(|signatures| signatures.get(server))
             .and_then(OwnedValue::as_object)
         else {
-            return vec![format!("no signatures from {origin}")];
+            return vec![format!("no signatures from {server}")];
         };
-        origin_signatures
+        server_signatures
             .keys()
             .map(|key_id| {
                 let Some(record) = self
                     .records
-                    .get(&(origin.to_ascii_lowercase(), key_id.as_bytes().to_vec()))
+                    .get(&(server.to_ascii_lowercase(), key_id.as_bytes().to_vec()))
                 else {
                     return format!("{key_id}: not in key store");
                 };
                 let key = &record.key;
                 if key.key.is_empty() {
                     return format!("{key_id}: no key bytes");
+                }
+                if record.parsed_key.is_none() {
+                    return format!("{key_id}: not a valid Ed25519 public key");
                 }
                 match timestamp {
                     Some(ts) if key.expired_ts.is_some_and(|expired| ts > expired) => format!(
@@ -652,6 +714,32 @@ fn event_origin<'a>(pdu: &'a OwnedValue, room_version: &str) -> Option<&'a str> 
         .strip_prefix('@')?
         .split_once(':')
         .map(|(_, server)| server)
+}
+
+/// The user named by a restricted join's
+/// `join_authorised_via_users_server`, if this event is one.
+fn restricted_join_authoriser(pdu: &OwnedValue) -> Option<&str> {
+    if pdu.get("type")?.as_str()? != M_ROOM_MEMBER {
+        return None;
+    }
+    let content = pdu.get("content")?.as_object()?;
+    if content.get("membership")?.as_str()? != "join" {
+        return None;
+    }
+    content.get("join_authorised_via_users_server")?.as_str()
+}
+
+/// The homeserver whose signature a restricted join requires.
+fn restricted_join_authoriser_server(pdu: &OwnedValue) -> Option<&str> {
+    restricted_join_authoriser(pdu).and_then(authoriser_server)
+}
+
+fn authoriser_server(user_id: &str) -> Option<&str> {
+    user_id
+        .strip_prefix('@')?
+        .split_once(':')
+        .map(|(_, server)| server)
+        .filter(|server| !server.is_empty())
 }
 
 /// An accepted event the first auth check refuted, and why.
@@ -2664,9 +2752,29 @@ mod signature_window_tests {
         valid_until_ts: u64,
         expired_ts: Option<u64>,
     ) -> KeyRecord {
+        key_record_for(ORIGIN, sk, key_id, valid_until_ts, expired_ts)
+    }
+
+    fn key_record_for(
+        origin: &str,
+        sk: &SigningKey,
+        key_id: &str,
+        valid_until_ts: u64,
+        expired_ts: Option<u64>,
+    ) -> KeyRecord {
         let bytes: Vec<u8> = AsRef::<[u8]>::as_ref(&sk.verification_key()).to_vec();
+        key_record_with_bytes(origin, key_id, bytes, valid_until_ts, expired_ts)
+    }
+
+    fn key_record_with_bytes(
+        origin: &str,
+        key_id: &str,
+        bytes: Vec<u8>,
+        valid_until_ts: u64,
+        expired_ts: Option<u64>,
+    ) -> KeyRecord {
         KeyRecord::Key {
-            origin: ORIGIN.to_owned(),
+            origin: origin.to_owned(),
             key: ServerKey {
                 key_id: key_id.as_bytes().to_vec(),
                 digest: key_digest(&bytes),
@@ -2711,6 +2819,45 @@ mod signature_window_tests {
             r#"{{{fields},"signatures":{{"{ORIGIN}":{{{}}}}}}}"#,
             signatures.join(",")
         );
+        RoomEvent {
+            event_id: "$m".to_owned(),
+            metadata: EventMetadata::default(),
+            prev_events: OwnedValue::Array(Vec::new()),
+            auth_events: OwnedValue::Array(Vec::new()),
+            pdu: OwnedValue::parse_bytes(signed.as_bytes()).unwrap(),
+            pdu_bytes: Bytes::new(),
+        }
+    }
+
+    /// A restricted-join event with signatures from arbitrary servers. Each
+    /// signer is `(server, key_id, signing key)`.
+    fn restricted_join(
+        ts: u64,
+        authoriser: &str,
+        signers: &[(&str, &str, &SigningKey)],
+    ) -> RoomEvent {
+        let fields = format!(
+            r#""type":"m.room.member","room_id":"!r:{ORIGIN}","sender":"@a:{ORIGIN}","state_key":"@a:{ORIGIN}","origin_server_ts":{ts},"content":{{"membership":"join","join_authorised_via_users_server":"{authoriser}"}},"depth":1,"auth_events":[],"prev_events":[]"#
+        );
+        let unsigned = OwnedValue::parse_bytes(format!("{{{fields}}}").as_bytes()).unwrap();
+        let canonical = rezzy::try_canonical_redacted_json(&unsigned, "10").unwrap();
+        let mut by_server: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (server, key_id, sk) in signers {
+            use base64::Engine as _;
+            let signature = sk.sign(canonical.as_bytes());
+            let encoded =
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode(signature.to_bytes());
+            by_server
+                .entry(server)
+                .or_default()
+                .push(format!(r#""{key_id}":"{encoded}""#));
+        }
+        let signatures = by_server
+            .into_iter()
+            .map(|(server, entries)| format!(r#""{server}":{{{}}}"#, entries.join(",")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let signed = format!(r#"{{{fields},"signatures":{{{signatures}}}}}"#);
         RoomEvent {
             event_id: "$m".to_owned(),
             metadata: EventMetadata::default(),
@@ -2957,12 +3104,7 @@ mod signature_window_tests {
         let sk = signing_key(1);
         for version in ["4", "10"] {
             for cached_deadline in [2_000, 5_000, 9_000] {
-                let keys = catalog(&[key_record(
-                    &sk,
-                    "ed25519:a",
-                    cached_deadline,
-                    Some(5_000),
-                )]);
+                let keys = catalog(&[key_record(&sk, "ed25519:a", cached_deadline, Some(5_000))]);
                 for ts in [4_999, 5_000] {
                     let event = signed_event_for(ts, &[("ed25519:a", &sk)], version);
                     assert!(
@@ -2980,12 +3122,7 @@ mod signature_window_tests {
         let sk = signing_key(1);
         for version in ["4", "10"] {
             for cached_deadline in [2_000, 5_000, 9_000] {
-                let keys = catalog(&[key_record(
-                    &sk,
-                    "ed25519:a",
-                    cached_deadline,
-                    Some(5_000),
-                )]);
+                let keys = catalog(&[key_record(&sk, "ed25519:a", cached_deadline, Some(5_000))]);
                 let event = signed_event_for(5_001, &[("ed25519:a", &sk)], version);
                 assert!(
                     matches!(keys.verify(&event, version), SignatureOutcome::NoKey),
@@ -3037,6 +3174,113 @@ mod signature_window_tests {
         assert!(
             findings.verified_keys.is_empty(),
             "late events do not corroborate"
+        );
+    }
+
+    #[test]
+    fn a_restricted_join_requires_and_accepts_the_authoriser_signature() {
+        let (origin_sk, authoriser_sk) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[
+            key_record(&origin_sk, "ed25519:a", 2_000, None),
+            key_record_for("auth.example", &authoriser_sk, "ed25519:b", 2_000, None),
+        ]);
+        let event = restricted_join(
+            1_000,
+            "@admin:auth.example",
+            &[
+                ("origin.example", "ed25519:a", &origin_sk),
+                ("auth.example", "ed25519:b", &authoriser_sk),
+            ],
+        );
+        assert!(matches!(
+            keys.verify(&event, "10"),
+            SignatureOutcome::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn a_bad_authoriser_signature_rejects_a_restricted_join() {
+        let (origin_sk, authoriser_sk, wrong) = (signing_key(1), signing_key(2), signing_key(3));
+        let keys = catalog(&[
+            key_record(&origin_sk, "ed25519:a", 2_000, None),
+            key_record_for("auth.example", &authoriser_sk, "ed25519:b", 2_000, None),
+        ]);
+        let event = restricted_join(
+            1_000,
+            "@admin:auth.example",
+            &[
+                ("origin.example", "ed25519:a", &origin_sk),
+                ("auth.example", "ed25519:b", &wrong),
+            ],
+        );
+        assert!(matches!(
+            keys.verify(&event, "10"),
+            SignatureOutcome::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn a_restricted_join_without_the_authoriser_key_is_deferred() {
+        let (origin_sk, authoriser_sk) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[key_record(&origin_sk, "ed25519:a", 2_000, None)]);
+        let event = restricted_join(
+            1_000,
+            "@admin:auth.example",
+            &[
+                ("origin.example", "ed25519:a", &origin_sk),
+                ("auth.example", "ed25519:b", &authoriser_sk),
+            ],
+        );
+        assert!(matches!(keys.verify(&event, "10"), SignatureOutcome::NoKey));
+    }
+
+    #[test]
+    fn a_restricted_join_without_the_authoriser_signature_is_deferred() {
+        let origin_sk = signing_key(1);
+        let keys = catalog(&[key_record(&origin_sk, "ed25519:a", 2_000, None)]);
+        let event = restricted_join(
+            1_000,
+            "@admin:auth.example",
+            &[("origin.example", "ed25519:a", &origin_sk)],
+        );
+        assert!(matches!(keys.verify(&event, "10"), SignatureOutcome::NoKey));
+    }
+
+    #[test]
+    fn an_authoriser_on_the_origin_does_not_need_a_second_signature() {
+        let origin_sk = signing_key(1);
+        let keys = catalog(&[key_record(&origin_sk, "ed25519:a", 2_000, None)]);
+        let event = restricted_join(
+            1_000,
+            "@admin:origin.example",
+            &[("origin.example", "ed25519:a", &origin_sk)],
+        );
+        assert!(matches!(
+            keys.verify(&event, "10"),
+            SignatureOutcome::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn an_unparseable_key_is_explained_as_invalid_public_key_material() {
+        use base64::Engine as _;
+        let sk = signing_key(1);
+        // A 32-byte value that is not a valid compressed Edwards point.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("LDxGK5kSPwLsvnrg9BS1wewISp91k+eG8U3Dq8GwVIs=")
+            .unwrap();
+        let keys = catalog(&[key_record_with_bytes(
+            ORIGIN,
+            "ed25519:a",
+            bytes,
+            2_000,
+            None,
+        )]);
+        let event = signed_event(1_000, &[("ed25519:a", &sk)]);
+        assert!(matches!(keys.verify(&event, "10"), SignatureOutcome::NoKey));
+        assert_eq!(
+            keys.explain(&event, "10"),
+            vec!["ed25519:a: not a valid Ed25519 public key"]
         );
     }
 }
