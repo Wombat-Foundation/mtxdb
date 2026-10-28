@@ -10,12 +10,12 @@ use super::{
     load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
     matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
     pack_identity, parse_federation_input, parse_pack_id_selector, parse_pack_selectors,
-    pretty_print_payload, record_matrix_adjacency, redacted_event_bytes, resolve_import_collection,
-    run, scan_payload_suffix, split_canonical_display, template_collection_id, template_node_id,
-    topological_event_order, valid_state_group_id, verify_auth_chain_edges, CollectionFlags,
-    CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension,
-    MetaReport, PackIdentity, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
-    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    prepare_state_collection, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
+    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
+    template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
+    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
+    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
+    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -1629,6 +1629,54 @@ fn live_scan_uses_the_index_instead_of_physical_frames() {
         true,
     )
     .unwrap();
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn state_collection_without_genesis_metadata_is_reset() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let store = PackfileStorage::open(layout.pool_dir(ShardType::State).unwrap()).unwrap();
+
+    let canonical_id = b"!room:example.org";
+    let collection = derive_collection_id(Some(*b"STAT"), canonical_id);
+    let node = [0x51; 16];
+    store
+        .put(
+            &collection,
+            &node,
+            &NodeData::new(Bytes::from_static(b"old root")),
+        )
+        .unwrap();
+    assert!(store
+        .get_collection_metadata(&collection)
+        .unwrap()
+        .is_none());
+    assert!(store.collection_exists(&collection));
+
+    let metadata = CollectionMetadata {
+        member_namespace: Some(*b"STAT"),
+        collection_canonical_id: canonical_id.to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+        role: Some("state_hamt".to_owned()),
+        schema: Some("sithnapse.state-hamt.v1".to_owned()),
+    };
+    prepare_state_collection(&store, &collection, &metadata).unwrap();
+
+    assert_eq!(
+        store.get_collection_metadata(&collection).unwrap(),
+        Some(metadata)
+    );
+    assert!(
+        store.get(&collection, &node).unwrap().is_none(),
+        "the metadata-less records are discarded before the collection is re-established"
+    );
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -6327,21 +6327,60 @@ fn materialize_state_hamts(
         )?;
     }
 
-    let stat_records = filter_new_records(state_store, &stat_collection, stat_records)?;
-    if !stat_records.is_empty() {
-        ensure_collection_metadata(state_store, &stat_collection, &state_hamt_metadata(room_id))?;
-        state_store.put_many(&stat_collection, &stat_records)?;
-    }
-    let stgp_records = filter_new_records(state_store, &stgp_collection, stgp_records)?;
-    if !stgp_records.is_empty() {
-        ensure_collection_metadata(
+    let stat_records = if stat_records.is_empty() {
+        Vec::new()
+    } else {
+        prepare_state_collection(state_store, &stat_collection, &state_hamt_metadata(room_id))?;
+        let records = filter_new_records(state_store, &stat_collection, stat_records)?;
+        if !records.is_empty() {
+            state_store.put_many(&stat_collection, &records)?;
+        }
+        records
+    };
+    let stgp_records = if stgp_records.is_empty() {
+        Vec::new()
+    } else {
+        prepare_state_collection(
             state_store,
             &stgp_collection,
             &state_group_metadata(room_id),
         )?;
-        state_store.put_many(&stgp_collection, &stgp_records)?;
-    }
+        let records = filter_new_records(state_store, &stgp_collection, stgp_records)?;
+        if !records.is_empty() {
+            state_store.put_many(&stgp_collection, &records)?;
+        }
+        records
+    };
     Ok(stat_records.len().saturating_add(stgp_records.len()))
+}
+
+/// Establish a state collection, resetting one that already has records but no
+/// genesis metadata.
+///
+/// Older server migrations wrote HAMT roots directly with `put_many` and no
+/// collection metadata. Those collections cannot be read or appended to. The
+/// import is rebuilding the room's state, so discard the unusable records and
+/// establish the collection before writing the new ones.
+fn prepare_state_collection(
+    state_store: &PackfileStorage,
+    collection_id: &[u8; 16],
+    metadata: &CollectionMetadata,
+) -> anyhow::Result<()> {
+    if state_store
+        .get_collection_metadata(collection_id)?
+        .is_none()
+        && state_store.collection_exists(collection_id)
+    {
+        eprintln!(
+            "warning: resetting state collection {} without genesis metadata",
+            format_id(collection_id)
+        );
+        state_store.delete_collection(collection_id)?;
+    }
+    state_store
+        .ensure_collection_metadata(collection_id, metadata)
+        .context("writing state collection metadata")?;
+    Ok(())
 }
 
 /// Drop records already present in `collection` and reject an id already bound
@@ -6373,26 +6412,6 @@ fn filter_new_records<S: StorageEngine + ?Sized>(
         }
     }
     Ok(fresh)
-}
-
-/// Ensure `collection` carries exactly `metadata`, tolerating an unchanged
-/// re-import and rejecting a conflicting definition.
-fn ensure_collection_metadata(
-    state_store: &PackfileStorage,
-    collection_id: &[u8; 16],
-    metadata: &CollectionMetadata,
-) -> anyhow::Result<()> {
-    match state_store.get_collection_metadata(collection_id)? {
-        Some(existing) if &existing == metadata => Ok(()),
-        Some(_) => bail!(
-            "collection {} has conflicting metadata",
-            format_id(collection_id)
-        ),
-        None => {
-            state_store.ensure_collection_metadata(collection_id, metadata)?;
-            Ok(())
-        }
-    }
 }
 
 /// Insert a HAMT record unless an identical one was already queued.
