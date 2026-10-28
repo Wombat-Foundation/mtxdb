@@ -3963,15 +3963,18 @@ impl JournalCoordinator {
     /// MiB. It is not available outside tests: a value of zero would force a
     /// checkpoint on every sync and one above the segment cap would switch the
     /// forced reclaim off.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn set_reclaim_trigger_len(&self, len: u64) {
         self.reclaim_trigger_len.store(len, Ordering::Relaxed);
     }
 
     /// Shrink the segment cap, and the trigger with it (a quarter of the cap),
     /// so a test can reach the hard limit with a few hundred KiB.
-    #[cfg(test)]
-    pub(crate) fn set_segment_cap(&self, cap: u64) {
+    ///
+    /// Only built for this crate's tests and the `test-util` feature; a
+    /// production caller has no reason to shrink the cap.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_segment_cap(&self, cap: u64) {
         self.journal.lock().segment_cap = cap;
         self.set_reclaim_trigger_len(cap / 4);
     }

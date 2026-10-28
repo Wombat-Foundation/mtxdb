@@ -106,6 +106,10 @@ default = ["zstd", "bitmaps"]
 # writes raw frames and refuses to read compressed ones.
 zstd = ["dep:zstd", "dep:zstd-sys"]
 
+# Exposes `JournalCoordinator::set_segment_cap` so downstream tests can reach the
+# journal's hard limit without writing hundreds of MiB. Not for production use.
+test-util = []
+
 # Cross-process read-committed workers. Always available: `Database`, the
 # shared WAL, transactions, record-version compare-and-set and recovery, the
 # in-process read journal and `open_read_committed` for read-only use, and the
