@@ -5,8 +5,9 @@
 //! collections, and the signing-key collection. Nothing here invents a
 //! layout. Each room's auth short ids and closure bitmaps are written here too,
 //! by the same completeness rule the server applies when it writes an event: an
-//! event gets a closure only when every auth event it cites has one. State is
-//! not written.
+//! event gets a closure only when every auth event it cites has one. The CLI
+//! import path then reconstructs state groups and HAMT records from the room's
+//! imported PDUs.
 //!
 //! A run is complete only when the import marker says so. Before the first
 //! record of a run the marker is cleared, data goes in capped batches, and the

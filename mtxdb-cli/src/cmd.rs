@@ -9725,7 +9725,8 @@ impl ImportContext<'_> {
     /// The untouched PDU bytes are stored as exported, and the edges, locators
     /// and auth closures are rebuilt from them. Rejections are derived by
     /// running the auth rules over the events; the export's own rejection
-    /// flags are not trusted. State groups are not built here yet.
+    /// flags are not trusted. State groups and their HAMTs are reconstructed
+    /// from the imported room events before this import can complete.
     fn import_room_export(
         &mut self,
         export: &RoomExport,
@@ -9756,6 +9757,15 @@ impl ImportContext<'_> {
             export,
             export_import::BATCH_BYTES,
             signature_keys,
+        )?;
+        let event_collection = mtxdb::interop::room_event_collection_id(export.room_id.as_bytes());
+        let room_version = import_room_version(self.store, &event_collection, &events)?;
+        repair_import_state_groups(
+            self.state_store,
+            &events,
+            &[],
+            &export.room_id,
+            &room_version,
         )?;
         eprintln!(
             "  {}",
@@ -10149,7 +10159,7 @@ fn import_pdu_events_with_raw(
         auth_chain,
         &resolved.canonical_id,
         &room_version,
-    );
+    )?;
 
     if let Some(room_id) = detected_collection {
         eprintln!("{room_id} ({collection_hex})");
@@ -10253,7 +10263,7 @@ fn repair_import_state_groups(
     auth_chain: &[OwnedValue],
     canonical_id: &str,
     room_version: &str,
-) {
+) -> anyhow::Result<()> {
     // Replayed batches still need state-group repair when the derived index is
     // incomplete, but a complete replay should not rebuild the whole DAG.
     // Read the existing mappings in one backend batch and only walk the DAG
@@ -10341,7 +10351,7 @@ fn repair_import_state_groups(
                     computed_instances.len()
                 );
             }
-            Err(error) => eprintln!("warning: unable to persist state HAMT: {error}"),
+            Err(error) => return Err(error).context("persisting imported state HAMTs"),
         }
     }
     if materialized && !loaded && !state_groups.is_empty() && publishable {
@@ -10352,10 +10362,10 @@ fn repair_import_state_groups(
             .iter()
             .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
             .collect();
-        if let Err(error) = aux.put_many(&entries) {
-            eprintln!("warning: unable to persist state groups: {error}");
-        }
+        aux.put_many(&entries)
+            .context("persisting imported state-group mappings")?;
     }
+    Ok(())
 }
 
 /// Resolve a Matrix input's room collection and prove that it is established
