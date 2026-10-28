@@ -440,13 +440,6 @@ impl SignatureKeyCatalog {
             return SignatureOutcome::NoMaterial;
         };
         let origin_outcome = self.verify_server(event, room_version, origin, timestamp);
-        if !matches!(
-            origin_outcome,
-            SignatureOutcome::Verified(_) | SignatureOutcome::VerifiedLate
-        ) {
-            return origin_outcome;
-        }
-
         let Some(authoriser) = restricted_join_authoriser(&event.pdu) else {
             return origin_outcome;
         };
@@ -458,13 +451,33 @@ impl SignatureKeyCatalog {
         if authoriser_server.eq_ignore_ascii_case(origin) {
             return origin_outcome;
         }
-        match self.verify_server(event, room_version, authoriser_server, timestamp) {
-            SignatureOutcome::Verified(_) | SignatureOutcome::VerifiedLate => origin_outcome,
-            SignatureOutcome::Invalid(reason) => {
-                SignatureOutcome::Invalid(format!("authoriser {authoriser_server}: {reason}"))
-            }
-            // A missing authoriser key or signature is missing evidence.
-            SignatureOutcome::NoKey | SignatureOutcome::NoMaterial => SignatureOutcome::NoKey,
+        let authoriser_outcome =
+            self.verify_server(event, room_version, authoriser_server, timestamp);
+
+        // All required signers must have usable evidence before a failure can
+        // be called Invalid. Otherwise one unavailable signer could hide a
+        // valid signature and manufacture a rejection.
+        if matches!(
+            &origin_outcome,
+            SignatureOutcome::NoKey | SignatureOutcome::NoMaterial
+        ) || matches!(
+            &authoriser_outcome,
+            SignatureOutcome::NoKey | SignatureOutcome::NoMaterial
+        ) {
+            return SignatureOutcome::NoKey;
+        }
+        if let SignatureOutcome::Invalid(reason) = origin_outcome {
+            return SignatureOutcome::Invalid(reason);
+        }
+        if let SignatureOutcome::Invalid(reason) = authoriser_outcome {
+            return SignatureOutcome::Invalid(format!("authoriser {authoriser_server}: {reason}"));
+        }
+        if matches!(&origin_outcome, SignatureOutcome::VerifiedLate)
+            || matches!(&authoriser_outcome, SignatureOutcome::VerifiedLate)
+        {
+            SignatureOutcome::VerifiedLate
+        } else {
+            origin_outcome
         }
     }
 
@@ -630,15 +643,19 @@ impl SignatureKeyCatalog {
                         "{key_id}: event after expired_ts {}",
                         key.expired_ts.unwrap_or_default()
                     ),
-                    Some(ts)
-                        if key.expired_ts.is_none()
-                            && uses_valid_until
-                            && ts > key.valid_until_ts =>
-                    {
-                        format!(
-                            "{key_id}: event after valid_until_ts {}",
-                            key.valid_until_ts
-                        )
+                    Some(ts) if uses_valid_until && ts > key.valid_until_ts => {
+                        if key.expired_ts.is_some() {
+                            format!(
+                                "{key_id}: event after valid_until_ts {} (retired key remains valid through expired_ts {})",
+                                key.valid_until_ts,
+                                key.expired_ts.unwrap_or_default()
+                            )
+                        } else {
+                            format!(
+                                "{key_id}: event after valid_until_ts {}",
+                                key.valid_until_ts
+                            )
+                        }
                     }
                     _ => format!("{key_id}: in window"),
                 }
@@ -3111,7 +3128,14 @@ mod signature_window_tests {
                         matches!(keys.verify(&event, version), SignatureOutcome::Verified(_)),
                         "v{version}, cached deadline {cached_deadline}, ts {ts}"
                     );
-                    assert_eq!(keys.explain(&event, version), vec!["ed25519:a: in window"]);
+                    let expected = if version == "4" || ts <= cached_deadline {
+                        "ed25519:a: in window".to_owned()
+                    } else {
+                        format!(
+                            "ed25519:a: event after valid_until_ts {cached_deadline} (retired key remains valid through expired_ts 5000)"
+                        )
+                    };
+                    assert_eq!(keys.explain(&event, version), vec![expected]);
                 }
             }
         }
@@ -3235,6 +3259,22 @@ mod signature_window_tests {
     }
 
     #[test]
+    fn missing_authoriser_evidence_defers_an_origin_signature_failure() {
+        let (origin_sk, wrong_origin_sk, authoriser_sk) =
+            (signing_key(1), signing_key(3), signing_key(2));
+        let keys = catalog(&[key_record(&origin_sk, "ed25519:a", 2_000, None)]);
+        let event = restricted_join(
+            1_000,
+            "@admin:auth.example",
+            &[
+                ("origin.example", "ed25519:a", &wrong_origin_sk),
+                ("auth.example", "ed25519:b", &authoriser_sk),
+            ],
+        );
+        assert!(matches!(keys.verify(&event, "10"), SignatureOutcome::NoKey));
+    }
+
+    #[test]
     fn a_restricted_join_without_the_authoriser_signature_is_deferred() {
         let origin_sk = signing_key(1);
         let keys = catalog(&[key_record(&origin_sk, "ed25519:a", 2_000, None)]);
@@ -3262,7 +3302,7 @@ mod signature_window_tests {
     }
 
     #[test]
-    fn an_unparseable_key_is_explained_as_invalid_public_key_material() {
+    fn an_unparsable_key_is_explained_as_invalid_public_key_material() {
         use base64::Engine as _;
         let sk = signing_key(1);
         // A 32-byte value that is not a valid compressed Edwards point.
