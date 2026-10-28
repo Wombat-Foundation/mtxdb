@@ -419,6 +419,30 @@ pub(crate) struct ScanEntryWithRemoval {
     pub disk_bytes: u64,
 }
 
+/// Relative forward skip that buffered readers can satisfy without
+/// discarding their buffer.
+pub trait SkipForward {
+    /// Advance by `bytes` from the current position.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the underlying seek fails.
+    fn skip_forward(&mut self, bytes: i64) -> io::Result<()>;
+}
+
+impl<R: Read + Seek> SkipForward for BufReader<R> {
+    fn skip_forward(&mut self, bytes: i64) -> io::Result<()> {
+        self.seek_relative(bytes)
+    }
+}
+
+impl<T: AsRef<[u8]>> SkipForward for io::Cursor<T> {
+    fn skip_forward(&mut self, bytes: i64) -> io::Result<()> {
+        self.seek(io::SeekFrom::Current(bytes)).map(|_| ())
+    }
+}
+
+const SCAN_BUF_BYTES: usize = 256 * 1024;
+
 /// Streaming packfile metadata scanner.
 pub struct PackfileScanner {
     reader: BufReader<File>,
@@ -455,7 +479,7 @@ pub(crate) fn scan_packfile_iter_from_file(
     verify_payload: bool,
 ) -> io::Result<PackfileScanner> {
     let file_end = file.metadata()?.len();
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     let done = read_header(&mut reader)?.is_none();
     Ok(PackfileScanner {
         reader,
@@ -1466,7 +1490,7 @@ fn read_record_metadata_scratch_with_len(
 /// conversions and the frame-length subtraction provably valid after the
 /// preceding bounds checks.
 pub fn read_record_metadata_skip_payload(
-    reader: &mut (impl Read + Seek),
+    reader: &mut (impl Read + Seek + SkipForward),
 ) -> io::Result<Option<RecordMetadata>> {
     let payload_start = reader.stream_position()?;
     let file_end = reader.seek(io::SeekFrom::End(0))?;
@@ -1474,16 +1498,16 @@ pub fn read_record_metadata_skip_payload(
     read_record_metadata_skip_payload_with_end(reader, file_end)
 }
 
-fn read_record_metadata_skip_payload_with_end(
-    reader: &mut (impl Read + Seek),
+fn read_record_metadata_skip_payload_with_end<R: Read + Seek + SkipForward>(
+    reader: &mut R,
     file_end: u64,
 ) -> io::Result<Option<RecordMetadata>> {
     read_record_metadata_skip_payload_with_end_and_len(reader, file_end)
         .map(|result| result.map(|(metadata, _)| metadata))
 }
 
-fn read_record_metadata_skip_payload_with_end_and_len(
-    reader: &mut (impl Read + Seek),
+fn read_record_metadata_skip_payload_with_end_and_len<R: Read + Seek + SkipForward>(
+    reader: &mut R,
     file_end: u64,
 ) -> io::Result<Option<(RecordMetadata, u64)>> {
     let Some(header) = read_frame_header(reader)? else {
@@ -1513,7 +1537,11 @@ fn read_record_metadata_skip_payload_with_end_and_len(
             "record payload or CRC is truncated",
         ));
     }
-    reader.seek(io::SeekFrom::Start(frame_end))?;
+    // `seek_relative` keeps the buffered window when the target is inside
+    // it, so scans over small frames avoid an lseek and refill per frame.
+    let skip = i64::try_from(skip)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record skip overflows i64"))?;
+    reader.skip_forward(skip)?;
     Ok(Some((
         RecordMetadata {
             collection_id: header.collection_id,
@@ -1799,7 +1827,7 @@ pub fn open_packfile(path: &Path, writable: bool, pack_id: &PackId) -> io::Resul
 
 /// Check that `file`'s header parses and names `pack_id`.
 fn validate_header_identity(file: &File, path: &Path, pack_id: &PackId) -> io::Result<()> {
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     let Some(header) = read_header(&mut reader)? else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1869,7 +1897,7 @@ pub fn open_packfile_with_creation_seq(
 /// any read-loop error other than `UnexpectedEof`.
 pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     let mut entries = Vec::new();
 
     if read_header(&mut reader)?.is_none() {
@@ -1904,7 +1932,7 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
 /// packfile.
 pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     let mut entries = Vec::new();
 
     if read_header(&mut reader)?.is_none() {
@@ -1941,7 +1969,7 @@ pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
 /// Returns `io::Error` on I/O failure other than `UnexpectedEof`.
 pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<ScanEntry>> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
 
     // Seek past the reserved header (HEADER_LEN bytes) to the first
     // record. If start_offset is already past the header, seek directly
@@ -2015,7 +2043,7 @@ pub(crate) fn scan_packfile_from_with_removal_visit(
     mut visit: impl FnMut(ScanEntryWithRemoval),
 ) -> io::Result<()> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     if start_offset == 0 {
         if read_header(&mut reader)?.is_none() {
             return Ok(());
@@ -2093,7 +2121,7 @@ impl RecordScanner {
 /// an mtxdb packfile header (rather than silently yielding an empty stream).
 pub fn scan_records_iter(path: &Path) -> io::Result<RecordScanner> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     match read_header(&mut reader)? {
         Some(_) => Ok(RecordScanner {
             reader,
