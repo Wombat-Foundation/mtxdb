@@ -1681,6 +1681,110 @@ fn state_collection_without_genesis_metadata_is_reset() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+fn state_test_metadata(canonical_id: &[u8]) -> CollectionMetadata {
+    CollectionMetadata {
+        member_namespace: Some(*b"STAT"),
+        collection_canonical_id: canonical_id.to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::ExternalCanonicalIdToCrosscheck,
+            digest_algorithm: DigestAlgorithm::Sha256,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+        role: Some("state_hamt".to_owned()),
+        schema: Some("sithnapse.state-hamt.v1".to_owned()),
+    }
+}
+
+/// A server migration wrote HAMT roots with no genesis metadata, the server
+/// stopped, and the import reopens the shared database. The reset must still
+/// establish the collection, and the records written after it must be readable.
+#[test]
+fn state_collection_without_genesis_is_reset_after_a_reopen() {
+    let root = unique_temp_dir().join("state-reopen");
+    let canonical_id = b"!room:example.org";
+    let collection = derive_collection_id(Some(*b"STAT"), canonical_id);
+    let old_node = [0x51; 16];
+    let new_node = [0x52; 16];
+
+    {
+        let db = Database::open(root.clone()).unwrap();
+        let state = db.pool(ShardType::State);
+        state
+            .put(
+                &collection,
+                &old_node,
+                &NodeData::new(Bytes::from_static(b"old root")),
+            )
+            .unwrap();
+        state.sync().unwrap();
+    }
+
+    let db = Database::open(root.clone()).unwrap();
+    let state = db.pool(ShardType::State);
+    assert!(state
+        .get_collection_metadata(&collection)
+        .unwrap()
+        .is_none());
+    assert!(state.collection_exists(&collection));
+
+    let metadata = state_test_metadata(canonical_id);
+    prepare_state_collection(state, &collection, &metadata).unwrap();
+    state
+        .put_many(
+            &collection,
+            &[(new_node, NodeData::new(Bytes::from_static(b"new root")))],
+        )
+        .unwrap();
+
+    assert_eq!(
+        state.get_collection_metadata(&collection).unwrap(),
+        Some(metadata)
+    );
+    assert!(state.get(&collection, &old_node).unwrap().is_none());
+    assert_eq!(
+        state.get(&collection, &new_node).unwrap().unwrap().bytes,
+        Bytes::from_static(b"new root")
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+}
+
+/// A room import prepares the collection, writes it, and a later import of the
+/// same room prepares it again. The second prepare must leave the records alone.
+#[test]
+fn preparing_an_established_state_collection_again_keeps_its_records() {
+    let root = unique_temp_dir().join("state-prepare-twice");
+    let db = Database::open(root.clone()).unwrap();
+    let state = db.pool(ShardType::State);
+    let canonical_id = b"!room:example.org";
+    let collection = derive_collection_id(Some(*b"STAT"), canonical_id);
+    let node = [0x53; 16];
+    let metadata = state_test_metadata(canonical_id);
+
+    prepare_state_collection(state, &collection, &metadata).unwrap();
+    state
+        .put_many(
+            &collection,
+            &[(node, NodeData::new(Bytes::from_static(b"root")))],
+        )
+        .unwrap();
+    prepare_state_collection(state, &collection, &metadata).unwrap();
+
+    assert_eq!(
+        state.get(&collection, &node).unwrap().unwrap().bytes,
+        Bytes::from_static(b"root")
+    );
+    assert_eq!(
+        state.get_collection_metadata(&collection).unwrap(),
+        Some(metadata)
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+}
+
 /// Template whose record identity derives from `sender` rather than the
 /// `event_id`, so two events with distinct `event_ids` can deliberately map to
 /// the same storage node ID — modelling the truncated-hash collision the
@@ -2091,6 +2195,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         &mut established,
         false,
         None,
+        true,
     )
     .unwrap();
     let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
@@ -2106,6 +2211,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         &mut established,
         false,
         None,
+        true,
     )
     .unwrap();
 
@@ -2162,6 +2268,7 @@ fn import_establishment_persists_the_matrix_extension() {
         &mut established,
         false,
         None,
+        true,
     )
     .unwrap();
 
@@ -2531,6 +2638,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         &mut established,
         false,
         None,
+        true,
     )
     .unwrap();
 
@@ -2567,6 +2675,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         &mut established,
         false,
         None,
+        true,
     )
     .unwrap();
 
@@ -2605,6 +2714,7 @@ fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         &mut established,
         false,
         None,
+        true,
     )
     .unwrap();
 
@@ -3460,6 +3570,7 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
         &mut established,
         false,
         None,
+        true,
     )
     .unwrap();
     db.edges().sync_all().unwrap();
@@ -4307,6 +4418,7 @@ fn coalesce_safeguards_reject_unsupported_commands() {
             paths: vec![],
             collection: None,
             template: None,
+            no_state_hamts: false,
         },
         Commands::Export {
             collection: "0x00000000000000000000000000000000".to_owned(),
@@ -4588,10 +4700,11 @@ fn import_into_a_freshly_initialized_root_creates_pools_on_first_write() {
             paths: vec![input.clone()],
             collection: None,
             template: None,
+            no_state_hamts: false,
         },
     };
 
-    cmd_import(&cli, &[input], None, None).expect("import into a fresh root");
+    cmd_import(&cli, &[input], None, None, false).expect("import into a fresh root");
 
     assert!(
         layout.pool_path(ShardType::EventDag).is_dir(),
@@ -5016,6 +5129,7 @@ fn import_inputs(db: &Database, root: &std::path::Path, inputs: &[(&str, &str)])
         None,
         &template,
         &mut HashSet::new(),
+        true,
     )
 }
 

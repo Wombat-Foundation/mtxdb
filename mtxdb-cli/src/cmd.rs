@@ -519,9 +519,16 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             paths,
             collection,
             template,
+            no_state_hamts,
         } => {
             cli.require_single_dir("import")?;
-            cmd_import(cli, paths, collection.as_deref(), template.as_deref())
+            cmd_import(
+                cli,
+                paths,
+                collection.as_deref(),
+                template.as_deref(),
+                *no_state_hamts,
+            )
         }
         Commands::Export {
             collection,
@@ -8254,11 +8261,16 @@ fn scan_payload_suffix(data: &[u8]) -> Option<String> {
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the import command owns setup, the data pass, and the audit sidecars"
+)]
 fn cmd_import(
     cli: &Cli,
     paths: &[std::path::PathBuf],
     collection_override: Option<&str>,
     template: Option<&Path>,
+    no_state_hamts: bool,
 ) -> anyhow::Result<()> {
     let import_template = compile_import_template(template)?;
     // One writer owns the entire batch: it prevents another writer from
@@ -8286,6 +8298,9 @@ fn cmd_import(
     // State-group mappings belong in the State pool, not the event pool.
     let state_store: &PackfileStorage = db.pool(ShardType::State);
     state_store.set_read_plan_policy(cli.read_plan);
+    if no_state_hamts {
+        eprintln!("state HAMTs: skipped (--no-state-hamts)");
+    }
     let mut run = import_data(
         &db,
         store,
@@ -8294,6 +8309,7 @@ fn cmd_import(
         collection_override,
         &import_template,
         &mut established_collections,
+        !no_state_hamts,
     );
     let hash_audit_path = layout.root().join("content-hash-mismatches.jsonl");
     if let Err(error) = write_hash_audit(&hash_audit_path, &run.hash_audit) {
@@ -8550,6 +8566,10 @@ fn has_signing_key_material(store: &PackfileStorage) -> anyhow::Result<bool> {
 /// before room exports regardless of argument order, so later room verdict
 /// derivation can consult the imported keys. Commits no marker, so a run that
 /// stops after this leaves the database visibly incomplete.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the data pass shares every open pool and batch option with its file reader"
+)]
 fn import_data(
     db: &Database,
     store: &PackfileStorage,
@@ -8558,6 +8578,7 @@ fn import_data(
     collection_override: Option<&str>,
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
+    write_state_hamts: bool,
 ) -> ImportRun {
     // Clear the marker before reading any input: an input that fails to parse
     // never reaches the importers that clear it, and must not leave the marker
@@ -8640,6 +8661,7 @@ fn import_data(
             established_collections,
             signature_checks_enabled,
             run.signature_catalog.as_ref(),
+            write_state_hamts,
         ) {
             Ok(outcome) => absorb_outcome(&mut run, outcome),
             Err(error) => {
@@ -9682,6 +9704,7 @@ fn cmd_import_file(
     established_collections: &mut HashSet<[u8; 16]>,
     signature_checks_enabled: bool,
     signature_catalog: Option<&export_import::SignatureKeyCatalog>,
+    write_state_hamts: bool,
 ) -> anyhow::Result<ImportOutcome> {
     let mut context = ImportContext {
         db,
@@ -9691,6 +9714,7 @@ fn cmd_import_file(
         established_collections,
         signature_checks_enabled,
         signature_catalog,
+        write_state_hamts,
     };
     context.import(path, collection_override)
 }
@@ -9710,6 +9734,7 @@ struct ImportContext<'a> {
     established_collections: &'a mut HashSet<[u8; 16]>,
     signature_checks_enabled: bool,
     signature_catalog: Option<&'a export_import::SignatureKeyCatalog>,
+    write_state_hamts: bool,
 }
 
 impl ImportContext<'_> {
@@ -9969,15 +9994,18 @@ impl ImportContext<'_> {
             export_import::BATCH_BYTES,
             signature_keys,
         )?;
-        let event_collection = mtxdb::interop::room_event_collection_id(export.room_id.as_bytes());
-        let room_version = import_room_version(self.store, &event_collection, &events)?;
-        repair_import_state_groups(
-            self.state_store,
-            &events,
-            &[],
-            &export.room_id,
-            &room_version,
-        )?;
+        if self.write_state_hamts {
+            let event_collection =
+                mtxdb::interop::room_event_collection_id(export.room_id.as_bytes());
+            let room_version = import_room_version(self.store, &event_collection, &events)?;
+            repair_import_state_groups(
+                self.state_store,
+                &events,
+                &[],
+                &export.room_id,
+                &room_version,
+            )?;
+        }
         eprintln!(
             "  {}",
             export_import::room_collections_line(&export.room_id)

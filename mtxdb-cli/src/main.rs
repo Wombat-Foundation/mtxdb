@@ -155,6 +155,7 @@ pub(crate) enum Commands {
         paths: Vec<PathBuf>,
         collection: Option<String>,
         template: Option<PathBuf>,
+        no_state_hamts: bool,
     },
     Export {
         collection: String,
@@ -726,6 +727,16 @@ fn sub_import() -> Command {
                 .value_name("FILE")
                 .help("JSON collection template; currently supports matrix-event-v1"),
         )
+        .arg(
+            Arg::new("no-state-hamts")
+                .long("no-state-hamts")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Do not reconstruct state groups or Synapse-format state HAMTs during a room \
+                     import. Use this when the target server builds its own state, for example \
+                     congruent's v20 migration.",
+                ),
+        )
 }
 
 fn sub_export() -> Command {
@@ -1274,6 +1285,7 @@ fn parse_cli() -> Cli {
                 .collect(),
             collection: m.get_one::<String>("collection").cloned(),
             template: m.get_one::<String>("template").map(PathBuf::from),
+            no_state_hamts: m.get_flag("no-state-hamts"),
         },
         Some(("export", m)) => Commands::Export {
             collection: m.get_one::<String>("collection").unwrap().clone(),
