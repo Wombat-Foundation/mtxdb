@@ -3960,11 +3960,11 @@ impl JournalCoordinator {
 
     /// Set the segment length above which a sync forces a reclaiming
     /// checkpoint. Tests use a small value to cross it without writing tens of
-    /// MiB. It is not available outside tests: a value of zero would force a
-    /// checkpoint on every sync and one above the segment cap would switch the
-    /// forced reclaim off.
+    /// MiB. This is available only to this crate's tests and downstream tests
+    /// that enable the `test-util` feature. A value of zero forces a checkpoint
+    /// on every sync; a value above the segment cap switches forced reclaim off.
     #[cfg(any(test, feature = "test-util"))]
-    pub(crate) fn set_reclaim_trigger_len(&self, len: u64) {
+    pub fn set_reclaim_trigger_len(&self, len: u64) {
         self.reclaim_trigger_len.store(len, Ordering::Relaxed);
     }
 
