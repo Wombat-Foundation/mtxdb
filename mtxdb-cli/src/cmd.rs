@@ -7510,10 +7510,7 @@ fn scan_pack(
         let collection_hex = format_id(collection_id);
         let id_hex = format_id(node_id);
         let should_decode = opts.decode.is_some() || (opts.verbose && !opts.header);
-        // State scans render the event -> state-group mapping inline, so they
-        // read frames even without `--verbose`/`--decode`; other shards keep
-        // the read-free default.
-        let need_record = should_decode || opts.header || shard_type == ShardType::State;
+        let need_record = should_decode || opts.header;
         let data = need_record
             .then(|| ShardPool::read_at_committed(shard, *offset, true))
             .transpose()?;
@@ -7560,8 +7557,8 @@ fn scan_payload_label(shard_type: ShardType) -> &'static str {
 }
 
 /// One aligned row: `location` is a collection or pack ID (hex), `id` the
-/// node ID (hex). `payload` is `None` for a non-`--verbose` scan (no frame
-/// data was read).
+/// node ID (hex). `payload` is `None` when the scan mode does not request
+/// payload data, so no frame payload was read.
 fn scan_table_row(location: &str, id: &str, offset: u64, payload: Option<&str>) -> String {
     format!(
         "  {location:<34} {id:<34} {offset:>10}  {}",
@@ -7791,51 +7788,74 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
     let max_rows = opts.max_rows();
     let bounded = max_rows != usize::MAX;
 
-    // Payload sorting needs every candidate. Other modes read only the rows
-    // that will be printed.
-    let rows: Vec<(Arc<mtxdb::shard::Shard>, u64, mtxdb::packfile::Record)> = if opts.is_sorting() {
-        let mut rows = Vec::with_capacity(records.len());
-        for (shard, offset) in records {
+    // The live index stores only `(slot, offset)`. A plain scan needs the
+    // fixed frame identity to print each node ID, but it need not touch the
+    // payload or checksum. Read whole records only for output modes that use
+    // payload bytes or metadata.
+    let read_payload = opts.raw
+        || opts.verbose
+        || opts.header
+        || opts.decode.is_some()
+        || opts.sort == Some(SortColumn::Payload);
+    let mut rows: Vec<(
+        Arc<mtxdb::shard::Shard>,
+        u64,
+        [u8; 16],
+        Option<mtxdb::packfile::Record>,
+    )> = Vec::with_capacity(if opts.is_sorting() {
+        records.len()
+    } else {
+        records.len().min(max_rows)
+    });
+    for (shard, offset) in records {
+        if !opts.is_sorting() && rows.len() >= max_rows {
+            break;
+        }
+        if read_payload {
             let record = ShardPool::read_at_committed(&shard, offset, true)?;
             if record.collection_id != collection_id {
                 continue;
             }
-            rows.push((shard, offset, record));
-        }
-        if opts.sort == Some(SortColumn::Payload) {
-            rows.sort_by(|a, b| a.2.data.cmp(&b.2.data));
+            rows.push((shard, offset, record.hash, Some(record)));
         } else {
-            rows.sort_by_key(|(_, offset, _)| *offset);
+            let (record_collection, record_id, removed) = pool.record_identity_at(&shard, offset)?;
+            if record_collection != collection_id || removed {
+                continue;
+            }
+            rows.push((shard, offset, record_id, None));
+        }
+    }
+    if opts.is_sorting() {
+        if opts.sort == Some(SortColumn::Payload) {
+            rows.sort_by(|a, b| {
+                a.3.as_ref()
+                    .expect("payload sort reads each record")
+                    .data
+                    .cmp(&b.3.as_ref().expect("payload sort reads each record").data)
+            });
+        } else {
+            rows.sort_by_key(|(_, offset, _, _)| *offset);
         }
         if opts.reverse {
             rows.reverse();
         }
-        rows
-    } else {
-        let mut rows = Vec::with_capacity(records.len().min(max_rows));
-        for (shard, offset) in records {
-            if rows.len() >= max_rows {
-                break;
-            }
-            let record = ShardPool::read_at_committed(&shard, offset, true)?;
-            if record.collection_id != collection_id {
-                continue;
-            }
-            rows.push((shard, offset, record));
-        }
-        rows
-    };
+    }
 
     if opts.raw {
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        for (_, offset, record) in rows.iter().take(max_rows) {
-            out.write_all(&record.data)?;
+        for (_, offset, _, record) in rows.iter().take(max_rows) {
+            out.write_all(
+                &record
+                    .as_ref()
+                    .expect("raw scan reads each record")
+                    .data,
+            )?;
             if opts.verbose {
                 eprintln!(
                     "collection {}: live raw frame @ {offset} ({} bytes, checksum verified)",
                     format_id(&collection_id),
-                    record.data.len()
+                    record.as_ref().expect("raw scan reads each record").data.len()
                 );
             }
         }
@@ -7873,9 +7893,15 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
         header: opts.header,
         decode: opts.decode.clone(),
     };
-    for (shard, offset, record) in rows.iter().take(max_rows) {
+    for (shard, offset, record_id, record) in rows.iter().take(max_rows) {
         context.frames = context.frames.saturating_add(1);
-        print_collection_record_with_data(shard, record.hash, *offset, Some(record), &mut context);
+        print_collection_record_with_data(
+            shard,
+            *record_id,
+            *offset,
+            record.as_ref(),
+            &mut context,
+        );
     }
     let frames = context.frames;
     if bounded && total_live > max_rows {
@@ -8068,7 +8094,7 @@ fn print_collection_record(
     context: &mut CollectionScanContext,
 ) -> anyhow::Result<()> {
     let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
-    let need_record = should_decode || context.header || context.shard_type == ShardType::State;
+    let need_record = should_decode || context.header;
     let data = need_record
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
