@@ -322,11 +322,11 @@ pub(crate) struct AuthFindings {
     pub(crate) signature_no_key: usize,
     /// Events without the origin, timestamp, or signature material to check.
     pub(crate) signature_no_material: usize,
-    /// Events that verified against a key after its cached
+    /// Events that verified against an unretired key after its cached
     /// `valid_until_ts`. That value is a refresh deadline, not the key's
     /// lifetime, so these are accepted but do not corroborate the key.
     pub(crate) signature_verified_late: usize,
-    /// One record per event that verified after its key's cached deadline.
+    /// One record per event that verified late against an unretired key.
     pub(crate) signature_late: Vec<SignatureAudit>,
     /// Derived rejections by stored rejection code.
     pub(crate) rejection_counts: BTreeMap<u8, usize>,
@@ -447,18 +447,21 @@ impl SignatureKeyCatalog {
                 continue;
             };
             let key = &record.key;
-            // Deliberately supersede the earlier both-bounds rule for retired
-            // keys: `expired_ts` alone is the hard signing boundary.
-            // `valid_until_ts` is a cache-refresh deadline, so a successful
-            // signature past it but before expiration is reported as late,
-            // whether or not the key has an `expired_ts`.
-            let past_cached_deadline = timestamp >= key.valid_until_ts;
-            if key.key.is_empty()
-                || key.expired_ts.is_some_and(|expired| timestamp >= expired)
-            {
+            // `expired_ts` alone is the hard retirement boundary. For v5+
+            // rooms, `valid_until_ts` is a cache-refresh deadline: an
+            // unretired key past it can still verify, but is reported late.
+            // A retired key before `expired_ts` verifies normally. Past a
+            // stale cached deadline, a failure stays NoKey rather than
+            // becoming a rejection, because the snapshot cannot refresh.
+            // v1-v4 ignore `valid_until_ts` entirely.
+            let past_cached_deadline =
+                room_version_uses_valid_until_ts(room_version) && timestamp >= key.valid_until_ts;
+            let late = key.expired_ts.is_none() && past_cached_deadline;
+            let reject_failure = !past_cached_deadline;
+            if key.key.is_empty() || key.expired_ts.is_some_and(|expired| timestamp >= expired) {
                 continue;
             }
-            candidates.push((record, key_id.as_str(), signature, past_cached_deadline));
+            candidates.push((record, key_id.as_str(), signature, late, reject_failure));
         }
         if candidates.is_empty() {
             return SignatureOutcome::NoKey;
@@ -467,10 +470,10 @@ impl SignatureKeyCatalog {
         // Prefer an in-window signature if multiple keys are present. A
         // verified late signature is useful migration evidence, but must not
         // hide a usable in-window signature.
-        candidates.sort_by_key(|(_, _, _, late)| *late);
-        let mut in_window_failure = None;
+        candidates.sort_by_key(|(_, _, _, late, _)| *late);
+        let mut rejectable_failure = None;
         let mut any_parsed_key = false;
-        for (record, key_id, _, late) in &candidates {
+        for (record, key_id, _, late, reject_failure) in &candidates {
             let Some(parsed_key) = record.parsed_key.as_ref() else {
                 continue;
             };
@@ -496,14 +499,14 @@ impl SignatureKeyCatalog {
                         })
                     };
                 }
-                Err(error) if !*late => in_window_failure = Some(error),
+                Err(error) if *reject_failure => rejectable_failure = Some(error),
                 Err(_) => {}
             }
         }
         if !any_parsed_key {
             return SignatureOutcome::NoMaterial;
         }
-        if let Some(error) = in_window_failure {
+        if let Some(error) = rejectable_failure {
             return SignatureOutcome::Invalid(error);
         }
         // Late failures alone cannot distinguish a bad signature from a key
@@ -521,6 +524,7 @@ impl SignatureKeyCatalog {
             .pdu
             .get("origin_server_ts")
             .and_then(OwnedValue::as_u64);
+        let uses_valid_until = room_version_uses_valid_until_ts(room_version);
         let Some(origin_signatures) = event
             .pdu
             .get("signatures")
@@ -530,7 +534,9 @@ impl SignatureKeyCatalog {
         else {
             return vec![format!("no signatures from {origin}")];
         };
-        origin_signatures.keys().map(|key_id| {
+        origin_signatures
+            .keys()
+            .map(|key_id| {
                 let Some(record) = self
                     .records
                     .get(&(origin.to_ascii_lowercase(), key_id.as_bytes().to_vec()))
@@ -546,7 +552,11 @@ impl SignatureKeyCatalog {
                         "{key_id}: event after expired_ts {}",
                         key.expired_ts.unwrap_or_default()
                     ),
-                    Some(ts) if ts >= key.valid_until_ts => {
+                    Some(ts)
+                        if key.expired_ts.is_none()
+                            && uses_valid_until
+                            && ts >= key.valid_until_ts =>
+                    {
                         format!(
                             "{key_id}: event after valid_until_ts {}",
                             key.valid_until_ts
@@ -593,9 +603,23 @@ enum SignatureOutcome {
     NoKey,
     NoMaterial,
     Verified(KeyBinding),
-    /// Verified, but after the key's cached `valid_until_ts`.
+    /// Verified against an unretired key after its cached `valid_until_ts`.
     VerifiedLate,
     Invalid(String),
+}
+
+/// Whether a room version applies `valid_until_ts` to historical signatures.
+/// Versions 1-4 ignore it; version 5 and later use it as a cache-refresh
+/// deadline. Unknown version strings are treated as modern.
+fn room_version_uses_valid_until_ts(room_version: &str) -> bool {
+    match room_version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+    {
+        Some(version) => version >= 5,
+        None => true,
+    }
 }
 
 fn event_origin<'a>(pdu: &'a OwnedValue, room_version: &str) -> Option<&'a str> {
@@ -1914,7 +1938,10 @@ mod auth_findings_tests {
         assert_eq!(findings.missing_auth, ["$bad"]);
         assert_eq!(findings.cascaded, ["$child", "$grandchild"]);
         assert_eq!(findings.rejection_counts.get(&MISSING_AUTH), Some(&1));
-        assert_eq!(findings.rejection_counts.get(&DEPENDS_ON_REJECTED), Some(&2));
+        assert_eq!(
+            findings.rejection_counts.get(&DEPENDS_ON_REJECTED),
+            Some(&2)
+        );
     }
 
     #[test]
@@ -2645,18 +2672,22 @@ mod signature_window_tests {
     /// A message event at `ts`, signed under each `(key_id, signing key)`.
     /// Signing a key that is not the registered one makes a bad signature.
     fn signed_event(ts: u64, signers: &[(&str, &SigningKey)]) -> RoomEvent {
+        signed_event_for(ts, signers, "10")
+    }
+
+    fn signed_event_for(ts: u64, signers: &[(&str, &SigningKey)], room_version: &str) -> RoomEvent {
         let fields = format!(
             r#""type":"m.room.message","room_id":"!r:{ORIGIN}","sender":"@a:{ORIGIN}","origin_server_ts":{ts},"content":{{"body":"hi"}},"depth":1,"auth_events":[],"prev_events":[]"#
         );
         let unsigned = OwnedValue::parse_bytes(format!("{{{fields}}}").as_bytes()).unwrap();
-        let canonical = rezzy::try_canonical_redacted_json(&unsigned, "10").unwrap();
+        let canonical = rezzy::try_canonical_redacted_json(&unsigned, room_version).unwrap();
         let signatures: Vec<String> = signers
             .iter()
             .map(|(key_id, sk)| {
                 use base64::Engine as _;
                 let signature = sk.sign(canonical.as_bytes());
-                let encoded = base64::engine::general_purpose::STANDARD_NO_PAD
-                    .encode(signature.to_bytes());
+                let encoded =
+                    base64::engine::general_purpose::STANDARD_NO_PAD.encode(signature.to_bytes());
                 format!(r#""{key_id}":"{encoded}""#)
             })
             .collect();
@@ -2783,14 +2814,74 @@ mod signature_window_tests {
     }
 
     #[test]
-    fn a_retired_key_past_its_cached_deadline_verifies_late_until_expiry() {
+    fn a_retired_key_past_its_cached_deadline_verifies_in_window_until_expiry() {
         let sk = signing_key(1);
         let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, Some(5_000))]);
-        let outcome = keys.verify(&signed_event(3_000, &[("ed25519:a", &sk)]), "10");
+        let event = signed_event(3_000, &[("ed25519:a", &sk)]);
+        let outcome = keys.verify(&event, "10");
         assert!(
-            matches!(outcome, SignatureOutcome::VerifiedLate),
+            matches!(&outcome, SignatureOutcome::Verified(_)),
             "the cached deadline is not the retired key's signing boundary"
         );
+
+        // A retired key still inside its expiry window corroborates normally.
+        let mut findings = AuthFindings {
+            forced: vec![None],
+            ..AuthFindings::default()
+        };
+        apply_signature_outcomes(
+            &mut findings,
+            std::slice::from_ref(&event),
+            vec![outcome],
+            &keys,
+            "!r:origin.example",
+            "10",
+        );
+        assert_eq!(findings.verified_keys.len(), 1);
+        assert!(findings.signature_late.is_empty());
+    }
+
+    #[test]
+    fn a_retired_key_past_its_cached_deadline_does_not_reject_a_bad_signature() {
+        let (signer, registered) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, Some(5_000))]);
+        let outcome = keys.verify(&signed_event(3_000, &[("ed25519:a", &signer)]), "10");
+        assert!(
+            matches!(outcome, SignatureOutcome::NoKey),
+            "a stale cached deadline must not turn an unverifiable retired-key signature into a rejection"
+        );
+    }
+
+    #[test]
+    fn room_versions_before_five_ignore_the_cached_deadline() {
+        let sk = signing_key(1);
+        let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, None)]);
+        let event = signed_event_for(3_000, &[("ed25519:a", &sk)], "4");
+        assert!(
+            matches!(keys.verify(&event, "4"), SignatureOutcome::Verified(_)),
+            "v1-v4 do not use valid_until_ts as a historical cutoff"
+        );
+    }
+
+    #[test]
+    fn room_versions_before_five_still_reject_a_bad_signature() {
+        let (signer, registered) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, None)]);
+        let event = signed_event_for(3_000, &[("ed25519:a", &signer)], "4");
+        assert!(
+            matches!(keys.verify(&event, "4"), SignatureOutcome::Invalid(_)),
+            "without a cached-deadline rule, a bad v1-v4 signature is in window"
+        );
+    }
+
+    #[test]
+    fn only_v5_and_later_rooms_apply_the_cached_deadline() {
+        for version in ["1", "2", "3", "4"] {
+            assert!(!room_version_uses_valid_until_ts(version), "{version}");
+        }
+        for version in ["5", "6", "9", "10", "11", "12", "12.1"] {
+            assert!(room_version_uses_valid_until_ts(version), "{version}");
+        }
     }
 
     #[test]
@@ -2842,7 +2933,13 @@ mod signature_window_tests {
         assert_eq!(findings.signature_late.len(), 1);
         assert_eq!(findings.signature_late[0].outcome, "verified_late");
         assert!(findings.signature_audit.is_empty());
-        assert_eq!(findings.hash_audit[0].signature_status, Some("verified_late"));
-        assert!(findings.verified_keys.is_empty(), "late events do not corroborate");
+        assert_eq!(
+            findings.hash_audit[0].signature_status,
+            Some("verified_late")
+        );
+        assert!(
+            findings.verified_keys.is_empty(),
+            "late events do not corroborate"
+        );
     }
 }
