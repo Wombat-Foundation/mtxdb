@@ -3645,10 +3645,19 @@ fn print_stats_table(dir: &Path, stats: &RuntimeStats, summaries: &[mtxdb::shard
     );
     println!();
     println!("  per-shard (persisted through `shard_stats.bin`):");
-    println!("    pack    bytes      writes   syncs");
+    let pack_id_width = summaries
+        .iter()
+        .map(|summary| summary.pack_id.to_string().len())
+        .max()
+        .unwrap_or(4)
+        .max("pack".len());
+    println!(
+        "    {:<pack_id_width$}  {:>10}  {:>7}  {:>5}",
+        "pack", "bytes", "writes", "syncs"
+    );
     for summary in summaries {
         println!(
-            "    {:>4}   {:>10}   {:>7}   {:>5}",
+            "    {:<pack_id_width$}  {:>10}  {:>7}  {:>5}",
             summary.pack_id,
             fmt_bytes(summary.stats.bytes_written),
             summary.stats.write_count,
