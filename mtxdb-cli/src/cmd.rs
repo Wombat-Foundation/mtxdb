@@ -465,7 +465,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         ),
         Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
-        Commands::Memory { evict } => cmd_memory(cli, *evict),
+        Commands::Memory { evict, evict_pages } => cmd_memory(cli, *evict, *evict_pages),
         Commands::Meta {
             target,
             json,
@@ -3244,12 +3244,25 @@ fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
     run_multi_dir(cli, |sub_cli| cmd_stats_single(sub_cli, json))
 }
 
-fn cmd_memory(cli: &Cli, evict: bool) -> anyhow::Result<()> {
-    run_multi_dir(cli, |sub_cli| cmd_memory_single(sub_cli, evict))
+fn cmd_memory(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| {
+        cmd_memory_single(sub_cli, evict, evict_pages)
+    })
 }
 
-fn cmd_memory_single(cli: &Cli, evict: bool) -> anyhow::Result<()> {
+fn cmd_memory_single(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
+    if evict_pages {
+        let (files, bytes) = evict_database_pages(layout.root())?;
+        println!(
+            "{} — requested page-cache eviction for {files} files ({} total file bytes)",
+            layout.root().display(),
+            fmt_bytes(bytes),
+        );
+        println!("note: eviction is advisory; dirty or actively mapped pages may remain");
+        return Ok(());
+    }
+
     let selected = cli.shard_type;
     let mut reported = false;
 
@@ -3300,6 +3313,53 @@ fn cmd_memory_single(cli: &Cli, evict: bool) -> anyhow::Result<()> {
         bail!("no shard pools found")
     }
     Ok(())
+}
+
+/// Ask Linux to discard cached pages for regular files under a database root.
+/// This walks paths directly instead of opening `PackfileStorage`, which would
+/// rebuild/load its index and warm the pages this command is trying to evict.
+fn evict_database_pages(root: &Path) -> anyhow::Result<(usize, u64)> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        bail!("`memory --evict-pages` is currently supported only on Linux");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut pending = vec![root.to_path_buf()];
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir)
+                .with_context(|| format!("reading database directory {}", dir.display()))?
+            {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let metadata = entry.metadata()?;
+                let file = fs::File::open(&path).with_context(|| {
+                    format!("opening {} for page-cache eviction", path.display())
+                })?;
+                // The kernel skips dirty pages, so flush first; a failed
+                // flush only leaves some pages resident.
+                let _ = file.sync_data();
+                rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).with_context(
+                    || format!("requesting page-cache eviction for {}", path.display()),
+                )?;
+                files = files.saturating_add(1);
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+        Ok((files, bytes))
+    }
 }
 
 #[allow(
@@ -7735,6 +7795,19 @@ fn cmd_scan_collection_in_pool(
     clippy::too_many_lines,
     reason = "the live scan keeps its index resolution, ordering, and output modes in one place"
 )]
+/// One live frame: its shard, offset, node id, and the full record when the
+/// output mode needs the payload (`None` for a header-only read).
+type LiveScanRow = (
+    Arc<mtxdb::shard::Shard>,
+    u64,
+    [u8; 16],
+    Option<mtxdb::packfile::Record>,
+);
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the live scan resolves locations, reads rows, and renders each output mode in one pass"
+)]
 fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow::Result<()> {
     let collection_id = parse_collection_selector(selector)?;
     let store = open_store_read_only(cli)?;
@@ -7797,12 +7870,7 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
         || opts.header
         || opts.decode.is_some()
         || opts.sort == Some(SortColumn::Payload);
-    let mut rows: Vec<(
-        Arc<mtxdb::shard::Shard>,
-        u64,
-        [u8; 16],
-        Option<mtxdb::packfile::Record>,
-    )> = Vec::with_capacity(if opts.is_sorting() {
+    let mut rows: Vec<LiveScanRow> = Vec::with_capacity(if opts.is_sorting() {
         records.len()
     } else {
         records.len().min(max_rows)
@@ -7818,7 +7886,8 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
             }
             rows.push((shard, offset, record.hash, Some(record)));
         } else {
-            let (record_collection, record_id, removed) = pool.record_identity_at(&shard, offset)?;
+            let (record_collection, record_id, removed) =
+                pool.record_identity_at(&shard, offset)?;
             if record_collection != collection_id || removed {
                 continue;
             }
@@ -7845,17 +7914,16 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
         let stdout = io::stdout();
         let mut out = stdout.lock();
         for (_, offset, _, record) in rows.iter().take(max_rows) {
-            out.write_all(
-                &record
-                    .as_ref()
-                    .expect("raw scan reads each record")
-                    .data,
-            )?;
+            out.write_all(&record.as_ref().expect("raw scan reads each record").data)?;
             if opts.verbose {
                 eprintln!(
                     "collection {}: live raw frame @ {offset} ({} bytes, checksum verified)",
                     format_id(&collection_id),
-                    record.as_ref().expect("raw scan reads each record").data.len()
+                    record
+                        .as_ref()
+                        .expect("raw scan reads each record")
+                        .data
+                        .len()
                 );
             }
         }

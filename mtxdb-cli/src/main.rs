@@ -120,6 +120,7 @@ pub(crate) enum Commands {
     },
     Memory {
         evict: bool,
+        evict_pages: bool,
     },
     Meta {
         target: String,
@@ -378,20 +379,29 @@ fn sub_stats() -> Command {
 
 fn sub_memory() -> Command {
     Command::new("memory")
-        .about("Inspect or evict mtxdb's in-process decoded-node caches")
+        .about("Inspect or evict in-process caches and filesystem pages")
         .long_about(
-            "Inspect or evict mtxdb's in-process decoded-node caches.\n\n".to_owned()
+            "Inspect or evict mtxdb's in-process decoded-node caches, or request eviction of the selected database's filesystem pages.\n\n".to_owned()
                 + "This reports heap objects decoded by the current mtxdb process only. "
                 + "It does not include durable records, indexes, memory-mapped files, or "
                 + "the operating system's filesystem page cache. A one-shot CLI process "
                 + "starts with an empty decoded-node cache; this is primarily useful to "
-                + "long-lived embedders.",
+                + "long-lived embedders. --evict-pages is a Linux-only, best-effort request "
+                + "to discard clean page-cache pages for files under the database directory; "
+                + "the kernel may retain dirty or actively mapped pages.",
         )
         .arg(
             Arg::new("evict")
                 .long("evict")
                 .action(ArgAction::SetTrue)
                 .help("Evict decoded nodes held by this process; does not flush the OS page cache"),
+        )
+        .arg(
+            Arg::new("evict-pages")
+                .long("evict-pages")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("evict")
+                .help("Request eviction of clean filesystem pages for database files (Linux; best effort)"),
         )
 }
 
@@ -1244,6 +1254,7 @@ fn parse_cli() -> Cli {
         },
         Some(("memory", m)) => Commands::Memory {
             evict: m.get_flag("evict"),
+            evict_pages: m.get_flag("evict-pages"),
         },
         Some(("meta", m)) => Commands::Meta {
             target: m.get_one::<String>("target").unwrap().clone(),
