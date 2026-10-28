@@ -25,7 +25,7 @@ use crate::journal::{
     TxnStageState,
 };
 use crate::layout::{DatabaseLayout, ShardType};
-use crate::packfile::storage::PackfileStorage;
+use crate::packfile::storage::{OpenPath, PackfileStorage};
 use crate::storage::{NodeId, StorageEngine, StorageError};
 
 /// Write and verification policy for a single storage pool.
@@ -814,6 +814,22 @@ impl Database {
             store.set_refresh_on_miss(false);
             store.enable_shared_journal(Arc::clone(&coordinator), shard)?;
             store.replay_journal()?;
+            // A rescan leaves no checkpoint describing the pack set, so every
+            // later open would pay the same rescan until something happened to
+            // sync. Persist one now, through the normal sync path so the packs
+            // are durable first. Best effort: the packs stay authoritative.
+            // Empty pools are skipped; they are created on first write.
+            if store
+                .open_timings()
+                .is_some_and(|t| t.path == OpenPath::FullScan)
+                && !store.collection_summaries().is_empty()
+            {
+                if let Err(error) = store.sync_all() {
+                    eprintln!(
+                        "warning: checkpointing {shard:?} after a full-scan open failed: {error}"
+                    );
+                }
+            }
             pools.push(Arc::new(store));
         }
         let pools: [Arc<PackfileStorage>; POOL_COUNT] = pools.try_into().map_err(|_| {

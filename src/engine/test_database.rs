@@ -4058,3 +4058,45 @@ fn rejected_remove_many_leaves_the_transaction_unchanged() {
     txn.commit().expect("no leftover record precondition");
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn a_full_scan_open_leaves_a_checkpoint_for_the_next_open() {
+    use crate::packfile::storage::OpenPath;
+
+    let root = test_root("full-scan-write-back");
+    let collection = [0x55u8; 16];
+    {
+        let db = Database::open(root.clone()).unwrap();
+        db.pool(ShardType::State)
+            .put(&collection, &node(1), &NodeData::from_slice(b"state-1"))
+            .unwrap();
+        db.pool(ShardType::State).sync_all().unwrap();
+    }
+    // Simulate a store whose checkpoint went stale or was never written.
+    let checkpoint = root
+        .join("pools/mtpl-state")
+        .join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE);
+    std::fs::remove_file(&checkpoint).unwrap();
+
+    {
+        let db = Database::open(root.clone()).unwrap();
+        assert_eq!(
+            db.pool(ShardType::State).open_timings().unwrap().path,
+            OpenPath::FullScan,
+            "without a checkpoint the open must rescan"
+        );
+    }
+    assert!(
+        checkpoint.exists(),
+        "the rescanning open must persist a checkpoint"
+    );
+
+    let db = Database::open(root.clone()).unwrap();
+    assert_eq!(
+        db.pool(ShardType::State).open_timings().unwrap().path,
+        OpenPath::Checkpoint,
+        "the next open must load the checkpoint instead of rescanning"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
