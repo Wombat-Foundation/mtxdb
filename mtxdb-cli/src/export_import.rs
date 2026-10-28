@@ -447,10 +447,10 @@ impl SignatureKeyCatalog {
                 continue;
             };
             let key = &record.key;
-            // `expired_ts` alone is the hard retirement boundary. For v5+
+            // `expired_ts` is the inclusive hard retirement boundary. For v5+
             // rooms, `valid_until_ts` is a cache-refresh deadline: an
             // unretired key past it can still verify, but is reported late.
-            // A retired key before `expired_ts` verifies normally. Past a
+            // A retired key at or before `expired_ts` verifies normally. Past a
             // stale cached deadline, a failure stays NoKey rather than
             // becoming a rejection, because the snapshot cannot refresh.
             // v1-v4 ignore `valid_until_ts` entirely.
@@ -458,7 +458,7 @@ impl SignatureKeyCatalog {
                 room_version_uses_valid_until_ts(room_version) && timestamp > key.valid_until_ts;
             let late = key.expired_ts.is_none() && past_cached_deadline;
             let reject_failure = !past_cached_deadline;
-            if key.key.is_empty() || key.expired_ts.is_some_and(|expired| timestamp >= expired) {
+            if key.key.is_empty() || key.expired_ts.is_some_and(|expired| timestamp > expired) {
                 continue;
             }
             candidates.push((record, key_id.as_str(), signature, late, reject_failure));
@@ -548,7 +548,7 @@ impl SignatureKeyCatalog {
                     return format!("{key_id}: no key bytes");
                 }
                 match timestamp {
-                    Some(ts) if key.expired_ts.is_some_and(|expired| ts >= expired) => format!(
+                    Some(ts) if key.expired_ts.is_some_and(|expired| ts > expired) => format!(
                         "{key_id}: event after expired_ts {}",
                         key.expired_ts.unwrap_or_default()
                     ),
@@ -2919,12 +2919,49 @@ mod signature_window_tests {
     }
 
     #[test]
-    fn a_retired_key_has_no_signature_at_or_after_its_expiry() {
+    fn a_retired_key_verifies_through_its_expiry_inclusively() {
         let sk = signing_key(1);
-        let keys = catalog(&[key_record(&sk, "ed25519:a", 9_000, Some(5_000))]);
-        for ts in [5_000, 6_000] {
-            let outcome = keys.verify(&signed_event(ts, &[("ed25519:a", &sk)]), "10");
-            assert!(matches!(outcome, SignatureOutcome::NoKey), "ts {ts}");
+        for version in ["4", "10"] {
+            for cached_deadline in [2_000, 5_000, 9_000] {
+                let keys = catalog(&[key_record(
+                    &sk,
+                    "ed25519:a",
+                    cached_deadline,
+                    Some(5_000),
+                )]);
+                for ts in [4_999, 5_000] {
+                    let event = signed_event_for(ts, &[("ed25519:a", &sk)], version);
+                    assert!(
+                        matches!(keys.verify(&event, version), SignatureOutcome::Verified(_)),
+                        "v{version}, cached deadline {cached_deadline}, ts {ts}"
+                    );
+                    assert_eq!(keys.explain(&event, version), vec!["ed25519:a: in window"]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_retired_key_is_unusable_one_millisecond_after_its_expiry() {
+        let sk = signing_key(1);
+        for version in ["4", "10"] {
+            for cached_deadline in [2_000, 5_000, 9_000] {
+                let keys = catalog(&[key_record(
+                    &sk,
+                    "ed25519:a",
+                    cached_deadline,
+                    Some(5_000),
+                )]);
+                let event = signed_event_for(5_001, &[("ed25519:a", &sk)], version);
+                assert!(
+                    matches!(keys.verify(&event, version), SignatureOutcome::NoKey),
+                    "v{version}, cached deadline {cached_deadline}"
+                );
+                assert_eq!(
+                    keys.explain(&event, version),
+                    vec!["ed25519:a: event after expired_ts 5000"]
+                );
+            }
         }
     }
 
