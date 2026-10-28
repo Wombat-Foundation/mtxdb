@@ -1471,6 +1471,7 @@ fn get_and_scan_with_header_and_decode() {
         false,
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1486,6 +1487,7 @@ fn get_and_scan_with_header_and_decode() {
         None,
         false,
         None,
+        false,
         false,
     )
     .unwrap();
@@ -1552,13 +1554,82 @@ fn scan_dash_t_all_finds_collection_across_pools() {
             raw: false,
             sort: None,
             reverse: false,
+            live: false,
         },
     };
 
     cmd_scan(
-        &cli, &col_hex, false, false, None, -1, None, None, false, None, false,
+        &cli, &col_hex, false, false, None, -1, None, None, false, None, false, false,
     )
     .unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn live_scan_uses_the_index_instead_of_physical_frames() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let store = PackfileStorage::open(layout.pool_dir(ShardType::EventDag).unwrap()).unwrap();
+    let collection = [0x41; 16];
+    let node = [0x42; 16];
+    store
+        .put(
+            &collection,
+            &node,
+            &NodeData::new(Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &node,
+            &NodeData::new(Bytes::from_static(b"second")),
+        )
+        .unwrap();
+    store.sync().unwrap();
+    assert_eq!(
+        store.collection_live_locations(&collection).unwrap().len(),
+        1,
+        "the superseded version must not appear in the live index"
+    );
+    drop(store);
+
+    let collection_hex = format_id(&collection);
+    let cli = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: Some(ShardType::EventDag),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Scan {
+            selector: collection_hex.clone(),
+            verbose: false,
+            header: false,
+            decode: None,
+            limit: 10,
+            id: None,
+            collection: None,
+            raw: false,
+            sort: None,
+            reverse: false,
+            live: true,
+        },
+    };
+    cmd_scan(
+        &cli,
+        &collection_hex,
+        false,
+        false,
+        None,
+        10,
+        None,
+        None,
+        false,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -4403,6 +4474,7 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
             raw: false,
             sort: None,
             reverse: false,
+            live: false,
         },
     };
     cmd_scan(
@@ -4417,13 +4489,16 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
         false,
         None,
         false,
+        false,
     )
     .unwrap();
 
     let missing = format_id(&[0x99; 16]);
     assert!(
-        cmd_scan(&cli_scan, &missing, false, false, None, 10, None, None, false, None, false)
-            .is_err()
+        cmd_scan(
+            &cli_scan, &missing, false, false, None, 10, None, None, false, None, false, false
+        )
+        .is_err()
     );
 
     std::fs::remove_dir_all(&dir1).ok();

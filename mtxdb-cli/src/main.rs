@@ -149,6 +149,7 @@ pub(crate) enum Commands {
         raw: bool,
         sort: Option<String>,
         reverse: bool,
+        live: bool,
     },
     Import {
         paths: Vec<PathBuf>,
@@ -615,6 +616,17 @@ fn sub_scan() -> Command {
                      matches, or up to --limit; use -l 0 for no cap). With --verbose, a per-frame \
                      context line goes to stderr so stdout stays a clean byte stream",
         ))
+        .arg(
+            Arg::new("live")
+                .long("live")
+                .alias("indexed")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Read the live collection index instead of scanning physical frames. \
+                     Superseded frames and tombstones are omitted; valid only for a collection \
+                     selector. Use plain `scan` for the physical view.",
+                ),
+        )
         .arg(sort_arg("payload, offset"))
         .arg(
             Arg::new("reverse")
@@ -1249,6 +1261,7 @@ fn parse_cli() -> Cli {
             raw: m.get_flag("raw"),
             sort: m.get_one::<String>("sort").cloned(),
             reverse: m.get_flag("reverse"),
+            live: m.get_flag("live"),
             limit: *m
                 .get_one::<i64>("limit")
                 .expect("clap supplies a default limit"),

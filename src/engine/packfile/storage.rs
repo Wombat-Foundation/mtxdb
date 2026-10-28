@@ -4225,6 +4225,21 @@ impl PackfileStorage {
         })
     }
 
+    /// A collection's live `(shard slot, frame offset)` locations.
+    ///
+    /// Reads the collection index only; unlike [`Self::scan_collection`] this
+    /// never scans pack files. The order is the index's bucket order. Callers
+    /// resolve the slot to a shard and read the frame at the offset. Returns
+    /// `None` when the collection is unknown.
+    pub fn collection_live_locations(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Option<Vec<(u16, u64)>> {
+        self.collections_read()
+            .get(collection_id)
+            .map(|generation| generation.load().index.live_entries().collect())
+    }
+
     /// `(collection_id, entry count, memory usage in bytes, index capacity)`
     /// for every known collection, sorted by collection ID, in a single pass
     /// over the collection map.

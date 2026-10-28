@@ -1015,6 +1015,22 @@ impl LossyIndex {
         self.len.load(Ordering::Acquire) == 0
     }
 
+    /// Iterate the live records' `(shard slot, frame offset)` locations.
+    ///
+    /// Removed versions and empty slots are skipped. The order is the hash
+    /// table's bucket order, not append order; callers that need a stable
+    /// physical order sort by `(pack id, offset)`.
+    pub fn live_entries(&self) -> impl Iterator<Item = (u16, u64)> + '_ {
+        (0..self.capacity as usize).filter_map(move |slot| {
+            let entry = IndexEntry(self.slots.get(slot));
+            if entry.is_empty() || entry.is_removed() || entry.has_invalid_slot_bits() {
+                None
+            } else {
+                Some((entry.slot(), entry.offset()))
+            }
+        })
+    }
+
     /// Bytes of private heap currently occupied by this table: its struct,
     /// initialized owned entry slots, and initialized `homes`/`tails` entries.
     /// Uses vector lengths rather than capacities. The entry array is absent

@@ -500,6 +500,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             raw,
             sort,
             reverse,
+            live,
         } => cmd_scan(
             cli,
             selector,
@@ -512,6 +513,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             *raw,
             sort.as_deref(),
             *reverse,
+            *live,
         ),
         Commands::Import {
             paths,
@@ -7146,7 +7148,11 @@ fn cmd_scan_coalesced(
     raw: bool,
     sort: Option<&str>,
     reverse: bool,
+    live: bool,
 ) -> anyhow::Result<()> {
+    if live {
+        bail!("--live is not supported with --coalesce");
+    }
     let target = classify_info_selector(cli, selector)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
@@ -7228,6 +7234,7 @@ fn cmd_scan_coalesced(
         println!("database: {}", matching_dirs[0].display());
         cmd_scan_single(
             &sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
+            live,
         )?;
     } else {
         for (i, db_dir) in matching_dirs.iter().enumerate() {
@@ -7238,7 +7245,7 @@ fn cmd_scan_coalesced(
             let sub_cli = cli.with_dir(db_dir.clone());
             if let Err(e) = cmd_scan_single(
                 &sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort,
-                reverse,
+                reverse, live,
             ) {
                 eprintln!("error in `{}`: {e:#}", db_dir.display());
             }
@@ -7270,15 +7277,18 @@ fn cmd_scan(
     raw: bool,
     sort: Option<&str>,
     reverse: bool,
+    live: bool,
 ) -> anyhow::Result<()> {
     if cli.coalesce {
         return cmd_scan_coalesced(
             cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
+            live,
         );
     }
     run_multi_dir(cli, |sub_cli| {
         cmd_scan_single(
             sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
+            live,
         )
     })
 }
@@ -7300,6 +7310,7 @@ fn cmd_scan_single(
     raw: bool,
     sort: Option<&str>,
     reverse: bool,
+    live: bool,
 ) -> anyhow::Result<()> {
     let sort_column = sort.map(SortColumn::from_str).transpose()?;
     if sort_column == Some(SortColumn::Payload) && (!verbose && decode.is_none() || raw) {
@@ -7324,7 +7335,13 @@ fn cmd_scan_single(
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
         }
+        if live {
+            return cmd_scan_collection_live(cli, selector, &opts);
+        }
         return cmd_scan_collection(cli, selector, &opts);
+    }
+    if live {
+        bail!("--live requires a collection selector, not a pack ID");
     }
     let selector = parse_pack_id_selector(selector)?;
     if cli.shard_type.is_none() {
@@ -7687,6 +7704,168 @@ fn cmd_scan_collection_in_pool(
     Ok(frames)
 }
 
+/// Print a collection's live records from its index.
+///
+/// Unlike [`cmd_scan_collection`], this never walks frames that belong to
+/// other collections and never sees superseded versions or tombstones. It is
+/// the fast view for "what is in this collection" on a large packfile.
+fn cmd_scan_collection_live(
+    cli: &Cli,
+    selector: &str,
+    opts: &ScanOptions,
+) -> anyhow::Result<()> {
+    let collection_id = parse_collection_selector(selector)?;
+    let store = open_store_read_only(cli)?;
+    let Some(locations) = store.collection_live_locations(&collection_id) else {
+        bail!(
+            "collection {} not found{}",
+            format_id(&collection_id),
+            other_shard_type_hint(cli, &collection_id)
+        );
+    };
+    let shard_type = cli.require_shard_type()?;
+    let pool = ShardPool::open_read_only(selected_pool_dir(cli)?)
+        .context("failed to open shard store")?;
+    let shards = pool.all_shards();
+    let mut by_slot: HashMap<u16, Arc<mtxdb::shard::Shard>> = HashMap::new();
+    for (slot, shard) in &shards {
+        by_slot.insert(*slot, Arc::clone(shard));
+    }
+
+    // A node-id filter is a point lookup: ask the index for the winning frame
+    // instead of enumerating the collection.
+    let locations = if let Some(node_id) = opts.node_id {
+        let Some((pack_id, offset)) = store.get_location(&collection_id, &node_id)? else {
+            bail!(
+                "node {} not found in collection {}",
+                format_id(&node_id),
+                format_id(&collection_id)
+            );
+        };
+        let Some((slot, _)) = shards.iter().find(|(_, shard)| shard.pack_id == pack_id)
+        else {
+            bail!(
+                "pack {} for node {} is not open",
+                pack_id.filename_stem(),
+                format_id(&node_id)
+            );
+        };
+        vec![(*slot, offset)]
+    } else {
+        locations
+    };
+
+    let mut records: Vec<(Arc<mtxdb::shard::Shard>, u64)> = locations
+        .into_iter()
+        .filter_map(|(slot, offset)| by_slot.get(&slot).map(|shard| (Arc::clone(shard), offset)))
+        .collect();
+    records.sort_unstable_by_key(|(shard, offset)| (shard.pack_id, *offset));
+    if opts.reverse {
+        records.reverse();
+    }
+    let total_live = records.len();
+    let max_rows = opts.max_rows();
+    let bounded = max_rows != usize::MAX;
+
+    // Payload sorting needs every candidate. Other modes read only the rows
+    // that will be printed.
+    let rows: Vec<(Arc<mtxdb::shard::Shard>, u64, mtxdb::packfile::Record)> =
+        if opts.is_sorting() {
+            let mut rows = Vec::with_capacity(records.len());
+            for (shard, offset) in records {
+                let record = ShardPool::read_at_committed(&shard, offset, true)?;
+                if record.collection_id != collection_id {
+                    continue;
+                }
+                rows.push((shard, offset, record));
+            }
+            if opts.sort == Some(SortColumn::Payload) {
+                rows.sort_by(|a, b| a.2.data.cmp(&b.2.data));
+            } else {
+                rows.sort_by_key(|(_, offset, _)| *offset);
+            }
+            if opts.reverse {
+                rows.reverse();
+            }
+            rows
+        } else {
+            let mut rows = Vec::with_capacity(records.len().min(max_rows));
+            for (shard, offset) in records {
+                if rows.len() >= max_rows {
+                    break;
+                }
+                let record = ShardPool::read_at_committed(&shard, offset, true)?;
+                if record.collection_id != collection_id {
+                    continue;
+                }
+                rows.push((shard, offset, record));
+            }
+            rows
+        };
+
+    if opts.raw {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for (_, offset, record) in rows.iter().take(max_rows) {
+            out.write_all(&record.data)?;
+            if opts.verbose {
+                eprintln!(
+                    "collection {}: live raw frame @ {offset} ({} bytes, checksum verified)",
+                    format_id(&collection_id),
+                    record.data.len()
+                );
+            }
+        }
+        out.flush()?;
+        eprintln!(
+            "collection {}: {total_live} live record{} (indexed view; superseded frames omitted)",
+            format_id(&collection_id),
+            if total_live == 1 { "" } else { "s" },
+        );
+        if bounded && total_live > max_rows {
+            eprintln!("note: showing first {max_rows}; use -l 0 to show all");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "collection {}: {total_live} live record{} (indexed view; superseded frames omitted)",
+        format_id(&collection_id),
+        if total_live == 1 { "" } else { "s" },
+    );
+    if bounded && total_live > max_rows {
+        println!("note: showing first {max_rows}; use -l 0 to show all");
+    }
+
+    let mut context = CollectionScanContext {
+        collection_id,
+        node_id: opts.node_id,
+        mode: CollectionScanMode::new(
+            opts.verbose,
+            opts.raw,
+            opts.sort,
+            opts.header,
+            opts.decode.is_some(),
+        ),
+        max_rows,
+        frames: 0,
+        raw_matches: Vec::new(),
+        header_printed: false,
+        shard_type,
+        sorted_records: Vec::new(),
+        reverse: opts.reverse,
+        show_section_header: false,
+        needs_section_spacing: false,
+        header: opts.header,
+        decode: opts.decode.clone(),
+    };
+    for (shard, offset, record) in rows.iter().take(max_rows) {
+        context.frames = context.frames.saturating_add(1);
+        print_collection_record_with_data(shard, record.hash, *offset, Some(record), &mut context)?;
+    }
+    Ok(())
+}
+
 /// Print every physical frame for a collection across all packs. This is a
 /// diagnostic scan, so superseded copies are deliberately retained in the
 /// output; use `export` to enumerate only the collection's live records.
@@ -7876,7 +8055,18 @@ fn print_collection_record(
     let data = need_record
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
-    let payload = data.as_ref().map(|data| {
+    print_collection_record_with_data(shard, record_id, offset, data.as_ref(), context)
+}
+
+fn print_collection_record_with_data(
+    shard: &std::sync::Arc<mtxdb::shard::Shard>,
+    record_id: [u8; 16],
+    offset: u64,
+    data: Option<&mtxdb::packfile::Record>,
+    context: &mut CollectionScanContext,
+) -> anyhow::Result<()> {
+    let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
+    let payload = data.map(|data| {
         if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
             "collection metadata".to_owned()
         } else {
@@ -7893,7 +8083,7 @@ fn print_collection_record(
         )
     );
     if context.header {
-        if let Some(record) = &data {
+        if let Some(record) = data {
             print_scan_record_header(record, &context.collection_id);
         }
     }
