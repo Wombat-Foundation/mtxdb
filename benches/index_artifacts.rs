@@ -853,18 +853,17 @@ fn measure_warm_lookups(
 }
 
 fn measure_end_to_end(pack: &Path, idx: &Idx, keys: &[[u8; 16]], lookups: usize) {
-    use std::os::unix::fs::FileExt;
     let file = std::fs::File::open(pack).expect("open pack");
     let mut buf = vec![0u8; 72 << 10];
     let (found, t) = timed(|| {
         let mut ok = 0;
         for key in keys {
             let off = idx.get(key).expect("hit");
-            let n = file.read_at(&mut buf[..4096], off).expect("pread");
+            let n = read_at(&file, &mut buf[..4096], off).expect("pread");
             let rec = if let Ok(rec) = mtxdb::packfile::read_record(&mut &buf[..n]) {
                 rec
             } else {
-                let n = file.read_at(&mut buf, off).expect("pread");
+                let n = read_at(&file, &mut buf, off).expect("pread");
                 mtxdb::packfile::read_record(&mut &buf[..n]).expect("read frame")
             };
             black_box(&rec);
@@ -877,6 +876,18 @@ fn measure_end_to_end(pack: &Path, idx: &Idx, keys: &[[u8; 16]], lookups: usize)
         "  end-to-end via .idx (locate + pread + read_record; naive read path, not tuned): {:.0} ns each",
         t.as_secs_f64() * 1e9 / usize_f64(lookups)
     );
+}
+
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
 }
 
 fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
