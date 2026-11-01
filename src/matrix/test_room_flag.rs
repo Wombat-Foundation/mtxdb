@@ -504,4 +504,297 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn repeated_stage_in_single_transaction_succeeds_commit() {
+        let db = Database::open(test_root("repeated_stage")).unwrap();
+        let room_id = b"!repeated:example.com";
+        let index = RoomFlagIndex::new(room_id);
+
+        // Commit initial record so chunk and meta have published versions > 0
+        let tx1 = db.begin_transaction();
+        index
+            .stage(&tx1, &[FlagChange::set(1, Flag::Present)])
+            .unwrap();
+        tx1.commit().unwrap();
+        assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
+
+        // Now in a single transaction, stage multiple batches touching the same chunk and meta
+        let tx2 = db.begin_transaction();
+        index
+            .stage(&tx2, &[FlagChange::set(2, Flag::Present)])
+            .unwrap();
+        index
+            .stage(&tx2, &[FlagChange::set(3, Flag::Present)])
+            .unwrap();
+        index
+            .stage(
+                &tx2,
+                &[
+                    FlagChange::set(2, Flag::Timeline),
+                    FlagChange::set(3, Flag::Timeline),
+                ],
+            )
+            .unwrap();
+
+        // This commit must succeed and not abort with StaleRead { expected: 0, actual: ... }
+        tx2.commit()
+            .expect("repeated stage in one transaction should not fail commit with StaleRead");
+
+        assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 3);
+        assert_eq!(
+            index.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn custom_flag_bounds_and_byte_mapping() {
+        assert_eq!(Flag::MAX_CUSTOM, 191);
+
+        // Checked constructor bounds
+        for i in 0..=191 {
+            assert_eq!(Flag::custom(i), Some(Flag::Custom(i)));
+        }
+        assert_eq!(Flag::custom(192), None);
+        assert_eq!(Flag::custom(255), None);
+
+        // Standard flags round-trip
+        let standard = [
+            (Flag::Present, 0),
+            (Flag::Timeline, 1),
+            (Flag::Outlier, 2),
+            (Flag::Rejected, 3),
+            (Flag::SoftFailed, 4),
+            (Flag::Redacted, 5),
+        ];
+        for (flag, byte) in standard {
+            assert_eq!(flag.to_byte(), byte);
+            assert_eq!(Flag::from_byte(byte), Some(flag));
+        }
+
+        // Reserved bytes 6..=63 return None
+        for b in 6..=63 {
+            assert_eq!(
+                Flag::from_byte(b),
+                None,
+                "byte {b} is reserved and must return None"
+            );
+        }
+
+        // Custom flags byte mapping (64..=255)
+        for i in 0..=191 {
+            let custom_flag = Flag::Custom(i);
+            let byte = 64_u8.saturating_add(i);
+            assert_eq!(custom_flag.to_byte(), byte);
+            assert_eq!(Flag::from_byte(byte), Some(custom_flag));
+        }
+    }
+
+    #[test]
+    fn rebuild_generation_swap_and_metadata_evolution() {
+        let db = Database::open(test_root("rebuild_gen")).unwrap();
+        let room_id = b"!gen_swap:example.com";
+        let index = RoomFlagIndex::new(room_id);
+        let auth_col = room_auth_collection_id(room_id);
+        let event_col = room_event_collection_id(room_id);
+
+        let ev1 = b"$ev1:example.com";
+        let node1 = event_record_id(ev1);
+
+        let tx = db.begin_transaction();
+        tx.put(
+            ShardType::Edges,
+            auth_col,
+            auth_counter_record_id(),
+            &NodeData::new(bytes::Bytes::from(encode_auth_counter(1).to_vec())),
+        )
+        .unwrap();
+        tx.put(
+            ShardType::Edges,
+            auth_col,
+            auth_reverse_record_id(1),
+            &NodeData::new(bytes::Bytes::from_static(ev1)),
+        )
+        .unwrap();
+        tx.put(
+            ShardType::EventDag,
+            event_col,
+            node1,
+            &NodeData::new(bytes::Bytes::from_static(b"ev1 body")),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // Initial unindexed state
+        let initial_meta = index.meta(&db).unwrap();
+        assert_eq!(initial_meta.generation, 1);
+        assert_eq!(initial_meta.write_count, 0);
+
+        let count = index.rebuild(&db).unwrap();
+        assert_eq!(count, 1);
+        let meta1 = index.meta(&db).unwrap();
+        assert_eq!(meta1.generation, 2);
+        assert_eq!(meta1.max_short_id, 1);
+        assert_eq!(meta1.write_count, 1);
+        assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
+
+        // Second rebuild should increment generation to 3
+        let count2 = index.rebuild(&db).unwrap();
+        assert_eq!(count2, 1);
+        let meta2 = index.meta(&db).unwrap();
+        assert_eq!(meta2.generation, 3);
+        assert_eq!(meta2.max_short_id, 1);
+        assert_eq!(meta2.write_count, 2);
+        assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
+    }
+
+    #[test]
+    fn concurrent_update_during_rebuild_is_detected_by_write_count_cas() {
+        let db = Database::open(test_root("concurrent_rebuild")).unwrap();
+        let room_id = b"!concurrent:example.com";
+        let index = RoomFlagIndex::new(room_id);
+        let auth_col = room_auth_collection_id(room_id);
+        let event_col = room_event_collection_id(room_id);
+
+        let ev1 = b"$ev1:example.com";
+        let node1 = event_record_id(ev1);
+
+        let tx = db.begin_transaction();
+        tx.put(
+            ShardType::Edges,
+            auth_col,
+            auth_counter_record_id(),
+            &NodeData::new(bytes::Bytes::from(encode_auth_counter(1).to_vec())),
+        )
+        .unwrap();
+        tx.put(
+            ShardType::Edges,
+            auth_col,
+            auth_reverse_record_id(1),
+            &NodeData::new(bytes::Bytes::from_static(ev1)),
+        )
+        .unwrap();
+        tx.put(
+            ShardType::EventDag,
+            event_col,
+            node1,
+            &NodeData::new(bytes::Bytes::from_static(b"ev1 body")),
+        )
+        .unwrap();
+        index
+            .stage(&tx, &[FlagChange::set(1, Flag::Present)])
+            .unwrap();
+        tx.commit().unwrap();
+
+        // 1. Rebuild starts and reserves generation
+        let (base_meta, _new_gen, meta_token) = index.reserve_rebuild_generation(&db).unwrap();
+
+        // 2. While rebuild is building, a concurrent writer updates a flag (bumps write_count)
+        index
+            .update(&db, &[FlagChange::set(1, Flag::Timeline)])
+            .unwrap();
+
+        // 3. Rebuild attempts to publish base_meta via CAS; it must detect the concurrent write and fail
+        let publish_tx = db.begin_transaction();
+        let (meta_nodes, _meta_versions) = publish_tx
+            .get_with_record_versions(
+                index.pool(),
+                index.collection(),
+                &[crate::room_flag::FLAG_META_ID],
+            )
+            .unwrap();
+        let live_raw = meta_nodes.into_iter().next().flatten().unwrap();
+        let live_meta = crate::room_flag::decode_meta(&live_raw.bytes).unwrap();
+
+        assert_ne!(
+            live_meta.write_count, base_meta.write_count,
+            "concurrent writer bumped write_count"
+        );
+
+        // If publish proceeded with base_meta_token expectation, commit would fail
+        publish_tx
+            .expect_record_version(
+                index.pool(),
+                *index.collection(),
+                crate::room_flag::FLAG_META_ID,
+                meta_token,
+            )
+            .unwrap();
+        let commit_res = publish_tx.commit();
+        assert!(
+            commit_res.is_err(),
+            "publish CAS must fail due to concurrent write"
+        );
+        assert!(commit_res.unwrap_err().is_stale_read());
+    }
+
+    #[test]
+    fn rebuild_crash_recovery_reserves_strictly_higher_generation() {
+        let db = Database::open(test_root("crash_rebuild")).unwrap();
+        let room_id = b"!crash:example.com";
+        let index = RoomFlagIndex::new(room_id);
+        let auth_col = room_auth_collection_id(room_id);
+        let event_col = room_event_collection_id(room_id);
+
+        let ev1 = b"$ev1:example.com";
+        let node1 = event_record_id(ev1);
+
+        let tx = db.begin_transaction();
+        tx.put(
+            ShardType::Edges,
+            auth_col,
+            auth_counter_record_id(),
+            &NodeData::new(bytes::Bytes::from(encode_auth_counter(1).to_vec())),
+        )
+        .unwrap();
+        tx.put(
+            ShardType::Edges,
+            auth_col,
+            auth_reverse_record_id(1),
+            &NodeData::new(bytes::Bytes::from_static(ev1)),
+        )
+        .unwrap();
+        tx.put(
+            ShardType::EventDag,
+            event_col,
+            node1,
+            &NodeData::new(bytes::Bytes::from_static(b"ev1 body")),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // 1. First rebuild reserves generation 2, then simulates crash (never publishes)
+        let (_meta, gen1, _token) = index.reserve_rebuild_generation(&db).unwrap();
+        assert_eq!(gen1, 2);
+
+        // Simulate leftover/poisoned data in chunk_collection(gen1)
+        let abandoned_col = index.chunk_collection(gen1);
+        let crash_tx = db.begin_transaction();
+        index
+            .stage_into_collection(
+                &crash_tx,
+                abandoned_col,
+                &[FlagChange::set(1, Flag::Rejected)],
+            )
+            .unwrap();
+        crash_tx.commit().unwrap();
+
+        // 2. Next rebuild runs to completion
+        let count = index.rebuild(&db).unwrap();
+        assert_eq!(count, 1);
+
+        let published_meta = index.meta(&db).unwrap();
+        assert_eq!(
+            published_meta.generation, 3,
+            "next rebuild must reserve generation 3 and never reuse generation 2"
+        );
+
+        // Stale leftover bits from crashed generation 2 must NOT be present in generation 3!
+        assert_eq!(
+            index.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+            0
+        );
+        assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
+    }
 }

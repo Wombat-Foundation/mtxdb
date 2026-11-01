@@ -3435,15 +3435,21 @@ fn cmd_flags(
 }
 
 fn parse_flag(name: &str) -> anyhow::Result<mtxdb::room_flag::Flag> {
-    match name.to_ascii_lowercase().replace('_', "-").as_str() {
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
         "present" => Ok(mtxdb::room_flag::Flag::Present),
         "timeline" => Ok(mtxdb::room_flag::Flag::Timeline),
         "outlier" => Ok(mtxdb::room_flag::Flag::Outlier),
         "rejected" => Ok(mtxdb::room_flag::Flag::Rejected),
         "soft-failed" | "soft-fail" | "softfail" => Ok(mtxdb::room_flag::Flag::SoftFailed),
         "redacted" => Ok(mtxdb::room_flag::Flag::Redacted),
+        other if other.starts_with("custom:") || other.starts_with("custom-") => {
+            let num_str = other.trim_start_matches("custom:").trim_start_matches("custom-");
+            let idx = num_str.parse::<u8>().map_err(|_| anyhow::anyhow!("invalid custom flag index '{num_str}'"))?;
+            mtxdb::room_flag::Flag::custom(idx).ok_or_else(|| anyhow::anyhow!("custom flag index {idx} exceeds maximum {}", mtxdb::room_flag::Flag::MAX_CUSTOM))
+        }
         other => anyhow::bail!(
-            "unknown flag '{other}'; valid flags: present, timeline, outlier, rejected, soft-failed, redacted"
+            "unknown flag '{other}'; valid flags: present, timeline, outlier, rejected, soft-failed, redacted, custom:<0..=191>"
         ),
     }
 }

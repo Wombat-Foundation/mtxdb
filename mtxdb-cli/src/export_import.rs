@@ -252,14 +252,20 @@ fn id_list<'a>(event: &'a RoomEvent, field: &str) -> anyhow::Result<Vec<&'a [u8]
         .collect()
 }
 
-/// The verdict to store for an event: the rejection the import derived, and
-/// nothing the export said about rejection, soft-fail or outlier status. Those
-/// are derived from the stored events and server keys, not migrated.
+/// The verdict to store for an event: the rejection the import derived, the
+/// exported soft-fail (if present), and outlier status. Rejection and outlier
+/// status are derived from auth checks. `soft_fail` carries the exported
+/// soft-fail disposition because soft-fail is not derived during room import.
 /// `redacted_by` is a fact about the stored event, so it is kept.
 fn verdict_of(metadata: &EventMetadata, forced: Option<u8>) -> Verdict {
+    let soft_fail = if metadata.soft_failed {
+        metadata.soft_fail_code.or(Some(1))
+    } else {
+        metadata.soft_fail_code
+    };
     Verdict {
         rejection: forced,
-        soft_fail: None,
+        soft_fail,
         redacted_by: metadata
             .redacted_by
             .as_ref()
@@ -1766,14 +1772,13 @@ fn write_room_flags(
     db: &Database,
     export: &RoomExport,
     findings: &AuthFindings,
-    batch_bytes: usize,
+    _batch_bytes: usize,
 ) -> anyhow::Result<()> {
     const FORWARD_BATCH_SIZE: usize = 512;
 
     let flag_index = RoomFlagIndex::new(export.room_id.as_bytes());
     let auth_col = room_auth_collection_id(export.room_id.as_bytes());
     let mut tx = db.begin_transaction();
-    let mut staged_bytes = 0_usize;
     let mut batch_changes = Vec::new();
 
     for (chunk_start, chunk) in export.events.chunks(FORWARD_BATCH_SIZE).enumerate() {
@@ -1816,15 +1821,10 @@ fn write_room_flags(
 
         if batch_changes.len() >= 1024 {
             flag_index.stage(&tx, &batch_changes)?;
-            staged_bytes = staged_bytes.saturating_add(batch_changes.len().saturating_mul(16));
             batch_changes.clear();
-
-            if staged_bytes >= batch_bytes {
-                tx.commit().context("committing room flag batch")?;
-                reclaim_journal(db)?;
-                tx = db.begin_transaction();
-                staged_bytes = 0;
-            }
+            tx.commit().context("committing room flag batch")?;
+            reclaim_journal(db)?;
+            tx = db.begin_transaction();
         }
     }
 
@@ -2594,13 +2594,22 @@ mod auth_findings_tests {
             outlier: true,
             ..EventMetadata::default()
         };
-        assert!(
-            verdict_of(&exported, None).is_empty(),
-            "exported rejection, soft-fail and outlier flags are not migrated"
-        );
+        let v = verdict_of(&exported, None);
+        assert_eq!(v.rejection, None, "exported rejection is not migrated");
+        assert!(!v.outlier, "exported outlier is not migrated");
+        assert_eq!(v.soft_fail, Some(2), "exported soft-fail is migrated");
+
+        let v_forced = verdict_of(&exported, Some(MISSING_AUTH));
         assert_eq!(
-            verdict_of(&exported, Some(MISSING_AUTH)).rejection,
-            Some(MISSING_AUTH)
+            v_forced.rejection,
+            Some(MISSING_AUTH),
+            "derived rejection is stored"
+        );
+        assert!(v_forced.outlier, "derived rejection is stored as outlier");
+        assert_eq!(
+            v_forced.soft_fail,
+            Some(2),
+            "soft-fail and derived rejection are independent"
         );
         assert!(verdict_of(&EventMetadata::default(), None).is_empty());
     }
