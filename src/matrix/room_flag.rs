@@ -26,8 +26,6 @@ pub const FLAG_META_MAGIC: [u8; 4] = *b"FLGM";
 pub const FLAG_META_VERSION: u8 = 1;
 /// Reserved node ID for the flag index metadata record.
 pub const FLAG_META_ID: NodeId = *b"MTXD-FLG-META-v1";
-/// Reserved node ID for the flag generation counter record.
-pub const FLAG_COUNTER_ID: NodeId = *b"MTXD-FLG-NEXTG-1";
 
 /// Maximum short IDs per chunk (64K).
 pub const CHUNK_CAPACITY: u32 = 65536;
@@ -170,24 +168,6 @@ pub(crate) fn decode_meta(bytes: &[u8]) -> Result<FlagMeta, StorageError> {
         max_short_id: u32::from_be_bytes(short_bytes),
         write_count: u64::from_be_bytes(write_bytes),
     })
-}
-
-fn encode_counter(next: u64) -> [u8; 12] {
-    let mut out = [0_u8; 12];
-    out[0..4].copy_from_slice(b"FLGC");
-    out[4..12].copy_from_slice(&next.to_be_bytes());
-    out
-}
-
-fn decode_counter(bytes: &[u8]) -> Result<u64, StorageError> {
-    if bytes.len() != 12 || bytes[0..4] != *b"FLGC" {
-        return Err(StorageError::Corrupt(
-            "malformed flag generation counter".to_owned(),
-        ));
-    }
-    let mut b = [0_u8; 8];
-    b.copy_from_slice(&bytes[4..12]);
-    Ok(u64::from_be_bytes(b))
 }
 
 /// A mutation to apply to an event's flag in the index.
@@ -724,90 +704,11 @@ impl RoomFlagIndex {
         Ok(event_ids)
     }
 
-    /// Reserve a never-reused generation number for rebuild.
-    ///
-    /// Reads the current active metadata and counter record, reserving a new
-    /// generation `> current_meta.generation` by committing an increment to
-    /// [`FLAG_COUNTER_ID`].
-    ///
-    /// Returns `(current_meta, new_generation, meta_token)`.
-    ///
-    /// # Errors
-    /// Returns [`StorageError`] on read error, corrupt counter, or exhausted retries.
-    pub fn reserve_rebuild_generation(
-        &self,
-        db: &Database,
-    ) -> Result<(FlagMeta, u64, u64), StorageError> {
-        let mut last = None;
-        for _ in 0..Self::MAX_RETRIES {
-            let tx = db.begin_transaction();
-            let (meta_nodes, meta_versions) =
-                tx.get_with_record_versions(self.pool, &self.collection, &[FLAG_META_ID])?;
-            let meta_token = meta_versions.first().copied().unwrap_or(0);
-            let meta_raw = meta_nodes.into_iter().next().flatten();
-            let current_meta = match meta_raw.as_ref() {
-                Some(data) => decode_meta(&data.bytes)?,
-                None => FlagMeta {
-                    generation: 1,
-                    max_short_id: 0,
-                    write_count: 0,
-                },
-            };
-
-            let (counter_nodes, counter_versions) =
-                tx.get_with_record_versions(self.pool, &self.collection, &[FLAG_COUNTER_ID])?;
-            let counter_token = counter_versions.first().copied().unwrap_or(0);
-            let counter_raw = counter_nodes.into_iter().next().flatten();
-            let next_alloc = match counter_raw.as_ref() {
-                Some(data) => decode_counter(&data.bytes)?,
-                None => current_meta.generation.saturating_add(1).max(2),
-            };
-
-            let new_gen = next_alloc.max(current_meta.generation.saturating_add(1));
-            let next_counter = new_gen
-                .checked_add(1)
-                .ok_or_else(|| StorageError::Internal("flag generation overflow".to_owned()))?;
-
-            tx.put(
-                self.pool,
-                self.collection,
-                FLAG_COUNTER_ID,
-                &NodeData::new(Bytes::from(encode_counter(next_counter).to_vec())),
-            )?;
-            if !(counter_raw.is_some() && counter_token == 0) {
-                tx.expect_record_version(
-                    self.pool,
-                    self.collection,
-                    FLAG_COUNTER_ID,
-                    counter_token,
-                )?;
-            }
-
-            match tx.commit() {
-                Ok(()) => return Ok((current_meta, new_gen, meta_token)),
-                Err(e) if e.is_stale_read() || matches!(e, StorageError::WouldBlock(_)) => {
-                    last = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last.unwrap_or(StorageError::StaleRead {
-            pool: self.pool,
-            collection_id: self.collection,
-            expected: 0,
-            actual: 0,
-        }))
-    }
-
-    /// Maximum rebuild retries on concurrent modification conflict (`4`).
-    pub const MAX_REBUILD_RETRIES: usize = 4;
-
     /// Rebuild the flag index for this room from existing auth short IDs and verdicts.
     ///
     /// Rebuilds into a new generation collection without mutating or deleting
     /// the active index. Upon completion, swaps the active generation pointer atomically
     /// via CAS. If rebuild fails, active index is unchanged and the target collection is cleaned up.
-    /// Retries up to [`Self::MAX_REBUILD_RETRIES`] on concurrent transaction conflicts.
     ///
     /// Returns the number of events indexed.
     ///
@@ -826,40 +727,42 @@ impl RoomFlagIndex {
             return Ok(0);
         }
 
-        let mut last_error = None;
-        for _ in 0..Self::MAX_REBUILD_RETRIES {
-            let (current_meta, new_gen, meta_token) = self.reserve_rebuild_generation(db)?;
-            let target_col = self.chunk_collection(new_gen);
+        let (current_meta, meta_token) = {
+            let tx = db.begin_transaction();
+            let (meta_nodes, meta_versions) =
+                tx.get_with_record_versions(self.pool, &self.collection, &[FLAG_META_ID])?;
+            let token = meta_versions.first().copied().unwrap_or(0);
+            let meta = match meta_nodes.into_iter().next().flatten() {
+                Some(data) => decode_meta(&data.bytes)?,
+                None => FlagMeta {
+                    generation: 1,
+                    max_short_id: 0,
+                    write_count: 0,
+                },
+            };
+            (meta, token)
+        };
 
-            // Pre-emptively clear target collection before writing
-            let prep_tx = db.begin_transaction();
-            let _ = prep_tx.delete_collection(self.pool, target_col);
-            let _ = prep_tx.commit();
+        let new_gen = current_meta.generation.saturating_add(1).max(1);
+        let target_col = self.chunk_collection(new_gen);
 
-            match self.rebuild_generation(db, counter, current_meta, new_gen, target_col, meta_token) {
-                Ok(total) => return Ok(total),
-                Err(e) => {
-                    let cleanup_tx = db.begin_transaction();
-                    if let Err(cleanup_err) = cleanup_tx.delete_collection(self.pool, target_col) {
-                        eprintln!("room flag rebuild: failed to delete target collection {new_gen}: {cleanup_err}");
-                    } else if let Err(cleanup_err) = cleanup_tx.commit() {
-                        eprintln!("room flag rebuild: failed to commit cleanup of target collection {new_gen}: {cleanup_err}");
-                    }
-                    if e.is_stale_read() {
-                        last_error = Some(e);
-                        continue;
-                    }
-                    return Err(e);
+        // Pre-emptively clear target collection before writing
+        let prep_tx = db.begin_transaction();
+        let _ = prep_tx.delete_collection(self.pool, target_col);
+        let _ = prep_tx.commit();
+
+        match self.rebuild_generation(db, counter, current_meta, new_gen, target_col, meta_token) {
+            Ok(total) => Ok(total),
+            Err(e) => {
+                let cleanup_tx = db.begin_transaction();
+                if let Err(cleanup_err) = cleanup_tx.delete_collection(self.pool, target_col) {
+                    eprintln!("room flag rebuild: failed to delete target collection {new_gen}: {cleanup_err}");
+                } else if let Err(cleanup_err) = cleanup_tx.commit() {
+                    eprintln!("room flag rebuild: failed to commit cleanup of target collection {new_gen}: {cleanup_err}");
                 }
+                Err(e)
             }
         }
-
-        Err(last_error.unwrap_or_else(|| {
-            StorageError::Internal(format!(
-                "flag index rebuild exceeded {} retries due to concurrent writes",
-                Self::MAX_REBUILD_RETRIES
-            ))
-        }))
     }
 
     #[allow(clippy::too_many_lines)]

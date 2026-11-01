@@ -687,8 +687,18 @@ mod tests {
             .unwrap();
         tx.commit().unwrap();
 
-        // 1. Rebuild starts and reserves generation
-        let (base_meta, _new_gen, meta_token) = index.reserve_rebuild_generation(&db).unwrap();
+        // 1. Rebuild starts and reads current metadata and token
+        let (meta_nodes, meta_versions) = db
+            .begin_transaction()
+            .get_with_record_versions(
+                index.pool(),
+                index.collection(),
+                &[crate::room_flag::FLAG_META_ID],
+            )
+            .unwrap();
+        let meta_token = meta_versions.first().copied().unwrap_or(0);
+        let base_raw = meta_nodes.into_iter().next().flatten().unwrap();
+        let base_meta = crate::room_flag::decode_meta(&base_raw.bytes).unwrap();
 
         // 2. While rebuild is building, a concurrent writer updates a flag (bumps write_count)
         index
@@ -730,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_crash_recovery_reserves_strictly_higher_generation() {
+    fn rebuild_cleans_leftover_chunks_from_crashed_rebuild() {
         let db = Database::open(test_root("crash_rebuild")).unwrap();
         let room_id = b"!crash:example.com";
         let index = RoomFlagIndex::new(room_id);
@@ -764,12 +774,10 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        // 1. First rebuild reserves generation 2, then simulates crash (never publishes)
-        let (_meta, gen1, _token) = index.reserve_rebuild_generation(&db).unwrap();
-        assert_eq!(gen1, 2);
-
-        // Simulate leftover/poisoned data in chunk_collection(gen1)
-        let abandoned_col = index.chunk_collection(gen1);
+        // 1. Target generation for a rebuild starting from default generation 1 is generation 2.
+        // Simulate a crashed rebuild that staged leftover/poisoned data into generation 2's chunk collection:
+        let target_gen = 2_u64;
+        let abandoned_col = index.chunk_collection(target_gen);
         let crash_tx = db.begin_transaction();
         index
             .stage_into_collection(
@@ -780,17 +788,14 @@ mod tests {
             .unwrap();
         crash_tx.commit().unwrap();
 
-        // 2. Next rebuild runs to completion
+        // 2. Next rebuild runs to completion, pre-emptively clearing generation 2 before writing
         let count = index.rebuild(&db).unwrap();
         assert_eq!(count, 1);
 
         let published_meta = index.meta(&db).unwrap();
-        assert_eq!(
-            published_meta.generation, 3,
-            "next rebuild must reserve generation 3 and never reuse generation 2"
-        );
+        assert_eq!(published_meta.generation, target_gen);
 
-        // Stale leftover bits from crashed generation 2 must NOT be present in generation 3!
+        // Stale leftover bits from crashed generation 2 must NOT be present!
         assert_eq!(
             index.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
             0
