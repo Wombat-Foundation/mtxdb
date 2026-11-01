@@ -28,6 +28,7 @@ use mtxdb::interop::{
     room_version_collection_id, room_version_node_id, ImportMarker, Verdict, DATA_FORMAT,
     EDGE_POOL, EVENT_POOL, SERVER_INFO_POOL,
 };
+use mtxdb::room_flag::{Flag, FlagChange, RoomFlagIndex};
 use mtxdb::server_keys;
 use mtxdb::storage::StorageEngine as _;
 use mtxdb::{Database, NodeData, PackfileStorage};
@@ -266,6 +267,43 @@ fn verdict_of(metadata: &EventMetadata, forced: Option<u8>) -> Verdict {
         // A derived rejection is stored as an outlier: the event cannot be
         // part of the room's accepted state.
         outlier: forced.is_some(),
+    }
+}
+
+/// Determine the topological ordering (depth) and stream ordering for a timeline event.
+///
+/// Returns `None` if the event is an outlier or lacks required ordering fields.
+pub(crate) fn timeline_orderings(export: &RoomExport, event: &RoomEvent) -> Option<(i64, i64)> {
+    if event.metadata.outlier {
+        return None;
+    }
+    let stream_opt = if export.timeline {
+        // When the export declares timeline contract, presence of
+        // stream_ordering is load-bearing: events without it are not
+        // timeline events (e.g. outliers or rejected events).
+        event.stream_ordering
+    } else {
+        // Legacy export fallback without explicit timeline metadata.
+        event.stream_ordering.or_else(|| {
+            event
+                .pdu
+                .get("origin_server_ts")
+                .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok())))
+        })
+    };
+
+    let depth_opt = event.depth.or_else(|| {
+        event
+            .pdu
+            .get("depth")
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok())))
+    });
+
+    match (depth_opt, stream_opt) {
+        (Some(topological_ordering), Some(stream_ordering)) => {
+            Some((topological_ordering, stream_ordering))
+        }
+        _ => None,
     }
 }
 
@@ -1579,6 +1617,7 @@ pub(crate) fn write_room_with_findings(
     write_room_with_signature_keys(db, export, batch_bytes, None)
 }
 
+#[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
 pub(crate) fn write_room_with_signature_keys(
     db: &Database,
     export: &RoomExport,
@@ -1688,39 +1727,15 @@ pub(crate) fn write_room_with_signature_keys(
             )?;
         }
 
-        if !event.metadata.outlier {
-            let stream_opt = if export.timeline {
-                // When the export declares timeline contract, presence of
-                // stream_ordering is load-bearing: events without it are not
-                // timeline events (e.g. outliers or rejected events).
-                event.stream_ordering
-            } else {
-                // Legacy export fallback without explicit timeline metadata.
-                event.stream_ordering.or_else(|| {
-                    event
-                        .pdu
-                        .get("origin_server_ts")
-                        .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|d| d as i64)))
-                })
-            };
-
-            let depth_opt = event.depth.or_else(|| {
-                event
-                    .pdu
-                    .get("depth")
-                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|d| d as i64)))
-            });
-
-            if let (Some(stream_ordering), Some(topological_ordering)) = (stream_opt, depth_opt) {
-                let event_ref = mtxdb::timeline::event_id_ref(event_id);
-                batch_timeline_entries.push(mtxdb::timeline::TimelineEntry::new(
-                    room_scope,
-                    topological_ordering,
-                    stream_ordering,
-                    record,
-                    event_ref,
-                ));
-            }
+        if let Some((topological_ordering, stream_ordering)) = timeline_orderings(export, event) {
+            let event_ref = mtxdb::timeline::event_id_ref(event_id);
+            batch_timeline_entries.push(mtxdb::timeline::TimelineEntry::new(
+                room_scope,
+                topological_ordering,
+                stream_ordering,
+                record,
+                event_ref,
+            ));
         }
 
         staged_bytes = staged_bytes.saturating_add(size);
@@ -1735,6 +1750,7 @@ pub(crate) fn write_room_with_signature_keys(
     tx.commit().context("committing an import batch")?;
     reclaim_journal(db)?;
     let closures = write_auth_closures(db, export, plan, batch_bytes)?;
+    write_room_flags(db, export, &findings, batch_bytes)?;
 
     Ok((
         ImportCounts {
@@ -1743,6 +1759,81 @@ pub(crate) fn write_room_with_signature_keys(
         },
         findings,
     ))
+}
+
+/// Populate the room's flag bitmap index for all imported events.
+fn write_room_flags(
+    db: &Database,
+    export: &RoomExport,
+    findings: &AuthFindings,
+    batch_bytes: usize,
+) -> anyhow::Result<()> {
+    const FORWARD_BATCH_SIZE: usize = 512;
+
+    let flag_index = RoomFlagIndex::new(export.room_id.as_bytes());
+    let auth_col = room_auth_collection_id(export.room_id.as_bytes());
+    let mut tx = db.begin_transaction();
+    let mut staged_bytes = 0_usize;
+    let mut batch_changes = Vec::new();
+
+    for (chunk_start, chunk) in export.events.chunks(FORWARD_BATCH_SIZE).enumerate() {
+        let base_pos = chunk_start.saturating_mul(FORWARD_BATCH_SIZE);
+        let fwd_keys: Vec<mtxdb::storage::NodeId> = chunk
+            .iter()
+            .map(|e| auth_forward_record_id(e.event_id.as_bytes()))
+            .collect();
+        let fwd_nodes = tx.get(EDGE_POOL, &auth_col, &fwd_keys)?;
+
+        for (offset, (event, node_opt)) in chunk.iter().zip(fwd_nodes).enumerate() {
+            let position = base_pos.saturating_add(offset);
+            let Some(node_data) = node_opt else {
+                anyhow::bail!("missing auth forward record for event {}", event.event_id);
+            };
+            let (short, _) = decode_auth_forward(&node_data.bytes)
+                .map_err(|e| anyhow::anyhow!("corrupt auth forward record for {}: {e}", event.event_id))?;
+
+            batch_changes.push(FlagChange::set(short, Flag::Present));
+
+            let forced = findings.forced.get(position).copied().flatten();
+            let verdict = verdict_of(&event.metadata, forced);
+            if verdict.outlier || event.metadata.outlier {
+                batch_changes.push(FlagChange::set(short, Flag::Outlier));
+            }
+            if verdict.soft_fail.is_some() {
+                batch_changes.push(FlagChange::set(short, Flag::SoftFailed));
+            }
+            if verdict.rejection.is_some() {
+                batch_changes.push(FlagChange::set(short, Flag::Rejected));
+            }
+            if event.metadata.redacted_by.is_some() {
+                batch_changes.push(FlagChange::set(short, Flag::Redacted));
+            }
+
+            if timeline_orderings(export, event).is_some() {
+                batch_changes.push(FlagChange::set(short, Flag::Timeline));
+            }
+        }
+
+        if batch_changes.len() >= 1024 {
+            flag_index.stage(&tx, &batch_changes)?;
+            staged_bytes = staged_bytes.saturating_add(batch_changes.len().saturating_mul(16));
+            batch_changes.clear();
+
+            if staged_bytes >= batch_bytes {
+                tx.commit().context("committing room flag batch")?;
+                reclaim_journal(db)?;
+                tx = db.begin_transaction();
+                staged_bytes = 0;
+            }
+        }
+    }
+
+    if !batch_changes.is_empty() {
+        flag_index.stage(&tx, &batch_changes)?;
+    }
+    tx.commit().context("committing final room flag batch")?;
+    reclaim_journal(db)?;
+    Ok(())
 }
 
 /// One room's auth short ids and closures, staged into capped batches.

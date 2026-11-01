@@ -127,6 +127,14 @@ pub(crate) enum Commands {
         limit: i64,
         reverse: bool,
     },
+    Flags {
+        room: String,
+        flag: Option<String>,
+        not: bool,
+        count: bool,
+        limit: usize,
+        rebuild: bool,
+    },
     Meta {
         target: String,
         json: bool,
@@ -273,6 +281,7 @@ fn build_cli() -> Command {
         .subcommand(sub_stats())
         .subcommand(sub_memory())
         .subcommand(sub_timeline())
+        .subcommand(sub_flags())
         .subcommand(sub_meta())
         .subcommand(sub_sync())
         .subcommand(sub_reclaim_wal())
@@ -434,6 +443,51 @@ fn sub_timeline() -> Command {
                 .short('r')
                 .action(ArgAction::SetTrue)
                 .help("Page timeline backwards from newest to oldest"),
+        )
+}
+
+fn sub_flags() -> Command {
+    Command::new("flags")
+        .about("Query or count room events by disposition or property flags")
+        .arg(
+            Arg::new("room")
+                .help("The room id (e.g. !room:example.org)")
+                .required(true)
+                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("flag")
+                .long("flag")
+                .short('f')
+                .help("Flag name to filter by (present, timeline, outlier, rejected, soft-failed, redacted)")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new()),
+        )
+        .arg(
+            Arg::new("not")
+                .long("not")
+                .action(ArgAction::SetTrue)
+                .help("Invert the flag query (events without this flag)"),
+        )
+        .arg(
+            Arg::new("count")
+                .long("count")
+                .short('c')
+                .action(ArgAction::SetTrue)
+                .help("Print only the count of matching events"),
+        )
+        .arg(
+            Arg::new("limit")
+                .long("limit")
+                .short('l')
+                .help("Maximum number of events to select")
+                .default_value("50")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("rebuild")
+                .long("rebuild")
+                .action(ArgAction::SetTrue)
+                .help("Rebuild the room flag index from authoritative records"),
         )
 }
 
@@ -1294,6 +1348,16 @@ fn parse_cli() -> Cli {
                 .get_one::<i64>("limit")
                 .expect("clap supplies a default limit"),
             reverse: m.get_flag("reverse"),
+        },
+        Some(("flags", m)) => Commands::Flags {
+            room: m.get_one::<String>("room").unwrap().clone(),
+            flag: m.get_one::<String>("flag").cloned(),
+            not: m.get_flag("not"),
+            count: m.get_flag("count"),
+            limit: *m
+                .get_one::<usize>("limit")
+                .expect("clap supplies a default limit"),
+            rebuild: m.get_flag("rebuild"),
         },
         Some(("meta", m)) => Commands::Meta {
             target: m.get_one::<String>("target").unwrap().clone(),

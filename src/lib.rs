@@ -126,6 +126,10 @@ pub mod record_class;
 #[cfg(feature = "bitmaps")]
 #[path = "matrix/room_auth.rs"]
 pub mod room_auth;
+/// Room-scoped flag and disposition bitmap index.
+#[cfg(feature = "bitmaps")]
+#[path = "matrix/room_flag.rs"]
+pub mod room_flag;
 /// Rebuildable full-text and field secondary indexes.
 #[path = "search.rs"]
 pub mod search;
@@ -174,6 +178,9 @@ mod test_population;
 #[cfg(all(test, feature = "bitmaps"))]
 #[path = "matrix/test_room_auth.rs"]
 mod test_room_auth;
+#[cfg(all(test, feature = "bitmaps"))]
+#[path = "matrix/test_room_flag.rs"]
+mod test_room_flag;
 #[cfg(test)]
 #[path = "test_search.rs"]
 mod test_search;
@@ -197,11 +204,11 @@ pub use interop::{
     decode_server_key, decode_state_root_handle_v1, decode_verdict, encode_auth_counter,
     encode_auth_forward, encode_import_marker, encode_server_key, encode_state_root_handle_v1,
     encode_verdict, event_record_id, event_state_root_node_id, event_verdict_collection_id,
-    import_marker_collection_id, import_marker_node_id, notary_record_id, room_roots_collection_id,
-    room_state_collection_id, room_state_root_node_id, server_keys_collection_id,
-    state_hamt_node_id, ImportMarker, StateRootHandleV1, Verdict, DATA_FORMAT, KEY_RECORD_VERSION,
-    MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL, STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS,
-    VERDICT_VERSION,
+    import_marker_collection_id, import_marker_node_id, notary_record_id, room_flag_collection_id,
+    room_roots_collection_id, room_state_collection_id, room_state_root_node_id,
+    server_keys_collection_id, state_hamt_node_id, ImportMarker, StateRootHandleV1, Verdict,
+    DATA_FORMAT, KEY_RECORD_VERSION, MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL,
+    STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS, VERDICT_VERSION,
 };
 pub use journal::SharedWalLock;
 pub use journal::{CollectionExpectation, StagedLookup, TxnStage, TxnStageState};
@@ -225,6 +232,11 @@ pub use packfile::{
 pub use record_class::{Durability, OrderingPolicy, RecordClass, Retention};
 #[cfg(feature = "reconcile")]
 pub use rezzy_recon as recon;
+#[cfg(feature = "bitmaps")]
+pub use room_flag::{
+    flag_chunk_node_id, Flag, FlagChange, FlagQuery, RoomFlagIndex, CHUNK_CAPACITY, FLAG_META_ID,
+    FLAG_META_MAGIC, FLAG_META_VERSION,
+};
 pub use search::{SearchDocument, SearchIndexes, SearchQuery};
 pub use shard::{LockHolderInfo, ShardPool};
 pub use state_group::{
@@ -244,9 +256,10 @@ pub use template::{
     CollectionMetadata, CollectionTemplate, EstablishmentRule, FrameIdInput, FrameIdPolicy,
     PayloadPolicy, RecordIdentityRule, COLLECTION_METADATA_RECORD_ID,
     COLLECTION_TEMPLATE_FORMAT_V1, MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT,
-    MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT,
-    MEMBER_NAMESPACE_STGP, NAMESPACE_BIAS_AUTH, NAMESPACE_BIAS_EVNT, NAMESPACE_BIAS_FWD,
-    NAMESPACE_BIAS_INTL, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
+    MEMBER_NAMESPACE_FLAG, MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_PREV,
+    MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP, NAMESPACE_BIAS_AUTH, NAMESPACE_BIAS_EVNT,
+    NAMESPACE_BIAS_FLAG, NAMESPACE_BIAS_FWD, NAMESPACE_BIAS_INTL, NAMESPACE_BIAS_PREV,
+    NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
 };
 pub use timeline::{
     event_id_ref, room_scope_id, timeline_collection_id, EventRef, TimelineCursor, TimelineEntry,

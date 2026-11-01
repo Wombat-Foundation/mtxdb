@@ -22,8 +22,8 @@
 
 use crate::{
     derive_group_full_id, derive_member_collection_id_from_group, storage::StorageError, ShardType,
-    MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT, MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT,
-    MEMBER_NAMESPACE_STGP,
+    MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT, MEMBER_NAMESPACE_FLAG, MEMBER_NAMESPACE_PREV,
+    MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP,
 };
 
 /// Serialized `rezzy::hamt::RootHandle` length used by the server's state
@@ -472,6 +472,12 @@ pub fn room_prev_collection_id(room_id: &[u8]) -> [u8; 16] {
 #[must_use]
 pub fn room_auth_collection_id(room_id: &[u8]) -> [u8; 16] {
     room_member_collection(MEMBER_NAMESPACE_AUTH, room_id)
+}
+
+/// Derive the collection holding a room's flag bitmaps.
+#[must_use]
+pub fn room_flag_collection_id(room_id: &[u8]) -> [u8; 16] {
+    room_member_collection(MEMBER_NAMESPACE_FLAG, room_id)
 }
 
 /// Derive the event-locator collection holding `node`.

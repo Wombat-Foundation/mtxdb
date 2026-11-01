@@ -438,7 +438,8 @@ fn parse_event(
     }
     let stream_ordering = optional_signed_number(line, object, "stream_ordering")?;
     let depth = optional_signed_number(line, object, "depth")?.or_else(|| {
-        pdu.get("depth").and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|d| d as i64)))
+        pdu.get("depth")
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok())))
     });
     Ok(RoomEvent {
         event_id,
@@ -605,7 +606,7 @@ fn optional_signed_number(
         .map(|value| {
             value
                 .as_i64()
-                .or_else(|| value.as_u64().map(|d| d as i64))
+                .or_else(|| value.as_u64().and_then(|d| i64::try_from(d).ok()))
                 .ok_or_else(|| anyhow!("line {line}: `{field}` must be an integer"))
         })
         .transpose()

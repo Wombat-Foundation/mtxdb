@@ -386,6 +386,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Stats { .. } => "stats",
         Commands::Memory { .. } => "memory",
         Commands::Timeline { .. } => "timeline",
+        Commands::Flags { .. } => "flags",
         Commands::Meta { .. } => "meta",
         Commands::Import { .. } => "import",
         Commands::Export { .. } => "export",
@@ -472,6 +473,14 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             limit,
             reverse,
         } => cmd_timeline(cli, room, *limit, *reverse),
+        Commands::Flags {
+            room,
+            flag,
+            not,
+            count,
+            limit,
+            rebuild,
+        } => cmd_flags(cli, room, flag.as_deref(), *not, *count, *limit, *rebuild),
         Commands::Meta {
             target,
             json,
@@ -3384,7 +3393,7 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
         println!("No timeline entries found for room {room}");
         return Ok(());
     }
-    println!("{:<6} {:<12} {:<12} {:<34} {}", "idx", "depth", "stream", "node_id", "event_id");
+    println!("{:<6} {:<12} {:<12} {:<34} event_id", "idx", "depth", "stream", "node_id");
     println!("{}", "-".repeat(90));
     for (idx, entry) in page.entries.iter().enumerate() {
         let node_hex = hex::encode(entry.node_id);
@@ -3408,6 +3417,117 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
     if page.next_cursor.is_some() {
         println!("\n(more events available)");
     }
+    Ok(())
+}
+
+fn cmd_flags(
+    cli: &Cli,
+    room: &str,
+    flag_name: Option<&str>,
+    not: bool,
+    count_only: bool,
+    limit: usize,
+    rebuild: bool,
+) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| {
+        cmd_flags_single(sub_cli, room, flag_name, not, count_only, limit, rebuild)
+    })
+}
+
+fn parse_flag(name: &str) -> anyhow::Result<mtxdb::room_flag::Flag> {
+    match name.to_ascii_lowercase().replace('_', "-").as_str() {
+        "present" => Ok(mtxdb::room_flag::Flag::Present),
+        "timeline" => Ok(mtxdb::room_flag::Flag::Timeline),
+        "outlier" => Ok(mtxdb::room_flag::Flag::Outlier),
+        "rejected" => Ok(mtxdb::room_flag::Flag::Rejected),
+        "soft-failed" | "soft-fail" | "softfail" => Ok(mtxdb::room_flag::Flag::SoftFailed),
+        "redacted" => Ok(mtxdb::room_flag::Flag::Redacted),
+        other => anyhow::bail!(
+            "unknown flag '{other}'; valid flags: present, timeline, outlier, rejected, soft-failed, redacted"
+        ),
+    }
+}
+
+fn cmd_flags_single(
+    cli: &Cli,
+    room: &str,
+    flag_name: Option<&str>,
+    not: bool,
+    count_only: bool,
+    limit: usize,
+    rebuild: bool,
+) -> anyhow::Result<()> {
+    let layout = open_layout(cli)?;
+    let db = Database::open(layout.root().to_path_buf())
+        .with_context(|| format!("opening database at {}", layout.root().display()))?;
+    let index = mtxdb::room_flag::RoomFlagIndex::new(room.as_bytes());
+
+    if rebuild {
+        println!("Rebuilding flag index for room {room}...");
+        let start = std::time::Instant::now();
+        let count = index.rebuild(&db)?;
+        let elapsed = start.elapsed();
+        println!("Rebuilt flag index for room {room}: {count} events indexed in {elapsed:?}");
+        return Ok(());
+    }
+
+    if let Some(name) = flag_name {
+        let flag = parse_flag(name)?;
+        let query = if not {
+            mtxdb::room_flag::FlagQuery::not(flag)
+        } else {
+            mtxdb::room_flag::FlagQuery::has(flag)
+        };
+
+        let label = if not {
+            format!("not({})", flag.as_str())
+        } else {
+            flag.as_str().to_owned()
+        };
+
+        if count_only {
+            let start = std::time::Instant::now();
+            let count = index.count(&db, &query)?;
+            let elapsed = start.elapsed();
+            println!("{room} [{label}]: {count} events ({elapsed:?})");
+        } else {
+            let start = std::time::Instant::now();
+            let events = index.select_bounded(&db, &query, limit)?;
+            let elapsed = start.elapsed();
+            println!(
+                "{room} [{label}]: found {} events (limited to {limit}) in {elapsed:?}:",
+                events.len()
+            );
+            for (idx, eid) in events.iter().enumerate() {
+                let id_str = String::from_utf8_lossy(eid);
+                println!("  {:>4}. {id_str}", idx.saturating_add(1));
+            }
+        }
+        return Ok(());
+    }
+
+    // Default: Summary of all standard flags
+    println!("Flag summary for room {room}:");
+    println!("{:<14} {:>10} {:>14}", "Flag", "Count", "Query Time");
+    println!("{}", "-".repeat(42));
+
+    let flags = [
+        mtxdb::room_flag::Flag::Present,
+        mtxdb::room_flag::Flag::Timeline,
+        mtxdb::room_flag::Flag::Outlier,
+        mtxdb::room_flag::Flag::SoftFailed,
+        mtxdb::room_flag::Flag::Rejected,
+        mtxdb::room_flag::Flag::Redacted,
+    ];
+
+    for flag in flags {
+        let query = mtxdb::room_flag::FlagQuery::has(flag);
+        let start = std::time::Instant::now();
+        let count = index.count(&db, &query)?;
+        let elapsed = start.elapsed();
+        println!("{:<14} {:>10} {:>14?}", flag.as_str(), count, elapsed);
+    }
+
     Ok(())
 }
 
