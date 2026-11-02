@@ -102,6 +102,9 @@ pub(crate) struct RoomEvent {
     pub(crate) pdu_bytes: Bytes,
     /// Caller-supplied stream ordering (negative for backfills).
     pub(crate) stream_ordering: Option<i64>,
+    /// When the source first saw the event, for events it kept out of its
+    /// timeline. Comparable with `stream_ordering`.
+    pub(crate) arrival_ordering: Option<i64>,
     /// Caller-supplied topological ordering (depth).
     pub(crate) depth: Option<i64>,
 }
@@ -242,7 +245,7 @@ pub(crate) fn parse_room(content: &[u8]) -> anyhow::Result<RoomExport> {
     }
     let server = require_string(header_line, header, field::SERVER)?.to_owned();
     let room_id = require_string(header_line, header, field::ROOM_ID)?.to_owned();
-    let timeline = optional_bool(header_line, header, "timeline")?;
+    let timeline = optional_bool(header_line, header, field::TIMELINE)?;
 
     let mut events = Vec::new();
     let mut end = None;
@@ -436,7 +439,8 @@ fn parse_event(
             }
         }
     }
-    let stream_ordering = optional_signed_number(line, object, "stream_ordering")?;
+    let stream_ordering = optional_signed_number(line, object, field::STREAM_ORDERING)?;
+    let arrival_ordering = optional_signed_number(line, object, field::ARRIVAL_ORDERING)?;
     let depth = optional_signed_number(line, object, "depth")?.or_else(|| {
         pdu.get("depth")
             .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok())))
@@ -449,6 +453,7 @@ fn parse_event(
         pdu: OwnedValue::Object(pdu.clone()),
         pdu_bytes: raw_pdu(line, raw)?,
         stream_ordering,
+        arrival_ordering,
         depth,
     })
 }
@@ -770,6 +775,7 @@ mod tests {
             pdu: OwnedValue::Object(fields),
             pdu_bytes: Bytes::new(),
             stream_ordering: None,
+            arrival_ordering: None,
             depth: None,
         };
         event.metadata.rejected = false;

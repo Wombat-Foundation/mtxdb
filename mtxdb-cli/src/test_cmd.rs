@@ -5833,8 +5833,9 @@ fn flag_index_timeline_count_matches_timeline_index() {
 }
 
 #[test]
-fn events_without_stream_ordering_stay_out_of_timeline_on_import() {
+fn stream_and_arrival_order_survive_import() {
     use crate::interchange::parse_room;
+    use mtxdb::interop::*;
     use mtxdb::room_flag::*;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
@@ -5843,34 +5844,49 @@ fn events_without_stream_ordering_stay_out_of_timeline_on_import() {
     let db = Database::open(root.clone()).unwrap();
 
     let room_id = "!nostream:test.conduwuit.local";
+    // origin_server_ts values are deliberately unrelated to the orderings, so
+    // any fallback to them would be visible in the timeline.
     let jsonl = format!(
         concat!(
             r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
             "\n",
-            r#"{{"event_id":"$ev1:test","depth":10,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":10,"event_id":"$ev1:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":900000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$softfailed_like:test","depth":11,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":11,"event_id":"$softfailed_like:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$live:test","depth":2,"stream_ordering":2,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":2,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":800000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
             "\n",
-            r#"{{"events":2,"t":"end"}}"#,
+            r#"{{"event_id":"$backfilled:test","depth":5,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":5,"event_id":"$backfilled:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":700000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$soft:test","depth":9,"arrival_ordering":7,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":9,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":600000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
             "\n"
         ),
         room = room_id
     );
 
     let export = parse_room(jsonl.as_bytes()).unwrap();
+    assert_eq!(export.events[3].arrival_ordering, Some(7));
     let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
-    assert_eq!(written.events, 2);
+    assert_eq!(written.events, 4);
 
     let room_scope = room_scope_id(room_id.as_bytes());
     let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
-    assert_eq!(page.entries.len(), 1);
-    assert_eq!(page.entries[0].stream_ordering, 1);
+    // Live and backfilled positions are preserved exactly; the soft-failed
+    // event has no timeline position and stays out.
+    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
+    assert_eq!(streams, vec![1, 2, -5]);
+    let depths: Vec<i64> = page
+        .entries
+        .iter()
+        .map(|e| e.topological_ordering)
+        .collect();
+    assert_eq!(depths, vec![1, 2, 5]);
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 2);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 1);
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 3);
 
     // Events with Present AND NOT Timeline (kept out of timeline)
     let non_timeline_shorts = flags
@@ -5880,6 +5896,20 @@ fn events_without_stream_ordering_stay_out_of_timeline_on_import() {
         )
         .unwrap();
     assert_eq!(non_timeline_shorts.len(), 1);
+
+    // The arrival ordering is a source-recorded fact and is kept in the
+    // verdict, without migrating the untrusted soft-fail flag itself.
+    let record = event_record_id(b"$soft:test");
+    let bytes = stored(
+        &db,
+        EVENT_POOL,
+        event_verdict_collection_id(&record),
+        record,
+    )
+    .expect("soft-failed event has a verdict record");
+    let (_, verdict) = decode_verdict(&bytes).unwrap();
+    assert_eq!(verdict.arrival_ordering, Some(7));
+    assert_eq!(verdict.soft_fail, None, "exported soft-fail stays untrusted");
 }
 
 #[test]

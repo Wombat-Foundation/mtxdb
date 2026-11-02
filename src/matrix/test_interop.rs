@@ -79,6 +79,7 @@ fn verdicts_round_trip_and_reject_truncation() {
         soft_fail: Some(7),
         redacted_by: Some(b"$redact:example.com".to_vec()),
         outlier: true,
+        arrival_ordering: Some(42),
     };
     let bytes = encode_verdict(b"$event:example.com", &verdict).unwrap();
     let (event_id, decoded) = decode_verdict(&bytes).unwrap();

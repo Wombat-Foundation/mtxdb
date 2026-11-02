@@ -234,6 +234,7 @@ const HAS_REJECTION: u8 = 1;
 const HAS_SOFT_FAIL: u8 = 1 << 1;
 const HAS_REDACTION: u8 = 1 << 2;
 const IS_OUTLIER: u8 = 1 << 3;
+const HAS_ARRIVAL: u8 = 1 << 4;
 
 /// Everything recorded about an event beyond its body and edges.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -247,6 +248,10 @@ pub struct Verdict {
     /// Whether the event is stored as an outlier. This is independent of its
     /// rejection and soft-fail verdicts.
     pub outlier: bool,
+    /// The source's global counter value when it first saw the event, for
+    /// events it kept out of its timeline. Comparable with the signed
+    /// `stream_ordering` of timeline events.
+    pub arrival_ordering: Option<u64>,
 }
 
 impl Verdict {
@@ -257,6 +262,7 @@ impl Verdict {
             && self.soft_fail.is_none()
             && self.redacted_by.is_none()
             && !self.outlier
+            && self.arrival_ordering.is_none()
     }
 }
 
@@ -301,6 +307,9 @@ pub fn encode_verdict(event_id: &[u8], verdict: &Verdict) -> Result<Vec<u8>, Sto
     if verdict.redacted_by.is_some() {
         flags |= HAS_REDACTION;
     }
+    if verdict.arrival_ordering.is_some() {
+        flags |= HAS_ARRIVAL;
+    }
 
     let mut out = vec![VERDICT_VERSION, flags];
     out.extend_from_slice(
@@ -311,6 +320,9 @@ pub fn encode_verdict(event_id: &[u8], verdict: &Verdict) -> Result<Vec<u8>, Sto
     out.extend_from_slice(event_id);
     out.extend(verdict.rejection);
     out.extend(verdict.soft_fail);
+    if let Some(arrival) = verdict.arrival_ordering {
+        out.extend_from_slice(&arrival.to_le_bytes());
+    }
     if let Some(redactor) = &verdict.redacted_by {
         out.extend_from_slice(
             &u32::try_from(redactor.len())
@@ -363,6 +375,11 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(&[u8], Verdict), StorageError> {
     if flags & HAS_SOFT_FAIL != 0 {
         let (&code, tail) = rest.split_first().ok_or_else(malformed)?;
         verdict.soft_fail = Some(code);
+        rest = tail;
+    }
+    if flags & HAS_ARRIVAL != 0 {
+        let (bytes, tail) = rest.split_first_chunk::<8>().ok_or_else(malformed)?;
+        verdict.arrival_ordering = Some(u64::from_le_bytes(*bytes));
         rest = tail;
     }
     if flags & HAS_REDACTION != 0 {

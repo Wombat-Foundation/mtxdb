@@ -260,6 +260,7 @@ fn verdict_of(metadata: &EventMetadata, forced: Option<u8>) -> Verdict {
     Verdict {
         rejection: forced,
         soft_fail: None,
+        arrival_ordering: None,
         redacted_by: metadata
             .redacted_by
             .as_ref()
@@ -1663,7 +1664,12 @@ pub(crate) fn write_room_with_signature_keys(
         let auth = id_list(event, "auth_events")?;
         let prev_bytes = encode_edges(&prev)?;
         let auth_bytes = encode_edges(&auth)?;
-        let verdict = verdict_of(&event.metadata, findings.forced[position]);
+        let mut verdict = verdict_of(&event.metadata, findings.forced[position]);
+        // Arrival ordering is a source-recorded fact that cannot be recomputed,
+        // like `redacted_by`, so keep it in the verdict record.
+        if let Some(arrival) = event.arrival_ordering {
+            verdict.arrival_ordering = u64::try_from(arrival).ok();
+        }
         // A mismatched content hash means the effective event is its redaction;
         // the export keeps the original bytes.
         let stored: &[u8] = findings
@@ -2140,6 +2146,7 @@ mod auth_findings_tests {
             pdu: OwnedValue::Object(fields),
             pdu_bytes: Bytes::new(),
             stream_ordering: None,
+            arrival_ordering: None,
             depth: None,
         }
     }
@@ -2998,6 +3005,7 @@ mod signature_window_tests {
             pdu: OwnedValue::parse_bytes(signed.as_bytes()).unwrap(),
             pdu_bytes: Bytes::new(),
             stream_ordering: None,
+            arrival_ordering: None,
             depth: None,
         }
     }
@@ -3039,6 +3047,7 @@ mod signature_window_tests {
             pdu: OwnedValue::parse_bytes(signed.as_bytes()).unwrap(),
             pdu_bytes: Bytes::new(),
             stream_ordering: None,
+            arrival_ordering: None,
             depth: None,
         }
     }

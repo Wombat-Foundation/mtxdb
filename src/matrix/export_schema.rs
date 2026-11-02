@@ -10,8 +10,10 @@
 //!
 //! Each line is one JSON object tagged by [`field::T`]:
 //!
-//! 1. [`tag::HEADER`]: [`field::FORMAT`], [`field::SERVER`], [`field::ROOM_ID`].
-//! 2. [`tag::EVENT`]: the event's identity, edges, flags, verdict codes and PDU.
+//! 1. [`tag::HEADER`]: [`field::FORMAT`], [`field::SERVER`], [`field::ROOM_ID`],
+//!    and optionally [`field::TIMELINE`].
+//! 2. [`tag::EVENT`]: the event's identity, edges, ordering, flags, verdict
+//!    codes and PDU.
 //! 3. [`tag::END`]: [`field::EVENTS`], the number of event records. A file
 //!    without it was truncated.
 //!
@@ -54,9 +56,20 @@ pub mod field {
     pub const SERVER: &str = "server";
     /// `header`: the room every event record belongs to.
     pub const ROOM_ID: &str = "room_id";
+    /// `header`, optional: whether the export guarantees timeline stream
+    /// orderings. Absent is false, for legacy exports.
+    pub const TIMELINE: &str = "timeline";
 
     /// `event`: the event's id.
     pub const EVENT_ID: &str = "event_id";
+    /// `event`, optional: the event's timeline position. Present only for
+    /// events the source put on its timeline, signed like a [`super::PduCount`]
+    /// (negative for backfill).
+    pub const STREAM_ORDERING: &str = "stream_ordering";
+    /// `event`, optional: when the source first saw the event, for events it
+    /// kept out of its timeline (soft-failed and rejected events). Uses the
+    /// source's global counter, so it is comparable with `stream_ordering`.
+    pub const ARRIVAL_ORDERING: &str = "arrival_ordering";
     /// `event`: ids of the event's `prev_events`.
     pub const PREV_EVENTS: &str = "prev_events";
     /// `event`: ids of the event's `auth_events`.
