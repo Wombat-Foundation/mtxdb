@@ -629,14 +629,12 @@ mod tests {
         // Initial unindexed state
         let initial_meta = index.meta(&db).unwrap();
         assert_eq!(initial_meta.generation, 1);
-        assert_eq!(initial_meta.write_count, 0);
 
         let count = index.rebuild(&db).unwrap();
         assert_eq!(count, 1);
         let meta1 = index.meta(&db).unwrap();
         assert_eq!(meta1.generation, 2);
         assert_eq!(meta1.max_short_id, 1);
-        assert_eq!(meta1.write_count, 1);
         assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
 
         // Second rebuild should increment generation to 3
@@ -645,12 +643,11 @@ mod tests {
         let meta2 = index.meta(&db).unwrap();
         assert_eq!(meta2.generation, 3);
         assert_eq!(meta2.max_short_id, 1);
-        assert_eq!(meta2.write_count, 2);
         assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
     }
 
     #[test]
-    fn concurrent_update_during_rebuild_is_detected_by_write_count_cas() {
+    fn concurrent_update_during_rebuild_is_detected_by_meta_cas() {
         let db = Database::open(test_root("concurrent_rebuild")).unwrap();
         let room_id = b"!concurrent:example.com";
         let index = RoomFlagIndex::new(room_id);
@@ -687,8 +684,8 @@ mod tests {
             .unwrap();
         tx.commit().unwrap();
 
-        // 1. Rebuild starts and reads current metadata and token
-        let (meta_nodes, meta_versions) = db
+        // 1. Rebuild starts and reads current metadata token
+        let (_meta_nodes, meta_versions) = db
             .begin_transaction()
             .get_with_record_versions(
                 index.pool(),
@@ -697,32 +694,23 @@ mod tests {
             )
             .unwrap();
         let meta_token = meta_versions.first().copied().unwrap_or(0);
-        let base_raw = meta_nodes.into_iter().next().flatten().unwrap();
-        let base_meta = crate::room_flag::decode_meta(&base_raw.bytes).unwrap();
 
-        // 2. While rebuild is building, a concurrent writer updates a flag (bumps write_count)
+        // 2. While rebuild is building, a concurrent writer updates a flag
         index
             .update(&db, &[FlagChange::set(1, Flag::Timeline)])
             .unwrap();
 
-        // 3. Rebuild attempts to publish base_meta via CAS; it must detect the concurrent write and fail
+        // 3. Rebuild attempts to publish via CAS with the old token; it must fail
         let publish_tx = db.begin_transaction();
-        let (meta_nodes, _meta_versions) = publish_tx
+        let (_meta_nodes, _meta_versions) = publish_tx
             .get_with_record_versions(
                 index.pool(),
                 index.collection(),
                 &[crate::room_flag::FLAG_META_ID],
             )
             .unwrap();
-        let live_raw = meta_nodes.into_iter().next().flatten().unwrap();
-        let live_meta = crate::room_flag::decode_meta(&live_raw.bytes).unwrap();
 
-        assert_ne!(
-            live_meta.write_count, base_meta.write_count,
-            "concurrent writer bumped write_count"
-        );
-
-        // If publish proceeded with base_meta_token expectation, commit would fail
+        // If publish proceeded with the stale meta token expectation, commit would fail
         publish_tx
             .expect_record_version(
                 index.pool(),

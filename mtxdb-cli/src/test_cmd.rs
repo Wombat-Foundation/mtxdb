@@ -5237,13 +5237,9 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
             verdict
         })
     };
-    assert_eq!(
-        verdict("soft").unwrap(),
-        Verdict {
-            soft_fail: Some(2),
-            ..Verdict::default()
-        },
-        "an exported soft-fail is migrated with its reason code"
+    assert!(
+        verdict("soft").is_none(),
+        "an exported soft-fail is not migrated; no verdict record is stored for it"
     );
     assert!(
         verdict("rejected").is_none(),
@@ -5290,7 +5286,7 @@ fn an_exported_outlier_flag_is_not_migrated() {
         .map(|bytes| mtxdb::interop::decode_verdict(&bytes).unwrap().1.outlier)
     };
     assert_eq!(outlier("ok"), None, "an exported outlier is not migrated");
-    assert_eq!(outlier("soft"), Some(false));
+    assert_eq!(outlier("soft"), None);
     assert_eq!(outlier("rejected"), None);
     assert_eq!(
         outlier("redacted"),
@@ -5674,7 +5670,7 @@ fn a_room_import_populates_flag_index() {
     );
     assert_eq!(
         flag_index.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
-        1
+        0
     );
     assert_eq!(
         flag_index.count(&db, &FlagQuery::has(Flag::Redacted)).unwrap(),
@@ -5827,37 +5823,6 @@ fn rebuild_fidelity_reproduces_exact_bitmaps_after_wipe() {
 
     assert_eq!(flags.select_shorts(&db, &FlagQuery::has(Flag::Present)).unwrap(), shorts_present_before);
     assert_eq!(flags.select_shorts(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), shorts_timeline_before);
-}
-
-#[test]
-fn imported_soft_fail_survives_rebuild_unchanged() {
-    use crate::interchange::parse_room;
-    use mtxdb::room_flag::*;
-
-    let root = unique_temp_dir();
-    let db = Database::open(root.clone()).unwrap();
-    let export = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
-    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
-    assert_eq!(written.events, 5);
-
-    let flags = RoomFlagIndex::new(FIXTURE_ROOM.as_bytes());
-    assert_eq!(
-        flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
-        1
-    );
-    let selected_before = flags.select(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap();
-    assert_eq!(selected_before, vec![b"$soft:test.conduwuit.local".to_vec()]);
-
-    // Rebuild index
-    let count = flags.rebuild(&db).unwrap();
-    assert_eq!(count, 5);
-
-    assert_eq!(
-        flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
-        1
-    );
-    let selected_after = flags.select(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap();
-    assert_eq!(selected_after, vec![b"$soft:test.conduwuit.local".to_vec()]);
 }
 
 #[test]

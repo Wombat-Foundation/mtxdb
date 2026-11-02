@@ -23,9 +23,14 @@ use crate::timeline::{room_scope_id, TimelineIndex};
 /// Magic prefix for the flag index metadata record (`b"FLGM"`).
 pub const FLAG_META_MAGIC: [u8; 4] = *b"FLGM";
 /// Wire format version for the flag index metadata record.
-pub const FLAG_META_VERSION: u8 = 1;
+///
+/// Version 2 dropped the per-write `write_count` field. Version 1 records are
+/// still accepted on read so existing databases decode without migration.
+pub const FLAG_META_VERSION: u8 = 2;
 /// Reserved node ID for the flag index metadata record.
 pub const FLAG_META_ID: NodeId = *b"MTXD-FLG-META-v1";
+/// Reserved node ID for the flag generation counter record.
+pub const FLAG_COUNTER_ID: NodeId = *b"MTXD-FLG-NEXTG-1";
 
 /// Maximum short IDs per chunk (64K).
 pub const CHUNK_CAPACITY: u32 = 65536;
@@ -40,8 +45,6 @@ pub struct FlagMeta {
     pub generation: u64,
     /// Maximum short ID indexed in this generation.
     pub max_short_id: u32,
-    /// Monotonic write counter incremented on every stage.
-    pub write_count: u64,
 }
 
 /// Event properties and dispositions tracked by [`RoomFlagIndex`].
@@ -141,18 +144,22 @@ pub fn flag_chunk_node_id(flag: Flag, chunk_idx: u16) -> NodeId {
     derive_id(b"room:flag:chunk", &key)
 }
 
-fn encode_meta(meta: FlagMeta) -> [u8; 25] {
-    let mut out = [0_u8; 25];
+fn encode_meta(meta: FlagMeta) -> [u8; 17] {
+    let mut out = [0_u8; 17];
     out[0..4].copy_from_slice(&FLAG_META_MAGIC);
     out[4] = FLAG_META_VERSION;
     out[5..13].copy_from_slice(&meta.generation.to_be_bytes());
     out[13..17].copy_from_slice(&meta.max_short_id.to_be_bytes());
-    out[17..25].copy_from_slice(&meta.write_count.to_be_bytes());
     out
 }
 
 pub(crate) fn decode_meta(bytes: &[u8]) -> Result<FlagMeta, StorageError> {
-    if bytes.len() != 25 || bytes[0..4] != FLAG_META_MAGIC || bytes[4] != FLAG_META_VERSION {
+    let valid_len = match bytes.get(4) {
+        Some(1) => bytes.len() == 25,
+        Some(2) => bytes.len() == 17,
+        _ => false,
+    };
+    if !valid_len || !bytes.starts_with(&FLAG_META_MAGIC) {
         return Err(StorageError::Corrupt(
             "malformed flag meta record".to_owned(),
         ));
@@ -161,13 +168,28 @@ pub(crate) fn decode_meta(bytes: &[u8]) -> Result<FlagMeta, StorageError> {
     gen_bytes.copy_from_slice(&bytes[5..13]);
     let mut short_bytes = [0_u8; 4];
     short_bytes.copy_from_slice(&bytes[13..17]);
-    let mut write_bytes = [0_u8; 8];
-    write_bytes.copy_from_slice(&bytes[17..25]);
     Ok(FlagMeta {
         generation: u64::from_be_bytes(gen_bytes),
         max_short_id: u32::from_be_bytes(short_bytes),
-        write_count: u64::from_be_bytes(write_bytes),
     })
+}
+
+fn encode_counter(next: u64) -> [u8; 12] {
+    let mut out = [0_u8; 12];
+    out[0..4].copy_from_slice(b"FLGC");
+    out[4..12].copy_from_slice(&next.to_be_bytes());
+    out
+}
+
+fn decode_counter(bytes: &[u8]) -> Result<u64, StorageError> {
+    if bytes.len() != 12 || bytes[0..4] != *b"FLGC" {
+        return Err(StorageError::Corrupt(
+            "malformed flag generation counter".to_owned(),
+        ));
+    }
+    let mut b = [0_u8; 8];
+    b.copy_from_slice(&bytes[4..12]);
+    Ok(u64::from_be_bytes(b))
 }
 
 /// A mutation to apply to an event's flag in the index.
@@ -336,7 +358,6 @@ impl RoomFlagIndex {
             None => Ok(FlagMeta {
                 generation: 1,
                 max_short_id: 0,
-                write_count: 0,
             }),
         }
     }
@@ -421,8 +442,9 @@ impl RoomFlagIndex {
     /// Stage a batch of flag changes into the transaction for the active generation.
     ///
     /// Changes are grouped and applied chunk-by-chunk in memory, writing each
-    /// touched chunk record exactly once. Monotonically bumps `write_count` and
-    /// asserts `FLAG_META_ID` version so concurrent rebuilds detect new writes.
+    /// touched chunk record exactly once. Bumps `max_short_id` and asserts
+    /// `FLAG_META_ID` version so a concurrent rebuild or writer is detected
+    /// rather than silently overwritten.
     ///
     /// # Errors
     /// Returns [`StorageError`] if reading existing chunks or staging writes fails.
@@ -444,7 +466,6 @@ impl RoomFlagIndex {
             None => FlagMeta {
                 generation: 1,
                 max_short_id: 0,
-                write_count: 0,
             },
         };
 
@@ -454,7 +475,6 @@ impl RoomFlagIndex {
         let new_meta = FlagMeta {
             generation: current_meta.generation,
             max_short_id: current_meta.max_short_id.max(max_short_seen),
-            write_count: current_meta.write_count.saturating_add(1),
         };
         let meta_encoded = encode_meta(new_meta);
         tx.put(
@@ -704,6 +724,80 @@ impl RoomFlagIndex {
         Ok(event_ids)
     }
 
+    /// Reserve a never-reused generation number for rebuild.
+    ///
+    /// Reads the current active metadata and counter record, reserving a new
+    /// generation `> current_meta.generation` by committing an increment to
+    /// [`FLAG_COUNTER_ID`].
+    ///
+    /// Returns `(current_meta, new_generation, meta_token)`.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] on read error, corrupt counter, or exhausted retries.
+    pub fn reserve_rebuild_generation(
+        &self,
+        db: &Database,
+    ) -> Result<(FlagMeta, u64, u64), StorageError> {
+        let mut last = None;
+        for _ in 0..Self::MAX_RETRIES {
+            let tx = db.begin_transaction();
+            let (meta_nodes, meta_versions) =
+                tx.get_with_record_versions(self.pool, &self.collection, &[FLAG_META_ID])?;
+            let meta_token = meta_versions.first().copied().unwrap_or(0);
+            let meta_raw = meta_nodes.into_iter().next().flatten();
+            let current_meta = match meta_raw.as_ref() {
+                Some(data) => decode_meta(&data.bytes)?,
+                None => FlagMeta {
+                    generation: 1,
+                    max_short_id: 0,
+                },
+            };
+
+            let (counter_nodes, counter_versions) =
+                tx.get_with_record_versions(self.pool, &self.collection, &[FLAG_COUNTER_ID])?;
+            let counter_token = counter_versions.first().copied().unwrap_or(0);
+            let counter_raw = counter_nodes.into_iter().next().flatten();
+            let next_alloc = match counter_raw.as_ref() {
+                Some(data) => decode_counter(&data.bytes)?,
+                None => current_meta.generation.saturating_add(1).max(2),
+            };
+
+            let new_gen = next_alloc.max(current_meta.generation.saturating_add(1));
+            let next_counter = new_gen
+                .checked_add(1)
+                .ok_or_else(|| StorageError::Internal("flag generation overflow".to_owned()))?;
+
+            tx.put(
+                self.pool,
+                self.collection,
+                FLAG_COUNTER_ID,
+                &NodeData::new(Bytes::from(encode_counter(next_counter).to_vec())),
+            )?;
+            if !(counter_raw.is_some() && counter_token == 0) {
+                tx.expect_record_version(
+                    self.pool,
+                    self.collection,
+                    FLAG_COUNTER_ID,
+                    counter_token,
+                )?;
+            }
+
+            match tx.commit() {
+                Ok(()) => return Ok((current_meta, new_gen, meta_token)),
+                Err(e) if e.is_stale_read() || matches!(e, StorageError::WouldBlock(_)) => {
+                    last = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or(StorageError::StaleRead {
+            pool: self.pool,
+            collection_id: self.collection,
+            expected: 0,
+            actual: 0,
+        }))
+    }
+
     /// Rebuild the flag index for this room from existing auth short IDs and verdicts.
     ///
     /// Rebuilds into a new generation collection without mutating or deleting
@@ -716,6 +810,12 @@ impl RoomFlagIndex {
     /// Returns [`StorageError`] if database reads, staging, or CAS publication fails.
     #[allow(clippy::too_many_lines)]
     pub fn rebuild(&self, db: &Database) -> Result<u64, StorageError> {
+        // Reserve the target generation before reading the auth counter. The
+        // reservation keeps generation numbers from ever being reused, and
+        // reading the counter afterwards keeps the scan bound consistent with
+        // the snapshot the rebuilt index is published against.
+        let (current_meta, new_gen, meta_token) = self.reserve_rebuild_generation(db)?;
+
         let counter_raw = db
             .pool(self.auth_pool)
             .get(&self.auth_collection, &auth_counter_record_id())?;
@@ -727,23 +827,6 @@ impl RoomFlagIndex {
             return Ok(0);
         }
 
-        let (current_meta, meta_token) = {
-            let tx = db.begin_transaction();
-            let (meta_nodes, meta_versions) =
-                tx.get_with_record_versions(self.pool, &self.collection, &[FLAG_META_ID])?;
-            let token = meta_versions.first().copied().unwrap_or(0);
-            let meta = match meta_nodes.into_iter().next().flatten() {
-                Some(data) => decode_meta(&data.bytes)?,
-                None => FlagMeta {
-                    generation: 1,
-                    max_short_id: 0,
-                    write_count: 0,
-                },
-            };
-            (meta, token)
-        };
-
-        let new_gen = current_meta.generation.saturating_add(1).max(1);
         let target_col = self.chunk_collection(new_gen);
 
         // Pre-emptively clear target collection before writing
@@ -893,13 +976,11 @@ impl RoomFlagIndex {
             None => FlagMeta {
                 generation: 1,
                 max_short_id: 0,
-                write_count: 0,
             },
         };
-        // Verify that no writes occurred to the room flags while rebuild was running
-        if live_meta.generation != current_meta.generation
-            || live_meta.write_count != current_meta.write_count
-        {
+        // Verify that no competing rebuild published a generation while this one
+        // was running. The meta record version CAS below covers any other write.
+        if live_meta.generation != current_meta.generation {
             return Err(StorageError::StaleRead {
                 pool: self.pool,
                 collection_id: self.collection,
@@ -910,7 +991,6 @@ impl RoomFlagIndex {
         let published_meta = FlagMeta {
             generation: new_gen,
             max_short_id: max_short_seen,
-            write_count: current_meta.write_count.saturating_add(1),
         };
         let meta_encoded = encode_meta(published_meta);
         publish_tx.put(

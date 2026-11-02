@@ -3479,6 +3479,13 @@ fn cmd_flags_single(
 
     if let Some(name) = flag_name {
         let flag = parse_flag(name)?;
+        if flag == mtxdb::room_flag::Flag::SoftFailed {
+            if not {
+                eprintln!("note: 'soft-failed' is empty on imported rooms until derived checks compute it; 'not(soft-failed)' returns every present event");
+            } else {
+                eprintln!("note: 'soft-failed' is empty on imported rooms until derived checks compute it");
+            }
+        }
         let query = if not {
             mtxdb::room_flag::FlagQuery::not(flag)
         } else {

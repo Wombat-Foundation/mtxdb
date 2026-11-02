@@ -252,20 +252,14 @@ fn id_list<'a>(event: &'a RoomEvent, field: &str) -> anyhow::Result<Vec<&'a [u8]
         .collect()
 }
 
-/// The verdict to store for an event: the rejection the import derived, the
-/// exported soft-fail (if present), and outlier status. Rejection and outlier
-/// status are derived from auth checks. `soft_fail` carries the exported
-/// soft-fail disposition because soft-fail is not derived during room import.
+/// The verdict to store for an event: the rejection the import derived, and
+/// nothing the export said about rejection or soft-fail status. Those
+/// are derived from the stored events and server keys, not migrated.
 /// `redacted_by` is a fact about the stored event, so it is kept.
 fn verdict_of(metadata: &EventMetadata, forced: Option<u8>) -> Verdict {
-    let soft_fail = if metadata.soft_failed {
-        metadata.soft_fail_code.or(Some(1))
-    } else {
-        metadata.soft_fail_code
-    };
     Verdict {
         rejection: forced,
-        soft_fail,
+        soft_fail: None,
         redacted_by: metadata
             .redacted_by
             .as_ref()
@@ -2597,7 +2591,7 @@ mod auth_findings_tests {
         let v = verdict_of(&exported, None);
         assert_eq!(v.rejection, None, "exported rejection is not migrated");
         assert!(!v.outlier, "exported outlier is not migrated");
-        assert_eq!(v.soft_fail, Some(2), "exported soft-fail is migrated");
+        assert_eq!(v.soft_fail, None, "exported soft-fail is not migrated");
 
         let v_forced = verdict_of(&exported, Some(MISSING_AUTH));
         assert_eq!(
@@ -2608,8 +2602,8 @@ mod auth_findings_tests {
         assert!(v_forced.outlier, "derived rejection is stored as outlier");
         assert_eq!(
             v_forced.soft_fail,
-            Some(2),
-            "soft-fail and derived rejection are independent"
+            None,
+            "exported soft-fail is not migrated on forced rejection"
         );
         assert!(verdict_of(&EventMetadata::default(), None).is_empty());
     }
