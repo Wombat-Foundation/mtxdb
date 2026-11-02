@@ -3484,13 +3484,6 @@ fn cmd_flags_single(
 
     if let Some(name) = flag_name {
         let flag = parse_flag(name)?;
-        if flag == mtxdb::room_flag::Flag::SoftFailed {
-            if not {
-                eprintln!("note: 'soft-failed' is not derivable from an import; 'not(soft-failed)' returns every present event");
-            } else {
-                eprintln!("note: 'soft-failed' is not derivable from an import");
-            }
-        }
         let query = if not {
             mtxdb::room_flag::FlagQuery::not(flag)
         } else {
@@ -3543,12 +3536,7 @@ fn cmd_flags_single(
         let start = std::time::Instant::now();
         let count = index.count(&db, &query)?;
         let elapsed = start.elapsed();
-        let note = if flag == mtxdb::room_flag::Flag::SoftFailed && count == 0 {
-            " (not derivable from import)"
-        } else {
-            ""
-        };
-        println!("{:<14} {:>10} {:>14?}{note}", flag.as_str(), count, elapsed);
+        println!("{:<14} {:>10} {:>14?}", flag.as_str(), count, elapsed);
     }
 
     Ok(())

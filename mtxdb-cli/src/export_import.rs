@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context};
-use mtxdb::export_schema::RejectionCode;
+use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::interop::{
     auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
     decode_auth_counter, decode_auth_forward, decode_event_locator, decode_import_marker,
@@ -252,14 +252,20 @@ fn id_list<'a>(event: &'a RoomEvent, field: &str) -> anyhow::Result<Vec<&'a [u8]
         .collect()
 }
 
-/// The verdict to store for an event: the rejection the import derived, and
-/// nothing the export said about rejection or soft-fail status. Those
-/// are derived from the stored events and server keys, not migrated.
-/// `redacted_by` is a fact about the stored event, so it is kept.
+/// The verdict to store for an event: the rejection the import derived, the
+/// soft-fail the export recorded, and `redacted_by`. Rejection is derived from
+/// the stored events and server keys, not migrated. Soft-fail is kept when the
+/// export marks the event soft-failed, as a historical source fact like
+/// `arrival_ordering`; a derived rejection takes precedence. `redacted_by` is a
+/// fact about the stored event, so it is kept.
 fn verdict_of(metadata: &EventMetadata, forced: Option<u8>) -> Verdict {
     Verdict {
         rejection: forced,
-        soft_fail: None,
+        soft_fail: (forced.is_none() && metadata.soft_failed).then(|| {
+            metadata
+                .soft_fail_code
+                .unwrap_or(SoftFailCode::Imported.to_u8())
+        }),
         arrival_ordering: None,
         redacted_by: metadata
             .redacted_by
@@ -1185,7 +1191,8 @@ impl SignatureAudit {
 /// create event is added to the auth state the rules read. An event the check
 /// cannot judge (an unknown room version, or a PDU rezzy cannot read) is
 /// stored accepted; one with an auth event missing from the export is stored
-/// as a rejected outlier. Soft-fail is not derived and is not stored.
+/// as a rejected outlier. Soft-fail is not derived here; the export's flag is
+/// kept as a historical source fact.
 enum EventAuthOutcome {
     Unchecked,
     Passed,
@@ -2604,7 +2611,7 @@ mod auth_findings_tests {
         let v = verdict_of(&exported, None);
         assert_eq!(v.rejection, None, "exported rejection is not migrated");
         assert!(!v.outlier, "exported outlier is not migrated");
-        assert_eq!(v.soft_fail, None, "exported soft-fail is not migrated");
+        assert_eq!(v.soft_fail, Some(2), "exported soft-fail is kept");
 
         let v_forced = verdict_of(&exported, Some(MISSING_AUTH));
         assert_eq!(
@@ -2614,11 +2621,20 @@ mod auth_findings_tests {
         );
         assert!(v_forced.outlier, "derived rejection is stored as outlier");
         assert_eq!(
-            v_forced.soft_fail,
-            None,
-            "exported soft-fail is not migrated on forced rejection"
+            v_forced.soft_fail, None,
+            "a derived rejection suppresses the exported soft-fail"
         );
         assert!(verdict_of(&EventMetadata::default(), None).is_empty());
+
+        let uncoded = EventMetadata {
+            soft_failed: true,
+            ..EventMetadata::default()
+        };
+        assert_eq!(
+            verdict_of(&uncoded, None).soft_fail,
+            Some(SoftFailCode::Imported.to_u8()),
+            "a soft-fail without a reason is stored as imported"
+        );
     }
 
     fn db() -> (Database, std::path::PathBuf) {

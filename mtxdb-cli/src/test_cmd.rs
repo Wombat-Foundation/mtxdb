@@ -5162,10 +5162,10 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
     finish_import(&db, &run).unwrap();
 
     // The fixture with a creator membership: the export marks `$soft`
-    // soft-failed and `$rejected` rejected, but verdicts are derived, not
-    // migrated, so neither is stored. `$redacted` was redacted by
-    // `$redaction`, which is a fact about the stored event, and `$ok` carries
-    // no verdict.
+    // soft-failed and `$rejected` rejected. Rejection is derived and not
+    // migrated, but the soft-fail is kept as a source fact. `$redacted` was
+    // redacted by `$redaction`, which is a fact about the stored event, and
+    // `$ok` carries no verdict.
     let parsed = parse_room(content.as_bytes()).unwrap();
     assert_eq!(parsed.room_id, FIXTURE_ROOM);
     assert_eq!(parsed.events.len(), 6);
@@ -5237,9 +5237,10 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
             verdict
         })
     };
-    assert!(
-        verdict("soft").is_none(),
-        "an exported soft-fail is not migrated; no verdict record is stored for it"
+    assert_eq!(
+        verdict("soft").unwrap().soft_fail,
+        Some(2),
+        "an exported soft-fail is kept with its reason"
     );
     assert!(
         verdict("rejected").is_none(),
@@ -5255,6 +5256,24 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
     assert!(
         verdict("ok").is_none(),
         "a clean timeline event needs no verdict record"
+    );
+}
+
+#[test]
+fn an_imported_soft_fail_sets_the_soft_failed_flag() {
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let content = room_export_with_auth();
+    let run = import_inputs(&db, &root, &[("room.jsonl", &content)]);
+    assert_eq!((run.failures, run.all_exports), (0, true));
+
+    let flags = RoomFlagIndex::new(FIXTURE_ROOM.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
+        1,
+        "a kept soft-fail is indexed as soft-failed"
     );
 }
 
@@ -5286,7 +5305,11 @@ fn an_exported_outlier_flag_is_not_migrated() {
         .map(|bytes| mtxdb::interop::decode_verdict(&bytes).unwrap().1.outlier)
     };
     assert_eq!(outlier("ok"), None, "an exported outlier is not migrated");
-    assert_eq!(outlier("soft"), None);
+    assert_eq!(
+        outlier("soft"),
+        Some(false),
+        "a soft-failed event has a verdict but is not a derived outlier"
+    );
     assert_eq!(outlier("rejected"), None);
     assert_eq!(
         outlier("redacted"),
@@ -5679,7 +5702,8 @@ fn a_room_import_populates_flag_index() {
         flag_index
             .count(&db, &FlagQuery::has(Flag::SoftFailed))
             .unwrap(),
-        0
+        0,
+        "every non-create event here is a derived rejection, which suppresses soft-fail"
     );
     assert_eq!(
         flag_index
