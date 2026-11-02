@@ -1,5 +1,5 @@
 ---
-name: Native platforms
+name: Platform coverage
 
 on:
   push:
@@ -163,3 +163,24 @@ jobs:
           rustc -vV
           cargo test --locked --target ${{ matrix.target }} --all-features --lib --tests
           cargo test --locked --target ${{ matrix.target }} --no-default-features --features multi-reader,zstd --lib --tests
+
+  arm64-64k:
+    name: Linux ARM64 real 64 KiB kernel (full-system VM)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install VM tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-arm qemu-utils qemu-efi-aarch64 cloud-image-utils
+      - name: Test under a real 64 KiB kernel
+        run: bash .github/scripts/arm64-64k.sh
+      - name: Upload guest console
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-64k-console
+          path: arm64-64k-serial.log
