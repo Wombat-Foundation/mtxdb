@@ -5833,6 +5833,65 @@ fn flag_index_timeline_count_matches_timeline_index() {
 }
 
 #[test]
+fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
+    use crate::interchange::parse_room;
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!legacy:test.conduwuit.local";
+    // Exactly what the exporter wrote before stream orderings: no `timeline`
+    // header, no `stream_ordering` or `arrival_ordering`, and only the
+    // outlier/soft-failed flags. Timeline entries therefore come from the
+    // legacy origin_server_ts fallback.
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","auth_events":[],"prev_events":[],"outlier":false,"soft_failed":false,"rejected":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$live:test","auth_events":[],"prev_events":[],"outlier":false,"soft_failed":false,"rejected":false,"pdu":{{"auth_events":[],"content":{{}},"depth":2,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$soft:test","auth_events":[],"prev_events":[],"outlier":true,"soft_failed":true,"soft_fail_code":1,"rejected":false,"pdu":{{"auth_events":[],"content":{{}},"depth":3,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":3,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    assert!(!export.timeline, "legacy exports carry no timeline contract");
+    assert_eq!(export.events[2].stream_ordering, None);
+    assert_eq!(export.events[2].arrival_ordering, None);
+    let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 3);
+
+    let room_scope = room_scope_id(room_id.as_bytes());
+    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
+    let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
+
+    // Only the two non-outliers make it in; the soft-failed outlier stays out
+    // even though its PDU carries a depth and timestamp.
+    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
+    assert_eq!(streams, vec![1000, 2000]);
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 3);
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 2);
+    let non_timeline = flags
+        .select_shorts(
+            &db,
+            &FlagQuery::and([FlagQuery::has(Flag::Present), FlagQuery::not(Flag::Timeline)]),
+        )
+        .unwrap();
+    assert_eq!(non_timeline.len(), 1, "only the soft-failed event is hidden");
+}
+
+#[test]
 fn stream_and_arrival_order_survive_import() {
     use crate::interchange::parse_room;
     use mtxdb::interop::*;
