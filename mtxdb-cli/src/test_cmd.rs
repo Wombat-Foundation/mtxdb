@@ -5972,6 +5972,37 @@ fn stream_and_arrival_order_survive_import() {
 }
 
 #[test]
+fn negative_arrival_ordering_is_rejected_on_import() {
+    use crate::interchange::parse_room;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!badarrival:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$soft:test","arrival_ordering":-1,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":2,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":2,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    assert_eq!(export.events[1].arrival_ordering, Some(-1));
+    let error = export_import::write_room_with_findings(&db, &export, 64 * 1024)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("arrival_ordering"), "{error}");
+    assert!(error.contains("non-negative"), "{error}");
+}
+
+#[test]
 fn rebuild_fidelity_reproduces_exact_bitmaps_after_wipe() {
     use crate::interchange::parse_room;
     use mtxdb::room_flag::*;

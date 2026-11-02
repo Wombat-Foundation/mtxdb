@@ -248,8 +248,9 @@ pub struct Verdict {
     /// Whether the event is stored as an outlier. This is independent of its
     /// rejection and soft-fail verdicts.
     pub outlier: bool,
-    /// The source's global counter value when it first saw the event, for
-    /// events it kept out of its timeline. Comparable with the signed
+    /// The source's global counter value when it finished soft-failing the
+    /// event, for events it kept out of its timeline. Only soft-failed events
+    /// carry this; rejected events do not. Comparable with the signed
     /// `stream_ordering` of timeline events.
     pub arrival_ordering: Option<u64>,
 }

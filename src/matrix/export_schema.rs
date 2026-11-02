@@ -66,9 +66,10 @@ pub mod field {
     /// events the source put on its timeline, signed like a [`super::PduCount`]
     /// (negative for backfill).
     pub const STREAM_ORDERING: &str = "stream_ordering";
-    /// `event`, optional: when the source first saw the event, for events it
-    /// kept out of its timeline (soft-failed and rejected events). Uses the
-    /// source's global counter, so it is comparable with `stream_ordering`.
+    /// `event`, optional: when the source finished soft-failing the event, for
+    /// events it kept out of its timeline. Only soft-failed events carry this;
+    /// rejected events do not. Uses the source's global counter, so it is
+    /// comparable with `stream_ordering`.
     pub const ARRIVAL_ORDERING: &str = "arrival_ordering";
     /// `event`: ids of the event's `prev_events`.
     pub const PREV_EVENTS: &str = "prev_events";

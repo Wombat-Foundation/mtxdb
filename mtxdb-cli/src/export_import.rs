@@ -1668,7 +1668,13 @@ pub(crate) fn write_room_with_signature_keys(
         // Arrival ordering is a source-recorded fact that cannot be recomputed,
         // like `redacted_by`, so keep it in the verdict record.
         if let Some(arrival) = event.arrival_ordering {
-            verdict.arrival_ordering = u64::try_from(arrival).ok();
+            let arrival = u64::try_from(arrival).map_err(|_| {
+                anyhow!(
+                    "{}: `arrival_ordering` must be a non-negative integer",
+                    event.event_id
+                )
+            })?;
+            verdict.arrival_ordering = Some(arrival);
         }
         // A mismatched content hash means the effective event is its redaction;
         // the export keeps the original bytes.

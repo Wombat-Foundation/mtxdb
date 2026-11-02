@@ -102,8 +102,9 @@ pub(crate) struct RoomEvent {
     pub(crate) pdu_bytes: Bytes,
     /// Caller-supplied stream ordering (negative for backfills).
     pub(crate) stream_ordering: Option<i64>,
-    /// When the source first saw the event, for events it kept out of its
-    /// timeline. Comparable with `stream_ordering`.
+    /// When the source finished soft-failing the event, for events it kept
+    /// out of its timeline. Only soft-failed events carry this. Comparable
+    /// with `stream_ordering`.
     pub(crate) arrival_ordering: Option<i64>,
     /// Caller-supplied topological ordering (depth).
     pub(crate) depth: Option<i64>,
