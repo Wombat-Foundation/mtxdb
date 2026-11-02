@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-15, ubuntu-24.04-arm]
     env:
       # Workflow declares `stable`, but the committed rust-toolchain.toml pin
       # (nightly-2026-08-20) outranks the installed default; RUSTUP_TOOLCHAIN
@@ -44,6 +44,13 @@ jobs:
         with:
           components: clippy
 
+      - name: Record architecture and page size (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          uname -m
+          getconf PAGESIZE
+          rustc -vV
+
       - name: Toolchain versions
         run: |
           rustc --version
@@ -62,9 +69,97 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install vmtouch
 
+      - name: Install vmtouch (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes vmtouch
+
       - name: Run benchmarks
         if: github.event_name == 'push'
         env:
           # read_plan requires disk-backed scratch storage for cold reads.
           MTXDB_BENCH_ROOT: ${{ runner.temp }}/mtxdb-bench
-        run: cargo bench --locked --manifest-path benches/Cargo.toml --benches --all-targets
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo bench --locked --manifest-path benches/Cargo.toml --benches --all-targets 2>&1 | tee bench-output.txt
+
+      - name: Upload platform benchmarks
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-${{ matrix.os }}
+          path: bench-output.txt
+
+  emulated:
+    name: Linux ${{ matrix.arch }} (QEMU userspace)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: ppc64le
+            page_size: 65536
+          - arch: s390x
+            page_size: 4096
+          - arch: armv7
+            page_size: 4096
+          - arch: riscv64
+            page_size: 4096
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # User emulation exercises target endianness and userspace page alignment.
+      # It still uses the host kernel; native 64 KiB kernel testing is separate.
+      - uses: uraimo/run-on-arch-action@v3
+        with:
+          arch: ${{ matrix.arch }}
+          distro: ubuntu24.04
+          env: |
+            RUSTUP_TOOLCHAIN: stable
+            RUSTC_WRAPPER: ""
+            QEMU_PAGESIZE: ${{ matrix.page_size }}
+          install: |
+            apt-get update
+            apt-get install -y build-essential curl ca-certificates pkg-config
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          run: |
+            set -eu
+            export PATH="$HOME/.cargo/bin:$PATH"
+            uname -m
+            getconf PAGESIZE
+            test "$(getconf PAGESIZE)" = "${{ matrix.page_size }}"
+            rustc -vV
+            cargo test --locked --all-features --lib --tests
+            cargo test --locked --no-default-features --features multi-reader,zstd --lib --tests
+
+  linux-abi:
+    name: Linux ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: i686-unknown-linux-gnu
+            packages: gcc-multilib libc6-dev-i386
+          - target: x86_64-unknown-linux-musl
+            packages: musl-tools
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install target compiler and libc
+        run: sudo apt-get update && sudo apt-get install --yes ${{ matrix.packages }}
+      - name: Test target
+        run: |
+          rustc -vV
+          cargo test --locked --target ${{ matrix.target }} --all-features --lib --tests
+          cargo test --locked --target ${{ matrix.target }} --no-default-features --features multi-reader,zstd --lib --tests
