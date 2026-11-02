@@ -5888,7 +5888,10 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
     );
 
     let export = parse_room(jsonl.as_bytes()).unwrap();
-    assert!(!export.timeline, "legacy exports carry no timeline contract");
+    assert!(
+        !export.timeline,
+        "legacy exports carry no timeline contract"
+    );
     assert_eq!(export.events[2].stream_ordering, None);
     assert_eq!(export.events[2].arrival_ordering, None);
     let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
@@ -5905,14 +5908,24 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
     assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 3);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 2);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        2
+    );
     let non_timeline = flags
         .select_shorts(
             &db,
-            &FlagQuery::and([FlagQuery::has(Flag::Present), FlagQuery::not(Flag::Timeline)]),
+            &FlagQuery::and([
+                FlagQuery::has(Flag::Present),
+                FlagQuery::not(Flag::Timeline),
+            ]),
         )
         .unwrap();
-    assert_eq!(non_timeline.len(), 1, "only the soft-failed event is hidden");
+    assert_eq!(
+        non_timeline.len(),
+        1,
+        "only the soft-failed event is hidden"
+    );
 }
 
 #[test]
@@ -5969,19 +5982,25 @@ fn stream_and_arrival_order_survive_import() {
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
     assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 3);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        3
+    );
 
     // Events with Present AND NOT Timeline (kept out of timeline)
     let non_timeline_shorts = flags
         .select_shorts(
             &db,
-            &FlagQuery::and([FlagQuery::has(Flag::Present), FlagQuery::not(Flag::Timeline)]),
+            &FlagQuery::and([
+                FlagQuery::has(Flag::Present),
+                FlagQuery::not(Flag::Timeline),
+            ]),
         )
         .unwrap();
     assert_eq!(non_timeline_shorts.len(), 1);
 
     // The arrival ordering is a source-recorded fact and is kept in the
-    // verdict, without migrating the untrusted soft-fail flag itself.
+    // verdict. This export does not mark the event soft-failed.
     let record = event_record_id(b"$soft:test");
     let bytes = stored(
         &db,
@@ -5992,7 +6011,88 @@ fn stream_and_arrival_order_survive_import() {
     .expect("soft-failed event has a verdict record");
     let (_, verdict) = decode_verdict(&bytes).unwrap();
     assert_eq!(verdict.arrival_ordering, Some(7));
-    assert_eq!(verdict.soft_fail, None, "exported soft-fail stays untrusted");
+    assert_eq!(
+        verdict.soft_fail, None,
+        "this export does not mark it soft-failed"
+    );
+}
+
+#[test]
+fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
+    use crate::interchange::parse_room;
+    use mtxdb::interop::*;
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!importedsoft:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$live:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":3,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$soft:test","depth":4,"arrival_ordering":7,"soft_failed":true,"soft_fail_code":2,"auth_events":["$create:test","$join:test"],"prev_events":["$live:test"],"outlier":true,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":["$live:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let export = parse_room(jsonl.as_bytes()).unwrap();
+    let (written, findings) =
+        export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    assert_eq!(written.events, 4);
+    assert_eq!(findings.rejection_counts.values().sum::<usize>(), 0);
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        3
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
+        1
+    );
+    assert_eq!(
+        flags
+            .select_shorts(&db, &FlagQuery::has(Flag::SoftFailed))
+            .unwrap()
+            .len(),
+        1,
+        "--flag soft-failed selects the imported event"
+    );
+
+    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
+        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+        .unwrap();
+    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
+    assert_eq!(
+        streams,
+        vec![1, 2, 3],
+        "the soft-failed event has no timeline slot"
+    );
+
+    let record = event_record_id(b"$soft:test");
+    let bytes = stored(
+        &db,
+        EVENT_POOL,
+        event_verdict_collection_id(&record),
+        record,
+    )
+    .expect("soft-failed event has a verdict record");
+    let (_, verdict) = decode_verdict(&bytes).unwrap();
+    assert_eq!(verdict.soft_fail, Some(2), "the exported reason survives");
+    assert_eq!(verdict.arrival_ordering, Some(7));
 }
 
 #[test]

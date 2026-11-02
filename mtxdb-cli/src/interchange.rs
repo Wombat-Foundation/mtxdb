@@ -443,8 +443,10 @@ fn parse_event(
     let stream_ordering = optional_signed_number(line, object, field::STREAM_ORDERING)?;
     let arrival_ordering = optional_signed_number(line, object, field::ARRIVAL_ORDERING)?;
     let depth = optional_signed_number(line, object, "depth")?.or_else(|| {
-        pdu.get("depth")
-            .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok())))
+        pdu.get("depth").and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok()))
+        })
     });
     Ok(RoomEvent {
         event_id,

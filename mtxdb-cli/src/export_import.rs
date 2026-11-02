@@ -254,10 +254,11 @@ fn id_list<'a>(event: &'a RoomEvent, field: &str) -> anyhow::Result<Vec<&'a [u8]
 
 /// The verdict to store for an event: the rejection the import derived, the
 /// soft-fail the export recorded, and `redacted_by`. Rejection is derived from
-/// the stored events and server keys, not migrated. Soft-fail is kept when the
-/// export marks the event soft-failed, as a historical source fact like
-/// `arrival_ordering`; a derived rejection takes precedence. `redacted_by` is a
-/// fact about the stored event, so it is kept.
+/// the stored events and server keys, not migrated. Soft-fail is the narrow
+/// exception to that derivation rule: check 6 depends on the state at arrival
+/// time, which the import cannot rebuild, so the export's value is kept as a
+/// historical fact like `arrival_ordering`. A derived rejection still takes
+/// precedence. `redacted_by` is a fact about the stored event, so it is kept.
 fn verdict_of(metadata: &EventMetadata, forced: Option<u8>) -> Verdict {
     Verdict {
         rejection: forced,
@@ -292,18 +293,18 @@ pub(crate) fn timeline_orderings(export: &RoomExport, event: &RoomEvent) -> Opti
     } else {
         // Legacy export fallback without explicit timeline metadata.
         event.stream_ordering.or_else(|| {
-            event
-                .pdu
-                .get("origin_server_ts")
-                .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok())))
+            event.pdu.get("origin_server_ts").and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok()))
+            })
         })
     };
 
     let depth_opt = event.depth.or_else(|| {
-        event
-            .pdu
-            .get("depth")
-            .and_then(|v| v.as_i64().or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok())))
+        event.pdu.get("depth").and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok()))
+        })
     });
 
     match (depth_opt, stream_opt) {
@@ -1658,10 +1659,8 @@ pub(crate) fn write_room_with_signature_keys(
     )?);
 
     let room_scope = mtxdb::timeline::room_scope_id(room);
-    let timeline_index = mtxdb::timeline::TimelineIndex::open(
-        db.pool(EVENT_POOL).as_ref(),
-        &export.room_id,
-    );
+    let timeline_index =
+        mtxdb::timeline::TimelineIndex::open(db.pool(EVENT_POOL).as_ref(), &export.room_id);
     let mut batch_timeline_entries = Vec::new();
 
     for (position, event) in export.events.iter().enumerate() {
@@ -1807,8 +1806,9 @@ fn write_room_flags(
             let Some(node_data) = node_opt else {
                 anyhow::bail!("missing auth forward record for event {}", event.event_id);
             };
-            let (short, _) = decode_auth_forward(&node_data.bytes)
-                .map_err(|e| anyhow::anyhow!("corrupt auth forward record for {}: {e}", event.event_id))?;
+            let (short, _) = decode_auth_forward(&node_data.bytes).map_err(|e| {
+                anyhow::anyhow!("corrupt auth forward record for {}: {e}", event.event_id)
+            })?;
 
             batch_changes.push(FlagChange::set(short, Flag::Present));
 
