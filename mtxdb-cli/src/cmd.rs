@@ -3378,7 +3378,9 @@ fn evict_database_pages(root: &Path) -> anyhow::Result<(usize, u64)> {
 }
 
 fn cmd_timeline(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyhow::Result<()> {
-    run_multi_dir(cli, |sub_cli| cmd_timeline_single(sub_cli, room, limit, reverse))
+    run_multi_dir(cli, |sub_cli| {
+        cmd_timeline_single(sub_cli, room, limit, reverse)
+    })
 }
 
 fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyhow::Result<()> {
@@ -3393,7 +3395,10 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
         println!("No timeline entries found for room {room}");
         return Ok(());
     }
-    println!("{:<6} {:<12} {:<12} {:<34} event_id", "idx", "depth", "stream", "node_id");
+    println!(
+        "{:<6} {:<12} {:<12} {:<34} event_id",
+        "idx", "depth", "stream", "node_id"
+    );
     println!("{}", "-".repeat(90));
     for (idx, entry) in page.entries.iter().enumerate() {
         let node_hex = hex::encode(entry.node_id);
@@ -3481,9 +3486,9 @@ fn cmd_flags_single(
         let flag = parse_flag(name)?;
         if flag == mtxdb::room_flag::Flag::SoftFailed {
             if not {
-                eprintln!("note: 'soft-failed' is empty on imported rooms until derived checks compute it; 'not(soft-failed)' returns every present event");
+                eprintln!("note: 'soft-failed' is not derivable from an import; 'not(soft-failed)' returns every present event");
             } else {
-                eprintln!("note: 'soft-failed' is empty on imported rooms until derived checks compute it");
+                eprintln!("note: 'soft-failed' is not derivable from an import");
             }
         }
         let query = if not {
@@ -3538,7 +3543,12 @@ fn cmd_flags_single(
         let start = std::time::Instant::now();
         let count = index.count(&db, &query)?;
         let elapsed = start.elapsed();
-        println!("{:<14} {:>10} {:>14?}", flag.as_str(), count, elapsed);
+        let note = if flag == mtxdb::room_flag::Flag::SoftFailed && count == 0 {
+            " (not derivable from import)"
+        } else {
+            ""
+        };
+        println!("{:<14} {:>10} {:>14?}{note}", flag.as_str(), count, elapsed);
     }
 
     Ok(())

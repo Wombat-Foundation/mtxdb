@@ -1,13 +1,13 @@
 use super::{
-    build_event_dag, canonical_column_width, cmd_collections, cmd_flags, cmd_get, cmd_import, cmd_import_file,
-    cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats, cmd_sync,
-    cmd_tombstones, collection_canonical_id, compile_import_template, compute_state_groups_partial,
-    decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
-    derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
-    export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
-    format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
-    interleaving_worth_noting, is_server_keys_export, keys_first, listing_shard_types,
-    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
+    build_event_dag, canonical_column_width, cmd_collections, cmd_flags, cmd_get, cmd_import,
+    cmd_import_file, cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats,
+    cmd_sync, cmd_tombstones, collection_canonical_id, compile_import_template,
+    compute_state_groups_partial, decode_event_json_record, decode_hamt_node, decode_hamt_root,
+    default_matrix_import_template, derive_template_key, display_collection_role, event_id,
+    event_room_id, event_short_id, export_envelope_line, extract_pointer_string, finish_import,
+    fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id, glob_pack_files,
+    import_data, import_pdu_events, interleaving_worth_noting, is_server_keys_export, keys_first,
+    listing_shard_types, load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
     matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
     pack_identity, parse_federation_input, parse_pack_id_selector, parse_pack_selectors,
     prepare_state_collection, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
@@ -5629,8 +5629,7 @@ fn a_room_import_populates_timeline_index() {
     assert_eq!(written.events, 5);
 
     let room_scope = room_scope_id(FIXTURE_ROOM.as_bytes());
-    let timeline_index =
-        TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), FIXTURE_ROOM);
+    let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), FIXTURE_ROOM);
     let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
     assert_eq!(page.entries.len(), 5);
 
@@ -5653,31 +5652,45 @@ fn a_room_import_populates_flag_index() {
 
     let flag_index = RoomFlagIndex::new(FIXTURE_ROOM.as_bytes());
     assert_eq!(
-        flag_index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(),
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Present))
+            .unwrap(),
         5
     );
     assert_eq!(
-        flag_index.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Timeline))
+            .unwrap(),
         5
     );
     assert_eq!(
-        flag_index.count(&db, &FlagQuery::has(Flag::Outlier)).unwrap(),
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Outlier))
+            .unwrap(),
         4
     );
     assert_eq!(
-        flag_index.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Rejected))
+            .unwrap(),
         4
     );
     assert_eq!(
-        flag_index.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::SoftFailed))
+            .unwrap(),
         0
     );
     assert_eq!(
-        flag_index.count(&db, &FlagQuery::has(Flag::Redacted)).unwrap(),
+        flag_index
+            .count(&db, &FlagQuery::has(Flag::Redacted))
+            .unwrap(),
         1
     );
 
-    let selected = flag_index.select(&db, &FlagQuery::has(Flag::Present)).unwrap();
+    let selected = flag_index
+        .select(&db, &FlagQuery::has(Flag::Present))
+        .unwrap();
     assert_eq!(selected.len(), 5);
 }
 
@@ -5707,7 +5720,16 @@ fn flags_cli_command_works() {
     };
 
     cmd_flags(&cli, FIXTURE_ROOM, Some("timeline"), false, true, 10, false).unwrap();
-    cmd_flags(&cli, FIXTURE_ROOM, Some("timeline"), false, false, 10, false).unwrap();
+    cmd_flags(
+        &cli,
+        FIXTURE_ROOM,
+        Some("timeline"),
+        false,
+        false,
+        10,
+        false,
+    )
+    .unwrap();
     cmd_flags(&cli, FIXTURE_ROOM, None, false, false, 10, false).unwrap();
     cmd_flags(&cli, FIXTURE_ROOM, None, false, false, 10, true).unwrap();
 }
@@ -5723,27 +5745,43 @@ fn forced_rejection_import_sets_flags_and_not_excludes_it() {
     let room_id = "!rejection_test:test.conduwuit.local";
     let jsonl = format!(
         concat!(
-            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#, "\n",
-            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"10"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$bad:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test","$missing:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test","$missing:test"],"content":{{}},"depth":3,"event_id":"$bad:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
-            r#"{{"events":3,"t":"end"}}"#, "\n"
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"10"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$bad:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test","$missing:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test","$missing:test"],"content":{{}},"depth":3,"event_id":"$bad:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":3,"t":"end"}}"#,
+            "\n"
         ),
         room = room_id
     );
 
     let export = parse_room(jsonl.as_bytes()).unwrap();
-    let (written, findings) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    let (written, findings) =
+        export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
     assert_eq!(written.events, 3);
     assert_eq!(findings.rejection_counts.values().sum::<usize>(), 1);
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
     assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 3);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(), 1);
-    assert_eq!(flags.count(&db, &FlagQuery::not(Flag::Rejected)).unwrap(), 2);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        1
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::not(Flag::Rejected)).unwrap(),
+        2
+    );
 
-    let rejected_shorts = flags.select_shorts(&db, &FlagQuery::has(Flag::Rejected)).unwrap();
-    let non_rejected_shorts = flags.select_shorts(&db, &FlagQuery::not(Flag::Rejected)).unwrap();
+    let rejected_shorts = flags
+        .select_shorts(&db, &FlagQuery::has(Flag::Rejected))
+        .unwrap();
+    let non_rejected_shorts = flags
+        .select_shorts(&db, &FlagQuery::not(Flag::Rejected))
+        .unwrap();
     assert_eq!(rejected_shorts.len(), 1);
     assert_eq!(non_rejected_shorts.len(), 2);
     assert!(!non_rejected_shorts.contains(&rejected_shorts[0]));
@@ -5762,13 +5800,20 @@ fn flag_index_timeline_count_matches_timeline_index() {
     let room_id = "!timeline_match:test.conduwuit.local";
     let jsonl = format!(
         concat!(
-            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#, "\n",
-            r#"{{"event_id":"$backfill:test","depth":10,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":10,"event_id":"$backfill:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$normal:test","depth":10,"stream_ordering":100,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":10,"event_id":"$normal:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$later:test","depth":11,"stream_ordering":101,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":11,"event_id":"$later:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$notimeline:test","depth":12,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":12,"event_id":"$notimeline:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$outlier:test","depth":13,"stream_ordering":200,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":13,"event_id":"$outlier:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":5000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
-            r#"{{"events":5,"t":"end"}}"#, "\n"
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$backfill:test","depth":10,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":10,"event_id":"$backfill:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$normal:test","depth":10,"stream_ordering":100,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":10,"event_id":"$normal:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$later:test","depth":11,"stream_ordering":101,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":11,"event_id":"$later:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$notimeline:test","depth":12,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":12,"event_id":"$notimeline:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$outlier:test","depth":13,"stream_ordering":200,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":13,"event_id":"$outlier:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":5000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":5,"t":"end"}}"#,
+            "\n"
         ),
         room = room_id
     );
@@ -5806,23 +5851,55 @@ fn rebuild_fidelity_reproduces_exact_bitmaps_after_wipe() {
     let soft_failed_before = flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap();
     let redacted_before = flags.count(&db, &FlagQuery::has(Flag::Redacted)).unwrap();
 
-    let shorts_present_before = flags.select_shorts(&db, &FlagQuery::has(Flag::Present)).unwrap();
-    let shorts_timeline_before = flags.select_shorts(&db, &FlagQuery::has(Flag::Timeline)).unwrap();
+    let shorts_present_before = flags
+        .select_shorts(&db, &FlagQuery::has(Flag::Present))
+        .unwrap();
+    let shorts_timeline_before = flags
+        .select_shorts(&db, &FlagQuery::has(Flag::Timeline))
+        .unwrap();
 
     // Run rebuild
     let count = flags.rebuild(&db).unwrap();
     assert_eq!(count, 5);
 
     // Assert exact equality
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), present_before);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), timeline_before);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Outlier)).unwrap(), outlier_before);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(), rejected_before);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(), soft_failed_before);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Redacted)).unwrap(), redacted_before);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(),
+        present_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        timeline_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Outlier)).unwrap(),
+        outlier_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        rejected_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::SoftFailed)).unwrap(),
+        soft_failed_before
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Redacted)).unwrap(),
+        redacted_before
+    );
 
-    assert_eq!(flags.select_shorts(&db, &FlagQuery::has(Flag::Present)).unwrap(), shorts_present_before);
-    assert_eq!(flags.select_shorts(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), shorts_timeline_before);
+    assert_eq!(
+        flags
+            .select_shorts(&db, &FlagQuery::has(Flag::Present))
+            .unwrap(),
+        shorts_present_before
+    );
+    assert_eq!(
+        flags
+            .select_shorts(&db, &FlagQuery::has(Flag::Timeline))
+            .unwrap(),
+        shorts_timeline_before
+    );
 }
 
 #[test]
@@ -5837,13 +5914,20 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     let room_id = "!test_ordering:test.conduwuit.local";
     let jsonl = format!(
         concat!(
-            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#, "\n",
-            r#"{{"event_id":"$backfill:test","depth":10,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":10,"event_id":"$backfill:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$normal:test","depth":10,"stream_ordering":100,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":10,"event_id":"$normal:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$later:test","depth":11,"stream_ordering":101,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":11,"event_id":"$later:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$notimeline:test","depth":12,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":12,"event_id":"$notimeline:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
-            r#"{{"event_id":"$outlier:test","depth":13,"stream_ordering":200,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":13,"event_id":"$outlier:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":5000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#, "\n",
-            r#"{{"events":5,"t":"end"}}"#, "\n"
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$backfill:test","depth":10,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":10,"event_id":"$backfill:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$normal:test","depth":10,"stream_ordering":100,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":10,"event_id":"$normal:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$later:test","depth":11,"stream_ordering":101,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":11,"event_id":"$later:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$notimeline:test","depth":12,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":12,"event_id":"$notimeline:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$outlier:test","depth":13,"stream_ordering":200,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":13,"event_id":"$outlier:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":5000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":5,"t":"end"}}"#,
+            "\n"
         ),
         room = room_id
     );
@@ -5876,7 +5960,8 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     assert_eq!(page.entries[2].stream_ordering, 101);
 
     // Verify re-import idempotence: re-importing the same export does not duplicate entries
-    let (written_again, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
+    let (written_again, _) =
+        export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
     assert_eq!(written_again.events, 5);
     let page_after = timeline_index.page(&room_scope, None, true, 10).unwrap();
     assert_eq!(page_after.entries.len(), 3);

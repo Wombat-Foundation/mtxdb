@@ -23,10 +23,7 @@ use crate::timeline::{room_scope_id, TimelineIndex};
 /// Magic prefix for the flag index metadata record (`b"FLGM"`).
 pub const FLAG_META_MAGIC: [u8; 4] = *b"FLGM";
 /// Wire format version for the flag index metadata record.
-///
-/// Version 2 dropped the per-write `write_count` field. Version 1 records are
-/// still accepted on read so existing databases decode without migration.
-pub const FLAG_META_VERSION: u8 = 2;
+pub const FLAG_META_VERSION: u8 = 1;
 /// Reserved node ID for the flag index metadata record.
 pub const FLAG_META_ID: NodeId = *b"MTXD-FLG-META-v1";
 /// Reserved node ID for the flag generation counter record.
@@ -144,7 +141,7 @@ pub fn flag_chunk_node_id(flag: Flag, chunk_idx: u16) -> NodeId {
     derive_id(b"room:flag:chunk", &key)
 }
 
-fn encode_meta(meta: FlagMeta) -> [u8; 17] {
+pub(crate) fn encode_meta(meta: FlagMeta) -> [u8; 17] {
     let mut out = [0_u8; 17];
     out[0..4].copy_from_slice(&FLAG_META_MAGIC);
     out[4] = FLAG_META_VERSION;
@@ -154,12 +151,7 @@ fn encode_meta(meta: FlagMeta) -> [u8; 17] {
 }
 
 pub(crate) fn decode_meta(bytes: &[u8]) -> Result<FlagMeta, StorageError> {
-    let valid_len = match bytes.get(4) {
-        Some(1) => bytes.len() == 25,
-        Some(2) => bytes.len() == 17,
-        _ => false,
-    };
-    if !valid_len || !bytes.starts_with(&FLAG_META_MAGIC) {
+    if bytes.len() != 17 || !bytes.starts_with(&FLAG_META_MAGIC) || bytes[4] != FLAG_META_VERSION {
         return Err(StorageError::Corrupt(
             "malformed flag meta record".to_owned(),
         ));
@@ -472,17 +464,19 @@ impl RoomFlagIndex {
         let chunk_col = self.chunk_collection(current_meta.generation);
         let max_short_seen = self.stage_into_collection(tx, chunk_col, changes)?;
 
-        let new_meta = FlagMeta {
-            generation: current_meta.generation,
-            max_short_id: current_meta.max_short_id.max(max_short_seen),
-        };
-        let meta_encoded = encode_meta(new_meta);
-        tx.put(
-            self.pool,
-            self.collection,
-            FLAG_META_ID,
-            &NodeData::new(Bytes::from(meta_encoded.to_vec())),
-        )?;
+        if meta_raw.is_none() || max_short_seen > current_meta.max_short_id {
+            let new_meta = FlagMeta {
+                generation: current_meta.generation,
+                max_short_id: current_meta.max_short_id.max(max_short_seen),
+            };
+            let meta_encoded = encode_meta(new_meta);
+            tx.put(
+                self.pool,
+                self.collection,
+                FLAG_META_ID,
+                &NodeData::new(Bytes::from(meta_encoded.to_vec())),
+            )?;
+        }
         if !(meta_raw.is_some() && meta_token == 0) {
             tx.expect_record_version(self.pool, self.collection, FLAG_META_ID, meta_token)?;
         }

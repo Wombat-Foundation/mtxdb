@@ -684,7 +684,7 @@ mod tests {
             .unwrap();
         tx.commit().unwrap();
 
-        // 1. Rebuild starts and reads current metadata token
+        // 1. Snapshot the current metadata and its record version token
         let (_meta_nodes, meta_versions) = db
             .begin_transaction()
             .get_with_record_versions(
@@ -695,23 +695,60 @@ mod tests {
             .unwrap();
         let meta_token = meta_versions.first().copied().unwrap_or(0);
 
-        // 2. While rebuild is building, a concurrent writer updates a flag
+        // 2. A writer updates an existing short ID (1). Since max_short_id does not grow,
+        // it must NOT touch FLAG_META_ID, avoiding writer contention.
+        let tx_writer = db.begin_transaction();
         index
-            .update(&db, &[FlagChange::set(1, Flag::Timeline)])
+            .stage(&tx_writer, &[FlagChange::set(1, Flag::Timeline)])
             .unwrap();
+        tx_writer.commit().unwrap();
 
-        // 3. Rebuild attempts to publish via CAS with the old token; it must fail
-        let publish_tx = db.begin_transaction();
-        let (_meta_nodes, _meta_versions) = publish_tx
+        // Verify FLAG_META_ID record version did NOT change
+        let (_meta_nodes_after, meta_versions_after) = db
+            .begin_transaction()
             .get_with_record_versions(
                 index.pool(),
                 index.collection(),
                 &[crate::room_flag::FLAG_META_ID],
             )
             .unwrap();
+        assert_eq!(
+            meta_versions_after[0], meta_token,
+            "FLAG_META_ID record version must not change when max_short_id does not grow"
+        );
 
-        // If publish proceeded with the stale meta token expectation, commit would fail
+        // 3. A generation swap (rebuild publish) updates FLAG_META_ID
+        let (current_meta, new_gen, publish_meta_token) =
+            index.reserve_rebuild_generation(&db).unwrap();
+        let publish_tx = db.begin_transaction();
+        let new_meta = crate::room_flag::FlagMeta {
+            generation: new_gen,
+            max_short_id: current_meta.max_short_id,
+        };
         publish_tx
+            .put(
+                index.pool(),
+                *index.collection(),
+                crate::room_flag::FLAG_META_ID,
+                &NodeData::new(bytes::Bytes::from(
+                    crate::room_flag::encode_meta(new_meta).to_vec(),
+                )),
+            )
+            .unwrap();
+        publish_tx
+            .expect_record_version(
+                index.pool(),
+                *index.collection(),
+                crate::room_flag::FLAG_META_ID,
+                publish_meta_token,
+            )
+            .unwrap();
+        publish_tx.commit().unwrap();
+
+        // 4. An in-flight writer that prepared with the old meta_token now attempts to commit;
+        // because stage kept expect_record_version on FLAG_META_ID, it must fail with StaleRead
+        let inflight_tx = db.begin_transaction();
+        inflight_tx
             .expect_record_version(
                 index.pool(),
                 *index.collection(),
@@ -719,11 +756,8 @@ mod tests {
                 meta_token,
             )
             .unwrap();
-        let commit_res = publish_tx.commit();
-        assert!(
-            commit_res.is_err(),
-            "publish CAS must fail due to concurrent write"
-        );
+        let commit_res = inflight_tx.commit();
+        assert!(commit_res.is_err());
         assert!(commit_res.unwrap_err().is_stale_read());
     }
 
