@@ -45,6 +45,12 @@ use rezzy::{LeanEvent, StateResVersion};
 use crate::interchange::{EventMetadata, KeyRecord, RoomEvent, RoomExport};
 use crate::state_resolve::lean_event;
 
+/// The auth events selected from the state before one event:
+/// `(event type, state key, event id)`.
+pub(crate) type AuthEntries = Vec<(String, String, String)>;
+/// The auth events selected from the state before each event, by event id.
+pub(crate) type AuthStateBefore = HashMap<String, AuthEntries>;
+
 /// Bytes one batch may stage. Half the engine's per-transaction limit, so the
 /// estimate below can be rough.
 pub(crate) const BATCH_BYTES: usize = 32 << 20;
@@ -344,12 +350,11 @@ pub(crate) struct AuthFindings {
     /// Events with a `prev_events` id that is not in the export. These keep
     /// their verdicts: a gap in history is not an authorization failure.
     pub(crate) missing_prev: Vec<String>,
-    /// Events the source exported as rejected that pass the first auth check,
-    /// by id. Their rejection is kept until the state-before-event check can
-    /// decide whether the export had another reason to reject them.
+    /// Events the source exported as rejected that pass the state-before-event
+    /// auth check, by id. The derived pass wins; the disagreement is reported.
     pub(crate) passes_but_exported_rejected: Vec<String>,
-    /// Events the source exported as accepted that fail the auth check, with
-    /// the rule that refused them.
+    /// Events the source exported as accepted that fail the state-before-event
+    /// auth check, with the rule that refused them.
     pub(crate) fails_but_exported_accepted: Vec<AuthFailure>,
     /// Events whose content hash does not match their contents. They are not
     /// rejected for it: the auth check ran on their redaction instead.
@@ -850,7 +855,7 @@ impl AuthFindings {
             (
                 self.passes_but_exported_rejected.len(),
                 &self.passes_but_exported_rejected,
-                "were exported as rejected but pass the first auth check (stored accepted; the state-before-event check is not run yet)",
+                "were exported as rejected but pass the state-before-event auth check (stored accepted)",
             ),
         ] {
             if count == 0 {
@@ -914,8 +919,8 @@ impl AuthFindings {
                 String::new()
             };
             lines.push(format!(
-                "{} events were exported as accepted but fail the auth check against their auth \
-                 events (stored as rejected), grouped by reason: {}{tail}",
+                "{} events were exported as accepted but fail the state-before-event auth check \
+                 (stored as rejected), grouped by reason: {}{tail}",
                 self.fails_but_exported_accepted.len(),
                 parts.join("; "),
             ));
@@ -1207,12 +1212,43 @@ fn judge_event_auth(
     lean: &[Option<LeanEvent<String>>],
     create: Option<&LeanEvent<String>>,
     version: StateResVersion,
+    base: Option<&AuthEntries>,
 ) -> anyhow::Result<EventAuthOutcome> {
     let Some(subject) = subject else {
         return Ok(EventAuthOutcome::Unchecked);
     };
     let is_create = event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE)
         && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("");
+    if let Some(base) = base {
+        let mut entries: Vec<(&str, &str, &LeanEvent<String>)> = Vec::with_capacity(base.len());
+        for (event_type, state_key, event_id) in base {
+            let Some(&parent_position) = index.get(event_id.as_bytes()) else {
+                return Ok(EventAuthOutcome::Unchecked);
+            };
+            let Some(parent) = lean[parent_position].as_ref() else {
+                return Ok(EventAuthOutcome::Unchecked);
+            };
+            entries.push((event_type.as_str(), state_key.as_str(), parent));
+        }
+        if version.is_v2_1_plus()
+            && !is_create
+            && !entries
+                .iter()
+                .any(|(kind, key, _)| *kind == M_ROOM_CREATE && key.is_empty())
+        {
+            let Some(create) = create else {
+                return Ok(EventAuthOutcome::Unchecked);
+            };
+            entries.push((M_ROOM_CREATE, "", create));
+        }
+        return Ok(match check_auth(subject, &AuthState(entries), version, None) {
+            Ok(()) => EventAuthOutcome::Passed,
+            Err(error) => EventAuthOutcome::Refused {
+                code: RejectionCode::AuthCheckFailed.to_u8(),
+                reason: error.to_string(),
+            },
+        });
+    }
     let mut cited = Vec::new();
     for auth in id_list(event, "auth_events")? {
         match index.get(auth).and_then(|&parent| lean[parent].as_ref()) {
@@ -1308,12 +1344,21 @@ fn judge_events(
     index: &HashMap<&[u8], usize>,
     create: Option<&LeanEvent<String>>,
     version: StateResVersion,
+    auth_before: Option<&AuthStateBefore>,
 ) -> anyhow::Result<AuthJudgement> {
     let mut checked = vec![false; events.len()];
     let mut refused: Vec<Option<u8>> = vec![None; events.len()];
     let mut reasons: Vec<Option<String>> = vec![None; events.len()];
     for (position, event) in events.iter().enumerate() {
-        match judge_event_auth(event, lean[position].as_ref(), index, lean, create, version)? {
+        match judge_event_auth(
+            event,
+            lean[position].as_ref(),
+            index,
+            lean,
+            create,
+            version,
+            auth_before.and_then(|base| base.get(&event.event_id)),
+        )? {
             EventAuthOutcome::Unchecked => {}
             EventAuthOutcome::Passed => checked[position] = true,
             EventAuthOutcome::Refused { code, reason } => {
@@ -1375,9 +1420,9 @@ fn apply_judgement(
                 });
             }
         } else if exported[position] {
-            // Passing the first check does not rule out a state-before-event
-            // rejection, which this pass cannot see yet. The event is stored
-            // accepted; the disagreement is reported.
+            // The event passes auth against the state before it, so the
+            // export's rejection is not reproduced. Store it accepted and
+            // report the disagreement.
             findings
                 .passes_but_exported_rejected
                 .push(event.event_id.clone());
@@ -1509,9 +1554,21 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
     derived_auth_findings_with_keys(export, None)
 }
 
+#[cfg(test)]
 pub(crate) fn derived_auth_findings_with_keys(
     export: &RoomExport,
     keys: Option<&SignatureKeyCatalog>,
+) -> anyhow::Result<AuthFindings> {
+    derived_auth_findings_with_state(export, keys, None)
+}
+
+/// Like [`derived_auth_findings_with_keys`], with the state before each event
+/// supplied for the check-5 auth pass. `None` falls back to the event's own
+/// cited `auth_events`.
+pub(crate) fn derived_auth_findings_with_state(
+    export: &RoomExport,
+    keys: Option<&SignatureKeyCatalog>,
+    auth_before: Option<&AuthStateBefore>,
 ) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let Some(room_version) = create_room_version(events) else {
@@ -1533,7 +1590,7 @@ pub(crate) fn derived_auth_findings_with_keys(
         .iter()
         .map(|event| exported_rejection(&event.metadata))
         .collect();
-    let judgement = judge_events(events, &lean, &index, create, version)?;
+    let judgement = judge_events(events, &lean, &index, create, version, auth_before)?;
 
     // Only a derived refusal seeds the cascade. The exported verdicts are
     // compared below for the report and are never stored.
@@ -1623,7 +1680,7 @@ pub(crate) fn write_room_with_findings(
     export: &RoomExport,
     batch_bytes: usize,
 ) -> anyhow::Result<(ImportCounts, AuthFindings)> {
-    write_room_with_signature_keys(db, export, batch_bytes, None)
+    write_room_with_signature_keys(db, export, batch_bytes, None, None)
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
@@ -1632,8 +1689,9 @@ pub(crate) fn write_room_with_signature_keys(
     export: &RoomExport,
     batch_bytes: usize,
     keys: Option<&SignatureKeyCatalog>,
+    auth_before: Option<&AuthStateBefore>,
 ) -> anyhow::Result<(ImportCounts, AuthFindings)> {
-    let findings = derived_auth_findings_with_keys(export, keys)?;
+    let findings = derived_auth_findings_with_state(export, keys, auth_before)?;
     let plan = closure_plan(export)?;
     let room = export.room_id.as_bytes();
     let event_collection = room_event_collection_id(room);

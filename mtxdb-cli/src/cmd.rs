@@ -25,7 +25,9 @@ use mtxdb::{
     DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion,
     PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
 };
+use rezzy::auth::auth_types_for_event;
 use rezzy::json::{self, Object, Value as OwnedValue};
+use rezzy::StateResVersion;
 
 use crate::export_import;
 use crate::interchange::{self, KeyRecord, RoomExport};
@@ -10261,23 +10263,34 @@ impl ImportContext<'_> {
             );
         }
         validate_establishment_room_version(&events)?;
+        let room_version = events
+            .iter()
+            .find(|event| matrix_create_event_id(event).is_some())
+            .and_then(|event| nested_event_string_field(event, "content", "room_version"))
+            .unwrap_or_default()
+            .to_owned();
+        let (computation, auth_before) = Self::compute_import_auth_before(
+            &events,
+            &export.room_id,
+            &room_version,
+            StateResVersion::from_room_version(&room_version),
+        );
         export_import::clear_marker(self.db)?;
         let (written, findings) = export_import::write_room_with_signature_keys(
             self.db,
             export,
             export_import::BATCH_BYTES,
             signature_keys,
+            Some(&auth_before),
         )?;
         if self.write_state_hamts {
-            let event_collection =
-                mtxdb::interop::room_event_collection_id(export.room_id.as_bytes());
-            let room_version = import_room_version(self.store, &event_collection, &events)?;
             repair_import_state_groups(
                 self.state_store,
                 &events,
                 &[],
                 &export.room_id,
                 &room_version,
+                Some(computation),
             )?;
         }
         eprintln!(
@@ -10306,6 +10319,70 @@ impl ImportContext<'_> {
             rejection_counts: findings.rejection_counts,
             ..ImportOutcome::default()
         })
+    }
+
+    /// Compute the room's state groups once before verdicts are written, and
+    /// capture the auth events selected from the state before each event for
+    /// check 5.
+    fn compute_import_auth_before(
+        events: &[OwnedValue],
+        room_id: &str,
+        room_version: &str,
+        state_version: Option<StateResVersion>,
+    ) -> (PartialStateComputation, export_import::AuthStateBefore) {
+        let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
+        let mut auth_before = export_import::AuthStateBefore::new();
+        let computation = if let Some(state_version) = state_version {
+            compute_state_groups_partial_with(
+                events,
+                &[],
+                StateView::Federated,
+                room_id,
+                policy,
+                |event_id, event, base| {
+                    let Some(event) = event else { return; };
+                    let event_type = event
+                        .get("type")
+                        .and_then(OwnedValue::as_str)
+                        .unwrap_or_default();
+                    let sender = event
+                        .get("sender")
+                        .and_then(OwnedValue::as_str)
+                        .unwrap_or_default();
+                    let state_key = event.get("state_key").and_then(OwnedValue::as_str);
+                    let content = event
+                        .get("content")
+                        .cloned()
+                        .unwrap_or_else(|| OwnedValue::Object(Object::default()));
+                    let entries = auth_types_for_event(
+                        event_type,
+                        sender,
+                        state_key,
+                        &content,
+                        state_version,
+                        room_version,
+                    )
+                    .into_iter()
+                    .filter_map(|(event_type, state_key)| {
+                        base.entries
+                            .get(&(event_type.clone(), state_key.clone()))
+                            .map(|event_id| (event_type, state_key, event_id.clone()))
+                    })
+                    .collect();
+                    auth_before.insert(event_id.to_owned(), entries);
+                },
+            )
+        } else {
+            compute_state_groups_partial_with(
+                events,
+                &[],
+                StateView::Federated,
+                room_id,
+                policy,
+                |_, _, _| {},
+            )
+        };
+        (computation, auth_before)
     }
 
     /// Import one `server_keys` export into the server-info pool, in the
@@ -10672,6 +10749,7 @@ fn import_pdu_events_with_raw(
         auth_chain,
         &resolved.canonical_id,
         &room_version,
+        None,
     )?;
 
     if let Some(room_id) = detected_collection {
@@ -10776,6 +10854,7 @@ fn repair_import_state_groups(
     auth_chain: &[OwnedValue],
     canonical_id: &str,
     room_version: &str,
+    precomputed: Option<PartialStateComputation>,
 ) -> anyhow::Result<()> {
     // Replayed batches still need state-group repair when the derived index is
     // incomplete, but a complete replay should not rebuild the whole DAG.
@@ -10813,13 +10892,17 @@ fn repair_import_state_groups(
                 "warning: room version {room_version} has no state-resolution rules mtxdb recognizes; state merges use the first-parent rule"
             );
         }
-        let state_computation = compute_state_groups_partial_with(
-            events,
-            auth_chain,
-            StateView::Federated,
-            canonical_id,
-            policy,
-        );
+        let state_computation = match precomputed {
+            Some(computation) => computation,
+            None => compute_state_groups_partial_with(
+                events,
+                auth_chain,
+                StateView::Federated,
+                canonical_id,
+                policy,
+                |_, _, _| {},
+            ),
+        };
         let unresolved = state_computation.unresolved;
         publishable = state_computation.incomplete.is_empty();
         warn_incomplete_merges(&state_computation.incomplete);
@@ -11524,6 +11607,7 @@ fn compute_state_groups_partial_in_view(
         view,
         room_id,
         batch_resolution_policy(events),
+        |_, _, _| {},
     )
 }
 
@@ -11544,6 +11628,7 @@ fn compute_state_groups_partial_with(
     view: StateView,
     room_id: &str,
     policy: ResolutionPolicy,
+    on_base: impl FnMut(&str, Option<&OwnedValue>, &StateSet),
 ) -> PartialStateComputation {
     // Borrow the input when there is no auth chain to merge in; cloning every
     // parsed event just to concatenate two slices doubles peak memory on large
@@ -11593,6 +11678,7 @@ fn compute_state_groups_partial_with(
         &events_by_sid,
         view,
         policy,
+        on_base,
     );
 
     PartialStateComputation {
@@ -11603,6 +11689,10 @@ fn compute_state_groups_partial_with(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the walk needs the DAG, the state view, and its base-state observer"
+)]
 fn walk_state_groups(
     room_id: &str,
     frontier: &mtxdb::dag::ActiveRoomFrontier,
@@ -11611,6 +11701,7 @@ fn walk_state_groups(
     events_by_sid: &HashMap<u64, &OwnedValue>,
     view: StateView,
     policy: ResolutionPolicy,
+    mut on_base: impl FnMut(&str, Option<&OwnedValue>, &StateSet),
 ) -> StateGroupWalk {
     let mut remaining_children = count_resident_children(frontier, sorted);
 
@@ -11672,8 +11763,13 @@ fn walk_state_groups(
             ),
         };
 
+        let event_value = events_by_sid.get(&short_id).copied();
+        if let Some(event_id) = reverse_map.get(&short_id) {
+            on_base(event_id, event_value, &base.set);
+        }
+
         let state = derive_state(
-            events_by_sid.get(&short_id).copied(),
+            event_value,
             &base,
             view,
             &parent_instances,

@@ -5088,7 +5088,7 @@ fn room_export_with_auth() -> String {
     const JOIN: &str = "$join:test.conduwuit.local";
 
     let join = format!(
-        r#"{{"auth_events":["{CREATE}"],"event_id":"{JOIN}","outlier":false,"prev_events":[],"pdu":{{"auth_events":["{CREATE}"],"content":{{"membership":"join"}},"depth":1,"event_id":"{JOIN}","origin_server_ts":123456789,"prev_events":[],"room_id":"!export:test.conduwuit.local","sender":"@alice:test.conduwuit.local","state_key":"@alice:test.conduwuit.local","type":"m.room.member"}},"rejected":false,"soft_failed":false,"t":"event"}}"#,
+        r#"{{"auth_events":["{CREATE}"],"event_id":"{JOIN}","outlier":false,"prev_events":["{CREATE}"],"pdu":{{"auth_events":["{CREATE}"],"content":{{"membership":"join"}},"depth":1,"event_id":"{JOIN}","origin_server_ts":123456789,"prev_events":["{CREATE}"],"room_id":"!export:test.conduwuit.local","sender":"@alice:test.conduwuit.local","state_key":"@alice:test.conduwuit.local","type":"m.room.member"}},"rejected":false,"soft_failed":false,"t":"event"}}"#,
     );
 
     let mut lines = Vec::new();
@@ -5104,6 +5104,10 @@ fn room_export_with_auth() -> String {
         }
         let auth = format!("[\"{JOIN}\",\"{CREATE}\"]");
         let line = line.replace("\"auth_events\":[]", &format!("\"auth_events\":{auth}"));
+        let line = line.replace(
+            "\"prev_events\":[]",
+            &format!("\"prev_events\":[\"{JOIN}\"]"),
+        );
         lines.push(line);
     }
     with_valid_content_hashes(&lines.join("\n"))
@@ -5809,6 +5813,49 @@ fn forced_rejection_import_sets_flags_and_not_excludes_it() {
     assert_eq!(rejected_shorts.len(), 1);
     assert_eq!(non_rejected_shorts.len(), 2);
     assert!(!non_rejected_shorts.contains(&rejected_shorts[0]));
+}
+
+#[test]
+fn stale_auth_events_are_rejected_against_state_before() {
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!staleauth:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$leave:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":3,"event_id":"$leave:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$stale:test","depth":4,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test"],"outlier":true,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$stale:test","origin_server_ts":4000,"prev_events":["$leave:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 4)
+    );
+    assert_eq!(run.rejection_counts.values().sum::<usize>(), 1);
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        1,
+        "the event is rejected against the state before it, not its cited auth events"
+    );
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 3);
 }
 
 #[test]
