@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -10882,6 +10882,13 @@ fn import_pdu_events_with_raw(
         events,
         auth_chain,
     )?;
+    record_raw_dependencies_and_waiting(
+        db,
+        template,
+        &resolved.canonical_id,
+        events.iter().chain(auth_chain),
+        &all_events,
+    )?;
 
     let room_events: Vec<RoomEvent> = all_events
         .iter()
@@ -10971,6 +10978,144 @@ fn import_pdu_events_with_raw(
     }
 
     Ok(())
+}
+
+/// Persist raw-import reverse edges and the room's set of currently missing
+/// parent node IDs. This step only records data; dirty-set traversal and
+/// `Unchecked` flag propagation are implemented by later import steps.
+fn record_raw_dependencies_and_waiting<'a>(
+    db: &Database,
+    template: &CollectionTemplate,
+    room_id: &str,
+    supplied_events: impl Iterator<Item = &'a OwnedValue>,
+    all_events: &[OwnedValue],
+) -> anyhow::Result<()> {
+    if !matches!(
+        &template.record_id_rule.policy,
+        FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
+    ) {
+        return Ok(());
+    }
+
+    let present_ids: HashSet<String> = all_events
+        .iter()
+        .filter(|event| event_room_id(event).is_none_or(|room| room == room_id))
+        .filter_map(event_id)
+        .map(str::to_owned)
+        .collect();
+    let mut prev_edges: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    let mut auth_edges: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    let mut arrived_nodes = BTreeSet::new();
+    let mut missing_nodes = BTreeSet::new();
+
+    for event in supplied_events {
+        if event_room_id(event).is_some_and(|room| room != room_id) {
+            continue;
+        }
+        let Some(event_id) = event_id(event) else {
+            continue;
+        };
+        let Some(child_node) = template_node_id(template, event)? else {
+            continue;
+        };
+        arrived_nodes.insert(child_node);
+        let fields = MatrixEventFields::from_event(event_id, event);
+        for (parents, edges) in [(&fields.prev, &mut prev_edges), (&fields.auth, &mut auth_edges)] {
+            for parent_event_id in parents {
+                let Some(parent_node) = raw_event_id_node_id(template, parent_event_id)? else {
+                    continue;
+                };
+                edges.entry(parent_node).or_default().push(child_node);
+                if !present_ids.contains(parent_event_id) {
+                    missing_nodes.insert(parent_node);
+                }
+            }
+        }
+    }
+
+    let edge_store = db.pool(ShardType::Edges);
+    for (kind, parents) in [("prev", prev_edges), ("auth", auth_edges)] {
+        for (parent, mut children) in parents {
+            children.sort_unstable();
+            children.dedup();
+            let collection = raw_reverse_edge_collection_id(kind, &parent);
+            for chunk in children.chunks(MAX_BATCH_EVENTS) {
+                let existing = edge_store.get_many(&collection, chunk)?;
+                let additions: Vec<(NodeId, NodeData)> = chunk
+                    .iter()
+                    .zip(existing)
+                    .filter_map(|(child, existing)| {
+                        existing
+                            .is_none()
+                            .then(|| (*child, NodeData::from_slice(b"RRE1")))
+                    })
+                    .collect();
+                if !additions.is_empty() {
+                    edge_store.put_many(&collection, &additions)?;
+                }
+            }
+        }
+    }
+
+    let waiting_collection = raw_waiting_collection_id(room_id);
+    for arrived in arrived_nodes {
+        // A newly supplied parent no longer belongs to the missing-node set.
+        edge_store.remove(&waiting_collection, &arrived)?;
+    }
+    let missing: Vec<NodeId> = missing_nodes.into_iter().collect();
+    for chunk in missing.chunks(MAX_BATCH_EVENTS) {
+        let existing = edge_store.get_many(&waiting_collection, chunk)?;
+        let additions: Vec<(NodeId, NodeData)> = chunk
+            .iter()
+            .zip(existing)
+            .filter_map(|(parent, existing)| {
+                existing
+                    .is_none()
+                    .then(|| (*parent, NodeData::from_slice(b"RWT1")))
+            })
+            .collect();
+        if !additions.is_empty() {
+            edge_store.put_many(&waiting_collection, &additions)?;
+        }
+    }
+    Ok(())
+}
+
+fn raw_event_id_node_id(
+    template: &CollectionTemplate,
+    event_id: &str,
+) -> anyhow::Result<Option<NodeId>> {
+    let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
+        return Ok(None);
+    };
+    if pointer != "/event_id" {
+        return Ok(None);
+    }
+    let resolve = |requested: &str| {
+        (requested == pointer).then(|| event_id.as_bytes().to_vec())
+    };
+    let input = FrameIdInput {
+        payload: &[],
+        descriptor: &[],
+        canonical: None,
+        resolve: &resolve,
+    };
+    Ok(frame_digest(
+        &template.record_id_rule.policy,
+        template.record_id_rule.digest_algorithm,
+        &input,
+    )
+    .map(|digest| record_logical_id(&digest)))
+}
+
+fn raw_reverse_edge_collection_id(kind: &str, parent: &NodeId) -> [u8; 16] {
+    let canonical = format!("raw-rev-{kind}:{}", format_id(parent));
+    derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_INTL), canonical.as_bytes())
+}
+
+fn raw_waiting_collection_id(room_id: &str) -> [u8; 16] {
+    let canonical = format!("sys:matrix-raw-waiting:v1:{room_id}");
+    derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_INTL), canonical.as_bytes())
 }
 
 /// The sidecar collection holding unredacted auth-relevant fields, keyed by

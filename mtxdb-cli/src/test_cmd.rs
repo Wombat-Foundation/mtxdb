@@ -12,7 +12,9 @@ use super::{
     matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
     overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
     parse_pack_selectors, prepare_state_collection, pretty_print_payload, raw_auth_projection,
-    raw_auth_projection_collection_id, record_matrix_adjacency, redacted_event_bytes,
+    raw_auth_projection_collection_id, raw_event_id_node_id, raw_reverse_edge_collection_id,
+    raw_waiting_collection_id, record_matrix_adjacency, record_raw_dependencies_and_waiting,
+    redacted_event_bytes,
     resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
     template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
     verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags, CollectionOptions,
@@ -2265,6 +2267,91 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
 }
 
 #[test]
+fn raw_import_records_reverse_edges_and_missing_parent_set() {
+    use mtxdb::storage::StorageEngine;
+
+    let root = unique_temp_dir().join("raw_dependencies");
+    let db = Database::open(root).unwrap();
+    let template = default_matrix_import_template();
+    let child = raw_event(
+        FIXTURE_ROOM,
+        "$child",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$missing-prev"]"#,
+        r#"["$known-auth"]"#,
+    );
+    let known_auth = raw_event(
+        FIXTURE_ROOM,
+        "$known-auth",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        "[]",
+        "[]",
+    );
+    let initial_all = vec![child.clone(), known_auth.clone()];
+
+    record_raw_dependencies_and_waiting(
+        &db,
+        &template,
+        FIXTURE_ROOM,
+        [&child].into_iter(),
+        &initial_all,
+    )
+    .unwrap();
+
+    let child_node = raw_event_id_node_id(&template, "$child")
+        .unwrap()
+        .unwrap();
+    let missing_node = raw_event_id_node_id(&template, "$missing-prev")
+        .unwrap()
+        .unwrap();
+    let known_node = raw_event_id_node_id(&template, "$known-auth")
+        .unwrap()
+        .unwrap();
+    let edge_store = db.pool(ShardType::Edges);
+    let prev_collection = raw_reverse_edge_collection_id("prev", &missing_node);
+    let auth_collection = raw_reverse_edge_collection_id("auth", &known_node);
+    let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
+    assert!(edge_store.get(&prev_collection, &child_node).unwrap().is_some());
+    assert!(edge_store.get(&auth_collection, &child_node).unwrap().is_some());
+    assert!(edge_store
+        .get(&waiting_collection, &missing_node)
+        .unwrap()
+        .is_some());
+    assert!(edge_store
+        .get(&waiting_collection, &known_node)
+        .unwrap()
+        .is_none());
+
+    let arrived_parent = raw_event(
+        FIXTURE_ROOM,
+        "$missing-prev",
+        "m.room.message",
+        "",
+        "{}",
+        "[]",
+        "[]",
+    );
+    let after_arrival = vec![child.clone(), known_auth, arrived_parent.clone()];
+    record_raw_dependencies_and_waiting(
+        &db,
+        &template,
+        FIXTURE_ROOM,
+        [&arrived_parent].into_iter(),
+        &after_arrival,
+    )
+    .unwrap();
+    assert!(edge_store
+        .get(&waiting_collection, &missing_node)
+        .unwrap()
+        .is_none());
+    assert!(edge_store.get(&prev_collection, &child_node).unwrap().is_some());
+}
+
+#[test]
 fn raw_import_derives_rejections_and_writes_flags() {
     use mtxdb::room_flag::*;
 
@@ -2472,6 +2559,72 @@ fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
     assert!(
         stale_verdict().is_some(),
         "the earlier event's stored verdict must be updated, not just its state group"
+    );
+}
+
+#[test]
+fn raw_import_records_reverse_edges_and_waiting_parents() {
+    let dir = unique_temp_dir().join("raw_rev_edges");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room3");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let edge_store = db.pool(ShardType::Edges);
+    let [create, join, stale, leave] = raw_late_parent_fixture();
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+
+    let leave_node = raw_event_id_node_id(&template, "$leave").unwrap().unwrap();
+    let stale_node = raw_event_id_node_id(&template, "$stale").unwrap().unwrap();
+    let waiting_coll = raw_waiting_collection_id("!room3");
+    let rev_prev_coll = raw_reverse_edge_collection_id("prev", &leave_node);
+
+    // Import create, join, stale (which cites $leave as prev)
+    import(&[create, join, stale]);
+
+    // 1. $leave is missing, so waiting_coll must contain leave_node
+    assert!(
+        edge_store.get(&waiting_coll, &leave_node).unwrap().is_some(),
+        "missing parent $leave must be recorded in raw_waiting"
+    );
+
+    // 2. Reverse edge leave -> stale must be present in raw-rev-prev
+    assert!(
+        edge_store.get(&rev_prev_coll, &stale_node).unwrap().is_some(),
+        "reverse edge from $leave to $stale must be present"
+    );
+
+    // Import leave
+    import(&[leave]);
+
+    // 3. Now that $leave has arrived, it must be removed from raw_waiting
+    assert!(
+        edge_store.get(&waiting_coll, &leave_node).unwrap().is_none(),
+        "arrived parent $leave must be removed from raw_waiting"
+    );
+
+    // 4. Reverse edge remains durable
+    assert!(
+        edge_store.get(&rev_prev_coll, &stale_node).unwrap().is_some(),
+        "reverse edge remains durable after parent arrives"
     );
 }
 
