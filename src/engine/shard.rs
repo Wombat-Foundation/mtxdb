@@ -744,17 +744,13 @@ pub struct ShardPool {
     /// [`AppendPolicy::Eager`], the historical per-put behavior. [`Self`]
     /// owns it so `put_record`'s flush decision needs no extra indirection.
     append_policy: AppendPolicy,
-    /// Present only for a writable pool — `open_read_only` takes no lock
-    /// at all, since it never writes or truncates anything (that risk
-    /// lives one layer up, in `PackfileStorage`'s collection-index rebuild, not
-    /// here), so there's nothing for a reader to need exclusivity from.
+    /// Present only for a writable pool. The open file descriptor owns the
+    /// exclusive advisory lock; closing it releases the lock. The PID and
+    /// start-time text in the file remains as diagnostic metadata and does
+    /// not itself determine whether the pool is locked.
     ///
-    /// Never read: this is an RAII guard held purely for its `Drop` side
-    /// effect (removing the `.mtxdb.lock` marker file when the pool
-    /// itself drops). Its value is deliberately never inspected — only
-    /// its lifetime matters — so `#[allow(dead_code)]` here is correct,
-    /// not a lint dodge: the field genuinely has no read access by
-    /// design, the same way a `MutexGuard` binding is never "used" either.
+    /// Never read: this field holds the RAII lock guard for its lifetime, so
+    /// `#[allow(dead_code)]` is intentional.
     #[allow(dead_code)]
     writer_lock: Option<WriterLock>,
 }
@@ -1467,27 +1463,21 @@ impl ShardPool {
         self.compress
     }
 
-    /// Claim the writer lock on `base_dir`: atomically create a
-    /// `.mtxdb.lock` marker file, which fails with `AlreadyExists` if
-    /// another writer already holds it. Pure `std::fs` — no OS-level
-    /// advisory-lock API and no dependency, so it needs one thing real
-    /// `flock` gives for free: recovery if the previous holder crashed
-    /// without cleaning up (`WriterLock`'s `Drop` handles the clean-exit
-    /// case). We store our `{pid, starttime}` in the file and, if creation
-    /// fails because it already exists, check whether that exact process
-    /// (not just that PID number) is still alive before concluding the
-    /// lock is genuinely held — a stale file from a killed process is
-    /// removed and retried once rather than wrongly blocking forever. The
-    /// starttime is what makes this safe across PID reuse (see
-    /// `lock_holder_is_dead`) — a bare PID is not enough on its own.
+    /// Claim the writer lock on `base_dir` using an exclusive advisory lock
+    /// on `.mtxdb.lock`. The file's `{pid, starttime}` text is diagnostic;
+    /// the kernel lock, not the marker's existence, determines ownership.
+    /// If the descriptor is inherited by this process's child across `fork`,
+    /// retry briefly while the marker still identifies this process. Standard
+    /// library file descriptors are close-on-exec, so a child that execs drops
+    /// the inherited descriptor at that point. Other-process contention still
+    /// returns immediately.
     fn acquire_writer_lock(base_dir: &Path) -> io::Result<WriterLock> {
         Self::acquire_lock_path(&base_dir.join(".mtxdb.lock"))
     }
 
     /// Acquire the same `{pid, starttime}`-guarded exclusive lock at an
     /// arbitrary path. Shared by the per-pool writer lock (`.mtxdb.lock`) and
-    /// the database-root shared-WAL lock (`.mtxdb.wal.lock`); see
-    /// `acquire_writer_lock`'s doc for the staleness contract.
+    /// the database-root shared-WAL lock (`.mtxdb.wal.lock`).
     pub(crate) fn acquire_lock_path(lock_path: &Path) -> io::Result<WriterLock> {
         // `flock` belongs to the open file description, so a child forked
         // while another thread holds a store lock inherits it until the child
