@@ -10875,6 +10875,9 @@ fn import_pdu_events_with_raw(
             "  warning: {unchecked} event(s) could not be checked against the state before them"
         );
     }
+    for warning in findings.warnings() {
+        eprintln!("  warning: {warning}");
+    }
     let rejected_total: usize = findings.rejection_counts.values().copied().sum();
     if rejected_total > 0 {
         eprintln!("  derived rejections: {rejected_total} events");
