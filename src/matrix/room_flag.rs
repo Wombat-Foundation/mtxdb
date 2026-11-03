@@ -362,62 +362,6 @@ impl RoomFlagIndex {
         self.meta(db).map(|m| m.max_short_id)
     }
 
-    /// Whether one event currently has `flag` set.
-    ///
-    /// Reads only the chunk containing `short_id`. Use this to avoid staging
-    /// a flag rewrite when the desired bit is already in that state.
-    ///
-    /// # Errors
-    /// Returns [`StorageError`] on read error or corrupt index payload.
-    pub fn has_flag(&self, db: &Database, short_id: u32, flag: Flag) -> Result<bool, StorageError> {
-        let meta = self.meta(db)?;
-        if short_id > meta.max_short_id {
-            return Ok(false);
-        }
-        let chunk_col = self.chunk_collection(meta.generation);
-        let chunk_idx = u16::try_from(short_id / CHUNK_CAPACITY)
-            .map_err(|_| StorageError::Corrupt("flag chunk index out of range".to_owned()))?;
-        let chunk = self.get_or_load_chunk(db, &chunk_col, flag, chunk_idx, &mut HashMap::new())?;
-        Ok(chunk.contains(short_id % CHUNK_CAPACITY))
-    }
-
-    /// Read several flags for many short ids, decoding each chunk once.
-    ///
-    /// Returns one bitmask per short id. Bit `i` is set when `flags[i]` is
-    /// present for that short id.
-    ///
-    /// # Errors
-    /// Returns [`StorageError`] on read error or corrupt index payload.
-    pub fn flags_for_shorts(
-        &self,
-        db: &Database,
-        shorts: &[u32],
-        flags: &[Flag],
-    ) -> Result<Vec<u32>, StorageError> {
-        let mut result = vec![0_u32; shorts.len()];
-        let meta = self.meta(db)?;
-        if meta.max_short_id == 0 || shorts.is_empty() {
-            return Ok(result);
-        }
-        let chunk_col = self.chunk_collection(meta.generation);
-        let mut cache: HashMap<(Flag, u16), BitmapSet> = HashMap::new();
-        for (position, &short_id) in shorts.iter().enumerate() {
-            if short_id > meta.max_short_id {
-                continue;
-            }
-            let chunk_idx = u16::try_from(short_id / CHUNK_CAPACITY)
-                .map_err(|_| StorageError::Corrupt("flag chunk index out of range".to_owned()))?;
-            let offset = short_id % CHUNK_CAPACITY;
-            for (bit, &flag) in flags.iter().enumerate() {
-                let chunk = self.get_or_load_chunk(db, &chunk_col, flag, chunk_idx, &mut cache)?;
-                if chunk.contains(offset) {
-                    result[position] |= 1_u32 << bit;
-                }
-            }
-        }
-        Ok(result)
-    }
-
     /// Stage a batch of flag changes directly into a specified chunk collection.
     ///
     /// Returns the maximum short ID encountered in `changes`.

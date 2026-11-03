@@ -7,10 +7,13 @@ mod tests {
     use crate::interop::{
         auth_counter_record_id, auth_reverse_record_id, decode_verdict, encode_auth_counter,
         encode_verdict, event_record_id, event_verdict_collection_id, room_auth_collection_id,
-        room_event_collection_id, Verdict,
+        room_event_collection_id, room_flag_collection_id, Verdict,
     };
     use crate::layout::ShardType;
-    use crate::room_flag::{Flag, FlagChange, FlagQuery, RoomFlagIndex, CHUNK_CAPACITY};
+    use crate::room_flag::{
+        flag_chunk_node_id, Flag, FlagChange, FlagQuery, RoomFlagIndex, CHUNK_CAPACITY,
+        FLAG_META_ID,
+    };
     use crate::storage::{NodeData, StorageEngine};
 
     struct TestRoot(PathBuf);
@@ -64,6 +67,70 @@ mod tests {
     }
 
     #[test]
+    fn no_op_stage_writes_no_records() {
+        let root = test_root("no_op_stage");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
+        let room_id = b"!no_op_stage:example.com";
+        let index = RoomFlagIndex::new(room_id);
+        let change = [
+            FlagChange::set(1, Flag::Present),
+            FlagChange::set(1, Flag::Rejected),
+        ];
+        let tx = db.begin_transaction();
+        index.stage(&tx, &change).unwrap();
+        tx.commit().unwrap();
+
+        let meta = index.meta(&db).unwrap();
+        let flag_col = room_flag_collection_id(room_id);
+        let chunk_col = index.chunk_collection(meta.generation);
+        let read = db.begin_transaction();
+        let (_, meta_before) = read
+            .get_with_record_versions(ShardType::EventDag, &flag_col, &[FLAG_META_ID])
+            .unwrap();
+        let (_, chunks_before) = read
+            .get_with_record_versions(
+                ShardType::EventDag,
+                &chunk_col,
+                &[
+                    flag_chunk_node_id(Flag::Present, 0),
+                    flag_chunk_node_id(Flag::Rejected, 0),
+                ],
+            )
+            .unwrap();
+        drop(read);
+
+        let tx = db.begin_transaction();
+        index.stage(&tx, &change).unwrap();
+        tx.commit().unwrap();
+        let tx = db.begin_transaction();
+        index
+            .stage(&tx, &[FlagChange::clear(999, Flag::Rejected)])
+            .unwrap();
+        tx.commit().unwrap();
+
+        let read = db.begin_transaction();
+        let (_, meta_after) = read
+            .get_with_record_versions(ShardType::EventDag, &flag_col, &[FLAG_META_ID])
+            .unwrap();
+        let (_, chunks_after) = read
+            .get_with_record_versions(
+                ShardType::EventDag,
+                &chunk_col,
+                &[
+                    flag_chunk_node_id(Flag::Present, 0),
+                    flag_chunk_node_id(Flag::Rejected, 0),
+                ],
+            )
+            .unwrap();
+        drop(read);
+        assert_eq!(meta_after, meta_before, "no-op stage rewrote flag metadata");
+        assert_eq!(
+            chunks_after, chunks_before,
+            "no-op stage rewrote flag chunks"
+        );
+    }
+
+    #[test]
     fn single_chunk_counts_and_queries() {
         let root = test_root("single_chunk");
         let db = Database::open(root.path().to_path_buf()).unwrap();
@@ -88,27 +155,6 @@ mod tests {
 
         index.stage(&tx, &changes).unwrap();
         tx.commit().unwrap();
-
-        assert!(index.has_flag(&db, 2, Flag::SoftFailed).unwrap());
-        assert!(index.has_flag(&db, 3, Flag::Rejected).unwrap());
-        assert!(index.has_flag(&db, 4, Flag::Rejected).unwrap());
-        assert!(!index.has_flag(&db, 1, Flag::SoftFailed).unwrap());
-        assert!(!index.has_flag(&db, 6, Flag::Present).unwrap());
-        assert_eq!(
-            index
-                .flags_for_shorts(
-                    &db,
-                    &[1, 2, 3, 4, 5],
-                    &[
-                        Flag::Present,
-                        Flag::SoftFailed,
-                        Flag::Rejected,
-                        Flag::Outlier
-                    ]
-                )
-                .unwrap(),
-            vec![1, 3, 5, 7, 9]
-        );
 
         // Counts
         assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 5);

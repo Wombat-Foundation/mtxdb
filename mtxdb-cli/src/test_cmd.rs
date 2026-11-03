@@ -11,13 +11,13 @@ use super::{
     load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
     matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
     pack_identity, parse_federation_input, parse_pack_id_selector, parse_pack_selectors,
-    prepare_state_collection, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
-    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
-    template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
-    verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, ScanOptions, SharedState,
-    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
-    STATE_GROUP_NAMESPACE,
+    prepare_state_collection, pretty_print_payload, raw_auth_projection, record_matrix_adjacency,
+    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+    split_canonical_display, template_collection_id, template_node_id, topological_event_order,
+    valid_state_group_id, verify_auth_chain_edges, CollectionFlags, CollectionOptions,
+    CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity,
+    ScanOptions, SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -57,6 +57,54 @@ fn raw_event(
     owned_value(&format!(
         r#"{{"event_id":"{id}","sender":"@alice:test","room_id":"{room}","type":"{kind}","state_key":"{state_key}","content":{content},"prev_events":{prev},"auth_events":{auth}}}"#
     ))
+}
+
+fn raw_v10_invite_fixture() -> [OwnedValue; 6] {
+    [
+        raw_event(
+            "!room5",
+            "$create",
+            "m.room.create",
+            "",
+            r#"{"room_version":"10"}"#,
+            "[]",
+            "[]",
+        ),
+        raw_event(
+            "!room5",
+            "$join_alice",
+            "m.room.member",
+            "@alice:test",
+            r#"{"membership":"join"}"#,
+            r#"["$create"]"#,
+            r#"["$create"]"#,
+        ),
+        raw_event(
+            "!room5",
+            "$pl",
+            "m.room.power_levels",
+            "",
+            r#"{"users":{"@alice:test":100},"invite":50}"#,
+            r#"["$join_alice"]"#,
+            r#"["$create","$join_alice"]"#,
+        ),
+        raw_event(
+            "!room5",
+            "$rules",
+            "m.room.join_rules",
+            "",
+            r#"{"join_rule":"public"}"#,
+            r#"["$pl"]"#,
+            r#"["$create","$join_alice","$pl"]"#,
+        ),
+        owned_value(
+            r#"{"event_id":"$join_bob","sender":"@bob:test","room_id":"!room5","type":"m.room.member","state_key":"@bob:test","content":{"membership":"join"},"prev_events":["$rules"],"auth_events":["$create","$pl","$rules"]}"#,
+        ),
+        // Bob is level 0 and the room's invite level is 50.
+        owned_value(
+            r#"{"event_id":"$invite","sender":"@bob:test","room_id":"!room5","type":"m.room.member","state_key":"@carol:test","content":{"membership":"invite"},"prev_events":["$join_bob"],"auth_events":["$create","$pl","$join_bob"]}"#,
+        ),
+    ]
 }
 
 /// A string field of a JSON object, or `None` if the key is absent or not
@@ -2374,6 +2422,103 @@ fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
         stale_verdict().is_some(),
         "the earlier event's stored verdict must be updated, not just its state group"
     );
+}
+
+#[test]
+fn raw_import_keeps_pre_v11_power_level_rejection_across_files() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_v10_invite");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room5");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let [create, join_alice, power_levels, join_rules, join_bob, invite] = raw_v10_invite_fixture();
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[
+        create,
+        join_alice,
+        power_levels,
+        join_rules,
+        join_bob,
+        invite,
+    ]);
+
+    let flags = RoomFlagIndex::new(b"!room5");
+    let rejected = FlagQuery::has(Flag::Rejected);
+    assert_eq!(flags.count(&db, &rejected).unwrap(), 1);
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$invite".to_vec()]
+    );
+
+    let live = raw_event(
+        "!room5",
+        "$live",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$join_bob"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    import(&[live]);
+
+    assert_eq!(
+        flags.count(&db, &rejected).unwrap(),
+        1,
+        "a later file must not clear the pre-v11 invite rejection"
+    );
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$invite".to_vec()],
+        "the rejected invite must still be selectable"
+    );
+}
+
+#[test]
+fn raw_auth_projection_keeps_v8_restricted_join_fields() {
+    let member = owned_value(
+        r#"{"event_id":"$join","sender":"@bob:test","room_id":"!room","type":"m.room.member","state_key":"@bob:test","content":{"membership":"join","join_authorised_via_users_server":"@alice:test"},"prev_events":[],"auth_events":[]}"#,
+    );
+    assert_eq!(
+        raw_auth_projection(&member, "8")
+            .unwrap()
+            .get("join_authorised_via_users_server")
+            .and_then(OwnedValue::as_str),
+        Some("@alice:test")
+    );
+    assert!(raw_auth_projection(&member, "10")
+        .and_then(|projection| projection.get("join_authorised_via_users_server").cloned())
+        .is_none());
+
+    let rules = owned_value(
+        r#"{"event_id":"$rules","sender":"@alice:test","room_id":"!room","type":"m.room.join_rules","state_key":"","content":{"join_rule":"restricted","allow":[{"type":"m.room.member","room_id":"!other","state_key":"@alice:test"}]},"prev_events":[],"auth_events":[]}"#,
+    );
+    assert!(raw_auth_projection(&rules, "8")
+        .unwrap()
+        .get("allow")
+        .is_some());
+    assert!(raw_auth_projection(&rules, "9").is_none());
+    assert!(raw_auth_projection(&member, "11").is_none());
 }
 
 #[test]

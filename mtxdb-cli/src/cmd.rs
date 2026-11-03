@@ -10764,7 +10764,7 @@ fn import_pdu_events_with_raw(
     // Existing records are part of the state the new batch inherits. Reading
     // them back is the simplest way to let check 5 run across separate files:
     // the walk sees the whole room, not just this file.
-    let prior = load_collection_events(store, &collection_id)?;
+    let prior = load_collection_events(store, &collection_id, &resolved.canonical_id)?;
     let mut stored_ids: HashSet<String> = prior
         .iter()
         .filter_map(event_id)
@@ -10860,6 +10860,14 @@ fn import_pdu_events_with_raw(
         store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
+    write_raw_auth_projections(
+        store,
+        &resolved.canonical_id,
+        template,
+        &room_version,
+        events,
+        auth_chain,
+    )?;
 
     let room_events: Vec<RoomEvent> = all_events
         .iter()
@@ -10902,7 +10910,7 @@ fn import_pdu_events_with_raw(
     if rejected_total > 0 {
         eprintln!("  derived rejections: {rejected_total} events");
     }
-    write_raw_verdicts_and_flags(
+    let (changed_earlier, changed_earlier_rejected) = write_raw_verdicts_and_flags(
         db,
         &synthetic.events,
         &findings.forced,
@@ -10911,6 +10919,11 @@ fn import_pdu_events_with_raw(
         template,
         &resolved.canonical_id,
     )?;
+    if changed_earlier > 0 {
+        eprintln!(
+            "  updated earlier verdicts: {changed_earlier} events ({changed_earlier_rejected} rejected)"
+        );
+    }
 
     repair_import_state_groups(
         state_store,
@@ -10945,21 +10958,139 @@ fn import_pdu_events_with_raw(
     Ok(())
 }
 
+/// The sidecar collection holding unredacted auth-relevant fields, keyed by
+/// event node id.
+fn raw_auth_projection_collection_id(room_id: &str) -> [u8; 16] {
+    derive_collection_id(
+        Some(mtxdb::MEMBER_NAMESPACE_INTL),
+        format!("raw-auth-projection:{room_id}").as_bytes(),
+    )
+}
+
+/// Fields redaction drops before room v11 but the auth rules still read.
+fn raw_auth_projection(event: &OwnedValue, room_version: &str) -> Option<OwnedValue> {
+    let major = room_version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())?;
+    if major >= 11 || event.get("state_key").is_none() {
+        return None;
+    }
+    let kind = event.get("type")?.as_str()?;
+    let OwnedValue::Object(content) = event.get("content")? else {
+        return None;
+    };
+    let mut projected = Object::new();
+    let fields: &[&str] = match kind {
+        // Redaction kept only creator before v11, so keep the whole create
+        // content, including m.federate.
+        "m.room.create" | "m.room.third_party_invite" => {
+            for (key, value) in content {
+                projected.insert(key.clone(), value.clone());
+            }
+            return (!projected.is_empty()).then_some(OwnedValue::Object(projected));
+        }
+        "m.room.power_levels" => &["invite"],
+        "m.room.member" if major == 8 => {
+            &["third_party_invite", "join_authorised_via_users_server"]
+        }
+        "m.room.member" => &["third_party_invite"],
+        // Restricted joins first exist in v8, and redaction preserves allow
+        // from v9 on, so only v8 needs this projection.
+        "m.room.join_rules" if major == 8 => &["allow"],
+        _ => return None,
+    };
+    for key in fields {
+        if let Some(value) = content.get(*key) {
+            projected.insert((*key).to_owned(), value.clone());
+        }
+    }
+    (!projected.is_empty()).then_some(OwnedValue::Object(projected))
+}
+
+fn write_raw_auth_projections(
+    store: &PackfileStorage,
+    room_id: &str,
+    template: &CollectionTemplate,
+    room_version: &str,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    let mut records = Vec::new();
+    for event in events.iter().chain(auth_chain) {
+        let Some(projection) = raw_auth_projection(event, room_version) else {
+            continue;
+        };
+        let Some(node) = template_node_id(template, event)? else {
+            continue;
+        };
+        if !seen.insert(node) {
+            continue;
+        }
+        records.push((node, NodeData::new(projection.encode().into_bytes().into())));
+    }
+    if records.is_empty() {
+        return Ok(());
+    }
+    let collection = raw_auth_projection_collection_id(room_id);
+    let metadata = CollectionMetadata {
+        member_namespace: Some(mtxdb::MEMBER_NAMESPACE_INTL),
+        collection_canonical_id: format!("raw-auth-projection:{room_id}").into_bytes(),
+        record_id_rule: template.record_id_rule.clone(),
+        payload: template.payload.clone(),
+        extension: None,
+        role: Some("raw-auth-projection".to_owned()),
+        schema: Some("matrix.event.auth-projection.v1".to_owned()),
+    };
+    store
+        .create_or_put_established(&collection, &metadata, &records)
+        .context("storing raw auth projections")?;
+    Ok(())
+}
+
+fn overlay_auth_projection(event: &mut OwnedValue, projection: OwnedValue) {
+    let OwnedValue::Object(fields) = event else {
+        return;
+    };
+    let OwnedValue::Object(projected) = projection else {
+        return;
+    };
+    if !matches!(fields.get("content"), Some(OwnedValue::Object(_))) {
+        fields.insert("content".to_owned(), OwnedValue::Object(Object::new()));
+    }
+    let Some(OwnedValue::Object(content)) = fields.get_mut("content") else {
+        return;
+    };
+    for (key, value) in projected {
+        content.insert(key, value);
+    }
+}
+
 /// Read back the events already in a raw-import collection, so a later file
-/// can be judged against the state its earlier files produced.
+/// can be judged against the state its earlier files produced. The redacted
+/// record is overlaid with the auth projection written at first import.
 fn load_collection_events(
     store: &PackfileStorage,
     collection_id: &[u8; 16],
+    room_id: &str,
 ) -> anyhow::Result<Vec<OwnedValue>> {
+    let projections = raw_auth_projection_collection_id(room_id);
     let mut events = Vec::new();
     for record in store.scan_collection(collection_id)? {
-        let (_, data) = record?;
-        let Ok(value) = OwnedValue::parse_bytes(&data.bytes) else {
+        let (node, data) = record?;
+        let Ok(mut value) = OwnedValue::parse_bytes(&data.bytes) else {
             continue;
         };
-        if event_id(&value).is_some() {
-            events.push(value);
+        if event_id(&value).is_none() {
+            continue;
         }
+        if let Some(projection) = store.get(&projections, &node)? {
+            if let Ok(projection) = OwnedValue::parse_bytes(&projection.bytes) {
+                overlay_auth_projection(&mut value, projection);
+            }
+        }
+        events.push(value);
     }
     Ok(events)
 }
@@ -10988,12 +11119,12 @@ fn write_raw_verdicts_and_flags(
     current_ids: &HashSet<String>,
     template: &CollectionTemplate,
     canonical_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(usize, usize)> {
     if !matches!(
         &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
     ) {
-        return Ok(());
+        return Ok((0, 0));
     }
     let forced_by_id: HashMap<&str, Option<u8>> = all_events
         .iter()
@@ -11001,6 +11132,8 @@ fn write_raw_verdicts_and_flags(
         .map(|(event, code)| (event.event_id.as_str(), *code))
         .collect();
 
+    let mut changed_earlier = 0_usize;
+    let mut changed_earlier_rejected = 0_usize;
     let mut by_room: BTreeMap<String, Vec<RawFlagRow>> = BTreeMap::new();
     for event in all_events {
         if !stored_ids.contains(&event.event_id) {
@@ -11050,14 +11183,7 @@ fn write_raw_verdicts_and_flags(
         ensure_raw_auth_collection(db, &room, template)?;
         let mut short_ids =
             export_import::ClosureWriter::new(db, &room, room_auth_collection_id(room.as_bytes()))?;
-        let flags = [
-            Flag::Present,
-            Flag::Rejected,
-            Flag::Outlier,
-            Flag::SoftFailed,
-        ];
-        let mut resolved = Vec::with_capacity(rows.len());
-        let mut short_values = Vec::with_capacity(rows.len());
+        let mut changes = Vec::with_capacity(rows.len().saturating_mul(4));
         let tx = db.begin_transaction();
         for (event_id, node, verdict, write_verdict) in rows {
             let (short, _) = short_ids.short_for(&tx, event_id.as_bytes())?;
@@ -11065,6 +11191,12 @@ fn write_raw_verdicts_and_flags(
             // Only overwrite when the derived verdict changed; empty records
             // for unchanged events would grow the store on every reimport.
             if write_verdict {
+                if !current_ids.contains(&event_id) {
+                    changed_earlier = changed_earlier.saturating_add(1);
+                    if verdict.rejection.is_some() {
+                        changed_earlier_rejected = changed_earlier_rejected.saturating_add(1);
+                    }
+                }
                 tx.put(
                     ShardType::EventDag,
                     event_verdict_collection_id(&node),
@@ -11072,33 +11204,26 @@ fn write_raw_verdicts_and_flags(
                     &NodeData::new(encode_verdict(event_id.as_bytes(), &verdict)?.into()),
                 )?;
             }
-            short_values.push(short);
-            resolved.push((verdict, short));
-        }
-        let existing = flag_index.flags_for_shorts(db, &short_values, &flags)?;
-        let mut changes = Vec::with_capacity(resolved.len().saturating_mul(4));
-        for (position, (verdict, short)) in resolved.into_iter().enumerate() {
-            let wanted = [
-                true,
-                verdict.rejection.is_some(),
-                verdict.outlier,
-                verdict.soft_fail.is_some(),
-            ];
-            for (bit, &flag) in flags.iter().enumerate() {
-                let current = existing[position] & (1_u32 << bit) != 0;
-                if current != wanted[bit] {
-                    changes.push(if wanted[bit] {
-                        FlagChange::set(short, flag)
-                    } else {
-                        FlagChange::clear(short, flag)
-                    });
-                }
+
+            for (flag, wanted) in [
+                (Flag::Present, true),
+                (Flag::Rejected, verdict.rejection.is_some()),
+                (Flag::Outlier, verdict.outlier),
+                (Flag::SoftFailed, verdict.soft_fail.is_some()),
+            ] {
+                changes.push(if wanted {
+                    FlagChange::set(short, flag)
+                } else {
+                    FlagChange::clear(short, flag)
+                });
             }
         }
+        // `stage` compares each touched chunk before writing; a reimport thus
+        // stages no chunk or metadata writes even though it builds this list.
         flag_index.stage(&tx, &changes)?;
         short_ids.commit(&tx)?;
     }
-    Ok(())
+    Ok((changed_earlier, changed_earlier_rejected))
 }
 
 /// The raw path writes room short ids into the server-layout auth collection
