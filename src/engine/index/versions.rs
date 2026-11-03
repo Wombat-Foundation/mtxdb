@@ -69,8 +69,9 @@ pub struct VersionsSnapshot {
 /// Atomically write `versions`, sorted by collection id, with `covered_lsn`.
 ///
 /// The write is temp-file + `sync_data` + rename, followed by a directory
-/// sync so the rename itself is durable. On any failure the temporary file is
-/// removed and the previous file is left untouched.
+/// sync so the rename itself is durable. Failures before rename leave the
+/// previous file untouched; a directory-sync failure is reported after the
+/// new file has been published.
 ///
 /// # Errors
 /// Returns an I/O error if the temporary file cannot be created, written,
@@ -116,7 +117,10 @@ pub fn write_versions(
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
     }
-    fs::rename(&tmp_path, path)?;
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
     if let Some(dir) = path.parent() {
         crate::shard::sync_directory(dir)?;
     }
@@ -136,14 +140,7 @@ pub fn read_versions(path: &Path) -> Option<VersionsSnapshot> {
 #[must_use]
 pub fn read_coverage(path: &Path) -> Option<u64> {
     let bytes = fs::read(path).ok()?;
-    let magic = bytes.get(..8)?;
-    if magic == MAGIC_V2 {
-        return Some(u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?));
-    }
-    if magic == MAGIC_V1 {
-        return Some(0);
-    }
-    None
+    decode_versions(&bytes).map(|snapshot| snapshot.covered_lsn)
 }
 
 fn decode_versions(bytes: &[u8]) -> Option<VersionsSnapshot> {

@@ -1174,6 +1174,23 @@ impl LossyIndex {
         counts
     }
 
+    /// Count entries by slot, excluding a precomputed set of slot ids.
+    #[must_use]
+    pub fn slot_counts_excluding_set(
+        &self,
+        excluded: &std::collections::HashSet<u16>,
+    ) -> std::collections::HashMap<u16, u64> {
+        let mut counts = std::collections::HashMap::new();
+        for index in 0..self.capacity as usize {
+            let entry = IndexEntry(self.entry_at(index));
+            if !entry.is_empty() && !excluded.contains(&entry.slot()) {
+                let count = counts.entry(entry.slot()).or_insert(0_u64);
+                *count = count.saturating_add(1);
+            }
+        }
+        counts
+    }
+
     /// Whether this collection's index currently has any live entry pointing
     /// into `slot`. Short-circuits on the first match — unlike
     /// `referenced_slot_ids`, which always builds a full `MAX_SHARDS`

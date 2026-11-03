@@ -238,6 +238,22 @@ mod tests {
     }
 
     #[test]
+    fn import_view_uses_derived_rejections_and_soft_fail_disposition() {
+        let rejected = value(r#"{"rejected":true,"type":"m.room.name"}"#);
+        let exporter_only = value(r#"{"rejected":true,"type":"m.room.name"}"#);
+        let soft_failed = value(r#"{"soft_failed":true,"type":"m.room.name"}"#);
+        let rejected_ids = HashSet::from(["$derived".to_owned()]);
+        let none = HashSet::new();
+
+        for view in [StateView::Federated, StateView::Client] {
+            assert!(view.excludes_import(&rejected, "$derived", &rejected_ids));
+            assert!(!view.excludes_import(&exporter_only, "$exporter-only", &none));
+        }
+        assert!(!StateView::Federated.excludes_import(&soft_failed, "$soft", &none));
+        assert!(StateView::Client.excludes_import(&soft_failed, "$soft", &none));
+    }
+
+    #[test]
     fn room_versions_map_to_their_spec_resolver() {
         assert_eq!(
             resolution_policy("1", StateGroupTrust::TrustedImport).rezzy_version,

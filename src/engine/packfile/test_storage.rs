@@ -12059,13 +12059,14 @@ fn sealing_a_pack_writes_a_sidecar_and_open_skips_recovery() {
         .unwrap()
         .collections
         .get(&TEST_COLLECTION)
-        .map(|collection| collection.disk_bytes);
+        .expect("test collection is present in physical layout")
+        .disk_bytes;
     assert_eq!(
         PackfileStorage::collection_disk_bytes_from_disk(&dir)
             .unwrap()
             .get(&TEST_COLLECTION)
             .copied(),
-        expected_disk_bytes,
+        Some(expected_disk_bytes),
         "reopened sidecar accounting matches physical pack bytes"
     );
     let rebuilt = reopened.rebuild_index(&TEST_COLLECTION).unwrap();
@@ -12118,7 +12119,7 @@ fn resident_checkpoint_open_releases_unconsumed_sealed_sidecars() {
 }
 
 #[test]
-fn full_scan_registers_sealed_locators_per_collection() {
+fn full_scan_registers_sealed_locators_for_collection() {
     let dir = test_dir("packidx_sealed_locators");
     let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
     let mut ids = Vec::new();

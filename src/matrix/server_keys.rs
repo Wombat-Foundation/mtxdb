@@ -548,6 +548,7 @@ pub fn set_verified_observations(
                         key.first_seen_ms = 0;
                         key.last_active_ms = 0;
                         key.corroborated = false;
+                        key.inferred_retired = false;
                     }
                     put_server_key(&tx, origin, &key)?;
                     changed = changed.saturating_add(1);

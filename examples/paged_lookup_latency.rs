@@ -167,19 +167,23 @@ fn measure(
 
 fn main() {
     let rounds = env_usize("MTXDB_LOOKUP_ROUNDS", 5);
+    assert!(rounds > 0, "MTXDB_LOOKUP_ROUNDS must be positive");
     let shard_bytes = shard_bytes();
-    let root = std::env::var_os("MTXDB_LOOKUP_ROOT").map_or_else(
+    let (root, owned_root) = std::env::var_os("MTXDB_LOOKUP_ROOT").map_or_else(
         || {
-            std::env::temp_dir().join(format!(
-                "mtxdb-paged-lookup-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ))
+            (
+                std::env::temp_dir().join(format!(
+                    "mtxdb-paged-lookup-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                )),
+                true,
+            )
         },
-        PathBuf::from,
+        |path| (PathBuf::from(path), false),
     );
     std::fs::create_dir_all(&root).expect("create benchmark root");
 
@@ -217,5 +221,7 @@ fn main() {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(&root);
+    if owned_root {
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

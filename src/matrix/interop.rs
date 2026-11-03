@@ -141,7 +141,9 @@ pub const DATA_FORMAT: u8 = 2;
 
 /// Stable domain tags for the importer's immutable room-version record.
 pub const ROOM_VERSION_DOMAIN: &[u8] = b"matrix-room-version-v1";
-/// Stable collection domain for immutable room-version records.
+/// Stable node-id domain for immutable room-version records. Its historical
+/// bytes match neither the collection domain nor the node value; changing them
+/// would change the stored node id, so preserve this tag as part of the format.
 pub const ROOM_VERSION_COLLECTION_DOMAIN: &[u8] = b"matrix-room-version-record-v1";
 /// Stable node identifier for immutable room-version records.
 pub const ROOM_VERSION_NODE: &[u8] = b"room-version";
@@ -229,7 +231,7 @@ pub fn derive_id(domain: &[u8], identifier: &[u8]) -> [u8; 16] {
 pub const VERDICT_BUCKETS: u32 = 256;
 
 /// Version byte of the verdict value encoding.
-pub const VERDICT_VERSION: u8 = 1;
+pub const VERDICT_VERSION: u8 = 2;
 const HAS_REJECTION: u8 = 1;
 const HAS_SOFT_FAIL: u8 = 1 << 1;
 const HAS_REDACTION: u8 = 1 << 2;
@@ -249,8 +251,8 @@ pub struct Verdict {
     /// rejection and soft-fail verdicts.
     pub outlier: bool,
     /// The source's global counter value when it finished soft-failing the
-    /// event, for events it kept out of its timeline. Only soft-failed events
-    /// carry this; rejected events do not. Comparable with the signed
+    /// event, for outliers kept out of its timeline. Soft-failed events and
+    /// non-soft-failed outliers can carry this. Comparable with the signed
     /// `stream_ordering` of timeline events.
     pub arrival_ordering: Option<u64>,
 }
@@ -351,7 +353,7 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(&[u8], Verdict), StorageError> {
     };
 
     let (&version, rest) = bytes.split_first().ok_or_else(malformed)?;
-    if version != VERDICT_VERSION {
+    if version != 1 && version != VERDICT_VERSION {
         return Err(StorageError::Corrupt(
             "unknown event verdict version".to_owned(),
         ));

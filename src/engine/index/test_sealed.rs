@@ -61,7 +61,11 @@ impl SealedIndex for FakeIndex {
 fn pack(seq: u64, slot: u16, index: FakeIndex) -> SealedPack {
     SealedPack {
         slot,
-        pack_id: PackId([u8::try_from(seq).unwrap_or(0); 16]),
+        pack_id: {
+            let mut bytes = [0; 16];
+            bytes[..8].copy_from_slice(&seq.to_le_bytes());
+            PackId(bytes)
+        },
         creation_seq: seq,
         index: Arc::new(index),
     }

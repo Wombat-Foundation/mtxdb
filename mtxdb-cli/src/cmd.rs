@@ -6620,11 +6620,11 @@ fn prepare_state_collection(
         .is_none()
         && state_store.collection_exists(collection_id)
     {
-        eprintln!(
-            "warning: resetting state collection {} without genesis metadata",
+        anyhow::ensure!(
+            state_store.collection_len(collection_id)?.unwrap_or(0) == 0,
+            "state collection {} has records but no genesis metadata; refusing to reset records that may be referenced by imported state roots",
             format_id(collection_id)
         );
-        state_store.delete_collection(collection_id)?;
     }
     state_store
         .ensure_collection_metadata(collection_id, metadata)
@@ -7991,6 +7991,15 @@ type LiveScanRow = (
     reason = "the live scan resolves locations, reads rows, and renders each output mode in one pass"
 )]
 fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow::Result<()> {
+    let (collection_id, rows, total_live) = cmd_scan_collection_live_rows(cli, selector, opts)?;
+    render_live_scan_rows(collection_id, &rows, total_live, cli, opts)
+}
+
+fn cmd_scan_collection_live_rows(
+    cli: &Cli,
+    selector: &str,
+    opts: &ScanOptions,
+) -> anyhow::Result<([u8; 16], Vec<LiveScanRow>, usize)> {
     let collection_id = parse_collection_selector(selector)?;
     let store = open_store_read_only(cli)?;
     let Some(locations) = store.collection_live_locations(&collection_id) else {
@@ -8000,7 +8009,6 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
             other_shard_type_hint(cli, &collection_id)
         );
     };
-    let shard_type = cli.require_shard_type()?;
     let pool =
         ShardPool::open_read_only(selected_pool_dir(cli)?).context("failed to open shard store")?;
     let shards = pool.all_shards();
@@ -8041,8 +8049,6 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
     }
     let total_live = records.len();
     let max_rows = opts.max_rows();
-    let bounded = max_rows != usize::MAX;
-
     // The live index stores only `(slot, offset)`. A plain scan needs the
     // fixed frame identity to print each node ID, but it need not touch the
     // payload or checksum. Read whole records only for output modes that use
@@ -8092,6 +8098,19 @@ fn cmd_scan_collection_live(cli: &Cli, selector: &str, opts: &ScanOptions) -> an
         }
     }
 
+    Ok((collection_id, rows, total_live))
+}
+
+fn render_live_scan_rows(
+    collection_id: [u8; 16],
+    rows: &[LiveScanRow],
+    total_live: usize,
+    cli: &Cli,
+    opts: &ScanOptions,
+) -> anyhow::Result<()> {
+    let shard_type = cli.require_shard_type()?;
+    let max_rows = opts.max_rows();
+    let bounded = max_rows != usize::MAX;
     if opts.raw {
         let stdout = io::stdout();
         let mut out = stdout.lock();
@@ -8616,18 +8635,10 @@ fn cmd_import(
             signature_audit_path.display()
         );
     }
-    let signature_late_path = layout.root().join("signature-late.jsonl");
-    if let Err(error) = write_signature_audit(&signature_late_path, &run.signature_late) {
-        eprintln!("writing {}: {error:#}", signature_late_path.display());
-        run.failures = run.failures.saturating_add(1);
-        run.all_exports = false;
-    } else {
-        eprintln!(
-            "signature late: {} events verified after their key's cached valid_until_ts; details in {}",
-            run.signature_late.len(),
-            signature_late_path.display()
-        );
-    }
+    eprintln!(
+        "signature late: {} events verified after their key's cached valid_until_ts",
+        run.signature_verified_late
+    );
     let rejected_total = run
         .rejection_counts
         .values()
@@ -8692,9 +8703,6 @@ struct ImportRun {
     imported_key_bindings: HashSet<export_import::KeyBinding>,
     /// Verified time ranges observed across this run's room files.
     verified_keys: HashMap<export_import::KeyBinding, (u64, u64)>,
-    /// Events that verified after their key's cached deadline, written as a
-    /// separate JSONL sidecar.
-    signature_late: Vec<export_import::SignatureAudit>,
     /// Derived rejections by stored rejection code, across the run.
     rejection_counts: std::collections::BTreeMap<u8, usize>,
     /// Events with no usable in-window key for their signer.
@@ -8718,7 +8726,6 @@ fn absorb_outcome(run: &mut ImportRun, outcome: ImportOutcome) {
     }
     run.hash_audit.extend(outcome.hash_audit);
     run.signature_audit.extend(outcome.signature_audit);
-    run.signature_late.extend(outcome.signature_late);
     for (code, count) in outcome.rejection_counts {
         let total = run.rejection_counts.entry(code).or_insert(0);
         *total = total.saturating_add(count);
@@ -8802,7 +8809,7 @@ fn input_export_format(path: &Path) -> Option<interchange::InputFormat> {
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line) {
+        match reader.by_ref().take(64 * 1024).read_until(b'\n', &mut line) {
             Ok(0) | Err(_) => return None,
             Ok(_) if line.iter().all(u8::is_ascii_whitespace) => {}
             Ok(_) => return interchange::detect(&line),
@@ -8879,7 +8886,6 @@ fn import_data(
         signature_no_material: 0,
         signature_invalid: 0,
         signature_verified_late: 0,
-        signature_late: Vec::new(),
         rejection_counts: std::collections::BTreeMap::new(),
     };
     let mut key_state_checked = false;
@@ -9955,7 +9961,6 @@ struct ImportOutcome {
     /// Verified key observations found in this input's room export.
     verified_keys: Vec<export_import::VerifiedKeyObservation>,
     /// Events that verified after their key's cached deadline.
-    signature_late: Vec<export_import::SignatureAudit>,
     /// Derived rejections by stored rejection code, from this input.
     rejection_counts: std::collections::BTreeMap<u8, usize>,
     /// Events with no usable in-window key for their signer.
@@ -10326,7 +10331,6 @@ impl ImportContext<'_> {
             signature_no_material: findings.signature_no_material,
             signature_invalid: findings.signature_failures.len(),
             signature_verified_late: findings.signature_verified_late,
-            signature_late: findings.signature_late,
             rejection_counts: findings.rejection_counts,
             ..ImportOutcome::default()
         })
@@ -11861,7 +11865,15 @@ fn walk_state_groups(
         let claimed_prev_ids: HashSet<&str> = event_value
             .and_then(|ev| ev.get("prev_events"))
             .and_then(OwnedValue::as_array)
-            .map(|arr| arr.iter().filter_map(OwnedValue::as_str).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|entry| match entry {
+                        OwnedValue::String(id) => Some(id.as_str()),
+                        OwnedValue::Array(fields) => fields.first().and_then(OwnedValue::as_str),
+                        _ => None,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         let mut parent_ids: Vec<u64> = Vec::new();
         let mut parents: Vec<Arc<SharedState>> = Vec::new();

@@ -266,7 +266,7 @@ fn id_list<'a>(event: &'a RoomEvent, field: &str) -> anyhow::Result<Vec<&'a [u8]
 fn verdict_of(metadata: &EventMetadata, forced: Option<u8>) -> Verdict {
     Verdict {
         rejection: forced,
-        soft_fail: (forced.is_none() && metadata.soft_failed).then(|| {
+        soft_fail: (forced.is_none() && metadata.soft_failed == Some(true)).then(|| {
             metadata
                 .soft_fail_code
                 .unwrap_or(SoftFailCode::Imported.to_u8())
@@ -324,7 +324,7 @@ pub(crate) fn timeline_orderings(
 }
 
 fn exported_rejection(metadata: &EventMetadata) -> bool {
-    metadata.rejected || metadata.rejection_code.is_some()
+    metadata.rejected == Some(true) || metadata.rejection_code.is_some()
 }
 
 /// The room's id and the hex ids of its event, auth and prev collections, as
@@ -364,6 +364,11 @@ pub(crate) struct AuthFindings {
     /// The redacted PDU to store for each event, by position in the export,
     /// when its content hash does not match. The export keeps the original.
     redacted_pdus: Vec<Option<Vec<u8>>>,
+    /// Events with a computed content-hash mismatch whose canonical redaction
+    /// could not be produced; imports containing them fail closed.
+    redactions_failed: HashSet<String>,
+    /// Whether any rejected/soft-failed annotation was present on each event.
+    verdict_present: Vec<bool>,
     /// One audit record per hash-mismatched event.
     pub(crate) hash_audit: Vec<HashAudit>,
     /// Key bindings corroborated by successfully verified historical events.
@@ -381,8 +386,6 @@ pub(crate) struct AuthFindings {
     /// `valid_until_ts`. That value is a refresh deadline, not the key's
     /// lifetime, so these are accepted but do not corroborate the key.
     pub(crate) signature_verified_late: usize,
-    /// One record per event that verified late against an unretired key.
-    pub(crate) signature_late: Vec<SignatureAudit>,
     /// Derived rejections by stored rejection code.
     pub(crate) rejection_counts: BTreeMap<u8, usize>,
 }
@@ -526,12 +529,24 @@ impl SignatureKeyCatalog {
         if let SignatureOutcome::Invalid(reason) = authoriser_outcome {
             return SignatureOutcome::Invalid(format!("authoriser {authoriser_server}: {reason}"));
         }
-        if matches!(&origin_outcome, SignatureOutcome::VerifiedLate)
-            || matches!(&authoriser_outcome, SignatureOutcome::VerifiedLate)
-        {
-            SignatureOutcome::VerifiedLate
+        let mut bindings = Vec::new();
+        let mut late = false;
+        for outcome in [origin_outcome, authoriser_outcome] {
+            match outcome {
+                SignatureOutcome::Verified(binding) => bindings.extend(binding),
+                SignatureOutcome::VerifiedLate(binding) => {
+                    bindings.extend(binding);
+                    late = true;
+                }
+                SignatureOutcome::NoKey
+                | SignatureOutcome::NoMaterial
+                | SignatureOutcome::Invalid(_) => unreachable!(),
+            }
+        }
+        if late {
+            SignatureOutcome::VerifiedLate(bindings)
         } else {
-            origin_outcome
+            SignatureOutcome::Verified(bindings)
         }
     }
 
@@ -609,13 +624,14 @@ impl SignatureKeyCatalog {
                 &verifier,
             ) {
                 Ok(()) => {
+                    let binding = KeyBinding {
+                        origin: record.origin.as_bytes().to_vec(),
+                        key_id: record.key.key_id.clone(),
+                    };
                     return if *late {
-                        SignatureOutcome::VerifiedLate
+                        SignatureOutcome::VerifiedLate(vec![binding])
                     } else {
-                        SignatureOutcome::Verified(KeyBinding {
-                            origin: record.origin.as_bytes().to_vec(),
-                            key_id: record.key.key_id.clone(),
-                        })
+                        SignatureOutcome::Verified(vec![binding])
                     };
                 }
                 Err(error) if *reject_failure => rejectable_failure = Some(error),
@@ -686,6 +702,9 @@ impl SignatureKeyCatalog {
                     return format!("{key_id}: not in key store");
                 };
                 let key = &record.key;
+                if timestamp.is_none() {
+                    return format!("{key_id}: missing origin_server_ts");
+                }
                 if key.key.is_empty() {
                     return format!("{key_id}: no key bytes");
                 }
@@ -751,9 +770,9 @@ impl SignatureVerifier for OneKeyVerifier<'_> {
 enum SignatureOutcome {
     NoKey,
     NoMaterial,
-    Verified(KeyBinding),
+    Verified(Vec<KeyBinding>),
     /// Verified against an unretired key after its cached `valid_until_ts`.
-    VerifiedLate,
+    VerifiedLate(Vec<KeyBinding>),
     Invalid(String),
 }
 
@@ -904,6 +923,9 @@ impl AuthFindings {
             let mut parts = Vec::new();
             for (reason, ids) in groups {
                 let take = id_limit.saturating_sub(shown).min(ids.len());
+                if take == 0 {
+                    continue;
+                }
                 let listed = ids
                     .iter()
                     .take(take)
@@ -1068,7 +1090,7 @@ pub(crate) fn apply_walk_rejections(
         findings.forced[position] = Some(*code);
         if *code == RejectionCode::DependsOnRejectedAuthEvent.to_u8() {
             findings.cascaded.push(event_id.clone());
-        } else if !exported[position] {
+        } else if !exported[position] && findings.verdict_present[position] {
             findings.fails_but_exported_accepted.push(AuthFailure {
                 event_id: event_id.clone(),
                 reason: reason.clone(),
@@ -1119,9 +1141,9 @@ fn create_room_version(events: &[RoomEvent]) -> Option<&str> {
 /// The event's redaction when its content hash does not match its contents.
 ///
 /// The spec redacts such an event before the auth rules run; it is not
-/// rejected for the mismatch. `None` when the hash matches, and when the hash
-/// cannot be judged: no `hashes.sha256`, a hash that cannot be computed, or a
-/// redaction that cannot be produced. Those events are checked as they are.
+/// rejected for the mismatch. `None` when the hash matches, or cannot be
+/// judged because it is absent or cannot be computed. A detected mismatch is
+/// retained even if canonical redaction fails, in which case import fails closed.
 fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<HashMismatch> {
     let expected = pdu
         .get("hashes")
@@ -1133,8 +1155,26 @@ fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<HashMismatc
     if computed == expected {
         return None;
     }
-    let redacted = rezzy::try_canonical_redacted_json(pdu, room_version).ok()?;
-    let value = OwnedValue::parse_bytes(redacted.as_bytes()).ok()?;
+    let Some((redacted, value)) = rezzy::try_canonical_redacted_json(pdu, room_version)
+        .ok()
+        .and_then(|redacted| {
+            OwnedValue::parse_bytes(redacted.as_bytes())
+                .ok()
+                .map(|value| (redacted, value))
+        })
+    else {
+        // Preserve the detected mismatch for reporting even if this PDU
+        // cannot be canonically redacted. The original remains the only
+        // storable representation, and the audit marks that fact.
+        return Some(HashMismatch {
+            value: pdu.clone(),
+            bytes: Vec::new(),
+            stored: expected.to_owned(),
+            computed,
+            content_matches_redaction: false,
+            redaction_failed: true,
+        });
+    };
     // Record whether canonical redaction leaves the PDU's content unchanged.
     let content_matches_redaction = pdu.get("content") == value.get("content");
     Some(HashMismatch {
@@ -1143,6 +1183,7 @@ fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<HashMismatc
         stored: expected.to_owned(),
         computed,
         content_matches_redaction,
+        redaction_failed: false,
     })
 }
 
@@ -1154,6 +1195,7 @@ struct HashMismatch {
     computed: String,
     /// Whether canonical redaction left the PDU's content unchanged.
     content_matches_redaction: bool,
+    redaction_failed: bool,
 }
 
 /// Audit record for one hash-mismatched event, written to a JSONL sidecar.
@@ -1165,6 +1207,7 @@ pub(crate) struct HashAudit {
     pub(crate) stored: String,
     pub(crate) computed: String,
     pub(crate) content_matches_redaction: bool,
+    pub(crate) redaction_failed: bool,
     /// Signature check result when signing keys were available for this import.
     pub(crate) signature_status: Option<&'static str>,
 }
@@ -1181,6 +1224,7 @@ impl HashAudit {
                 "content_matches_redaction",
                 self.content_matches_redaction.to_string(),
             ),
+            ("redaction_failed", self.redaction_failed.to_string()),
             ("room_version", crate::cmd::json_string(&self.room_version)),
             (
                 "signature_status",
@@ -1227,36 +1271,14 @@ impl SignatureAudit {
     }
 }
 
-/// [`auth_findings`] with the rejections derived from the events, not read
-/// from the export.
-///
-/// Each event is checked with rezzy's auth rules against the state its own
-/// `auth_events` describe (the spec's first check). The exported verdicts are
-/// not an input and are never stored: they are stripped before the event is
-/// built, and are compared with the result only to report disagreements.
-///
-/// An event that passes is stored accepted even if the export rejected it,
-/// because the state-before-event check (the spec's second check) and the
-/// signature checks are not run here yet. Those rejections will appear once
-/// they are.
-///
-/// An event whose content hash does not match is checked in its redacted form
-/// and listed in `hash_mismatched`; a bad hash never rejects on its own.
-///
-/// A v12+ event's `auth_events` no longer cite `m.room.create`, so the room's
-/// create event is added to the auth state the rules read. An event the check
-/// cannot judge (an unknown room version, or a PDU rezzy cannot read) is
-/// stored accepted; one with an auth event missing from the export is stored
-/// as a rejected outlier. Soft-fail is not derived here; the export's flag is
-/// kept as a historical source fact.
+/// Outcome of one event's authorization check.
 pub(crate) enum EventAuthOutcome {
     Unchecked,
     Passed,
     Refused { code: u8, reason: String },
 }
 
-/// Judge an event against both its own `auth_events` (check 4) and the state
-/// before it (check 5). Check 4 runs first.
+/// Judge an event against its auth events and the state before it.
 pub(crate) fn judge_event_with_state(
     event: &RoomEvent,
     subject: Option<&LeanEvent<String>>,
@@ -1462,6 +1484,7 @@ fn audit_hash_mismatches(
                 stored: m.stored.clone(),
                 computed: m.computed.clone(),
                 content_matches_redaction: m.content_matches_redaction,
+                redaction_failed: m.redaction_failed,
                 signature_status: None,
             })
         })
@@ -1481,7 +1504,7 @@ fn apply_judgement(
         if let Some(code) = judgement.refused[position] {
             // The seed kept the cascade from assigning a code.
             findings.forced[position] = Some(code);
-            if !exported[position] {
+            if !exported[position] && findings.verdict_present[position] {
                 findings.fails_but_exported_accepted.push(AuthFailure {
                     event_id: event.event_id.clone(),
                     reason: judgement.reason[position]
@@ -1543,7 +1566,7 @@ fn apply_signature_outcomes(
             SignatureOutcome::NoKey => "no_usable_key",
             SignatureOutcome::NoMaterial => "no_signature_material",
             SignatureOutcome::Verified(_) => "verified",
-            SignatureOutcome::VerifiedLate => "verified_late",
+            SignatureOutcome::VerifiedLate(_) => "verified_late",
             SignatureOutcome::Invalid(_) => "invalid",
         };
         if let Some(&audit_position) = audit_positions.get(&events[position].event_id) {
@@ -1568,9 +1591,7 @@ fn apply_signature_outcomes(
                 outcome: status,
                 detail,
             };
-            if matches!(outcome, SignatureOutcome::VerifiedLate) {
-                findings.signature_late.push(row);
-            } else {
+            if !matches!(outcome, SignatureOutcome::VerifiedLate(_)) {
                 findings.signature_audit.push(row);
             }
         }
@@ -1579,24 +1600,28 @@ fn apply_signature_outcomes(
         match outcome {
             SignatureOutcome::NoKey => no_key = no_key.saturating_add(1),
             SignatureOutcome::NoMaterial => no_material = no_material.saturating_add(1),
-            SignatureOutcome::VerifiedLate => verified_late = verified_late.saturating_add(1),
-            SignatureOutcome::Verified(binding) => {
+            SignatureOutcome::VerifiedLate(_) => verified_late = verified_late.saturating_add(1),
+            SignatureOutcome::Verified(bindings) => {
                 let timestamp = events[position]
                     .pdu
                     .get("origin_server_ts")
                     .and_then(OwnedValue::as_u64)
                     .expect("verified signatures require origin_server_ts");
-                verified
-                    .entry(binding)
-                    .and_modify(|(first, last)| {
-                        *first = (*first).min(timestamp);
-                        *last = (*last).max(timestamp);
-                    })
-                    .or_insert((timestamp, timestamp));
+                for binding in bindings {
+                    verified
+                        .entry(binding)
+                        .and_modify(|(first, last)| {
+                            *first = (*first).min(timestamp);
+                            *last = (*last).max(timestamp);
+                        })
+                        .or_insert((timestamp, timestamp));
+                }
             }
             SignatureOutcome::Invalid(reason) => {
-                findings.forced[position] =
-                    Some(RejectionCode::SignatureVerificationFailed.to_u8());
+                if findings.forced[position].is_none() {
+                    findings.forced[position] =
+                        Some(RejectionCode::SignatureVerificationFailed.to_u8());
+                }
                 findings.signature_failures.push(AuthFailure {
                     event_id: events[position].event_id.clone(),
                     reason,
@@ -1624,6 +1649,10 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
     derived_auth_findings_with_keys(export, None)
 }
 
+/// Derive authorization findings from event contents and graph relationships.
+/// Exported verdict annotations are used only to report disagreements.
+/// Check 4 evaluates each event's auth events before check 5 evaluates the
+/// state before it.
 pub(crate) fn derived_auth_findings_with_keys(
     export: &RoomExport,
     keys: Option<&SignatureKeyCatalog>,
@@ -1680,6 +1709,16 @@ pub(crate) fn derived_auth_findings_with_keys(
         .map(|(event, _)| event.event_id.clone())
         .collect();
     findings.hash_audit = audit_hash_mismatches(events, &redacted, &export.room_id, room_version);
+    findings.redactions_failed = events
+        .iter()
+        .zip(&redacted)
+        .filter(|(_, mismatch)| {
+            mismatch
+                .as_ref()
+                .is_some_and(|mismatch| mismatch.redaction_failed)
+        })
+        .map(|(event, _)| event.event_id.clone())
+        .collect();
     findings.redacted_pdus = redacted
         .into_iter()
         .map(|redacted| redacted.map(|m| m.bytes))
@@ -1816,6 +1855,12 @@ pub(crate) fn write_room_with_resolved_findings(
         }
         // A mismatched content hash means the effective event is its redaction;
         // the export keeps the original bytes.
+        if findings.redactions_failed.contains(&event.event_id) {
+            bail!(
+                "{}: content hash mismatched but canonical redaction failed",
+                event.event_id
+            );
+        }
         let stored: &[u8] = findings
             .redacted_pdus
             .get(position)
@@ -1946,7 +1991,7 @@ fn write_room_flags(
 
             let forced = findings.forced.get(position).copied().flatten();
             let verdict = verdict_of(&event.metadata, forced);
-            if verdict.outlier || event.metadata.outlier {
+            if verdict.outlier {
                 batch_changes.push(FlagChange::set(short, Flag::Outlier));
             }
             if verdict.soft_fail.is_some() {
@@ -2365,7 +2410,7 @@ mod auth_findings_tests {
     #[test]
     fn an_exported_rejection_is_not_read_and_does_not_cascade() {
         let mut rejected = event("$bad", "m.room.message", &["$create"], &["$create"]);
-        rejected.metadata.rejected = true;
+        rejected.metadata.rejected = Some(true);
         rejected.metadata.rejection_code = Some(7);
         let findings = auth_findings(&export(vec![
             event("$create", "m.room.create", &[], &[]),
@@ -2485,7 +2530,7 @@ mod auth_findings_tests {
     #[test]
     fn an_exported_rejection_that_passes_the_first_check_is_reported_not_stored() {
         let mut rejected = message(&["$create", "$join"]);
-        rejected.metadata.rejected = true;
+        rejected.metadata.rejected = Some(true);
         rejected.metadata.rejection_code = Some(7);
         let findings = derived_auth_findings(&export(vec![
             event("$create", "m.room.create", &[], &[]),
@@ -2544,7 +2589,7 @@ mod auth_findings_tests {
     fn writing_does_not_store_an_exported_rejection() {
         let (db, dir) = db();
         let mut rejected = message(&["$create", "$join"]);
-        rejected.metadata.rejected = true;
+        rejected.metadata.rejected = Some(true);
         rejected.metadata.rejection_code = Some(7);
         let room = export(vec![
             event("$create", "m.room.create", &[], &[]),
@@ -2563,7 +2608,7 @@ mod auth_findings_tests {
         // this accepted-by-the-check event is judged and its exported
         // rejection is reported as a disagreement.
         let mut rejected = message(&["$join"]);
-        rejected.metadata.rejected = true;
+        rejected.metadata.rejected = Some(true);
         rejected.metadata.rejection_code = Some(7);
         let findings = derived_auth_findings(&export(vec![
             create_with_version("12"),
@@ -2718,7 +2763,7 @@ mod auth_findings_tests {
     #[test]
     fn an_unknown_room_version_derives_only_the_missing_auth_rejections() {
         let mut rejected = event("$msg", "m.room.message", &["$create"], &["$create"]);
-        rejected.metadata.rejected = true;
+        rejected.metadata.rejected = Some(true);
         let export = export(vec![create_with_version("not-a-version"), rejected]);
         assert_eq!(
             derived_auth_findings(&export).unwrap(),
@@ -2733,9 +2778,9 @@ mod auth_findings_tests {
         assert!(verdict.outlier);
 
         let exported = EventMetadata {
-            rejected: true,
+            rejected: Some(true),
             rejection_code: Some(7),
-            soft_failed: true,
+            soft_failed: Some(true),
             soft_fail_code: Some(2),
             outlier: true,
             ..EventMetadata::default()
@@ -2759,7 +2804,7 @@ mod auth_findings_tests {
         assert!(verdict_of(&EventMetadata::default(), None).is_empty());
 
         let uncoded = EventMetadata {
-            soft_failed: true,
+            soft_failed: Some(true),
             ..EventMetadata::default()
         };
         assert_eq!(
@@ -3223,7 +3268,7 @@ mod signature_window_tests {
         let sk = signing_key(1);
         let keys = catalog(&[key_record(&sk, "ed25519:a", 2_000, None)]);
         let outcome = keys.verify(&signed_event(3_000, &[("ed25519:a", &sk)]), "10");
-        assert!(matches!(outcome, SignatureOutcome::VerifiedLate));
+        assert!(matches!(outcome, SignatureOutcome::VerifiedLate(_)));
     }
 
     #[test]
@@ -3297,7 +3342,7 @@ mod signature_window_tests {
 
         assert!(matches!(
             keys.verify(&event, "10"),
-            SignatureOutcome::VerifiedLate
+            SignatureOutcome::VerifiedLate(_)
         ));
     }
 
@@ -3383,7 +3428,6 @@ mod signature_window_tests {
             "10",
         );
         assert_eq!(findings.verified_keys.len(), 1);
-        assert!(findings.signature_late.is_empty());
     }
 
     #[test]
@@ -3495,11 +3539,12 @@ mod signature_window_tests {
                 stored: "stored".to_owned(),
                 computed: "computed".to_owned(),
                 content_matches_redaction: false,
+                redaction_failed: false,
                 signature_status: None,
             }],
             ..AuthFindings::default()
         };
-        let outcomes = vec![SignatureOutcome::VerifiedLate];
+        let outcomes = vec![SignatureOutcome::VerifiedLate(Vec::new())];
         apply_signature_outcomes(
             &mut findings,
             &events,
@@ -3509,8 +3554,7 @@ mod signature_window_tests {
             "10",
         );
         assert_eq!(findings.signature_verified_late, 1);
-        assert_eq!(findings.signature_late.len(), 1);
-        assert_eq!(findings.signature_late[0].outcome, "verified_late");
+        assert_eq!(findings.signature_verified_late, 1);
         assert!(findings.signature_audit.is_empty());
         assert_eq!(
             findings.hash_audit[0].signature_status,

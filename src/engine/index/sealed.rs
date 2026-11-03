@@ -94,7 +94,7 @@ impl SealedIndex for super::packidx::PackIndex {
     }
 
     fn mapped_bytes(&self) -> u64 {
-        super::packidx::PackIndex::mapped_file_bytes(self)
+        0
     }
 
     fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
@@ -205,6 +205,12 @@ impl SealedLocators {
     #[must_use]
     pub fn contains_pack(&self, pack_id: PackId) -> bool {
         self.packs.iter().any(|pack| pack.pack_id == pack_id)
+    }
+
+    /// Slot ids referenced by sealed locator packs.
+    #[must_use]
+    pub fn slot_ids(&self) -> std::collections::HashSet<u16> {
+        self.packs.iter().map(|pack| pack.slot).collect()
     }
 
     /// Drop a pack that has been retired or repacked away.

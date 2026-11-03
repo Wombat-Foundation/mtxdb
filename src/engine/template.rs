@@ -241,7 +241,7 @@ pub const NAMESPACE_BIAS_INTL: [u8; 32] = [
 
 /// Map a 4-byte member namespace to its fixed 32-byte bias constant.
 ///
-/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`).
+/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`, `FLAG`).
 /// Returns `None` for unrecognized namespaces (such as physical pool tags like `b"EDGE"`).
 #[must_use]
 pub const fn namespace_bias(namespace: [u8; 4]) -> Option<[u8; 32]> {

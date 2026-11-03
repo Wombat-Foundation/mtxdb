@@ -16,6 +16,17 @@ use mtxdb::{ReadPlanPolicy, ShardType};
 
 static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 
+fn shard_type_from_arg(value: &str) -> Option<ShardType> {
+    match value {
+        "state" => Some(ShardType::State),
+        "event" | "events" | "event-dag" => Some(ShardType::EventDag),
+        "edges" => Some(ShardType::Edges),
+        "server-info" | "server_info" => Some(ShardType::ServerInfo),
+        "all" => None,
+        _ => unreachable!("clap validates shard type"),
+    }
+}
+
 pub(crate) fn debug_enabled() -> bool {
     DEBUG_ENABLED.get().copied().unwrap_or(false)
 }
@@ -1289,18 +1300,12 @@ fn parse_cli() -> Cli {
             .map(String::as_str)
             .expect("clap supplies the default read-plan mode"),
     );
-    let shard_type = match matches
-        .get_one::<String>("shard_type")
-        .map(String::as_str)
-        .expect("clap supplies the default shard type")
-    {
-        "state" => Some(ShardType::State),
-        "event" | "events" | "event-dag" => Some(ShardType::EventDag),
-        "edges" => Some(ShardType::Edges),
-        "server-info" | "server_info" => Some(ShardType::ServerInfo),
-        "all" => None,
-        _ => unreachable!("clap validates shard type"),
-    };
+    let shard_type = shard_type_from_arg(
+        matches
+            .get_one::<String>("shard_type")
+            .map(String::as_str)
+            .expect("clap supplies the default shard type"),
+    );
 
     let command = match matches.subcommand() {
         Some(("put", m)) => Commands::Put {

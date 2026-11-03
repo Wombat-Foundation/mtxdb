@@ -1210,7 +1210,8 @@ impl StreamingOpenScan {
                 shards.set_collection_home(&collection_id, home);
             }
             let counts = if self.residency == crate::index::IndexResidency::Paged {
-                let mut counts = index.slot_counts_excluding(|slot| sealed.contains_slot(slot));
+                let sealed_slots = sealed.slot_ids();
+                let mut counts = index.slot_counts_excluding_set(&sealed_slots);
                 for (slot, count) in sealed.slot_counts_in_collection(&collection_id) {
                     let entry = counts.entry(slot).or_insert(0u64);
                     *entry = entry.saturating_add(count);
@@ -1737,9 +1738,10 @@ static SHARD_ROOMS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 struct RoomGeneration {
     index: LossyIndex,
-    /// Locator indexes for sealed packs, newest last. Empty while the
-    /// resident index is authoritative for every pack, which is the
-    /// current default; read paths consult it after the resident index.
+    /// Locator indexes for sealed packs, newest last. Populated when opening
+    /// sidecar-backed sealed packs; it may be empty when a resident scan has
+    /// already incorporated their live locators. Read paths consult it after
+    /// the resident index.
     sealed: Arc<crate::index::sealed::SealedLocators>,
     /// Whether the resident table deliberately omits sealed packs, so a
     /// sealed lookup is required even when a resident tag candidate exists.
@@ -4520,9 +4522,10 @@ impl PackfileStorage {
     ) -> Option<(usize, usize, usize, u32)> {
         self.collections_read().get(collection_id).map(|gen| {
             let g = gen.load();
+            let sealed_slots = g.sealed.slot_ids();
             let resident_entries: u64 = g
                 .index
-                .slot_counts_excluding(|slot| g.sealed.contains_slot(slot))
+                .slot_counts_excluding_set(&sealed_slots)
                 .values()
                 .copied()
                 .sum();
@@ -4545,9 +4548,10 @@ impl PackfileStorage {
     pub fn collection_index_info(&self, collection_id: &[u8; 16]) -> Option<(usize, usize, u32)> {
         self.collections_read().get(collection_id).map(|gen| {
             let g = gen.load();
+            let sealed_slots = g.sealed.slot_ids();
             let resident_entries: u64 = g
                 .index
-                .slot_counts_excluding(|slot| g.sealed.contains_slot(slot))
+                .slot_counts_excluding_set(&sealed_slots)
                 .values()
                 .copied()
                 .sum();
@@ -4573,7 +4577,7 @@ impl PackfileStorage {
             .map(|generation| {
                 let g = generation.load();
                 let mut locations: Vec<(u16, u64)> = g.index.live_entries().collect();
-                if g.sealed.is_empty() {
+                if !g.paged || g.sealed.is_empty() {
                     return locations;
                 }
                 // The resident tail is newer than every sealed pack, so its keys
@@ -4608,9 +4612,10 @@ impl PackfileStorage {
             .filter_map(|id| {
                 tables.collections.get(id).map(|gen| {
                     let g = gen.load();
+                    let sealed_slots = g.sealed.slot_ids();
                     let resident_entries: u64 = g
                         .index
-                        .slot_counts_excluding(|slot| g.sealed.contains_slot(slot))
+                        .slot_counts_excluding_set(&sealed_slots)
                         .values()
                         .copied()
                         .sum();
@@ -7492,7 +7497,8 @@ impl PackfileStorage {
             // resident table. Rebuild only the unsealed tail and re-derive
             // the sealed locator set from the packs that are sealed now.
             let (new_index, sealed) = self.rebuild_tail(collection_id)?;
-            let mut counts = new_index.slot_counts_excluding(|slot| sealed.contains_slot(slot));
+            let sealed_slots = sealed.slot_ids();
+            let mut counts = new_index.slot_counts_excluding_set(&sealed_slots);
             for (slot, count) in sealed.slot_counts_in_collection(collection_id) {
                 let entry = counts.entry(slot).or_insert(0u64);
                 *entry = entry.saturating_add(count);

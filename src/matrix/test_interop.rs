@@ -20,6 +20,7 @@ fn room_version_record_round_trips_and_rejects_malformed_values() {
         ("!room:example.com", "12")
     );
     assert!(decode_room_version_record(&encoded[..7]).is_err());
+    assert!(decode_room_version_record(&encoded[..13]).is_err());
     assert!(decode_room_version_record(b"bad!").is_err());
     assert_ne!(
         room_version_collection_id(b"!a:example.com"),

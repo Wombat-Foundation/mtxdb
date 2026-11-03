@@ -378,6 +378,8 @@ impl RoomFlagIndex {
             return Ok(0);
         }
 
+        let (_, collection_version) = tx.get_with_collection_version(self.pool, &chunk_col, &[])?;
+        tx.expect_collection_version(self.pool, chunk_col, collection_version)?;
         let mut grouped: HashMap<(Flag, u16), Vec<(u32, bool)>> = HashMap::new();
         let mut max_short_seen = 0_u32;
 
@@ -402,7 +404,7 @@ impl RoomFlagIndex {
             let existing_data = existing_nodes.into_iter().next().flatten();
 
             let mut bitmap = match existing_data.as_ref() {
-                Some(data) => BitmapSet::decode(&data.bytes)?,
+                Some(data) => BitmapSet::decode_in_domain(&data.bytes, self.domain)?,
                 None => BitmapSet::new(self.domain),
             };
 
@@ -423,7 +425,7 @@ impl RoomFlagIndex {
             )?;
             // If the record was already staged in this transaction, token is 0.
             // Avoid adding a bogus version 0 expectation that fails commit.
-            if !(existing_data.is_some() && token == 0) {
+            if existing_data.is_none() || token != 0 {
                 tx.expect_record_version(self.pool, chunk_col, chunk_id, token)?;
             }
         }
@@ -464,6 +466,7 @@ impl RoomFlagIndex {
         let chunk_col = self.chunk_collection(current_meta.generation);
         let max_short_seen = self.stage_into_collection(tx, chunk_col, changes)?;
 
+        tx.expect_record_version(self.pool, self.collection, FLAG_META_ID, meta_token)?;
         if meta_raw.is_none() || max_short_seen > current_meta.max_short_id {
             let new_meta = FlagMeta {
                 generation: current_meta.generation,
@@ -477,10 +480,6 @@ impl RoomFlagIndex {
                 &NodeData::new(Bytes::from(meta_encoded.to_vec())),
             )?;
         }
-        if !(meta_raw.is_some() && meta_token == 0) {
-            tx.expect_record_version(self.pool, self.collection, FLAG_META_ID, meta_token)?;
-        }
-
         Ok(())
     }
 
@@ -547,7 +546,7 @@ impl RoomFlagIndex {
         }
         let chunk_id = flag_chunk_node_id(flag, chunk_idx);
         let set = match db.pool(self.pool).get(chunk_col, &chunk_id)? {
-            Some(data) => BitmapSet::decode(&data.bytes)?,
+            Some(data) => BitmapSet::decode_in_domain(&data.bytes, self.domain)?,
             None => BitmapSet::new(self.domain),
         };
         cache.insert((flag, chunk_idx), set.clone());
@@ -809,6 +808,12 @@ impl RoomFlagIndex {
         // reading the counter afterwards keeps the scan bound consistent with
         // the snapshot the rebuilt index is published against.
         let (current_meta, new_gen, meta_token) = self.reserve_rebuild_generation(db)?;
+        let source_tx = db.begin_transaction();
+        let (_, source_chunk_version) = source_tx.get_with_collection_version(
+            self.pool,
+            &self.chunk_collection(current_meta.generation),
+            &[],
+        )?;
 
         let counter_raw = db
             .pool(self.auth_pool)
@@ -823,12 +828,22 @@ impl RoomFlagIndex {
 
         let target_col = self.chunk_collection(new_gen);
 
-        // Pre-emptively clear target collection before writing
+        // Pre-emptively clear target collection before writing. A failed delete
+        // or commit must stop here: otherwise stale data from a crashed rebuild
+        // could be published alongside this rebuild's chunks.
         let prep_tx = db.begin_transaction();
-        let _ = prep_tx.delete_collection(self.pool, target_col);
-        let _ = prep_tx.commit();
+        prep_tx.delete_collection(self.pool, target_col)?;
+        prep_tx.commit()?;
 
-        match self.rebuild_generation(db, counter, current_meta, new_gen, target_col, meta_token) {
+        match self.rebuild_generation(
+            db,
+            counter,
+            current_meta,
+            new_gen,
+            target_col,
+            meta_token,
+            source_chunk_version,
+        ) {
             Ok(total) => Ok(total),
             Err(e) => {
                 let cleanup_tx = db.begin_transaction();
@@ -851,6 +866,7 @@ impl RoomFlagIndex {
         new_gen: u64,
         target_col: [u8; 16],
         meta_token: u64,
+        source_chunk_version: u64,
     ) -> Result<u64, StorageError> {
         // Query timeline index for timeline events in this room
         let room_name = String::from_utf8_lossy(&self.room_id);
@@ -973,7 +989,8 @@ impl RoomFlagIndex {
             },
         };
         // Verify that no competing rebuild published a generation while this one
-        // was running. The meta record version CAS below covers any other write.
+        // was running. The chunk-collection version CAS below also detects writes
+        // to existing short IDs, which do not need to change the metadata record.
         if live_meta.generation != current_meta.generation {
             return Err(StorageError::StaleRead {
                 pool: self.pool,
@@ -982,6 +999,14 @@ impl RoomFlagIndex {
                 actual: live_meta_token,
             });
         }
+        let (_, chunks_version) =
+            publish_tx.get_with_collection_version(self.pool, &target_col, &[])?;
+        publish_tx.expect_collection_version(self.pool, target_col, chunks_version)?;
+        publish_tx.expect_collection_version(
+            self.pool,
+            self.chunk_collection(current_meta.generation),
+            source_chunk_version,
+        )?;
         let published_meta = FlagMeta {
             generation: new_gen,
             max_short_id: max_short_seen,
@@ -1003,25 +1028,10 @@ impl RoomFlagIndex {
         }
         publish_tx.commit()?;
 
-        // Clean up previous generation collection
-        let old_col = self.chunk_collection(current_meta.generation);
-        let retire_tx = db.begin_transaction();
-        match retire_tx.delete_collection(self.pool, old_col) {
-            Ok(()) => {
-                if let Err(e) = retire_tx.commit() {
-                    eprintln!(
-                        "room flag rebuild: failed to commit retirement of generation {}: {e}",
-                        current_meta.generation
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "room flag rebuild: failed to delete retired collection for generation {}: {e}",
-                    current_meta.generation
-                );
-            }
-        }
+        // Keep the old generation available to readers that fetched its meta
+        // before publication. Database reads do not offer a cross-collection
+        // snapshot or reader lease, so deleting it here could turn a valid
+        // old-generation query into an empty/partial result.
 
         Ok(total_indexed)
     }

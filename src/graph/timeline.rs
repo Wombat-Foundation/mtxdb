@@ -60,7 +60,7 @@ use crate::template::{
     MEMBER_NAMESPACE_INTL,
 };
 
-/// Truncate or hash a room ID into a 16-byte scope for [`TimelineEntry`].
+/// Derive a 16-byte scope for [`TimelineEntry`] with domain-separated BLAKE3 over the room ID.
 #[must_use]
 pub fn room_scope_id(room_id: &[u8]) -> [u8; 16] {
     crate::interop::derive_id(b"timeline-room-scope", room_id)
