@@ -10,6 +10,7 @@ use anyhow::{anyhow, bail, Context};
 
 use mtxdb::auxiliary::AuxiliaryIndex;
 use mtxdb::export_schema::{RejectionCode, SoftFailCode};
+use mtxdb::interop::room_auth_collection_id;
 use mtxdb::matrix_adjacency::EventRecord;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
@@ -21,11 +22,11 @@ use mtxdb::shard::ShardPool;
 use mtxdb::state_group::{StateGroupDerivation, StateGroupTrust};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
-    derive_collection_id, encode_verdict, event_verdict_collection_id, frame_digest,
-    record_logical_id, state_group_instance_id, CollectionKeyRule, CollectionMetadata,
-    CollectionTemplate, Database, DatabaseLayout, DigestAlgorithm, EstablishmentRule, FrameIdInput,
-    FrameIdPolicy, MatrixRoomVersion, PackfileStorage, PayloadPolicy, RecordIdentityRule,
-    ShardType, Verdict,
+    decode_verdict, derive_collection_id, encode_verdict, event_verdict_collection_id,
+    frame_digest, record_logical_id, state_group_instance_id, CollectionKeyRule,
+    CollectionMetadata, CollectionTemplate, Database, DatabaseLayout, DigestAlgorithm,
+    EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion, PackfileStorage,
+    PayloadPolicy, RecordIdentityRule, ShardType, Verdict,
 };
 use rezzy::auth::auth_types_for_event;
 use rezzy::json::{self, Object, Value as OwnedValue};
@@ -10764,6 +10765,11 @@ fn import_pdu_events_with_raw(
     // them back is the simplest way to let check 5 run across separate files:
     // the walk sees the whole room, not just this file.
     let prior = load_collection_events(store, &collection_id)?;
+    let mut stored_ids: HashSet<String> = prior
+        .iter()
+        .filter_map(event_id)
+        .map(str::to_owned)
+        .collect();
     let mut all_events: Vec<OwnedValue> = prior;
     let mut seen_event_ids: HashSet<String> = all_events
         .iter()
@@ -10776,6 +10782,15 @@ fn import_pdu_events_with_raw(
         };
         if seen_event_ids.insert(id.to_owned()) {
             all_events.push(event.clone());
+        }
+    }
+    // auth_chain events are judged but are not necessarily stored, so they
+    // must not acquire flags or verdicts of their own.
+    let mut current_ids = HashSet::new();
+    for event in events {
+        if let Some(id) = event_id(event) {
+            stored_ids.insert(id.to_owned());
+            current_ids.insert(id.to_owned());
         }
     }
 
@@ -10830,7 +10845,7 @@ fn import_pdu_events_with_raw(
             to_write.push((id_bytes, data));
         }
     }
-    let shorts = record_matrix_adjacency_with_raw(db, template, events, raw_adjacency)?;
+    record_matrix_adjacency_with_raw(db, template, events, raw_adjacency)?;
 
     // Preserve causal order even when input arrives newest-first.
     sort_events_topologically(&mut to_write, events, template)?;
@@ -10884,10 +10899,10 @@ fn import_pdu_events_with_raw(
     }
     write_raw_verdicts_and_flags(
         db,
-        events,
         &synthetic.events,
         &findings.forced,
-        &shorts,
+        &stored_ids,
+        &current_ids,
         template,
         &resolved.canonical_id,
     )?;
@@ -10945,25 +10960,34 @@ fn load_collection_events(
 }
 
 /// One raw event's identity and derived verdict, grouped for flag writing.
-type RawFlagRow = (String, [u8; 16], u32, Verdict);
+type RawFlagRow = (String, [u8; 16], Verdict, bool);
 
 /// Store the raw import's derived verdicts and mirror them into the room's
 /// flag bitmap, so rejected events are countable and selectable.
+///
+/// Every event already stored in the collection is rewritten, not just the
+/// current file's events. A later file can complete a base that an earlier
+/// file lacked, which changes an earlier event's derived verdict; leaving the
+/// old verdict and flags behind would describe state the state groups no
+/// longer use.
 #[allow(
     clippy::too_many_arguments,
     clippy::type_complexity,
-    reason = "the writer needs the batch, its derived verdicts, and the room identity"
+    reason = "the writer needs the stored events, their derived verdicts, and the room identity"
 )]
 fn write_raw_verdicts_and_flags(
     db: &Database,
-    current_events: &[OwnedValue],
     all_events: &[RoomEvent],
     forced: &[Option<u8>],
-    shorts: &HashMap<String, u32>,
+    stored_ids: &HashSet<String>,
+    current_ids: &HashSet<String>,
     template: &CollectionTemplate,
     canonical_id: &str,
 ) -> anyhow::Result<()> {
-    if shorts.is_empty() {
+    if !matches!(
+        &template.record_id_rule.policy,
+        FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
+    ) {
         return Ok(());
     }
     let forced_by_id: HashMap<&str, Option<u8>> = all_events
@@ -10973,44 +10997,62 @@ fn write_raw_verdicts_and_flags(
         .collect();
 
     let mut by_room: BTreeMap<String, Vec<RawFlagRow>> = BTreeMap::new();
-    for event in current_events {
-        let Some(id) = event_id(event) else {
+    for event in all_events {
+        if !stored_ids.contains(&event.event_id) {
+            continue;
+        }
+        let Some(node) = template_node_id(template, &event.pdu)? else {
             continue;
         };
-        let Some(&short) = shorts.get(id) else {
-            continue;
-        };
-        let Some(node) = template_node_id(template, event)? else {
-            continue;
-        };
-        let room = event_room_id(event).unwrap_or(canonical_id).to_owned();
-        let forced = forced_by_id.get(id).copied().flatten();
+        let room = event
+            .pdu
+            .get("room_id")
+            .and_then(OwnedValue::as_str)
+            .unwrap_or(canonical_id)
+            .to_owned();
+        let forced = forced_by_id.get(event.event_id.as_str()).copied().flatten();
+        let existing = db
+            .pool(ShardType::EventDag)
+            .get(&event_verdict_collection_id(&node), &node)?
+            .map(|data| decode_verdict(&data.bytes).map(|(_, verdict)| verdict))
+            .transpose()?;
         let mut verdict = Verdict {
             rejection: forced,
             outlier: forced.is_some(),
             ..Verdict::default()
         };
         if forced.is_none() {
-            match crate::state_policy::event_disposition(event) {
-                crate::state_policy::EventDisposition::SoftFailed => {
-                    verdict.soft_fail = Some(SoftFailCode::Imported.to_u8());
-                }
-                crate::state_policy::EventDisposition::Accepted
-                | crate::state_policy::EventDisposition::Rejected => {}
-            }
+            // The stored event is redacted, so its source soft-fail claim is
+            // gone by the next file. Keep the verdict written by the file that
+            // supplied the event.
+            verdict.soft_fail = if current_ids.contains(&event.event_id) {
+                (event.metadata.soft_failed == Some(true)).then(|| SoftFailCode::Imported.to_u8())
+            } else {
+                existing.as_ref().and_then(|verdict| verdict.soft_fail)
+            };
         }
-        by_room
-            .entry(room)
-            .or_default()
-            .push((id.to_owned(), node, short, verdict));
+        let write_verdict = existing.as_ref() != Some(&verdict);
+        by_room.entry(room).or_default().push((
+            event.event_id.clone(),
+            node,
+            verdict,
+            write_verdict,
+        ));
     }
 
     for (room, rows) in by_room {
         let flag_index = RoomFlagIndex::new(room.as_bytes());
+        ensure_raw_auth_collection(db, &room, template)?;
+        let mut short_ids =
+            export_import::ClosureWriter::new(db, &room, room_auth_collection_id(room.as_bytes()))?;
         let mut changes = Vec::with_capacity(rows.len().saturating_mul(4));
         let tx = db.begin_transaction();
-        for (event_id, node, short, verdict) in rows {
-            if !verdict.is_empty() {
+        for (event_id, node, verdict, write_verdict) in rows {
+            let (short, _) = short_ids.short_for(&tx, event_id.as_bytes())?;
+
+            // Only overwrite when the derived verdict changed; empty records
+            // for unchanged events would grow the store on every reimport.
+            if write_verdict {
                 tx.put(
                     ShardType::EventDag,
                     event_verdict_collection_id(&node),
@@ -11018,21 +11060,51 @@ fn write_raw_verdicts_and_flags(
                     &NodeData::new(encode_verdict(event_id.as_bytes(), &verdict)?.into()),
                 )?;
             }
+
             changes.push(FlagChange::set(short, Flag::Present));
-            if verdict.rejection.is_some() {
-                changes.push(FlagChange::set(short, Flag::Rejected));
-            }
-            if verdict.outlier {
-                changes.push(FlagChange::set(short, Flag::Outlier));
-            }
-            if verdict.soft_fail.is_some() {
-                changes.push(FlagChange::set(short, Flag::SoftFailed));
-            }
+            changes.push(if verdict.rejection.is_some() {
+                FlagChange::set(short, Flag::Rejected)
+            } else {
+                FlagChange::clear(short, Flag::Rejected)
+            });
+            changes.push(if verdict.outlier {
+                FlagChange::set(short, Flag::Outlier)
+            } else {
+                FlagChange::clear(short, Flag::Outlier)
+            });
+            changes.push(if verdict.soft_fail.is_some() {
+                FlagChange::set(short, Flag::SoftFailed)
+            } else {
+                FlagChange::clear(short, Flag::SoftFailed)
+            });
         }
         flag_index.stage(&tx, &changes)?;
-        tx.commit()?;
-        export_import::reclaim_journal(db)?;
+        short_ids.commit(&tx)?;
     }
+    Ok(())
+}
+
+/// The raw path writes room short ids into the server-layout auth collection
+/// so the flag index can select events by id. That collection needs its
+/// genesis metadata before the first forward/reverse record.
+fn ensure_raw_auth_collection(
+    db: &Database,
+    room: &str,
+    template: &CollectionTemplate,
+) -> anyhow::Result<()> {
+    let collection = room_auth_collection_id(room.as_bytes());
+    let metadata = CollectionMetadata {
+        member_namespace: Some(mtxdb::MEMBER_NAMESPACE_AUTH),
+        collection_canonical_id: room.as_bytes().to_vec(),
+        record_id_rule: template.record_id_rule.clone(),
+        payload: template.payload.clone(),
+        extension: None,
+        role: Some("auth_chain".to_owned()),
+        schema: Some("matrix.event.v1".to_owned()),
+    };
+    db.edges()
+        .create_or_put_established(&collection, &metadata, &[])
+        .with_context(|| format!("creating the auth collection for {room}"))?;
     Ok(())
 }
 

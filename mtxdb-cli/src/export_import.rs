@@ -2052,19 +2052,42 @@ fn write_room_flags(
 }
 
 /// One room's auth short ids and closures, staged into capped batches.
-struct ClosureWriter<'a> {
+pub(crate) struct ClosureWriter<'a> {
     db: &'a Database,
     room: &'a str,
     collection: [u8; 16],
     batch_bytes: usize,
+    initial_counter: u32,
     counter: u32,
 }
 
-impl ClosureWriter<'_> {
+impl<'a> ClosureWriter<'a> {
+    /// Open the room's short-id space without staging a closure batch.
+    pub(crate) fn new(
+        db: &'a Database,
+        room: &'a str,
+        collection: [u8; 16],
+    ) -> anyhow::Result<Self> {
+        let counter = db
+            .pool(mtxdb::ShardType::Edges)
+            .get(&collection, &auth_counter_record_id())?
+            .map(|data| decode_auth_counter(&data.bytes))
+            .transpose()?
+            .unwrap_or(0);
+        Ok(Self {
+            db,
+            room,
+            collection,
+            batch_bytes: 0,
+            initial_counter: counter,
+            counter,
+        })
+    }
+
     /// The short id for `id`: an existing one is reused, a new one advances the
     /// counter and stages its forward and reverse records. Returns the bytes
     /// the new records stage.
-    fn short_for(
+    pub(crate) fn short_for(
         &mut self,
         tx: &mtxdb::DatabaseTransaction<'_>,
         id: &[u8],
@@ -2111,13 +2134,15 @@ impl ClosureWriter<'_> {
 
     /// Stage the short-id counter and commit the batch. The counter goes in
     /// every batch so it is never behind the shorts a committed batch holds.
-    fn commit(&self, tx: &mtxdb::DatabaseTransaction<'_>) -> anyhow::Result<()> {
-        tx.put(
-            EDGE_POOL,
-            self.collection,
-            auth_counter_record_id(),
-            &node(self.counter.to_be_bytes().to_vec()),
-        )?;
+    pub(crate) fn commit(&self, tx: &mtxdb::DatabaseTransaction<'_>) -> anyhow::Result<()> {
+        if self.counter != self.initial_counter {
+            tx.put(
+                EDGE_POOL,
+                self.collection,
+                auth_counter_record_id(),
+                &node(self.counter.to_be_bytes().to_vec()),
+            )?;
+        }
         tx.commit().context("committing auth closures")?;
         reclaim_journal(self.db)?;
         Ok(())
@@ -2276,6 +2301,7 @@ fn write_auth_closures(
         room: &export.room_id,
         collection,
         batch_bytes,
+        initial_counter: counter,
         counter,
     };
     let mut has_closure = vec![false; events.len()];

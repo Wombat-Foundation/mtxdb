@@ -45,6 +45,20 @@ fn owned_value(json: &str) -> OwnedValue {
     OwnedValue::parse_bytes(&bytes).expect("valid JSON fixture")
 }
 
+fn raw_event(
+    room: &str,
+    id: &str,
+    kind: &str,
+    state_key: &str,
+    content: &str,
+    prev: &str,
+    auth: &str,
+) -> OwnedValue {
+    owned_value(&format!(
+        r#"{{"event_id":"{id}","sender":"@alice:test","room_id":"{room}","type":"{kind}","state_key":"{state_key}","content":{content},"prev_events":{prev},"auth_events":{auth}}}"#
+    ))
+}
+
 /// A string field of a JSON object, or `None` if the key is absent or not
 /// a string. Used to assert on parsed output rather than substrings.
 fn json_str(value: &OwnedValue, key: &str) -> Option<String> {
@@ -2151,27 +2165,6 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     assert!(valid_state_group_id(&state_group));
 }
 
-/// Open every pack in a pool and total the records it physically holds.
-fn count_pack_records(pool_dir: &Path) -> u64 {
-    let mut total = 0;
-    if !pool_dir.exists() {
-        return total;
-    }
-    for (pack_id, _, _) in glob_pack_files(pool_dir).unwrap() {
-        let pack = pool_dir.join(pack_id.filename());
-        let file = std::fs::File::open(pack).unwrap();
-        let mut reader = std::io::BufReader::new(file);
-        if mtxdb::packfile::read_header(&mut reader).unwrap().is_none() {
-            continue;
-        }
-        while let Some(record) = mtxdb::packfile::read_record(&mut reader).unwrap() {
-            let _ = record;
-            total = total.saturating_add(1);
-        }
-    }
-    total
-}
-
 #[test]
 fn raw_import_derives_rejections_and_writes_flags() {
     use mtxdb::room_flag::*;
@@ -2272,6 +2265,206 @@ fn raw_import_derives_rejections_and_writes_flags() {
 }
 
 #[test]
+fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_late_parent");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room3");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let event = |id: &str, kind: &str, state_key: &str, content: &str, prev: &str, auth: &str| {
+        owned_value(&format!(
+            r#"{{"event_id":"{id}","sender":"@alice:test","room_id":"!room3","type":"{kind}","state_key":"{state_key}","content":{content},"prev_events":{prev},"auth_events":{auth}}}"#
+        ))
+    };
+    let create = event(
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let join = event(
+        "$join",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    // Its parent is in the next file, so the first import cannot check it.
+    let stale = event(
+        "$stale",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$leave"]"#,
+        r#"["$create","$join"]"#,
+    );
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join, stale]);
+
+    let flags = RoomFlagIndex::new(b"!room3");
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0,
+        "an event with a missing parent is left unchecked"
+    );
+
+    let record = mtxdb::interop::event_record_id(b"$stale");
+    let verdict_collection = mtxdb::interop::event_verdict_collection_id(&record);
+    let stale_verdict = || {
+        stored(&db, mtxdb::ShardType::EventDag, verdict_collection, record)
+            .map(|bytes| mtxdb::interop::decode_verdict(&bytes).unwrap().1.rejection)
+    };
+    assert_eq!(
+        stale_verdict().flatten(),
+        None,
+        "the first file stores no rejection for the unchecked event"
+    );
+
+    let leave = event(
+        "$leave",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"leave"}"#,
+        r#"["$join"]"#,
+        r#"["$create","$join"]"#,
+    );
+    import(&[leave]);
+
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        1,
+        "the late parent makes the earlier event fail check 5"
+    );
+    assert_eq!(
+        flags.select(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        vec![b"$stale".to_vec()],
+        "the flag index must map the short id back to the event"
+    );
+    assert!(
+        stale_verdict().is_some(),
+        "the earlier event's stored verdict must be updated, not just its state group"
+    );
+}
+
+#[test]
+fn raw_import_keeps_soft_failed_flag_from_earlier_files() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_soft_fail");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room4");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let create = raw_event(
+        "!room4",
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let join = raw_event(
+        "!room4",
+        "$join",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let mut soft = raw_event(
+        "!room4",
+        "$soft",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$join"]"#,
+        r#"["$create","$join"]"#,
+    );
+    if let OwnedValue::Object(fields) = &mut soft {
+        fields.insert("soft_failed".to_owned(), OwnedValue::Bool(true));
+    }
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join, soft]);
+
+    let flags = RoomFlagIndex::new(b"!room4");
+    let soft_query = FlagQuery::has(Flag::SoftFailed);
+    assert_eq!(flags.count(&db, &soft_query).unwrap(), 1);
+    assert_eq!(
+        flags.select(&db, &soft_query).unwrap(),
+        vec![b"$soft".to_vec()]
+    );
+
+    let live = raw_event(
+        "!room4",
+        "$live",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$soft"]"#,
+        r#"["$create","$join"]"#,
+    );
+    import(&[live]);
+
+    assert_eq!(
+        flags.count(&db, &soft_query).unwrap(),
+        1,
+        "a later file must not clear an earlier file's soft-fail flag"
+    );
+    assert_eq!(
+        flags.select(&db, &soft_query).unwrap(),
+        vec![b"$soft".to_vec()],
+        "the soft-failed event must still be selectable"
+    );
+}
+
+#[test]
 fn raw_import_ignores_incoming_rejected_flags_on_valid_events() {
     let dir = unique_temp_dir().join("raw_unflagged");
     let db = Database::open(dir.clone()).unwrap();
@@ -2354,6 +2547,27 @@ fn raw_import_ignores_incoming_rejected_flags_on_valid_events() {
         0,
         "valid event must not be marked rejected"
     );
+}
+
+/// Open every pack in a pool and total the records it physically holds.
+fn count_pack_records(pool_dir: &Path) -> u64 {
+    let mut total = 0;
+    if !pool_dir.exists() {
+        return total;
+    }
+    for (pack_id, _, _) in glob_pack_files(pool_dir).unwrap() {
+        let pack = pool_dir.join(pack_id.filename());
+        let file = std::fs::File::open(pack).unwrap();
+        let mut reader = std::io::BufReader::new(file);
+        if mtxdb::packfile::read_header(&mut reader).unwrap().is_none() {
+            continue;
+        }
+        while let Some(record) = mtxdb::packfile::read_record(&mut reader).unwrap() {
+            let _ = record;
+            total = total.saturating_add(1);
+        }
+    }
+    total
 }
 
 #[test]
