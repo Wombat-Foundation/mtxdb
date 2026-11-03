@@ -7940,9 +7940,14 @@ impl PackfileStorage {
         // concurrent repack can still retire the shard ids that generation's
         // index points at; without pinning, a node resolved after the swap
         // would miss even though it is still live. See `pin_shards`.
+        let mut referenced = gen.index.referenced_slot_ids();
+        for pack in gen.sealed.packs() {
+            if let Some(entry) = referenced.get_mut(usize::from(pack.slot)) {
+                *entry = true;
+            }
+        }
         let pinned = self.pin_shards(
-            gen.index
-                .referenced_slot_ids()
+            referenced
                 .into_iter()
                 .enumerate()
                 .filter(|&(_, referenced)| referenced)
@@ -9386,6 +9391,14 @@ impl PackfileStorage {
             let ids = gen.index.referenced_slot_ids();
             for (i, &has_refs) in ids.iter().enumerate() {
                 referenced[i] |= has_refs;
+            }
+            // In paged mode the resident table omits sealed packs, but their
+            // sidecars still hold live records. A sealed shard must not be
+            // retired just because only the sidecar references it.
+            for pack in gen.sealed.packs() {
+                if let Some(entry) = referenced.get_mut(usize::from(pack.slot)) {
+                    *entry = true;
+                }
             }
         }
 

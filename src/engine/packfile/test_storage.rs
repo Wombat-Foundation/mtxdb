@@ -12416,3 +12416,28 @@ fn paged_session_sealing_marks_checkpoint_complete_then_reopen_evicts() {
     drop(reopened);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn paged_sealed_shards_are_not_retired_as_unreferenced() {
+    let dir = test_dir("paged_retire_sealed");
+    let ids = paged_fixture(&dir);
+    let store = paged_open(&dir);
+    let sealed_before = store.generation(&TEST_COLLECTION).unwrap().sealed.len();
+    assert!(sealed_before > 0);
+    // The resident table does not reference these shards; retirement must
+    // consult SealedLocators as well.
+    store.retire_empty_shards_after_batch();
+    let sealed_after = store.generation(&TEST_COLLECTION).unwrap().sealed.len();
+    assert_eq!(
+        sealed_after, sealed_before,
+        "sealed shards are still referenced by their sidecars"
+    );
+    for id in &ids {
+        assert!(
+            store.get(&TEST_COLLECTION, id).unwrap().is_some(),
+            "retirement must not unlink a shard still serving sealed records"
+        );
+    }
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
