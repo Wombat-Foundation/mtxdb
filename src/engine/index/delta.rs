@@ -37,13 +37,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, io};
 
 use super::format::{DeltaFrame, DELTA_FRAME_LEN};
 use super::redo::{RedoOp, RedoRecord, REDO_RECORD_LEN};
-
-static COMPACT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// File name of the incremental index delta log inside a store's base dir.
 pub const INDEX_DELTA_FILE: &str = "index.delta";
@@ -1203,20 +1200,11 @@ pub fn compact_delta_log(path: &Path) -> io::Result<Option<u64>> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::other("delta log path has no file name"))?;
-    let temp = loop {
-        let serial = COMPACT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate =
-            path.with_file_name(format!(".{name}.compact.{}.{}", std::process::id(), serial));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(_) => break candidate,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    };
+    // Compaction is serialized by the caller's persist lock, so one fixed
+    // temporary name is enough. Removing it first also reaps a file left by a
+    // crash between the write and the rename.
+    let temp = path.with_file_name(format!(".{name}.compact"));
+    let _ = fs::remove_file(&temp);
 
     let result = (|| {
         append_batch_with_durability(

@@ -431,17 +431,13 @@ pub fn read_checkpoint_with_policy(
     }
     let slot_base =
         CHECKPOINT_HEADER_LEN.checked_add(usize::try_from(header.directory_bytes).ok()?)?;
-    if (header.homes_bytes == 0) != (header.tails_bytes == 0) {
+    // v1 checkpoints written before identity side tables were removed must not
+    // be loaded at all: the reader does not consume those tables, and their
+    // presence would only make the section offsets ambiguous.
+    if header.homes_bytes != 0 || header.tails_bytes != 0 {
         return None;
     }
-    // Older v1 checkpoints stored identity side tables after collection slots.
-    // We no longer load those tables, but must account for their bytes to find
-    // the pack table and logical_versions section correctly. This preserves
-    // the version baseline while the index itself falls back to a pack scan.
-    let body_bytes = header
-        .slots_bytes
-        .checked_add(header.homes_bytes)?
-        .checked_add(header.tails_bytes)?;
+    let body_bytes = header.slots_bytes;
     // Slots are unique u16 values, so a valid pack table cannot exceed 65,536
     // entries; reject before `pack_table` and its dedupe sets reserve capacity
     // from `pack_table_count`.
@@ -484,9 +480,6 @@ pub fn read_checkpoint_with_policy(
 
     let mut collections = Vec::with_capacity(count);
     let mut body_offset = 0_usize;
-    let mut slots_total = 0_u64;
-    let mut homes_total = 0_u64;
-    let mut tails_total = 0_u64;
     for i in 0..count {
         let entry_offset =
             CHECKPOINT_HEADER_LEN.checked_add(i.checked_mul(COLLECTION_DIR_ENTRY_LEN)?)?;
@@ -495,9 +488,7 @@ pub fn read_checkpoint_with_policy(
             .try_into()
             .ok()?;
         let entry = CollectionDirEntry::decode(&entry_bytes)?;
-        if (entry.homes_offset == 0) != (entry.tails_offset == 0)
-            || (header.homes_bytes == 0 && (entry.homes_offset != 0 || entry.tails_offset != 0))
-        {
+        if entry.homes_offset != 0 || entry.tails_offset != 0 {
             return None;
         }
         if entry.capacity < 16 || !entry.capacity.is_power_of_two() {
@@ -525,27 +516,6 @@ pub fn read_checkpoint_with_policy(
             return None;
         }
         body_offset = body_offset.checked_add(slots_len)?;
-        slots_total = slots_total.checked_add(u64::try_from(slots_len).ok()?)?;
-        if entry.homes_offset != 0 {
-            if usize::try_from(entry.homes_offset).ok()? != body_offset {
-                return None;
-            }
-            let homes = slot_base.checked_add(body_offset)?;
-            if homes.checked_add(slots_len)? > pack_table_base {
-                return None;
-            }
-            body_offset = body_offset.checked_add(slots_len)?;
-            homes_total = homes_total.checked_add(u64::try_from(slots_len).ok()?)?;
-            if usize::try_from(entry.tails_offset).ok()? != body_offset {
-                return None;
-            }
-            let tails = slot_base.checked_add(body_offset)?;
-            if tails.checked_add(slots_len)? > pack_table_base {
-                return None;
-            }
-            body_offset = body_offset.checked_add(slots_len)?;
-            tails_total = tails_total.checked_add(u64::try_from(slots_len).ok()?)?;
-        }
         for slot_bytes in buf
             .get(region..region.checked_add(slots_len)?)?
             .as_chunks::<8>()
@@ -564,11 +534,7 @@ pub fn read_checkpoint_with_policy(
             slot_count: entry.slot_count,
         });
     }
-    if body_offset != usize::try_from(body_bytes).ok()?
-        || slots_total != header.slots_bytes
-        || homes_total != header.homes_bytes
-        || tails_total != header.tails_bytes
-    {
+    if body_offset != usize::try_from(body_bytes).ok()? {
         return None;
     }
 
@@ -773,42 +739,6 @@ mod tests {
             &[([0xA1; 16], 7)],
         )
         .unwrap();
-    }
-
-    #[test]
-    fn legacy_checkpoint_with_identity_tables_restores_logical_versions() {
-        let path = temp_checkpoint("legacy-identity");
-        write_slots_only_checkpoint(&path, &[]);
-        let current = fs::read(&path).unwrap();
-        let mut header =
-            CheckpointHeader::decode(current[..CHECKPOINT_HEADER_LEN].try_into().unwrap()).unwrap();
-        let directory_at = CHECKPOINT_HEADER_LEN;
-        let directory_end = directory_at + COLLECTION_DIR_ENTRY_LEN;
-        let mut directory =
-            CollectionDirEntry::decode(&current[directory_at..directory_end]).unwrap();
-        let slot_base = directory_end;
-        let slot_len = usize::try_from(header.slots_bytes).unwrap();
-        let pack_table_at = slot_base + slot_len;
-        directory.homes_offset = u64::try_from(slot_len).unwrap();
-        directory.tails_offset = u64::try_from(slot_len * 2).unwrap();
-
-        let mut legacy = Vec::with_capacity(current.len() + slot_len * 2);
-        legacy.extend_from_slice(&current[..directory_at]);
-        legacy.extend_from_slice(&directory.encode());
-        legacy.extend_from_slice(&current[slot_base..pack_table_at]);
-        legacy.resize(legacy.len() + slot_len * 2, 0);
-        legacy.extend_from_slice(&current[pack_table_at..]);
-        header.homes_bytes = u64::try_from(slot_len).unwrap();
-        header.tails_bytes = u64::try_from(slot_len).unwrap();
-        legacy[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
-        rewrite_crc(&mut legacy);
-        fs::write(&path, legacy).unwrap();
-
-        let restored = read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full)
-            .expect("legacy checkpoint remains readable");
-        assert_eq!(restored.covered_lsn, 10);
-        assert_eq!(restored.logical_versions, vec![([0xA1; 16], 7)]);
-        let _ = fs::remove_file(path);
     }
 
     #[test]

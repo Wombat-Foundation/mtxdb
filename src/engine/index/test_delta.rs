@@ -212,14 +212,13 @@ fn compact_delta_log_skips_a_log_with_marginal_savings() {
 }
 
 #[test]
-fn concurrent_delta_compactions_use_independent_temporary_files() {
-    let dir = std::env::temp_dir().join(format!(
-        "mtxdb_delta_compact_concurrent_{}",
-        std::process::id()
-    ));
+fn compact_delta_log_reaps_a_crash_leftover_temp() {
+    let dir =
+        std::env::temp_dir().join(format!("mtxdb_delta_compact_stale_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_DELTA_FILE);
+    let stale = dir.join(format!(".{INDEX_DELTA_FILE}.compact"));
     let collection = [0x61; 16];
     let operations = vec![
         redo_set(collection, [1; 16], 1),
@@ -228,31 +227,16 @@ fn concurrent_delta_compactions_use_independent_temporary_files() {
         DeltaOperation::Coverage { covered_lsn: 77 },
     ];
     std::fs::write(&path, v1_log(&operations, 0x7171)).unwrap();
+    std::fs::write(&stale, b"leftover").unwrap();
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-    let workers: Vec<_> = (0..2)
-        .map(|_| {
-            let path = path.clone();
-            let barrier = std::sync::Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                compact_delta_log(&path)
-            })
-        })
-        .collect();
-    barrier.wait();
-    for worker in workers {
-        worker.join().unwrap().unwrap();
-    }
+    compact_delta_log(&path)
+        .expect("compaction succeeds")
+        .expect("operations were redundant");
 
     let compacted = read_delta_log(&path).expect("live log remains readable");
     assert_eq!(compacted.coverage, Some(77));
     assert_eq!(compacted.operations.len(), 3);
-    assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .contains(".compact.")));
+    assert!(!stale.exists(), "a crash leftover is removed before reuse");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
