@@ -3395,7 +3395,12 @@ impl PackfileStorage {
         else {
             return false;
         };
-        crate::index::versions::write_versions(&versions_path, &checkpoint.logical_versions).is_ok()
+        crate::index::versions::write_versions(
+            &versions_path,
+            &checkpoint.logical_versions,
+            checkpoint.covered_lsn,
+        )
+        .is_ok()
     }
 
     /// Path of one *epoch* of this store's incremental index delta log.
@@ -3460,10 +3465,20 @@ impl PackfileStorage {
     /// only after the checkpoint is durable, so for a moment the checkpoint's
     /// header is the only place that coverage is written down.
     fn durable_index_state(base_dir: &std::path::Path) -> DurableIndexState {
+        // The versions file is the coverage record that survives checkpoint
+        // retirement: a writable paged open deletes the checkpoint but keeps
+        // this file, so a crash between its fsync and `journal.lsn` must still
+        // recover the coverage it names.
+        let versions_coverage =
+            crate::index::versions::read_coverage(&Self::index_versions_path(base_dir))
+                .unwrap_or(0);
         let Ok(Some(summary)) = crate::index::checkpoint::read_checkpoint_summary(
             &Self::index_checkpoint_path(base_dir),
         ) else {
-            return DurableIndexState::default();
+            return DurableIndexState {
+                covered_lsn: versions_coverage,
+                fingerprint: 0,
+            };
         };
         // One pass over the delta log yields both what it claims and where it
         // ends; the log is only trusted if it names this checkpoint.
@@ -3477,7 +3492,7 @@ impl PackfileStorage {
             Err(_) => (0, 0),
         };
         DurableIndexState {
-            covered_lsn: summary.covered_lsn.max(log_coverage),
+            covered_lsn: summary.covered_lsn.max(log_coverage).max(versions_coverage),
             fingerprint,
         }
     }
@@ -5964,9 +5979,13 @@ impl PackfileStorage {
         };
         let through = journal.committed_lsn_for_pool(pool);
         let versions = journal.collection_versions_through(pool, through);
+        // Paged mode does not advance coverage; record the coverage the store
+        // already durably has, never `through`, or this file would authorize a
+        // reclaim the packs have not been checkpointed for.
         let _ = crate::index::versions::write_versions(
             &Self::index_versions_path(&self.base_dir),
             &versions,
+            self.durable_coverage(),
         );
     }
 
@@ -11307,10 +11326,10 @@ impl PackfileStorage {
         // merging this pool-local table with `max` preserves whichever side is
         // newer. The checkpoint is also read for compatibility with a store
         // written before the file existed (a writable paged open migrates it).
-        if let Some(versions) =
+        if let Some(snapshot) =
             crate::index::versions::read_versions(&Self::index_versions_path(&self.base_dir))
         {
-            journal.restore_collection_versions(pool, &versions);
+            journal.restore_collection_versions(pool, &snapshot.versions);
         }
         if let Some(checkpoint) =
             crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(&self.base_dir))
@@ -13102,8 +13121,13 @@ impl CheckpointTail {
         crate::index::versions::write_versions(
             &PackfileStorage::index_versions_path(&self.base_dir),
             &self.logical_versions,
+            self.covered_lsn.unwrap_or(0),
         )
         .map_err(StorageError::Io)?;
+        // The versions are durable; the coverage claim below may now reclaim
+        // the WAL. Crash tests stop between the two to prove the versions file
+        // alone is enough to restore versions and coverage.
+        versions_crash_point("after-versions-fsync");
         // The image is durable; record the LSN it covers so a reopen replays only
         // what follows, and let the journal drop what the packs now cover. The
         // pack fsync happened before the handoff, so everything through the LSN
@@ -13266,6 +13290,26 @@ impl Drop for TestBeforePinGuard {
         PackfileStorage::set_test_before_pin(None);
     }
 }
+
+/// Exit code of a child stopped at a versions crash point. Distinct from 0
+/// (clean run) and 101 (panic), so a test can tell an injected crash from
+/// either.
+#[cfg(test)]
+pub(crate) const VERSIONS_CRASH_EXIT_CODE: i32 = 87;
+
+/// Test-only crash injection for the checkpoint tail: exit the process at
+/// `name` when `MTXDB_CRASH_AT` matches, without running destructors or
+/// flushing anything.
+#[cfg(test)]
+fn versions_crash_point(name: &str) {
+    if std::env::var("MTXDB_CRASH_AT").as_deref() == Ok(name) {
+        std::process::exit(VERSIONS_CRASH_EXIT_CODE);
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn versions_crash_point(_name: &str) {}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

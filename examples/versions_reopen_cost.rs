@@ -145,7 +145,7 @@ fn main() {
         .enumerate()
         .map(|(index, collection)| (*collection, 1_000 + index as u64))
         .collect();
-    versions::write_versions(&versions_path, &version_entries).expect("write versions");
+    versions::write_versions(&versions_path, &version_entries, 0).expect("write versions");
     let bytes = std::fs::metadata(&versions_path).map_or(0, |meta| meta.len());
     let version_count = version_entries.len();
     let bytes_per_collection = usize::try_from(bytes).unwrap_or(0) / version_entries.len();
@@ -154,6 +154,7 @@ fn main() {
     let (a_duration, a_entries) = sample(rounds, || {
         versions::read_versions(&versions_path)
             .expect("read versions")
+            .versions
             .len()
     });
 
