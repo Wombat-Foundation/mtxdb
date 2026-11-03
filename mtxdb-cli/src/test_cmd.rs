@@ -2513,12 +2513,41 @@ fn raw_auth_projection_keeps_v8_restricted_join_fields() {
     let rules = owned_value(
         r#"{"event_id":"$rules","sender":"@alice:test","room_id":"!room","type":"m.room.join_rules","state_key":"","content":{"join_rule":"restricted","allow":[{"type":"m.room.member","room_id":"!other","state_key":"@alice:test"}]},"prev_events":[],"auth_events":[]}"#,
     );
-    assert!(raw_auth_projection(&rules, "8")
-        .unwrap()
-        .get("allow")
-        .is_some());
+    // `allow` is not read by the auth rules; the v8 redaction bug belongs
+    // in rezzy, not in this projection.
+    assert!(raw_auth_projection(&rules, "8").is_none());
     assert!(raw_auth_projection(&rules, "9").is_none());
     assert!(raw_auth_projection(&member, "11").is_none());
+
+    // v11 redaction still strips all of m.room.third_party_invite.
+    let third_party = owned_value(
+        r#"{"event_id":"$tpi","sender":"@alice:test","room_id":"!room","type":"m.room.third_party_invite","state_key":"token","content":{"public_key":"key","public_keys":[{"public_key":"key"}]},"prev_events":[],"auth_events":[]}"#,
+    );
+    let projection = raw_auth_projection(&third_party, "11").unwrap();
+    assert_eq!(
+        projection.get("public_key").and_then(OwnedValue::as_str),
+        Some("key")
+    );
+    assert!(projection.get("public_keys").is_some());
+
+    let third_party_member = owned_value(
+        r#"{"event_id":"$member","sender":"@bob:test","room_id":"!room","type":"m.room.member","state_key":"@bob:test","content":{"membership":"invite","third_party_invite":{"display_name":"Bob","signed":{"mxid":"@bob:test","token":"token"}}},"prev_events":[],"auth_events":[]}"#,
+    );
+    let projection = raw_auth_projection(&third_party_member, "10").unwrap();
+    let token = projection.get("third_party_invite").unwrap();
+    assert!(token.get("signed").is_some());
+    assert!(token.get("display_name").is_none());
+
+    let create = owned_value(
+        r#"{"event_id":"$create","sender":"@alice:test","room_id":"!room","type":"m.room.create","state_key":"","content":{"room_version":"10","m.federate":false},"prev_events":[],"auth_events":[]}"#,
+    );
+    assert_eq!(
+        raw_auth_projection(&create, "10")
+            .unwrap()
+            .get("m.federate")
+            .and_then(OwnedValue::as_bool),
+        Some(false)
+    );
 }
 
 #[test]

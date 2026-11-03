@@ -10967,37 +10967,44 @@ fn raw_auth_projection_collection_id(room_id: &str) -> [u8; 16] {
     )
 }
 
-/// Fields redaction drops before room v11 but the auth rules still read.
+/// Fields redaction drops but the auth rules still read.
 fn raw_auth_projection(event: &OwnedValue, room_version: &str) -> Option<OwnedValue> {
     let major = room_version
         .split('.')
         .next()
         .and_then(|major| major.parse::<u32>().ok())?;
-    if major >= 11 || event.get("state_key").is_none() {
+    event.get("state_key")?;
+    let kind = event.get("type")?.as_str()?;
+    // v11 redaction strips all of m.room.third_party_invite, so its public
+    // keys still need a projection even though other auth fields survive.
+    if major >= 11 && kind != "m.room.third_party_invite" {
         return None;
     }
-    let kind = event.get("type")?.as_str()?;
     let OwnedValue::Object(content) = event.get("content")? else {
         return None;
     };
     let mut projected = Object::new();
-    let fields: &[&str] = match kind {
-        // Redaction kept only creator before v11, so keep the whole create
-        // content, including m.federate.
-        "m.room.create" | "m.room.third_party_invite" => {
-            for (key, value) in content {
-                projected.insert(key.clone(), value.clone());
+    if kind == "m.room.member" {
+        // The auth rule reads the signed token, not display_name or the
+        // surrounding signatures.
+        if let Some(OwnedValue::Object(third_party)) = content.get("third_party_invite") {
+            if let Some(signed) = third_party.get("signed") {
+                let mut token = Object::new();
+                token.insert("signed".to_owned(), signed.clone());
+                projected.insert("third_party_invite".to_owned(), OwnedValue::Object(token));
             }
-            return (!projected.is_empty()).then_some(OwnedValue::Object(projected));
         }
+        if major == 8 {
+            if let Some(value) = content.get("join_authorised_via_users_server") {
+                projected.insert("join_authorised_via_users_server".to_owned(), value.clone());
+            }
+        }
+        return (!projected.is_empty()).then_some(OwnedValue::Object(projected));
+    }
+    let fields: &[&str] = match kind {
+        "m.room.create" => &["m.federate"],
+        "m.room.third_party_invite" => &["public_key", "public_keys"],
         "m.room.power_levels" => &["invite"],
-        "m.room.member" if major == 8 => {
-            &["third_party_invite", "join_authorised_via_users_server"]
-        }
-        "m.room.member" => &["third_party_invite"],
-        // Restricted joins first exist in v8, and redaction preserves allow
-        // from v9 on, so only v8 needs this projection.
-        "m.room.join_rules" if major == 8 => &["allow"],
         _ => return None,
     };
     for key in fields {

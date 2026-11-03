@@ -615,6 +615,11 @@ mod tests {
         index
             .stage(&tx2, &[FlagChange::set(2, Flag::Present)])
             .unwrap();
+        // A no-op stage after the earlier stage already wrote this
+        // transaction's chunk and metadata must still commit.
+        index
+            .stage(&tx2, &[FlagChange::set(2, Flag::Present)])
+            .unwrap();
         index
             .stage(&tx2, &[FlagChange::set(3, Flag::Present)])
             .unwrap();
@@ -738,6 +743,49 @@ mod tests {
         assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
     }
 
+    fn assert_noop_stage_is_fenced_by_meta(db: &Database, index: &RoomFlagIndex) {
+        let before_noop = index.meta(db).unwrap();
+        let noop_tx = db.begin_transaction();
+        index
+            .stage(&noop_tx, &[FlagChange::set(1, Flag::Present)])
+            .unwrap();
+        let publish_tx = db.begin_transaction();
+        let (_, publish_versions) = publish_tx
+            .get_with_record_versions(
+                index.pool(),
+                index.collection(),
+                &[crate::room_flag::FLAG_META_ID],
+            )
+            .unwrap();
+        let publish_token = publish_versions.first().copied().unwrap_or(0);
+        publish_tx
+            .put(
+                index.pool(),
+                *index.collection(),
+                crate::room_flag::FLAG_META_ID,
+                &NodeData::new(bytes::Bytes::from(
+                    crate::room_flag::encode_meta(crate::room_flag::FlagMeta {
+                        generation: before_noop.generation.saturating_add(1),
+                        max_short_id: before_noop.max_short_id,
+                    })
+                    .to_vec(),
+                )),
+            )
+            .unwrap();
+        publish_tx
+            .expect_record_version(
+                index.pool(),
+                *index.collection(),
+                crate::room_flag::FLAG_META_ID,
+                publish_token,
+            )
+            .unwrap();
+        publish_tx.commit().unwrap();
+        let commit_res = noop_tx.commit();
+        assert!(commit_res.is_err());
+        assert!(commit_res.unwrap_err().is_stale_read());
+    }
+
     #[test]
     fn stale_meta_token_after_rebuild_publish_fails_commit() {
         let root = test_root("concurrent_rebuild");
@@ -853,6 +901,8 @@ mod tests {
         let commit_res = inflight_tx.commit();
         assert!(commit_res.is_err());
         assert!(commit_res.unwrap_err().is_stale_read());
+
+        assert_noop_stage_is_fenced_by_meta(&db, &index);
     }
 
     #[test]

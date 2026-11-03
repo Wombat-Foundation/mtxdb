@@ -482,6 +482,11 @@ impl RoomFlagIndex {
         let chunk_col = self.chunk_collection(current_meta.generation);
         let (max_short_seen, mutated) = self.stage_into_collection_inner(tx, chunk_col, changes)?;
         if !mutated {
+            // No records are written, but keep the metadata CAS check so a
+            // rebuild that published after our read aborts this transaction.
+            if !(meta_raw.is_some() && meta_token == 0) {
+                tx.expect_record_version(self.pool, self.collection, FLAG_META_ID, meta_token)?;
+            }
             return Ok(());
         }
 
