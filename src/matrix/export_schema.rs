@@ -63,8 +63,7 @@ pub mod field {
     /// `event`: the event's id.
     pub const EVENT_ID: &str = "event_id";
     /// `event`, optional: the event's timeline position. Present only for
-    /// events the source put on its timeline, signed like a [`super::PduCount`]
-    /// (negative for backfill).
+    /// events the source put on its timeline, with negative positions for backfill.
     pub const STREAM_ORDERING: &str = "stream_ordering";
     /// `event`, optional: when the source finished soft-failing the event, for
     /// events it kept out of its timeline. Only soft-failed events carry this;
