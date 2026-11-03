@@ -13,7 +13,7 @@ use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
 
 use crate::index::packidx;
-use crate::packfile::{self, Record};
+use crate::packfile::{self, PackId, Record};
 
 // Linux `sync_file_range(2)`, declared directly rather than adding a `libc`
 // dependency for a single probe call.
@@ -657,6 +657,14 @@ pub struct ShardPool {
     dirty: parking_lot::Mutex<HashSet<u16>>,
     /// Detached sidecar builders; joined on clean pool shutdown.
     seal_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Packs whose sidecar has been durably published since the last drain.
+    ///
+    /// A pack is marked `sealed` before its sidecar exists, so this queue is
+    /// the publication edge: only a successfully written (and therefore
+    /// atomically renamed) sidecar is announced. A paged store drains it to
+    /// evict those packs from the resident table without ever exposing a
+    /// window where a record is in neither place.
+    sealed_ready: Arc<Mutex<Vec<(u16, PackId)>>>,
     /// Total number of shards retired (garbage-collected after a repack)
     /// over the pool's lifetime.
     retired_count: AtomicU64,
@@ -1260,6 +1268,7 @@ impl ShardPool {
             bucket_seed,
             dirty: parking_lot::Mutex::new(HashSet::new()),
             seal_workers: Mutex::new(Vec::new()),
+            sealed_ready: Arc::new(Mutex::new(Vec::new())),
             retired_count: AtomicU64::new(0),
             stats_snapshots: AtomicU64::new(0),
             collection_home: RwLock::new(HashMap::new()),
@@ -2925,6 +2934,7 @@ impl ShardPool {
             self.flush_shard_with_guard(shard, &guard)?;
         }
         let shard = Arc::clone(shard);
+        let sealed_ready = Arc::clone(&self.sealed_ready);
         let worker = std::thread::Builder::new()
             .name("mtxdb-pack-index".to_owned())
             .spawn(move || {
@@ -2936,12 +2946,17 @@ impl ShardPool {
                     shard.fsync_advancing_watermark(false)
                 }
                 .and_then(|()| packidx::build_and_write(&shard.path, true));
-                if let Err(error) = result {
-                    if shard.is_current.load(Ordering::Acquire) {
-                        eprintln!(
-                            "mtxdb: pack index for {} could not be written: {error}",
-                            shard.path.display()
-                        );
+                match result {
+                    // The sidecar's rename is durable; a reader can find this
+                    // pack now. Announce it only at that point.
+                    Ok(()) => sealed_ready.lock().push((shard.slot, shard.pack_id)),
+                    Err(error) => {
+                        if shard.is_current.load(Ordering::Acquire) {
+                            eprintln!(
+                                "mtxdb: pack index for {} could not be written: {error}",
+                                shard.path.display()
+                            );
+                        }
                     }
                 }
             })?;
@@ -2965,6 +2980,21 @@ impl ShardPool {
         for worker in workers {
             let _ = worker.join();
         }
+    }
+
+    /// Drain packs whose sidecars were durably published since the last call.
+    ///
+    /// A pack is marked `sealed` before its sidecar exists; this is the later
+    /// publication edge. Callers that evict sealed packs must use this queue
+    /// (after [`Self::wait_for_seals`] if they need a synchronous drain), not
+    /// the `sealed` flag.
+    pub fn take_sealed_ready(&self) -> Vec<(u16, PackId)> {
+        std::mem::take(&mut *self.sealed_ready.lock())
+    }
+
+    /// Return publications that a storage generation could not install yet.
+    pub fn return_sealed_ready(&self, ready: impl IntoIterator<Item = (u16, PackId)>) {
+        self.sealed_ready.lock().extend(ready);
     }
 
     /// A pool rotation does not end the homes of unrelated collections. Seal

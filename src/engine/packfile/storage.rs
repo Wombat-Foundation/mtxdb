@@ -184,6 +184,12 @@ pub struct OpenTimings {
     pub packfile_open_calls: u64,
     /// Packfiles whose full-scan index build came from a sealed `.idx` sidecar.
     pub pack_index_sidecars: u64,
+    /// Time spent opening and validating sealed sidecars during the full scan.
+    pub pack_index_open: std::time::Duration,
+    /// Time spent folding a sealed sidecar into the per-collection locators.
+    pub pack_index_build: std::time::Duration,
+    /// Time spent scanning unsealed pack frames during the full scan.
+    pub tail_scan: std::time::Duration,
     /// Restoring pool metadata and persisted shard statistics.
     pub metadata_restore: std::time::Duration,
     /// Restoring pool.meta header and reading next pack ID.
@@ -253,6 +259,9 @@ impl Default for OpenTimings {
             packfile_open: std::time::Duration::ZERO,
             packfile_open_calls: 0,
             pack_index_sidecars: 0,
+            pack_index_open: std::time::Duration::ZERO,
+            pack_index_build: std::time::Duration::ZERO,
+            tail_scan: std::time::Duration::ZERO,
             metadata_restore: std::time::Duration::ZERO,
             pool_meta_restore: std::time::Duration::ZERO,
             persisted_stats_restore: std::time::Duration::ZERO,
@@ -3094,20 +3103,31 @@ impl PackfileStorage {
                 && (residency == crate::index::IndexResidency::Paged
                     || !shards.checksum_policy().verifies_reads());
             if use_sidecar {
-                if let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) {
+                let sidecar_open_started = std::time::Instant::now();
+                let opened = crate::index::packidx::open_for_pack(&shard.path);
+                timings.pack_index_open = timings
+                    .pack_index_open
+                    .saturating_add(sidecar_open_started.elapsed());
+                if let Some(sidecar) = opened {
                     let sidecar = Arc::new(sidecar);
-                    scan_state.insert_sidecar(
+                    let sidecar_build_started = std::time::Instant::now();
+                    let inserted = scan_state.insert_sidecar(
                         &sidecar,
                         slot,
                         shard.pack_id,
                         u64::from(shard.creation_seq),
                         &deleted_collections,
                         index_config,
-                    )?;
+                    );
+                    timings.pack_index_build = timings
+                        .pack_index_build
+                        .saturating_add(sidecar_build_started.elapsed());
+                    inserted?;
                     timings.pack_index_sidecars = timings.pack_index_sidecars.saturating_add(1);
                     continue;
                 }
             }
+            let tail_started = std::time::Instant::now();
             if writable {
                 // Recovery can safely truncate only a torn final frame. The
                 // visitor keeps no per-shard entry vector while preserving
@@ -3165,6 +3185,7 @@ impl PackfileStorage {
                     return Err(error.into());
                 }
             }
+            timings.tail_scan = timings.tail_scan.saturating_add(tail_started.elapsed());
         }
         timings.full_scan = scan_started.elapsed();
 
@@ -7341,6 +7362,78 @@ impl PackfileStorage {
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
+    /// Evict packs whose sidecar was durably published since the last drain
+    /// from a paged store's resident index.
+    ///
+    /// The pack is marked `sealed` before its sidecar exists, so eviction is
+    /// driven by [`ShardPool::take_sealed_ready`] — the queue is populated only
+    /// after the sidecar's atomic rename. `wait` joins in-flight sidecar
+    /// builders first, for a synchronous barrier.
+    ///
+    /// Each affected collection is rebuilt from the unsealed packs and the
+    /// now-published sidecars, then its generation is swapped in atomically.
+    /// A concurrent lookup therefore sees either the old generation (record
+    /// still resident) or the new one (record served by the sidecar), never a
+    /// gap. A missing or invalid sidecar leaves the collection resident; that
+    /// costs memory, never correctness.
+    fn evict_newly_sealed(&self, wait: bool) {
+        if self.index_residency != crate::index::IndexResidency::Paged {
+            return;
+        }
+        if wait {
+            self.shards.wait_for_seals();
+        }
+        let notices = self.shards.take_sealed_ready();
+        if notices.is_empty() {
+            return;
+        }
+        let mut affected: HashMap<[u8; 16], Vec<(u16, PackId)>> = HashMap::new();
+        for (slot, pack_id) in notices {
+            let Some(shard) = self.shards.get_shard(slot) else {
+                continue;
+            };
+            if shard.pack_id != pack_id || !shard.is_current.load(Ordering::Acquire) {
+                continue;
+            }
+            let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) else {
+                // The announce edge means this should not happen; if it does,
+                // keep the entries resident and let a later rebuild scan them.
+                continue;
+            };
+            sidecar.for_each_collection(|collection_id, count| {
+                if count > 0 {
+                    affected
+                        .entry(collection_id)
+                        .or_default()
+                        .push((slot, pack_id));
+                }
+            });
+        }
+        let mut retry = Vec::new();
+        for (collection_id, pending) in affected {
+            if let Some(generation) = self.generation(&collection_id) {
+                if pending
+                    .iter()
+                    .all(|(_, pack_id)| generation.sealed.contains_pack(*pack_id))
+                {
+                    continue;
+                }
+            }
+            if let Err(error) = self.refresh_collection(&collection_id) {
+                eprintln!(
+                    "mtxdb: paged eviction could not refresh {}: {error}",
+                    hex16(&collection_id)
+                );
+                // Do not drop the publication edge on a transient failure:
+                // the entries stay resident, and a later drain retries.
+                retry.extend(pending);
+            }
+        }
+        if !retry.is_empty() {
+            self.shards.return_sealed_ready(retry);
+        }
+    }
+
     /// Forces a re-scan of a collection's shards from disk and atomically swaps in the new index.
     /// This is designed for multi-worker environments to pull in external appends on demand.
     ///
@@ -10715,7 +10808,11 @@ impl StorageEngine for PackfileStorage {
         } else {
             OperationTimer::disabled()
         };
-        self.put_internal(collection_id, id, data, None)
+        let result = self.put_internal(collection_id, id, data, None);
+        // A put that rotated a pack may have published its sidecar while this
+        // call ran. Drain without waiting; a later operation picks it up.
+        self.evict_newly_sealed(false);
+        result
     }
 
     fn put_many(
@@ -10728,11 +10825,15 @@ impl StorageEngine for PackfileStorage {
         } else {
             OperationTimer::disabled()
         };
-        self.put_many_internal(collection_id, entries, None)
+        let result = self.put_many_internal(collection_id, entries, None);
+        self.evict_newly_sealed(false);
+        result
     }
 
     fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError> {
-        self.remove_record(collection_id, id)
+        let result = self.remove_record(collection_id, id);
+        self.evict_newly_sealed(false);
+        result
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -10784,6 +10885,9 @@ impl StorageEngine for PackfileStorage {
         self.record_sync_diagnostics(&timings);
         if result.is_ok() {
             self.count_sync_persistence(&timings);
+            // A sync is the barrier that makes eviction deterministic: wait
+            // for sidecar builders, then swap each affected collection.
+            self.evict_newly_sealed(true);
         }
         *self.last_sync_timings.lock() = Some(timings);
         result
@@ -11072,6 +11176,7 @@ impl PackfileStorage {
         self.record_sync_diagnostics(&timings);
         if result.is_ok() {
             self.count_sync_persistence(&timings);
+            self.evict_newly_sealed(true);
         }
         *self.last_sync_timings.lock() = Some(timings);
         result

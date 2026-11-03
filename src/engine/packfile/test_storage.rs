@@ -12290,6 +12290,98 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
     fs::remove_dir_all(&store_dir).ok();
 }
 
+/// The coverage cap applies whenever a valid versions file exists, in either
+/// mode. A Resident checkpoint therefore has to refresh that file every time
+/// it writes `journal.lsn`, or a store that switched Paged -> Resident would
+/// keep a stale cap and retain WAL it no longer needs.
+#[test]
+fn resident_checkpoint_refreshes_a_stale_versions_file() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("versions_resident_refresh_wal");
+    let store_dir = test_dir("versions_resident_refresh_store");
+    let wal = wal_dir.join("shared.wal");
+
+    let stale = {
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let store = PackfileStorage::open_with_max_shard_bytes_and_residency(
+            store_dir.clone(),
+            48 * 1024,
+            crate::packfile::ChecksumPolicy::Full,
+            crate::index::IndexResidency::Paged,
+        )
+        .unwrap();
+        store
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(1),
+                &NodeData::from_slice(b"paged"),
+            )
+            .unwrap();
+        coordinator.sync().unwrap();
+        store.sync_all().unwrap();
+        crate::index::versions::read_coverage(&PackfileStorage::index_versions_path(&store_dir))
+            .expect("a paged sync publishes index.versions")
+    };
+    assert_eq!(stale, 0, "paged mode has not checkpointed coverage");
+
+    let expected = {
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let store =
+            PackfileStorage::open_with_max_shard_bytes(store_dir.clone(), 48 * 1024).unwrap();
+        store
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(2),
+                &NodeData::from_slice(b"resident"),
+            )
+            .unwrap();
+        coordinator.sync().unwrap();
+        store.sync_all().unwrap();
+        store.force_index_checkpoint().unwrap();
+        let expected = store.durable_coverage();
+        assert!(expected > stale, "the checkpoint must advance coverage");
+        let published = crate::index::versions::read_coverage(
+            &PackfileStorage::index_versions_path(&store_dir),
+        )
+        .expect("the Resident checkpoint must refresh index.versions");
+        assert_eq!(
+            published, expected,
+            "index.versions must carry the coverage journal.lsn was written with"
+        );
+        expected
+    };
+
+    let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        store_dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.durable_coverage(),
+        expected,
+        "a stale versions file capped coverage below the Resident checkpoint"
+    );
+    drop(reopened);
+    fs::remove_dir_all(&wal_dir).ok();
+    fs::remove_dir_all(&store_dir).ok();
+}
+
 /// A `journal.lsn` ahead of the versions file is a leftover, not a coverage
 /// claim: the versions file is synced first, so a larger value must not let a
 /// paged reopen (or a later reclaim) move past the versions it can restore.
@@ -12694,6 +12786,94 @@ fn paged_refresh_rebuilds_only_the_unsealed_tail() {
     for id in &ids {
         assert!(store.get(&TEST_COLLECTION, id).unwrap().is_some());
     }
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_lookups_remain_available_while_sealed_pack_is_evicted() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = test_dir("paged_seal_evict_concurrent");
+    let store = Arc::new(
+        PackfileStorage::open_with_max_shard_bytes_and_residency(
+            dir.clone(),
+            8192,
+            crate::packfile::ChecksumPolicy::Full,
+            crate::index::IndexResidency::Paged,
+        )
+        .unwrap(),
+    );
+    let ids = Arc::new(parking_lot::Mutex::new(Vec::<[u8; 16]>::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let eviction_seen = Arc::new(AtomicBool::new(false));
+
+    let reader_store = Arc::clone(&store);
+    let reader_ids = Arc::clone(&ids);
+    let reader_done = Arc::clone(&done);
+    let reader_eviction_seen = Arc::clone(&eviction_seen);
+    let reader = std::thread::spawn(move || {
+        while !reader_done.load(Ordering::Acquire) {
+            let snapshot = reader_ids.lock().clone();
+            for id in snapshot {
+                assert!(
+                    reader_store.get(&TEST_COLLECTION, &id).unwrap().is_some(),
+                    "a concurrent lookup missed {id:02x?} during sidecar publication/eviction"
+                );
+            }
+            if let Some(generation) = reader_store.generation(&TEST_COLLECTION) {
+                if !generation.sealed.is_empty()
+                    && generation
+                        .sealed
+                        .packs()
+                        .iter()
+                        .all(|pack| !generation.index.references_slot(pack.slot))
+                {
+                    reader_eviction_seen.store(true, Ordering::Release);
+                }
+            }
+            std::thread::yield_now();
+        }
+    });
+
+    for index in 0..200u8 {
+        let id = distinct_id(index);
+        store
+            .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&[index; 64]))
+            .unwrap();
+        ids.lock().push(id);
+    }
+    store.shards.wait_for_seals();
+    store.evict_newly_sealed(true);
+    for _ in 0..10_000 {
+        if eviction_seen.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    done.store(true, Ordering::Release);
+    reader.join().unwrap();
+    assert!(
+        eviction_seen.load(Ordering::Acquire),
+        "reader must observe the atomically published sidecar generation"
+    );
+
+    let generation = store.generation(&TEST_COLLECTION).expect("generation");
+    assert!(
+        !generation.sealed.is_empty(),
+        "the fixture must seal a pack"
+    );
+    for pack in generation.sealed.packs() {
+        assert!(
+            !generation.index.references_slot(pack.slot),
+            "sealed pack {} remained resident after its sidecar was published",
+            pack.pack_id
+        );
+    }
+    for id in ids.lock().iter() {
+        assert!(store.get(&TEST_COLLECTION, id).unwrap().is_some());
+    }
+    drop(generation);
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }

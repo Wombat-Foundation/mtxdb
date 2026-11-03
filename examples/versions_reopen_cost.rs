@@ -213,8 +213,8 @@ fn main() {
         mtxdb::packfile::ChecksumPolicy::Full,
         IndexResidency::Paged,
     ) {
-        let total = open.open_timings().map(|t| t.total);
-        println!("paged full open: {total:?}");
+        let timings = open.open_timings();
+        println!("paged full open timings: {timings:#?}");
         drop(open);
     } else {
         println!("paged full open: failed");

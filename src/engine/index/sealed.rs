@@ -171,17 +171,40 @@ impl SealedLocators {
     /// Replacing the same `pack_id` is idempotent (for example when an open is
     /// retried); it keeps the set sorted and never duplicates a pack.
     pub fn insert(&mut self, pack: SealedPack) {
+        let key = (pack.creation_seq, pack.pack_id);
         if let Some(existing) = self
             .packs
             .iter_mut()
             .find(|existing| existing.pack_id == pack.pack_id)
         {
             *existing = pack;
-        } else {
-            self.packs.push(pack);
+            // A replacement keeps the same pack identity in practice, but a
+            // changed creation sequence must not leave the vector unsorted.
+            self.packs
+                .sort_by_key(|pack| (pack.creation_seq, pack.pack_id));
+            return;
         }
-        self.packs
-            .sort_by_key(|pack| (pack.creation_seq, pack.pack_id));
+        // Open scans insert packs oldest-first, so the common path is an
+        // append. Avoid re-sorting the whole vector per pack: that turned a
+        // 1,000-pack open into O(packs^2 log packs) comparisons.
+        if self
+            .packs
+            .last()
+            .is_none_or(|last| (last.creation_seq, last.pack_id) < key)
+        {
+            self.packs.push(pack);
+            return;
+        }
+        let position = self
+            .packs
+            .partition_point(|existing| (existing.creation_seq, existing.pack_id) < key);
+        self.packs.insert(position, pack);
+    }
+
+    /// Whether the set already serves `pack_id`.
+    #[must_use]
+    pub fn contains_pack(&self, pack_id: PackId) -> bool {
+        self.packs.iter().any(|pack| pack.pack_id == pack_id)
     }
 
     /// Drop a pack that has been retired or repacked away.
