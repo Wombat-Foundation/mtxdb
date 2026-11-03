@@ -15,6 +15,16 @@ use parking_lot::{Mutex, RwLock};
 use crate::index::packidx;
 use crate::packfile::{self, PackId, Record};
 
+/// Test-only pause between `remap_shard` sampling the file length and
+/// publishing it, so a regression test can append inside that window. It
+/// applies only to the named thread.
+#[cfg(test)]
+type RemapPause = Arc<(std::sync::Barrier, std::sync::Barrier)>;
+
+#[cfg(test)]
+static TEST_REMAP_PAUSE: std::sync::OnceLock<parking_lot::Mutex<Option<(String, RemapPause)>>> =
+    std::sync::OnceLock::new();
+
 // Linux `sync_file_range(2)`, declared directly rather than adding a `libc`
 // dependency for a single probe call.
 #[cfg(target_os = "linux")]
@@ -2952,6 +2962,17 @@ impl ShardPool {
             .metadata()
             .map_err(crate::storage::StorageError::Io)?
             .len();
+        #[cfg(test)]
+        if let Some((thread_name, pause)) = TEST_REMAP_PAUSE
+            .get_or_init(|| parking_lot::Mutex::new(None))
+            .lock()
+            .clone()
+        {
+            if std::thread::current().name() == Some(thread_name.as_str()) {
+                pause.0.wait();
+                pause.1.wait();
+            }
+        }
         let mut guard = shard.mmap.write();
         if guard.as_ref().is_none_or(|m| (m.len() as u64) < file_len) {
             *guard = Some(Arc::new(
@@ -2961,7 +2982,10 @@ impl ShardPool {
         // A read-only pool can observe an append made by another process. Its
         // local atomic is only a steady-state fast-path cache, so publish the
         // length verified while remapping before retrying the read.
-        shard.file_len.store(file_len, Ordering::Release);
+        // Another local writer may have extended the pack after the metadata
+        // snapshot above. Never let a stale remap snapshot move the allocator's
+        // append frontier backwards and make the next put overwrite a frame.
+        shard.file_len.fetch_max(file_len, Ordering::Release);
         Ok(())
     }
 

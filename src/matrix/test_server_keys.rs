@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -405,11 +406,39 @@ fn overlapping_writers_never_lose_a_key() {
         .collect();
     let actual: std::collections::BTreeSet<Vec<u8>> =
         all.iter().map(|key| key.key_id.clone()).collect();
+    let diagnostics = if actual == expected {
+        String::new()
+    } else {
+        expected
+            .difference(&actual)
+            .map(|key_id| {
+                let record_id = origin_key_record_id(key_id);
+                let direct_get = db
+                    .server_info()
+                    .get_many(&origin_keys_collection_id(b"o"), &[record_id])
+                    .map(|records| records.first().is_some_and(Option::is_some));
+                let location = db
+                    .server_info()
+                    .get_location(&origin_keys_collection_id(b"o"), &record_id);
+                let mut record_id_hex = String::with_capacity(record_id.len() * 2);
+                for byte in record_id {
+                    write!(&mut record_id_hex, "{byte:02x}")
+                        .expect("writing to a String cannot fail");
+                }
+                format!(
+                    "missing {:?} record_id={}: direct_get={direct_get:?}, get_location={location:?}",
+                    String::from_utf8_lossy(key_id),
+                    record_id_hex,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
     assert_eq!(
         actual,
         expected,
-        "every worker's keys and the shared one; keys read: {:?}",
-        all.iter().map(|key| &key.key_id).collect::<Vec<_>>()
+        "every worker's keys and the shared one; keys read: {:?}; diagnostics: {diagnostics}",
+        all.iter().map(|key| &key.key_id).collect::<Vec<_>>(),
     );
     drop(db);
     let _ = std::fs::remove_dir_all(root);
