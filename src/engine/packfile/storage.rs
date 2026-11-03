@@ -10990,6 +10990,8 @@ impl PackfileStorage {
                 return Ok(None);
             };
             let candidates = gen.candidates(collection_id, node_id);
+            #[cfg(test)]
+            Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
             let current = self.generation(collection_id);
             if !current

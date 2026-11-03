@@ -4153,6 +4153,61 @@ fn slots_only_reopen_resolves_removed_state_from_the_frame() {
     fs::remove_dir_all(dir).ok();
 }
 
+/// `durable_removed` resolves candidates from one generation, then pins the
+/// shards those candidates point at. If a refresh or repack swaps the
+/// generation in between, the pinned shards may be retired; the lookup must
+/// retry against the new generation instead of reporting a stale answer.
+#[test]
+fn durable_removed_retries_when_generation_swaps_before_pin() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let dir = test_dir("durable_removed_generation_retry");
+    let collection = [0xAA; 16];
+    let removed = distinct_id(0x71);
+    let live = distinct_id(0x72);
+    let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+    store
+        .put(&collection, &removed, &NodeData::from_slice(b"old"))
+        .unwrap();
+    assert!(store.remove(&collection, &removed).unwrap());
+    store
+        .put(&collection, &live, &NodeData::from_slice(b"live"))
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let swapped = Arc::new(AtomicBool::new(false));
+    let weak = Arc::downgrade(&store);
+    let hook = PackfileStorage::install_test_before_pin(Box::new({
+        let calls = Arc::clone(&calls);
+        let swapped = Arc::clone(&swapped);
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if !swapped.swap(true, Ordering::SeqCst) {
+                if let Some(store) = weak.upgrade() {
+                    store.refresh_collection(&collection).unwrap();
+                }
+            }
+        }
+    }));
+
+    assert_eq!(
+        store.durable_removed(&collection, &removed).unwrap(),
+        Some(true)
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "the lookup must retry after the generation swap"
+    );
+    assert_eq!(
+        store.durable_removed(&collection, &live).unwrap(),
+        Some(false)
+    );
+    drop(hook);
+    drop(store);
+    fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn collection_len_overlay_handles_slots_only_tombstone_put_and_remove() {
     let dir = test_dir("collection_len_slots_only_overlay_tombstone");
