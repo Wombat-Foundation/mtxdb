@@ -1428,10 +1428,23 @@ struct AuthJudgement {
 }
 
 /// The canonical redaction of every event whose content hash fails.
-fn redactions_for_export(events: &[RoomEvent], room_version: &str) -> Vec<Option<HashMismatch>> {
+///
+/// Events loaded from this store are already redacted; re-redacting them would
+/// strip the auth projection laid over their stored content.
+fn redactions_for_export(
+    events: &[RoomEvent],
+    room_version: &str,
+    already_redacted: &HashSet<String>,
+) -> Vec<Option<HashMismatch>> {
     events
         .iter()
-        .map(|event| redacted_for_hash(&event.pdu, room_version))
+        .map(|event| {
+            if already_redacted.contains(&event.event_id) {
+                None
+            } else {
+                redacted_for_hash(&event.pdu, room_version)
+            }
+        })
         .collect()
 }
 
@@ -1680,23 +1693,35 @@ pub(crate) fn derived_auth_findings_with_keys(
     export: &RoomExport,
     keys: Option<&SignatureKeyCatalog>,
 ) -> anyhow::Result<AuthFindings> {
-    derived_auth_findings_inner(export, keys, true)
+    derived_auth_findings_inner(export, keys, true, None, &HashSet::new())
 }
 
 /// [`derived_auth_findings_with_keys`] for a partial raw import: a batch may
 /// not contain enough history to authorize the create event, and that is not
 /// a reason to refuse the batch.
-pub(crate) fn derived_auth_findings_for_raw(export: &RoomExport) -> anyhow::Result<AuthFindings> {
-    derived_auth_findings_inner(export, None, false)
+///
+/// `room_version` is passed explicitly because the stored create event is
+/// redacted and may no longer carry `content.room_version`. `already_redacted`
+/// names events loaded from this store: their content hash intentionally no
+/// longer matches because the stored form is redacted, so they must not be
+/// redacted again or their auth projection would be lost.
+pub(crate) fn derived_auth_findings_for_raw(
+    export: &RoomExport,
+    room_version: &str,
+    already_redacted: &HashSet<String>,
+) -> anyhow::Result<AuthFindings> {
+    derived_auth_findings_inner(export, None, false, Some(room_version), already_redacted)
 }
 
 fn derived_auth_findings_inner(
     export: &RoomExport,
     keys: Option<&SignatureKeyCatalog>,
     require_create_authorized: bool,
+    room_version_override: Option<&str>,
+    already_redacted: &HashSet<String>,
 ) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
-    let Some(room_version) = create_room_version(events) else {
+    let Some(room_version) = room_version_override.or_else(|| create_room_version(events)) else {
         return auth_findings(export);
     };
     let Some(version) = StateResVersion::from_room_version(room_version) else {
@@ -1707,8 +1732,9 @@ fn derived_auth_findings_inner(
         .enumerate()
         .map(|(position, event)| (event.event_id.as_bytes(), position))
         .collect();
-    // An event whose content hash fails is judged in its redacted form.
-    let redacted = redactions_for_export(events, room_version);
+    // An event whose content hash fails is judged in its redacted form, unless
+    // it is a stored event that was redacted on import.
+    let redacted = redactions_for_export(events, room_version, already_redacted);
     let lean = lean_redacted_events(events, &redacted, &export.room_id);
     let create = create_position(events).and_then(|position| lean[position].as_ref());
     let exported: Vec<bool> = events
@@ -2389,6 +2415,7 @@ pub(crate) fn write_keys(db: &Database, records: &[KeyRecord]) -> anyhow::Result
 mod auth_findings_tests {
     use bytes::Bytes;
     use mtxdb::server_keys::{key_digest, KeyTier, ServerKey};
+    use rezzy::json::Object;
     use rezzy::signing::ed25519_zebra::SigningKey;
 
     use super::*;
@@ -2469,6 +2496,44 @@ mod auth_findings_tests {
 
     const MISSING_AUTH: u8 = 4;
     const DEPENDS_ON_REJECTED: u8 = 2;
+
+    fn room_event(json: &str) -> RoomEvent {
+        let value = OwnedValue::parse_bytes(json.as_bytes()).expect("valid event JSON");
+        RoomEvent::from_pdu(&value, "!room:test").expect("event has an id")
+    }
+
+    #[test]
+    fn stored_projection_survives_content_hash_redaction() {
+        let mut create = room_event(
+            r#"{"event_id":"$create","sender":"@alice:test","room_id":"!room:test","type":"m.room.create","state_key":"","content":{"room_version":"10","m.federate":false},"prev_events":[],"auth_events":[]}"#,
+        );
+        let stored_hash = rezzy::compute_content_hash(&create.pdu, "10").expect("content hash");
+        if let OwnedValue::Object(fields) = &mut create.pdu {
+            // The stored create is already redacted: it kept only the
+            // projected m.federate field, not room_version or other content.
+            let mut content = Object::new();
+            content.insert("m.federate".to_owned(), OwnedValue::Bool(false));
+            fields.insert("content".to_owned(), OwnedValue::Object(content));
+            let mut hashes = Object::new();
+            hashes.insert("sha256".to_owned(), OwnedValue::String(stored_hash));
+            fields.insert("hashes".to_owned(), OwnedValue::Object(hashes));
+        }
+        let rules = room_event(
+            r#"{"event_id":"$rules","sender":"@alice:test","room_id":"!room:test","type":"m.room.join_rules","state_key":"","content":{"join_rule":"public"},"prev_events":["$create"],"auth_events":["$create"]}"#,
+        );
+        let join_bob = room_event(
+            r#"{"event_id":"$join_bob","sender":"@bob:other","room_id":"!room:test","type":"m.room.member","state_key":"@bob:other","content":{"membership":"join"},"prev_events":["$rules"],"auth_events":["$create","$rules"]}"#,
+        );
+        let export = export(vec![create, rules, join_bob]);
+        let already_redacted = HashSet::from(["$create".to_owned()]);
+
+        let findings = derived_auth_findings_for_raw(&export, "10", &already_redacted).unwrap();
+        assert_eq!(
+            forced(&findings, 2),
+            Some(RejectionCode::AuthCheckFailed.to_u8()),
+            "the projected m.federate must survive the stored-event hash check"
+        );
+    }
 
     #[test]
     fn a_complete_room_has_no_findings() {
