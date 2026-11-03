@@ -6021,7 +6021,7 @@ fn partial_base_state_is_left_unchecked() {
 }
 
 #[test]
-fn incomplete_base_is_inherited_by_descendants() {
+fn base_is_incomplete_inherits_from_parents() {
     let instance = [0_u8; STATE_GROUP_ID_LENGTH];
     let complete = SharedState::new(StateSet::new(), instance, true);
     let incomplete = SharedState::new(StateSet::new(), instance, false);
@@ -6032,6 +6032,51 @@ fn incomplete_base_is_inherited_by_descendants() {
         false,
         std::slice::from_ref(&incomplete)
     ));
+}
+
+#[test]
+fn incomplete_base_is_inherited_by_descendants() {
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!inheritedgap:test.conduwuit.local";
+    // $orphan_leave has no prev_events, so its own base is incomplete even
+    // though it is walked. Its leave state is non-empty, so a child judged
+    // against it would reject Alice. The child inherits the gap instead.
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$orphan_leave:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":[],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":3,"event_id":"$orphan_leave:test","origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$child:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$orphan_leave:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$child:test","origin_server_ts":4000,"prev_events":["$orphan_leave:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 4)
+    );
+    assert_eq!(
+        run.rejection_counts.values().sum::<usize>(),
+        0,
+        "the child inherits $orphan_leave's incomplete base"
+    );
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(), 0);
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 4);
 }
 
 #[test]
