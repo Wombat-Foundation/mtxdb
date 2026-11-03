@@ -12080,6 +12080,44 @@ fn sealing_a_pack_writes_a_sidecar_and_open_skips_recovery() {
 }
 
 #[test]
+fn resident_checkpoint_open_releases_unconsumed_sealed_sidecars() {
+    let dir = test_dir("resident_checkpoint_releases_sidecars");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAB;
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[u8::try_from(index).unwrap(); 32]),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    let reopened = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    assert_eq!(reopened.open_timings().unwrap().path, OpenPath::Checkpoint);
+    let sealed: Vec<_> = reopened
+        .shards
+        .all_shards()
+        .into_iter()
+        .filter(|(_, shard)| shard.sealed.load(Ordering::Acquire))
+        .collect();
+    assert!(!sealed.is_empty(), "fixture must contain sealed packs");
+    assert!(
+        sealed
+            .iter()
+            .all(|(_, shard)| shard.sealed_index.lock().is_none()),
+        "checkpoint opens must release sidecar images not consumed by a scan"
+    );
+    drop(reopened);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn full_scan_registers_sealed_locators_per_collection() {
     let dir = test_dir("packidx_sealed_locators");
     let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();

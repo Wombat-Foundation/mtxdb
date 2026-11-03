@@ -3057,6 +3057,12 @@ impl PackfileStorage {
             None
         };
         if let Some((scan_out, collection_order, delta_state, checkpoint_covered)) = checkpoint {
+            // Pool open retains verified sidecars so a full-scan index build
+            // can reuse them. A checkpoint open skips that scan, so release
+            // any images it did not consume before returning the store.
+            for (_, shard) in shards.all_shards() {
+                let _ = shard.take_sealed_index();
+            }
             timings.path = OpenPath::Checkpoint;
             let assemble_started = std::time::Instant::now();
             let store = Self::assemble(
@@ -3103,13 +3109,20 @@ impl PackfileStorage {
                 && (residency == crate::index::IndexResidency::Paged
                     || !shards.checksum_policy().verifies_reads());
             if use_sidecar {
-                let sidecar_open_started = std::time::Instant::now();
-                let opened = crate::index::packidx::open_for_pack(&shard.path);
-                timings.pack_index_open = timings
-                    .pack_index_open
-                    .saturating_add(sidecar_open_started.elapsed());
+                // Pool open already verified this pack's sidecar to decide it
+                // was sealed; reuse that image instead of checksumming it
+                // again here.
+                let opened = if let Some(sidecar) = shard.take_sealed_index() {
+                    Some(sidecar)
+                } else {
+                    let sidecar_open_started = std::time::Instant::now();
+                    let opened = crate::index::packidx::open_for_pack(&shard.path);
+                    timings.pack_index_open = timings
+                        .pack_index_open
+                        .saturating_add(sidecar_open_started.elapsed());
+                    opened.map(Arc::new)
+                };
                 if let Some(sidecar) = opened {
-                    let sidecar = Arc::new(sidecar);
                     let sidecar_build_started = std::time::Instant::now();
                     let inserted = scan_state.insert_sidecar(
                         &sidecar,
@@ -3126,6 +3139,9 @@ impl PackfileStorage {
                     timings.pack_index_sidecars = timings.pack_index_sidecars.saturating_add(1);
                     continue;
                 }
+            } else {
+                // Resident mode will not consult this image; release it.
+                let _ = shard.take_sealed_index();
             }
             let tail_started = std::time::Instant::now();
             if writable {
@@ -3186,6 +3202,10 @@ impl PackfileStorage {
                 }
             }
             timings.tail_scan = timings.tail_scan.saturating_add(tail_started.elapsed());
+        }
+        // Also cover unusual scan paths that did not consume a verified image.
+        for (_, shard) in shards.all_shards() {
+            let _ = shard.take_sealed_index();
         }
         timings.full_scan = scan_started.elapsed();
 

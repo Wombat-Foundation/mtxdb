@@ -290,6 +290,12 @@ pub struct Shard {
     pub(crate) is_current: AtomicBool,
     /// A pack with a durable, validated locator sidecar is no longer writable.
     pub(crate) sealed: AtomicBool,
+    /// Sidecar verified while opening the pool, waiting for the index build.
+    ///
+    /// The pool must verify a sidecar to decide whether the pack is sealed.
+    /// Keeping the verified image here lets the full-scan index build consume
+    /// it instead of opening and checksumming the same file a second time.
+    pub(crate) sealed_index: Mutex<Option<Arc<packidx::MappedPackIndex>>>,
     /// Current file length, tracked atomically for rotation decisions
     /// without a `metadata()` syscall on every put. This is the *committed*
     /// on-disk length — buffered records occupy `[file_len, file_len +
@@ -496,6 +502,7 @@ impl Shard {
             sync_lock: parking_lot::Mutex::new(()),
             is_current: AtomicBool::new(true),
             sealed: AtomicBool::new(false),
+            sealed_index: Mutex::new(None),
             file_len: AtomicU64::new(file_len),
             pending: Mutex::new(Vec::new()),
             pending_records: AtomicU64::new(0),
@@ -505,6 +512,14 @@ impl Shard {
             synced_len: AtomicU64::new(file_len),
             poisoned: AtomicBool::new(false),
         }
+    }
+
+    /// Take the sidecar image verified during pool open, if it is still here.
+    ///
+    /// Opening consumes it so the caller can fold it into the index without a
+    /// second full checksum verification.
+    pub(crate) fn take_sealed_index(&self) -> Option<Arc<packidx::MappedPackIndex>> {
+        self.sealed_index.lock().take()
     }
 
     /// Whether this shard has been poisoned by an unrecoverable rollback
@@ -1075,7 +1090,10 @@ impl ShardPool {
         let mut packfile_open_time = Duration::ZERO;
         let mut packfile_open_calls: u64 = 0;
         for (pack_id, path, creation_seq) in pack_files {
-            let sealed = packidx::open_for_pack(&path).is_some();
+            // Open once: this both decides whether the pack is sealed and
+            // yields the verified image the index build will consume.
+            let sealed_index = packidx::open_for_pack(&path);
+            let sealed = sealed_index.is_some();
             if writable && !sealed {
                 let recovery_started = Instant::now();
                 // Only the safety of appending matters here (every frame and CRC
@@ -1116,6 +1134,9 @@ impl ShardPool {
                 file_len,
             ));
             shard.sealed.store(sealed, Ordering::Release);
+            if let Some(index) = sealed_index {
+                *shard.sealed_index.lock() = Some(Arc::new(index));
+            }
             shards[slot as usize] = Some(shard);
         }
         Ok((
