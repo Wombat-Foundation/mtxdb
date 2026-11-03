@@ -134,9 +134,17 @@ impl RoomEvent {
             v.as_i64()
                 .or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok()))
         });
+        // Keep what the source claimed so the derived verdict can be compared
+        // with it, while the analysis PDU above stays unflagged.
+        let metadata = EventMetadata {
+            outlier: crate::state_policy::has_event_flag(pdu, "outlier"),
+            rejected: Some(crate::state_policy::has_event_flag(pdu, "rejected")),
+            soft_failed: Some(crate::state_policy::has_event_flag(pdu, "soft_failed")),
+            ..EventMetadata::default()
+        };
         Some(Self {
             event_id: eid.to_owned(),
-            metadata: EventMetadata::default(),
+            metadata,
             prev_events,
             auth_events,
             pdu: clean_pdu,
@@ -835,6 +843,25 @@ mod tests {
             create.get("event_id"),
             Some(&OwnedValue::String("$create".to_owned()))
         );
+    }
+
+    #[test]
+    fn from_pdu_keeps_the_source_disposition_for_comparison() {
+        let pdu = OwnedValue::parse_bytes(
+            br#"{"event_id":"$e","room_id":"!room:example.org","type":"m.room.message",
+                 "sender":"@alice:example.org","content":{},"rejected":true,
+                 "__soft-failed":true,"outlier":true}"#,
+        )
+        .expect("test PDU is valid JSON");
+        let event = RoomEvent::from_pdu(&pdu, "!room:example.org").expect("has an event id");
+        assert_eq!(event.metadata.rejected, Some(true));
+        assert_eq!(event.metadata.soft_failed, Some(true));
+        assert!(event.metadata.outlier);
+        assert!(!crate::state_policy::has_event_flag(&event.pdu, "rejected"));
+        assert!(!crate::state_policy::has_event_flag(
+            &event.pdu,
+            "soft_failed"
+        ));
     }
 
     #[test]
