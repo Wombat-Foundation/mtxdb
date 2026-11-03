@@ -378,8 +378,6 @@ impl RoomFlagIndex {
             return Ok(0);
         }
 
-        let (_, collection_version) = tx.get_with_collection_version(self.pool, &chunk_col, &[])?;
-        tx.expect_collection_version(self.pool, chunk_col, collection_version)?;
         let mut grouped: HashMap<(Flag, u16), Vec<(u32, bool)>> = HashMap::new();
         let mut max_short_seen = 0_u32;
 
@@ -466,20 +464,23 @@ impl RoomFlagIndex {
         let chunk_col = self.chunk_collection(current_meta.generation);
         let max_short_seen = self.stage_into_collection(tx, chunk_col, changes)?;
 
-        tx.expect_record_version(self.pool, self.collection, FLAG_META_ID, meta_token)?;
-        if meta_raw.is_none() || max_short_seen > current_meta.max_short_id {
-            let new_meta = FlagMeta {
-                generation: current_meta.generation,
-                max_short_id: current_meta.max_short_id.max(max_short_seen),
-            };
-            let meta_encoded = encode_meta(new_meta);
-            tx.put(
-                self.pool,
-                self.collection,
-                FLAG_META_ID,
-                &NodeData::new(Bytes::from(meta_encoded.to_vec())),
-            )?;
+        if !(meta_raw.is_some() && meta_token == 0) {
+            tx.expect_record_version(self.pool, self.collection, FLAG_META_ID, meta_token)?;
         }
+        // Every writer updates this CAS record, including changes that do not
+        // increase max_short_id. Rebuild publication checks the same record,
+        // so a flag update to an existing event cannot race the generation swap.
+        let new_meta = FlagMeta {
+            generation: current_meta.generation,
+            max_short_id: current_meta.max_short_id.max(max_short_seen),
+        };
+        let meta_encoded = encode_meta(new_meta);
+        tx.put(
+            self.pool,
+            self.collection,
+            FLAG_META_ID,
+            &NodeData::new(Bytes::from(meta_encoded.to_vec())),
+        )?;
         Ok(())
     }
 
@@ -808,13 +809,6 @@ impl RoomFlagIndex {
         // reading the counter afterwards keeps the scan bound consistent with
         // the snapshot the rebuilt index is published against.
         let (current_meta, new_gen, meta_token) = self.reserve_rebuild_generation(db)?;
-        let source_tx = db.begin_transaction();
-        let (_, source_chunk_version) = source_tx.get_with_collection_version(
-            self.pool,
-            &self.chunk_collection(current_meta.generation),
-            &[],
-        )?;
-
         let counter_raw = db
             .pool(self.auth_pool)
             .get(&self.auth_collection, &auth_counter_record_id())?;
@@ -835,15 +829,7 @@ impl RoomFlagIndex {
         prep_tx.delete_collection(self.pool, target_col)?;
         prep_tx.commit()?;
 
-        match self.rebuild_generation(
-            db,
-            counter,
-            current_meta,
-            new_gen,
-            target_col,
-            meta_token,
-            source_chunk_version,
-        ) {
+        match self.rebuild_generation(db, counter, current_meta, new_gen, target_col, meta_token) {
             Ok(total) => Ok(total),
             Err(e) => {
                 let cleanup_tx = db.begin_transaction();
@@ -857,7 +843,7 @@ impl RoomFlagIndex {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn rebuild_generation(
         &self,
         db: &Database,
@@ -866,7 +852,6 @@ impl RoomFlagIndex {
         new_gen: u64,
         target_col: [u8; 16],
         meta_token: u64,
-        source_chunk_version: u64,
     ) -> Result<u64, StorageError> {
         // Query timeline index for timeline events in this room
         let room_name = String::from_utf8_lossy(&self.room_id);
@@ -988,9 +973,9 @@ impl RoomFlagIndex {
                 max_short_id: 0,
             },
         };
-        // Verify that no competing rebuild published a generation while this one
-        // was running. The chunk-collection version CAS below also detects writes
-        // to existing short IDs, which do not need to change the metadata record.
+        // Verify that no competing rebuild or writer published while this one
+        // was running. Every writer CASes FLAG_META_ID, even when max_short_id
+        // is unchanged, so this also detects updates to existing short IDs.
         if live_meta.generation != current_meta.generation {
             return Err(StorageError::StaleRead {
                 pool: self.pool,
@@ -999,14 +984,6 @@ impl RoomFlagIndex {
                 actual: live_meta_token,
             });
         }
-        let (_, chunks_version) =
-            publish_tx.get_with_collection_version(self.pool, &target_col, &[])?;
-        publish_tx.expect_collection_version(self.pool, target_col, chunks_version)?;
-        publish_tx.expect_collection_version(
-            self.pool,
-            self.chunk_collection(current_meta.generation),
-            source_chunk_version,
-        )?;
         let published_meta = FlagMeta {
             generation: new_gen,
             max_short_id: max_short_seen,

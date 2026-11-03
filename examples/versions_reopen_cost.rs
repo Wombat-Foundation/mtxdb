@@ -183,7 +183,10 @@ fn main() {
         b_misses = missed;
         seen
     });
-    assert_eq!(b_misses, 0);
+    assert_eq!(
+        b_misses, 0,
+        "every pack must have a readable sidecar for the B measurement"
+    );
 
     // The cheapest form of B: one open and one fixed-size header read per
     // sidecar, no full-body verification. This is the floor if B rides along

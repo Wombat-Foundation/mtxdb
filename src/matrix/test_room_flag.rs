@@ -719,15 +719,16 @@ mod tests {
             .unwrap();
         let meta_token = meta_versions.first().copied().unwrap_or(0);
 
-        // 2. A writer updates an existing short ID (1). Since max_short_id does not grow,
-        // it must NOT touch FLAG_META_ID, avoiding writer contention.
+        // 2. A writer updates an existing short ID (1). Even though
+        // max_short_id does not grow, the metadata CAS record must change so a
+        // rebuild cannot publish a generation that misses this flag update.
         let tx_writer = db.begin_transaction();
         index
             .stage(&tx_writer, &[FlagChange::set(1, Flag::Timeline)])
             .unwrap();
         tx_writer.commit().unwrap();
 
-        // Verify FLAG_META_ID record version did NOT change
+        // Verify FLAG_META_ID record version changed.
         let (_meta_nodes_after, meta_versions_after) = db
             .begin_transaction()
             .get_with_record_versions(
@@ -736,9 +737,9 @@ mod tests {
                 &[crate::room_flag::FLAG_META_ID],
             )
             .unwrap();
-        assert_eq!(
+        assert_ne!(
             meta_versions_after[0], meta_token,
-            "FLAG_META_ID record version must not change when max_short_id does not grow"
+            "FLAG_META_ID must guard updates even when max_short_id stays fixed"
         );
 
         // 3. A generation swap (rebuild publish) updates FLAG_META_ID

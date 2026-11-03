@@ -223,9 +223,10 @@ fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
 /// `MTXDB_MEASURE_RESIDENCY=paged` to measure the tail-only reopen.
 fn measure_residency() -> mtxdb::index::IndexResidency {
     match std::env::var("MTXDB_MEASURE_RESIDENCY").as_deref() {
-        Err(std::env::VarError::NotPresent) => mtxdb::index::IndexResidency::Resident,
         Ok("paged") => mtxdb::index::IndexResidency::Paged,
-        Ok("resident") => mtxdb::index::IndexResidency::Resident,
+        Ok("resident") | Err(std::env::VarError::NotPresent) => {
+            mtxdb::index::IndexResidency::Resident
+        }
         Ok(other) => panic!("unknown MTXDB_MEASURE_RESIDENCY value: {other}"),
         Err(error) => panic!("cannot read MTXDB_MEASURE_RESIDENCY: {error}"),
     }
