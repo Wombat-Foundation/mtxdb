@@ -11,6 +11,8 @@
 //! keys are spread over the older 90% of the collection; misses are unique.
 //! `MTXDB_LOOKUP_SHARD_BYTES` changes the seal size, and
 //! `MTXDB_LOOKUP_PACK_COUNTS=1000` runs only a selected pack-count fixture.
+//! With `MTXDB_LOOKUP_ROOT` set, fixtures are kept there and a complete one
+//! (marked by its `fixture-records` file) is reused by later runs.
 
 #![allow(clippy::arithmetic_side_effects, clippy::cast_precision_loss)]
 
@@ -89,37 +91,67 @@ fn sidecar_count(dir: &Path) -> usize {
         .count()
 }
 
-fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64) -> Vec<NodeId> {
+/// File in a fixture directory recording how many records it holds; present
+/// only once the fixture is complete.
+const FIXTURE_RECORDS: &str = "fixture-records";
+
+/// Record count of a complete fixture with at least `wanted` sealed packs.
+fn fixture_records(dir: &Path, wanted: usize) -> Option<u64> {
+    let records = std::fs::read_to_string(dir.join(FIXTURE_RECORDS))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (sidecar_count(dir) >= wanted).then_some(records)
+}
+
+fn append_batch(store: &PackfileStorage, sequence: &mut u64, count: u64) {
+    let capacity = usize::try_from(count).unwrap_or(0);
+    let mut batch = Vec::with_capacity(capacity);
+    for _ in 0..count {
+        let id = node_id(*sequence);
+        let data = payload(*sequence);
+        batch.push((id, NodeData::from_slice(&data)));
+        *sequence += 1;
+    }
+    store
+        .put_many(&COLLECTION, &batch)
+        .expect("write fixture batch");
+}
+
+fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64) -> u64 {
     let store = PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), shard_bytes)
         .expect("open fixture store");
-    let mut ids = Vec::new();
     let mut sequence = 0u64;
-    // This incompressible record shape uses roughly 341 bytes per frame, so
-    // scale the batch with the seal size and add more until the target pack
-    // count is met if the estimate is low.
+    // A rough first guess at records per pack (about 341 bytes per frame;
+    // real frames are smaller). The top-up below corrects it from the
+    // measured count.
     let records_per_shard = (shard_bytes / 341).max(1);
     let initial_records = u64::try_from(wanted_packs + 1)
         .expect("pack count fits in u64")
         .saturating_mul(records_per_shard);
-    for _ in 0..initial_records {
-        let id = node_id(sequence);
-        let data = payload(sequence);
-        store
-            .put(&COLLECTION, &id, &NodeData::from_slice(&data))
-            .expect("write fixture record");
-        ids.push(id);
-        sequence += 1;
+    let mut remaining = initial_records;
+    while remaining > 0 {
+        let count = records_per_shard.min(remaining);
+        append_batch(&store, &mut sequence, count);
+        remaining -= count;
     }
     store.sync_all().expect("seal fixture packs");
-    while sidecar_count(dir) < wanted_packs {
-        for _ in 0..records_per_shard {
-            let id = node_id(sequence);
-            let data = payload(sequence);
-            store
-                .put(&COLLECTION, &id, &NodeData::from_slice(&data))
-                .expect("write fixture record");
-            ids.push(id);
-            sequence += 1;
+    // The estimate above can be far off (frames are about 180 bytes, not
+    // 341), and every sync rewrites the whole index checkpoint, so top up
+    // from the measured records per pack instead of syncing once per batch.
+    loop {
+        let sealed = u64::try_from(sidecar_count(dir)).expect("pack count fits in u64");
+        let wanted = u64::try_from(wanted_packs).expect("pack count fits in u64");
+        if sealed >= wanted {
+            break;
+        }
+        let per_pack = (sequence / sealed.max(1)).max(1);
+        let mut remaining = (wanted - sealed + 1).saturating_mul(per_pack);
+        while remaining > 0 {
+            let count = records_per_shard.min(remaining);
+            append_batch(&store, &mut sequence, count);
+            remaining -= count;
         }
         store.sync_all().expect("seal fixture packs");
     }
@@ -127,7 +159,7 @@ fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64) -> Vec<NodeI
         .force_index_checkpoint()
         .expect("write resident checkpoint");
     drop(store);
-    ids
+    sequence
 }
 
 fn open(dir: &Path, residency: IndexResidency, shard_bytes: u64) -> PackfileStorage {
@@ -204,15 +236,33 @@ fn main() {
     println!("packs\tmode\topen_ms\thit_us\tmiss_us\theap_mib\tmapped_mib\tsealed_packs\trecords");
     for wanted in pack_counts() {
         let base = root.join(format!("base-{wanted}"));
-        std::fs::create_dir_all(&base).expect("create fixture directory");
-        let ids = build_fixture(&base, wanted, shard_bytes);
+        let total_records = if let Some(records) = fixture_records(&base, wanted) {
+            // A Paged open deletes the resident checkpoint, so restore it
+            // before the Resident measurement, as a fresh build would.
+            PackfileStorage::open_with_max_shard_bytes(base.clone(), shard_bytes)
+                .expect("open reused fixture")
+                .force_index_checkpoint()
+                .expect("rewrite resident checkpoint");
+            records
+        } else {
+            if base.exists() {
+                std::fs::remove_dir_all(&base).expect("clear incomplete fixture");
+            }
+            std::fs::create_dir_all(&base).expect("create fixture directory");
+            let records = build_fixture(&base, wanted, shard_bytes);
+            std::fs::write(base.join(FIXTURE_RECORDS), records.to_string())
+                .expect("record fixture size");
+            records
+        };
 
-        let hit_range = ids.len().saturating_mul(9) / 10;
+        let hit_range = total_records.saturating_mul(9) / 10;
         let hits: Vec<NodeId> = (0..PROBES)
-            .map(|index| ids[index * hit_range / PROBES])
+            .map(|index| node_id((index as u64).saturating_mul(hit_range) / (PROBES as u64)))
             .collect();
+        // Fixture ids count up from zero, so ids counted down from the top of
+        // the sequence space are never written.
         let misses: Vec<NodeId> = (0..PROBES)
-            .map(|index| node_id(u64::try_from(ids.len()).unwrap() + index as u64 + 10_000_000))
+            .map(|index| node_id(u64::MAX - index as u64))
             .collect();
         // Measure Resident first: it consumes the checkpoint the fixture
         // wrote. The first Paged open then deletes that checkpoint, so later
@@ -231,10 +281,9 @@ fn main() {
                 heap as f64 / (1024.0 * 1024.0),
                 mapped as f64 / (1024.0 * 1024.0),
                 sidecar_count(&base),
-                ids.len()
+                total_records
             );
         }
-        std::fs::remove_dir_all(&base).ok();
     }
     if owned_root {
         let _ = std::fs::remove_dir_all(&root);
