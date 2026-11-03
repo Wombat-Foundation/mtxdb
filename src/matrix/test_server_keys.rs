@@ -397,10 +397,19 @@ fn overlapping_writers_never_lose_a_key() {
         worker.join().unwrap();
     }
     let all = read_server_keys(db.server_info(), b"o").unwrap();
+    let expected: std::collections::BTreeSet<Vec<u8>> = (0..4_u8)
+        .flat_map(|worker| {
+            (0..10_u8).map(move |round| format!("ed25519:{worker}-{round}").into_bytes())
+        })
+        .chain(std::iter::once(b"ed25519:shared".to_vec()))
+        .collect();
+    let actual: std::collections::BTreeSet<Vec<u8>> =
+        all.iter().map(|key| key.key_id.clone()).collect();
     assert_eq!(
-        all.len(),
-        4 * 10 + 1,
-        "every worker's keys and the shared one"
+        actual,
+        expected,
+        "every worker's keys and the shared one; keys read: {:?}",
+        all.iter().map(|key| &key.key_id).collect::<Vec<_>>()
     );
     drop(db);
     let _ = std::fs::remove_dir_all(root);

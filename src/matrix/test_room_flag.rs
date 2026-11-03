@@ -51,14 +51,16 @@ mod tests {
             index.count(&db, &FlagQuery::not(Flag::Rejected)).unwrap(),
             0
         );
-        assert!(index
-            .select_shorts(&db, &FlagQuery::has(Flag::Present))
-            .unwrap()
-            .is_empty());
-        assert!(index
-            .select(&db, &FlagQuery::has(Flag::Present))
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            index
+                .select_shorts(&db, &FlagQuery::has(Flag::Present))
+                .unwrap(),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            index.select(&db, &FlagQuery::has(Flag::Present)).unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
     }
 
     #[test]

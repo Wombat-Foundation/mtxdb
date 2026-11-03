@@ -87,7 +87,7 @@ fn build_packs(dir: &Path, collections: &[[u8; 16]], wanted: usize) {
                 .expect("put");
             sequence += 1;
         }
-        if sequence % (collections.len() * 16) == 0 && sidecars(dir).len() >= wanted {
+        if sequence.is_multiple_of(collections.len() * 16) && sidecars(dir).len() >= wanted {
             break;
         }
         assert!(

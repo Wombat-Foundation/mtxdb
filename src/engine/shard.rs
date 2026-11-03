@@ -795,8 +795,10 @@ impl ShardPool {
     /// Acquires an exclusive lock on `base_dir` (a `.mtxdb.lock` marker
     /// file within it) for the pool's lifetime. A second writer opening
     /// the same directory while this one is alive fails here instead
-    /// of silently risking corruption. A same-process open that observes our
-    /// marker retries briefly to cover the inherited-fd window after `fork` — nothing else in this engine
+    /// of silently risking corruption. If the lock marker belongs to this
+    /// process, the open retries for up to 250 ms to cover the inherited-fd
+    /// window after `fork`, so a second same-process open may wait briefly
+    /// before failing. Nothing else in this engine
     /// coordinates concurrent writers across processes; `active_write`,
     /// `file_len`, and `append_lock` are all purely in-process state, so
     /// two processes racing on the same shard file would interleave

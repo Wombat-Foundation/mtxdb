@@ -12270,7 +12270,11 @@ fn full_scan_registers_sealed_locators_for_collection() {
     // This slice keeps the resident index complete; the sealed set is a
     // verified fallback, not yet the only locator source.
     for id in &ids {
-        assert!(!generation.candidates(&TEST_COLLECTION, id).is_empty());
+        assert_ne!(
+            generation.candidates(&TEST_COLLECTION, id),
+            Vec::<(u16, u64)>::new(),
+            "every record should have a resident or sealed locator"
+        );
     }
     drop(generation);
 

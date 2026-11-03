@@ -75,7 +75,7 @@ fn node_id(sequence: u64) -> NodeId {
 
 fn payload(sequence: u64) -> [u8; PAYLOAD_BYTES] {
     let mut bytes = [0u8; PAYLOAD_BYTES];
-    for (chunk, word) in bytes.chunks_exact_mut(8).zip(0u64..) {
+    for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(0u64..) {
         chunk.copy_from_slice(&mix(sequence.wrapping_add(word)).to_le_bytes());
     }
     bytes
