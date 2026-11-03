@@ -347,6 +347,26 @@ fn main() {
     let baseline = rss_bytes();
     let (store, peak) = peak_rss_during(|| open_store(dir.clone(), measure_residency()));
     let (heap, _mapped, _logical, _slots) = index_memory(&store);
+    if let Some(timing) = store.open_timings() {
+        println!(
+            "open stages: total={:?}, shard_open={:?} (discovery={:?}, writer_lock={:?}, recovery={:?}, pack_open={:?}, metadata_restore={:?}), metadata_load={:?}, checkpoint_decode={:?}, fingerprint={:?}, index_materialization={:?}, full_scan={:?}, bookkeeping={:?}, assemble={:?}, sidecars={}",
+            timing.total,
+            timing.shard_open,
+            timing.shard_discovery,
+            timing.writer_lock,
+            timing.packfile_recovery,
+            timing.packfile_open,
+            timing.metadata_restore,
+            timing.metadata_load,
+            timing.checkpoint_decode,
+            timing.fingerprint,
+            timing.index_materialization,
+            timing.full_scan,
+            timing.bookkeeping,
+            timing.assemble,
+            timing.pack_index_sidecars,
+        );
+    }
     println!(
         "full-scan open: peak rss {:.1} MiB (from {:.1} MiB, +{:.1}), final heap {:.1} MiB ({:.2} B/rec)",
         mib(peak),
