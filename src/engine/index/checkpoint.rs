@@ -38,9 +38,9 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 use super::format::{
-    CheckpointHeader, CheckpointResidency, CollectionDirEntry, CollectionVersionEntry,
-    PackTableEntry, SealedRefEntry, CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN,
-    COLLECTION_VERSION_ENTRY_LEN, PACK_TABLE_ENTRY_LEN, SEALED_REF_ENTRY_LEN,
+    CheckpointHeader, CollectionDirEntry, CollectionVersionEntry, PackTableEntry,
+    CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN, COLLECTION_VERSION_ENTRY_LEN,
+    PACK_TABLE_ENTRY_LEN,
 };
 use crate::packfile::PackId;
 
@@ -117,10 +117,6 @@ pub struct LoadedCheckpoint {
     /// Per-pool logical versions captured through `covered_lsn`, including
     /// IDs of collections deleted after their last live record was written.
     pub logical_versions: Vec<([u8; 16], u64)>,
-    /// Whether the index is complete or only the unsealed tail.
-    pub residency: CheckpointResidency,
-    /// Sealed packs a `TailOnly` index depends on. Empty for `Complete`.
-    pub sealed_refs: Vec<SealedRefEntry>,
 }
 
 /// One collection's raw slots in the checkpoint mapping.
@@ -205,7 +201,6 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
 /// Returns `io::Error` on any failure; the previous checkpoint (if any) is
 /// left intact in that case.
 #[allow(
-    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the checkpoint phases are one atomic construction; splitting them would scatter overflow-checked arithmetic that must stay in lockstep"
 )]
@@ -214,32 +209,10 @@ pub fn write_checkpoint(
     fingerprint: u64,
     covered_lsn: u64,
     base_delta_seq: u64,
-    residency: CheckpointResidency,
     collections: &[([u8; 16], u64, &[u8])],
     pack_table: &[(u16, PackId)],
     logical_versions: &[([u8; 16], u64)],
-    sealed_refs: &[SealedRefEntry],
 ) -> std::io::Result<()> {
-    if residency == CheckpointResidency::Complete && !sealed_refs.is_empty() {
-        return Err(std::io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a complete checkpoint cannot carry sealed-pack references",
-        ));
-    }
-    if sealed_refs
-        .windows(2)
-        .any(|pair| pair[0].pack_id >= pair[1].pack_id)
-        || sealed_refs.iter().any(|entry| entry.pack_id.is_zero())
-    {
-        return Err(std::io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "sealed references must be sorted, unique, and non-zero",
-        ));
-    }
-    let sealed_bytes = u64::try_from(sealed_refs.len())
-        .ok()
-        .and_then(|n| n.checked_mul(SEALED_REF_ENTRY_LEN as u64))
-        .ok_or_else(|| std::io::Error::other("checkpoint sealed-ref size overflow"))?;
     let pack_table_count = u32::try_from(pack_table.len())
         .map_err(|_| std::io::Error::other("too many packs for checkpoint pack table u32"))?;
     let pack_table_bytes = u64::try_from(pack_table.len())
@@ -298,8 +271,7 @@ pub fn write_checkpoint(
         .saturating_add(usize::try_from(directory_bytes).unwrap_or(usize::MAX))
         .saturating_add(usize::try_from(slots_bytes).unwrap_or(usize::MAX))
         .saturating_add(usize::try_from(pack_table_bytes).unwrap_or(usize::MAX))
-        .saturating_add(usize::try_from(logical_version_bytes).unwrap_or(usize::MAX))
-        .saturating_add(usize::try_from(sealed_bytes).unwrap_or(usize::MAX));
+        .saturating_add(usize::try_from(logical_version_bytes).unwrap_or(usize::MAX));
     // Reserve the header first, then build the body directly into the final
     // buffer. This avoids retaining a second checkpoint-sized body merely to
     // calculate the CRC carried by the header.
@@ -366,12 +338,6 @@ pub fn write_checkpoint(
             .encode(),
         );
     }
-    // Phase 6: sealed-pack references for a tail-only index. Sorted by pack id
-    // so the reader can validate without a set; the section's length is the
-    // remainder of the file, which keeps the header layout unchanged.
-    for entry in sealed_refs {
-        buf.extend_from_slice(&entry.encode());
-    }
 
     let content_crc32 = crc32fast::hash(&buf[CHECKPOINT_HEADER_LEN..]);
 
@@ -391,7 +357,6 @@ pub fn write_checkpoint(
         base_delta_seq,
         logical_version_count,
         logical_version_bytes,
-        residency,
     };
     buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
 
@@ -490,16 +455,9 @@ pub fn read_checkpoint_with_policy(
     let pack_table_base = slot_base.checked_add(usize::try_from(body_bytes).ok()?)?;
     let logical_versions_base =
         pack_table_base.checked_add(usize::try_from(header.pack_table_bytes).ok()?)?;
-    let logical_versions_end =
-        logical_versions_base.checked_add(usize::try_from(header.logical_version_bytes).ok()?)?;
-    if buf.len() < logical_versions_end {
-        return None;
-    }
-    let sealed_bytes = buf.len().checked_sub(logical_versions_end)?;
-    if header.residency == CheckpointResidency::Complete && sealed_bytes != 0 {
-        return None;
-    }
-    if sealed_bytes % SEALED_REF_ENTRY_LEN != 0 {
+    if buf.len()
+        != logical_versions_base.checked_add(usize::try_from(header.logical_version_bytes).ok()?)?
+    {
         return None;
     }
 
@@ -603,26 +561,6 @@ pub fn read_checkpoint_with_policy(
         logical_versions.push((entry.collection_id, entry.last_write_lsn));
     }
 
-    let sealed_count = sealed_bytes / SEALED_REF_ENTRY_LEN;
-    let mut sealed_refs = Vec::with_capacity(sealed_count);
-    let mut previous_pack_id: Option<PackId> = None;
-    for i in 0..sealed_count {
-        let entry_offset =
-            logical_versions_end.checked_add(i.checked_mul(SEALED_REF_ENTRY_LEN)?)?;
-        let entry_bytes: [u8; SEALED_REF_ENTRY_LEN] = buf
-            .get(entry_offset..entry_offset.saturating_add(SEALED_REF_ENTRY_LEN))?
-            .try_into()
-            .ok()?;
-        let entry = SealedRefEntry::decode(&entry_bytes)?;
-        if entry.pack_id.is_zero()
-            || previous_pack_id.is_some_and(|previous| previous >= entry.pack_id)
-        {
-            return None;
-        }
-        previous_pack_id = Some(entry.pack_id);
-        sealed_refs.push(entry);
-    }
-
     Some(LoadedCheckpoint {
         fingerprint: header.pack_fingerprint,
         covered_lsn: header.covered_lsn,
@@ -631,8 +569,6 @@ pub fn read_checkpoint_with_policy(
         mmap,
         pack_table,
         logical_versions,
-        residency: header.residency,
-        sealed_refs,
     })
 }
 

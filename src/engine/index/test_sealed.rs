@@ -56,10 +56,6 @@ impl SealedIndex for FakeIndex {
             .count();
         (count > 0).then(|| u64::try_from(count).unwrap_or(u64::MAX))
     }
-
-    fn crc32(&self) -> u32 {
-        0
-    }
 }
 
 fn pack(seq: u64, slot: u16, index: FakeIndex) -> SealedPack {

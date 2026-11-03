@@ -1,10 +1,7 @@
 #![allow(clippy::tests_outside_test_module)]
 
 use mtxdb::index::checkpoint::*;
-use mtxdb::index::format::{
-    CheckpointHeader, CheckpointResidency, SealedRefEntry, CHECKPOINT_HEADER_LEN,
-    COLLECTION_DIR_ENTRY_LEN,
-};
+use mtxdb::index::format::{CheckpointHeader, CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN};
 use mtxdb::index::LossyIndex;
 use mtxdb::packfile::{PackId, PACK_ID_LEN};
 use std::io::Write;
@@ -76,12 +73,10 @@ fn checkpoint_round_trips_index_slots() {
         fingerprint,
         0,
         0,
-        CheckpointResidency::Complete,
         &blobs
             .iter()
             .map(|(id, blob)| (*id, 0, blob.as_slice()))
             .collect::<Vec<_>>(),
-        &[],
         &[],
         &[],
     )
@@ -143,18 +138,7 @@ fn empty_checkpoint_round_trips() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
-    write_checkpoint(
-        &path,
-        pack_fingerprint(&[]),
-        0,
-        0,
-        CheckpointResidency::Complete,
-        &[],
-        &[],
-        &[],
-        &[],
-    )
-    .unwrap();
+    write_checkpoint(&path, pack_fingerprint(&[]), 0, 0, &[], &[], &[]).unwrap();
     let loaded = read_checkpoint(&path).expect("empty checkpoint is still a valid file");
     assert_eq!(loaded.fingerprint, pack_fingerprint(&[]));
     assert!(loaded.collections.is_empty());
@@ -178,12 +162,10 @@ fn corrupt_checkpoints_read_as_none() {
         0,
         0,
         0,
-        CheckpointResidency::Complete,
         &blobs
             .iter()
             .map(|(id, b)| (*id, 0, b.as_slice()))
             .collect::<Vec<_>>(),
-        &[],
         &[],
         &[],
     )
@@ -203,12 +185,10 @@ fn corrupt_checkpoints_read_as_none() {
         0,
         0,
         0,
-        CheckpointResidency::Complete,
         &blobs
             .iter()
             .map(|(id, b)| (*id, 0, b.as_slice()))
             .collect::<Vec<_>>(),
-        &[],
         &[],
         &[],
     )
@@ -242,13 +222,11 @@ fn previous_version_checkpoint_is_rejected() {
         pack_fingerprint(&[(pid(1), 10)]),
         0,
         0,
-        CheckpointResidency::Complete,
         &blobs
             .iter()
             .map(|(id, b)| (*id, 0, b.as_slice()))
             .collect::<Vec<_>>(),
         &[(0, pid(1))],
-        &[],
         &[],
     )
     .unwrap();
@@ -297,12 +275,10 @@ fn content_crc32_catches_value_preserving_slot_corruption() {
         0,
         0,
         0,
-        CheckpointResidency::Complete,
         &blobs
             .iter()
             .map(|(id, b)| (*id, 0, b.as_slice()))
             .collect::<Vec<_>>(),
-        &[],
         &[],
         &[],
     )
@@ -403,7 +379,6 @@ fn read_pack_fingerprint_valid_roundtrip() {
         base_delta_seq: 0,
         logical_version_count: 0,
         logical_version_bytes: 0,
-        residency: CheckpointResidency::Complete,
     };
     std::fs::write(&path, header.encode()).unwrap();
 
@@ -447,7 +422,6 @@ fn read_durable_fingerprint_checkpoint_only() {
         base_delta_seq: 0,
         logical_version_count: 0,
         logical_version_bytes: 0,
-        residency: CheckpointResidency::Complete,
     };
     std::fs::write(&path, header.encode()).unwrap();
 
@@ -489,13 +463,11 @@ fn base_delta_seq_round_trips_through_the_header() {
         pack_fingerprint(&[(pid(1), 10)]),
         5,
         0xDEAD_BEEF_0042,
-        CheckpointResidency::Complete,
         &blobs
             .iter()
             .map(|(id, b)| (*id, 1, b.as_slice()))
             .collect::<Vec<_>>(),
         &[(0, pid(1))],
-        &[],
         &[],
     )
     .unwrap();
@@ -516,145 +488,14 @@ fn checkpoint_round_trips_sorted_collection_versions() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
     let versions = [([1; 16], 3), ([2; 16], 7)];
-    write_checkpoint(
-        &path,
-        pack_fingerprint(&[]),
-        7,
-        0,
-        CheckpointResidency::Complete,
-        &[],
-        &[],
-        &versions,
-        &[],
-    )
-    .unwrap();
+    write_checkpoint(&path, pack_fingerprint(&[]), 7, 0, &[], &[], &versions).unwrap();
 
     let loaded = read_checkpoint(&path).expect("valid logical-version checkpoint");
     assert_eq!(loaded.logical_versions, versions);
 
     let unsorted = [([2; 16], 7), ([1; 16], 3)];
-    assert!(write_checkpoint(
-        &path,
-        pack_fingerprint(&[]),
-        7,
-        0,
-        CheckpointResidency::Complete,
-        &[],
-        &[],
-        &unsorted,
-        &[]
-    )
-    .is_err());
+    assert!(write_checkpoint(&path, pack_fingerprint(&[]), 7, 0, &[], &[], &unsorted).is_err());
     let uncovered = [([1; 16], 8)];
-    assert!(write_checkpoint(
-        &path,
-        pack_fingerprint(&[]),
-        7,
-        0,
-        CheckpointResidency::Complete,
-        &[],
-        &[],
-        &uncovered,
-        &[]
-    )
-    .is_err());
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn tail_only_checkpoint_round_trips_sealed_refs() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_tailonly_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(INDEX_CHECKPOINT_FILE);
-    let blobs = [([1u8; 16], index_with_entries(1, 10).serialize())];
-    let refs = [
-        SealedRefEntry {
-            pack_id: pid(1),
-            creation_seq: 4,
-            sidecar_crc32: 0xDEAD_BEEF,
-        },
-        SealedRefEntry {
-            pack_id: pid(2),
-            creation_seq: 9,
-            sidecar_crc32: 0x1234_5678,
-        },
-    ];
-    write_checkpoint(
-        &path,
-        pack_fingerprint(&[(pid(1), 10), (pid(2), 20)]),
-        0,
-        0,
-        CheckpointResidency::TailOnly,
-        &blobs
-            .iter()
-            .map(|(id, b)| (*id, 0, b.as_slice()))
-            .collect::<Vec<_>>(),
-        &[(0, pid(1)), (1, pid(2))],
-        &[],
-        &refs,
-    )
-    .unwrap();
-
-    let loaded = read_checkpoint(&path).expect("tail-only checkpoint");
-    assert_eq!(loaded.residency, CheckpointResidency::TailOnly);
-    assert_eq!(loaded.sealed_refs, refs);
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn complete_checkpoint_rejects_sealed_refs_and_unsorted_refs_are_rejected() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_refgate_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(INDEX_CHECKPOINT_FILE);
-    let refs = [SealedRefEntry {
-        pack_id: pid(1),
-        creation_seq: 1,
-        sidecar_crc32: 1,
-    }];
-    assert!(
-        write_checkpoint(
-            &path,
-            pack_fingerprint(&[]),
-            0,
-            0,
-            CheckpointResidency::Complete,
-            &[],
-            &[],
-            &[],
-            &refs,
-        )
-        .is_err(),
-        "a complete image cannot claim a sealed manifest"
-    );
-
-    let unsorted = [
-        SealedRefEntry {
-            pack_id: pid(2),
-            creation_seq: 2,
-            sidecar_crc32: 2,
-        },
-        SealedRefEntry {
-            pack_id: pid(1),
-            creation_seq: 1,
-            sidecar_crc32: 1,
-        },
-    ];
-    assert!(
-        write_checkpoint(
-            &path,
-            pack_fingerprint(&[]),
-            0,
-            0,
-            CheckpointResidency::TailOnly,
-            &[],
-            &[],
-            &[],
-            &unsorted,
-        )
-        .is_err(),
-        "sealed references must be sorted"
-    );
+    assert!(write_checkpoint(&path, pack_fingerprint(&[]), 7, 0, &[], &[], &uncovered).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }

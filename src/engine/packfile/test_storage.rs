@@ -12267,62 +12267,77 @@ fn paged_full_scan_uses_sidecars_under_full_checksums() {
 }
 
 #[test]
-fn paged_tail_only_checkpoint_roundtrip_and_resident_rejection() {
-    let dir = test_dir("paged_tail_only_checkpoint");
-    let ids = paged_fixture(&dir);
-
-    // A paged open rejects the complete writer checkpoint and rebuilds, then
-    // its sync publishes a tail-only checkpoint naming the sealed sidecars.
-    let store = paged_open(&dir);
-    store.sync_all().unwrap();
-    drop(store);
-
-    let checkpoint =
-        crate::index::checkpoint::read_checkpoint(&PackfileStorage::index_checkpoint_path(&dir))
-            .expect("tail-only checkpoint");
-    assert_eq!(
-        checkpoint.residency,
-        crate::index::format::CheckpointResidency::TailOnly
-    );
-    assert!(
-        !checkpoint.sealed_refs.is_empty(),
-        "tail-only checkpoint must name its sealed packs"
-    );
-
-    let paged = paged_open(&dir);
-    assert_eq!(paged.open_timings().unwrap().path, OpenPath::Checkpoint);
-    {
-        let generation = paged.generation(&TEST_COLLECTION).expect("generation");
-        assert!(generation.index.len() < ids.len());
-        assert!(!generation.sealed.is_empty());
+fn resident_to_paged_writes_then_resident_sees_every_record() {
+    let dir = test_dir("paged_cross_mode");
+    let checkpoint = PackfileStorage::index_checkpoint_path(&dir);
+    let resident = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    let mut ids = Vec::new();
+    for index in 0..100u8 {
+        let id = distinct_id(index);
+        resident
+            .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&[index; 32]))
+            .unwrap();
+        ids.push(id);
     }
-    for id in &ids {
-        assert!(paged.get(&TEST_COLLECTION, id).unwrap().is_some());
+    resident.sync_all().unwrap();
+    drop(resident);
+    assert!(checkpoint.exists(), "resident sync writes a checkpoint");
+
+    // A paged writer removes the resident checkpoint before its first write,
+    // and publishes neither a checkpoint nor a delta of its own.
+    let paged = paged_open(&dir);
+    assert!(
+        !checkpoint.exists(),
+        "paged open must invalidate a leftover resident checkpoint"
+    );
+    for index in 100..150u8 {
+        let id = distinct_id(index);
+        paged
+            .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&[index; 32]))
+            .unwrap();
+        ids.push(id);
+    }
+    paged.sync_all().unwrap();
+    assert!(
+        !checkpoint.exists(),
+        "paged sync must not publish a checkpoint"
+    );
+    let delta_prefix = format!("{}.", crate::index::delta::INDEX_DELTA_FILE);
+    for entry in fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            name != crate::index::delta::INDEX_DELTA_FILE && !name.starts_with(&delta_prefix),
+            "paged sync must not publish a delta log: {name}"
+        );
     }
     drop(paged);
 
-    // A resident open must never trust the tail-only image.
-    let resident = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
-    let timings = resident.open_timings().unwrap();
-    assert_eq!(timings.path, OpenPath::FullScan);
-    assert_eq!(
-        timings.checkpoint_reject,
-        Some(CheckpointReject::ResidencyMismatch)
-    );
+    // With no checkpoint left, a resident reopen must scan and still see the
+    // records written while the store was paged.
+    let reopened = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    assert_eq!(reopened.open_timings().unwrap().path, OpenPath::FullScan);
     for id in &ids {
-        assert!(resident.get(&TEST_COLLECTION, id).unwrap().is_some());
+        assert!(
+            reopened.get(&TEST_COLLECTION, id).unwrap().is_some(),
+            "resident reopen lost a record written during the paged session"
+        );
     }
-    drop(resident);
+    drop(reopened);
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn paged_missing_sidecar_rejects_checkpoint_and_scans() {
+fn paged_missing_sidecar_falls_back_to_frames() {
     let dir = test_dir("paged_missing_sidecar");
     let ids = paged_fixture(&dir);
     let store = paged_open(&dir);
     store.sync_all().unwrap();
     drop(store);
+    assert!(
+        !PackfileStorage::index_checkpoint_path(&dir).exists(),
+        "paged sync must not leave a checkpoint"
+    );
 
     let sidecar = fs::read_dir(&dir)
         .unwrap()
@@ -12333,12 +12348,7 @@ fn paged_missing_sidecar_rejects_checkpoint_and_scans() {
     fs::remove_file(&sidecar).unwrap();
 
     let reopened = paged_open(&dir);
-    let timings = reopened.open_timings().unwrap();
-    assert_eq!(timings.path, OpenPath::FullScan);
-    assert_eq!(
-        timings.checkpoint_reject,
-        Some(CheckpointReject::ResidencyMismatch)
-    );
+    assert_eq!(reopened.open_timings().unwrap().path, OpenPath::FullScan);
     for id in &ids {
         assert!(
             reopened.get(&TEST_COLLECTION, id).unwrap().is_some(),
@@ -12375,49 +12385,6 @@ fn paged_repack_after_open_preserves_every_record() {
 }
 
 #[test]
-fn paged_session_sealing_marks_checkpoint_complete_then_reopen_evicts() {
-    let dir = test_dir("paged_session_seal");
-    let store = paged_open(&dir);
-    let mut ids = Vec::new();
-    for index in 0..200u8 {
-        let id = distinct_id(index);
-        store
-            .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&[index; 32]))
-            .unwrap();
-        ids.push(id);
-    }
-    // Shards sealed during this session still have their locators resident,
-    // so the checkpoint must not claim to be tail-only.
-    store.sync_all().unwrap();
-    drop(store);
-
-    let checkpoint =
-        crate::index::checkpoint::read_checkpoint(&PackfileStorage::index_checkpoint_path(&dir))
-            .expect("checkpoint");
-    assert_eq!(
-        checkpoint.residency,
-        crate::index::format::CheckpointResidency::Complete,
-        "in-session sealed locators are still resident"
-    );
-    assert!(checkpoint.sealed_refs.is_empty());
-
-    // A paged reopen rebuilds the tail and drops those locators; the sealed
-    // sidecars answer them instead.
-    let reopened = paged_open(&dir);
-    assert_eq!(reopened.open_timings().unwrap().path, OpenPath::FullScan);
-    {
-        let generation = reopened.generation(&TEST_COLLECTION).expect("generation");
-        assert!(generation.index.len() < ids.len());
-        assert!(!generation.sealed.is_empty());
-    }
-    for id in &ids {
-        assert!(reopened.get(&TEST_COLLECTION, id).unwrap().is_some());
-    }
-    drop(reopened);
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn paged_sealed_shards_are_not_retired_as_unreferenced() {
     let dir = test_dir("paged_retire_sealed");
     let ids = paged_fixture(&dir);
@@ -12437,6 +12404,34 @@ fn paged_sealed_shards_are_not_retired_as_unreferenced() {
             store.get(&TEST_COLLECTION, id).unwrap().is_some(),
             "retirement must not unlink a shard still serving sealed records"
         );
+    }
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_refresh_rebuilds_only_the_unsealed_tail() {
+    let dir = test_dir("paged_refresh_tail");
+    let ids = paged_fixture(&dir);
+    let store = paged_open(&dir);
+    let sealed_before = store.generation(&TEST_COLLECTION).unwrap().sealed.len();
+    assert!(sealed_before > 0);
+
+    store.refresh_collection(&TEST_COLLECTION).unwrap();
+
+    let generation = store.generation(&TEST_COLLECTION).expect("generation");
+    assert!(
+        generation.index.len() < ids.len(),
+        "a paged refresh must not pull sealed packs back into the resident table"
+    );
+    assert_eq!(
+        generation.sealed.len(),
+        sealed_before,
+        "the refresh must keep the sealed locator set"
+    );
+    drop(generation);
+    for id in &ids {
+        assert!(store.get(&TEST_COLLECTION, id).unwrap().is_some());
     }
     drop(store);
     let _ = fs::remove_dir_all(&dir);

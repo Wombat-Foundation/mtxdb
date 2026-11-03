@@ -126,10 +126,6 @@ pub enum CheckpointReject {
     /// Applying a delta-log frame or redo set onto a materialized index
     /// failed.
     IndexUpdateFailed,
-    /// The checkpoint's completeness did not match this open's residency
-    /// policy (a resident open cannot trust a tail-only index; a paged open
-    /// rebuilds rather than materialize a complete one and defeat the mode).
-    ResidencyMismatch,
 }
 
 /// How strictly `PackfileStorage::checkpoint_scan_out` validates the live pack
@@ -3008,6 +3004,16 @@ impl PackfileStorage {
         // rescan and index rebuild entirely. It is only trusted when every
         // pack on disk still matches the fingerprint it was written against.
         let deleted_collections = Self::load_deleted_collections(&base_dir);
+        // Paged mode persists no primary index: sealed packs are served from
+        // their sidecars and the resident table is rebuilt from the active
+        // pack. Delete any checkpoint and delta epoch left by an earlier
+        // resident session *before* this session's first write, so a later
+        // resident open cannot load an image that predates those writes (and
+        // cannot replay a delta this session never wrote).
+        if residency == crate::index::IndexResidency::Paged && writable {
+            let _ = fs::remove_file(Self::index_checkpoint_path(&base_dir));
+            Self::sweep_orphan_delta_logs(&base_dir, None);
+        }
         // Capture the journal coverage *before* loading the index, so the bound
         // can never be newer than the index this handle builds. A writer writes
         // `journal.lsn` only after its covering checkpoint, so reading it first
@@ -3015,7 +3021,7 @@ impl PackfileStorage {
         let durable_state = Self::durable_index_state(&base_dir);
         let read_covered = Self::journal_lsn_with(&base_dir, durable_state.covered_lsn);
         timings.metadata_load = metadata_started.elapsed();
-        if let Some((scan_out, collection_order, delta_state, checkpoint_covered)) =
+        let checkpoint = if residency == crate::index::IndexResidency::Resident {
             Self::checkpoint_scan_out(
                 &base_dir,
                 cache_capacity,
@@ -3025,10 +3031,12 @@ impl PackfileStorage {
                 writable,
                 ReloadMode::Strict,
                 index_config,
-                residency,
                 &mut timings,
             )
-        {
+        } else {
+            None
+        };
+        if let Some((scan_out, collection_order, delta_state, checkpoint_covered)) = checkpoint {
             timings.path = OpenPath::Checkpoint;
             let assemble_started = std::time::Instant::now();
             let store = Self::assemble(
@@ -3670,64 +3678,6 @@ impl PackfileStorage {
     /// coverage binds to exactly that base. The checkpoint itself must still be
     /// valid; only the "packs match exactly / log bridges to live" checks are
     /// dropped.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_lines)]
-    /// Re-open every sidecar a tail-only checkpoint names and turn the
-    /// validated set into per-collection locator sources.
-    ///
-    /// Returns `None` if any reference is missing, the pack is no longer
-    /// sealed, its creation sequence changed, or the sidecar's identity/CRC
-    /// differs. The caller then falls back to a frame scan, which is slower
-    /// but never treats a bad manifest entry as absence.
-    fn open_sealed_refs(
-        shards: &ShardPool,
-        refs: &[crate::index::format::SealedRefEntry],
-    ) -> Option<HashMap<[u8; 16], crate::index::sealed::SealedLocators>> {
-        let shards_by_pack: HashMap<PackId, (u16, Arc<Shard>)> = shards
-            .all_shards()
-            .into_iter()
-            .map(|(slot, shard)| (shard.pack_id, (slot, shard)))
-            .collect();
-        // Every currently sealed pack must be named. A sealed pack absent from
-        // the manifest would have no sidecar entry in `SealedLocators`, and
-        // paged lookups would report its records as absent.
-        if shards_by_pack.values().any(|(_, shard)| {
-            shard.sealed.load(Ordering::Acquire)
-                && !refs.iter().any(|entry| entry.pack_id == shard.pack_id)
-        }) {
-            return None;
-        }
-        let mut out: HashMap<[u8; 16], crate::index::sealed::SealedLocators> = HashMap::new();
-        for entry in refs {
-            let (slot, shard) = shards_by_pack.get(&entry.pack_id)?;
-            if !shard.sealed.load(Ordering::Acquire)
-                || u64::from(shard.creation_seq) != entry.creation_seq
-            {
-                return None;
-            }
-            let sidecar = Arc::new(crate::index::packidx::open_for_pack(&shard.path)?);
-            if sidecar.crc32() != entry.sidecar_crc32
-                || sidecar.identity().creation_seq != entry.creation_seq
-            {
-                return None;
-            }
-            let sealed_index: Arc<dyn crate::index::sealed::SealedIndex> = sidecar.clone();
-            let mut collections = Vec::new();
-            sidecar.for_each_collection(|collection_id, _| collections.push(collection_id));
-            for collection_id in collections {
-                out.entry(collection_id)
-                    .or_default()
-                    .insert(crate::index::sealed::SealedPack {
-                        slot: *slot,
-                        pack_id: entry.pack_id,
-                        creation_seq: entry.creation_seq,
-                        index: Arc::clone(&sealed_index),
-                    });
-            }
-        }
-        Some(out)
-    }
-
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -3742,7 +3692,6 @@ impl PackfileStorage {
         writable: bool,
         reload_mode: ReloadMode,
         index_config: crate::index::IndexConfig,
-        residency: crate::index::IndexResidency,
         timings: &mut OpenTimings,
     ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState, u64)> {
         let decode_started = std::time::Instant::now();
@@ -3753,39 +3702,6 @@ impl PackfileStorage {
             timings.checkpoint_reject = Some(CheckpointReject::MissingOrMalformed);
             return None;
         };
-        // Completeness is part of the checkpoint's meaning. A resident open
-        // must never trust an index that omits sealed packs; a paged open
-        // cannot strip sealed entries out of a complete raw-slot image (its
-        // slots-only format has no identities to rehash from), so it rebuilds
-        // the tail instead of materializing the whole table.
-        match (residency, checkpoint.residency) {
-            (
-                crate::index::IndexResidency::Resident,
-                crate::index::format::CheckpointResidency::TailOnly,
-            )
-            | (
-                crate::index::IndexResidency::Paged,
-                crate::index::format::CheckpointResidency::Complete,
-            ) => {
-                timings.checkpoint_reject = Some(CheckpointReject::ResidencyMismatch);
-                return None;
-            }
-            _ => {}
-        }
-        // A tail-only checkpoint is only trustworthy while every sealed pack
-        // it names still has the same sidecar. A missing/stale sidecar must
-        // send this open to the frame scan, never make the records look absent.
-        let mut sealed_by_collection =
-            if checkpoint.residency == crate::index::format::CheckpointResidency::TailOnly {
-                if let Some(sealed) = Self::open_sealed_refs(shards, &checkpoint.sealed_refs) {
-                    sealed
-                } else {
-                    timings.checkpoint_reject = Some(CheckpointReject::ResidencyMismatch);
-                    return None;
-                }
-            } else {
-                HashMap::new()
-            };
         let covered_lsn = checkpoint.covered_lsn;
         let fingerprint_started = std::time::Instant::now();
         let packs: Vec<(PackId, u64)> = open_shards
@@ -4215,22 +4131,7 @@ impl PackfileStorage {
                 }
                 None => index,
             };
-            let sealed = Arc::new(
-                sealed_by_collection
-                    .remove(&loaded.collection_id)
-                    .unwrap_or_default(),
-            );
-            let len = if residency == crate::index::IndexResidency::Paged {
-                let tail: u64 = index
-                    .slot_counts_excluding(|slot| sealed.contains_slot(slot))
-                    .values()
-                    .copied()
-                    .sum();
-                tail.saturating_add(sealed.entry_count_in_collection(&loaded.collection_id))
-            } else {
-                u64::try_from(index.len()).unwrap_or(u64::MAX)
-            };
-            let Some(len) = u32::try_from(len).ok() else {
+            let Some(len) = u32::try_from(index.len()).ok() else {
                 timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
                 return None;
             };
@@ -4239,8 +4140,9 @@ impl PackfileStorage {
                 loaded.collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
-                    sealed,
-                    paged: residency == crate::index::IndexResidency::Paged,
+                    sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
+                    // Checkpoint loading is resident-only under strategy 1.
+                    paged: false,
                     cache: Arc::new(NodeCache::new(cache_capacity)),
                     generation,
                 }),
@@ -4277,22 +4179,7 @@ impl PackfileStorage {
                 }
                 None => index,
             };
-            let sealed = Arc::new(
-                sealed_by_collection
-                    .remove(&collection_id)
-                    .unwrap_or_default(),
-            );
-            let len = if residency == crate::index::IndexResidency::Paged {
-                let tail: u64 = index
-                    .slot_counts_excluding(|slot| sealed.contains_slot(slot))
-                    .values()
-                    .copied()
-                    .sum();
-                tail.saturating_add(sealed.entry_count_in_collection(&collection_id))
-            } else {
-                u64::try_from(index.len()).unwrap_or(u64::MAX)
-            };
-            let Some(len) = u32::try_from(len).ok() else {
+            let Some(len) = u32::try_from(index.len()).ok() else {
                 timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
                 return None;
             };
@@ -4301,8 +4188,9 @@ impl PackfileStorage {
                 collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
-                    sealed,
-                    paged: residency == crate::index::IndexResidency::Paged,
+                    sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
+                    // Checkpoint loading is resident-only under strategy 1.
+                    paged: false,
                     cache: Arc::new(NodeCache::new(cache_capacity)),
                     generation,
                 }),
@@ -4353,42 +4241,18 @@ impl PackfileStorage {
         // Bookkeeping (home-shard seeding + shard directory) from the sidecar
         // where that passed its gates, otherwise a slot walk of the — possibly
         // replayed — live indexes.
-        let counts_lookup: HashMap<[u8; 16], HashMap<u16, u64>> =
-            if residency == crate::index::IndexResidency::Paged {
-                // Count sealed records exactly once: the sidecar directory
-                // entry is authoritative for a sealed pack, and the resident
-                // tail contributes only slots that are not sealed (a pack
-                // sealed during the previous session may still be resident in
-                // this checkpoint's tail).
+        let counts_lookup: HashMap<[u8; 16], HashMap<u16, u64>> = match bookkeeping_source {
+            BookkeepingSource::Sidecar => sidecar_counts,
+            BookkeepingSource::SlotScan => {
                 let mut out = HashMap::with_capacity(collection_order.len());
                 for collection_id in &collection_order {
                     if let Some(gen) = scan_out.collections.get(collection_id) {
-                        let g = gen.load();
-                        let mut counts = g
-                            .index
-                            .slot_counts_excluding(|slot| g.sealed.contains_slot(slot));
-                        for (slot, count) in g.sealed.slot_counts_in_collection(collection_id) {
-                            let entry = counts.entry(slot).or_insert(0u64);
-                            *entry = entry.saturating_add(count);
-                        }
-                        out.insert(*collection_id, counts);
+                        out.insert(*collection_id, gen.load().index.slot_counts());
                     }
                 }
                 out
-            } else {
-                match bookkeeping_source {
-                    BookkeepingSource::Sidecar => sidecar_counts,
-                    BookkeepingSource::SlotScan => {
-                        let mut out = HashMap::with_capacity(collection_order.len());
-                        for collection_id in &collection_order {
-                            if let Some(gen) = scan_out.collections.get(collection_id) {
-                                out.insert(*collection_id, gen.load().index.slot_counts());
-                            }
-                        }
-                        out
-                    }
-                }
-            };
+            }
+        };
         for collection_id in &collection_order {
             let Some(counts) = counts_lookup.get(collection_id) else {
                 continue;
@@ -5923,6 +5787,12 @@ impl PackfileStorage {
         locator: RecordLocator,
         removed: bool,
     ) {
+        // No persisted index, so there is no delta batch to queue. Keeping
+        // `pending` empty also stops it growing without bound in a long paged
+        // session.
+        if self.index_residency == crate::index::IndexResidency::Paged {
+            return;
+        }
         let RecordLocator {
             slot,
             offset,
@@ -5997,35 +5867,6 @@ impl PackfileStorage {
                 })
             })
             .collect()
-    }
-
-    /// Deduplicated sealed-pack manifest for a tail-only checkpoint.
-    ///
-    /// Each collection's `SealedLocators` names the same pack once per
-    /// collection it contains, so dedupe by `pack_id`. The sidecar CRC is the
-    /// value written in the sidecar header; an open compares it before trusting
-    /// the checkpoint.
-    fn collect_sealed_refs(
-        live_shards: &[(u16, Arc<Shard>)],
-    ) -> Option<Vec<crate::index::format::SealedRefEntry>> {
-        let mut refs = Vec::new();
-        for (_, shard) in live_shards {
-            if !shard.sealed.load(Ordering::Acquire) {
-                continue;
-            }
-            // A seal's sidecar worker may still be running (or may have
-            // failed). Without a header to name, a tail-only image could not
-            // prove that pack's records are sidecar-served, so the caller
-            // publishes a complete checkpoint instead.
-            let sidecar_crc32 = crate::index::packidx::sidecar_crc(&shard.path)?;
-            refs.push(crate::index::format::SealedRefEntry {
-                pack_id: shard.pack_id,
-                creation_seq: u64::from(shard.creation_seq),
-                sidecar_crc32,
-            });
-        }
-        refs.sort_unstable_by_key(|entry| entry.pack_id);
-        Some(refs)
     }
 
     /// The journal LSN this store's checkpoint covers: its own pool's committed
@@ -6127,6 +5968,14 @@ impl PackfileStorage {
     fn capture_checkpoint(&self) -> Result<Option<CapturedCheckpoint>, StorageError> {
         let started = std::time::Instant::now();
         let mut breakdown = CheckpointBreakdown::default();
+        // Strategy 1: a paged store never publishes a primary-index
+        // checkpoint. The resident table is only the active pack, so an image
+        // would either omit sealed records (unsafe for a resident open) or
+        // require materializing them (defeating the mode).
+        if self.index_residency == crate::index::IndexResidency::Paged {
+            self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+            return Ok(None);
+        }
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -6239,45 +6088,6 @@ impl PackfileStorage {
             .collect();
 
         let snapshots = self.checkpoint_snapshots();
-        // A paged writer publishes a tail-only index: its resident table
-        // deliberately omits sealed packs, so the checkpoint records which
-        // sidecars those records live in. A resident writer publishes the
-        // historical complete image.
-        // A pack that sealed during this session still has its locators in the
-        // resident table (runtime eviction is later work). Such a table is not
-        // a tail-only image: publishing it as `TailOnly` would reload those
-        // locators on the next paged open instead of dropping them. Mark the
-        // checkpoint complete in that case; a paged open then rebuilds the
-        // tail from the unsealed packs and evicts them.
-        let sealed_slots: std::collections::HashSet<u16> = live_shards
-            .iter()
-            .filter(|(_, shard)| shard.sealed.load(Ordering::Acquire))
-            .map(|(slot, _)| *slot)
-            .collect();
-        let resident_holds_sealed = snapshots
-            .iter()
-            .any(|(_, _, room)| room.index.references_any_slot(&sealed_slots));
-        let (checkpoint_residency, sealed_refs) = if self.index_residency
-            == crate::index::IndexResidency::Paged
-            && !resident_holds_sealed
-        {
-            match Self::collect_sealed_refs(&live_shards) {
-                Some(refs) => (crate::index::format::CheckpointResidency::TailOnly, refs),
-                // A sealed pack has no validated sidecar header (worker
-                // still running, or it failed). Its entries are still in
-                // the resident table, so publish a complete image rather
-                // than a tail-only one whose manifest cannot cover it.
-                None => (
-                    crate::index::format::CheckpointResidency::Complete,
-                    Vec::new(),
-                ),
-            }
-        } else {
-            (
-                crate::index::format::CheckpointResidency::Complete,
-                Vec::new(),
-            )
-        };
         let serialize_started = std::time::Instant::now();
 
         // Rotate the delta epoch while still locked: `old_base_fingerprint`
@@ -6335,8 +6145,6 @@ impl PackfileStorage {
             logical_versions,
             blobs,
             pack_table,
-            residency: checkpoint_residency,
-            sealed_refs,
             old_base_fingerprint,
             journal: self.journal(),
             pool_tag: self.journal_pool.load(Ordering::Acquire),
@@ -6377,11 +6185,9 @@ impl PackfileStorage {
             fingerprint,
             covered_lsn,
             base_delta_seq,
-            crate::index::format::CheckpointResidency::Complete,
             &blobs,
             pack_table,
             logical_versions,
-            &[],
         )?;
         Ok(serialized)
     }
@@ -6981,6 +6787,11 @@ impl PackfileStorage {
     /// claim last, appended and fsynced. A crash before the batch is durable
     /// leaves no claim; a torn batch fails its CRC and claims nothing.
     fn append_index_delta_v1(&self, with_coverage: bool) -> Result<Option<u64>, StorageError> {
+        // Strategy 1: no persisted primary index means no delta epoch to
+        // continue. `record_redo` already skips queueing frames.
+        if self.index_residency == crate::index::IndexResidency::Paged {
+            return Ok(None);
+        }
         if with_coverage {
             // Make the bulk of the pack bytes durable before any lock is taken;
             // the fsync under the locks below then only covers what was written
@@ -7472,12 +7283,33 @@ impl PackfileStorage {
             None
         };
         self.shards.discover_shards()?;
-        let new_index = self.rebuild_index(collection_id)?;
         let existing_cache = self.generation(collection_id).map(|g| g.cache.clone());
+        if self.index_residency == crate::index::IndexResidency::Paged {
+            // A paged refresh must not pull sealed packs back into the
+            // resident table. Rebuild only the unsealed tail and re-derive
+            // the sealed locator set from the packs that are sealed now.
+            let (new_index, sealed) = self.rebuild_tail(collection_id)?;
+            let mut counts = new_index.slot_counts_excluding(|slot| sealed.contains_slot(slot));
+            for (slot, count) in sealed.slot_counts_in_collection(collection_id) {
+                let entry = counts.entry(slot).or_insert(0u64);
+                *entry = entry.saturating_add(count);
+            }
+            self.replace_collection_shard_counts(
+                collection_id,
+                &self.slot_counts_to_pack_id_counts(&counts),
+            );
+            return self.store_generation_with_sealed(
+                collection_id,
+                new_index,
+                Arc::new(sealed),
+                existing_cache,
+                true,
+            );
+        }
+        let new_index = self.rebuild_index(collection_id)?;
         // `rebuild_index` scans every pack, so the result is complete and
         // supersedes any previously registered sealed locators. Keeping them
-        // would double-count and could answer from a retired pack; a paged
-        // reopen rebuilds the tail-only set.
+        // would double-count and could answer from a retired pack.
         self.store_generation_with_sealed(
             collection_id,
             new_index,
@@ -7485,6 +7317,80 @@ impl PackfileStorage {
             existing_cache,
             true,
         )
+    }
+
+    /// Rebuild only the unsealed tail for one collection, registering every
+    /// sealed pack that contains it as a sidecar-backed locator source.
+    ///
+    /// A sealed pack with no usable sidecar is scanned into the resident
+    /// index instead, so a missing sidecar costs memory, never correctness.
+    fn rebuild_tail(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<(LossyIndex, crate::index::sealed::SealedLocators), StorageError> {
+        self.index_rebuild_count.fetch_add(1, Ordering::Relaxed);
+        self.shards.flush_all()?;
+        let mut shards = self.shards.all_shards();
+        shards.sort_by_key(|(_, shard)| shard.creation_seq);
+        let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
+        let mut sealed = crate::index::sealed::SealedLocators::new();
+        for (slot, shard) in shards {
+            if !shard.is_current.load(Ordering::Acquire) {
+                continue;
+            }
+            if shard.sealed.load(Ordering::Acquire) {
+                if let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) {
+                    if sidecar.collection_entry_count(collection_id).is_some() {
+                        let sidecar: Arc<dyn crate::index::sealed::SealedIndex> = Arc::new(sidecar);
+                        sealed.insert(crate::index::sealed::SealedPack {
+                            slot,
+                            pack_id: shard.pack_id,
+                            creation_seq: u64::from(shard.creation_seq),
+                            index: sidecar,
+                        });
+                    }
+                    // A valid sidecar is authoritative for this collection,
+                    // including "not present"; no frame scan is needed.
+                    continue;
+                }
+            }
+            let mut scanner = packfile::scan_packfile_iter(
+                &shard.path,
+                self.shards.checksum_policy().verifies_reads(),
+            )?;
+            while let Some(record) = scanner.next_with_removal() {
+                let record = record?;
+                if record.collection_id != *collection_id {
+                    continue;
+                }
+                check_index_offset(slot, &record.hash, record.offset)?;
+                loop {
+                    match index.insert_tracked_with_removed(
+                        &record.hash,
+                        slot,
+                        record.offset,
+                        record.removed,
+                    ) {
+                        Ok(_) => break,
+                        Err(InsertError::TableFull) => {
+                            index = index.grow().ok_or_else(|| {
+                                StorageError::Corrupt(format!(
+                                    "index insert failed for the record at offset {} in shard {slot}: table cannot grow",
+                                    record.offset
+                                ))
+                            })?;
+                        }
+                        Err(error) => {
+                            return Err(StorageError::Corrupt(format!(
+                                "index insert failed for the record at offset {} in shard {slot}: {error}",
+                                record.offset
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok((index, sealed))
     }
 
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
@@ -11115,6 +11021,13 @@ impl PackfileStorage {
     /// # Errors
     /// Propagates any shard-fsync or checkpoint-write failure.
     pub fn force_index_checkpoint(&self) -> Result<(), StorageError> {
+        // No primary-index checkpoint exists to force in paged mode; still
+        // honour the caller's durability request by flushing the packs.
+        if self.index_residency == crate::index::IndexResidency::Paged {
+            self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+            self.shards.sync_dirty().map_err(StorageError::Io)?;
+            return Ok(());
+        }
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.shards.sync_dirty().map_err(StorageError::Io)?;
         let _persist_guard = self.index_persist_lock.lock();
@@ -11147,7 +11060,9 @@ impl PackfileStorage {
     /// # Errors
     /// Propagates any shard-fsync failure from the synchronous fallback.
     pub fn force_index_checkpoint_detached(&self) -> Result<(), StorageError> {
-        if !self.background_checkpoint.load(Ordering::Relaxed) {
+        if self.index_residency == crate::index::IndexResidency::Paged
+            || !self.background_checkpoint.load(Ordering::Relaxed)
+        {
             return self.force_index_checkpoint();
         }
         self.shards.sync_dirty().map_err(StorageError::Io)?;
@@ -12106,6 +12021,20 @@ impl PackfileStorage {
         if !self.settle_checkpoint_worker() {
             return;
         }
+        // Strategy 1: paged stores persist no primary index. The
+        // shard→collection inspection sidecar is separate metadata and is
+        // still worth refreshing at a sync anchor.
+        if self.index_residency == crate::index::IndexResidency::Paged {
+            self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+            if self.shard_collections_dirty.load(Ordering::Relaxed)
+                || self.shard_collections_stale.load(Ordering::Relaxed)
+            {
+                let sidecar_started = std::time::Instant::now();
+                self.persist_shard_collections_best_effort();
+                timings.sidecar = sidecar_started.elapsed();
+            }
+            return;
+        }
         // A delta append does not advance the journal coverage, so on its own it
         // never lets the segment shrink and the journal would fill to its hard
         // limit. Once the segment is large, a pool with journal frames its
@@ -13033,8 +12962,6 @@ struct CheckpointTail {
     logical_versions: Vec<([u8; 16], u64)>,
     blobs: Vec<([u8; 16], u64, Vec<u8>)>,
     pack_table: Vec<(u16, PackId)>,
-    residency: crate::index::format::CheckpointResidency,
-    sealed_refs: Vec<crate::index::format::SealedRefEntry>,
     old_base_fingerprint: Option<u64>,
     journal: Option<Arc<JournalCoordinator>>,
     pool_tag: u8,
@@ -13080,11 +13007,9 @@ impl CheckpointTail {
             self.fingerprint,
             self.covered_lsn.unwrap_or(0),
             self.base_delta_seq,
-            self.residency,
             &blobs,
             &self.pack_table,
             &self.logical_versions,
-            &self.sealed_refs,
         )
         .map_err(StorageError::Io)?;
         done.write = write_started.elapsed();

@@ -56,10 +56,6 @@ pub trait SealedIndex: Send + Sync {
 
     /// Unique locators recorded for one collection.
     fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64>;
-
-    /// CRC32 stored in the sidecar header, used by a tail-only checkpoint's
-    /// sealed-pack manifest.
-    fn crc32(&self) -> u32;
 }
 
 impl SealedIndex for MappedPackIndex {
@@ -82,10 +78,6 @@ impl SealedIndex for MappedPackIndex {
     fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
         MappedPackIndex::collection_entry_count(self, collection_id)
     }
-
-    fn crc32(&self) -> u32 {
-        MappedPackIndex::crc32(self)
-    }
 }
 
 impl SealedIndex for super::packidx::PackIndex {
@@ -107,10 +99,6 @@ impl SealedIndex for super::packidx::PackIndex {
 
     fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
         super::packidx::PackIndex::collection_entry_count(self, collection_id)
-    }
-
-    fn crc32(&self) -> u32 {
-        super::packidx::PackIndex::crc32(self)
     }
 }
 

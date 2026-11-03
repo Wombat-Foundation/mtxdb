@@ -29,7 +29,6 @@ fn fixed_width_records_round_trip() {
         base_delta_seq: 0x0123_4567_89AB,
         logical_version_count: 0,
         logical_version_bytes: 0,
-        residency: CheckpointResidency::Complete,
     };
     assert_eq!(CheckpointHeader::decode(&header.encode()), Some(header));
 

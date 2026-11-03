@@ -149,19 +149,6 @@ pub fn build_and_write(pack_path: &Path, verify_checksum: bool) -> io::Result<()
     index.write_atomic(&pack_index_path(pack_path))
 }
 
-/// Lightweight read of a pack's sidecar CRC without verifying its body.
-///
-/// Returns `None` when the sidecar is missing or its header/directory does not
-/// match the pack. A caller that publishes this value in a manifest still
-/// verifies the full sidecar on the next open, so a corrupt body is rejected
-/// there rather than trusted here.
-#[must_use]
-pub fn sidecar_crc(pack_path: &Path) -> Option<u32> {
-    let identity = pack_identity(pack_path).ok()?;
-    let index = PackIndex::open_mmap(&pack_index_path(pack_path), identity).ok()?;
-    Some(index.crc32())
-}
-
 /// Open a pack's sidecar when it matches the pack's current header and extent.
 ///
 /// Returns `None` for a missing, stale, or corrupt sidecar; callers fall back
@@ -451,12 +438,6 @@ impl PackIndex {
         u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
     }
 
-    /// CRC32 stored in the sidecar header (calculated with the field zeroed).
-    #[must_use]
-    pub fn crc32(&self) -> u32 {
-        stored_crc(&self.bytes)
-    }
-
     /// Unique locators recorded for one collection.
     #[must_use]
     pub fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
@@ -734,12 +715,6 @@ impl MappedPackIndex {
     #[must_use]
     pub fn mapped_file_bytes(&self) -> u64 {
         u64::try_from(self.map.len()).unwrap_or(u64::MAX)
-    }
-
-    /// CRC32 stored in the sidecar header (calculated with the field zeroed).
-    #[must_use]
-    pub fn crc32(&self) -> u32 {
-        stored_crc(&self.map)
     }
 
     /// Unique locators recorded for one collection.
@@ -1093,10 +1068,6 @@ fn crc_with_zeroed_field(bytes: &[u8]) -> Option<u32> {
     hasher.update(&[0; 4]);
     hasher.update(bytes.get(CRC_RANGE.end..)?);
     Some(hasher.finalize())
-}
-
-fn stored_crc(bytes: &[u8]) -> u32 {
-    read_u32(bytes, CRC_RANGE.start).unwrap_or(0)
 }
 
 fn collection_count(collections: &[CollectionView], collection_id: &[u8; 16]) -> Option<u64> {

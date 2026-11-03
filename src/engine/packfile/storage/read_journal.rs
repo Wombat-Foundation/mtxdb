@@ -761,6 +761,13 @@ impl PackfileStorage {
     /// Coverage is captured before the checkpoint is read, so the new bound can
     /// never be newer than the index loaded below.
     pub(super) fn reload_index_from_checkpoint(&self) -> bool {
+        // Paged mode keeps no primary-index checkpoint, and a resident
+        // checkpoint would re-materialize sealed locators. Fail closed here;
+        // the caller's durable-read path remains authoritative.
+        if self.index_residency == crate::index::IndexResidency::Paged {
+            self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         // A writer may have created new packs since this handle opened, and the
         // checkpoint it wrote names that new pack set. Rediscover before
         // building the fingerprint, or the reload can never match.
@@ -799,7 +806,6 @@ impl PackfileStorage {
                 false,
                 ReloadMode::JournalBound,
                 self.index_config,
-                self.index_residency,
                 &mut timings,
             )
         else {

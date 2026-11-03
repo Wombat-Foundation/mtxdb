@@ -1173,22 +1173,6 @@ impl LossyIndex {
         counts
     }
 
-    /// Whether any occupied entry points into one of `slots`.
-    ///
-    /// Used by a paged checkpoint to tell whether its resident table still
-    /// holds a pack that has since sealed; such a table cannot be published as
-    /// a tail-only image.
-    #[must_use]
-    pub fn references_any_slot(&self, slots: &std::collections::HashSet<u16>) -> bool {
-        if slots.is_empty() {
-            return false;
-        }
-        (0..self.capacity as usize).any(|index| {
-            let entry = IndexEntry(self.entry_at(index));
-            !entry.is_empty() && slots.contains(&entry.slot())
-        })
-    }
-
     /// Whether this collection's index currently has any live entry pointing
     /// into `slot`. Short-circuits on the first match — unlike
     /// `referenced_slot_ids`, which always builds a full `MAX_SHARDS`
