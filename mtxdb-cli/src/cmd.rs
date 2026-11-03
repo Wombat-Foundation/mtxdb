@@ -9327,26 +9327,13 @@ fn derive_template_key(algorithm: &str, extracted: &str) -> anyhow::Result<[u8; 
     )))
 }
 
-/// Run a template's record-identity rule against one event, producing the
-/// node ID that storage keys it by.
-fn template_node_id(
+/// Derive a node ID from one already-extracted record-identity value.
+fn template_pointer_node_id(
     template: &CollectionTemplate,
-    event: &OwnedValue,
-) -> anyhow::Result<Option<[u8; 16]>> {
-    // The importer only derives identities from a source pointer today. Any
-    // other policy must fail loudly rather than hash empty input and mint a
-    // meaningless key.
-    if !matches!(
-        &template.record_id_rule.policy,
-        FrameIdPolicy::Pointer { .. }
-    ) {
-        bail!(
-            "record identity policy {:?} is not supported by the importer",
-            template.record_id_rule.policy
-        );
-    }
-    let resolve =
-        |pointer: &str| extract_pointer_string(event, pointer).map(|s| s.as_bytes().to_vec());
+    pointer: &str,
+    value: &str,
+) -> anyhow::Result<[u8; 16]> {
+    let resolve = |req: &str| (req == pointer).then(|| value.as_bytes().to_vec());
     let input = FrameIdInput {
         payload: &[],
         descriptor: &[],
@@ -9358,9 +9345,44 @@ fn template_node_id(
         template.record_id_rule.digest_algorithm,
         &input,
     ) else {
+        bail!("failed to compute frame digest for record identity value '{value}'");
+    };
+    Ok(record_logical_id(&digest))
+}
+
+/// Produce the node ID for an event ID string under the template's record-identity rule.
+fn template_event_id_node_id(
+    template: &CollectionTemplate,
+    event_id: &str,
+) -> anyhow::Result<[u8; 16]> {
+    let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
+        bail!(
+            "record identity policy {:?} is not supported by the raw importer",
+            template.record_id_rule.policy
+        );
+    };
+    if pointer != "/event_id" {
+        bail!("raw Matrix import requires record identity pointer '/event_id', got '{pointer}'");
+    }
+    template_pointer_node_id(template, pointer, event_id)
+}
+
+/// Run a template's record-identity rule against one event, producing the
+/// node ID that storage keys it by.
+fn template_node_id(
+    template: &CollectionTemplate,
+    event: &OwnedValue,
+) -> anyhow::Result<Option<[u8; 16]>> {
+    let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
+        bail!(
+            "record identity policy {:?} is not supported by the importer",
+            template.record_id_rule.policy
+        );
+    };
+    let Some(val) = extract_pointer_string(event, pointer) else {
         return Ok(None);
     };
-    Ok(Some(record_logical_id(&digest)))
+    template_pointer_node_id(template, pointer, &val).map(Some)
 }
 
 /// Run a template's collection-key rule against an already-extracted
@@ -10882,13 +10904,16 @@ fn import_pdu_events_with_raw(
         events,
         auth_chain,
     )?;
-    record_raw_dependencies_and_waiting(
-        db,
-        template,
-        &resolved.canonical_id,
-        events.iter().chain(auth_chain),
-        &all_events,
-    )?;
+    if raw_adjacency.is_some() {
+        record_raw_dependencies_and_waiting(
+            db,
+            store,
+            &collection_id,
+            template,
+            &resolved.canonical_id,
+            events.iter().chain(auth_chain),
+        )?;
+    }
 
     let room_events: Vec<RoomEvent> = all_events
         .iter()
@@ -10981,54 +11006,80 @@ fn import_pdu_events_with_raw(
 }
 
 /// Persist raw-import reverse edges and the room's set of currently missing
-/// parent node IDs. This step only records data; dirty-set traversal and
-/// `Unchecked` flag propagation are implemented by later import steps.
+/// parent node IDs.
+///
+/// Write-only step: dirty-set traversal and `Unchecked` flag propagation are
+/// implemented by later import steps.
+///
+/// Crash-safety note: these writes are not atomic with the event/projection
+/// writes or with each other. They are applied in the order reverse edges,
+/// waiting removals, then waiting additions. Each collection operation is
+/// idempotent, so a crash can leave partial dependency metadata and re-import
+/// repairs it. No read path consumes these records until a later import step.
 fn record_raw_dependencies_and_waiting<'a>(
     db: &Database,
+    event_store: &PackfileStorage,
+    room_event_collection_id: &[u8; 16],
     template: &CollectionTemplate,
     room_id: &str,
     supplied_events: impl Iterator<Item = &'a OwnedValue>,
-    all_events: &[OwnedValue],
 ) -> anyhow::Result<()> {
-    if !matches!(
-        &template.record_id_rule.policy,
-        FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
-    ) {
-        return Ok(());
+    let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
+        bail!(
+            "record identity policy {:?} is not supported by the raw importer",
+            template.record_id_rule.policy
+        );
+    };
+    if pointer != "/event_id" {
+        bail!("raw Matrix import requires record identity pointer '/event_id', got '{pointer}'");
     }
 
-    let present_ids: HashSet<String> = all_events
-        .iter()
-        .filter(|event| event_room_id(event).is_none_or(|room| room == room_id))
-        .filter_map(event_id)
-        .map(str::to_owned)
-        .collect();
+    let mut file_event_ids: HashSet<String> = HashSet::new();
     let mut prev_edges: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
     let mut auth_edges: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
     let mut arrived_nodes = BTreeSet::new();
-    let mut missing_nodes = BTreeSet::new();
+    let mut candidate_missing: BTreeSet<NodeId> = BTreeSet::new();
 
-    for event in supplied_events {
-        if event_room_id(event).is_some_and(|room| room != room_id) {
-            continue;
+    let events_vec: Vec<&'a OwnedValue> = supplied_events
+        .filter(|event| event_room_id(event).is_none_or(|room| room == room_id))
+        .collect();
+
+    for event in &events_vec {
+        if let Some(id) = event_id(event) {
+            file_event_ids.insert(id.to_owned());
         }
+    }
+
+    for event in events_vec {
         let Some(event_id) = event_id(event) else {
             continue;
         };
-        let Some(child_node) = template_node_id(template, event)? else {
-            continue;
-        };
+        let child_node = template_event_id_node_id(template, event_id)?;
         arrived_nodes.insert(child_node);
         let fields = MatrixEventFields::from_event(event_id, event);
-        for (parents, edges) in [(&fields.prev, &mut prev_edges), (&fields.auth, &mut auth_edges)] {
+        for (parents, edges) in [
+            (&fields.prev, &mut prev_edges),
+            (&fields.auth, &mut auth_edges),
+        ] {
             for parent_event_id in parents {
-                let Some(parent_node) = raw_event_id_node_id(template, parent_event_id)? else {
-                    continue;
-                };
+                let parent_node = template_event_id_node_id(template, parent_event_id)?;
                 edges.entry(parent_node).or_default().push(child_node);
-                if !present_ids.contains(parent_event_id) {
-                    missing_nodes.insert(parent_node);
+                if !file_event_ids.contains(parent_event_id.as_str()) {
+                    candidate_missing.insert(parent_node);
                 }
+            }
+        }
+    }
+
+    // Determine genuinely missing parents via point lookups against the room's event collection,
+    // rather than relying on a whole-room batch scan.
+    let candidates: Vec<NodeId> = candidate_missing.into_iter().collect();
+    let mut missing_nodes = BTreeSet::new();
+    if !candidates.is_empty() {
+        let existing = event_store.get_many(room_event_collection_id, &candidates)?;
+        for (node, found) in candidates.iter().zip(existing) {
+            if found.is_none() {
+                missing_nodes.insert(*node);
             }
         }
     }
@@ -11044,8 +11095,8 @@ fn record_raw_dependencies_and_waiting<'a>(
                 let additions: Vec<(NodeId, NodeData)> = chunk
                     .iter()
                     .zip(existing)
-                    .filter_map(|(child, existing)| {
-                        existing
+                    .filter_map(|(child, found)| {
+                        found
                             .is_none()
                             .then(|| (*child, NodeData::from_slice(b"RRE1")))
                     })
@@ -11057,19 +11108,35 @@ fn record_raw_dependencies_and_waiting<'a>(
         }
     }
 
+    // Remove arrived nodes from raw_waiting using get_many first to avoid
+    // taking the packfile snapshot gate for nodes that are not in the set.
     let waiting_collection = raw_waiting_collection_id(room_id);
-    for arrived in arrived_nodes {
-        // A newly supplied parent no longer belongs to the missing-node set.
-        edge_store.remove(&waiting_collection, &arrived)?;
+    let arrived_vec: Vec<NodeId> = arrived_nodes.into_iter().collect();
+    let mut waiting_removals = Vec::new();
+    if !arrived_vec.is_empty() {
+        let existing = edge_store.get_many(&waiting_collection, &arrived_vec)?;
+        for (arrived, found) in arrived_vec.iter().zip(existing) {
+            if found.is_some() {
+                waiting_removals.push(*arrived);
+            }
+        }
     }
+    if !waiting_removals.is_empty() {
+        let tx = db.begin_transaction();
+        for chunk in waiting_removals.chunks(MAX_BATCH_EVENTS) {
+            tx.remove_many(ShardType::Edges, waiting_collection, chunk)?;
+        }
+        tx.commit()?;
+    }
+
     let missing: Vec<NodeId> = missing_nodes.into_iter().collect();
     for chunk in missing.chunks(MAX_BATCH_EVENTS) {
         let existing = edge_store.get_many(&waiting_collection, chunk)?;
         let additions: Vec<(NodeId, NodeData)> = chunk
             .iter()
             .zip(existing)
-            .filter_map(|(parent, existing)| {
-                existing
+            .filter_map(|(parent, found)| {
+                found
                     .is_none()
                     .then(|| (*parent, NodeData::from_slice(b"RWT1")))
             })
@@ -11079,33 +11146,6 @@ fn record_raw_dependencies_and_waiting<'a>(
         }
     }
     Ok(())
-}
-
-fn raw_event_id_node_id(
-    template: &CollectionTemplate,
-    event_id: &str,
-) -> anyhow::Result<Option<NodeId>> {
-    let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
-        return Ok(None);
-    };
-    if pointer != "/event_id" {
-        return Ok(None);
-    }
-    let resolve = |requested: &str| {
-        (requested == pointer).then(|| event_id.as_bytes().to_vec())
-    };
-    let input = FrameIdInput {
-        payload: &[],
-        descriptor: &[],
-        canonical: None,
-        resolve: &resolve,
-    };
-    Ok(frame_digest(
-        &template.record_id_rule.policy,
-        template.record_id_rule.digest_algorithm,
-        &input,
-    )
-    .map(|digest| record_logical_id(&digest)))
 }
 
 fn raw_reverse_edge_collection_id(kind: &str, parent: &NodeId) -> [u8; 16] {
