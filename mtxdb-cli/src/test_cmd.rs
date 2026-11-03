@@ -2774,7 +2774,7 @@ fn raw_auth_projection_keeps_v8_restricted_join_fields() {
 }
 
 #[test]
-fn raw_auth_projection_collision_keeps_first_for_opaque_event_ids() {
+fn raw_auth_projection_collision_keeps_first_for_conflicting_exports() {
     let dir = unique_temp_dir().join("projection_collision");
     let db = Database::open(dir).unwrap();
     let template = default_matrix_import_template();
@@ -2799,9 +2799,10 @@ fn raw_auth_projection_collision_keeps_first_for_opaque_event_ids() {
         "[]",
     );
     let warnings =
-        write_raw_auth_projections(store, room, &template, "1", &[first.clone()], &[]).unwrap();
+        write_raw_auth_projections(store, room, &template, "10", &[first.clone()], &[]).unwrap();
     assert!(warnings.is_empty());
-    let warnings = write_raw_auth_projections(store, room, &template, "1", &[second], &[]).unwrap();
+    let warnings =
+        write_raw_auth_projections(store, room, &template, "10", &[second], &[]).unwrap();
     assert_eq!(warnings.len(), 1);
     assert!(
         warnings[0].contains("$same") && warnings[0].contains("keeping the first"),
@@ -2815,7 +2816,7 @@ fn raw_auth_projection_collision_keeps_first_for_opaque_event_ids() {
     assert_eq!(
         projection.get("invite").and_then(OwnedValue::as_i64),
         Some(50),
-        "a later projection must not replace the first for an opaque event id"
+        "a later projection must not replace the first from a conflicting export"
     );
 }
 
@@ -2914,6 +2915,33 @@ fn raw_import_keeps_v11_third_party_invite_public_keys_across_files() {
         .get("content")
         .and_then(|content| content.get("public_keys"))
         .is_some());
+}
+
+#[test]
+fn raw_auth_projection_rejects_unknown_room_versions() {
+    let dir = unique_temp_dir().join("projection_unknown_version");
+    let db = Database::open(dir).unwrap();
+    let template = default_matrix_import_template();
+    let store = db.event_dag();
+    let room = "!projection_unknown_version";
+    let event = raw_event(
+        room,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"not-a-version","m.federate":false}"#,
+        "[]",
+        "[]",
+    );
+
+    let error = write_raw_auth_projections(store, room, &template, "not-a-version", &[event], &[])
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not supported for auth projection"),
+        "an unknown room version must be an error, got: {error}"
+    );
 }
 
 #[test]

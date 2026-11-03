@@ -10868,7 +10868,7 @@ fn import_pdu_events_with_raw(
         events,
         auth_chain,
     )? {
-        eprintln!("warning: {warning}");
+        eprintln!("  warning: {warning}");
     }
 
     let room_events: Vec<RoomEvent> = all_events
@@ -11050,6 +11050,14 @@ fn write_raw_auth_projections(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
 ) -> anyhow::Result<Vec<String>> {
+    // Never guess at an unknown version. The establishment validator rejects
+    // these before an import, but the projection writer is also called
+    // directly by tests and future callers.
+    if !importer_room_version(room_version).is_some_and(MatrixRoomVersion::is_supported) {
+        anyhow::bail!(
+            "room version {room_version:?} is not supported for auth projection; mtxdb requires v4 or later"
+        );
+    }
     let mut seen = HashSet::new();
     let mut records = Vec::new();
     for event in events.iter().chain(auth_chain) {
