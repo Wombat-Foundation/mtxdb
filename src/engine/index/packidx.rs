@@ -45,6 +45,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use memmap2::Mmap;
 
@@ -67,6 +68,7 @@ pub const PACK_INDEX_FLAG_REMOVED: u8 = 1;
 const CRC_RANGE: std::ops::Range<usize> = 60..64;
 const MAX_FILE_LEN: u64 = 0xFFFF_FFFF;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static BLOOM_MASTER_SEED: OnceLock<[u8; 16]> = OnceLock::new();
 
 /// One locator supplied to [`PackIndex::build`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +201,9 @@ pub struct PackIndex {
 pub struct MappedPackIndex {
     map: Mmap,
     collections: Vec<CollectionView>,
+    /// Per-collection filters for quickly rejecting misses across many sealed
+    /// packs. Missing filters only cost lookup time; they never affect answers.
+    blooms: Vec<Option<BloomFilter>>,
     identity: PackIndexIdentity,
     entry_count: u64,
 }
@@ -212,6 +217,109 @@ struct CollectionView {
     offsets_at: usize,
     flags_at: usize,
     disk_bytes: u64,
+}
+
+/// Compact in-memory negative-lookup filter for one collection in a pack.
+///
+/// The sidecar remains authoritative. A positive result always proceeds to
+/// its binary search; a negative result is safe because the filter is built
+/// from every logical id in that sidecar section.
+#[derive(Debug)]
+struct BloomFilter {
+    words: Vec<u64>,
+    bit_mask: u64,
+    seed: [u8; 16],
+}
+
+impl BloomFilter {
+    const BITS_PER_ENTRY: u64 = 10;
+    const HASH_COUNT: u64 = 5;
+    const MIN_ENTRIES: u32 = 128;
+
+    fn new(expected_entries: u32, seed: [u8; 16]) -> Option<Self> {
+        // For tiny sidecar sections the filter check costs more than the few
+        // binary-search comparisons it can avoid.
+        if expected_entries < Self::MIN_ENTRIES {
+            return None;
+        }
+        let bit_count = u64::from(expected_entries)
+            .checked_mul(Self::BITS_PER_ENTRY)?
+            .max(64)
+            .checked_next_power_of_two()?;
+        let word_count = usize::try_from(bit_count / 64).ok()?;
+        let mut words = Vec::new();
+        words.try_reserve_exact(word_count).ok()?;
+        words.resize(word_count, 0);
+        Some(Self {
+            words,
+            bit_mask: bit_count.saturating_sub(1),
+            seed,
+        })
+    }
+
+    fn insert(&mut self, id: &[u8; 16]) {
+        let (first, step) = Self::hash_pair(id, &self.seed);
+        for probe in 0..Self::HASH_COUNT {
+            let bit = first.wrapping_add(probe.wrapping_mul(step)) & self.bit_mask;
+            let word = usize::try_from(bit / 64).unwrap_or(usize::MAX);
+            let shift = u32::try_from(bit % 64).unwrap_or(0);
+            if let Some(slot) = self.words.get_mut(word) {
+                *slot |= 1_u64 << shift;
+            }
+        }
+    }
+
+    fn may_contain(&self, id: &[u8; 16]) -> bool {
+        let (first, step) = Self::hash_pair(id, &self.seed);
+        (0..Self::HASH_COUNT).all(|probe| {
+            let bit = first.wrapping_add(probe.wrapping_mul(step)) & self.bit_mask;
+            let word = usize::try_from(bit / 64).unwrap_or(usize::MAX);
+            let shift = u32::try_from(bit % 64).unwrap_or(0);
+            self.words
+                .get(word)
+                .is_some_and(|slot| slot & (1_u64 << shift) != 0)
+        })
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.words.len().saturating_mul(std::mem::size_of::<u64>())
+    }
+
+    fn allocated_bytes_u64(&self) -> u64 {
+        u64::try_from(self.allocated_bytes()).unwrap_or(u64::MAX)
+    }
+
+    fn hash_pair(id: &[u8; 16], seed: &[u8; 16]) -> (u64, u64) {
+        let left = u64::from_le_bytes(id[..8].try_into().unwrap_or([0; 8]));
+        let right = u64::from_le_bytes(id[8..].try_into().unwrap_or([0; 8]));
+        let seed_left = u64::from_le_bytes(seed[..8].try_into().unwrap_or([0; 8]));
+        let seed_right = u64::from_le_bytes(seed[8..].try_into().unwrap_or([0; 8]));
+        let first = Self::mix64(left ^ right.rotate_left(23) ^ seed_left);
+        let step = Self::mix64(right ^ left.rotate_left(41) ^ seed_right) | 1;
+        (first, step)
+    }
+
+    fn mix64(mut value: u64) -> u64 {
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+}
+
+fn bloom_seed_for(identity: PackIndexIdentity) -> [u8; 16] {
+    let master = BLOOM_MASTER_SEED.get_or_init(|| crate::packfile::PackId::random().0);
+    let pack_left = u64::from_le_bytes(identity.pack_id.0[..8].try_into().unwrap_or([0; 8]));
+    let pack_right = u64::from_le_bytes(identity.pack_id.0[8..].try_into().unwrap_or([0; 8]));
+    let secret_left = u64::from_le_bytes(master[..8].try_into().unwrap_or([0; 8]));
+    let secret_right = u64::from_le_bytes(master[8..].try_into().unwrap_or([0; 8]));
+    let left = BloomFilter::mix64(pack_left ^ secret_left ^ identity.creation_seq);
+    let right = BloomFilter::mix64(pack_right ^ secret_right ^ identity.pack_file_len);
+    let mut seed = [0; 16];
+    seed[..8].copy_from_slice(&left.to_le_bytes());
+    seed[8..].copy_from_slice(&right.to_le_bytes());
+    seed
 }
 
 #[derive(Clone, Copy)]
@@ -414,9 +522,12 @@ impl PackIndex {
         if parsed.identity != expected {
             return Err(PackIndexOpenError::InvalidOrStale);
         }
+        let bloom_seed = bloom_seed_for(parsed.identity);
+        let blooms = build_bloom_filters(&map, &parsed.collections, bloom_seed);
         Ok(MappedPackIndex {
             map,
             collections: parsed.collections,
+            blooms,
             identity: parsed.identity,
             entry_count: parsed.entry_count,
         })
@@ -731,7 +842,7 @@ impl MappedPackIndex {
     /// removal. Use [`Self::get_locator`] when the difference matters.
     #[must_use]
     pub fn get(&self, collection_id: &[u8; 16], logical_id: &[u8; 16]) -> Option<u32> {
-        match lookup(&self.map, &self.collections, collection_id, logical_id)? {
+        match self.get_locator(collection_id, logical_id)? {
             PackIndexLocator::Frame(offset) => Some(offset),
             PackIndexLocator::Removed(_) => None,
         }
@@ -745,7 +856,39 @@ impl MappedPackIndex {
         collection_id: &[u8; 16],
         logical_id: &[u8; 16],
     ) -> Option<PackIndexLocator> {
+        if let Ok(index) = self
+            .collections
+            .binary_search_by_key(collection_id, |view| view.id)
+        {
+            if self
+                .blooms
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|filter| !filter.may_contain(logical_id))
+            {
+                return None;
+            }
+        }
         lookup(&self.map, &self.collections, collection_id, logical_id)
+    }
+
+    /// Heap bytes used by the per-collection negative-lookup filters.
+    #[must_use]
+    pub fn bloom_filter_bytes(&self) -> usize {
+        self.blooms.iter().flatten().fold(0_usize, |total, filter| {
+            total.saturating_add(filter.allocated_bytes())
+        })
+    }
+
+    /// Heap bytes used by one collection's negative-lookup filter.
+    #[must_use]
+    pub fn collection_bloom_filter_bytes(&self, collection_id: &[u8; 16]) -> u64 {
+        self.collections
+            .binary_search_by_key(collection_id, |view| view.id)
+            .ok()
+            .and_then(|index| self.blooms.get(index))
+            .and_then(Option::as_ref)
+            .map_or(0, BloomFilter::allocated_bytes_u64)
     }
 
     /// Visit every `(collection_id, logical_id, locator)` in the index.
@@ -871,6 +1014,25 @@ fn for_each_in_collection(
         };
         visit(id, locator);
     }
+}
+
+fn build_bloom_filters(
+    bytes: &[u8],
+    collections: &[CollectionView],
+    seed: [u8; 16],
+) -> Vec<Option<BloomFilter>> {
+    let mut blooms = Vec::new();
+    if blooms.try_reserve_exact(collections.len()).is_err() {
+        return blooms;
+    }
+    for collection in collections {
+        let mut filter = BloomFilter::new(collection.count, seed);
+        if let Some(filter) = &mut filter {
+            for_each_in_collection(bytes, collection, |id, _| filter.insert(&id));
+        }
+        blooms.push(filter);
+    }
+    blooms
 }
 
 fn lookup(

@@ -12,7 +12,7 @@
 //! `MTXDB_LOOKUP_SHARD_BYTES` changes the seal size, and
 //! `MTXDB_LOOKUP_PACK_COUNTS=1000` runs only a selected pack-count fixture.
 
-#![allow(clippy::arithmetic_side_effects)]
+#![allow(clippy::arithmetic_side_effects, clippy::cast_precision_loss)]
 
 use mtxdb::index::IndexResidency;
 use mtxdb::packfile::ChecksumPolicy;
@@ -155,14 +155,25 @@ fn measure(
     probes: &[NodeId],
     rounds: usize,
     shard_bytes: u64,
-) -> Duration {
-    let mut best = Duration::MAX;
+) -> (Duration, Duration, usize, usize) {
+    let mut best_open = Duration::MAX;
+    let mut best_lookup = Duration::MAX;
+    let mut heap_bytes = 0;
+    let mut mapped_bytes = 0;
     for _ in 0..rounds {
+        let open_started = Instant::now();
         let store = open(dir, residency, shard_bytes);
-        best = best.min(average_lookup(&store, probes));
+        best_open = best_open.min(open_started.elapsed());
+        if let Some((_entries, heap, mapped, _capacity)) =
+            store.collection_index_residency(&COLLECTION)
+        {
+            heap_bytes = heap;
+            mapped_bytes = mapped;
+        }
+        best_lookup = best_lookup.min(average_lookup(&store, probes));
         drop(store);
     }
-    best
+    (best_open, best_lookup, heap_bytes, mapped_bytes)
 }
 
 fn main() {
@@ -188,9 +199,9 @@ fn main() {
     std::fs::create_dir_all(&root).expect("create benchmark root");
 
     println!(
-        "warm get_location latency, best of {rounds}; {PROBES} hits and misses; {shard_bytes} byte seal"
+        "warm open and get_location latency, best of {rounds}; {PROBES} hits and misses; {shard_bytes} byte seal"
     );
-    println!("packs\tmode\thit_us\tmiss_us\tsealed_packs\trecords");
+    println!("packs\tmode\topen_ms\thit_us\tmiss_us\theap_mib\tmapped_mib\tsealed_packs\trecords");
     for wanted in pack_counts() {
         let base = root.join(format!("base-{wanted}"));
         std::fs::create_dir_all(&base).expect("create fixture directory");
@@ -210,16 +221,20 @@ fn main() {
             ("resident", IndexResidency::Resident),
             ("paged", IndexResidency::Paged),
         ] {
-            let hit = measure(&base, residency, &hits, rounds, shard_bytes);
-            let miss = measure(&base, residency, &misses, rounds, shard_bytes);
+            let (open, hit, heap, mapped) = measure(&base, residency, &hits, rounds, shard_bytes);
+            let (_, miss, _, _) = measure(&base, residency, &misses, rounds, shard_bytes);
             println!(
-                "{wanted}\t{label}\t{:.3}\t{:.3}\t{}\t{}",
+                "{wanted}\t{label}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}",
+                open.as_secs_f64() * 1e3,
                 hit.as_secs_f64() * 1e6,
                 miss.as_secs_f64() * 1e6,
+                heap as f64 / (1024.0 * 1024.0),
+                mapped as f64 / (1024.0 * 1024.0),
                 sidecar_count(&base),
                 ids.len()
             );
         }
+        std::fs::remove_dir_all(&base).ok();
     }
     if owned_root {
         let _ = std::fs::remove_dir_all(&root);
