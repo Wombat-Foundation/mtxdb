@@ -1,14 +1,14 @@
 use super::{
     base_is_incomplete, build_event_dag, canonical_column_width, cmd_collections, cmd_flags,
-    cmd_get, cmd_import,
-    cmd_import_file, cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats,
-    cmd_sync, cmd_tombstones, collection_canonical_id, compile_import_template,
-    compute_state_groups_partial, decode_event_json_record, decode_hamt_node, decode_hamt_root,
-    default_matrix_import_template, derive_template_key, display_collection_role, event_id,
-    event_room_id, event_short_id, export_envelope_line, extract_pointer_string, finish_import,
-    fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id, glob_pack_files,
-    import_data, import_pdu_events, interleaving_worth_noting, is_server_keys_export, keys_first,
-    listing_shard_types, load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
+    cmd_get, cmd_import, cmd_import_file, cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan,
+    cmd_shards, cmd_stats, cmd_sync, cmd_tombstones, collection_canonical_id,
+    compile_import_template, compute_state_groups_partial, decode_event_json_record,
+    decode_hamt_node, decode_hamt_root, default_matrix_import_template, derive_template_key,
+    display_collection_role, event_id, event_room_id, event_short_id, export_envelope_line,
+    extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
+    format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
+    interleaving_worth_noting, is_server_keys_export, keys_first, listing_shard_types,
+    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
     matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
     pack_identity, parse_federation_input, parse_pack_id_selector, parse_pack_selectors,
     prepare_state_collection, pretty_print_payload, record_matrix_adjacency, redacted_event_bytes,
@@ -6006,8 +6006,14 @@ fn partial_base_state_is_left_unchecked() {
     );
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(), 0);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 5);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        5
+    );
 
     let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
         .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
@@ -6028,10 +6034,7 @@ fn base_is_incomplete_inherits_from_parents() {
 
     assert!(!base_is_incomplete(false, std::slice::from_ref(&complete)));
     assert!(base_is_incomplete(true, std::slice::from_ref(&complete)));
-    assert!(base_is_incomplete(
-        false,
-        std::slice::from_ref(&incomplete)
-    ));
+    assert!(base_is_incomplete(false, std::slice::from_ref(&incomplete)));
 }
 
 #[test]
@@ -6075,8 +6078,14 @@ fn incomplete_base_is_inherited_by_descendants() {
     );
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(), 0);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        4
+    );
 }
 
 #[test]

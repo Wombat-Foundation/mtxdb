@@ -10405,14 +10405,10 @@ impl ImportContext<'_> {
                     return None;
                 };
                 if let Some(current) = current {
-                    let cites_rejected = room_event
-                        .auth_events
-                        .as_array()
-                        .is_some_and(|ids| {
-                            ids.iter().any(|id| {
-                                id.as_str().is_some_and(|id| current.contains(id))
-                            })
-                        });
+                    let cites_rejected = room_event.auth_events.as_array().is_some_and(|ids| {
+                        ids.iter()
+                            .any(|id| id.as_str().is_some_and(|id| current.contains(id)))
+                    });
                     if cites_rejected {
                         let code = RejectionCode::DependsOnRejectedAuthEvent.to_u8();
                         let reason = "auth_events cites a rejected event".to_owned();
@@ -11934,15 +11930,7 @@ fn walk_state_groups(
                 .is_some_and(|set| set.contains(event_id));
             if !already_rejected {
                 let current = rejected.as_deref();
-                if judge(
-                    event_id,
-                    event_value,
-                    &base.set,
-                    !base_incomplete,
-                    current,
-                )
-                .is_some()
-                {
+                if judge(event_id, event_value, &base.set, !base_incomplete, current).is_some() {
                     if let Some(set) = rejected.as_deref_mut() {
                         set.insert(event_id.clone());
                     }

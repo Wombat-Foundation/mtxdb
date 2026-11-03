@@ -1266,15 +1266,7 @@ pub(crate) fn judge_event_with_state(
     version: StateResVersion,
     base: &AuthEntries,
 ) -> anyhow::Result<EventAuthOutcome> {
-    judge_event_auth(
-        event,
-        subject,
-        index,
-        lean,
-        create,
-        version,
-        Some(base),
-    )
+    judge_event_auth(event, subject, index, lean, create, version, Some(base))
 }
 
 fn judge_event_auth(
