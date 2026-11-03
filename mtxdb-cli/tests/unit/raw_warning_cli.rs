@@ -4,6 +4,19 @@
 mod tests {
     use std::process::Command;
 
+    /// A per-test temp root. Test thread names contain `::`, which is not
+    /// valid in a Windows path, so colons become underscores.
+    fn test_root(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace(':', "_")
+        ))
+    }
+
     fn with_content_hash(line: &str, room_version: &str) -> String {
         let mut value = rezzy::json::Value::parse_bytes(line.as_bytes()).expect("valid event JSON");
         let hash =
@@ -18,14 +31,7 @@ mod tests {
 
     #[test]
     fn raw_import_rejects_conflicting_auth_projection() {
-        let root = std::env::temp_dir().join(format!(
-            "mtxdb-raw-projection-cli-{}-{}",
-            std::process::id(),
-            std::thread::current()
-                .name()
-                .unwrap_or("test")
-                .replace(':', "_")
-        ));
+        let root = test_root("mtxdb-raw-projection-cli");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
@@ -95,11 +101,7 @@ mod tests {
 
     #[test]
     fn raw_import_warnings_only_name_current_file_events() {
-        let root = std::env::temp_dir().join(format!(
-            "mtxdb-raw-warning-cli-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root = test_root("mtxdb-raw-warning-cli");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 

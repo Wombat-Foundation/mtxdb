@@ -12,7 +12,8 @@
 //! `MTXDB_LOOKUP_SHARD_BYTES` changes the seal size, and
 //! `MTXDB_LOOKUP_PACK_COUNTS=1000` runs only a selected pack-count fixture.
 //! With `MTXDB_LOOKUP_ROOT` set, fixtures are kept there and a complete one
-//! (marked by its `fixture-records` file) is reused by later runs.
+//! (marked by its `fixture-records` file) is reused by later runs with the same
+//! pack count, seal size and payload size.
 
 #![allow(clippy::arithmetic_side_effects, clippy::cast_precision_loss)]
 
@@ -77,13 +78,17 @@ fn node_id(sequence: u64) -> NodeId {
 }
 
 fn payload_len() -> usize {
-    env_usize("MTXDB_LOOKUP_PAYLOAD_BYTES", PAYLOAD_BYTES).max(8)
+    let len = env_usize("MTXDB_LOOKUP_PAYLOAD_BYTES", PAYLOAD_BYTES);
+    assert!(len > 0, "MTXDB_LOOKUP_PAYLOAD_BYTES must be positive");
+    len
 }
 
+/// `len` incompressible bytes, including a partial final word.
 fn payload(sequence: u64, len: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; len];
-    for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(0u64..) {
-        chunk.copy_from_slice(&mix(sequence.wrapping_add(word)).to_le_bytes());
+    for (chunk, word) in bytes.chunks_mut(8).zip(0u64..) {
+        let value = mix(sequence.wrapping_add(word)).to_le_bytes();
+        chunk.copy_from_slice(&value[..chunk.len()]);
     }
     bytes
 }
@@ -246,7 +251,9 @@ fn main() {
     );
     println!("packs\tmode\topen_ms\thit_us\tmiss_us\theap_mib\tmapped_mib\tsealed_packs\trecords");
     for wanted in pack_counts() {
-        let base = root.join(format!("base-{wanted}-p{payload_len}"));
+        // Key the fixture by everything that shapes its packs, so a reused
+        // fixture always matches the requested seal and payload size.
+        let base = root.join(format!("base-{wanted}-s{shard_bytes}-p{payload_len}"));
         let total_records = if let Some(records) = fixture_records(&base, wanted) {
             // A Paged open deletes the resident checkpoint, so restore it
             // before the Resident measurement, as a fresh build would.
