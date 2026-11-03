@@ -9,6 +9,8 @@
 //! measures `get_location`, which performs the production locator search and
 //! verifies the winning frame but avoids payload decode/cache effects. Hit
 //! keys are spread over the older 90% of the collection; misses are unique.
+//! `MTXDB_LOOKUP_SHARD_BYTES` changes the seal size, and
+//! `MTXDB_LOOKUP_PACK_COUNTS=1000` runs only a selected pack-count fixture.
 
 #![allow(clippy::arithmetic_side_effects)]
 
@@ -21,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const COLLECTION: [u8; 16] = [0x4D; 16];
-const SHARD_BYTES: u64 = 8192;
+const DEFAULT_SHARD_BYTES: u64 = 8192;
 const PAYLOAD_BYTES: usize = 120;
 const PROBES: usize = 500;
 
@@ -30,6 +32,31 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn shard_bytes() -> u64 {
+    env_u64("MTXDB_LOOKUP_SHARD_BYTES", DEFAULT_SHARD_BYTES)
+}
+
+fn pack_counts() -> Vec<usize> {
+    std::env::var("MTXDB_LOOKUP_PACK_COUNTS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse().ok())
+                .filter(|count| *count > 0)
+                .collect()
+        })
+        .filter(|counts: &Vec<usize>| !counts.is_empty())
+        .unwrap_or_else(|| vec![10, 100, 1000])
 }
 
 fn mix(mut value: u64) -> u64 {
@@ -62,16 +89,15 @@ fn sidecar_count(dir: &Path) -> usize {
         .count()
 }
 
-fn build_fixture(dir: &Path, wanted_packs: usize) -> Vec<NodeId> {
-    let store = PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), SHARD_BYTES)
+fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64) -> Vec<NodeId> {
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), shard_bytes)
         .expect("open fixture store");
     let mut ids = Vec::new();
     let mut sequence = 0u64;
-    // This incompressible record shape fills about 24 frames per 8 KiB shard.
-    // Leave one shard active; every earlier shard gets a sidecar once the
-    // collection moves to the next home. If the measured frame density differs
-    // on a platform, add one shard of records and sync until the target is met.
-    let records_per_shard = 24u64;
+    // This incompressible record shape uses roughly 341 bytes per frame, so
+    // scale the batch with the seal size and add more until the target pack
+    // count is met if the estimate is low.
+    let records_per_shard = (shard_bytes / 341).max(1);
     let initial_records = u64::try_from(wanted_packs + 1)
         .expect("pack count fits in u64")
         .saturating_mul(records_per_shard);
@@ -104,20 +130,10 @@ fn build_fixture(dir: &Path, wanted_packs: usize) -> Vec<NodeId> {
     ids
 }
 
-fn copy_fixture(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).expect("create lookup-mode directory");
-    for entry in std::fs::read_dir(from).expect("read fixture").flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            std::fs::copy(&path, to.join(entry.file_name())).expect("copy fixture file");
-        }
-    }
-}
-
-fn open(dir: &Path, residency: IndexResidency) -> PackfileStorage {
+fn open(dir: &Path, residency: IndexResidency, shard_bytes: u64) -> PackfileStorage {
     PackfileStorage::open_with_max_shard_bytes_and_residency(
         dir.to_path_buf(),
-        SHARD_BYTES,
+        shard_bytes,
         ChecksumPolicy::Full,
         residency,
     )
@@ -133,10 +149,16 @@ fn average_lookup(store: &PackfileStorage, ids: &[NodeId]) -> Duration {
     started.elapsed().div_f64(f64::from(probe_count))
 }
 
-fn measure(dir: &Path, residency: IndexResidency, probes: &[NodeId], rounds: usize) -> Duration {
+fn measure(
+    dir: &Path,
+    residency: IndexResidency,
+    probes: &[NodeId],
+    rounds: usize,
+    shard_bytes: u64,
+) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..rounds {
-        let store = open(dir, residency);
+        let store = open(dir, residency, shard_bytes);
         best = best.min(average_lookup(&store, probes));
         drop(store);
     }
@@ -145,21 +167,30 @@ fn measure(dir: &Path, residency: IndexResidency, probes: &[NodeId], rounds: usi
 
 fn main() {
     let rounds = env_usize("MTXDB_LOOKUP_ROUNDS", 5);
-    let root: PathBuf =
-        std::env::temp_dir().join(format!("mtxdb-paged-lookup-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let shard_bytes = shard_bytes();
+    let root = std::env::var_os("MTXDB_LOOKUP_ROOT").map_or_else(
+        || {
+            std::env::temp_dir().join(format!(
+                "mtxdb-paged-lookup-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ))
+        },
+        PathBuf::from,
+    );
     std::fs::create_dir_all(&root).expect("create benchmark root");
 
-    println!("warm get_location latency, best of {rounds}; {PROBES} hits and misses");
+    println!(
+        "warm get_location latency, best of {rounds}; {PROBES} hits and misses; {shard_bytes} byte seal"
+    );
     println!("packs\tmode\thit_us\tmiss_us\tsealed_packs\trecords");
-    for wanted in [10usize, 100, 1000] {
+    for wanted in pack_counts() {
         let base = root.join(format!("base-{wanted}"));
         std::fs::create_dir_all(&base).expect("create fixture directory");
-        let ids = build_fixture(&base, wanted);
-        let resident_dir = root.join(format!("resident-{wanted}"));
-        let paged_dir = root.join(format!("paged-{wanted}"));
-        copy_fixture(&base, &resident_dir);
-        copy_fixture(&base, &paged_dir);
+        let ids = build_fixture(&base, wanted, shard_bytes);
 
         let hit_range = ids.len().saturating_mul(9) / 10;
         let hits: Vec<NodeId> = (0..PROBES)
@@ -168,12 +199,15 @@ fn main() {
         let misses: Vec<NodeId> = (0..PROBES)
             .map(|index| node_id(u64::try_from(ids.len()).unwrap() + index as u64 + 10_000_000))
             .collect();
-        for (label, dir, residency) in [
-            ("resident", &resident_dir, IndexResidency::Resident),
-            ("paged", &paged_dir, IndexResidency::Paged),
+        // Measure Resident first: it consumes the checkpoint the fixture
+        // wrote. The first Paged open then deletes that checkpoint, so later
+        // Paged rounds exercise the real full-scan open.
+        for (label, residency) in [
+            ("resident", IndexResidency::Resident),
+            ("paged", IndexResidency::Paged),
         ] {
-            let hit = measure(dir, residency, &hits, rounds);
-            let miss = measure(dir, residency, &misses, rounds);
+            let hit = measure(&base, residency, &hits, rounds, shard_bytes);
+            let miss = measure(&base, residency, &misses, rounds, shard_bytes);
             println!(
                 "{wanted}\t{label}\t{:.3}\t{:.3}\t{}\t{}",
                 hit.as_secs_f64() * 1e6,
