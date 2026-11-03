@@ -99,7 +99,7 @@ jobs:
       matrix:
         include:
           - arch: ppc64le
-            page_size: 65536
+            page_size: 4096
           - arch: s390x
             page_size: 4096
           - arch: armv7
