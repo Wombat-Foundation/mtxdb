@@ -4,8 +4,20 @@
 mod tests {
     use std::process::Command;
 
+    fn with_content_hash(line: &str, room_version: &str) -> String {
+        let mut value = rezzy::json::Value::parse_bytes(line.as_bytes()).expect("valid event JSON");
+        let hash =
+            rezzy::compute_content_hash(&value, room_version).expect("content hash is computable");
+        if let rezzy::json::Value::Object(fields) = &mut value {
+            let mut hashes = rezzy::json::Object::new();
+            hashes.insert("sha256".to_owned(), rezzy::json::Value::String(hash));
+            fields.insert("hashes".to_owned(), rezzy::json::Value::Object(hashes));
+        }
+        rezzy::json::write_string_value(&value).expect("event serializes")
+    }
+
     #[test]
-    fn raw_import_warns_on_conflicting_auth_projection() {
+    fn raw_import_rejects_conflicting_auth_projection() {
         let root = std::env::temp_dir().join(format!(
             "mtxdb-raw-projection-cli-{}-{}",
             std::process::id(),
@@ -14,28 +26,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
+        let first_pl = with_content_hash(
+            r#"{"event_id":"$pl","sender":"@alice:test","room_id":"!room:test","type":"m.room.power_levels","state_key":"","content":{"users":{"@alice:test":100},"invite":50},"prev_events":["$join"],"auth_events":["$create","$join"]}"#,
+            "10",
+        );
         let first = root.join("first.jsonl");
         std::fs::write(
             &first,
-            concat!(
+            format!(
+                "{}\n{}\n{}\n",
                 r#"{"event_id":"$create","sender":"@alice:test","room_id":"!room:test","type":"m.room.create","state_key":"","content":{"room_version":"10"},"prev_events":[],"auth_events":[]}"#,
-                "\n",
                 r#"{"event_id":"$join","sender":"@alice:test","room_id":"!room:test","type":"m.room.member","state_key":"@alice:test","content":{"membership":"join"},"prev_events":["$create"],"auth_events":["$create"]}"#,
-                "\n",
-                r#"{"event_id":"$pl","sender":"@alice:test","room_id":"!room:test","type":"m.room.power_levels","state_key":"","content":{"users":{"@alice:test":100},"invite":50},"prev_events":["$join"],"auth_events":["$create","$join"]}"#,
-                "\n",
+                first_pl,
             ),
         )
         .unwrap();
+        let second_pl = with_content_hash(
+            r#"{"event_id":"$pl","sender":"@alice:test","room_id":"!room:test","type":"m.room.power_levels","state_key":"","content":{"users":{"@alice:test":100},"invite":0},"prev_events":["$join"],"auth_events":["$create","$join"]}"#,
+            "10",
+        );
         let second = root.join("second.jsonl");
-        std::fs::write(
-            &second,
-            concat!(
-                r#"{"event_id":"$pl","sender":"@alice:test","room_id":"!room:test","type":"m.room.power_levels","state_key":"","content":{"users":{"@alice:test":100},"invite":0},"prev_events":["$join"],"auth_events":["$create","$join"]}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
+        std::fs::write(&second, format!("{second_pl}\n")).unwrap();
 
         let init = Command::new(env!("CARGO_BIN_EXE_mtxdb"))
             .args(["init", "--dir"])
@@ -67,10 +78,13 @@ mod tests {
             .output()
             .expect("run second import");
         let stderr = String::from_utf8_lossy(&second_output.stderr);
-        assert!(second_output.status.success(), "stderr: {stderr}");
         assert!(
-            stderr.contains("  warning: auth projection for event $pl conflicts with the stored projection; keeping the first"),
-            "the second import must report the conflicting projection: {stderr}"
+            !second_output.status.success(),
+            "a verified projection conflict must fail the import: {stderr}"
+        );
+        assert!(
+            stderr.contains("auth projection for event $pl conflicts with the stored projection"),
+            "the second import must name the conflicting projection: {stderr}"
         );
 
         let _ = std::fs::remove_dir_all(root);

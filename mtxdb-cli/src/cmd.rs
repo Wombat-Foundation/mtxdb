@@ -10874,16 +10874,14 @@ fn import_pdu_events_with_raw(
         store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
-    for warning in write_raw_auth_projections(
+    write_raw_auth_projections(
         store,
         &resolved.canonical_id,
         template,
         &room_version,
         events,
         auth_chain,
-    )? {
-        eprintln!("  warning: {warning}");
-    }
+    )?;
 
     let room_events: Vec<RoomEvent> = all_events
         .iter()
@@ -11062,6 +11060,22 @@ fn raw_auth_projection(event: &OwnedValue, room_version: &str) -> Option<OwnedVa
     (!projected.is_empty()).then_some(OwnedValue::Object(projected))
 }
 
+/// Whether the event's declared content hash matches its current content.
+///
+/// Events without `hashes.sha256` cannot be verified here, so they get no auth
+/// projection. The event itself is still stored and judged in its redacted
+/// form, which is the spec's fallback.
+fn content_hash_verifies(event: &OwnedValue, room_version: &str) -> bool {
+    let Some(expected) = event
+        .get("hashes")
+        .and_then(|hashes| hashes.get("sha256"))
+        .and_then(OwnedValue::as_str)
+    else {
+        return false;
+    };
+    rezzy::compute_content_hash(event, room_version).is_ok_and(|computed| computed == expected)
+}
+
 fn write_raw_auth_projections(
     store: &PackfileStorage,
     room_id: &str,
@@ -11069,7 +11083,7 @@ fn write_raw_auth_projections(
     room_version: &str,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<()> {
     // Never guess at an unknown version. The establishment validator rejects
     // these before an import, but the projection writer is also called
     // directly by tests and future callers.
@@ -11081,6 +11095,12 @@ fn write_raw_auth_projections(
     let mut seen = HashSet::new();
     let mut records = Vec::new();
     for event in events.iter().chain(auth_chain) {
+        // A projection is auth input. It may only be taken from content whose
+        // hash verifies; otherwise a forged event could seed the fields that
+        // later files overlay onto their redacted copy.
+        if !content_hash_verifies(event, room_version) {
+            continue;
+        }
         // auth_chain-only events are projected too: step 3 will use them as
         // edge and state providers without storing them as timeline events.
         let Some(projection) = raw_auth_projection(event, room_version) else {
@@ -11102,24 +11122,18 @@ fn write_raw_auth_projections(
         ));
     }
     if records.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let collection = raw_auth_projection_collection_id(room_id);
     let ids: Vec<[u8; 16]> = records.iter().map(|(id, _, _)| *id).collect();
     let existing = store.get_many(&collection, &ids)?;
-    let mut warnings = Vec::new();
     let mut to_write = Vec::with_capacity(records.len());
     for ((node, id, data), existing) in records.into_iter().zip(existing) {
         if let Some(existing) = existing {
-            // First projection wins. Event ids are opaque in v1-v3, so the
-            // same id can legitimately arrive with different content; the
-            // event collection already keeps the first stored payload. For
-            // content-addressed versions this is also the conservative
-            // choice: never replace an established projection.
             if existing.bytes != data.bytes {
-                warnings.push(format!(
-                    "auth projection for event {id} conflicts with the stored projection; keeping the first"
-                ));
+                anyhow::bail!(
+                    "auth projection for event {id} conflicts with the stored projection; event ids are content hashes from v4 on, so this is corrupted data"
+                );
             }
             continue;
         }
@@ -11139,7 +11153,7 @@ fn write_raw_auth_projections(
             .create_or_put_established(&collection, &metadata, &to_write)
             .context("storing raw auth projections")?;
     }
-    Ok(warnings)
+    Ok(())
 }
 
 fn overlay_auth_projection(event: &mut OwnedValue, projection: OwnedValue) {

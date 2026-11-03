@@ -2541,14 +2541,17 @@ fn raw_import_keeps_msc3389_power_level_rejection_across_files() {
         r#"["$create"]"#,
         r#"["$create"]"#,
     );
-    let power_levels = raw_event(
-        "!room8",
-        "$pl",
-        "m.room.power_levels",
-        "",
-        r#"{"users":{"@alice:test":100},"invite":50}"#,
-        r#"["$join_alice"]"#,
-        r#"["$create","$join_alice"]"#,
+    let power_levels = with_content_hash(
+        raw_event(
+            "!room8",
+            "$pl",
+            "m.room.power_levels",
+            "",
+            r#"{"users":{"@alice:test":100},"invite":50}"#,
+            r#"["$join_alice"]"#,
+            r#"["$create","$join_alice"]"#,
+        ),
+        "org.matrix.msc3389.10",
     );
     let join_rules = raw_event(
         "!room8",
@@ -2629,14 +2632,17 @@ fn raw_import_keeps_pre_v11_m_federate_rejection_across_files() {
     let store = db.event_dag();
     let state_store = db.state().as_ref();
 
-    let create = raw_event(
-        "!room6",
-        "$create",
-        "m.room.create",
-        "",
-        r#"{"room_version":"10","m.federate":false}"#,
-        "[]",
-        "[]",
+    let create = with_content_hash(
+        raw_event(
+            "!room6",
+            "$create",
+            "m.room.create",
+            "",
+            r#"{"room_version":"10","m.federate":false}"#,
+            "[]",
+            "[]",
+        ),
+        "10",
     );
     let join_alice = raw_event(
         "!room6",
@@ -2790,39 +2796,45 @@ fn raw_auth_projection_keeps_v8_restricted_join_fields() {
 }
 
 #[test]
-fn raw_auth_projection_collision_keeps_first_for_conflicting_exports() {
+fn raw_auth_projection_rejects_conflicting_exports() {
     let dir = unique_temp_dir().join("projection_collision");
     let db = Database::open(dir).unwrap();
     let template = default_matrix_import_template();
     let store = db.event_dag();
     let room = "!projection_collision";
-    let first = raw_event(
-        room,
-        "$same",
-        "m.room.power_levels",
-        "",
-        r#"{"invite":50}"#,
-        "[]",
-        "[]",
+    let first = with_content_hash(
+        raw_event(
+            room,
+            "$same",
+            "m.room.power_levels",
+            "",
+            r#"{"invite":50}"#,
+            "[]",
+            "[]",
+        ),
+        "10",
     );
-    let second = raw_event(
-        room,
-        "$same",
-        "m.room.power_levels",
-        "",
-        r#"{"invite":0}"#,
-        "[]",
-        "[]",
+    let second = with_content_hash(
+        raw_event(
+            room,
+            "$same",
+            "m.room.power_levels",
+            "",
+            r#"{"invite":0}"#,
+            "[]",
+            "[]",
+        ),
+        "10",
     );
-    let warnings =
-        write_raw_auth_projections(store, room, &template, "10", &[first.clone()], &[]).unwrap();
-    assert!(warnings.is_empty());
-    let warnings =
-        write_raw_auth_projections(store, room, &template, "10", &[second], &[]).unwrap();
-    assert_eq!(warnings.len(), 1);
+    write_raw_auth_projections(store, room, &template, "10", &[first.clone()], &[]).unwrap();
+    let error =
+        write_raw_auth_projections(store, room, &template, "10", &[second], &[]).unwrap_err();
     assert!(
-        warnings[0].contains("$same") && warnings[0].contains("keeping the first"),
-        "collision warning must name the event and the policy: {warnings:?}"
+        error.to_string().contains("$same")
+            && error
+                .to_string()
+                .contains("conflicts with the stored projection"),
+        "a verified projection conflict is corrupted data: {error}"
     );
 
     let node = template_node_id(&template, &first).unwrap().unwrap();
@@ -2832,7 +2844,7 @@ fn raw_auth_projection_collision_keeps_first_for_conflicting_exports() {
     assert_eq!(
         projection.get("invite").and_then(OwnedValue::as_i64),
         Some(50),
-        "a later projection must not replace the first from a conflicting export"
+        "the first verified projection must survive a rejected conflict"
     );
 }
 
@@ -2864,14 +2876,17 @@ fn raw_import_keeps_v11_third_party_invite_public_keys_across_files() {
         r#"["$create"]"#,
         r#"["$create"]"#,
     );
-    let third_party = raw_event(
-        "!room7",
-        "$tpi",
-        "m.room.third_party_invite",
-        "token",
-        r#"{"public_key":"key","public_keys":[{"public_key":"key"}]}"#,
-        r#"["$join_alice"]"#,
-        r#"["$create","$join_alice"]"#,
+    let third_party = with_content_hash(
+        raw_event(
+            "!room7",
+            "$tpi",
+            "m.room.third_party_invite",
+            "token",
+            r#"{"public_key":"key","public_keys":[{"public_key":"key"}]}"#,
+            r#"["$join_alice"]"#,
+            r#"["$create","$join_alice"]"#,
+        ),
+        "11",
     );
     let message = raw_event(
         "!room7",
