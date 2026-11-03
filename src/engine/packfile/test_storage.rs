@@ -21,11 +21,24 @@ const OTHER_COLLECTION: [u8; 16] = [0x02; 16];
 fn test_dir(name: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("mdb_test_pfs_{name}_{}_{id}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    loop {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mdb_test_pfs_{name}_{}_{}_{}",
+            std::process::id(),
+            id,
+            nonce
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create test directory {}: {error}", dir.display()),
+        }
+    }
 }
 
 #[test]
