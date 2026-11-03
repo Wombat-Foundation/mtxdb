@@ -71,6 +71,40 @@ fn with_content_hash(mut event: OwnedValue, room_version: &str) -> OwnedValue {
     event
 }
 
+/// A power-levels event whose content says `invite: 50` but whose hash belongs
+/// to an honest `invite: 0` event. The hash must fail, so this content may not
+/// seed an auth projection.
+fn forged_power_levels_with_stale_hash(room: &str) -> OwnedValue {
+    let mut event = raw_event(
+        room,
+        "$pl",
+        "m.room.power_levels",
+        "",
+        r#"{"users":{"@alice:test":100},"invite":50}"#,
+        r#"["$join_alice"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    let honest_hash = rezzy::compute_content_hash(
+        &raw_event(
+            room,
+            "$pl",
+            "m.room.power_levels",
+            "",
+            r#"{"users":{"@alice:test":100},"invite":0}"#,
+            r#"["$join_alice"]"#,
+            r#"["$create","$join_alice"]"#,
+        ),
+        "10",
+    )
+    .expect("content hash is computable");
+    if let OwnedValue::Object(fields) = &mut event {
+        let mut hashes = rezzy::json::Object::new();
+        hashes.insert("sha256".to_owned(), OwnedValue::String(honest_hash));
+        fields.insert("hashes".to_owned(), OwnedValue::Object(hashes));
+    }
+    event
+}
+
 fn raw_v10_invite_fixture() -> [OwnedValue; 6] {
     [
         raw_event(
@@ -2508,6 +2542,104 @@ fn raw_import_keeps_pre_v11_power_level_rejection_across_files() {
         flags.select(&db, &rejected).unwrap(),
         vec![b"$invite".to_vec()],
         "the rejected invite must still be selectable"
+    );
+}
+
+#[test]
+fn raw_import_does_not_project_hash_failing_content() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_forged_projection");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room_forged");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let room = "!room_forged";
+
+    let create = raw_event(
+        room,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"10"}"#,
+        "[]",
+        "[]",
+    );
+    let join_alice = raw_event(
+        room,
+        "$join_alice",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let power_levels = forged_power_levels_with_stale_hash(room);
+    let rules = raw_event(
+        room,
+        "$rules",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$pl"]"#,
+        r#"["$create","$join_alice","$pl"]"#,
+    );
+    let join_bob = owned_value(
+        r#"{"event_id":"$join_bob","sender":"@bob:test","room_id":"!room_forged","type":"m.room.member","state_key":"@bob:test","content":{"membership":"join"},"prev_events":["$rules"],"auth_events":["$create","$pl","$rules"]}"#,
+    );
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join_alice, power_levels.clone(), rules, join_bob]);
+
+    let node = template_node_id(&template, &power_levels).unwrap().unwrap();
+    assert!(
+        store
+            .get(&raw_auth_projection_collection_id(room), &node)
+            .unwrap()
+            .is_none(),
+        "a hash-failing event must not write an auth projection"
+    );
+    let loaded = load_collection_events(store, &collection_id, room).unwrap();
+    let stored_pl = loaded
+        .iter()
+        .find(|event| event_id(event) == Some("$pl"))
+        .expect("the power levels event is stored");
+    assert!(
+        stored_pl
+            .get("content")
+            .and_then(|content| content.get("invite"))
+            .is_none(),
+        "the forged invite field must not be overlaid from a projection"
+    );
+
+    let invite = owned_value(
+        r#"{"event_id":"$invite","sender":"@bob:test","room_id":"!room_forged","type":"m.room.member","state_key":"@carol:test","content":{"membership":"invite"},"prev_events":["$join_bob"],"auth_events":["$create","$pl","$join_bob"]}"#,
+    );
+    import(&[invite]);
+
+    let flags = RoomFlagIndex::new(room.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0,
+        "the redacted power levels invite level is 0, so Bob's invite must not be rejected"
     );
 }
 
