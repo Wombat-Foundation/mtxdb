@@ -10,6 +10,10 @@
 //! ```text
 //! MTXDB_MEASURE_RECORDS=4000000 cargo run --release --example checkpoint_memory
 //! ```
+//!
+//! `MTXDB_MEASURE_DIR` is an optional base directory; each run creates a fresh
+//! process-specific child directory beneath it and removes that child on exit.
+//! `MTXDB_MEASURE_MODE=slots` runs only the cold slots-checkpoint rewrite.
 
 // A measurement harness: byte counts and ratios are printed, never used for
 // control flow, and the phases are intentionally linear.
@@ -262,10 +266,11 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4_000_000);
-    let dir: PathBuf = match std::env::var("MTXDB_MEASURE_DIR") {
+    let base: PathBuf = match std::env::var("MTXDB_MEASURE_DIR") {
         Ok(value) => PathBuf::from(value),
-        Err(_) => std::env::temp_dir().join(format!("mtxdb_measure_{}", std::process::id())),
+        Err(_) => std::env::temp_dir(),
     };
+    let dir = base.join(format!("mtxdb_measure_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let checkpoint = dir.join(INDEX_CHECKPOINT_FILE);

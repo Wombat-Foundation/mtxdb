@@ -471,7 +471,7 @@ fn the_first_expired_ts_wins_and_a_future_one_is_dropped() {
     )];
     let merged =
         update_server_keys(&db, &update("o", KeySighting::Direct, "d", &future, 1_000)).unwrap();
-    assert!(merged.keys.is_empty(), "the entry is dropped");
+    assert_eq!(merged.keys, Vec::new(), "the entry is dropped");
     assert_eq!(merged.issues[0].kind, KeyIssueKind::FutureExpiredTs);
     assert_eq!(
         read_server_key(db.server_info(), b"o", b"ed25519:a")
@@ -713,7 +713,7 @@ fn the_digest_cap_refuses_new_key_ids_per_bucket_and_promotion_moves_one() {
     let b = [observed("ed25519:b", b"BBBB", 9_000)];
     let refused = update_server_keys(&db, &capped(KeySighting::Notary, &b, 2)).unwrap();
     assert_eq!(refused.issues[0].kind, KeyIssueKind::DigestCapReached);
-    assert!(refused.keys.is_empty(), "no digest binding, no key");
+    assert_eq!(refused.keys, Vec::new(), "no digest binding, no key");
 
     // The direct bucket is separate, so a notary flood does not block it.
     let direct = merge(&db, &capped(KeySighting::Direct, &b, 3)).unwrap();

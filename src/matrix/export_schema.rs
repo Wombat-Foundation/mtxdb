@@ -107,7 +107,6 @@ pub mod field {
     pub const VALID_UNTIL_TS: &str = "valid_until_ts";
     /// `server_keys` key: who first supplied the key.
     pub const SOURCE: &str = "source";
-    /// `server_keys` key: millisecond timestamp the key was last seen.
     /// `provisional` or `permanent`, optional: base64 SHA-256 of the key body.
     /// A key whose bytes were evicted carries this and no `key`.
     pub const DIGEST: &str = "digest";

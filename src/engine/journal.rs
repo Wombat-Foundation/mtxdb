@@ -3370,7 +3370,9 @@ impl JournalCoordinator {
     /// reads that would wait for the group fail with `cause` until the database
     /// is reopened and the WAL replayed. Only the first cause is kept.
     pub(crate) fn fail_apply(&self, cause: String) {
+        let publication = self.publication.lock();
         let _ = self.apply_failure.set(cause);
+        drop(publication);
         // Wake reads waiting for the group so they see the failure.
         self.notify_materialized();
     }

@@ -898,6 +898,10 @@ fn try_update(
     // An evicted key whose body returns competes for a retention slot again,
     // which only a full read can rank.
     if update.snapshot
+        || update
+            .observed
+            .iter()
+            .any(|observed| observed.expired_ts.is_some())
         || ids.iter().any(|id| !current.contains_key(id))
         || current.values().any(ServerKey::is_evicted)
     {

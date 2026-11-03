@@ -9933,6 +9933,7 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
         metadatas: Option<&[Option<FrameMetadata>]>,
+        journaled: bool,
     ) -> Result<bool, StorageError> {
         if entries.is_empty() {
             return Ok(false);
@@ -9946,7 +9947,7 @@ impl PackfileStorage {
                 collection_id: *collection_id,
                 hash: *id,
                 data: data.bytes.clone(),
-                metadata: Self::stamp_last_write_lsn(metadata, Some(0)),
+                metadata: Self::stamp_last_write_lsn(metadata, journaled.then_some(0)),
             })?;
         }
         Ok(true)
@@ -10302,7 +10303,12 @@ impl PackfileStorage {
                 "per-entry metadata must align with entries"
             );
         }
-        if !Self::validate_put_many_inputs(collection_id, entries, metadatas)? {
+        if !Self::validate_put_many_inputs(
+            collection_id,
+            entries,
+            metadatas,
+            self.journal().is_some(),
+        )? {
             return Ok(0);
         }
 
@@ -10986,7 +10992,10 @@ impl PackfileStorage {
             let candidates = gen.candidates(collection_id, node_id);
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
             let current = self.generation(collection_id);
-            if !Self::same_generation(current.as_ref(), gen) {
+            if !current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, gen))
+            {
                 continue;
             }
             for (slot, offset) in candidates {

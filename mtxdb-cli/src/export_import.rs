@@ -1510,10 +1510,10 @@ fn apply_judgement(
                         .unwrap_or_else(|| "unknown auth-check failure".to_owned()),
                 });
             }
-        } else if exported[position] {
+        } else if exported[position] && findings.forced[position].is_none() {
             // The event passes auth against the state before it, so the
-            // export's rejection is not reproduced. Store it accepted and
-            // report the disagreement.
+            // export's rejection is not reproduced. Cascade-rejected events
+            // remain rejected, matching the verdict that will be stored.
             findings
                 .passes_but_exported_rejected
                 .push(event.event_id.clone());
@@ -1895,6 +1895,12 @@ pub(crate) fn write_room_with_resolved_findings(
             );
         }
         if staged_bytes.saturating_add(size) > batch_bytes && staged_bytes > 0 {
+            if written == 0 {
+                bail!(
+                    "room {} version record and first event need more than the {batch_bytes}-byte batch limit",
+                    export.room_id
+                );
+            }
             if !batch_timeline_entries.is_empty() {
                 timeline_index
                     .stage_append(&tx, EVENT_POOL, &batch_timeline_entries)
@@ -2301,6 +2307,18 @@ fn write_auth_closures(
 /// Write a keys export in one transaction: a handful of records, far under
 /// the batch limit.
 pub(crate) fn write_keys(db: &Database, records: &[KeyRecord]) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    for record in records {
+        if let KeyRecord::Key { origin, key } = record {
+            let binding = (origin.to_ascii_lowercase(), key.key_id.clone());
+            anyhow::ensure!(
+                seen.insert(binding),
+                "duplicate signing key for origin {} and key id {}",
+                origin,
+                String::from_utf8_lossy(&key.key_id)
+            );
+        }
+    }
     let tx = db.begin_transaction();
     for record in records {
         match record {
@@ -2319,6 +2337,8 @@ pub(crate) fn write_keys(db: &Database, records: &[KeyRecord]) -> anyhow::Result
 #[cfg(test)]
 mod auth_findings_tests {
     use bytes::Bytes;
+    use mtxdb::server_keys::{key_digest, KeyTier, ServerKey};
+    use rezzy::signing::ed25519_zebra::SigningKey;
 
     use super::*;
 
@@ -2371,6 +2391,29 @@ mod auth_findings_tests {
 
     fn forced(findings: &AuthFindings, position: usize) -> Option<u8> {
         findings.forced[position]
+    }
+
+    fn signing_key_record(origin: &str, key_id: &str) -> KeyRecord {
+        let key = SigningKey::from([17; 32]);
+        let bytes = AsRef::<[u8]>::as_ref(&key.verification_key()).to_vec();
+        KeyRecord::Key {
+            origin: origin.to_owned(),
+            key: ServerKey {
+                key_id: key_id.as_bytes().to_vec(),
+                digest: key_digest(&bytes),
+                key: bytes,
+                valid_until_ts: 100,
+                source: b"test".to_vec(),
+                ts_added_ms: 0,
+                tier: KeyTier::Permanent,
+                first_seen_ms: 0,
+                last_active_ms: 0,
+                corroborated: false,
+                promote_by_ms: 0,
+                expired_ts: None,
+                inferred_retired: false,
+            },
+        }
     }
 
     const MISSING_AUTH: u8 = 4;
@@ -2656,6 +2699,18 @@ mod auth_findings_tests {
     #[test]
     fn a_derived_create_failure_fails_the_room() {
         let create = with_field(create_with_version("10"), "sender", "not-an-mxid");
+        let error = derived_auth_findings(&export(vec![create]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("m.room.create"), "{error}");
+    }
+
+    #[test]
+    fn a_derived_create_without_a_sender_fails_the_room() {
+        let mut create = create_with_version("10");
+        if let OwnedValue::Object(fields) = &mut create.pdu {
+            fields.remove("sender");
+        }
         let error = derived_auth_findings(&export(vec![create]))
             .unwrap_err()
             .to_string();
@@ -2994,6 +3049,50 @@ mod auth_findings_tests {
                 Some(walked(&room, &event.event_id))
             );
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_first_event_that_does_not_fit_with_room_version_writes_nothing() {
+        let (db, dir) = db();
+        let room = diamond();
+        // 710 bytes fits the first event, but not the immutable room version
+        // record plus that event. The failed import must not publish the
+        // version record in a separate transaction.
+        let result = write_room_with_findings(&db, &room, 710);
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("version record and first event"),
+            "the first event should not fit beside its version record: {error}"
+        );
+        assert!(
+            read_pool(
+                &db,
+                SERVER_INFO_POOL,
+                room_version_collection_id(room.room_id.as_bytes()),
+                room_version_node_id()
+            )
+            .is_none(),
+            "the version record must remain uncommitted"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn duplicate_signing_key_records_are_rejected_before_writing() {
+        let (db, dir) = db();
+        let records = [
+            signing_key_record("example.org", "ed25519:a"),
+            signing_key_record("EXAMPLE.ORG", "ed25519:a"),
+        ];
+        let error = write_keys(&db, &records).unwrap_err().to_string();
+        assert!(error.contains("duplicate signing key"), "{error}");
+        assert!(
+            server_keys::read_server_key(db.pool(SERVER_INFO_POOL), b"example.org", b"ed25519:a")
+                .unwrap()
+                .is_none(),
+            "prevalidation must leave the transaction untouched"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
