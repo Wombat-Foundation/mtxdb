@@ -341,6 +341,109 @@ fn a_corrupt_block_fails_lookups_instead_of_missing() {
     assert!(run.entries().any(|entry| entry.is_err()));
 }
 
+/// Recompute `meta_crc32` after a test edits the header or metadata.
+fn reseal_meta(bytes: &mut [u8]) {
+    let meta_at = usize::try_from(read_u64(bytes, 40).unwrap()).unwrap();
+    bytes[CRC_AT..CRC_AT.checked_add(4).unwrap()].fill(0);
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&bytes[..RUN_HEADER_LEN]);
+    hasher.update(&bytes[meta_at..]);
+    let meta_crc = hasher.finalize();
+    bytes[CRC_AT..CRC_AT.checked_add(4).unwrap()].copy_from_slice(&meta_crc.to_le_bytes());
+}
+
+/// Byte offset of block `index`'s table entry.
+fn block_entry_at(bytes: &[u8], index: usize) -> usize {
+    let meta_at = usize::try_from(read_u64(bytes, 40).unwrap()).unwrap();
+    let packs = usize::try_from(read_u32(bytes, 24).unwrap()).unwrap();
+    let collections = usize::try_from(read_u32(bytes, 28).unwrap()).unwrap();
+    meta_at
+        .checked_add(packs.checked_mul(PACK_ENTRY_LEN).unwrap())
+        .and_then(|at| at.checked_add(collections.checked_mul(COLLECTION_ENTRY_LEN).unwrap()))
+        .and_then(|at| at.checked_add(index.checked_mul(BLOCK_ENTRY_LEN).unwrap()))
+        .unwrap()
+}
+
+#[test]
+fn open_rejects_overlapping_block_ranges() {
+    let dir = TestDir::new();
+    let path = dir.join("overlap.run");
+    let entries = sorted((0..8).map(|id| entry(0, id, 0, 0)).collect());
+    write_run(&path, 1, &entries).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    // Claim block 0 ends at block 1's fence, with a valid metadata CRC.
+    let second_fence = entries[4].logical_id;
+    let last_at = block_entry_at(&bytes, 0).checked_add(ID_LEN).unwrap();
+    bytes[last_at..last_at.checked_add(ID_LEN).unwrap()].copy_from_slice(&second_fence);
+    reseal_meta(&mut bytes);
+    fs::write(&path, &bytes).unwrap();
+    assert!(matches!(RunIndex::open(&path), Err(RunError::Invalid)));
+}
+
+#[test]
+fn a_block_whose_data_runs_past_its_recorded_last_id_is_corrupt() {
+    let dir = TestDir::new();
+    let path = dir.join("tail.run");
+    let entries = sorted((0..8).map(|id| entry(0, id, 0, 0)).collect());
+    write_run(&path, 1, &entries).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    // Rewrite block 0's last id in the data to sit beyond block 1's fence and
+    // fix that block's CRC, leaving the recorded last id alone.
+    let beyond = entries[7].logical_id;
+    let last_id_at = RUN_HEADER_LEN
+        .checked_add(ID_LEN.checked_mul(3).unwrap())
+        .unwrap();
+    bytes[last_id_at..last_id_at.checked_add(ID_LEN).unwrap()].copy_from_slice(&beyond);
+    let block_len = ENTRY_LEN.checked_mul(4).unwrap();
+    let crc =
+        crc32fast::hash(&bytes[RUN_HEADER_LEN..RUN_HEADER_LEN.checked_add(block_len).unwrap()]);
+    let crc_at = block_entry_at(&bytes, 0).checked_add(44).unwrap();
+    bytes[crc_at..crc_at.checked_add(4).unwrap()].copy_from_slice(&crc.to_le_bytes());
+    reseal_meta(&mut bytes);
+    fs::write(&path, &bytes).unwrap();
+
+    let run = RunIndex::open(&path).unwrap();
+    assert_eq!(
+        run.lookup(&entries[0].collection_id, &entries[0].logical_id),
+        Err(RunCorrupt)
+    );
+}
+
+#[test]
+fn a_pack_table_with_one_id_twice_is_rejected() {
+    let dir = TestDir::new();
+    let mut again = identity(1);
+    again.creation_seq = 2;
+    assert!(matches!(
+        RunWriter::create(&dir.join("dup.run"), vec![identity(1), again], 4),
+        Err(RunError::BadPackTable)
+    ));
+}
+
+#[test]
+fn an_empty_merge_removes_a_stale_run_at_its_path() {
+    let dir = TestDir::new();
+    let removal: PackModel = [((collection(0), logical_id(1)), (offset(0), true))]
+        .into_iter()
+        .collect();
+    let sidecar = write_sidecar(&dir, 1, &removal);
+    let path = dir.join("range.run");
+    let sources = [MergeSource::Sidecar(&sidecar)];
+    merge_to_path(&sources, MergeOptions::default(), &path)
+        .unwrap()
+        .unwrap();
+    assert!(path.exists(), "removals are kept by default");
+    let options = MergeOptions {
+        drop_removals: true,
+        ..MergeOptions::default()
+    };
+    assert_eq!(merge_to_path(&sources, options, &path).unwrap(), None);
+    assert!(
+        !path.exists(),
+        "the earlier run for this range must not survive"
+    );
+}
+
 #[test]
 fn a_block_whose_crc_matches_but_whose_order_is_wrong_is_rejected() {
     let dir = TestDir::new();
@@ -366,13 +469,7 @@ fn a_block_whose_crc_matches_but_whose_order_is_wrong_is_rejected() {
     // the defect.
     let fence_at = bytes.len().checked_sub(BLOCK_ENTRY_LEN).unwrap();
     bytes[fence_at..fence_at.checked_add(ID_LEN).unwrap()].copy_from_slice(&b);
-    let meta_at = usize::try_from(read_u64(&bytes, 40).unwrap()).unwrap();
-    bytes[CRC_AT..CRC_AT.checked_add(4).unwrap()].fill(0);
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&bytes[..RUN_HEADER_LEN]);
-    hasher.update(&bytes[meta_at..]);
-    let meta_crc = hasher.finalize();
-    bytes[CRC_AT..CRC_AT.checked_add(4).unwrap()].copy_from_slice(&meta_crc.to_le_bytes());
+    reseal_meta(&mut bytes);
     fs::write(&path, &bytes).unwrap();
 
     let run = RunIndex::open(&path).unwrap();

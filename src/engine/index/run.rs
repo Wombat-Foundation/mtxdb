@@ -24,8 +24,11 @@
 //!   pack_file_len)`, strictly increasing in `(creation_seq, pack_id)`.
 //! - **Collection directory:** `(collection_id, entry_count, first_block,
 //!   block_count)`, strictly increasing by id. A collection is never empty.
-//! - **Block table:** `(fence, data_offset, entries, crc32)`, where `fence` is
-//!   the block's first logical id. Blocks never span collections.
+//! - **Block table:** `(fence, last, data_offset, entries, crc32)`, where
+//!   `fence` and `last` are the block's first and last logical ids. Blocks
+//!   never span collections, and within a collection each block's `fence` is
+//!   above the previous block's `last`, so block selection cannot be misled by
+//!   damaged data.
 //! - **Entry block:** up to `B` sorted 16-byte logical ids, then one 7-byte
 //!   locator per id: `u16` pack ordinal, `u32` frame offset, `u8` flags.
 //!
@@ -69,7 +72,7 @@ const LOCATOR_LEN: usize = 7;
 const ENTRY_LEN: usize = ID_LEN + LOCATOR_LEN;
 const PACK_ENTRY_LEN: usize = 32;
 const COLLECTION_ENTRY_LEN: usize = 32;
-const BLOCK_ENTRY_LEN: usize = 32;
+const BLOCK_ENTRY_LEN: usize = 48;
 const CRC_AT: usize = 56;
 
 /// A run failed a check after open. The run must not answer lookups; the
@@ -205,6 +208,13 @@ fn validate_pack_table(packs: &[PackIndexIdentity]) -> Result<(), RunError> {
     {
         return Err(RunError::BadPackTable);
     }
+    // Pack ids name packs everywhere else, so one id twice (with different
+    // sequences) is as invalid as an exact duplicate.
+    let mut ids: Vec<[u8; 16]> = packs.iter().map(|pack| pack.pack_id.0).collect();
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(RunError::BadPackTable);
+    }
     Ok(())
 }
 
@@ -219,6 +229,7 @@ struct CollectionMeta {
 #[derive(Debug, Clone, Copy)]
 struct BlockMeta {
     fence: [u8; 16],
+    last: [u8; 16],
     data_offset: u64,
     entries: u32,
     crc: u32,
@@ -226,8 +237,8 @@ struct BlockMeta {
 
 /// Streams sorted entries into a run file.
 ///
-/// Memory is one block of entries plus the metadata: 32 bytes per block and
-/// per collection, so O(entries / B) rather than O(entries).
+/// Memory is one block of entries plus the metadata: 48 bytes per block and
+/// 32 per collection, so O(entries / B) rather than O(entries).
 #[derive(Debug)]
 pub struct RunWriter {
     file: BufWriter<File>,
@@ -240,6 +251,7 @@ pub struct RunWriter {
     pending_locators: Vec<u8>,
     pending_count: u32,
     pending_fence: [u8; 16],
+    pending_last: [u8; 16],
     data_end: u64,
     last: Option<([u8; 16], [u8; 16])>,
     entry_count: u64,
@@ -280,6 +292,7 @@ impl RunWriter {
             pending_locators: Vec::with_capacity(capacity.saturating_mul(LOCATOR_LEN)),
             pending_count: 0,
             pending_fence: [0; 16],
+            pending_last: [0; 16],
             data_end: u64::try_from(RUN_HEADER_LEN).unwrap_or(u64::MAX),
             last: None,
             entry_count: 0,
@@ -321,6 +334,7 @@ impl RunWriter {
         if self.pending_count == 0 {
             self.pending_fence = entry.logical_id;
         }
+        self.pending_last = entry.logical_id;
         self.pending_ids.extend_from_slice(&entry.logical_id);
         self.pending_locators
             .extend_from_slice(&entry.ordinal.to_le_bytes());
@@ -346,6 +360,7 @@ impl RunWriter {
         self.file.write_all(&self.pending_locators)?;
         self.blocks.push(BlockMeta {
             fence: self.pending_fence,
+            last: self.pending_last,
             data_offset: self.data_end,
             entries: self.pending_count,
             crc: hasher.finalize(),
@@ -407,6 +422,7 @@ impl RunWriter {
         }
         for block in &self.blocks {
             meta.extend_from_slice(&block.fence);
+            meta.extend_from_slice(&block.last);
             meta.extend_from_slice(&block.data_offset.to_le_bytes());
             meta.extend_from_slice(&block.entries.to_le_bytes());
             meta.extend_from_slice(&block.crc.to_le_bytes());
@@ -593,7 +609,7 @@ impl RunIndex {
             .first_block
             .checked_add(position)
             .ok_or(RunCorrupt)?;
-        let block = self.block(collection, block_index)?;
+        let block = self.block(block_index)?;
         let Some(index) = block.find(logical_id) else {
             return Ok(None);
         };
@@ -627,7 +643,7 @@ impl RunIndex {
             .checked_add(collection.block_count)
             .ok_or(RunCorrupt)?;
         for block_index in collection.first_block..end {
-            let block = self.block(collection, block_index)?;
+            let block = self.block(block_index)?;
             for index in 0..block.count {
                 let id = block.id(index).ok_or(RunCorrupt)?;
                 let (ordinal, locator) = block.locator(index).ok_or(RunCorrupt)?;
@@ -652,7 +668,7 @@ impl RunIndex {
                 .first_block
                 .saturating_add(collection.block_count);
             (collection.first_block..end).flat_map(move |block_index| {
-                let block = self.block(collection, block_index);
+                let block = self.block(block_index);
                 let count = block.as_ref().map_or(1, |block| block.count);
                 (0..count).map(move |index| {
                     let block = block.as_ref().map_err(|error| *error)?;
@@ -678,7 +694,7 @@ impl RunIndex {
                 .checked_add(collection.block_count)
                 .ok_or(RunCorrupt)?;
             for block_index in collection.first_block..end {
-                self.block(collection, block_index)?;
+                self.block(block_index)?;
             }
         }
         Ok(())
@@ -689,22 +705,18 @@ impl RunIndex {
     }
 
     /// A block's bytes, checked on first access.
-    fn block(&self, collection: &CollectionMeta, block: u32) -> Result<BlockView<'_>, RunCorrupt> {
+    fn block(&self, block: u32) -> Result<BlockView<'_>, RunCorrupt> {
         if self.is_invalid() {
             return Err(RunCorrupt);
         }
-        let view = self.block_view(collection, block);
+        let view = self.block_view(block);
         if view.is_err() {
             self.invalid.store(true, Ordering::Release);
         }
         view
     }
 
-    fn block_view(
-        &self,
-        collection: &CollectionMeta,
-        block: u32,
-    ) -> Result<BlockView<'_>, RunCorrupt> {
+    fn block_view(&self, block: u32) -> Result<BlockView<'_>, RunCorrupt> {
         let meta = self.block_meta(block)?;
         let count = usize::try_from(meta.entries).map_err(|_| RunCorrupt)?;
         let start = usize::try_from(meta.data_offset).map_err(|_| RunCorrupt)?;
@@ -721,20 +733,7 @@ impl RunIndex {
         if word.load(Ordering::Acquire) & bit != 0 {
             return Ok(view);
         }
-        let last_block = collection
-            .first_block
-            .checked_add(collection.block_count)
-            .and_then(|end| end.checked_sub(1))
-            .ok_or(RunCorrupt)?;
-        let next_fence = if block < last_block {
-            Some(
-                self.block_meta(block.checked_add(1).ok_or(RunCorrupt)?)?
-                    .fence,
-            )
-        } else {
-            None
-        };
-        if !view.is_valid(meta, next_fence, &self.packs) {
+        if !view.is_valid(meta, &self.packs) {
             return Err(RunCorrupt);
         }
         word.fetch_or(bit, Ordering::AcqRel);
@@ -827,7 +826,7 @@ impl RunHeader {
 
     /// The collection directory, after checking that collections are sorted
     /// and non-empty, blocks are contiguous and tile the data region exactly,
-    /// and fences increase within each collection.
+    /// and block id ranges are disjoint and increasing within each collection.
     fn parse_collections(&self, bytes: &[u8]) -> Option<Vec<CollectionMeta>> {
         let collections_at = self.collections_at()?;
         let block_table_at = self.block_table_at()?;
@@ -857,17 +856,19 @@ impl RunHeader {
                 return None;
             }
             let mut collection_entries = 0_u64;
-            let mut previous_fence: Option<[u8; 16]> = None;
+            let mut previous_last: Option<[u8; 16]> = None;
             for block in collection.first_block..end {
                 let meta = block_meta_at(bytes, block_table_at, block)?;
                 if meta.data_offset != next_data
                     || meta.entries == 0
                     || meta.entries > self.block_entries
-                    || previous_fence.is_some_and(|fence| fence >= meta.fence)
+                    || meta.fence > meta.last
+                    || (meta.entries == 1) != (meta.fence == meta.last)
+                    || previous_last.is_some_and(|last| last >= meta.fence)
                 {
                     return None;
                 }
-                previous_fence = Some(meta.fence);
+                previous_last = Some(meta.last);
                 next_data =
                     next_data.checked_add(u64::from(meta.entries).checked_mul(entry_len)?)?;
                 collection_entries = collection_entries.checked_add(u64::from(meta.entries))?;
@@ -890,9 +891,10 @@ fn block_meta_at(bytes: &[u8], table_at: usize, block: u32) -> Option<BlockMeta>
     let at = table_at.checked_add(usize::try_from(block).ok()?.checked_mul(BLOCK_ENTRY_LEN)?)?;
     Some(BlockMeta {
         fence: read_id(bytes, at)?,
-        data_offset: read_u64(bytes, at.checked_add(16)?)?,
-        entries: read_u32(bytes, at.checked_add(24)?)?,
-        crc: read_u32(bytes, at.checked_add(28)?)?,
+        last: read_id(bytes, at.checked_add(16)?)?,
+        data_offset: read_u64(bytes, at.checked_add(32)?)?,
+        entries: read_u32(bytes, at.checked_add(40)?)?,
+        crc: read_u32(bytes, at.checked_add(44)?)?,
     })
 }
 
@@ -936,15 +938,16 @@ impl BlockView<'_> {
         None
     }
 
-    /// CRC, strictly increasing ids starting at the fence and below the next
-    /// block's fence, known flags, and every locator inside its pack.
-    fn is_valid(
-        &self,
-        meta: BlockMeta,
-        next_fence: Option<[u8; 16]>,
-        packs: &[PackIndexIdentity],
-    ) -> bool {
-        if crc32fast::hash(self.bytes) != meta.crc || self.id(0) != Some(meta.fence) {
+    /// CRC, strictly increasing ids from the block table's fence to its last
+    /// id, known flags, and every locator inside its pack. Open has already
+    /// checked that block id ranges are disjoint and increasing, so a block
+    /// that passes cannot hide a key another block was chosen for.
+    fn is_valid(&self, meta: BlockMeta, packs: &[PackIndexIdentity]) -> bool {
+        let last_index = self.count.checked_sub(1);
+        if crc32fast::hash(self.bytes) != meta.crc
+            || self.id(0) != Some(meta.fence)
+            || last_index.and_then(|index| self.id(index)) != Some(meta.last)
+        {
             return false;
         }
         let mut previous: Option<[u8; 16]> = None;
@@ -982,18 +985,17 @@ impl BlockView<'_> {
                 return false;
             }
         }
-        match (previous, next_fence) {
-            (Some(last), Some(next)) => last < next,
-            (Some(_), None) => true,
-            (None, _) => false,
-        }
+        previous.is_some()
     }
 }
 
 /// One input to [`merge_to_path`].
 #[derive(Debug, Clone, Copy)]
 pub enum MergeSource<'a> {
-    /// One sealed pack's sidecar.
+    /// One sealed pack's sidecar. It must have passed
+    /// [`MappedPackIndex::verify`], as [`super::packidx::open_for_pack`]
+    /// sidecars have: the merge reads entries without re-checking them, so an
+    /// unverified damaged sidecar could publish a run that is missing keys.
     Sidecar(&'a MappedPackIndex),
     /// An existing run.
     Run(&'a RunIndex),
@@ -1038,7 +1040,9 @@ type HeapKey = Reverse<([u8; 16], [u8; 16], Reverse<u16>, usize)>;
 ///
 /// The output is written to `<path>.tmp`, fsynced, renamed to `path`, and the
 /// directory fsynced. An output with no entries (every key was a dropped
-/// removal) is not written and returns `None`. Memory is one entry per input
+/// removal) is not written, any earlier run at `path` is removed, and `None`
+/// is returned. The merge checks that inputs do not overlap or interleave; that
+/// they cover every pack of the pool's range is the caller's check. Memory is one entry per input
 /// plus the writer's per-block metadata.
 ///
 /// # Errors
@@ -1121,10 +1125,20 @@ pub fn merge_to_path(
             let _ = fs::remove_file(&temp);
             return Err(error.into());
         }
-        if let Some(parent) = path.parent() {
-            sync_dir(parent)?;
+    } else {
+        // Nothing survived the merge. A run left at `path` from an earlier
+        // merge of this range must not outlive it.
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
         }
     }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    crate::shard::sync_directory(parent)?;
     Ok(summary)
 }
 
@@ -1220,16 +1234,6 @@ fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(
         bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
     ))
-}
-
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
