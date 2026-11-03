@@ -432,6 +432,12 @@ impl PackIndex {
         self.entry_count
     }
 
+    /// Bytes of the owned encoded index image.
+    #[must_use]
+    pub fn mapped_file_bytes(&self) -> u64 {
+        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    }
+
     /// Encoded bytes, including the header and CRC-protected body.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -697,6 +703,12 @@ impl MappedPackIndex {
     #[must_use]
     pub const fn entry_count(&self) -> u64 {
         self.entry_count
+    }
+
+    /// Bytes of the mapped sidecar file.
+    #[must_use]
+    pub fn mapped_file_bytes(&self) -> u64 {
+        u64::try_from(self.map.len()).unwrap_or(u64::MAX)
     }
 
     /// Resolve a key to a live frame offset in this pack.

@@ -998,6 +998,10 @@ struct StreamingOpenScan {
     seen_collections: HashSet<[u8; 16]>,
     collection_home: HashMap<[u8; 16], u16>,
     collection_disk_bytes: HashMap<PackId, HashMap<[u8; 16], u64>>,
+    /// Per-collection sealed-pack locators. Populated even while the resident
+    /// index still holds the same entries, so read paths can be validated
+    /// against real sidecars before sealed packs stop being loaded into it.
+    sealed: HashMap<[u8; 16], crate::index::sealed::SealedLocators>,
 }
 
 impl StreamingOpenScan {
@@ -1010,6 +1014,7 @@ impl StreamingOpenScan {
             seen_collections: HashSet::new(),
             collection_home: HashMap::new(),
             collection_disk_bytes: HashMap::new(),
+            sealed: HashMap::new(),
         }
     }
 
@@ -1086,9 +1091,10 @@ impl StreamingOpenScan {
     /// physical accounting that a frame scan would have produced.
     fn insert_sidecar(
         &mut self,
-        sidecar: &crate::index::packidx::MappedPackIndex,
+        sidecar: &Arc<crate::index::packidx::MappedPackIndex>,
         slot: u16,
         pack_id: PackId,
+        creation_seq: u64,
         deleted_collections: &HashSet<[u8; 16]>,
         index_config: crate::index::IndexConfig,
     ) -> Result<(), StorageError> {
@@ -1112,6 +1118,16 @@ impl StreamingOpenScan {
                 .or_default();
             *bytes = bytes.saturating_add(disk_bytes);
             self.collection_home.insert(collection_id, slot);
+            let mapped: Arc<crate::index::packidx::MappedPackIndex> = Arc::clone(sidecar);
+            let sealed_index: Arc<dyn crate::index::sealed::SealedIndex> = mapped;
+            self.sealed.entry(collection_id).or_default().insert(
+                crate::index::sealed::SealedPack {
+                    slot,
+                    pack_id,
+                    creation_seq,
+                    index: sealed_index,
+                },
+            );
             sidecar.for_each_entry_in_collection(&collection_id, |hash, locator| {
                 if error.is_some() {
                     return;
@@ -1171,6 +1187,7 @@ impl StreamingOpenScan {
                 collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
+                    sealed: Arc::new(self.sealed.remove(&collection_id).unwrap_or_default()),
                     cache: Arc::new(NodeCache::new(cache_capacity)),
                     generation: 1,
                 }),
@@ -1670,8 +1687,31 @@ static SHARD_ROOMS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 struct RoomGeneration {
     index: LossyIndex,
+    /// Locator indexes for sealed packs, newest last. Empty while the
+    /// resident index is authoritative for every pack, which is the
+    /// current default; read paths consult it after the resident index.
+    sealed: Arc<crate::index::sealed::SealedLocators>,
     cache: Arc<NodeCache>,
     generation: u64,
+}
+
+impl RoomGeneration {
+    /// Locators to try for one key: the resident index first, then a sealed
+    /// pack only when the resident index has no candidate at all.
+    ///
+    /// The resident index is authoritative while it holds every pack. In the
+    /// paged mode this is building toward, only unsealed packs are resident,
+    /// so a miss there is exactly when a sealed locator is needed. A resident
+    /// removal stays first and therefore shadows an older sealed frame.
+    fn candidates(&self, collection_id: &[u8; 16], id: &NodeId) -> Vec<(u16, u64)> {
+        let mut candidates: Vec<(u16, u64)> = self.index.lookup_all(id).collect();
+        if candidates.is_empty() {
+            if let Some(hit) = self.sealed.lookup(collection_id, id) {
+                candidates.push((hit.slot, hit.offset()));
+            }
+        }
+        candidates
+    }
 }
 
 /// Where a just-appended record lives: its shard slot, byte offset, and on-disk
@@ -2892,10 +2932,12 @@ impl PackfileStorage {
         for (slot, shard) in scan_shards {
             if shard.sealed.load(Ordering::Acquire) && !shards.checksum_policy().verifies_reads() {
                 if let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) {
+                    let sidecar = Arc::new(sidecar);
                     scan_state.insert_sidecar(
                         &sidecar,
                         slot,
                         shard.pack_id,
+                        u64::from(shard.creation_seq),
                         &deleted_collections,
                         index_config,
                     )?;
@@ -3940,6 +3982,7 @@ impl PackfileStorage {
                 loaded.collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
+                    sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                     cache: Arc::new(NodeCache::new(cache_capacity)),
                     generation,
                 }),
@@ -3985,6 +4028,7 @@ impl PackfileStorage {
                 collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
+                    sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                     cache: Arc::new(NodeCache::new(cache_capacity)),
                     generation,
                 }),
@@ -4608,6 +4652,7 @@ impl PackfileStorage {
                 } else {
                     Arc::new(RoomGeneration {
                         index: generation.index.clone(),
+                        sealed: Arc::clone(&generation.sealed),
                         cache: Arc::clone(&generation.cache),
                         generation: generation.generation,
                     })
@@ -4652,8 +4697,9 @@ impl PackfileStorage {
         let mut work = Vec::new();
         if let Some(generation) = generation {
             Self::append_collection_locator_work(
+                collection_id,
                 keys,
-                &generation.index,
+                generation,
                 &HashMap::new(),
                 &HashSet::new(),
                 shards,
@@ -4757,6 +4803,7 @@ impl PackfileStorage {
             } else {
                 Arc::new(RoomGeneration {
                     index: generation.index.clone(),
+                    sealed: Arc::clone(&generation.sealed),
                     cache: Arc::clone(&generation.cache),
                     generation: generation.generation,
                 })
@@ -4784,8 +4831,9 @@ impl PackfileStorage {
         let mut work = Vec::new();
         if let Some(generation) = generation.as_deref() {
             Self::append_collection_locator_work(
+                collection_id,
                 keys,
-                &generation.index,
+                generation,
                 overlay_puts,
                 overlay_removes,
                 &shards,
@@ -4854,9 +4902,14 @@ impl PackfileStorage {
 
     /// Append indexed candidates for keys not shadowed by `overlay_puts`,
     /// pinning available shard handles. Keys without candidates are skipped.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one scan snapshot: collection, keys, generation, overlay, shards, and outputs"
+    )]
     fn append_collection_locator_work(
+        collection_id: &[u8; 16],
         keys: Vec<NodeId>,
-        index: &LossyIndex,
+        generation: &RoomGeneration,
         overlay_puts: &HashMap<NodeId, NodeData>,
         overlay_removes: &HashSet<NodeId>,
         shards: &[(u16, Arc<Shard>)],
@@ -4868,7 +4921,7 @@ impl PackfileStorage {
                 // An overlay mutation is newer than the durable one.
                 continue;
             }
-            let candidates: Vec<(u16, u64)> = index.lookup_all(&id).collect();
+            let candidates = generation.candidates(collection_id, &id);
             if candidates.is_empty() {
                 continue;
             }
@@ -6876,11 +6929,18 @@ impl PackfileStorage {
         if structural {
             self.invalidate_delta_log(collection_id);
         }
-        let generation = self.generation(collection_id).map_or(1, |gen| {
-            gen.generation.saturating_add(u64::from(bump_generation))
-        });
+        let (generation, sealed) = self.generation(collection_id).map_or(
+            (1, Arc::new(crate::index::sealed::SealedLocators::new())),
+            |gen| {
+                (
+                    gen.generation.saturating_add(u64::from(bump_generation)),
+                    Arc::clone(&gen.sealed),
+                )
+            },
+        );
         let new_gen = Arc::new(RoomGeneration {
             index,
+            sealed,
             cache,
             generation,
         });
@@ -6899,6 +6959,7 @@ impl PackfileStorage {
                 .or_insert_with(|| {
                     ArcSwap::from_pointee(RoomGeneration {
                         index: LossyIndex::new(0),
+                        sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                         cache: Arc::new(NodeCache::new(self.cache_capacity)),
                         generation: 1,
                     })
@@ -6921,6 +6982,7 @@ impl PackfileStorage {
                     .or_insert_with(|| {
                         ArcSwap::from_pointee(RoomGeneration {
                             index: LossyIndex::new(0),
+                            sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                             cache: Arc::new(NodeCache::new(self.cache_capacity)),
                             generation: 1,
                         })
@@ -7402,6 +7464,7 @@ impl PackfileStorage {
     fn bfs_ancestors(
         &self,
         gen: &Arc<RoomGeneration>,
+        collection_id: &[u8; 16],
         frontier: &[[u8; 16]],
         stop_at: &[[u8; 16]],
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
@@ -7436,7 +7499,7 @@ impl PackfileStorage {
         }
 
         while let Some(hash) = queue.pop_front() {
-            let Some(data) = self.resolve_pinned(gen, &pinned, &hash)? else {
+            let Some(data) = self.resolve_pinned(gen, collection_id, &pinned, &hash)? else {
                 // Not actually present under this generation — nothing to
                 // expand from and nothing to yield.
                 continue;
@@ -7472,6 +7535,7 @@ impl PackfileStorage {
     fn resolve_pinned(
         &self,
         gen: &Arc<RoomGeneration>,
+        collection_id: &[u8; 16],
         pinned: &HashMap<u16, Arc<Shard>>,
         id: &NodeId,
     ) -> Result<Option<NodeData>, StorageError> {
@@ -7479,7 +7543,7 @@ impl PackfileStorage {
             return Ok(Some((*data).clone()));
         }
         let track = self.stats_enabled.load(Ordering::Relaxed);
-        let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
+        let candidates = gen.candidates(collection_id, id);
         if track {
             self.index_candidates
                 .fetch_add(candidates.len() as u64, Ordering::Relaxed);
@@ -8757,8 +8821,14 @@ impl PackfileStorage {
             });
         };
 
-        let ((live_hashes, adjacency), resolved) =
-            self.bfs_ancestors(&gen, frontier, stop_at, &extract_edges, limits)?;
+        let ((live_hashes, adjacency), resolved) = self.bfs_ancestors(
+            &gen,
+            collection_id,
+            frontier,
+            stop_at,
+            &extract_edges,
+            limits,
+        )?;
 
         let csr = Csr::build_from_edges(&live_hashes, &adjacency);
         let mut topo = csr.topo_order();
@@ -10055,7 +10125,7 @@ impl StorageEngine for PackfileStorage {
                         results[i] = Some((*data).clone());
                         continue;
                     }
-                    let candidates: Vec<(u16, u64)> = g.index.lookup_all(id).collect();
+                    let candidates = g.candidates(collection_id, id);
                     candidates_seen = candidates_seen.saturating_add(candidates.len() as u64);
                     if !candidates.is_empty() {
                         to_fetch.push((i, candidates));

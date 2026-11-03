@@ -12066,6 +12066,68 @@ fn sealing_a_pack_writes_a_sidecar_and_open_skips_recovery() {
 }
 
 #[test]
+fn full_scan_registers_sealed_locators_per_collection() {
+    let dir = test_dir("packidx_sealed_locators");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    let mut ids = Vec::new();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAC;
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[u8::try_from(index % 256).unwrap(); 32]),
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    let _ = fs::remove_file(dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE));
+    let reopened = PackfileStorage::open_with_policies(
+        dir.clone(),
+        true,
+        crate::packfile::ChecksumPolicy::Disabled,
+    )
+    .unwrap();
+    assert!(reopened.open_timings().unwrap().pack_index_sidecars > 0);
+
+    let generation = reopened.generation(&TEST_COLLECTION).expect("generation");
+    assert!(
+        !generation.sealed.is_empty(),
+        "sealed sidecars must be registered per collection"
+    );
+    assert!(generation.sealed.mapped_bytes() > 0);
+    let sealed = ids
+        .iter()
+        .filter(|id| generation.sealed.lookup(&TEST_COLLECTION, id).is_some())
+        .count();
+    assert!(
+        sealed > 0,
+        "records from packs sealed before this open must have sealed locators"
+    );
+    assert!(
+        sealed < ids.len(),
+        "the current unsealed pack's records must stay resident"
+    );
+    // This slice keeps the resident index complete; the sealed set is a
+    // verified fallback, not yet the only locator source.
+    for id in &ids {
+        assert!(!generation.candidates(&TEST_COLLECTION, id).is_empty());
+    }
+    drop(generation);
+
+    for id in &ids {
+        assert!(reopened.get(&TEST_COLLECTION, id).unwrap().is_some());
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn full_scan_uses_sealed_sidecars_instead_of_raw_frames() {
     let dir = test_dir("packidx_full_scan");
     let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
