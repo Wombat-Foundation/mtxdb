@@ -3011,7 +3011,18 @@ impl PackfileStorage {
         // resident open cannot load an image that predates those writes (and
         // cannot replay a delta this session never wrote).
         if residency == crate::index::IndexResidency::Paged && writable {
-            let _ = fs::remove_file(Self::index_checkpoint_path(&base_dir));
+            // The checkpoint is not the primary index in paged mode, but it
+            // is the only durable copy of collection versions for WAL groups
+            // that were already reclaimed. Move those versions to their own
+            // file before retiring it; if that fails, leave the checkpoint in
+            // place rather than destroying the only copy. This open never
+            // loads it, and a later resident open is protected by the pack
+            // fingerprint gate after any write.
+            let checkpoint_path = Self::index_checkpoint_path(&base_dir);
+            let versions_persisted = Self::ensure_versions_file(&base_dir);
+            if versions_persisted || !checkpoint_path.exists() {
+                let _ = fs::remove_file(&checkpoint_path);
+            }
             Self::sweep_orphan_delta_logs(&base_dir, None);
         }
         // Capture the journal coverage *before* loading the index, so the bound
@@ -3360,6 +3371,31 @@ impl PackfileStorage {
     /// Path of this store's persisted-index checkpoint.
     fn index_checkpoint_path(base_dir: &std::path::Path) -> PathBuf {
         base_dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE)
+    }
+
+    /// Path of this store's collection-version baseline.
+    fn index_versions_path(base_dir: &std::path::Path) -> PathBuf {
+        base_dir.join(crate::index::versions::INDEX_VERSIONS_FILE)
+    }
+
+    /// Persist collection versions from a legacy checkpoint into their own
+    /// file before a writable paged open retires the checkpoint.
+    ///
+    /// Returns `true` when a valid versions file is present afterwards (or
+    /// when there is no checkpoint to migrate). Sealed packs carry no version
+    /// tag, so the checkpoint's `logical_versions` are the only durable copy
+    /// for frames whose WAL groups were reclaimed.
+    fn ensure_versions_file(base_dir: &std::path::Path) -> bool {
+        let versions_path = Self::index_versions_path(base_dir);
+        if crate::index::versions::read_versions(&versions_path).is_some() {
+            return true;
+        }
+        let Some(checkpoint) =
+            crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir))
+        else {
+            return false;
+        };
+        crate::index::versions::write_versions(&versions_path, &checkpoint.logical_versions).is_ok()
     }
 
     /// Path of one *epoch* of this store's incremental index delta log.
@@ -5911,6 +5947,27 @@ impl PackfileStorage {
         }
         let _ = covered_lsn;
         Vec::new()
+    }
+
+    /// Refresh the collection-version baseline from a paged sync.
+    ///
+    /// Paged mode has no checkpoint to carry versions and does not advance
+    /// journal coverage, so the WAL normally keeps them. Writing the file
+    /// anyway keeps the durable baseline current without paying for an index
+    /// image, and covers a later WAL truncation outside this writer's control.
+    fn persist_versions_file(&self) {
+        let (Some(journal), Some(pool)) = (
+            self.journal(),
+            pool_from_tag(self.journal_pool.load(Ordering::Acquire)),
+        ) else {
+            return;
+        };
+        let through = journal.committed_lsn_for_pool(pool);
+        let versions = journal.collection_versions_through(pool, through);
+        let _ = crate::index::versions::write_versions(
+            &Self::index_versions_path(&self.base_dir),
+            &versions,
+        );
     }
 
     /// Persist the full per-collection index state to `index.checkpoint`, so
@@ -11026,6 +11083,7 @@ impl PackfileStorage {
         if self.index_residency == crate::index::IndexResidency::Paged {
             self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
             self.shards.sync_dirty().map_err(StorageError::Io)?;
+            self.persist_versions_file();
             return Ok(());
         }
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
@@ -11244,9 +11302,16 @@ impl PackfileStorage {
         self.journal_recovery
             .lock()
             .clone_from(&journal.recovered_groups());
-        // Checkpoint versions are the durable baseline for collection clocks;
-        // the coordinator already seeded versions from the retained WAL, so
-        // merging this pool-local table preserves whichever side is newer.
+        // The versions file is the durable baseline for collection clocks; the
+        // coordinator already seeded versions from the retained WAL, so
+        // merging this pool-local table with `max` preserves whichever side is
+        // newer. The checkpoint is also read for compatibility with a store
+        // written before the file existed (a writable paged open migrates it).
+        if let Some(versions) =
+            crate::index::versions::read_versions(&Self::index_versions_path(&self.base_dir))
+        {
+            journal.restore_collection_versions(pool, &versions);
+        }
         if let Some(checkpoint) =
             crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(&self.base_dir))
         {
@@ -12026,6 +12091,9 @@ impl PackfileStorage {
         // still worth refreshing at a sync anchor.
         if self.index_residency == crate::index::IndexResidency::Paged {
             self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
+            // The packs were flushed before this call, so committed versions
+            // in the journal are durable in their frames.
+            self.persist_versions_file();
             if self.shard_collections_dirty.load(Ordering::Relaxed)
                 || self.shard_collections_stale.load(Ordering::Relaxed)
             {
@@ -13027,6 +13095,15 @@ impl CheckpointTail {
         if self.journal.is_some() && self.covered_lsn.is_some() {
             directory_synced.map_err(StorageError::Io)?;
         }
+        // Collection versions are not reconstructible from sealed packs: a
+        // reclaimed WAL group has no frame-level version tag. Make the
+        // versions file durable before the coverage claim below can let the
+        // journal drop the groups that still carry them.
+        crate::index::versions::write_versions(
+            &PackfileStorage::index_versions_path(&self.base_dir),
+            &self.logical_versions,
+        )
+        .map_err(StorageError::Io)?;
         // The image is durable; record the LSN it covers so a reopen replays only
         // what follows, and let the journal drop what the packs now cover. The
         // pack fsync happened before the handoff, so everything through the LSN

@@ -9,6 +9,7 @@ pub mod format;
 pub mod packidx;
 pub mod redo;
 pub mod sealed;
+pub mod versions;
 
 use crate::index::delta::DeltaReplayError;
 use crate::index::format::DeltaFrame;

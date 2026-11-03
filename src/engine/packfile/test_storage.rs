@@ -12210,6 +12210,75 @@ fn paged_open(dir: &std::path::Path) -> PackfileStorage {
     .unwrap()
 }
 
+/// A collection version is durable in the checkpoint (or the WAL groups the
+/// checkpoint has not reclaimed), not in the sealed packs' frames. A paged
+/// open deletes the checkpoint, so a version that only lived there must not
+/// come back as zero after the WAL has been reclaimed.
+#[test]
+fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("paged_version_wal");
+    let store_dir = test_dir("paged_version_store");
+    let wal = wal_dir.join("shared.wal");
+    let probe = distinct_id(255);
+
+    let version_before = {
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let store =
+            PackfileStorage::open_with_max_shard_bytes(store_dir.clone(), 48 * 1024).unwrap();
+        store
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        fill_incompressible(&store, &TEST_COLLECTION, 10_000, 120);
+        coordinator.sync().unwrap();
+        store.sync_all().unwrap();
+        // A full checkpoint is what advances coverage and lets the journal
+        // drop the groups; a delta append would leave them for replay.
+        store.force_index_checkpoint().unwrap();
+        assert_eq!(
+            Journal::scan_read_only(&wal).unwrap().groups.len(),
+            0,
+            "the checkpoint must cover and reclaim every WAL group"
+        );
+        let (_, version) = store
+            .get_with_collection_version(&TEST_COLLECTION, &[probe])
+            .unwrap();
+        assert!(version > 0, "the writer must observe its own version");
+        version
+    };
+
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        store_dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    let (_, version_after) = reopened
+        .get_with_collection_version(&TEST_COLLECTION, &[probe])
+        .unwrap();
+    assert!(
+        version_after >= version_before,
+        "a paged reopen lowered the collection version: before={version_before}, after={version_after}"
+    );
+    drop(reopened);
+    drop(coordinator);
+    fs::remove_dir_all(&wal_dir).ok();
+    fs::remove_dir_all(&store_dir).ok();
+}
+
 #[test]
 fn paged_full_scan_uses_sidecars_under_full_checksums() {
     let dir = test_dir("paged_full_scan_full_checksums");
