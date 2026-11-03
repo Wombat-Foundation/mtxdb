@@ -94,6 +94,21 @@ mod tests {
         assert!(index.has_flag(&db, 4, Flag::Rejected).unwrap());
         assert!(!index.has_flag(&db, 1, Flag::SoftFailed).unwrap());
         assert!(!index.has_flag(&db, 6, Flag::Present).unwrap());
+        assert_eq!(
+            index
+                .flags_for_shorts(
+                    &db,
+                    &[1, 2, 3, 4, 5],
+                    &[
+                        Flag::Present,
+                        Flag::SoftFailed,
+                        Flag::Rejected,
+                        Flag::Outlier
+                    ]
+                )
+                .unwrap(),
+            vec![1, 3, 5, 7, 9]
+        );
 
         // Counts
         assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 5);

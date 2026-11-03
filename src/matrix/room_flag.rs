@@ -381,6 +381,43 @@ impl RoomFlagIndex {
         Ok(chunk.contains(short_id % CHUNK_CAPACITY))
     }
 
+    /// Read several flags for many short ids, decoding each chunk once.
+    ///
+    /// Returns one bitmask per short id. Bit `i` is set when `flags[i]` is
+    /// present for that short id.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] on read error or corrupt index payload.
+    pub fn flags_for_shorts(
+        &self,
+        db: &Database,
+        shorts: &[u32],
+        flags: &[Flag],
+    ) -> Result<Vec<u32>, StorageError> {
+        let mut result = vec![0_u32; shorts.len()];
+        let meta = self.meta(db)?;
+        if meta.max_short_id == 0 || shorts.is_empty() {
+            return Ok(result);
+        }
+        let chunk_col = self.chunk_collection(meta.generation);
+        let mut cache: HashMap<(Flag, u16), BitmapSet> = HashMap::new();
+        for (position, &short_id) in shorts.iter().enumerate() {
+            if short_id > meta.max_short_id {
+                continue;
+            }
+            let chunk_idx = u16::try_from(short_id / CHUNK_CAPACITY)
+                .map_err(|_| StorageError::Corrupt("flag chunk index out of range".to_owned()))?;
+            let offset = short_id % CHUNK_CAPACITY;
+            for (bit, &flag) in flags.iter().enumerate() {
+                let chunk = self.get_or_load_chunk(db, &chunk_col, flag, chunk_idx, &mut cache)?;
+                if chunk.contains(offset) {
+                    result[position] |= 1_u32 << bit;
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Stage a batch of flag changes directly into a specified chunk collection.
     ///
     /// Returns the maximum short ID encountered in `changes`.
@@ -393,12 +430,22 @@ impl RoomFlagIndex {
         chunk_col: [u8; 16],
         changes: &[FlagChange],
     ) -> Result<u32, StorageError> {
+        Ok(self.stage_into_collection_inner(tx, chunk_col, changes)?.0)
+    }
+
+    fn stage_into_collection_inner(
+        &self,
+        tx: &DatabaseTransaction<'_>,
+        chunk_col: [u8; 16],
+        changes: &[FlagChange],
+    ) -> Result<(u32, bool), StorageError> {
         if changes.is_empty() {
-            return Ok(0);
+            return Ok((0, false));
         }
 
         let mut grouped: HashMap<(Flag, u16), Vec<(u32, bool)>> = HashMap::new();
         let mut max_short_seen = 0_u32;
+        let mut mutated = false;
 
         for change in changes {
             if change.short_id > max_short_seen {
@@ -434,12 +481,20 @@ impl RoomFlagIndex {
             }
 
             let encoded = bitmap.encode()?;
+            if existing_data
+                .as_ref()
+                .is_some_and(|data| data.bytes.as_ref() == encoded.as_slice())
+                || (existing_data.is_none() && bitmap.is_empty())
+            {
+                continue;
+            }
             tx.put(
                 self.pool,
                 chunk_col,
                 chunk_id,
                 &NodeData::new(Bytes::from(encoded)),
             )?;
+            mutated = true;
             // If the record was already staged in this transaction, token is 0.
             // Avoid adding a bogus version 0 expectation that fails commit.
             if existing_data.is_none() || token != 0 {
@@ -447,7 +502,7 @@ impl RoomFlagIndex {
             }
         }
 
-        Ok(max_short_seen)
+        Ok((max_short_seen, mutated))
     }
 
     /// Stage a batch of flag changes into the transaction for the active generation.
@@ -481,7 +536,10 @@ impl RoomFlagIndex {
         };
 
         let chunk_col = self.chunk_collection(current_meta.generation);
-        let max_short_seen = self.stage_into_collection(tx, chunk_col, changes)?;
+        let (max_short_seen, mutated) = self.stage_into_collection_inner(tx, chunk_col, changes)?;
+        if !mutated {
+            return Ok(());
+        }
 
         if !(meta_raw.is_some() && meta_token == 0) {
             tx.expect_record_version(self.pool, self.collection, FLAG_META_ID, meta_token)?;

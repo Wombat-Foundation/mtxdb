@@ -10893,7 +10893,12 @@ fn import_pdu_events_with_raw(
     for warning in findings.current_warnings(&current_ids) {
         eprintln!("  warning: {warning}");
     }
-    let rejected_total: usize = findings.rejection_counts.values().copied().sum();
+    let rejected_total = synthetic
+        .events
+        .iter()
+        .zip(&findings.forced)
+        .filter(|(event, forced)| forced.is_some() && current_ids.contains(&event.event_id))
+        .count();
     if rejected_total > 0 {
         eprintln!("  derived rejections: {rejected_total} events");
     }
@@ -11045,7 +11050,14 @@ fn write_raw_verdicts_and_flags(
         ensure_raw_auth_collection(db, &room, template)?;
         let mut short_ids =
             export_import::ClosureWriter::new(db, &room, room_auth_collection_id(room.as_bytes()))?;
-        let mut changes = Vec::with_capacity(rows.len().saturating_mul(4));
+        let flags = [
+            Flag::Present,
+            Flag::Rejected,
+            Flag::Outlier,
+            Flag::SoftFailed,
+        ];
+        let mut resolved = Vec::with_capacity(rows.len());
+        let mut short_values = Vec::with_capacity(rows.len());
         let tx = db.begin_transaction();
         for (event_id, node, verdict, write_verdict) in rows {
             let (short, _) = short_ids.short_for(&tx, event_id.as_bytes())?;
@@ -11060,15 +11072,22 @@ fn write_raw_verdicts_and_flags(
                     &NodeData::new(encode_verdict(event_id.as_bytes(), &verdict)?.into()),
                 )?;
             }
-
-            for (flag, wanted) in [
-                (Flag::Present, true),
-                (Flag::Rejected, verdict.rejection.is_some()),
-                (Flag::Outlier, verdict.outlier),
-                (Flag::SoftFailed, verdict.soft_fail.is_some()),
-            ] {
-                if flag_index.has_flag(db, short, flag)? != wanted {
-                    changes.push(if wanted {
+            short_values.push(short);
+            resolved.push((verdict, short));
+        }
+        let existing = flag_index.flags_for_shorts(db, &short_values, &flags)?;
+        let mut changes = Vec::with_capacity(resolved.len().saturating_mul(4));
+        for (position, (verdict, short)) in resolved.into_iter().enumerate() {
+            let wanted = [
+                true,
+                verdict.rejection.is_some(),
+                verdict.outlier,
+                verdict.soft_fail.is_some(),
+            ];
+            for (bit, &flag) in flags.iter().enumerate() {
+                let current = existing[position] & (1_u32 << bit) != 0;
+                if current != wanted[bit] {
+                    changes.push(if wanted[bit] {
                         FlagChange::set(short, flag)
                     } else {
                         FlagChange::clear(short, flag)
