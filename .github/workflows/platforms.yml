@@ -100,8 +100,6 @@ jobs:
         include:
           - arch: ppc64le
             page_size: 4096
-          - arch: s390x
-            page_size: 4096
           - arch: armv7
             page_size: 4096
           - arch: riscv64
@@ -110,8 +108,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      # User emulation exercises target endianness and userspace page alignment.
-      # It still uses the host kernel; native 64 KiB kernel testing is separate.
+      # User emulation exercises cross-architecture ABI and page alignment.
+      # The index format currently rejects big-endian targets at compile time.
+      # These containers still use the host kernel; native 64 KiB testing is separate.
       - uses: uraimo/run-on-arch-action@v3
         with:
           arch: ${{ matrix.arch }}
