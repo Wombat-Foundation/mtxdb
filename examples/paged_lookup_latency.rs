@@ -75,8 +75,12 @@ fn node_id(sequence: u64) -> NodeId {
     id
 }
 
-fn payload(sequence: u64) -> [u8; PAYLOAD_BYTES] {
-    let mut bytes = [0u8; PAYLOAD_BYTES];
+fn payload_len() -> usize {
+    env_usize("MTXDB_LOOKUP_PAYLOAD_BYTES", PAYLOAD_BYTES).max(8)
+}
+
+fn payload(sequence: u64, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
     for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(0u64..) {
         chunk.copy_from_slice(&mix(sequence.wrapping_add(word)).to_le_bytes());
     }
@@ -105,12 +109,12 @@ fn fixture_records(dir: &Path, wanted: usize) -> Option<u64> {
     (sidecar_count(dir) >= wanted).then_some(records)
 }
 
-fn append_batch(store: &PackfileStorage, sequence: &mut u64, count: u64) {
+fn append_batch(store: &PackfileStorage, sequence: &mut u64, count: u64, payload_len: usize) {
     let capacity = usize::try_from(count).unwrap_or(0);
     let mut batch = Vec::with_capacity(capacity);
     for _ in 0..count {
         let id = node_id(*sequence);
-        let data = payload(*sequence);
+        let data = payload(*sequence, payload_len);
         batch.push((id, NodeData::from_slice(&data)));
         *sequence += 1;
     }
@@ -119,21 +123,23 @@ fn append_batch(store: &PackfileStorage, sequence: &mut u64, count: u64) {
         .expect("write fixture batch");
 }
 
-fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64) -> u64 {
+fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64, payload_len: usize) -> u64 {
     let store = PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), shard_bytes)
         .expect("open fixture store");
     let mut sequence = 0u64;
-    // A rough first guess at records per pack (about 341 bytes per frame;
-    // real frames are smaller). The top-up below corrects it from the
-    // measured count.
-    let records_per_shard = (shard_bytes / 341).max(1);
+    // A rough first guess at records per pack (frame overhead is about 48
+    // bytes). The top-up below corrects it from the measured count.
+    let frame_bytes = u64::try_from(payload_len)
+        .unwrap_or(u64::MAX)
+        .saturating_add(48);
+    let records_per_shard = (shard_bytes / frame_bytes).max(1);
     let initial_records = u64::try_from(wanted_packs + 1)
         .expect("pack count fits in u64")
         .saturating_mul(records_per_shard);
     let mut remaining = initial_records;
     while remaining > 0 {
         let count = records_per_shard.min(remaining);
-        append_batch(&store, &mut sequence, count);
+        append_batch(&store, &mut sequence, count, payload_len);
         remaining -= count;
     }
     store.sync_all().expect("seal fixture packs");
@@ -150,7 +156,7 @@ fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64) -> u64 {
         let mut remaining = (wanted - sealed + 1).saturating_mul(per_pack);
         while remaining > 0 {
             let count = records_per_shard.min(remaining);
-            append_batch(&store, &mut sequence, count);
+            append_batch(&store, &mut sequence, count, payload_len);
             remaining -= count;
         }
         store.sync_all().expect("seal fixture packs");
@@ -212,6 +218,7 @@ fn main() {
     let rounds = env_usize("MTXDB_LOOKUP_ROUNDS", 5);
     assert!(rounds > 0, "MTXDB_LOOKUP_ROUNDS must be positive");
     let shard_bytes = shard_bytes();
+    let payload_len = payload_len();
     let (root, owned_root) = std::env::var_os("MTXDB_LOOKUP_ROOT").map_or_else(
         || {
             (
@@ -231,11 +238,11 @@ fn main() {
     std::fs::create_dir_all(&root).expect("create benchmark root");
 
     println!(
-        "warm open and get_location latency, best of {rounds}; {PROBES} hits and misses; {shard_bytes} byte seal"
+        "warm open and get_location latency, best of {rounds}; {PROBES} hits and misses; {shard_bytes} byte seal; {payload_len} byte payload"
     );
     println!("packs\tmode\topen_ms\thit_us\tmiss_us\theap_mib\tmapped_mib\tsealed_packs\trecords");
     for wanted in pack_counts() {
-        let base = root.join(format!("base-{wanted}"));
+        let base = root.join(format!("base-{wanted}-p{payload_len}"));
         let total_records = if let Some(records) = fixture_records(&base, wanted) {
             // A Paged open deletes the resident checkpoint, so restore it
             // before the Resident measurement, as a fresh build would.
@@ -249,7 +256,7 @@ fn main() {
                 std::fs::remove_dir_all(&base).expect("clear incomplete fixture");
             }
             std::fs::create_dir_all(&base).expect("create fixture directory");
-            let records = build_fixture(&base, wanted, shard_bytes);
+            let records = build_fixture(&base, wanted, shard_bytes, payload_len);
             std::fs::write(base.join(FIXTURE_RECORDS), records.to_string())
                 .expect("record fixture size");
             records
