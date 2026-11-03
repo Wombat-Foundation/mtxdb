@@ -5879,7 +5879,7 @@ fn stale_auth_events_are_rejected_against_state_before() {
 }
 
 #[test]
-fn rejected_state_event_cascades_to_dependents() {
+fn rejected_state_event_does_not_change_later_state() {
     use mtxdb::export_schema::RejectionCode;
     use mtxdb::room_flag::*;
     use mtxdb::timeline::*;

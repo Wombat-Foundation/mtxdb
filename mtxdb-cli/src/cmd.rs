@@ -10404,14 +10404,6 @@ impl ImportContext<'_> {
                     unchecked = unchecked.saturating_add(1);
                     return None;
                 };
-                if !base_complete {
-                    // A missing parent or a merge that fell back to the
-                    // first-parent rule means this base state is incomplete.
-                    // Leave the event unchecked rather than inventing a
-                    // rejection.
-                    unchecked = unchecked.saturating_add(1);
-                    return None;
-                }
                 if let Some(current) = current {
                     let cites_rejected = room_event
                         .auth_events
@@ -10424,9 +10416,17 @@ impl ImportContext<'_> {
                     if cites_rejected {
                         let code = RejectionCode::DependsOnRejectedAuthEvent.to_u8();
                         let reason = "auth_events cites a rejected event".to_owned();
-                        walk_rejections.insert(event_id.to_owned(), (code, reason));
-                        return Some((code, "auth_events cites a rejected event".to_owned()));
+                        walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
+                        return Some((code, reason));
                     }
+                }
+                if !base_complete {
+                    // A missing parent or a merge that fell back to the
+                    // first-parent rule means this base state is incomplete.
+                    // Leave the event unchecked rather than inventing a
+                    // rejection.
+                    unchecked = unchecked.saturating_add(1);
+                    return None;
                 }
                 let is_create = event.get("type").and_then(OwnedValue::as_str)
                     == Some("m.room.create")
@@ -10444,13 +10444,19 @@ impl ImportContext<'_> {
                     create,
                     state_version,
                     &entries,
+                    current,
                 ) {
                     Ok(export_import::EventAuthOutcome::Refused { code, reason }) => {
                         walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
                         Some((code, reason))
                     }
                     Ok(export_import::EventAuthOutcome::Passed) => None,
-                    Ok(export_import::EventAuthOutcome::Unchecked) | Err(_) => {
+                    Ok(export_import::EventAuthOutcome::Unchecked) => {
+                        unchecked = unchecked.saturating_add(1);
+                        None
+                    }
+                    Err(err) => {
+                        eprintln!("  warning: error judging event {event_id}: {err}");
                         unchecked = unchecked.saturating_add(1);
                         None
                     }
@@ -11851,6 +11857,16 @@ fn walk_state_groups(
 
     for &idx in sorted {
         let short_id = frontier.nodes[idx].short_id;
+        let event_value = events_by_sid.get(&short_id).copied();
+        let is_create = event_value.is_some_and(|ev| {
+            ev.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
+                && ev.get("state_key").and_then(OwnedValue::as_str) == Some("")
+        });
+        let claimed_prev_count = event_value
+            .and_then(|ev| ev.get("prev_events"))
+            .and_then(OwnedValue::as_array)
+            .map_or(0, Vec::len);
+
         let mut parent_ids: Vec<u64> = Vec::new();
         let mut parents: Vec<Arc<SharedState>> = Vec::new();
         let mut parent_instances: Vec<[u8; STATE_GROUP_ID_LENGTH]> = Vec::new();
@@ -11865,7 +11881,15 @@ fn walk_state_groups(
             if let Some(parent_state) = state_at.get(&parent_id) {
                 parent_instances.push(parent_state.instance);
                 parents.push(Arc::clone(parent_state));
+            } else {
+                base_incomplete = true;
             }
+        }
+        if !is_create && parents.is_empty() {
+            base_incomplete = true;
+        }
+        if parents.len() != claimed_prev_count {
+            base_incomplete = true;
         }
 
         // State-resolution merge. Parents that already agree share their state
@@ -11900,7 +11924,6 @@ fn walk_state_groups(
         };
 
         let event_id = reverse_map.get(&short_id);
-        let event_value = events_by_sid.get(&short_id).copied();
         if let (Some(event_id), Some(event_value)) = (event_id, event_value) {
             let already_rejected = rejected
                 .as_deref()

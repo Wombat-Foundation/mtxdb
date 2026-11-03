@@ -1075,6 +1075,34 @@ pub(crate) fn apply_walk_rejections(
             });
         }
     }
+
+    // Cascade walk rejections transitively to all dependent events citing them.
+    let mut dependents = vec![Vec::new(); export.events.len()];
+    for (position, event) in export.events.iter().enumerate() {
+        if let Ok(auths) = id_list(event, "auth_events") {
+            for auth in auths {
+                if let Ok(auth_str) = std::str::from_utf8(auth) {
+                    if let Some(&parent) = positions.get(auth_str) {
+                        dependents[parent].push(position);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pending: Vec<usize> = (0..export.events.len())
+        .filter(|&i| findings.forced[i].is_some())
+        .collect();
+    while let Some(parent) = pending.pop() {
+        for &child in &dependents[parent] {
+            if findings.forced[child].is_none() {
+                findings.forced[child] = Some(RejectionCode::DependsOnRejectedAuthEvent.to_u8());
+                findings.cascaded.push(export.events[child].event_id.clone());
+                pending.push(child);
+            }
+        }
+    }
+
     refresh_rejection_counts(findings);
 }
 
@@ -1256,6 +1284,7 @@ pub(crate) enum EventAuthOutcome {
 
 /// Judge an event against both its own `auth_events` (check 4) and the state
 /// before it (check 5). Check 4 runs first.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn judge_event_with_state(
     event: &RoomEvent,
     subject: Option<&LeanEvent<String>>,
@@ -1264,10 +1293,21 @@ pub(crate) fn judge_event_with_state(
     create: Option<&LeanEvent<String>>,
     version: StateResVersion,
     base: &AuthEntries,
+    rejected: Option<&HashSet<String>>,
 ) -> anyhow::Result<EventAuthOutcome> {
-    judge_event_auth(event, subject, index, lean, create, version, Some(base))
+    judge_event_auth(
+        event,
+        subject,
+        index,
+        lean,
+        create,
+        version,
+        Some(base),
+        rejected,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn judge_event_auth(
     event: &RoomEvent,
     subject: Option<&LeanEvent<String>>,
@@ -1276,10 +1316,23 @@ fn judge_event_auth(
     create: Option<&LeanEvent<String>>,
     version: StateResVersion,
     base: Option<&AuthEntries>,
+    rejected: Option<&HashSet<String>>,
 ) -> anyhow::Result<EventAuthOutcome> {
     let Some(subject) = subject else {
         return Ok(EventAuthOutcome::Unchecked);
     };
+    if let Some(rejected) = rejected {
+        for auth in id_list(event, "auth_events")? {
+            if let Ok(auth_str) = std::str::from_utf8(auth) {
+                if rejected.contains(auth_str) {
+                    return Ok(EventAuthOutcome::Refused {
+                        code: RejectionCode::DependsOnRejectedAuthEvent.to_u8(),
+                        reason: format!("depends on rejected auth event {auth_str}"),
+                    });
+                }
+            }
+        }
+    }
     let is_create = event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE)
         && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("");
     let mut cited = Vec::new();
@@ -1426,6 +1479,7 @@ fn judge_events(
             lean,
             create,
             version,
+            None,
             None,
         )? {
             EventAuthOutcome::Unchecked => {}
