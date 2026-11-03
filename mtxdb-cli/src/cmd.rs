@@ -10890,7 +10890,7 @@ fn import_pdu_events_with_raw(
             "  warning: {unchecked} event(s) could not be checked against the state before them"
         );
     }
-    for warning in findings.warnings() {
+    for warning in findings.current_warnings(&current_ids) {
         eprintln!("  warning: {warning}");
     }
     let rejected_total: usize = findings.rejection_counts.values().copied().sum();
@@ -11061,22 +11061,20 @@ fn write_raw_verdicts_and_flags(
                 )?;
             }
 
-            changes.push(FlagChange::set(short, Flag::Present));
-            changes.push(if verdict.rejection.is_some() {
-                FlagChange::set(short, Flag::Rejected)
-            } else {
-                FlagChange::clear(short, Flag::Rejected)
-            });
-            changes.push(if verdict.outlier {
-                FlagChange::set(short, Flag::Outlier)
-            } else {
-                FlagChange::clear(short, Flag::Outlier)
-            });
-            changes.push(if verdict.soft_fail.is_some() {
-                FlagChange::set(short, Flag::SoftFailed)
-            } else {
-                FlagChange::clear(short, Flag::SoftFailed)
-            });
+            for (flag, wanted) in [
+                (Flag::Present, true),
+                (Flag::Rejected, verdict.rejection.is_some()),
+                (Flag::Outlier, verdict.outlier),
+                (Flag::SoftFailed, verdict.soft_fail.is_some()),
+            ] {
+                if flag_index.has_flag(db, short, flag)? != wanted {
+                    changes.push(if wanted {
+                        FlagChange::set(short, flag)
+                    } else {
+                        FlagChange::clear(short, flag)
+                    });
+                }
+            }
         }
         flag_index.stage(&tx, &changes)?;
         short_ids.commit(&tx)?;

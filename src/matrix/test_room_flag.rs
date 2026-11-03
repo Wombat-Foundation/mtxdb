@@ -89,6 +89,12 @@ mod tests {
         index.stage(&tx, &changes).unwrap();
         tx.commit().unwrap();
 
+        assert!(index.has_flag(&db, 2, Flag::SoftFailed).unwrap());
+        assert!(index.has_flag(&db, 3, Flag::Rejected).unwrap());
+        assert!(index.has_flag(&db, 4, Flag::Rejected).unwrap());
+        assert!(!index.has_flag(&db, 1, Flag::SoftFailed).unwrap());
+        assert!(!index.has_flag(&db, 6, Flag::Present).unwrap());
+
         // Counts
         assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 5);
         assert_eq!(

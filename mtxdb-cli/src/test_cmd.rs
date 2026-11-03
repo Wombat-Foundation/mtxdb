@@ -2264,6 +2264,48 @@ fn raw_import_derives_rejections_and_writes_flags() {
     );
 }
 
+fn raw_late_parent_fixture() -> [OwnedValue; 4] {
+    [
+        raw_event(
+            "!room3",
+            "$create",
+            "m.room.create",
+            "",
+            r#"{"room_version":"11"}"#,
+            "[]",
+            "[]",
+        ),
+        raw_event(
+            "!room3",
+            "$join",
+            "m.room.member",
+            "@alice:test",
+            r#"{"membership":"join"}"#,
+            r#"["$create"]"#,
+            r#"["$create"]"#,
+        ),
+        // Its parent is in the next file, so the first import cannot check it.
+        raw_event(
+            "!room3",
+            "$stale",
+            "m.room.join_rules",
+            "",
+            r#"{"join_rule":"public"}"#,
+            r#"["$leave"]"#,
+            r#"["$create","$join"]"#,
+        ),
+        raw_event(
+            "!room3",
+            "$leave",
+            "m.room.member",
+            "@alice:test",
+            r#"{"membership":"leave"}"#,
+            r#"["$join"]"#,
+            r#"["$create","$join"]"#,
+        ),
+    ]
+}
+
 #[test]
 fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
     use mtxdb::room_flag::*;
@@ -2275,37 +2317,8 @@ fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
     let path = dir.join("room.jsonl");
     let store = db.event_dag();
     let state_store = db.state().as_ref();
+    let [create, join, stale, leave] = raw_late_parent_fixture();
 
-    let event = |id: &str, kind: &str, state_key: &str, content: &str, prev: &str, auth: &str| {
-        owned_value(&format!(
-            r#"{{"event_id":"{id}","sender":"@alice:test","room_id":"!room3","type":"{kind}","state_key":"{state_key}","content":{content},"prev_events":{prev},"auth_events":{auth}}}"#
-        ))
-    };
-    let create = event(
-        "$create",
-        "m.room.create",
-        "",
-        r#"{"room_version":"11"}"#,
-        "[]",
-        "[]",
-    );
-    let join = event(
-        "$join",
-        "m.room.member",
-        "@alice:test",
-        r#"{"membership":"join"}"#,
-        r#"["$create"]"#,
-        r#"["$create"]"#,
-    );
-    // Its parent is in the next file, so the first import cannot check it.
-    let stale = event(
-        "$stale",
-        "m.room.join_rules",
-        "",
-        r#"{"join_rule":"public"}"#,
-        r#"["$leave"]"#,
-        r#"["$create","$join"]"#,
-    );
     let mut established = HashSet::new();
     established.insert(collection_id);
     let mut import = |events: &[OwnedValue]| {
@@ -2344,14 +2357,6 @@ fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
         "the first file stores no rejection for the unchecked event"
     );
 
-    let leave = event(
-        "$leave",
-        "m.room.member",
-        "@alice:test",
-        r#"{"membership":"leave"}"#,
-        r#"["$join"]"#,
-        r#"["$create","$join"]"#,
-    );
     import(&[leave]);
 
     assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
@@ -2611,6 +2616,7 @@ fn auth_chain_reimport_writes_nothing_new() {
     .unwrap();
     let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
     let first_import_records = count_pack_records(&auth_dir);
+    let first_event_records = count_pack_records(&pool_dir);
     // Declares the create so batch_has_create resolves for any follow-up.
     cmd_import_file(
         &db,
@@ -2630,6 +2636,11 @@ fn auth_chain_reimport_writes_nothing_new() {
         count_pack_records(&auth_dir),
         first_import_records,
         "reimport must not append duplicate edge or auth-chain records"
+    );
+    assert_eq!(
+        count_pack_records(&pool_dir),
+        first_event_records,
+        "reimport must not append duplicate verdicts or flag chunks"
     );
     let auth_store = db.edges().as_ref();
     let auth_col = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), b"!room");

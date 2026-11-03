@@ -362,6 +362,25 @@ impl RoomFlagIndex {
         self.meta(db).map(|m| m.max_short_id)
     }
 
+    /// Whether one event currently has `flag` set.
+    ///
+    /// Reads only the chunk containing `short_id`. Use this to avoid staging
+    /// a flag rewrite when the desired bit is already in that state.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] on read error or corrupt index payload.
+    pub fn has_flag(&self, db: &Database, short_id: u32, flag: Flag) -> Result<bool, StorageError> {
+        let meta = self.meta(db)?;
+        if short_id > meta.max_short_id {
+            return Ok(false);
+        }
+        let chunk_col = self.chunk_collection(meta.generation);
+        let chunk_idx = u16::try_from(short_id / CHUNK_CAPACITY)
+            .map_err(|_| StorageError::Corrupt("flag chunk index out of range".to_owned()))?;
+        let chunk = self.get_or_load_chunk(db, &chunk_col, flag, chunk_idx, &mut HashMap::new())?;
+        Ok(chunk.contains(short_id % CHUNK_CAPACITY))
+    }
+
     /// Stage a batch of flag changes directly into a specified chunk collection.
     ///
     /// Returns the maximum short ID encountered in `changes`.

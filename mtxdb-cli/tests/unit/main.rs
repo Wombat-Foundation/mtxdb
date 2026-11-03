@@ -6,3 +6,4 @@
 //! target explicitly.
 
 mod meta_cli;
+mod raw_warning_cli;

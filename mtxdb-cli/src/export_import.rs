@@ -340,7 +340,7 @@ pub(crate) fn room_collections_line(room_id: &str) -> String {
 }
 
 /// What a room's edges say about events the import cannot fully authorize.
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AuthFindings {
     /// The rejection code forced on each event, by position in the export.
     pub(crate) forced: Vec<Option<u8>>,
@@ -831,7 +831,7 @@ fn authoriser_server(user_id: &str) -> Option<&str> {
 }
 
 /// An accepted event the first auth check refuted, and why.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthFailure {
     /// The event the source exported as accepted.
     pub(crate) event_id: String,
@@ -851,6 +851,31 @@ fn warning_id_limit() -> usize {
 }
 
 impl AuthFindings {
+    /// Warning lines for events in the current file only.
+    ///
+    /// Stored events are redacted, so their source `rejected`/`soft_failed`
+    /// claims are not available on a later import. Reporting those earlier
+    /// events again would compare the derived verdict with a false default.
+    pub(crate) fn current_warnings(&self, current: &HashSet<String>) -> Vec<String> {
+        let mut filtered = self.clone();
+        filtered.missing_auth.retain(|id| current.contains(id));
+        filtered.cascaded.retain(|id| current.contains(id));
+        filtered.missing_prev.retain(|id| current.contains(id));
+        filtered
+            .passes_but_exported_rejected
+            .retain(|id| current.contains(id));
+        filtered
+            .fails_but_exported_accepted
+            .retain(|failure| current.contains(&failure.event_id));
+        filtered
+            .hash_audit
+            .retain(|row| current.contains(&row.event_id));
+        filtered
+            .signature_failures
+            .retain(|failure| current.contains(&failure.event_id));
+        filtered.warnings()
+    }
+
     /// Human-readable warnings, empty for a clean room.
     pub(crate) fn warnings(&self) -> Vec<String> {
         let id_limit = warning_id_limit();
@@ -1197,7 +1222,7 @@ struct HashMismatch {
 }
 
 /// Audit record for one hash-mismatched event, written to a JSONL sidecar.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HashAudit {
     pub(crate) event_id: String,
     pub(crate) room_id: String,
@@ -1234,7 +1259,7 @@ impl HashAudit {
 }
 
 /// Audit record for one non-plain-verified event, written to a JSONL sidecar.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SignatureAudit {
     pub(crate) event_id: String,
     pub(crate) room_id: String,
@@ -2132,8 +2157,8 @@ impl<'a> ClosureWriter<'a> {
         Ok((short, staged))
     }
 
-    /// Stage the short-id counter and commit the batch. The counter goes in
-    /// every batch so it is never behind the shorts a committed batch holds.
+    /// Stage the short-id counter when it advanced, then commit the batch.
+    /// A batch that only reuses existing shorts leaves the counter untouched.
     pub(crate) fn commit(&self, tx: &mtxdb::DatabaseTransaction<'_>) -> anyhow::Result<()> {
         if self.counter != self.initial_counter {
             tx.put(
