@@ -10664,24 +10664,34 @@ fn import_room_version(
     collection_id: &[u8; 16],
     events: &[OwnedValue],
 ) -> anyhow::Result<String> {
-    if let Some(version) = events
+    let version = if let Some(version) = events
         .iter()
         .find_map(|event| nested_event_string_field(event, "content", "room_version"))
     {
-        return Ok(version.to_owned());
+        version.to_owned()
+    } else {
+        store
+            .get_collection_metadata(collection_id)
+            .ok()
+            .flatten()
+            .and_then(|metadata| MatrixRoomExtension::decode_blob(metadata.extension.as_deref()?))
+            .and_then(|extension| extension.room_version)
+            .with_context(|| {
+                format!(
+                    "cannot redact imported events for collection {}: room version is unavailable",
+                    format_id(collection_id)
+                )
+            })?
+    };
+    // Redaction, auth and state resolution all need a version rezzy can
+    // classify. Failing here prevents storing events with stripped content,
+    // wrong event ids, or unchecked auth.
+    if !importer_room_version(&version).is_some_and(MatrixRoomVersion::is_supported) {
+        bail!(
+            "room version {version:?} is not supported; mtxdb requires v4 or later and recognises MSC3389"
+        );
     }
-    let version = store
-        .get_collection_metadata(collection_id)
-        .ok()
-        .flatten()
-        .and_then(|metadata| MatrixRoomExtension::decode_blob(metadata.extension.as_deref()?))
-        .and_then(|extension| extension.room_version);
-    version.with_context(|| {
-        format!(
-            "cannot redact imported events for collection {}: room version is unavailable",
-            format_id(collection_id)
-        )
-    })
+    Ok(version)
 }
 
 /// Import PDU events through the normal event-DAG path.
@@ -10986,6 +10996,11 @@ fn redaction_preserves(event_type: &str, room_version: &str, path: &str) -> bool
 /// numeric parse here, so unstable versions (`MSC3389`, `MSC4242`, `NutraCdo`) get
 /// the same treatment as their numeric rule sets.
 fn raw_auth_projection(event: &OwnedValue, room_version: &str) -> Option<OwnedValue> {
+    // Unknown versions are rejected before import. Do not invent an
+    // everything-is-unpreserved rule if this helper is called directly.
+    if !importer_room_version(room_version).is_some_and(MatrixRoomVersion::is_supported) {
+        return None;
+    }
     event.get("state_key")?;
     let kind = event.get("type")?.as_str()?;
     let OwnedValue::Object(content) = event.get("content")? else {
@@ -11149,6 +11164,15 @@ fn load_collection_events(
     room_id: &str,
 ) -> anyhow::Result<Vec<OwnedValue>> {
     let projections = raw_auth_projection_collection_id(room_id);
+    // One sequential scan beats one random lookup per stored event. Only
+    // events with a non-empty projection have a record, so this map is small.
+    let mut projected = HashMap::new();
+    for record in store.scan_collection(&projections)? {
+        let (node, data) = record?;
+        if let Ok(projection) = OwnedValue::parse_bytes(&data.bytes) {
+            projected.insert(node, projection);
+        }
+    }
     let mut events = Vec::new();
     for record in store.scan_collection(collection_id)? {
         let (node, data) = record?;
@@ -11158,10 +11182,8 @@ fn load_collection_events(
         if event_id(&value).is_none() {
             continue;
         }
-        if let Some(projection) = store.get(&projections, &node)? {
-            if let Ok(projection) = OwnedValue::parse_bytes(&projection.bytes) {
-                overlay_auth_projection(&mut value, projection);
-            }
+        if let Some(projection) = projected.get(&node).cloned() {
+            overlay_auth_projection(&mut value, projection);
         }
         events.push(value);
     }

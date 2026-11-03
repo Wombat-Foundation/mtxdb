@@ -2945,6 +2945,50 @@ fn raw_auth_projection_rejects_unknown_room_versions() {
 }
 
 #[test]
+fn raw_import_rejects_unknown_room_version() {
+    let dir = unique_temp_dir().join("raw_unknown_version");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room9");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let create = raw_event(
+        "!room9",
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"not-a-version"}"#,
+        "[]",
+        "[]",
+    );
+    let mut established = HashSet::new();
+
+    let error = import_pdu_events(
+        &db,
+        store,
+        state_store,
+        &path,
+        &[create],
+        &[],
+        None,
+        None,
+        &template,
+        &mut established,
+    )
+    .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("requires v4") || text.contains("not supported"),
+        "an unknown room version must fail the import: {text}"
+    );
+    assert!(
+        !established.contains(&collection_id),
+        "a rejected room version must not establish the collection"
+    );
+}
+
+#[test]
 fn raw_import_keeps_soft_failed_flag_from_earlier_files() {
     use mtxdb::room_flag::*;
 
