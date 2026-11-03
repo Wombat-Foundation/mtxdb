@@ -5879,7 +5879,8 @@ fn stale_auth_events_are_rejected_against_state_before() {
 }
 
 #[test]
-fn rejected_state_event_does_not_change_later_state() {
+fn rejected_state_event_cascades_to_dependents() {
+    use mtxdb::export_schema::RejectionCode;
     use mtxdb::room_flag::*;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
@@ -5888,6 +5889,11 @@ fn rejected_state_event_does_not_change_later_state() {
     let db = Database::open(root.clone()).unwrap();
 
     let room_id = "!staterollback:test.conduwuit.local";
+    // $rules_ok makes the room public while Alice is joined. $rules_bad is
+    // the same value but cites the stale join after Alice left, so only
+    // check 5 rejects it. Bob's join passes checks 4 and 5 against the public
+    // state, but cites $rules_bad, so only the rejected-auth cascade rejects
+    // him.
     let jsonl = format!(
         concat!(
             r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
@@ -5896,13 +5902,15 @@ fn rejected_state_event_does_not_change_later_state() {
             "\n",
             r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$leave:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":3,"event_id":"$leave:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            r#"{{"event_id":"$rules_ok:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"join_rule":"public"}},"depth":3,"event_id":"$rules_ok:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.join_rules"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$rules:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"join_rule":"public"}},"depth":4,"event_id":"$rules:test","origin_server_ts":4000,"prev_events":["$leave:test"],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.join_rules"}},"t":"event"}}"#,
+            r#"{{"event_id":"$leave:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$rules_ok:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":4,"event_id":"$leave:test","origin_server_ts":4000,"prev_events":["$rules_ok:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$bob:test","depth":5,"stream_ordering":5,"auth_events":["$create:test","$rules:test"],"prev_events":["$rules:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$rules:test"],"content":{{"membership":"join"}},"depth":5,"event_id":"$bob:test","origin_server_ts":5000,"prev_events":["$rules:test"],"room_id":"{room}","sender":"@bob:test","state_key":"@bob:test","type":"m.room.member"}},"t":"event"}}"#,
+            r#"{{"event_id":"$rules_bad:test","depth":5,"stream_ordering":5,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"join_rule":"public"}},"depth":5,"event_id":"$rules_bad:test","origin_server_ts":5000,"prev_events":["$leave:test"],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.join_rules"}},"t":"event"}}"#,
             "\n",
-            r#"{{"events":5,"t":"end"}}"#,
+            r#"{{"event_id":"$bob:test","depth":6,"stream_ordering":6,"auth_events":["$create:test","$rules_bad:test"],"prev_events":["$rules_bad:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$rules_bad:test"],"content":{{"membership":"join"}},"depth":6,"event_id":"$bob:test","origin_server_ts":6000,"prev_events":["$rules_bad:test"],"room_id":"{room}","sender":"@bob:test","state_key":"@bob:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":6,"t":"end"}}"#,
             "\n"
         ),
         room = room_id
@@ -5911,19 +5919,32 @@ fn rejected_state_event_does_not_change_later_state() {
     let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
     assert_eq!(
         (run.failures, run.all_exports, run.exported_events),
-        (0, true, 5)
+        (0, true, 6)
     );
-    assert_eq!(run.rejection_counts.values().sum::<usize>(), 2);
+    assert_eq!(
+        run.rejection_counts
+            .get(&RejectionCode::AuthCheckFailed.to_u8())
+            .copied(),
+        Some(1),
+        "$rules_bad fails check 5"
+    );
+    assert_eq!(
+        run.rejection_counts
+            .get(&RejectionCode::DependsOnRejectedAuthEvent.to_u8())
+            .copied(),
+        Some(1),
+        "bob passes checks 4 and 5 but cites a rejected auth event"
+    );
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 5);
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 6);
     assert_eq!(
         flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
         2
     );
     assert_eq!(
         flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
-        3
+        4
     );
 
     let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
@@ -5934,7 +5955,64 @@ fn rejected_state_event_does_not_change_later_state() {
         .iter()
         .map(|entry| entry.stream_ordering)
         .collect();
-    assert_eq!(streams, vec![1, 2, 3]);
+    assert_eq!(streams, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn partial_base_state_is_left_unchecked() {
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!partialstate:test.conduwuit.local";
+    // $partial's second parent is missing, so its base state is only the
+    // leave. Checking against that partial state would reject Alice; with an
+    // incomplete base the event must stay unchecked instead.
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$leave:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":3,"event_id":"$leave:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$partial:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test","$missing:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$partial:test","origin_server_ts":4000,"prev_events":["$leave:test","$missing:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 4)
+    );
+    assert_eq!(
+        run.rejection_counts.values().sum::<usize>(),
+        0,
+        "a missing parent leaves the event unchecked"
+    );
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(), 0);
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 4);
+
+    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
+        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+        .unwrap();
+    let streams: Vec<i64> = page
+        .entries
+        .iter()
+        .map(|entry| entry.stream_ordering)
+        .collect();
+    assert_eq!(streams, vec![1, 2, 3, 4]);
 }
 
 #[test]

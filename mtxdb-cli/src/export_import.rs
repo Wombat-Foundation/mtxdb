@@ -1042,9 +1042,10 @@ pub(crate) fn rejected_event_ids(export: &RoomExport, findings: &AuthFindings) -
         .collect()
 }
 
-/// Apply the check-5 rejections the state walk derived: record the code, add
-/// a report row when the export disagreed, and refresh the counts.
-pub(crate) fn apply_check5_rejections(
+/// Apply the rejections the state walk derived (check 5 and rejected-auth
+/// cascades): record the code, add a report row when the export disagreed, and
+/// refresh the counts.
+pub(crate) fn apply_walk_rejections(
     export: &RoomExport,
     findings: &mut AuthFindings,
     rejections: &HashMap<String, (u8, String)>,
@@ -1065,7 +1066,9 @@ pub(crate) fn apply_check5_rejections(
             continue;
         };
         findings.forced[position] = Some(*code);
-        if !exported[position] {
+        if *code == RejectionCode::DependsOnRejectedAuthEvent.to_u8() {
+            findings.cascaded.push(event_id.clone());
+        } else if !exported[position] {
             findings.fails_but_exported_accepted.push(AuthFailure {
                 event_id: event_id.clone(),
                 reason: reason.clone(),

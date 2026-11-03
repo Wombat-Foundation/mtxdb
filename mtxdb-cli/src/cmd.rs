@@ -10271,7 +10271,7 @@ impl ImportContext<'_> {
             .to_owned();
         let mut findings = export_import::derived_auth_findings_with_keys(export, signature_keys)?;
         let mut rejected = export_import::rejected_event_ids(export, &findings);
-        let mut check5 = HashMap::new();
+        let mut walk_rejections = HashMap::new();
         let (computation, unchecked) = Self::compute_import_auth_before(
             &events,
             &export.events,
@@ -10279,9 +10279,9 @@ impl ImportContext<'_> {
             &room_version,
             StateResVersion::from_room_version(&room_version),
             &mut rejected,
-            &mut check5,
+            &mut walk_rejections,
         );
-        export_import::apply_check5_rejections(export, &mut findings, &check5);
+        export_import::apply_walk_rejections(export, &mut findings, &walk_rejections);
         if unchecked > 0 {
             eprintln!(
                 "  warning: {unchecked} event(s) could not be checked against the state before them"
@@ -10337,6 +10337,10 @@ impl ImportContext<'_> {
     /// rejected are excluded, and every other event gets check 4 followed by
     /// check 5 against the state before it. A rejection is fed back into the
     /// walk, so a rejected state event contributes no state to later events.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the walk and its per-event auth context are kept together"
+    )]
     fn compute_import_auth_before(
         events: &[OwnedValue],
         room_events: &[RoomEvent],
@@ -10344,7 +10348,7 @@ impl ImportContext<'_> {
         room_version: &str,
         state_version: Option<StateResVersion>,
         rejected: &mut HashSet<String>,
-        check5: &mut HashMap<String, (u8, String)>,
+        walk_rejections: &mut HashMap<String, (u8, String)>,
     ) -> (PartialStateComputation, usize) {
         let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
         let Some(state_version) = state_version else {
@@ -10356,7 +10360,7 @@ impl ImportContext<'_> {
                     room_id,
                     policy,
                     None,
-                    |_, _, _| false,
+                    |_, _, _, _, _| None,
                 ),
                 0,
             );
@@ -10391,24 +10395,45 @@ impl ImportContext<'_> {
             room_id,
             policy,
             Some(rejected),
-            |event_id, event, base| {
+            |event_id, event, base, base_complete, current| {
                 let Some(room_event) = by_id.get(event_id) else {
                     unchecked = unchecked.saturating_add(1);
-                    return false;
+                    return None;
                 };
                 let Some(position) = index.get(event_id.as_bytes()).copied() else {
                     unchecked = unchecked.saturating_add(1);
-                    return false;
+                    return None;
                 };
+                if !base_complete {
+                    // A missing parent or a merge that fell back to the
+                    // first-parent rule means this base state is incomplete.
+                    // Leave the event unchecked rather than inventing a
+                    // rejection.
+                    unchecked = unchecked.saturating_add(1);
+                    return None;
+                }
+                if let Some(current) = current {
+                    let cites_rejected = room_event
+                        .auth_events
+                        .as_array()
+                        .is_some_and(|ids| {
+                            ids.iter().any(|id| {
+                                id.as_str().is_some_and(|id| current.contains(id))
+                            })
+                        });
+                    if cites_rejected {
+                        let code = RejectionCode::DependsOnRejectedAuthEvent.to_u8();
+                        let reason = "auth_events cites a rejected event".to_owned();
+                        walk_rejections.insert(event_id.to_owned(), (code, reason));
+                        return Some((code, "auth_events cites a rejected event".to_owned()));
+                    }
+                }
                 let is_create = event.get("type").and_then(OwnedValue::as_str)
                     == Some("m.room.create")
                     && event.get("state_key").and_then(OwnedValue::as_str) == Some("");
                 if base.entries.is_empty() && !is_create {
-                    // No usable base state (missing parents or an incomplete
-                    // merge): leave the event unchecked rather than inventing
-                    // a rejection.
                     unchecked = unchecked.saturating_add(1);
-                    return false;
+                    return None;
                 }
                 let entries = auth_entries_from_base(event, base, state_version, room_version);
                 match export_import::judge_event_with_state(
@@ -10421,13 +10446,13 @@ impl ImportContext<'_> {
                     &entries,
                 ) {
                     Ok(export_import::EventAuthOutcome::Refused { code, reason }) => {
-                        check5.insert(event_id.to_owned(), (code, reason));
-                        true
+                        walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
+                        Some((code, reason))
                     }
-                    Ok(export_import::EventAuthOutcome::Passed) => false,
+                    Ok(export_import::EventAuthOutcome::Passed) => None,
                     Ok(export_import::EventAuthOutcome::Unchecked) | Err(_) => {
                         unchecked = unchecked.saturating_add(1);
-                        false
+                        None
                     }
                 }
             },
@@ -10951,7 +10976,7 @@ fn repair_import_state_groups(
                 canonical_id,
                 policy,
                 None,
-                |_, _, _| false,
+                |_, _, _, _, _| None,
             ),
         };
         let unresolved = state_computation.unresolved;
@@ -11659,7 +11684,7 @@ fn compute_state_groups_partial_in_view(
         room_id,
         batch_resolution_policy(events),
         None,
-        |_, _, _| false,
+        |_, _, _, _, _| None,
     )
 }
 
@@ -11718,7 +11743,13 @@ fn compute_state_groups_partial_with(
     room_id: &str,
     policy: ResolutionPolicy,
     rejected: Option<&mut HashSet<String>>,
-    judge: impl FnMut(&str, &OwnedValue, &StateSet) -> bool,
+    judge: impl FnMut(
+        &str,
+        &OwnedValue,
+        &StateSet,
+        bool,
+        Option<&HashSet<String>>,
+    ) -> Option<(u8, String)>,
 ) -> PartialStateComputation {
     // Borrow the input when there is no auth chain to merge in; cloning every
     // parsed event just to concatenate two slices doubles peak memory on large
@@ -11782,6 +11813,7 @@ fn compute_state_groups_partial_with(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the walk needs the DAG, the state view, and its base-state observer"
 )]
 fn walk_state_groups(
@@ -11793,7 +11825,13 @@ fn walk_state_groups(
     view: StateView,
     policy: ResolutionPolicy,
     mut rejected: Option<&mut HashSet<String>>,
-    mut judge: impl FnMut(&str, &OwnedValue, &StateSet) -> bool,
+    mut judge: impl FnMut(
+        &str,
+        &OwnedValue,
+        &StateSet,
+        bool,
+        Option<&HashSet<String>>,
+    ) -> Option<(u8, String)>,
 ) -> StateGroupWalk {
     let mut remaining_children = count_resident_children(frontier, sorted);
 
@@ -11816,8 +11854,10 @@ fn walk_state_groups(
         let mut parent_ids: Vec<u64> = Vec::new();
         let mut parents: Vec<Arc<SharedState>> = Vec::new();
         let mut parent_instances: Vec<[u8; STATE_GROUP_ID_LENGTH]> = Vec::new();
+        let mut base_incomplete = false;
         for edge in frontier.prev_edges(idx) {
             if !edge.is_resident() {
+                base_incomplete = true;
                 continue;
             }
             let parent_id = frontier.nodes[edge.arena_index()].short_id;
@@ -11845,14 +11885,18 @@ fn walk_state_groups(
             {
                 Arc::clone(first)
             }
-            [..] => merge_parent_states(
-                &mut context,
-                &parents,
-                &parent_instances,
-                room_id,
-                policy,
-                &mut incomplete,
-            ),
+            [..] => {
+                let (merged, fallback) = merge_parent_states(
+                    &mut context,
+                    &parents,
+                    &parent_instances,
+                    room_id,
+                    policy,
+                    &mut incomplete,
+                );
+                base_incomplete |= fallback;
+                merged
+            }
         };
 
         let event_id = reverse_map.get(&short_id);
@@ -11861,9 +11905,20 @@ fn walk_state_groups(
             let already_rejected = rejected
                 .as_deref()
                 .is_some_and(|set| set.contains(event_id));
-            if !already_rejected && judge(event_id, event_value, &base.set) {
-                if let Some(set) = rejected.as_deref_mut() {
-                    set.insert(event_id.clone());
+            if !already_rejected {
+                let current = rejected.as_deref();
+                if judge(
+                    event_id,
+                    event_value,
+                    &base.set,
+                    !base_incomplete,
+                    current,
+                )
+                .is_some()
+                {
+                    if let Some(set) = rejected.as_deref_mut() {
+                        set.insert(event_id.clone());
+                    }
                 }
             }
         }
@@ -12004,18 +12059,20 @@ fn merge_parent_states(
     room_id: &str,
     policy: ResolutionPolicy,
     incomplete: &mut HashSet<String>,
-) -> Arc<SharedState> {
+) -> (Arc<SharedState>, bool) {
     let parent_entries: Vec<&StateEntries> =
         parents.iter().map(|parent| &parent.set.entries).collect();
+    let mut fallback = false;
     let merged = match resolve_parents(context, &parent_entries, policy) {
         Ok(entries) => StateSet { entries },
         Err(gap) => {
+            fallback = true;
             incomplete.extend(gap.missing);
-            let mut fallback = StateSet::new();
+            let mut merged = StateSet::new();
             for parent in parents {
-                fallback.merge(&parent.set);
+                merged.merge(&parent.set);
             }
-            fallback
+            merged
         }
     };
     let instance = state_group_instance_id(
@@ -12024,7 +12081,7 @@ fn merge_parent_states(
         &merged.lthash(),
         policy.derivation,
     );
-    SharedState::new(merged, instance)
+    (SharedState::new(merged, instance), fallback)
 }
 
 /// Number of distinct instance ids in `instances`.
