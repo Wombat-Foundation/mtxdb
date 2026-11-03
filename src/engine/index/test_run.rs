@@ -381,10 +381,13 @@ fn a_block_whose_crc_matches_but_whose_order_is_wrong_is_rejected() {
 
 #[test]
 fn merge_keeps_the_newest_version_against_a_model() {
-    for seed in 0..40_u64 {
+    for seed in 0..60_u64 {
         let dir = TestDir::new();
         let mut rng = Rng(seed);
-        let pack_count = rng.below(7).checked_add(1).unwrap();
+        let pack_count = usize::try_from(rng.below(9))
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
         let models: Vec<PackModel> = (0..pack_count).map(|_| random_pack(&mut rng, 60)).collect();
         let sidecars: Vec<MappedPackIndex> = models
             .iter()
@@ -392,32 +395,44 @@ fn merge_keeps_the_newest_version_against_a_model() {
             .map(|(model, seq)| write_sidecar(&dir, seq, model))
             .collect();
 
-        // Merge the older half into a run first, so the final merge mixes a
-        // run with sidecars and has to remap the run's pack ordinals.
-        let split = usize::try_from(rng.below(pack_count)).unwrap();
-        let older: Vec<MergeSource<'_>> =
-            sidecars[..split].iter().map(MergeSource::Sidecar).collect();
-        let older_run = if older.is_empty() {
-            None
-        } else {
-            let path = dir.join("older.run");
-            merge_to_path(&older, MergeOptions::default(), &path)
+        // Cut the packs into up to three contiguous groups. A group of two or
+        // more becomes its own run, so newer runs land at output ordinals
+        // above their own and the final merge must remap them.
+        let mut cuts: Vec<usize> = (0..2)
+            .map(|_| usize::try_from(rng.below(u64::try_from(pack_count).unwrap())).unwrap())
+            .chain([0, pack_count])
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut runs = Vec::new();
+        let mut loose: Vec<&MappedPackIndex> = Vec::new();
+        for (group, bounds) in cuts.windows(2).enumerate() {
+            let members = &sidecars[bounds[0]..bounds[1]];
+            if members.len() < 2 {
+                loose.extend(members);
+                continue;
+            }
+            let sources: Vec<MergeSource<'_>> = members.iter().map(MergeSource::Sidecar).collect();
+            let path = dir.join(&format!("group-{group}.run"));
+            if merge_to_path(&sources, MergeOptions::default(), &path)
                 .unwrap()
-                .map(|_| RunIndex::open(&path).unwrap())
-        };
-        let mut sources: Vec<MergeSource<'_>> =
-            sidecars[split..].iter().map(MergeSource::Sidecar).collect();
-        if let Some(run) = &older_run {
-            sources.push(MergeSource::Run(run));
+                .is_some()
+            {
+                runs.push(RunIndex::open(&path).unwrap());
+            }
         }
+        let mut sources: Vec<MergeSource<'_>> = runs
+            .iter()
+            .map(MergeSource::Run)
+            .chain(loose.into_iter().map(MergeSource::Sidecar))
+            .collect();
+        // The output must not depend on input order.
+        sources.reverse();
         let options = MergeOptions {
             drop_removals: false,
             block_entries: 3,
         };
         let path = dir.join("merged.run");
-        if older_run.is_none() && split > 0 {
-            continue;
-        }
         let merged = merge_to_path(&sources, options, &path).unwrap().unwrap();
         let run = RunIndex::open(&path).unwrap();
         run.verify_all().unwrap();
