@@ -48,8 +48,6 @@ use crate::state_resolve::lean_event;
 /// The auth events selected from the state before one event:
 /// `(event type, state key, event id)`.
 pub(crate) type AuthEntries = Vec<(String, String, String)>;
-/// The auth events selected from the state before each event, by event id.
-pub(crate) type AuthStateBefore = HashMap<String, AuthEntries>;
 
 /// Bytes one batch may stage. Half the engine's per-transaction limit, so the
 /// estimate below can be rough.
@@ -287,8 +285,12 @@ fn verdict_of(metadata: &EventMetadata, forced: Option<u8>) -> Verdict {
 /// Determine the topological ordering (depth) and stream ordering for a timeline event.
 ///
 /// Returns `None` if the event is an outlier or lacks required ordering fields.
-pub(crate) fn timeline_orderings(export: &RoomExport, event: &RoomEvent) -> Option<(i64, i64)> {
-    if event.metadata.outlier {
+pub(crate) fn timeline_orderings(
+    export: &RoomExport,
+    event: &RoomEvent,
+    rejected: bool,
+) -> Option<(i64, i64)> {
+    if rejected || event.metadata.outlier {
         return None;
     }
     let stream_opt = if export.timeline {
@@ -1029,6 +1031,50 @@ fn auth_findings_seeded(export: &RoomExport, seeds: &[bool]) -> anyhow::Result<A
     Ok(findings)
 }
 
+/// Event ids the initial findings pass rejected: check 4, missing auth,
+/// signature failure, or a cascade from one of those.
+pub(crate) fn rejected_event_ids(export: &RoomExport, findings: &AuthFindings) -> HashSet<String> {
+    export
+        .events
+        .iter()
+        .zip(&findings.forced)
+        .filter_map(|(event, forced)| forced.map(|_| event.event_id.clone()))
+        .collect()
+}
+
+/// Apply the check-5 rejections the state walk derived: record the code, add
+/// a report row when the export disagreed, and refresh the counts.
+pub(crate) fn apply_check5_rejections(
+    export: &RoomExport,
+    findings: &mut AuthFindings,
+    rejections: &HashMap<String, (u8, String)>,
+) {
+    let positions: HashMap<&str, usize> = export
+        .events
+        .iter()
+        .enumerate()
+        .map(|(position, event)| (event.event_id.as_str(), position))
+        .collect();
+    let exported: Vec<bool> = export
+        .events
+        .iter()
+        .map(|event| exported_rejection(&event.metadata))
+        .collect();
+    for (event_id, (code, reason)) in rejections {
+        let Some(&position) = positions.get(event_id.as_str()) else {
+            continue;
+        };
+        findings.forced[position] = Some(*code);
+        if !exported[position] {
+            findings.fails_but_exported_accepted.push(AuthFailure {
+                event_id: event_id.clone(),
+                reason: reason.clone(),
+            });
+        }
+    }
+    refresh_rejection_counts(findings);
+}
+
 fn refresh_rejection_counts(findings: &mut AuthFindings) {
     findings.rejection_counts.clear();
     for code in findings.forced.iter().flatten() {
@@ -1199,10 +1245,24 @@ impl SignatureAudit {
 /// stored accepted; one with an auth event missing from the export is stored
 /// as a rejected outlier. Soft-fail is not derived here; the export's flag is
 /// kept as a historical source fact.
-enum EventAuthOutcome {
+pub(crate) enum EventAuthOutcome {
     Unchecked,
     Passed,
     Refused { code: u8, reason: String },
+}
+
+/// Judge an event against both its own `auth_events` (check 4) and the state
+/// before it (check 5). Check 4 runs first.
+pub(crate) fn judge_event_with_state(
+    event: &RoomEvent,
+    subject: Option<&LeanEvent<String>>,
+    index: &HashMap<&[u8], usize>,
+    lean: &[Option<LeanEvent<String>>],
+    create: Option<&LeanEvent<String>>,
+    version: StateResVersion,
+    base: &AuthEntries,
+) -> anyhow::Result<EventAuthOutcome> {
+    judge_event_auth(event, subject, index, lean, create, version, Some(base))
 }
 
 fn judge_event_auth(
@@ -1219,36 +1279,6 @@ fn judge_event_auth(
     };
     let is_create = event.pdu.get("type").and_then(OwnedValue::as_str) == Some(M_ROOM_CREATE)
         && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("");
-    if let Some(base) = base {
-        let mut entries: Vec<(&str, &str, &LeanEvent<String>)> = Vec::with_capacity(base.len());
-        for (event_type, state_key, event_id) in base {
-            let Some(&parent_position) = index.get(event_id.as_bytes()) else {
-                return Ok(EventAuthOutcome::Unchecked);
-            };
-            let Some(parent) = lean[parent_position].as_ref() else {
-                return Ok(EventAuthOutcome::Unchecked);
-            };
-            entries.push((event_type.as_str(), state_key.as_str(), parent));
-        }
-        if version.is_v2_1_plus()
-            && !is_create
-            && !entries
-                .iter()
-                .any(|(kind, key, _)| *kind == M_ROOM_CREATE && key.is_empty())
-        {
-            let Some(create) = create else {
-                return Ok(EventAuthOutcome::Unchecked);
-            };
-            entries.push((M_ROOM_CREATE, "", create));
-        }
-        return Ok(match check_auth(subject, &AuthState(entries), version, None) {
-            Ok(()) => EventAuthOutcome::Passed,
-            Err(error) => EventAuthOutcome::Refused {
-                code: RejectionCode::AuthCheckFailed.to_u8(),
-                reason: error.to_string(),
-            },
-        });
-    }
     let mut cited = Vec::new();
     for auth in id_list(event, "auth_events")? {
         match index.get(auth).and_then(|&parent| lean[parent].as_ref()) {
@@ -1291,6 +1321,43 @@ fn judge_event_auth(
             code: RejectionCode::DuplicateAuthEventKey.to_u8(),
             reason: "auth_events contains a duplicate (type, state_key) pair".to_owned(),
         });
+    }
+    // Check 4: authorization against the event's own auth_events. This runs
+    // first and is not skipped when the state before the event is available.
+    match check_auth(subject, &AuthState(entries), version, None) {
+        Ok(()) => {}
+        Err(error) => {
+            return Ok(EventAuthOutcome::Refused {
+                code: RejectionCode::AuthCheckFailed.to_u8(),
+                reason: error.to_string(),
+            });
+        }
+    }
+
+    // Check 5: authorization against the state before the event.
+    let Some(base) = base else {
+        return Ok(EventAuthOutcome::Passed);
+    };
+    let mut entries: Vec<(&str, &str, &LeanEvent<String>)> = Vec::with_capacity(base.len());
+    for (event_type, state_key, event_id) in base {
+        let Some(&parent_position) = index.get(event_id.as_bytes()) else {
+            return Ok(EventAuthOutcome::Unchecked);
+        };
+        let Some(parent) = lean[parent_position].as_ref() else {
+            return Ok(EventAuthOutcome::Unchecked);
+        };
+        entries.push((event_type.as_str(), state_key.as_str(), parent));
+    }
+    if version.is_v2_1_plus()
+        && !is_create
+        && !entries
+            .iter()
+            .any(|(kind, key, _)| *kind == M_ROOM_CREATE && key.is_empty())
+    {
+        let Some(create) = create else {
+            return Ok(EventAuthOutcome::Unchecked);
+        };
+        entries.push((M_ROOM_CREATE, "", create));
     }
     match check_auth(subject, &AuthState(entries), version, None) {
         Ok(()) => Ok(EventAuthOutcome::Passed),
@@ -1344,7 +1411,6 @@ fn judge_events(
     index: &HashMap<&[u8], usize>,
     create: Option<&LeanEvent<String>>,
     version: StateResVersion,
-    auth_before: Option<&AuthStateBefore>,
 ) -> anyhow::Result<AuthJudgement> {
     let mut checked = vec![false; events.len()];
     let mut refused: Vec<Option<u8>> = vec![None; events.len()];
@@ -1357,7 +1423,7 @@ fn judge_events(
             lean,
             create,
             version,
-            auth_before.and_then(|base| base.get(&event.event_id)),
+            None,
         )? {
             EventAuthOutcome::Unchecked => {}
             EventAuthOutcome::Passed => checked[position] = true,
@@ -1554,21 +1620,9 @@ pub(crate) fn derived_auth_findings(export: &RoomExport) -> anyhow::Result<AuthF
     derived_auth_findings_with_keys(export, None)
 }
 
-#[cfg(test)]
 pub(crate) fn derived_auth_findings_with_keys(
     export: &RoomExport,
     keys: Option<&SignatureKeyCatalog>,
-) -> anyhow::Result<AuthFindings> {
-    derived_auth_findings_with_state(export, keys, None)
-}
-
-/// Like [`derived_auth_findings_with_keys`], with the state before each event
-/// supplied for the check-5 auth pass. `None` falls back to the event's own
-/// cited `auth_events`.
-pub(crate) fn derived_auth_findings_with_state(
-    export: &RoomExport,
-    keys: Option<&SignatureKeyCatalog>,
-    auth_before: Option<&AuthStateBefore>,
 ) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let Some(room_version) = create_room_version(events) else {
@@ -1590,7 +1644,7 @@ pub(crate) fn derived_auth_findings_with_state(
         .iter()
         .map(|event| exported_rejection(&event.metadata))
         .collect();
-    let judgement = judge_events(events, &lean, &index, create, version, auth_before)?;
+    let judgement = judge_events(events, &lean, &index, create, version)?;
 
     // Only a derived refusal seeds the cascade. The exported verdicts are
     // compared below for the report and are never stored.
@@ -1680,18 +1734,34 @@ pub(crate) fn write_room_with_findings(
     export: &RoomExport,
     batch_bytes: usize,
 ) -> anyhow::Result<(ImportCounts, AuthFindings)> {
-    write_room_with_signature_keys(db, export, batch_bytes, None, None)
+    write_room_with_signature_keys(db, export, batch_bytes, None)
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
+#[cfg(test)]
 pub(crate) fn write_room_with_signature_keys(
     db: &Database,
     export: &RoomExport,
     batch_bytes: usize,
     keys: Option<&SignatureKeyCatalog>,
-    auth_before: Option<&AuthStateBefore>,
 ) -> anyhow::Result<(ImportCounts, AuthFindings)> {
-    let findings = derived_auth_findings_with_state(export, keys, auth_before)?;
+    let findings = derived_auth_findings_with_keys(export, keys)?;
+    let written = write_room_with_resolved_findings(db, export, batch_bytes, &findings)?;
+    Ok((written, findings))
+}
+
+/// Write a room using verdicts the caller has already finalized, including
+/// check-5 rejections from the state walk.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the batch writer keeps one event's records together"
+)]
+pub(crate) fn write_room_with_resolved_findings(
+    db: &Database,
+    export: &RoomExport,
+    batch_bytes: usize,
+    findings: &AuthFindings,
+) -> anyhow::Result<ImportCounts> {
     let plan = closure_plan(export)?;
     let room = export.room_id.as_bytes();
     let event_collection = room_event_collection_id(room);
@@ -1803,7 +1873,10 @@ pub(crate) fn write_room_with_signature_keys(
             )?;
         }
 
-        if let Some((topological_ordering, stream_ordering)) = timeline_orderings(export, event) {
+        let rejected = findings.forced.get(position).copied().flatten().is_some();
+        if let Some((topological_ordering, stream_ordering)) =
+            timeline_orderings(export, event, rejected)
+        {
             let event_ref = mtxdb::timeline::event_id_ref(event_id);
             batch_timeline_entries.push(mtxdb::timeline::TimelineEntry::new(
                 room_scope,
@@ -1826,15 +1899,12 @@ pub(crate) fn write_room_with_signature_keys(
     tx.commit().context("committing an import batch")?;
     reclaim_journal(db)?;
     let closures = write_auth_closures(db, export, plan, batch_bytes)?;
-    write_room_flags(db, export, &findings, batch_bytes)?;
+    write_room_flags(db, export, findings, batch_bytes)?;
 
-    Ok((
-        ImportCounts {
-            events: written,
-            closures,
-        },
-        findings,
-    ))
+    Ok(ImportCounts {
+        events: written,
+        closures,
+    })
 }
 
 /// Populate the room's flag bitmap index for all imported events.
@@ -1885,7 +1955,7 @@ fn write_room_flags(
                 batch_changes.push(FlagChange::set(short, Flag::Redacted));
             }
 
-            if timeline_orderings(export, event).is_some() {
+            if timeline_orderings(export, event, forced.is_some()).is_some() {
                 batch_changes.push(FlagChange::set(short, Flag::Timeline));
             }
         }

@@ -27,12 +27,12 @@ use mtxdb::{
 };
 use rezzy::auth::auth_types_for_event;
 use rezzy::json::{self, Object, Value as OwnedValue};
-use rezzy::StateResVersion;
+use rezzy::{LeanEvent, StateResVersion};
 
 use crate::export_import;
-use crate::interchange::{self, KeyRecord, RoomExport};
+use crate::interchange::{self, KeyRecord, RoomEvent, RoomExport};
 use crate::state_policy::{resolution_policy, ResolutionPolicy, StateView};
-use crate::state_resolve::{resolve_parents, LeanEventContext, StateEntries};
+use crate::state_resolve::{lean_event, resolve_parents, LeanEventContext, StateEntries};
 use crate::{Cli, Commands, PacksAction};
 
 const MAX_DEBUG_UNRESOLVED: usize = 20;
@@ -10251,7 +10251,7 @@ impl ImportContext<'_> {
         let events: Vec<OwnedValue> = export
             .events
             .iter()
-            .map(|event| event.annotated(&export.room_id))
+            .map(|event| event.unflagged(&export.room_id))
             .collect();
         if !events
             .iter()
@@ -10269,19 +10269,30 @@ impl ImportContext<'_> {
             .and_then(|event| nested_event_string_field(event, "content", "room_version"))
             .unwrap_or_default()
             .to_owned();
-        let (computation, auth_before) = Self::compute_import_auth_before(
+        let mut findings = export_import::derived_auth_findings_with_keys(export, signature_keys)?;
+        let mut rejected = export_import::rejected_event_ids(export, &findings);
+        let mut check5 = HashMap::new();
+        let (computation, unchecked) = Self::compute_import_auth_before(
             &events,
+            &export.events,
             &export.room_id,
             &room_version,
             StateResVersion::from_room_version(&room_version),
+            &mut rejected,
+            &mut check5,
         );
+        export_import::apply_check5_rejections(export, &mut findings, &check5);
+        if unchecked > 0 {
+            eprintln!(
+                "  warning: {unchecked} event(s) could not be checked against the state before them"
+            );
+        }
         export_import::clear_marker(self.db)?;
-        let (written, findings) = export_import::write_room_with_signature_keys(
+        let written = export_import::write_room_with_resolved_findings(
             self.db,
             export,
             export_import::BATCH_BYTES,
-            signature_keys,
-            Some(&auth_before),
+            &findings,
         )?;
         if self.write_state_hamts {
             repair_import_state_groups(
@@ -10321,68 +10332,107 @@ impl ImportContext<'_> {
         })
     }
 
-    /// Compute the room's state groups once before verdicts are written, and
-    /// capture the auth events selected from the state before each event for
-    /// check 5.
+    /// Walk the room's state groups once before verdicts are written. Each
+    /// event is judged in topological order: events the findings pass already
+    /// rejected are excluded, and every other event gets check 4 followed by
+    /// check 5 against the state before it. A rejection is fed back into the
+    /// walk, so a rejected state event contributes no state to later events.
     fn compute_import_auth_before(
         events: &[OwnedValue],
+        room_events: &[RoomEvent],
         room_id: &str,
         room_version: &str,
         state_version: Option<StateResVersion>,
-    ) -> (PartialStateComputation, export_import::AuthStateBefore) {
+        rejected: &mut HashSet<String>,
+        check5: &mut HashMap<String, (u8, String)>,
+    ) -> (PartialStateComputation, usize) {
         let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
-        let mut auth_before = export_import::AuthStateBefore::new();
-        let computation = if let Some(state_version) = state_version {
-            compute_state_groups_partial_with(
-                events,
-                &[],
-                StateView::Federated,
-                room_id,
-                policy,
-                |event_id, event, base| {
-                    let Some(event) = event else { return; };
-                    let event_type = event
-                        .get("type")
-                        .and_then(OwnedValue::as_str)
-                        .unwrap_or_default();
-                    let sender = event
-                        .get("sender")
-                        .and_then(OwnedValue::as_str)
-                        .unwrap_or_default();
-                    let state_key = event.get("state_key").and_then(OwnedValue::as_str);
-                    let content = event
-                        .get("content")
-                        .cloned()
-                        .unwrap_or_else(|| OwnedValue::Object(Object::default()));
-                    let entries = auth_types_for_event(
-                        event_type,
-                        sender,
-                        state_key,
-                        &content,
-                        state_version,
-                        room_version,
-                    )
-                    .into_iter()
-                    .filter_map(|(event_type, state_key)| {
-                        base.entries
-                            .get(&(event_type.clone(), state_key.clone()))
-                            .map(|event_id| (event_type, state_key, event_id.clone()))
-                    })
-                    .collect();
-                    auth_before.insert(event_id.to_owned(), entries);
-                },
-            )
-        } else {
-            compute_state_groups_partial_with(
-                events,
-                &[],
-                StateView::Federated,
-                room_id,
-                policy,
-                |_, _, _| {},
-            )
+        let Some(state_version) = state_version else {
+            return (
+                compute_state_groups_partial_with(
+                    events,
+                    &[],
+                    StateView::Federated,
+                    room_id,
+                    policy,
+                    None,
+                    |_, _, _| false,
+                ),
+                0,
+            );
         };
-        (computation, auth_before)
+
+        let index: HashMap<&[u8], usize> = room_events
+            .iter()
+            .enumerate()
+            .map(|(position, event)| (event.event_id.as_bytes(), position))
+            .collect();
+        let lean: Vec<Option<LeanEvent<String>>> = room_events
+            .iter()
+            .map(|event| lean_event(&event.unflagged(room_id), &event.event_id))
+            .collect();
+        let by_id: HashMap<&str, &RoomEvent> = room_events
+            .iter()
+            .map(|event| (event.event_id.as_str(), event))
+            .collect();
+        let create = room_events
+            .iter()
+            .position(|event| {
+                event.pdu.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
+                    && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
+            })
+            .and_then(|position| lean[position].as_ref());
+
+        let mut unchecked = 0_usize;
+        let computation = compute_state_groups_partial_with(
+            events,
+            &[],
+            StateView::Federated,
+            room_id,
+            policy,
+            Some(rejected),
+            |event_id, event, base| {
+                let Some(room_event) = by_id.get(event_id) else {
+                    unchecked = unchecked.saturating_add(1);
+                    return false;
+                };
+                let Some(position) = index.get(event_id.as_bytes()).copied() else {
+                    unchecked = unchecked.saturating_add(1);
+                    return false;
+                };
+                let is_create = event.get("type").and_then(OwnedValue::as_str)
+                    == Some("m.room.create")
+                    && event.get("state_key").and_then(OwnedValue::as_str) == Some("");
+                if base.entries.is_empty() && !is_create {
+                    // No usable base state (missing parents or an incomplete
+                    // merge): leave the event unchecked rather than inventing
+                    // a rejection.
+                    unchecked = unchecked.saturating_add(1);
+                    return false;
+                }
+                let entries = auth_entries_from_base(event, base, state_version, room_version);
+                match export_import::judge_event_with_state(
+                    room_event,
+                    lean[position].as_ref(),
+                    &index,
+                    &lean,
+                    create,
+                    state_version,
+                    &entries,
+                ) {
+                    Ok(export_import::EventAuthOutcome::Refused { code, reason }) => {
+                        check5.insert(event_id.to_owned(), (code, reason));
+                        true
+                    }
+                    Ok(export_import::EventAuthOutcome::Passed) => false,
+                    Ok(export_import::EventAuthOutcome::Unchecked) | Err(_) => {
+                        unchecked = unchecked.saturating_add(1);
+                        false
+                    }
+                }
+            },
+        );
+        (computation, unchecked)
     }
 
     /// Import one `server_keys` export into the server-info pool, in the
@@ -10900,7 +10950,8 @@ fn repair_import_state_groups(
                 StateView::Federated,
                 canonical_id,
                 policy,
-                |_, _, _| {},
+                None,
+                |_, _, _| false,
             ),
         };
         let unresolved = state_computation.unresolved;
@@ -11607,7 +11658,8 @@ fn compute_state_groups_partial_in_view(
         view,
         room_id,
         batch_resolution_policy(events),
-        |_, _, _| {},
+        None,
+        |_, _, _| false,
     )
 }
 
@@ -11622,13 +11674,51 @@ fn batch_resolution_policy(events: &[OwnedValue]) -> ResolutionPolicy {
     resolution_policy(room_version, StateGroupTrust::TrustedImport)
 }
 
+/// Select the auth events this event needs from its base state.
+fn auth_entries_from_base(
+    event: &OwnedValue,
+    base: &StateSet,
+    version: StateResVersion,
+    room_version: &str,
+) -> export_import::AuthEntries {
+    let event_type = event
+        .get("type")
+        .and_then(OwnedValue::as_str)
+        .unwrap_or_default();
+    let sender = event
+        .get("sender")
+        .and_then(OwnedValue::as_str)
+        .unwrap_or_default();
+    let state_key = event.get("state_key").and_then(OwnedValue::as_str);
+    let content = event
+        .get("content")
+        .cloned()
+        .unwrap_or_else(|| OwnedValue::Object(Object::default()));
+    auth_types_for_event(
+        event_type,
+        sender,
+        state_key,
+        &content,
+        version,
+        room_version,
+    )
+    .into_iter()
+    .filter_map(|(event_type, state_key)| {
+        base.entries
+            .get(&(event_type.clone(), state_key.clone()))
+            .map(|event_id| (event_type, state_key, event_id.clone()))
+    })
+    .collect()
+}
+
 fn compute_state_groups_partial_with(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
     view: StateView,
     room_id: &str,
     policy: ResolutionPolicy,
-    on_base: impl FnMut(&str, Option<&OwnedValue>, &StateSet),
+    rejected: Option<&mut HashSet<String>>,
+    judge: impl FnMut(&str, &OwnedValue, &StateSet) -> bool,
 ) -> PartialStateComputation {
     // Borrow the input when there is no auth chain to merge in; cloning every
     // parsed event just to concatenate two slices doubles peak memory on large
@@ -11678,7 +11768,8 @@ fn compute_state_groups_partial_with(
         &events_by_sid,
         view,
         policy,
-        on_base,
+        rejected,
+        judge,
     );
 
     PartialStateComputation {
@@ -11701,7 +11792,8 @@ fn walk_state_groups(
     events_by_sid: &HashMap<u64, &OwnedValue>,
     view: StateView,
     policy: ResolutionPolicy,
-    mut on_base: impl FnMut(&str, Option<&OwnedValue>, &StateSet),
+    mut rejected: Option<&mut HashSet<String>>,
+    mut judge: impl FnMut(&str, &OwnedValue, &StateSet) -> bool,
 ) -> StateGroupWalk {
     let mut remaining_children = count_resident_children(frontier, sorted);
 
@@ -11763,18 +11855,28 @@ fn walk_state_groups(
             ),
         };
 
+        let event_id = reverse_map.get(&short_id);
         let event_value = events_by_sid.get(&short_id).copied();
-        if let Some(event_id) = reverse_map.get(&short_id) {
-            on_base(event_id, event_value, &base.set);
+        if let (Some(event_id), Some(event_value)) = (event_id, event_value) {
+            let already_rejected = rejected
+                .as_deref()
+                .is_some_and(|set| set.contains(event_id));
+            if !already_rejected && judge(event_id, event_value, &base.set) {
+                if let Some(set) = rejected.as_deref_mut() {
+                    set.insert(event_id.clone());
+                }
+            }
         }
 
         let state = derive_state(
             event_value,
+            event_id.map(String::as_str),
             &base,
             view,
             &parent_instances,
             room_id,
             policy,
+            rejected.as_deref(),
         );
 
         instances
@@ -11843,14 +11945,20 @@ fn count_resident_children(
 )]
 fn derive_state(
     event: Option<&OwnedValue>,
+    event_id_ref: Option<&str>,
     base: &Arc<SharedState>,
     view: StateView,
     parent_instances: &[[u8; STATE_GROUP_ID_LENGTH]],
     room_id: &str,
     policy: ResolutionPolicy,
+    rejected: Option<&HashSet<String>>,
 ) -> Arc<SharedState> {
+    let excluded = event.is_some_and(|ev| match rejected {
+        Some(set) => view.excludes_import(ev, event_id_ref.unwrap_or(""), set),
+        None => view.excludes(ev),
+    });
     match event {
-        Some(ev) if is_state_event(ev) && !view.excludes(ev) => {
+        Some(ev) if is_state_event(ev) && !excluded => {
             let mut set = base.set.clone();
             set.set(
                 event_string_field(ev, "type").unwrap_or(""),

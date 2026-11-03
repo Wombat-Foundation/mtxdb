@@ -13,6 +13,8 @@
 //!   by another, and an unverified import can never masquerade as a verified
 //!   one.
 
+use std::collections::HashSet;
+
 use mtxdb::state_group::{StateGroupDerivation, StateGroupResolver, StateGroupTrust};
 use rezzy::json::Value as OwnedValue;
 use rezzy::StateResVersion;
@@ -100,6 +102,22 @@ impl StateView {
             EventDisposition::SoftFailed => self == Self::Client,
             EventDisposition::Accepted => false,
         }
+    }
+
+    /// Whether this view drops an event, using the import's own rejection
+    /// verdicts instead of the exporter's annotation. Soft-failed events stay
+    /// in the federated view.
+    #[must_use]
+    pub(crate) fn excludes_import(
+        self,
+        event: &OwnedValue,
+        event_id: &str,
+        rejected: &HashSet<String>,
+    ) -> bool {
+        if rejected.contains(event_id) {
+            return true;
+        }
+        self == Self::Client && event_disposition(event) == EventDisposition::SoftFailed
     }
 }
 

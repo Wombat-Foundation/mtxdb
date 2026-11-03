@@ -137,6 +137,7 @@ impl RoomEvent {
     ///
     /// Only the returned value is analyzed. [`Self::pdu_bytes`] is what gets
     /// stored, so these merged flags never reach the store.
+    #[cfg(test)]
     pub(crate) fn annotated(&self, room_id: &str) -> OwnedValue {
         self.annotated_from(&self.pdu, room_id)
     }

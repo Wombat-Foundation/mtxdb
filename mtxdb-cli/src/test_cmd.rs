@@ -5650,15 +5650,16 @@ fn a_room_import_populates_timeline_index() {
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    let export = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    let content = room_export_with_auth();
+    let export = parse_room(content.as_bytes()).unwrap();
 
     let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
-    assert_eq!(written.events, 5);
+    assert_eq!(written.events, 6);
 
     let room_scope = room_scope_id(FIXTURE_ROOM.as_bytes());
     let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), FIXTURE_ROOM);
     let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
-    assert_eq!(page.entries.len(), 5);
+    assert_eq!(page.entries.len(), 6);
 
     for pair in page.entries.windows(2) {
         assert!(pair[0] < pair[1]);
@@ -5672,42 +5673,42 @@ fn a_room_import_populates_flag_index() {
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    let export = parse_room(ROOM_EXPORT_FIXTURE.as_bytes()).unwrap();
+    let content = room_export_with_auth();
+    let export = parse_room(content.as_bytes()).unwrap();
 
     let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
-    assert_eq!(written.events, 5);
+    assert_eq!(written.events, 6);
 
     let flag_index = RoomFlagIndex::new(FIXTURE_ROOM.as_bytes());
     assert_eq!(
         flag_index
             .count(&db, &FlagQuery::has(Flag::Present))
             .unwrap(),
-        5
+        6
     );
     assert_eq!(
         flag_index
             .count(&db, &FlagQuery::has(Flag::Timeline))
             .unwrap(),
-        5
+        6
     );
     assert_eq!(
         flag_index
             .count(&db, &FlagQuery::has(Flag::Outlier))
             .unwrap(),
-        4
+        0
     );
     assert_eq!(
         flag_index
             .count(&db, &FlagQuery::has(Flag::Rejected))
             .unwrap(),
-        4
+        0
     );
     assert_eq!(
         flag_index
             .count(&db, &FlagQuery::has(Flag::SoftFailed))
             .unwrap(),
-        0,
-        "every non-create event here is a derived rejection, which suppresses soft-fail"
+        1
     );
     assert_eq!(
         flag_index
@@ -5719,7 +5720,7 @@ fn a_room_import_populates_flag_index() {
     let selected = flag_index
         .select(&db, &FlagQuery::has(Flag::Present))
         .unwrap();
-    assert_eq!(selected.len(), 5);
+    assert_eq!(selected.len(), 6);
 }
 
 #[test]
@@ -5818,6 +5819,8 @@ fn forced_rejection_import_sets_flags_and_not_excludes_it() {
 #[test]
 fn stale_auth_events_are_rejected_against_state_before() {
     use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
 
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
@@ -5833,7 +5836,7 @@ fn stale_auth_events_are_rejected_against_state_before() {
             "\n",
             r#"{{"event_id":"$leave:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":3,"event_id":"$leave:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$stale:test","depth":4,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test"],"outlier":true,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$stale:test","origin_server_ts":4000,"prev_events":["$leave:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$stale:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$stale:test","origin_server_ts":4000,"prev_events":["$leave:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
             "\n",
             r#"{{"events":4,"t":"end"}}"#,
             "\n"
@@ -5855,7 +5858,183 @@ fn stale_auth_events_are_rejected_against_state_before() {
         1,
         "the event is rejected against the state before it, not its cited auth events"
     );
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 3);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        3
+    );
+
+    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
+        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+        .unwrap();
+    let streams: Vec<i64> = page
+        .entries
+        .iter()
+        .map(|entry| entry.stream_ordering)
+        .collect();
+    assert_eq!(
+        streams,
+        vec![1, 2, 3],
+        "the rejected timeline event has no timeline slot"
+    );
+}
+
+#[test]
+fn rejected_state_event_does_not_change_later_state() {
+    use mtxdb::room_flag::*;
+    use mtxdb::timeline::*;
+    use mtxdb::ShardType;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!staterollback:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$leave:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"leave"}},"depth":3,"event_id":"$leave:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$rules:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"join_rule":"public"}},"depth":4,"event_id":"$rules:test","origin_server_ts":4000,"prev_events":["$leave:test"],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.join_rules"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$bob:test","depth":5,"stream_ordering":5,"auth_events":["$create:test","$rules:test"],"prev_events":["$rules:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$rules:test"],"content":{{"membership":"join"}},"depth":5,"event_id":"$bob:test","origin_server_ts":5000,"prev_events":["$rules:test"],"room_id":"{room}","sender":"@bob:test","state_key":"@bob:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":5,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 5)
+    );
+    assert_eq!(run.rejection_counts.values().sum::<usize>(), 2);
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 5);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        2
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        3
+    );
+
+    let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
+        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+        .unwrap();
+    let streams: Vec<i64> = page
+        .entries
+        .iter()
+        .map(|entry| entry.stream_ordering)
+        .collect();
+    assert_eq!(streams, vec![1, 2, 3]);
+}
+
+#[test]
+fn duplicate_cited_auth_events_are_still_rejected() {
+    use mtxdb::export_schema::RejectionCode;
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!dupauth:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join2:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"membership":"join"}},"depth":3,"event_id":"$join2:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$dup:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test","$join2:test"],"prev_events":["$join2:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test","$join2:test"],"content":{{}},"depth":4,"event_id":"$dup:test","origin_server_ts":4000,"prev_events":["$join2:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 4)
+    );
+    assert_eq!(
+        run.rejection_counts
+            .get(&RejectionCode::DuplicateAuthEventKey.to_u8())
+            .copied(),
+        Some(1),
+        "check 4 still rejects duplicate cited auth events"
+    );
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        1
+    );
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        3
+    );
+}
+
+#[test]
+fn exported_rejected_flag_is_not_trusted_for_state() {
+    use mtxdb::room_flag::*;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+
+    let room_id = "!exporterflag:test.conduwuit.local";
+    let jsonl = format!(
+        concat!(
+            r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
+            "\n",
+            r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","origin_server_ts":2000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$rules:test","depth":3,"stream_ordering":3,"rejected":true,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{"join_rule":"public"}},"depth":3,"event_id":"$rules:test","origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.join_rules"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"event_id":"$bob:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$rules:test"],"prev_events":["$rules:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$rules:test"],"content":{{"membership":"join"}},"depth":4,"event_id":"$bob:test","origin_server_ts":4000,"prev_events":["$rules:test"],"room_id":"{room}","sender":"@bob:test","state_key":"@bob:test","type":"m.room.member"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
+            "\n"
+        ),
+        room = room_id
+    );
+
+    let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
+    assert_eq!(
+        (run.failures, run.all_exports, run.exported_events),
+        (0, true, 4)
+    );
+    assert_eq!(
+        run.rejection_counts.values().sum::<usize>(),
+        0,
+        "the export's rejected flag does not reject a valid event"
+    );
+
+    let flags = RoomFlagIndex::new(room_id.as_bytes());
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
+        0
+    );
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(
+        flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
+        4
+    );
 }
 
 #[test]
@@ -5900,7 +6079,7 @@ fn flag_index_timeline_count_matches_timeline_index() {
     let flags = RoomFlagIndex::new(room_id.as_bytes());
     let timeline_count = flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap();
     assert_eq!(timeline_count, page.entries.len() as u64);
-    assert_eq!(timeline_count, 3);
+    assert_eq!(timeline_count, 1);
 }
 
 #[test]
@@ -5924,11 +6103,13 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
             "\n",
             r#"{{"event_id":"$create:test","auth_events":[],"prev_events":[],"outlier":false,"soft_failed":false,"rejected":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$live:test","auth_events":[],"prev_events":[],"outlier":false,"soft_failed":false,"rejected":false,"pdu":{{"auth_events":[],"content":{{}},"depth":2,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$join:test","auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"soft_failed":false,"rejected":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1500,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$soft:test","auth_events":[],"prev_events":[],"outlier":true,"soft_failed":true,"soft_fail_code":1,"rejected":false,"pdu":{{"auth_events":[],"content":{{}},"depth":3,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$live:test","auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"soft_failed":false,"rejected":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":3,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
             "\n",
-            r#"{{"events":3,"t":"end"}}"#,
+            r#"{{"event_id":"$soft:test","auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":true,"soft_failed":true,"soft_fail_code":1,"rejected":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":4,"t":"end"}}"#,
             "\n"
         ),
         room = room_id
@@ -5939,25 +6120,25 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
         !export.timeline,
         "legacy exports carry no timeline contract"
     );
-    assert_eq!(export.events[2].stream_ordering, None);
-    assert_eq!(export.events[2].arrival_ordering, None);
+    assert_eq!(export.events[3].stream_ordering, None);
+    assert_eq!(export.events[3].arrival_ordering, None);
     let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
-    assert_eq!(written.events, 3);
+    assert_eq!(written.events, 4);
 
     let room_scope = room_scope_id(room_id.as_bytes());
     let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
-    // Only the two non-outliers make it in; the soft-failed outlier stays out
-    // even though its PDU carries a depth and timestamp.
+    // The two non-outliers make it in; the soft-failed outlier stays out even
+    // though its PDU carries a depth and timestamp.
     let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
-    assert_eq!(streams, vec![1000, 2000]);
+    assert_eq!(streams, vec![1000, 1500, 2000]);
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 3);
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
     assert_eq!(
         flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
-        2
+        3
     );
     let non_timeline = flags
         .select_shorts(
@@ -5995,22 +6176,24 @@ fn stream_and_arrival_order_survive_import() {
             "\n",
             r#"{{"event_id":"$create:test","depth":1,"stream_ordering":1,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":1,"event_id":"$create:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":900000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$live:test","depth":2,"stream_ordering":2,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":2,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":800000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$join:test","depth":2,"stream_ordering":2,"auth_events":["$create:test"],"prev_events":["$create:test"],"outlier":false,"pdu":{{"auth_events":["$create:test"],"content":{{"membership":"join"}},"depth":2,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":850000,"prev_events":["$create:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$backfilled:test","depth":5,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":5,"event_id":"$backfilled:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":700000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$live:test","depth":3,"stream_ordering":3,"auth_events":["$create:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":3,"event_id":"$live:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":800000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$soft:test","depth":9,"arrival_ordering":7,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":9,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":600000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$backfilled:test","depth":5,"stream_ordering":-5,"auth_events":["$create:test","$join:test"],"prev_events":["$live:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":5,"event_id":"$backfilled:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":700000,"prev_events":["$live:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
             "\n",
-            r#"{{"events":4,"t":"end"}}"#,
+            r#"{{"event_id":"$soft:test","depth":9,"arrival_ordering":7,"auth_events":["$create:test","$join:test"],"prev_events":["$backfilled:test"],"outlier":true,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":9,"event_id":"$soft:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":600000,"prev_events":["$backfilled:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":5,"t":"end"}}"#,
             "\n"
         ),
         room = room_id
     );
 
     let export = parse_room(jsonl.as_bytes()).unwrap();
-    assert_eq!(export.events[3].arrival_ordering, Some(7));
+    assert_eq!(export.events[4].arrival_ordering, Some(7));
     let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
-    assert_eq!(written.events, 4);
+    assert_eq!(written.events, 5);
 
     let room_scope = room_scope_id(room_id.as_bytes());
     let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
@@ -6019,19 +6202,19 @@ fn stream_and_arrival_order_survive_import() {
     // Live and backfilled positions are preserved exactly; the soft-failed
     // event has no timeline position and stays out.
     let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
-    assert_eq!(streams, vec![1, 2, -5]);
+    assert_eq!(streams, vec![1, 2, 3, -5]);
     let depths: Vec<i64> = page
         .entries
         .iter()
         .map(|e| e.topological_ordering)
         .collect();
-    assert_eq!(depths, vec![1, 2, 5]);
+    assert_eq!(depths, vec![1, 2, 3, 5]);
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 4);
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 5);
     assert_eq!(
         flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
-        3
+        4
     );
 
     // Events with Present AND NOT Timeline (kept out of timeline)
@@ -6259,15 +6442,17 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
             "\n",
             r#"{{"event_id":"$backfill:test","depth":10,"stream_ordering":-5,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{"room_version":"11"}},"depth":10,"event_id":"$backfill:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","state_key":"","type":"m.room.create"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$normal:test","depth":10,"stream_ordering":100,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":10,"event_id":"$normal:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$join:test","depth":10,"stream_ordering":0,"auth_events":["$backfill:test"],"prev_events":["$backfill:test"],"outlier":false,"pdu":{{"auth_events":["$backfill:test"],"content":{{"membership":"join"}},"depth":10,"event_id":"$join:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":1500,"prev_events":["$backfill:test"],"room_id":"{room}","sender":"@alice:test","state_key":"@alice:test","type":"m.room.member"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$later:test","depth":11,"stream_ordering":101,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":11,"event_id":"$later:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$normal:test","depth":10,"stream_ordering":100,"auth_events":["$backfill:test","$join:test"],"prev_events":["$join:test"],"outlier":false,"pdu":{{"auth_events":["$backfill:test","$join:test"],"content":{{}},"depth":10,"event_id":"$normal:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":2000,"prev_events":["$join:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$notimeline:test","depth":12,"auth_events":[],"prev_events":[],"outlier":false,"pdu":{{"auth_events":[],"content":{{}},"depth":12,"event_id":"$notimeline:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$later:test","depth":11,"stream_ordering":101,"auth_events":["$backfill:test","$join:test"],"prev_events":["$normal:test"],"outlier":false,"pdu":{{"auth_events":["$backfill:test","$join:test"],"content":{{}},"depth":11,"event_id":"$later:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":3000,"prev_events":["$normal:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
             "\n",
-            r#"{{"event_id":"$outlier:test","depth":13,"stream_ordering":200,"auth_events":[],"prev_events":[],"outlier":true,"pdu":{{"auth_events":[],"content":{{}},"depth":13,"event_id":"$outlier:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":5000,"prev_events":[],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            r#"{{"event_id":"$notimeline:test","depth":12,"auth_events":["$backfill:test","$join:test"],"prev_events":["$later:test"],"outlier":false,"pdu":{{"auth_events":["$backfill:test","$join:test"],"content":{{}},"depth":12,"event_id":"$notimeline:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":4000,"prev_events":["$later:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
             "\n",
-            r#"{{"events":5,"t":"end"}}"#,
+            r#"{{"event_id":"$outlier:test","depth":13,"stream_ordering":200,"auth_events":["$backfill:test","$join:test"],"prev_events":["$notimeline:test"],"outlier":true,"pdu":{{"auth_events":["$backfill:test","$join:test"],"content":{{}},"depth":13,"event_id":"$outlier:test","hashes":{{"sha256":"dummy"}},"origin_server_ts":5000,"prev_events":["$notimeline:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":6,"t":"end"}}"#,
             "\n"
         ),
         room = room_id
@@ -6275,37 +6460,41 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
 
     let export = parse_room(jsonl.as_bytes()).unwrap();
     assert!(export.timeline);
-    assert_eq!(export.events.len(), 5);
+    assert_eq!(export.events.len(), 6);
 
     let (written, _) = export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
-    assert_eq!(written.events, 5);
+    assert_eq!(written.events, 6);
 
     let room_scope = room_scope_id(room_id.as_bytes());
     let timeline_index = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id);
     let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
 
-    // Only the 3 timeline events should be present ($notimeline and $outlier excluded)
-    assert_eq!(page.entries.len(), 3);
+    // Only the 4 timeline events should be present ($notimeline and $outlier excluded)
+    assert_eq!(page.entries.len(), 4);
 
     // Verify ordering:
     // 1. $backfill (depth: 10, stream: -5)
     assert_eq!(page.entries[0].topological_ordering, 10);
     assert_eq!(page.entries[0].stream_ordering, -5);
 
-    // 2. $normal (depth: 10, stream: 100)
+    // 2. $join (depth: 10, stream: 0)
     assert_eq!(page.entries[1].topological_ordering, 10);
-    assert_eq!(page.entries[1].stream_ordering, 100);
+    assert_eq!(page.entries[1].stream_ordering, 0);
 
-    // 3. $later (depth: 11, stream: 101)
-    assert_eq!(page.entries[2].topological_ordering, 11);
-    assert_eq!(page.entries[2].stream_ordering, 101);
+    // 3. $normal (depth: 10, stream: 100)
+    assert_eq!(page.entries[2].topological_ordering, 10);
+    assert_eq!(page.entries[2].stream_ordering, 100);
+
+    // 4. $later (depth: 11, stream: 101)
+    assert_eq!(page.entries[3].topological_ordering, 11);
+    assert_eq!(page.entries[3].stream_ordering, 101);
 
     // Verify re-import idempotence: re-importing the same export does not duplicate entries
     let (written_again, _) =
         export_import::write_room_with_findings(&db, &export, 64 * 1024).unwrap();
-    assert_eq!(written_again.events, 5);
+    assert_eq!(written_again.events, 6);
     let page_after = timeline_index.page(&room_scope, None, true, 10).unwrap();
-    assert_eq!(page_after.entries.len(), 3);
+    assert_eq!(page_after.entries.len(), 4);
     assert_eq!(page.entries, page_after.entries);
 }
 
