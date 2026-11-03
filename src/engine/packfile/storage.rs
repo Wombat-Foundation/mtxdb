@@ -1248,7 +1248,7 @@ impl StreamingOpenScan {
                 shards.set_collection_home(&collection_id, home);
             }
             let counts = if self.residency == crate::index::IndexResidency::Paged {
-                let sealed_slots = sealed.slot_ids();
+                let sealed_slots = sealed.slot_ids_in_collection(&collection_id);
                 let mut counts = index.slot_counts_excluding_set(&sealed_slots);
                 for (slot, count) in sealed.slot_counts_in_collection(&collection_id) {
                     let entry = counts.entry(slot).or_insert(0u64);
@@ -4679,7 +4679,7 @@ impl PackfileStorage {
     ) -> Option<(usize, usize, usize, u32)> {
         self.collections_read().get(collection_id).map(|gen| {
             let g = gen.load();
-            let sealed_slots = g.sealed.slot_ids();
+            let sealed_slots = g.sealed.slot_ids_in_collection(collection_id);
             let resident_entries: u64 = g
                 .index
                 .slot_counts_excluding_set(&sealed_slots)
@@ -4705,7 +4705,7 @@ impl PackfileStorage {
     pub fn collection_index_info(&self, collection_id: &[u8; 16]) -> Option<(usize, usize, u32)> {
         self.collections_read().get(collection_id).map(|gen| {
             let g = gen.load();
-            let sealed_slots = g.sealed.slot_ids();
+            let sealed_slots = g.sealed.slot_ids_in_collection(collection_id);
             let resident_entries: u64 = g
                 .index
                 .slot_counts_excluding_set(&sealed_slots)
@@ -4779,7 +4779,7 @@ impl PackfileStorage {
             .filter_map(|id| {
                 tables.collections.get(id).map(|gen| {
                     let g = gen.load();
-                    let sealed_slots = g.sealed.slot_ids();
+                    let sealed_slots = g.sealed.slot_ids_in_collection(id);
                     let resident_entries: u64 = g
                         .index
                         .slot_counts_excluding_set(&sealed_slots)
@@ -7665,7 +7665,7 @@ impl PackfileStorage {
             // resident table. Rebuild only the unsealed tail and re-derive
             // the sealed locator set from the packs that are sealed now.
             let (new_index, sealed) = self.rebuild_tail(collection_id)?;
-            let sealed_slots = sealed.slot_ids();
+            let sealed_slots = sealed.slot_ids_in_collection(collection_id);
             let mut counts = new_index.slot_counts_excluding_set(&sealed_slots);
             for (slot, count) in sealed.slot_counts_in_collection(collection_id) {
                 let entry = counts.entry(slot).or_insert(0u64);
@@ -8248,7 +8248,7 @@ impl PackfileStorage {
         // index points at; without pinning, a node resolved after the swap
         // would miss even though it is still live. See `pin_shards`.
         let mut referenced = gen.index.referenced_slot_ids();
-        for slot in gen.sealed.slot_ids() {
+        for slot in gen.sealed.slot_ids_in_collection(collection_id) {
             if let Some(entry) = referenced.get_mut(usize::from(slot)) {
                 *entry = true;
             }
@@ -9687,6 +9687,12 @@ impl PackfileStorage {
 
     /// Every collection writer lock is held by the caller.
     fn retire_empty_shards_locked(&self) {
+        // Runs pin only the packs where a collection has entries, so a pack
+        // that no collection reads any more can retire even while it sits in
+        // a run. Such a run is replaced first, in every generation holding
+        // it, by its surviving packs' sidecars.
+        self.invalidate_runs_over_retiring_packs();
+
         // Do not retain the map guard while acquiring collection locks: another
         // operation may need the map lock while it holds a collection lock.
         let collections = self.collections_read();
@@ -9701,7 +9707,9 @@ impl PackfileStorage {
             }
             // In paged mode the resident table omits sealed packs, but their
             // sidecars still hold live records. A sealed shard must not be
-            // retired just because only the sidecar references it.
+            // retired just because only the sidecar references it. A run
+            // still held here (its invalidation failed) pins every pack it
+            // covers, since its fallback would read them.
             for slot in gen.sealed.slot_ids() {
                 if let Some(entry) = referenced.get_mut(usize::from(slot)) {
                     *entry = true;
@@ -9726,6 +9734,121 @@ impl PackfileStorage {
         tables
             .collection_disk_bytes
             .retain(|pack_id, _| live_pack_ids.contains(pack_id));
+    }
+
+    /// Replace every run that covers a pack about to retire. Every collection
+    /// writer lock is held by the caller.
+    ///
+    /// A pack is about to retire when no collection reads it: no resident
+    /// entry, no unmerged sidecar, and no run stats row for a collection that
+    /// holds the run. A run covering such a pack would keep it pinned forever
+    /// (its fallback reads every covered pack), so it is dropped as a whole
+    /// and each holding generation gets the surviving covered packs back as
+    /// sidecars. If any survivor's sidecar cannot be loaded, the run stays and
+    /// keeps all its packs: locators are never dropped silently.
+    fn invalidate_runs_over_retiring_packs(&self) {
+        let mut referenced = [false; shard::MAX_SHARDS];
+        let mut holders: Vec<([u8; 16], Arc<RoomGeneration>)> = Vec::new();
+        let mut runs: Vec<Arc<crate::index::sealed::SealedRun>> = Vec::new();
+        {
+            let collections = self.collections_read();
+            for (collection_id, gen_swap) in collections.iter() {
+                let gen = gen_swap.load_full();
+                for (i, &has_refs) in gen.index.referenced_slot_ids().iter().enumerate() {
+                    referenced[i] |= has_refs;
+                }
+                for slot in gen.sealed.slot_ids_in_collection(collection_id) {
+                    if let Some(entry) = referenced.get_mut(usize::from(slot)) {
+                        *entry = true;
+                    }
+                }
+                if gen.sealed.runs().is_empty() {
+                    continue;
+                }
+                for run in gen.sealed.runs() {
+                    if !runs.iter().any(|known| Arc::ptr_eq(known, run)) {
+                        runs.push(Arc::clone(run));
+                    }
+                }
+                holders.push((*collection_id, gen));
+            }
+        }
+        let retiring = |slot: u16| !referenced.get(usize::from(slot)).copied().unwrap_or(true);
+        for run in runs {
+            if !run.packs().iter().any(|pack| retiring(pack.slot)) {
+                continue;
+            }
+            let mut survivors = Vec::new();
+            for (pack, identity) in run.packs().iter().zip(run.run().packs()) {
+                if retiring(pack.slot) {
+                    continue;
+                }
+                let Some(shard) = self
+                    .shards
+                    .get_shard(pack.slot)
+                    .filter(|shard| shard.pack_id == pack.pack_id)
+                else {
+                    survivors.clear();
+                    break;
+                };
+                survivors.push((shard.path.clone(), *pack, *identity));
+            }
+            let expected = run
+                .packs()
+                .iter()
+                .filter(|pack| !retiring(pack.slot))
+                .count();
+            let restored = if survivors.len() == expected {
+                load_run_fallback(&survivors)
+            } else {
+                Err("a surviving covered pack has no current shard".into())
+            };
+            let restored = match restored {
+                Ok(restored) => restored,
+                Err(error) => {
+                    eprintln!(
+                        "mtxdb: keeping a run over a retiring pack; its sidecars could not be restored: {error}"
+                    );
+                    continue;
+                }
+            };
+            let mut swapped_all = true;
+            for (collection_id, gen) in &mut holders {
+                if !gen.sealed.contains_run(&run) {
+                    continue;
+                }
+                let mut sealed = (*gen.sealed).clone();
+                sealed.remove_run(&run);
+                for pack in &restored {
+                    if pack.index.collection_entry_count(collection_id).is_some() {
+                        sealed.insert(pack.clone());
+                    }
+                }
+                if let Err(error) = self.store_generation_with_sealed(
+                    collection_id,
+                    gen.index.clone(),
+                    Arc::new(sealed),
+                    Some(Arc::clone(&gen.cache)),
+                    false,
+                ) {
+                    eprintln!(
+                        "mtxdb: could not swap out a run for {}: {error}",
+                        hex16(collection_id)
+                    );
+                    swapped_all = false;
+                    continue;
+                }
+                if let Some(updated) = self.generation(collection_id) {
+                    *gen = Arc::clone(&updated);
+                }
+            }
+            // A generation that still holds the run pins every covered pack
+            // in the retirement pass, so a failed swap only delays retirement.
+            // Keep the run in the pool until no generation holds it.
+            if swapped_all {
+                self.shards.drop_sealed_run(&run);
+            }
+        }
     }
 }
 

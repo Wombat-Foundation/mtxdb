@@ -882,3 +882,32 @@ fn pack_stats_in_collection_matches_a_filtered_scan() {
         assert_eq!(found, expected, "collection {value}");
     }
 }
+
+#[test]
+fn verify_collection_checks_only_that_collections_blocks() {
+    let dir = TestDir::new();
+    let path = dir.join("verify.run");
+    let mut entries: Vec<RunEntry> = (0..12).map(|id| entry(1, id, 0, 10)).collect();
+    entries.extend((0..12).map(|id| entry(2, id, 0, 20)));
+    write_run(&path, 1, &sorted(entries)).unwrap();
+
+    let run = RunIndex::open(&path).unwrap();
+    run.verify_collection(&collection(1)).unwrap();
+    run.verify_collection(&collection(9)).unwrap();
+    assert!(!run.is_invalid());
+
+    // Damage collection 2's first block; collection 1 uses blocks 0 to 2.
+    let mut bytes = fs::read(&path).unwrap();
+    let meta = block_entry_at(&bytes, 3);
+    let data = usize::try_from(read_u64(&bytes, meta.checked_add(32).unwrap()).unwrap()).unwrap();
+    bytes[data] ^= 0xFF;
+    let damaged = dir.join("damaged.run");
+    fs::write(&damaged, &bytes).unwrap();
+
+    let run = RunIndex::open(&damaged).unwrap();
+    run.verify_collection(&collection(1))
+        .expect("collection 1's blocks are intact");
+    assert_eq!(run.verify_collection(&collection(2)), Err(RunCorrupt));
+    assert!(run.is_invalid(), "a failed block invalidates the run");
+    assert_eq!(run.verify_collection(&collection(1)), Err(RunCorrupt));
+}

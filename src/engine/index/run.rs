@@ -777,6 +777,29 @@ impl RunIndex {
         })
     }
 
+    /// Check every block of one collection, so a scan can then stream its
+    /// entries without buffering them against a later block failure.
+    ///
+    /// # Errors
+    /// Returns [`RunCorrupt`] if the run is invalid or one of the
+    /// collection's blocks fails its check.
+    pub fn verify_collection(&self, collection_id: &[u8; 16]) -> Result<(), RunCorrupt> {
+        if self.is_invalid() {
+            return Err(RunCorrupt);
+        }
+        let Some(collection) = self.collection(collection_id) else {
+            return Ok(());
+        };
+        let end = collection
+            .first_block
+            .checked_add(collection.block_count)
+            .ok_or(RunCorrupt)?;
+        for block_index in collection.first_block..end {
+            self.block(block_index)?;
+        }
+        Ok(())
+    }
+
     /// Check every block, as a scrub does.
     ///
     /// # Errors

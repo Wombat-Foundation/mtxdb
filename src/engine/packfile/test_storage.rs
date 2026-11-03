@@ -13363,3 +13363,70 @@ fn resident_open_reads_run_covered_packs_correctly() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn paged_repack_invalidates_a_run_over_retired_packs() {
+    let dir = test_dir("paged_run_repack");
+    // TEST_COLLECTION alone fills the oldest packs, OTHER_COLLECTION the
+    // newer ones, so repacking TEST_COLLECTION leaves its old packs unread.
+    let mut expected: Vec<ExpectedRecord> = Vec::new();
+    {
+        let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+        for (collection, tag) in [(TEST_COLLECTION, 0xA1), (OTHER_COLLECTION, 0xB2)] {
+            for index in 0..150u8 {
+                let mut id = distinct_id(index);
+                id[15] = tag;
+                let value = vec![index ^ tag; 32];
+                store
+                    .put(&collection, &id, &NodeData::from_slice(&value))
+                    .unwrap();
+                expected.push((collection, id, Some(value)));
+            }
+        }
+        store.sync_all().unwrap();
+    }
+    drop(paged_open(&dir));
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 4, "fixture must seal several packs, got {sealed}");
+    let run_path = write_pool_run(&dir, &(0..sealed).collect::<Vec<_>>());
+
+    let store = paged_open(&dir);
+    assert_eq!(
+        store
+            .generation(&OTHER_COLLECTION)
+            .unwrap()
+            .sealed
+            .runs()
+            .len(),
+        1
+    );
+    let retired_before = store.shards.retired_count();
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    assert!(
+        store.shards.retired_count() > retired_before,
+        "packs only TEST_COLLECTION read must retire despite the run"
+    );
+    let other = store.generation(&OTHER_COLLECTION).unwrap();
+    assert!(
+        other.sealed.runs().is_empty(),
+        "a run over a retired pack must leave every generation"
+    );
+    assert!(
+        !other.sealed.packs().is_empty(),
+        "the surviving covered packs answer through their sidecars"
+    );
+    drop(other);
+    assert!(store.shards.sealed_runs().is_empty());
+    assert_store_matches(&store, &expected, "after repack");
+    store.sync_all().unwrap();
+    drop(store);
+
+    // The run names a retired pack, so the next writable open discards it.
+    let reopened = paged_open(&dir);
+    assert!(!run_path.exists(), "a stale run is deleted at open");
+    assert_store_matches(&reopened, &expected, "after reopen");
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}

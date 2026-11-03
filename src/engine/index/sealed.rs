@@ -252,19 +252,30 @@ impl SealedRun {
         collection_id: &[u8; 16],
         visit: &mut dyn FnMut(SealedHit, NodeId),
     ) -> Result<(), SealedUnavailable> {
-        // A block failure stops the walk part-way, so buffer the run's entries
-        // and discard them if the run turns out to be damaged.
-        let mut entries = Vec::new();
-        let walked = self
-            .run
-            .for_each_in_collection(collection_id, |hit, logical_id| {
-                entries.push((hit.ordinal, hit.locator, logical_id));
-            });
-        if walked.is_ok() {
-            for (ordinal, locator, logical_id) in entries {
-                visit(self.hit(ordinal, locator)?, logical_id);
+        // Check the collection's blocks before visiting any entry, so the walk
+        // streams instead of buffering against a later block failure.
+        if self.run.verify_collection(collection_id).is_ok() {
+            let mut failure = None;
+            let walked = self
+                .run
+                .for_each_in_collection(collection_id, |hit, logical_id| {
+                    if failure.is_none() {
+                        match self.hit(hit.ordinal, hit.locator) {
+                            Ok(hit) => visit(hit, logical_id),
+                            Err(error) => failure = Some(error),
+                        }
+                    }
+                });
+            if let Some(error) = failure {
+                return Err(error);
             }
-            return Ok(());
+            if walked.is_ok() {
+                return Ok(());
+            }
+            // A concurrent reader found a damaged block elsewhere in this run
+            // mid-walk. The entries already visited were verified and are the
+            // newest in this range; the fallback repeats the range's versions
+            // after them, which first-occurrence callers already ignore.
         }
         for_each_in_packs(self.fallback()?, collection_id, visit);
         Ok(())
@@ -449,6 +460,38 @@ impl SealedLocators {
                     .flat_map(|run| run.packs().iter().map(|pack| pack.slot)),
             )
             .collect()
+    }
+
+    /// Shard slots referenced by this collection's sealed sidecars and run
+    /// accounting rows. A pool-wide run contributes only packs whose original
+    /// sidecar recorded entries for this collection.
+    #[must_use]
+    pub fn slot_ids_in_collection(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> std::collections::HashSet<u16> {
+        self.packs
+            .iter()
+            .filter(|pack| pack.index.collection_entry_count(collection_id).is_some())
+            .map(|pack| pack.slot)
+            .chain(self.runs.iter().flat_map(|run| {
+                run.collection_slot_counts(collection_id)
+                    .map(|(slot, _)| slot)
+            }))
+            .collect()
+    }
+
+    /// Whether this set contains the exact published run instance.
+    #[must_use]
+    pub fn contains_run(&self, run: &Arc<SealedRun>) -> bool {
+        self.runs.iter().any(|existing| Arc::ptr_eq(existing, run))
+    }
+
+    /// Remove the exact published run instance. Returns whether it was held.
+    pub fn remove_run(&mut self, run: &Arc<SealedRun>) -> bool {
+        let before = self.runs.len();
+        self.runs.retain(|existing| !Arc::ptr_eq(existing, run));
+        self.runs.len() != before
     }
 
     /// Drop a pack that has been retired or repacked away.
