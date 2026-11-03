@@ -10867,7 +10867,6 @@ fn import_pdu_events_with_raw(
         &room_version,
         events,
         auth_chain,
-        &stored_ids,
     )?;
 
     let room_events: Vec<RoomEvent> = all_events
@@ -11048,21 +11047,12 @@ fn write_raw_auth_projections(
     room_version: &str,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
-    stored_ids: &HashSet<String>,
 ) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
     let mut records = Vec::new();
     for event in events.iter().chain(auth_chain) {
-        // auth_chain-only events are not stored in this collection, so a
-        // projection for them would be unreachable. Only project events the
-        // importer can load back (including earlier stored events repeated in
-        // an auth chain).
-        let Some(id) = event_id(event) else {
-            continue;
-        };
-        if !stored_ids.contains(id) {
-            continue;
-        }
+        // auth_chain-only events are projected too: step 3 will use them as
+        // edge and state providers without storing them as timeline events.
         let Some(projection) = raw_auth_projection(event, room_version) else {
             continue;
         };

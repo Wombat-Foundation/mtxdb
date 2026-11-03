@@ -8,7 +8,7 @@ use super::{
     export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
     format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
     interleaving_worth_noting, is_server_keys_export, keys_first, listing_shard_types,
-    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
+    load_collection_events, load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
     matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
     overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
     parse_pack_selectors, prepare_state_collection, pretty_print_payload, raw_auth_projection,
@@ -2692,11 +2692,8 @@ fn raw_auth_projection_collision_keeps_first_for_opaque_event_ids() {
         "[]",
         "[]",
     );
-    let stored: HashSet<String> = ["$same".to_owned()].into_iter().collect();
-
-    write_raw_auth_projections(store, room, &template, "1", &[first.clone()], &[], &stored)
-        .unwrap();
-    write_raw_auth_projections(store, room, &template, "1", &[second], &[], &stored).unwrap();
+    write_raw_auth_projections(store, room, &template, "1", &[first.clone()], &[]).unwrap();
+    write_raw_auth_projections(store, room, &template, "1", &[second], &[]).unwrap();
 
     let node = template_node_id(&template, &first).unwrap().unwrap();
     let collection = raw_auth_projection_collection_id(room);
@@ -2710,41 +2707,100 @@ fn raw_auth_projection_collision_keeps_first_for_opaque_event_ids() {
 }
 
 #[test]
-fn raw_auth_projection_skips_auth_chain_only_events() {
-    let dir = unique_temp_dir().join("projection_auth_chain_only");
-    let db = Database::open(dir).unwrap();
+fn raw_import_keeps_v11_third_party_invite_public_keys_across_files() {
+    let dir = unique_temp_dir().join("raw_v11_third_party_invite");
+    let db = Database::open(dir.clone()).unwrap();
     let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room7");
+    let path = dir.join("room.jsonl");
     let store = db.event_dag();
-    let room = "!projection_auth_chain_only";
-    let auth_event = raw_event(
-        room,
-        "$auth_only",
+    let state_store = db.state().as_ref();
+
+    let create = raw_event(
+        "!room7",
+        "$create",
         "m.room.create",
         "",
-        r#"{"room_version":"10","m.federate":false}"#,
+        r#"{"room_version":"11"}"#,
         "[]",
         "[]",
     );
+    let join_alice = raw_event(
+        "!room7",
+        "$join_alice",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let third_party = raw_event(
+        "!room7",
+        "$tpi",
+        "m.room.third_party_invite",
+        "token",
+        r#"{"public_key":"key","public_keys":[{"public_key":"key"}]}"#,
+        r#"["$join_alice"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    let message = raw_event(
+        "!room7",
+        "$message",
+        "m.room.message",
+        "",
+        r#"{"body":"after"}"#,
+        r#"["$tpi"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
 
-    write_raw_auth_projections(
-        store,
-        room,
-        &template,
-        "10",
-        &[],
-        &[auth_event],
-        &HashSet::new(),
-    )
-    .unwrap();
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join_alice, third_party.clone()]);
+    import(&[message]);
 
-    let collection = raw_auth_projection_collection_id(room);
+    let node = template_node_id(&template, &third_party).unwrap().unwrap();
+    let stored = store.get(&collection_id, &node).unwrap().unwrap();
+    let stored = OwnedValue::parse_bytes(&stored.bytes).unwrap();
     assert!(
-        store
-            .get_collection_metadata(&collection)
-            .unwrap()
+        stored
+            .get("content")
+            .and_then(|content| content.get("public_key"))
             .is_none(),
-        "an auth_chain-only event must not create an unreachable projection"
+        "v11 redaction still strips m.room.third_party_invite content"
     );
+
+    let loaded = load_collection_events(store, &collection_id, "!room7").unwrap();
+    let loaded_third_party = loaded
+        .iter()
+        .find(|event| event_id(event) == Some("$tpi"))
+        .unwrap();
+    assert_eq!(
+        loaded_third_party
+            .get("content")
+            .and_then(|content| content.get("public_key"))
+            .and_then(OwnedValue::as_str),
+        Some("key"),
+        "a later file must load the v11 third-party invite public key"
+    );
+    assert!(loaded_third_party
+        .get("content")
+        .and_then(|content| content.get("public_keys"))
+        .is_some());
 }
 
 #[test]
