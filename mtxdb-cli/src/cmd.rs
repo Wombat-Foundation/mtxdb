@@ -9,21 +9,23 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context};
 
 use mtxdb::auxiliary::AuxiliaryIndex;
-use mtxdb::export_schema::RejectionCode;
+use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::matrix_adjacency::EventRecord;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
+use mtxdb::room_flag::{Flag, FlagChange, RoomFlagIndex};
 use mtxdb::server_keys::KeyTier;
 use mtxdb::shard::ShardPool;
 use mtxdb::state_group::{StateGroupDerivation, StateGroupTrust};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
-    derive_collection_id, frame_digest, record_logical_id, state_group_instance_id,
-    CollectionKeyRule, CollectionMetadata, CollectionTemplate, Database, DatabaseLayout,
-    DigestAlgorithm, EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion,
-    PackfileStorage, PayloadPolicy, RecordIdentityRule, ShardType,
+    derive_collection_id, encode_verdict, event_verdict_collection_id, frame_digest,
+    record_logical_id, state_group_instance_id, CollectionKeyRule, CollectionMetadata,
+    CollectionTemplate, Database, DatabaseLayout, DigestAlgorithm, EstablishmentRule, FrameIdInput,
+    FrameIdPolicy, MatrixRoomVersion, PackfileStorage, PayloadPolicy, RecordIdentityRule,
+    ShardType, Verdict,
 };
 use rezzy::auth::auth_types_for_event;
 use rezzy::json::{self, Object, Value as OwnedValue};
@@ -10272,8 +10274,9 @@ impl ImportContext<'_> {
         let mut findings = export_import::derived_auth_findings_with_keys(export, signature_keys)?;
         let mut rejected = export_import::rejected_event_ids(export, &findings);
         let mut walk_rejections = HashMap::new();
-        let (computation, unchecked) = Self::compute_import_auth_before(
+        let (computation, unchecked) = compute_import_auth_before(
             &events,
+            &[],
             &export.events,
             &export.room_id,
             &room_version,
@@ -10332,135 +10335,6 @@ impl ImportContext<'_> {
         })
     }
 
-    /// Walk the room's state groups once before verdicts are written. Each
-    /// event is judged in topological order: events the findings pass already
-    /// rejected are excluded, and every other event gets check 4 followed by
-    /// check 5 against the state before it. A rejection is fed back into the
-    /// walk, so a rejected state event contributes no state to later events.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the walk and its per-event auth context are kept together"
-    )]
-    fn compute_import_auth_before(
-        events: &[OwnedValue],
-        room_events: &[RoomEvent],
-        room_id: &str,
-        room_version: &str,
-        state_version: Option<StateResVersion>,
-        rejected: &mut HashSet<String>,
-        walk_rejections: &mut HashMap<String, (u8, String)>,
-    ) -> (PartialStateComputation, usize) {
-        let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
-        let Some(state_version) = state_version else {
-            return (
-                compute_state_groups_partial_with(
-                    events,
-                    &[],
-                    StateView::Federated,
-                    room_id,
-                    policy,
-                    None,
-                    |_, _, _, _, _| None,
-                ),
-                0,
-            );
-        };
-
-        let index: HashMap<&[u8], usize> = room_events
-            .iter()
-            .enumerate()
-            .map(|(position, event)| (event.event_id.as_bytes(), position))
-            .collect();
-        let lean: Vec<Option<LeanEvent<String>>> = room_events
-            .iter()
-            .map(|event| lean_event(&event.unflagged(room_id), &event.event_id))
-            .collect();
-        let by_id: HashMap<&str, &RoomEvent> = room_events
-            .iter()
-            .map(|event| (event.event_id.as_str(), event))
-            .collect();
-        let create = room_events
-            .iter()
-            .position(|event| {
-                event.pdu.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
-                    && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
-            })
-            .and_then(|position| lean[position].as_ref());
-
-        let mut unchecked = 0_usize;
-        let computation = compute_state_groups_partial_with(
-            events,
-            &[],
-            StateView::Federated,
-            room_id,
-            policy,
-            Some(rejected),
-            |event_id, event, base, base_complete, current| {
-                let Some(room_event) = by_id.get(event_id) else {
-                    unchecked = unchecked.saturating_add(1);
-                    return None;
-                };
-                let Some(position) = index.get(event_id.as_bytes()).copied() else {
-                    unchecked = unchecked.saturating_add(1);
-                    return None;
-                };
-                if let Some(current) = current {
-                    let cites_rejected = room_event.auth_events.as_array().is_some_and(|ids| {
-                        ids.iter()
-                            .any(|id| id.as_str().is_some_and(|id| current.contains(id)))
-                    });
-                    if cites_rejected {
-                        let code = RejectionCode::DependsOnRejectedAuthEvent.to_u8();
-                        let reason = "auth_events cites a rejected event".to_owned();
-                        walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
-                        return Some((code, reason));
-                    }
-                }
-                if !base_complete {
-                    // A missing parent, a merge that fell back to the
-                    // first-parent rule, or an ancestor with either gap means
-                    // this base state is incomplete. Leave the event unchecked
-                    // rather than inventing a rejection.
-                    unchecked = unchecked.saturating_add(1);
-                    return None;
-                }
-                let is_create = event.get("type").and_then(OwnedValue::as_str)
-                    == Some("m.room.create")
-                    && event.get("state_key").and_then(OwnedValue::as_str) == Some("");
-                if base.entries.is_empty() && !is_create {
-                    unchecked = unchecked.saturating_add(1);
-                    return None;
-                }
-                let entries = auth_entries_from_base(event, base, state_version, room_version);
-                match export_import::judge_event_with_state(
-                    room_event,
-                    lean[position].as_ref(),
-                    &index,
-                    &lean,
-                    create,
-                    state_version,
-                    &entries,
-                ) {
-                    Ok(export_import::EventAuthOutcome::Refused { code, reason }) => {
-                        walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
-                        Some((code, reason))
-                    }
-                    Ok(export_import::EventAuthOutcome::Passed) => None,
-                    Ok(export_import::EventAuthOutcome::Unchecked) => {
-                        unchecked = unchecked.saturating_add(1);
-                        None
-                    }
-                    Err(err) => {
-                        eprintln!("  warning: error judging event {event_id}: {err}");
-                        unchecked = unchecked.saturating_add(1);
-                        None
-                    }
-                }
-            },
-        );
-        (computation, unchecked)
-    }
-
     /// Import one `server_keys` export into the server-info pool, in the
     /// layout the server reads: one record per key in its origin's collection,
     /// and each notary payload stored as the export decoded it.
@@ -10498,6 +10372,136 @@ impl ImportContext<'_> {
             })
             .collect())
     }
+}
+
+/// Walk the room's state groups once before verdicts are written. Each
+/// event is judged in topological order: events the findings pass already
+/// rejected are excluded, and every other event gets check 4 followed by
+/// check 5 against the state before it. A rejection is fed back into the
+/// walk, so a rejected state event contributes no state to later events.
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "the walk and its per-event auth context are kept together"
+)]
+fn compute_import_auth_before(
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+    room_events: &[RoomEvent],
+    room_id: &str,
+    room_version: &str,
+    state_version: Option<StateResVersion>,
+    rejected: &mut HashSet<String>,
+    walk_rejections: &mut HashMap<String, (u8, String)>,
+) -> (PartialStateComputation, usize) {
+    let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
+    let Some(state_version) = state_version else {
+        return (
+            compute_state_groups_partial_with(
+                events,
+                auth_chain,
+                StateView::Federated,
+                room_id,
+                policy,
+                None,
+                |_, _, _, _, _| None,
+            ),
+            0,
+        );
+    };
+
+    let index: HashMap<&[u8], usize> = room_events
+        .iter()
+        .enumerate()
+        .map(|(position, event)| (event.event_id.as_bytes(), position))
+        .collect();
+    let lean: Vec<Option<LeanEvent<String>>> = room_events
+        .iter()
+        .map(|event| lean_event(&event.unflagged(room_id), &event.event_id))
+        .collect();
+    let by_id: HashMap<&str, &RoomEvent> = room_events
+        .iter()
+        .map(|event| (event.event_id.as_str(), event))
+        .collect();
+    let create = room_events
+        .iter()
+        .position(|event| {
+            event.pdu.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
+                && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
+        })
+        .and_then(|position| lean[position].as_ref());
+
+    let mut unchecked = 0_usize;
+    let computation = compute_state_groups_partial_with(
+        events,
+        auth_chain,
+        StateView::Federated,
+        room_id,
+        policy,
+        Some(rejected),
+        |event_id, event, base, base_complete, current| {
+            let Some(room_event) = by_id.get(event_id) else {
+                unchecked = unchecked.saturating_add(1);
+                return None;
+            };
+            let Some(position) = index.get(event_id.as_bytes()).copied() else {
+                unchecked = unchecked.saturating_add(1);
+                return None;
+            };
+            if let Some(current) = current {
+                let cites_rejected = room_event.auth_events.as_array().is_some_and(|ids| {
+                    ids.iter()
+                        .any(|id| id.as_str().is_some_and(|id| current.contains(id)))
+                });
+                if cites_rejected {
+                    let code = RejectionCode::DependsOnRejectedAuthEvent.to_u8();
+                    let reason = "auth_events cites a rejected event".to_owned();
+                    walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
+                    return Some((code, reason));
+                }
+            }
+            if !base_complete {
+                // A missing parent, a merge that fell back to the
+                // first-parent rule, or an ancestor with either gap means
+                // this base state is incomplete. Leave the event unchecked
+                // rather than inventing a rejection.
+                unchecked = unchecked.saturating_add(1);
+                return None;
+            }
+            let is_create = event.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
+                && event.get("state_key").and_then(OwnedValue::as_str) == Some("");
+            if base.entries.is_empty() && !is_create {
+                unchecked = unchecked.saturating_add(1);
+                return None;
+            }
+            let entries = auth_entries_from_base(event, base, state_version, room_version);
+            match export_import::judge_event_with_state(
+                room_event,
+                lean[position].as_ref(),
+                &index,
+                &lean,
+                create,
+                state_version,
+                &entries,
+            ) {
+                Ok(export_import::EventAuthOutcome::Refused { code, reason }) => {
+                    walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
+                    Some((code, reason))
+                }
+                Ok(export_import::EventAuthOutcome::Passed) => None,
+                Ok(export_import::EventAuthOutcome::Unchecked) => {
+                    unchecked = unchecked.saturating_add(1);
+                    None
+                }
+                Err(err) => {
+                    eprintln!("  warning: error judging event {event_id}: {err}");
+                    unchecked = unchecked.saturating_add(1);
+                    None
+                }
+            }
+        },
+    );
+    (computation, unchecked)
 }
 
 /// Group an auth chain's events by the collection each one belongs to.
@@ -10752,6 +10756,25 @@ fn import_pdu_events_with_raw(
 
     let collection_hex = format_id(&collection_id);
 
+    // Existing records are part of the state the new batch inherits. Reading
+    // them back is the simplest way to let check 5 run across separate files:
+    // the walk sees the whole room, not just this file.
+    let prior = load_collection_events(store, &collection_id)?;
+    let mut all_events: Vec<OwnedValue> = prior;
+    let mut seen_event_ids: HashSet<String> = all_events
+        .iter()
+        .filter_map(event_id)
+        .map(str::to_owned)
+        .collect();
+    for event in events.iter().chain(auth_chain) {
+        let Some(id) = event_id(event) else {
+            continue;
+        };
+        if seen_event_ids.insert(id.to_owned()) {
+            all_events.push(event.clone());
+        }
+    }
+
     let first: Vec<([u8; 16], String, NodeData)> = {
         let mut first = Vec::with_capacity(events.len());
         let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(events.len());
@@ -10803,7 +10826,7 @@ fn import_pdu_events_with_raw(
             to_write.push((id_bytes, data));
         }
     }
-    record_matrix_adjacency_with_raw(db, template, events, raw_adjacency)?;
+    let shorts = record_matrix_adjacency_with_raw(db, template, events, raw_adjacency)?;
 
     // Preserve causal order even when input arrives newest-first.
     sort_events_topologically(&mut to_write, events, template)?;
@@ -10819,13 +10842,56 @@ fn import_pdu_events_with_raw(
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
 
+    let room_events: Vec<RoomEvent> = all_events
+        .iter()
+        .filter_map(|event| RoomEvent::from_pdu(event, &resolved.canonical_id))
+        .collect();
+    let synthetic = RoomExport {
+        server: "raw-import".to_owned(),
+        room_id: resolved.canonical_id.clone(),
+        events: room_events,
+        timeline: false,
+    };
+    let mut findings = export_import::derived_auth_findings_for_raw(&synthetic)?;
+    let mut rejected = export_import::rejected_event_ids(&synthetic, &findings);
+    let mut walk_rejections = HashMap::new();
+    let (computation, unchecked) = compute_import_auth_before(
+        &all_events,
+        &[],
+        &synthetic.events,
+        &synthetic.room_id,
+        &room_version,
+        StateResVersion::from_room_version(&room_version),
+        &mut rejected,
+        &mut walk_rejections,
+    );
+    export_import::apply_walk_rejections(&synthetic, &mut findings, &walk_rejections);
+    if unchecked > 0 {
+        eprintln!(
+            "  warning: {unchecked} event(s) could not be checked against the state before them"
+        );
+    }
+    let rejected_total: usize = findings.rejection_counts.values().copied().sum();
+    if rejected_total > 0 {
+        eprintln!("  derived rejections: {rejected_total} events");
+    }
+    write_raw_verdicts_and_flags(
+        db,
+        events,
+        &synthetic.events,
+        &findings.forced,
+        &shorts,
+        template,
+        &resolved.canonical_id,
+    )?;
+
     repair_import_state_groups(
         state_store,
-        events,
-        auth_chain,
+        &all_events,
+        &[],
         &resolved.canonical_id,
         &room_version,
-        None,
+        Some(computation),
     )?;
 
     if let Some(room_id) = detected_collection {
@@ -10849,6 +10915,117 @@ fn import_pdu_events_with_raw(
         );
     }
 
+    Ok(())
+}
+
+/// Read back the events already in a raw-import collection, so a later file
+/// can be judged against the state its earlier files produced.
+fn load_collection_events(
+    store: &PackfileStorage,
+    collection_id: &[u8; 16],
+) -> anyhow::Result<Vec<OwnedValue>> {
+    let mut events = Vec::new();
+    for record in store.scan_collection(collection_id)? {
+        let (_, data) = record?;
+        let Ok(value) = OwnedValue::parse_bytes(&data.bytes) else {
+            continue;
+        };
+        if event_id(&value).is_some() {
+            events.push(value);
+        }
+    }
+    Ok(events)
+}
+
+/// One raw event's identity and derived verdict, grouped for flag writing.
+type RawFlagRow = (String, [u8; 16], u32, Verdict);
+
+/// Store the raw import's derived verdicts and mirror them into the room's
+/// flag bitmap, so rejected events are countable and selectable.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "the writer needs the batch, its derived verdicts, and the room identity"
+)]
+fn write_raw_verdicts_and_flags(
+    db: &Database,
+    current_events: &[OwnedValue],
+    all_events: &[RoomEvent],
+    forced: &[Option<u8>],
+    shorts: &HashMap<String, u32>,
+    template: &CollectionTemplate,
+    canonical_id: &str,
+) -> anyhow::Result<()> {
+    if shorts.is_empty() {
+        return Ok(());
+    }
+    let forced_by_id: HashMap<&str, Option<u8>> = all_events
+        .iter()
+        .zip(forced)
+        .map(|(event, code)| (event.event_id.as_str(), *code))
+        .collect();
+
+    let mut by_room: BTreeMap<String, Vec<RawFlagRow>> = BTreeMap::new();
+    for event in current_events {
+        let Some(id) = event_id(event) else {
+            continue;
+        };
+        let Some(&short) = shorts.get(id) else {
+            continue;
+        };
+        let Some(node) = template_node_id(template, event)? else {
+            continue;
+        };
+        let room = event_room_id(event).unwrap_or(canonical_id).to_owned();
+        let forced = forced_by_id.get(id).copied().flatten();
+        let mut verdict = Verdict {
+            rejection: forced,
+            outlier: forced.is_some(),
+            ..Verdict::default()
+        };
+        if forced.is_none() {
+            match crate::state_policy::event_disposition(event) {
+                crate::state_policy::EventDisposition::SoftFailed => {
+                    verdict.soft_fail = Some(SoftFailCode::Imported.to_u8());
+                }
+                crate::state_policy::EventDisposition::Accepted
+                | crate::state_policy::EventDisposition::Rejected => {}
+            }
+        }
+        by_room
+            .entry(room)
+            .or_default()
+            .push((id.to_owned(), node, short, verdict));
+    }
+
+    for (room, rows) in by_room {
+        let flag_index = RoomFlagIndex::new(room.as_bytes());
+        let mut changes = Vec::with_capacity(rows.len().saturating_mul(4));
+        let tx = db.begin_transaction();
+        for (event_id, node, short, verdict) in rows {
+            if !verdict.is_empty() {
+                tx.put(
+                    ShardType::EventDag,
+                    event_verdict_collection_id(&node),
+                    node,
+                    &NodeData::new(encode_verdict(event_id.as_bytes(), &verdict)?.into()),
+                )?;
+            }
+            changes.push(FlagChange::set(short, Flag::Present));
+            if verdict.rejection.is_some() {
+                changes.push(FlagChange::set(short, Flag::Rejected));
+            }
+            if verdict.outlier {
+                changes.push(FlagChange::set(short, Flag::Outlier));
+            }
+            if verdict.soft_fail.is_some() {
+                changes.push(FlagChange::set(short, Flag::SoftFailed));
+            }
+        }
+        flag_index.stage(&tx, &changes)?;
+        tx.commit()?;
+        export_import::reclaim_journal(db)?;
+    }
     Ok(())
 }
 
@@ -10924,6 +11101,10 @@ fn warn_incomplete_merges(missing: &[String]) {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the repair phase owns cache loading, judging, and state publication together"
+)]
 fn repair_import_state_groups(
     state_store: &PackfileStorage,
     events: &[OwnedValue],
@@ -10968,17 +11149,47 @@ fn repair_import_state_groups(
                 "warning: room version {room_version} has no state-resolution rules mtxdb recognizes; state merges use the first-parent rule"
             );
         }
-        let state_computation = match precomputed {
-            Some(computation) => computation,
-            None => compute_state_groups_partial_with(
-                events,
-                auth_chain,
-                StateView::Federated,
+        let state_computation = if let Some(computation) = precomputed {
+            computation
+        } else {
+            let unflagged_events: Vec<OwnedValue> = events
+                .iter()
+                .map(|ev| interchange::unflag_pdu(ev, canonical_id))
+                .collect();
+            let unflagged_auth: Vec<OwnedValue> = auth_chain
+                .iter()
+                .map(|ev| interchange::unflag_pdu(ev, canonical_id))
+                .collect();
+            let mut room_events: Vec<RoomEvent> =
+                Vec::with_capacity(unflagged_events.len().saturating_add(unflagged_auth.len()));
+            let mut seen_ids = HashSet::new();
+            for ev in unflagged_events.iter().chain(unflagged_auth.iter()) {
+                if let Some(eid) = event_id(ev) {
+                    if seen_ids.insert(eid.to_owned()) {
+                        if let Some(room_ev) = RoomEvent::from_pdu(ev, canonical_id) {
+                            room_events.push(room_ev);
+                        }
+                    }
+                }
+            }
+            let mut rejected = HashSet::new();
+            let mut walk_rejections = HashMap::new();
+            let (comp, unchecked) = compute_import_auth_before(
+                &unflagged_events,
+                &unflagged_auth,
+                &room_events,
                 canonical_id,
-                policy,
-                None,
-                |_, _, _, _, _| None,
-            ),
+                room_version,
+                StateResVersion::from_room_version(room_version),
+                &mut rejected,
+                &mut walk_rejections,
+            );
+            if unchecked > 0 {
+                eprintln!(
+                        "  warning: {unchecked} event(s) could not be checked against the state before them"
+                    );
+            }
+            comp
         };
         let unresolved = state_computation.unresolved;
         publishable = state_computation.incomplete.is_empty();
@@ -13366,7 +13577,7 @@ fn record_matrix_adjacency(
     template: &CollectionTemplate,
     events: &[OwnedValue],
 ) -> anyhow::Result<()> {
-    record_matrix_adjacency_with_raw(db, template, events, None)
+    record_matrix_adjacency_with_raw(db, template, events, None).map(|_| ())
 }
 
 fn record_matrix_adjacency_with_raw(
@@ -13374,13 +13585,14 @@ fn record_matrix_adjacency_with_raw(
     template: &CollectionTemplate,
     events: &[OwnedValue],
     raw_adjacency: Option<&[rezzy::OwnedMatrixEvent]>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HashMap<String, u32>> {
     if !matches!(
         &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
     ) {
-        return Ok(());
+        return Ok(HashMap::new());
     }
+    let mut shorts = HashMap::with_capacity(events.len());
     // Ordered, so the order adjacency is recorded in is the same on every run.
     let mut rooms: BTreeMap<&str, Vec<MatrixEventFields>> = BTreeMap::new();
     for (index, event) in events.iter().enumerate() {
@@ -13418,11 +13630,15 @@ fn record_matrix_adjacency_with_raw(
                     field.as_record(&prev[prev_start..prev_end], &auth[auth_start..auth_end])
                 })
                 .collect();
-            room.record_events(db, &records)
+            let recorded = room
+                .record_events(db, &records)
                 .with_context(|| format!("recording auth adjacency for room {room_id}"))?;
+            for (field, recorded) in chunk.iter().zip(recorded) {
+                shorts.insert(field.event_id.clone(), recorded.short_id);
+            }
         }
     }
-    Ok(())
+    Ok(shorts)
 }
 
 fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {

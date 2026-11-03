@@ -253,7 +253,7 @@ fn u64_field(value: &OwnedValue, field: &str) -> u64 {
 /// Read an array of event references. Matrix rooms v1/v2 encode references as
 /// `[event_id, hashes]` pairs while later room versions use plain strings;
 /// both forms name the id in the same place.
-fn reference_list(value: &OwnedValue, field: &str) -> Vec<String> {
+pub(crate) fn reference_list(value: &OwnedValue, field: &str) -> Vec<String> {
     let Some(OwnedValue::Array(items)) = value.get(field) else {
         return Vec::new();
     };

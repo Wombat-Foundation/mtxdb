@@ -343,7 +343,7 @@ pub(crate) fn room_collections_line(room_id: &str) -> String {
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct AuthFindings {
     /// The rejection code forced on each event, by position in the export.
-    forced: Vec<Option<u8>>,
+    pub(crate) forced: Vec<Option<u8>>,
     /// Events with an `auth_events` id that is not in the export.
     pub(crate) missing_auth: Vec<String>,
     /// Events rejected because they cite a rejected auth event, in the order
@@ -1628,6 +1628,21 @@ pub(crate) fn derived_auth_findings_with_keys(
     export: &RoomExport,
     keys: Option<&SignatureKeyCatalog>,
 ) -> anyhow::Result<AuthFindings> {
+    derived_auth_findings_inner(export, keys, true)
+}
+
+/// [`derived_auth_findings_with_keys`] for a partial raw import: a batch may
+/// not contain enough history to authorize the create event, and that is not
+/// a reason to refuse the batch.
+pub(crate) fn derived_auth_findings_for_raw(export: &RoomExport) -> anyhow::Result<AuthFindings> {
+    derived_auth_findings_inner(export, None, false)
+}
+
+fn derived_auth_findings_inner(
+    export: &RoomExport,
+    keys: Option<&SignatureKeyCatalog>,
+    require_create_authorized: bool,
+) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let Some(room_version) = create_room_version(events) else {
         return auth_findings(export);
@@ -1696,7 +1711,9 @@ pub(crate) fn derived_auth_findings_with_keys(
         );
     }
     refresh_rejection_counts(&mut findings);
-    ensure_create_authorized(export, events, &findings)?;
+    if require_create_authorized {
+        ensure_create_authorized(export, events, &findings)?;
+    }
     Ok(findings)
 }
 

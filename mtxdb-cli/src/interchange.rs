@@ -111,6 +111,42 @@ pub(crate) struct RoomEvent {
 }
 
 impl RoomEvent {
+    /// Build a [`RoomEvent`] from an unparsed PDU, normalizing its references
+    /// and clearing incoming verdict flags so auth checks judge it on its own.
+    pub(crate) fn from_pdu(pdu: &OwnedValue, room_id: &str) -> Option<Self> {
+        let eid = crate::cmd::event_id(pdu)?;
+        let prev_ids = crate::state_resolve::reference_list(pdu, "prev_events");
+        let auth_ids = crate::state_resolve::reference_list(pdu, "auth_events");
+        let prev_events = OwnedValue::Array(prev_ids.into_iter().map(OwnedValue::String).collect());
+        let auth_events = OwnedValue::Array(auth_ids.into_iter().map(OwnedValue::String).collect());
+        let mut clean_pdu = pdu.clone();
+        if let OwnedValue::Object(fields) = &mut clean_pdu {
+            set_flag(fields, "rejected", false);
+            set_flag(fields, "soft_failed", false);
+            fields.insert("event_id".to_owned(), OwnedValue::String(eid.to_owned()));
+            fields
+                .entry("room_id".to_owned())
+                .or_insert_with(|| OwnedValue::String(room_id.to_owned()));
+            fields.insert("prev_events".to_owned(), prev_events.clone());
+            fields.insert("auth_events".to_owned(), auth_events.clone());
+        }
+        let depth = pdu.get("depth").and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok()))
+        });
+        Some(Self {
+            event_id: eid.to_owned(),
+            metadata: EventMetadata::default(),
+            prev_events,
+            auth_events,
+            pdu: clean_pdu,
+            pdu_bytes: Bytes::new(),
+            stream_ordering: None,
+            arrival_ordering: None,
+            depth,
+        })
+    }
+
     /// [`Self::annotated`] without the source's verdicts: the `rejected` and
     /// `soft_failed` flags are removed, so an auth check judges the event by
     /// its own contents and cannot read the answer the exporting server
@@ -478,6 +514,25 @@ fn raw_pdu(line_number: usize, raw: &[u8]) -> anyhow::Result<Bytes> {
         .find(|member| member.key.as_ref() == field::PDU)
         .map(|member| Bytes::copy_from_slice(member.raw_value))
         .ok_or_else(|| anyhow!("line {line_number}: record is missing `pdu`"))
+}
+
+/// Strip incoming verdict flags from a raw PDU so auth checks and state-group
+/// computations judge it by its own content.
+pub(crate) fn unflag_pdu(event: &OwnedValue, room_id: &str) -> OwnedValue {
+    let mut ev = event.clone();
+    if let OwnedValue::Object(fields) = &mut ev {
+        set_flag(fields, "rejected", false);
+        set_flag(fields, "soft_failed", false);
+        if let Some(eid) = crate::cmd::event_id(event) {
+            fields
+                .entry("event_id".to_owned())
+                .or_insert_with(|| OwnedValue::String(eid.to_owned()));
+        }
+        fields
+            .entry("room_id".to_owned())
+            .or_insert_with(|| OwnedValue::String(room_id.to_owned()));
+    }
+    ev
 }
 
 /// Set a top-level disposition flag, replacing whatever spelling the PDU kept.
