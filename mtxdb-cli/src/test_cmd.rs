@@ -2496,6 +2496,112 @@ fn raw_import_keeps_pre_v11_power_level_rejection_across_files() {
 }
 
 #[test]
+fn raw_import_keeps_msc3389_power_level_rejection_across_files() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_msc3389_invite");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room8");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let create = raw_event(
+        "!room8",
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"org.matrix.msc3389.10"}"#,
+        "[]",
+        "[]",
+    );
+    let join_alice = raw_event(
+        "!room8",
+        "$join_alice",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let power_levels = raw_event(
+        "!room8",
+        "$pl",
+        "m.room.power_levels",
+        "",
+        r#"{"users":{"@alice:test":100},"invite":50}"#,
+        r#"["$join_alice"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    let join_rules = raw_event(
+        "!room8",
+        "$rules",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$pl"]"#,
+        r#"["$create","$join_alice","$pl"]"#,
+    );
+    let join_bob = owned_value(
+        r#"{"event_id":"$join_bob","sender":"@bob:test","room_id":"!room8","type":"m.room.member","state_key":"@bob:test","content":{"membership":"join"},"prev_events":["$rules"],"auth_events":["$create","$pl","$rules"]}"#,
+    );
+    let invite = owned_value(
+        r#"{"event_id":"$invite","sender":"@bob:test","room_id":"!room8","type":"m.room.member","state_key":"@carol:test","content":{"membership":"invite"},"prev_events":["$join_bob"],"auth_events":["$create","$pl","$join_bob"]}"#,
+    );
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[
+        create,
+        join_alice,
+        power_levels,
+        join_rules,
+        join_bob,
+        invite,
+    ]);
+
+    let flags = RoomFlagIndex::new(b"!room8");
+    let rejected = FlagQuery::has(Flag::Rejected);
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$invite".to_vec()]
+    );
+
+    let live = raw_event(
+        "!room8",
+        "$live",
+        "m.room.message",
+        "",
+        "{}",
+        r#"["$join_bob"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    import(&[live]);
+
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$invite".to_vec()],
+        "MSC3389 uses v10 redaction and must keep the invite rejection"
+    );
+}
+
+#[test]
 fn raw_import_keeps_pre_v11_m_federate_rejection_across_files() {
     use mtxdb::room_flag::*;
 
@@ -2677,31 +2783,38 @@ fn raw_auth_projection_collision_keeps_first_for_opaque_event_ids() {
     let first = raw_event(
         room,
         "$same",
-        "m.room.create",
+        "m.room.power_levels",
         "",
-        r#"{"room_version":"1","m.federate":false}"#,
+        r#"{"invite":50}"#,
         "[]",
         "[]",
     );
     let second = raw_event(
         room,
         "$same",
-        "m.room.create",
+        "m.room.power_levels",
         "",
-        r#"{"room_version":"1","m.federate":true}"#,
+        r#"{"invite":0}"#,
         "[]",
         "[]",
     );
-    write_raw_auth_projections(store, room, &template, "1", &[first.clone()], &[]).unwrap();
-    write_raw_auth_projections(store, room, &template, "1", &[second], &[]).unwrap();
+    let warnings =
+        write_raw_auth_projections(store, room, &template, "1", &[first.clone()], &[]).unwrap();
+    assert!(warnings.is_empty());
+    let warnings = write_raw_auth_projections(store, room, &template, "1", &[second], &[]).unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].contains("$same") && warnings[0].contains("keeping the first"),
+        "collision warning must name the event and the policy: {warnings:?}"
+    );
 
     let node = template_node_id(&template, &first).unwrap().unwrap();
     let collection = raw_auth_projection_collection_id(room);
     let record = store.get(&collection, &node).unwrap().unwrap();
     let projection = OwnedValue::parse_bytes(&record.bytes).unwrap();
     assert_eq!(
-        projection.get("m.federate").and_then(OwnedValue::as_bool),
-        Some(false),
+        projection.get("invite").and_then(OwnedValue::as_i64),
+        Some(50),
         "a later projection must not replace the first for an opaque event id"
     );
 }

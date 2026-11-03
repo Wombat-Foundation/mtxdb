@@ -10860,14 +10860,16 @@ fn import_pdu_events_with_raw(
         store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
-    write_raw_auth_projections(
+    for warning in write_raw_auth_projections(
         store,
         &resolved.canonical_id,
         template,
         &room_version,
         events,
         auth_chain,
-    )?;
+    )? {
+        eprintln!("warning: {warning}");
+    }
 
     let room_events: Vec<RoomEvent> = all_events
         .iter()
@@ -11047,7 +11049,7 @@ fn write_raw_auth_projections(
     room_version: &str,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut records = Vec::new();
     for event in events.iter().chain(auth_chain) {
@@ -11062,42 +11064,54 @@ fn write_raw_auth_projections(
         if !seen.insert(node) {
             continue;
         }
-        records.push((node, NodeData::new(projection.encode().into_bytes().into())));
+        let Some(id) = event_id(event) else {
+            continue;
+        };
+        records.push((
+            node,
+            id.to_owned(),
+            NodeData::new(projection.encode().into_bytes().into()),
+        ));
     }
     if records.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let collection = raw_auth_projection_collection_id(room_id);
-    let ids: Vec<[u8; 16]> = records.iter().map(|(id, _)| *id).collect();
+    let ids: Vec<[u8; 16]> = records.iter().map(|(id, _, _)| *id).collect();
     let existing = store.get_many(&collection, &ids)?;
+    let mut warnings = Vec::new();
     let mut to_write = Vec::with_capacity(records.len());
-    for ((node, data), existing) in records.into_iter().zip(existing) {
-        if existing.is_some() {
+    for ((node, id, data), existing) in records.into_iter().zip(existing) {
+        if let Some(existing) = existing {
             // First projection wins. Event ids are opaque in v1-v3, so the
             // same id can legitimately arrive with different content; the
             // event collection already keeps the first stored payload. For
             // content-addressed versions this is also the conservative
             // choice: never replace an established projection.
+            if existing.bytes != data.bytes {
+                warnings.push(format!(
+                    "auth projection for event {id} conflicts with the stored projection; keeping the first"
+                ));
+            }
             continue;
         }
         to_write.push((node, data));
     }
-    if to_write.is_empty() {
-        return Ok(());
+    if !to_write.is_empty() {
+        let metadata = CollectionMetadata {
+            member_namespace: Some(mtxdb::MEMBER_NAMESPACE_INTL),
+            collection_canonical_id: format!("raw-auth-projection:{room_id}").into_bytes(),
+            record_id_rule: template.record_id_rule.clone(),
+            payload: template.payload.clone(),
+            extension: None,
+            role: Some("raw-auth-projection".to_owned()),
+            schema: Some("matrix.event.auth-projection.v1".to_owned()),
+        };
+        store
+            .create_or_put_established(&collection, &metadata, &to_write)
+            .context("storing raw auth projections")?;
     }
-    let metadata = CollectionMetadata {
-        member_namespace: Some(mtxdb::MEMBER_NAMESPACE_INTL),
-        collection_canonical_id: format!("raw-auth-projection:{room_id}").into_bytes(),
-        record_id_rule: template.record_id_rule.clone(),
-        payload: template.payload.clone(),
-        extension: None,
-        role: Some("raw-auth-projection".to_owned()),
-        schema: Some("matrix.event.auth-projection.v1".to_owned()),
-    };
-    store
-        .create_or_put_established(&collection, &metadata, &to_write)
-        .context("storing raw auth projections")?;
-    Ok(())
+    Ok(warnings)
 }
 
 fn overlay_auth_projection(event: &mut OwnedValue, projection: OwnedValue) {
@@ -11537,10 +11551,22 @@ struct ResolvedCollection {
     batch_has_create: bool,
 }
 
+/// Map a declared room version onto the numeric policy that governs it.
+///
+/// `MatrixRoomVersion` covers stock versions only. MSC3389 is v10 with
+/// relation-preserving redaction, so its event-id and collection rules are
+/// v10's. Rezzy still owns the actual redaction and auth decisions.
+fn importer_room_version(value: &str) -> Option<MatrixRoomVersion> {
+    match value {
+        "org.matrix.msc3389.10" => Some(MatrixRoomVersion::V10),
+        _ => MatrixRoomVersion::parse(value),
+    }
+}
+
 /// Parse the room version declared by an establishment record's
 /// `content.room_version`.
 fn event_room_version(event: &OwnedValue) -> Option<MatrixRoomVersion> {
-    MatrixRoomVersion::parse(nested_event_string_field(event, "content", "room_version")?)
+    importer_room_version(nested_event_string_field(event, "content", "room_version")?)
 }
 
 /// The collection identity an establishment record assigns, normalized to the
@@ -11666,14 +11692,12 @@ fn validate_establishment_room_version(events: &[OwnedValue]) -> anyhow::Result<
         return Ok(());
     };
     let declared = nested_event_string_field(create, "content", "room_version");
-    let version = declared
-        .and_then(MatrixRoomVersion::parse)
-        .with_context(|| {
-            format!(
-                "m.room.create declares room version {:?}; mtxdb requires v4 or later",
-                declared.unwrap_or("<absent>")
-            )
-        })?;
+    let version = declared.and_then(importer_room_version).with_context(|| {
+        format!(
+            "m.room.create declares room version {:?}; mtxdb requires v4 or later",
+            declared.unwrap_or("<absent>")
+        )
+    })?;
     if !version.is_supported() {
         bail!("room version {version:?} is not supported; mtxdb requires v4 or later");
     }
