@@ -33,6 +33,8 @@ impl Drop for TestDir {
 }
 
 const PACK_LEN: u64 = 1 << 20;
+/// Disk bytes each test sidecar records per entry.
+const FRAME_BYTES: u64 = 100;
 
 fn header_len() -> u32 {
     u32::try_from(HEADER_LEN).unwrap()
@@ -98,7 +100,7 @@ fn write_sidecar(dir: &TestDir, seq: u64, model: &PackModel) -> MappedPackIndex 
                 logical_id,
                 offset: u64::from(at),
                 removed,
-                disk_bytes: 0,
+                disk_bytes: FRAME_BYTES,
             },
         )
         .collect();
@@ -557,7 +559,98 @@ fn merge_keeps_the_newest_version_against_a_model() {
         for miss in 60..80 {
             assert_eq!(run.lookup(&collection(0), &logical_id(miss)), Ok(None));
         }
+
+        // Accounting is each pack's own sidecar directory, not a recount of
+        // the merged winners.
+        let mut expected_stats: Vec<RunPackStats> = Vec::new();
+        for (index, model) in models.iter().enumerate() {
+            let mut per_collection: BTreeMap<[u8; 16], u64> = BTreeMap::new();
+            for (collection_id, _) in model.keys() {
+                let count = per_collection.entry(*collection_id).or_default();
+                *count = count.checked_add(1).unwrap();
+            }
+            for (collection_id, entry_count) in per_collection {
+                expected_stats.push(RunPackStats {
+                    ordinal: u16::try_from(index).unwrap(),
+                    collection_id,
+                    entry_count,
+                    disk_bytes: entry_count.checked_mul(FRAME_BYTES).unwrap(),
+                });
+            }
+        }
+        expected_stats.sort_unstable_by_key(|row| (row.collection_id, row.ordinal));
+        assert_eq!(
+            run.pack_stats().collect::<Vec<_>>(),
+            expected_stats,
+            "seed {seed}"
+        );
     }
+}
+
+#[test]
+fn writer_rejects_invalid_pack_stats() {
+    let dir = TestDir::new();
+    let mut writer = RunWriter::create(&dir.join("stats.run"), vec![identity(1)], 4).unwrap();
+    let row = RunPackStats {
+        ordinal: 0,
+        collection_id: collection(0),
+        entry_count: 1,
+        disk_bytes: 10,
+    };
+    let unknown_pack = RunPackStats { ordinal: 1, ..row };
+    let empty = RunPackStats {
+        entry_count: 0,
+        ..row
+    };
+    assert!(matches!(
+        writer.set_pack_stats(vec![unknown_pack]),
+        Err(RunError::BadLocator)
+    ));
+    assert!(matches!(
+        writer.set_pack_stats(vec![empty]),
+        Err(RunError::BadLocator)
+    ));
+    assert!(matches!(
+        writer.set_pack_stats(vec![row, row]),
+        Err(RunError::BadLocator)
+    ));
+    writer.set_pack_stats(vec![row]).unwrap();
+}
+
+#[test]
+fn open_rejects_corrupt_pack_stats() {
+    let dir = TestDir::new();
+    let path = dir.join("stats.run");
+    let packs = vec![identity(1), identity(2)];
+    let mut writer = RunWriter::create(&path, packs, 4).unwrap();
+    writer.push(entry(0, 1, 0, 0)).unwrap();
+    let row = |ordinal| RunPackStats {
+        ordinal,
+        collection_id: collection(0),
+        entry_count: 1,
+        disk_bytes: 10,
+    };
+    writer.set_pack_stats(vec![row(0), row(1)]).unwrap();
+    writer.finish().unwrap().unwrap();
+    let good = fs::read(&path).unwrap();
+    assert_eq!(RunIndex::open(&path).unwrap().pack_stats().count(), 2);
+
+    // Point the last row at a pack outside the table, with a valid CRC.
+    let mut bytes = good.clone();
+    let ordinal_at = bytes.len().checked_sub(STATS_ENTRY_LEN).unwrap();
+    bytes[ordinal_at..ordinal_at.checked_add(2).unwrap()].copy_from_slice(&2_u16.to_le_bytes());
+    reseal_meta(&mut bytes);
+    fs::write(&path, &bytes).unwrap();
+    assert!(matches!(RunIndex::open(&path), Err(RunError::Invalid)));
+
+    // Swap the rows so they are out of order.
+    let mut bytes = good;
+    bytes[ordinal_at..ordinal_at.checked_add(2).unwrap()].copy_from_slice(&0_u16.to_le_bytes());
+    let first_at = ordinal_at.checked_sub(STATS_ENTRY_LEN).unwrap();
+    bytes[first_at..first_at.checked_add(2).unwrap()].copy_from_slice(&1_u16.to_le_bytes());
+    reseal_meta(&mut bytes);
+    fs::write(&path, &bytes).unwrap();
+    assert!(matches!(RunIndex::open(&path), Err(RunError::Invalid)));
 }
 
 #[test]

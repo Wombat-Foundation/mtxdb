@@ -11,11 +11,11 @@
 //! ```text
 //! [64-byte header]
 //! [entry blocks, back to back]
-//! [metadata: pack table, collection directory, block table]
+//! [metadata: pack table, collection directory, block table, pack stats]
 //! ```
 //!
 //! The header holds the `MTXRUN01` magic, the version, the block size `B`,
-//! the entry, pack, collection and block counts, the metadata offset and
+//! the entry, pack, collection, block and stats counts, the metadata offset and
 //! length, and `meta_crc32` over the header (with that field zeroed) and the
 //! metadata. The metadata sits after the blocks because a streaming merge
 //! learns the collection and block counts only as it writes.
@@ -29,6 +29,11 @@
 //!   never span collections, and within a collection each block's `fence` is
 //!   above the previous block's `last`, so block selection cannot be misled by
 //!   damaged data.
+//! - **Pack stats:** one `(pack ordinal, collection_id, entry_count,
+//!   disk_bytes)` row per collection present in a covered pack, sorted by
+//!   collection then ordinal. These are each pack's own sidecar directory
+//!   values, carried through merges unchanged, so open can rebuild per-pack
+//!   accounting without opening the covered sidecars.
 //! - **Entry block:** up to `B` sorted 16-byte logical ids, then one 7-byte
 //!   locator per id: `u16` pack ordinal, `u32` frame offset, `u8` flags.
 //!
@@ -73,6 +78,7 @@ const ENTRY_LEN: usize = ID_LEN + LOCATOR_LEN;
 const PACK_ENTRY_LEN: usize = 32;
 const COLLECTION_ENTRY_LEN: usize = 32;
 const BLOCK_ENTRY_LEN: usize = 48;
+const STATS_ENTRY_LEN: usize = 34;
 const CRC_AT: usize = 56;
 
 /// A run failed a check after open. The run must not answer lookups; the
@@ -159,6 +165,36 @@ pub struct RunEntry {
     pub ordinal: u16,
     /// The frame, live or removal.
     pub locator: PackIndexLocator,
+}
+
+/// One covered pack's accounting for one collection, as its sidecar directory
+/// recorded it: every locator and frame byte in that pack, including versions
+/// a newer pack supersedes. Merges carry these rows forward rather than
+/// recounting merged entries, which hold only the newest version of each key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunPackStats {
+    /// Index into the run's pack table.
+    pub ordinal: u16,
+    /// The collection.
+    pub collection_id: [u8; 16],
+    /// Unique locators the pack's sidecar records for the collection.
+    pub entry_count: u64,
+    /// Bytes the collection's frames occupy in the pack.
+    pub disk_bytes: u64,
+}
+
+fn stats_key(row: &RunPackStats) -> ([u8; 16], u16) {
+    (row.collection_id, row.ordinal)
+}
+
+/// Rows strictly increasing by `(collection, ordinal)`, naming known packs,
+/// each with at least one entry.
+fn stats_are_valid(rows: &[RunPackStats], pack_count: usize) -> bool {
+    rows.iter()
+        .all(|row| usize::from(row.ordinal) < pack_count && row.entry_count > 0)
+        && rows
+            .windows(2)
+            .all(|pair| stats_key(&pair[0]) < stats_key(&pair[1]))
 }
 
 /// Shape of a written run.
@@ -255,6 +291,7 @@ pub struct RunWriter {
     data_end: u64,
     last: Option<([u8; 16], [u8; 16])>,
     entry_count: u64,
+    stats: Vec<RunPackStats>,
 }
 
 impl RunWriter {
@@ -296,6 +333,7 @@ impl RunWriter {
             data_end: u64::try_from(RUN_HEADER_LEN).unwrap_or(u64::MAX),
             last: None,
             entry_count: 0,
+            stats: Vec::new(),
         })
     }
 
@@ -346,6 +384,20 @@ impl RunWriter {
         if self.pending_count >= self.block_entries {
             self.flush_block()?;
         }
+        Ok(())
+    }
+
+    /// Record the covered packs' per-collection accounting, in any order.
+    ///
+    /// # Errors
+    /// Returns [`RunError::BadLocator`] if a row names an unknown pack, has no
+    /// entries, or repeats a `(collection, pack)` pair.
+    pub fn set_pack_stats(&mut self, mut stats: Vec<RunPackStats>) -> Result<(), RunError> {
+        stats.sort_unstable_by_key(stats_key);
+        if !stats_are_valid(&stats, self.packs.len()) {
+            return Err(RunError::BadLocator);
+        }
+        self.stats = stats;
         Ok(())
     }
 
@@ -408,6 +460,7 @@ impl RunWriter {
         let collection_count =
             u32::try_from(self.collections.len()).map_err(|_| RunError::Invalid)?;
         let block_count = u32::try_from(self.blocks.len()).map_err(|_| RunError::Invalid)?;
+        let stats_count = u32::try_from(self.stats.len()).map_err(|_| RunError::Invalid)?;
         let mut meta = Vec::new();
         for pack in &self.packs {
             meta.extend_from_slice(&pack.pack_id.0);
@@ -427,6 +480,12 @@ impl RunWriter {
             meta.extend_from_slice(&block.entries.to_le_bytes());
             meta.extend_from_slice(&block.crc.to_le_bytes());
         }
+        for row in &self.stats {
+            meta.extend_from_slice(&row.ordinal.to_le_bytes());
+            meta.extend_from_slice(&row.collection_id);
+            meta.extend_from_slice(&row.entry_count.to_le_bytes());
+            meta.extend_from_slice(&row.disk_bytes.to_le_bytes());
+        }
         let meta_len = u64::try_from(meta.len()).map_err(|_| RunError::Invalid)?;
         let mut header = [0_u8; RUN_HEADER_LEN];
         header[0..8].copy_from_slice(&RUN_MAGIC);
@@ -436,6 +495,7 @@ impl RunWriter {
         header[24..28].copy_from_slice(&pack_count.to_le_bytes());
         header[28..32].copy_from_slice(&collection_count.to_le_bytes());
         header[32..36].copy_from_slice(&block_count.to_le_bytes());
+        header[36..40].copy_from_slice(&stats_count.to_le_bytes());
         header[40..48].copy_from_slice(&self.data_end.to_le_bytes());
         header[48..56].copy_from_slice(&meta_len.to_le_bytes());
         let mut hasher = crc32fast::Hasher::new();
@@ -475,6 +535,8 @@ pub struct RunIndex {
     collections: Vec<CollectionMeta>,
     block_entries: u32,
     block_table_at: usize,
+    stats_at: usize,
+    stats_count: usize,
     entry_count: u64,
     verified: Vec<AtomicU64>,
     invalid: AtomicBool,
@@ -508,6 +570,7 @@ impl RunIndex {
         let header = RunHeader::parse(&map)?;
         let packs = header.parse_packs(&map)?;
         let collections = header.parse_collections(&map)?;
+        header.check_stats(&map)?;
         let words = usize::try_from(header.block_count).ok()?.div_ceil(64);
         let verified = (0..words).map(|_| AtomicU64::new(0)).collect();
         Some(Self {
@@ -516,6 +579,8 @@ impl RunIndex {
             collections,
             block_entries: header.block_entries,
             block_table_at: header.block_table_at()?,
+            stats_at: header.stats_at()?,
+            stats_count: header.stats_count,
             entry_count: header.entry_count,
             verified,
             invalid: AtomicBool::new(false),
@@ -526,6 +591,12 @@ impl RunIndex {
     #[must_use]
     pub fn packs(&self) -> &[PackIndexIdentity] {
         &self.packs
+    }
+
+    /// Each covered pack's per-collection accounting, sorted by collection then
+    /// pack ordinal. Checked at open.
+    pub fn pack_stats(&self) -> impl Iterator<Item = RunPackStats> + '_ {
+        (0..self.stats_count).filter_map(move |index| stats_row_at(&self.map, self.stats_at, index))
     }
 
     /// Unique `(collection, id)` entries in the run.
@@ -748,6 +819,7 @@ struct RunHeader {
     pack_count: usize,
     collection_count: usize,
     block_count: u32,
+    stats_count: usize,
     meta_at: usize,
 }
 
@@ -762,14 +834,11 @@ impl RunHeader {
             pack_count: usize::try_from(read_u32(bytes, 24)?).ok()?,
             collection_count: usize::try_from(read_u32(bytes, 28)?).ok()?,
             block_count: read_u32(bytes, 32)?,
+            stats_count: usize::try_from(read_u32(bytes, 36)?).ok()?,
             meta_at: usize::try_from(read_u64(bytes, 40)?).ok()?,
         };
         let meta_len = usize::try_from(read_u64(bytes, 48)?).ok()?;
-        if header.block_entries == 0
-            || header.entry_count == 0
-            || read_u32(bytes, 36)? != 0
-            || read_u32(bytes, 60)? != 0
-        {
+        if header.block_entries == 0 || header.entry_count == 0 || read_u32(bytes, 60)? != 0 {
             return None;
         }
         let expected_meta = header
@@ -780,7 +849,8 @@ impl RunHeader {
                 usize::try_from(header.block_count)
                     .ok()?
                     .checked_mul(BLOCK_ENTRY_LEN)?,
-            )?;
+            )?
+            .checked_add(header.stats_count.checked_mul(STATS_ENTRY_LEN)?)?;
         if header.meta_at < RUN_HEADER_LEN
             || meta_len != expected_meta
             || header.meta_at.checked_add(meta_len)? != bytes.len()
@@ -805,6 +875,31 @@ impl RunHeader {
     fn block_table_at(&self) -> Option<usize> {
         self.collections_at()?
             .checked_add(self.collection_count.checked_mul(COLLECTION_ENTRY_LEN)?)
+    }
+
+    fn stats_at(&self) -> Option<usize> {
+        self.block_table_at()?.checked_add(
+            usize::try_from(self.block_count)
+                .ok()?
+                .checked_mul(BLOCK_ENTRY_LEN)?,
+        )
+    }
+
+    /// Check the stats rows without keeping them: O(rows) at open.
+    fn check_stats(&self, bytes: &[u8]) -> Option<()> {
+        let at = self.stats_at()?;
+        let mut previous: Option<RunPackStats> = None;
+        for index in 0..self.stats_count {
+            let row = stats_row_at(bytes, at, index)?;
+            if usize::from(row.ordinal) >= self.pack_count
+                || row.entry_count == 0
+                || previous.is_some_and(|previous| stats_key(&previous) >= stats_key(&row))
+            {
+                return None;
+            }
+            previous = Some(row);
+        }
+        Some(())
     }
 
     fn parse_packs(&self, bytes: &[u8]) -> Option<Vec<PackIndexIdentity>> {
@@ -885,6 +980,16 @@ impl RunHeader {
             && next_data == u64::try_from(self.meta_at).ok()?;
         complete.then_some(collections)
     }
+}
+
+fn stats_row_at(bytes: &[u8], table_at: usize, index: usize) -> Option<RunPackStats> {
+    let at = table_at.checked_add(index.checked_mul(STATS_ENTRY_LEN)?)?;
+    Some(RunPackStats {
+        ordinal: u16::from_le_bytes(bytes.get(at..at.checked_add(2)?)?.try_into().ok()?),
+        collection_id: read_id(bytes, at.checked_add(2)?)?,
+        entry_count: read_u64(bytes, at.checked_add(18)?)?,
+        disk_bytes: read_u64(bytes, at.checked_add(26)?)?,
+    })
 }
 
 fn block_meta_at(bytes: &[u8], table_at: usize, block: u32) -> Option<BlockMeta> {
@@ -1008,6 +1113,41 @@ impl MergeSource<'_> {
             Self::Run(run) => run.packs().to_vec(),
         }
     }
+
+    /// This source's accounting rows with ordinals mapped through `remap`.
+    fn stats(&self, remap: &[u16]) -> Result<Vec<RunPackStats>, RunError> {
+        match self {
+            Self::Sidecar(index) => {
+                let ordinal = *remap.first().ok_or(RunError::BadPackTable)?;
+                let mut rows = Vec::new();
+                let mut missing = false;
+                index.for_each_collection(|collection_id, disk_bytes| {
+                    match index.collection_entry_count(&collection_id) {
+                        Some(entry_count) => rows.push(RunPackStats {
+                            ordinal,
+                            collection_id,
+                            entry_count,
+                            disk_bytes,
+                        }),
+                        None => missing = true,
+                    }
+                });
+                if missing {
+                    return Err(RunError::Invalid);
+                }
+                Ok(rows)
+            }
+            Self::Run(run) => run
+                .pack_stats()
+                .map(|mut row| {
+                    row.ordinal = *remap
+                        .get(usize::from(row.ordinal))
+                        .ok_or(RunError::BadPackTable)?;
+                    Ok(row)
+                })
+                .collect(),
+        }
+    }
 }
 
 /// How a merge treats its inputs.
@@ -1041,7 +1181,8 @@ type HeapKey = Reverse<([u8; 16], [u8; 16], Reverse<u16>, usize)>;
 /// The output is written to `<path>.tmp`, fsynced, renamed to `path`, and the
 /// directory fsynced. An output with no entries (every key was a dropped
 /// removal) is not written, any earlier run at `path` is removed, and `None`
-/// is returned. The merge checks that inputs do not overlap or interleave; that
+/// is returned. Each input's per-pack accounting is copied into the output's
+/// pack stats with remapped ordinals. The merge checks that inputs do not overlap or interleave; that
 /// they cover every pack of the pool's range is the caller's check. Memory is one entry per input
 /// plus the writer's per-block metadata.
 ///
@@ -1071,6 +1212,7 @@ pub fn merge_to_path(
     };
 
     let mut cursors: Vec<Cursor<'_>> = Vec::with_capacity(sources.len());
+    let mut stats = Vec::new();
     for source in sources {
         let source_packs = source.packs();
         let remap = source_packs
@@ -1085,6 +1227,7 @@ pub fn merge_to_path(
         {
             return Err(RunError::OverlappingInputs);
         }
+        stats.extend(source.stats(&remap)?);
         match *source {
             MergeSource::Sidecar(index) => {
                 let ordinal = *remap.first().ok_or(RunError::BadPackTable)?;
@@ -1112,7 +1255,7 @@ pub fn merge_to_path(
     let mut temp: OsString = path.as_os_str().to_owned();
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
-    let result = write_merged(&mut cursors, packs, options, &temp);
+    let result = write_merged(&mut cursors, packs, stats, options, &temp);
     let summary = match result {
         Ok(summary) => summary,
         Err(error) => {
@@ -1145,10 +1288,12 @@ pub fn merge_to_path(
 fn write_merged(
     cursors: &mut [Cursor<'_>],
     packs: Vec<PackIndexIdentity>,
+    stats: Vec<RunPackStats>,
     options: MergeOptions,
     temp: &Path,
 ) -> Result<Option<RunSummary>, RunError> {
     let mut writer = RunWriter::create(temp, packs, options.block_entries)?;
+    writer.set_pack_stats(stats)?;
     // Min-heap on (collection, id), newest pack first among equal keys.
     let mut heap: BinaryHeap<HeapKey> = BinaryHeap::with_capacity(cursors.len());
     let mut heads: Vec<Option<RunEntry>> = vec![None; cursors.len()];
