@@ -262,6 +262,9 @@ fn outlier_flag_is_part_of_the_verdict_record() {
     // version, flags (outlier = bit 3), u32 length, event id
     assert_eq!(bytes, [&[2, 0b1000, 4, 0, 0, 0][..], b"$e:x"].concat());
     assert_eq!(decode_verdict(&bytes).unwrap().1, outlier);
+    // Version 1 records written before the bump must still decode.
+    let legacy = [&[1, 0b1000, 4, 0, 0, 0][..], b"$e:x"].concat();
+    assert_eq!(decode_verdict(&legacy).unwrap().1, outlier);
     let timeline = Verdict::default();
     assert!(timeline.is_empty());
     assert!(

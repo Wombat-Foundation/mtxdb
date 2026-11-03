@@ -11,6 +11,10 @@ fn matrix_pool_policies_skips_compression_for_small_or_dense_pools() {
     assert!(policies.for_shard(ShardType::Edges).compress);
     assert!(!policies.for_shard(ShardType::ServerInfo).compress);
     assert_eq!(
+        policies.for_shard(ShardType::ServerInfo).checksum_policy,
+        mtxdb::packfile::ChecksumPolicy::Full
+    );
+    assert_eq!(
         policies.for_shard(ShardType::State).checksum_policy,
         mtxdb::packfile::ChecksumPolicy::Full
     );

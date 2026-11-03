@@ -824,6 +824,11 @@ impl RoomFlagIndex {
     /// the active index. Upon completion, swaps the active generation pointer atomically
     /// via CAS. If rebuild fails, active index is unchanged and the target collection is cleaned up.
     ///
+    /// Retired generation collections are retained indefinitely. Reads do not
+    /// provide a cross-collection snapshot or reader lease, so a rebuild cannot
+    /// safely reclaim an old collection after publication. Repeated successful
+    /// rebuilds therefore grow storage until a safe reclamation protocol exists.
+    ///
     /// Returns the number of events indexed.
     ///
     /// # Errors
@@ -983,6 +988,11 @@ impl RoomFlagIndex {
                 tx.commit()?;
             }
 
+            if end_id == counter {
+                break;
+            }
+            // Here end_id < counter <= u32::MAX, so the increment cannot
+            // overflow. In particular, the final u32::MAX batch exits above.
             start_id = end_id.saturating_add(1);
         }
 

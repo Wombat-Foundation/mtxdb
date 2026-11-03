@@ -66,6 +66,31 @@ fn redo_set(collection_id: [u8; 16], full_hash: [u8; 16], delta_seq: u64) -> Del
     })
 }
 
+fn replay_incremental_snapshot_model(
+    operations: &[DeltaOperation],
+) -> HashMap<[u8; 16], Vec<DeltaOperation>> {
+    let mut state = HashMap::<[u8; 16], Vec<DeltaOperation>>::new();
+    for operation in operations {
+        match operation {
+            DeltaOperation::Incremental(frame) => {
+                let entries = state.entry(frame.collection_id).or_default();
+                entries.retain(|existing| {
+                    !matches!(existing, DeltaOperation::Incremental(old) if old.bucket == frame.bucket)
+                });
+                entries.push(operation.clone());
+            }
+            DeltaOperation::CollectionSnapshot { collection_id, .. } => {
+                state.insert(*collection_id, vec![operation.clone()]);
+            }
+            DeltaOperation::CollectionTombstone { collection_id, .. } => {
+                state.remove(collection_id);
+            }
+            DeltaOperation::Coverage { .. } | DeltaOperation::Redo(_) => {}
+        }
+    }
+    state
+}
+
 #[test]
 fn compaction_keeps_the_newest_redo_and_the_final_coverage() {
     let collection = [3; 16];
@@ -184,6 +209,126 @@ fn compact_delta_log_skips_a_log_with_marginal_savings() {
         "the log is unchanged"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_delta_compactions_use_independent_temporary_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "mtxdb_delta_compact_concurrent_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(INDEX_DELTA_FILE);
+    let collection = [0x61; 16];
+    let operations = vec![
+        redo_set(collection, [1; 16], 1),
+        redo_set(collection, [2; 16], 2),
+        redo_set(collection, [1; 16], 3),
+        DeltaOperation::Coverage { covered_lsn: 77 },
+    ];
+    std::fs::write(&path, v1_log(&operations, 0x7171)).unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                compact_delta_log(&path)
+            })
+        })
+        .collect();
+    barrier.wait();
+    for worker in workers {
+        worker.join().unwrap().unwrap();
+    }
+
+    let compacted = read_delta_log(&path).expect("live log remains readable");
+    assert_eq!(compacted.coverage, Some(77));
+    assert_eq!(compacted.operations.len(), 3);
+    assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains(".compact.")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compact_operations_preserve_incremental_and_snapshot_replay_result() {
+    let collection_a = [0x71; 16];
+    let collection_b = [0x72; 16];
+    let operations = vec![
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_a,
+            bucket: 1,
+            generation: 1,
+            slot: 11,
+        }),
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_b,
+            bucket: 9,
+            generation: 1,
+            slot: 19,
+        }),
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_b,
+            bucket: 9,
+            generation: 1,
+            slot: 29,
+        }),
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_a,
+            bucket: 1,
+            generation: 1,
+            slot: 12,
+        }),
+        DeltaOperation::CollectionSnapshot {
+            collection_id: collection_a,
+            generation: 3,
+            order_key: 4,
+            index_blob: vec![3, 3, 3],
+        },
+        DeltaOperation::Incremental(DeltaFrame {
+            collection_id: collection_a,
+            bucket: 7,
+            generation: 3,
+            slot: 17,
+        }),
+        DeltaOperation::Coverage { covered_lsn: 88 },
+    ];
+
+    let compacted = compact_operations(&operations);
+    assert_eq!(
+        replay_incremental_snapshot_model(&operations),
+        replay_incremental_snapshot_model(&compacted)
+    );
+    assert_eq!(
+        compacted
+            .iter()
+            .filter(|operation| matches!(operation, DeltaOperation::Incremental(frame) if frame.collection_id == collection_b && frame.bucket == 9))
+            .count(),
+        1,
+        "only the latest incremental frame for a bucket survives"
+    );
+    assert!(
+        compacted.iter().any(|operation| matches!(
+            operation,
+            DeltaOperation::CollectionSnapshot { collection_id, generation: 3, .. }
+                if *collection_id == collection_a
+        )),
+        "the latest snapshot must survive the cut"
+    );
+    assert!(
+        !compacted.iter().any(|operation| matches!(
+            operation,
+            DeltaOperation::Incremental(frame)
+                if frame.collection_id == collection_a && frame.generation == 1
+        )),
+        "the snapshot must cut earlier incrementals"
+    );
 }
 
 #[test]

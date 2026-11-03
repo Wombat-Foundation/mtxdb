@@ -589,8 +589,15 @@ fn sealed_pack_index_skips_recovery_and_corruption_falls_back() {
     let last = sidecar.len() - 1;
     sidecar[last] ^= 0xff;
     fs::write(&sidecar_path, sidecar).unwrap();
-    let pool = ShardPool::open(dir).unwrap();
+    let pool = ShardPool::open(dir.clone()).unwrap();
     assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 2);
+    assert!(pool.get_shard(slot).unwrap().sealed.load(Ordering::Acquire));
+    drop(pool);
+
+    // The invalid sidecar was rebuilt while opening the non-active pack.
+    // Later opens should recover-scan only the active append pack.
+    let pool = ShardPool::open(dir).unwrap();
+    assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 1);
 }
 
 /// Core fix: a collection's writes must stay on its own home shard even

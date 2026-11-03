@@ -1177,6 +1177,31 @@ impl ShardPool {
             .map_or_else(|| next_slot.saturating_sub(1), |(_, slot)| slot)
     }
 
+    /// Persist sidecars for recovered, non-active packs. They are closed to
+    /// future appends for this pool session, so after their frames are durable
+    /// they can safely be treated as sealed. This also upgrades legacy or
+    /// missing sidecars once instead of recovery-scanning those packs on every
+    /// writable reopen.
+    fn seal_recovered_non_active_packs(shards: &[Option<Arc<Shard>>], active_slot: u16) {
+        for shard in shards.iter().flatten() {
+            if shard.slot == active_slot || shard.sealed.load(Ordering::Acquire) {
+                continue;
+            }
+            let _append_guard = shard.append_lock.lock();
+            if shard.sealed.load(Ordering::Acquire)
+                || shard.fsync_advancing_watermark(false).is_err()
+                || packidx::build_and_write(&shard.path, true).is_err()
+            {
+                continue;
+            }
+            let Some(index) = packidx::open_for_pack(&shard.path) else {
+                continue;
+            };
+            *shard.sealed_index.lock() = Some(Arc::new(index));
+            shard.sealed.store(true, Ordering::Release);
+        }
+    }
+
     /// Bootstrap a brand-new pool: create the first pack file, persist
     /// `pool.meta` (with a fresh seed if needed).
     /// Returns `(bucket_seed, pool_meta_persist_time)`.
@@ -1405,6 +1430,9 @@ impl ShardPool {
             Self::recover_and_open_packs(writable, pack_files, &mut shards, &mut next_slot)?;
 
         let highest_active = Self::choose_active_slot(&shards, max_shard_bytes, next_slot);
+        if writable {
+            Self::seal_recovered_non_active_packs(&shards, highest_active);
+        }
 
         // Restore bucket_seed from pool.meta if available. A corrupt pool.meta
         // is a hard error.

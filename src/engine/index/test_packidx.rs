@@ -132,6 +132,17 @@ fn dedup_accumulates_superseded_frame_disk_bytes() {
 }
 
 #[test]
+fn dedup_rejects_disk_byte_overflow() {
+    let mut inputs = sample_inputs();
+    inputs[1].disk_bytes = u64::MAX;
+    inputs[2].disk_bytes = 1;
+    assert_eq!(
+        PackIndex::build(sample_identity(), inputs).unwrap_err(),
+        PackIndexError::TooLarge
+    );
+}
+
+#[test]
 fn empty_pack_index_is_valid() {
     let built = PackIndex::build(
         PackIndexIdentity {

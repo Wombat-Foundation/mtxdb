@@ -621,6 +621,13 @@ impl LossyIndex {
         offset: u64,
         removed: bool,
     ) -> Result<(u32, u64, EntryUndo), InsertError> {
+        // A checkpoint-backed index is read-only until its caller clones it
+        // into owned storage. Do not resize the identity tables on a write
+        // that must fail: the mapped index has no slot storage to update.
+        if !matches!(&self.slots, EntryStorage::Owned(_)) {
+            self.bump_max_probe_len(0);
+            return Err(InsertError::TableFull);
+        }
         // A checkpoint-mapped index has no in-memory identity tables. Once a
         // caller materializes it for writing, allocate zeroed tables so new
         // entries can be recorded while existing candidates still request

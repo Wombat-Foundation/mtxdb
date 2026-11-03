@@ -12,6 +12,16 @@ fn presence_is_ephemeral_and_volatile() {
 }
 
 #[test]
+fn server_info_pool_keeps_full_checksum_verification() {
+    let policies = matrix_pool_policies();
+    let policy = policies.for_shard(crate::layout::ShardType::ServerInfo);
+    assert_eq!(
+        policy.checksum_policy,
+        crate::packfile::ChecksumPolicy::Full
+    );
+}
+
+#[test]
 fn events_are_immutable_durable_and_streamed() {
     let class = MatrixRecordClass::Events.record_class();
     assert_eq!(class.retention, Retention::Immutable);

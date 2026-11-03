@@ -324,17 +324,22 @@ impl PackIndex {
                 .then_with(|| left.logical_id.cmp(&right.logical_id))
                 .then_with(|| right.offset.cmp(&left.offset))
         });
-        inputs.dedup_by(|later, earlier| {
-            if later.collection_id == earlier.collection_id
-                && later.logical_id == earlier.logical_id
-            {
-                earlier.disk_bytes = earlier.disk_bytes.saturating_add(later.disk_bytes);
-                true
-            } else {
-                false
+        let mut deduplicated: Vec<PackIndexInput> = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if let Some(previous) = deduplicated.last_mut() {
+                if previous.collection_id == input.collection_id
+                    && previous.logical_id == input.logical_id
+                {
+                    previous.disk_bytes = previous
+                        .disk_bytes
+                        .checked_add(input.disk_bytes)
+                        .ok_or(PackIndexError::TooLarge)?;
+                    continue;
+                }
             }
-        });
-        Self::encode_sorted(identity, &inputs)
+            deduplicated.push(input);
+        }
+        Self::encode_sorted(identity, &deduplicated)
     }
 
     #[allow(clippy::too_many_lines)]
