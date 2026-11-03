@@ -8,6 +8,7 @@ pub mod delta;
 pub mod format;
 pub mod packidx;
 pub mod redo;
+pub mod run;
 pub mod sealed;
 pub mod versions;
 

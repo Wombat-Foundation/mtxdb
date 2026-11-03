@@ -770,6 +770,19 @@ impl MappedPackIndex {
             .map(|view| view.disk_bytes)
     }
 
+    /// Every `(collection_id, logical_id, locator)` in collection order, then
+    /// logical-id order, as a pull iterator for streaming merges. Unlike the
+    /// callback visitors it can be advanced in step with other sources.
+    pub fn entries(&self) -> impl Iterator<Item = ([u8; 16], [u8; 16], PackIndexLocator)> + '_ {
+        self.collections.iter().flat_map(move |collection| {
+            let count = usize::try_from(collection.count).unwrap_or(0);
+            (0..count).filter_map(move |index| {
+                entry_at(&self.map, collection, index)
+                    .map(|(id, locator)| (collection.id, id, locator))
+            })
+        })
+    }
+
     /// Visit one collection's `(logical_id, locator)` entries.
     pub fn for_each_entry_in_collection(
         &self,
@@ -843,34 +856,32 @@ fn for_each_in_collection(
 ) {
     let count = usize::try_from(collection.count).unwrap_or(0);
     for index in 0..count {
-        let Some(id_at) = collection.ids_at.checked_add(index.saturating_mul(16)) else {
-            continue;
-        };
-        let Some(id) = bytes
-            .get(id_at..id_at.saturating_add(16))
-            .and_then(|id| <[u8; 16]>::try_from(id).ok())
-        else {
-            continue;
-        };
-        let Some(offset_at) = collection.offsets_at.checked_add(index.saturating_mul(4)) else {
-            continue;
-        };
-        let Some(offset) = read_u32(bytes, offset_at) else {
-            continue;
-        };
-        let Some(flags_at) = collection.flags_at.checked_add(index) else {
-            continue;
-        };
-        let Some(flags) = bytes.get(flags_at).copied() else {
-            continue;
-        };
-        let locator = if flags & PACK_INDEX_FLAG_REMOVED != 0 {
-            PackIndexLocator::Removed(offset)
-        } else {
-            PackIndexLocator::Frame(offset)
-        };
-        visit(id, locator);
+        if let Some((id, locator)) = entry_at(bytes, collection, index) {
+            visit(id, locator);
+        }
     }
+}
+
+/// The `index`th entry of a collection section, or `None` if it lies outside
+/// the mapping.
+fn entry_at(
+    bytes: &[u8],
+    collection: &CollectionView,
+    index: usize,
+) -> Option<([u8; 16], PackIndexLocator)> {
+    let id_at = collection.ids_at.checked_add(index.checked_mul(16)?)?;
+    let id = <[u8; 16]>::try_from(bytes.get(id_at..id_at.checked_add(16)?)?).ok()?;
+    let offset = read_u32(
+        bytes,
+        collection.offsets_at.checked_add(index.checked_mul(4)?)?,
+    )?;
+    let flags = *bytes.get(collection.flags_at.checked_add(index)?)?;
+    let locator = if flags & PACK_INDEX_FLAG_REMOVED != 0 {
+        PackIndexLocator::Removed(offset)
+    } else {
+        PackIndexLocator::Frame(offset)
+    };
+    Some((id, locator))
 }
 
 fn lookup(
