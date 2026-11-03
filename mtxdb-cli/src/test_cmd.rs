@@ -1,5 +1,6 @@
 use super::{
-    build_event_dag, canonical_column_width, cmd_collections, cmd_flags, cmd_get, cmd_import,
+    base_is_incomplete, build_event_dag, canonical_column_width, cmd_collections, cmd_flags,
+    cmd_get, cmd_import,
     cmd_import_file, cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_shards, cmd_stats,
     cmd_sync, cmd_tombstones, collection_canonical_id, compile_import_template,
     compute_state_groups_partial, decode_event_json_record, decode_hamt_node, decode_hamt_root,
@@ -14,8 +15,8 @@ use super::{
     resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
     template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
     verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, StateGroupLoad, StateSet,
-    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, SharedState, StateGroupLoad,
+    StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -5971,6 +5972,8 @@ fn partial_base_state_is_left_unchecked() {
     // $partial's second parent is missing, so its base state is only the
     // leave. Checking against that partial state would reject Alice; with an
     // incomplete base the event must stay unchecked instead.
+    // $child descends from $partial. Its own parents are all present, but
+    // because it inherits an incomplete base it must also stay unchecked.
     let jsonl = format!(
         concat!(
             r#"{{"format":"mtxdb-export/v1","room_id":"{room}","server":"test.conduwuit.local","timeline":true,"t":"header"}}"#,
@@ -5983,7 +5986,9 @@ fn partial_base_state_is_left_unchecked() {
             "\n",
             r#"{{"event_id":"$partial:test","depth":4,"stream_ordering":4,"auth_events":["$create:test","$join:test"],"prev_events":["$leave:test","$missing:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":4,"event_id":"$partial:test","origin_server_ts":4000,"prev_events":["$leave:test","$missing:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
             "\n",
-            r#"{{"events":4,"t":"end"}}"#,
+            r#"{{"event_id":"$child:test","depth":5,"stream_ordering":5,"auth_events":["$create:test","$join:test"],"prev_events":["$partial:test"],"outlier":false,"pdu":{{"auth_events":["$create:test","$join:test"],"content":{{}},"depth":5,"event_id":"$child:test","origin_server_ts":5000,"prev_events":["$partial:test"],"room_id":"{room}","sender":"@alice:test","type":"m.room.message"}},"t":"event"}}"#,
+            "\n",
+            r#"{{"events":5,"t":"end"}}"#,
             "\n"
         ),
         room = room_id
@@ -5992,17 +5997,17 @@ fn partial_base_state_is_left_unchecked() {
     let run = import_inputs(&db, &root, &[("room.jsonl", &jsonl)]);
     assert_eq!(
         (run.failures, run.all_exports, run.exported_events),
-        (0, true, 4)
+        (0, true, 5)
     );
     assert_eq!(
         run.rejection_counts.values().sum::<usize>(),
         0,
-        "a missing parent leaves the event unchecked"
+        "a missing parent and its descendants stay unchecked"
     );
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
     assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(), 0);
-    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 4);
+    assert_eq!(flags.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(), 5);
 
     let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
         .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
@@ -6012,7 +6017,21 @@ fn partial_base_state_is_left_unchecked() {
         .iter()
         .map(|entry| entry.stream_ordering)
         .collect();
-    assert_eq!(streams, vec![1, 2, 3, 4]);
+    assert_eq!(streams, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn incomplete_base_is_inherited_by_descendants() {
+    let instance = [0_u8; STATE_GROUP_ID_LENGTH];
+    let complete = SharedState::new(StateSet::new(), instance, true);
+    let incomplete = SharedState::new(StateSet::new(), instance, false);
+
+    assert!(!base_is_incomplete(false, std::slice::from_ref(&complete)));
+    assert!(base_is_incomplete(true, std::slice::from_ref(&complete)));
+    assert!(base_is_incomplete(
+        false,
+        std::slice::from_ref(&incomplete)
+    ));
 }
 
 #[test]

@@ -10421,10 +10421,10 @@ impl ImportContext<'_> {
                     }
                 }
                 if !base_complete {
-                    // A missing parent or a merge that fell back to the
-                    // first-parent rule means this base state is incomplete.
-                    // Leave the event unchecked rather than inventing a
-                    // rejection.
+                    // A missing parent, a merge that fell back to the
+                    // first-parent rule, or an ancestor with either gap means
+                    // this base state is incomplete. Leave the event unchecked
+                    // rather than inventing a rejection.
                     unchecked = unchecked.saturating_add(1);
                     return None;
                 }
@@ -10444,7 +10444,6 @@ impl ImportContext<'_> {
                     create,
                     state_version,
                     &entries,
-                    current,
                 ) {
                     Ok(export_import::EventAuthOutcome::Refused { code, reason }) => {
                         walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
@@ -11850,6 +11849,7 @@ fn walk_state_groups(
     let empty = SharedState::new(
         empty_set,
         state_group_instance_id(room_id, &[], &StateSet::new().lthash(), policy.derivation),
+        true,
     );
     let mut state_at: HashMap<u64, Arc<SharedState>> = HashMap::new();
     let mut result: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
@@ -11862,11 +11862,11 @@ fn walk_state_groups(
             ev.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
                 && ev.get("state_key").and_then(OwnedValue::as_str) == Some("")
         });
-        let claimed_prev_count = event_value
+        let claimed_prev_ids: HashSet<&str> = event_value
             .and_then(|ev| ev.get("prev_events"))
             .and_then(OwnedValue::as_array)
-            .map_or(0, Vec::len);
-
+            .map(|arr| arr.iter().filter_map(OwnedValue::as_str).collect())
+            .unwrap_or_default();
         let mut parent_ids: Vec<u64> = Vec::new();
         let mut parents: Vec<Arc<SharedState>> = Vec::new();
         let mut parent_instances: Vec<[u8; STATE_GROUP_ID_LENGTH]> = Vec::new();
@@ -11885,12 +11885,16 @@ fn walk_state_groups(
                 base_incomplete = true;
             }
         }
+        let unique_parents: HashSet<u64> = parent_ids.iter().copied().collect();
         if !is_create && parents.is_empty() {
             base_incomplete = true;
         }
-        if parents.len() != claimed_prev_count {
+        if unique_parents.len() != claimed_prev_ids.len() {
             base_incomplete = true;
         }
+        // Incompleteness is inherited: a child of an event with a gapped base
+        // has a gapped base too, even when all of its own parents are present.
+        base_incomplete = base_is_incomplete(base_incomplete, &parents);
 
         // State-resolution merge. Parents that already agree share their state
         // instead of copying it, so a plain message event costs no allocation;
@@ -11955,6 +11959,7 @@ fn walk_state_groups(
             room_id,
             policy,
             rejected.as_deref(),
+            !base_incomplete,
         );
 
         instances
@@ -11988,6 +11993,11 @@ fn walk_state_groups(
         instances,
         incomplete,
     }
+}
+
+/// Whether a base is incomplete, including gaps inherited from any parent.
+fn base_is_incomplete(own_gap: bool, parents: &[Arc<SharedState>]) -> bool {
+    own_gap || parents.iter().any(|parent| !parent.complete)
 }
 
 /// How many resident children still need each event's state. Once the last
@@ -12030,6 +12040,7 @@ fn derive_state(
     room_id: &str,
     policy: ResolutionPolicy,
     rejected: Option<&HashSet<String>>,
+    base_complete: bool,
 ) -> Arc<SharedState> {
     let excluded = event.is_some_and(|ev| match rejected {
         Some(set) => view.excludes_import(ev, event_id_ref.unwrap_or(""), set),
@@ -12049,12 +12060,15 @@ fn derive_state(
                 &set.lthash(),
                 policy.derivation,
             );
-            SharedState::new(set, instance)
+            SharedState::new(set, instance, base_complete)
         }
         _ if distinct_instances(parent_instances) > 1 => {
             let instance =
                 state_group_instance_id(room_id, parent_instances, &base.lthash, policy.derivation);
-            SharedState::new(base.set.clone(), instance)
+            SharedState::new(base.set.clone(), instance, base_complete)
+        }
+        _ if base_complete != base.complete => {
+            SharedState::new(base.set.clone(), base.instance, base_complete)
         }
         _ => Arc::clone(base),
     }
@@ -12104,7 +12118,8 @@ fn merge_parent_states(
         &merged.lthash(),
         policy.derivation,
     );
-    (SharedState::new(merged, instance), fallback)
+    let complete = !fallback && parents.iter().all(|parent| parent.complete);
+    (SharedState::new(merged, instance, complete), fallback)
 }
 
 /// Number of distinct instance ids in `instances`.
@@ -12242,15 +12257,20 @@ struct SharedState {
     set: StateSet,
     lthash: [u8; 32],
     instance: [u8; STATE_GROUP_ID_LENGTH],
+    /// Whether every event this state descends from had a complete base. A
+    /// missing parent or a resolution fallback marks the whole subtree, so
+    /// descendants are not judged against state built on a gap.
+    complete: bool,
 }
 
 impl SharedState {
-    fn new(set: StateSet, instance: [u8; STATE_GROUP_ID_LENGTH]) -> Arc<Self> {
+    fn new(set: StateSet, instance: [u8; STATE_GROUP_ID_LENGTH], complete: bool) -> Arc<Self> {
         let lthash = set.lthash();
         Arc::new(Self {
             set,
             lthash,
             instance,
+            complete,
         })
     }
 }
