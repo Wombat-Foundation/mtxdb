@@ -120,9 +120,10 @@ jobs:
             RUSTUP_TOOLCHAIN: stable
             RUSTC_WRAPPER: ""
             QEMU_PAGESIZE: ${{ matrix.page_size }}
+            CARGO_NET_GIT_FETCH_WITH_CLI: "true"
           install: |
             apt-get update
-            apt-get install -y build-essential curl ca-certificates pkg-config
+            apt-get install -y build-essential curl ca-certificates git pkg-config libzstd-dev
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           run: |
             set -eu

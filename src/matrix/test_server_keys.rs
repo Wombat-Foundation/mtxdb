@@ -404,6 +404,7 @@ fn overlapping_writers_never_lose_a_key() {
         })
         .chain(std::iter::once(b"ed25519:shared".to_vec()))
         .collect();
+    assert_eq!(all.len(), expected.len(), "key records must be unique");
     let actual: std::collections::BTreeSet<Vec<u8>> =
         all.iter().map(|key| key.key_id.clone()).collect();
     let diagnostics = if actual == expected {

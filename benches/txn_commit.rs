@@ -206,6 +206,7 @@ fn open_db(dir: PathBuf, compress: bool) -> Database {
     let policy = PoolPolicy {
         compress,
         checksum_policy: ChecksumPolicy::Full,
+        ..PoolPolicy::default()
     };
     let policies = PoolPolicies::uniform(policy);
     Database::open_with_policies(dir, policies).expect("open shared database")

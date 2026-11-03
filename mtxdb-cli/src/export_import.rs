@@ -850,6 +850,16 @@ fn warning_id_limit() -> usize {
     }
 }
 
+fn visible_warning_ids<'a>(
+    ids: &'a [String],
+    current: Option<&HashSet<String>>,
+) -> Vec<&'a str> {
+    ids.iter()
+        .filter(|id| current.is_none_or(|set| set.contains(id.as_str())))
+        .map(String::as_str)
+        .collect()
+}
+
 impl AuthFindings {
     /// Warning lines for events in the current file only.
     ///
@@ -857,55 +867,41 @@ impl AuthFindings {
     /// claims are not available on a later import. Reporting those earlier
     /// events again would compare the derived verdict with a false default.
     pub(crate) fn current_warnings(&self, current: &HashSet<String>) -> Vec<String> {
-        let mut filtered = self.clone();
-        filtered.missing_auth.retain(|id| current.contains(id));
-        filtered.cascaded.retain(|id| current.contains(id));
-        filtered.missing_prev.retain(|id| current.contains(id));
-        filtered
-            .passes_but_exported_rejected
-            .retain(|id| current.contains(id));
-        filtered
-            .fails_but_exported_accepted
-            .retain(|failure| current.contains(&failure.event_id));
-        filtered
-            .hash_audit
-            .retain(|row| current.contains(&row.event_id));
-        filtered
-            .signature_failures
-            .retain(|failure| current.contains(&failure.event_id));
-        filtered.warnings()
+        self.warnings_for(Some(current))
     }
 
     /// Human-readable warnings, empty for a clean room.
     pub(crate) fn warnings(&self) -> Vec<String> {
+        self.warnings_for(None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn warnings_for(&self, current: Option<&HashSet<String>>) -> Vec<String> {
         let id_limit = warning_id_limit();
         let mut lines = Vec::new();
-        for (count, ids, what) in [
+        for (ids, what) in [
             (
-                self.missing_auth.len(),
-                &self.missing_auth,
+                visible_warning_ids(&self.missing_auth, current),
                 "stored as rejected outliers: an auth event is not in the export",
             ),
             (
-                self.cascaded.len(),
-                &self.cascaded,
+                visible_warning_ids(&self.cascaded, current),
                 "stored as rejected outliers: they cite a rejected auth event",
             ),
             (
-                self.missing_prev.len(),
-                &self.missing_prev,
+                visible_warning_ids(&self.missing_prev, current),
                 "have a prev event that is not in the export (verdicts unchanged)",
             ),
             (
-                self.passes_but_exported_rejected.len(),
-                &self.passes_but_exported_rejected,
+                visible_warning_ids(&self.passes_but_exported_rejected, current),
                 "were exported as rejected but pass the state-before-event auth check (stored accepted)",
             ),
         ] {
+            let count = ids.len();
             if count == 0 {
                 continue;
             }
-            let shown: Vec<&str> = ids.iter().take(id_limit).map(String::as_str).collect();
+            let shown: Vec<&str> = ids.iter().take(id_limit).copied().collect();
             let more = count.saturating_sub(shown.len());
             let tail = if more > 0 {
                 format!(", and {more} more")
@@ -920,6 +916,7 @@ impl AuthFindings {
         let differs: Vec<&str> = self
             .hash_audit
             .iter()
+            .filter(|row| current.is_none_or(|set| set.contains(&row.event_id)))
             .filter(|row| !row.content_matches_redaction)
             .map(|row| row.event_id.as_str())
             .collect();
@@ -930,9 +927,14 @@ impl AuthFindings {
                 differs.join(", ")
             ));
         }
-        if !self.fails_but_exported_accepted.is_empty() {
+        let failures: Vec<_> = self
+            .fails_but_exported_accepted
+            .iter()
+            .filter(|failure| current.is_none_or(|set| set.contains(&failure.event_id)))
+            .collect();
+        if !failures.is_empty() {
             let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
-            for failure in &self.fails_but_exported_accepted {
+            for failure in &failures {
                 if let Some((_, ids)) = groups
                     .iter_mut()
                     .find(|(reason, _)| *reason == failure.reason)
@@ -959,7 +961,7 @@ impl AuthFindings {
                 parts.push(format!("{reason} ({}): {listed}{suffix}", ids.len()));
                 shown = shown.saturating_add(take);
             }
-            let more = self.fails_but_exported_accepted.len().saturating_sub(shown);
+            let more = failures.len().saturating_sub(shown);
             let tail = if more > 0 {
                 format!(", and {more} more")
             } else {
@@ -968,38 +970,37 @@ impl AuthFindings {
             lines.push(format!(
                 "{} events were exported as accepted but fail the state-before-event auth check \
                  (stored as rejected), grouped by reason: {}{tail}",
-                self.fails_but_exported_accepted.len(),
+                failures.len(),
                 parts.join("; "),
             ));
         }
-        if let Some(warning) = self.signature_failure_warning(id_limit) {
+        let signature_failures: Vec<_> = self
+            .signature_failures
+            .iter()
+            .filter(|failure| current.is_none_or(|set| set.contains(&failure.event_id)))
+            .collect();
+        if !signature_failures.is_empty() {
+            let shown = signature_failures
+                .iter()
+                .take(id_limit)
+                .map(|failure| failure.event_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = signature_failures.len().saturating_sub(id_limit);
+            let tail = if more > 0 {
+                format!(", and {more} more")
+            } else {
+                String::new()
+            };
+            let warning = format!(
+                "{} events have an invalid signature from an available in-window key (stored as rejected): {shown}{tail}",
+                signature_failures.len()
+            );
             lines.push(warning);
         }
         lines
     }
 
-    fn signature_failure_warning(&self, listed_limit: usize) -> Option<String> {
-        if self.signature_failures.is_empty() {
-            return None;
-        }
-        let shown = self
-            .signature_failures
-            .iter()
-            .take(listed_limit)
-            .map(|failure| failure.event_id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let more = self.signature_failures.len().saturating_sub(listed_limit);
-        let tail = if more > 0 {
-            format!(", and {more} more")
-        } else {
-            String::new()
-        };
-        Some(format!(
-            "{} events have an invalid signature from an available in-window key (stored as rejected): {shown}{tail}",
-            self.signature_failures.len()
-        ))
-    }
 }
 
 /// Work out which events cannot be authorized from the room's own edges.
@@ -2185,7 +2186,7 @@ impl<'a> ClosureWriter<'a> {
 
     /// Stage the short-id counter when it advanced, then commit the batch.
     /// A batch that only reuses existing shorts leaves the counter untouched.
-    pub(crate) fn commit(&self, tx: &mtxdb::DatabaseTransaction<'_>) -> anyhow::Result<()> {
+    pub(crate) fn commit(&mut self, tx: &mtxdb::DatabaseTransaction<'_>) -> anyhow::Result<()> {
         if self.counter != self.initial_counter {
             tx.put(
                 EDGE_POOL,
@@ -2195,6 +2196,7 @@ impl<'a> ClosureWriter<'a> {
             )?;
         }
         tx.commit().context("committing auth closures")?;
+        self.initial_counter = self.counter;
         reclaim_journal(self.db)?;
         Ok(())
     }

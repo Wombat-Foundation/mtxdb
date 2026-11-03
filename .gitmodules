@@ -1,4 +1,4 @@
 [submodule "docs"]
 	path = docs
-	url = https://git.nutra.tk/wombat-founation/mtxdb-docs.git
+	url = https://git.nutra.tk/wombat-foundation/mtxdb-docs.git
 	update = none

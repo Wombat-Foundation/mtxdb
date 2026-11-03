@@ -21,7 +21,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "mtxdb-raw-projection-cli-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace(':', "_")
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();

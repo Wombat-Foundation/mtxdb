@@ -77,6 +77,7 @@ fn open(dir: &Path, policy: &Policy) -> Database {
     let pool = PoolPolicy {
         compress: policy.compress,
         checksum_policy: policy.checksum,
+        ..PoolPolicy::default()
     };
     Database::open_with_policies(
         dir.to_path_buf(),
