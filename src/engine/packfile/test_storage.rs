@@ -11283,6 +11283,7 @@ fn repack_scan_keeps_a_re_added_key_live_in_a_misordered_layout() {
 /// with the raw on-disk flags byte for every frame in a pack that mixes
 /// plain, compressed, metadata-bearing and removal-marker frames, under both
 /// checksum modes.
+#[cfg(feature = "zstd")]
 #[test]
 fn repack_scan_removal_flag_matches_a_direct_frame_read() {
     use std::io::{Read, Seek, SeekFrom};
