@@ -2,8 +2,10 @@
 //!
 //! Packs remain authoritative. The sidecar stores
 //! `(collection_id, logical_id) -> byte_offset` and can be rebuilt by scanning
-//! its pack. This module defines the format and I/O primitives; pack sealing
-//! and store-open integration are separate work.
+//! its pack. Sealing publishes a sidecar through [`build_and_write`], and
+//! store open loads it through [`open_for_pack`]. A Paged store serves sealed
+//! lookups from sidecars; a Resident store uses them when its checksum policy
+//! does not verify reads, and otherwise scans frames.
 //!
 //! The `index_artifacts` benchmark writes frames in arrival order; it does not
 //! measure repacked packs. Repacking rewrites a collection's live frames in
@@ -13,9 +15,9 @@
 //! would require an id-ordered write path and would trade away the locality
 //! repack creates. Truncated ids (drop the trailing bytes, then verify the full
 //! id from the frame header and probe adjacent equal prefixes) project to about
-//! 40% less sidecar data, before accounting for any additional lookup metadata;
-//! this format has no production mmap loader yet. Today only tests and the
-//! `index_artifacts` bench call [`PackIndex::open_mmap`].
+//! 40% less sidecar data, before accounting for any additional lookup metadata.
+//! [`PackIndex::open_mmap`] is the production loader (via [`open_for_pack`]),
+//! and the `index_artifacts` bench also calls it directly.
 //!
 //! Version 1 is little-endian:
 //!
