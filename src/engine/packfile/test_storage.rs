@@ -12290,6 +12290,85 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
     fs::remove_dir_all(&store_dir).ok();
 }
 
+/// A `journal.lsn` ahead of the versions file is a leftover, not a coverage
+/// claim: the versions file is synced first, so a larger value must not let a
+/// paged reopen (or a later reclaim) move past the versions it can restore.
+#[test]
+fn paged_coverage_is_capped_by_the_versions_file() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("versions_cap_wal");
+    let store_dir = test_dir("versions_cap_store");
+    let wal = wal_dir.join("shared.wal");
+    let probe = distinct_id(255);
+
+    let (version, versions_coverage) = {
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let store =
+            PackfileStorage::open_with_max_shard_bytes(store_dir.clone(), 48 * 1024).unwrap();
+        store
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        fill_incompressible(&store, &TEST_COLLECTION, 10_000, 120);
+        coordinator.sync().unwrap();
+        store.sync_all().unwrap();
+        store.force_index_checkpoint().unwrap();
+        assert_eq!(
+            Journal::scan_read_only(&wal).unwrap().groups.len(),
+            0,
+            "the checkpoint must reclaim the WAL before the cap matters"
+        );
+        let coverage = crate::index::versions::read_coverage(
+            &PackfileStorage::index_versions_path(&store_dir),
+        )
+        .expect("the checkpoint tail must publish index.versions");
+        let (_, version) = store
+            .get_with_collection_version(&TEST_COLLECTION, &[probe])
+            .unwrap();
+        assert!(coverage >= version);
+        (version, coverage)
+    };
+
+    fs::write(
+        PackfileStorage::journal_lsn_path(&store_dir),
+        (versions_coverage + 1_000_000).to_le_bytes(),
+    )
+    .unwrap();
+
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        store_dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    let coverage = reopened.durable_coverage();
+    assert!(
+        coverage <= versions_coverage,
+        "journal.lsn overclaimed coverage: versions={versions_coverage}, reported={coverage}"
+    );
+    assert!(coverage >= version);
+    let (_, version_after) = reopened
+        .get_with_collection_version(&TEST_COLLECTION, &[probe])
+        .unwrap();
+    assert!(version_after >= version);
+    drop(reopened);
+    drop(coordinator);
+    fs::remove_dir_all(&wal_dir).ok();
+    fs::remove_dir_all(&store_dir).ok();
+}
+
 /// Child half of [`versions_fsync_precedes_wal_reclaim_crash_safe`]: write,
 /// commit the WAL, then force a checkpoint and die after the versions fsync but
 /// before `journal.lsn` and reclaim.

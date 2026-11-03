@@ -3434,8 +3434,11 @@ impl PackfileStorage {
     ///
     /// A missing, torn or corrupt record of either kind claims nothing, so the
     /// result can only be lower than the truth, which makes recovery replay
-    /// more, never less. It reads the disk (and scans the delta log), so a
-    /// writer uses [`Self::durable_coverage`] instead.
+    /// more, never less. A `journal.lsn` ahead of a valid `index.versions`
+    /// file is capped at the versions/checkpoint coverage: the versions file
+    /// is synced first, so a larger leftover cannot be trusted. It reads the
+    /// disk (and scans the delta log), so a writer uses
+    /// [`Self::durable_coverage`] instead.
     #[must_use]
     pub fn read_journal_lsn(base_dir: &std::path::Path) -> u64 {
         Self::journal_lsn_with(base_dir, Self::durable_index_state(base_dir).covered_lsn)
@@ -3450,6 +3453,17 @@ impl PackfileStorage {
             .and_then(|bytes| bytes.get(..8).map(<[u8; 8]>::try_from))
             .and_then(Result::ok)
             .map_or(0, u64::from_le_bytes);
+        // The versions file is synced before `journal.lsn`, so every writer
+        // this store controls leaves `journal.lsn <=` its coverage. If a
+        // leftover or externally edited `journal.lsn` is ahead, trusting it
+        // would claim coverage past the versions the store can restore (and
+        // let reclaim drop the only WAL groups carrying them). Cap at the
+        // checkpoint/versions record instead; a lower claim only replays more.
+        if let Some(versions_coverage) =
+            crate::index::versions::read_coverage(&Self::index_versions_path(base_dir))
+        {
+            return checkpoint_and_delta.max(versions_coverage);
+        }
         recorded.max(checkpoint_and_delta)
     }
 
