@@ -60,6 +60,17 @@ fn raw_event(
     ))
 }
 
+fn with_content_hash(mut event: OwnedValue, room_version: &str) -> OwnedValue {
+    let hash =
+        rezzy::compute_content_hash(&event, room_version).expect("content hash is computable");
+    if let OwnedValue::Object(fields) = &mut event {
+        let mut hashes = rezzy::json::Object::new();
+        hashes.insert("sha256".to_owned(), OwnedValue::String(hash));
+        fields.insert("hashes".to_owned(), OwnedValue::Object(hashes));
+    }
+    event
+}
+
 fn raw_v10_invite_fixture() -> [OwnedValue; 6] {
     [
         raw_event(
@@ -80,14 +91,19 @@ fn raw_v10_invite_fixture() -> [OwnedValue; 6] {
             r#"["$create"]"#,
             r#"["$create"]"#,
         ),
-        raw_event(
-            "!room5",
-            "$pl",
-            "m.room.power_levels",
-            "",
-            r#"{"users":{"@alice:test":100},"invite":50}"#,
-            r#"["$join_alice"]"#,
-            r#"["$create","$join_alice"]"#,
+        // The stored form redacts `invite`, so its content hash will not match
+        // on the next file. The projection must survive that check.
+        with_content_hash(
+            raw_event(
+                "!room5",
+                "$pl",
+                "m.room.power_levels",
+                "",
+                r#"{"users":{"@alice:test":100},"invite":50}"#,
+                r#"["$join_alice"]"#,
+                r#"["$create","$join_alice"]"#,
+            ),
+            "10",
         ),
         raw_event(
             "!room5",

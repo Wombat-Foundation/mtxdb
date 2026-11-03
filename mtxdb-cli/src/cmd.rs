@@ -10780,6 +10780,10 @@ fn import_pdu_events_with_raw(
         .filter_map(event_id)
         .map(str::to_owned)
         .collect();
+    // These events are already stored in redacted form. Their content hash
+    // intentionally no longer matches, so re-redacting them would strip the
+    // auth projection that load_collection_events just laid over them.
+    let already_redacted = stored_ids.clone();
     let mut all_events: Vec<OwnedValue> = prior;
     let mut seen_event_ids: HashSet<String> = all_events
         .iter()
@@ -10891,7 +10895,8 @@ fn import_pdu_events_with_raw(
         events: room_events,
         timeline: false,
     };
-    let mut findings = export_import::derived_auth_findings_for_raw(&synthetic)?;
+    let mut findings =
+        export_import::derived_auth_findings_for_raw(&synthetic, &room_version, &already_redacted)?;
     let mut rejected = export_import::rejected_event_ids(&synthetic, &findings);
     let mut walk_rejections = HashMap::new();
     let (computation, unchecked) = compute_import_auth_before(
