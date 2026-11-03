@@ -850,10 +850,7 @@ fn warning_id_limit() -> usize {
     }
 }
 
-fn visible_warning_ids<'a>(
-    ids: &'a [String],
-    current: Option<&HashSet<String>>,
-) -> Vec<&'a str> {
+fn visible_warning_ids<'a>(ids: &'a [String], current: Option<&HashSet<String>>) -> Vec<&'a str> {
     ids.iter()
         .filter(|id| current.is_none_or(|set| set.contains(id.as_str())))
         .map(String::as_str)
@@ -1000,7 +997,6 @@ impl AuthFindings {
         }
         lines
     }
-
 }
 
 /// Work out which events cannot be authorized from the room's own edges.
