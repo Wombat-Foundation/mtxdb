@@ -56,12 +56,6 @@ pub trait SealedIndex: Send + Sync {
 
     /// Unique locators recorded for one collection.
     fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64>;
-
-    /// Heap bytes used by an optional negative-lookup filter for this
-    /// collection. The default implementation has no filter.
-    fn bloom_filter_bytes(&self, _collection_id: &[u8; 16]) -> u64 {
-        0
-    }
 }
 
 impl SealedIndex for MappedPackIndex {
@@ -83,10 +77,6 @@ impl SealedIndex for MappedPackIndex {
 
     fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
         MappedPackIndex::collection_entry_count(self, collection_id)
-    }
-
-    fn bloom_filter_bytes(&self, collection_id: &[u8; 16]) -> u64 {
-        MappedPackIndex::collection_bloom_filter_bytes(self, collection_id)
     }
 }
 
@@ -256,14 +246,6 @@ impl SealedLocators {
     pub fn mapped_bytes(&self) -> u64 {
         self.packs.iter().fold(0_u64, |total, pack| {
             total.saturating_add(pack.index.mapped_bytes())
-        })
-    }
-
-    /// Heap bytes used by per-pack bloom filters for one collection.
-    #[must_use]
-    pub fn bloom_filter_bytes(&self, collection_id: &[u8; 16]) -> u64 {
-        self.packs.iter().fold(0_u64, |total, pack| {
-            total.saturating_add(pack.index.bloom_filter_bytes(collection_id))
         })
     }
 
