@@ -793,3 +793,92 @@ fn merging_a_corrupt_run_fails_and_leaves_no_output() {
     ));
     assert!(!path.exists());
 }
+
+/// Write an empty-stats run over exactly `packs`.
+fn write_run_over(path: &Path, packs: Vec<PackIndexIdentity>) {
+    let mut writer = RunWriter::create(path, packs, 4).unwrap();
+    writer.push(entry(1, 1, 0, 0)).unwrap();
+    writer.finish().unwrap().unwrap();
+}
+
+#[test]
+fn load_pool_runs_keeps_only_runs_that_match_the_pool() {
+    let dir = TestDir::new();
+    let pool: Vec<PackIndexIdentity> = (1..=8).map(identity).collect();
+    let valid = dir.join("valid.run");
+    write_run_over(&valid, vec![identity(1), identity(2)]);
+    let mut changed = identity(3);
+    changed.pack_file_len = changed.pack_file_len.checked_add(1).unwrap();
+    let stale = dir.join("stale.run");
+    write_run_over(&stale, vec![changed]);
+    // Pack 5 sits inside this range without being covered.
+    let gapped = dir.join("gapped.run");
+    write_run_over(&gapped, vec![identity(4), identity(6)]);
+    let missing = dir.join("missing.run");
+    write_run_over(&missing, vec![identity(9)]);
+    let overlap_a = dir.join("overlap-a.run");
+    write_run_over(&overlap_a, vec![identity(7), identity(8)]);
+    let overlap_b = dir.join("overlap-b.run");
+    write_run_over(&overlap_b, vec![identity(8)]);
+    let damaged = dir.join("damaged.run");
+    fs::write(&damaged, b"not a run").unwrap();
+    let temporary = dir.join("x.run.tmp");
+    fs::write(&temporary, b"partial").unwrap();
+    let unrelated = dir.join("notes.txt");
+    fs::write(&unrelated, b"keep").unwrap();
+
+    let rejected = [
+        &stale, &gapped, &missing, &overlap_a, &overlap_b, &damaged, &temporary,
+    ];
+
+    // A read-only open accepts the same runs but deletes nothing.
+    let read_only = load_pool_runs(&dir.0, &pool, false);
+    assert_eq!(
+        read_only
+            .iter()
+            .map(|run| run.path.clone())
+            .collect::<Vec<_>>(),
+        vec![valid.clone()]
+    );
+    for path in rejected {
+        assert!(path.exists(), "read-only open kept {}", path.display());
+    }
+
+    let writable = load_pool_runs(&dir.0, &pool, true);
+    assert_eq!(
+        writable
+            .iter()
+            .map(|run| run.path.clone())
+            .collect::<Vec<_>>(),
+        vec![valid.clone()]
+    );
+    for path in rejected {
+        assert!(!path.exists(), "writable open removed {}", path.display());
+    }
+    assert!(valid.exists());
+    assert!(unrelated.exists(), "only run files are touched");
+}
+
+#[test]
+fn pack_stats_in_collection_matches_a_filtered_scan() {
+    let dir = TestDir::new();
+    let mut rng = Rng(0x5EED_57A7);
+    let sidecars: Vec<MappedPackIndex> = (1..=6)
+        .map(|seq| write_sidecar(&dir, seq, &random_pack(&mut rng, 64)))
+        .collect();
+    let sources: Vec<MergeSource<'_>> = sidecars.iter().map(MergeSource::Sidecar).collect();
+    let path = dir.join("stats.run");
+    merge_to_path(&sources, MergeOptions::default(), &path)
+        .unwrap()
+        .unwrap();
+    let run = RunIndex::open(&path).unwrap();
+    for value in 0..=3 {
+        let collection_id = collection(value);
+        let expected: Vec<RunPackStats> = run
+            .pack_stats()
+            .filter(|row| row.collection_id == collection_id)
+            .collect();
+        let found: Vec<RunPackStats> = run.pack_stats_in_collection(&collection_id).collect();
+        assert_eq!(found, expected, "collection {value}");
+    }
+}

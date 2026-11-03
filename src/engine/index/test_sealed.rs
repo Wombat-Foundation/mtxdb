@@ -96,7 +96,10 @@ fn lookup_prefers_the_newest_pack() {
         ),
     ]);
 
-    let hit = set.lookup(&COLLECTION, &KEY).expect("newest locator");
+    let hit = set
+        .lookup(&COLLECTION, &KEY)
+        .unwrap()
+        .expect("newest locator");
     assert_eq!(hit.creation_seq, 2);
     assert_eq!(hit.slot, 2);
     assert_eq!(hit.locator, PackIndexLocator::Frame(20));
@@ -117,7 +120,10 @@ fn a_removal_shadows_an_older_live_frame() {
         ),
     ]);
 
-    let hit = set.lookup(&COLLECTION, &KEY).expect("removal locator");
+    let hit = set
+        .lookup(&COLLECTION, &KEY)
+        .unwrap()
+        .expect("removal locator");
     assert_eq!(hit.creation_seq, 2);
     assert!(hit.removed());
 }
@@ -137,7 +143,10 @@ fn an_older_removal_does_not_shadow_a_newer_live_frame() {
         ),
     ]);
 
-    let hit = set.lookup(&COLLECTION, &KEY).expect("live locator");
+    let hit = set
+        .lookup(&COLLECTION, &KEY)
+        .unwrap()
+        .expect("live locator");
     assert_eq!(hit.creation_seq, 2);
     assert!(!hit.removed());
 }
@@ -150,14 +159,14 @@ fn lookup_is_isolated_by_collection() {
         FakeIndex::new(&[(OTHER_COLLECTION, KEY, PackIndexLocator::Frame(10))], 0),
     )]);
 
-    assert!(set.lookup(&COLLECTION, &KEY).is_none());
-    assert!(set.lookup(&OTHER_COLLECTION, &KEY).is_some());
+    assert!(set.lookup(&COLLECTION, &KEY).unwrap().is_none());
+    assert!(set.lookup(&OTHER_COLLECTION, &KEY).unwrap().is_some());
 }
 
 #[test]
 fn a_missing_key_is_none() {
     let set = locators(vec![pack(1, 1, FakeIndex::new(&[], 0))]);
-    assert!(set.lookup(&COLLECTION, &KEY).is_none());
+    assert!(set.lookup(&COLLECTION, &KEY).unwrap().is_none());
 }
 
 #[test]
@@ -174,7 +183,7 @@ fn replacing_the_same_pack_is_idempotent() {
     ));
 
     assert_eq!(set.len(), 1);
-    let hit = set.lookup(&COLLECTION, &KEY).expect("replacement");
+    let hit = set.lookup(&COLLECTION, &KEY).unwrap().expect("replacement");
     assert_eq!(hit.slot, 7);
     assert_eq!(hit.locator, PackIndexLocator::Frame(99));
 }
@@ -187,7 +196,7 @@ fn removing_a_pack_drops_its_locators() {
         FakeIndex::new(&[(COLLECTION, KEY, PackIndexLocator::Frame(10))], 0),
     )]);
     assert!(set.remove_pack(pack_id(1)));
-    assert!(set.lookup(&COLLECTION, &KEY).is_none());
+    assert!(set.lookup(&COLLECTION, &KEY).unwrap().is_none());
     assert!(!set.remove_pack(pack_id(1)));
 }
 
@@ -216,7 +225,8 @@ fn iteration_yields_newest_pack_first() {
     ]);
 
     let mut seen = Vec::new();
-    set.for_each_in_collection(&COLLECTION, |hit, _key| seen.push(hit.creation_seq));
+    set.for_each_in_collection(&COLLECTION, |hit, _key| seen.push(hit.creation_seq))
+        .unwrap();
     assert_eq!(seen, vec![2, 1]);
 }
 
@@ -226,5 +236,145 @@ fn empty_set_has_no_packs() {
     assert!(set.is_empty());
     assert_eq!(set.len(), 0);
     assert_eq!(set.mapped_bytes(), 0);
-    assert!(set.lookup(&COLLECTION, &KEY).is_none());
+    assert!(set.lookup(&COLLECTION, &KEY).unwrap().is_none());
+}
+
+const KEY_2: NodeId = [0x22; 16];
+const KEY_3: NodeId = [0x33; 16];
+
+fn run_offset(delta: u32) -> u32 {
+    u32::try_from(crate::packfile::HEADER_LEN)
+        .unwrap()
+        .checked_add(delta)
+        .unwrap()
+}
+
+fn run_identity(seq: u64) -> crate::index::packidx::PackIndexIdentity {
+    crate::index::packidx::PackIndexIdentity {
+        pack_id: pack_id(seq),
+        creation_seq: seq,
+        pack_file_len: 1 << 20,
+    }
+}
+
+/// A run over packs 2 and 3 holding `KEY` (pack 3) and `KEY_3` (pack 2),
+/// served from slots 20 and 30.
+fn sample_run(
+    dir: &std::path::Path,
+    fallback: crate::index::sealed::RunFallback,
+) -> Arc<SealedRun> {
+    use crate::index::run::{RunEntry, RunIndex, RunWriter};
+    let path = dir.join("sample.run");
+    let mut writer = RunWriter::create(&path, vec![run_identity(2), run_identity(3)], 4).unwrap();
+    let mut entries = [
+        RunEntry {
+            collection_id: COLLECTION,
+            logical_id: KEY,
+            ordinal: 1,
+            locator: PackIndexLocator::Frame(run_offset(30)),
+        },
+        RunEntry {
+            collection_id: COLLECTION,
+            logical_id: KEY_3,
+            ordinal: 0,
+            locator: PackIndexLocator::Frame(run_offset(20)),
+        },
+    ];
+    entries.sort_by_key(|entry| entry.logical_id);
+    for entry in entries {
+        writer.push(entry).unwrap();
+    }
+    writer.finish().unwrap().unwrap();
+    let packs = vec![
+        RunPack {
+            slot: 20,
+            pack_id: pack_id(2),
+            creation_seq: 2,
+        },
+        RunPack {
+            slot: 30,
+            pack_id: pack_id(3),
+            creation_seq: 3,
+        },
+    ];
+    Arc::new(SealedRun::new(Arc::new(RunIndex::open(&path).unwrap()), packs, fallback).unwrap())
+}
+
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("mtxdb-sealed-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn runs_and_unmerged_packs_are_walked_newest_first() {
+    let dir = scratch_dir("order");
+    let mut set = locators(vec![
+        // Older than the run: shadowed by it for KEY, sole source of KEY_2.
+        pack(
+            1,
+            10,
+            FakeIndex::new(
+                &[
+                    (COLLECTION, KEY, PackIndexLocator::Frame(10)),
+                    (COLLECTION, KEY_2, PackIndexLocator::Frame(11)),
+                ],
+                0,
+            ),
+        ),
+        // Newer than the run: shadows it for KEY_3.
+        pack(
+            4,
+            40,
+            FakeIndex::new(&[(COLLECTION, KEY_3, PackIndexLocator::Removed(40))], 0),
+        ),
+    ]);
+    set.insert_run(sample_run(&dir, Box::new(|| Err("unused".into()))));
+
+    let hit = set.lookup(&COLLECTION, &KEY).unwrap().unwrap();
+    assert_eq!((hit.slot, hit.creation_seq), (30, 3), "run shadows pack 1");
+    let hit = set.lookup(&COLLECTION, &KEY_2).unwrap().unwrap();
+    assert_eq!((hit.slot, hit.creation_seq), (10, 1));
+    let hit = set.lookup(&COLLECTION, &KEY_3).unwrap().unwrap();
+    assert_eq!((hit.slot, hit.creation_seq), (40, 4), "pack 4 shadows run");
+    assert!(hit.removed());
+
+    let mut order = Vec::new();
+    set.for_each_in_collection(&COLLECTION, |hit, _| order.push(hit.creation_seq))
+        .unwrap();
+    let mut newest_first = order.clone();
+    newest_first.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(order, newest_first, "scan yields newer sources first");
+    assert!(set.contains_pack(pack_id(2)) && set.contains_slot(30));
+    assert_eq!(set.len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_damaged_run_without_fallback_fails_instead_of_missing() {
+    let dir = scratch_dir("no_fallback");
+    let run = sample_run(&dir, Box::new(|| Err("sidecars unavailable".into())));
+    // Damage the run's only block after open.
+    let path = dir.join("sample.run");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[crate::index::run::RUN_HEADER_LEN] ^= 0xFF;
+    // Replace the file rather than writing through the live mapping.
+    let damaged = dir.join("damaged.run");
+    std::fs::write(&damaged, &bytes).unwrap();
+    let packs = run.packs().to_vec();
+    let damaged_run = SealedRun::new(
+        Arc::new(crate::index::run::RunIndex::open(&damaged).unwrap()),
+        packs,
+        Box::new(|| Err("sidecars unavailable".into())),
+    )
+    .unwrap();
+    let mut set = SealedLocators::new();
+    set.insert_run(Arc::new(damaged_run));
+    assert!(
+        set.lookup(&COLLECTION, &KEY).is_err(),
+        "a damaged run must never report a miss"
+    );
+    assert!(set.for_each_in_collection(&COLLECTION, |_, _| {}).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }

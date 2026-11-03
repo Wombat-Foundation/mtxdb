@@ -25,13 +25,23 @@
 //! published. A caller must consult the resident index first and this set
 //! second. A miss in both is a true miss only when every pack is sealed and
 //! accounted for; otherwise the caller must fall back to a pack scan.
+//!
+//! # Runs
+//!
+//! A [`SealedRun`] serves a contiguous range of sealed packs from one merged
+//! run file instead of one sidecar per pack. Runs and unmerged sidecars are
+//! walked together in pack order, newest first. A run that fails a block
+//! check answers from its covered packs' sidecars instead, loaded on first
+//! need; if those cannot be loaded either, the lookup fails rather than
+//! reporting a miss.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::packfile::PackId;
 use crate::storage::NodeId;
 
 use super::packidx::{MappedPackIndex, PackIndexLocator};
+use super::run::RunIndex;
 
 /// A sidecar that can answer locator lookups for one sealed pack.
 ///
@@ -117,6 +127,215 @@ pub struct SealedPack {
     pub index: Arc<dyn SealedIndex>,
 }
 
+/// One pack a run covers, resolved to the pool slot it occupies now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunPack {
+    /// Shard slot holding the pack.
+    pub slot: u16,
+    /// Stable pack identity.
+    pub pack_id: PackId,
+    /// Creation order of the pack.
+    pub creation_seq: u64,
+}
+
+/// Loads the covered packs' sidecars when a run can no longer answer.
+pub type RunFallback = Box<dyn Fn() -> Result<Vec<SealedPack>, String> + Send + Sync>;
+
+/// A sealed lookup could not be answered: a run failed its check and the
+/// covered packs' sidecars could not be loaded either. This is never a miss.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedUnavailable(pub String);
+
+impl std::fmt::Display for SealedUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sealed locators unavailable: {}", self.0)
+    }
+}
+
+impl std::error::Error for SealedUnavailable {}
+
+/// A merged run serving a contiguous range of sealed packs.
+///
+/// One value is shared by every collection the run holds.
+pub struct SealedRun {
+    run: Arc<RunIndex>,
+    /// The run's packs, indexed by run ordinal.
+    packs: Vec<RunPack>,
+    load_fallback: RunFallback,
+    fallback: OnceLock<Result<Vec<SealedPack>, SealedUnavailable>>,
+}
+
+impl SealedRun {
+    /// Wrap an opened run. `packs` must list the run's packs in ordinal order;
+    /// `load_fallback` returns their sidecars, oldest first.
+    ///
+    /// # Errors
+    /// Returns an error if `packs` does not match the run's pack table.
+    pub fn new(
+        run: Arc<RunIndex>,
+        packs: Vec<RunPack>,
+        load_fallback: RunFallback,
+    ) -> Result<Self, SealedUnavailable> {
+        let matches = run.packs().len() == packs.len()
+            && run.packs().iter().zip(&packs).all(|(identity, pack)| {
+                identity.pack_id == pack.pack_id && identity.creation_seq == pack.creation_seq
+            });
+        if !matches {
+            return Err(SealedUnavailable(
+                "run pack table does not match the pool".into(),
+            ));
+        }
+        Ok(Self {
+            run,
+            packs,
+            load_fallback,
+            fallback: OnceLock::new(),
+        })
+    }
+
+    /// The run's packs, oldest first.
+    #[must_use]
+    pub fn packs(&self) -> &[RunPack] {
+        &self.packs
+    }
+
+    /// The underlying run.
+    #[must_use]
+    pub fn run(&self) -> &RunIndex {
+        &self.run
+    }
+
+    fn newest_key(&self) -> (u64, PackId) {
+        self.packs.last().map_or((0, PackId([0; 16])), |pack| {
+            (pack.creation_seq, pack.pack_id)
+        })
+    }
+
+    fn covers(&self, pack_id: PackId) -> bool {
+        self.packs.iter().any(|pack| pack.pack_id == pack_id)
+    }
+
+    fn hit(&self, ordinal: u16, locator: PackIndexLocator) -> Result<SealedHit, SealedUnavailable> {
+        let pack = self
+            .packs
+            .get(usize::from(ordinal))
+            .ok_or_else(|| SealedUnavailable("run ordinal outside its pack table".into()))?;
+        Ok(SealedHit {
+            slot: pack.slot,
+            pack_id: pack.pack_id,
+            creation_seq: pack.creation_seq,
+            locator,
+        })
+    }
+
+    fn fallback(&self) -> Result<&[SealedPack], SealedUnavailable> {
+        self.fallback
+            .get_or_init(|| (self.load_fallback)().map_err(SealedUnavailable))
+            .as_deref()
+            .map_err(Clone::clone)
+    }
+
+    fn lookup(
+        &self,
+        collection_id: &[u8; 16],
+        logical_id: &NodeId,
+    ) -> Result<Option<SealedHit>, SealedUnavailable> {
+        match self.run.lookup(collection_id, logical_id) {
+            Ok(Some(hit)) => self.hit(hit.ordinal, hit.locator).map(Some),
+            Ok(None) => Ok(None),
+            Err(_) => Ok(lookup_packs(self.fallback()?, collection_id, logical_id)),
+        }
+    }
+
+    fn for_each_in_collection(
+        &self,
+        collection_id: &[u8; 16],
+        visit: &mut dyn FnMut(SealedHit, NodeId),
+    ) -> Result<(), SealedUnavailable> {
+        // A block failure stops the walk part-way, so buffer the run's entries
+        // and discard them if the run turns out to be damaged.
+        let mut entries = Vec::new();
+        let walked = self
+            .run
+            .for_each_in_collection(collection_id, |hit, logical_id| {
+                entries.push((hit.ordinal, hit.locator, logical_id));
+            });
+        if walked.is_ok() {
+            for (ordinal, locator, logical_id) in entries {
+                visit(self.hit(ordinal, locator)?, logical_id);
+            }
+            return Ok(());
+        }
+        for_each_in_packs(self.fallback()?, collection_id, visit);
+        Ok(())
+    }
+
+    fn collection_slot_counts(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> impl Iterator<Item = (u16, u64)> + '_ {
+        let collection_id = *collection_id;
+        let mut rows = Vec::new();
+        for stats in self.run.pack_stats_in_collection(&collection_id) {
+            if let Some(pack) = self.packs.get(usize::from(stats.ordinal)) {
+                rows.push((pack.slot, stats.entry_count));
+            }
+        }
+        rows.into_iter()
+    }
+}
+
+fn lookup_packs(
+    packs: &[SealedPack],
+    collection_id: &[u8; 16],
+    logical_id: &NodeId,
+) -> Option<SealedHit> {
+    packs
+        .iter()
+        .rev()
+        .find_map(|pack| pack.lookup(collection_id, logical_id))
+}
+
+fn for_each_in_packs(
+    packs: &[SealedPack],
+    collection_id: &[u8; 16],
+    visit: &mut dyn FnMut(SealedHit, NodeId),
+) {
+    for pack in packs.iter().rev() {
+        pack.index
+            .for_each_in_collection(collection_id, &mut |logical_id, locator| {
+                visit(pack.hit(locator), logical_id);
+            });
+    }
+}
+
+impl SealedPack {
+    fn key(&self) -> (u64, PackId) {
+        (self.creation_seq, self.pack_id)
+    }
+
+    fn hit(&self, locator: PackIndexLocator) -> SealedHit {
+        SealedHit {
+            slot: self.slot,
+            pack_id: self.pack_id,
+            creation_seq: self.creation_seq,
+            locator,
+        }
+    }
+
+    fn lookup(&self, collection_id: &[u8; 16], logical_id: &NodeId) -> Option<SealedHit> {
+        self.index
+            .locator(collection_id, logical_id)
+            .map(|locator| self.hit(locator))
+    }
+}
+
+/// One source in newest-first order.
+enum Source<'a> {
+    Pack(&'a SealedPack),
+    Run(&'a SealedRun),
+}
+
 /// A locator resolved from a sealed pack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SealedHit {
@@ -155,8 +374,11 @@ impl SealedHit {
 /// with the rest of the collection generation.
 #[derive(Clone, Default)]
 pub struct SealedLocators {
-    /// Sorted by `(creation_seq, pack_id)`, oldest first.
+    /// Unmerged sidecars, sorted by `(creation_seq, pack_id)`, oldest first.
     packs: Vec<SealedPack>,
+    /// Runs holding this collection, oldest first. Their pack ranges never
+    /// overlap each other or an unmerged pack.
+    runs: Vec<Arc<SealedRun>>,
 }
 
 impl SealedLocators {
@@ -171,7 +393,7 @@ impl SealedLocators {
     /// Replacing the same `pack_id` is idempotent (for example when an open is
     /// retried); it keeps the set sorted and never duplicates a pack.
     pub fn insert(&mut self, pack: SealedPack) {
-        let key = (pack.creation_seq, pack.pack_id);
+        let key = pack.key();
         if let Some(existing) = self
             .packs
             .iter_mut()
@@ -180,37 +402,53 @@ impl SealedLocators {
             *existing = pack;
             // A replacement keeps the same pack identity in practice, but a
             // changed creation sequence must not leave the vector unsorted.
-            self.packs
-                .sort_by_key(|pack| (pack.creation_seq, pack.pack_id));
+            self.packs.sort_by_key(SealedPack::key);
             return;
         }
         // Open scans insert packs oldest-first, so the common path is an
         // append. Avoid re-sorting the whole vector per pack: that turned a
         // 1,000-pack open into O(packs^2 log packs) comparisons.
-        if self
-            .packs
-            .last()
-            .is_none_or(|last| (last.creation_seq, last.pack_id) < key)
-        {
+        if self.packs.last().is_none_or(|last| last.key() < key) {
             self.packs.push(pack);
             return;
         }
-        let position = self
-            .packs
-            .partition_point(|existing| (existing.creation_seq, existing.pack_id) < key);
+        let position = self.packs.partition_point(|existing| existing.key() < key);
         self.packs.insert(position, pack);
     }
 
-    /// Whether the set already serves `pack_id`.
+    /// Add a run. Adding the same run again is a no-op. The caller guarantees
+    /// that its packs overlap no other run or unmerged pack in the set.
+    pub fn insert_run(&mut self, run: Arc<SealedRun>) {
+        if self.runs.iter().any(|existing| Arc::ptr_eq(existing, &run)) {
+            return;
+        }
+        let key = run.newest_key();
+        let position = self
+            .runs
+            .partition_point(|existing| existing.newest_key() < key);
+        self.runs.insert(position, run);
+    }
+
+    /// Whether the set already serves `pack_id`, from a sidecar or a run.
     #[must_use]
     pub fn contains_pack(&self, pack_id: PackId) -> bool {
         self.packs.iter().any(|pack| pack.pack_id == pack_id)
+            || self.runs.iter().any(|run| run.covers(pack_id))
     }
 
-    /// Slot ids referenced by sealed locator packs.
+    /// Slot ids referenced by sealed sidecars and runs. A run contributes
+    /// every pack it covers, even ones that hold none of this collection.
     #[must_use]
     pub fn slot_ids(&self) -> std::collections::HashSet<u16> {
-        self.packs.iter().map(|pack| pack.slot).collect()
+        self.packs
+            .iter()
+            .map(|pack| pack.slot)
+            .chain(
+                self.runs
+                    .iter()
+                    .flat_map(|run| run.packs().iter().map(|pack| pack.slot)),
+            )
+            .collect()
     }
 
     /// Drop a pack that has been retired or repacked away.
@@ -223,29 +461,39 @@ impl SealedLocators {
         self.packs.len() != before
     }
 
-    /// Number of sealed packs in the set.
+    /// Number of sources in the set: unmerged sidecars plus runs.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.packs.len()
+        self.packs.len().saturating_add(self.runs.len())
     }
 
-    /// Whether the set holds no sealed packs.
+    /// Whether the set holds no sidecars and no runs.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.packs.is_empty()
+        self.packs.is_empty() && self.runs.is_empty()
     }
 
-    /// The sealed packs, oldest first.
+    /// The unmerged sealed packs, oldest first. Packs served by runs are not
+    /// listed; see [`Self::runs`].
     #[must_use]
     pub fn packs(&self) -> &[SealedPack] {
         &self.packs
     }
 
-    /// Total bytes mapped by the sidecars.
+    /// The runs, oldest first.
+    #[must_use]
+    pub fn runs(&self) -> &[Arc<SealedRun>] {
+        &self.runs
+    }
+
+    /// Total bytes mapped by the sidecars and runs.
     #[must_use]
     pub fn mapped_bytes(&self) -> u64 {
-        self.packs.iter().fold(0_u64, |total, pack| {
+        let packs = self.packs.iter().fold(0_u64, |total, pack| {
             total.saturating_add(pack.index.mapped_bytes())
+        });
+        self.runs.iter().fold(packs, |total, run| {
+            total.saturating_add(run.run.mapped_bytes())
         })
     }
 
@@ -253,84 +501,115 @@ impl SealedLocators {
     #[must_use]
     pub fn contains_slot(&self, slot: u16) -> bool {
         self.packs.iter().any(|pack| pack.slot == slot)
+            || self
+                .runs
+                .iter()
+                .any(|run| run.packs().iter().any(|pack| pack.slot == slot))
     }
 
-    /// Unique locators recorded for one collection across every sealed pack.
+    /// Unique locators recorded for one collection across every sealed pack,
+    /// counted per pack as its sidecar directory records them.
     #[must_use]
     pub fn entry_count_in_collection(&self, collection_id: &[u8; 16]) -> u64 {
-        self.packs.iter().fold(0_u64, |total, pack| {
-            total.saturating_add(
-                pack.index
-                    .collection_entry_count(collection_id)
-                    .unwrap_or(0),
-            )
-        })
+        self.slot_counts_in_collection(collection_id)
+            .values()
+            .fold(0_u64, |total, count| total.saturating_add(*count))
     }
 
     /// Locator counts per shard slot for one collection, derived from each
     /// sidecar's directory entry count (the same number a slot walk would
-    /// produce, because the sidecar has one entry per unique id).
+    /// produce, because the sidecar has one entry per unique id). Packs served
+    /// by a run report the counts their sidecars recorded, from the run's pack
+    /// stats.
     #[must_use]
     pub fn slot_counts_in_collection(
         &self,
         collection_id: &[u8; 16],
     ) -> std::collections::HashMap<u16, u64> {
         let mut counts = std::collections::HashMap::new();
+        let mut add = |slot: u16, count: u64| {
+            if count > 0 {
+                let entry = counts.entry(slot).or_insert(0u64);
+                *entry = entry.saturating_add(count);
+            }
+        };
         for pack in &self.packs {
             if let Some(count) = pack.index.collection_entry_count(collection_id) {
-                if count > 0 {
-                    let entry = counts.entry(pack.slot).or_insert(0u64);
-                    *entry = entry.saturating_add(count);
-                }
+                add(pack.slot, count);
+            }
+        }
+        for run in &self.runs {
+            for (slot, count) in run.collection_slot_counts(collection_id) {
+                add(slot, count);
             }
         }
         counts
     }
 
-    /// Resolve a key to the newest sealed version.
-    ///
-    /// Packs are walked newest to oldest and the first hit wins. A removal hit
-    /// is returned as such; the caller must treat it as authoritative and stop
-    /// falling back to older packs.
-    #[must_use]
-    pub fn lookup(&self, collection_id: &[u8; 16], logical_id: &NodeId) -> Option<SealedHit> {
-        self.packs.iter().rev().find_map(|pack| {
-            pack.index
-                .locator(collection_id, logical_id)
-                .map(|locator| SealedHit {
-                    slot: pack.slot,
-                    pack_id: pack.pack_id,
-                    creation_seq: pack.creation_seq,
-                    locator,
-                })
+    /// Sidecars and runs, newest first by pack order.
+    fn newest_first(&self) -> impl Iterator<Item = Source<'_>> {
+        let mut packs = self.packs.iter().rev().peekable();
+        let mut runs = self.runs.iter().rev().peekable();
+        std::iter::from_fn(move || match (packs.peek(), runs.peek()) {
+            (Some(pack), Some(run)) if pack.key() > run.newest_key() => {
+                packs.next().map(Source::Pack)
+            }
+            (Some(_), None) => packs.next().map(Source::Pack),
+            (_, Some(_)) => runs.next().map(|run| Source::Run(run)),
+            (None, None) => None,
         })
     }
 
-    /// Visit one collection's entries, newest pack first.
+    /// Resolve a key to the newest sealed version.
+    ///
+    /// Sources are walked newest to oldest and the first hit wins. A removal
+    /// hit is returned as such; the caller must treat it as authoritative and
+    /// stop falling back to older packs.
+    ///
+    /// # Errors
+    /// Returns [`SealedUnavailable`] when a damaged run's fallback sidecars
+    /// cannot be loaded. That is never a miss.
+    pub fn lookup(
+        &self,
+        collection_id: &[u8; 16],
+        logical_id: &NodeId,
+    ) -> Result<Option<SealedHit>, SealedUnavailable> {
+        for source in self.newest_first() {
+            let hit = match source {
+                Source::Pack(pack) => pack.lookup(collection_id, logical_id),
+                Source::Run(run) => run.lookup(collection_id, logical_id)?,
+            };
+            if hit.is_some() {
+                return Ok(hit);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Visit one collection's entries, newest source first.
     ///
     /// Entries from different packs are yielded with the newer pack's version
     /// first, so a caller that keeps the first occurrence of each id gets
-    /// newest-wins semantics without a second sort. Duplicate ids across packs
-    /// are yielded more than once; deduplication is the caller's job.
+    /// newest-wins semantics without a second sort. Duplicate ids across
+    /// sources are yielded more than once; deduplication is the caller's job.
+    ///
+    /// # Errors
+    /// Returns [`SealedUnavailable`] when a damaged run's fallback sidecars
+    /// cannot be loaded; entries already visited must then be discarded.
     pub fn for_each_in_collection(
         &self,
         collection_id: &[u8; 16],
         mut visit: impl FnMut(SealedHit, NodeId),
-    ) {
-        for pack in self.packs.iter().rev() {
-            pack.index
-                .for_each_in_collection(collection_id, &mut |logical_id, locator| {
-                    visit(
-                        SealedHit {
-                            slot: pack.slot,
-                            pack_id: pack.pack_id,
-                            creation_seq: pack.creation_seq,
-                            locator,
-                        },
-                        logical_id,
-                    );
-                });
+    ) -> Result<(), SealedUnavailable> {
+        for source in self.newest_first() {
+            match source {
+                Source::Pack(pack) => {
+                    for_each_in_packs(std::slice::from_ref(pack), collection_id, &mut visit);
+                }
+                Source::Run(run) => run.for_each_in_collection(collection_id, &mut visit)?,
+            }
         }
+        Ok(())
     }
 }
 

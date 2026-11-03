@@ -12257,7 +12257,13 @@ fn full_scan_registers_sealed_locators_for_collection() {
     assert!(generation.sealed.mapped_bytes() > 0);
     let sealed = ids
         .iter()
-        .filter(|id| generation.sealed.lookup(&TEST_COLLECTION, id).is_some())
+        .filter(|id| {
+            generation
+                .sealed
+                .lookup(&TEST_COLLECTION, id)
+                .unwrap()
+                .is_some()
+        })
         .count();
     assert!(
         sealed > 0,
@@ -12271,7 +12277,7 @@ fn full_scan_registers_sealed_locators_for_collection() {
     // verified fallback, not yet the only locator source.
     for id in &ids {
         assert_ne!(
-            generation.candidates(&TEST_COLLECTION, id),
+            generation.candidates(&TEST_COLLECTION, id).unwrap(),
             Vec::<(u16, u64)>::new(),
             "every record should have a resident or sealed locator"
         );
@@ -13011,5 +13017,349 @@ fn paged_lookups_remain_available_while_sealed_pack_is_evicted() {
     }
     drop(generation);
     drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `(collection, id, expected value)`; `None` means removed.
+type ExpectedRecord = ([u8; 16], [u8; 16], Option<Vec<u8>>);
+
+/// `(collection, id)`.
+type RecordKey = ([u8; 16], [u8; 16]);
+
+/// Two collections across several sealed packs, with overwrites and removals
+/// in later packs, so newer versions shadow older ones across pack ranges.
+/// Returns the expected value of every key ever written (`None` = removed).
+fn paged_run_fixture(dir: &std::path::Path) -> Vec<ExpectedRecord> {
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), 8192).unwrap();
+    let mut model: HashMap<RecordKey, Option<Vec<u8>>> = HashMap::new();
+    let mut put = |collection: [u8; 16], id: [u8; 16], value: Vec<u8>| {
+        store
+            .put(&collection, &id, &NodeData::from_slice(&value))
+            .unwrap();
+        model.insert((collection, id), Some(value));
+    };
+    for index in 0..200u8 {
+        put(TEST_COLLECTION, distinct_id(index), vec![index; 32]);
+        if index < 120 {
+            let mut id = distinct_id(index);
+            id[15] = 0x5A;
+            put(OTHER_COLLECTION, id, vec![index ^ 0xFF; 24]);
+        }
+    }
+    for index in 0..40u8 {
+        put(
+            TEST_COLLECTION,
+            distinct_id(index),
+            vec![index.wrapping_add(100); 40],
+        );
+    }
+    for index in 40..60u8 {
+        let id = distinct_id(index);
+        assert!(store.remove(&TEST_COLLECTION, &id).unwrap());
+        model.insert((TEST_COLLECTION, id), None);
+    }
+    for index in 0..20u8 {
+        let mut id = distinct_id(index);
+        id[15] = 0x5A;
+        assert!(store.remove(&OTHER_COLLECTION, &id).unwrap());
+        model.insert((OTHER_COLLECTION, id), None);
+    }
+    store.sync_all().unwrap();
+    drop(store);
+    // A writable Paged open seals every non-active pack and publishes its
+    // sidecar, so the runs below can cover all but the newest pack.
+    drop(paged_open(dir));
+    let mut expected: Vec<_> = model
+        .into_iter()
+        .map(|((collection, id), value)| (collection, id, value))
+        .collect();
+    expected.sort();
+    expected
+}
+
+/// Every pack in `dir`, oldest first, with its identity.
+fn pool_pack_identities(
+    dir: &std::path::Path,
+) -> Vec<(crate::index::packidx::PackIndexIdentity, PathBuf)> {
+    let mut packs: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .map(|path| {
+            let mut file = fs::File::open(&path).unwrap();
+            let header = crate::packfile::read_header(&mut file).unwrap().unwrap();
+            let identity = crate::index::packidx::PackIndexIdentity {
+                pack_id: header.pack_id,
+                creation_seq: u64::from(header.creation_seq),
+                pack_file_len: file.metadata().unwrap().len(),
+            };
+            (identity, path)
+        })
+        .collect();
+    packs.sort_by_key(|(identity, _)| (identity.creation_seq, identity.pack_id.0));
+    packs
+}
+
+/// Merge the sidecars of the packs at `positions` (oldest-first pool order)
+/// into one run in `dir`. Returns the run path.
+fn write_pool_run(dir: &std::path::Path, positions: &[usize]) -> PathBuf {
+    let packs = pool_pack_identities(dir);
+    let sidecars: Vec<_> = positions
+        .iter()
+        .map(|&position| {
+            crate::index::packidx::open_for_pack(&packs[position].1).expect("sealed sidecar")
+        })
+        .collect();
+    let sources: Vec<_> = sidecars
+        .iter()
+        .map(crate::index::run::MergeSource::Sidecar)
+        .collect();
+    let first = packs[*positions.first().unwrap()].0;
+    let last = packs[*positions.last().unwrap()].0;
+    let path = dir.join(crate::index::run::run_file_name(&first, &last));
+    crate::index::run::merge_to_path(
+        &sources,
+        crate::index::run::MergeOptions {
+            drop_removals: positions.first() == Some(&0),
+            block_entries: 8,
+        },
+        &path,
+    )
+    .unwrap()
+    .expect("a non-empty run");
+    path
+}
+
+/// Sealed packs in pool order, counted from the oldest until the first pack
+/// without a valid sidecar.
+fn leading_sealed_packs(dir: &std::path::Path) -> usize {
+    pool_pack_identities(dir)
+        .iter()
+        .take_while(|(_, path)| crate::index::packidx::open_for_pack(path).is_some())
+        .count()
+}
+
+fn assert_store_matches(store: &PackfileStorage, expected: &[ExpectedRecord], context: &str) {
+    for (collection, id, value) in expected {
+        let got = store
+            .get(collection, id)
+            .unwrap()
+            .map(|data| data.bytes.to_vec());
+        assert_eq!(&got, value, "{context}: key {id:?} in {collection:?}");
+    }
+}
+
+type ShardAccounting = (
+    HashMap<PackId, HashMap<[u8; 16], u64>>,
+    HashMap<[u8; 16], HashSet<PackId>>,
+    HashMap<PackId, HashMap<[u8; 16], u64>>,
+);
+
+fn shard_accounting(store: &PackfileStorage) -> ShardAccounting {
+    let tables = store.index_tables.read();
+    (
+        tables.shard_collections.clone(),
+        tables.collection_shards.clone(),
+        tables.collection_disk_bytes.clone(),
+    )
+}
+
+#[test]
+fn paged_run_replaces_covered_sidecars_with_identical_answers() {
+    let dir = test_dir("paged_run_open");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 3, "fixture must seal several packs, got {sealed}");
+
+    let baseline = paged_open(&dir);
+    let baseline_sidecars = baseline.open_timings().unwrap().pack_index_sidecars;
+    let baseline_accounting = shard_accounting(&baseline);
+    let baseline_summaries = baseline.collection_summaries();
+    assert_store_matches(&baseline, &expected, "sidecars only");
+    drop(baseline);
+
+    // Cover every sealed pack but the newest, so one sidecar stays unmerged
+    // and lookups must order it before the run.
+    let covered: Vec<usize> = (0..sealed - 1).collect();
+    write_pool_run(&dir, &covered);
+
+    let store = paged_open(&dir);
+    let timings = store.open_timings().unwrap();
+    assert_eq!(
+        timings.pack_index_sidecars,
+        baseline_sidecars - u64::try_from(covered.len()).unwrap(),
+        "covered packs must not be read through their sidecars at open"
+    );
+    // Pool open decides sealed status by verifying sidecars; a run's identity
+    // check replaces that for every pack it covers.
+    let pool_verified = |store: &PackfileStorage| {
+        store
+            .shards
+            .open_timings()
+            .expect("pool open timings")
+            .sidecar_verify_calls
+    };
+    let packs = u64::try_from(pool_pack_identities(&dir).len()).unwrap();
+    assert_eq!(
+        pool_verified(&store),
+        packs - u64::try_from(covered.len()).unwrap(),
+        "pool open must not verify a covered sidecar"
+    );
+    {
+        let generation = store.generation(&TEST_COLLECTION).unwrap();
+        assert_eq!(generation.sealed.runs().len(), 1);
+        assert_eq!(
+            generation.sealed.runs()[0].packs().len(),
+            covered.len(),
+            "the run serves every covered pack"
+        );
+    }
+    assert_eq!(
+        shard_accounting(&store),
+        baseline_accounting,
+        "run pack stats must reproduce sidecar accounting"
+    );
+    assert_eq!(store.collection_summaries(), baseline_summaries);
+    assert_store_matches(&store, &expected, "run plus sidecars");
+
+    // A refresh rebuilds the sealed set from this session's runs, not by
+    // reopening every covered sidecar.
+    store.refresh_collection(&TEST_COLLECTION).unwrap();
+    assert_eq!(
+        store
+            .generation(&TEST_COLLECTION)
+            .unwrap()
+            .sealed
+            .runs()
+            .len(),
+        1
+    );
+    assert_eq!(shard_accounting(&store), baseline_accounting);
+    assert_store_matches(&store, &expected, "after refresh");
+
+    // Retirement must still see run-covered packs as referenced.
+    store.retire_empty_shards_after_batch();
+    assert_store_matches(&store, &expected, "after retirement pass");
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_corrupt_run_block_falls_back_to_sidecars() {
+    let dir = test_dir("paged_run_corrupt_block");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    let run_path = write_pool_run(&dir, &(0..sealed).collect::<Vec<_>>());
+
+    // Damage the first entry block. The metadata CRC does not cover blocks,
+    // so the run still opens and fails only on first read.
+    let mut bytes = fs::read(&run_path).unwrap();
+    bytes[crate::index::run::RUN_HEADER_LEN] ^= 0xFF;
+    fs::write(&run_path, &bytes).unwrap();
+
+    let store = paged_open(&dir);
+    assert_eq!(
+        store
+            .generation(&TEST_COLLECTION)
+            .unwrap()
+            .sealed
+            .runs()
+            .len(),
+        1,
+        "a block fault is not visible at open"
+    );
+    assert_store_matches(&store, &expected, "damaged run");
+    assert!(
+        store.generation(&TEST_COLLECTION).unwrap().sealed.runs()[0]
+            .run()
+            .is_invalid(),
+        "the lookup walk must have hit the damaged block"
+    );
+    let live = store
+        .collection_live_locations(&TEST_COLLECTION)
+        .unwrap()
+        .unwrap();
+    let live_expected = expected
+        .iter()
+        .filter(|(collection, _, value)| *collection == TEST_COLLECTION && value.is_some())
+        .count();
+    assert!(
+        live.len() >= live_expected,
+        "scans fall back to sidecars as well"
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_open_discards_gapped_damaged_and_temporary_runs() {
+    let dir = test_dir("paged_run_rejects");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 3);
+    // Packs 0 and 2 without 1: an uncovered pack inside the range.
+    let gapped = write_pool_run(&dir, &[0, 2]);
+    // A run whose metadata no longer matches its CRC.
+    let damaged = dir.join("00000000000000000098-00000000000000000099.run");
+    let mut bytes = fs::read(&gapped).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    fs::write(&damaged, &bytes).unwrap();
+    let temporary = dir.join("00000000000000000001-00000000000000000002.run.tmp");
+    fs::write(&temporary, b"partial").unwrap();
+
+    let store = paged_open(&dir);
+    assert!(
+        store
+            .generation(&TEST_COLLECTION)
+            .unwrap()
+            .sealed
+            .runs()
+            .is_empty(),
+        "no rejected run may serve lookups"
+    );
+    assert_store_matches(&store, &expected, "rejected runs");
+    for path in [&gapped, &damaged, &temporary] {
+        assert!(!path.exists(), "a writable open deletes {}", path.display());
+    }
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resident_open_reads_run_covered_packs_correctly() {
+    let dir = test_dir("resident_run_covered");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    let run_path = write_pool_run(&dir, &(0..sealed).collect::<Vec<_>>());
+    for policy in [
+        crate::packfile::ChecksumPolicy::Full,
+        crate::packfile::ChecksumPolicy::Disabled,
+    ] {
+        // Force the full scan: Resident mode ignores runs, but pool open has
+        // marked the covered packs sealed without loading their sidecars.
+        let _ = fs::remove_file(PackfileStorage::index_checkpoint_path(&dir));
+        let store = PackfileStorage::open_with_max_shard_bytes_and_residency(
+            dir.clone(),
+            8192,
+            policy,
+            crate::index::IndexResidency::Resident,
+        )
+        .unwrap();
+        assert_eq!(store.open_timings().unwrap().path, OpenPath::FullScan);
+        assert!(
+            store
+                .generation(&TEST_COLLECTION)
+                .unwrap()
+                .sealed
+                .runs()
+                .is_empty(),
+            "Resident mode does not serve lookups from runs"
+        );
+        assert_store_matches(&store, &expected, &format!("resident {policy:?}"));
+        drop(store);
+        assert!(run_path.exists(), "a valid run survives a Resident open");
+    }
     let _ = fs::remove_dir_all(&dir);
 }

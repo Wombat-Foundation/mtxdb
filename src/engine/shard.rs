@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
 
-use crate::index::packidx;
+use crate::index::{packidx, run};
 use crate::packfile::{self, PackId, Record};
 
 /// Test-only pause between `remap_shard` sampling the file length and
@@ -734,6 +734,13 @@ pub struct ShardPool {
     /// mechanism.
     dirty_lock_wait: AtomicU64,
     last_open_timings: Mutex<Option<ShardOpenTimings>>,
+    /// Runs accepted at open, oldest first, until the index build takes them.
+    /// Their packs were marked sealed without opening their sidecars.
+    open_runs: Mutex<Vec<run::PoolRun>>,
+    /// Runs serving lookups for this session, oldest first. A Paged index
+    /// build publishes them; rebuilds of one collection's sealed set reuse
+    /// them instead of reopening the covered sidecars.
+    sealed_runs: RwLock<Vec<Arc<crate::index::sealed::SealedRun>>>,
     /// Whether this pool holds the writer lock on `base_dir` (see `open`
     /// vs `open_read_only`). Gates `persist_stats`: a read-only pool
     /// never writes anything, including its own (always-zero) stats
@@ -780,6 +787,9 @@ pub struct ShardOpenTimings {
     pub packfile_open: Duration,
     /// Number of packfiles successfully opened.
     pub packfile_open_calls: u64,
+    /// Sealed sidecars opened and fully verified to decide whether a pack is
+    /// sealed. Packs covered by an accepted run skip this.
+    pub sidecar_verify_calls: u64,
     /// Time spent restoring pool metadata and persisted shard statistics.
     pub metadata_restore: Duration,
     /// Restoring pool.meta bucket seed.
@@ -1084,25 +1094,81 @@ impl ShardPool {
         ))
     }
 
+    /// Accept the runs in `base_dir` whose packs are all present, consecutive
+    /// and unchanged. See [`run::load_pool_runs`].
+    fn load_runs(
+        base_dir: &Path,
+        pack_files: &[(packfile::PackId, PathBuf, u32)],
+        writable: bool,
+    ) -> Vec<run::PoolRun> {
+        let mut identities = Vec::with_capacity(pack_files.len());
+        for (pack_id, path, creation_seq) in pack_files {
+            let Ok(metadata) = fs::metadata(path) else {
+                continue;
+            };
+            identities.push(packidx::PackIndexIdentity {
+                pack_id: *pack_id,
+                creation_seq: u64::from(*creation_seq),
+                pack_file_len: metadata.len(),
+            });
+        }
+        identities.sort_by_key(|pack| (pack.creation_seq, pack.pack_id.0));
+        run::load_pool_runs(base_dir, &identities, writable)
+    }
+
+    /// Take the runs accepted at open. The index build calls this once; a
+    /// second call returns nothing.
+    pub(crate) fn take_open_runs(&self) -> Vec<run::PoolRun> {
+        std::mem::take(&mut *self.open_runs.lock())
+    }
+
+    /// Publish the runs serving this session, oldest first.
+    pub(crate) fn set_sealed_runs(&self, runs: Vec<Arc<crate::index::sealed::SealedRun>>) {
+        *self.sealed_runs.write() = runs;
+    }
+
+    /// The runs serving this session, oldest first.
+    pub(crate) fn sealed_runs(&self) -> Vec<Arc<crate::index::sealed::SealedRun>> {
+        self.sealed_runs.read().clone()
+    }
+
+    /// Stop serving `run`, for example because a pack it covers was retired.
+    pub(crate) fn drop_sealed_run(&self, run: &Arc<crate::index::sealed::SealedRun>) {
+        self.sealed_runs
+            .write()
+            .retain(|existing| !Arc::ptr_eq(existing, run));
+    }
+
     /// Recover (if writable) and open every pack file, slotting them into
     /// the shard vector. Consumes `pack_files` so each `PathBuf` moves into
     /// its `Shard` rather than being cloned. Returns `(recovery_time,
-    /// recovery_calls, packfile_open_time, packfile_open_calls)`.
+    /// recovery_calls, packfile_open_time, packfile_open_calls,
+    /// sidecar_verify_calls)`.
     fn recover_and_open_packs(
         writable: bool,
         pack_files: Vec<(packfile::PackId, PathBuf, u32)>,
+        run_covered: &HashSet<PackId>,
         shards: &mut [Option<Arc<Shard>>],
         next_slot: &mut u16,
-    ) -> io::Result<(Duration, u64, Duration, u64)> {
+    ) -> io::Result<(Duration, u64, Duration, u64, u64)> {
+        let mut sidecar_verify_calls: u64 = 0;
         let mut recovery_time = Duration::ZERO;
         let mut recovery_calls: u64 = 0;
         let mut packfile_open_time = Duration::ZERO;
         let mut packfile_open_calls: u64 = 0;
         for (pack_id, path, creation_seq) in pack_files {
             // Open once: this both decides whether the pack is sealed and
-            // yields the verified image the index build will consume.
-            let sealed_index = packidx::open_for_pack(&path);
-            let sealed = sealed_index.is_some();
+            // yields the verified image the index build will consume. A pack
+            // covered by an accepted run is sealed by the run's identity
+            // check; its sidecar is opened only if the run later fails.
+            let covered = run_covered.contains(&pack_id);
+            let sealed_index = if covered {
+                None
+            } else {
+                sidecar_verify_calls = sidecar_verify_calls.saturating_add(1);
+                packidx::open_for_pack(&path)
+            };
+            let sealed = covered || sealed_index.is_some();
             if writable && !sealed {
                 let recovery_started = Instant::now();
                 // Only the safety of appending matters here (every frame and CRC
@@ -1153,6 +1219,7 @@ impl ShardPool {
             recovery_calls,
             packfile_open_time,
             packfile_open_calls,
+            sidecar_verify_calls,
         ))
     }
 
@@ -1332,6 +1399,8 @@ impl ShardPool {
             last_sync_split: Mutex::new(None),
             dirty_lock_wait: AtomicU64::new(0),
             last_open_timings: Mutex::new(Some(timings)),
+            open_runs: Mutex::new(Vec::new()),
+            sealed_runs: RwLock::new(Vec::new()),
             writable,
             compress,
             checksum_policy,
@@ -1426,8 +1495,25 @@ impl ShardPool {
         let (pack_files, next_creation_seq) = Self::discover_pack_files_sorted(&base_dir)?;
         let discovery_time = discovery_started.elapsed();
 
-        let (recovery_time, recovery_calls, packfile_open_time, packfile_open_calls) =
-            Self::recover_and_open_packs(writable, pack_files, &mut shards, &mut next_slot)?;
+        let runs = Self::load_runs(&base_dir, &pack_files, writable);
+        let run_covered: HashSet<PackId> = runs
+            .iter()
+            .flat_map(|pool_run| pool_run.run.packs().iter().map(|pack| pack.pack_id))
+            .collect();
+
+        let (
+            recovery_time,
+            recovery_calls,
+            packfile_open_time,
+            packfile_open_calls,
+            sidecar_verify_calls,
+        ) = Self::recover_and_open_packs(
+            writable,
+            pack_files,
+            &run_covered,
+            &mut shards,
+            &mut next_slot,
+        )?;
 
         let highest_active = Self::choose_active_slot(&shards, max_shard_bytes, next_slot);
         if writable {
@@ -1457,7 +1543,7 @@ impl ShardPool {
 
         let total = open_started.elapsed();
 
-        Ok(Self::build_pool(
+        let pool = Self::build_pool(
             shards,
             base_dir,
             max_shard_bytes,
@@ -1474,6 +1560,7 @@ impl ShardPool {
                 packfile_recovery_calls: recovery_calls,
                 packfile_open: packfile_open_time,
                 packfile_open_calls,
+                sidecar_verify_calls,
                 metadata_restore: metadata_restore_time,
                 pool_meta_restore: pool_meta_restore_time,
                 persisted_stats_restore: persisted_stats_restore_time,
@@ -1483,7 +1570,9 @@ impl ShardPool {
             },
             writer_lock,
             next_creation_seq,
-        ))
+        );
+        *pool.open_runs.lock() = runs;
+        Ok(pool)
     }
 
     /// Return the timing breakdown from the most recent pool open.

@@ -1172,6 +1172,44 @@ impl StreamingOpenScan {
         error.map_or(Ok(()), Err)
     }
 
+    /// Ingest a run in place of its covered packs' sidecars. Its pack stats
+    /// are those sidecars' directory values, so accounting, collection homes
+    /// and first-seen collection order match what ingesting each covered
+    /// sidecar oldest first would produce.
+    fn insert_run(
+        &mut self,
+        run: &Arc<crate::index::sealed::SealedRun>,
+        deleted_collections: &HashSet<[u8; 16]>,
+    ) {
+        let mut rows: Vec<crate::index::run::RunPackStats> = run.run().pack_stats().collect();
+        rows.sort_by_key(|row| (row.ordinal, row.collection_id));
+        for row in rows {
+            let Some(pack) = run.packs().get(usize::from(row.ordinal)).copied() else {
+                continue;
+            };
+            let collection_id = row.collection_id;
+            self.seen_collections.insert(collection_id);
+            if self.known_collections.insert(collection_id) {
+                self.collection_order.push(collection_id);
+            }
+            if deleted_collections.contains(&collection_id) {
+                continue;
+            }
+            let bytes = self
+                .collection_disk_bytes
+                .entry(pack.pack_id)
+                .or_default()
+                .entry(collection_id)
+                .or_default();
+            *bytes = bytes.saturating_add(row.disk_bytes);
+            self.collection_home.insert(collection_id, pack.slot);
+            self.sealed
+                .entry(collection_id)
+                .or_default()
+                .insert_run(Arc::clone(run));
+        }
+    }
+
     fn finish(
         mut self,
         shards: &ShardPool,
@@ -1246,6 +1284,76 @@ impl StreamingOpenScan {
         }
         (out, self.collection_order)
     }
+}
+
+/// Serve a run accepted at pool open. `by_pack` maps each current pack to its
+/// slot and path. Returns `None` if a covered pack has no current shard; its
+/// packs then use their sidecars.
+fn sealed_run_for(
+    pool_run: crate::index::run::PoolRun,
+    by_pack: &HashMap<PackId, (u16, PathBuf)>,
+) -> Option<Arc<crate::index::sealed::SealedRun>> {
+    let mut packs = Vec::with_capacity(pool_run.run.packs().len());
+    let mut fallback = Vec::with_capacity(pool_run.run.packs().len());
+    for identity in pool_run.run.packs() {
+        let (slot, path) = by_pack.get(&identity.pack_id)?;
+        let pack = crate::index::sealed::RunPack {
+            slot: *slot,
+            pack_id: identity.pack_id,
+            creation_seq: identity.creation_seq,
+        };
+        packs.push(pack);
+        fallback.push((path.clone(), pack, *identity));
+    }
+    let run_path = pool_run.path;
+    let load: crate::index::sealed::RunFallback = Box::new(move || {
+        eprintln!(
+            "mtxdb: run {} failed verification; serving its packs from sidecars",
+            run_path.display()
+        );
+        load_run_fallback(&fallback)
+    });
+    crate::index::sealed::SealedRun::new(Arc::new(pool_run.run), packs, load)
+        .ok()
+        .map(Arc::new)
+}
+
+/// The covered packs' sidecars for a run that failed a check, oldest first. A
+/// sidecar that is missing or fails verification is rebuilt in memory from
+/// its pack.
+fn load_run_fallback(
+    packs: &[(
+        PathBuf,
+        crate::index::sealed::RunPack,
+        crate::index::packidx::PackIndexIdentity,
+    )],
+) -> Result<Vec<crate::index::sealed::SealedPack>, String> {
+    packs
+        .iter()
+        .map(|(path, pack, identity)| {
+            let index: Arc<dyn crate::index::sealed::SealedIndex> =
+                match crate::index::packidx::open_for_pack(path) {
+                    Some(sidecar) if sidecar.identity() == *identity => Arc::new(sidecar),
+                    _ => {
+                        let built = crate::index::packidx::build_for_pack(path, true)
+                            .map_err(|error| format!("pack {}: {error}", path.display()))?;
+                        if built.identity() != *identity {
+                            return Err(format!(
+                                "pack {} changed since its run was built",
+                                path.display()
+                            ));
+                        }
+                        Arc::new(built)
+                    }
+                };
+            Ok(crate::index::sealed::SealedPack {
+                slot: pack.slot,
+                pack_id: pack.pack_id,
+                creation_seq: pack.creation_seq,
+                index,
+            })
+        })
+        .collect()
 }
 
 /// Per-pack, per-collection on-disk bytes as `physical_layout` reports them
@@ -1758,7 +1866,15 @@ impl RoomGeneration {
     /// paged mode this is building toward, only unsealed packs are resident,
     /// so a miss there is exactly when a sealed locator is needed. A resident
     /// removal stays first and therefore shadows an older sealed frame.
-    fn candidates(&self, collection_id: &[u8; 16], id: &NodeId) -> Vec<(u16, u64)> {
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] when a damaged run's covered packs
+    /// cannot be served from their sidecars either; never a false miss.
+    fn candidates(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+    ) -> Result<Vec<(u16, u64)>, StorageError> {
         let mut candidates: Vec<(u16, u64)> = self.index.lookup_all(id).collect();
         // Resident entries are always newer than sealed packs (they live in
         // the active pack, or in a pack sealed during this session). In paged
@@ -1768,12 +1884,16 @@ impl RoomGeneration {
         // stops at the first 16-byte hash match, so a resident removal still
         // shadows an older sealed frame.
         if !candidates.is_empty() && !self.paged {
-            return candidates;
+            return Ok(candidates);
         }
-        if let Some(hit) = self.sealed.lookup(collection_id, id) {
+        if let Some(hit) = self
+            .sealed
+            .lookup(collection_id, id)
+            .map_err(|error| StorageError::Corrupt(error.to_string()))?
+        {
             candidates.push((hit.slot, hit.offset()));
         }
-        candidates
+        Ok(candidates)
     }
 }
 
@@ -3065,6 +3185,7 @@ impl PackfileStorage {
             for (_, shard) in shards.all_shards() {
                 let _ = shard.take_sealed_index();
             }
+            drop(shards.take_open_runs());
             timings.path = OpenPath::Checkpoint;
             let assemble_started = std::time::Instant::now();
             let store = Self::assemble(
@@ -3097,12 +3218,47 @@ impl PackfileStorage {
 
         let scan_started = std::time::Instant::now();
         let mut scan_state = StreamingOpenScan::new(collection_order, residency);
+        // Runs replace their covered packs' sidecars in Paged mode only. A
+        // resident build still reads each covered pack through its sidecar or
+        // a frame scan below.
+        let pool_runs = shards.take_open_runs();
+        let mut sealed_runs: Vec<Arc<crate::index::sealed::SealedRun>> = Vec::new();
+        let mut run_of_pack: HashMap<PackId, usize> = HashMap::new();
+        if residency == crate::index::IndexResidency::Paged {
+            let by_pack: HashMap<PackId, (u16, PathBuf)> = shards
+                .all_shards()
+                .into_iter()
+                .map(|(slot, shard)| (shard.pack_id, (slot, shard.path.clone())))
+                .collect();
+            for pool_run in pool_runs {
+                if let Some(run) = sealed_run_for(pool_run, &by_pack) {
+                    for pack in run.packs() {
+                        run_of_pack.insert(pack.pack_id, sealed_runs.len());
+                    }
+                    sealed_runs.push(run);
+                }
+            }
+        }
+        let mut runs_ingested = vec![false; sealed_runs.len()];
         // The index must see physical versions in order so inserts naturally
         // replace older values and removal markers. The open_shards snapshot
         // remains slot ordered for fingerprinting; sort a separate list here.
         let mut scan_shards = shards.all_shards();
         scan_shards.sort_by_key(|(_, shard)| shard.creation_seq);
         for (slot, shard) in scan_shards {
+            if let Some(&run_index) = run_of_pack.get(&shard.pack_id) {
+                // Runs cover consecutive packs, so ingesting the whole run at
+                // its first pack keeps the scan in creation order.
+                if let (Some(ingested), Some(run)) =
+                    (runs_ingested.get_mut(run_index), sealed_runs.get(run_index))
+                {
+                    if !*ingested {
+                        scan_state.insert_run(run, &deleted_collections);
+                        *ingested = true;
+                    }
+                }
+                continue;
+            }
             // In `Paged` mode a sidecar replaces the frame scan even under
             // `Full` checksums: point reads still verify each resolved frame,
             // and an explicit scrub remains the eager whole-store sweep. In
@@ -3215,6 +3371,7 @@ impl PackfileStorage {
         // them into the shared generation and shard-accounting structures.
         let materialization_started = std::time::Instant::now();
         let (scan_out, collection_order) = scan_state.finish(&shards, cache_capacity);
+        shards.set_sealed_runs(sealed_runs);
         timings.index_materialization = materialization_started.elapsed();
 
         let store = Self::assemble(
@@ -4571,14 +4728,21 @@ impl PackfileStorage {
     /// never scans pack files. The order is the index's bucket order. Callers
     /// resolve the slot to a shard and read the frame at the offset. Returns
     /// `None` when the collection is unknown.
-    pub fn collection_live_locations(&self, collection_id: &[u8; 16]) -> Option<Vec<(u16, u64)>> {
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] when a damaged run's covered packs
+    /// cannot be served from their sidecars either.
+    pub fn collection_live_locations(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<Option<Vec<(u16, u64)>>, StorageError> {
         self.collections_read()
             .get(collection_id)
             .map(|generation| {
                 let g = generation.load();
                 let mut locations: Vec<(u16, u64)> = g.index.live_entries().collect();
                 if !g.paged || g.sealed.is_empty() {
-                    return locations;
+                    return Ok(locations);
                 }
                 // The resident tail is newer than every sealed pack, so its keys
                 // win. Among sealed packs, iteration is newest-first; keep the
@@ -4590,15 +4754,18 @@ impl PackfileStorage {
                 // live versions via `seen`.
                 let mut seen: HashSet<[u8; 16]> =
                     HashSet::with_capacity(g.sealed.len().saturating_mul(64));
-                g.sealed.for_each_in_collection(collection_id, |hit, id| {
-                    if hit.removed() {
-                        seen.insert(id);
-                    } else if seen.insert(id) {
-                        locations.push((hit.slot, hit.offset()));
-                    }
-                });
-                locations
+                g.sealed
+                    .for_each_in_collection(collection_id, |hit, id| {
+                        if hit.removed() {
+                            seen.insert(id);
+                        } else if seen.insert(id) {
+                            locations.push((hit.slot, hit.offset()));
+                        }
+                    })
+                    .map_err(|error| StorageError::Corrupt(error.to_string()))?;
+                Ok(locations)
             })
+            .transpose()
     }
 
     /// `(collection_id, entry count, memory usage in bytes, index capacity)`
@@ -5035,7 +5202,7 @@ impl PackfileStorage {
                 shards,
                 &mut pinned,
                 &mut work,
-            );
+            )?;
         }
         Ok(CollectionScan {
             store: self,
@@ -5170,7 +5337,7 @@ impl PackfileStorage {
                 &shards,
                 &mut pinned,
                 &mut work,
-            );
+            )?;
         }
 
         // Durable keys shadowed by the overlay were skipped above, so each
@@ -5246,13 +5413,13 @@ impl PackfileStorage {
         shards: &[(u16, Arc<Shard>)],
         pinned: &mut HashMap<u16, Arc<Shard>>,
         work: &mut Vec<ScanWork>,
-    ) {
+    ) -> Result<(), StorageError> {
         for id in keys {
             if overlay_puts.contains_key(&id) || overlay_removes.contains(&id) {
                 // An overlay mutation is newer than the durable one.
                 continue;
             }
-            let candidates = generation.candidates(collection_id, &id);
+            let candidates = generation.candidates(collection_id, &id)?;
             if candidates.is_empty() {
                 continue;
             }
@@ -5263,6 +5430,7 @@ impl PackfileStorage {
             }
             work.push(ScanWork::Locators(id, candidates));
         }
+        Ok(())
     }
 
     /// Materialized scan of one collection, kept for tests that assert on
@@ -7543,8 +7711,32 @@ impl PackfileStorage {
         shards.sort_by_key(|(_, shard)| shard.creation_seq);
         let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
         let mut sealed = crate::index::sealed::SealedLocators::new();
+        // Reuse this session's runs for the packs they cover. A run with a
+        // pack that is no longer current stops serving; its remaining packs
+        // are read through their sidecars below.
+        let mut run_covered: HashSet<PackId> = HashSet::new();
+        for run in self.shards.sealed_runs() {
+            let current = run.packs().iter().all(|pack| {
+                self.shards.get_shard(pack.slot).is_some_and(|shard| {
+                    shard.pack_id == pack.pack_id && shard.is_current.load(Ordering::Acquire)
+                })
+            });
+            if !current {
+                self.shards.drop_sealed_run(&run);
+                continue;
+            }
+            run_covered.extend(run.packs().iter().map(|pack| pack.pack_id));
+            if run
+                .run()
+                .pack_stats_in_collection(collection_id)
+                .next()
+                .is_some()
+            {
+                sealed.insert_run(run);
+            }
+        }
         for (slot, shard) in shards {
-            if !shard.is_current.load(Ordering::Acquire) {
+            if !shard.is_current.load(Ordering::Acquire) || run_covered.contains(&shard.pack_id) {
                 continue;
             }
             if shard.sealed.load(Ordering::Acquire) {
@@ -7938,7 +8130,7 @@ impl PackfileStorage {
         let Some(generation) = gen_guard.as_deref() else {
             return Ok(None);
         };
-        let candidates: Vec<(u16, u64)> = generation.candidates(collection_id, id);
+        let candidates: Vec<(u16, u64)> = generation.candidates(collection_id, id)?;
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -8056,8 +8248,8 @@ impl PackfileStorage {
         // index points at; without pinning, a node resolved after the swap
         // would miss even though it is still live. See `pin_shards`.
         let mut referenced = gen.index.referenced_slot_ids();
-        for pack in gen.sealed.packs() {
-            if let Some(entry) = referenced.get_mut(usize::from(pack.slot)) {
+        for slot in gen.sealed.slot_ids() {
+            if let Some(entry) = referenced.get_mut(usize::from(slot)) {
                 *entry = true;
             }
         }
@@ -8120,7 +8312,7 @@ impl PackfileStorage {
             return Ok(Some((*data).clone()));
         }
         let track = self.stats_enabled.load(Ordering::Relaxed);
-        let candidates = gen.candidates(collection_id, id);
+        let candidates = gen.candidates(collection_id, id)?;
         if track {
             self.index_candidates
                 .fetch_add(candidates.len() as u64, Ordering::Relaxed);
@@ -9510,8 +9702,8 @@ impl PackfileStorage {
             // In paged mode the resident table omits sealed packs, but their
             // sidecars still hold live records. A sealed shard must not be
             // retired just because only the sidecar references it.
-            for pack in gen.sealed.packs() {
-                if let Some(entry) = referenced.get_mut(usize::from(pack.slot)) {
+            for slot in gen.sealed.slot_ids() {
+                if let Some(entry) = referenced.get_mut(usize::from(slot)) {
                     *entry = true;
                 }
             }
@@ -10401,7 +10593,7 @@ impl PackfileStorage {
             let Some(gen) = gen_guard.as_deref() else {
                 return Ok(None);
             };
-            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id);
+            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
             #[cfg(test)]
             Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
@@ -10678,7 +10870,7 @@ impl StorageEngine for PackfileStorage {
                 }
                 return Ok(Some((*data).clone()));
             }
-            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id);
+            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
             #[cfg(test)]
             Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
@@ -10739,7 +10931,7 @@ impl StorageEngine for PackfileStorage {
                         results[i] = Some((*data).clone());
                         continue;
                     }
-                    let candidates = g.candidates(collection_id, id);
+                    let candidates = g.candidates(collection_id, id)?;
                     candidates_seen = candidates_seen.saturating_add(candidates.len() as u64);
                     if !candidates.is_empty() {
                         to_fetch.push((i, candidates));
@@ -10989,7 +11181,7 @@ impl PackfileStorage {
             let Some(gen) = generation.as_ref() else {
                 return Ok(None);
             };
-            let candidates = gen.candidates(collection_id, node_id);
+            let candidates = gen.candidates(collection_id, node_id)?;
             #[cfg(test)]
             Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));

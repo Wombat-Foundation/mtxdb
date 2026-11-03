@@ -599,6 +599,29 @@ impl RunIndex {
         (0..self.stats_count).filter_map(move |index| stats_row_at(&self.map, self.stats_at, index))
     }
 
+    /// The [`Self::pack_stats`] rows for one collection, oldest pack first,
+    /// found by binary search over the sorted stats table.
+    pub fn pack_stats_in_collection<'a>(
+        &'a self,
+        collection_id: &'a [u8; 16],
+    ) -> impl Iterator<Item = RunPackStats> + 'a {
+        let row = move |index| stats_row_at(&self.map, self.stats_at, index);
+        let mut low = 0_usize;
+        let mut high = self.stats_count;
+        while low < high {
+            let middle = low.midpoint(high);
+            match row(middle) {
+                Some(stats) if stats.collection_id < *collection_id => {
+                    low = middle.saturating_add(1);
+                }
+                _ => high = middle,
+            }
+        }
+        (low..self.stats_count).map_while(move |index| {
+            row(index).filter(|stats| stats.collection_id == *collection_id)
+        })
+    }
+
     /// Unique `(collection, id)` entries in the run.
     #[must_use]
     pub const fn entry_count(&self) -> u64 {
@@ -1363,6 +1386,117 @@ fn advance(
     )));
     *heads.get_mut(source).ok_or(RunError::Invalid)? = Some(entry);
     Ok(())
+}
+
+/// Extension of a published run file.
+pub const RUN_EXTENSION: &str = "run";
+
+/// File name for a run covering `first..=last` by creation sequence.
+#[must_use]
+pub fn run_file_name(first: &PackIndexIdentity, last: &PackIndexIdentity) -> String {
+    format!(
+        "{:020}-{:020}.{RUN_EXTENSION}",
+        first.creation_seq, last.creation_seq
+    )
+}
+
+/// A run accepted by [`load_pool_runs`].
+#[derive(Debug)]
+pub struct PoolRun {
+    /// The published run file.
+    pub path: PathBuf,
+    /// The opened run.
+    pub run: RunIndex,
+}
+
+/// Open every run in `dir` that can serve the pool's current packs.
+///
+/// `pool` is every pack in the pool, sorted by `(creation_seq, pack_id)`. A
+/// run is kept only if it opens, every covered pack is in `pool` with the same
+/// identity, its packs are consecutive in `pool` (so no uncovered pack falls
+/// inside its range), and it does not overlap another kept run. Kept runs are
+/// returned oldest first.
+///
+/// When `writable`, rejected runs and leftover `.run.tmp` files are deleted:
+/// runs are derived data and the covered packs fall back to their sidecars. A
+/// read-only open leaves them in place.
+#[must_use]
+pub fn load_pool_runs(dir: &Path, pool: &[PackIndexIdentity], writable: bool) -> Vec<PoolRun> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut rejected = Vec::new();
+    let mut candidates: Vec<(usize, usize, PoolRun)> = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".run.tmp") {
+            rejected.push(path);
+            continue;
+        }
+        if path
+            .extension()
+            .is_none_or(|extension| extension != RUN_EXTENSION)
+        {
+            continue;
+        }
+        match RunIndex::open(&path)
+            .ok()
+            .and_then(|run| pool_span(&run, pool).map(|span| (span, run)))
+        {
+            Some(((start, end), run)) => candidates.push((start, end, PoolRun { path, run })),
+            None => rejected.push(path),
+        }
+    }
+    candidates.sort_by_key(|(start, end, _)| (*start, *end));
+    // A run that overlaps a neighbour is dropped together with it: either
+    // could be stale, and sidecars answer correctly for both ranges.
+    let mut overlapping = vec![false; candidates.len()];
+    for index in 1..candidates.len() {
+        let previous_end = candidates
+            .get(index.saturating_sub(1))
+            .map(|(_, end, _)| *end);
+        let start = candidates.get(index).map(|(start, _, _)| *start);
+        if let (Some(previous_end), Some(start)) = (previous_end, start) {
+            if start <= previous_end {
+                if let Some(flag) = overlapping.get_mut(index.saturating_sub(1)) {
+                    *flag = true;
+                }
+                if let Some(flag) = overlapping.get_mut(index) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+    let mut kept = Vec::with_capacity(candidates.len());
+    for ((_, _, pool_run), overlaps) in candidates.into_iter().zip(overlapping) {
+        if overlaps {
+            rejected.push(pool_run.path);
+        } else {
+            kept.push(pool_run);
+        }
+    }
+    if writable {
+        for path in rejected {
+            let _ = fs::remove_file(path);
+        }
+    }
+    kept
+}
+
+/// The inclusive index range of `run`'s packs within `pool`, or `None` if any
+/// pack is missing, has a different identity, or the packs are not
+/// consecutive in `pool`.
+fn pool_span(run: &RunIndex, pool: &[PackIndexIdentity]) -> Option<(usize, usize)> {
+    let first = run.packs().first()?;
+    let start = pool
+        .binary_search_by_key(&pack_order(first), pack_order)
+        .ok()?;
+    let end = start.checked_add(run.packs().len().checked_sub(1)?)?;
+    let covered = pool.get(start..=end)?;
+    (covered == run.packs()).then_some((start, end))
 }
 
 fn read_id(bytes: &[u8], at: usize) -> Option<[u8; 16]> {

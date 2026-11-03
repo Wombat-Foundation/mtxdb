@@ -8005,7 +8005,7 @@ fn cmd_scan_collection_live_rows(
 ) -> anyhow::Result<([u8; 16], Vec<LiveScanRow>, usize)> {
     let collection_id = parse_collection_selector(selector)?;
     let store = open_store_read_only(cli)?;
-    let Some(locations) = store.collection_live_locations(&collection_id) else {
+    let Some(locations) = store.collection_live_locations(&collection_id)? else {
         bail!(
             "collection {} not found{}",
             format_id(&collection_id),

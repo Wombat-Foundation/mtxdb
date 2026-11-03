@@ -1703,7 +1703,7 @@ fn live_collection_scan_excludes_superseded_versions() {
         .unwrap();
     store.sync().unwrap();
     assert_eq!(
-        store.collection_live_locations(&collection).unwrap().len(),
+        store.collection_live_locations(&collection).unwrap().unwrap().len(),
         1,
         "the superseded version must not appear in the live index"
     );
