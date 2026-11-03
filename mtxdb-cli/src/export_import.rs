@@ -367,8 +367,6 @@ pub(crate) struct AuthFindings {
     /// Events with a computed content-hash mismatch whose canonical redaction
     /// could not be produced; imports containing them fail closed.
     redactions_failed: HashSet<String>,
-    /// Whether any rejected/soft-failed annotation was present on each event.
-    verdict_present: Vec<bool>,
     /// One audit record per hash-mismatched event.
     pub(crate) hash_audit: Vec<HashAudit>,
     /// Key bindings corroborated by successfully verified historical events.
@@ -1000,10 +998,6 @@ fn auth_findings_seeded(export: &RoomExport, seeds: &[bool]) -> anyhow::Result<A
         .collect();
     let mut findings = AuthFindings {
         forced: vec![None; events.len()],
-        verdict_present: events
-            .iter()
-            .map(|event| event.metadata.rejected.is_some() || event.metadata.soft_failed.is_some())
-            .collect(),
         ..AuthFindings::default()
     };
     let mut rejected: Vec<bool> = seeds.to_vec();
@@ -1508,13 +1502,7 @@ fn apply_judgement(
         if let Some(code) = judgement.refused[position] {
             // The seed kept the cascade from assigning a code.
             findings.forced[position] = Some(code);
-            if !exported[position]
-                && findings
-                    .verdict_present
-                    .get(position)
-                    .copied()
-                    .unwrap_or(false)
-            {
+            if !exported[position] {
                 findings.fails_but_exported_accepted.push(AuthFailure {
                     event_id: event.event_id.clone(),
                     reason: judgement.reason[position]
