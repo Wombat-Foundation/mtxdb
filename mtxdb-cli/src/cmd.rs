@@ -30,7 +30,7 @@ use mtxdb::{
 };
 use rezzy::auth::auth_types_for_event;
 use rezzy::json::{self, Object, Value as OwnedValue};
-use rezzy::{LeanEvent, StateResVersion};
+use rezzy::{redaction_preserved_keys, LeanEvent, RedactionRule, StateResVersion};
 
 use crate::export_import;
 use crate::interchange::{self, KeyRecord, RoomEvent, RoomExport};
@@ -10867,6 +10867,7 @@ fn import_pdu_events_with_raw(
         &room_version,
         events,
         auth_chain,
+        &stored_ids,
     )?;
 
     let room_events: Vec<RoomEvent> = all_events
@@ -10967,50 +10968,75 @@ fn raw_auth_projection_collection_id(room_id: &str) -> [u8; 16] {
     )
 }
 
+/// Whether redaction preserves a `content` path for this event type and room
+/// version. Unknown versions fail closed in rezzy, so every auth field is
+/// projected rather than silently skipped.
+fn redaction_preserves(event_type: &str, room_version: &str, path: &str) -> bool {
+    match redaction_preserved_keys(event_type, room_version) {
+        RedactionRule::All => true,
+        RedactionRule::Keys(keys) => keys.contains(&path),
+        RedactionRule::None => false,
+    }
+}
+
 /// Fields redaction drops but the auth rules still read.
+///
+/// Version classification comes from rezzy's redaction table rather than a
+/// numeric parse here, so unstable versions (`MSC3389`, `MSC4242`, `NutraCdo`) get
+/// the same treatment as their numeric rule sets.
 fn raw_auth_projection(event: &OwnedValue, room_version: &str) -> Option<OwnedValue> {
-    let major = room_version
-        .split('.')
-        .next()
-        .and_then(|major| major.parse::<u32>().ok())?;
     event.get("state_key")?;
     let kind = event.get("type")?.as_str()?;
-    // v11 redaction strips all of m.room.third_party_invite, so its public
-    // keys still need a projection even though other auth fields survive.
-    if major >= 11 && kind != "m.room.third_party_invite" {
-        return None;
-    }
     let OwnedValue::Object(content) = event.get("content")? else {
         return None;
     };
     let mut projected = Object::new();
-    if kind == "m.room.member" {
-        // The auth rule reads the signed token, not display_name or the
-        // surrounding signatures.
-        if let Some(OwnedValue::Object(third_party)) = content.get("third_party_invite") {
-            if let Some(signed) = third_party.get("signed") {
-                let mut token = Object::new();
-                token.insert("signed".to_owned(), signed.clone());
-                projected.insert("third_party_invite".to_owned(), OwnedValue::Object(token));
+    match kind {
+        "m.room.member" => {
+            // The auth rule reads the signed token, not display_name or the
+            // surrounding signatures.
+            if !redaction_preserves(kind, room_version, "third_party_invite.signed") {
+                if let Some(OwnedValue::Object(third_party)) = content.get("third_party_invite") {
+                    if let Some(signed) = third_party.get("signed") {
+                        let mut token = Object::new();
+                        token.insert("signed".to_owned(), signed.clone());
+                        projected
+                            .insert("third_party_invite".to_owned(), OwnedValue::Object(token));
+                    }
+                }
+            }
+            if !redaction_preserves(kind, room_version, "join_authorised_via_users_server") {
+                if let Some(value) = content.get("join_authorised_via_users_server") {
+                    projected.insert("join_authorised_via_users_server".to_owned(), value.clone());
+                }
             }
         }
-        if major == 8 {
-            if let Some(value) = content.get("join_authorised_via_users_server") {
-                projected.insert("join_authorised_via_users_server".to_owned(), value.clone());
+        "m.room.create" => {
+            if !redaction_preserves(kind, room_version, "m.federate") {
+                if let Some(value) = content.get("m.federate") {
+                    projected.insert("m.federate".to_owned(), value.clone());
+                }
             }
         }
-        return (!projected.is_empty()).then_some(OwnedValue::Object(projected));
-    }
-    let fields: &[&str] = match kind {
-        "m.room.create" => &["m.federate"],
-        "m.room.third_party_invite" => &["public_key", "public_keys"],
-        "m.room.power_levels" => &["invite"],
+        "m.room.power_levels" => {
+            if !redaction_preserves(kind, room_version, "invite") {
+                if let Some(value) = content.get("invite") {
+                    projected.insert("invite".to_owned(), value.clone());
+                }
+            }
+        }
+        "m.room.third_party_invite" => {
+            // v11 redaction still strips this event's entire content, so its
+            // public keys need a projection in every room version.
+            for key in ["public_key", "public_keys"] {
+                if !redaction_preserves(kind, room_version, key) {
+                    if let Some(value) = content.get(key) {
+                        projected.insert(key.to_owned(), value.clone());
+                    }
+                }
+            }
+        }
         _ => return None,
-    };
-    for key in fields {
-        if let Some(value) = content.get(*key) {
-            projected.insert((*key).to_owned(), value.clone());
-        }
     }
     (!projected.is_empty()).then_some(OwnedValue::Object(projected))
 }
@@ -11022,10 +11048,21 @@ fn write_raw_auth_projections(
     room_version: &str,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
+    stored_ids: &HashSet<String>,
 ) -> anyhow::Result<()> {
     let mut seen = HashSet::new();
     let mut records = Vec::new();
     for event in events.iter().chain(auth_chain) {
+        // auth_chain-only events are not stored in this collection, so a
+        // projection for them would be unreachable. Only project events the
+        // importer can load back (including earlier stored events repeated in
+        // an auth chain).
+        let Some(id) = event_id(event) else {
+            continue;
+        };
+        if !stored_ids.contains(id) {
+            continue;
+        }
         let Some(projection) = raw_auth_projection(event, room_version) else {
             continue;
         };
@@ -11041,6 +11078,23 @@ fn write_raw_auth_projections(
         return Ok(());
     }
     let collection = raw_auth_projection_collection_id(room_id);
+    let ids: Vec<[u8; 16]> = records.iter().map(|(id, _)| *id).collect();
+    let existing = store.get_many(&collection, &ids)?;
+    let mut to_write = Vec::with_capacity(records.len());
+    for ((node, data), existing) in records.into_iter().zip(existing) {
+        if existing.is_some() {
+            // First projection wins. Event ids are opaque in v1-v3, so the
+            // same id can legitimately arrive with different content; the
+            // event collection already keeps the first stored payload. For
+            // content-addressed versions this is also the conservative
+            // choice: never replace an established projection.
+            continue;
+        }
+        to_write.push((node, data));
+    }
+    if to_write.is_empty() {
+        return Ok(());
+    }
     let metadata = CollectionMetadata {
         member_namespace: Some(mtxdb::MEMBER_NAMESPACE_INTL),
         collection_canonical_id: format!("raw-auth-projection:{room_id}").into_bytes(),
@@ -11051,7 +11105,7 @@ fn write_raw_auth_projections(
         schema: Some("matrix.event.auth-projection.v1".to_owned()),
     };
     store
-        .create_or_put_established(&collection, &metadata, &records)
+        .create_or_put_established(&collection, &metadata, &to_write)
         .context("storing raw auth projections")?;
     Ok(())
 }

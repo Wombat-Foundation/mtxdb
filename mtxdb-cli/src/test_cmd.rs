@@ -10,11 +10,12 @@ use super::{
     interleaving_worth_noting, is_server_keys_export, keys_first, listing_shard_types,
     load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
     matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
-    pack_identity, parse_federation_input, parse_pack_id_selector, parse_pack_selectors,
-    prepare_state_collection, pretty_print_payload, raw_auth_projection, record_matrix_adjacency,
-    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-    split_canonical_display, template_collection_id, template_node_id, topological_event_order,
-    valid_state_group_id, verify_auth_chain_edges, CollectionFlags, CollectionOptions,
+    overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
+    parse_pack_selectors, prepare_state_collection, pretty_print_payload, raw_auth_projection,
+    raw_auth_projection_collection_id, record_matrix_adjacency, redacted_event_bytes,
+    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
+    template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
+    verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags, CollectionOptions,
     CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity,
     ScanOptions, SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
     STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
@@ -2495,6 +2496,78 @@ fn raw_import_keeps_pre_v11_power_level_rejection_across_files() {
 }
 
 #[test]
+fn raw_import_keeps_pre_v11_m_federate_rejection_across_files() {
+    use mtxdb::room_flag::*;
+
+    let dir = unique_temp_dir().join("raw_v10_federate");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room6");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let create = raw_event(
+        "!room6",
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"10","m.federate":false}"#,
+        "[]",
+        "[]",
+    );
+    let join_alice = raw_event(
+        "!room6",
+        "$join_alice",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let rules = raw_event(
+        "!room6",
+        "$rules",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$join_alice"]"#,
+        r#"["$create","$join_alice"]"#,
+    );
+    let join_bob = owned_value(
+        r#"{"event_id":"$join_bob","sender":"@bob:other","room_id":"!room6","type":"m.room.member","state_key":"@bob:other","content":{"membership":"join"},"prev_events":["$rules"],"auth_events":["$create","$rules"]}"#,
+    );
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut import = |events: &[OwnedValue]| {
+        import_pdu_events(
+            &db,
+            store,
+            state_store,
+            &path,
+            events,
+            &[],
+            None,
+            None,
+            &template,
+            &mut established,
+        )
+        .unwrap();
+    };
+    import(&[create, join_alice, rules]);
+    import(&[join_bob]);
+
+    let flags = RoomFlagIndex::new(b"!room6");
+    let rejected = FlagQuery::has(Flag::Rejected);
+    assert_eq!(
+        flags.select(&db, &rejected).unwrap(),
+        vec![b"$join_bob".to_vec()],
+        "the redacted create event must keep m.federate=false for later files"
+    );
+}
+
+#[test]
 fn raw_auth_projection_keeps_v8_restricted_join_fields() {
     let member = owned_value(
         r#"{"event_id":"$join","sender":"@bob:test","room_id":"!room","type":"m.room.member","state_key":"@bob:test","content":{"membership":"join","join_authorised_via_users_server":"@alice:test"},"prev_events":[],"auth_events":[]}"#,
@@ -2547,6 +2620,130 @@ fn raw_auth_projection_keeps_v8_restricted_join_fields() {
             .get("m.federate")
             .and_then(OwnedValue::as_bool),
         Some(false)
+    );
+
+    // Version classification must come from rezzy's redaction rules, not a
+    // numeric parse here. MSC3389 uses v10 redaction; MSC4242 and NutraCdo
+    // use v11 redaction.
+    let levels = owned_value(
+        r#"{"event_id":"$pl","sender":"@alice:test","room_id":"!room","type":"m.room.power_levels","state_key":"","content":{"invite":50},"prev_events":[],"auth_events":[]}"#,
+    );
+    assert_eq!(
+        raw_auth_projection(&levels, "org.matrix.msc3389.10")
+            .unwrap()
+            .get("invite")
+            .and_then(OwnedValue::as_i64),
+        Some(50)
+    );
+    assert_eq!(
+        raw_auth_projection(&create, "org.matrix.msc3389.10")
+            .unwrap()
+            .get("m.federate")
+            .and_then(OwnedValue::as_bool),
+        Some(false)
+    );
+    assert!(raw_auth_projection(&create, "org.matrix.msc4242.12").is_none());
+    assert!(raw_auth_projection(&create, "tk.nutra.cdo.12").is_none());
+
+    // v11 redaction strips m.room.third_party_invite entirely; the projection
+    // is what restores its public keys when a stored event is loaded back.
+    let redacted = redacted_event_bytes(&third_party, "11").unwrap();
+    let mut redacted = OwnedValue::parse_bytes(&redacted).unwrap();
+    assert!(
+        redacted
+            .get("content")
+            .and_then(|content| content.get("public_key"))
+            .is_none(),
+        "v11 redaction must strip the public key"
+    );
+    let projection = raw_auth_projection(&third_party, "11").unwrap();
+    overlay_auth_projection(&mut redacted, projection);
+    assert_eq!(
+        redacted
+            .get("content")
+            .and_then(|content| content.get("public_key"))
+            .and_then(OwnedValue::as_str),
+        Some("key")
+    );
+}
+
+#[test]
+fn raw_auth_projection_collision_keeps_first_for_opaque_event_ids() {
+    let dir = unique_temp_dir().join("projection_collision");
+    let db = Database::open(dir).unwrap();
+    let template = default_matrix_import_template();
+    let store = db.event_dag();
+    let room = "!projection_collision";
+    let first = raw_event(
+        room,
+        "$same",
+        "m.room.create",
+        "",
+        r#"{"room_version":"1","m.federate":false}"#,
+        "[]",
+        "[]",
+    );
+    let second = raw_event(
+        room,
+        "$same",
+        "m.room.create",
+        "",
+        r#"{"room_version":"1","m.federate":true}"#,
+        "[]",
+        "[]",
+    );
+    let stored: HashSet<String> = ["$same".to_owned()].into_iter().collect();
+
+    write_raw_auth_projections(store, room, &template, "1", &[first.clone()], &[], &stored)
+        .unwrap();
+    write_raw_auth_projections(store, room, &template, "1", &[second], &[], &stored).unwrap();
+
+    let node = template_node_id(&template, &first).unwrap().unwrap();
+    let collection = raw_auth_projection_collection_id(room);
+    let record = store.get(&collection, &node).unwrap().unwrap();
+    let projection = OwnedValue::parse_bytes(&record.bytes).unwrap();
+    assert_eq!(
+        projection.get("m.federate").and_then(OwnedValue::as_bool),
+        Some(false),
+        "a later projection must not replace the first for an opaque event id"
+    );
+}
+
+#[test]
+fn raw_auth_projection_skips_auth_chain_only_events() {
+    let dir = unique_temp_dir().join("projection_auth_chain_only");
+    let db = Database::open(dir).unwrap();
+    let template = default_matrix_import_template();
+    let store = db.event_dag();
+    let room = "!projection_auth_chain_only";
+    let auth_event = raw_event(
+        room,
+        "$auth_only",
+        "m.room.create",
+        "",
+        r#"{"room_version":"10","m.federate":false}"#,
+        "[]",
+        "[]",
+    );
+
+    write_raw_auth_projections(
+        store,
+        room,
+        &template,
+        "10",
+        &[],
+        &[auth_event],
+        &HashSet::new(),
+    )
+    .unwrap();
+
+    let collection = raw_auth_projection_collection_id(room);
+    assert!(
+        store
+            .get_collection_metadata(&collection)
+            .unwrap()
+            .is_none(),
+        "an auth_chain-only event must not create an unreachable projection"
     );
 }
 
