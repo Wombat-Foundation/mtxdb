@@ -4513,8 +4513,7 @@ impl PackfileStorage {
     }
 
     /// A collection's `(entry count, private heap bytes, mapped bytes,
-    /// index capacity)`, if the collection exists. Private heap bytes include
-    /// the resident table and Paged negative-lookup filters. Unlike
+    /// index capacity)`, if the collection exists. Unlike
     /// [`Self::collection_index_info`], this separates the heap the table owns
     /// from the checkpoint-mapped entry array, which is reclaimable.
     pub fn collection_index_residency(
@@ -4534,10 +4533,7 @@ impl PackfileStorage {
                 resident_entries.saturating_add(g.sealed.entry_count_in_collection(collection_id));
             (
                 usize::try_from(entries).unwrap_or(usize::MAX),
-                g.index.resident_bytes().saturating_add(
-                    usize::try_from(g.sealed.bloom_filter_bytes(collection_id))
-                        .unwrap_or(usize::MAX),
-                ),
+                g.index.resident_bytes(),
                 g.index
                     .mapped_bytes()
                     .saturating_add(usize::try_from(g.sealed.mapped_bytes()).unwrap_or(usize::MAX)),
@@ -4563,10 +4559,7 @@ impl PackfileStorage {
                 resident_entries.saturating_add(g.sealed.entry_count_in_collection(collection_id));
             (
                 usize::try_from(entries).unwrap_or(usize::MAX),
-                g.index.memory_usage().saturating_add(
-                    usize::try_from(g.sealed.bloom_filter_bytes(collection_id))
-                        .unwrap_or(usize::MAX),
-                ),
+                g.index.memory_usage(),
                 g.index.capacity(),
             )
         })
@@ -4631,9 +4624,7 @@ impl PackfileStorage {
                     (
                         *id,
                         usize::try_from(entries).unwrap_or(usize::MAX),
-                        g.index.memory_usage().saturating_add(
-                            usize::try_from(g.sealed.bloom_filter_bytes(id)).unwrap_or(usize::MAX),
-                        ),
+                        g.index.memory_usage(),
                         g.index.capacity(),
                     )
                 })

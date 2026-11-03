@@ -57,88 +57,6 @@ fn sample_index() -> PackIndex {
 }
 
 #[test]
-fn bloom_filter_has_no_false_negatives_and_low_false_positive_rate() {
-    let id_for = |value: u64| {
-        let mixed = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut id = [0; 16];
-        id[..8].copy_from_slice(&mixed.to_le_bytes());
-        id[8..].copy_from_slice(&mixed.rotate_left(29).to_le_bytes());
-        id
-    };
-    let seed = crate::packfile::PackId::random().0;
-    let seed_for_index = bloom_seed_for(sample_identity());
-    let other_index_seed = bloom_seed_for(PackIndexIdentity {
-        creation_seq: sample_identity().creation_seq + 1,
-        ..sample_identity()
-    });
-    assert_ne!(seed_for_index, other_index_seed);
-    let mut filter = BloomFilter::new(2_000, seed).expect("small filter allocation");
-    for value in 0..2_000 {
-        filter.insert(&id_for(value));
-    }
-    for value in 0..2_000 {
-        assert!(
-            filter.may_contain(&id_for(value)),
-            "false negative for {value}"
-        );
-    }
-
-    let false_positives = (2_000..22_000)
-        .filter(|value| filter.may_contain(&id_for(*value)))
-        .count();
-    assert!(
-        false_positives < 400,
-        "false-positive rate was {}% ({} / 20,000)",
-        false_positives * 100 / 20_000,
-        false_positives
-    );
-}
-
-#[test]
-fn mapped_index_filter_covers_every_entry_in_a_large_collection() {
-    let collection = [0x53; 16];
-    let entry_count = 2_048_u64;
-    let id_for = |value: u64| {
-        let mut id = [0; 16];
-        id[..8].copy_from_slice(&value.to_le_bytes());
-        id[8..].copy_from_slice(&BloomFilter::mix64(value).to_le_bytes());
-        id
-    };
-    let inputs = (0..entry_count)
-        .map(|index| PackIndexInput {
-            collection_id: collection,
-            logical_id: id_for(index),
-            offset: frame_offset(index.saturating_mul(8)),
-            removed: index % 17 == 0,
-            disk_bytes: 8,
-        })
-        .collect();
-    let identity = PackIndexIdentity {
-        pack_id: PackId([0x54; 16]),
-        creation_seq: 7,
-        pack_file_len: frame_offset(entry_count.saturating_mul(8).saturating_add(1)),
-    };
-    let path = test_path();
-    PackIndex::build(identity, inputs)
-        .unwrap()
-        .write_atomic(&path)
-        .unwrap();
-    let mapped = PackIndex::open_mmap(&path, identity).unwrap();
-    assert!(mapped.collection_bloom_filter_bytes(&collection) > 0);
-    for index in 0..entry_count {
-        assert!(
-            mapped.get_locator(&collection, &id_for(index)).is_some(),
-            "filter rejected entry {index}"
-        );
-    }
-    let miss = id_for(entry_count.saturating_add(100_000));
-    assert!(!mapped.blooms[0].as_ref().unwrap().may_contain(&miss));
-    assert_eq!(mapped.get_locator(&collection, &miss), None);
-    drop(mapped);
-    fs::remove_file(path).unwrap();
-}
-
-#[test]
 fn tombstone_wins_only_when_it_is_the_newest_version() {
     let collection = [9; 16];
     let key = [7; 16];
@@ -334,11 +252,6 @@ fn mapped_open_checks_identity_and_verify_detects_body_corruption() {
     assert_eq!(
         mapped.get(&[1; 16], &[0x10; 16]),
         Some(frame_offset_u32(80))
-    );
-    assert_eq!(
-        mapped.bloom_filter_bytes(),
-        0,
-        "tiny collections skip the filter because binary search is cheaper"
     );
     assert_eq!(mapped.verify(), Ok(()));
     drop(mapped);
