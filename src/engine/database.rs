@@ -35,6 +35,9 @@ pub struct PoolPolicy {
     pub compress: bool,
     /// How much CRC32 checksum verification this pool applies.
     pub checksum_policy: crate::packfile::ChecksumPolicy,
+    /// Whether sealed packs keep their locators in the resident index or are
+    /// served from their sidecars.
+    pub index_residency: crate::index::IndexResidency,
 }
 
 impl Default for PoolPolicy {
@@ -42,6 +45,7 @@ impl Default for PoolPolicy {
         Self {
             compress: true,
             checksum_policy: crate::packfile::ChecksumPolicy::Full,
+            index_residency: crate::index::IndexResidency::Resident,
         }
     }
 }
@@ -803,8 +807,12 @@ impl Database {
         for shard in ShardType::ALL {
             let dir = layout.pool_path(shard);
             let policy = policies.for_shard(shard);
-            let store =
-                PackfileStorage::open_shared_member(dir, policy.compress, policy.checksum_policy)?;
+            let store = PackfileStorage::open_shared_member(
+                dir,
+                policy.compress,
+                policy.checksum_policy,
+                policy.index_residency,
+            )?;
             // This process holds the exclusive WAL lock, so its in-memory
             // index is authoritative and a negative lookup is a true miss.
             // Left on, every miss after a sync (which moves the durable

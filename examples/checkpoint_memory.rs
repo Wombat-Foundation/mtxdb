@@ -218,6 +218,40 @@ fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (out, peak.load(Ordering::Relaxed))
 }
 
+/// Index residency selected for reopened handles. The initial build always
+/// runs resident so the store looks like a default-written database; set
+/// `MTXDB_MEASURE_RESIDENCY=paged` to measure the tail-only reopen.
+fn measure_residency() -> mtxdb::index::IndexResidency {
+    match std::env::var("MTXDB_MEASURE_RESIDENCY").as_deref() {
+        Ok("paged") => mtxdb::index::IndexResidency::Paged,
+        _ => mtxdb::index::IndexResidency::Resident,
+    }
+}
+
+fn open_store(dir: PathBuf, residency: mtxdb::index::IndexResidency) -> PackfileStorage {
+    if residency == mtxdb::index::IndexResidency::Paged {
+        PackfileStorage::open_with_residency(dir, mtxdb::packfile::ChecksumPolicy::Full, residency)
+            .unwrap()
+    } else {
+        PackfileStorage::open(dir).unwrap()
+    }
+}
+
+/// The initial build uses the default resident index. `MTXDB_MEASURE_MAX_SHARD_BYTES`
+/// lets a measurement run rotate small packs so a modest record count produces
+/// sealed sidecars without writing hundreds of megabytes.
+fn build_store(dir: PathBuf) -> PackfileStorage {
+    match std::env::var("MTXDB_MEASURE_MAX_SHARD_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(max_shard_bytes) => {
+            PackfileStorage::open_with_max_shard_bytes(dir, max_shard_bytes).unwrap()
+        }
+        None => PackfileStorage::open(dir).unwrap(),
+    }
+}
+
 fn main() {
     let records: u64 = std::env::var("MTXDB_MEASURE_RECORDS")
         .ok()
@@ -240,7 +274,7 @@ fn main() {
     println!("records={records} dir={}", dir.display());
     println!("rss at start: {:.1} MiB", mib(rss_bytes()));
 
-    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let store = build_store(dir.clone());
     let build = put_range(&store, 0, records);
     store.sync_all().unwrap();
     let mut live = records;
@@ -269,7 +303,7 @@ fn main() {
     // Reopen the slots-only checkpoint and measure write costs.
     drop(store);
     let rss_before = rss_bytes();
-    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let store = open_store(dir.clone(), measure_residency());
     let (heap, mapped, logical, slots) = index_memory(&store);
     println!(
         "reopen (slots-only): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB ({:.2} B/slot), logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
@@ -311,7 +345,7 @@ fn main() {
         }
     }
     let baseline = rss_bytes();
-    let (store, peak) = peak_rss_during(|| PackfileStorage::open(dir.clone()).unwrap());
+    let (store, peak) = peak_rss_during(|| open_store(dir.clone(), measure_residency()));
     let (heap, _mapped, _logical, _slots) = index_memory(&store);
     println!(
         "full-scan open: peak rss {:.1} MiB (from {:.1} MiB, +{:.1}), final heap {:.1} MiB ({:.2} B/rec)",
@@ -353,7 +387,7 @@ fn evict_dir(dir: &Path) -> String {
 /// reopen, optionally evict the page cache, then rewrite existing keys twice.
 fn run_cold_rewrite(dir: &Path, records: u64) {
     let label = "slots-only";
-    let store = PackfileStorage::open(dir.to_path_buf()).unwrap();
+    let store = build_store(dir.to_path_buf());
     let build = put_range(&store, 0, records);
     store.sync_all().unwrap();
     store.force_index_checkpoint().unwrap();
@@ -369,7 +403,7 @@ fn run_cold_rewrite(dir: &Path, records: u64) {
     );
     drop(store);
 
-    let reopened = PackfileStorage::open(dir.to_path_buf()).unwrap();
+    let reopened = open_store(dir.to_path_buf(), measure_residency());
     let (heap, mapped, _logical, slots) = index_memory(&reopened);
     let evicted = if std::env::var("MTXDB_MEASURE_EVICT").as_deref() == Ok("1") {
         evict_dir(dir)

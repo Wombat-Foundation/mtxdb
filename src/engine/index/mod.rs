@@ -13,6 +13,22 @@ pub mod sealed;
 use crate::index::delta::DeltaReplayError;
 use crate::index::format::DeltaFrame;
 
+/// Where sealed packs' locators are served from.
+///
+/// `Resident` is the historical behaviour: every pack, sealed or not, has a
+/// copy in the resident [`LossyIndex`]. `Paged` keeps only unsealed packs in
+/// the resident table and resolves sealed packs through their mmap'd sidecars.
+/// It is an opt-in memory/CPU trade: a sealed miss becomes a sidecar lookup
+/// instead of a hash-table probe, and a missing sidecar falls back to a scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexResidency {
+    /// Every pack is indexed in the resident hash table.
+    #[default]
+    Resident,
+    /// Only the unsealed tail is resident; sealed packs use sidecars.
+    Paged,
+}
+
 /// Per-database-instance tuning for [`LossyIndex`] construction.
 ///
 /// `seed` is mixed into bucket *and* tag derivation to prevent adversarial
@@ -1134,15 +1150,43 @@ impl LossyIndex {
     /// of the packfile itself.
     #[must_use]
     pub fn slot_counts(&self) -> std::collections::HashMap<u16, u64> {
+        self.slot_counts_excluding(|_| false)
+    }
+
+    /// As [`Self::slot_counts`], excluding slots a caller will account for
+    /// from another source. A paged collection uses this to count only its
+    /// unsealed tail while sealed sidecars supply the rest, so a pack sealed
+    /// during the session is never counted twice.
+    #[must_use]
+    pub fn slot_counts_excluding(
+        &self,
+        mut excluded: impl FnMut(u16) -> bool,
+    ) -> std::collections::HashMap<u16, u64> {
         let mut counts = std::collections::HashMap::new();
         for index in 0..self.capacity as usize {
             let entry = IndexEntry(self.entry_at(index));
-            if !entry.is_empty() {
+            if !entry.is_empty() && !excluded(entry.slot()) {
                 let entry = counts.entry(entry.slot()).or_insert(0u64);
                 *entry = entry.saturating_add(1);
             }
         }
         counts
+    }
+
+    /// Whether any occupied entry points into one of `slots`.
+    ///
+    /// Used by a paged checkpoint to tell whether its resident table still
+    /// holds a pack that has since sealed; such a table cannot be published as
+    /// a tail-only image.
+    #[must_use]
+    pub fn references_any_slot(&self, slots: &std::collections::HashSet<u16>) -> bool {
+        if slots.is_empty() {
+            return false;
+        }
+        (0..self.capacity as usize).any(|index| {
+            let entry = IndexEntry(self.entry_at(index));
+            !entry.is_empty() && slots.contains(&entry.slot())
+        })
     }
 
     /// Whether this collection's index currently has any live entry pointing

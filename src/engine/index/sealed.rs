@@ -53,6 +53,13 @@ pub trait SealedIndex: Send + Sync {
 
     /// File-backed bytes this sidecar maps.
     fn mapped_bytes(&self) -> u64;
+
+    /// Unique locators recorded for one collection.
+    fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64>;
+
+    /// CRC32 stored in the sidecar header, used by a tail-only checkpoint's
+    /// sealed-pack manifest.
+    fn crc32(&self) -> u32;
 }
 
 impl SealedIndex for MappedPackIndex {
@@ -71,6 +78,14 @@ impl SealedIndex for MappedPackIndex {
     fn mapped_bytes(&self) -> u64 {
         MappedPackIndex::mapped_file_bytes(self)
     }
+
+    fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
+        MappedPackIndex::collection_entry_count(self, collection_id)
+    }
+
+    fn crc32(&self) -> u32 {
+        MappedPackIndex::crc32(self)
+    }
 }
 
 impl SealedIndex for super::packidx::PackIndex {
@@ -88,6 +103,14 @@ impl SealedIndex for super::packidx::PackIndex {
 
     fn mapped_bytes(&self) -> u64 {
         super::packidx::PackIndex::mapped_file_bytes(self)
+    }
+
+    fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
+        super::packidx::PackIndex::collection_entry_count(self, collection_id)
+    }
+
+    fn crc32(&self) -> u32 {
+        super::packidx::PackIndex::crc32(self)
     }
 }
 
@@ -207,6 +230,44 @@ impl SealedLocators {
         self.packs.iter().fold(0_u64, |total, pack| {
             total.saturating_add(pack.index.mapped_bytes())
         })
+    }
+
+    /// Whether any sealed pack in the set occupies `slot`.
+    #[must_use]
+    pub fn contains_slot(&self, slot: u16) -> bool {
+        self.packs.iter().any(|pack| pack.slot == slot)
+    }
+
+    /// Unique locators recorded for one collection across every sealed pack.
+    #[must_use]
+    pub fn entry_count_in_collection(&self, collection_id: &[u8; 16]) -> u64 {
+        self.packs.iter().fold(0_u64, |total, pack| {
+            total.saturating_add(
+                pack.index
+                    .collection_entry_count(collection_id)
+                    .unwrap_or(0),
+            )
+        })
+    }
+
+    /// Locator counts per shard slot for one collection, derived from each
+    /// sidecar's directory entry count (the same number a slot walk would
+    /// produce, because the sidecar has one entry per unique id).
+    #[must_use]
+    pub fn slot_counts_in_collection(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> std::collections::HashMap<u16, u64> {
+        let mut counts = std::collections::HashMap::new();
+        for pack in &self.packs {
+            if let Some(count) = pack.index.collection_entry_count(collection_id) {
+                if count > 0 {
+                    let entry = counts.entry(pack.slot).or_insert(0u64);
+                    *entry = entry.saturating_add(count);
+                }
+            }
+        }
+        counts
     }
 
     /// Resolve a key to the newest sealed version.

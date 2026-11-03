@@ -47,6 +47,19 @@ impl SealedIndex for FakeIndex {
     fn mapped_bytes(&self) -> u64 {
         self.bytes
     }
+
+    fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
+        let count = self
+            .entries
+            .keys()
+            .filter(|(collection, _)| collection == collection_id)
+            .count();
+        (count > 0).then(|| u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
+    fn crc32(&self) -> u32 {
+        0
+    }
 }
 
 fn pack(seq: u64, slot: u16, index: FakeIndex) -> SealedPack {

@@ -340,6 +340,7 @@ pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
     let uncompressed = PoolPolicy {
         compress: false,
         checksum_policy: crate::packfile::ChecksumPolicy::Full,
+        index_residency: crate::index::IndexResidency::Resident,
     };
     PoolPolicies::default()
         .with(ShardType::State, uncompressed)

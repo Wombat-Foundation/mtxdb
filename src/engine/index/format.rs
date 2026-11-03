@@ -19,6 +19,88 @@ pub const COLLECTION_DIR_ENTRY_LEN: usize = 56;
 pub const PACK_TABLE_ENTRY_LEN: usize = 20;
 /// Bytes in one collection logical-version entry: collection id plus LSN.
 pub const COLLECTION_VERSION_ENTRY_LEN: usize = 24;
+/// Bytes in one tail-only checkpoint sealed-pack reference:
+/// `PackId`(16) + creation sequence(8) + sidecar CRC32(4).
+pub const SEALED_REF_ENTRY_LEN: usize = 28;
+
+/// Whether a checkpoint index describes every pack or only the mutable tail.
+///
+/// Encoded in a reserved header byte (not the wire version), so a reader can
+/// tell the two apart without decoding the body. A `Complete` checkpoint is
+/// the historical format; treating a missing/zero marker as `Complete` keeps
+/// old checkpoints readable. A `TailOnly` checkpoint must never be trusted by
+/// a resident open: it intentionally omits sealed packs, whose locators only
+/// exist in the referenced sidecars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckpointResidency {
+    /// The index describes every pack in the store.
+    #[default]
+    Complete,
+    /// The index describes only unsealed packs; sealed packs are named in the
+    /// trailing sealed-reference section and served from their sidecars.
+    TailOnly,
+}
+
+impl CheckpointResidency {
+    /// Header byte value.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Complete => 0,
+            Self::TailOnly => 1,
+        }
+    }
+
+    /// Decode a header byte; unknown values make the checkpoint invalid.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Complete),
+            1 => Some(Self::TailOnly),
+            _ => None,
+        }
+    }
+}
+
+/// One sealed pack a tail-only checkpoint depends on.
+///
+/// The sidecar CRC is the value stored in the sidecar header (calculated with
+/// its own CRC field zeroed). On open, a mismatched or missing reference makes
+/// the checkpoint untrustworthy and the pack is scanned instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedRefEntry {
+    /// Stable pack identity.
+    pub pack_id: PackId,
+    /// Pack creation sequence, ordering competing versions.
+    pub creation_seq: u64,
+    /// CRC32 of the sidecar file body.
+    pub sidecar_crc32: u32,
+}
+
+impl SealedRefEntry {
+    #[must_use]
+    /// Encodes this reference in fixed-width little-endian form.
+    pub fn encode(self) -> [u8; SEALED_REF_ENTRY_LEN] {
+        let mut bytes = [0; SEALED_REF_ENTRY_LEN];
+        bytes[..16].copy_from_slice(self.pack_id.as_bytes());
+        bytes[16..24].copy_from_slice(&self.creation_seq.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.sidecar_crc32.to_le_bytes());
+        bytes
+    }
+
+    #[must_use]
+    /// Decodes exactly one fixed-width sealed reference.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; SEALED_REF_ENTRY_LEN] = bytes.try_into().ok()?;
+        let mut pack_id = [0u8; crate::packfile::PACK_ID_LEN];
+        pack_id.copy_from_slice(&bytes[..16]);
+        Some(Self {
+            pack_id: PackId(pack_id),
+            creation_seq: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
+            sidecar_crc32: u32::from_le_bytes(bytes[24..28].try_into().ok()?),
+        })
+    }
+}
 
 /// One slot overwrite after a checkpoint.
 ///
@@ -114,6 +196,9 @@ pub struct CheckpointHeader {
     pub logical_version_count: u32,
     /// Total byte length of the logical-version section.
     pub logical_version_bytes: u64,
+    /// Whether the index is complete or describes only the unsealed tail.
+    /// Encoded in a reserved byte, independent of `version`.
+    pub residency: CheckpointResidency,
 }
 
 impl CheckpointHeader {
@@ -135,6 +220,7 @@ impl CheckpointHeader {
         bytes[72..80].copy_from_slice(&self.pack_table_bytes.to_le_bytes());
         bytes[80..88].copy_from_slice(&self.base_delta_seq.to_le_bytes());
         bytes[88..92].copy_from_slice(&self.logical_version_count.to_le_bytes());
+        bytes[92] = self.residency.as_byte();
         bytes[96..104].copy_from_slice(&self.logical_version_bytes.to_le_bytes());
         bytes
     }
@@ -143,10 +229,12 @@ impl CheckpointHeader {
     /// Decodes exactly one fixed-width header, rejecting any other length.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let bytes: &[u8; CHECKPOINT_HEADER_LEN] = bytes.try_into().ok()?;
-        if bytes[92..96] != [0; 4] {
+        if bytes[93..96] != [0; 3] {
             return None;
         }
+        let residency = CheckpointResidency::from_byte(bytes[92])?;
         Some(Self {
+            residency,
             magic: bytes[..8].try_into().ok()?,
             version: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
             collection_count: u32::from_le_bytes(bytes[12..16].try_into().ok()?),

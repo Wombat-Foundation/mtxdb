@@ -126,6 +126,10 @@ pub enum CheckpointReject {
     /// Applying a delta-log frame or redo set onto a materialized index
     /// failed.
     IndexUpdateFailed,
+    /// The checkpoint's completeness did not match this open's residency
+    /// policy (a resident open cannot trust a tail-only index; a paged open
+    /// rebuilds rather than materialize a complete one and defeat the mode).
+    ResidencyMismatch,
 }
 
 /// How strictly `PackfileStorage::checkpoint_scan_out` validates the live pack
@@ -998,14 +1002,16 @@ struct StreamingOpenScan {
     seen_collections: HashSet<[u8; 16]>,
     collection_home: HashMap<[u8; 16], u16>,
     collection_disk_bytes: HashMap<PackId, HashMap<[u8; 16], u64>>,
-    /// Per-collection sealed-pack locators. Populated even while the resident
-    /// index still holds the same entries, so read paths can be validated
-    /// against real sidecars before sealed packs stop being loaded into it.
+    /// Per-collection sealed-pack locators. In `Resident` mode the resident
+    /// index still holds the same entries, so this is a read fallback; in
+    /// `Paged` mode it is the only locator source for these packs.
     sealed: HashMap<[u8; 16], crate::index::sealed::SealedLocators>,
+    /// Whether sealed packs are also copied into the resident index.
+    residency: crate::index::IndexResidency,
 }
 
 impl StreamingOpenScan {
-    fn new(collection_order: Vec<[u8; 16]>) -> Self {
+    fn new(collection_order: Vec<[u8; 16]>, residency: crate::index::IndexResidency) -> Self {
         let known_collections = collection_order.iter().copied().collect();
         Self {
             indexes: HashMap::new(),
@@ -1015,6 +1021,7 @@ impl StreamingOpenScan {
             collection_home: HashMap::new(),
             collection_disk_bytes: HashMap::new(),
             sealed: HashMap::new(),
+            residency,
         }
     }
 
@@ -1128,24 +1135,34 @@ impl StreamingOpenScan {
                     index: sealed_index,
                 },
             );
-            sidecar.for_each_entry_in_collection(&collection_id, |hash, locator| {
-                if error.is_some() {
-                    return;
-                }
-                let (offset, removed) = match locator {
-                    crate::index::packidx::PackIndexLocator::Frame(offset) => {
-                        (u64::from(offset), false)
+            // `Paged` exists to keep these locators out of the hash table; the
+            // sidecar plus `SealedLocators` is authoritative for this pack.
+            // `Resident` keeps the historical redundant copy.
+            if self.residency == crate::index::IndexResidency::Resident {
+                sidecar.for_each_entry_in_collection(&collection_id, |hash, locator| {
+                    if error.is_some() {
+                        return;
                     }
-                    crate::index::packidx::PackIndexLocator::Removed(offset) => {
-                        (u64::from(offset), true)
+                    let (offset, removed) = match locator {
+                        crate::index::packidx::PackIndexLocator::Frame(offset) => {
+                            (u64::from(offset), false)
+                        }
+                        crate::index::packidx::PackIndexLocator::Removed(offset) => {
+                            (u64::from(offset), true)
+                        }
+                    };
+                    if let Err(failure) = self.insert_locator(
+                        collection_id,
+                        &hash,
+                        offset,
+                        removed,
+                        slot,
+                        index_config,
+                    ) {
+                        error = Some(failure);
                     }
-                };
-                if let Err(failure) =
-                    self.insert_locator(collection_id, &hash, offset, removed, slot, index_config)
-                {
-                    error = Some(failure);
-                }
-            });
+                });
+            }
         });
         error.map_or(Ok(()), Err)
     }
@@ -1166,11 +1183,38 @@ impl StreamingOpenScan {
             collection_disk_bytes: self.collection_disk_bytes,
             ..RoomScanOutput::default()
         };
-        for (collection_id, index) in self.indexes {
+        let index_config = crate::index::IndexConfig {
+            seed: shards.bucket_seed(),
+            ..Default::default()
+        };
+        // A paged collection may have sealed packs but no unsealed tail, so
+        // the collection set is the union of both maps, not just `indexes`.
+        let mut collection_ids: Vec<[u8; 16]> = self.indexes.keys().copied().collect();
+        collection_ids.extend(
+            self.sealed
+                .keys()
+                .filter(|id| !self.indexes.contains_key(*id))
+                .copied(),
+        );
+        for collection_id in collection_ids {
+            let index = self.indexes.remove(&collection_id).unwrap_or_else(|| {
+                LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, index_config)
+            });
+            let sealed = Arc::new(self.sealed.remove(&collection_id).unwrap_or_default());
             if let Some(&home) = self.collection_home.get(&collection_id) {
                 shards.set_collection_home(&collection_id, home);
             }
-            for (slot, count) in index.slot_counts() {
+            let counts = if self.residency == crate::index::IndexResidency::Paged {
+                let mut counts = index.slot_counts_excluding(|slot| sealed.contains_slot(slot));
+                for (slot, count) in sealed.slot_counts_in_collection(&collection_id) {
+                    let entry = counts.entry(slot).or_insert(0u64);
+                    *entry = entry.saturating_add(count);
+                }
+                counts
+            } else {
+                index.slot_counts()
+            };
+            for (slot, count) in counts {
                 let Some(&pack_id) = slot_to_pack_id.get(&slot) else {
                     continue;
                 };
@@ -1187,7 +1231,8 @@ impl StreamingOpenScan {
                 collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
-                    sealed: Arc::new(self.sealed.remove(&collection_id).unwrap_or_default()),
+                    sealed,
+                    paged: self.residency == crate::index::IndexResidency::Paged,
                     cache: Arc::new(NodeCache::new(cache_capacity)),
                     generation: 1,
                 }),
@@ -1691,6 +1736,9 @@ struct RoomGeneration {
     /// resident index is authoritative for every pack, which is the
     /// current default; read paths consult it after the resident index.
     sealed: Arc<crate::index::sealed::SealedLocators>,
+    /// Whether the resident table deliberately omits sealed packs, so a
+    /// sealed lookup is required even when a resident tag candidate exists.
+    paged: bool,
     cache: Arc<NodeCache>,
     generation: u64,
 }
@@ -1705,10 +1753,18 @@ impl RoomGeneration {
     /// removal stays first and therefore shadows an older sealed frame.
     fn candidates(&self, collection_id: &[u8; 16], id: &NodeId) -> Vec<(u16, u64)> {
         let mut candidates: Vec<(u16, u64)> = self.index.lookup_all(id).collect();
-        if candidates.is_empty() {
-            if let Some(hit) = self.sealed.lookup(collection_id, id) {
-                candidates.push((hit.slot, hit.offset()));
-            }
+        // Resident entries are always newer than sealed packs (they live in
+        // the active pack, or in a pack sealed during this session). In paged
+        // mode the resident table is incomplete by design, so a resident tag
+        // candidate does not prove the key is absent from sealed packs: append
+        // the sealed version as the next authoritative candidate. Resolution
+        // stops at the first 16-byte hash match, so a resident removal still
+        // shadows an older sealed frame.
+        if !candidates.is_empty() && !self.paged {
+            return candidates;
+        }
+        if let Some(hit) = self.sealed.lookup(collection_id, id) {
+            candidates.push((hit.slot, hit.offset()));
         }
         candidates
     }
@@ -1999,6 +2055,8 @@ pub struct PackfileStorage {
     /// Per-instance index config: seed from the pool's `pool.meta`, floor
     /// and load factor from defaults (or future tuning).
     index_config: crate::index::IndexConfig,
+    /// Where sealed packs' locators are served from.
+    index_residency: crate::index::IndexResidency,
     /// Merged-read-plan tuning for `get_many` (see [`ReadPlanPolicy`]).
     /// Read once per batch; settable at runtime via
     /// [`Self::set_read_plan_policy`].
@@ -2752,6 +2810,79 @@ impl PackfileStorage {
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
     ) -> Result<Self, std::io::Error> {
+        Self::open_with_options_and_residency(
+            base_dir,
+            cache_capacity,
+            swizzle,
+            writable,
+            max_shard_bytes,
+            compress,
+            checksum_policy,
+            crate::index::IndexResidency::Resident,
+        )
+    }
+
+    /// Open a packfile storage choosing where sealed packs' locators live.
+    ///
+    /// `Paged` keeps only the unsealed tail in the resident index and serves
+    /// sealed packs from their sidecars, including under `ChecksumPolicy::Full`
+    /// (point reads still verify each frame's CRC). See
+    /// `docs/2026-11-02-paged-primary-index.md`.
+    ///
+    /// # Errors
+    /// Same as [`Self::open`].
+    pub fn open_with_residency(
+        base_dir: PathBuf,
+        checksum_policy: packfile::ChecksumPolicy,
+        residency: crate::index::IndexResidency,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options_and_residency(
+            base_dir,
+            DEFAULT_CACHE_CAPACITY,
+            None,
+            true,
+            None,
+            true,
+            checksum_policy,
+            residency,
+        )
+    }
+
+    /// Open with a custom shard rotation threshold and index residency.
+    /// Intended for tests and benchmarks that need many sealed packs without
+    /// writing gigabytes.
+    ///
+    /// # Errors
+    /// Same as [`Self::open_with_max_shard_bytes`].
+    pub fn open_with_max_shard_bytes_and_residency(
+        base_dir: PathBuf,
+        max_shard_bytes: u64,
+        checksum_policy: packfile::ChecksumPolicy,
+        residency: crate::index::IndexResidency,
+    ) -> Result<Self, std::io::Error> {
+        Self::open_with_options_and_residency(
+            base_dir,
+            DEFAULT_CACHE_CAPACITY,
+            None,
+            true,
+            Some(max_shard_bytes),
+            true,
+            checksum_policy,
+            residency,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_options_and_residency(
+        base_dir: PathBuf,
+        cache_capacity: usize,
+        swizzle: Option<SwizzleFn>,
+        writable: bool,
+        max_shard_bytes: Option<u64>,
+        compress: bool,
+        checksum_policy: packfile::ChecksumPolicy,
+        residency: crate::index::IndexResidency,
+    ) -> Result<Self, std::io::Error> {
         Self::open_with_options_locked(
             base_dir,
             cache_capacity,
@@ -2760,6 +2891,7 @@ impl PackfileStorage {
             max_shard_bytes,
             compress,
             checksum_policy,
+            residency,
             true,
         )
     }
@@ -2770,6 +2902,7 @@ impl PackfileStorage {
         base_dir: PathBuf,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
+        residency: crate::index::IndexResidency,
     ) -> Result<Self, std::io::Error> {
         Self::open_with_options_locked(
             base_dir,
@@ -2779,6 +2912,7 @@ impl PackfileStorage {
             None,
             compress,
             checksum_policy,
+            residency,
             false,
         )
     }
@@ -2793,6 +2927,7 @@ impl PackfileStorage {
         max_shard_bytes: Option<u64>,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
+        residency: crate::index::IndexResidency,
         take_writer_lock: bool,
     ) -> Result<Self, std::io::Error> {
         // Only a standalone writer creates its directory here. A member of a
@@ -2890,6 +3025,7 @@ impl PackfileStorage {
                 writable,
                 ReloadMode::Strict,
                 index_config,
+                residency,
                 &mut timings,
             )
         {
@@ -2903,6 +3039,7 @@ impl PackfileStorage {
                 base_dir,
                 swizzle,
                 cache_capacity,
+                residency,
                 delta_state,
                 checkpoint_covered,
                 read_covered,
@@ -2923,14 +3060,21 @@ impl PackfileStorage {
         }
 
         let scan_started = std::time::Instant::now();
-        let mut scan_state = StreamingOpenScan::new(collection_order);
+        let mut scan_state = StreamingOpenScan::new(collection_order, residency);
         // The index must see physical versions in order so inserts naturally
         // replace older values and removal markers. The open_shards snapshot
         // remains slot ordered for fingerprinting; sort a separate list here.
         let mut scan_shards = shards.all_shards();
         scan_shards.sort_by_key(|(_, shard)| shard.creation_seq);
         for (slot, shard) in scan_shards {
-            if shard.sealed.load(Ordering::Acquire) && !shards.checksum_policy().verifies_reads() {
+            // In `Paged` mode a sidecar replaces the frame scan even under
+            // `Full` checksums: point reads still verify each resolved frame,
+            // and an explicit scrub remains the eager whole-store sweep. In
+            // `Resident` mode the historical gate is unchanged.
+            let use_sidecar = shard.sealed.load(Ordering::Acquire)
+                && (residency == crate::index::IndexResidency::Paged
+                    || !shards.checksum_policy().verifies_reads());
+            if use_sidecar {
                 if let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) {
                     let sidecar = Arc::new(sidecar);
                     scan_state.insert_sidecar(
@@ -3019,6 +3163,7 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             cache_capacity,
+            residency,
             // A full rescan re-cooks every index from scratch, so no delta log
             // can continue anything the checkpoint recorded; force the next
             // dirty sync into a full checkpoint rewrite that re-bases the log.
@@ -3055,6 +3200,7 @@ impl PackfileStorage {
         base_dir: PathBuf,
         swizzle: Option<SwizzleFn>,
         cache_capacity: usize,
+        residency: crate::index::IndexResidency,
         delta_state: DeltaLogState,
         read_covered: u64,
         durable_coverage: u64,
@@ -3098,6 +3244,7 @@ impl PackfileStorage {
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
             index_config,
+            index_residency: residency,
             read_plan: RwLock::new(ReadPlanPolicy::default()),
             repack_count: AtomicU64::new(0),
             repack_kept_total: AtomicU64::new(0),
@@ -3525,6 +3672,67 @@ impl PackfileStorage {
     /// dropped.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
+    /// Re-open every sidecar a tail-only checkpoint names and turn the
+    /// validated set into per-collection locator sources.
+    ///
+    /// Returns `None` if any reference is missing, the pack is no longer
+    /// sealed, its creation sequence changed, or the sidecar's identity/CRC
+    /// differs. The caller then falls back to a frame scan, which is slower
+    /// but never treats a bad manifest entry as absence.
+    fn open_sealed_refs(
+        shards: &ShardPool,
+        refs: &[crate::index::format::SealedRefEntry],
+    ) -> Option<HashMap<[u8; 16], crate::index::sealed::SealedLocators>> {
+        let shards_by_pack: HashMap<PackId, (u16, Arc<Shard>)> = shards
+            .all_shards()
+            .into_iter()
+            .map(|(slot, shard)| (shard.pack_id, (slot, shard)))
+            .collect();
+        // Every currently sealed pack must be named. A sealed pack absent from
+        // the manifest would have no sidecar entry in `SealedLocators`, and
+        // paged lookups would report its records as absent.
+        if shards_by_pack.values().any(|(_, shard)| {
+            shard.sealed.load(Ordering::Acquire)
+                && !refs.iter().any(|entry| entry.pack_id == shard.pack_id)
+        }) {
+            return None;
+        }
+        let mut out: HashMap<[u8; 16], crate::index::sealed::SealedLocators> = HashMap::new();
+        for entry in refs {
+            let (slot, shard) = shards_by_pack.get(&entry.pack_id)?;
+            if !shard.sealed.load(Ordering::Acquire)
+                || u64::from(shard.creation_seq) != entry.creation_seq
+            {
+                return None;
+            }
+            let sidecar = Arc::new(crate::index::packidx::open_for_pack(&shard.path)?);
+            if sidecar.crc32() != entry.sidecar_crc32
+                || sidecar.identity().creation_seq != entry.creation_seq
+            {
+                return None;
+            }
+            let sealed_index: Arc<dyn crate::index::sealed::SealedIndex> = sidecar.clone();
+            let mut collections = Vec::new();
+            sidecar.for_each_collection(|collection_id, _| collections.push(collection_id));
+            for collection_id in collections {
+                out.entry(collection_id)
+                    .or_default()
+                    .insert(crate::index::sealed::SealedPack {
+                        slot: *slot,
+                        pack_id: entry.pack_id,
+                        creation_seq: entry.creation_seq,
+                        index: Arc::clone(&sealed_index),
+                    });
+            }
+        }
+        Some(out)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one validation/materialization pipeline; splitting it would duplicate the fail-closed gates"
+    )]
     fn checkpoint_scan_out(
         base_dir: &std::path::Path,
         cache_capacity: usize,
@@ -3534,6 +3742,7 @@ impl PackfileStorage {
         writable: bool,
         reload_mode: ReloadMode,
         index_config: crate::index::IndexConfig,
+        residency: crate::index::IndexResidency,
         timings: &mut OpenTimings,
     ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState, u64)> {
         let decode_started = std::time::Instant::now();
@@ -3544,6 +3753,39 @@ impl PackfileStorage {
             timings.checkpoint_reject = Some(CheckpointReject::MissingOrMalformed);
             return None;
         };
+        // Completeness is part of the checkpoint's meaning. A resident open
+        // must never trust an index that omits sealed packs; a paged open
+        // cannot strip sealed entries out of a complete raw-slot image (its
+        // slots-only format has no identities to rehash from), so it rebuilds
+        // the tail instead of materializing the whole table.
+        match (residency, checkpoint.residency) {
+            (
+                crate::index::IndexResidency::Resident,
+                crate::index::format::CheckpointResidency::TailOnly,
+            )
+            | (
+                crate::index::IndexResidency::Paged,
+                crate::index::format::CheckpointResidency::Complete,
+            ) => {
+                timings.checkpoint_reject = Some(CheckpointReject::ResidencyMismatch);
+                return None;
+            }
+            _ => {}
+        }
+        // A tail-only checkpoint is only trustworthy while every sealed pack
+        // it names still has the same sidecar. A missing/stale sidecar must
+        // send this open to the frame scan, never make the records look absent.
+        let mut sealed_by_collection =
+            if checkpoint.residency == crate::index::format::CheckpointResidency::TailOnly {
+                if let Some(sealed) = Self::open_sealed_refs(shards, &checkpoint.sealed_refs) {
+                    sealed
+                } else {
+                    timings.checkpoint_reject = Some(CheckpointReject::ResidencyMismatch);
+                    return None;
+                }
+            } else {
+                HashMap::new()
+            };
         let covered_lsn = checkpoint.covered_lsn;
         let fingerprint_started = std::time::Instant::now();
         let packs: Vec<(PackId, u64)> = open_shards
@@ -3973,7 +4215,22 @@ impl PackfileStorage {
                 }
                 None => index,
             };
-            let Some(len) = u32::try_from(index.len()).ok() else {
+            let sealed = Arc::new(
+                sealed_by_collection
+                    .remove(&loaded.collection_id)
+                    .unwrap_or_default(),
+            );
+            let len = if residency == crate::index::IndexResidency::Paged {
+                let tail: u64 = index
+                    .slot_counts_excluding(|slot| sealed.contains_slot(slot))
+                    .values()
+                    .copied()
+                    .sum();
+                tail.saturating_add(sealed.entry_count_in_collection(&loaded.collection_id))
+            } else {
+                u64::try_from(index.len()).unwrap_or(u64::MAX)
+            };
+            let Some(len) = u32::try_from(len).ok() else {
                 timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
                 return None;
             };
@@ -3982,7 +4239,8 @@ impl PackfileStorage {
                 loaded.collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
-                    sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
+                    sealed,
+                    paged: residency == crate::index::IndexResidency::Paged,
                     cache: Arc::new(NodeCache::new(cache_capacity)),
                     generation,
                 }),
@@ -4019,7 +4277,22 @@ impl PackfileStorage {
                 }
                 None => index,
             };
-            let Some(len) = u32::try_from(index.len()).ok() else {
+            let sealed = Arc::new(
+                sealed_by_collection
+                    .remove(&collection_id)
+                    .unwrap_or_default(),
+            );
+            let len = if residency == crate::index::IndexResidency::Paged {
+                let tail: u64 = index
+                    .slot_counts_excluding(|slot| sealed.contains_slot(slot))
+                    .values()
+                    .copied()
+                    .sum();
+                tail.saturating_add(sealed.entry_count_in_collection(&collection_id))
+            } else {
+                u64::try_from(index.len()).unwrap_or(u64::MAX)
+            };
+            let Some(len) = u32::try_from(len).ok() else {
                 timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
                 return None;
             };
@@ -4028,7 +4301,8 @@ impl PackfileStorage {
                 collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
-                    sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
+                    sealed,
+                    paged: residency == crate::index::IndexResidency::Paged,
                     cache: Arc::new(NodeCache::new(cache_capacity)),
                     generation,
                 }),
@@ -4079,20 +4353,46 @@ impl PackfileStorage {
         // Bookkeeping (home-shard seeding + shard directory) from the sidecar
         // where that passed its gates, otherwise a slot walk of the — possibly
         // replayed — live indexes.
-        let counts_lookup: HashMap<[u8; 16], HashMap<u16, u64>> = match bookkeeping_source {
-            BookkeepingSource::Sidecar => sidecar_counts,
-            BookkeepingSource::SlotScan => {
+        let counts_lookup: HashMap<[u8; 16], HashMap<u16, u64>> =
+            if residency == crate::index::IndexResidency::Paged {
+                // Count sealed records exactly once: the sidecar directory
+                // entry is authoritative for a sealed pack, and the resident
+                // tail contributes only slots that are not sealed (a pack
+                // sealed during the previous session may still be resident in
+                // this checkpoint's tail).
                 let mut out = HashMap::with_capacity(collection_order.len());
                 for collection_id in &collection_order {
                     if let Some(gen) = scan_out.collections.get(collection_id) {
-                        out.insert(*collection_id, gen.load().index.slot_counts());
+                        let g = gen.load();
+                        let mut counts = g
+                            .index
+                            .slot_counts_excluding(|slot| g.sealed.contains_slot(slot));
+                        for (slot, count) in g.sealed.slot_counts_in_collection(collection_id) {
+                            let entry = counts.entry(slot).or_insert(0u64);
+                            *entry = entry.saturating_add(count);
+                        }
+                        out.insert(*collection_id, counts);
                     }
                 }
                 out
-            }
-        };
+            } else {
+                match bookkeeping_source {
+                    BookkeepingSource::Sidecar => sidecar_counts,
+                    BookkeepingSource::SlotScan => {
+                        let mut out = HashMap::with_capacity(collection_order.len());
+                        for collection_id in &collection_order {
+                            if let Some(gen) = scan_out.collections.get(collection_id) {
+                                out.insert(*collection_id, gen.load().index.slot_counts());
+                            }
+                        }
+                        out
+                    }
+                }
+            };
         for collection_id in &collection_order {
-            let counts = &counts_lookup[collection_id];
+            let Some(counts) = counts_lookup.get(collection_id) else {
+                continue;
+            };
             // Seed the home shard from the highest shard a slot references —
             // the nearest proxy for the scan path's "shard of the last
             // record", since slots were appended in shard-id order.
@@ -4250,10 +4550,20 @@ impl PackfileStorage {
     ) -> Option<(usize, usize, usize, u32)> {
         self.collections_read().get(collection_id).map(|gen| {
             let g = gen.load();
+            let resident_entries: u64 = g
+                .index
+                .slot_counts_excluding(|slot| g.sealed.contains_slot(slot))
+                .values()
+                .copied()
+                .sum();
+            let entries =
+                resident_entries.saturating_add(g.sealed.entry_count_in_collection(collection_id));
             (
-                g.index.len(),
+                usize::try_from(entries).unwrap_or(usize::MAX),
                 g.index.resident_bytes(),
-                g.index.mapped_bytes(),
+                g.index
+                    .mapped_bytes()
+                    .saturating_add(usize::try_from(g.sealed.mapped_bytes()).unwrap_or(usize::MAX)),
                 g.index.capacity(),
             )
         })
@@ -4265,7 +4575,19 @@ impl PackfileStorage {
     pub fn collection_index_info(&self, collection_id: &[u8; 16]) -> Option<(usize, usize, u32)> {
         self.collections_read().get(collection_id).map(|gen| {
             let g = gen.load();
-            (g.index.len(), g.index.memory_usage(), g.index.capacity())
+            let resident_entries: u64 = g
+                .index
+                .slot_counts_excluding(|slot| g.sealed.contains_slot(slot))
+                .values()
+                .copied()
+                .sum();
+            let entries =
+                resident_entries.saturating_add(g.sealed.entry_count_in_collection(collection_id));
+            (
+                usize::try_from(entries).unwrap_or(usize::MAX),
+                g.index.memory_usage(),
+                g.index.capacity(),
+            )
         })
     }
 
@@ -4278,7 +4600,31 @@ impl PackfileStorage {
     pub fn collection_live_locations(&self, collection_id: &[u8; 16]) -> Option<Vec<(u16, u64)>> {
         self.collections_read()
             .get(collection_id)
-            .map(|generation| generation.load().index.live_entries().collect())
+            .map(|generation| {
+                let g = generation.load();
+                let mut locations: Vec<(u16, u64)> = g.index.live_entries().collect();
+                if g.sealed.is_empty() {
+                    return locations;
+                }
+                // The resident tail is newer than every sealed pack, so its keys
+                // win. Among sealed packs, iteration is newest-first; keep the
+                // first occurrence of each id and drop removal versions.
+                // Recovering ids for resident entries would require reading their
+                // frames, so a sealed entry that is also resident is yielded
+                // twice. That is harmless for this diagnostic surface (callers
+                // verify the hash), and sealed removals still shadow older sealed
+                // live versions via `seen`.
+                let mut seen: HashSet<[u8; 16]> =
+                    HashSet::with_capacity(g.sealed.len().saturating_mul(64));
+                g.sealed.for_each_in_collection(collection_id, |hit, id| {
+                    if hit.removed() {
+                        seen.insert(id);
+                    } else if seen.insert(id) {
+                        locations.push((hit.slot, hit.offset()));
+                    }
+                });
+                locations
+            })
     }
 
     /// `(collection_id, entry count, memory usage in bytes, index capacity)`
@@ -4292,9 +4638,17 @@ impl PackfileStorage {
             .filter_map(|id| {
                 tables.collections.get(id).map(|gen| {
                     let g = gen.load();
+                    let resident_entries: u64 = g
+                        .index
+                        .slot_counts_excluding(|slot| g.sealed.contains_slot(slot))
+                        .values()
+                        .copied()
+                        .sum();
+                    let entries =
+                        resident_entries.saturating_add(g.sealed.entry_count_in_collection(id));
                     (
                         *id,
-                        g.index.len(),
+                        usize::try_from(entries).unwrap_or(usize::MAX),
                         g.index.memory_usage(),
                         g.index.capacity(),
                     )
@@ -4653,6 +5007,7 @@ impl PackfileStorage {
                     Arc::new(RoomGeneration {
                         index: generation.index.clone(),
                         sealed: Arc::clone(&generation.sealed),
+                        paged: generation.paged,
                         cache: Arc::clone(&generation.cache),
                         generation: generation.generation,
                     })
@@ -4804,6 +5159,7 @@ impl PackfileStorage {
                 Arc::new(RoomGeneration {
                     index: generation.index.clone(),
                     sealed: Arc::clone(&generation.sealed),
+                    paged: generation.paged,
                     cache: Arc::clone(&generation.cache),
                     generation: generation.generation,
                 })
@@ -5643,6 +5999,35 @@ impl PackfileStorage {
             .collect()
     }
 
+    /// Deduplicated sealed-pack manifest for a tail-only checkpoint.
+    ///
+    /// Each collection's `SealedLocators` names the same pack once per
+    /// collection it contains, so dedupe by `pack_id`. The sidecar CRC is the
+    /// value written in the sidecar header; an open compares it before trusting
+    /// the checkpoint.
+    fn collect_sealed_refs(
+        live_shards: &[(u16, Arc<Shard>)],
+    ) -> Option<Vec<crate::index::format::SealedRefEntry>> {
+        let mut refs = Vec::new();
+        for (_, shard) in live_shards {
+            if !shard.sealed.load(Ordering::Acquire) {
+                continue;
+            }
+            // A seal's sidecar worker may still be running (or may have
+            // failed). Without a header to name, a tail-only image could not
+            // prove that pack's records are sidecar-served, so the caller
+            // publishes a complete checkpoint instead.
+            let sidecar_crc32 = crate::index::packidx::sidecar_crc(&shard.path)?;
+            refs.push(crate::index::format::SealedRefEntry {
+                pack_id: shard.pack_id,
+                creation_seq: u64::from(shard.creation_seq),
+                sidecar_crc32,
+            });
+        }
+        refs.sort_unstable_by_key(|entry| entry.pack_id);
+        Some(refs)
+    }
+
     /// The journal LSN this store's checkpoint covers: its own pool's committed
     /// watermark on a shared segment (one group can interleave other pools'
     /// frames), or the global committed LSN for a per-pool segment. `None` when
@@ -5854,6 +6239,45 @@ impl PackfileStorage {
             .collect();
 
         let snapshots = self.checkpoint_snapshots();
+        // A paged writer publishes a tail-only index: its resident table
+        // deliberately omits sealed packs, so the checkpoint records which
+        // sidecars those records live in. A resident writer publishes the
+        // historical complete image.
+        // A pack that sealed during this session still has its locators in the
+        // resident table (runtime eviction is later work). Such a table is not
+        // a tail-only image: publishing it as `TailOnly` would reload those
+        // locators on the next paged open instead of dropping them. Mark the
+        // checkpoint complete in that case; a paged open then rebuilds the
+        // tail from the unsealed packs and evicts them.
+        let sealed_slots: std::collections::HashSet<u16> = live_shards
+            .iter()
+            .filter(|(_, shard)| shard.sealed.load(Ordering::Acquire))
+            .map(|(slot, _)| *slot)
+            .collect();
+        let resident_holds_sealed = snapshots
+            .iter()
+            .any(|(_, _, room)| room.index.references_any_slot(&sealed_slots));
+        let (checkpoint_residency, sealed_refs) = if self.index_residency
+            == crate::index::IndexResidency::Paged
+            && !resident_holds_sealed
+        {
+            match Self::collect_sealed_refs(&live_shards) {
+                Some(refs) => (crate::index::format::CheckpointResidency::TailOnly, refs),
+                // A sealed pack has no validated sidecar header (worker
+                // still running, or it failed). Its entries are still in
+                // the resident table, so publish a complete image rather
+                // than a tail-only one whose manifest cannot cover it.
+                None => (
+                    crate::index::format::CheckpointResidency::Complete,
+                    Vec::new(),
+                ),
+            }
+        } else {
+            (
+                crate::index::format::CheckpointResidency::Complete,
+                Vec::new(),
+            )
+        };
         let serialize_started = std::time::Instant::now();
 
         // Rotate the delta epoch while still locked: `old_base_fingerprint`
@@ -5911,6 +6335,8 @@ impl PackfileStorage {
             logical_versions,
             blobs,
             pack_table,
+            residency: checkpoint_residency,
+            sealed_refs,
             old_base_fingerprint,
             journal: self.journal(),
             pool_tag: self.journal_pool.load(Ordering::Acquire),
@@ -5951,9 +6377,11 @@ impl PackfileStorage {
             fingerprint,
             covered_lsn,
             base_delta_seq,
+            crate::index::format::CheckpointResidency::Complete,
             &blobs,
             pack_table,
             logical_versions,
+            &[],
         )?;
         Ok(serialized)
     }
@@ -6897,13 +7325,19 @@ impl PackfileStorage {
         })?;
         Ok(Some((record.hash, new_slot, new_offset, disk_bytes)))
     }
-    fn swap_generation(
+    /// Swap in a generation with a freshly derived sealed set.
+    ///
+    /// Repack/refresh build a full index from current frames, so every sealed
+    /// pack they replace must be dropped: a locator pointing at a retired
+    /// pack could otherwise resurrect a dropped record on a resident miss.
+    fn swap_generation_with_sealed(
         &self,
         collection_id: &[u8; 16],
         index: LossyIndex,
+        sealed: Arc<crate::index::sealed::SealedLocators>,
     ) -> Result<(), StorageError> {
         let cache = self.generation(collection_id).map(|g| g.cache.clone());
-        self.store_generation(collection_id, index, cache, true)
+        self.store_generation_with_sealed(collection_id, index, sealed, cache, true)
     }
 
     /// Store a new generation for a collection, reusing the existing cache if present.
@@ -6923,24 +7357,35 @@ impl PackfileStorage {
         cache: Option<Arc<NodeCache>>,
         bump_generation: bool,
     ) -> Result<(), StorageError> {
+        let sealed = self.generation(collection_id).map_or_else(
+            || Arc::new(crate::index::sealed::SealedLocators::new()),
+            |gen| Arc::clone(&gen.sealed),
+        );
+        self.store_generation_with_sealed(collection_id, index, sealed, cache, bump_generation)
+    }
+
+    /// As [`Self::store_generation`], with an explicit sealed-locator set.
+    fn store_generation_with_sealed(
+        &self,
+        collection_id: &[u8; 16],
+        index: LossyIndex,
+        sealed: Arc<crate::index::sealed::SealedLocators>,
+        cache: Option<Arc<NodeCache>>,
+        bump_generation: bool,
+    ) -> Result<(), StorageError> {
         let cache = cache.unwrap_or_else(|| Arc::new(NodeCache::new(self.cache_capacity)));
         let is_new = self.collections_read().get(collection_id).is_none();
         let structural = bump_generation || is_new;
         if structural {
             self.invalidate_delta_log(collection_id);
         }
-        let (generation, sealed) = self.generation(collection_id).map_or(
-            (1, Arc::new(crate::index::sealed::SealedLocators::new())),
-            |gen| {
-                (
-                    gen.generation.saturating_add(u64::from(bump_generation)),
-                    Arc::clone(&gen.sealed),
-                )
-            },
-        );
+        let generation = self.generation(collection_id).map_or(1, |gen| {
+            gen.generation.saturating_add(u64::from(bump_generation))
+        });
         let new_gen = Arc::new(RoomGeneration {
             index,
             sealed,
+            paged: self.index_residency == crate::index::IndexResidency::Paged,
             cache,
             generation,
         });
@@ -6960,6 +7405,7 @@ impl PackfileStorage {
                     ArcSwap::from_pointee(RoomGeneration {
                         index: LossyIndex::new(0),
                         sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
+                        paged: self.index_residency == crate::index::IndexResidency::Paged,
                         cache: Arc::new(NodeCache::new(self.cache_capacity)),
                         generation: 1,
                     })
@@ -6983,6 +7429,7 @@ impl PackfileStorage {
                         ArcSwap::from_pointee(RoomGeneration {
                             index: LossyIndex::new(0),
                             sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
+                            paged: self.index_residency == crate::index::IndexResidency::Paged,
                             cache: Arc::new(NodeCache::new(self.cache_capacity)),
                             generation: 1,
                         })
@@ -7027,7 +7474,17 @@ impl PackfileStorage {
         self.shards.discover_shards()?;
         let new_index = self.rebuild_index(collection_id)?;
         let existing_cache = self.generation(collection_id).map(|g| g.cache.clone());
-        self.store_generation(collection_id, new_index, existing_cache, true)
+        // `rebuild_index` scans every pack, so the result is complete and
+        // supersedes any previously registered sealed locators. Keeping them
+        // would double-count and could answer from a retired pack; a paged
+        // reopen rebuilds the tail-only set.
+        self.store_generation_with_sealed(
+            collection_id,
+            new_index,
+            Arc::new(crate::index::sealed::SealedLocators::new()),
+            existing_cache,
+            true,
+        )
     }
 
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
@@ -7366,7 +7823,7 @@ impl PackfileStorage {
         let Some(generation) = gen_guard.as_deref() else {
             return Ok(None);
         };
-        let candidates: Vec<(u16, u64)> = generation.index.lookup_all(id).collect();
+        let candidates: Vec<(u16, u64)> = generation.candidates(collection_id, id);
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -8403,7 +8860,13 @@ impl PackfileStorage {
             collection_id,
             &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
         );
-        self.swap_generation(collection_id, index)?;
+        // The repack index is rebuilt from current frames and is therefore
+        // complete; drop sealed locators that may point at retired packs.
+        self.swap_generation_with_sealed(
+            collection_id,
+            index,
+            Arc::new(crate::index::sealed::SealedLocators::new()),
+        )?;
         self.retire_empty_shards(collection_id);
 
         self.repack_count.fetch_add(1, Ordering::Relaxed);
@@ -8712,7 +9175,13 @@ impl PackfileStorage {
                 collection_id,
                 &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
             );
-            self.swap_generation(collection_id, index)?;
+            // The repack index is rebuilt from current frames and is therefore
+            // complete; drop sealed locators that may point at retired packs.
+            self.swap_generation_with_sealed(
+                collection_id,
+                index,
+                Arc::new(crate::index::sealed::SealedLocators::new()),
+            )?;
             // The batch path does a full cold-start scan (scan_collection_record_maps),
             // so we have no incremental adjacency to carry forward. Pass an empty
             // map so the next single-collection repack starts with a fresh cache
@@ -9787,7 +10256,7 @@ impl PackfileStorage {
             let Some(gen) = gen_guard.as_deref() else {
                 return Ok(None);
             };
-            let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
+            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id);
             #[cfg(test)]
             Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
@@ -10064,7 +10533,7 @@ impl StorageEngine for PackfileStorage {
                 }
                 return Ok(Some((*data).clone()));
             }
-            let candidates: Vec<(u16, u64)> = gen.index.lookup_all(id).collect();
+            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id);
             #[cfg(test)]
             Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
@@ -10362,7 +10831,7 @@ impl PackfileStorage {
         let Some(generation) = self.generation(collection_id) else {
             return Ok(None);
         };
-        for (slot, offset) in generation.index.lookup_all(node_id) {
+        for (slot, offset) in generation.candidates(collection_id, node_id) {
             let Some(shard) = self.shards.get_shard(slot) else {
                 continue;
             };
@@ -12551,6 +13020,8 @@ struct CheckpointTail {
     logical_versions: Vec<([u8; 16], u64)>,
     blobs: Vec<([u8; 16], u64, Vec<u8>)>,
     pack_table: Vec<(u16, PackId)>,
+    residency: crate::index::format::CheckpointResidency,
+    sealed_refs: Vec<crate::index::format::SealedRefEntry>,
     old_base_fingerprint: Option<u64>,
     journal: Option<Arc<JournalCoordinator>>,
     pool_tag: u8,
@@ -12596,9 +13067,11 @@ impl CheckpointTail {
             self.fingerprint,
             self.covered_lsn.unwrap_or(0),
             self.base_delta_seq,
+            self.residency,
             &blobs,
             &self.pack_table,
             &self.logical_versions,
+            &self.sealed_refs,
         )
         .map_err(StorageError::Io)?;
         done.write = write_started.elapsed();

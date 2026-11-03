@@ -799,6 +799,7 @@ impl PackfileStorage {
                 false,
                 ReloadMode::JournalBound,
                 self.index_config,
+                self.index_residency,
                 &mut timings,
             )
         else {
