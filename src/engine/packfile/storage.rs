@@ -6765,8 +6765,7 @@ impl PackfileStorage {
                     if let Some(room) = collections.get(&collection_id) {
                         let generation = arc_swap::ArcSwapAny::load_full(room);
                         // The v1 payload is the canonical slots-only form.
-                        let (blob_len, index_blob) =
-                            Self::serialize_snapshot_index(&generation.index);
+                        let blob_len = generation.index.serialized_len();
                         let frame_len =
                             delta::v1_snapshot_frame_len(blob_len).ok_or_else(|| {
                                 StorageError::Io(std::io::Error::other("v1 batch size overflow"))
@@ -6775,6 +6774,7 @@ impl PackfileStorage {
                         if u64::try_from(projected).unwrap_or(u64::MAX) > budget {
                             return Err(too_large(projected));
                         }
+                        let (_, index_blob) = Self::serialize_snapshot_index(&generation.index);
                         let order_key =
                             if let Some(order_key) = state.base_order.get(&collection_id) {
                                 *order_key
@@ -9786,7 +9786,13 @@ impl PackfileStorage {
             data: data.bytes.clone(),
             metadata,
         };
-        ShardPool::validate_record(&record).map_err(StorageError::Io)?;
+        let mut validation_record = record.clone();
+        // A journaled append adds this field after publishing. Reserve its
+        // encoded size during preflight so an input cannot pass validation
+        // and then fail only after its WAL mutation is durable.
+        validation_record.metadata =
+            Self::stamp_last_write_lsn(validation_record.metadata, self.journal().map(|_| 0));
+        ShardPool::validate_record(&validation_record).map_err(StorageError::Io)?;
         // Publish the group before writing its frame so the frame can carry the
         // group's LSN as its record version. This mirrors the transaction path:
         // the group is durable and visible from the WAL (and replayed on
@@ -9926,16 +9932,21 @@ impl PackfileStorage {
     fn validate_put_many_inputs(
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
+        metadatas: Option<&[Option<FrameMetadata>]>,
     ) -> Result<bool, StorageError> {
         if entries.is_empty() {
             return Ok(false);
         }
-        for (id, data) in entries {
+        for (index, (id, data)) in entries.iter().enumerate() {
+            let metadata = metadatas
+                .and_then(|values| values.get(index))
+                .cloned()
+                .flatten();
             ShardPool::validate_record(&Record {
                 collection_id: *collection_id,
                 hash: *id,
                 data: data.bytes.clone(),
-                metadata: None,
+                metadata: Self::stamp_last_write_lsn(metadata, Some(0)),
             })?;
         }
         Ok(true)
@@ -10291,7 +10302,7 @@ impl PackfileStorage {
                 "per-entry metadata must align with entries"
             );
         }
-        if !Self::validate_put_many_inputs(collection_id, entries)? {
+        if !Self::validate_put_many_inputs(collection_id, entries, metadatas)? {
             return Ok(0);
         }
 
@@ -10967,20 +10978,29 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         node_id: &[u8; 16],
     ) -> Result<Option<bool>, StorageError> {
-        let Some(generation) = self.generation(collection_id) else {
-            return Ok(None);
-        };
-        for (slot, offset) in generation.candidates(collection_id, node_id) {
-            let Some(shard) = self.shards.get_shard(slot) else {
-                continue;
+        loop {
+            let generation = self.generation(collection_id);
+            let Some(gen) = generation.as_ref() else {
+                return Ok(None);
             };
-            let (found_collection, found_hash, removed) =
-                self.shards.record_identity_at(&shard, offset)?;
-            if &found_collection == collection_id && &found_hash == node_id {
-                return Ok(Some(removed));
+            let candidates = gen.candidates(collection_id, node_id);
+            let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
+            let current = self.generation(collection_id);
+            if !Self::same_generation(current.as_ref(), gen) {
+                continue;
             }
+            for (slot, offset) in candidates {
+                let Some(shard) = pinned.get(&slot) else {
+                    continue;
+                };
+                let (found_collection, found_hash, removed) =
+                    self.shards.record_identity_at(shard, offset)?;
+                if &found_collection == collection_id && &found_hash == node_id {
+                    return Ok(Some(removed));
+                }
+            }
+            return Ok(None);
         }
-        Ok(None)
     }
 
     /// Return collection length at read-committed visibility.
@@ -11364,10 +11384,13 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns [`StorageError::Internal`] for a pool inside a database root;
-    /// such pools must use `enable_shared_journal`.
+    /// such pools must use `enable_shared_journal`. Returns
+    /// [`StorageError::Unsupported`] for Paged residency, which does not yet
+    /// advance journal coverage during sync.
     /// Propagates root-inspection, journal-open, recovery, and publish-signal
     /// setup errors, including OS entropy failures, as [`StorageError::Io`].
     pub fn enable_journal(&self, path: impl AsRef<std::path::Path>) -> Result<(), StorageError> {
+        self.reject_journaling_in_paged()?;
         self.reject_per_pool_journal_in_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
@@ -11399,6 +11422,19 @@ impl PackfileStorage {
         }
     }
 
+    /// Paged sync persists the packs and collection versions but does not yet
+    /// publish a newer journal coverage anchor. Refuse every journal mode so
+    /// the WAL cannot grow to its limit while this pool is unable to advance
+    /// reclaim.
+    fn reject_journaling_in_paged(&self) -> Result<(), StorageError> {
+        if self.index_residency == crate::index::IndexResidency::Paged {
+            return Err(StorageError::Unsupported(
+                "Paged index residency cannot use WAL journaling until sync can advance durable journal coverage; use Resident residency".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Route durability through a journal whose group sequence is drawn from a
     /// shared, cross-pool counter.
     ///
@@ -11415,6 +11451,7 @@ impl PackfileStorage {
         path: impl AsRef<std::path::Path>,
         sequence: Arc<AtomicU64>,
     ) -> Result<(), StorageError> {
+        self.reject_journaling_in_paged()?;
         self.reject_per_pool_journal_in_root()?;
         let (journal, scan) = Journal::open(path).map_err(StorageError::Io)?;
         self.journal_recovery.lock().clone_from(&scan.groups);
@@ -11449,7 +11486,8 @@ impl PackfileStorage {
     /// already covered).
     ///
     /// # Errors
-    /// Returns [`StorageError::Internal`] if a journal is already enabled, or
+    /// Returns [`StorageError::Unsupported`] for Paged residency, or
+    /// [`StorageError::Internal`] if a journal is already enabled, or
     /// [`StorageError::Io`] if publish-signal setup fails, including OS entropy
     /// failures.
     pub fn enable_shared_journal(
@@ -11457,6 +11495,7 @@ impl PackfileStorage {
         journal: Arc<JournalCoordinator>,
         pool: crate::layout::ShardType,
     ) -> Result<(), StorageError> {
+        self.reject_journaling_in_paged()?;
         let mut slot = self.journal.lock();
         if slot.is_some() {
             return Err(StorageError::Internal(
