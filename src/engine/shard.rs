@@ -1,7 +1,7 @@
 use fs2::FileExt as _;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufReader, Seek, Write};
+use std::io::{self, BufReader, Read, Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -1489,45 +1489,84 @@ impl ShardPool {
     /// the database-root shared-WAL lock (`.mtxdb.wal.lock`); see
     /// `acquire_writer_lock`'s doc for the staleness contract.
     pub(crate) fn acquire_lock_path(lock_path: &Path) -> io::Result<WriterLock> {
-        let mut file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)?;
+        // `flock` belongs to the open file description, so a child forked
+        // while another thread holds a store lock inherits it until the child
+        // execs. A close-and-reopen in that window sees WouldBlock with our
+        // own PID in the marker. Retry briefly for that case only; a lock held
+        // by a different process still fails immediately.
+        const SELF_LOCK_RETRY: Duration = Duration::from_millis(250);
+        let retry_deadline = Instant::now().checked_add(SELF_LOCK_RETRY);
+        loop {
+            let mut file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(lock_path)?;
 
-        file.try_lock_exclusive().map_err(|error| {
-            // fs2 exposes Windows ERROR_LOCK_VIOLATION directly, while std
-            // does not map that Windows error to WouldBlock. Preserve the
-            // platform-independent lock contract.
-            let lock_contended = error.kind() == io::ErrorKind::WouldBlock
-                || (cfg!(target_os = "windows")
-                    && error.raw_os_error() == Some(WINDOWS_ERROR_LOCK_VIOLATION));
-            if lock_contended {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "{} is already locked by another writer",
-                        lock_path.display()
-                    ),
-                )
-            } else {
-                error
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    file.set_len(0)?;
+                    let marker = Self::own_lock_marker();
+                    file.write_all(format!("{marker}\n").as_bytes())?;
+                    file.sync_all()?;
+                    return Ok(WriterLock { _file: file });
+                }
+                Err(error)
+                    if Self::writer_lock_is_contended(&error)
+                        && Self::lock_marker_owned_by_self(&mut file)
+                        && retry_deadline.is_some_and(|deadline| Instant::now() < deadline) =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(Self::writer_lock_error(lock_path, error)),
             }
-        })?;
+        }
+    }
 
-        file.set_len(0)?;
+    /// This process's `{pid, starttime}` marker, without the trailing newline.
+    fn own_lock_marker() -> String {
         #[cfg(target_os = "linux")]
-        let marker = Self::proc_start_time("self").map_or_else(
-            || format!("{}\n", std::process::id()),
-            |start| format!("{} {start}\n", std::process::id()),
-        );
+        {
+            Self::proc_start_time("self").map_or_else(
+                || std::process::id().to_string(),
+                |start| format!("{} {start}", std::process::id()),
+            )
+        }
         #[cfg(not(target_os = "linux"))]
-        let marker = format!("{}\n", std::process::id());
-        file.write_all(marker.as_bytes())?;
-        file.sync_all()?;
+        {
+            std::process::id().to_string()
+        }
+    }
 
-        Ok(WriterLock { _file: file })
+    /// Whether the lock file records this process as its holder.
+    fn lock_marker_owned_by_self(file: &mut File) -> bool {
+        let mut contents = String::new();
+        Read::read_to_string(file, &mut contents).is_ok()
+            && contents.trim() == Self::own_lock_marker()
+    }
+
+    /// fs2 exposes Windows `ERROR_LOCK_VIOLATION` directly, while std does not
+    /// map that Windows error to `WouldBlock`. Preserve the platform-independent
+    /// lock contract.
+    fn writer_lock_is_contended(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::WouldBlock
+            || (cfg!(target_os = "windows")
+                && error.raw_os_error() == Some(WINDOWS_ERROR_LOCK_VIOLATION))
+    }
+
+    fn writer_lock_error(lock_path: &Path, error: io::Error) -> io::Error {
+        if Self::writer_lock_is_contended(&error) {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "{} is already locked by another writer",
+                    lock_path.display()
+                ),
+            )
+        } else {
+            error
+        }
     }
 
     /// Atomically create the lock file and write our `{pid, starttime}`
