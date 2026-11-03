@@ -441,7 +441,7 @@ impl<T: AsRef<[u8]>> SkipForward for io::Cursor<T> {
     }
 }
 
-const SCAN_BUF_BYTES: usize = 256 * 1024;
+const SCAN_BUF_BYTES: usize = 16 * 1024;
 
 /// Streaming packfile metadata scanner.
 pub struct PackfileScanner {
@@ -479,7 +479,7 @@ pub(crate) fn scan_packfile_iter_from_file(
     verify_payload: bool,
 ) -> io::Result<PackfileScanner> {
     let file_end = file.metadata()?.len();
-    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
+    let mut reader = BufReader::with_capacity(HEADER_LEN, file);
     let done = read_header(&mut reader)?.is_none();
     Ok(PackfileScanner {
         reader,
@@ -1827,7 +1827,7 @@ pub fn open_packfile(path: &Path, writable: bool, pack_id: &PackId) -> io::Resul
 
 /// Check that `file`'s header parses and names `pack_id`.
 fn validate_header_identity(file: &File, path: &Path, pack_id: &PackId) -> io::Result<()> {
-    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
+    let mut reader = BufReader::with_capacity(HEADER_LEN, file);
     let Some(header) = read_header(&mut reader)? else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

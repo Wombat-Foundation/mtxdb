@@ -1,6 +1,6 @@
 //! Compare the reopen cost of the two homes for collection versions:
 //!
-//! * A: one `index.versions` file (`16 B × collections` plus framing), read in
+//! * A: one `index.versions` file (`24 B × collections` plus framing), read in
 //!   one sequential pass.
 //! * B: a version in each sealed pack's sidecar header, which requires one
 //!   header read per pack and a max-fold across them.
@@ -114,6 +114,11 @@ fn main() {
     let wanted = env_usize("MTXDB_VERSIONS_PACKS", 1_000);
     let collection_count = env_usize("MTXDB_VERSIONS_COLLECTIONS", 64);
     let rounds = env_usize("MTXDB_VERSIONS_ROUNDS", 25);
+    assert!(
+        collection_count > 0,
+        "MTXDB_VERSIONS_COLLECTIONS must be positive"
+    );
+    assert!(rounds > 0, "MTXDB_VERSIONS_ROUNDS must be positive");
     let collections = collection_ids(collection_count);
     let dir = std::env::temp_dir().join(format!(
         "mtxdb-versions-cost-{}-{}",
@@ -158,16 +163,30 @@ fn main() {
             .len()
     });
 
+    let mut b_misses = 0usize;
     let (b_duration, b_entries) = sample(rounds, || {
         let mut seen = 0usize;
+        let mut missed = 0usize;
         for sidecar in &packs {
             let pack = sidecar.with_extension("pack");
             if let Some(index) = packidx::open_for_pack(&pack) {
-                index.for_each_collection(|_, count| seen += usize::try_from(count).unwrap_or(0));
+                seen =
+                    seen.saturating_add(usize::try_from(index.entry_count()).unwrap_or(usize::MAX));
+            } else {
+                missed += 1;
             }
         }
+        assert_eq!(
+            missed, 0,
+            "failed to open {missed} of {pack_count} sidecars"
+        );
+        b_misses = missed;
         seen
     });
+    assert_eq!(
+        b_misses, 0,
+        "every pack must have a readable sidecar for the B measurement"
+    );
 
     // The cheapest form of B: one open and one fixed-size header read per
     // sidecar, no full-body verification. This is the floor if B rides along
@@ -180,9 +199,7 @@ fn main() {
         for sidecar in &packs {
             if let Ok(mut file) = std::fs::File::open(sidecar) {
                 if file.read_exact(&mut header).is_ok() {
-                    total +=
-                        usize::try_from(u64::from_le_bytes(header[16..24].try_into().unwrap()))
-                            .unwrap_or(0);
+                    total = total.saturating_add(header.len());
                 }
             }
         }
@@ -192,7 +209,7 @@ fn main() {
     println!("A read_versions: {a_duration:?} best of {rounds} ({a_entries} entries)");
     println!(
         "B open_for_pack x{pack_count}: {b_duration:?} best of {rounds} \
-         ({b_entries} collection entries touched)"
+         ({b_entries} sidecar entries touched)"
     );
     println!(
         "B header-only x{pack_count}: {b_header_duration:?} best of {rounds} \
@@ -207,17 +224,18 @@ fn main() {
         .unwrap_or_default();
     println!("per-pack B cost: {per_pack:?}");
 
-    if let Ok(open) = PackfileStorage::open_with_max_shard_bytes_and_residency(
+    match PackfileStorage::open_with_max_shard_bytes_and_residency(
         dir.clone(),
         COLLECTION_SHARD_BYTES,
         mtxdb::packfile::ChecksumPolicy::Full,
         IndexResidency::Paged,
     ) {
-        let timings = open.open_timings();
-        println!("paged full open timings: {timings:#?}");
-        drop(open);
-    } else {
-        println!("paged full open: failed");
+        Ok(open) => {
+            let timings = open.open_timings();
+            println!("paged full open timings: {timings:#?}");
+            drop(open);
+        }
+        Err(error) => println!("paged full open: failed: {error}"),
     }
 
     let _ = std::fs::remove_dir_all(&dir);

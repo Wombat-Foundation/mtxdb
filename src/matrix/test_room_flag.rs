@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     use crate::database::Database;
@@ -13,18 +13,33 @@ mod tests {
     use crate::room_flag::{Flag, FlagChange, FlagQuery, RoomFlagIndex, CHUNK_CAPACITY};
     use crate::storage::{NodeData, StorageEngine};
 
-    fn test_root(name: &str) -> PathBuf {
+    struct TestRoot(PathBuf);
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl TestRoot {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn test_root(name: &str) -> TestRoot {
         let path = std::env::temp_dir().join(format!(
             "mtxdb-test-room-flag-{name}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&path);
-        path
+        TestRoot(path)
     }
 
     #[test]
     fn empty_room_flag_index_reports_zero_and_empty() {
-        let db = Database::open(test_root("empty")).unwrap();
+        let root = test_root("empty");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let index = RoomFlagIndex::new(b"!room:example.com");
 
         assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 0);
@@ -48,7 +63,8 @@ mod tests {
 
     #[test]
     fn single_chunk_counts_and_queries() {
-        let db = Database::open(test_root("single_chunk")).unwrap();
+        let root = test_root("single_chunk");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!single_chunk:example.com";
         let index = RoomFlagIndex::new(room_id);
 
@@ -120,7 +136,8 @@ mod tests {
 
     #[test]
     fn multi_chunk_boundary_and_clearing() {
-        let db = Database::open(test_root("multi_chunk")).unwrap();
+        let root = test_root("multi_chunk");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!multi_chunk:example.com";
         let index = RoomFlagIndex::new(room_id);
 
@@ -195,7 +212,8 @@ mod tests {
 
     #[test]
     fn select_resolves_reverse_event_ids() {
-        let db = Database::open(test_root("select_rev")).unwrap();
+        let root = test_root("select_rev");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!reverse:example.com";
         let index = RoomFlagIndex::new(room_id);
         let auth_col = room_auth_collection_id(room_id);
@@ -249,7 +267,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn rebuild_populates_flag_index_from_events_and_verdicts() {
-        let db = Database::open(test_root("rebuild")).unwrap();
+        let root = test_root("rebuild");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!rebuild:example.com";
         let index = RoomFlagIndex::new(room_id);
         let auth_col = room_auth_collection_id(room_id);
@@ -399,11 +418,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual performance benchmark"]
     fn benchmark_flag_query_vs_raw_scan() {
         const TOTAL_EVENTS: u32 = 5000;
         const SOFT_FAILED_COUNT: u32 = 25;
 
-        let db = Database::open(test_root("bench")).unwrap();
+        let root = test_root("bench");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!bench:example.com";
         let index = RoomFlagIndex::new(room_id);
         let auth_col = room_auth_collection_id(room_id);
@@ -507,7 +528,8 @@ mod tests {
 
     #[test]
     fn repeated_stage_in_single_transaction_succeeds_commit() {
-        let db = Database::open(test_root("repeated_stage")).unwrap();
+        let root = test_root("repeated_stage");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!repeated:example.com";
         let index = RoomFlagIndex::new(room_id);
 
@@ -593,7 +615,8 @@ mod tests {
 
     #[test]
     fn rebuild_generation_swap_and_metadata_evolution() {
-        let db = Database::open(test_root("rebuild_gen")).unwrap();
+        let root = test_root("rebuild_gen");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!gen_swap:example.com";
         let index = RoomFlagIndex::new(room_id);
         let auth_col = room_auth_collection_id(room_id);
@@ -647,8 +670,9 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_update_during_rebuild_is_detected_by_meta_cas() {
-        let db = Database::open(test_root("concurrent_rebuild")).unwrap();
+    fn stale_meta_token_after_rebuild_publish_fails_commit() {
+        let root = test_root("concurrent_rebuild");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!concurrent:example.com";
         let index = RoomFlagIndex::new(room_id);
         let auth_col = room_auth_collection_id(room_id);
@@ -695,15 +719,16 @@ mod tests {
             .unwrap();
         let meta_token = meta_versions.first().copied().unwrap_or(0);
 
-        // 2. A writer updates an existing short ID (1). Since max_short_id does not grow,
-        // it must NOT touch FLAG_META_ID, avoiding writer contention.
+        // 2. A writer updates an existing short ID (1). Even though
+        // max_short_id does not grow, the metadata CAS record must change so a
+        // rebuild cannot publish a generation that misses this flag update.
         let tx_writer = db.begin_transaction();
         index
             .stage(&tx_writer, &[FlagChange::set(1, Flag::Timeline)])
             .unwrap();
         tx_writer.commit().unwrap();
 
-        // Verify FLAG_META_ID record version did NOT change
+        // Verify FLAG_META_ID record version changed.
         let (_meta_nodes_after, meta_versions_after) = db
             .begin_transaction()
             .get_with_record_versions(
@@ -712,9 +737,9 @@ mod tests {
                 &[crate::room_flag::FLAG_META_ID],
             )
             .unwrap();
-        assert_eq!(
+        assert_ne!(
             meta_versions_after[0], meta_token,
-            "FLAG_META_ID record version must not change when max_short_id does not grow"
+            "FLAG_META_ID must guard updates even when max_short_id stays fixed"
         );
 
         // 3. A generation swap (rebuild publish) updates FLAG_META_ID
@@ -763,7 +788,8 @@ mod tests {
 
     #[test]
     fn rebuild_cleans_leftover_chunks_from_crashed_rebuild() {
-        let db = Database::open(test_root("crash_rebuild")).unwrap();
+        let root = test_root("crash_rebuild");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!crash:example.com";
         let index = RoomFlagIndex::new(room_id);
         let auth_col = room_auth_collection_id(room_id);

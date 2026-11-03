@@ -224,7 +224,11 @@ fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
 fn measure_residency() -> mtxdb::index::IndexResidency {
     match std::env::var("MTXDB_MEASURE_RESIDENCY").as_deref() {
         Ok("paged") => mtxdb::index::IndexResidency::Paged,
-        _ => mtxdb::index::IndexResidency::Resident,
+        Ok("resident") | Err(std::env::VarError::NotPresent) => {
+            mtxdb::index::IndexResidency::Resident
+        }
+        Ok(other) => panic!("unknown MTXDB_MEASURE_RESIDENCY value: {other}"),
+        Err(error) => panic!("cannot read MTXDB_MEASURE_RESIDENCY: {error}"),
     }
 }
 
@@ -241,14 +245,15 @@ fn open_store(dir: PathBuf, residency: mtxdb::index::IndexResidency) -> Packfile
 /// lets a measurement run rotate small packs so a modest record count produces
 /// sealed sidecars without writing hundreds of megabytes.
 fn build_store(dir: PathBuf) -> PackfileStorage {
-    match std::env::var("MTXDB_MEASURE_MAX_SHARD_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        Some(max_shard_bytes) => {
+    match std::env::var("MTXDB_MEASURE_MAX_SHARD_BYTES") {
+        Ok(value) => {
+            let max_shard_bytes = value
+                .parse::<u64>()
+                .unwrap_or_else(|error| panic!("invalid MTXDB_MEASURE_MAX_SHARD_BYTES: {error}"));
             PackfileStorage::open_with_max_shard_bytes(dir, max_shard_bytes).unwrap()
         }
-        None => PackfileStorage::open(dir).unwrap(),
+        Err(std::env::VarError::NotPresent) => PackfileStorage::open(dir).unwrap(),
+        Err(error) => panic!("cannot read MTXDB_MEASURE_MAX_SHARD_BYTES: {error}"),
     }
 }
 

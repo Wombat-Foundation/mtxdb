@@ -1,11 +1,11 @@
 use super::{
     base_is_incomplete, build_event_dag, canonical_column_width, cmd_collections, cmd_flags,
     cmd_get, cmd_import, cmd_import_file, cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan,
-    cmd_shards, cmd_stats, cmd_sync, cmd_tombstones, collection_canonical_id,
-    compile_import_template, compute_state_groups_partial, decode_event_json_record,
-    decode_hamt_node, decode_hamt_root, default_matrix_import_template, derive_template_key,
-    display_collection_role, event_id, event_room_id, event_short_id, export_envelope_line,
-    extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
+    cmd_scan_collection_live_rows, cmd_shards, cmd_stats, cmd_sync, cmd_tombstones,
+    collection_canonical_id, compile_import_template, compute_state_groups_partial,
+    decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
+    derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
+    export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
     format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
     interleaving_worth_noting, is_server_keys_export, keys_first, listing_shard_types,
     load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
@@ -15,8 +15,9 @@ use super::{
     resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
     template_collection_id, template_node_id, topological_event_order, valid_state_group_id,
     verify_auth_chain_edges, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, SharedState, StateGroupLoad,
-    StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, ScanOptions, SharedState,
+    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -1567,7 +1568,7 @@ fn scan_dash_t_all_finds_collection_across_pools() {
 }
 
 #[test]
-fn live_scan_uses_the_index_instead_of_physical_frames() {
+fn live_collection_scan_excludes_superseded_versions() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
     let store = PackfileStorage::open(layout.pool_dir(ShardType::EventDag).unwrap()).unwrap();
@@ -1615,6 +1616,24 @@ fn live_scan_uses_the_index_instead_of_physical_frames() {
             live: true,
         },
     };
+    let opts = ScanOptions {
+        verbose: false,
+        header: false,
+        decode: None,
+        limit: 10,
+        node_id: None,
+        raw: true,
+        sort: None,
+        reverse: false,
+    };
+    let (scanned_collection, rows, _) =
+        cmd_scan_collection_live_rows(&cli, &collection_hex, &opts).unwrap();
+    assert_eq!(scanned_collection, collection);
+    let payloads: Vec<_> = rows
+        .iter()
+        .map(|(_, _, _, record)| record.as_ref().unwrap().data.as_ref())
+        .collect();
+    assert_eq!(payloads, [b"second".as_slice()]);
     cmd_scan(
         &cli,
         &collection_hex,
@@ -1635,7 +1654,7 @@ fn live_scan_uses_the_index_instead_of_physical_frames() {
 }
 
 #[test]
-fn state_collection_without_genesis_metadata_is_reset() {
+fn state_collection_without_genesis_metadata_is_preserved_and_rejected() {
     let dir = unique_temp_dir();
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
     let store = PackfileStorage::open(layout.pool_dir(ShardType::State).unwrap()).unwrap();
@@ -1668,15 +1687,16 @@ fn state_collection_without_genesis_metadata_is_reset() {
         role: Some("state_hamt".to_owned()),
         schema: Some("sithnapse.state-hamt.v1".to_owned()),
     };
-    prepare_state_collection(&store, &collection, &metadata).unwrap();
-
+    let error = prepare_state_collection(&store, &collection, &metadata).unwrap_err();
+    assert!(error.to_string().contains("refusing to reset"));
+    assert!(store
+        .get_collection_metadata(&collection)
+        .unwrap()
+        .is_none());
     assert_eq!(
-        store.get_collection_metadata(&collection).unwrap(),
-        Some(metadata)
-    );
-    assert!(
-        store.get(&collection, &node).unwrap().is_none(),
-        "the metadata-less records are discarded before the collection is re-established"
+        store.get(&collection, &node).unwrap().unwrap().bytes,
+        Bytes::from_static(b"old root"),
+        "unreferenced status cannot be established, so preserve the records"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1701,12 +1721,11 @@ fn state_test_metadata(canonical_id: &[u8]) -> CollectionMetadata {
 /// stopped, and the import reopens the shared database. The reset must still
 /// establish the collection, and the records written after it must be readable.
 #[test]
-fn state_collection_without_genesis_is_reset_after_a_reopen() {
+fn state_collection_without_genesis_is_preserved_after_a_reopen() {
     let root = unique_temp_dir().join("state-reopen");
     let canonical_id = b"!room:example.org";
     let collection = derive_collection_id(Some(*b"STAT"), canonical_id);
     let old_node = [0x51; 16];
-    let new_node = [0x52; 16];
 
     {
         let db = Database::open(root.clone()).unwrap();
@@ -1730,22 +1749,15 @@ fn state_collection_without_genesis_is_reset_after_a_reopen() {
     assert!(state.collection_exists(&collection));
 
     let metadata = state_test_metadata(canonical_id);
-    prepare_state_collection(state, &collection, &metadata).unwrap();
-    state
-        .put_many(
-            &collection,
-            &[(new_node, NodeData::new(Bytes::from_static(b"new root")))],
-        )
-        .unwrap();
-
+    let error = prepare_state_collection(state, &collection, &metadata).unwrap_err();
+    assert!(error.to_string().contains("refusing to reset"));
+    assert!(state
+        .get_collection_metadata(&collection)
+        .unwrap()
+        .is_none());
     assert_eq!(
-        state.get_collection_metadata(&collection).unwrap(),
-        Some(metadata)
-    );
-    assert!(state.get(&collection, &old_node).unwrap().is_none());
-    assert_eq!(
-        state.get(&collection, &new_node).unwrap().unwrap().bytes,
-        Bytes::from_static(b"new root")
+        state.get(&collection, &old_node).unwrap().unwrap().bytes,
+        Bytes::from_static(b"old root")
     );
 
     drop(db);
@@ -2246,6 +2258,101 @@ fn raw_import_derives_rejections_and_writes_flags() {
     assert_eq!(
         flags.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
         1
+    );
+
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
+    let loaded = load_state_groups(&aux, &["$leave".to_owned(), "$stale".to_owned()]).unwrap();
+    let StateGroupLoad::Complete(groups) = loaded else {
+        panic!("state groups should be cached");
+    };
+    assert_eq!(
+        groups["$stale"], groups["$leave"],
+        "rejected state event must not change later state"
+    );
+}
+
+#[test]
+fn raw_import_ignores_incoming_rejected_flags_on_valid_events() {
+    let dir = unique_temp_dir().join("raw_unflagged");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, "!room2");
+    let path = dir.join("room.jsonl");
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+
+    let event = |id: &str, kind: &str, state_key: &str, content: &str, prev: &str, auth: &str| {
+        owned_value(&format!(
+            r#"{{"event_id":"{id}","sender":"@alice:test","room_id":"!room2","type":"{kind}","state_key":"{state_key}","content":{content},"prev_events":{prev},"auth_events":{auth}}}"#
+        ))
+    };
+    let create = event(
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let join = event(
+        "$join",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    // Valid join_rules event sent while Alice is joined, but carrying a false
+    // incoming "rejected": true flag from an untrusted source.
+    let mut valid_rules = event(
+        "$rules",
+        "m.room.join_rules",
+        "",
+        r#"{"join_rule":"public"}"#,
+        r#"["$join"]"#,
+        r#"["$create","$join"]"#,
+    );
+    if let OwnedValue::Object(fields) = &mut valid_rules {
+        fields.insert("rejected".to_owned(), OwnedValue::Bool(true));
+        fields.insert("__rejected".to_owned(), OwnedValue::Bool(true));
+    }
+
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    import_pdu_events(
+        &db,
+        store,
+        state_store,
+        &path,
+        &[create, join, valid_rules],
+        &[],
+        None,
+        None,
+        &template,
+        &mut established,
+    )
+    .unwrap();
+
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
+    let loaded = load_state_groups(&aux, &["$join".to_owned(), "$rules".to_owned()]).unwrap();
+    let StateGroupLoad::Complete(groups) = loaded else {
+        panic!("state groups should be cached");
+    };
+    assert_ne!(
+        groups["$rules"], groups["$join"],
+        "valid event must not be excluded from state just because incoming JSON claimed rejected"
+    );
+
+    let flags = mtxdb::room_flag::RoomFlagIndex::new(b"!room2");
+    assert_eq!(
+        flags
+            .count(
+                &db,
+                &mtxdb::room_flag::FlagQuery::has(mtxdb::room_flag::Flag::Rejected)
+            )
+            .unwrap(),
+        0,
+        "valid event must not be marked rejected"
     );
 }
 
@@ -5375,7 +5482,8 @@ fn an_imported_soft_fail_sets_the_soft_failed_flag() {
 fn an_exported_outlier_flag_is_not_migrated() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
-    // The exporter marks `$ok` an outlier; the import derives its own.
+    // The exporter marks `$ok` an outlier; the stored verdict omits the
+    // annotation, while the rebuild must recover the derived flag from it.
     let content = room_export_with_auth().replace(
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":false",
         "\"event_id\":\"$ok:test.conduwuit.local\",\"outlier\":true",
@@ -5398,7 +5506,11 @@ fn an_exported_outlier_flag_is_not_migrated() {
         )
         .map(|bytes| mtxdb::interop::decode_verdict(&bytes).unwrap().1.outlier)
     };
-    assert_eq!(outlier("ok"), None, "an exported outlier is not migrated");
+    assert_eq!(
+        outlier("ok"),
+        Some(false),
+        "an exported outlier is not migrated"
+    );
     assert_eq!(
         outlier("soft"),
         Some(false),
@@ -6569,9 +6681,6 @@ fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
 fn negative_arrival_ordering_is_rejected_on_import() {
     use crate::interchange::parse_room;
 
-    let root = unique_temp_dir();
-    let db = Database::open(root.clone()).unwrap();
-
     let room_id = "!badarrival:test.conduwuit.local";
     let jsonl = format!(
         concat!(
@@ -6587,11 +6696,7 @@ fn negative_arrival_ordering_is_rejected_on_import() {
         room = room_id
     );
 
-    let export = parse_room(jsonl.as_bytes()).unwrap();
-    assert_eq!(export.events[1].arrival_ordering, Some(-1));
-    let error = export_import::write_room_with_findings(&db, &export, 64 * 1024)
-        .unwrap_err()
-        .to_string();
+    let error = parse_room(jsonl.as_bytes()).unwrap_err().to_string();
     assert!(error.contains("arrival_ordering"), "{error}");
     assert!(error.contains("non-negative"), "{error}");
 }

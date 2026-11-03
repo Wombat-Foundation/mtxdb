@@ -20,6 +20,7 @@ fn room_version_record_round_trips_and_rejects_malformed_values() {
         ("!room:example.com", "12")
     );
     assert!(decode_room_version_record(&encoded[..7]).is_err());
+    assert!(decode_room_version_record(&encoded[..13]).is_err());
     assert!(decode_room_version_record(b"bad!").is_err());
     assert_ne!(
         room_version_collection_id(b"!a:example.com"),
@@ -259,7 +260,7 @@ fn outlier_flag_is_part_of_the_verdict_record() {
     assert!(!outlier.is_empty(), "an outlier needs a record");
     let bytes = encode_verdict(b"$e:x", &outlier).unwrap();
     // version, flags (outlier = bit 3), u32 length, event id
-    assert_eq!(bytes, [&[1, 0b1000, 4, 0, 0, 0][..], b"$e:x"].concat());
+    assert_eq!(bytes, [&[2, 0b1000, 4, 0, 0, 0][..], b"$e:x"].concat());
     assert_eq!(decode_verdict(&bytes).unwrap().1, outlier);
     let timeline = Verdict::default();
     assert!(timeline.is_empty());

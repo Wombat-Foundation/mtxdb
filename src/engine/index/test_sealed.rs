@@ -61,10 +61,16 @@ impl SealedIndex for FakeIndex {
 fn pack(seq: u64, slot: u16, index: FakeIndex) -> SealedPack {
     SealedPack {
         slot,
-        pack_id: PackId([u8::try_from(seq).unwrap_or(0); 16]),
+        pack_id: pack_id(seq),
         creation_seq: seq,
         index: Arc::new(index),
     }
+}
+
+fn pack_id(seq: u64) -> PackId {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&seq.to_le_bytes());
+    PackId(bytes)
 }
 
 fn locators(packs: Vec<SealedPack>) -> SealedLocators {
@@ -180,9 +186,9 @@ fn removing_a_pack_drops_its_locators() {
         1,
         FakeIndex::new(&[(COLLECTION, KEY, PackIndexLocator::Frame(10))], 0),
     )]);
-    assert!(set.remove_pack(PackId([1; 16])));
+    assert!(set.remove_pack(pack_id(1)));
     assert!(set.lookup(&COLLECTION, &KEY).is_none());
-    assert!(!set.remove_pack(PackId([1; 16])));
+    assert!(!set.remove_pack(pack_id(1)));
 }
 
 #[test]

@@ -65,11 +65,12 @@ pub mod field {
     /// `event`, optional: the event's timeline position. Present only for
     /// events the source put on its timeline, with negative positions for backfill.
     pub const STREAM_ORDERING: &str = "stream_ordering";
-    /// `event`, optional: when the source finished soft-failing the event, for
-    /// events it kept out of its timeline. Only soft-failed events carry this;
-    /// rejected events do not. Uses the source's global counter, so it is
+    /// `event`, optional: the source's global ordering for an outlier kept off
+    /// the timeline, including a soft-failed event. Uses the source's counter, so it is
     /// comparable with `stream_ordering`.
     pub const ARRIVAL_ORDERING: &str = "arrival_ordering";
+    /// `event`, optional: the event's depth.
+    pub const DEPTH: &str = "depth";
     /// `event`: ids of the event's `prev_events`.
     pub const PREV_EVENTS: &str = "prev_events";
     /// `event`: ids of the event's `auth_events`.

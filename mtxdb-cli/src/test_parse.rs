@@ -282,5 +282,6 @@ fn test_shard_type_flag_accepts_server_info() {
             m.get_one::<String>("shard_type").map(String::as_str),
             Some(val)
         );
+        assert_eq!(shard_type_from_arg(val), Some(ShardType::ServerInfo));
     }
 }

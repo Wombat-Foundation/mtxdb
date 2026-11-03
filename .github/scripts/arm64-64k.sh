@@ -58,7 +58,15 @@ remote 'sudo cp /boot/vmlinuz-*-64k /home/tester/kernel; sudo cp /boot/initrd.im
 scp -i "$work/key" -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null tester@127.0.0.1:kernel "$work/kernel"
 scp -i "$work/key" -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null tester@127.0.0.1:initrd "$work/initrd"
 remote 'sudo poweroff' || true
-wait "$vm_pid"
+shutdown_deadline=$((SECONDS + 60))
+while kill -0 "$vm_pid" 2>/dev/null && (( SECONDS < shutdown_deadline )); do
+    sleep 1
+done
+if kill -0 "$vm_pid" 2>/dev/null; then
+    echo "QEMU did not exit after guest poweroff; stopping it" >&2
+    kill "$vm_pid" 2>/dev/null || true
+fi
+wait "$vm_pid" || true
 vm_pid=''
 boot -kernel "$work/kernel" -initrd "$work/initrd" \
     -append 'root=LABEL=cloudimg-rootfs rw console=ttyAMA0'

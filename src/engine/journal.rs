@@ -1016,11 +1016,21 @@ impl TxnStage {
         if self.state.load(Ordering::Acquire) != Self::ACTIVE {
             return Err(io::Error::other("transaction stage is not active"));
         }
-        data.expectations.push(CollectionExpectation {
-            pool,
-            collection_id,
-            expected,
-        });
+        if !data
+            .expectations
+            .iter()
+            .any(|existing| existing.pool == pool && existing.collection_id == collection_id)
+        {
+            // Keep the first version observed before this transaction's own
+            // staged writes. Later staged-view reads can return a synthetic
+            // zero token for a fully staged collection and must not replace
+            // the original commit precondition.
+            data.expectations.push(CollectionExpectation {
+                pool,
+                collection_id,
+                expected,
+            });
+        }
         Ok(())
     }
 

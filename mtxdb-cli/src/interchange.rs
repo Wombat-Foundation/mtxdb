@@ -8,8 +8,8 @@
 //! * `event` — the `event_id`, the `pdu` as the source stored it, the
 //!   `prev_events` / `auth_events` lists, an optional `outlier` flag, and `redacted_by`
 //!   when the source recorded it. Verdicts are not part of an export: the
-//!   `rejected` / `soft_failed` flags and their codes are optional, read for
-//!   old files, and ignored by the importer, which derives rejections itself.
+//!   `rejected` / `soft_failed` flags and their codes are optional and read for
+//!   reporting only; they are not stored, and rejections are derived by importer.
 //! * `end` — the event count. A file without it was truncated.
 //!
 //! A keys export drops the framing: every line is a `server_keys` record with
@@ -72,10 +72,10 @@ pub(crate) enum InputFormat {
 pub(crate) struct EventMetadata {
     /// The event is an outlier: outside the room's forward extremities.
     pub(crate) outlier: bool,
-    /// The event failed auth and the server refused it.
-    pub(crate) rejected: bool,
-    /// The event failed auth checks against the current room state.
-    pub(crate) soft_failed: bool,
+    /// Whether the source marked the event rejected, when present.
+    pub(crate) rejected: Option<bool>,
+    /// Whether the source marked the event soft-failed, when present.
+    pub(crate) soft_failed: Option<bool>,
     /// Why the event was rejected, as the source numbered it.
     pub(crate) rejection_code: Option<u8>,
     /// Why the event soft-failed, as the source numbered it.
@@ -183,8 +183,12 @@ impl RoomEvent {
         let OwnedValue::Object(fields) = &mut event else {
             return event;
         };
-        set_flag(fields, "rejected", self.metadata.rejected);
-        set_flag(fields, "soft_failed", self.metadata.soft_failed);
+        set_flag(fields, "rejected", self.metadata.rejected.unwrap_or(false));
+        set_flag(
+            fields,
+            "soft_failed",
+            self.metadata.soft_failed.unwrap_or(false),
+        );
         fields.insert(
             "event_id".to_owned(),
             OwnedValue::String(self.event_id.clone()),
@@ -430,8 +434,8 @@ fn parse_event(
     let auth_events = require_array(line, object, field::AUTH_EVENTS)?.clone();
     let metadata = EventMetadata {
         outlier: optional_bool(line, object, field::OUTLIER)?,
-        rejected: optional_bool(line, object, field::REJECTED)?,
-        soft_failed: optional_bool(line, object, field::SOFT_FAILED)?,
+        rejected: optional_optional_bool(line, object, field::REJECTED)?,
+        soft_failed: optional_optional_bool(line, object, field::SOFT_FAILED)?,
         rejection_code: optional_code(line, object, field::REJECTION_CODE)?,
         soft_fail_code: optional_code(line, object, field::SOFT_FAIL_CODE)?,
         redacted_by: match object.get(field::REDACTED_BY) {
@@ -479,7 +483,11 @@ fn parse_event(
     }
     let stream_ordering = optional_signed_number(line, object, field::STREAM_ORDERING)?;
     let arrival_ordering = optional_signed_number(line, object, field::ARRIVAL_ORDERING)?;
-    let depth = optional_signed_number(line, object, "depth")?.or_else(|| {
+    anyhow::ensure!(
+        arrival_ordering.is_none_or(|value| value >= 0),
+        "line {line}: `arrival_ordering` must be a non-negative integer"
+    );
+    let depth = optional_signed_number(line, object, field::DEPTH)?.or_else(|| {
         pdu.get("depth").and_then(|v| {
             v.as_i64()
                 .or_else(|| v.as_u64().and_then(|d| i64::try_from(d).ok()))
@@ -647,6 +655,17 @@ fn optional_bool(line: usize, object: &Object, field: &str) -> anyhow::Result<bo
     }
 }
 
+fn optional_optional_bool(
+    line: usize,
+    object: &Object,
+    field: &str,
+) -> anyhow::Result<Option<bool>> {
+    object
+        .get(field)
+        .map(|_| require_bool(line, object, field))
+        .transpose()
+}
+
 /// An optional non-negative integer field of a record.
 fn optional_number(line: usize, object: &Object, field: &str) -> anyhow::Result<Option<u64>> {
     object
@@ -771,7 +790,7 @@ mod tests {
         let create = &export.events[0];
         assert_eq!(create.event_id, "$create");
         assert!(create.metadata.outlier);
-        assert!(!create.metadata.rejected);
+        assert_eq!(create.metadata.rejected, Some(false));
         assert!(create.metadata.outlier, "the outlier flag is metadata");
 
         let message = &export.events[1];
@@ -837,7 +856,7 @@ mod tests {
             arrival_ordering: None,
             depth: None,
         };
-        event.metadata.rejected = false;
+        event.metadata.rejected = Some(false);
         let annotated = event.annotated("!room:example.org");
         assert!(
             annotated.get("rejected").is_none(),
