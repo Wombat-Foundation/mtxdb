@@ -18,6 +18,7 @@
 
 use mtxdb::index::IndexResidency;
 use mtxdb::packfile::ChecksumPolicy;
+use mtxdb::shard::AppendPolicy;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::PackfileStorage;
 use std::hint::black_box;
@@ -124,8 +125,11 @@ fn append_batch(store: &PackfileStorage, sequence: &mut u64, count: u64, payload
 }
 
 fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64, payload_len: usize) -> u64 {
+    // Buffer frames in memory between syncs: the build ends in `sync_all`,
+    // so per-frame positioned writes would only slow it down.
     let store = PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), shard_bytes)
-        .expect("open fixture store");
+        .expect("open fixture store")
+        .with_append_policy(AppendPolicy::buffered());
     let mut sequence = 0u64;
     // A rough first guess at records per pack (frame overhead is about 48
     // bytes). The top-up below corrects it from the measured count.
