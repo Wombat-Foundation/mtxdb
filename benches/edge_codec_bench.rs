@@ -15,6 +15,9 @@ use mtxdb::{BitmapSet, DomainTag};
 #[path = "edge_layout_common.rs"]
 mod common;
 
+#[path = "edge_sensitivity.rs"]
+mod sensitivity;
+
 use common::{len_f64, num};
 
 const BENCH_DOMAIN: DomainTag = DomainTag::new([0u8; 16]);
@@ -903,6 +906,10 @@ fn run_write_amplification_bench(room: &RoomGraph, event_count: usize, relations
 // ---------------------------------------------------------------- main entry
 fn main() {
     verify_reverse_codec();
+    if std::env::args().nth(1).as_deref() == Some("--sweep") {
+        sensitivity::run();
+        return;
+    }
     // Round-trip the late-parent case absent from the locality-biased generator.
     // Exercise both sparse arrays and promotion to a hub bitmap.
     let edges = vec![vec![4, 2], vec![4], vec![], vec![], vec![0]];
