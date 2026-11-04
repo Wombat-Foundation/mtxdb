@@ -3,9 +3,68 @@ use super::{append_reverse_row, BitmapSet, CsrRawForward, CsrVarintForward, BENC
 
 pub(super) fn run() {
     density();
+    pl_hubs();
     holes();
     forward();
     roots();
+}
+
+/// Power-level-like rows: a few contiguous authorization intervals per hub,
+/// broken by evenly sized fork/backfill gaps. The run size stays a 4 B-per-run
+/// model; gap and bitmap sizes are measured by the real encoders.
+fn pl_hubs() {
+    println!("# pl_hubs: piecewise-contiguous rows with 2-short fork gaps; run_B = 4*runs model");
+    println!("children\truns\tgap_B\tbitmap_B\trun_B\twinner\tmax_runs_vs_gap\tmax_runs_vs_bitmap");
+    for children in [4096usize, 8192, 16_384, 32_768, 60_000] {
+        for runs in [1usize, 4, 16, 64, 256, 1024, 2048, 4096] {
+            let Some(values) = piecewise_children(children, runs) else {
+                continue;
+            };
+            let mut gaps = Vec::new();
+            append_reverse_row(0, &values, &mut gaps);
+            let bitmap = BitmapSet::from_values(BENCH_DOMAIN, values.iter().copied())
+                .encode()
+                .expect("bitmap encodes");
+            let run_bytes = runs.checked_mul(4).expect("size fits");
+            let (_, winner) = [
+                (gaps.len(), "gap"),
+                (bitmap.len(), "bitmap"),
+                (run_bytes, "run"),
+            ]
+            .into_iter()
+            .min()
+            .expect("three candidates");
+            // Largest run count whose 4 B model still beats each measured encoding.
+            let max_vs_gap = gaps.len().checked_div(4).expect("nonzero divisor");
+            let max_vs_bitmap = bitmap.len().checked_div(4).expect("nonzero divisor");
+            println!(
+                "{children}\t{runs}\t{}\t{}\t{run_bytes}\t{winner}\t{max_vs_gap}\t{max_vs_bitmap}",
+                gaps.len(),
+                bitmap.len()
+            );
+        }
+    }
+}
+
+/// `children` shorts split into `runs` near-equal ranges, separated by two
+/// missing shorts. Returns `None` when there are more runs than children.
+fn piecewise_children(children: usize, runs: usize) -> Option<Vec<u32>> {
+    let base = children.checked_div(runs)?;
+    let extra = children.checked_rem(runs)?;
+    if base == 0 {
+        return None;
+    }
+    let mut values = Vec::with_capacity(children);
+    let mut next = 0u32;
+    for index in 0..runs {
+        let length = base.checked_add(usize::from(index < extra))?;
+        for _ in 0..length {
+            values.push(next);
+            next = next.checked_add(1)?;
+        }
+        next = next.checked_add(2)?;
+    }
+    Some(values)
 }
 
 fn density() {
