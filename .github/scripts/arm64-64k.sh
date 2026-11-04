@@ -53,7 +53,7 @@ boot() {
 }
 boot -drive "if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd" \
     -drive "if=pflash,format=raw,file=$work/vars.fd"
-remote 'set -e; sudo cloud-init status --wait; sudo apt-get update; sudo apt-get install -y linux-image-generic-64k build-essential curl ca-certificates pkg-config'
+remote 'set -e; sudo cloud-init status --wait; sudo apt-get update; sudo apt-get install -y linux-image-generic-64k build-essential curl ca-certificates pkg-config libzstd-dev'
 remote 'sudo cp /boot/vmlinuz-*-64k /home/tester/kernel; sudo cp /boot/initrd.img-*-64k /home/tester/initrd; sudo chown tester:tester /home/tester/kernel /home/tester/initrd'
 scp -i "$work/key" -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null tester@127.0.0.1:kernel "$work/kernel"
 scp -i "$work/key" -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null tester@127.0.0.1:initrd "$work/initrd"
