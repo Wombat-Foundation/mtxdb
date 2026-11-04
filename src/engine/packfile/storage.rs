@@ -7773,11 +7773,22 @@ impl PackfileStorage {
                 sealed.insert_run(run);
             }
         }
+        // Sidecars this session already opened and verified, from every
+        // collection's generation: a sealed pack is immutable, so reopening
+        // and re-verifying it on each refresh (about 0.5 ms a pack) only adds
+        // put latency at every pack rotation.
+        let loaded = self.loaded_sidecars();
         for (slot, shard) in shards {
             if !shard.is_current.load(Ordering::Acquire) || run_covered.contains(&shard.pack_id) {
                 continue;
             }
             if shard.sealed.load(Ordering::Acquire) {
+                if let Some(pack) = loaded.get(&shard.pack_id).filter(|pack| pack.slot == slot) {
+                    if pack.index.collection_entry_count(collection_id).is_some() {
+                        sealed.insert(pack.clone());
+                    }
+                    continue;
+                }
                 if let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) {
                     if sidecar.collection_entry_count(collection_id).is_some() {
                         let sidecar: Arc<dyn crate::index::sealed::SealedIndex> = Arc::new(sidecar);
@@ -7830,6 +7841,17 @@ impl PackfileStorage {
             }
         }
         Ok((index, sealed))
+    }
+
+    /// Every sidecar loaded into a collection generation, by pack.
+    fn loaded_sidecars(&self) -> HashMap<PackId, crate::index::sealed::SealedPack> {
+        let mut loaded = HashMap::new();
+        for gen_swap in self.collections_read().values() {
+            for pack in gen_swap.load().sealed.packs() {
+                loaded.entry(pack.pack_id).or_insert_with(|| pack.clone());
+            }
+        }
+        loaded
     }
 
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
@@ -10181,17 +10203,10 @@ impl PackfileStorage {
                 .any(|window| window == identities)
     }
 
-    /// Check, under every collection lock, that `new_run` can replace its
-    /// inputs, and build each serving generation's replacement sealed set.
-    /// See [`Self::install_run`].
-    fn prepare_run_install(
-        &self,
-        new_run: &Arc<crate::index::sealed::SealedRun>,
-    ) -> Result<RunInstall, String> {
-        let current = new_run
-            .packs()
+    fn run_packs_match_current_identity(&self, run: &crate::index::sealed::SealedRun) -> bool {
+        run.packs()
             .iter()
-            .zip(new_run.run().packs())
+            .zip(run.run().packs())
             .all(|(pack, identity)| {
                 self.shards.get_shard(pack.slot).is_some_and(|shard| {
                     shard.pack_id == pack.pack_id
@@ -10201,7 +10216,17 @@ impl PackfileStorage {
                         && shard.is_current.load(Ordering::Acquire)
                         && shard.sealed.load(Ordering::Acquire)
                 })
-            });
+            })
+    }
+
+    /// Check, under every collection lock, that `new_run` can replace its
+    /// inputs, and build each serving generation's replacement sealed set.
+    /// See [`Self::install_run`].
+    fn prepare_run_install(
+        &self,
+        new_run: &Arc<crate::index::sealed::SealedRun>,
+    ) -> Result<RunInstall, String> {
+        let current = self.run_packs_match_current_identity(new_run);
         let contiguous = self.run_covers_contiguous_sealed_pool(new_run.run().packs());
         if !current || !contiguous {
             return Err("a covered pack was retired or replaced".into());

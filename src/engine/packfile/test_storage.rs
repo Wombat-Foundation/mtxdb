@@ -13756,6 +13756,7 @@ fn paged_run_install_rechecks_pack_identity_under_the_locks() {
     let built = build_planned_run(store.shards.base_dir(), &plan)
         .unwrap()
         .expect("a non-empty run");
+    let path = built.path.clone();
     let by_pack: HashMap<PackId, (u16, PathBuf)> = store
         .shards
         .all_shards()
@@ -13778,10 +13779,39 @@ fn paged_run_install_rechecks_pack_identity_under_the_locks() {
     changed.file_len.fetch_sub(1, Ordering::AcqRel);
     assert!(store.prepare_run_install(&run).is_ok());
 
+    // Model slot reuse after the earlier pack-id lookup: keep the run's
+    // identity table intact, but make one ordinal resolve through another
+    // current pack's slot. Pool coverage still matches, so only the final
+    // slot-to-identity recheck should reject it.
+    let mut stale_packs = run.packs().to_vec();
+    stale_packs[0].slot = stale_packs[1].slot;
+    let stale = Arc::new(
+        crate::index::sealed::SealedRun::new(
+            Arc::new(crate::index::run::RunIndex::open(&path).unwrap()),
+            stale_packs,
+            Box::new(|| Ok(Vec::new())),
+        )
+        .unwrap(),
+    );
+    assert!(store.run_covers_contiguous_sealed_pool(stale.run().packs()));
+    let mut collection_ids: Vec<_> = store.collections_read().keys().copied().collect();
+    collection_ids.extend(stale.run().pack_stats().map(|row| row.collection_id));
+    collection_ids.sort_unstable();
+    collection_ids.dedup();
+    let mutexes: Vec<_> = collection_ids.iter().map(|id| store.put_mutex(id)).collect();
+    let guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
+    assert!(matches!(
+        store.prepare_run_install(&stale),
+        Err(reason) if reason == "a covered pack was retired or replaced"
+    ));
+    drop(guards);
+    drop(stale);
+
     // The pack retired after the run was built.
     store.shards.retire_slot(run.packs()[1].slot);
     assert!(rejection(&store).contains("retired or replaced"));
     drop(changed);
+    drop(run);
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }
