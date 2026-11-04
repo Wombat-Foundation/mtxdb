@@ -10904,7 +10904,13 @@ fn import_pdu_events_with_raw(
         events,
         auth_chain,
     )?;
-    if raw_adjacency.is_some() {
+    // Dependency recording is for raw Matrix PDUs keyed by event ID. JSONL and
+    // federation readers both reach this point; gate on the template identity
+    // rule rather than on whether adjacency happened to be parsed.
+    if matches!(
+        &template.record_id_rule.policy,
+        FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
+    ) {
         record_raw_dependencies_and_waiting(
             db,
             store,

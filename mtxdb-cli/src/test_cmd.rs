@@ -7,20 +7,20 @@ use super::{
     derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
     export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
     format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
-    import_pdu_events_with_raw,
-    interleaving_worth_noting, is_server_keys_export, keys_first, listing_shard_types,
-    load_collection_events, load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
-    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
-    overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
-    parse_pack_selectors, prepare_state_collection, pretty_print_payload, raw_auth_projection,
-    raw_auth_projection_collection_id, raw_reverse_edge_collection_id, raw_waiting_collection_id,
-    record_matrix_adjacency, record_raw_dependencies_and_waiting, redacted_event_bytes,
-    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
-    template_collection_id, template_event_id_node_id, template_node_id, topological_event_order,
-    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
-    CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension,
-    MetaReport, PackIdentity, ScanOptions, SharedState, StateGroupLoad, StateSet,
-    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    import_pdu_events_with_raw, interleaving_worth_noting, is_server_keys_export, keys_first,
+    listing_shard_types, load_collection_events, load_state_groups, matrix_batch_has_create,
+    matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
+    meta_pools, meta_raw, overlay_auth_projection, pack_identity, parse_federation_input,
+    parse_pack_id_selector, parse_pack_selectors, prepare_state_collection, pretty_print_payload,
+    raw_auth_projection, raw_auth_projection_collection_id, raw_reverse_edge_collection_id,
+    raw_waiting_collection_id, record_matrix_adjacency, record_raw_dependencies_and_waiting,
+    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+    split_canonical_display, template_collection_id, template_event_id_node_id, template_node_id,
+    topological_event_order, valid_state_group_id, verify_auth_chain_edges,
+    write_raw_auth_projections, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
+    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, ScanOptions, SharedState,
+    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -2995,6 +2995,121 @@ fn raw_import_auth_chain_parent_clears_waiting() {
             .unwrap()
             .is_none(),
         "a parent supplied only through auth_chain must leave raw_waiting"
+    );
+}
+
+#[test]
+fn raw_import_records_dependencies_for_federation_documents() {
+    let dir = unique_temp_dir().join("raw_federation_dependencies");
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let edge_store = db.pool(ShardType::Edges);
+    let mut established = HashSet::new();
+
+    let first = dir.join("first.json");
+    std::fs::write(
+        &first,
+        r#"{
+            "pdus": [
+                {"event_id":"$create","sender":"@alice:test","room_id":"!room3",
+                 "type":"m.room.create","state_key":"",
+                 "content":{"creator":"@alice:test","room_version":"11"},
+                 "prev_events":[],"auth_events":[]},
+                {"event_id":"$join","sender":"@alice:test","room_id":"!room3",
+                 "type":"m.room.member","state_key":"@alice:test",
+                 "content":{"membership":"join"},
+                 "prev_events":["$create"],"auth_events":["$create"]},
+                {"event_id":"$stale","sender":"@alice:test","room_id":"!room3",
+                 "type":"m.room.join_rules","state_key":"",
+                 "content":{"join_rule":"public"},
+                 "prev_events":["$leave"],"auth_events":["$create","$join"]}
+            ]
+        }"#,
+    )
+    .unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        state_store,
+        &first,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
+
+    let leave_node = template_event_id_node_id(&template, "$leave").unwrap();
+    let stale_node = template_event_id_node_id(&template, "$stale").unwrap();
+    let waiting_coll = raw_waiting_collection_id("!room3");
+    let stale_edge_coll = raw_reverse_edge_collection_id("prev", &leave_node);
+    assert!(
+        edge_store
+            .get(&waiting_coll, &leave_node)
+            .unwrap()
+            .is_some(),
+        "federation PDUs must record their missing parent"
+    );
+    assert!(
+        edge_store
+            .get(&stale_edge_coll, &stale_node)
+            .unwrap()
+            .is_some(),
+        "federation PDUs must record reverse edges"
+    );
+
+    let second = dir.join("second.json");
+    std::fs::write(
+        &second,
+        r#"{
+            "pdus": [
+                {"event_id":"$late","sender":"@alice:test","room_id":"!room3",
+                 "type":"m.room.message","state_key":"",
+                 "content":{},"prev_events":["$leave"],
+                 "auth_events":["$create","$join"]}
+            ],
+            "auth_chain": [
+                {"event_id":"$leave","sender":"@alice:test","room_id":"!room3",
+                 "type":"m.room.member","state_key":"@alice:test",
+                 "content":{"membership":"leave"},
+                 "prev_events":["$join"],"auth_events":["$create","$join"]}
+            ]
+        }"#,
+    )
+    .unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        state_store,
+        &second,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
+
+    let late_node = template_event_id_node_id(&template, "$late").unwrap();
+    let late_edge_coll = raw_reverse_edge_collection_id("prev", &leave_node);
+    assert!(
+        edge_store
+            .get(&waiting_coll, &leave_node)
+            .unwrap()
+            .is_none(),
+        "an auth-chain parent in a federation document must clear raw_waiting"
+    );
+    assert!(
+        edge_store
+            .get(&late_edge_coll, &late_node)
+            .unwrap()
+            .is_some(),
+        "a federation PDU must record an auth-chain parent edge"
     );
 }
 
