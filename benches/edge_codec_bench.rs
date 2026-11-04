@@ -4,544 +4,776 @@
 //! (children-of, relations) encodings over dense room-local u32 short ids,
 //! plus head/sealed rewrite amplification under batched ingest.
 //!
-//! Usage: edgebench [events] [seed]
+//! Usage: `edge_codec_bench` [events] [seed]
 
-use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Instant;
 
+use mtxdb::{BitmapSet, DomainTag};
+
+#[path = "edge_layout_common.rs"]
+mod common;
+
+use common::{len_f64, num};
+
+const BENCH_DOMAIN: DomainTag = DomainTag::new([0u8; 16]);
+const CHUNK_SIZE: usize = 1024;
+const TUPLE_OVERHEAD_BYTES: usize = 63;
+
 // ---------------------------------------------------------------- rng
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
+struct PseudoRng(u64);
+
+impl PseudoRng {
+    fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn f(&mut self) -> f64 {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+
+    fn next_fraction(&mut self) -> f64 {
+        let value = self.next_u64() >> 11;
+        num(value) / 9_007_199_254_740_992.0 // 2^53
     }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
+
+    fn below(&mut self, upper_bound: u64) -> u64 {
+        let divisor = upper_bound.max(1);
+        self.next_u64()
+            .checked_rem(divisor)
+            .expect("non-zero divisor")
     }
 }
 
 // ---------------------------------------------------------------- model
-struct Room {
-    prev: Vec<Vec<u32>>,         // forward, per child short
-    auth: Vec<Vec<u32>>,         // forward, per child short
-    rel: Vec<Option<(u32, u8)>>, // forward relation (parent, rel_type)
+struct RoomGraph {
+    prev: Vec<Vec<u32>>,
+    auth: Vec<Vec<u32>>,
+    relations: Vec<Option<(u32, u8)>>,
 }
 
-/// Matrix-shaped room: short 0 = create, 1 = join_rules, power levels
+/// Matrix-shaped room: short 0 = create, 1 = `join_rules`, power levels
 /// re-issued every ~50k events, one member event per user on first send,
 /// skewed senders, prev to recent events (rare forks), ~15% relations
 /// (reactions/edits/replies) skewed toward recent and a hot set.
-fn gen_room(n: usize, seed: u64) -> Room {
-    let mut r = Rng(seed | 1);
-    let users = 2000u64;
-    let mut prev = vec![Vec::new(); n];
-    let mut auth = vec![Vec::new(); n];
-    let mut rel = vec![None; n];
-    let mut member: HashMap<u64, u32> = HashMap::new();
-    let mut pl: u32 = 1;
-    let mut hot: Vec<u32> = Vec::new();
-    for s in 2..n as u32 {
-        let i = s as usize;
-        // prev: 1 (92%), 2 (7%), 3..5 (1%)
-        let roll = r.f();
-        let k = if roll < 0.92 { 1 } else if roll < 0.99 { 2 } else { 3 + r.below(3) as usize };
-        let mut ps = Vec::with_capacity(k);
-        for _ in 0..k {
-            let back = 1 + r.below(8.min(s as u64 - 1)) as u32;
-            let p = s - back;
-            if !ps.contains(&p) {
-                ps.push(p);
+fn generate_room(event_count: usize, seed: u64) -> RoomGraph {
+    let mut rng = PseudoRng(seed | 1);
+    let user_count = 2000u64;
+    let mut prev = vec![Vec::new(); event_count];
+    let mut auth = vec![Vec::new(); event_count];
+    let mut relations = vec![None; event_count];
+    let mut user_member_events: HashMap<u64, u32> = HashMap::new();
+    let mut active_power_levels_event: u32 = 1;
+    let mut hot_events: Vec<u32> = Vec::new();
+
+    let max_short = u32::try_from(event_count).expect("event count fits in u32");
+    for current_short in 2..max_short {
+        let event_index = usize::try_from(current_short).expect("short fits in usize");
+        let roll = rng.next_fraction();
+        let prev_count = if roll < 0.92 {
+            1
+        } else if roll < 0.99 {
+            2
+        } else {
+            let extra = usize::try_from(rng.below(3)).expect("extra fits in usize");
+            3_usize.saturating_add(extra)
+        };
+
+        let mut parents = Vec::with_capacity(prev_count);
+        for _ in 0..prev_count {
+            let max_lookback = 8u64.min(u64::from(current_short).saturating_sub(1));
+            let lookback = 1u32.saturating_add(
+                u32::try_from(rng.below(max_lookback)).expect("lookback fits in u32"),
+            );
+            let parent_short = current_short.saturating_sub(lookback);
+            if !parents.contains(&parent_short) {
+                parents.push(parent_short);
             }
         }
-        ps.sort_unstable();
-        prev[i] = ps;
+        parents.sort_unstable();
+        prev[event_index] = parents;
 
-        let u = ((r.f() * r.f()) * users as f64) as u64; // skewed sender
-        let mut a = vec![0u32, pl];
-        let is_member = !member.contains_key(&u);
-        if is_member {
-            a.push(1); // join rules
-            member.insert(u, s);
+        let user_id = rng.below(user_count).min(rng.below(user_count));
+
+        let mut auth_list = vec![0u32, active_power_levels_event];
+        let is_first_send = !user_member_events.contains_key(&user_id);
+        if is_first_send {
+            auth_list.push(1); // join rules
+            user_member_events.insert(user_id, current_short);
         } else {
-            a.push(member[&u]);
+            auth_list.push(user_member_events[&user_id]);
         }
-        if s % 50_000 == 0 {
-            pl = s; // this event is a new power-levels event
-        }
-        a.sort_unstable();
-        a.dedup();
-        auth[i] = a;
 
-        if !is_member && r.f() < 0.15 {
-            let parent = if r.f() < 0.7 || hot.is_empty() {
-                s - 1 - r.below(50.min(s as u64 - 1)) as u32
-            } else {
-                hot[(r.f() * r.f() * hot.len() as f64) as usize]
-            };
-            let ty = (r.below(4)) as u8; // annotation/replace/thread/reference
-            rel[i] = Some((parent, ty));
+        if current_short.is_multiple_of(50_000) {
+            active_power_levels_event = current_short;
         }
-        if r.f() < 0.001 {
-            hot.push(s);
+        auth_list.sort_unstable();
+        auth_list.dedup();
+        auth[event_index] = auth_list;
+
+        if !is_first_send && rng.next_fraction() < 0.15 {
+            let target_parent = if rng.next_fraction() < 0.7 || hot_events.is_empty() {
+                let max_rel_lookback = 50u64.min(u64::from(current_short).saturating_sub(1));
+                let rel_lookback =
+                    u32::try_from(rng.below(max_rel_lookback)).expect("rel lookback fits in u32");
+                current_short.saturating_sub(1).saturating_sub(rel_lookback)
+            } else {
+                let hot_count = u64::try_from(hot_events.len()).expect("fits in u64");
+                let hot_sample = rng.below(hot_count).min(rng.below(hot_count));
+                let hot_index = usize::try_from(hot_sample).expect("fits in usize");
+                hot_events[hot_index]
+            };
+            let rel_type = u8::try_from(rng.below(4)).expect("rel type fits in u8");
+            relations[event_index] = Some((target_parent, rel_type));
+        }
+
+        if rng.next_fraction() < 0.001 {
+            hot_events.push(current_short);
         }
     }
-    Room { prev, auth, rel }
+
+    RoomGraph {
+        prev,
+        auth,
+        relations,
+    }
 }
 
 // ---------------------------------------------------------------- varint
-fn varint_len(mut v: u32) -> usize {
-    let mut n = 1;
-    while v >= 0x80 {
-        v >>= 7;
-        n += 1;
+fn varint_length(mut value: u32) -> usize {
+    let mut count = 1usize;
+    while value >= 0x80 {
+        value >>= 7;
+        count = count.saturating_add(1);
     }
-    n
-}
-fn put_varint(out: &mut Vec<u8>, mut v: u32) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-fn get_varint(b: &[u8], at: &mut usize) -> u32 {
-    let mut v = 0u32;
-    let mut shift = 0;
-    loop {
-        let x = b[*at];
-        *at += 1;
-        v |= ((x & 0x7f) as u32) << shift;
-        if x < 0x80 {
-            return v;
-        }
-        shift += 7;
-    }
+    count
 }
 
-const CHUNK: usize = 1024;
+fn append_varint(buffer: &mut Vec<u8>, mut value: u32) {
+    while value >= 0x80 {
+        let byte = u8::try_from(value & 0x7f).expect("fits in u8") | 0x80;
+        buffer.push(byte);
+        value >>= 7;
+    }
+    buffer.push(u8::try_from(value).expect("fits in u8"));
+}
+
+fn read_varint(bytes: &[u8], cursor: &mut usize) -> u32 {
+    let mut decoded = 0u32;
+    let mut shift_bits = 0u32;
+    loop {
+        let raw_byte = bytes[*cursor];
+        *cursor = cursor.saturating_add(1);
+        decoded |= u32::from(raw_byte & 0x7f) << shift_bits;
+        if raw_byte < 0x80 {
+            return decoded;
+        }
+        shift_bits = shift_bits.saturating_add(7);
+    }
+}
 
 // ---------------------------------------------------------------- forward encodings
-/// F2: raw CSR, offsets u32[C+1] + targets u32.
-struct CsrRaw {
+struct CsrRawForward {
     chunks: Vec<(Vec<u32>, Vec<u32>)>,
 }
-impl CsrRaw {
-    fn build(lists: &[Vec<u32>]) -> Self {
-        let chunks = lists
-            .chunks(CHUNK)
-            .map(|c| {
-                let mut off = Vec::with_capacity(c.len() + 1);
-                let mut tg = Vec::new();
-                off.push(0);
-                for l in c {
-                    tg.extend_from_slice(l);
-                    off.push(tg.len() as u32);
+
+impl CsrRawForward {
+    fn build(edge_lists: &[Vec<u32>]) -> Self {
+        let chunks = edge_lists
+            .chunks(CHUNK_SIZE)
+            .map(|chunk_slice| {
+                let mut offsets = Vec::with_capacity(chunk_slice.len().saturating_add(1));
+                let mut targets = Vec::new();
+                offsets.push(0);
+                for target_list in chunk_slice {
+                    targets.extend_from_slice(target_list);
+                    let target_offset = u32::try_from(targets.len()).expect("offset fits in u32");
+                    offsets.push(target_offset);
                 }
-                (off, tg)
+                (offsets, targets)
             })
             .collect();
         Self { chunks }
     }
-    fn bytes(&self) -> usize {
-        self.chunks.iter().map(|(o, t)| 4 * (o.len() + t.len())).sum()
+
+    fn total_bytes(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|(offsets, targets)| {
+                let word_count = offsets.len().saturating_add(targets.len());
+                word_count.saturating_mul(4)
+            })
+            .sum()
     }
-    fn get(&self, s: u32) -> &[u32] {
-        let (o, t) = &self.chunks[s as usize / CHUNK];
-        let i = s as usize % CHUNK;
-        &t[o[i] as usize..o[i + 1] as usize]
+
+    fn lookup(&self, short_id: u32) -> &[u32] {
+        let chunk_index = usize::try_from(short_id).expect("fits in usize") / CHUNK_SIZE;
+        let (offsets, targets) = &self.chunks[chunk_index];
+        let within_chunk = usize::try_from(short_id).expect("fits in usize") % CHUNK_SIZE;
+        let start_pos = usize::try_from(offsets[within_chunk]).expect("fits in usize");
+        let next_index = within_chunk.saturating_add(1);
+        let end_pos = usize::try_from(offsets[next_index]).expect("fits in usize");
+        &targets[start_pos..end_pos]
     }
 }
 
-/// F3: CSR with u16 byte offset per child, targets as varint(child - target)
-/// for the first and varint(gap) after (targets sorted descending by delta).
-struct CsrVar {
+struct CsrVarintForward {
     chunks: Vec<(Vec<u16>, Vec<u8>)>,
 }
-impl CsrVar {
-    fn build(lists: &[Vec<u32>]) -> Self {
+
+impl CsrVarintForward {
+    fn build(edge_lists: &[Vec<u32>]) -> Self {
         let mut chunks = Vec::new();
-        for (ci, c) in lists.chunks(CHUNK).enumerate() {
-            let mut off = Vec::with_capacity(c.len() + 1);
-            let mut body = Vec::new();
-            for (j, l) in c.iter().enumerate() {
-                off.push(body.len() as u16);
-                let child = (ci * CHUNK + j) as u32;
-                // deltas ascending: nearest parent first
-                let mut d: Vec<u32> = l.iter().map(|&p| child - p).collect();
-                d.sort_unstable();
-                let mut last = 0;
-                for x in d {
-                    put_varint(&mut body, x - last);
-                    last = x;
+        for (chunk_index, chunk_slice) in edge_lists.chunks(CHUNK_SIZE).enumerate() {
+            let mut offsets = Vec::with_capacity(chunk_slice.len().saturating_add(1));
+            let mut payload = Vec::new();
+            for (offset_in_chunk, target_list) in chunk_slice.iter().enumerate() {
+                offsets.push(u16::try_from(payload.len()).expect("offset fits in u16"));
+                let base_short = u32::try_from(
+                    chunk_index
+                        .saturating_mul(CHUNK_SIZE)
+                        .saturating_add(offset_in_chunk),
+                )
+                .expect("short fits in u32");
+
+                let mut deltas: Vec<u32> = target_list
+                    .iter()
+                    .map(|&parent| base_short.saturating_sub(parent))
+                    .collect();
+                deltas.sort_unstable();
+
+                let mut last_delta = 0u32;
+                for delta in deltas {
+                    append_varint(&mut payload, delta.saturating_sub(last_delta));
+                    last_delta = delta;
                 }
             }
-            off.push(body.len() as u16);
-            chunks.push((off, body));
+            offsets.push(u16::try_from(payload.len()).expect("offset fits in u16"));
+            chunks.push((offsets, payload));
         }
         Self { chunks }
     }
-    fn bytes(&self) -> usize {
-        // the trailing sentinel offset is the chunk length; count it
-        self.chunks.iter().map(|(o, b)| 2 * o.len() + b.len()).sum()
-    }
-    fn get(&self, s: u32, out: &mut Vec<u32>) {
-        out.clear();
-        let (o, b) = &self.chunks[s as usize / CHUNK];
-        let i = s as usize % CHUNK;
-        let (mut at, end) = (o[i] as usize, o[i + 1] as usize);
-        let mut acc = 0;
-        while at < end {
-            acc += get_varint(b, &mut at);
-            out.push(s - acc);
-        }
-    }
-}
 
-/// F5: one roaring bitmap per chunk of children, key = (offset << 22) | delta.
-/// Delta must fit 22 bits (rooms under ~4M events).
-struct Roaring2d {
-    chunks: Vec<RoaringBitmap>,
-}
-impl Roaring2d {
-    fn build(lists: &[Vec<u32>]) -> Self {
-        let chunks = lists
-            .chunks(CHUNK)
-            .enumerate()
-            .map(|(ci, c)| {
-                let mut b = RoaringBitmap::new();
-                for (j, l) in c.iter().enumerate() {
-                    let child = (ci * CHUNK + j) as u32;
-                    for &p in l {
-                        let d = child - p;
-                        assert!(d < 1 << 22, "delta exceeds 22 bits");
-                        b.insert(((j as u32) << 22) | d);
-                    }
-                }
-                b
+    fn total_bytes(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|(offsets, payload)| {
+                let offset_bytes = offsets.len().saturating_mul(2);
+                offset_bytes.saturating_add(payload.len())
             })
-            .collect();
-        Self { chunks }
+            .sum()
     }
-    fn bytes(&self) -> usize {
-        self.chunks.iter().map(RoaringBitmap::serialized_size).sum()
-    }
-    fn get(&self, s: u32, out: &mut Vec<u32>) {
-        out.clear();
-        let b = &self.chunks[s as usize / CHUNK];
-        let j = (s as usize % CHUNK) as u32;
-        let lo = j << 22;
-        let start = if lo == 0 { 0 } else { b.rank(lo - 1) };
-        let end = b.rank(lo | ((1 << 22) - 1));
-        for k in start..end {
-            let v = b.select(k as u32).unwrap();
-            out.push(s - (v & ((1 << 22) - 1)));
+
+    fn lookup(&self, short_id: u32, output: &mut Vec<u32>) {
+        output.clear();
+        let short_usize = usize::try_from(short_id).expect("fits in usize");
+        let (offsets, payload) = &self.chunks[short_usize / CHUNK_SIZE];
+        let within_chunk = short_usize % CHUNK_SIZE;
+        let mut cursor = usize::from(offsets[within_chunk]);
+        let end_cursor = usize::from(offsets[within_chunk.saturating_add(1)]);
+
+        let mut accumulated_delta = 0u32;
+        while cursor < end_cursor {
+            accumulated_delta = accumulated_delta.saturating_add(read_varint(payload, &mut cursor));
+            output.push(short_id.saturating_sub(accumulated_delta));
         }
     }
 }
 
-/// F4: a roaring bitmap per child (as if each child's edge set were a bitmap).
-fn roaring_per_list_bytes(lists: &[Vec<u32>]) -> usize {
-    lists
-        .iter()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.iter().copied().collect::<RoaringBitmap>().serialized_size())
-        .sum()
+// ---------------------------------------------------------------- rezzy bitmap helpers
+fn rezzy_bitmap_sets_bytes(edge_lists: &[Vec<u32>]) -> (usize, usize) {
+    let mut total_with_headers = 0usize;
+    let mut total_raw_payload = 0usize;
+    for target_list in edge_lists {
+        if target_list.is_empty() {
+            continue;
+        }
+        let set = BitmapSet::from_values(BENCH_DOMAIN, target_list.iter().copied());
+        if let Ok(encoded_bytes) = set.encode() {
+            total_with_headers = total_with_headers.saturating_add(encoded_bytes.len());
+            total_raw_payload =
+                total_raw_payload.saturating_add(encoded_bytes.len().saturating_sub(21));
+        }
+    }
+    (total_with_headers, total_raw_payload)
 }
 
 // ---------------------------------------------------------------- reverse
-fn invert(lists: &[Vec<u32>], n: usize) -> Vec<Vec<u32>> {
-    let mut rev = vec![Vec::new(); n];
-    for (c, l) in lists.iter().enumerate() {
-        for &p in l {
-            rev[p as usize].push(c as u32);
+fn invert_edges(edge_lists: &[Vec<u32>], node_count: usize) -> Vec<Vec<u32>> {
+    let mut reversed = vec![Vec::new(); node_count];
+    for (child_index, target_list) in edge_lists.iter().enumerate() {
+        let child_short = u32::try_from(child_index).expect("fits in u32");
+        for &parent_short in target_list {
+            let parent_index = usize::try_from(parent_short).expect("fits in usize");
+            reversed[parent_index].push(child_short);
         }
     }
-    rev
+    reversed
 }
 
-/// R4/R5: reverse CSR keyed by parent chunk, children as varint gaps;
-/// parents with in-degree above `hub` move to a roaring bitmap instead.
-struct RevAdaptive {
-    csr: CsrGaps,
-    hubs: HashMap<u32, RoaringBitmap>,
-}
-struct CsrGaps {
+struct CsrGapStorage {
     chunks: Vec<(Vec<u32>, Vec<u8>)>,
 }
-impl RevAdaptive {
-    fn build(rev: &[Vec<u32>], hub: usize) -> Self {
-        let mut hubs = HashMap::new();
+
+struct AdaptiveReverseRezzy {
+    csr_storage: CsrGapStorage,
+    hub_bitmaps: HashMap<u32, BitmapSet>,
+}
+
+impl AdaptiveReverseRezzy {
+    fn build(reversed_lists: &[Vec<u32>], hub_threshold: usize) -> Self {
+        let mut hub_bitmaps = HashMap::new();
         let mut chunks = Vec::new();
-        for (ci, c) in rev.chunks(CHUNK).enumerate() {
-            let mut off = Vec::with_capacity(c.len() + 1);
-            let mut body = Vec::new();
-            for (j, l) in c.iter().enumerate() {
-                off.push(body.len() as u32);
-                let p = (ci * CHUNK + j) as u32;
-                if l.len() > hub {
-                    hubs.insert(p, l.iter().copied().collect::<RoaringBitmap>());
+
+        for (chunk_index, chunk_slice) in reversed_lists.chunks(CHUNK_SIZE).enumerate() {
+            let mut offsets = Vec::with_capacity(chunk_slice.len().saturating_add(1));
+            let mut payload = Vec::new();
+
+            for (offset_in_chunk, child_list) in chunk_slice.iter().enumerate() {
+                offsets.push(u32::try_from(payload.len()).expect("fits in u32"));
+                let parent_short = u32::try_from(
+                    chunk_index
+                        .saturating_mul(CHUNK_SIZE)
+                        .saturating_add(offset_in_chunk),
+                )
+                .expect("short fits in u32");
+
+                if child_list.len() > hub_threshold {
+                    let set = BitmapSet::from_values(BENCH_DOMAIN, child_list.iter().copied());
+                    hub_bitmaps.insert(parent_short, set);
                     continue;
                 }
-                let mut last = p;
-                for &x in l {
-                    put_varint(&mut body, x - last);
-                    last = x;
+
+                let mut last_child = parent_short;
+                for &child in child_list {
+                    let gap = child.saturating_sub(last_child);
+                    append_varint(&mut payload, gap);
+                    last_child = child;
                 }
             }
-            off.push(body.len() as u32);
-            chunks.push((off, body));
+            offsets.push(u32::try_from(payload.len()).expect("fits in u32"));
+            chunks.push((offsets, payload));
         }
-        Self { csr: CsrGaps { chunks }, hubs }
+
+        Self {
+            csr_storage: CsrGapStorage { chunks },
+            hub_bitmaps,
+        }
     }
-    fn bytes(&self) -> (usize, usize) {
-        // u32 offsets; a real layout could use u16 with a chunk base.
-        let a = self.csr.chunks.iter().map(|(o, b)| 4 * o.len() + b.len()).sum();
-        let h = self.hubs.values().map(RoaringBitmap::serialized_size).sum();
-        (a, h)
+
+    fn byte_breakdown(&self) -> (usize, usize) {
+        let csr_bytes: usize = self
+            .csr_storage
+            .chunks
+            .iter()
+            .map(|(offsets, payload)| {
+                offsets
+                    .len()
+                    .saturating_mul(4)
+                    .saturating_add(payload.len())
+            })
+            .sum();
+
+        let hub_bytes: usize = self
+            .hub_bitmaps
+            .values()
+            .map(|bitmap| bitmap.encode().map_or(0, |bytes| bytes.len()))
+            .sum();
+
+        (csr_bytes, hub_bytes)
     }
-    fn count(&self, p: u32) -> usize {
-        if let Some(b) = self.hubs.get(&p) {
-            return b.len() as usize;
+
+    fn count_children(&self, parent_short: u32) -> usize {
+        if let Some(bitmap) = self.hub_bitmaps.get(&parent_short) {
+            return usize::try_from(bitmap.len()).unwrap_or(0);
         }
-        let (o, b) = &self.csr.chunks[p as usize / CHUNK];
-        let i = p as usize % CHUNK;
-        let (mut at, end) = (o[i] as usize, o[i + 1] as usize);
-        let mut n = 0;
-        while at < end {
-            black_box(get_varint(b, &mut at));
-            n += 1;
+
+        let parent_usize = usize::try_from(parent_short).expect("fits in usize");
+        let (offsets, payload) = &self.csr_storage.chunks[parent_usize / CHUNK_SIZE];
+        let within_chunk = parent_usize % CHUNK_SIZE;
+        let mut cursor = usize::try_from(offsets[within_chunk]).expect("fits in usize");
+        let end_cursor =
+            usize::try_from(offsets[within_chunk.saturating_add(1)]).expect("fits in usize");
+
+        let mut child_count = 0usize;
+        while cursor < end_cursor {
+            black_box(read_varint(payload, &mut cursor));
+            child_count = child_count.saturating_add(1);
         }
-        n
+        child_count
     }
 }
 
-// ---------------------------------------------------------------- head/sealed WA
-/// Bytes written to persist a forward CSR-varint column when the head chunk
-/// is rewritten once per ingest batch and sealed at `head` events.
-fn forward_wa(lists: &[Vec<u32>], head: usize, batch: usize) -> (usize, usize) {
-    let mut written = 0usize;
-    let mut final_bytes = 0usize;
-    let mut cur = 0usize;
-    let mut in_head = 0usize;
-    for (s, l) in lists.iter().enumerate() {
-        let mut sz = 2; // u16 offset
-        let mut d: Vec<u32> = l.iter().map(|&p| s as u32 - p).collect();
-        d.sort_unstable();
-        let mut last = 0;
-        for x in d {
-            sz += varint_len(x - last);
-            last = x;
+// ---------------------------------------------------------------- write amplification
+fn measure_forward_wa(
+    edge_lists: &[Vec<u32>],
+    head_capacity: usize,
+    batch_size: usize,
+) -> (usize, usize) {
+    let mut total_written = 0usize;
+    let mut final_stored_bytes = 0usize;
+    let mut current_head_bytes = 0usize;
+    let mut events_in_head = 0usize;
+
+    for (event_index, target_list) in edge_lists.iter().enumerate() {
+        let base_short = u32::try_from(event_index).expect("fits in u32");
+        let mut entry_size = 2usize; // u16 offset
+
+        let mut deltas: Vec<u32> = target_list
+            .iter()
+            .map(|&parent| base_short.saturating_sub(parent))
+            .collect();
+        deltas.sort_unstable();
+
+        let mut last_delta = 0u32;
+        for delta in deltas {
+            entry_size = entry_size.saturating_add(varint_length(delta.saturating_sub(last_delta)));
+            last_delta = delta;
         }
-        cur += sz;
-        in_head += 1;
-        let batch_end = (s + 1) % batch == 0;
-        if batch_end || in_head == head {
-            written += cur; // rewrite the whole head
+
+        current_head_bytes = current_head_bytes.saturating_add(entry_size);
+        events_in_head = events_in_head.saturating_add(1);
+
+        let is_batch_flush = event_index.saturating_add(1).is_multiple_of(batch_size);
+        if is_batch_flush || events_in_head == head_capacity {
+            total_written = total_written.saturating_add(current_head_bytes);
         }
-        if in_head == head {
-            final_bytes += cur;
-            cur = 0;
-            in_head = 0;
+
+        if events_in_head == head_capacity {
+            final_stored_bytes = final_stored_bytes.saturating_add(current_head_bytes);
+            current_head_bytes = 0;
+            events_in_head = 0;
         }
     }
-    final_bytes += cur;
-    written += cur;
-    (written, final_bytes)
+
+    final_stored_bytes = final_stored_bytes.saturating_add(current_head_bytes);
+    total_written = total_written.saturating_add(current_head_bytes);
+    (total_written, final_stored_bytes)
 }
 
-/// Bytes written to persist reverse edges when every touched record is
-/// rewritten once per batch. Records: one CSR-gap record per 1024-parent
-/// chunk; parents above `hub` children get bitmap records split by
-/// child >> 16 (only the newest container moves).
-fn reverse_wa(lists: &[Vec<u32>], n: usize, hub: usize, batch: usize) -> (usize, usize) {
-    let mut deg = vec![0u32; n];
-    let mut last_child = vec![0u32; n];
-    let mut chunk_bytes = vec![0usize; n.div_ceil(CHUNK)];
-    let mut hub_sets: HashMap<(u32, u32), RoaringBitmap> = HashMap::new();
+fn measure_reverse_wa(
+    edge_lists: &[Vec<u32>],
+    node_count: usize,
+    hub_threshold: usize,
+    batch_size: usize,
+) -> (usize, usize) {
+    let mut in_degrees = vec![0u32; node_count];
+    let mut last_seen_child = vec![0u32; node_count];
+    let chunk_count = node_count.div_ceil(CHUNK_SIZE);
+    let mut chunk_body_bytes = vec![0usize; chunk_count];
+    let mut hub_bitmap_sets: HashMap<(u32, u32), BitmapSet> = HashMap::new();
     let mut touched_chunks: Vec<usize> = Vec::new();
     let mut touched_hubs: Vec<(u32, u32)> = Vec::new();
-    let mut written = 0usize;
-    for (c, l) in lists.iter().enumerate() {
-        let c = c as u32;
-        for &p in l {
-            let pi = p as usize;
-            deg[pi] += 1;
-            if deg[pi] as usize > hub {
-                let key = (p, c >> 16);
-                hub_sets.entry(key).or_default().insert(c);
-                if !touched_hubs.contains(&key) {
-                    touched_hubs.push(key);
+    let mut total_written = 0usize;
+
+    for (child_index, target_list) in edge_lists.iter().enumerate() {
+        let child_short = u32::try_from(child_index).expect("fits in u32");
+        for &parent_short in target_list {
+            let parent_index = usize::try_from(parent_short).expect("fits in usize");
+            in_degrees[parent_index] = in_degrees[parent_index].saturating_add(1);
+
+            if usize::try_from(in_degrees[parent_index]).expect("fits in usize") > hub_threshold {
+                let hub_key = (parent_short, child_short >> 16);
+                hub_bitmap_sets
+                    .entry(hub_key)
+                    .or_insert_with(|| BitmapSet::new(BENCH_DOMAIN))
+                    .insert(child_short);
+
+                if !touched_hubs.contains(&hub_key) {
+                    touched_hubs.push(hub_key);
                 }
             } else {
-                let gap = c - if deg[pi] == 1 { p } else { last_child[pi] };
-                chunk_bytes[pi / CHUNK] += varint_len(gap);
-                last_child[pi] = c;
-                if !touched_chunks.contains(&(pi / CHUNK)) {
-                    touched_chunks.push(pi / CHUNK);
+                let last = if in_degrees[parent_index] == 1 {
+                    parent_short
+                } else {
+                    last_seen_child[parent_index]
+                };
+                let gap = child_short.saturating_sub(last);
+                let chunk_idx = parent_index / CHUNK_SIZE;
+                chunk_body_bytes[chunk_idx] =
+                    chunk_body_bytes[chunk_idx].saturating_add(varint_length(gap));
+                last_seen_child[parent_index] = child_short;
+
+                if !touched_chunks.contains(&chunk_idx) {
+                    touched_chunks.push(chunk_idx);
                 }
             }
         }
-        if (c as usize + 1) % batch == 0 {
-            for &k in &touched_chunks {
-                written += chunk_bytes[k] + 4 * (CHUNK + 1);
+
+        if child_index.saturating_add(1).is_multiple_of(batch_size) {
+            for &chunk_idx in &touched_chunks {
+                let chunk_overhead = 4usize.saturating_mul(CHUNK_SIZE.saturating_add(1));
+                total_written = total_written
+                    .saturating_add(chunk_body_bytes[chunk_idx])
+                    .saturating_add(chunk_overhead);
             }
-            for k in &touched_hubs {
-                written += hub_sets[k].serialized_size();
+            for hub_key in &touched_hubs {
+                let size = hub_bitmap_sets[hub_key]
+                    .encode()
+                    .map_or(0, |bytes| bytes.len());
+                total_written = total_written.saturating_add(size);
             }
             touched_chunks.clear();
             touched_hubs.clear();
         }
     }
-    let final_bytes = chunk_bytes.iter().map(|b| b + 4 * (CHUNK + 1)).sum::<usize>()
-        + hub_sets.values().map(RoaringBitmap::serialized_size).sum::<usize>();
-    (written, final_bytes)
-}
 
-// ---------------------------------------------------------------- timing
-fn ns_per<F: FnMut(u32)>(queries: &[u32], mut f: F) -> f64 {
-    let t = Instant::now();
-    for &q in queries {
-        f(q);
-    }
-    t.elapsed().as_nanos() as f64 / queries.len() as f64
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
-    let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0x5EED);
-    let room = gen_room(n, seed);
-    let rel_fwd: Vec<Vec<u32>> = room
-        .rel
+    let final_csr_bytes: usize = chunk_body_bytes
         .iter()
-        .map(|r| r.map(|(p, _)| vec![p]).unwrap_or_default())
+        .map(|&body| body.saturating_add(4usize.saturating_mul(CHUNK_SIZE.saturating_add(1))))
+        .sum();
+
+    let final_hub_bytes: usize = hub_bitmap_sets
+        .values()
+        .map(|bitmap| bitmap.encode().map_or(0, |bytes| bytes.len()))
+        .sum();
+
+    let final_total = final_csr_bytes.saturating_add(final_hub_bytes);
+    (total_written, final_total)
+}
+
+// ---------------------------------------------------------------- timing helper
+fn measure_lookup_nanos<F: FnMut(u32)>(query_sample: &[u32], mut lookup_fn: F) -> f64 {
+    let timer = Instant::now();
+    for &query_id in query_sample {
+        lookup_fn(query_id);
+    }
+    let elapsed_nanos = timer.elapsed().as_nanos();
+    let sample_count = query_sample.len().max(1);
+    num(u64::try_from(elapsed_nanos).unwrap_or(u64::MAX)) / len_f64(sample_count)
+}
+
+// ---------------------------------------------------------------- runner subroutines
+fn run_forward_bench(family_name: &str, edge_lists: &[Vec<u32>], queries: &[u32]) {
+    let edge_count: usize = edge_lists.iter().map(Vec::len).sum();
+    let nonempty_lists = edge_lists.iter().filter(|list| !list.is_empty()).count();
+
+    let print_row = |codec_name: &str,
+                     tuple_count: usize,
+                     payload_bytes: usize,
+                     lookup_nanos: f64| {
+        let total_bytes =
+            payload_bytes.saturating_add(tuple_count.saturating_mul(TUPLE_OVERHEAD_BYTES));
+        let divisor = len_f64(edge_count.max(1));
+        let payload_per_edge = len_f64(payload_bytes) / divisor;
+        let total_per_edge = len_f64(total_bytes) / divisor;
+        println!(
+            "{family_name}\t{codec_name}\t{edge_count}\t{tuple_count}\t{payload_bytes}\t{payload_per_edge:.2}\t{total_per_edge:.2}\t{lookup_nanos:.1}"
+        );
+    };
+
+    // 1. Point tuple per event
+    let point_tuple_payload = edge_count.saturating_mul(4);
+    let ns_point_tuple = measure_lookup_nanos(queries, |short_id| {
+        let index = usize::try_from(short_id).expect("fits in usize");
+        black_box(edge_lists[index].as_slice());
+    });
+    print_row(
+        "tuple_per_event_u32",
+        nonempty_lists,
+        point_tuple_payload,
+        ns_point_tuple,
+    );
+
+    // 2. CSR raw u32
+    let csr_raw = CsrRawForward::build(edge_lists);
+    let ns_csr_raw = measure_lookup_nanos(queries, |short_id| {
+        black_box(csr_raw.lookup(short_id));
+    });
+    print_row(
+        "csr_raw_u32_c1024",
+        csr_raw.chunks.len(),
+        csr_raw.total_bytes(),
+        ns_csr_raw,
+    );
+
+    // 3. CSR varint delta
+    let csr_varint = CsrVarintForward::build(edge_lists);
+    let mut decode_buffer = Vec::new();
+    let ns_csr_varint = measure_lookup_nanos(queries, |short_id| {
+        csr_varint.lookup(short_id, &mut decode_buffer);
+        black_box(&decode_buffer);
+    });
+    print_row(
+        "csr_varint_delta_c1024",
+        csr_varint.chunks.len(),
+        csr_varint.total_bytes(),
+        ns_csr_varint,
+    );
+
+    // 4. Rezzy BitmapSet per event (with 21-byte header)
+    let (rezzy_bytes_hdr, rezzy_bytes_raw) = rezzy_bitmap_sets_bytes(edge_lists);
+    print_row(
+        "rezzy_bmps_per_event",
+        nonempty_lists,
+        rezzy_bytes_hdr,
+        f64::NAN,
+    );
+    print_row(
+        "rezzy_raw_per_event",
+        nonempty_lists,
+        rezzy_bytes_raw,
+        f64::NAN,
+    );
+}
+
+fn run_reverse_bench(
+    family_name: &str,
+    edge_lists: &[Vec<u32>],
+    node_count: usize,
+    queries: &[u32],
+) {
+    let reversed = invert_edges(edge_lists, node_count);
+    let edge_count: usize = reversed.iter().map(Vec::len).sum();
+    let parent_count = reversed.iter().filter(|list| !list.is_empty()).count();
+    let valid_queries: Vec<u32> = queries
+        .iter()
+        .copied()
+        .filter(|&parent| {
+            let parent_idx = usize::try_from(parent).expect("fits in usize");
+            !reversed[parent_idx].is_empty()
+        })
         .collect();
 
-    let mut q = Rng(seed ^ 0xABCD);
-    let queries: Vec<u32> = (0..200_000).map(|_| 2 + q.below(n as u64 - 2) as u32).collect();
+    let divisor = len_f64(edge_count.max(1));
 
-    println!("events\t{n}");
-    // assumed point-tuple overhead: ~40 B frame (header + collection/logical id)
-    // + 23 B sidecar/run entry. Verify against the packfile frame format.
-    const TUPLE: usize = 63;
+    // 1. Point tuple per parent
+    let tuple_payload = edge_count.saturating_mul(4);
+    let tuple_total =
+        tuple_payload.saturating_add(parent_count.saturating_mul(TUPLE_OVERHEAD_BYTES));
+    println!(
+        "{family_name}\ttuple_per_parent_u32\t{edge_count}\t{parent_count}\t0\t{parent_count}\t{tuple_payload}\t{:.2}\t{:.2}\t-\t-",
+        len_f64(tuple_payload) / divisor,
+        len_f64(tuple_total) / divisor
+    );
 
-    println!("\n# forward\nfamily\tencoding\tedges\ttuples\tpayload_B\tB_per_edge\tB_per_edge_incl_tuples\tlookup_ns");
-    for (name, lists) in [("prev", &room.prev), ("auth", &room.auth), ("rel", &rel_fwd)] {
-        let edges: usize = lists.iter().map(Vec::len).sum();
-        let nonempty = lists.iter().filter(|l| !l.is_empty()).count();
-        let row = |enc: &str, tuples: usize, payload: usize, ns: f64| {
-            println!(
-                "{name}\t{enc}\t{edges}\t{tuples}\t{payload}\t{:.2}\t{:.2}\t{:.1}",
-                payload as f64 / edges as f64,
-                (payload + tuples * TUPLE) as f64 / edges as f64,
-                ns
-            );
+    // 2. Rezzy BitmapSet per parent
+    let (rezzy_hdr, _) = rezzy_bitmap_sets_bytes(&reversed);
+    let rezzy_total = rezzy_hdr.saturating_add(parent_count.saturating_mul(TUPLE_OVERHEAD_BYTES));
+    println!(
+        "{family_name}\trezzy_per_parent\t{edge_count}\t{parent_count}\t0\t{parent_count}\t{rezzy_hdr}\t{:.2}\t{:.2}\t-\t-",
+        len_f64(rezzy_hdr) / divisor,
+        len_f64(rezzy_total) / divisor
+    );
+
+    // 3. Adaptive reverse with Rezzy BitmapSet for hubs
+    for &hub_threshold in &[usize::MAX, 4096, 256] {
+        let adaptive = AdaptiveReverseRezzy::build(&reversed, hub_threshold);
+        let (csr_bytes, hub_bytes) = adaptive.byte_breakdown();
+        let payload_bytes = csr_bytes.saturating_add(hub_bytes);
+        let tuple_count = adaptive
+            .csr_storage
+            .chunks
+            .len()
+            .saturating_add(adaptive.hub_bitmaps.len());
+        let total_bytes =
+            payload_bytes.saturating_add(tuple_count.saturating_mul(TUPLE_OVERHEAD_BYTES));
+
+        let ns_scan = measure_lookup_nanos(&valid_queries, |parent_short| {
+            black_box(adaptive.count_children(parent_short));
+        });
+
+        let ns_hub = if !edge_lists.is_empty() && family_name == "auth" {
+            let hub_queries: Vec<u32> = vec![0; 200];
+            measure_lookup_nanos(&hub_queries, |parent_short| {
+                black_box(adaptive.count_children(parent_short));
+            })
+        } else {
+            f64::NAN
         };
-        // F1: per-event tuple holding u32 shorts (MatrixAdjacency shape)
-        let f1 = edges * 4;
-        let ns1 = ns_per(&queries, |s| {
-            black_box(lists[s as usize].as_slice());
-        });
-        row("tuple_per_event_u32", nonempty, f1, ns1);
 
-        let raw = CsrRaw::build(lists);
-        let nsr = ns_per(&queries, |s| {
-            black_box(raw.get(s));
-        });
-        row("csr_raw_u32_c1024", raw.chunks.len(), raw.bytes(), nsr);
+        let label = if hub_threshold == usize::MAX {
+            "csr_gap_varint_c1024".to_owned()
+        } else {
+            format!("rezzy_adaptive_hub>{hub_threshold}")
+        };
 
-        let var = CsrVar::build(lists);
-        let mut buf = Vec::new();
-        let nsv = ns_per(&queries, |s| {
-            var.get(s, &mut buf);
-            black_box(&buf);
-        });
-        row("csr_varint_delta_c1024", var.chunks.len(), var.bytes(), nsv);
-
-        let r2 = Roaring2d::build(lists);
-        let ns2 = ns_per(&queries, |s| {
-            r2.get(s, &mut buf);
-            black_box(&buf);
-        });
-        row("roaring_2d_c1024", r2.chunks.len(), r2.bytes(), ns2);
-
-        let rp = roaring_per_list_bytes(lists);
-        row("roaring_per_event", nonempty, rp, f64::NAN);
-    }
-
-    println!("\n# reverse (children-of)\nfamily\tencoding\tedges\tparents\thubs\ttuples\tpayload_B\tB_per_edge\tB_per_edge_incl_tuples\tlookup_ns\thub_lookup_ns");
-    for (name, lists) in [("prev", &room.prev), ("auth", &room.auth), ("rel", &rel_fwd)] {
-        let rev = invert(lists, n);
-        let edges: usize = rev.iter().map(Vec::len).sum();
-        let parents = rev.iter().filter(|l| !l.is_empty()).count();
-        let pq: Vec<u32> = queries.iter().copied().filter(|&p| !rev[p as usize].is_empty()).collect();
-
-        // per-parent tuple (u32 child list), i.e. one record per parent
-        let f1 = edges * 4;
         println!(
-            "{name}\ttuple_per_parent_u32\t{edges}\t{parents}\t0\t{parents}\t{f1}\t{:.2}\t{:.2}\t-\t-",
-            f1 as f64 / edges as f64,
-            (f1 + parents * TUPLE) as f64 / edges as f64
+            "{family_name}\t{label}\t{edge_count}\t{parent_count}\t{}\t{tuple_count}\t{payload_bytes}\t{:.2}\t{:.2}\t{ns_scan:.1}\t{ns_hub:.0}",
+            adaptive.hub_bitmaps.len(),
+            len_f64(payload_bytes) / divisor,
+            len_f64(total_bytes) / divisor
         );
-        // per-parent roaring bitmap record
-        let rpb = roaring_per_list_bytes(&rev);
-        println!(
-            "{name}\troaring_per_parent\t{edges}\t{parents}\t0\t{parents}\t{rpb}\t{:.2}\t{:.2}\t-\t-",
-            rpb as f64 / edges as f64,
-            (rpb + parents * TUPLE) as f64 / edges as f64
-        );
-        for hub in [usize::MAX, 4096, 256] {
-            let ra = RevAdaptive::build(&rev, hub);
-            let (a, h) = ra.bytes();
-            let tuples = ra.csr.chunks.len() + ra.hubs.len();
-            let ns = ns_per(&pq, |p| {
-                black_box(ra.count(p));
-            });
-            let hub_ns = if lists.len() > 0 && name == "auth" {
-                let hq: Vec<u32> = vec![0; 200];
-                ns_per(&hq, |p| {
-                    black_box(ra.count(p));
-                })
-            } else {
-                f64::NAN
-            };
-            let label = if hub == usize::MAX {
-                "csr_gap_varint_c1024".to_string()
-            } else {
-                format!("adaptive_hub>{hub}")
-            };
-            println!(
-                "{name}\t{label}\t{edges}\t{parents}\t{}\t{tuples}\t{}\t{:.2}\t{:.2}\t{ns:.1}\t{hub_ns:.0}",
-                ra.hubs.len(),
-                a + h,
-                (a + h) as f64 / edges as f64,
-                (a + h + tuples * TUPLE) as f64 / edges as f64
-            );
-        }
     }
+}
 
+fn run_write_amplification_bench(room: &RoomGraph, event_count: usize, relations_fwd: &[Vec<u32>]) {
     println!("\n# head/sealed write amplification (bytes written / final bytes)");
     println!("family\tside\thead_or_hub\tbatch\twritten_B\tfinal_B\tWA");
-    for (name, lists) in [("prev", &room.prev), ("auth", &room.auth)] {
-        for head in [64, 256, 1024] {
-            for batch in [1, 16, 128] {
-                let (w, f) = forward_wa(lists, head, batch);
-                println!("{name}\tforward\thead={head}\t{batch}\t{w}\t{f}\t{:.1}", w as f64 / f as f64);
+
+    for (family_name, edge_lists) in [("prev", &room.prev), ("auth", &room.auth)] {
+        for &head_cap in &[64usize, 256, 1024] {
+            for &batch_sz in &[1usize, 16, 128] {
+                let (written, final_sz) = measure_forward_wa(edge_lists, head_cap, batch_sz);
+                let wa = len_f64(written) / len_f64(final_sz.max(1));
+                println!("{family_name}\tforward\thead={head_cap}\t{batch_sz}\t{written}\t{final_sz}\t{wa:.1}");
             }
         }
     }
-    for (name, lists) in [("prev", &room.prev), ("auth", &room.auth), ("rel", &rel_fwd)] {
-        for batch in [1, 16, 128] {
-            let (w, f) = reverse_wa(lists, n, 4096, batch);
-            println!("{name}\treverse\thub>4096\t{batch}\t{w}\t{f}\t{:.1}", w as f64 / f as f64);
+
+    for (family_name, edge_lists) in [
+        ("prev", room.prev.as_slice()),
+        ("auth", room.auth.as_slice()),
+        ("rel", relations_fwd),
+    ] {
+        for &batch_sz in &[1usize, 16, 128] {
+            let (written, final_sz) = measure_reverse_wa(edge_lists, event_count, 4096, batch_sz);
+            let wa = len_f64(written) / len_f64(final_sz.max(1));
+            println!(
+                "{family_name}\treverse\thub>4096\t{batch_sz}\t{written}\t{final_sz}\t{wa:.1}"
+            );
         }
     }
+}
+
+// ---------------------------------------------------------------- main entry
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let event_count: usize = args
+        .get(1)
+        .and_then(|arg_str| arg_str.parse().ok())
+        .unwrap_or(1_000_000);
+    let random_seed: u64 = args
+        .get(2)
+        .and_then(|arg_str| arg_str.parse().ok())
+        .unwrap_or(0x5EED);
+
+    let room = generate_room(event_count, random_seed);
+    let relations_forward: Vec<Vec<u32>> = room
+        .relations
+        .iter()
+        .map(|rel_opt| rel_opt.map(|(parent, _)| vec![parent]).unwrap_or_default())
+        .collect();
+
+    let mut query_rng = PseudoRng(random_seed ^ 0xABCD);
+    let max_query_bound = u64::try_from(event_count)
+        .expect("fits in u64")
+        .saturating_sub(2);
+    let query_sample: Vec<u32> = (0..200_000)
+        .map(|_| {
+            let offset = u32::try_from(query_rng.below(max_query_bound)).expect("fits in u32");
+            2u32.saturating_add(offset)
+        })
+        .collect();
+
+    println!("events\t{event_count}");
+    println!("\n# forward\nfamily\tencoding\tedges\ttuples\tpayload_B\tB_per_edge\tB_per_edge_incl_tuples\tlookup_ns");
+    for (family_name, edge_lists) in [
+        ("prev", &room.prev),
+        ("auth", &room.auth),
+        ("rel", &relations_forward),
+    ] {
+        run_forward_bench(family_name, edge_lists, &query_sample);
+    }
+
+    println!("\n# reverse (children-of)\nfamily\tencoding\tedges\tparents\thubs\ttuples\tpayload_B\tB_per_edge\tB_per_edge_incl_tuples\tlookup_ns\thub_lookup_ns");
+    for (family_name, edge_lists) in [
+        ("prev", &room.prev),
+        ("auth", &room.auth),
+        ("rel", &relations_forward),
+    ] {
+        run_reverse_bench(family_name, edge_lists, event_count, &query_sample);
+    }
+
+    run_write_amplification_bench(&room, event_count, &relations_forward);
 }

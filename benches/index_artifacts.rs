@@ -93,7 +93,9 @@ fn usize_f64(value: usize) -> f64 {
 }
 
 fn mib_f64(bytes: u64) -> f64 {
-    bytes as f64 / (1_u64 << 20) as f64
+    let high = u32::try_from(bytes >> 32).unwrap_or(u32::MAX);
+    let low = u32::try_from(bytes & 0xFFFF_FFFF).unwrap_or(u32::MAX);
+    (f64::from(high) * 4_294_967_296.0 + f64::from(low)) / 1_048_576.0
 }
 
 fn sample_index(seed: u64, count: u64) -> u64 {
@@ -463,7 +465,7 @@ fn build(dir: &Path, target: u64, mixed: bool) -> u64 {
     while written < target {
         let len = if mixed {
             add_usize(
-                usize::try_from(mix(seq ^ 77) % (64_u64 << 10)).expect("len"),
+                usize::try_from(mix(seq ^ 0x4d) % (64_u64 << 10)).expect("len"),
                 1,
             )
         } else {
@@ -966,9 +968,9 @@ fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
         (Some((anon_before, file_before)), Some((anon_after, file_after))) => {
             let delta = |after: u64, before: u64| {
                 if after >= before {
-                    mib_f64(after - before)
+                    mib_f64(sub_u64(after, before))
                 } else {
-                    -mib_f64(before - after)
+                    -mib_f64(sub_u64(before, after))
                 }
             };
             println!(

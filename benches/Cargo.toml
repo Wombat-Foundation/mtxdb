@@ -211,3 +211,8 @@ harness = false
 name = "edge_layout_sithnapse"
 path = "edge_layout_sithnapse.rs"
 harness = false
+
+[[bench]]
+name = "edge_codec_bench"
+path = "edge_codec_bench.rs"
+harness = false

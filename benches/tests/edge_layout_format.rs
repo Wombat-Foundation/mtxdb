@@ -192,7 +192,11 @@ mod tests {
     #[test]
     fn a_hash_absent_from_every_run_is_a_miss() {
         let index = Index::build(&[&["$c1", "$a"]]);
-        assert_eq!(index.candidates("$zzz"), [] as [u32; 0]);
+        assert_eq!(
+            index.candidates("$zzz"),
+            Vec::<u32>::new(),
+            "candidate list must be empty"
+        );
         assert_eq!(index.lookup("$zzz"), Ok(None));
     }
 

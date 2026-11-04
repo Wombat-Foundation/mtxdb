@@ -218,7 +218,8 @@ impl Proto {
             for entry in record
                 .get(8..)
                 .unwrap_or_default()
-                .as_chunks::<{ format::RUN_ENTRY }>().0
+                .as_chunks::<{ format::RUN_ENTRY }>()
+                .0
             {
                 let hash: [u8; 16] = entry[..16].try_into().expect("hash");
                 all.push((hash, be32(entry, 16).expect("id")));
