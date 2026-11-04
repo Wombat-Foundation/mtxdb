@@ -13762,9 +13762,13 @@ fn paged_run_install_rechecks_pack_identity_under_the_locks() {
     let store = paged_open(&dir);
     store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
     let plan = store.plan_run_merge().expect("a planned merge");
-    let built = build_planned_run(store.shards.base_dir(), &plan)
-        .unwrap()
-        .expect("a non-empty run");
+    let built = build_planned_run(
+        store.shards.base_dir(),
+        &plan,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap()
+    .expect("a non-empty run");
     let path = built.path.clone();
     let by_pack: HashMap<PackId, (u16, PathBuf)> = store
         .shards
