@@ -30,7 +30,6 @@ fjall = "2.11.2"
 libmdbx = "0.6"
 base64 = "0.22"
 mtxdb = { path = "..", features = ["reconcile"] }
-roaring = "0.10"
 rusqlite = "0.32"
 
 [target.'cfg(windows)'.dependencies]
