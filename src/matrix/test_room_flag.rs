@@ -650,7 +650,9 @@ mod tests {
 
         // Checked constructor bounds
         for i in 0..=191 {
-            assert_eq!(Flag::custom(i), Some(Flag::Custom(i)));
+            let flag = Flag::custom(i).expect("index within bounds");
+            assert_eq!(flag.to_byte(), 64_u8 + i);
+            assert_eq!(Flag::from_byte(64_u8 + i), Some(flag));
         }
         assert_eq!(Flag::custom(192), None);
         assert_eq!(Flag::custom(255), None);
@@ -680,7 +682,7 @@ mod tests {
 
         // Custom flags byte mapping (64..=255)
         for i in 0..=191 {
-            let custom_flag = Flag::Custom(i);
+            let custom_flag = Flag::custom(i).unwrap();
             let byte = 64_u8.saturating_add(i);
             assert_eq!(custom_flag.to_byte(), byte);
             assert_eq!(Flag::from_byte(byte), Some(custom_flag));

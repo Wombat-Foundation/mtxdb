@@ -44,6 +44,30 @@ pub struct FlagMeta {
     pub max_short_id: u32,
 }
 
+/// A validated custom flag identifier with an index in `0..=191`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CustomFlag(u8);
+
+impl CustomFlag {
+    /// Construct a custom flag index in `0..=191`.
+    ///
+    /// Returns `None` if `index > Flag::MAX_CUSTOM`.
+    #[must_use]
+    pub const fn new(index: u8) -> Option<Self> {
+        if index <= Flag::MAX_CUSTOM {
+            Some(Self(index))
+        } else {
+            None
+        }
+    }
+
+    /// The custom flag index (`0..=191`).
+    #[must_use]
+    pub const fn index(self) -> u8 {
+        self.0
+    }
+}
+
 /// Event properties and dispositions tracked by [`RoomFlagIndex`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Flag {
@@ -60,7 +84,7 @@ pub enum Flag {
     /// The event was redacted.
     Redacted,
     /// Caller-defined flag (values 0..=191).
-    Custom(u8),
+    Custom(CustomFlag),
 }
 
 impl Flag {
@@ -72,8 +96,8 @@ impl Flag {
     /// Returns `None` if `index > MAX_CUSTOM`.
     #[must_use]
     pub const fn custom(index: u8) -> Option<Self> {
-        if index <= Self::MAX_CUSTOM {
-            Some(Self::Custom(index))
+        if let Some(flag) = CustomFlag::new(index) {
+            Some(Self::Custom(flag))
         } else {
             None
         }
@@ -89,14 +113,7 @@ impl Flag {
             Self::Rejected => 3,
             Self::SoftFailed => 4,
             Self::Redacted => 5,
-            Self::Custom(b) => {
-                let clamped = if b > Self::MAX_CUSTOM {
-                    Self::MAX_CUSTOM
-                } else {
-                    b
-                };
-                64_u8.saturating_add(clamped)
-            }
+            Self::Custom(flag) => 64_u8.saturating_add(flag.index()),
         }
     }
 
@@ -113,7 +130,13 @@ impl Flag {
             4 => Some(Self::SoftFailed),
             5 => Some(Self::Redacted),
             6..=63 => None,
-            64..=255 => Some(Self::Custom(b.saturating_sub(64))),
+            64..=255 => {
+                if let Some(flag) = CustomFlag::new(b.saturating_sub(64)) {
+                    Some(Self::Custom(flag))
+                } else {
+                    None
+                }
+            }
         }
     }
 
