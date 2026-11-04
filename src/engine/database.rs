@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config::RuntimeConfig;
 use crate::journal::{
     CommitReceipt, Journal, JournalCoordinator, SharedWalLock, StagedLookup, TxnStage,
     TxnStageState,
@@ -763,7 +764,20 @@ impl Database {
     /// Returns an error if the root lock is held, the shared segment cannot be
     /// opened, or any pool cannot be opened or attached.
     pub fn open(root: PathBuf) -> Result<Self, StorageError> {
-        Self::open_with_policies(root, PoolPolicies::default())
+        Self::open_with_config(root, RuntimeConfig::default())
+    }
+
+    /// Open `root` with explicit runtime settings.
+    ///
+    /// Callers that want environment defaults pass [`RuntimeConfig::from_env`]
+    /// here. The config is validated before the root lock or WAL is touched, so
+    /// an unsupported residency cannot modify on-disk state before failing.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid config, if the root lock is held, or if
+    /// any pool cannot be opened or attached.
+    pub fn open_with_config(root: PathBuf, config: RuntimeConfig) -> Result<Self, StorageError> {
+        Self::open_with_policies_and_config(root, PoolPolicies::default(), config)
     }
 
     /// Open `root` for writing through one shared WAL with explicit per-pool policies.
@@ -772,15 +786,45 @@ impl Database {
     /// exist. This blocks with `WouldBlock` if another live process holds the
     /// root writer lock.
     ///
+    /// Explicit policies are used as-is; environment defaults are not
+    /// consulted. Use [`Self::open_with_config`] for environment-driven
+    /// defaults.
+    ///
     /// # Errors
     /// Returns an error if the root lock is held, the shared segment cannot be
     /// opened, or any pool cannot be opened or attached.
     pub fn open_with_policies(root: PathBuf, policies: PoolPolicies) -> Result<Self, StorageError> {
-        Self::open_with_policies_and_stage_limit(
-            root,
-            policies,
-            crate::journal::MAX_TXN_STAGE_BYTES,
-        )
+        Self::open_with_policies_and_config(root, policies, RuntimeConfig::default())
+    }
+
+    /// Open with explicit policies and runtime settings.
+    ///
+    /// A `Some` index residency in `config` overrides every pool's policy.
+    /// Paged residency is rejected before any I/O because shared-WAL
+    /// journaling cannot advance durable coverage from a paged sync.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid config, unsupported residency, if the
+    /// root lock is held, or if any pool cannot be opened or attached.
+    pub fn open_with_policies_and_config(
+        root: PathBuf,
+        mut policies: PoolPolicies,
+        config: RuntimeConfig,
+    ) -> Result<Self, StorageError> {
+        config.validate_for_database()?;
+        if let Some(residency) = config.index_residency {
+            for shard in ShardType::ALL {
+                policies.for_shard_mut(shard).index_residency = residency;
+            }
+        }
+        for shard in ShardType::ALL {
+            if policies.for_shard(shard).index_residency == crate::index::IndexResidency::Paged {
+                return Err(StorageError::Unsupported(format!(
+                    "{shard:?} uses Paged index residency, which cannot use shared WAL journaling; use Resident residency"
+                )));
+            }
+        }
+        Self::open_with_policies_and_config_unchecked(root, policies, config)
     }
 
     #[cfg(test)]
@@ -788,13 +832,17 @@ impl Database {
         root: PathBuf,
         limit_bytes: usize,
     ) -> Result<Self, StorageError> {
-        Self::open_with_policies_and_stage_limit(root, PoolPolicies::default(), limit_bytes)
+        let config = RuntimeConfig {
+            txn_stage_limit_bytes: limit_bytes,
+            ..RuntimeConfig::default()
+        };
+        Self::open_with_config(root, config)
     }
 
-    fn open_with_policies_and_stage_limit(
+    fn open_with_policies_and_config_unchecked(
         root: PathBuf,
         policies: PoolPolicies,
-        txn_stage_limit_bytes: usize,
+        config: RuntimeConfig,
     ) -> Result<Self, StorageError> {
         let layout = DatabaseLayout::open(root)?;
         let wal_path = layout.shared_wal_path();
@@ -809,10 +857,12 @@ impl Database {
             let policy = policies.for_shard(shard);
             let store = PackfileStorage::open_shared_member(
                 dir,
+                config.cache_capacity,
                 policy.compress,
                 policy.checksum_policy,
                 policy.index_residency,
             )?;
+            store.set_stats_enabled(config.stats_enabled);
             // This process holds the exclusive WAL lock, so its in-memory
             // index is authoritative and a negative lookup is a true miss.
             // Left on, every miss after a sync (which moves the durable
@@ -867,7 +917,7 @@ impl Database {
             layout,
             coordinator,
             pools,
-            txn_stage_limit_bytes,
+            txn_stage_limit_bytes: config.txn_stage_limit_bytes,
             recovery_queue: parking_lot::Mutex::new(Vec::new()),
             recovery_lifecycle: parking_lot::Mutex::new(()),
             commit_phases: CommitPhases::default(),
@@ -879,6 +929,12 @@ impl Database {
     #[must_use]
     pub fn layout(&self) -> &DatabaseLayout {
         &self.layout
+    }
+
+    /// Maximum charged payload one transaction may stage on this database.
+    #[must_use]
+    pub fn txn_stage_limit_bytes(&self) -> usize {
+        self.txn_stage_limit_bytes
     }
 
     /// The one coordinator every pool publishes through.

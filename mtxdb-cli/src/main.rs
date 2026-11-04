@@ -15,6 +15,14 @@ use clap::{Arg, ArgAction, Command};
 use mtxdb::{ReadPlanPolicy, ShardType};
 
 static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+/// Parsed once from `MTXDB_*` in `main`. Tests that call `cmd::run` directly
+/// fall back to the library defaults instead of reading the ambient
+/// environment.
+static RUNTIME_CONFIG: OnceLock<mtxdb::RuntimeConfig> = OnceLock::new();
+
+pub(crate) fn runtime_config() -> &'static mtxdb::RuntimeConfig {
+    RUNTIME_CONFIG.get_or_init(mtxdb::RuntimeConfig::default)
+}
 
 fn shard_type_from_arg(value: &str) -> Option<ShardType> {
     match value {
@@ -1554,6 +1562,15 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     }
+    let runtime_config = match mtxdb::RuntimeConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let _ = RUNTIME_CONFIG.set(runtime_config);
+
     match cmd::run(&cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {

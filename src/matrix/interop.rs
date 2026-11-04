@@ -793,13 +793,11 @@ pub fn commit_state_batches<'a>(
         }
         Ok(())
     }
-    if batch_bytes == 0 || batch_bytes > crate::journal::MAX_TXN_STAGE_BYTES {
+    let stage_limit = db.txn_stage_limit_bytes();
+    if batch_bytes == 0 || batch_bytes > stage_limit {
         return Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!(
-                "state batch budget must be in 1..={} bytes",
-                crate::journal::MAX_TXN_STAGE_BYTES
-            ),
+            format!("state batch budget must be in 1..={stage_limit} bytes"),
         )));
     }
     let mut committed = 0_usize;

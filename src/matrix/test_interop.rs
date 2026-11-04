@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn state_batch_budget_respects_the_configured_stage_limit() {
+    let dir =
+        std::env::temp_dir().join(format!("mtxdb-interop-stage-limit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = crate::RuntimeConfig {
+        txn_stage_limit_bytes: 512,
+        ..crate::RuntimeConfig::default()
+    };
+    let db = crate::Database::open_with_config(dir.clone(), config).unwrap();
+    let room = b"!room:example.com";
+    let stat = room_state_collection_id(room);
+    let payload = [0x11_u8; 100];
+    let node = state_hamt_node_id(&[0x22_u8; 32]);
+
+    let error = commit_state_batches(&db, [(stat, node, payload.as_slice())], [], 1024)
+        .expect_err("the requested batch exceeds the configured stage limit");
+    assert!(
+        error.to_string().contains("1..=512"),
+        "unexpected error: {error}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn derive_id_separates_domains_and_is_stable() {
     assert_eq!(derive_id(b"event", b"x"), derive_id(b"event", b"x"));
     assert_ne!(derive_id(b"event", b"x"), derive_id(b"root", b"x"));

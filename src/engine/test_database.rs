@@ -1,4 +1,6 @@
-use super::{Database, DatabaseTransaction, TransactionOverlayGuard};
+use super::{Database, DatabaseTransaction, PoolPolicies, PoolPolicy, TransactionOverlayGuard};
+use crate::config::RuntimeConfig;
+use crate::index::IndexResidency;
 use crate::journal::Journal;
 use crate::layout::ShardType;
 use crate::packfile::storage::PackfileStorage;
@@ -10,6 +12,58 @@ fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("mtxdb-shared-db-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
+}
+
+#[test]
+fn paged_residency_is_rejected_before_the_root_is_created() {
+    let root = test_root("config-paged-before-io");
+    let config = RuntimeConfig {
+        index_residency: Some(IndexResidency::Paged),
+        ..RuntimeConfig::default()
+    };
+    let Err(error) = Database::open_with_config(root.clone(), config) else {
+        panic!("paged residency must be rejected");
+    };
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("paged"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !root.exists(),
+        "validation must run before the layout creates the root"
+    );
+}
+
+#[test]
+fn a_paged_pool_policy_is_rejected_before_the_root_is_created() {
+    let root = test_root("policy-paged-before-io");
+    let policy = PoolPolicy {
+        index_residency: IndexResidency::Paged,
+        ..PoolPolicy::default()
+    };
+    let error = match Database::open_with_policies(root.clone(), PoolPolicies::uniform(policy)) {
+        Ok(_) => panic!("paged residency must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("paged"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !root.exists(),
+        "validation must run before the layout creates the root"
+    );
+}
+
+#[test]
+fn configured_transaction_stage_limit_is_visible_on_the_database() {
+    let root = test_root("config-stage-limit");
+    let config = RuntimeConfig {
+        txn_stage_limit_bytes: 1 << 20,
+        ..RuntimeConfig::default()
+    };
+    let db = Database::open_with_config(root, config).unwrap();
+    assert_eq!(db.txn_stage_limit_bytes(), 1 << 20);
 }
 
 fn prepare_partial_materialization(

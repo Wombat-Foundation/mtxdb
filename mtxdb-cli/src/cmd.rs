@@ -629,7 +629,7 @@ const SUBPROCESS_RECORD: [u8; 16] = [0xD0; 16];
 const SUBPROCESS_SEED: [u8; 16] = [0xC0; 16];
 
 fn cmd_subprocess_writer(path: &str, sync: bool, seed: bool) -> anyhow::Result<()> {
-    let store = PackfileStorage::open(PathBuf::from(path)).context("failed to open test store")?;
+    let store = open_pool(PathBuf::from(path)).context("failed to open test store")?;
     let id = if seed {
         SUBPROCESS_SEED
     } else {
@@ -647,7 +647,7 @@ fn cmd_subprocess_writer(path: &str, sync: bool, seed: bool) -> anyhow::Result<(
 }
 
 fn cmd_subprocess_reader(path: &str) -> anyhow::Result<()> {
-    let store = PackfileStorage::open_read_only(PathBuf::from(path))
+    let store = open_pool_read_only(PathBuf::from(path))
         .context("failed to open test store read-only")?;
     store.reset_stats();
     let result = store
@@ -775,12 +775,27 @@ fn parse_collection_selector(selector: &str) -> anyhow::Result<[u8; 16]> {
     }
 }
 
+/// Open a writable pool with the CLI's resolved runtime config.
+fn open_pool(dir: PathBuf) -> io::Result<PackfileStorage> {
+    PackfileStorage::open_with_config(dir, crate::runtime_config())
+}
+
+/// Open a read-only pool with the CLI's resolved runtime config.
+fn open_pool_read_only(dir: PathBuf) -> io::Result<PackfileStorage> {
+    PackfileStorage::open_read_only_with_config(dir, crate::runtime_config())
+}
+
+/// Open a shared-WAL database with the CLI's resolved runtime config.
+fn open_database(dir: PathBuf) -> Result<Database, mtxdb::storage::StorageError> {
+    Database::open_with_config(dir, *crate::runtime_config())
+}
+
 /// Open the store as its exclusive writer. Fails fast if another process
 /// (e.g. a live embedder) already holds the writer lock — required for
 /// any command that mutates data.
 fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
     let pool = selected_pool_dir(cli)?;
-    let store = PackfileStorage::open(pool.clone()).with_context(|| {
+    let store = open_pool(pool.clone()).with_context(|| {
         let lock_path = pool.join(".mtxdb.lock");
         if lock_path.exists() {
             format!(
@@ -798,8 +813,7 @@ fn open_store(cli: &Cli) -> anyhow::Result<PackfileStorage> {
 /// Open the store read-only — coexists with a live writer process rather
 /// than contending with it. For commands that only ever read collection data.
 fn open_store_read_only(cli: &Cli) -> anyhow::Result<PackfileStorage> {
-    let store =
-        PackfileStorage::open_read_only(selected_pool_dir(cli)?).context("failed to open store")?;
+    let store = open_pool_read_only(selected_pool_dir(cli)?).context("failed to open store")?;
     store.set_read_plan_policy(cli.read_plan);
     Ok(store)
 }
@@ -1026,7 +1040,7 @@ fn other_shard_type_node_hint(cli: &Cli, node_id: &[u8; 16]) -> String {
             let Ok(dir) = pool_dir(&layout, shard_type) else {
                 return false;
             };
-            let Ok(store) = PackfileStorage::open_read_only(dir) else {
+            let Ok(store) = open_pool_read_only(dir) else {
                 return false;
             };
             store
@@ -1275,7 +1289,7 @@ fn cmd_get_single(
         let mut matches: Vec<(ShardType, [u8; 16], NodeData)> = Vec::new();
         for shard_type in cli.shard_types() {
             let dir = pool_dir(&db_layout, shard_type)?;
-            let Ok(store) = PackfileStorage::open_read_only(dir) else {
+            let Ok(store) = open_pool_read_only(dir) else {
                 continue;
             };
             for (col_id, data) in get_matches_in_store(&store, collection, &node_id)? {
@@ -1288,7 +1302,7 @@ fn cmd_get_single(
                 if header {
                     let store = pool_dir(&db_layout, *shard_type)
                         .ok()
-                        .and_then(|dir| PackfileStorage::open_read_only(dir).ok());
+                        .and_then(|dir| open_pool_read_only(dir).ok());
                     print_get_header(&node_id, collection_id, *shard_type, data, store.as_ref());
                 }
                 if verbose {
@@ -1381,7 +1395,7 @@ fn cmd_get_coalesced(
             let Ok(dir) = pool_dir(&layout, shard_type) else {
                 continue;
             };
-            let Ok(store) = PackfileStorage::open_read_only(dir) else {
+            let Ok(store) = open_pool_read_only(dir) else {
                 continue;
             };
             for (col_id, data) in get_matches_in_store(&store, collection, &node_id)? {
@@ -1444,7 +1458,7 @@ fn cmd_get_coalesced(
         let store = DatabaseLayout::open_read_only(winner.db_dir.clone())
             .ok()
             .and_then(|layout| pool_dir(&layout, winner.shard_type).ok())
-            .and_then(|dir| PackfileStorage::open_read_only(dir).ok());
+            .and_then(|dir| open_pool_read_only(dir).ok());
         print_get_header(
             &node_id,
             &winner.collection_id,
@@ -2187,7 +2201,7 @@ fn cmd_collections_coalesced(
             let summaries = match PackfileStorage::collection_summaries_from_disk(&pool_dir) {
                 Some(s) => s,
                 None => {
-                    if let Ok(store) = PackfileStorage::open_read_only(pool_dir.clone()) {
+                    if let Ok(store) = open_pool_read_only(pool_dir.clone()) {
                         store.collection_summaries()
                     } else {
                         Vec::new()
@@ -2210,7 +2224,7 @@ fn cmd_collections_coalesced(
                     None
                 };
             let canonical_map: HashMap<[u8; 16], String> = if canonical {
-                PackfileStorage::open_read_only(pool_dir.clone())
+                open_pool_read_only(pool_dir.clone())
                     .ok()
                     .map_or_else(HashMap::new, |store| {
                         canonical_collection_ids(&store, &summaries)
@@ -2593,7 +2607,7 @@ fn cmd_collections_in_dir(
         None if glob_pack_files(dir)?.is_empty() => Vec::new(),
         // Old stores have no sidecar yet. Keep the complete, slower fallback
         // so `collections` remains useful until `mtxdb sync` writes one.
-        None => PackfileStorage::open_read_only(dir.into())
+        None => open_pool_read_only(dir.into())
             .context("failed to open store")?
             .collection_summaries(),
     };
@@ -2705,7 +2719,7 @@ fn cmd_collections_in_dir(
     let displayed: Vec<_> = ordered.into_iter().take(max_rows).collect();
     let canonical_ids: HashMap<[u8; 16], String> = if canonical {
         let displayed_summaries: Vec<_> = displayed.iter().map(|(_, s)| **s).collect();
-        PackfileStorage::open_read_only(dir.to_path_buf())
+        open_pool_read_only(dir.to_path_buf())
             .ok()
             .map_or_else(HashMap::new, |store| {
                 canonical_collection_ids(&store, &displayed_summaries)
@@ -3237,7 +3251,7 @@ fn read_stats_for_dir(
         Ok((RuntimeStats::default(), Vec::new()))
     } else {
         let store =
-            PackfileStorage::open_read_only(dir.to_path_buf()).context("failed to open store")?;
+            open_pool_read_only(dir.to_path_buf()).context("failed to open store")?;
         let stats = store.stats();
         let summaries = store.shard_summaries();
         Ok((stats, summaries))
@@ -3296,7 +3310,7 @@ fn cmd_memory_single(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Resul
             continue;
         };
         let store =
-            PackfileStorage::open_read_only(pool.clone()).context("failed to open store")?;
+            open_pool_read_only(pool.clone()).context("failed to open store")?;
         let before = store.resident_cache_stats();
         let evicted = if evict {
             store.evict_resident_caches()
@@ -3391,7 +3405,7 @@ fn cmd_timeline(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyhow::Res
 fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
     let pool = pool_dir(&layout, ShardType::EventDag)?;
-    let store = PackfileStorage::open_read_only(pool).context("failed to open EventDag store")?;
+    let store = open_pool_read_only(pool).context("failed to open EventDag store")?;
     let timeline_index = mtxdb::timeline::TimelineIndex::open(&store, room);
     let room_scope = mtxdb::timeline::room_scope_id(room.as_bytes());
     let limit_usize = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
@@ -3474,7 +3488,7 @@ fn cmd_flags_single(
     rebuild: bool,
 ) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
-    let db = Database::open(layout.root().to_path_buf())
+    let db = open_database(layout.root().to_path_buf())
         .with_context(|| format!("opening database at {}", layout.root().display()))?;
     let index = mtxdb::room_flag::RoomFlagIndex::new(room.as_bytes());
 
@@ -4717,7 +4731,7 @@ fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
             let has = if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir)
             {
                 summaries.iter().any(|(id, _, _, _)| id == target_id)
-            } else if let Ok(store) = PackfileStorage::open_read_only(dir) {
+            } else if let Ok(store) = open_pool_read_only(dir) {
                 store.collection_index_info(target_id).is_some()
             } else {
                 false
@@ -4918,7 +4932,7 @@ fn cmd_info_coalesced(
                         PackfileStorage::collection_summaries_from_disk(&dir)
                     {
                         summaries.iter().any(|(id, _, _, _)| id == &collection_id)
-                    } else if let Ok(store) = PackfileStorage::open_read_only(dir.clone()) {
+                    } else if let Ok(store) = open_pool_read_only(dir.clone()) {
                         store.collection_index_info(&collection_id).is_some()
                     } else {
                         false
@@ -6242,7 +6256,7 @@ fn print_collection_info(
         fmt_load_factor(len, capacity)
     );
     print_collection_shards(shards);
-    let room_extension = PackfileStorage::open_read_only(dir.to_path_buf())
+    let room_extension = open_pool_read_only(dir.to_path_buf())
         .ok()
         .and_then(|store| matrix_room_extension_from_store(&store, collection_id));
     if deep && room_extension.is_some() {
@@ -6300,7 +6314,7 @@ fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16], deep: bool) -
         return false;
     }
 
-    let Ok(store) = PackfileStorage::open_read_only(dir.to_path_buf()) else {
+    let Ok(store) = open_pool_read_only(dir.to_path_buf()) else {
         return false;
     };
     if let Some((len, mem, capacity)) = store.collection_index_info(collection_id) {
@@ -6332,7 +6346,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str, deep: bool) -> anyhow::Resul
             let has_collection =
                 if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir) {
                     summaries.iter().any(|(id, _, _, _)| id == &collection_id)
-                } else if let Ok(store) = PackfileStorage::open_read_only(dir.clone()) {
+                } else if let Ok(store) = open_pool_read_only(dir.clone()) {
                     store.collection_index_info(&collection_id).is_some()
                 } else {
                     false
@@ -7189,7 +7203,7 @@ fn print_room_event_stats(stats: &RoomEventStats) {
 /// with `deep`, event statistics from a full pass over its records.
 fn print_collection_details(dir: &Path, collection_id: &[u8; 16], deep: bool) {
     let mut matrix_room = false;
-    if let Ok(store) = PackfileStorage::open_read_only(dir.to_path_buf()) {
+    if let Ok(store) = open_pool_read_only(dir.to_path_buf()) {
         if let Ok(Some(metadata)) = store.get_collection_metadata(collection_id) {
             matrix_room = metadata
                 .extension
@@ -7449,7 +7463,7 @@ fn cmd_scan_coalesced(
                         PackfileStorage::collection_summaries_from_disk(&dir)
                     {
                         summaries.iter().any(|(id, _, _, _)| id == &collection_id)
-                    } else if let Ok(store) = PackfileStorage::open_read_only(dir) {
+                    } else if let Ok(store) = open_pool_read_only(dir) {
                         store.collection_index_info(&collection_id).is_some()
                     } else {
                         false
@@ -8585,7 +8599,7 @@ fn cmd_import(
     // describes. Every pool the import touches is synced once at the end.
     let layout = open_layout(cli)?;
     let shard = cli.require_shard_type()?;
-    let db = Database::open(layout.root().to_path_buf()).with_context(|| {
+    let db = open_database(layout.root().to_path_buf()).with_context(|| {
         format!(
             "failed to open the database at `{}` for writing",
             layout.root().display()
@@ -13334,7 +13348,7 @@ fn cmd_repack_coalesced(
         if glob_pack_files(&pool_dir).map_or(true, |p| p.is_empty()) {
             continue;
         }
-        let store = PackfileStorage::open_read_only(pool_dir.clone())?;
+        let store = open_pool_read_only(pool_dir.clone())?;
         sources.push(CoalescedSourceDb {
             path: db_dir.clone(),
             store,
@@ -13460,7 +13474,7 @@ fn cmd_repack_coalesced(
 
     let target_layout = DatabaseLayout::open(out_dir.to_path_buf())?;
     let target_pool_dir = target_layout.pool_dir(shard_type)?;
-    let target_store = PackfileStorage::open(target_pool_dir)?;
+    let target_store = open_pool(target_pool_dir)?;
 
     let mut sorted_collection_ids: Vec<[u8; 16]> = candidates_by_col.keys().copied().collect();
     sorted_collection_ids.sort_unstable();
@@ -14364,7 +14378,7 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 /// reclaim through the oldest covered group.
 fn cmd_reclaim_wal(cli: &Cli) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
-    let db = Database::open(layout.root().to_path_buf())
+    let db = open_database(layout.root().to_path_buf())
         .context("opening the shared database to reclaim its WAL")?;
     let before = db.coordinator().segment_len();
 
@@ -14400,7 +14414,7 @@ fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
                 eprintln!("{}: skipped (no packfiles)", shard_type.as_str());
                 continue;
             }
-            let store = PackfileStorage::open(dir.clone()).with_context(|| {
+            let store = open_pool(dir.clone()).with_context(|| {
                 let lock_path = dir.join(".mtxdb.lock");
                 if lock_path.exists() {
                     format!(

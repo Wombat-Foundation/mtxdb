@@ -69,6 +69,9 @@ pub mod cache;
 /// Persisted closure generations published through a logical head.
 #[path = "graph/closure_store.rs"]
 pub mod closure_store;
+/// Explicit runtime configuration and the opt-in `MTXDB_*` environment reader.
+#[path = "engine/config.rs"]
+pub mod config;
 /// Compressed sparse row graph for deterministic topological ordering.
 #[path = "graph/csr/mod.rs"]
 pub mod csr;
@@ -194,6 +197,7 @@ pub use auxiliary::{
 #[cfg(feature = "bitmaps")]
 pub use bitmap_set::{BitmapSet, DomainTag, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
 pub use cache::NodeCache;
+pub use config::{ConfigError, RuntimeConfig};
 pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
 };

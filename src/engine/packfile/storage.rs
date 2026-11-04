@@ -9,6 +9,7 @@ use arc_swap::ArcSwap;
 use parking_lot::{MutexGuard, RwLock};
 
 use crate::cache::{NodeCache, PinnedNodes};
+use crate::config::RuntimeConfig;
 use crate::csr::Csr;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
@@ -2597,7 +2598,7 @@ struct RepackIncrementalState {
 }
 
 const DEFAULT_REPACK_THRESHOLD_ENTRIES: u64 = 2048;
-const DEFAULT_CACHE_CAPACITY: usize = 100_000;
+pub(crate) const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 
 /// Minimum `LossyIndex` capacity for a brand-new collection's first
 /// insert (`put` and `put_many`), in slots (8 bytes each).
@@ -2690,6 +2691,67 @@ impl PackfileStorage {
             true,
             packfile::ChecksumPolicy::Full,
         )
+    }
+
+    /// Open a writable packfile storage with explicit runtime settings.
+    ///
+    /// Callers that want environment defaults pass
+    /// [`RuntimeConfig::from_env`] here. Explicit `open_with_cache*` /
+    /// `open_with_residency*` constructors keep their explicit arguments; this
+    /// constructor applies `config` as-is.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for an invalid [`RuntimeConfig`], or the same
+    /// directory errors as [`Self::open`].
+    pub fn open_with_config(
+        base_dir: PathBuf,
+        config: &RuntimeConfig,
+    ) -> Result<Self, std::io::Error> {
+        config.validate()?;
+        let residency = config
+            .index_residency
+            .unwrap_or(crate::index::IndexResidency::Resident);
+        let store = Self::open_with_options_and_residency(
+            base_dir,
+            config.cache_capacity,
+            None,
+            true,
+            None,
+            true,
+            packfile::ChecksumPolicy::Full,
+            residency,
+        )?;
+        store.set_stats_enabled(config.stats_enabled);
+        Ok(store)
+    }
+
+    /// Open a read-only packfile storage with explicit runtime settings.
+    ///
+    /// See [`Self::open_with_config`].
+    ///
+    /// # Errors
+    /// Same as [`Self::open_with_config`], with the read-only contract of
+    /// [`Self::open_read_only`].
+    pub fn open_read_only_with_config(
+        base_dir: PathBuf,
+        config: &RuntimeConfig,
+    ) -> Result<Self, std::io::Error> {
+        config.validate()?;
+        let residency = config
+            .index_residency
+            .unwrap_or(crate::index::IndexResidency::Resident);
+        let store = Self::open_with_options_and_residency(
+            base_dir,
+            config.cache_capacity,
+            None,
+            false,
+            None,
+            true,
+            packfile::ChecksumPolicy::Full,
+            residency,
+        )?;
+        store.set_stats_enabled(config.stats_enabled);
+        Ok(store)
     }
 
     /// Open a packfile storage with explicit compression and checksum
@@ -3050,13 +3112,14 @@ impl PackfileStorage {
     /// root's writer lock covers it, so the pool creates no `.mtxdb.lock`.
     pub(crate) fn open_shared_member(
         base_dir: PathBuf,
+        cache_capacity: usize,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
         residency: crate::index::IndexResidency,
     ) -> Result<Self, std::io::Error> {
         Self::open_with_options_locked(
             base_dir,
-            DEFAULT_CACHE_CAPACITY,
+            cache_capacity,
             None,
             true,
             None,
