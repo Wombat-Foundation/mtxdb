@@ -357,11 +357,22 @@ fn rezzy_bitmap_sets_bytes(edge_lists: &[Vec<u32>]) -> (usize, usize) {
             continue;
         }
         let set = BitmapSet::from_values(BENCH_DOMAIN, target_list.iter().copied());
-        if let Ok(encoded_bytes) = set.encode() {
-            total_with_headers = total_with_headers.saturating_add(encoded_bytes.len());
-            total_raw_payload =
-                total_raw_payload.saturating_add(encoded_bytes.len().saturating_sub(21));
-        }
+        let encoded_bytes = set.encode().expect("benchmark bitmap must encode");
+        total_with_headers = total_with_headers
+            .checked_add(encoded_bytes.len())
+            .expect("byte count fits");
+        // BitmapSet's private wire header is magic (4), version (1), domain (16).
+        let header_len = 5usize
+            .checked_add(BENCH_DOMAIN.as_bytes().len())
+            .expect("header length fits");
+        total_raw_payload = total_raw_payload
+            .checked_add(
+                encoded_bytes
+                    .len()
+                    .checked_sub(header_len)
+                    .expect("bitmap header present"),
+            )
+            .expect("byte count fits");
     }
     (total_with_headers, total_raw_payload)
 }
@@ -381,6 +392,65 @@ fn invert_edges(edge_lists: &[Vec<u32>], node_count: usize) -> Vec<Vec<u32>> {
 
 struct CsrGapStorage {
     chunks: Vec<(Vec<u32>, Vec<u8>)>,
+}
+
+/// Encode one reverse row: the first child is a zigzag delta from the parent,
+/// and later children are ascending gaps. A referenced parent can have a
+/// higher short than one of its children, so the first delta is signed.
+fn append_reverse_row(parent_short: u32, child_list: &[u32], payload: &mut Vec<u8>) {
+    let Some((&first_child, rest)) = child_list.split_first() else {
+        return;
+    };
+    let first_delta = i64::from(first_child)
+        .checked_sub(i64::from(parent_short))
+        .expect("u32 difference fits i64");
+    append_varint_u64(payload, zigzag_encode(first_delta));
+    let mut last_child = first_child;
+    for &child in rest {
+        let gap = child
+            .checked_sub(last_child)
+            .expect("reverse edge children are stored in ascending order");
+        append_varint(payload, gap);
+        last_child = child;
+    }
+}
+
+fn decode_reverse_row(parent_short: u32, payload: &[u8], child_count: usize) -> Vec<u32> {
+    let mut children = Vec::with_capacity(child_count);
+    if child_count == 0 {
+        return children;
+    }
+    let mut cursor = 0usize;
+    let first_delta = zigzag_decode(read_varint_u64(payload, &mut cursor));
+    let first = i64::from(parent_short)
+        .checked_add(first_delta)
+        .and_then(|value| u32::try_from(value).ok())
+        .expect("decoded first child fits in u32");
+    children.push(first);
+    for _ in 1..child_count {
+        let gap = read_varint(payload, &mut cursor);
+        let next = children
+            .last()
+            .copied()
+            .expect("row is non-empty")
+            .checked_add(gap)
+            .expect("decoded child does not overflow");
+        children.push(next);
+    }
+    children
+}
+
+fn verify_reverse_codec() {
+    for (parent, children) in [
+        (1_000u32, vec![900u32, 1_001, 1_100]),
+        (5u32, vec![6, 7, 9]),
+        (10u32, vec![10]),
+    ] {
+        let mut payload = Vec::new();
+        append_reverse_row(parent, &children, &mut payload);
+        let decoded = decode_reverse_row(parent, &payload, children.len());
+        assert_eq!(decoded, children, "parent short {parent}");
+    }
 }
 
 struct AdaptiveReverseRezzy {
@@ -412,12 +482,7 @@ impl AdaptiveReverseRezzy {
                     continue;
                 }
 
-                let mut last_child = parent_short;
-                for &child in child_list {
-                    let gap = child.saturating_sub(last_child);
-                    append_varint(&mut payload, gap);
-                    last_child = child;
-                }
+                append_reverse_row(parent_short, child_list, &mut payload);
             }
             offsets.push(u32::try_from(payload.len()).expect("fits in u32"));
             chunks.push((offsets, payload));
@@ -445,10 +510,37 @@ impl AdaptiveReverseRezzy {
         let hub_bytes: usize = self
             .hub_bitmaps
             .values()
-            .map(|bitmap| bitmap.encode().map_or(0, |bytes| bytes.len()))
+            .map(|bitmap| bitmap.encode().expect("benchmark bitmap must encode").len())
             .sum();
 
         (csr_bytes, hub_bytes)
+    }
+
+    fn children(&self, parent_short: u32) -> Vec<u32> {
+        if let Some(bitmap) = self.hub_bitmaps.get(&parent_short) {
+            return bitmap.iter().collect();
+        }
+        let parent = usize::try_from(parent_short).expect("fits in usize");
+        let (offsets, payload) = &self.csr_storage.chunks[parent / CHUNK_SIZE];
+        let row = parent % CHUNK_SIZE;
+        let mut cursor = usize::try_from(offsets[row]).expect("fits in usize");
+        let end =
+            usize::try_from(offsets[row.checked_add(1).expect("row fits")]).expect("fits in usize");
+        let mut children = Vec::new();
+        if cursor < end {
+            let first = i64::from(parent_short)
+                .checked_add(zigzag_decode(read_varint_u64(payload, &mut cursor)))
+                .expect("first child fits");
+            let mut child = u32::try_from(first).expect("valid child short");
+            children.push(child);
+            while cursor < end {
+                child = child
+                    .checked_add(read_varint(payload, &mut cursor))
+                    .expect("child fits");
+                children.push(child);
+            }
+        }
+        children
     }
 
     fn count_children(&self, parent_short: u32) -> usize {
@@ -465,7 +557,7 @@ impl AdaptiveReverseRezzy {
 
         let mut child_count = 0usize;
         while cursor < end_cursor {
-            black_box(read_varint(payload, &mut cursor));
+            black_box(read_varint_u64(payload, &mut cursor));
             child_count = child_count.saturating_add(1);
         }
         child_count
@@ -558,10 +650,22 @@ fn measure_reverse_wa(
                 } else {
                     last_seen_child[parent_index]
                 };
-                let gap = child_short.saturating_sub(last);
+                let encoded_len = if in_degrees[parent_index] == 1 {
+                    varint_length_u64(zigzag_encode(
+                        i64::from(child_short)
+                            .checked_sub(i64::from(last))
+                            .expect("u32 difference fits i64"),
+                    ))
+                } else {
+                    varint_length(
+                        child_short
+                            .checked_sub(last)
+                            .expect("children sorted ascending"),
+                    )
+                };
                 let chunk_idx = parent_index / CHUNK_SIZE;
                 chunk_body_bytes[chunk_idx] =
-                    chunk_body_bytes[chunk_idx].saturating_add(varint_length(gap));
+                    chunk_body_bytes[chunk_idx].saturating_add(encoded_len);
                 last_seen_child[parent_index] = child_short;
 
                 if !touched_chunks.contains(&chunk_idx) {
@@ -595,7 +699,7 @@ fn measure_reverse_wa(
 
     let final_hub_bytes: usize = hub_bitmap_sets
         .values()
-        .map(|bitmap| bitmap.encode().map_or(0, |bytes| bytes.len()))
+        .map(|bitmap| bitmap.encode().expect("benchmark bitmap must encode").len())
         .sum();
 
     let final_total = final_csr_bytes.saturating_add(final_hub_bytes);
@@ -798,6 +902,37 @@ fn run_write_amplification_bench(room: &RoomGraph, event_count: usize, relations
 
 // ---------------------------------------------------------------- main entry
 fn main() {
+    verify_reverse_codec();
+    // Round-trip the late-parent case absent from the locality-biased generator.
+    // Exercise both sparse arrays and promotion to a hub bitmap.
+    let edges = vec![vec![4, 2], vec![4], vec![], vec![], vec![0]];
+    let forward = CsrVarintForward::build(&edges);
+    for (short, expected) in edges.iter().enumerate() {
+        let mut decoded = Vec::new();
+        forward.lookup(u32::try_from(short).expect("short fits"), &mut decoded);
+        decoded.sort_unstable();
+        let mut expected = expected.clone();
+        expected.sort_unstable();
+        assert_eq!(decoded, expected, "forward late-parent row {short}");
+    }
+    let reversed = invert_edges(&edges, edges.len());
+    for threshold in [0, usize::MAX] {
+        let reverse = AdaptiveReverseRezzy::build(&reversed, threshold);
+        for (parent, expected) in reversed.iter().enumerate() {
+            let parent = u32::try_from(parent).expect("short fits");
+            assert_eq!(
+                reverse.children(parent),
+                *expected,
+                "reverse late-parent row {parent}, threshold {threshold}"
+            );
+            assert_eq!(
+                reverse.count_children(parent),
+                expected.len(),
+                "reverse count for {parent}"
+            );
+        }
+    }
+
     let args: Vec<String> = std::env::args().collect();
     let event_count: usize = args
         .get(1)
@@ -836,7 +971,7 @@ fn main() {
         run_forward_bench(family_name, edge_lists, &query_sample);
     }
 
-    println!("\n# reverse (children-of)\nfamily\tencoding\tedges\tparents\thubs\ttuples\tpayload_B\tB_per_edge\tB_per_edge_incl_tuples\tlookup_ns\thub_lookup_ns");
+    println!("\n# reverse (children-of)\nfamily\tencoding\tedges\tparents\thubs\ttuples\tpayload_B\tB_per_edge\tB_per_edge_incl_tuples\tcount_ns\thub_count_ns");
     for (family_name, edge_lists) in [
         ("prev", &room.prev),
         ("auth", &room.auth),
