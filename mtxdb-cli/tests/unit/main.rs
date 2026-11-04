@@ -7,3 +7,4 @@
 
 mod meta_cli;
 mod raw_warning_cli;
+mod shard_type_cli;

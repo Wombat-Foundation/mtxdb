@@ -875,7 +875,7 @@ impl RoomFlagIndex {
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    fn rebuild_generation(
+    pub(crate) fn rebuild_generation(
         &self,
         db: &Database,
         counter: u32,
@@ -1012,7 +1012,7 @@ impl RoomFlagIndex {
         // Verify that no competing rebuild or writer published while this one
         // was running. Every writer CASes FLAG_META_ID, even when max_short_id
         // is unchanged, so this also detects updates to existing short IDs.
-        if live_meta.generation != current_meta.generation {
+        if live_meta.generation != current_meta.generation || live_meta_token != meta_token {
             return Err(StorageError::StaleRead {
                 pool: self.pool,
                 collection_id: self.collection,
@@ -1031,12 +1031,12 @@ impl RoomFlagIndex {
             FLAG_META_ID,
             &NodeData::new(Bytes::from(meta_encoded.to_vec())),
         )?;
-        if !(live_meta_raw.is_some() && live_meta_token == 0) {
+        if !(live_meta_raw.is_some() && meta_token == 0) {
             publish_tx.expect_record_version(
                 self.pool,
                 self.collection,
                 FLAG_META_ID,
-                live_meta_token,
+                meta_token,
             )?;
         }
         publish_tx.commit()?;

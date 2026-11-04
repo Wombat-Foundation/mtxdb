@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(first.root_record, second.root_record);
         assert_eq!(first.nodes, second.nodes);
         assert!(first.root_record.starts_with(b"MTHR\x01"));
-        assert!(!first.nodes.is_empty());
+        assert_ne!(first.nodes, Vec::<([u8; 32], Vec<u8>)>::new());
         assert!(first
             .nodes
             .iter()

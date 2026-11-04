@@ -906,6 +906,81 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_fails_if_flag_committed_after_reservation() {
+        let root = test_root("rebuild_flag_race");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
+        let room_id = b"!rebuild_race:example.com";
+        let index = RoomFlagIndex::new(room_id);
+        let auth_col = room_auth_collection_id(room_id);
+        let event_col = room_event_collection_id(room_id);
+
+        let ev1 = b"$ev1:example.com";
+        let node1 = event_record_id(ev1);
+
+        let tx = db.begin_transaction();
+        tx.put(
+            ShardType::Edges,
+            auth_col,
+            auth_counter_record_id(),
+            &NodeData::new(bytes::Bytes::from(encode_auth_counter(1).to_vec())),
+        )
+        .unwrap();
+        tx.put(
+            ShardType::Edges,
+            auth_col,
+            auth_reverse_record_id(1),
+            &NodeData::new(bytes::Bytes::from_static(ev1)),
+        )
+        .unwrap();
+        tx.put(
+            ShardType::EventDag,
+            event_col,
+            node1,
+            &NodeData::new(bytes::Bytes::from_static(b"ev1 body")),
+        )
+        .unwrap();
+        index
+            .stage(&tx, &[FlagChange::set(1, Flag::Present)])
+            .unwrap();
+        tx.commit().unwrap();
+
+        // 1. Reserve rebuild generation and capture snapshot meta_token
+        let (current_meta, new_gen, meta_token) = index.reserve_rebuild_generation(&db).unwrap();
+        let target_col = index.chunk_collection(new_gen);
+
+        // 2. Commit a flag change after reservation but before rebuild publish
+        let tx_writer = db.begin_transaction();
+        index
+            .stage(&tx_writer, &[FlagChange::set(1, Flag::Timeline)])
+            .unwrap();
+        tx_writer.commit().unwrap();
+
+        // 3. Attempt to publish via the library rebuild path
+        let res = index.rebuild_generation(&db, 1, current_meta, new_gen, target_col, meta_token);
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err().is_stale_read(),
+            "rebuild publish must abort when a flag change commits after reservation"
+        );
+
+        // 4. Verify that the committed flag change remains intact and generation is not corrupted
+        let active_meta = index.meta(&db).unwrap();
+        assert_eq!(active_meta.generation, current_meta.generation);
+        assert_eq!(
+            index
+                .select_shorts(&db, &FlagQuery::has(Flag::Present))
+                .unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            index
+                .select_shorts(&db, &FlagQuery::has(Flag::Timeline))
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn rebuild_cleans_leftover_chunks_from_crashed_rebuild() {
         let root = test_root("crash_rebuild");
         let db = Database::open(root.path().to_path_buf()).unwrap();

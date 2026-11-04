@@ -1657,8 +1657,8 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
     // the state-group id (BLAKE2b over the lanes), the same identity the
     // event->state-group aux index stores.
     let mut lanes = [0u16; 1024];
-    for (lane, chunk) in lanes.iter_mut().zip(lattice_bytes.chunks_exact(2)) {
-        *lane = u16::from_le_bytes([chunk[0], chunk[1]]);
+    for (lane, [lo, hi]) in lanes.iter_mut().zip(lattice_bytes.as_chunks::<2>().0) {
+        *lane = u16::from_le_bytes([*lo, *hi]);
     }
     let lattice = rezzy::incremental::LtLattice::<1024>::from(lanes);
     let state_group_id = rezzy::hamt::state_group_id_from_lthash(&lattice);
@@ -10430,7 +10430,7 @@ fn compute_import_auth_before(
                 StateView::Federated,
                 room_id,
                 policy,
-                None,
+                Some(rejected),
                 |_, _, _, _, _| None,
             ),
             0,
@@ -10789,6 +10789,22 @@ fn import_pdu_events_with_raw(
         established_collections,
     )?;
     let collection_id = resolved.collection_id;
+    // `RoomEvent::from_pdu` fills a missing `room_id` from the batch, but an
+    // event that carries a different room must not be analyzed (or stored)
+    // under this batch's identity. `resolve_import_collection` already
+    // rejects mixed rooms in `events`; auth-chain PDUs can arrive from a
+    // federation response too, so check both lists here.
+    for event in events.iter().chain(auth_chain) {
+        if let Some(room) = event_room_id(event) {
+            if room != resolved.canonical_id.as_str() {
+                bail!(
+                    "event {} belongs to room {room}, not the imported room {}",
+                    event_id(event).unwrap_or("<missing event_id>"),
+                    resolved.canonical_id
+                );
+            }
+        }
+    }
     let room_version = import_room_version(store, &collection_id, events)?;
 
     let collection_hex = format_id(&collection_id);
@@ -11063,8 +11079,11 @@ fn collect_raw_dependencies<'a>(
     let events: Vec<&OwnedValue> = supplied_events
         .filter(|event| event_room_id(event).is_none_or(|room| room == room_id))
         .collect();
-    let file_event_ids: HashSet<String> =
-        events.iter().filter_map(|event| event_id(event)).map(str::to_owned).collect();
+    let file_event_ids: HashSet<String> = events
+        .iter()
+        .filter_map(|event| event_id(event))
+        .map(str::to_owned)
+        .collect();
     let mut graph = RawDependencyGraph {
         prev_edges: BTreeMap::new(),
         auth_edges: BTreeMap::new(),
@@ -11995,7 +12014,9 @@ fn matrix_create_collections_on_disk(dir: &Path) -> anyhow::Result<HashSet<[u8; 
     let deleted_path = dir.join("deleted.collections");
     let deleted_bytes = fs::read(&deleted_path).unwrap_or_default();
     let deleted: HashSet<[u8; 16]> = deleted_bytes
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|chunk| {
             let mut id = [0u8; 16];
             id.copy_from_slice(chunk);

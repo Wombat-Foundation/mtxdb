@@ -179,6 +179,11 @@ fn injected_directory_sync_failure(dir: &Path) -> Option<io::Error> {
 /// `vm.max_map_count` first.
 pub const MAX_SHARDS: usize = 4096;
 
+/// Maximum number of background pack-index builders a pool keeps alive at
+/// once. Rotations can outpace sidecar builds; without a bound every rotation
+/// would add another thread until the writers run out of memory or handles.
+const MAX_SEAL_WORKERS: usize = 4;
+
 const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
 
 /// Maximum number of shards as `u16`. Primary constant for shard IDs
@@ -3262,6 +3267,13 @@ impl ShardPool {
             } else {
                 pending.push(existing);
             }
+        }
+        // Bound the number of concurrent builders. Joining the oldest keeps
+        // the active set fixed without dropping a sidecar: its result is
+        // announced through `sealed_ready` exactly as usual.
+        while pending.len() >= MAX_SEAL_WORKERS {
+            let oldest = pending.remove(0);
+            let _ = oldest.join();
         }
         pending.push(worker);
         *workers = pending;

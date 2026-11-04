@@ -2064,21 +2064,24 @@ fn write_room_flags(
 
             let forced = findings.forced.get(position).copied().flatten();
             let verdict = verdict_of(&event.metadata, forced);
-            if verdict.outlier {
-                batch_changes.push(FlagChange::set(short, Flag::Outlier));
-            }
-            if verdict.soft_fail.is_some() {
-                batch_changes.push(FlagChange::set(short, Flag::SoftFailed));
-            }
-            if verdict.rejection.is_some() {
-                batch_changes.push(FlagChange::set(short, Flag::Rejected));
-            }
-            if event.metadata.redacted_by.is_some() {
-                batch_changes.push(FlagChange::set(short, Flag::Redacted));
-            }
-
-            if timeline_orderings(export, event, forced.is_some()).is_some() {
-                batch_changes.push(FlagChange::set(short, Flag::Timeline));
+            // Re-importing an event must also clear derived flags the current
+            // record no longer carries; a set-only update would leave a stale
+            // verdict visible forever.
+            for (flag, set) in [
+                (Flag::Outlier, verdict.outlier),
+                (Flag::SoftFailed, verdict.soft_fail.is_some()),
+                (Flag::Rejected, verdict.rejection.is_some()),
+                (Flag::Redacted, event.metadata.redacted_by.is_some()),
+                (
+                    Flag::Timeline,
+                    timeline_orderings(export, event, forced.is_some()).is_some(),
+                ),
+            ] {
+                batch_changes.push(if set {
+                    FlagChange::set(short, flag)
+                } else {
+                    FlagChange::clear(short, flag)
+                });
             }
         }
 
@@ -2541,7 +2544,7 @@ mod auth_findings_tests {
         ]))
         .unwrap();
         assert_eq!(findings.forced, vec![None, None]);
-        assert!(findings.warnings().is_empty());
+        assert_eq!(findings.warnings(), Vec::<String>::new());
     }
 
     #[test]
@@ -2554,7 +2557,7 @@ mod auth_findings_tests {
         assert_eq!(forced(&findings, 0), None);
         assert_eq!(forced(&findings, 1), Some(MISSING_AUTH));
         assert_eq!(findings.missing_auth, ["$a"]);
-        assert!(findings.cascaded.is_empty());
+        assert_eq!(findings.cascaded, Vec::<String>::new());
         assert_eq!(findings.rejection_counts.get(&MISSING_AUTH), Some(&1));
     }
 
@@ -2595,7 +2598,7 @@ mod auth_findings_tests {
         ]))
         .unwrap();
         assert_eq!(findings.forced, vec![None, None, None]);
-        assert!(findings.cascaded.is_empty());
+        assert_eq!(findings.cascaded, Vec::<String>::new());
     }
 
     #[test]
@@ -2717,7 +2720,10 @@ mod auth_findings_tests {
         .unwrap();
         assert_eq!(forced(&findings, 2), None);
         assert_eq!(findings.passes_but_exported_rejected, ["$msg"]);
-        assert!(findings.fails_but_exported_accepted.is_empty());
+        assert_eq!(
+            findings.fails_but_exported_accepted,
+            Vec::<AuthFailure>::new()
+        );
     }
 
     #[test]
@@ -2797,7 +2803,10 @@ mod auth_findings_tests {
         .unwrap();
         assert_eq!(forced(&findings, 2), None);
         assert_eq!(findings.passes_but_exported_rejected, ["$msg"]);
-        assert!(findings.fails_but_exported_accepted.is_empty());
+        assert_eq!(
+            findings.fails_but_exported_accepted,
+            Vec::<AuthFailure>::new()
+        );
     }
 
     #[test]
@@ -2807,7 +2816,10 @@ mod auth_findings_tests {
         let create = with_field(create_with_version("10"), "sender", "@Milan:tchncs.de");
         let findings = derived_auth_findings(&export(vec![create])).unwrap();
         assert_eq!(forced(&findings, 0), None);
-        assert!(findings.fails_but_exported_accepted.is_empty());
+        assert_eq!(
+            findings.fails_but_exported_accepted,
+            Vec::<AuthFailure>::new()
+        );
     }
 
     #[test]
@@ -2850,7 +2862,7 @@ mod auth_findings_tests {
     fn a_matching_content_hash_is_not_reported() {
         let create = with_hash(event("$create", "m.room.create", &[], &[]), None);
         let findings = derived_auth_findings(&export(vec![create])).unwrap();
-        assert!(findings.hash_mismatched.is_empty());
+        assert_eq!(findings.hash_mismatched, Vec::<String>::new());
         assert_eq!(findings.redacted_pdus, [None]);
     }
 
@@ -2948,7 +2960,7 @@ mod auth_findings_tests {
         let findings =
             derived_auth_findings(&export(vec![event("$create", "m.room.create", &[], &[])]))
                 .unwrap();
-        assert!(findings.hash_mismatched.is_empty());
+        assert_eq!(findings.hash_mismatched, Vec::<String>::new());
     }
 
     #[test]
@@ -3282,7 +3294,7 @@ mod auth_findings_tests {
             })
             .unwrap();
         }
-        assert!(synced.is_empty());
+        assert_eq!(synced, Vec::<mtxdb::ShardType>::new());
     }
 
     #[test]
@@ -3790,7 +3802,7 @@ mod signature_window_tests {
         );
         assert_eq!(findings.signature_verified_late, 1);
         assert_eq!(findings.signature_verified_late, 1);
-        assert!(findings.signature_audit.is_empty());
+        assert_eq!(findings.signature_audit, Vec::<SignatureAudit>::new());
         assert_eq!(
             findings.hash_audit[0].signature_status,
             Some("verified_late")

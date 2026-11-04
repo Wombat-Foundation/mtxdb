@@ -353,6 +353,12 @@ pub(crate) fn parse_keys(content: &[u8]) -> anyhow::Result<Vec<KeyRecord>> {
                 if key_id.is_empty() {
                     bail!("line {line}: `key_id` is empty");
                 }
+                if key_id.len() > mtxdb::server_keys::MAX_KEY_ID_BYTES {
+                    bail!(
+                        "line {line}: `key_id` exceeds {} bytes",
+                        mtxdb::server_keys::MAX_KEY_ID_BYTES
+                    );
+                }
                 let tier = if kind == key_kind::PROVISIONAL {
                     KeyTier::Provisional
                 } else {
@@ -1064,6 +1070,17 @@ mod tests {
             .contains("does not match"));
         let neither = KEY_LINE.replace("\"key\":\"AQID\",", "");
         assert!(parse_keys(neither.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn parse_keys_rejects_an_oversized_key_id() {
+        let too_long = "a".repeat(mtxdb::server_keys::MAX_KEY_ID_BYTES.saturating_add(1));
+        let line = KEY_LINE.replace("ed25519:A", &too_long);
+        let error = parse_keys(line.as_bytes()).expect_err("oversized key id must fail");
+        assert!(
+            error.to_string().contains("exceeds"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

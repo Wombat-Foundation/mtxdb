@@ -3164,6 +3164,7 @@ impl PackfileStorage {
         // resident session *before* this session's first write, so a later
         // resident open cannot load an image that predates those writes (and
         // cannot replay a delta this session never wrote).
+        let mut versions_valid = true;
         if residency == crate::index::IndexResidency::Paged && writable {
             // The checkpoint is not the primary index in paged mode, but it
             // is the only durable copy of collection versions for WAL groups
@@ -3173,8 +3174,8 @@ impl PackfileStorage {
             // loads it, and a later resident open is protected by the pack
             // fingerprint gate after any write.
             let checkpoint_path = Self::index_checkpoint_path(&base_dir);
-            let versions_persisted = Self::ensure_versions_file(&base_dir);
-            if versions_persisted || !checkpoint_path.exists() {
+            versions_valid = Self::ensure_versions_file(&base_dir);
+            if versions_valid || !checkpoint_path.exists() {
                 let _ = fs::remove_file(&checkpoint_path);
             }
             Self::sweep_orphan_delta_logs(&base_dir, None);
@@ -3185,6 +3186,24 @@ impl PackfileStorage {
         // always yields a bound <= the coverage of the checkpoint/scan below.
         let durable_state = Self::durable_index_state(&base_dir);
         let read_covered = Self::journal_lsn_with(&base_dir, durable_state.covered_lsn);
+        // A writable paged open retires the checkpoint and relies on
+        // `index.versions` as the durable collection-version baseline. If that
+        // file is missing or unreadable while the WAL claims nonzero coverage,
+        // opening anyway would start from an empty baseline and let reclaim
+        // drop the groups that still carry those versions.
+        if residency == crate::index::IndexResidency::Paged
+            && writable
+            && !versions_valid
+            && read_covered > 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} is missing or unreadable, but durable WAL coverage is {read_covered}; refusing to open a writable paged store with an empty version baseline",
+                    Self::index_versions_path(&base_dir).display()
+                ),
+            ));
+        }
         timings.metadata_load = metadata_started.elapsed();
         let checkpoint = if residency == crate::index::IndexResidency::Resident {
             Self::checkpoint_scan_out(

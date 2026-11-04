@@ -141,23 +141,31 @@ mod tests {
             String::from_utf8_lossy(&init.stderr)
         );
 
-        let output = Command::new(env!("CARGO_BIN_EXE_mtxdb"))
+        let first_output = Command::new(env!("CARGO_BIN_EXE_mtxdb"))
             .args(["import", "--dir"])
             .arg(&root)
             .arg(&first)
+            .output()
+            .expect("run mtxdb import first file");
+        let first_stderr = String::from_utf8_lossy(&first_output.stderr);
+        assert!(first_output.status.success(), "stderr: {first_stderr}");
+        assert!(
+            first_stderr.contains("fail the state-before-event auth check")
+                && first_stderr.contains("$bad"),
+            "the first file should report its disagreement: {first_stderr}"
+        );
+
+        let second_output = Command::new(env!("CARGO_BIN_EXE_mtxdb"))
+            .args(["import", "--dir"])
+            .arg(&root)
             .arg(&second)
             .output()
-            .expect("run mtxdb import");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "stderr: {stderr}");
+            .expect("run mtxdb import second file");
+        let second_stderr = String::from_utf8_lossy(&second_output.stderr);
+        assert!(second_output.status.success(), "stderr: {second_stderr}");
         assert!(
-            stderr.contains("fail the state-before-event auth check"),
-            "the first file should report the disagreement: {stderr}"
-        );
-        assert_eq!(
-            stderr.matches("$bad").count(),
-            1,
-            "the earlier file's disagreement must not be reported again: {stderr}"
+            !second_stderr.contains("$bad"),
+            "the second file must not report the earlier file's disagreement: {second_stderr}"
         );
 
         let _ = std::fs::remove_dir_all(root);

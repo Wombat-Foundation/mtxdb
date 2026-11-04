@@ -28,7 +28,7 @@ use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::RoomAuth;
 use mtxdb::shard::ShardPool;
-use mtxdb::storage::{NodeData, StorageEngine};
+use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::template::{
     CollectionKeyRule, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
 };
@@ -2732,30 +2732,32 @@ fn raw_late_parent_fixture() -> [OwnedValue; 4] {
     ]
 }
 
-fn import_raw_fixture_batch(
-    db: &Database,
-    store: &PackfileStorage,
-    state_store: &PackfileStorage,
-    path: &Path,
-    template: &CollectionTemplate,
-    established: &mut HashSet<[u8; 16]>,
-    events: &[OwnedValue],
-    auth_chain: &[OwnedValue],
-) {
-    import_pdu_events_with_raw(
-        db,
-        store,
-        state_store,
-        path,
-        events,
-        auth_chain,
-        Some(&[]),
-        None,
-        None,
-        template,
-        established,
-    )
-    .unwrap();
+struct RawFixtureImporter<'a> {
+    db: &'a Database,
+    store: &'a PackfileStorage,
+    state_store: &'a PackfileStorage,
+    path: &'a Path,
+    template: &'a CollectionTemplate,
+    established: &'a mut HashSet<[u8; 16]>,
+}
+
+impl RawFixtureImporter<'_> {
+    fn import(&mut self, events: &[OwnedValue], auth_chain: &[OwnedValue]) {
+        import_pdu_events_with_raw(
+            self.db,
+            self.store,
+            self.state_store,
+            self.path,
+            events,
+            auth_chain,
+            Some(&[]),
+            None,
+            None,
+            self.template,
+            self.established,
+        )
+        .unwrap();
+    }
 }
 
 fn assert_raw_reimport_keeps_versions(
@@ -2859,6 +2861,40 @@ fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
     );
 }
 
+fn assert_raw_waiting_and_reverse(
+    edge_store: &PackfileStorage,
+    waiting: &[u8; 16],
+    reverse: &[u8; 16],
+    waiting_node: NodeId,
+    reverse_node: NodeId,
+) {
+    assert!(
+        edge_store.get(waiting, &waiting_node).unwrap().is_some(),
+        "missing parent must be recorded in raw_waiting"
+    );
+    assert!(
+        edge_store.get(reverse, &reverse_node).unwrap().is_some(),
+        "reverse edge from the missing parent must be present"
+    );
+}
+
+fn assert_raw_arrival_clears_waiting(
+    edge_store: &PackfileStorage,
+    waiting: &[u8; 16],
+    reverse: &[u8; 16],
+    waiting_node: NodeId,
+    reverse_node: NodeId,
+) {
+    assert!(
+        edge_store.get(waiting, &waiting_node).unwrap().is_none(),
+        "arrived parent must be removed from raw_waiting"
+    );
+    assert!(
+        edge_store.get(reverse, &reverse_node).unwrap().is_some(),
+        "reverse edge remains durable after the parent arrives"
+    );
+}
+
 #[test]
 fn raw_import_records_reverse_edges_and_waiting_parents() {
     let dir = unique_temp_dir().join("raw_rev_edges");
@@ -2883,94 +2919,53 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
     );
     let waiting_coll = raw_waiting_collection_id("!room3");
     let rev_prev_coll = raw_reverse_edge_collection_id("prev", &leave_node);
-
-    // Import create, join, stale (which cites $leave as prev)
-    import_raw_fixture_batch(
-        &db,
+    let mut fixture = RawFixtureImporter {
+        db: &db,
         store,
         state_store,
-        &path,
-        &template,
-        &mut established,
-        &[create.clone(), join.clone(), stale.clone()],
-        &[],
+        path: &path,
+        template: &template,
+        established: &mut established,
+    };
+
+    // Import create, join, stale (which cites $leave as prev). $leave is
+    // missing, so it must enter raw_waiting and leave a reverse edge to stale.
+    let initial = [create, join, stale];
+    fixture.import(&initial, &[]);
+    assert_raw_waiting_and_reverse(
+        edge_store,
+        &waiting_coll,
+        &rev_prev_coll,
+        leave_node,
+        stale_node,
     );
 
-    // 1. $leave is missing, so waiting_coll must contain leave_node
-    assert!(
-        edge_store
-            .get(&waiting_coll, &leave_node)
-            .unwrap()
-            .is_some(),
-        "missing parent $leave must be recorded in raw_waiting"
-    );
-
-    // 2. Reverse edge leave -> stale must be present in raw-rev-prev
-    assert!(
-        edge_store
-            .get(&rev_prev_coll, &stale_node)
-            .unwrap()
-            .is_some(),
-        "reverse edge from $leave to $stale must be present"
-    );
-
-    // Re-importing the same file must not change the recorded state or advance versions.
+    // Re-importing the same file must not change the recorded state or advance
+    // collection versions.
     assert_raw_reimport_keeps_versions(
         edge_store,
         &waiting_coll,
         &rev_prev_coll,
         leave_node,
         stale_node,
-        || {
-            import_raw_fixture_batch(
-                &db,
-                store,
-                state_store,
-                &path,
-                &template,
-                &mut established,
-                &[create.clone(), join.clone(), stale.clone()],
-                &[],
-            );
-        },
+        || fixture.import(&initial, &[]),
     );
-    assert!(edge_store
-        .get(&waiting_coll, &leave_node)
-        .unwrap()
-        .is_some());
-    assert!(edge_store
-        .get(&rev_prev_coll, &stale_node)
-        .unwrap()
-        .is_some());
-
-    // Import leave
-    import_raw_fixture_batch(
-        &db,
-        store,
-        state_store,
-        &path,
-        &template,
-        &mut established,
-        &[leave],
-        &[],
+    assert_raw_waiting_and_reverse(
+        edge_store,
+        &waiting_coll,
+        &rev_prev_coll,
+        leave_node,
+        stale_node,
     );
 
-    // 3. Now that $leave has arrived, it must be removed from raw_waiting
-    assert!(
-        edge_store
-            .get(&waiting_coll, &leave_node)
-            .unwrap()
-            .is_none(),
-        "arrived parent $leave must be removed from raw_waiting"
-    );
-
-    // 4. Reverse edge remains durable
-    assert!(
-        edge_store
-            .get(&rev_prev_coll, &stale_node)
-            .unwrap()
-            .is_some(),
-        "reverse edge remains durable after parent arrives"
+    // Import leave: arrival clears waiting but keeps the reverse edge.
+    fixture.import(&[leave], &[]);
+    assert_raw_arrival_clears_waiting(
+        edge_store,
+        &waiting_coll,
+        &rev_prev_coll,
+        leave_node,
+        stale_node,
     );
 
     // A parent stored by an earlier file must not be marked missing again.
@@ -2983,16 +2978,7 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
         r#"["$leave"]"#,
         r#"["$create","$join"]"#,
     );
-    import_raw_fixture_batch(
-        &db,
-        store,
-        state_store,
-        &path,
-        &template,
-        &mut established,
-        &[late],
-        &[],
-    );
+    fixture.import(&[late], &[]);
     assert!(
         edge_store
             .get(&waiting_coll, &leave_node)
@@ -3658,7 +3644,15 @@ fn raw_auth_projection_rejects_conflicting_exports() {
         ),
         "10",
     );
-    write_raw_auth_projections(store, room, &template, "10", &[first.clone()], &[]).unwrap();
+    write_raw_auth_projections(
+        store,
+        room,
+        &template,
+        "10",
+        std::slice::from_ref(&first),
+        &[],
+    )
+    .unwrap();
     let error =
         write_raw_auth_projections(store, room, &template, "10", &[second], &[]).unwrap_err();
     assert!(
@@ -5487,7 +5481,7 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
     assert_eq!(chain, vec!["$c", "$m", "$member"]);
     // The auth-chain event was recorded through the same path as the PDUs.
     assert_eq!(auth.auth_edges(&db, "$member").unwrap(), vec!["$c"]);
-    assert!(auth.auth_edges(&db, "$c").unwrap().is_empty());
+    assert_eq!(auth.auth_edges(&db, "$c").unwrap(), Vec::<String>::new());
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -5703,7 +5697,7 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     );
     let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[], "!r:x");
     assert!(!first.groups.contains_key("$child"));
-    assert!(!first.unresolved.is_empty());
+    assert_ne!(first.unresolved, Vec::<String>::new());
     assert_eq!(aux.get(b"$child").unwrap(), None);
 
     let parent = owned_value(
@@ -5711,7 +5705,7 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     );
     let repaired = compute_state_groups_partial(&[parent, incomplete], &[], "!r:x");
     assert!(repaired.groups.contains_key("$child"));
-    assert!(repaired.unresolved.is_empty());
+    assert_eq!(repaired.unresolved, Vec::<String>::new());
     let entries: Vec<(&[u8], &[u8])> = repaired
         .groups
         .iter()
@@ -7286,9 +7280,10 @@ fn imported_keys_export_is_readable_in_the_servers_layout() {
         expected_notary,
         "the notary payload must come back byte for byte"
     );
-    assert!(read_server_keys(db.server_info(), b"other.example.org")
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        read_server_keys(db.server_info(), b"other.example.org").unwrap(),
+        Vec::<mtxdb::server_keys::ServerKey>::new()
+    );
 }
 
 fn marker(db: &Database) -> Option<mtxdb::interop::ImportMarker> {

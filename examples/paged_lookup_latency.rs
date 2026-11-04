@@ -207,19 +207,32 @@ fn open(dir: &Path, residency: IndexResidency, shard_bytes: u64) -> PackfileStor
     .expect("open lookup fixture")
 }
 
-fn average_lookup(store: &PackfileStorage, ids: &[NodeId]) -> Duration {
+fn average_lookup(store: &PackfileStorage, ids: &[NodeId], expected_present: bool) -> Duration {
     let started = Instant::now();
+    let mut mismatches = 0usize;
     for id in ids {
-        black_box(store.get_location(&COLLECTION, id).expect("point lookup"));
+        let found = black_box(store.get_location(&COLLECTION, id).expect("point lookup"));
+        if found.is_some() != expected_present {
+            mismatches = mismatches.saturating_add(1);
+        }
     }
+    let elapsed = started.elapsed();
+    assert_eq!(
+        mismatches,
+        0,
+        "{} of {} probes returned the wrong presence (expected {expected_present})",
+        mismatches,
+        ids.len()
+    );
     let probe_count = u32::try_from(ids.len()).expect("probe count fits in u32");
-    started.elapsed().div_f64(f64::from(probe_count))
+    elapsed.div_f64(f64::from(probe_count))
 }
 
 fn measure(
     dir: &Path,
     residency: IndexResidency,
     probes: &[NodeId],
+    expected_present: bool,
     rounds: usize,
     shard_bytes: u64,
 ) -> (Duration, Duration, usize, usize) {
@@ -237,7 +250,7 @@ fn measure(
             heap_bytes = heap;
             mapped_bytes = mapped;
         }
-        best_lookup = best_lookup.min(average_lookup(&store, probes));
+        best_lookup = best_lookup.min(average_lookup(&store, probes, expected_present));
         drop(store);
     }
     (best_open, best_lookup, heap_bytes, mapped_bytes)
@@ -309,8 +322,9 @@ fn main() {
             ("resident", IndexResidency::Resident),
             ("paged", IndexResidency::Paged),
         ] {
-            let (open, hit, heap, mapped) = measure(&base, residency, &hits, rounds, shard_bytes);
-            let (_, miss, _, _) = measure(&base, residency, &misses, rounds, shard_bytes);
+            let (open, hit, heap, mapped) =
+                measure(&base, residency, &hits, true, rounds, shard_bytes);
+            let (_, miss, _, _) = measure(&base, residency, &misses, false, rounds, shard_bytes);
             println!(
                 "{wanted}\t{label}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}",
                 open.as_secs_f64() * 1e3,

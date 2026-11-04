@@ -298,7 +298,7 @@ mod tests {
             event("$unrelated", &[]),
         ];
         let mut context = LeanEventContext::new(events.iter());
-        assert!(context.ensure(&["$child".to_owned()]).is_empty());
+        assert_eq!(context.ensure(&["$child".to_owned()]), Vec::<String>::new());
         assert!(context.map().contains_key("$child"));
         assert!(context.map().contains_key("$root"));
         assert!(!context.map().contains_key("$unrelated"));

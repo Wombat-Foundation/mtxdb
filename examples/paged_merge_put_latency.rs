@@ -92,14 +92,12 @@ fn run_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn count_ext(dir: &Path, ext: &str) -> usize {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.path().extension().is_some_and(|e| e == ext))
-                .count()
-        })
-        .unwrap_or(0)
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == ext))
+            .count()
+    })
 }
 
 /// Paced puts: one every `interval`, each sample is that call's wall time.

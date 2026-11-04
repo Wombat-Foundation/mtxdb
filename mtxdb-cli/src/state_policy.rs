@@ -117,7 +117,7 @@ impl StateView {
         if rejected.contains(event_id) {
             return true;
         }
-        self == Self::Client && event_disposition(event) == EventDisposition::SoftFailed
+        self == Self::Client && has_event_flag(event, "soft_failed")
     }
 }
 
@@ -242,6 +242,7 @@ mod tests {
         let rejected = value(r#"{"rejected":true,"type":"m.room.name"}"#);
         let exporter_only = value(r#"{"rejected":true,"type":"m.room.name"}"#);
         let soft_failed = value(r#"{"soft_failed":true,"type":"m.room.name"}"#);
+        let both = value(r#"{"rejected":true,"soft_failed":true,"type":"m.room.name"}"#);
         let rejected_ids = HashSet::from(["$derived".to_owned()]);
         let none = HashSet::new();
 
@@ -251,6 +252,11 @@ mod tests {
         }
         assert!(!StateView::Federated.excludes_import(&soft_failed, "$soft", &none));
         assert!(StateView::Client.excludes_import(&soft_failed, "$soft", &none));
+        // The exporter's own rejection annotation is not used for import
+        // filtering, but a soft-fail still drops the event from the client
+        // view even when a rejection annotation accompanies it.
+        assert!(!StateView::Federated.excludes_import(&both, "$both", &none));
+        assert!(StateView::Client.excludes_import(&both, "$both", &none));
     }
 
     #[test]

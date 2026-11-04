@@ -147,6 +147,15 @@ fn notary_record_ids_are_distinct_per_origin() {
     let one = notary_record_id(b"a.example");
     assert_ne!(one, notary_record_id(b"b.example"));
     assert_eq!(one, notary_record_id(b"a.example"));
+    // Pin the derivation so changing the domain or hash silently rewrites
+    // every existing Notary slot id is caught here.
+    assert_eq!(
+        one,
+        [
+            0xE2, 0x68, 0xE8, 0x1F, 0xF2, 0x0A, 0xFA, 0x72, 0xE0, 0x04, 0x45, 0xB0, 0x00, 0xCE,
+            0x60, 0xA0,
+        ]
+    );
 }
 
 #[test]
