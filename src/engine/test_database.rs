@@ -41,9 +41,9 @@ fn a_paged_pool_policy_is_rejected_before_the_root_is_created() {
         index_residency: IndexResidency::Paged,
         ..PoolPolicy::default()
     };
-    let error = match Database::open_with_policies(root.clone(), PoolPolicies::uniform(policy)) {
-        Ok(_) => panic!("paged residency must be rejected"),
-        Err(error) => error,
+    let Err(error) = Database::open_with_policies(root.clone(), PoolPolicies::uniform(policy))
+    else {
+        panic!("paged residency must be rejected");
     };
     assert!(
         error.to_string().to_ascii_lowercase().contains("paged"),
