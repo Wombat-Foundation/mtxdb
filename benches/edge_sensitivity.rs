@@ -52,28 +52,31 @@ fn density_row(pattern: &str, children: &[u32]) {
 }
 
 fn holes() {
-    println!("# holes: one 65536-short universe; directory bytes only, values excluded");
-    println!(
-        "hole_percent\tpresent\tsorted_u32_B\tbitmap_B\tassumed_point_charge_B\tsmaller_directory"
-    );
-    for hole_percent in [0u32, 25, 50, 75, 90, 95, 99, 100] {
+    println!("# holes: one 65536-short universe; raw directory payloads versus serialized bitmap (includes headers); values excluded");
+    println!("hole_percent\tpresent\tsorted_u16_B\tgap_B\tbitmap_B\tsmaller_directory");
+    for hole_percent in [0u32, 25, 50, 75, 85, 87, 88, 90, 93, 94, 95, 99, 100] {
         let present: Vec<u32> = (0u32..65_536)
             .filter(|short| short.checked_rem(100).expect("nonzero divisor") >= hole_percent)
             .collect();
-        let sparse_bytes = present.len().checked_mul(4).expect("size fits");
+        let sparse_bytes = present.len().checked_mul(2).expect("size fits");
+        let mut gaps = Vec::new();
+        append_reverse_row(0, &present, &mut gaps);
         let bitmap_bytes = BitmapSet::from_values(BENCH_DOMAIN, present.iter().copied())
             .encode()
             .expect("bitmap encodes")
             .len();
-        let charge = present.len().checked_mul(63).expect("size fits");
-        let winner = if sparse_bytes < bitmap_bytes {
-            "sorted"
-        } else {
-            "bitmap"
-        };
+        let (_, winner) = [
+            (sparse_bytes, "u16"),
+            (gaps.len(), "gaps"),
+            (bitmap_bytes, "bitmap"),
+        ]
+        .into_iter()
+        .min()
+        .expect("three candidates");
         println!(
-            "{hole_percent}\t{}\t{sparse_bytes}\t{bitmap_bytes}\t{charge}\t{winner}",
-            present.len()
+            "{hole_percent}\t{}\t{sparse_bytes}\t{}\t{bitmap_bytes}\t{winner}",
+            present.len(),
+            gaps.len()
         );
     }
 }
