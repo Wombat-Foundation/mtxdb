@@ -13120,9 +13120,10 @@ fn write_pool_run(dir: &std::path::Path, positions: &[usize]) -> PathBuf {
     let path = dir.join(crate::index::run::run_file_name(&first, &last));
     crate::index::run::merge_to_path(
         &sources,
-        crate::index::run::MergeOptions {
+        &crate::index::run::MergeOptions {
             drop_removals: positions.first() == Some(&0),
             block_entries: 8,
+            ..crate::index::run::MergeOptions::default()
         },
         &path,
     )
@@ -13507,10 +13508,14 @@ fn pool_sidecar_verifies(store: &PackfileStorage) -> u64 {
 /// state a crash leaves after the run file is published.
 fn publish_planned_run(store: &PackfileStorage) -> PathBuf {
     let plan = store.plan_run_merge().expect("a planned merge");
-    build_planned_run(store.shards.base_dir(), &plan)
-        .unwrap()
-        .expect("a non-empty run")
-        .path
+    build_planned_run(
+        store.shards.base_dir(),
+        &plan,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap()
+    .expect("a non-empty run")
+    .path
 }
 
 #[test]
@@ -13688,9 +13693,13 @@ fn paged_run_install_is_discarded_after_its_packs_retire() {
     let store = paged_open(&dir);
     store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
     let plan = store.plan_run_merge().expect("a planned merge");
-    let built = build_planned_run(store.shards.base_dir(), &plan)
-        .unwrap()
-        .expect("a non-empty run");
+    let built = build_planned_run(
+        store.shards.base_dir(),
+        &plan,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap()
+    .expect("a non-empty run");
     let path = built.path.clone();
     // A repack retires packs the run covers before it is installed.
     store

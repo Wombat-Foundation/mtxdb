@@ -903,8 +903,10 @@ fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
         fresh_index.resident_bytes(),
         fresh_index.mapped_bytes(),
     );
+    let fresh_capacity = fresh_index.capacity();
+    drop(fresh_index);
     let (post_grow_index, post_grow_build) =
-        timed(|| build_post_grow_lossy_index(entries, fresh_index.capacity()));
+        timed(|| build_post_grow_lossy_index(entries, fresh_capacity));
     println!(
         "  LossyIndex post-grow setup: {:.0} ms",
         ms(post_grow_build)
@@ -916,7 +918,7 @@ fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
         post_grow_index.resident_bytes(),
         post_grow_index.mapped_bytes(),
     );
-    drop((fresh_index, post_grow_index));
+    drop(post_grow_index);
 
     let checkpoint_store = PackfileStorage::open(PathBuf::from(dir))
         .expect("open store before writing a clean checkpoint");

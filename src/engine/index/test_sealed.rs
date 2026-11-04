@@ -263,7 +263,7 @@ fn sample_run(
     dir: &std::path::Path,
     fallback: crate::index::sealed::RunFallback,
 ) -> Arc<SealedRun> {
-    use crate::index::run::{RunEntry, RunIndex, RunWriter};
+    use crate::index::run::{RunEntry, RunIndex, RunPackStats, RunWriter};
     let path = dir.join("sample.run");
     let mut writer = RunWriter::create(&path, vec![run_identity(2), run_identity(3)], 4).unwrap();
     let mut entries = [
@@ -284,6 +284,22 @@ fn sample_run(
     for entry in entries {
         writer.push(entry).unwrap();
     }
+    writer
+        .set_pack_stats(vec![
+            RunPackStats {
+                ordinal: 0,
+                collection_id: COLLECTION,
+                entry_count: 1,
+                disk_bytes: 0,
+            },
+            RunPackStats {
+                ordinal: 1,
+                collection_id: COLLECTION,
+                entry_count: 1,
+                disk_bytes: 0,
+            },
+        ])
+        .unwrap();
     writer.finish().unwrap().unwrap();
     let packs = vec![
         RunPack {
@@ -376,5 +392,72 @@ fn a_damaged_run_without_fallback_fails_instead_of_missing() {
         "a damaged run must never report a miss"
     );
     assert!(set.for_each_in_collection(&COLLECTION, |_, _| {}).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn damaged_run_fallback_retries_after_transient_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = scratch_dir("transient_fallback");
+    let run = sample_run(&dir, Box::new(|| Err("unused".into())));
+    let path = dir.join("sample.run");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[crate::index::run::RUN_HEADER_LEN] ^= 0xFF;
+    let damaged = dir.join("damaged.run");
+    std::fs::write(&damaged, &bytes).unwrap();
+    let packs = run.packs().to_vec();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = Arc::clone(&attempts);
+
+    let damaged_run = SealedRun::new(
+        Arc::new(crate::index::run::RunIndex::open(&damaged).unwrap()),
+        packs,
+        Box::new(move || {
+            let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                Err("transient load failure".into())
+            } else {
+                Ok(vec![
+                    pack(
+                        2,
+                        20,
+                        FakeIndex::new(
+                            &[(COLLECTION, KEY_3, PackIndexLocator::Frame(run_offset(20)))],
+                            0,
+                        ),
+                    ),
+                    pack(
+                        3,
+                        30,
+                        FakeIndex::new(
+                            &[(COLLECTION, KEY, PackIndexLocator::Frame(run_offset(30)))],
+                            0,
+                        ),
+                    ),
+                ])
+            }
+        }),
+    )
+    .unwrap();
+
+    let mut set = SealedLocators::new();
+    set.insert_run(Arc::new(damaged_run));
+
+    // First attempt fails due to transient error and must not permanently cache failure
+    assert!(set.lookup(&COLLECTION, &KEY).is_err());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    // Second attempt retries and succeeds
+    let hit = set.lookup(&COLLECTION, &KEY).unwrap().unwrap();
+    assert_eq!((hit.slot, hit.creation_seq), (30, 3));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    // Subsequent lookups reuse the cached successful fallback
+    let hit = set.lookup(&COLLECTION, &KEY_3).unwrap().unwrap();
+    assert_eq!((hit.slot, hit.creation_seq), (20, 2));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
     let _ = std::fs::remove_dir_all(&dir);
 }

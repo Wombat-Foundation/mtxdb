@@ -58,6 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             path.extension()
                 .is_some_and(|extension| extension == "pack")
         })
+        .filter(|path| pack_index_path(path).exists())
         .map(|path| identity(&path).map(|identity| (identity.creation_seq, path, identity)))
         .collect::<Result<Vec<_>, _>>()?;
     packs.sort_by_key(|(creation_seq, _, _)| *creation_seq);

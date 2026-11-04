@@ -155,6 +155,27 @@ fn sorted(mut entries: Vec<RunEntry>) -> Vec<RunEntry> {
     entries
 }
 
+fn fixture_pack_stats(entries: &[RunEntry]) -> Vec<RunPackStats> {
+    let mut counts = BTreeMap::new();
+    for entry in entries {
+        let count = counts
+            .entry((entry.collection_id, entry.ordinal))
+            .or_insert(0_u64);
+        *count = count
+            .checked_add(1)
+            .expect("pack stats entry count overflow");
+    }
+    counts
+        .into_iter()
+        .map(|((collection_id, ordinal), entry_count)| RunPackStats {
+            ordinal,
+            collection_id,
+            entry_count,
+            disk_bytes: 0,
+        })
+        .collect()
+}
+
 /// Write `entries` (sorted) as a run over packs `1..=pack_count` with small
 /// blocks so tests cross block boundaries.
 fn write_run(path: &Path, pack_count: u64, entries: &[RunEntry]) -> Option<RunSummary> {
@@ -163,6 +184,7 @@ fn write_run(path: &Path, pack_count: u64, entries: &[RunEntry]) -> Option<RunSu
     for entry in entries {
         writer.push(*entry).unwrap();
     }
+    writer.set_pack_stats(fixture_pack_stats(entries)).unwrap();
     writer.finish().unwrap()
 }
 
@@ -431,7 +453,7 @@ fn an_empty_merge_removes_a_stale_run_at_its_path() {
     let sidecar = write_sidecar(&dir, 1, &removal);
     let path = dir.join("range.run");
     let sources = [MergeSource::Sidecar(&sidecar)];
-    merge_to_path(&sources, MergeOptions::default(), &path)
+    merge_to_path(&sources, &MergeOptions::default(), &path)
         .unwrap()
         .unwrap();
     assert!(path.exists(), "removals are kept by default");
@@ -439,7 +461,7 @@ fn an_empty_merge_removes_a_stale_run_at_its_path() {
         drop_removals: true,
         ..MergeOptions::default()
     };
-    assert_eq!(merge_to_path(&sources, options, &path).unwrap(), None);
+    assert_eq!(merge_to_path(&sources, &options, &path).unwrap(), None);
     assert!(
         !path.exists(),
         "the earlier run for this range must not survive"
@@ -465,11 +487,17 @@ fn a_block_whose_crc_matches_but_whose_order_is_wrong_is_rejected() {
     bytes[second..second.checked_add(ID_LEN).unwrap()].copy_from_slice(&a);
     let block_len = ENTRY_LEN.checked_mul(4).unwrap();
     let block_crc = crc32fast::hash(&bytes[first..first.checked_add(block_len).unwrap()]);
-    let crc_at = bytes.len().checked_sub(4).unwrap();
-    bytes[crc_at..].copy_from_slice(&block_crc.to_le_bytes());
+    let header = RunHeader::parse(&bytes).unwrap();
+    let block_at = header.block_table_at().unwrap();
+    let crc_at = block_at
+        .checked_add(BLOCK_ENTRY_LEN)
+        .unwrap()
+        .checked_sub(4)
+        .unwrap();
+    bytes[crc_at..crc_at.checked_add(4).unwrap()].copy_from_slice(&block_crc.to_le_bytes());
     // The fence must still match the (new) first id for the swap alone to be
     // the defect.
-    let fence_at = bytes.len().checked_sub(BLOCK_ENTRY_LEN).unwrap();
+    let fence_at = block_at;
     bytes[fence_at..fence_at.checked_add(ID_LEN).unwrap()].copy_from_slice(&b);
     reseal_meta(&mut bytes);
     fs::write(&path, &bytes).unwrap();
@@ -513,7 +541,7 @@ fn merge_keeps_the_newest_version_against_a_model() {
             }
             let sources: Vec<MergeSource<'_>> = members.iter().map(MergeSource::Sidecar).collect();
             let path = dir.join(&format!("group-{group}.run"));
-            if merge_to_path(&sources, MergeOptions::default(), &path)
+            if merge_to_path(&sources, &MergeOptions::default(), &path)
                 .unwrap()
                 .is_some()
             {
@@ -530,9 +558,10 @@ fn merge_keeps_the_newest_version_against_a_model() {
         let options = MergeOptions {
             drop_removals: false,
             block_entries: 3,
+            ..MergeOptions::default()
         };
         let path = dir.join("merged.run");
-        let merged = merge_to_path(&sources, options, &path).unwrap().unwrap();
+        let merged = merge_to_path(&sources, &options, &path).unwrap().unwrap();
         let run = RunIndex::open(&path).unwrap();
         run.verify_all().unwrap();
         let mut keys: Vec<Key> = models
@@ -675,7 +704,7 @@ fn removals_are_dropped_only_when_asked() {
     let sources: Vec<MergeSource<'_>> = sidecars.iter().map(MergeSource::Sidecar).collect();
 
     let kept = dir.join("kept.run");
-    merge_to_path(&sources, MergeOptions::default(), &kept)
+    merge_to_path(&sources, &MergeOptions::default(), &kept)
         .unwrap()
         .unwrap();
     let kept = RunIndex::open(&kept).unwrap();
@@ -694,7 +723,9 @@ fn removals_are_dropped_only_when_asked() {
         drop_removals: true,
         ..MergeOptions::default()
     };
-    merge_to_path(&sources, options, &dropped).unwrap().unwrap();
+    merge_to_path(&sources, &options, &dropped)
+        .unwrap()
+        .unwrap();
     let dropped = RunIndex::open(&dropped).unwrap();
     assert_eq!(dropped.lookup(&collection(0), &logical_id(1)), Ok(None));
     assert_eq!(dropped.lookup(&collection(0), &logical_id(3)), Ok(None));
@@ -722,7 +753,7 @@ fn a_merge_of_only_dropped_removals_writes_nothing() {
         ..MergeOptions::default()
     };
     assert_eq!(
-        merge_to_path(&[MergeSource::Sidecar(&sidecar)], options, &path).unwrap(),
+        merge_to_path(&[MergeSource::Sidecar(&sidecar)], &options, &path).unwrap(),
         None
     );
     assert!(!path.exists());
@@ -747,7 +778,7 @@ fn merge_rejects_overlapping_and_interleaved_inputs() {
         MergeSource::Sidecar(&sidecars[0]),
     ];
     assert!(matches!(
-        merge_to_path(&twice, MergeOptions::default(), &path),
+        merge_to_path(&twice, &MergeOptions::default(), &path),
         Err(RunError::OverlappingInputs)
     ));
 
@@ -758,7 +789,7 @@ fn merge_rejects_overlapping_and_interleaved_inputs() {
             MergeSource::Sidecar(&sidecars[0]),
             MergeSource::Sidecar(&sidecars[2]),
         ],
-        MergeOptions::default(),
+        &MergeOptions::default(),
         &outer,
     )
     .unwrap()
@@ -767,7 +798,7 @@ fn merge_rejects_overlapping_and_interleaved_inputs() {
     assert!(matches!(
         merge_to_path(
             &[MergeSource::Run(&outer), MergeSource::Sidecar(&sidecars[1])],
-            MergeOptions::default(),
+            &MergeOptions::default(),
             &path,
         ),
         Err(RunError::OverlappingInputs)
@@ -788,7 +819,7 @@ fn merging_a_corrupt_run_fails_and_leaves_no_output() {
 
     let path = dir.join("out.run");
     assert!(matches!(
-        merge_to_path(&[MergeSource::Run(&run)], MergeOptions::default(), &path),
+        merge_to_path(&[MergeSource::Run(&run)], &MergeOptions::default(), &path),
         Err(RunError::Corrupt(RunCorrupt))
     ));
     assert!(!path.exists());
@@ -797,7 +828,9 @@ fn merging_a_corrupt_run_fails_and_leaves_no_output() {
 /// Write an empty-stats run over exactly `packs`.
 fn write_run_over(path: &Path, packs: Vec<PackIndexIdentity>) {
     let mut writer = RunWriter::create(path, packs, 4).unwrap();
-    writer.push(entry(1, 1, 0, 0)).unwrap();
+    let entry = entry(1, 1, 0, 0);
+    writer.push(entry).unwrap();
+    writer.set_pack_stats(fixture_pack_stats(&[entry])).unwrap();
     writer.finish().unwrap().unwrap();
 }
 
@@ -876,7 +909,7 @@ fn pack_stats_in_collection_matches_a_filtered_scan() {
         .collect();
     let sources: Vec<MergeSource<'_>> = sidecars.iter().map(MergeSource::Sidecar).collect();
     let path = dir.join("stats.run");
-    merge_to_path(&sources, MergeOptions::default(), &path)
+    merge_to_path(&sources, &MergeOptions::default(), &path)
         .unwrap()
         .unwrap();
     let run = RunIndex::open(&path).unwrap();
@@ -918,4 +951,76 @@ fn verify_collection_checks_only_that_collections_blocks() {
     assert_eq!(run.verify_collection(&collection(2)), Err(RunCorrupt));
     assert!(run.is_invalid(), "a failed block invalidates the run");
     assert_eq!(run.verify_collection(&collection(1)), Err(RunCorrupt));
+}
+
+#[test]
+fn writer_emits_default_pack_stats_when_omitted() {
+    let dir = TestDir::new();
+    let path = dir.join("default_stats.run");
+    let mut writer = RunWriter::create(&path, vec![identity(1), identity(2)], 4).unwrap();
+    writer.push(entry(0, 1, 0, 10)).unwrap();
+    writer.push(entry(0, 2, 1, 20)).unwrap();
+    writer.finish().unwrap().unwrap();
+
+    let run = RunIndex::open(&path).unwrap();
+    assert!(run.has_pack_stats());
+    assert_eq!(run.stats_count(), 2);
+    let stats: Vec<_> = run.pack_stats().collect();
+    assert_eq!(stats.len(), 2);
+    assert_eq!(stats[0].ordinal, 0);
+    assert_eq!(stats[0].entry_count, 1);
+    assert_eq!(stats[1].ordinal, 1);
+    assert_eq!(stats[1].entry_count, 1);
+}
+
+#[test]
+fn load_pool_runs_rejects_nonempty_run_without_pack_stats() {
+    let dir = TestDir::new();
+    let path = dir.join("no_stats.run");
+    let mut writer = RunWriter::create(&path, vec![identity(1)], 4).unwrap();
+    let entry = entry(0, 1, 0, 10);
+    writer.push(entry).unwrap();
+    writer.set_pack_stats(fixture_pack_stats(&[entry])).unwrap();
+    writer.finish().unwrap().unwrap();
+
+    let mut bytes = fs::read(&path).unwrap();
+    // Zero out stats_count in header (bytes 36..40) and reseal
+    bytes[36..40].copy_from_slice(&0_u32.to_le_bytes());
+    reseal_meta(&mut bytes);
+    fs::write(&path, &bytes).unwrap();
+
+    let pool = vec![identity(1)];
+    let kept = load_pool_runs(&dir.0, &pool, true);
+    assert!(
+        kept.is_empty(),
+        "nonempty run without pack stats must be rejected"
+    );
+    assert!(
+        !path.exists(),
+        "rejected run should be removed when writable"
+    );
+}
+
+#[test]
+fn merge_aborts_when_stop_signalled() {
+    let dir = TestDir::new();
+    let models = [random_pack(&mut Rng(1), 50), random_pack(&mut Rng(2), 50)];
+    let sidecars: Vec<MappedPackIndex> = models
+        .iter()
+        .zip(1_u64..)
+        .map(|(model, seq)| write_sidecar(&dir, seq, model))
+        .collect();
+    let sources: Vec<MergeSource<'_>> = sidecars.iter().map(MergeSource::Sidecar).collect();
+    let path = dir.join("cancelled.run");
+    let stop = Arc::new(AtomicBool::new(true));
+    let options = MergeOptions {
+        stop: Some(stop),
+        ..MergeOptions::default()
+    };
+    let result = merge_to_path(&sources, &options, &path);
+    assert!(matches!(result, Err(RunError::Cancelled)));
+    assert!(!path.exists());
+    let mut temp = path.into_os_string();
+    temp.push(".tmp");
+    assert!(!PathBuf::from(temp).exists());
 }

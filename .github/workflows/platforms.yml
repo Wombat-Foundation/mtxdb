@@ -39,6 +39,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install zstd development files (Linux ARM)
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: sudo apt-get update && sudo apt-get install --yes libzstd-dev pkg-config
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

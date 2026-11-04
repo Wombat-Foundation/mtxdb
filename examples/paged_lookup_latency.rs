@@ -30,6 +30,11 @@ const COLLECTION: [u8; 16] = [0x4D; 16];
 const DEFAULT_SHARD_BYTES: u64 = 8192;
 const PAYLOAD_BYTES: usize = 120;
 const PROBES: usize = 500;
+/// How long to wait for an asynchronous sidecar build before treating it as
+/// stalled. Without this, a failed `mtxdb-pack-index` worker would let the
+/// top-up loop keep growing the fixture until a write or sync fails.
+const SIDECAR_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+const SIDECAR_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -155,11 +160,26 @@ fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64, payload_len:
     // The estimate above can be far off (frames are about 180 bytes, not
     // 341), and every sync rewrites the whole index checkpoint, so top up
     // from the measured records per pack instead of syncing once per batch.
+    let wanted = u64::try_from(wanted_packs).expect("pack count fits in u64");
+    let mut last_sealed = 0u64;
+    let mut stalled_since = None;
     loop {
         let sealed = u64::try_from(sidecar_count(dir)).expect("pack count fits in u64");
-        let wanted = u64::try_from(wanted_packs).expect("pack count fits in u64");
         if sealed >= wanted {
             break;
+        }
+        if sealed > last_sealed {
+            last_sealed = sealed;
+            stalled_since = None;
+        } else {
+            let since = *stalled_since.get_or_insert_with(Instant::now);
+            assert!(
+                since.elapsed() < SIDECAR_STALL_TIMEOUT,
+                "fixture top-up stalled at {sealed} of {wanted} sidecars; \
+                 mtxdb-pack-index may have failed (check its log)"
+            );
+            std::thread::sleep(SIDECAR_POLL_INTERVAL);
+            continue;
         }
         let per_pack = (sequence / sealed.max(1)).max(1);
         let mut remaining = (wanted - sealed + 1).saturating_mul(per_pack);

@@ -743,6 +743,8 @@ pub struct ShardPool {
     sealed_runs: RwLock<Vec<Arc<crate::index::sealed::SealedRun>>>,
     /// At most one asynchronous run merge is built for this pool at a time.
     run_merge_active: Arc<AtomicBool>,
+    /// Cancellation signal for any in-flight run merge.
+    run_merge_stop: Arc<AtomicBool>,
     /// The in-flight run merge, if any. Kept apart from `seal_workers` so a
     /// sync, which waits for sidecar builders, never waits for a merge.
     run_merge_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1152,7 +1154,7 @@ impl ShardPool {
     /// the storage layer's responsibility.
     pub(crate) fn start_run_merge_worker(
         &self,
-        task: impl FnOnce() -> io::Result<Option<run::PoolRun>> + Send + 'static,
+        task: impl FnOnce(Arc<AtomicBool>) -> io::Result<Option<run::PoolRun>> + Send + 'static,
     ) -> io::Result<bool> {
         if self
             .run_merge_active
@@ -1161,12 +1163,14 @@ impl ShardPool {
         {
             return Ok(false);
         }
+        self.run_merge_stop.store(false, Ordering::Release);
         let active = Arc::clone(&self.run_merge_active);
+        let stop = Arc::clone(&self.run_merge_stop);
         let completed = Arc::clone(&self.completed_run_merges);
         let worker = std::thread::Builder::new()
             .name("mtxdb-run-merge".to_owned())
             .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(stop)));
                 match result {
                     Ok(Ok(Some(run))) => completed.lock().push(run),
                     Ok(Ok(None)) => {}
@@ -1192,6 +1196,11 @@ impl ShardPool {
     /// Whether a run merge is being built.
     pub(crate) fn run_merge_active(&self) -> bool {
         self.run_merge_active.load(Ordering::Acquire)
+    }
+
+    /// Signal any in-flight run merge to stop early.
+    pub(crate) fn stop_run_merge(&self) {
+        self.run_merge_stop.store(true, Ordering::Release);
     }
 
     /// Block until the in-flight run merge, if any, has finished. Returns
@@ -1489,6 +1498,7 @@ impl ShardPool {
             open_runs: Mutex::new(Vec::new()),
             sealed_runs: RwLock::new(Vec::new()),
             run_merge_active: Arc::new(AtomicBool::new(false)),
+            run_merge_stop: Arc::new(AtomicBool::new(false)),
             run_merge_worker: Mutex::new(None),
             completed_run_merges: Arc::new(Mutex::new(Vec::new())),
             writable,
@@ -3739,6 +3749,7 @@ impl Drop for ShardPool {
     /// original error path the caller was already on.
     fn drop(&mut self) {
         self.wait_for_seals();
+        self.stop_run_merge();
         let _ = self.wait_for_run_merge();
         self.persist_stats_best_effort();
     }

@@ -2732,6 +2732,63 @@ fn raw_late_parent_fixture() -> [OwnedValue; 4] {
     ]
 }
 
+fn import_raw_fixture_batch(
+    db: &Database,
+    store: &PackfileStorage,
+    state_store: &PackfileStorage,
+    path: &Path,
+    template: &CollectionTemplate,
+    established: &mut HashSet<[u8; 16]>,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+) {
+    import_pdu_events_with_raw(
+        db,
+        store,
+        state_store,
+        path,
+        events,
+        auth_chain,
+        Some(&[]),
+        None,
+        None,
+        template,
+        established,
+    )
+    .unwrap();
+}
+
+fn assert_raw_reimport_keeps_versions(
+    edge_store: &PackfileStorage,
+    waiting: &[u8; 16],
+    reverse: &[u8; 16],
+    waiting_node: NodeId,
+    reverse_node: NodeId,
+    reimport: impl FnOnce(),
+) {
+    let (_, waiting_before) = edge_store
+        .get_with_collection_version(waiting, &[waiting_node])
+        .unwrap();
+    let (_, reverse_before) = edge_store
+        .get_with_collection_version(reverse, &[reverse_node])
+        .unwrap();
+    reimport();
+    let (_, waiting_after) = edge_store
+        .get_with_collection_version(waiting, &[waiting_node])
+        .unwrap();
+    let (_, reverse_after) = edge_store
+        .get_with_collection_version(reverse, &[reverse_node])
+        .unwrap();
+    assert_eq!(
+        waiting_before, waiting_after,
+        "re-import must not advance the waiting collection version"
+    );
+    assert_eq!(
+        reverse_before, reverse_after,
+        "re-import must not advance the reverse-edge collection version"
+    );
+}
+
 #[test]
 fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
     use mtxdb::room_flag::*;
@@ -2816,22 +2873,6 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
 
     let mut established = HashSet::new();
     established.insert(collection_id);
-    let mut import = |events: &[OwnedValue]| {
-        import_pdu_events_with_raw(
-            &db,
-            store,
-            state_store,
-            &path,
-            events,
-            &[],
-            Some(&[]),
-            None,
-            None,
-            &template,
-            &mut established,
-        )
-        .unwrap();
-    };
 
     let leave_node = template_event_id_node_id(&template, "$leave").unwrap();
     let stale_node = template_event_id_node_id(&template, "$stale").unwrap();
@@ -2844,7 +2885,16 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
     let rev_prev_coll = raw_reverse_edge_collection_id("prev", &leave_node);
 
     // Import create, join, stale (which cites $leave as prev)
-    import(&[create.clone(), join.clone(), stale.clone()]);
+    import_raw_fixture_batch(
+        &db,
+        store,
+        state_store,
+        &path,
+        &template,
+        &mut established,
+        &[create.clone(), join.clone(), stale.clone()],
+        &[],
+    );
 
     // 1. $leave is missing, so waiting_coll must contain leave_node
     assert!(
@@ -2865,26 +2915,24 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
     );
 
     // Re-importing the same file must not change the recorded state or advance versions.
-    let (_, waiting_ver_before) = edge_store
-        .get_with_collection_version(&waiting_coll, &[leave_node])
-        .unwrap();
-    let (_, rev_ver_before) = edge_store
-        .get_with_collection_version(&rev_prev_coll, &[stale_node])
-        .unwrap();
-    import(&[create.clone(), join.clone(), stale.clone()]);
-    let (_, waiting_ver_after) = edge_store
-        .get_with_collection_version(&waiting_coll, &[leave_node])
-        .unwrap();
-    let (_, rev_ver_after) = edge_store
-        .get_with_collection_version(&rev_prev_coll, &[stale_node])
-        .unwrap();
-    assert_eq!(
-        waiting_ver_before, waiting_ver_after,
-        "re-import must not advance waiting_coll collection version"
-    );
-    assert_eq!(
-        rev_ver_before, rev_ver_after,
-        "re-import must not advance rev_prev_coll collection version"
+    assert_raw_reimport_keeps_versions(
+        edge_store,
+        &waiting_coll,
+        &rev_prev_coll,
+        leave_node,
+        stale_node,
+        || {
+            import_raw_fixture_batch(
+                &db,
+                store,
+                state_store,
+                &path,
+                &template,
+                &mut established,
+                &[create.clone(), join.clone(), stale.clone()],
+                &[],
+            );
+        },
     );
     assert!(edge_store
         .get(&waiting_coll, &leave_node)
@@ -2896,7 +2944,16 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
         .is_some());
 
     // Import leave
-    import(&[leave]);
+    import_raw_fixture_batch(
+        &db,
+        store,
+        state_store,
+        &path,
+        &template,
+        &mut established,
+        &[leave],
+        &[],
+    );
 
     // 3. Now that $leave has arrived, it must be removed from raw_waiting
     assert!(
@@ -2926,7 +2983,16 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
         r#"["$leave"]"#,
         r#"["$create","$join"]"#,
     );
-    import(&[late]);
+    import_raw_fixture_batch(
+        &db,
+        store,
+        state_store,
+        &path,
+        &template,
+        &mut established,
+        &[late],
+        &[],
+    );
     assert!(
         edge_store
             .get(&waiting_coll, &leave_node)
@@ -2998,6 +3064,38 @@ fn raw_import_auth_chain_parent_clears_waiting() {
     );
 }
 
+const FEDERATION_FIRST_DOC: &str = r#"{
+    "pdus": [
+        {"event_id":"$create","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.create","state_key":"",
+         "content":{"creator":"@alice:test","room_version":"11"},
+         "prev_events":[],"auth_events":[]},
+        {"event_id":"$join","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.member","state_key":"@alice:test",
+         "content":{"membership":"join"},
+         "prev_events":["$create"],"auth_events":["$create"]},
+        {"event_id":"$stale","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.join_rules","state_key":"",
+         "content":{"join_rule":"public"},
+         "prev_events":["$leave"],"auth_events":["$create","$join"]}
+    ]
+}"#;
+
+const FEDERATION_SECOND_DOC: &str = r#"{
+    "pdus": [
+        {"event_id":"$late","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.message","state_key":"",
+         "content":{},"prev_events":["$leave"],
+         "auth_events":["$create","$join"]}
+    ],
+    "auth_chain": [
+        {"event_id":"$leave","sender":"@alice:test","room_id":"!room3",
+         "type":"m.room.member","state_key":"@alice:test",
+         "content":{"membership":"leave"},
+         "prev_events":["$join"],"auth_events":["$create","$join"]}
+    ]
+}"#;
+
 #[test]
 fn raw_import_records_dependencies_for_federation_documents() {
     let dir = unique_temp_dir().join("raw_federation_dependencies");
@@ -3009,26 +3107,7 @@ fn raw_import_records_dependencies_for_federation_documents() {
     let mut established = HashSet::new();
 
     let first = dir.join("first.json");
-    std::fs::write(
-        &first,
-        r#"{
-            "pdus": [
-                {"event_id":"$create","sender":"@alice:test","room_id":"!room3",
-                 "type":"m.room.create","state_key":"",
-                 "content":{"creator":"@alice:test","room_version":"11"},
-                 "prev_events":[],"auth_events":[]},
-                {"event_id":"$join","sender":"@alice:test","room_id":"!room3",
-                 "type":"m.room.member","state_key":"@alice:test",
-                 "content":{"membership":"join"},
-                 "prev_events":["$create"],"auth_events":["$create"]},
-                {"event_id":"$stale","sender":"@alice:test","room_id":"!room3",
-                 "type":"m.room.join_rules","state_key":"",
-                 "content":{"join_rule":"public"},
-                 "prev_events":["$leave"],"auth_events":["$create","$join"]}
-            ]
-        }"#,
-    )
-    .unwrap();
+    std::fs::write(&first, FEDERATION_FIRST_DOC).unwrap();
     cmd_import_file(
         &db,
         store,
@@ -3063,24 +3142,7 @@ fn raw_import_records_dependencies_for_federation_documents() {
     );
 
     let second = dir.join("second.json");
-    std::fs::write(
-        &second,
-        r#"{
-            "pdus": [
-                {"event_id":"$late","sender":"@alice:test","room_id":"!room3",
-                 "type":"m.room.message","state_key":"",
-                 "content":{},"prev_events":["$leave"],
-                 "auth_events":["$create","$join"]}
-            ],
-            "auth_chain": [
-                {"event_id":"$leave","sender":"@alice:test","room_id":"!room3",
-                 "type":"m.room.member","state_key":"@alice:test",
-                 "content":{"membership":"leave"},
-                 "prev_events":["$join"],"auth_events":["$create","$join"]}
-            ]
-        }"#,
-    )
-    .unwrap();
+    std::fs::write(&second, FEDERATION_SECOND_DOC).unwrap();
     cmd_import_file(
         &db,
         store,

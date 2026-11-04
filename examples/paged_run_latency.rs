@@ -7,8 +7,10 @@
 //! `<fixture-dir>` is a complete `paged_lookup_latency` fixture (it has a
 //! `fixture-records` file). The example measures Paged open, hits and misses
 //! with sidecars only, merges every sealed pack except the newest
-//! `unmerged-packs` (default 16) into one run, measures again, and removes the
-//! run so the fixture is unchanged. `MTXDB_LOOKUP_ROUNDS` sets the rounds
+//! `unmerged-packs` (default 16, capped to leave at least one pack to merge)
+//! into one run, measures again, and removes the run afterward. Paged opens
+//! update index metadata in the fixture (including removing `index.checkpoint`
+//! and writing `index.versions`). `MTXDB_LOOKUP_ROUNDS` sets the rounds
 //! (default 3); the best round is reported.
 
 use std::hint::black_box;
@@ -25,6 +27,7 @@ use mtxdb::PackfileStorage;
 const COLLECTION: [u8; 16] = [0x4D; 16];
 const PROBES: u64 = 500;
 const SHARD_BYTES: u64 = 4 * 1024 * 1024;
+const DEFAULT_UNMERGED_PACKS: usize = 16;
 
 fn mix(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -118,13 +121,17 @@ fn main() {
         args.next()
             .expect("usage: paged_run_latency <fixture-dir> [unmerged-packs]"),
     );
-    let unmerged: usize = args.next().map_or(16, |value| {
-        value.to_string_lossy().parse().expect("unmerged-packs")
+    let requested_unmerged = args.next().map(|value| {
+        value
+            .to_string_lossy()
+            .parse::<usize>()
+            .expect("unmerged-packs must be a non-negative integer")
     });
     let rounds: usize = std::env::var("MTXDB_LOOKUP_ROUNDS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3);
+    assert!(rounds > 0, "MTXDB_LOOKUP_ROUNDS must be at least 1");
     let records: u64 = std::fs::read_to_string(dir.join("fixture-records"))
         .expect("fixture-records")
         .trim()
@@ -137,28 +144,63 @@ fn main() {
         .collect();
     let misses: Vec<NodeId> = (0..PROBES).map(|index| node_id(u64::MAX ^ index)).collect();
 
+    let all = packs(&dir);
+    let mut sealed = Vec::new();
+    let mut first_missing: Option<PathBuf> = None;
+    for (identity, path) in &all {
+        match open_for_pack(path) {
+            Some(sidecar) => {
+                if let Some(missing) = &first_missing {
+                    panic!(
+                        "sidecar gap: {} has no openable sidecar, but later pack {} does",
+                        missing.display(),
+                        path.display()
+                    );
+                }
+                sealed.push((*identity, sidecar));
+            }
+            None => {
+                first_missing.get_or_insert_with(|| path.clone());
+            }
+        }
+    }
+    assert!(
+        !sealed.is_empty(),
+        "fixture has no openable sealed-pack sidecars"
+    );
+    let default_unmerged = DEFAULT_UNMERGED_PACKS.min(sealed.len().saturating_sub(1));
+    let unmerged = requested_unmerged.unwrap_or(default_unmerged);
+    assert!(
+        unmerged < sealed.len(),
+        "unmerged-packs ({unmerged}) must be less than the {} openable sealed packs",
+        sealed.len()
+    );
+    let covered = sealed
+        .len()
+        .checked_sub(unmerged)
+        .expect("unmerged pack count was validated");
+    let last_covered = covered
+        .checked_sub(1)
+        .expect("at least one pack is covered");
+
     println!("mode\topen_ms\thit_us\tmiss_us");
     print_row("sidecars", measure(&dir, &hits, &misses, rounds));
 
-    let all = packs(&dir);
-    let sealed: Vec<_> = all
-        .iter()
-        .map_while(|(identity, path)| open_for_pack(path).map(|sidecar| (*identity, sidecar)))
-        .collect();
-    let covered = sealed.len().saturating_sub(unmerged);
-    assert!(covered > 0, "nothing to merge");
     let sources: Vec<MergeSource<'_>> = sealed[..covered]
         .iter()
         .map(|(_, sidecar)| MergeSource::Sidecar(sidecar))
         .collect();
-    let run_path = dir.join(run_file_name(
-        &sealed[0].0,
-        &sealed[covered.saturating_sub(1)].0,
-    ));
+    let run_path = dir.join(run_file_name(&sealed[0].0, &sealed[last_covered].0));
+    assert!(
+        !run_path.exists(),
+        "refusing to overwrite existing run file {}",
+        run_path.display()
+    );
+    let _cleanup = RemoveRunOnDrop(run_path.clone());
     let started = Instant::now();
     let summary = merge_to_path(
         &sources,
-        MergeOptions {
+        &MergeOptions {
             drop_removals: true,
             ..MergeOptions::default()
         },
@@ -178,6 +220,13 @@ fn main() {
     drop(sealed);
 
     let with_run = measure(&dir, &hits, &misses, rounds);
-    std::fs::remove_file(&run_path).expect("remove run");
     print_row(&format!("run+{unmerged}"), with_run);
+}
+
+struct RemoveRunOnDrop(PathBuf);
+
+impl Drop for RemoveRunOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }

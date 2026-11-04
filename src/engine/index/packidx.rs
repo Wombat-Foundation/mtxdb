@@ -80,7 +80,8 @@ pub struct PackIndexInput {
     /// Whether the frame at `offset` is a removal version.
     pub removed: bool,
     /// Bytes this frame occupies on disk, used to preserve the physical byte
-    /// accounting when an open is served from the sidecar.
+    /// accounting when an open is served from the sidecar. The checked extent
+    /// `offset..offset + disk_bytes` must fit inside the pack.
     pub disk_bytes: u64,
 }
 
@@ -241,6 +242,15 @@ pub enum PackIndexError {
         /// The pack extent used during construction.
         pack_len: u64,
     },
+    /// A frame's byte extent overflows or extends past the pack end.
+    FrameExtentOutsidePack {
+        /// The frame's start offset.
+        offset: u64,
+        /// The frame's byte length.
+        disk_bytes: u64,
+        /// The pack extent used during construction.
+        pack_len: u64,
+    },
 }
 
 impl std::fmt::Display for PackIndexError {
@@ -254,6 +264,14 @@ impl std::fmt::Display for PackIndexError {
             Self::OffsetOutsidePack { offset, pack_len } => {
                 write!(f, "pack offset {offset} is outside pack length {pack_len}")
             }
+            Self::FrameExtentOutsidePack {
+                offset,
+                disk_bytes,
+                pack_len,
+            } => write!(
+                f,
+                "frame extent at {offset} with length {disk_bytes} exceeds pack length {pack_len}"
+            ),
         }
     }
 }
@@ -295,7 +313,8 @@ impl PackIndex {
     ///
     /// # Errors
     /// Returns an error if a pack id is zero, an offset is outside frame data
-    /// or the pack extent, or v1 cannot represent the output.
+    /// or the pack extent, a frame's checked `offset + disk_bytes` extent
+    /// exceeds the pack length, or v1 cannot represent the output.
     pub fn build(
         identity: PackIndexIdentity,
         mut inputs: Vec<PackIndexInput>,
@@ -313,6 +332,17 @@ impl PackIndex {
             if input.offset >= identity.pack_file_len {
                 return Err(PackIndexError::OffsetOutsidePack {
                     offset: input.offset,
+                    pack_len: identity.pack_file_len,
+                });
+            }
+            if input
+                .offset
+                .checked_add(input.disk_bytes)
+                .is_none_or(|end| end > identity.pack_file_len)
+            {
+                return Err(PackIndexError::FrameExtentOutsidePack {
+                    offset: input.offset,
+                    disk_bytes: input.disk_bytes,
                     pack_len: identity.pack_file_len,
                 });
             }

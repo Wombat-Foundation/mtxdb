@@ -9940,7 +9940,7 @@ impl PackfileStorage {
         let dir = self.shards.base_dir().to_path_buf();
         match self
             .shards
-            .start_run_merge_worker(move || build_planned_run(&dir, &plan))
+            .start_run_merge_worker(move |stop| build_planned_run(&dir, &plan, stop))
         {
             Ok(true) => {}
             // Another merge is still running; look again after it lands.
@@ -10376,8 +10376,13 @@ impl RunMergePlan {
 fn build_planned_run(
     dir: &Path,
     plan: &RunMergePlan,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<Option<crate::index::run::PoolRun>> {
     use crate::index::run::{MergeOptions, MergeSource, RunIndex};
+
+    if stop.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     let mut sidecars = Vec::with_capacity(plan.inputs.len());
     let mut identities = Vec::with_capacity(plan.inputs.len());
     for input in &plan.inputs {
@@ -10425,19 +10430,26 @@ fn build_planned_run(
         return Ok(None);
     };
     let path = dir.join(crate::index::run::run_file_name(first, last));
-    let summary = crate::index::run::merge_to_path(
+    let summary = match crate::index::run::merge_to_path(
         &sources,
-        MergeOptions {
+        &MergeOptions {
             drop_removals: plan.drop_removals,
+            stop: Some(stop),
             ..MergeOptions::default()
         },
         &path,
-    )
-    .map_err(std::io::Error::other)?;
+    ) {
+        Ok(summary) => summary,
+        Err(crate::index::run::RunError::Cancelled) => return Ok(None),
+        Err(error) => return Err(std::io::Error::other(error)),
+    };
     if summary.is_none() {
         return Ok(None);
     }
     let run = RunIndex::open(&path).map_err(std::io::Error::other)?;
+    if run.entry_count() > 0 && !run.has_pack_stats() {
+        return Err(std::io::Error::other("the merged run has no pack stats"));
+    }
     Ok(Some(crate::index::run::PoolRun { path, run }))
 }
 

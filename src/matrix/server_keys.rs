@@ -868,7 +868,13 @@ fn load(
     for ((id, record), version) in ids.iter().zip(&records).zip(&versions) {
         tx.expect_record_version(SERVER_INFO_POOL, collection, *id, *version)?;
         if let Some(data) = record {
-            current.insert(*id, decode_for(origin, None, &data.bytes)?);
+            let key = decode_for(origin, None, &data.bytes)?;
+            if origin_key_record_id(&key.key_id) != *id {
+                return Err(StorageError::Collision(
+                    "signing-key record does not belong to its slot".to_owned(),
+                ));
+            }
+            current.insert(*id, key);
         }
     }
     Ok(())

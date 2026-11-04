@@ -136,10 +136,10 @@ fn dedup_rejects_disk_byte_overflow() {
     let mut inputs = sample_inputs();
     inputs[1].disk_bytes = u64::MAX;
     inputs[2].disk_bytes = 1;
-    assert_eq!(
+    assert!(matches!(
         PackIndex::build(sample_identity(), inputs).unwrap_err(),
-        PackIndexError::TooLarge
-    );
+        PackIndexError::TooLarge | PackIndexError::FrameExtentOutsidePack { .. }
+    ));
 }
 
 #[test]
@@ -251,6 +251,36 @@ fn pack_index_rejects_offsets_at_pack_end_during_build_and_decode() {
     let crc = crc_with_zeroed_field(&bytes).unwrap();
     bytes[CRC_RANGE].copy_from_slice(&crc.to_le_bytes());
     assert!(PackIndex::decode(&bytes).is_none());
+}
+
+#[test]
+fn pack_index_rejects_frame_extents_past_pack_end_or_overflowing() {
+    let identity = PackIndexIdentity {
+        pack_id: PackId([0x42; 16]),
+        creation_seq: 0,
+        pack_file_len: frame_offset(128),
+    };
+    let input = PackIndexInput {
+        collection_id: [1; 16],
+        logical_id: [2; 16],
+        offset: frame_offset(100),
+        removed: false,
+        disk_bytes: 29,
+    };
+    assert!(matches!(
+        PackIndex::build(identity, vec![input]),
+        Err(PackIndexError::FrameExtentOutsidePack { .. })
+    ));
+
+    let overflowing = PackIndexInput {
+        offset: frame_offset(100),
+        disk_bytes: u64::MAX,
+        ..input
+    };
+    assert!(matches!(
+        PackIndex::build(identity, vec![overflowing]),
+        Err(PackIndexError::FrameExtentOutsidePack { .. })
+    ));
 }
 
 #[test]

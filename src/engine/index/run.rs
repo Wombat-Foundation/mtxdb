@@ -46,12 +46,13 @@
 //! [`RunCorrupt`], never as a miss, so the caller falls back to sidecars.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use memmap2::Mmap;
 
@@ -113,6 +114,8 @@ pub enum RunError {
     BadPackTable,
     /// Merge inputs name the same pack twice or interleave in pack order.
     OverlappingInputs,
+    /// A merge was cancelled before it completed.
+    Cancelled,
 }
 
 impl std::fmt::Display for RunError {
@@ -125,6 +128,7 @@ impl std::fmt::Display for RunError {
             Self::BadLocator => f.write_str("run locator outside its pack"),
             Self::BadPackTable => f.write_str("invalid run pack table"),
             Self::OverlappingInputs => f.write_str("run merge inputs overlap"),
+            Self::Cancelled => f.write_str("run merge cancelled"),
         }
     }
 }
@@ -292,6 +296,7 @@ pub struct RunWriter {
     last: Option<([u8; 16], [u8; 16])>,
     entry_count: u64,
     stats: Vec<RunPackStats>,
+    seen_stats: BTreeMap<([u8; 16], u16), u64>,
 }
 
 impl RunWriter {
@@ -334,6 +339,7 @@ impl RunWriter {
             last: None,
             entry_count: 0,
             stats: Vec::new(),
+            seen_stats: BTreeMap::new(),
         })
     }
 
@@ -356,6 +362,11 @@ impl RunWriter {
         if !offset_in_pack(offset, pack) {
             return Err(RunError::BadLocator);
         }
+        let count = self
+            .seen_stats
+            .entry((entry.collection_id, entry.ordinal))
+            .or_insert(0);
+        *count = count.checked_add(1).ok_or(RunError::Invalid)?;
         let new_collection = self
             .last
             .is_none_or(|(collection, _)| collection != entry.collection_id);
@@ -455,6 +466,19 @@ impl RunWriter {
             drop(self.file);
             fs::remove_file(&self.path)?;
             return Ok(None);
+        }
+        if self.stats.is_empty() {
+            self.stats = self
+                .seen_stats
+                .into_iter()
+                .map(|((collection_id, ordinal), entry_count)| RunPackStats {
+                    ordinal,
+                    collection_id,
+                    entry_count,
+                    disk_bytes: 0,
+                })
+                .collect();
+            self.stats.sort_unstable_by_key(stats_key);
         }
         let pack_count = u32::try_from(self.packs.len()).map_err(|_| RunError::Invalid)?;
         let collection_count =
@@ -634,6 +658,18 @@ impl RunIndex {
     #[must_use]
     pub const fn entry_count(&self) -> u64 {
         self.entry_count
+    }
+
+    /// Number of pack stats rows recorded in this run.
+    #[must_use]
+    pub const fn stats_count(&self) -> usize {
+        self.stats_count
+    }
+
+    /// Whether this run records per-collection pack accounting rows.
+    #[must_use]
+    pub const fn has_pack_stats(&self) -> bool {
+        self.stats_count > 0
     }
 
     /// Entries per block, as recorded in the header.
@@ -1205,13 +1241,15 @@ impl MergeSource<'_> {
 }
 
 /// How a merge treats its inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MergeOptions {
     /// Drop removal versions. Set this only when the output covers the pool's
     /// oldest sealed pack, so no older run or sidecar can hold the key.
     pub drop_removals: bool,
     /// Entries per output block.
     pub block_entries: u32,
+    /// Optional cancellation signal. When set, an in-progress merge aborts early.
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 impl Default for MergeOptions {
@@ -1219,6 +1257,7 @@ impl Default for MergeOptions {
         Self {
             drop_removals: false,
             block_entries: RUN_DEFAULT_BLOCK_ENTRIES,
+            stop: None,
         }
     }
 }
@@ -1246,7 +1285,7 @@ type HeapKey = Reverse<([u8; 16], [u8; 16], Reverse<u16>, usize)>;
 /// block check, and I/O errors. On error no file is left at `path`.
 pub fn merge_to_path(
     sources: &[MergeSource<'_>],
-    options: MergeOptions,
+    options: &MergeOptions,
     path: &Path,
 ) -> Result<Option<RunSummary>, RunError> {
     let mut packs: Vec<PackIndexIdentity> = sources.iter().flat_map(MergeSource::packs).collect();
@@ -1343,7 +1382,7 @@ fn write_merged(
     cursors: &mut [Cursor<'_>],
     packs: Vec<PackIndexIdentity>,
     stats: Vec<RunPackStats>,
-    options: MergeOptions,
+    options: &MergeOptions,
     temp: &Path,
 ) -> Result<Option<RunSummary>, RunError> {
     let mut writer = RunWriter::create(temp, packs, options.block_entries)?;
@@ -1355,6 +1394,13 @@ fn write_merged(
         advance(cursor, source, &mut heads, &mut heap)?;
     }
     while let Some(Reverse((collection_id, logical_id, _, source))) = heap.pop() {
+        if options
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+        {
+            return Err(RunError::Cancelled);
+        }
         // Read the head without clearing it: `advance` compares the next
         // entry against it to catch an input that steps backwards.
         let winner = heads
@@ -1478,7 +1524,13 @@ pub fn load_pool_runs(dir: &Path, pool: &[PackIndexIdentity], writable: bool) ->
             .ok()
             .and_then(|run| pool_span(&run, pool).map(|span| (span, run)))
         {
-            Some(((start, end), run)) => candidates.push((start, end, PoolRun { path, run })),
+            Some(((start, end), run)) => {
+                if run.entry_count() > 0 && !run.has_pack_stats() {
+                    rejected.push(path);
+                } else {
+                    candidates.push((start, end, PoolRun { path, run }));
+                }
+            }
             None => rejected.push(path),
         }
     }

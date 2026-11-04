@@ -9382,7 +9382,7 @@ fn template_node_id(
     let Some(val) = extract_pointer_string(event, pointer) else {
         return Ok(None);
     };
-    template_pointer_node_id(template, pointer, &val).map(Some)
+    template_pointer_node_id(template, pointer, val).map(Some)
 }
 
 /// Run a template's collection-key rule against an already-extracted
@@ -11030,6 +11030,27 @@ fn record_raw_dependencies_and_waiting<'a>(
     room_id: &str,
     supplied_events: impl Iterator<Item = &'a OwnedValue>,
 ) -> anyhow::Result<()> {
+    let graph = collect_raw_dependencies(template, room_id, supplied_events)?;
+    let missing = missing_raw_parents(event_store, room_event_collection_id, &graph.candidates)?;
+    let edge_store = db.pool(ShardType::Edges);
+    write_raw_reverse_edges(edge_store, graph.prev_edges, graph.auth_edges)?;
+    remove_raw_waiting(db, edge_store, room_id, &graph.arrived)?;
+    add_raw_waiting(edge_store, room_id, &missing)?;
+    Ok(())
+}
+
+struct RawDependencyGraph {
+    prev_edges: BTreeMap<NodeId, Vec<NodeId>>,
+    auth_edges: BTreeMap<NodeId, Vec<NodeId>>,
+    arrived: BTreeSet<NodeId>,
+    candidates: BTreeSet<NodeId>,
+}
+
+fn collect_raw_dependencies<'a>(
+    template: &CollectionTemplate,
+    room_id: &str,
+    supplied_events: impl Iterator<Item = &'a OwnedValue>,
+) -> anyhow::Result<RawDependencyGraph> {
     let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
         bail!(
             "record identity policy {:?} is not supported by the raw importer",
@@ -11039,58 +11060,62 @@ fn record_raw_dependencies_and_waiting<'a>(
     if pointer != "/event_id" {
         bail!("raw Matrix import requires record identity pointer '/event_id', got '{pointer}'");
     }
-
-    let mut file_event_ids: HashSet<String> = HashSet::new();
-    let mut prev_edges: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    let mut auth_edges: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-    let mut arrived_nodes = BTreeSet::new();
-    let mut candidate_missing: BTreeSet<NodeId> = BTreeSet::new();
-
-    let events_vec: Vec<&'a OwnedValue> = supplied_events
+    let events: Vec<&OwnedValue> = supplied_events
         .filter(|event| event_room_id(event).is_none_or(|room| room == room_id))
         .collect();
-
-    for event in &events_vec {
-        if let Some(id) = event_id(event) {
-            file_event_ids.insert(id.to_owned());
-        }
-    }
-
-    for event in events_vec {
+    let file_event_ids: HashSet<String> =
+        events.iter().filter_map(|event| event_id(event)).map(str::to_owned).collect();
+    let mut graph = RawDependencyGraph {
+        prev_edges: BTreeMap::new(),
+        auth_edges: BTreeMap::new(),
+        arrived: BTreeSet::new(),
+        candidates: BTreeSet::new(),
+    };
+    for event in events {
         let Some(event_id) = event_id(event) else {
             continue;
         };
         let child_node = template_event_id_node_id(template, event_id)?;
-        arrived_nodes.insert(child_node);
+        graph.arrived.insert(child_node);
         let fields = MatrixEventFields::from_event(event_id, event);
         for (parents, edges) in [
-            (&fields.prev, &mut prev_edges),
-            (&fields.auth, &mut auth_edges),
+            (&fields.prev, &mut graph.prev_edges),
+            (&fields.auth, &mut graph.auth_edges),
         ] {
             for parent_event_id in parents {
                 let parent_node = template_event_id_node_id(template, parent_event_id)?;
                 edges.entry(parent_node).or_default().push(child_node);
                 if !file_event_ids.contains(parent_event_id.as_str()) {
-                    candidate_missing.insert(parent_node);
+                    graph.candidates.insert(parent_node);
                 }
             }
         }
     }
+    Ok(graph)
+}
 
-    // Determine genuinely missing parents via point lookups against the room's event collection,
-    // rather than relying on a whole-room batch scan.
-    let candidates: Vec<NodeId> = candidate_missing.into_iter().collect();
-    let mut missing_nodes = BTreeSet::new();
-    if !candidates.is_empty() {
-        let existing = event_store.get_many(room_event_collection_id, &candidates)?;
-        for (node, found) in candidates.iter().zip(existing) {
-            if found.is_none() {
-                missing_nodes.insert(*node);
-            }
-        }
+fn missing_raw_parents(
+    event_store: &PackfileStorage,
+    room_event_collection_id: &[u8; 16],
+    candidates: &BTreeSet<NodeId>,
+) -> anyhow::Result<BTreeSet<NodeId>> {
+    if candidates.is_empty() {
+        return Ok(BTreeSet::new());
     }
+    let candidates: Vec<NodeId> = candidates.iter().copied().collect();
+    let existing = event_store.get_many(room_event_collection_id, &candidates)?;
+    Ok(candidates
+        .iter()
+        .zip(existing)
+        .filter_map(|(node, found)| found.is_none().then_some(*node))
+        .collect())
+}
 
-    let edge_store = db.pool(ShardType::Edges);
+fn write_raw_reverse_edges(
+    edge_store: &PackfileStorage,
+    prev_edges: BTreeMap<NodeId, Vec<NodeId>>,
+    auth_edges: BTreeMap<NodeId, Vec<NodeId>>,
+) -> anyhow::Result<()> {
     for (kind, parents) in [("prev", prev_edges), ("auth", auth_edges)] {
         for (parent, mut children) in parents {
             children.sort_unstable();
@@ -11113,31 +11138,46 @@ fn record_raw_dependencies_and_waiting<'a>(
             }
         }
     }
+    Ok(())
+}
 
-    // Remove arrived nodes from raw_waiting using get_many first to avoid
-    // taking the packfile snapshot gate for nodes that are not in the set.
-    let waiting_collection = raw_waiting_collection_id(room_id);
-    let arrived_vec: Vec<NodeId> = arrived_nodes.into_iter().collect();
-    let mut waiting_removals = Vec::new();
-    if !arrived_vec.is_empty() {
-        let existing = edge_store.get_many(&waiting_collection, &arrived_vec)?;
-        for (arrived, found) in arrived_vec.iter().zip(existing) {
-            if found.is_some() {
-                waiting_removals.push(*arrived);
-            }
-        }
+fn remove_raw_waiting(
+    db: &Database,
+    edge_store: &PackfileStorage,
+    room_id: &str,
+    arrived: &BTreeSet<NodeId>,
+) -> anyhow::Result<()> {
+    let waiting = raw_waiting_collection_id(room_id);
+    let arrived: Vec<NodeId> = arrived.iter().copied().collect();
+    if arrived.is_empty() {
+        return Ok(());
     }
-    if !waiting_removals.is_empty() {
-        let tx = db.begin_transaction();
-        for chunk in waiting_removals.chunks(MAX_BATCH_EVENTS) {
-            tx.remove_many(ShardType::Edges, waiting_collection, chunk)?;
-        }
-        tx.commit()?;
+    let existing = edge_store.get_many(&waiting, &arrived)?;
+    let removals: Vec<NodeId> = arrived
+        .iter()
+        .zip(existing)
+        .filter_map(|(node, found)| found.is_some().then_some(*node))
+        .collect();
+    if removals.is_empty() {
+        return Ok(());
     }
+    let tx = db.begin_transaction();
+    for chunk in removals.chunks(MAX_BATCH_EVENTS) {
+        tx.remove_many(ShardType::Edges, waiting, chunk)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
 
-    let missing: Vec<NodeId> = missing_nodes.into_iter().collect();
+fn add_raw_waiting(
+    edge_store: &PackfileStorage,
+    room_id: &str,
+    missing: &BTreeSet<NodeId>,
+) -> anyhow::Result<()> {
+    let waiting = raw_waiting_collection_id(room_id);
+    let missing: Vec<NodeId> = missing.iter().copied().collect();
     for chunk in missing.chunks(MAX_BATCH_EVENTS) {
-        let existing = edge_store.get_many(&waiting_collection, chunk)?;
+        let existing = edge_store.get_many(&waiting, chunk)?;
         let additions: Vec<(NodeId, NodeData)> = chunk
             .iter()
             .zip(existing)
@@ -11148,7 +11188,7 @@ fn record_raw_dependencies_and_waiting<'a>(
             })
             .collect();
         if !additions.is_empty() {
-            edge_store.put_many(&waiting_collection, &additions)?;
+            edge_store.put_many(&waiting, &additions)?;
         }
     }
     Ok(())

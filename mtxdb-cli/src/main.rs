@@ -477,6 +477,7 @@ fn sub_flags() -> Command {
             Arg::new("not")
                 .long("not")
                 .action(ArgAction::SetTrue)
+                .requires("flag")
                 .help("Invert the flag query (events without this flag)"),
         )
         .arg(

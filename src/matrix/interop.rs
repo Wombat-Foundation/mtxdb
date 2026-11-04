@@ -231,7 +231,7 @@ pub fn derive_id(domain: &[u8], identifier: &[u8]) -> [u8; 16] {
 pub const VERDICT_BUCKETS: u32 = 256;
 
 /// Version byte of the verdict value encoding.
-pub const VERDICT_VERSION: u8 = 2;
+pub const VERDICT_VERSION: u8 = 1;
 const HAS_REJECTION: u8 = 1;
 const HAS_SOFT_FAIL: u8 = 1 << 1;
 const HAS_REDACTION: u8 = 1 << 2;
@@ -353,7 +353,7 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(&[u8], Verdict), StorageError> {
     };
 
     let (&version, rest) = bytes.split_first().ok_or_else(malformed)?;
-    if version != 1 && version != VERDICT_VERSION {
+    if version != VERDICT_VERSION {
         return Err(StorageError::Corrupt(
             "unknown event verdict version".to_owned(),
         ));

@@ -35,7 +35,9 @@
 //! need; if those cannot be loaded either, the lookup fails rather than
 //! reporting a miss.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::packfile::PackId;
 use crate::storage::NodeId;
@@ -162,7 +164,7 @@ pub struct SealedRun {
     /// The run's packs, indexed by run ordinal.
     packs: Vec<RunPack>,
     load_fallback: RunFallback,
-    fallback: OnceLock<Result<Vec<SealedPack>, SealedUnavailable>>,
+    fallback: RwLock<Option<Arc<[SealedPack]>>>,
 }
 
 impl SealedRun {
@@ -189,7 +191,7 @@ impl SealedRun {
             run,
             packs,
             load_fallback,
-            fallback: OnceLock::new(),
+            fallback: RwLock::new(None),
         })
     }
 
@@ -228,11 +230,17 @@ impl SealedRun {
         })
     }
 
-    fn fallback(&self) -> Result<&[SealedPack], SealedUnavailable> {
-        self.fallback
-            .get_or_init(|| (self.load_fallback)().map_err(SealedUnavailable))
-            .as_deref()
-            .map_err(Clone::clone)
+    fn fallback(&self) -> Result<Arc<[SealedPack]>, SealedUnavailable> {
+        if let Some(cached) = self.fallback.read().as_ref() {
+            return Ok(Arc::clone(cached));
+        }
+        let mut guard = self.fallback.write();
+        if let Some(cached) = guard.as_ref() {
+            return Ok(Arc::clone(cached));
+        }
+        let loaded: Arc<[SealedPack]> = (self.load_fallback)().map_err(SealedUnavailable)?.into();
+        *guard = Some(Arc::clone(&loaded));
+        Ok(loaded)
     }
 
     fn lookup(
@@ -243,7 +251,10 @@ impl SealedRun {
         match self.run.lookup(collection_id, logical_id) {
             Ok(Some(hit)) => self.hit(hit.ordinal, hit.locator).map(Some),
             Ok(None) => Ok(None),
-            Err(_) => Ok(lookup_packs(self.fallback()?, collection_id, logical_id)),
+            Err(_) => {
+                let fallback = self.fallback()?;
+                Ok(lookup_packs(&fallback, collection_id, logical_id))
+            }
         }
     }
 
@@ -277,7 +288,8 @@ impl SealedRun {
             // newest in this range; the fallback repeats the range's versions
             // after them, which first-occurrence callers already ignore.
         }
-        for_each_in_packs(self.fallback()?, collection_id, visit);
+        let fallback = self.fallback()?;
+        for_each_in_packs(&fallback, collection_id, visit);
         Ok(())
     }
 

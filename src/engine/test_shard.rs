@@ -1607,3 +1607,33 @@ fn test_reopen_picks_most_recent_pack_not_highest_address() {
     let pool = ShardPool::open(dir).unwrap();
     assert_eq!(pool.active_shard().path, newest_path);
 }
+
+#[test]
+fn test_run_merge_worker_stops_when_signalled() {
+    let dir = test_dir("run_merge_stop");
+    let pool = ShardPool::open(dir).unwrap();
+    let started = Arc::new(AtomicBool::new(false));
+    let started_clone = Arc::clone(&started);
+    let worker_stopped = Arc::new(AtomicBool::new(false));
+    let worker_stopped_clone = Arc::clone(&worker_stopped);
+
+    let started_ok = pool
+        .start_run_merge_worker(move |stop| {
+            started_clone.store(true, Ordering::Release);
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worker_stopped_clone.store(true, Ordering::Release);
+            Ok(None)
+        })
+        .unwrap();
+    assert!(started_ok);
+    while !started.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    assert!(pool.run_merge_active());
+    pool.stop_run_merge();
+    assert!(pool.wait_for_run_merge());
+    assert!(!pool.run_merge_active());
+    assert!(worker_stopped.load(Ordering::Acquire));
+}
