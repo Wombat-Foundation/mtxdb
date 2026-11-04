@@ -63,7 +63,7 @@ fn decode(bytes: &[u8]) -> Vec<u32> {
     bytes
         .get(5..)
         .unwrap_or_default()
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }

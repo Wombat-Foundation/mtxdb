@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn a_hash_absent_from_every_run_is_a_miss() {
         let index = Index::build(&[&["$c1", "$a"]]);
-        assert!(index.candidates("$zzz").is_empty());
+        assert_eq!(index.candidates("$zzz"), [] as [u32; 0]);
         assert_eq!(index.lookup("$zzz"), Ok(None));
     }
 
@@ -201,7 +201,7 @@ mod tests {
         let index = Index::build(&[&["$c1", "$a"], &["$b", "$c2"]]);
         let mut merged: Vec<(KeyHash, u32)> = Vec::new();
         for run in &index.runs {
-            for entry in run.chunks_exact(20) {
+            for entry in run.as_chunks::<20>().0 {
                 let id = u32::from_be_bytes(entry[16..20].try_into().unwrap());
                 merged.push((entry[..16].try_into().unwrap(), id));
             }

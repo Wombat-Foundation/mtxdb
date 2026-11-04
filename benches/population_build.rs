@@ -66,7 +66,7 @@ fn index() -> ShortIdIndex {
 fn digest(i: u32) -> [u8; 32] {
     let mut out = [0_u8; 32];
     let mut x = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    for chunk in out.chunks_exact_mut(8) {
+    for chunk in out.as_chunks_mut::<8>().0 {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -250,7 +250,7 @@ fn read_runs(db: &Database, owners: u32) -> usize {
             .get_with_record_versions(ShardType::Edges, &RUN_COLLECTION, &ids)
             .expect("read runs");
         for record in found.into_iter().flatten() {
-            for chunk in record.bytes.chunks_exact(32) {
+            for chunk in record.bytes.as_chunks::<32>().0 {
                 let (h64, rest) = chunk.split_at(8);
                 let (q3, h128) = rest.split_at(8);
                 hashes.push(ElementHash {

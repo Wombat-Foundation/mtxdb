@@ -283,7 +283,7 @@ pub(crate) fn spread(kind: u8, n: u32) -> [u8; 16] {
         .saturating_add(u64::from(n))
         .wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let mut out = [0_u8; 16];
-    for half in out.chunks_exact_mut(8) {
+    for half in out.as_chunks_mut::<8>().0 {
         x ^= x >> 31;
         x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         half.copy_from_slice(&x.to_le_bytes());
