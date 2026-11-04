@@ -11,8 +11,8 @@ mod tests {
     };
     use crate::layout::ShardType;
     use crate::room_flag::{
-        flag_chunk_node_id, Flag, FlagChange, FlagQuery, RoomFlagIndex, CHUNK_CAPACITY,
-        FLAG_META_ID,
+        flag_chunk_node_id, Flag, FlagChange, FlagQuery, RebuildInputs, RoomFlagIndex,
+        CHUNK_CAPACITY, FLAG_META_ID,
     };
     use crate::storage::{NodeData, StorageEngine};
 
@@ -956,7 +956,16 @@ mod tests {
         tx_writer.commit().unwrap();
 
         // 3. Attempt to publish via the library rebuild path
-        let res = index.rebuild_generation(&db, 1, current_meta, new_gen, target_col, meta_token);
+        let res = index.rebuild_generation(
+            &db,
+            RebuildInputs {
+                counter: 1,
+                current_meta,
+                new_gen,
+                target_col,
+                meta_token,
+            },
+        );
         assert!(res.is_err());
         assert!(
             res.unwrap_err().is_stale_read(),

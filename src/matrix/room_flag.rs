@@ -5,7 +5,7 @@
 //! slices (`short_id >> 16`), providing bounded chunk sizes and fast set algebra
 //! (AND/OR/NOT) for flag queries.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use bytes::Bytes;
 
@@ -265,6 +265,15 @@ pub struct RoomFlagIndex {
     auth_collection: [u8; 16],
     domain: DomainTag,
     room_id: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RebuildInputs {
+    pub(crate) counter: u32,
+    pub(crate) current_meta: FlagMeta,
+    pub(crate) new_gen: u64,
+    pub(crate) target_col: [u8; 16],
+    pub(crate) meta_token: u64,
 }
 
 impl RoomFlagIndex {
@@ -833,7 +842,6 @@ impl RoomFlagIndex {
     ///
     /// # Errors
     /// Returns [`StorageError`] if database reads, staging, or CAS publication fails.
-    #[allow(clippy::too_many_lines)]
     pub fn rebuild(&self, db: &Database) -> Result<u64, StorageError> {
         // Reserve the target generation before reading the auth counter. The
         // reservation keeps generation numbers from ever being reused, and
@@ -860,7 +868,14 @@ impl RoomFlagIndex {
         prep_tx.delete_collection(self.pool, target_col)?;
         prep_tx.commit()?;
 
-        match self.rebuild_generation(db, counter, current_meta, new_gen, target_col, meta_token) {
+        let inputs = RebuildInputs {
+            counter,
+            current_meta,
+            new_gen,
+            target_col,
+            meta_token,
+        };
+        match self.rebuild_generation(db, inputs) {
             Ok(total) => Ok(total),
             Err(e) => {
                 let cleanup_tx = db.begin_transaction();
@@ -874,121 +889,32 @@ impl RoomFlagIndex {
         }
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(crate) fn rebuild_generation(
         &self,
         db: &Database,
-        counter: u32,
-        current_meta: FlagMeta,
-        new_gen: u64,
-        target_col: [u8; 16],
-        meta_token: u64,
+        inputs: RebuildInputs,
     ) -> Result<u64, StorageError> {
-        // Query timeline index for timeline events in this room
-        let room_name = String::from_utf8_lossy(&self.room_id);
-        let timeline_index =
-            TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_name.as_ref());
-        let room_scope = room_scope_id(&self.room_id);
-        let mut cursor = None;
-        let mut timeline_nodes = HashSet::new();
-        loop {
-            let page = timeline_index.page(&room_scope, cursor.as_ref(), true, 1024)?;
-            if page.entries.is_empty() {
-                break;
-            }
-            for entry in &page.entries {
-                timeline_nodes.insert(entry.node_id);
-            }
-            if page.next_cursor.is_none() {
-                break;
-            }
-            cursor = page.next_cursor;
-        }
-
-        let event_col = room_event_collection_id(&self.room_id);
+        let timeline_nodes = self.timeline_nodes(db)?;
         let mut total_indexed = 0_u64;
         let mut max_short_seen = 0_u32;
-
         let mut start_id = 1_u32;
-        while start_id <= counter {
+        while start_id <= inputs.counter {
             let end_id = start_id
                 .saturating_add(REBUILD_BATCH_SIZE)
                 .saturating_sub(1)
-                .min(counter);
-            let mut changes = Vec::new();
-
-            // 1. Fetch reverse records for this batch of shorts
-            let shorts: Vec<u32> = (start_id..=end_id).collect();
-            let reverse_keys: Vec<NodeId> =
-                shorts.iter().map(|&s| auth_reverse_record_id(s)).collect();
-            let reverse_nodes = db
-                .pool(self.auth_pool)
-                .get_many(&self.auth_collection, &reverse_keys)?;
-
-            // 2. Map existing events and check event presence + verdicts
-            let mut event_node_pairs = Vec::new();
-            for (&short, node_opt) in shorts.iter().zip(reverse_nodes) {
-                if let Some(data) = node_opt {
-                    let event_id = data.bytes.to_vec();
-                    let node_id = event_record_id(&event_id);
-                    event_node_pairs.push((short, event_id, node_id));
-                }
-            }
-
-            if !event_node_pairs.is_empty() {
-                let event_nodes: Vec<NodeId> =
-                    event_node_pairs.iter().map(|(_, _, node)| *node).collect();
-                let event_data = db
-                    .pool(ShardType::EventDag)
-                    .get_many(&event_col, &event_nodes)?;
-
-                let mut present_events = Vec::new();
-                for ((short, event_id, node_id), event_data) in
-                    event_node_pairs.into_iter().zip(event_data)
-                {
-                    if event_data.is_some() {
-                        changes.push(FlagChange::set(short, Flag::Present));
-                        if timeline_nodes.contains(&node_id) {
-                            changes.push(FlagChange::set(short, Flag::Timeline));
-                        }
-                        present_events.push((short, event_id, node_id));
-                        total_indexed = total_indexed.saturating_add(1);
-                    }
-                }
-
-                // Check verdicts for present events
-                for (short, _event_id, node_id) in present_events {
-                    let verdict_col = event_verdict_collection_id(&node_id);
-                    if let Some(v_data) =
-                        db.pool(ShardType::EventDag).get(&verdict_col, &node_id)?
-                    {
-                        let (_, verdict) = decode_verdict(&v_data.bytes)?;
-                        if verdict.outlier {
-                            changes.push(FlagChange::set(short, Flag::Outlier));
-                        }
-                        if verdict.soft_fail.is_some() {
-                            changes.push(FlagChange::set(short, Flag::SoftFailed));
-                        }
-                        if verdict.rejection.is_some() {
-                            changes.push(FlagChange::set(short, Flag::Rejected));
-                        }
-                        if verdict.redacted_by.is_some() {
-                            changes.push(FlagChange::set(short, Flag::Redacted));
-                        }
-                    }
-                }
-            }
+                .min(inputs.counter);
+            let (changes, batch_indexed) =
+                self.scan_short_batch(db, &timeline_nodes, start_id, end_id)?;
+            total_indexed = total_indexed.saturating_add(batch_indexed);
 
             if !changes.is_empty() {
                 let tx = db.begin_transaction();
-                let batch_max = self.stage_into_collection(&tx, target_col, &changes)?;
-                if batch_max > max_short_seen {
-                    max_short_seen = batch_max;
-                }
+                let batch_max = self.stage_into_collection(&tx, inputs.target_col, &changes)?;
+                max_short_seen = max_short_seen.max(batch_max);
                 tx.commit()?;
             }
 
-            if end_id == counter {
+            if end_id == inputs.counter {
                 break;
             }
             // Here end_id < counter <= u32::MAX, so the increment cannot
@@ -996,6 +922,114 @@ impl RoomFlagIndex {
             start_id = end_id.saturating_add(1);
         }
 
+        self.publish_generation(db, inputs, max_short_seen)?;
+        Ok(total_indexed)
+    }
+
+    fn timeline_nodes(&self, db: &Database) -> Result<Vec<NodeId>, StorageError> {
+        let room_name = String::from_utf8_lossy(&self.room_id);
+        let timeline_index =
+            TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_name.as_ref());
+        let room_scope = room_scope_id(&self.room_id);
+        let mut cursor = None;
+        let mut timeline_nodes = Vec::new();
+        loop {
+            let page = timeline_index.page(&room_scope, cursor.as_ref(), true, 1024)?;
+            if page.entries.is_empty() {
+                break;
+            }
+            for entry in &page.entries {
+                timeline_nodes.push(entry.node_id);
+            }
+            if page.next_cursor.is_none() {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        timeline_nodes.sort_unstable();
+        timeline_nodes.dedup();
+        Ok(timeline_nodes)
+    }
+
+    fn scan_short_batch(
+        &self,
+        db: &Database,
+        timeline_nodes: &[NodeId],
+        start_id: u32,
+        end_id: u32,
+    ) -> Result<(Vec<FlagChange>, u64), StorageError> {
+        let event_col = room_event_collection_id(&self.room_id);
+        let mut total_indexed = 0_u64;
+        let mut changes = Vec::new();
+
+        // 1. Fetch reverse records for this batch of shorts
+        let shorts: Vec<u32> = (start_id..=end_id).collect();
+        let reverse_keys: Vec<NodeId> = shorts.iter().map(|&s| auth_reverse_record_id(s)).collect();
+        let reverse_nodes = db
+            .pool(self.auth_pool)
+            .get_many(&self.auth_collection, &reverse_keys)?;
+
+        // 2. Map existing events and check event presence + verdicts
+        let mut event_node_pairs = Vec::new();
+        for (&short, node_opt) in shorts.iter().zip(reverse_nodes) {
+            if let Some(data) = node_opt {
+                let event_id = data.bytes.to_vec();
+                let node_id = event_record_id(&event_id);
+                event_node_pairs.push((short, event_id, node_id));
+            }
+        }
+
+        if !event_node_pairs.is_empty() {
+            let event_nodes: Vec<NodeId> =
+                event_node_pairs.iter().map(|(_, _, node)| *node).collect();
+            let event_data = db
+                .pool(ShardType::EventDag)
+                .get_many(&event_col, &event_nodes)?;
+
+            let mut present_events = Vec::new();
+            for ((short, _event_id, node_id), event_data) in
+                event_node_pairs.into_iter().zip(event_data)
+            {
+                if event_data.is_some() {
+                    changes.push(FlagChange::set(short, Flag::Present));
+                    if timeline_nodes.binary_search(&node_id).is_ok() {
+                        changes.push(FlagChange::set(short, Flag::Timeline));
+                    }
+                    present_events.push((short, node_id));
+                    total_indexed = total_indexed.saturating_add(1);
+                }
+            }
+
+            // Check verdicts for present events
+            for (short, node_id) in present_events {
+                let verdict_col = event_verdict_collection_id(&node_id);
+                if let Some(v_data) = db.pool(ShardType::EventDag).get(&verdict_col, &node_id)? {
+                    let (_, verdict) = decode_verdict(&v_data.bytes)?;
+                    if verdict.outlier {
+                        changes.push(FlagChange::set(short, Flag::Outlier));
+                    }
+                    if verdict.soft_fail.is_some() {
+                        changes.push(FlagChange::set(short, Flag::SoftFailed));
+                    }
+                    if verdict.rejection.is_some() {
+                        changes.push(FlagChange::set(short, Flag::Rejected));
+                    }
+                    if verdict.redacted_by.is_some() {
+                        changes.push(FlagChange::set(short, Flag::Redacted));
+                    }
+                }
+            }
+        }
+
+        Ok((changes, total_indexed))
+    }
+
+    fn publish_generation(
+        &self,
+        db: &Database,
+        inputs: RebuildInputs,
+        max_short_seen: u32,
+    ) -> Result<(), StorageError> {
         // Atomically publish new generation via CAS
         let publish_tx = db.begin_transaction();
         let (meta_nodes, meta_versions) =
@@ -1012,16 +1046,18 @@ impl RoomFlagIndex {
         // Verify that no competing rebuild or writer published while this one
         // was running. Every writer CASes FLAG_META_ID, even when max_short_id
         // is unchanged, so this also detects updates to existing short IDs.
-        if live_meta.generation != current_meta.generation || live_meta_token != meta_token {
+        if live_meta.generation != inputs.current_meta.generation
+            || live_meta_token != inputs.meta_token
+        {
             return Err(StorageError::StaleRead {
                 pool: self.pool,
                 collection_id: self.collection,
-                expected: meta_token,
+                expected: inputs.meta_token,
                 actual: live_meta_token,
             });
         }
         let published_meta = FlagMeta {
-            generation: new_gen,
+            generation: inputs.new_gen,
             max_short_id: max_short_seen,
         };
         let meta_encoded = encode_meta(published_meta);
@@ -1031,12 +1067,12 @@ impl RoomFlagIndex {
             FLAG_META_ID,
             &NodeData::new(Bytes::from(meta_encoded.to_vec())),
         )?;
-        if !(live_meta_raw.is_some() && meta_token == 0) {
+        if !(live_meta_raw.is_some() && inputs.meta_token == 0) {
             publish_tx.expect_record_version(
                 self.pool,
                 self.collection,
                 FLAG_META_ID,
-                meta_token,
+                inputs.meta_token,
             )?;
         }
         publish_tx.commit()?;
@@ -1046,6 +1082,6 @@ impl RoomFlagIndex {
         // snapshot or reader lease, so deleting it here could turn a valid
         // old-generation query into an empty/partial result.
 
-        Ok(total_indexed)
+        Ok(())
     }
 }
