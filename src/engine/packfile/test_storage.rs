@@ -13798,7 +13798,10 @@ fn paged_run_install_rechecks_pack_identity_under_the_locks() {
     collection_ids.extend(stale.run().pack_stats().map(|row| row.collection_id));
     collection_ids.sort_unstable();
     collection_ids.dedup();
-    let mutexes: Vec<_> = collection_ids.iter().map(|id| store.put_mutex(id)).collect();
+    let mutexes: Vec<_> = collection_ids
+        .iter()
+        .map(|id| store.put_mutex(id))
+        .collect();
     let guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
     assert!(matches!(
         store.prepare_run_install(&stale),
