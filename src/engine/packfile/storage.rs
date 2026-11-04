@@ -9903,8 +9903,11 @@ impl PackfileStorage {
         // before it clears the flag, so an idle worker has nothing in flight.
         let active = self.shards.run_merge_active();
         for pool_run in self.shards.take_completed_run_merges() {
-            self.install_run(pool_run);
-            self.run_merge_due.store(true, Ordering::Release);
+            // A discarded run waits for the next sealed pack: replanning now
+            // would rebuild the same range and fail the same check.
+            if self.install_run(pool_run) {
+                self.run_merge_due.store(true, Ordering::Release);
+            }
         }
         if active || !self.run_merge_due.swap(false, Ordering::AcqRel) {
             return;
@@ -9929,14 +9932,15 @@ impl PackfileStorage {
     /// as a deterministic barrier; a sync never waits for a merge.
     #[cfg(test)]
     fn settle_run_merges(&self) {
+        let _ = self.shards.wait_for_run_merge();
         self.run_merge_due.store(true, Ordering::Release);
         loop {
-            self.shards.wait_for_run_merge();
+            // Install what the last merge produced and start the next one; a
+            // pass that starts nothing leaves no worker to wait for.
             self.maintain_runs();
-            if !self.shards.run_merge_active() && !self.run_merge_due.load(Ordering::Acquire) {
+            if !self.shards.wait_for_run_merge() {
                 return;
             }
-            std::thread::yield_now();
         }
     }
 
@@ -10046,8 +10050,8 @@ impl PackfileStorage {
     /// and the pool lists it in the same critical section, so a later
     /// `rebuild_tail` reuses it. Any failed check discards the new file and
     /// leaves every generation unchanged. The input run files are deleted
-    /// once every swap succeeded.
-    fn install_run(&self, pool_run: crate::index::run::PoolRun) {
+    /// once every swap succeeded. Returns whether the run was installed.
+    fn install_run(&self, pool_run: crate::index::run::PoolRun) -> bool {
         let path = pool_run.path.clone();
         let discard = |reason: &str| {
             eprintln!("mtxdb: discarding run {}: {reason}", path.display());
@@ -10062,7 +10066,7 @@ impl PackfileStorage {
             .collect();
         let Some(new_run) = sealed_run_for(pool_run, &by_pack) else {
             discard("a covered pack is no longer in the pool");
-            return;
+            return false;
         };
         let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
         collection_ids.extend(new_run.run().pack_stats().map(|row| row.collection_id));
@@ -10080,7 +10084,7 @@ impl PackfileStorage {
             Err(reason) => {
                 drop(guards);
                 discard(&reason);
-                return;
+                return false;
             }
         };
         let is_input = |run: &Arc<crate::index::sealed::SealedRun>| {
@@ -10131,7 +10135,7 @@ impl PackfileStorage {
             }
             // If a rollback itself fails, leave the fully-published file in
             // place: any generation that still points at it must keep working.
-            return;
+            return false;
         }
         let mut runs: Vec<_> = pool_runs.into_iter().filter(|run| !is_input(run)).collect();
         runs.push(Arc::clone(&new_run));
@@ -10148,6 +10152,7 @@ impl PackfileStorage {
         for input in &inputs {
             let _ = fs::remove_file(input.run().path());
         }
+        true
     }
 
     /// Whether `identities` is one contiguous window of the current sealed

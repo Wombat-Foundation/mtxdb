@@ -1194,12 +1194,14 @@ impl ShardPool {
         self.run_merge_active.load(Ordering::Acquire)
     }
 
-    /// Block until the in-flight run merge, if any, has finished.
-    pub(crate) fn wait_for_run_merge(&self) {
+    /// Block until the in-flight run merge, if any, has finished. Returns
+    /// whether there was one to wait for.
+    pub(crate) fn wait_for_run_merge(&self) -> bool {
         let worker = self.run_merge_worker.lock().take();
-        if let Some(worker) = worker {
+        worker.is_some_and(|worker| {
             let _ = worker.join();
-        }
+            true
+        })
     }
 
     /// Whether this pool holds the writer lock on its directory.
@@ -3737,7 +3739,7 @@ impl Drop for ShardPool {
     /// original error path the caller was already on.
     fn drop(&mut self) {
         self.wait_for_seals();
-        self.wait_for_run_merge();
+        let _ = self.wait_for_run_merge();
         self.persist_stats_best_effort();
     }
 }
