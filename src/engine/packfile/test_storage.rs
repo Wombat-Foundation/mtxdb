@@ -13745,3 +13745,43 @@ fn paged_lookups_see_no_gap_while_a_run_installs() {
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn paged_run_install_rechecks_pack_identity_under_the_locks() {
+    let dir = test_dir("paged_run_install_identity");
+    let _ = paged_run_fixture(&dir);
+    let store = paged_open(&dir);
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    let plan = store.plan_run_merge().expect("a planned merge");
+    let built = build_planned_run(store.shards.base_dir(), &plan)
+        .unwrap()
+        .expect("a non-empty run");
+    let by_pack: HashMap<PackId, (u16, PathBuf)> = store
+        .shards
+        .all_shards()
+        .into_iter()
+        .map(|(slot, shard)| (shard.pack_id, (slot, shard.path.clone())))
+        .collect();
+    // Wrapping succeeds: every pack was current when the run was opened.
+    let run = sealed_run_for(built, &by_pack).expect("a wrapped run");
+    assert!(store.prepare_run_install(&run).is_ok());
+    let rejection = |store: &PackfileStorage| match store.prepare_run_install(&run) {
+        Ok(_) => panic!("a run over a changed pack must not install"),
+        Err(reason) => reason,
+    };
+
+    // The pack changed after the run was built (as a replacement would):
+    // same slot and id, different length.
+    let changed = store.shards.get_shard(run.packs()[1].slot).unwrap();
+    changed.file_len.fetch_add(1, Ordering::AcqRel);
+    assert!(rejection(&store).contains("retired or replaced"));
+    changed.file_len.fetch_sub(1, Ordering::AcqRel);
+    assert!(store.prepare_run_install(&run).is_ok());
+
+    // The pack retired after the run was built.
+    store.shards.retire_slot(run.packs()[1].slot);
+    assert!(rejection(&store).contains("retired or replaced"));
+    drop(changed);
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
