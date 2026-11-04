@@ -531,6 +531,7 @@ impl RunWriter {
 #[derive(Debug)]
 pub struct RunIndex {
     map: Mmap,
+    path: PathBuf,
     packs: Vec<PackIndexIdentity>,
     collections: Vec<CollectionMeta>,
     block_entries: u32,
@@ -563,10 +564,10 @@ impl RunIndex {
         if u64::try_from(map.len()).ok() != Some(len) {
             return Err(RunError::Invalid);
         }
-        Self::from_map(map).ok_or(RunError::Invalid)
+        Self::from_map(map, path.to_path_buf()).ok_or(RunError::Invalid)
     }
 
-    fn from_map(map: Mmap) -> Option<Self> {
+    fn from_map(map: Mmap, path: PathBuf) -> Option<Self> {
         let header = RunHeader::parse(&map)?;
         let packs = header.parse_packs(&map)?;
         let collections = header.parse_collections(&map)?;
@@ -575,6 +576,7 @@ impl RunIndex {
         let verified = (0..words).map(|_| AtomicU64::new(0)).collect();
         Some(Self {
             map,
+            path,
             packs,
             collections,
             block_entries: header.block_entries,
@@ -591,6 +593,12 @@ impl RunIndex {
     #[must_use]
     pub fn packs(&self) -> &[PackIndexIdentity] {
         &self.packs
+    }
+
+    /// Filesystem path from which this immutable run mapping was opened.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Each covered pack's per-collection accounting, sorted by collection then
@@ -1436,9 +1444,10 @@ pub struct PoolRun {
 ///
 /// `pool` is every pack in the pool, sorted by `(creation_seq, pack_id)`. A
 /// run is kept only if it opens, every covered pack is in `pool` with the same
-/// identity, its packs are consecutive in `pool` (so no uncovered pack falls
-/// inside its range), and it does not overlap another kept run. Kept runs are
-/// returned oldest first.
+/// identity, and its packs are consecutive in `pool` (so no uncovered pack
+/// falls inside its range). When a newly merged run contains older run ranges,
+/// the containing run wins and the superseded files are rejected. Partial
+/// overlaps are rejected together. Kept runs are returned oldest first.
 ///
 /// When `writable`, rejected runs and leftover `.run.tmp` files are deleted:
 /// runs are derived data and the covered packs fall back to their sidecars. A
@@ -1473,34 +1482,60 @@ pub fn load_pool_runs(dir: &Path, pool: &[PackIndexIdentity], writable: bool) ->
             None => rejected.push(path),
         }
     }
-    candidates.sort_by_key(|(start, end, _)| (*start, *end));
-    // A run that overlaps a neighbour is dropped together with it: either
-    // could be stale, and sidecars answer correctly for both ranges.
-    let mut overlapping = vec![false; candidates.len()];
-    for index in 1..candidates.len() {
-        let previous_end = candidates
-            .get(index.saturating_sub(1))
-            .map(|(_, end, _)| *end);
-        let start = candidates.get(index).map(|(start, _, _)| *start);
-        if let (Some(previous_end), Some(start)) = (previous_end, start) {
-            if start <= previous_end {
-                if let Some(flag) = overlapping.get_mut(index.saturating_sub(1)) {
-                    *flag = true;
-                }
-                if let Some(flag) = overlapping.get_mut(index) {
-                    *flag = true;
-                }
+    // Prefer strict supersets: a crash after publishing a merged run but
+    // before swapping generations leaves the old, valid input runs beside the
+    // new file. The superset contains their complete coverage and is itself
+    // safe to use because every pack identity was checked above. Incomparable
+    // partial overlaps remain ambiguous and are all rejected.
+    candidates.sort_by_key(|(start, end, _)| {
+        (std::cmp::Reverse(end.saturating_sub(*start)), *start, *end)
+    });
+    let mut selected: Vec<(usize, usize, PoolRun)> = Vec::new();
+    let mut ambiguous = Vec::new();
+    for candidate in candidates {
+        let (start, end, _) = &candidate;
+        let mut partial_overlap = false;
+        for (selected_start, selected_end, _) in &selected {
+            if start > selected_end || end < selected_start {
+                continue;
             }
+            if (*start <= *selected_start && *end >= *selected_end)
+                || (*selected_start <= *start && *selected_end >= *end)
+            {
+                // The already-selected range is at least as large, or this
+                // candidate contains it. Sorting by descending size means
+                // the latter is only possible for equal-size duplicates.
+                partial_overlap = false;
+                break;
+            }
+            partial_overlap = true;
+            break;
         }
-    }
-    let mut kept = Vec::with_capacity(candidates.len());
-    for ((_, _, pool_run), overlaps) in candidates.into_iter().zip(overlapping) {
-        if overlaps {
-            rejected.push(pool_run.path);
+        if partial_overlap {
+            ambiguous.push((candidate.0, candidate.1));
+            rejected.push(candidate.2.path);
+        } else if selected.iter().any(|(selected_start, selected_end, _)| {
+            *selected_start <= *start && *selected_end >= *end
+        }) {
+            rejected.push(candidate.2.path);
         } else {
-            kept.push(pool_run);
+            selected.push(candidate);
         }
     }
+    // If an incomparable overlap was found, reject every selected run it
+    // intersects as well. This deliberately falls back to authoritative
+    // sidecars rather than guessing which coverage is newer.
+    selected.retain(|(start, end, pool_run)| {
+        let conflicts = ambiguous
+            .iter()
+            .any(|(other_start, other_end)| *start <= *other_end && *end >= *other_start);
+        if conflicts {
+            rejected.push(pool_run.path.clone());
+        }
+        !conflicts
+    });
+    selected.sort_by_key(|(start, end, _)| (*start, *end));
+    let kept = selected.into_iter().map(|(_, _, run)| run).collect();
     if writable {
         for path in rejected {
             let _ = fs::remove_file(path);

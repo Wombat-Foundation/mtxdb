@@ -741,6 +741,14 @@ pub struct ShardPool {
     /// build publishes them; rebuilds of one collection's sealed set reuse
     /// them instead of reopening the covered sidecars.
     sealed_runs: RwLock<Vec<Arc<crate::index::sealed::SealedRun>>>,
+    /// At most one asynchronous run merge is built for this pool at a time.
+    run_merge_active: Arc<AtomicBool>,
+    /// The in-flight run merge, if any. Kept apart from `seal_workers` so a
+    /// sync, which waits for sidecar builders, never waits for a merge.
+    run_merge_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Fully published run files waiting for the storage layer to validate
+    /// and install into collection generations.
+    completed_run_merges: Arc<Mutex<Vec<run::PoolRun>>>,
     /// Whether this pool holds the writer lock on `base_dir` (see `open`
     /// vs `open_read_only`). Gates `persist_stats`: a read-only pool
     /// never writes anything, including its own (always-zero) stats
@@ -1139,6 +1147,83 @@ impl ShardPool {
             .retain(|existing| !Arc::ptr_eq(existing, run));
     }
 
+    /// Start one background merge task. The task publishes its complete run
+    /// file before returning it; collection-generation installation remains
+    /// the storage layer's responsibility.
+    pub(crate) fn start_run_merge_worker(
+        &self,
+        task: impl FnOnce() -> io::Result<Option<run::PoolRun>> + Send + 'static,
+    ) -> io::Result<bool> {
+        if self
+            .run_merge_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let active = Arc::clone(&self.run_merge_active);
+        let completed = Arc::clone(&self.completed_run_merges);
+        let worker = std::thread::Builder::new()
+            .name("mtxdb-run-merge".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+                match result {
+                    Ok(Ok(Some(run))) => completed.lock().push(run),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => eprintln!("mtxdb: run merge skipped: {error}"),
+                    Err(_) => eprintln!("mtxdb: run merge worker panicked"),
+                }
+                active.store(false, Ordering::Release);
+            });
+        match worker {
+            Ok(worker) => {
+                if let Some(previous) = self.run_merge_worker.lock().replace(worker) {
+                    let _ = previous.join();
+                }
+                Ok(true)
+            }
+            Err(error) => {
+                self.run_merge_active.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether a run merge is being built.
+    pub(crate) fn run_merge_active(&self) -> bool {
+        self.run_merge_active.load(Ordering::Acquire)
+    }
+
+    /// Block until the in-flight run merge, if any, has finished.
+    pub(crate) fn wait_for_run_merge(&self) {
+        let worker = self.run_merge_worker.lock().take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+
+    /// Whether this pool holds the writer lock on its directory.
+    pub(crate) const fn is_writable(&self) -> bool {
+        self.writable
+    }
+
+    /// The directory holding this pool's packs, sidecars and runs.
+    pub(crate) fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    /// Take completed run files for identity validation and generation
+    /// installation by the owning `PackfileStorage`.
+    pub(crate) fn take_completed_run_merges(&self) -> Vec<run::PoolRun> {
+        std::mem::take(&mut *self.completed_run_merges.lock())
+    }
+
+    /// Replace the pool's serving run list after generation swaps have
+    /// installed the same replacement set.
+    pub(crate) fn replace_sealed_runs(&self, runs: Vec<Arc<crate::index::sealed::SealedRun>>) {
+        *self.sealed_runs.write() = runs;
+    }
+
     /// Recover (if writable) and open every pack file, slotting them into
     /// the shard vector. Consumes `pack_files` so each `PathBuf` moves into
     /// its `Shard` rather than being cloned. Returns `(recovery_time,
@@ -1401,6 +1486,9 @@ impl ShardPool {
             last_open_timings: Mutex::new(Some(timings)),
             open_runs: Mutex::new(Vec::new()),
             sealed_runs: RwLock::new(Vec::new()),
+            run_merge_active: Arc::new(AtomicBool::new(false)),
+            run_merge_worker: Mutex::new(None),
+            completed_run_merges: Arc::new(Mutex::new(Vec::new())),
             writable,
             compress,
             checksum_policy,
@@ -3649,6 +3737,7 @@ impl Drop for ShardPool {
     /// original error path the caller was already on.
     fn drop(&mut self) {
         self.wait_for_seals();
+        self.wait_for_run_merge();
         self.persist_stats_best_effort();
     }
 }

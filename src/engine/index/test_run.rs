@@ -804,7 +804,7 @@ fn write_run_over(path: &Path, packs: Vec<PackIndexIdentity>) {
 #[test]
 fn load_pool_runs_keeps_only_runs_that_match_the_pool() {
     let dir = TestDir::new();
-    let pool: Vec<PackIndexIdentity> = (1..=8).map(identity).collect();
+    let pool: Vec<PackIndexIdentity> = (1..=12).map(identity).collect();
     let valid = dir.join("valid.run");
     write_run_over(&valid, vec![identity(1), identity(2)]);
     let mut changed = identity(3);
@@ -815,11 +815,18 @@ fn load_pool_runs_keeps_only_runs_that_match_the_pool() {
     let gapped = dir.join("gapped.run");
     write_run_over(&gapped, vec![identity(4), identity(6)]);
     let missing = dir.join("missing.run");
-    write_run_over(&missing, vec![identity(9)]);
+    write_run_over(&missing, vec![identity(13)]);
+    // A merged run published before its input run was deleted: the
+    // containing run serves both ranges.
+    let containing = dir.join("containing.run");
+    write_run_over(&containing, vec![identity(7), identity(8)]);
+    let contained = dir.join("contained.run");
+    write_run_over(&contained, vec![identity(8)]);
+    // Partial overlaps are ambiguous; both fall back to sidecars.
     let overlap_a = dir.join("overlap-a.run");
-    write_run_over(&overlap_a, vec![identity(7), identity(8)]);
+    write_run_over(&overlap_a, vec![identity(9), identity(10)]);
     let overlap_b = dir.join("overlap-b.run");
-    write_run_over(&overlap_b, vec![identity(8)]);
+    write_run_over(&overlap_b, vec![identity(10), identity(11)]);
     let damaged = dir.join("damaged.run");
     fs::write(&damaged, b"not a run").unwrap();
     let temporary = dir.join("x.run.tmp");
@@ -828,7 +835,7 @@ fn load_pool_runs_keeps_only_runs_that_match_the_pool() {
     fs::write(&unrelated, b"keep").unwrap();
 
     let rejected = [
-        &stale, &gapped, &missing, &overlap_a, &overlap_b, &damaged, &temporary,
+        &stale, &gapped, &missing, &contained, &overlap_a, &overlap_b, &damaged, &temporary,
     ];
 
     // A read-only open accepts the same runs but deletes nothing.
@@ -838,7 +845,7 @@ fn load_pool_runs_keeps_only_runs_that_match_the_pool() {
             .iter()
             .map(|run| run.path.clone())
             .collect::<Vec<_>>(),
-        vec![valid.clone()]
+        vec![valid.clone(), containing.clone()]
     );
     for path in rejected {
         assert!(path.exists(), "read-only open kept {}", path.display());
@@ -850,12 +857,13 @@ fn load_pool_runs_keeps_only_runs_that_match_the_pool() {
             .iter()
             .map(|run| run.path.clone())
             .collect::<Vec<_>>(),
-        vec![valid.clone()]
+        vec![valid.clone(), containing.clone()]
     );
     for path in rejected {
         assert!(!path.exists(), "writable open removed {}", path.display());
     }
     assert!(valid.exists());
+    assert!(containing.exists());
     assert!(unrelated.exists(), "only run files are touched");
 }
 

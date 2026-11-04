@@ -1459,6 +1459,14 @@ const READ_RUN_GAP_BYTES: u64 = 128;
 /// cold page the plan exists to prefetch.
 const MAX_FRAME_DISK_LEN: u64 = 64 * 1024 + 8;
 
+/// Default tiered merge threshold `T`: more unmerged sealed packs than this
+/// become one run.
+const RUN_MERGE_UNMERGED_PACKS: u64 = 16;
+
+/// Default tiered merge fan-in `r`: the newest run is folded into the next
+/// older one while it holds at least `1 / r` of that run's entries.
+const RUN_MERGE_FAN_IN: u64 = 4;
+
 /// Tuning for `get_many`'s merged read plan.
 ///
 /// `get_many` probes the lossy index once per requested id, so a large batch
@@ -2384,6 +2392,21 @@ pub struct PackfileStorage {
     index_grow_count: AtomicU64,
     /// Fallback `rebuild_index` calls (full pack scan).
     index_rebuild_count: AtomicU64,
+    /// Whether the sealed packs changed since the run merge policy last
+    /// looked (a Paged writable store only). Set at open, when sidecars are
+    /// drained and when a run is installed or discarded.
+    run_merge_due: AtomicBool,
+    /// Serializes run installs and merge planning across the threads that
+    /// drain sealed packs, so one range is never built twice.
+    run_maintenance: parking_lot::Mutex<()>,
+    /// Tiered merge policy: merge more than this many unmerged sealed packs
+    /// into a run (`T`).
+    run_merge_unmerged_packs: AtomicU64,
+    /// Tiered merge policy: fold the newest run into the next older one while
+    /// it holds at least `1 / r` of that run's entries (`r`).
+    run_merge_fan_in: AtomicU64,
+    /// Runs installed by the merge policy over this store's lifetime.
+    run_merges_installed: AtomicU64,
     /// Frame-header reads that resolved a same-tag probe candidate whose
     /// identity the index did not hold (slots-only checkpoint indexes).
     index_identity_reads: AtomicU64,
@@ -3398,6 +3421,9 @@ impl PackfileStorage {
         if writable {
             store.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         }
+        if writable && residency == crate::index::IndexResidency::Paged {
+            store.maintain_runs();
+        }
         timings.total = started.elapsed();
         *store.last_open_timings.lock() = Some(timings);
         Ok(store)
@@ -3554,6 +3580,11 @@ impl PackfileStorage {
             index_clone_time_ns: AtomicU64::new(0),
             index_grow_count: AtomicU64::new(0),
             index_rebuild_count: AtomicU64::new(0),
+            run_merge_due: AtomicBool::new(true),
+            run_maintenance: parking_lot::Mutex::new(()),
+            run_merge_unmerged_packs: AtomicU64::new(RUN_MERGE_UNMERGED_PACKS),
+            run_merge_fan_in: AtomicU64::new(RUN_MERGE_FAN_IN),
+            run_merges_installed: AtomicU64::new(0),
             index_identity_reads: AtomicU64::new(0),
             delta_invalidations: AtomicU64::new(0),
             sync_calls: AtomicU64::new(0),
@@ -7577,9 +7608,16 @@ impl PackfileStorage {
             self.shards.wait_for_seals();
         }
         let notices = self.shards.take_sealed_ready();
-        if notices.is_empty() {
-            return;
+        if !notices.is_empty() {
+            self.evict_sealed_notices(notices);
+            self.run_merge_due.store(true, Ordering::Release);
         }
+        self.maintain_runs();
+    }
+
+    /// Swap each collection with entries in newly announced sealed packs to a
+    /// generation that serves them from their sidecars.
+    fn evict_sealed_notices(&self, notices: Vec<(u16, PackId)>) {
         let mut affected: HashMap<[u8; 16], Vec<(u16, PackId)>> = HashMap::new();
         for (slot, pack_id) in notices {
             let Some(shard) = self.shards.get_shard(slot) else {
@@ -9850,6 +9888,527 @@ impl PackfileStorage {
             }
         }
     }
+
+    /// Install finished runs, then start the next merge the tiered policy
+    /// asks for. Paged writable stores only; a no-op while another thread is
+    /// already doing this.
+    fn maintain_runs(&self) {
+        if !self.shards.is_writable() {
+            return;
+        }
+        let Some(_maintenance) = self.run_maintenance.try_lock() else {
+            return;
+        };
+        // Read the flag before taking results: the worker queues its result
+        // before it clears the flag, so an idle worker has nothing in flight.
+        let active = self.shards.run_merge_active();
+        for pool_run in self.shards.take_completed_run_merges() {
+            self.install_run(pool_run);
+            self.run_merge_due.store(true, Ordering::Release);
+        }
+        if active || !self.run_merge_due.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let Some(plan) = self.plan_run_merge() else {
+            return;
+        };
+        let dir = self.shards.base_dir().to_path_buf();
+        match self
+            .shards
+            .start_run_merge_worker(move || build_planned_run(&dir, &plan))
+        {
+            Ok(true) => {}
+            // Another merge is still running; look again after it lands.
+            Ok(false) => self.run_merge_due.store(true, Ordering::Release),
+            Err(error) => eprintln!("mtxdb: could not start a run merge: {error}"),
+        }
+    }
+
+    /// Block until the in-flight run merge has been built and installed, and
+    /// run the policy again until it has nothing more to merge. Tests use it
+    /// as a deterministic barrier; a sync never waits for a merge.
+    #[cfg(test)]
+    fn settle_run_merges(&self) {
+        self.run_merge_due.store(true, Ordering::Release);
+        loop {
+            self.shards.wait_for_run_merge();
+            self.maintain_runs();
+            if !self.shards.run_merge_active() && !self.run_merge_due.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// The next merge the tiered policy asks for, or `None`.
+    ///
+    /// Sources are walked in the pool's `(creation_seq, pack_id)` order from
+    /// its oldest pack: each existing run, then each sealed pack not in a run,
+    /// up to the first pack that is unsealed. A run must cover consecutive
+    /// pool packs or open rejects it, so the walk never skips a pack. In
+    /// order of preference:
+    ///
+    /// 1. sealed packs that sit between two runs (left when a repack
+    ///    invalidated a run) become a run of their own;
+    /// 2. more than `T` sealed packs after the newest run become one run;
+    /// 3. the newest run is merged with the next older one while it holds at
+    ///    least `1 / r` of that run's entries.
+    fn plan_run_merge(&self) -> Option<RunMergePlan> {
+        let mut pool: Vec<(u16, Arc<Shard>)> = self
+            .shards
+            .all_shards()
+            .into_iter()
+            .filter(|(_, shard)| shard.is_current.load(Ordering::Acquire))
+            .collect();
+        pool.sort_by_key(|(_, shard)| (shard.creation_seq, shard.pack_id.0));
+        let runs = self.shards.sealed_runs();
+        let mut units: Vec<RunMergeInput> = Vec::new();
+        let mut index = 0;
+        while let Some((_, shard)) = pool.get(index) {
+            let covering = runs
+                .iter()
+                .find(|run| run.packs().iter().any(|pack| pack.pack_id == shard.pack_id));
+            if let Some(run) = covering {
+                let span = pool.get(index..index.saturating_add(run.packs().len()));
+                let consecutive = run.packs().first().map(|pack| pack.pack_id)
+                    == Some(shard.pack_id)
+                    && span.is_some_and(|span| {
+                        span.len() == run.packs().len()
+                            && span
+                                .iter()
+                                .zip(run.packs())
+                                .all(|((_, shard), pack)| shard.pack_id == pack.pack_id)
+                    });
+                if !consecutive || run.run().is_invalid() {
+                    break;
+                }
+                units.push(RunMergeInput::Run(Arc::clone(run)));
+                index = index.saturating_add(run.packs().len());
+                continue;
+            }
+            if !shard.sealed.load(Ordering::Acquire) {
+                break;
+            }
+            units.push(RunMergeInput::Sidecar {
+                path: shard.path.clone(),
+                pack_id: shard.pack_id,
+                creation_seq: u64::from(shard.creation_seq),
+            });
+            index = index.saturating_add(1);
+        }
+
+        let is_run = |unit: &RunMergeInput| matches!(unit, RunMergeInput::Run(_));
+        // 1. Sidecars older than some run.
+        if let Some(last_run) = units.iter().rposition(is_run) {
+            if let Some(start) = units.get(..last_run)?.iter().position(|unit| !is_run(unit)) {
+                let len = units.get(start..)?.iter().position(is_run).unwrap_or(0);
+                return Some(RunMergePlan::new(units, start, len));
+            }
+        }
+        // 2. The unmerged tail.
+        let tail_start = units
+            .iter()
+            .rposition(is_run)
+            .map_or(0, |at| at.saturating_add(1));
+        let tail_len = units.len().saturating_sub(tail_start);
+        let threshold = self.run_merge_unmerged_packs.load(Ordering::Relaxed);
+        if u64::try_from(tail_len).unwrap_or(u64::MAX) > threshold {
+            return Some(RunMergePlan::new(units, tail_start, tail_len));
+        }
+        // 3. Carry the newest run into the next older one.
+        let run_positions: Vec<usize> = units
+            .iter()
+            .enumerate()
+            .filter_map(|(at, unit)| is_run(unit).then_some(at))
+            .collect();
+        let [.., older, newer] = run_positions.as_slice() else {
+            return None;
+        };
+        let (RunMergeInput::Run(older_run), RunMergeInput::Run(newer_run)) =
+            (units.get(*older)?, units.get(*newer)?)
+        else {
+            return None;
+        };
+        let fan_in = self.run_merge_fan_in.load(Ordering::Relaxed).max(1);
+        let carries =
+            newer_run.run().entry_count().saturating_mul(fan_in) >= older_run.run().entry_count();
+        (carries && newer.checked_sub(*older) == Some(1))
+            .then(|| RunMergePlan::new(units, *older, 2))
+    }
+
+    /// Install a published run into every generation that serves its packs.
+    ///
+    /// Under every collection lock, the run's packs must all still be current
+    /// with the same identity, any existing run touching its range must lie
+    /// inside it, and each collection with entries in the range must serve
+    /// either all or none of its packs from the run's inputs. Each serving
+    /// generation then swaps those sidecars and input runs for the new run,
+    /// and the pool lists it in the same critical section, so a later
+    /// `rebuild_tail` reuses it. Any failed check discards the new file and
+    /// leaves every generation unchanged. The input run files are deleted
+    /// once every swap succeeded.
+    fn install_run(&self, pool_run: crate::index::run::PoolRun) {
+        let path = pool_run.path.clone();
+        let discard = |reason: &str| {
+            eprintln!("mtxdb: discarding run {}: {reason}", path.display());
+            let _ = fs::remove_file(&path);
+        };
+        let by_pack: HashMap<PackId, (u16, PathBuf)> = self
+            .shards
+            .all_shards()
+            .into_iter()
+            .filter(|(_, shard)| shard.is_current.load(Ordering::Acquire))
+            .map(|(slot, shard)| (shard.pack_id, (slot, shard.path.clone())))
+            .collect();
+        let Some(new_run) = sealed_run_for(pool_run, &by_pack) else {
+            discard("a covered pack is no longer in the pool");
+            return;
+        };
+        let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
+        collection_ids.extend(new_run.run().pack_stats().map(|row| row.collection_id));
+        collection_ids.sort_unstable();
+        collection_ids.dedup();
+        let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
+        let guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
+
+        let RunInstall {
+            pool_runs,
+            inputs,
+            swaps,
+        } = match self.prepare_run_install(&new_run) {
+            Ok(install) => install,
+            Err(reason) => {
+                drop(guards);
+                discard(&reason);
+                return;
+            }
+        };
+        let is_input = |run: &Arc<crate::index::sealed::SealedRun>| {
+            inputs.iter().any(|input| Arc::ptr_eq(input, run))
+        };
+
+        let mut applied = Vec::with_capacity(swaps.len());
+        let mut install_error = None;
+        for (collection_id, gen, sealed) in swaps {
+            match self.store_generation_with_sealed(
+                &collection_id,
+                gen.index.clone(),
+                Arc::new(sealed),
+                Some(Arc::clone(&gen.cache)),
+                false,
+            ) {
+                Ok(()) => applied.push((collection_id, gen)),
+                Err(error) => {
+                    install_error = Some((collection_id, error));
+                    break;
+                }
+            }
+        }
+        if let Some((failed_collection, error)) = install_error {
+            eprintln!(
+                "mtxdb: could not install a run for {}: {error}; rolling back prior swaps",
+                hex16(&failed_collection)
+            );
+            let mut rollback_ok = true;
+            for (collection_id, gen) in applied.into_iter().rev() {
+                if let Err(error) = self.store_generation_with_sealed(
+                    &collection_id,
+                    gen.index.clone(),
+                    Arc::clone(&gen.sealed),
+                    Some(Arc::clone(&gen.cache)),
+                    false,
+                ) {
+                    eprintln!(
+                        "mtxdb: could not roll back run install for {}: {error}",
+                        hex16(&collection_id)
+                    );
+                    rollback_ok = false;
+                }
+            }
+            drop(guards);
+            if rollback_ok {
+                discard("a collection generation rejected the install");
+            }
+            // If a rollback itself fails, leave the fully-published file in
+            // place: any generation that still points at it must keep working.
+            return;
+        }
+        let mut runs: Vec<_> = pool_runs.into_iter().filter(|run| !is_input(run)).collect();
+        runs.push(Arc::clone(&new_run));
+        runs.sort_by_key(|run| {
+            run.packs()
+                .first()
+                .map(|pack| (pack.creation_seq, pack.pack_id.0))
+        });
+        self.shards.replace_sealed_runs(runs);
+        drop(guards);
+        self.run_merges_installed.fetch_add(1, Ordering::Relaxed);
+        // Mapped readers keep working on Unix; where unlinking a mapped file
+        // fails, the next writable open rejects the contained run.
+        for input in &inputs {
+            let _ = fs::remove_file(input.run().path());
+        }
+    }
+
+    /// Whether `identities` is one contiguous window of the current sealed
+    /// pool in `(creation_seq, pack_id)` order.
+    fn run_covers_contiguous_sealed_pool(
+        &self,
+        identities: &[crate::index::packidx::PackIndexIdentity],
+    ) -> bool {
+        let mut current_pool: Vec<_> = self
+            .shards
+            .all_shards()
+            .into_iter()
+            .filter(|(_, shard)| {
+                shard.is_current.load(Ordering::Acquire) && shard.sealed.load(Ordering::Acquire)
+            })
+            .map(|(_, shard)| crate::index::packidx::PackIndexIdentity {
+                pack_id: shard.pack_id,
+                creation_seq: u64::from(shard.creation_seq),
+                pack_file_len: shard.file_len.load(Ordering::Acquire),
+            })
+            .collect();
+        current_pool.sort_by_key(|identity| (identity.creation_seq, identity.pack_id.0));
+        !identities.is_empty()
+            && current_pool
+                .windows(identities.len())
+                .any(|window| window == identities)
+    }
+
+    /// Check, under every collection lock, that `new_run` can replace its
+    /// inputs, and build each serving generation's replacement sealed set.
+    /// See [`Self::install_run`].
+    fn prepare_run_install(
+        &self,
+        new_run: &Arc<crate::index::sealed::SealedRun>,
+    ) -> Result<RunInstall, String> {
+        let current = new_run
+            .packs()
+            .iter()
+            .zip(new_run.run().packs())
+            .all(|(pack, identity)| {
+                self.shards.get_shard(pack.slot).is_some_and(|shard| {
+                    shard.pack_id == pack.pack_id
+                        && shard.pack_id == identity.pack_id
+                        && u64::from(shard.creation_seq) == identity.creation_seq
+                        && shard.file_len.load(Ordering::Acquire) == identity.pack_file_len
+                        && shard.is_current.load(Ordering::Acquire)
+                        && shard.sealed.load(Ordering::Acquire)
+                })
+            });
+        let contiguous = self.run_covers_contiguous_sealed_pool(new_run.run().packs());
+        if !current || !contiguous {
+            return Err("a covered pack was retired or replaced".into());
+        }
+        let covered: HashSet<PackId> = new_run.packs().iter().map(|pack| pack.pack_id).collect();
+        let (pool_runs, inputs) = self.run_inputs_for_install(&covered)?;
+        let swaps = self.prepare_run_generation_swaps(new_run, &covered, &inputs)?;
+        Ok(RunInstall {
+            pool_runs,
+            inputs,
+            swaps,
+        })
+    }
+
+    fn run_inputs_for_install(&self, covered: &HashSet<PackId>) -> Result<RunInputSet, String> {
+        let pool_runs = self.shards.sealed_runs();
+        let mut inputs = Vec::new();
+        for run in &pool_runs {
+            let touches = run
+                .packs()
+                .iter()
+                .filter(|pack| covered.contains(&pack.pack_id))
+                .count();
+            match touches {
+                0 => {}
+                inside if inside == run.packs().len() => inputs.push(Arc::clone(run)),
+                _ => return Err("an existing run overlaps its range".into()),
+            }
+        }
+        Ok((pool_runs, inputs))
+    }
+
+    fn prepare_run_generation_swaps(
+        &self,
+        new_run: &Arc<crate::index::sealed::SealedRun>,
+        covered: &HashSet<PackId>,
+        inputs: &[Arc<crate::index::sealed::SealedRun>],
+    ) -> Result<Vec<RunGenerationSwap>, String> {
+        let is_input = |run: &Arc<crate::index::sealed::SealedRun>| {
+            inputs.iter().any(|input| Arc::ptr_eq(input, run))
+        };
+        let mut rows: HashMap<[u8; 16], Vec<PackId>> = HashMap::new();
+        for row in new_run.run().pack_stats() {
+            if let Some(pack) = new_run.packs().get(usize::from(row.ordinal)) {
+                rows.entry(row.collection_id)
+                    .or_default()
+                    .push(pack.pack_id);
+            }
+        }
+        let mut swaps = Vec::new();
+        for (collection_id, packs) in &rows {
+            let Some(gen) = self.generation(collection_id) else {
+                // Deleted, or never loaded: nothing serves these packs.
+                continue;
+            };
+            let held = packs
+                .iter()
+                .filter(|pack_id| gen.sealed.contains_pack(**pack_id))
+                .count();
+            let foreign_run = gen.sealed.runs().iter().any(|run| {
+                run.packs()
+                    .iter()
+                    .any(|pack| covered.contains(&pack.pack_id))
+                    && !is_input(run)
+            });
+            if held == 0 && !foreign_run {
+                // This generation serves none of the range from sealed
+                // sources (for example, a collection re-created after a
+                // delete). Leave its view unchanged.
+                continue;
+            }
+            if held != packs.len() || foreign_run {
+                return Err(format!(
+                    "collection {} does not serve the range from its inputs",
+                    hex16(collection_id)
+                ));
+            }
+            let mut sealed = (*gen.sealed).clone();
+            for input in inputs {
+                sealed.remove_run(input);
+            }
+            for pack_id in covered {
+                sealed.remove_pack(*pack_id);
+            }
+            sealed.insert_run(Arc::clone(new_run));
+            swaps.push((*collection_id, Arc::clone(&*gen), sealed));
+        }
+        Ok(swaps)
+    }
+}
+
+/// A validated run install: the pool's runs before it, the ones it
+/// replaces, and each serving generation with its replacement sealed set.
+struct RunInstall {
+    pool_runs: Vec<Arc<crate::index::sealed::SealedRun>>,
+    inputs: Vec<Arc<crate::index::sealed::SealedRun>>,
+    swaps: Vec<RunGenerationSwap>,
+}
+
+type RunInputSet = (
+    Vec<Arc<crate::index::sealed::SealedRun>>,
+    Vec<Arc<crate::index::sealed::SealedRun>>,
+);
+
+type RunGenerationSwap = (
+    [u8; 16],
+    Arc<RoomGeneration>,
+    crate::index::sealed::SealedLocators,
+);
+
+/// One source of a planned merge, in pool order.
+enum RunMergeInput {
+    /// A sealed pack served by its sidecar.
+    Sidecar {
+        path: PathBuf,
+        pack_id: PackId,
+        creation_seq: u64,
+    },
+    /// An existing run.
+    Run(Arc<crate::index::sealed::SealedRun>),
+}
+
+/// A merge chosen by [`PackfileStorage::plan_run_merge`].
+struct RunMergePlan {
+    inputs: Vec<RunMergeInput>,
+    /// The output starts at the pool's oldest pack, so no older source can
+    /// hold a key and removals can be dropped.
+    drop_removals: bool,
+}
+
+impl RunMergePlan {
+    fn new(mut units: Vec<RunMergeInput>, start: usize, len: usize) -> Self {
+        let inputs: Vec<RunMergeInput> = units
+            .drain(start..start.saturating_add(len).min(units.len()))
+            .collect();
+        Self {
+            inputs,
+            drop_removals: start == 0,
+        }
+    }
+}
+
+/// Build the run a plan describes: reopen and verify each input sidecar,
+/// merge, and publish the file (temp write, fsync, rename, directory fsync,
+/// all in [`crate::index::run::merge_to_path`]). Holds no storage lock. A
+/// missing or damaged input skips this merge; nothing is published.
+fn build_planned_run(
+    dir: &Path,
+    plan: &RunMergePlan,
+) -> std::io::Result<Option<crate::index::run::PoolRun>> {
+    use crate::index::run::{MergeOptions, MergeSource, RunIndex};
+    let mut sidecars = Vec::with_capacity(plan.inputs.len());
+    let mut identities = Vec::with_capacity(plan.inputs.len());
+    for input in &plan.inputs {
+        match input {
+            RunMergeInput::Sidecar {
+                path,
+                pack_id,
+                creation_seq,
+                ..
+            } => {
+                let sidecar = crate::index::packidx::open_for_pack(path)
+                    .filter(|sidecar| {
+                        let identity = sidecar.identity();
+                        identity.pack_id == *pack_id && identity.creation_seq == *creation_seq
+                    })
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "the sidecar for {} is missing or damaged",
+                            path.display()
+                        ))
+                    })?;
+                identities.push(sidecar.identity());
+                sidecars.push(Some(sidecar));
+            }
+            RunMergeInput::Run(run) => {
+                if run.run().is_invalid() {
+                    return Err(std::io::Error::other("an input run failed a block check"));
+                }
+                identities.extend(run.run().packs().iter().copied());
+                sidecars.push(None);
+            }
+        }
+    }
+    let sources: Vec<MergeSource<'_>> = plan
+        .inputs
+        .iter()
+        .zip(&sidecars)
+        .map(|(input, sidecar)| match (input, sidecar) {
+            (RunMergeInput::Run(run), _) => MergeSource::Run(run.run()),
+            (RunMergeInput::Sidecar { .. }, Some(sidecar)) => MergeSource::Sidecar(sidecar),
+            (RunMergeInput::Sidecar { .. }, None) => unreachable!("every sidecar input was opened"),
+        })
+        .collect();
+    let (Some(first), Some(last)) = (identities.first(), identities.last()) else {
+        return Ok(None);
+    };
+    let path = dir.join(crate::index::run::run_file_name(first, last));
+    let summary = crate::index::run::merge_to_path(
+        &sources,
+        MergeOptions {
+            drop_removals: plan.drop_removals,
+            ..MergeOptions::default()
+        },
+        &path,
+    )
+    .map_err(std::io::Error::other)?;
+    if summary.is_none() {
+        return Ok(None);
+    }
+    let run = RunIndex::open(&path).map_err(std::io::Error::other)?;
+    Ok(Some(crate::index::run::PoolRun { path, run }))
 }
 
 impl PackfileStorage {

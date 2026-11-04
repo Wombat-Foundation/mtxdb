@@ -13246,6 +13246,57 @@ fn paged_run_replaces_covered_sidecars_with_identical_answers() {
 }
 
 #[test]
+fn paged_writable_store_publishes_runs_after_sealing() {
+    let dir = test_dir("paged_run_publish");
+    let store = paged_open(&dir);
+    let mut expected = Vec::new();
+    let mut sequence = 0_u64;
+    let sealed_count = || {
+        store
+            .shards
+            .all_shards()
+            .iter()
+            .filter(|(_, shard)| shard.sealed.load(Ordering::Acquire))
+            .count()
+    };
+    while sealed_count() <= 16 {
+        for _ in 0..256 {
+            let mut id = [0_u8; 16];
+            id[..8].copy_from_slice(&sequence.to_le_bytes());
+            id[8..].copy_from_slice(&sequence.rotate_left(17).to_le_bytes());
+            let value = sequence.to_le_bytes().to_vec();
+            store
+                .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&value))
+                .unwrap();
+            expected.push((TEST_COLLECTION, id, Some(value)));
+            sequence = sequence.saturating_add(1);
+        }
+    }
+    store.sync_all().unwrap();
+    store.settle_run_merges();
+    let runs = store.shards.sealed_runs();
+    assert!(
+        !runs.is_empty(),
+        "sealing more than T packs publishes a run"
+    );
+    assert!(
+        runs.iter().any(|run| run.packs().len() > 16),
+        "the run covers the sealed sidecars selected by the T=16 policy"
+    );
+    assert_store_matches(&store, &expected, "published run");
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        !reopened.shards.sealed_runs().is_empty(),
+        "a published run is discovered and installed on the next open"
+    );
+    assert_store_matches(&reopened, &expected, "reopened published run");
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn paged_corrupt_run_block_falls_back_to_sidecars() {
     let dir = test_dir("paged_run_corrupt_block");
     let expected = paged_run_fixture(&dir);
@@ -13428,5 +13479,269 @@ fn paged_repack_invalidates_a_run_over_retired_packs() {
     assert!(!run_path.exists(), "a stale run is deleted at open");
     assert_store_matches(&reopened, &expected, "after reopen");
     drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Every published run file in `dir`, sorted.
+fn run_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut runs: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "run"))
+        .collect();
+    runs.sort();
+    runs
+}
+
+/// Sidecars the pool verified at its last open.
+fn pool_sidecar_verifies(store: &PackfileStorage) -> u64 {
+    store
+        .shards
+        .open_timings()
+        .expect("pool open timings")
+        .sidecar_verify_calls
+}
+
+/// Build the merge the policy would start next, without installing it: the
+/// state a crash leaves after the run file is published.
+fn publish_planned_run(store: &PackfileStorage) -> PathBuf {
+    let plan = store.plan_run_merge().expect("a planned merge");
+    build_planned_run(store.shards.base_dir(), &plan)
+        .unwrap()
+        .expect("a non-empty run")
+        .path
+}
+
+#[test]
+fn paged_store_publishes_a_run_with_identical_answers() {
+    let dir = test_dir("paged_run_publish");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 3, "fixture must seal several packs, got {sealed}");
+    let packs = u64::try_from(pool_pack_identities(&dir).len()).unwrap();
+
+    let store = paged_open(&dir);
+    let baseline_accounting = shard_accounting(&store);
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    store.settle_run_merges();
+    assert_eq!(store.run_merges_installed.load(Ordering::Relaxed), 1);
+    let runs = store.shards.sealed_runs();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].packs().len(),
+        sealed,
+        "the run covers every sealed pack"
+    );
+    for collection in [TEST_COLLECTION, OTHER_COLLECTION] {
+        let generation = store.generation(&collection).unwrap();
+        assert!(
+            generation.sealed.packs().is_empty(),
+            "covered sidecars leave the generation"
+        );
+        assert!(generation.sealed.contains_run(&runs[0]));
+    }
+    drop(runs);
+    assert_eq!(shard_accounting(&store), baseline_accounting);
+    assert_store_matches(&store, &expected, "after publication");
+    assert_eq!(run_files(&dir).len(), 1);
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert_eq!(
+        pool_sidecar_verifies(&reopened),
+        packs - u64::try_from(sealed).unwrap(),
+        "a published run replaces its packs' sidecars at open"
+    );
+    assert_store_matches(&reopened, &expected, "after reopen");
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_run_carry_replaces_its_input_runs() {
+    let dir = test_dir("paged_run_carry");
+    let mut expected = paged_run_fixture(&dir);
+    let store = paged_open(&dir);
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    store.settle_run_merges();
+    let first = run_files(&dir);
+    assert_eq!(first.len(), 1);
+
+    // Seal more packs, then fold their run into the first one.
+    store.run_merge_unmerged_packs.store(0, Ordering::Relaxed);
+    store.run_merge_fan_in.store(u64::MAX, Ordering::Relaxed);
+    // Both collections move on, so their old home packs seal.
+    for index in 0..200u8 {
+        for collection in [TEST_COLLECTION, OTHER_COLLECTION] {
+            let mut id = distinct_id(index);
+            id[14] = 0xC4;
+            let value = vec![index; 48];
+            store
+                .put(&collection, &id, &NodeData::from_slice(&value))
+                .unwrap();
+            expected.push((collection, id, Some(value)));
+        }
+    }
+    store.sync_all().unwrap();
+    store.settle_run_merges();
+    assert!(store.run_merges_installed.load(Ordering::Relaxed) >= 3);
+    let runs = store.shards.sealed_runs();
+    assert_eq!(
+        runs.len(),
+        1,
+        "every carry folds into one run: {:?} installed {} files {:?}",
+        runs.iter()
+            .map(|run| (run.packs()[0].creation_seq, run.packs().len()))
+            .collect::<Vec<_>>(),
+        store.run_merges_installed.load(Ordering::Relaxed),
+        run_files(&dir)
+    );
+    let covered = runs[0].packs().len();
+    drop(runs);
+    let files = run_files(&dir);
+    assert_eq!(files.len(), 1, "input runs are deleted after the carry");
+    assert!(!files.contains(&first[0]));
+    assert_store_matches(&store, &expected, "after the carry");
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert_eq!(reopened.shards.sealed_runs()[0].packs().len(), covered);
+    assert_store_matches(&reopened, &expected, "after reopen");
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_run_crash_points_reopen_with_identical_answers() {
+    let dir = test_dir("paged_run_crash");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 3);
+    let packs = u64::try_from(pool_pack_identities(&dir).len()).unwrap();
+
+    // Before the rename: only the temp file exists.
+    let identities = pool_pack_identities(&dir);
+    let temporary = dir.join(format!(
+        "{}.tmp",
+        crate::index::run::run_file_name(&identities[0].0, &identities[sealed - 1].0)
+    ));
+    fs::write(&temporary, b"partial run").unwrap();
+    let store = paged_open(&dir);
+    assert!(!temporary.exists(), "a writable open deletes a temp run");
+    assert!(store.shards.sealed_runs().is_empty());
+    assert_store_matches(&store, &expected, "after a crash before rename");
+
+    // After the rename (with or without the directory fsync), before the
+    // generation swap: an orphan run that open validates and accepts.
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    let orphan = publish_planned_run(&store);
+    assert_store_matches(&store, &expected, "while the run is uninstalled");
+    drop(store);
+    let store = paged_open(&dir);
+    assert!(orphan.exists());
+    assert_eq!(
+        pool_sidecar_verifies(&store),
+        packs - u64::try_from(sealed).unwrap()
+    );
+    assert_store_matches(&store, &expected, "after a crash before install");
+    drop(store);
+
+    // A carry published, its input run not yet deleted: the containing run
+    // wins at open and the contained one is removed.
+    fs::remove_file(&orphan).unwrap();
+    let older = write_pool_run(&dir, &(0..sealed - 1).collect::<Vec<_>>());
+    let newer = write_pool_run(&dir, &[sealed - 1]);
+    let store = paged_open(&dir);
+    assert_eq!(store.shards.sealed_runs().len(), 2);
+    store.run_merge_fan_in.store(u64::MAX, Ordering::Relaxed);
+    let carried = publish_planned_run(&store);
+    drop(store);
+    let store = paged_open(&dir);
+    assert_eq!(run_files(&dir), vec![carried.clone()]);
+    assert!(!older.exists() && !newer.exists());
+    assert_eq!(store.shards.sealed_runs()[0].packs().len(), sealed);
+    assert_store_matches(&store, &expected, "after a crash before deleting inputs");
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_run_install_is_discarded_after_its_packs_retire() {
+    let dir = test_dir("paged_run_install_retired");
+    let mut expected: Vec<ExpectedRecord> = Vec::new();
+    {
+        let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+        for (collection, tag) in [(TEST_COLLECTION, 0xA1), (OTHER_COLLECTION, 0xB2)] {
+            for index in 0..150u8 {
+                let mut id = distinct_id(index);
+                id[15] = tag;
+                let value = vec![index ^ tag; 32];
+                store
+                    .put(&collection, &id, &NodeData::from_slice(&value))
+                    .unwrap();
+                expected.push((collection, id, Some(value)));
+            }
+        }
+        store.sync_all().unwrap();
+    }
+    let store = paged_open(&dir);
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    let plan = store.plan_run_merge().expect("a planned merge");
+    let built = build_planned_run(store.shards.base_dir(), &plan)
+        .unwrap()
+        .expect("a non-empty run");
+    let path = built.path.clone();
+    // A repack retires packs the run covers before it is installed.
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    store.install_run(built);
+    assert!(!path.exists(), "a run over a retired pack is discarded");
+    assert!(store.shards.sealed_runs().is_empty());
+    assert_eq!(store.run_merges_installed.load(Ordering::Relaxed), 0);
+    for collection in [TEST_COLLECTION, OTHER_COLLECTION] {
+        assert!(store
+            .generation(&collection)
+            .unwrap()
+            .sealed
+            .runs()
+            .is_empty());
+    }
+    assert_store_matches(&store, &expected, "after a discarded install");
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_lookups_see_no_gap_while_a_run_installs() {
+    let dir = test_dir("paged_run_concurrent");
+    let expected = Arc::new(paged_run_fixture(&dir));
+    let store = Arc::new(paged_open(&dir));
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let expected = Arc::clone(&expected);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut rounds = 0u64;
+                while !stop.load(Ordering::Acquire) || rounds == 0 {
+                    assert_store_matches(&store, &expected, "during install");
+                    rounds = rounds.saturating_add(1);
+                }
+                rounds
+            })
+        })
+        .collect();
+    store.settle_run_merges();
+    assert_eq!(store.run_merges_installed.load(Ordering::Relaxed), 1);
+    stop.store(true, Ordering::Release);
+    for reader in readers {
+        assert!(reader.join().unwrap() > 0);
+    }
+    assert_store_matches(&store, &expected, "after install");
+    drop(store);
     let _ = fs::remove_dir_all(&dir);
 }
