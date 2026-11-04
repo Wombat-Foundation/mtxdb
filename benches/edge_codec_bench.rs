@@ -43,6 +43,14 @@ impl PseudoRng {
             .checked_rem(divisor)
             .expect("non-zero divisor")
     }
+
+    fn sample_quadratic(&mut self, bound: u64) -> u64 {
+        let r1 = u128::from(u32::try_from(self.next_u64() >> 32).unwrap_or(0));
+        let r2 = u128::from(u32::try_from(self.next_u64() >> 32).unwrap_or(0));
+        let product = (r1.saturating_mul(r2)) >> 32;
+        let scaled = (product.saturating_mul(u128::from(bound))) >> 32;
+        u64::try_from(scaled).expect("scaled fits in u64")
+    }
 }
 
 // ---------------------------------------------------------------- model
@@ -93,7 +101,7 @@ fn generate_room(event_count: usize, seed: u64) -> RoomGraph {
         parents.sort_unstable();
         prev[event_index] = parents;
 
-        let user_id = rng.below(user_count).min(rng.below(user_count));
+        let user_id = rng.sample_quadratic(user_count);
 
         let mut auth_list = vec![0u32, active_power_levels_event];
         let is_first_send = !user_member_events.contains_key(&user_id);
@@ -119,7 +127,7 @@ fn generate_room(event_count: usize, seed: u64) -> RoomGraph {
                 current_short.saturating_sub(1).saturating_sub(rel_lookback)
             } else {
                 let hot_count = u64::try_from(hot_events.len()).expect("fits in u64");
-                let hot_sample = rng.below(hot_count).min(rng.below(hot_count));
+                let hot_sample = rng.sample_quadratic(hot_count);
                 let hot_index = usize::try_from(hot_sample).expect("fits in usize");
                 hot_events[hot_index]
             };
@@ -139,8 +147,32 @@ fn generate_room(event_count: usize, seed: u64) -> RoomGraph {
     }
 }
 
-// ---------------------------------------------------------------- varint
+// ---------------------------------------------------------------- varint & zigzag
+fn zigzag_encode(val: i64) -> u64 {
+    let shifted = val.wrapping_shl(1);
+    let mask = val.wrapping_shr(63);
+    (shifted ^ mask).cast_unsigned()
+}
+
+fn zigzag_decode(val: u64) -> i64 {
+    let unsigned_half = (val >> 1).cast_signed();
+    if val & 1 == 1 {
+        !unsigned_half
+    } else {
+        unsigned_half
+    }
+}
+
 fn varint_length(mut value: u32) -> usize {
+    let mut count = 1usize;
+    while value >= 0x80 {
+        value >>= 7;
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+fn varint_length_u64(mut value: u64) -> usize {
     let mut count = 1usize;
     while value >= 0x80 {
         value >>= 7;
@@ -158,6 +190,15 @@ fn append_varint(buffer: &mut Vec<u8>, mut value: u32) {
     buffer.push(u8::try_from(value).expect("fits in u8"));
 }
 
+fn append_varint_u64(buffer: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        let byte = u8::try_from(value & 0x7f).expect("fits in u8") | 0x80;
+        buffer.push(byte);
+        value >>= 7;
+    }
+    buffer.push(u8::try_from(value).expect("fits in u8"));
+}
+
 fn read_varint(bytes: &[u8], cursor: &mut usize) -> u32 {
     let mut decoded = 0u32;
     let mut shift_bits = 0u32;
@@ -165,6 +206,20 @@ fn read_varint(bytes: &[u8], cursor: &mut usize) -> u32 {
         let raw_byte = bytes[*cursor];
         *cursor = cursor.saturating_add(1);
         decoded |= u32::from(raw_byte & 0x7f) << shift_bits;
+        if raw_byte < 0x80 {
+            return decoded;
+        }
+        shift_bits = shift_bits.saturating_add(7);
+    }
+}
+
+fn read_varint_u64(bytes: &[u8], cursor: &mut usize) -> u64 {
+    let mut decoded = 0u64;
+    let mut shift_bits = 0u32;
+    loop {
+        let raw_byte = bytes[*cursor];
+        *cursor = cursor.saturating_add(1);
+        decoded |= u64::from(raw_byte & 0x7f) << shift_bits;
         if raw_byte < 0x80 {
             return decoded;
         }
@@ -236,16 +291,18 @@ impl CsrVarintForward {
                 )
                 .expect("short fits in u32");
 
-                let mut deltas: Vec<u32> = target_list
-                    .iter()
-                    .map(|&parent| base_short.saturating_sub(parent))
-                    .collect();
-                deltas.sort_unstable();
+                if !target_list.is_empty() {
+                    let mut sorted = target_list.clone();
+                    sorted.sort_unstable_by(|a, b| b.cmp(a));
+                    let diff_0 = i64::from(base_short)
+                        .checked_sub(i64::from(sorted[0]))
+                        .expect("valid diff");
+                    append_varint_u64(&mut payload, zigzag_encode(diff_0));
 
-                let mut last_delta = 0u32;
-                for delta in deltas {
-                    append_varint(&mut payload, delta.saturating_sub(last_delta));
-                    last_delta = delta;
+                    for window in sorted.windows(2) {
+                        let gap = window[0].checked_sub(window[1]).expect("sorted descending");
+                        append_varint(&mut payload, gap);
+                    }
                 }
             }
             offsets.push(u16::try_from(payload.len()).expect("offset fits in u16"));
@@ -272,10 +329,21 @@ impl CsrVarintForward {
         let mut cursor = usize::from(offsets[within_chunk]);
         let end_cursor = usize::from(offsets[within_chunk.saturating_add(1)]);
 
-        let mut accumulated_delta = 0u32;
-        while cursor < end_cursor {
-            accumulated_delta = accumulated_delta.saturating_add(read_varint(payload, &mut cursor));
-            output.push(short_id.saturating_sub(accumulated_delta));
+        if cursor < end_cursor {
+            let initial_diff = zigzag_decode(read_varint_u64(payload, &mut cursor));
+            let parent_i64 = i64::from(short_id)
+                .checked_sub(initial_diff)
+                .expect("parent fits in i64");
+            let mut current_parent = u32::try_from(parent_i64).expect("parent fits in u32");
+            output.push(current_parent);
+
+            while cursor < end_cursor {
+                let gap = read_varint(payload, &mut cursor);
+                current_parent = current_parent
+                    .checked_sub(gap)
+                    .expect("valid descending gap");
+                output.push(current_parent);
+            }
         }
     }
 }
@@ -419,16 +487,18 @@ fn measure_forward_wa(
         let base_short = u32::try_from(event_index).expect("fits in u32");
         let mut entry_size = 2usize; // u16 offset
 
-        let mut deltas: Vec<u32> = target_list
-            .iter()
-            .map(|&parent| base_short.saturating_sub(parent))
-            .collect();
-        deltas.sort_unstable();
+        if !target_list.is_empty() {
+            let mut sorted = target_list.clone();
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            let diff_0 = i64::from(base_short)
+                .checked_sub(i64::from(sorted[0]))
+                .expect("valid diff");
+            entry_size = entry_size.saturating_add(varint_length_u64(zigzag_encode(diff_0)));
 
-        let mut last_delta = 0u32;
-        for delta in deltas {
-            entry_size = entry_size.saturating_add(varint_length(delta.saturating_sub(last_delta)));
-            last_delta = delta;
+            for window in sorted.windows(2) {
+                let gap = window[0].checked_sub(window[1]).expect("sorted descending");
+                entry_size = entry_size.saturating_add(varint_length(gap));
+            }
         }
 
         current_head_bytes = current_head_bytes.saturating_add(entry_size);
