@@ -674,8 +674,9 @@ fn run_reclaim_rounds(
 /// A reader streaming `get_read_committed` must not stop the writer's sync from
 /// advancing the checkpoint and reclaiming the journal. Transient `WouldBlock`
 /// is allowed for the reader; a gap or wrong value is not. The reader starts
-/// before the first reclaim, reads each newly committed value, and must make
-/// progress in every round, so the reclaims and reads actually overlap.
+/// before the first reclaim and must acknowledge each round's newly committed
+/// value before the writer continues. This coordinates interleaving between
+/// rounds; it does not force a read to run inside a reclaim.
 #[test]
 fn streaming_read_committed_does_not_hold_back_reclaim() {
     use std::sync::atomic::{AtomicBool, AtomicU8};
