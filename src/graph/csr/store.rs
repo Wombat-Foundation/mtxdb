@@ -117,9 +117,11 @@ pub struct CsrStore {
 ///
 /// The decoded-tail cache assumes a single writer per store directory, and the
 /// database root's writer lock provides it for the life of the [`Database`].
-/// Borrowing the `Database` here makes a write impossible without that lock
-/// held, and [`CsrStore::writer`] refuses a database whose root is not the
-/// store's. The raw write methods on [`CsrStore`] are crate-private.
+/// Borrowing the `Database` here makes a write without that lock impossible,
+/// and [`CsrStore::writer`] refuses a database whose root is not the store's.
+/// Serialization between threads is the store's per-directory write lock, so
+/// the raw crate-private methods take it too. This handle only adds the
+/// root-lock proof; it does not take the lock itself.
 #[derive(Clone, Copy)]
 pub struct CsrWriter<'a> {
     store: &'a CsrStore,
@@ -688,11 +690,12 @@ static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, TailState>>> =
 
 /// One write lock per store directory, shared by every handle in the process.
 ///
-/// The root lock keeps other processes out, but threads sharing one `Database`
-/// can each hold a [`CsrWriter`]. Appends, purges and seals each open the tail,
-/// compare it with the verified length and may truncate or replace it, so two
-/// of them at once would cut each other's frames. Every mutation therefore
-/// holds this lock from the tail check through its seal.
+/// The root lock keeps other processes out, but threads can write to one store
+/// through a [`CsrWriter`] or, inside the crate, the store's own methods.
+/// Appends, purges and seals each open the tail, compare it with the verified
+/// length and may truncate or replace it, so two of them at once would cut
+/// each other's frames. Every mutation therefore holds this lock from the tail
+/// check through its seal.
 static WRITE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1471,6 +1474,53 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_direct_mutations_serialize_on_the_store() {
+        const THREADS: u32 = 4;
+        const PER_THREAD: u32 = 150;
+        let layout = layout("direct_writer_threads");
+        let store = CsrStore::open(&layout, ShardType::State);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let store = &store;
+                scope.spawn(move || {
+                    let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
+                    for owner in 0..PER_THREAD {
+                        let row = RowRecord {
+                            family: EdgeFamily::typed(3),
+                            owner,
+                            edges: vec![
+                                Edge {
+                                    target: owner,
+                                    kind: 1
+                                };
+                                64
+                            ],
+                        };
+                        store.append_rows(scope_id, &[row]).unwrap();
+                        // Seal while the other threads are still appending.
+                        if owner % 50 == 49 {
+                            store.seal().unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        for thread in 0..THREADS {
+            let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
+            assert_eq!(
+                store.read_scope(scope_id).unwrap().rows.len(),
+                usize::try_from(PER_THREAD).unwrap(),
+                "scope {thread} lost rows to a direct concurrent writer"
+            );
+        }
+        // The purge entry point shares the same lock.
+        let purged = ScopeId([0; 16]);
+        store.purge_scope(purged).unwrap();
+        assert!(store.read_scope(purged).unwrap().rows.is_empty());
+        let _ = fs::remove_dir_all(layout.root());
     }
 
     #[test]
