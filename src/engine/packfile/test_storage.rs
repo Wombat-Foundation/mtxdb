@@ -14148,6 +14148,63 @@ fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
     );
 }
 
+/// A held `ReadSnapshot` delays writers on the same handle: `put` takes the
+/// snapshot gate, so it completes only after the snapshot drops. This pins the
+/// cost the type's doc warns about, so a change that removes the delay (or
+/// makes it unbounded) shows up here. Reads on the pinned handle are not part
+/// of this: they share the overlay and are covered by the reclaim tests.
+#[test]
+fn a_held_read_snapshot_delays_a_put_until_it_drops() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let dir = test_dir("snapshot_write_delay");
+    let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+    let collection = [0x4Du8; 16];
+    store
+        .put(
+            &collection,
+            &[1u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+
+    let snapshot = store.read_snapshot().unwrap();
+    let put_finished = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let store = Arc::clone(&store);
+        let put_finished = Arc::clone(&put_finished);
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            store
+                .put(
+                    &collection,
+                    &[2u8; 16],
+                    &NodeData::new(bytes::Bytes::from_static(b"next")),
+                )
+                .unwrap();
+            put_finished.store(true, Ordering::Release);
+            started.elapsed()
+        })
+    };
+
+    let hold = Duration::from_millis(150);
+    std::thread::sleep(hold);
+    assert!(
+        !put_finished.load(Ordering::Acquire),
+        "a put must wait while a snapshot holds the gate"
+    );
+    drop(snapshot);
+    let waited = writer.join().unwrap();
+    assert!(
+        waited >= hold,
+        "the put waited {waited:?}, less than the {hold:?} the snapshot was held"
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A read completes while a reclaim is paused inside its critical section
 /// (sync and journal locks held, segment not yet rewritten), so ordinary
 /// committed reads are not blocked by a reclaim in progress.
