@@ -10202,7 +10202,7 @@ impl ImportContext<'_> {
     }
 
     /// A federation response document: its PDUs through the event DAG, its
-    /// auth chain through the edges pool.
+    /// auth-chain bodies in the State pool.
     fn import_federation(
         &mut self,
         path: &Path,
@@ -10270,7 +10270,7 @@ impl ImportContext<'_> {
         )
     }
 
-    /// A federation document's auth chain, into the edges pool.
+    /// Write a federation document's auth-chain bodies into the State pool.
     ///
     /// Auth-chain events may span several rooms, so they are grouped first
     /// and then probed and written one batch per room rather than one round
@@ -10304,7 +10304,7 @@ impl ImportContext<'_> {
         }
         auth_store.sync_all()?;
         eprintln!(
-            "imported {written} edges events ({} dangling references)",
+            "imported {written} auth-chain events ({} dangling references)",
             dangling.len()
         );
         if skipped > 0 {
