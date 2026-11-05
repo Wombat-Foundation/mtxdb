@@ -20,8 +20,14 @@
 //!
 //! A purge is a tombstone record: it clears the scope during replay, so rows
 //! already sealed into shared segments are hidden without rewriting them.
+//!
+//! Whole-scope reads cache the decoded sealed rows per store directory, so a
+//! segment is decoded once for all scopes instead of once per scope. Point and
+//! family reads keep using the on-disk `(family, owner)` directory and do not
+//! touch that cache. The cache is bounded by [`SEGMENT_CACHE_BUDGET`] with LRU
+//! eviction and is in-process state, not a durability boundary.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -224,12 +230,63 @@ impl CsrStore {
 
     /// Read every visible row of `scope`.
     ///
+    /// Sealed segments are decoded once per directory and reused by later
+    /// whole-scope reads; the tail is applied on top from its own cache.
+    ///
     /// # Errors
     /// I/O errors or a malformed sealed segment.
     pub fn read_scope(&self, scope: ScopeId) -> io::Result<ScopeData> {
+        let segments = self.segments()?;
+        let signature = segment_signature(&segments)?;
+        let cached = SEGMENT_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(&self.dir);
+        let mut cache = cached.unwrap_or_default();
+        let outcome = self.read_scope_cached(scope, &segments, signature, &mut cache);
+        if outcome.is_ok() {
+            SEGMENT_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .put(self.dir.clone(), cache);
+        }
+        outcome
+    }
+
+    fn read_scope_cached(
+        &self,
+        scope: ScopeId,
+        segments: &[(u64, PathBuf)],
+        signature: Vec<(u64, u64)>,
+        cache: &mut SegmentCache,
+    ) -> io::Result<ScopeData> {
+        if cache.signature != signature {
+            if signature.len() > cache.signature.len() && signature.starts_with(&cache.signature) {
+                for (_, path) in &segments[cache.signature.len()..] {
+                    apply_segment_all(path, &mut cache.rows)?;
+                    #[cfg(test)]
+                    {
+                        cache.segment_reads = cache.segment_reads.saturating_add(1);
+                    }
+                }
+            } else {
+                cache.rows.clear();
+                for (_, path) in segments {
+                    apply_segment_all(path, &mut cache.rows)?;
+                    #[cfg(test)]
+                    {
+                        cache.segment_reads = cache.segment_reads.saturating_add(1);
+                    }
+                }
+            }
+            cache.signature = signature;
+            cache.bytes = rows_bytes(&cache.rows);
+        }
         let mut rows: HashMap<RowKey, (bool, Vec<Edge>)> = HashMap::new();
-        for (_, path) in self.segments()? {
-            apply_segment(&path, scope, None, None, &mut rows)?;
+        for (key, value) in &cache.rows {
+            if key.0 == scope.0 {
+                rows.insert(*key, value.clone());
+            }
         }
         self.with_tail(|tail| {
             // A tombstone in the tail is newer than every sealed segment.
@@ -573,6 +630,61 @@ impl TailState {
 static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, TailState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Decoded rows from every sealed segment of one store directory.
+///
+/// Whole-scope reads use this so a segment is decoded once for all scopes
+/// instead of once per scope. Point and family reads keep using the on-disk
+/// directory, so they neither populate nor depend on this cache.
+#[derive(Default)]
+struct SegmentCache {
+    signature: Vec<(u64, u64)>,
+    rows: HashMap<RowKey, (bool, Vec<Edge>)>,
+    bytes: usize,
+    #[cfg(test)]
+    segment_reads: u64,
+}
+
+#[derive(Default)]
+struct SegmentCacheSet {
+    entries: HashMap<PathBuf, SegmentCache>,
+    order: VecDeque<PathBuf>,
+    bytes: usize,
+}
+
+/// Bound on decoded sealed rows kept across all directories.
+const SEGMENT_CACHE_BUDGET: usize = 64 * 1024 * 1024;
+
+impl SegmentCacheSet {
+    fn take(&mut self, dir: &Path) -> Option<SegmentCache> {
+        let cache = self.entries.remove(dir)?;
+        self.bytes = self.bytes.saturating_sub(cache.bytes);
+        self.order.retain(|entry| entry != dir);
+        Some(cache)
+    }
+
+    fn put(&mut self, dir: PathBuf, cache: SegmentCache) {
+        self.order.retain(|entry| entry != &dir);
+        self.bytes = self.bytes.saturating_add(cache.bytes);
+        self.entries.insert(dir.clone(), cache);
+        self.order.push_back(dir);
+        self.evict_to(SEGMENT_CACHE_BUDGET);
+    }
+
+    fn evict_to(&mut self, budget: usize) {
+        while self.bytes > budget {
+            let Some(lru) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(cache) = self.entries.remove(&lru) {
+                self.bytes = self.bytes.saturating_sub(cache.bytes);
+            }
+        }
+    }
+}
+
+static SEGMENT_CACHE: LazyLock<Mutex<SegmentCacheSet>> =
+    LazyLock::new(|| Mutex::new(SegmentCacheSet::default()));
+
 struct Frame {
     payload: Vec<u8>,
 }
@@ -717,68 +829,139 @@ fn apply_segment(
     rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
 ) -> io::Result<()> {
     let (mut file, index_bytes, payload_start, payload_len) = open_segment(path)?;
-    let corrupt = |what: &str| segment_error(path, what);
     for entry in index_bytes.chunks_exact(SCOPE_ENTRY) {
         if entry[..16] != scope.0 {
             continue;
         }
-        let flags = u32::from_le_bytes([entry[16], entry[17], entry[18], entry[19]]);
-        let block_off = u32::from_le_bytes([entry[20], entry[21], entry[22], entry[23]]) as usize;
-        let block_len = u32::from_le_bytes([entry[24], entry[25], entry[26], entry[27]]) as usize;
-        let directory_len =
-            u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]) as usize;
-        if block_off
-            .checked_add(block_len)
-            .is_none_or(|end| end > payload_len)
-        {
-            return Err(corrupt("scope block out of range"));
-        }
-        if directory_len < BLOCK_COUNT || directory_len > block_len {
-            return Err(corrupt("scope directory out of range"));
-        }
-        if flags & SCOPE_FLAG_PURGE != 0 {
-            rows.retain(|(row_scope, _, _), _| *row_scope != scope.0);
-        }
-        let data_len = block_len.saturating_sub(directory_len);
-        let directory_start = payload_start.saturating_add(block_off);
-        file.seek(SeekFrom::Start(directory_start as u64))?;
-        let mut count_bytes = [0u8; BLOCK_COUNT];
-        file.read_exact(&mut count_bytes)?;
-        let count = u32::from_le_bytes(count_bytes) as usize;
-        if BLOCK_COUNT.saturating_add(count.saturating_mul(DIR_ENTRY)) != directory_len {
-            return Err(corrupt("scope directory length does not match its count"));
-        }
-        let entries_start = directory_start.saturating_add(BLOCK_COUNT);
-        let data_start = directory_start.saturating_add(directory_len);
-        if let Some(wanted) = wanted {
-            // Sorted directory: probe it on disk instead of reading it.
-            for &(family, owner) in wanted {
-                if let Some((offset, len, crc)) =
-                    find_directory_entry(&mut file, entries_start, count, family, owner)?
-                {
-                    read_row_at(&mut file, data_start, data_len, offset, len, crc, rows)?;
-                }
-            }
-        } else if let Some(family) = family {
-            read_family_directory(
-                &mut file,
-                entries_start,
-                count,
-                data_start,
-                data_len,
-                family.id,
-                rows,
-            )?;
-        } else {
-            read_whole_directory(&mut file, entries_start, count, data_start, data_len, rows)
-                .map_err(|e| match e.kind() {
-                    io::ErrorKind::UnexpectedEof => corrupt("scope directory entry is short"),
-                    _ => e,
-                })?;
-        }
+        apply_scope_entry(
+            path,
+            &mut file,
+            entry,
+            PayloadRange {
+                start: payload_start,
+                len: payload_len,
+            },
+            wanted,
+            family,
+            rows,
+        )?;
         return Ok(());
     }
     Ok(())
+}
+
+/// Apply every scope block in one sealed segment.
+fn apply_segment_all(path: &Path, rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>) -> io::Result<()> {
+    let (mut file, index_bytes, payload_start, payload_len) = open_segment(path)?;
+    for entry in index_bytes.chunks_exact(SCOPE_ENTRY) {
+        apply_scope_entry(
+            path,
+            &mut file,
+            entry,
+            PayloadRange {
+                start: payload_start,
+                len: payload_len,
+            },
+            None,
+            None,
+            rows,
+        )?;
+    }
+    Ok(())
+}
+
+/// Where a segment's payload starts and how long it is.
+#[derive(Clone, Copy)]
+struct PayloadRange {
+    start: usize,
+    len: usize,
+}
+
+fn apply_scope_entry(
+    path: &Path,
+    file: &mut File,
+    entry: &[u8],
+    payload: PayloadRange,
+    wanted: Option<&HashSet<(u16, u32)>>,
+    family: Option<EdgeFamily>,
+    rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+) -> io::Result<()> {
+    let corrupt = |what: &str| segment_error(path, what);
+    let mut scope = [0u8; 16];
+    scope.copy_from_slice(&entry[..16]);
+    let flags = u32::from_le_bytes([entry[16], entry[17], entry[18], entry[19]]);
+    let block_off = u32::from_le_bytes([entry[20], entry[21], entry[22], entry[23]]) as usize;
+    let block_len = u32::from_le_bytes([entry[24], entry[25], entry[26], entry[27]]) as usize;
+    let directory_len = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]) as usize;
+    if block_off
+        .checked_add(block_len)
+        .is_none_or(|end| end > payload.len)
+    {
+        return Err(corrupt("scope block out of range"));
+    }
+    if directory_len < BLOCK_COUNT || directory_len > block_len {
+        return Err(corrupt("scope directory out of range"));
+    }
+    if flags & SCOPE_FLAG_PURGE != 0 {
+        rows.retain(|(row_scope, _, _), _| *row_scope != scope);
+    }
+    let data_len = block_len.saturating_sub(directory_len);
+    let directory_start = payload.start.saturating_add(block_off);
+    file.seek(SeekFrom::Start(directory_start as u64))?;
+    let mut count_bytes = [0u8; BLOCK_COUNT];
+    file.read_exact(&mut count_bytes)?;
+    let count = u32::from_le_bytes(count_bytes) as usize;
+    if BLOCK_COUNT.saturating_add(count.saturating_mul(DIR_ENTRY)) != directory_len {
+        return Err(corrupt("scope directory length does not match its count"));
+    }
+    let entries_start = directory_start.saturating_add(BLOCK_COUNT);
+    let data_start = directory_start.saturating_add(directory_len);
+    if let Some(wanted) = wanted {
+        // Sorted directory: probe it on disk instead of reading it.
+        for &(family, owner) in wanted {
+            if let Some((offset, len, crc)) =
+                find_directory_entry(file, entries_start, count, family, owner)?
+            {
+                read_row_at(file, data_start, data_len, offset, len, crc, rows)?;
+            }
+        }
+    } else if let Some(family) = family {
+        read_family_directory(
+            file,
+            entries_start,
+            count,
+            data_start,
+            data_len,
+            family.id,
+            rows,
+        )?;
+    } else {
+        read_whole_directory(file, entries_start, count, data_start, data_len, rows).map_err(
+            |e| match e.kind() {
+                io::ErrorKind::UnexpectedEof => corrupt("scope directory entry is short"),
+                _ => e,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn segment_signature(segments: &[(u64, PathBuf)]) -> io::Result<Vec<(u64, u64)>> {
+    let mut signature = Vec::with_capacity(segments.len());
+    for (seq, path) in segments {
+        signature.push((*seq, fs::metadata(path)?.len()));
+    }
+    Ok(signature)
+}
+
+/// Approximate decoded size of `rows`, charged against the cache budget.
+fn rows_bytes(rows: &HashMap<RowKey, (bool, Vec<Edge>)>) -> usize {
+    rows.values().fold(0usize, |total, (_, edges)| {
+        total
+            .saturating_add(std::mem::size_of::<RowKey>())
+            .saturating_add(std::mem::size_of::<(bool, Vec<Edge>)>())
+            .saturating_add(edges.len().saturating_mul(std::mem::size_of::<Edge>()))
+    })
 }
 
 fn segment_error(path: &Path, what: &str) -> io::Error {
@@ -1208,6 +1391,85 @@ mod tests {
         store.seal().unwrap();
         assert!(store.read_scope(scope).unwrap().rows.is_empty());
         let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn whole_scope_cache_decodes_each_segment_once_across_scopes() {
+        let layout = layout("scope-cache");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let a = ScopeId([6; 16]);
+        let b = ScopeId([7; 16]);
+        let segment_reads = || {
+            SEGMENT_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entries
+                .get(&store.dir)
+                .map_or(0, |cache| cache.segment_reads)
+        };
+        store.append_rows(a, &[row(2, 1)]).unwrap();
+        store.append_rows(b, &[row(3, 4)]).unwrap();
+        assert_eq!(store.read_scope(a).unwrap().rows[0].edges[0].target, 2);
+        assert_eq!(store.read_scope(b).unwrap().rows[0].edges[0].target, 3);
+        assert_eq!(segment_reads(), 0, "tail rows need no segment decode");
+
+        store.seal().unwrap();
+        assert_eq!(store.read_scope(a).unwrap().rows[0].edges[0].target, 2);
+        assert_eq!(segment_reads(), 1);
+        assert_eq!(store.read_scope(b).unwrap().rows[0].edges[0].target, 3);
+        assert_eq!(segment_reads(), 1, "the second scope reuses the segment");
+
+        // Point reads keep using the on-disk directory, not this cache.
+        let point = store.read_rows(a, &[(EdgeFamily::typed(3), 1)]).unwrap();
+        assert_eq!(point[0].as_ref().unwrap()[0].target, 2);
+        assert_eq!(segment_reads(), 1);
+
+        // A new tail row is visible without re-decoding sealed segments.
+        store.append_rows(a, &[row(5, 1)]).unwrap();
+        assert_eq!(store.read_scope(a).unwrap().rows[0].edges[0].target, 5);
+        assert_eq!(segment_reads(), 1);
+
+        // A second seal decodes only the new segment, and only once.
+        store.seal().unwrap();
+        assert_eq!(store.read_scope(b).unwrap().rows[0].edges[0].target, 3);
+        assert_eq!(segment_reads(), 2);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn segment_cache_sees_writes_from_another_handle() {
+        let layout = layout("scope-cache-handles");
+        let writer = CsrStore::open(&layout, ShardType::State);
+        let reader = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([8; 16]);
+        writer.append_rows(scope, &[row(2, 1)]).unwrap();
+        assert_eq!(reader.read_scope(scope).unwrap().rows[0].edges[0].target, 2);
+        writer.seal().unwrap();
+        assert_eq!(reader.read_scope(scope).unwrap().rows[0].edges[0].target, 2);
+        writer.append_rows(scope, &[row(5, 1)]).unwrap();
+        assert_eq!(reader.read_scope(scope).unwrap().rows[0].edges[0].target, 5);
+        reader.append_rows(scope, &[row(9, 1)]).unwrap();
+        assert_eq!(writer.read_scope(scope).unwrap().rows[0].edges[0].target, 9);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn segment_cache_evicts_least_recently_used() {
+        let mut set = SegmentCacheSet::default();
+        for (name, bytes) in [("a", 40usize), ("b", 40)] {
+            set.put(
+                PathBuf::from(name),
+                SegmentCache {
+                    bytes,
+                    ..SegmentCache::default()
+                },
+            );
+        }
+        assert_eq!(set.bytes, 80);
+        set.evict_to(40);
+        assert!(!set.entries.contains_key(Path::new("a")));
+        assert!(set.entries.contains_key(Path::new("b")));
+        assert_eq!(set.bytes, 40);
     }
 
     #[test]
