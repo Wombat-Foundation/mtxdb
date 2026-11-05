@@ -1,4 +1,6 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const TEST_COLLECTION: [u8; 16] = [0x01; 16];
@@ -14064,15 +14066,67 @@ fn paged_run_install_rechecks_pack_identity_under_the_locks() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn rewrite_test_key(i: u8) -> [u8; 16] {
+    [0x80u8.wrapping_add(i); 16]
+}
+
+fn rewrite_test_value(i: u8) -> Vec<u8> {
+    vec![i; 8]
+}
+
+/// Read every committed key and record each successful read's nanosecond
+/// interval, returning them for the rewrite-overlap check.
+fn rewrite_test_reader(
+    reader: &PackfileStorage,
+    phase: &crate::journal::RewritePhase,
+    committed: &AtomicU64,
+    stop: &AtomicBool,
+    verified: &AtomicUsize,
+    collection: [u8; 16],
+) -> Vec<(u64, u64)> {
+    let mut intervals = Vec::new();
+    while !stop.load(Ordering::Acquire) {
+        let done = committed.load(Ordering::Acquire);
+        if done == 0 {
+            std::thread::yield_now();
+            continue;
+        }
+        // Keys 0..done are committed and synced; read them all.
+        let count = u8::try_from(done).unwrap();
+        let keys: Vec<_> = (0..count).map(rewrite_test_key).collect();
+        loop {
+            let start = phase.now_ns();
+            let got = reader.get_read_committed(&collection, &keys);
+            let end = phase.now_ns();
+            match got {
+                Ok(values) => {
+                    for (i, value) in values.iter().enumerate() {
+                        let i = u8::try_from(i).unwrap();
+                        assert_eq!(
+                            value.as_ref().map(|d| d.bytes.to_vec()),
+                            Some(rewrite_test_value(i)),
+                            "key {i} must stay readable across a rewrite"
+                        );
+                    }
+                    verified.fetch_add(1, Ordering::Relaxed);
+                    intervals.push((start, end));
+                    break;
+                }
+                Err(StorageError::WouldBlock(_)) => std::thread::yield_now(),
+                Err(err) => panic!("unexpected read error: {err}"),
+            }
+        }
+    }
+    intervals
+}
+
 /// Readers verify every committed key while the writer reclaims on every sync,
 /// so each reclaim rewrites and renames the WAL segment under them. A test-only
-/// counter marks the rewrite window, and the test requires that some reads
-/// were in flight while it was open (started inside it or saw it change), so
-/// the coverage is not vacuous. A transient `WouldBlock` is retried.
+/// recorder timestamps each rewrite window, and the test requires that at least
+/// one read's own time interval intersects one of those windows, so the
+/// coverage is not vacuous. A transient `WouldBlock` is retried.
 #[test]
 fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-
     const ROUNDS: u8 = 120;
     let ReclaimFixture {
         writer,
@@ -14085,57 +14139,27 @@ fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
     let committed = AtomicU64::new(0);
     let stop = AtomicBool::new(false);
     let verified = AtomicUsize::new(0);
-    let overlapped = AtomicUsize::new(0);
-    let key_for = |i: u8| [0x80u8.wrapping_add(i); 16];
-    let value_for = |i: u8| vec![i; 8];
 
     let mut last_base = Journal::scan_read_only(&wal).unwrap().base_lsn;
     let mut base_moves = 0usize;
-    std::thread::scope(|scope| {
+    let read_intervals: Vec<(u64, u64)> = std::thread::scope(|scope| {
+        let mut workers = Vec::new();
         for _ in 0..3 {
-            scope.spawn(|| {
-                while !stop.load(Ordering::Acquire) {
-                    let done = committed.load(Ordering::Acquire);
-                    if done == 0 {
-                        std::thread::yield_now();
-                        continue;
-                    }
-                    // Keys 0..done are committed and synced; read them all.
-                    let count = u8::try_from(done).unwrap();
-                    let keys: Vec<_> = (0..count).map(key_for).collect();
-                    loop {
-                        let before = phase.load(Ordering::SeqCst);
-                        let got = reader.get_read_committed(&collection, &keys);
-                        let after = phase.load(Ordering::SeqCst);
-                        match got {
-                            Ok(values) => {
-                                for (i, value) in values.iter().enumerate() {
-                                    let i = u8::try_from(i).unwrap();
-                                    assert_eq!(
-                                        value.as_ref().map(|d| d.bytes.to_vec()),
-                                        Some(value_for(i)),
-                                        "key {i} must stay readable across a rewrite"
-                                    );
-                                }
-                                verified.fetch_add(1, Ordering::Relaxed);
-                                if before % 2 == 1 || before != after {
-                                    overlapped.fetch_add(1, Ordering::Relaxed);
-                                }
-                                break;
-                            }
-                            Err(StorageError::WouldBlock(_)) => std::thread::yield_now(),
-                            Err(err) => panic!("unexpected read error: {err}"),
-                        }
-                    }
-                }
-            });
+            let reader = Arc::clone(&reader);
+            let phase = Arc::clone(&phase);
+            let committed = &committed;
+            let stop = &stop;
+            let verified = &verified;
+            workers.push(scope.spawn(move || {
+                rewrite_test_reader(&reader, &phase, committed, stop, verified, collection)
+            }));
         }
         for i in 0..ROUNDS {
             writer
                 .put(
                     &collection,
-                    &key_for(i),
-                    &NodeData::new(bytes::Bytes::from(value_for(i))),
+                    &rewrite_test_key(i),
+                    &NodeData::new(bytes::Bytes::from(rewrite_test_value(i))),
                 )
                 .unwrap();
             writer.sync().unwrap();
@@ -14147,7 +14171,24 @@ fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
             }
         }
         stop.store(true, Ordering::Release);
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect()
     });
+    let windows = phase.windows();
+    assert!(
+        !windows.is_empty(),
+        "the run must record at least one rewrite window"
+    );
+    let overlapped = read_intervals
+        .iter()
+        .filter(|(read_start, read_end)| {
+            windows
+                .iter()
+                .any(|(start, end)| read_start <= end && start <= read_end)
+        })
+        .count();
     assert!(
         base_moves >= usize::from(ROUNDS) / 4,
         "the segment must be rewritten repeatedly, saw {base_moves} base moves"
@@ -14157,9 +14198,10 @@ fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
         "readers must verify reads"
     );
     assert!(
-        overlapped.load(Ordering::Relaxed) > 0,
-        "no read overlapped a rewrite window ({} verified reads)",
-        verified.load(Ordering::Relaxed)
+        overlapped > 0,
+        "no read interval intersected a rewrite window ({} reads, {} windows)",
+        read_intervals.len(),
+        windows.len()
     );
 }
 

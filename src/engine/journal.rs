@@ -1739,29 +1739,66 @@ pub struct Journal {
     /// is still decoded and checked before it is copied, so a damaged group
     /// there is reported instead of being carried into the new segment.
     groups: Vec<GroupMark>,
-    /// Test-only: odd while `install_rebuilt` is replacing the segment, bumped
-    /// on entry and on every exit path, so a test can tell whether a read
-    /// overlapped the rewrite window.
+    /// Test-only: records the intervals during which `install_rebuilt` is
+    /// replacing the segment, so a test can check whether a read's own time
+    /// interval intersected a rewrite.
     #[cfg(test)]
-    rewrite_phase: Arc<AtomicU64>,
+    rewrite_phase: Arc<RewritePhase>,
 }
 
-/// Marks the rewrite window for [`Journal::rewrite_phase`]: odd while alive.
+/// Test-only rewrite-window recorder: monotonic nanoseconds from one base.
 #[cfg(test)]
-struct RewritePhaseGuard(Arc<AtomicU64>);
+pub(crate) struct RewritePhase {
+    base: std::time::Instant,
+    windows: Mutex<Vec<(u64, u64)>>,
+}
+
+#[cfg(test)]
+impl RewritePhase {
+    fn new() -> Self {
+        Self {
+            base: std::time::Instant::now(),
+            windows: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Current time in nanoseconds on this recorder's monotonic base.
+    pub(crate) fn now_ns(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn record(&self, start: u64, end: u64) {
+        self.windows.lock().push((start, end));
+    }
+
+    /// Completed rewrite windows as `(start, end)` nanosecond intervals.
+    pub(crate) fn windows(&self) -> Vec<(u64, u64)> {
+        self.windows.lock().clone()
+    }
+}
+
+/// Marks the rewrite window for [`Journal::rewrite_phase`].
+#[cfg(test)]
+struct RewritePhaseGuard {
+    phase: Arc<RewritePhase>,
+    start: u64,
+}
 
 #[cfg(test)]
 impl RewritePhaseGuard {
-    fn enter(phase: &Arc<AtomicU64>) -> Self {
-        phase.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(phase))
+    fn enter(phase: &Arc<RewritePhase>) -> Self {
+        Self {
+            phase: Arc::clone(phase),
+            start: phase.now_ns(),
+        }
     }
 }
 
 #[cfg(test)]
 impl Drop for RewritePhaseGuard {
     fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        let end = self.phase.now_ns();
+        self.phase.record(self.start, end);
     }
 }
 
@@ -4190,10 +4227,10 @@ impl JournalCoordinator {
         self.reclaim_trigger_len.load(Ordering::Relaxed)
     }
 
-    /// Test-only handle on the rewrite-window counter; see
+    /// Test-only handle on the rewrite-window recorder; see
     /// `Journal::rewrite_phase`.
     #[cfg(test)]
-    pub(crate) fn rewrite_phase(&self) -> Arc<AtomicU64> {
+    pub(crate) fn rewrite_phase(&self) -> Arc<RewritePhase> {
         Arc::clone(&self.journal.lock().rewrite_phase)
     }
 
@@ -4996,7 +5033,7 @@ impl Journal {
             segment_cap: MAX_SEGMENT_LEN,
             groups: marks_from_scan(&scan),
             #[cfg(test)]
-            rewrite_phase: Arc::new(AtomicU64::new(0)),
+            rewrite_phase: Arc::new(RewritePhase::new()),
         };
         if !scan.groups.is_empty() {
             // Recovery fsynced what it kept above, so record that in the mark.

@@ -194,7 +194,8 @@ impl CsrStore {
         framed.extend_from_slice(&crc(&body).to_be_bytes());
         framed.extend_from_slice(&body);
         self.log.write_all(&framed)?;
-        self.tail.insert((scope, family, owner), (typed, row.to_vec()));
+        self.tail
+            .insert((scope, family, owner), (typed, row.to_vec()));
         Ok(())
     }
 
@@ -249,7 +250,13 @@ impl CsrStore {
     }
 }
 
-fn encode_record(scope: Scope, family: u16, typed: bool, owner: u32, row: &[(u32, u16)]) -> Vec<u8> {
+fn encode_record(
+    scope: Scope,
+    family: u16,
+    typed: bool,
+    owner: u32,
+    row: &[(u32, u16)],
+) -> Vec<u8> {
     let mut chunk = EdgeChunk::new(typed);
     chunk.insert(owner, row);
     let mut out = scope.to_vec();
@@ -312,7 +319,10 @@ fn read_segment(path: &Path) -> Result<HashMap<Key, EdgeChunk>, CsrStoreError> {
             .get(at + 26..at + 26 + len)
             .ok_or_else(|| bad("truncated"))?;
         let typed = body.first() == Some(&1);
-        chunks.insert((scope, family, chunk_index), EdgeChunk::decode(body, typed)?);
+        chunks.insert(
+            (scope, family, chunk_index),
+            EdgeChunk::decode(body, typed)?,
+        );
         at += 26 + len;
     }
     if at != payload.len() {
@@ -393,7 +403,11 @@ mod tests {
         let store = CsrStore::open(&d).unwrap();
         assert_eq!(store.get(S, 1, 5), Some(vec![(2, 0)]));
         assert_eq!(store.get(T, 1, 5), Some(vec![(3, 0)]));
-        assert_eq!(fs::read_dir(&d).unwrap().count(), 2, "tail.log + one segment");
+        assert_eq!(
+            fs::read_dir(&d).unwrap().count(),
+            2,
+            "tail.log + one segment"
+        );
         let _ = fs::remove_dir_all(&d);
     }
 
