@@ -215,3 +215,9 @@ harness = false
 name = "edge_codec_bench"
 path = "edge_codec_bench.rs"
 harness = false
+
+# Reclaim-trigger sweep with and without a held replay lease (synthetic, host-specific).
+[[bench]]
+name = "reclaim_trigger_sweep"
+path = "reclaim_trigger_sweep.rs"
+harness = false
