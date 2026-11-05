@@ -12,17 +12,23 @@ use std::time::Instant;
 
 use mtxdb::{BitmapSet, DomainTag};
 
-#[path = "edge_layout_common.rs"]
-mod common;
-
 #[path = "edge_sensitivity.rs"]
 mod sensitivity;
-
-use common::{len_f64, num};
 
 const BENCH_DOMAIN: DomainTag = DomainTag::new([0u8; 16]);
 const CHUNK_SIZE: usize = 1024;
 const TUPLE_OVERHEAD_BYTES: usize = 63;
+const TWO_POW_32: f64 = 4_294_967_296.0;
+
+fn num(n: u64) -> f64 {
+    let high = u32::try_from(n >> 32).unwrap_or(u32::MAX);
+    let low = u32::try_from(n & 0xFFFF_FFFF).unwrap_or(u32::MAX);
+    f64::from(high) * TWO_POW_32 + f64::from(low)
+}
+
+fn len_f64(n: usize) -> f64 {
+    num(u64::try_from(n).unwrap_or(u64::MAX))
+}
 
 // ---------------------------------------------------------------- rng
 struct PseudoRng(u64);
