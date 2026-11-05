@@ -1,6 +1,6 @@
 //! Shared-WAL replay paging and multi-collection snapshots under load.
 //!
-//! The first run measures incremental resume pages while four pool writers
+//! The first run measures incremental resume pages while three pool writers
 //! publish and parallel readers catch up. The second repeats with shared WAL
 //! reclaim enabled, exercising lease advancement and stale-offset fallback.
 //! During each run the main thread times 1/2/4/8-collection snapshots against
@@ -34,12 +34,7 @@ use mtxdb::layout::ShardType;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine, StorageError};
 use mtxdb::PackfileStorage;
 
-const POOLS: [ShardType; 4] = [
-    ShardType::Edges,
-    ShardType::EventDag,
-    ShardType::State,
-    ShardType::ServerInfo,
-];
+const POOLS: [ShardType; 3] = [ShardType::EventDag, ShardType::State, ShardType::ServerInfo];
 const SNAPSHOT_COLLECTIONS: usize = 8;
 
 struct ScratchDir(PathBuf);

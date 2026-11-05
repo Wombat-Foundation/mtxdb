@@ -2125,7 +2125,7 @@ fn precheck_room_auth(export: &RoomExport) -> anyhow::Result<()> {
             };
             if let Some(&parent) = index.get(id) {
                 if seen.insert(parent) {
-                    waiting[child] += 1;
+                    waiting[child] = waiting[child].saturating_add(1);
                     children[parent].push(child);
                 }
             }
@@ -2134,9 +2134,9 @@ fn precheck_room_auth(export: &RoomExport) -> anyhow::Result<()> {
     let mut order: Vec<usize> = (0..events.len()).filter(|&i| waiting[i] == 0).collect();
     let mut next = 0;
     while let Some(&current) = order.get(next) {
-        next += 1;
+        next = next.saturating_add(1);
         for &child in &children[current] {
-            waiting[child] -= 1;
+            waiting[child] = waiting[child].saturating_sub(1);
             if waiting[child] == 0 {
                 order.push(child);
             }
