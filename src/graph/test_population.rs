@@ -56,7 +56,6 @@ fn record(db: &Database, range: std::ops::Range<u32>) {
             db,
             &[BatchEvent {
                 owner: &key,
-                families: &[],
                 owner_payload: Some(&payload),
             }],
         );
@@ -140,7 +139,6 @@ fn a_malformed_payload_is_corruption() {
             &db,
             &[BatchEvent {
                 owner: b"$a",
-                families: &[],
                 owner_payload: Some(b"too short"),
             }],
         )
@@ -211,7 +209,7 @@ fn compaction_folds_the_log_without_changing_the_population() {
     // New owners land in the new generation and join as the tail.
     record(&db, 50..60);
     assert_serves(&index().population_snapshot(&db).unwrap(), 0..60);
-    assert!(index().verify(&db, &[]).unwrap().is_consistent());
+    assert!(index().verify(&db).unwrap().is_consistent());
     // A tail below the trigger is left alone unless forced.
     assert_eq!(index().compact(&db, 0, GRACE_MS, false).unwrap(), None);
     drop(db);
@@ -231,7 +229,7 @@ fn comparable_runs_merge_and_a_small_run_stands_alone() {
     let small = index().compact(&db, 0, GRACE_MS, true).unwrap().unwrap();
     assert_eq!((small.folded_entries, small.run_entries), (10, 10));
     assert_serves(&index().population_snapshot(&db).unwrap(), 0..70);
-    assert!(index().verify(&db, &[]).unwrap().is_consistent());
+    assert!(index().verify(&db).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -318,7 +316,7 @@ fn writers_racing_compaction_lose_nothing() {
     writer.join().unwrap();
     index().compact(&db, 0, GRACE_MS, true).unwrap();
     assert!(compactions >= 1, "compaction never ran against the writer");
-    let report = index().verify(&db, &[]).unwrap();
+    let report = index().verify(&db).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
     assert_eq!(report.owners_checked, 400);
     assert_serves(&index().population_snapshot(&db).unwrap(), 0..400);
@@ -402,7 +400,7 @@ fn verify_flags_runs_that_disagree_with_the_log() {
     let db = Database::open(root.clone()).unwrap();
     record(&db, 0..10);
     index().compact(&db, 0, GRACE_MS, true).unwrap();
-    assert!(index().verify(&db, &[]).unwrap().is_consistent());
+    assert!(index().verify(&db).unwrap().is_consistent());
     // Make the counter claim one more folded owner than the runs hold.
     let counters = index().counters(&db).unwrap();
     let txn = db.begin_transaction();
@@ -420,7 +418,7 @@ fn verify_flags_runs_that_disagree_with_the_log() {
     )
     .unwrap();
     txn.commit().unwrap();
-    let report = index().verify(&db, &[]).unwrap();
+    let report = index().verify(&db).unwrap();
     assert!(!report.is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
@@ -445,7 +443,6 @@ fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
                     &db,
                     &[BatchEvent {
                         owner: &key,
-                        families: &[],
                         owner_payload: Some(&payload),
                     }],
                 );
@@ -491,7 +488,7 @@ fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
             "a written run is neither live nor queued"
         );
     }
-    let report = scope.verify(&db, &[]).unwrap();
+    let report = scope.verify(&db).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
@@ -513,7 +510,6 @@ fn a_run_collected_before_the_publish_is_never_published() {
             &db,
             &[BatchEvent {
                 owner: &key,
-                families: &[],
                 owner_payload: Some(&payload),
             }],
         );
@@ -542,7 +538,7 @@ fn a_run_collected_before_the_publish_is_never_published() {
     let db = Database::open(root.clone()).unwrap();
     let snapshot = scope.population_snapshot(&db).unwrap();
     assert_eq!(snapshot.len(), 20);
-    assert!(scope.verify(&db, &[]).unwrap().is_consistent());
+    assert!(scope.verify(&db).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -565,7 +561,6 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
                 &db,
                 &[BatchEvent {
                     owner: &key,
-                    families: &[],
                     owner_payload: Some(&payload),
                 }],
             );
@@ -597,7 +592,7 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
     }
     let snapshot = scope.population_snapshot(&db).unwrap();
     assert_eq!(snapshot.len(), 40);
-    assert!(scope.verify(&db, &[]).unwrap().is_consistent());
+    assert!(scope.verify(&db).unwrap().is_consistent());
 
     assert_eq!(scope.collect_garbage(&db, u64::MAX).unwrap().dropped, 1);
     assert!(!has(ShardType::ServerInfo, generation0, entry1));
@@ -639,7 +634,7 @@ fn a_back_to_back_writer_cannot_starve_compaction() {
     writer.join().unwrap();
     index().compact(&db, 0, GRACE_MS, true).unwrap();
     assert!(landed >= 1, "compaction never ran against the writer");
-    let report = index().verify(&db, &[]).unwrap();
+    let report = index().verify(&db).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
     assert_eq!(report.owners_checked, 2000);
     assert_serves(&index().population_snapshot(&db).unwrap(), 0..2000);
@@ -665,7 +660,6 @@ fn a_stale_queue_entry_does_not_shorten_a_retired_runs_grace() {
                 &db,
                 &[BatchEvent {
                     owner: &key,
-                    families: &[],
                     owner_payload: Some(&payload),
                 }],
             );

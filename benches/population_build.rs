@@ -142,7 +142,6 @@ fn build_store(dir: &Path, owners: u32) -> Database {
             .zip(&payloads)
             .map(|(key, payload)| BatchEvent {
                 owner: key,
-                families: &[],
                 owner_payload: with_payload.then_some(payload.as_slice()),
             })
             .collect();
@@ -282,7 +281,6 @@ fn sync_scaling(db: &Database, dir: &Path, owners: u32) {
             .zip(&payloads)
             .map(|(key, payload)| BatchEvent {
                 owner: key,
-                families: &[],
                 owner_payload: Some(payload),
             })
             .collect();

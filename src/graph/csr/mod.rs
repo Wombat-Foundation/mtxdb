@@ -2,7 +2,6 @@
 //!
 //! [`CsrStore`](crate::csr::store::CsrStore) keeps derived graph rows outside the packs, one store per
 //! source pool, addressed by `(collection id, family, owner)`.
-pub mod chunk;
 pub mod store;
 
 use std::collections::{HashMap, HashSet, VecDeque};

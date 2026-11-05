@@ -658,14 +658,14 @@ impl CsrAdjacency {
         let mut report = AdjacencyVerifyReport::default();
         report.problems.extend(
             self.events
-                .verify(db, &[])?
+                .verify(db)?
                 .problems
                 .into_iter()
                 .map(|problem| format!("events: {problem}")),
         );
         report.problems.extend(
             self.kinds
-                .verify(db, &[])?
+                .verify(db)?
                 .problems
                 .into_iter()
                 .map(|problem| format!("relation kinds: {problem}")),

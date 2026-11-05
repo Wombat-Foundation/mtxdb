@@ -1,10 +1,10 @@
-//! Room-scoped dense `u32` short ids and compact adjacency families.
+//! Room-scoped dense `u32` short ids.
 //!
 //! This is the generic substrate for graph workloads that need compact integer
 //! ids (auth-chain closure bitmaps, relation walks). It knows nothing about
 //! Matrix: a *scope* (one collection, e.g. a room) maps opaque key bytes to
-//! sequentially allocated `u32` ids, and stores per-id **adjacency** as named
-//! *families*. The schema-aware layer decides what keys and families mean.
+//! sequentially allocated `u32` ids. Adjacency is not stored here; it lives in
+//! the CSR store (see [`crate::csr`]) keyed by these ids.
 //!
 //! Records, all in one collection so a scope purges with one
 //! `delete_collection`:
@@ -14,37 +14,23 @@
 //!   truncated hash, so the stored key is compared on every hit and a mismatch
 //!   is reported as a collision, never silently list;
 //! - **reverse** (`SIDR`): `id -> key bytes`;
-//! - **edges** (`SIDE`): `(family, id) -> sorted [Edge]`, where an [`Edge`](crate::short_id::Edge) is a
-//!   `u32` target plus, for typed families, a `u16` kind. A record is never
-//!   empty (it has a header), so a known owner with zero edges is distinguishable
-//!   from an absent record.
+//! - **owner log**: the keys recorded as owners, in order.
 //!
-//! An [`EdgeFamily`](crate::short_id::EdgeFamily) fixes whether edges are typed. Edge lists are **immutable
-//! once written**: writing the same list again is a no-op and a different list
-//! for an existing owner is a collision. Mutable visibility (for example
-//! redaction or rejection of the owning record) is not modelled here; callers
-//! filter at read time against their own authoritative state. The typing is
-//! stored in each record and checked on every access, so a caller cannot
-//! reinterpret a family.
-//!
-//! Allocation and every family's edge write commit in one
-//! [`DatabaseTransaction`] guarded by the engine's per-record compare-and-swap
-//! (the counter, every forward record that was absent, and every edge record
-//! that was read). A lost race surfaces as `StorageError::StaleRead` and the
+//! Allocation commits in one [`DatabaseTransaction`] guarded by the engine's
+//! per-record compare-and-swap (the counter and every forward record that was
+//! absent). A lost race surfaces as `StorageError::StaleRead` and the
 //! operation re-reads and retries, finding the winner's state. There is no
-//! partial state to repair: counter, forward, reverse and edge records publish
+//! partial state to repair: counter, forward and reverse records publish
 //! together or not at all.
 //!
 //! Ids start at 1 and never wrap; exhausting `u32` is a checked error. The
 //! CAS is atomic within the single writer process, through the transaction layer
 //! in [`crate::database`].
 
-use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 
-use crate::csr::chunk::{chunk_of, ChunkError, EdgeChunk};
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
@@ -58,12 +44,10 @@ pub const SHORT_ID_MAX: u32 = u32::MAX - 1;
 const COUNTER_MAGIC: [u8; 4] = *b"SIDC";
 const FORWARD_MAGIC: [u8; 4] = *b"SIDF";
 const REVERSE_MAGIC: [u8; 4] = *b"SIDR";
-const EDGES_MAGIC: [u8; 4] = *b"SIDC";
 const OWNER_LOG_MAGIC: [u8; 4] = *b"OWNL";
 
 pub(crate) const COUNTER_ID: NodeId = *b"MTXD-SID-CNTR-v1";
 const REVERSE_PREFIX: [u8; 8] = *b"MTXSIDR\0";
-const EDGES_PREFIX: [u8; 8] = *b"MTXSIDE\0";
 const OWNER_LOG_PREFIX: [u8; 8] = *b"MTXOWNL\0";
 const OWNER_LOG_SCOPE: &[u8] = b"short-id-owner-log";
 
@@ -124,23 +108,12 @@ impl<'a> EdgeKey<'a> {
     }
 }
 
-/// The edges to record for one family of the owner.
-#[derive(Debug, Clone, Copy)]
-pub struct FamilyEdges<'a> {
-    /// The family.
-    pub family: EdgeFamily,
-    /// Its edges; sorted and de-duplicated on write.
-    pub edges: &'a [EdgeKey<'a>],
-}
-
 /// One event of a [`ShortIdIndex::record_events`](crate::short_id::ShortIdIndex::record_events)
-/// batch: an owner key and its edge lists.
+/// batch: an owner key and its optional owner-log payload.
 #[derive(Debug, Clone, Copy)]
 pub struct BatchEvent<'a> {
     /// The owner's key.
     pub owner: &'a [u8],
-    /// The owner's edge lists, one per family.
-    pub families: &'a [FamilyEdges<'a>],
     /// If set, this event is an *owner*: one the caller holds, as opposed to
     /// an id allocated only because something referenced it. The first time a
     /// key is recorded as an owner (its owner bit goes false -> true) the
@@ -149,15 +122,6 @@ pub struct BatchEvent<'a> {
     /// nothing. The payload is opaque here (for populations, the element
     /// hashes). The same owner twice in a batch must carry the same payload.
     pub owner_payload: Option<&'a [u8]>,
-}
-
-/// Outcome of [`ShortIdIndex::record_event`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordedEvent {
-    /// The owner's short id.
-    pub id: u32,
-    /// The stored edge list of each requested family, in request order.
-    pub edges: Vec<Vec<Edge>>,
 }
 
 fn forward_id(key: &[u8]) -> NodeId {
@@ -190,12 +154,6 @@ fn indexed_id(prefix: [u8; 8], short_id: u32) -> NodeId {
     derived_id(prefix, short_id, 0)
 }
 
-/// The id of the CSR chunk holding `chunk`'s rows of `family`. One record per
-/// `CHUNK_SHORTS` owners, not one per owner.
-fn edges_record_id(chunk: u32, family: u16) -> NodeId {
-    derived_id(EDGES_PREFIX, chunk, family)
-}
-
 /// The id of the reverse record for `short_id`, exposed so a test can check the
 /// ids the index will see are spread.
 #[cfg(test)]
@@ -207,12 +165,6 @@ pub(crate) fn reverse_record_id_for_test(short_id: u32) -> NodeId {
 #[cfg(test)]
 pub(crate) fn owner_log_record_id_for_test(seq: u32) -> NodeId {
     owner_log_record_id(seq)
-}
-
-/// The id of an edges record, exposed for the same reason.
-#[cfg(test)]
-pub(crate) fn edges_record_id_for_test(chunk: u32, family: u16) -> NodeId {
-    edges_record_id(chunk, family)
 }
 
 pub(crate) fn header(magic: [u8; 4]) -> Vec<u8> {
@@ -380,36 +332,11 @@ fn encode_reverse(key: &[u8]) -> Vec<u8> {
     out
 }
 
-fn encode_chunk(chunk: &EdgeChunk) -> Vec<u8> {
-    let mut out = header(EDGES_MAGIC);
-    out.extend_from_slice(&chunk.encode());
-    out
-}
-
-fn decode_chunk(family: EdgeFamily, bytes: &[u8]) -> Result<EdgeChunk, StorageError> {
-    let body = check_header(bytes, EDGES_MAGIC, "edges")?;
-    EdgeChunk::decode(body, family.typed).map_err(|error| match error {
-        ChunkError::TypingMismatch => StorageError::Collision(format!(
-            "short-id family {} was stored with different typing",
-            family.id
-        )),
-        other => StorageError::Corrupt(format!("short-id edges: {other}")),
-    })
-}
-
-fn row_edges(row: &[(u32, u16)]) -> Vec<Edge> {
-    row.iter()
-        .map(|&(target, kind)| Edge { target, kind })
-        .collect()
-}
-
 /// Result of [`ShortIdIndex::verify`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShortIdVerifyReport {
     /// Ids below the counter that have a reverse record.
     pub ids_checked: u32,
-    /// Edge lists decoded.
-    pub edge_lists_checked: u32,
     /// Forward records carrying the owner bit.
     pub owners_checked: u32,
     /// Human-readable invariant violations; empty means consistent.
@@ -607,7 +534,7 @@ impl ShortIdIndex {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        self.write_with_retry(db, keys, None).map(|(ids, _)| ids)
+        self.write_with_retry(db, keys, &HashMap::new())
     }
 
     /// The short id of `key` if it has one; never allocates.
@@ -634,150 +561,42 @@ impl ShortIdIndex {
         }
     }
 
-    /// Allocate ids for `owner` and every edge target, then store each family's
-    /// edge list for `owner`, all in one transaction.
+    /// Record several owners in **one** transaction.
     ///
-    /// Edges are sorted and de-duplicated. Per family, a list that matches the
-    /// stored one is a no-op and a different one is a collision error. Returns
-    /// the owner's id and each family's stored list.
-    ///
-    /// # Errors
-    /// As [`Self::get_or_create`], plus a collision error for a family whose
-    /// list differs from the stored one or that was stored with different
-    /// typing, or an error for a non-zero kind on an untyped family.
-    pub fn record_event(
-        &self,
-        db: &Database,
-        owner: &[u8],
-        families: &[FamilyEdges<'_>],
-    ) -> Result<RecordedEvent, StorageError> {
-        for family in families {
-            if !family.family.typed && family.edges.iter().any(|edge| edge.kind != 0) {
-                return Err(StorageError::Internal(
-                    "untyped edge family given a non-zero kind".to_owned(),
-                ));
-            }
-        }
-        let mut keys: Vec<&[u8]> = vec![owner];
-        for family in families {
-            keys.extend(family.edges.iter().map(|edge| edge.target));
-        }
-        self.write_with_retry(db, &keys, Some(families))
-            .map(|(_, recorded)| recorded)
-    }
-
-    /// Record several events' edge lists in **one** transaction.
-    ///
-    /// Ids are allocated once for every owner and target across the whole batch,
-    /// so events that reference each other share ids, and either every event is
-    /// recorded or none is. The same owner twice with the same lists is a no-op;
-    /// with different lists it is a collision error and nothing is published.
-    /// Returns one [`RecordedEvent`] per input, in order.
+    /// Ids are allocated once for every owner across the whole batch, and
+    /// either every owner is recorded or none is. An owner with a payload is
+    /// appended to the owner log the first time it becomes an owner (see
+    /// [`BatchEvent::owner_payload`]). Returns each owner's id, in order.
     ///
     /// The transaction layer bounds how much one transaction may stage, so a
     /// caller with a very large import should split it into batches.
     ///
     /// # Errors
-    /// As [`Self::record_event`], applied to the whole batch.
+    /// As [`Self::get_or_create`], plus a collision error when one owner
+    /// carries two different payloads in the batch.
     pub fn record_events(
         &self,
         db: &Database,
         events: &[BatchEvent<'_>],
-    ) -> Result<Vec<RecordedEvent>, StorageError> {
+    ) -> Result<Vec<u32>, StorageError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<&[u8]> = events.iter().map(|event| event.owner).collect();
+        let mut owners: HashMap<&[u8], &[u8]> = HashMap::new();
         for event in events {
-            for family in event.families {
-                if !family.family.typed && family.edges.iter().any(|edge| edge.kind != 0) {
-                    return Err(StorageError::Internal(
-                        "untyped edge family given a non-zero kind".to_owned(),
+            if let Some(payload) = event.owner_payload {
+                if owners
+                    .insert(event.owner, payload)
+                    .is_some_and(|p| p != payload)
+                {
+                    return Err(StorageError::Collision(
+                        "short-id owner payload differs from one already in this batch".to_owned(),
                     ));
                 }
             }
         }
-        if events.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut keys: Vec<&[u8]> = Vec::new();
-        let mut starts: Vec<usize> = Vec::with_capacity(events.len());
-        for event in events {
-            starts.push(keys.len());
-            keys.push(event.owner);
-            for family in event.families {
-                keys.extend(family.edges.iter().map(|edge| edge.target));
-            }
-        }
-        let mut last = None;
-        for _ in 0..MAX_ATTEMPTS {
-            let txn = db.begin_transaction();
-            match self.attempt_batch(&txn, &keys, &starts, events) {
-                Ok((recorded, commit_needed)) => {
-                    if !commit_needed {
-                        return Ok(recorded);
-                    }
-                    match txn.commit() {
-                        Ok(()) => return Ok(recorded),
-                        Err(error) if error.is_stale_read() => last = Some(error),
-                        Err(error) => return Err(error),
-                    }
-                }
-                Err(error)
-                    if error.is_stale_read() || matches!(error, StorageError::WouldBlock(_)) =>
-                {
-                    last = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last.unwrap_or_else(|| StorageError::Internal("short-id retry budget".to_owned())))
-    }
-
-    /// Convenience for one untyped family: record `owner`'s edges to `targets`
-    /// in `family`. Returns `(owner id, sorted target ids)`.
-    ///
-    /// # Errors
-    /// As [`Self::record_event`].
-    pub fn record_edges(
-        &self,
-        db: &Database,
-        owner: &[u8],
-        family: EdgeFamily,
-        targets: &[&[u8]],
-    ) -> Result<(u32, Vec<u32>), StorageError> {
-        let edges: Vec<EdgeKey<'_>> = targets.iter().map(|t| EdgeKey::plain(t)).collect();
-        let recorded = self.record_event(
-            db,
-            owner,
-            &[FamilyEdges {
-                family,
-                edges: &edges,
-            }],
-        )?;
-        let targets = recorded.edges[0].iter().map(|edge| edge.target).collect();
-        Ok((recorded.id, targets))
-    }
-
-    /// The edge list of `short_id` in `family`, or `None` if none was recorded.
-    ///
-    /// # Errors
-    /// Returns an error on a read failure, a corrupt record, or a family stored
-    /// with different flags.
-    pub fn edges(
-        &self,
-        db: &Database,
-        short_id: u32,
-        family: EdgeFamily,
-    ) -> Result<Option<Vec<Edge>>, StorageError> {
-        let txn = db.begin_transaction();
-        let (records, _) = txn.get_with_record_versions(
-            self.pool,
-            &self.collection_id,
-            &[edges_record_id(chunk_of(short_id), family.id)],
-        )?;
-        let Some(record) = records.into_iter().next().flatten() else {
-            return Ok(None);
-        };
-        Ok(decode_chunk(family, &record.bytes)?
-            .get(short_id)
-            .map(|row| row_edges(&row)))
+        self.write_with_retry(db, &keys, &owners)
     }
 
     /// Resolve short ids back to their key bytes; `None` for an unknown id.
@@ -878,17 +697,12 @@ impl ShortIdIndex {
     }
 
     /// Check the scope's invariants: every id below the counter has a reverse
-    /// record whose key maps forward to the same id, and every edge list in
-    /// `families` decodes with targets that resolve.
+    /// record whose key maps forward to the same id.
     ///
     /// # Errors
     /// Returns an error only if a record cannot be read; invariant violations
     /// are reported in the returned report.
-    pub fn verify(
-        &self,
-        db: &Database,
-        families: &[EdgeFamily],
-    ) -> Result<ShortIdVerifyReport, StorageError> {
+    pub fn verify(&self, db: &Database) -> Result<ShortIdVerifyReport, StorageError> {
         // A transaction reads the live store, not a snapshot, so a writer
         // committing mid-pass can make a healthy store look inconsistent.
         // Every write moves the counter record (ids and owner sequence
@@ -897,7 +711,7 @@ impl ShortIdIndex {
         for _ in 0..MAX_ATTEMPTS {
             let txn = db.begin_transaction();
             let (_, before) = self.read_counters(&txn)?;
-            let report = self.verify_pass(&txn, families)?;
+            let report = self.verify_pass(&txn)?;
             let (_, after) = self.read_counters(&txn)?;
             if before == after {
                 return Ok(report);
@@ -911,7 +725,6 @@ impl ShortIdIndex {
     fn verify_pass(
         &self,
         txn: &DatabaseTransaction<'_>,
-        families: &[EdgeFamily],
     ) -> Result<ShortIdVerifyReport, StorageError> {
         let (counters, _) = self.read_counters(txn)?;
         let mut report = ShortIdVerifyReport::default();
@@ -920,7 +733,6 @@ impl ShortIdIndex {
         }
         let next = counters.next_id;
         let mut owner_bits = 0_u32;
-        let mut chunks: HashMap<(u32, u16), Option<EdgeChunk>> = HashMap::new();
         let get = |id: NodeId| -> Result<Option<NodeData>, StorageError> {
             let (records, _) =
                 txn.get_with_record_versions(self.pool, &self.collection_id, &[id])?;
@@ -951,37 +763,6 @@ impl ShortIdIndex {
                 None => report
                     .problems
                     .push(format!("id {short_id}: reverse has no forward record")),
-            }
-            for family in families {
-                let key = (chunk_of(short_id), family.id);
-                if let Entry::Vacant(slot) = chunks.entry(key) {
-                    let loaded = match get(edges_record_id(key.0, family.id))? {
-                        Some(record) => Some(decode_chunk(*family, &record.bytes)?),
-                        None => None,
-                    };
-                    slot.insert(loaded);
-                }
-                let Some(row) = chunks
-                    .get(&key)
-                    .and_then(Option::as_ref)
-                    .and_then(|chunk| chunk.get(short_id))
-                else {
-                    continue;
-                };
-                report.edge_lists_checked = report.edge_lists_checked.saturating_add(1);
-                for edge in row_edges(&row) {
-                    if edge.target == 0 || edge.target >= next {
-                        report.problems.push(format!(
-                            "id {short_id}: family {} target {} is out of range",
-                            family.id, edge.target
-                        ));
-                    } else if get(indexed_id(REVERSE_PREFIX, edge.target))?.is_none() {
-                        report.problems.push(format!(
-                            "id {short_id}: family {} target {} unresolved",
-                            family.id, edge.target
-                        ));
-                    }
-                }
             }
         }
         self.verify_owner_log(txn, counters, &mut report)?;
@@ -1049,23 +830,20 @@ impl ShortIdIndex {
         Ok(())
     }
 
-    /// `families` is `Some` when `keys[0]` owns the edge lists built from the
-    /// remaining keys (in family order), or `None` for a plain allocation.
+    /// Allocate every key in one transaction, retrying a stale read.
     fn write_with_retry(
         &self,
         db: &Database,
         keys: &[&[u8]],
-        families: Option<&[FamilyEdges<'_>]>,
-    ) -> Result<(Vec<u32>, RecordedEvent), StorageError> {
+        owners: &HashMap<&[u8], &[u8]>,
+    ) -> Result<Vec<u32>, StorageError> {
         let mut last = None;
         for _ in 0..MAX_ATTEMPTS {
             let txn = db.begin_transaction();
-            match self.attempt(&txn, keys, families) {
-                Ok(outcome) if !outcome.commit_needed => {
-                    return Ok((outcome.ids, outcome.recorded))
-                }
-                Ok(outcome) => match txn.commit() {
-                    Ok(()) => return Ok((outcome.ids, outcome.recorded)),
+            match self.attempt(&txn, keys, owners) {
+                Ok((ids, false)) => return Ok(ids),
+                Ok((ids, true)) => match txn.commit() {
+                    Ok(()) => return Ok(ids),
                     Err(error) if error.is_stale_read() => last = Some(error),
                     Err(error) => return Err(error),
                 },
@@ -1194,126 +972,6 @@ impl ShortIdIndex {
         Ok(())
     }
 
-    /// Merge the requested edge lists into the CSR chunks that hold them.
-    ///
-    /// The owner is `allocation.ids[start]` and its targets follow it. `chunks`
-    /// holds every chunk this attempt has loaded, with its CAS token, so the same
-    /// owner and family twice either matches or collides, and each chunk is read
-    /// once and staged once per attempt (see [`Self::flush_chunks`]).
-    fn stage_edges(
-        &self,
-        txn: &DatabaseTransaction<'_>,
-        allocation: &Allocation,
-        start: usize,
-        families: &[FamilyEdges<'_>],
-        chunks: &mut HashMap<NodeId, ChunkState>,
-    ) -> Result<Vec<Vec<Edge>>, StorageError> {
-        let owner = allocation.ids[start];
-        let mut lists = Vec::with_capacity(families.len());
-        let mut cursor = start.saturating_add(1);
-        for family in families {
-            let mut wanted: BTreeSet<Edge> = BTreeSet::new();
-            for edge in family.edges {
-                wanted.insert(Edge {
-                    target: allocation.ids[cursor],
-                    kind: edge.kind,
-                });
-                cursor = cursor.saturating_add(1);
-            }
-            let list: Vec<Edge> = wanted.into_iter().collect();
-            let record = edges_record_id(chunk_of(owner), family.family.id);
-            if let Entry::Vacant(slot) = chunks.entry(record) {
-                let (records, tokens) =
-                    txn.get_with_record_versions(self.pool, &self.collection_id, &[record])?;
-                let token = tokens.into_iter().next();
-                let chunk = match records.into_iter().next().flatten() {
-                    Some(stored) => decode_chunk(family.family, &stored.bytes)?,
-                    None => EdgeChunk::new(family.family.typed),
-                };
-                slot.insert(ChunkState {
-                    chunk,
-                    token,
-                    dirty: false,
-                });
-            }
-            let state = chunks
-                .get_mut(&record)
-                .ok_or_else(|| StorageError::Internal("edge chunk state".to_owned()))?;
-            if state.chunk.is_typed() != family.family.typed {
-                return Err(StorageError::Collision(format!(
-                    "short-id family {} was stored with different typing",
-                    family.family.id
-                )));
-            }
-            if let Some(stored) = state.chunk.get(owner) {
-                if row_edges(&stored) != list {
-                    return Err(StorageError::Collision(
-                        "short-id edge list differs from the recorded one".to_owned(),
-                    ));
-                }
-            } else {
-                let row: Vec<(u32, u16)> =
-                    list.iter().map(|edge| (edge.target, edge.kind)).collect();
-                state.chunk.insert(owner, &row);
-                state.dirty = true;
-            }
-            lists.push(list);
-        }
-        Ok(lists)
-    }
-
-    /// Stage every chunk an attempt changed, guarded by the token it was read at.
-    fn flush_chunks(allocation: &mut Allocation, chunks: HashMap<NodeId, ChunkState>) {
-        for (record, state) in chunks {
-            if state.dirty {
-                allocation
-                    .staged
-                    .push((record, encode_chunk(&state.chunk), state.token));
-            }
-        }
-    }
-
-    /// One attempt at a whole batch: allocate every key once, stage each event's
-    /// edges, then stage the counter and records. Returns the recorded events and
-    /// whether anything needs committing.
-    fn attempt_batch(
-        &self,
-        txn: &DatabaseTransaction<'_>,
-        keys: &[&[u8]],
-        starts: &[usize],
-        events: &[BatchEvent<'_>],
-    ) -> Result<(Vec<RecordedEvent>, bool), StorageError> {
-        let mut owners: HashMap<&[u8], &[u8]> = HashMap::new();
-        for event in events {
-            if let Some(payload) = event.owner_payload {
-                if owners
-                    .insert(event.owner, payload)
-                    .is_some_and(|p| p != payload)
-                {
-                    return Err(StorageError::Collision(
-                        "short-id owner payload differs from one already in this batch".to_owned(),
-                    ));
-                }
-            }
-        }
-        let mut allocation = self.allocate(txn, keys, &owners)?;
-        let mut chunks: HashMap<NodeId, ChunkState> = HashMap::new();
-        let mut recorded = Vec::with_capacity(events.len());
-        for (event, &start) in events.iter().zip(starts) {
-            let edges = self.stage_edges(txn, &allocation, start, event.families, &mut chunks)?;
-            recorded.push(RecordedEvent {
-                id: allocation.ids[start],
-                edges,
-            });
-        }
-        Self::flush_chunks(&mut allocation, chunks);
-        if allocation.staged.is_empty() {
-            return Ok((recorded, false));
-        }
-        self.stage_allocation(txn, allocation)?;
-        Ok((recorded, true))
-    }
-
     /// Stage the counter bump (if ids were allocated) and every record.
     fn stage_allocation(
         &self,
@@ -1353,37 +1011,21 @@ impl ShortIdIndex {
         Ok(())
     }
 
+    /// One attempt: allocate every key, then stage the counter and records.
+    /// Returns the ids and whether anything needs committing.
     fn attempt(
         &self,
         txn: &DatabaseTransaction<'_>,
         keys: &[&[u8]],
-        families: Option<&[FamilyEdges<'_>]>,
-    ) -> Result<Attempt, StorageError> {
-        let mut allocation = self.allocate(txn, keys, &HashMap::new())?;
-        let edges = match families {
-            Some(families) => {
-                let mut chunks = HashMap::new();
-                let edges = self.stage_edges(txn, &allocation, 0, families, &mut chunks)?;
-                Self::flush_chunks(&mut allocation, chunks);
-                edges
-            }
-            None => Vec::new(),
-        };
+        owners: &HashMap<&[u8], &[u8]>,
+    ) -> Result<(Vec<u32>, bool), StorageError> {
+        let allocation = self.allocate(txn, keys, owners)?;
         let ids = allocation.ids.clone();
-        let recorded = RecordedEvent { id: ids[0], edges };
         if allocation.staged.is_empty() {
-            return Ok(Attempt {
-                recorded,
-                ids,
-                commit_needed: false,
-            });
+            return Ok((ids, false));
         }
         self.stage_allocation(txn, allocation)?;
-        Ok(Attempt {
-            recorded,
-            ids,
-            commit_needed: true,
-        })
+        Ok((ids, true))
     }
 }
 
@@ -1398,20 +1040,6 @@ struct Allocation {
     owner_log: Vec<(u32, Vec<u8>)>,
     /// `(counter token, counters after this attempt)`.
     counter: (u64, ScopeCounters),
-}
-
-/// One edge chunk loaded during an attempt: its contents, the version token it
-/// was read at (`None`: not stored yet), and whether it needs writing.
-struct ChunkState {
-    chunk: EdgeChunk,
-    token: Option<u64>,
-    dirty: bool,
-}
-
-struct Attempt {
-    recorded: RecordedEvent,
-    ids: Vec<u32>,
-    commit_needed: bool,
 }
 
 #[cfg(test)]

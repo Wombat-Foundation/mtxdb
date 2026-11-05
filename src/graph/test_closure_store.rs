@@ -1,6 +1,6 @@
 use super::closure_store;
 use super::closure_store::*;
-use super::short_id::{EdgeFamily, ShortIdIndex};
+use super::short_id::ShortIdIndex;
 use crate::database::Database;
 use crate::layout::ShardType;
 use crate::storage::{NodeData, StorageError};
@@ -717,8 +717,7 @@ fn scope_purge_is_atomic_with_the_short_id_scope() {
     let root = test_root("purge");
     let db = open_db(&root);
     let ids = ShortIdIndex::new(POOL, SCOPE);
-    ids.record_edges(&db, b"$a", EdgeFamily::plain(1), &[b"$b"])
-        .unwrap();
+    ids.get_or_create(&db, &[b"$a", b"$b"]).unwrap();
     build(&db, 1, 1..3);
     build(&db, 2, 1..3);
 
