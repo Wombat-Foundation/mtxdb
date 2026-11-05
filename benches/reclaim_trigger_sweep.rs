@@ -5,9 +5,9 @@
 //! latency in nanoseconds (p50/p99/max, split by whether a sync was in flight
 //! when the read started), reader `WouldBlock` count, reads that missed the
 //! newest published id ("stale"), syncs where a reclaim was due (WAL above the
-//! trigger) versus those that shrank the WAL, elapsed time of due syncs that shrank the WAL (all-pool `sync_all`, so
-//! checkpoint and sync work, not reclaim alone), and peak
-//! segment fill. `N` readers chase the newest committed ids. A due sync that
+//! trigger) versus those that shrank the WAL, replay leases revoked by the
+//! cap, elapsed time of due syncs that shrank the WAL (all-pool `sync_all`, so
+//! checkpoint and sync work, not reclaim alone), and peak segment fill. `N` readers chase the newest committed ids. A due sync that
 //! did not shrink the WAL is a blocked reclaim, e.g. by a held lease. The
 //! trigger is validated against the emergency boundary (three quarters of the
 //! cap), so an unlimited trigger is not expressible: the largest accepted
@@ -18,9 +18,20 @@
 //!   cargo bench --manifest-path benches/Cargo.toml --bench reclaim_trigger_sweep
 //! ```
 //!
-//! Knobs: `MTXDB_RTS_SECS` (per run, default 6), `MTXDB_RTS_RUNS` (default 3),
-//! `MTXDB_RTS_READERS` (default 2), `MTXDB_RTS_COMMITS` (commits per sync, default 100), `MTXDB_RTS_BATCH`
-//! (default 20), `MTXDB_RTS_PAYLOAD` (default 2048), `MTXDB_BENCH_ROOT`.
+//! Knobs: `MTXDB_RTS_SECS` (wall-clock ceiling per run, default 60),
+//! `MTXDB_RTS_WRITE_MIB` (payload target per run, default 384; a run also
+//! stops after 1000 refused commits), `MTXDB_RTS_RUNS` (default 3),
+//! `MTXDB_RTS_READERS` (default 2), `MTXDB_RTS_COMMITS` (commits per sync,
+//! default 100), `MTXDB_RTS_BATCH` (default 20), `MTXDB_RTS_PAYLOAD`
+//! (default 2048), `MTXDB_BENCH_ROOT`.
+//!
+//! Lease caps: `MTXDB_RTS_LEASE_CAP_MIB` sets one fixed per-lease cap (unset or
+//! 0 is unlimited) and is reported per row; the unlimited held-lease row is
+//! kept as the control. `MTXDB_RTS_LEASE_CAP_SWEEP=1` instead runs unlimited,
+//! trigger + 32 MiB, and trigger / 2 for every trigger. A cap at or below the
+//! trigger can be exceeded before the first due reclaim, because the cap is
+//! enforced only inside a reclaim. `wb-cmt` counts commits refused with
+//! `WouldBlock`; blocked reclaims are `due - recl`.
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::pedantic,
@@ -78,6 +89,7 @@ struct Run {
     due: u64,
     /// Due syncs after which the WAL had shrunk.
     reclaims: u64,
+    revoked: u64,
     reclaim_ms: Vec<f64>,
     peak_wal: u64,
     secs: f64,
@@ -87,12 +99,15 @@ fn run_once(
     root: &std::path::Path,
     trigger: u64,
     lease: bool,
-    secs: u64,
+    max_secs: u64,
+    write_target: u64,
     readers: usize,
+    lease_cap: Option<u64>,
 ) -> (Run, u64) {
     let _ = std::fs::remove_dir_all(root);
     let config = RuntimeConfig {
         reclaim_trigger_bytes: Some(trigger),
+        replay_lease_max_retained_bytes: lease_cap,
         ..RuntimeConfig::default()
     };
     let db = Database::open_with_config(root.to_path_buf(), config).expect("open");
@@ -125,7 +140,10 @@ fn run_once(
     let latest = AtomicU64::new(1000);
     let mut run = Run::default();
     let started = Instant::now();
-    let deadline = Duration::from_secs(secs);
+    let deadline = Duration::from_secs(max_secs);
+    // Nominal payload bytes committed; every row does the same amount of work
+    // regardless of host speed, unless the segment fills first.
+    let mut written = 0u64;
     let store = db.pool(ShardType::EventDag);
     let per_reader = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..readers)
@@ -163,7 +181,7 @@ fn run_once(
             })
             .collect();
         let mut next = 1000u64;
-        while started.elapsed() < deadline {
+        while started.elapsed() < deadline && written < write_target && run.refused_commits < 1000 {
             for _ in 0..commits_per_sync {
                 let txn = db.begin_transaction();
                 let mut staged = true;
@@ -180,6 +198,7 @@ fn run_once(
                 match staged.then(|| txn.commit()) {
                     Some(Ok(())) => {
                         run.commits += 1;
+                        written += batch * payload as u64;
                         latest.store(next - 1, Ordering::Release);
                     }
                     Some(Err(e)) if is_would_block(&e) => run.refused_commits += 1,
@@ -219,13 +238,39 @@ fn run_once(
         run.calm_ns.extend(r.calm_ns);
         run.sync_ns.extend(r.sync_ns);
     }
+    run.revoked = db.coordinator().replay_leases_revoked();
     drop(db);
     (run, cap)
 }
 
 fn main() {
-    let secs = env_u64("MTXDB_RTS_SECS", 6);
+    // Upper bound per run; each run stops earlier once it has committed
+    // `MTXDB_RTS_WRITE_MIB` of payload or been refused 1000 commits.
+    let secs = env_u64("MTXDB_RTS_SECS", 60);
+    let write_target = env_u64("MTXDB_RTS_WRITE_MIB", 384) << 20;
     let runs = env_u64("MTXDB_RTS_RUNS", 3);
+    // Optional fixed per-lease cap in MiB; unset or zero means unlimited.
+    let fixed_lease_cap = std::env::var("MTXDB_RTS_LEASE_CAP_MIB")
+        .ok()
+        .map(|value| {
+            let mib = value
+                .parse::<u64>()
+                .expect("MTXDB_RTS_LEASE_CAP_MIB must be a non-negative integer");
+            mib.checked_mul(1 << 20)
+                .expect("MTXDB_RTS_LEASE_CAP_MIB is too large")
+        })
+        .filter(|bytes| *bytes > 0);
+    let relative_cap_sweep = std::env::var("MTXDB_RTS_LEASE_CAP_SWEEP")
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => panic!("MTXDB_RTS_LEASE_CAP_SWEEP must be 0, 1, true, or false"),
+        })
+        .unwrap_or(false);
+    assert!(
+        !(relative_cap_sweep && std::env::var_os("MTXDB_RTS_LEASE_CAP_MIB").is_some()),
+        "use either MTXDB_RTS_LEASE_CAP_SWEEP or MTXDB_RTS_LEASE_CAP_MIB, not both"
+    );
     let readers = usize::try_from(env_u64("MTXDB_RTS_READERS", 2))
         .unwrap()
         .max(1);
@@ -234,26 +279,54 @@ fn main() {
     std::fs::create_dir_all(&base).expect("bench root");
     let root = base.join(format!("mtxdb_bench_rts_{}", std::process::id()));
 
-    let (_, cap) = run_once(&root, 1 << 20, false, 0, 1);
+    let (_, cap) = run_once(&root, 1 << 20, false, 0, 0, 1, None);
     let max_trigger = cap - cap / 4 - 1;
     let settings = [
         ("quarter", cap / 4),
         ("half", cap / 2),
         ("max(~3/4)", max_trigger),
     ];
+    let wt = write_target >> 20;
     println!(
-        "segment cap {} MiB; {secs}s x {runs} runs per row; {readers} reader(s); latencies in ns per 16-key read batch (ids built before the timer)",
-        cap >> 20
+        "segment cap {} MiB; lease cap {}; <= {secs}s / {wt} MiB payload x {runs} runs per row; {readers} reader(s); latencies in ns per 16-key read batch (ids built before the timer)",
+        cap >> 20,
+        if relative_cap_sweep {
+            "relative sweep".to_owned()
+        } else {
+            fixed_lease_cap.map_or_else(|| "off".to_owned(), |b| format!("{} MiB", b >> 20))
+        }
     );
     println!(
-        "{:<10} {:<5} {:>8} {:>7} {:>4} {:>4} {:>7} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7}",
-        "trigger", "lease", "commit/s", "wb-cmt", "due", "recl", "dueshrk ms", "peakMiB", "reads/s",
+        "{:<10} {:<5} {:<12} {:>8} {:>7} {:>4} {:>4} {:>5} {:>7} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7}",
+        "trigger", "lease", "lease cap", "commit/s", "wb-cmt", "due", "recl", "revkd", "dueshrk ms", "peakMiB", "reads/s",
         "wb-read", "stale", "calm p50", "calm p99", "sync p99", "sync max", "calm max", "calm n", "sync n"
     );
     for (name, trigger) in settings {
-        for lease in [false, true] {
+        let mut held_caps = if relative_cap_sweep {
+            vec![
+                ("unlimited", None),
+                ("trigger+32", Some(trigger + (32 << 20))),
+                ("trigger/2", Some(trigger / 2)),
+            ]
+        } else {
+            vec![("unlimited", None)]
+        };
+        if let Some(fixed_cap) = fixed_lease_cap {
+            held_caps.push(("fixed", Some(fixed_cap)));
+        }
+        let cases = std::iter::once((false, "off", None))
+            .chain(held_caps.into_iter().map(|(label, cap)| (true, label, cap)));
+        for (lease, cap_label, lease_cap) in cases {
             for n in 0..runs {
-                let (mut r, _) = run_once(&root, trigger, lease, secs, readers);
+                let (mut r, _) = run_once(
+                    &root,
+                    trigger,
+                    lease,
+                    secs,
+                    write_target,
+                    readers,
+                    lease_cap,
+                );
                 r.calm_ns.sort_unstable();
                 r.sync_ns.sort_unstable();
                 r.reclaim_ms.sort_by(f64::total_cmp);
@@ -263,13 +336,15 @@ fn main() {
                     .copied()
                     .unwrap_or(0.0);
                 println!(
-                    "{:<10} {:<5} {:>8.0} {:>7} {:>4} {:>4} {:>7.0} {:>7} {:>8.0} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7}  run {n}",
+                    "{:<10} {:<5} {:<12} {:>8.0} {:>7} {:>4} {:>4} {:>5} {:>7.0} {:>7} {:>8.0} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7}  run {n}",
                     name,
                     if lease { "held" } else { "none" },
+                    cap_label,
                     r.commits as f64 / r.secs,
                     r.refused_commits,
                     r.due,
                     r.reclaims,
+                    r.revoked,
                     med,
                     r.peak_wal >> 20,
                     r.reads as f64 / r.secs,
