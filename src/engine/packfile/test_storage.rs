@@ -733,6 +733,13 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     let ReclaimFixture {
         writer,
         reader,
@@ -742,6 +749,8 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
     } = open_reclaim_fixture("read_committed_stream_vs_reclaim");
 
     let stop = Arc::new(AtomicBool::new(false));
+    // A writer panic must still wake the reader before unwinding.
+    let _stop_on_drop = StopOnDrop(stop.as_ref());
     let published = Arc::new(AtomicU8::new(0));
     let acknowledged = Arc::new(AtomicU8::new(0));
     let (started_tx, started_rx) = mpsc::channel::<()>();

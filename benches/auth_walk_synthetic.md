@@ -17,7 +17,8 @@ cost in the measured operations. Instrumentation overhead is included.
 
 ## Reproduce
 
-Python 3.10+ and the standard library suffice. The default helper source is
+Python 3.10+, the standard library, and `ruff` (for the lint and format checks
+below) suffice. The default helper source is
 `../sithnapse/synapse/storage/databases/main/embedded_event_auth_chains.py`;
 `--sithnapse-source` can override it. Source SHA-256, Python/SQLite versions and
 fixture parameters are recorded beside each CSV.
@@ -33,9 +34,10 @@ ruff format --check benches/auth_walk_synthetic.py
 ```
 
 The two benchmark commands should run sequentially. Each case reports three
-wall-time samples without memory tracing, as median/min/max. Memory is collected
-in a separate invocation, outside those timings. Returned subgraphs are checked
-against an independent fixture oracle after every sample. A preliminary fork
+wall-time samples without memory tracing, as median/min/max. Memory is then
+collected as one additional traced sample in the same invocation, outside those
+timings. Returned subgraphs are checked against an independent fixture oracle
+after every sample. A preliminary fork
 fixture checks seed inclusion, pruning of out-of-candidate descendants, SQL
 repair of wholly empty embedded child rows, and both discovery modes.
 

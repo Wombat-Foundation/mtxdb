@@ -3512,6 +3512,7 @@ fn disjoint_record_writes_do_not_conflict() {
             let key = *key;
             std::thread::spawn(move || {
                 barrier.wait();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 let txn = loop {
                     let txn = db.begin_transaction();
                     match txn.get_with_record_versions(pool, &collection, &[key]) {
@@ -3523,7 +3524,12 @@ fn disjoint_record_writes_do_not_conflict() {
                         }
                         // A concurrent commit may publish a group whose
                         // materialization has not reached this reader yet.
-                        Err(error) if error.is_would_block() => {}
+                        Err(error) if error.is_would_block() => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "versioned read kept blocking: {error}"
+                            );
+                        }
                         Err(error) => panic!("versioned read failed: {error}"),
                     }
                 };
