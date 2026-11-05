@@ -334,16 +334,15 @@ impl CsrAdjacency {
         let prepared = self.prepare_events(db, events)?;
 
         // Validate everything that can collide before allocating any id, so a
-        // rejected batch records nothing (matching the old transactional write).
-        let next = self.events.counter(db)?;
-        let mut snapshot = self.load_snapshot(db, next as usize)?;
-        self.check_conflicts(db, &prepared, &snapshot)?;
+        // rejected batch records nothing. Only the batch's own owners are read;
+        // the rest of the collection is not touched.
+        let (owner_ids, mut stored) = self.load_stored(db, &prepared)?;
+        self.check_conflicts(db, &prepared, &owner_ids, &stored)?;
 
         // Allocate every id in one call, exactly as the short-id layer did.
         let (keys, starts) = batch_keys(&prepared);
         let ids = self.events.get_or_create(db, &keys)?;
-        snapshot.resize(self.events.counter(db)? as usize);
-        let (owners, changed_rows) = merge_batch(&mut snapshot, &prepared, &starts, &ids)?;
+        let (owners, changed_rows) = merge_batch(&mut stored, &prepared, &starts, &ids)?;
         if !changed_rows.is_empty() {
             self.store(db)
                 .append_rows(self.scope(), &changed_rows)
@@ -396,12 +395,42 @@ impl CsrAdjacency {
         Ok(prepared)
     }
 
+    /// The short ids of the batch's already-known owners and their stored rows.
+    fn load_stored<'a>(
+        &self,
+        db: &Database,
+        prepared: &[PreparedEvent<'a>],
+    ) -> Result<(HashMap<&'a [u8], u32>, StoredRows), StorageError> {
+        let mut owner_ids: HashMap<&[u8], u32> = HashMap::new();
+        let mut stored_keys: Vec<(EdgeFamily, u32)> = Vec::new();
+        for event in prepared {
+            if let Some(owner) = self.events.lookup(db, event.owner)? {
+                owner_ids.insert(event.owner, owner);
+                for family in FAMILIES {
+                    stored_keys.push((family, owner));
+                }
+            }
+        }
+        let rows = self
+            .store(db)
+            .read_rows(self.scope(), &stored_keys)
+            .map_err(StorageError::Io)?;
+        let mut stored: StoredRows = HashMap::new();
+        for ((family, owner), row) in stored_keys.iter().zip(rows) {
+            if let Some(row) = row {
+                stored.insert((family.id, *owner), row);
+            }
+        }
+        Ok((owner_ids, stored))
+    }
+
     /// Reject a batch whose edges contradict each other or what is stored.
     fn check_conflicts(
         &self,
         db: &Database,
         prepared: &[PreparedEvent<'_>],
-        snapshot: &Snapshot,
+        owner_ids: &HashMap<&[u8], u32>,
+        stored: &StoredRows,
     ) -> Result<(), StorageError> {
         let mut claims: HashMap<&[u8], Vec<ClaimedEdges>> = HashMap::new();
         for event in prepared {
@@ -415,8 +444,8 @@ impl CsrAdjacency {
             } else {
                 claims.insert(event.owner, wanted.to_vec());
             }
-            if let Some(owner) = self.events.lookup(db, event.owner)? {
-                self.check_stored(db, snapshot, owner, &wanted)?;
+            if let Some(owner) = owner_ids.get(event.owner).copied() {
+                self.check_stored(db, stored, owner, &wanted)?;
             }
         }
         Ok(())
@@ -426,22 +455,21 @@ impl CsrAdjacency {
     fn check_stored(
         &self,
         db: &Database,
-        snapshot: &Snapshot,
+        stored: &StoredRows,
         owner: u32,
         wanted: &[ClaimedEdges; 3],
     ) -> Result<(), StorageError> {
         for (index, family) in FAMILIES.iter().enumerate() {
-            let rows = &snapshot.families[index];
-            if (owner as usize) >= rows.recorded.len() || !rows.recorded[owner as usize] {
+            let Some(stored_edges) = stored.get(&(family.id, owner)) else {
                 continue;
-            }
-            let stored = self.resolve_row(db, &rows.rows[owner as usize])?;
+            };
+            let stored_set = self.resolve_row(db, stored_edges)?;
             let requested = &wanted[index];
             // Relations are add-only and absent means "unknown".
             let conflicts = if family.typed {
-                !requested.is_empty() && !stored.is_empty() && stored != *requested
+                !requested.is_empty() && !stored_set.is_empty() && stored_set != *requested
             } else {
-                stored != *requested
+                stored_set != *requested
             };
             if conflicts {
                 return Err(StorageError::Collision(DIFFERS_FROM_RECORDED.to_owned()));
@@ -512,18 +540,36 @@ impl CsrAdjacency {
         short_id: u32,
         family: EdgeFamily,
     ) -> Result<Option<Vec<Edge>>, StorageError> {
-        let next = self.events.counter(db)?;
-        if short_id == 0 || short_id >= next {
-            return Ok(None);
-        }
-        let row = self
+        let mut rows = self
             .store(db)
-            .get_row(self.scope(), family, short_id)
+            .read_rows(self.scope(), &[(family, short_id)])
             .map_err(StorageError::Io)?;
-        // As in `load_snapshot`: a row naming an id outside the committed
-        // counter is a leftover of a rolled-back allocation, not part of the
-        // scope's graph.
-        Ok(row.filter(|edges| edges.iter().all(|e| e.target != 0 && e.target < next)))
+        Ok(rows.pop().flatten())
+    }
+
+    /// Every recorded row of one family for this scope, in one store read.
+    ///
+    /// Use this instead of calling [`Self::family_edges`] in a loop: the store
+    /// is append-only, so one scope read is far cheaper than N point reads that
+    /// each replay the tail.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt segment.
+    pub(crate) fn family_rows(
+        &self,
+        db: &Database,
+        family: EdgeFamily,
+    ) -> Result<Vec<(u32, Vec<Edge>)>, StorageError> {
+        let data = self
+            .store(db)
+            .read_scope(self.scope())
+            .map_err(StorageError::Io)?;
+        Ok(data
+            .rows
+            .into_iter()
+            .filter(|row| row.family.id == family.id && row.family.typed == family.typed)
+            .map(|row| (row.owner, row.edges))
+            .collect())
     }
 
     /// The event's relation if it has one and `visibility` shows it.
@@ -726,6 +772,9 @@ struct PreparedEvent<'a> {
     relation: Vec<EdgeKey<'a>>,
 }
 
+/// Stored rows of the batch's owners, by `(family id, owner)`.
+type StoredRows = HashMap<(u16, u32), Vec<Edge>>;
+
 impl<'a> PreparedEvent<'a> {
     /// The edge keys of the family at `index` in [`FAMILIES`].
     fn family_keys(&self, index: usize) -> &[EdgeKey<'a>] {
@@ -774,10 +823,10 @@ fn batch_keys<'a>(prepared: &[PreparedEvent<'a>]) -> (Vec<&'a [u8]>, Vec<usize>)
     (keys, starts)
 }
 
-/// Merge the batch into the snapshot, returning each owner's short id and the
-/// rows that changed.
+/// Merge the batch into the stored rows, returning each owner's short id and
+/// the rows that changed.
 fn merge_batch(
-    snapshot: &mut Snapshot,
+    stored: &mut StoredRows,
     prepared: &[PreparedEvent<'_>],
     starts: &[usize],
     ids: &[u32],
@@ -803,46 +852,37 @@ fn merge_batch(
                 continue;
             }
             let list: Vec<Edge> = wanted.into_iter().collect();
-            merge_row(
-                &mut snapshot.families[index],
-                *family,
-                owner,
-                list,
-                &mut changed_rows,
-            )?;
+            merge_row(stored, *family, owner, list, &mut changed_rows)?;
         }
     }
     Ok((owners, changed_rows))
 }
 
-/// Merge one owner's row into a family, recording it in `changed` if it is new
-/// or (for the add-only relations family) gained edges.
+/// Merge one owner's row into the stored rows, recording it in `changed` if it
+/// is new or (for the add-only relations family) gained edges.
 fn merge_row(
-    rows: &mut FamilyRows,
+    stored: &mut StoredRows,
     family: EdgeFamily,
     owner: u32,
     list: Vec<Edge>,
     changed: &mut Vec<RowRecord>,
 ) -> Result<(), StorageError> {
-    let slot = owner as usize;
-    if rows.recorded[slot] {
-        let stored = &rows.rows[slot];
+    let key = (family.id, owner);
+    if let Some(stored_edges) = stored.get(&key) {
         if family.typed {
-            if !list.is_empty() && !stored.is_empty() && *stored != list {
+            if !list.is_empty() && !stored_edges.is_empty() && *stored_edges != list {
                 return Err(StorageError::Collision(DIFFERS_FROM_RECORDED.to_owned()));
             }
-            if list.is_empty() || !stored.is_empty() {
+            if list.is_empty() || !stored_edges.is_empty() {
                 return Ok(());
             }
-        } else if *stored != list {
+        } else if *stored_edges != list {
             return Err(StorageError::Collision(DIFFERS_FROM_RECORDED.to_owned()));
         } else {
             return Ok(());
         }
-    } else {
-        rows.recorded[slot] = true;
     }
-    rows.rows[slot].clone_from(&list);
+    stored.insert(key, list.clone());
     changed.push(RowRecord {
         family,
         owner,

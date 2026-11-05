@@ -42,6 +42,7 @@ use crate::closure_store::{
 use crate::csr_adjacency::{CsrAdjacency, AUTH};
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
+use crate::short_id::Edge;
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
 /// Outcome of an ancestors-only auth-closure walk.
@@ -440,6 +441,8 @@ impl AuthClosure {
         let next = events.counter(db)?;
         let ids: Vec<u32> = (1..next).collect();
         let labels = events.resolve(db, &ids)?;
+        let auth_rows: HashMap<u32, Vec<Edge>> =
+            self.adjacency.family_rows(db, AUTH)?.into_iter().collect();
         let mut graph = AuthGraph::new(self.domain);
         for (short_id, key) in ids.into_iter().zip(labels) {
             if let Some(bytes) = key {
@@ -450,7 +453,7 @@ impl AuthClosure {
                 })?;
                 graph.insert_event(event_id, short_id);
             }
-            if let Some(edges) = self.adjacency.family_edges(db, short_id, AUTH)? {
+            if let Some(edges) = auth_rows.get(&short_id) {
                 graph.record_auth(short_id, edges.iter().map(|edge| edge.target));
             }
         }

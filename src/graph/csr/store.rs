@@ -21,11 +21,10 @@
 //! A purge is a tombstone record: it clears the scope during replay, so rows
 //! already sealed into shared segments are hidden without rewriting them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex, PoisonError};
 
 use crate::layout::{DatabaseLayout, ShardType};
 use crate::short_id::{Edge, EdgeFamily};
@@ -41,6 +40,16 @@ pub const SEAL_THRESHOLD: u64 = 4 * 1024 * 1024;
 
 const RECORD_HEADER: usize = 16 + 2 + 1 + 1 + 4 + 4;
 const EDGE_SIZE: usize = 4 + 2;
+/// Segment header: magic, version, scope count, record count, payload length.
+const SEGMENT_HEADER: usize = 4 + 1 + 4 + 4 + 4;
+/// One scope index entry: scope, flags, block offset, block length, directory
+/// length. The directory is `(family, owner) -> row`.
+const SCOPE_ENTRY: usize = 16 + 4 + 4 + 4 + 4;
+/// One directory entry: family, owner, row offset in the data region, row
+/// length, row checksum.
+const DIR_ENTRY: usize = 2 + 4 + 4 + 4 + 4;
+const SCOPE_FLAG_PURGE: u32 = 1;
+const BLOCK_COUNT: usize = 4;
 
 /// A generic collection scope: the engine's 16-byte collection id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,25 +91,6 @@ pub struct CsrStore {
 }
 
 type RowKey = ([u8; 16], u16, u32);
-type ScopeCacheKey = (PathBuf, [u8; 16]);
-type ScopeCache = HashMap<ScopeCacheKey, ScopeState>;
-
-/// Decoded rows of one scope, and the store state they were decoded from.
-///
-/// Reading a scope otherwise replays every segment and the whole tail. This
-/// cache is only valid for an unchanged segment set; a seal changes the set
-/// and forces a reload, while tail growth is applied incrementally.
-struct ScopeState {
-    signature: Vec<(u64, u64)>,
-    tail_applied: u64,
-    rows: HashMap<RowKey, (bool, Vec<Edge>)>,
-}
-
-static SCOPE_CACHE: LazyLock<Mutex<ScopeCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Per store directory: the tail length already verified as whole frames.
-static TAIL_VALID: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl CsrStore {
     /// Address the store for `pool` under `layout`.
@@ -132,7 +122,7 @@ impl CsrStore {
             return Ok(());
         }
         fs::create_dir_all(&self.dir)?;
-        let valid = self.valid_tail_len()?;
+        let (_, valid) = self.read_tail()?;
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -140,9 +130,9 @@ impl CsrStore {
             .truncate(false)
             .open(self.tail_path())?;
         let len = file.metadata()?.len();
-        if valid < len {
+        if (valid as u64) < len {
             // Drop a torn final frame so new records follow a valid boundary.
-            file.set_len(valid)?;
+            file.set_len(valid as u64)?;
         }
         file.seek(SeekFrom::End(0))?;
         let mut buffer = Vec::new();
@@ -168,10 +158,10 @@ impl CsrStore {
             .write(true)
             .truncate(false)
             .open(self.tail_path())?;
-        let valid = self.valid_tail_len()?;
+        let (_, valid) = self.read_tail()?;
         let len = file.metadata()?.len();
-        if valid < len {
-            file.set_len(valid)?;
+        if (valid as u64) < len {
+            file.set_len(valid as u64)?;
         }
         file.seek(SeekFrom::End(0))?;
         let payload = encode_row(scope, EdgeFamily::plain(0), 0, &[], true)?;
@@ -204,33 +194,8 @@ impl CsrStore {
             }
             return Ok(());
         }
-        let mut payload = Vec::new();
-        for record in &records {
-            payload.extend_from_slice(
-                &u32::try_from(record.payload.len())
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "csr row exceeds u32::MAX")
-                    })?
-                    .to_le_bytes(),
-            );
-            payload.extend_from_slice(&record.payload);
-        }
-        let mut file_bytes =
-            Vec::with_capacity(13usize.saturating_add(payload.len()).saturating_add(4));
-        file_bytes.extend_from_slice(&SEGMENT_MAGIC);
-        file_bytes.push(SEGMENT_VERSION);
-        file_bytes.extend_from_slice(
-            &u32::try_from(records.len())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many csr rows"))?
-                .to_le_bytes(),
-        );
-        file_bytes.extend_from_slice(
-            &u32::try_from(payload.len())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "csr segment too large"))?
-                .to_le_bytes(),
-        );
-        file_bytes.extend_from_slice(&payload);
-        file_bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        let mut groups = group_tail(&records)?;
+        let file_bytes = encode_segment(&mut groups, records.len())?;
 
         let seq = self.next_segment_number();
         let name = format!("{SEGMENT_PREFIX}{seq:012}{SEGMENT_SUFFIX}");
@@ -261,97 +226,69 @@ impl CsrStore {
     /// # Errors
     /// I/O errors or a malformed sealed segment.
     pub fn read_scope(&self, scope: ScopeId) -> io::Result<ScopeData> {
-        self.with_scope(scope, |rows| ScopeData {
-            rows: rows
-                .iter()
-                .map(|((_, family, owner), (typed, edges))| StoredRow {
-                    family: EdgeFamily {
-                        id: *family,
-                        typed: *typed,
-                    },
-                    owner: *owner,
-                    edges: edges.clone(),
-                })
-                .collect(),
-        })
+        let mut rows: HashMap<RowKey, (bool, Vec<Edge>)> = HashMap::new();
+        for (_, path) in self.segments()? {
+            apply_segment(&path, scope, None, &mut rows)?;
+        }
+        for record in self.read_tail()?.0 {
+            if record.payload.len() >= 16 && record.payload[..16] == scope.0 {
+                apply_payload(&record.payload, &mut rows)?;
+            }
+        }
+        let mut out = Vec::new();
+        for ((_, family, owner), (typed, edges)) in rows {
+            out.push(StoredRow {
+                family: EdgeFamily { id: family, typed },
+                owner,
+                edges,
+            });
+        }
+        out.sort_by_key(|row| (row.family.id, row.owner));
+        Ok(ScopeData { rows: out })
     }
 
-    /// One row of `scope`, or `None` if it was never recorded (or was purged).
+    /// Read specific `(family, owner)` rows, in the order requested.
     ///
-    /// A point lookup on the cached rows: it costs the same however many rows
-    /// the scope holds.
+    /// This is the hot path for recording and point reads: sealed segments are
+    /// sought by their `(family, owner)` directory, so a lookup does not decode
+    /// the rest of the collection. `None` means the row is not recorded.
     ///
     /// # Errors
-    /// I/O errors or a corrupt segment or frame.
-    pub fn get_row(
+    /// I/O errors or a malformed sealed segment.
+    pub fn read_rows(
         &self,
         scope: ScopeId,
-        family: EdgeFamily,
-        owner: u32,
-    ) -> io::Result<Option<Vec<Edge>>> {
-        self.with_scope(scope, |rows| {
-            rows.get(&(scope.0, family.id, owner))
-                .filter(|(typed, _)| *typed == family.typed)
-                .map(|(_, edges)| edges.clone())
-        })
-    }
-
-    /// Run `read` over the scope's decoded rows, bringing the cache up to date
-    /// first. Only tail bytes not yet seen are decoded; the segment set is
-    /// reloaded when it changed.
-    fn with_scope<R>(
-        &self,
-        scope: ScopeId,
-        read: impl FnOnce(&HashMap<RowKey, (bool, Vec<Edge>)>) -> R,
-    ) -> io::Result<R> {
-        let segments = self.segments()?;
-        let signature = segments
-            .iter()
-            .map(|(seq, path)| fs::metadata(path).map(|meta| (*seq, meta.len())))
-            .collect::<io::Result<Vec<_>>>()?;
-        let tail_len = match fs::metadata(self.tail_path()) {
-            Ok(meta) => meta.len(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error),
-        };
-        let key = (self.dir.clone(), scope.0);
-        // Take the entry out so no lock is held across disk reads.
-        let cached = SCOPE_CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&key);
-        let mut state = match cached {
-            Some(state) if state.signature == signature && state.tail_applied <= tail_len => state,
-            _ => {
-                let mut rows: HashMap<RowKey, (bool, Vec<Edge>)> = HashMap::new();
-                for (seq, path) in &segments {
-                    apply_segment(path, *seq, &mut rows)?;
-                }
-                rows.retain(|(row_scope, _, _), _| *row_scope == scope.0);
-                ScopeState {
-                    signature,
-                    tail_applied: 0,
-                    rows,
-                }
-            }
-        };
-        // Apply only the tail bytes not yet seen. A scope's own records are
-        // identified by the scope bytes that start every payload.
-        if state.tail_applied < tail_len {
-            let (frames, valid) = self.read_tail_from(state.tail_applied)?;
-            for frame in frames {
-                if frame.payload.get(..16) == Some(&scope.0[..]) {
-                    apply_payload(&frame.payload, &mut state.rows)?;
-                }
-            }
-            state.tail_applied = state.tail_applied.saturating_add(valid as u64);
+        keys: &[(EdgeFamily, u32)],
+    ) -> io::Result<Vec<Option<Vec<Edge>>>> {
+        let mut wanted: HashSet<(u16, u32)> = HashSet::with_capacity(keys.len());
+        for (family, owner) in keys {
+            wanted.insert((family.id, *owner));
         }
-        let result = read(&state.rows);
-        SCOPE_CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, state);
-        Ok(result)
+        let mut found: HashMap<RowKey, (bool, Vec<Edge>)> = HashMap::new();
+        for (_, path) in self.segments()? {
+            apply_segment(&path, scope, Some(&wanted), &mut found)?;
+        }
+        for record in self.read_tail()?.0 {
+            if record.payload.len() < RECORD_HEADER || record.payload[..16] != scope.0 {
+                continue;
+            }
+            let (_, family, owner, purge, edges) = decode_row(&record.payload)?;
+            if purge {
+                found.retain(|row, _| row.0 != scope.0);
+                continue;
+            }
+            if wanted.contains(&(family.id, owner)) {
+                found.insert((scope.0, family.id, owner), (family.typed, edges));
+            }
+        }
+        Ok(keys
+            .iter()
+            .map(|(family, owner)| {
+                found
+                    .get(&(scope.0, family.id, *owner))
+                    .map(|(_, edges)| edges.clone())
+            })
+            .collect())
     }
 
     fn next_segment_number(&self) -> u64 {
@@ -383,51 +320,6 @@ impl CsrStore {
         Ok(segments)
     }
 
-    /// Decode the tail frames that start at byte `offset`, returning them and
-    /// how many bytes from `offset` they cover.
-    fn read_tail_from(&self, offset: u64) -> io::Result<(Vec<Frame>, usize)> {
-        let mut file = match File::open(self.tail_path()) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
-            Err(error) => return Err(error),
-        };
-        file.seek(SeekFrom::Start(offset))?;
-        let mut data = Vec::new();
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            data.extend_from_slice(&buffer[..read]);
-        }
-        Ok(decode_frames(&data))
-    }
-
-    /// The length of the tail's valid frame prefix. Only bytes past the last
-    /// length this process checked are decoded.
-    fn valid_tail_len(&self) -> io::Result<u64> {
-        let len = match fs::metadata(self.tail_path()) {
-            Ok(meta) => meta.len(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(error),
-        };
-        let known = TAIL_VALID
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&self.dir)
-            .copied()
-            .filter(|known| *known <= len)
-            .unwrap_or(0);
-        let (_, valid) = self.read_tail_from(known)?;
-        let total = known.saturating_add(valid as u64);
-        TAIL_VALID
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(self.dir.clone(), total);
-        Ok(total)
-    }
-
     fn read_tail(&self) -> io::Result<(Vec<Frame>, usize)> {
         let path = self.tail_path();
         let data = match fs::read(&path) {
@@ -439,8 +331,135 @@ impl CsrStore {
     }
 }
 
+/// Group the tail by scope, then by `(family, owner)` inside each scope, so a
+/// point or batch read can seek straight to the rows it asked for.
+fn group_tail(records: &[Frame]) -> io::Result<Vec<([u8; 16], ScopeGroup)>> {
+    let mut groups: Vec<([u8; 16], ScopeGroup)> = Vec::new();
+    let mut group_index: HashMap<[u8; 16], usize> = HashMap::new();
+    for record in records {
+        if record.payload.len() < RECORD_HEADER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "csr row has no scope",
+            ));
+        }
+        let (scope, family, owner, purge, _) = decode_row(&record.payload)?;
+        let slot = *group_index.entry(scope.0).or_insert_with(|| {
+            groups.push((scope.0, ScopeGroup::default()));
+            groups.len().saturating_sub(1)
+        });
+        let group = &mut groups[slot].1;
+        if purge {
+            group.rows.clear();
+            group.index.clear();
+            group.purged = true;
+            continue;
+        }
+        let key = (family.id, owner);
+        if let Some(&at) = group.index.get(&key) {
+            group.rows[at].1.clone_from(&record.payload);
+        } else {
+            group.index.insert(key, group.rows.len());
+            group.rows.push((key, record.payload.clone()));
+        }
+    }
+    Ok(groups)
+}
+
+fn too_large(what: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what)
+}
+
+/// One scope's block: its `(family, owner)` directory followed by the row data.
+fn encode_scope_block(group: &mut ScopeGroup) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    group.rows.sort_by_key(|(key, _)| *key);
+    let mut directory =
+        Vec::with_capacity(BLOCK_COUNT.saturating_add(group.rows.len().saturating_mul(DIR_ENTRY)));
+    directory.extend_from_slice(
+        &u32::try_from(group.rows.len())
+            .map_err(|_| too_large("too many csr rows"))?
+            .to_le_bytes(),
+    );
+    let mut data = Vec::new();
+    for ((family, owner), row) in &group.rows {
+        let offset =
+            u32::try_from(data.len()).map_err(|_| too_large("csr scope block too large"))?;
+        let len = u32::try_from(row.len()).map_err(|_| too_large("csr row too large"))?;
+        directory.extend_from_slice(&family.to_le_bytes());
+        directory.extend_from_slice(&owner.to_le_bytes());
+        directory.extend_from_slice(&offset.to_le_bytes());
+        directory.extend_from_slice(&len.to_le_bytes());
+        directory.extend_from_slice(&crc32fast::hash(row).to_le_bytes());
+        data.extend_from_slice(row);
+    }
+    Ok((directory, data))
+}
+
+/// Lay the grouped tail out as one segment file: header, scope index, payload
+/// and a checksum over the payload.
+fn encode_segment(groups: &mut [([u8; 16], ScopeGroup)], records: usize) -> io::Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    let mut index = Vec::with_capacity(groups.len().saturating_mul(SCOPE_ENTRY));
+    for (scope, group) in groups.iter_mut() {
+        let purged = group.purged;
+        let (directory, data) = encode_scope_block(group)?;
+        let block_len = directory.len().saturating_add(data.len());
+        let block_off =
+            u32::try_from(payload.len()).map_err(|_| too_large("csr segment too large"))?;
+        index.extend_from_slice(scope);
+        index.extend_from_slice(&if purged { SCOPE_FLAG_PURGE } else { 0 }.to_le_bytes());
+        index.extend_from_slice(&block_off.to_le_bytes());
+        index.extend_from_slice(
+            &u32::try_from(block_len)
+                .map_err(|_| too_large("csr scope block too large"))?
+                .to_le_bytes(),
+        );
+        index.extend_from_slice(
+            &u32::try_from(directory.len())
+                .map_err(|_| too_large("csr directory too large"))?
+                .to_le_bytes(),
+        );
+        payload.extend_from_slice(&directory);
+        payload.extend_from_slice(&data);
+    }
+    let mut file_bytes = Vec::with_capacity(
+        SEGMENT_HEADER
+            .saturating_add(index.len())
+            .saturating_add(payload.len())
+            .saturating_add(4),
+    );
+    file_bytes.extend_from_slice(&SEGMENT_MAGIC);
+    file_bytes.push(SEGMENT_VERSION);
+    file_bytes.extend_from_slice(
+        &u32::try_from(groups.len())
+            .map_err(|_| too_large("too many csr scopes"))?
+            .to_le_bytes(),
+    );
+    file_bytes.extend_from_slice(
+        &u32::try_from(records)
+            .map_err(|_| too_large("too many csr rows"))?
+            .to_le_bytes(),
+    );
+    file_bytes.extend_from_slice(
+        &u32::try_from(payload.len())
+            .map_err(|_| too_large("csr segment too large"))?
+            .to_le_bytes(),
+    );
+    file_bytes.extend_from_slice(&index);
+    file_bytes.extend_from_slice(&payload);
+    file_bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    Ok(file_bytes)
+}
+
 struct Frame {
     payload: Vec<u8>,
+}
+
+#[derive(Default)]
+struct ScopeGroup {
+    rows: Vec<((u16, u32), Vec<u8>)>,
+    index: HashMap<(u16, u32), usize>,
+    purged: bool,
 }
 
 fn write_frame(out: &mut Vec<u8>, payload: &[u8]) {
@@ -570,58 +589,173 @@ fn apply_payload(payload: &[u8], rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>) 
     Ok(())
 }
 
+/// Apply only `scope`'s block from one sealed segment.
+///
+/// The segment carries a small scope index, so a read seeks straight to its
+/// own rows and never decodes the other scopes sharing the file.
 fn apply_segment(
     path: &Path,
-    seq: u64,
+    scope: ScopeId,
+    wanted: Option<&HashSet<(u16, u32)>>,
     rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
 ) -> io::Result<()> {
-    let data = fs::read(path)?;
     let corrupt = |what: &str| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("csr segment {} ({what})", path.display()),
         )
     };
-    if data.len() < 13 || data[..4] != SEGMENT_MAGIC {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0u8; SEGMENT_HEADER];
+    file.read_exact(&mut header)?;
+    if header[..4] != SEGMENT_MAGIC {
         return Err(corrupt("bad magic"));
     }
-    if data[4] != SEGMENT_VERSION {
+    if header[4] != SEGMENT_VERSION {
         return Err(corrupt("unsupported version"));
     }
-    let count = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
-    let payload_len = u32::from_le_bytes([data[9], data[10], data[11], data[12]]) as usize;
-    let payload_end = 13usize
-        .checked_add(payload_len)
-        .ok_or_else(|| corrupt("length overflows"))?;
-    if payload_end.saturating_add(4) != data.len() {
+    let scope_count = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+    let index_len = scope_count
+        .checked_mul(SCOPE_ENTRY)
+        .ok_or_else(|| corrupt("index overflows"))?;
+    let mut index_bytes = vec![0u8; index_len];
+    file.read_exact(&mut index_bytes)?;
+    let payload_len = u32::from_le_bytes([header[13], header[14], header[15], header[16]]) as usize;
+    let payload_start = SEGMENT_HEADER
+        .checked_add(index_len)
+        .ok_or_else(|| corrupt("index overflows"))?;
+    if (payload_start as u64)
+        .checked_add(payload_len as u64)
+        .and_then(|end| end.checked_add(4))
+        != Some(file_len)
+    {
         return Err(corrupt("length does not match file size"));
     }
-    let payload = &data[13..payload_end];
-    let expected_crc = le_u32(&data, payload_end).ok_or_else(|| corrupt("truncated checksum"))?;
-    if crc32fast::hash(payload) != expected_crc {
-        return Err(corrupt("checksum mismatch"));
-    }
-    let mut at = 0usize;
-    for _ in 0..count {
-        if at.saturating_add(4) > payload.len() {
-            return Err(corrupt("truncated row table"));
+    for entry in index_bytes.chunks_exact(SCOPE_ENTRY) {
+        if entry[..16] != scope.0 {
+            continue;
         }
-        let len = le_u32(payload, at).ok_or_else(|| corrupt("truncated row table"))? as usize;
-        at = at.saturating_add(4);
-        let end = at
-            .checked_add(len)
-            .ok_or_else(|| corrupt("row length overflows"))?;
-        if end > payload.len() {
-            return Err(corrupt("truncated row"));
+        let flags = u32::from_le_bytes([entry[16], entry[17], entry[18], entry[19]]);
+        let block_off = u32::from_le_bytes([entry[20], entry[21], entry[22], entry[23]]) as usize;
+        let block_len = u32::from_le_bytes([entry[24], entry[25], entry[26], entry[27]]) as usize;
+        let directory_len =
+            u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]) as usize;
+        if block_off
+            .checked_add(block_len)
+            .is_none_or(|end| end > payload_len)
+        {
+            return Err(corrupt("scope block out of range"));
         }
-        apply_payload(&payload[at..end], rows).map_err(|_| corrupt("malformed row"))?;
-        at = end;
+        if directory_len < BLOCK_COUNT || directory_len > block_len {
+            return Err(corrupt("scope directory out of range"));
+        }
+        if flags & SCOPE_FLAG_PURGE != 0 {
+            rows.retain(|(row_scope, _, _), _| *row_scope != scope.0);
+        }
+        let data_len = block_len.saturating_sub(directory_len);
+        let directory_start = payload_start.saturating_add(block_off);
+        file.seek(SeekFrom::Start(directory_start as u64))?;
+        let mut count_bytes = [0u8; BLOCK_COUNT];
+        file.read_exact(&mut count_bytes)?;
+        let count = u32::from_le_bytes(count_bytes) as usize;
+        if BLOCK_COUNT.saturating_add(count.saturating_mul(DIR_ENTRY)) != directory_len {
+            return Err(corrupt("scope directory length does not match its count"));
+        }
+        let entries_start = directory_start.saturating_add(BLOCK_COUNT);
+        let data_start = directory_start.saturating_add(directory_len);
+        if let Some(wanted) = wanted {
+            // Sorted directory: probe it on disk instead of reading it.
+            for &(family, owner) in wanted {
+                if let Some((offset, len, crc)) =
+                    find_directory_entry(&mut file, entries_start, count, family, owner)?
+                {
+                    read_row_at(&mut file, data_start, data_len, offset, len, crc, rows)?;
+                }
+            }
+        } else {
+            file.seek(SeekFrom::Start(entries_start as u64))?;
+            let mut directory = vec![0u8; count.saturating_mul(DIR_ENTRY)];
+            file.read_exact(&mut directory)?;
+            for item in directory.chunks_exact(DIR_ENTRY) {
+                let (Some(offset), Some(len), Some(crc)) =
+                    (le_u32(item, 6), le_u32(item, 10), le_u32(item, 14))
+                else {
+                    return Err(corrupt("scope directory entry is short"));
+                };
+                read_row_at(
+                    &mut file,
+                    data_start,
+                    data_len,
+                    offset as usize,
+                    len as usize,
+                    crc,
+                    rows,
+                )?;
+            }
+        }
+        return Ok(());
     }
-    if at != payload.len() {
-        return Err(corrupt("trailing bytes after rows"));
-    }
-    let _ = seq;
     Ok(())
+}
+
+/// Binary-search a sorted directory for one `(family, owner)` entry.
+fn find_directory_entry(
+    file: &mut File,
+    entries_start: usize,
+    count: usize,
+    family: u16,
+    owner: u32,
+) -> io::Result<Option<(usize, usize, u32)>> {
+    use std::cmp::Ordering;
+    let mut low = 0usize;
+    let mut high = count;
+    let mut entry = [0u8; DIR_ENTRY];
+    while low < high {
+        let mid = low.saturating_add(high.saturating_sub(low) / 2);
+        file.seek(SeekFrom::Start(
+            entries_start.saturating_add(mid.saturating_mul(DIR_ENTRY)) as u64,
+        ))?;
+        file.read_exact(&mut entry)?;
+        let found = (
+            u16::from_le_bytes([entry[0], entry[1]]),
+            u32::from_le_bytes([entry[2], entry[3], entry[4], entry[5]]),
+        );
+        match found.cmp(&(family, owner)) {
+            Ordering::Less => low = mid.saturating_add(1),
+            Ordering::Greater => high = mid,
+            Ordering::Equal => {
+                return Ok(Some((
+                    u32::from_le_bytes([entry[6], entry[7], entry[8], entry[9]]) as usize,
+                    u32::from_le_bytes([entry[10], entry[11], entry[12], entry[13]]) as usize,
+                    u32::from_le_bytes([entry[14], entry[15], entry[16], entry[17]]),
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn read_row_at(
+    file: &mut File,
+    data_start: usize,
+    data_len: usize,
+    offset: usize,
+    len: usize,
+    crc: u32,
+    rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+) -> io::Result<()> {
+    let corrupt = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_owned());
+    if offset.checked_add(len).is_none_or(|end| end > data_len) {
+        return Err(corrupt("csr row out of range"));
+    }
+    file.seek(SeekFrom::Start(data_start.saturating_add(offset) as u64))?;
+    let mut row = vec![0u8; len];
+    file.read_exact(&mut row)?;
+    if crc32fast::hash(&row) != crc {
+        return Err(corrupt("csr row checksum mismatch"));
+    }
+    apply_payload(&row, rows).map_err(|_| corrupt("malformed csr row"))
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -690,36 +824,56 @@ mod tests {
     }
 
     #[test]
-    fn cached_reads_follow_appends_a_seal_and_a_purge() {
-        let layout = layout("cache");
+    fn a_sealed_segment_serves_each_scope_independently() {
+        let layout = layout("sealed-scopes");
         let store = CsrStore::open(&layout, ShardType::State);
-        let scope = ScopeId([5; 16]);
-        let other = ScopeId([6; 16]);
-        let family = EdgeFamily::typed(3);
-        let point = |owner| store.get_row(scope, family, owner).unwrap();
-
-        assert_eq!(point(1), None);
-        store.append_rows(scope, &[row(2, 1)]).unwrap();
-        assert_eq!(point(1).map(|edges| edges.len()), Some(1));
-        // Another scope's append must not leak into this scope's cache.
-        store.append_rows(other, &[row(3, 1)]).unwrap();
-        assert_eq!(store.read_scope(scope).unwrap().rows.len(), 1);
-        // A second append is picked up from the tail without a reload.
-        let second = RowRecord {
-            owner: 2,
-            ..row(4, 0)
-        };
-        store.append_rows(scope, &[second]).unwrap();
-        assert_eq!(store.read_scope(scope).unwrap().rows.len(), 2);
-        // Sealing changes the segment set; the rows must survive it.
+        let a = ScopeId([1; 16]);
+        let b = ScopeId([2; 16]);
+        store.append_rows(a, &[row(2, 1)]).unwrap();
+        store.append_rows(b, &[row(3, 4)]).unwrap();
         store.seal().unwrap();
-        assert_eq!(store.read_scope(scope).unwrap().rows.len(), 2);
-        assert_eq!(point(2).map(|edges| edges[0].target), Some(4));
-        // A purge applies incrementally and hides the sealed rows.
-        store.purge_scope(scope).unwrap();
-        assert_eq!(point(1), None);
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
-        assert_eq!(store.read_scope(other).unwrap().rows.len(), 1);
+        assert_eq!(store.read_scope(a).unwrap().rows[0].edges[0].target, 2);
+        assert_eq!(store.read_scope(b).unwrap().rows[0].edges[0].target, 3);
+        assert!(store.read_scope(ScopeId([3; 16])).unwrap().rows.is_empty());
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn point_reads_use_the_sealed_directory() {
+        let layout = layout("point");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([1; 16]);
+        store
+            .append_rows(
+                scope,
+                &[
+                    RowRecord {
+                        family: EdgeFamily::typed(3),
+                        owner: 1,
+                        edges: vec![Edge { target: 2, kind: 1 }],
+                    },
+                    RowRecord {
+                        family: EdgeFamily::plain(1),
+                        owner: 2,
+                        edges: Vec::new(),
+                    },
+                ],
+            )
+            .unwrap();
+        store.seal().unwrap();
+        let rows = store
+            .read_rows(
+                scope,
+                &[
+                    (EdgeFamily::typed(3), 1),
+                    (EdgeFamily::plain(1), 2),
+                    (EdgeFamily::plain(1), 9),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows[0].as_ref().unwrap()[0].target, 2);
+        assert!(rows[1].as_ref().unwrap().is_empty(), "recorded empty row");
+        assert!(rows[2].is_none(), "unrecorded row");
         let _ = fs::remove_dir_all(layout.root());
     }
 
