@@ -20,11 +20,17 @@
 //!
 //! A purge is a tombstone record: it clears the scope during replay, so rows
 //! already sealed into shared segments are hidden without rewriting them.
+//!
+//! Decoded rows are cached in process, one cache per store directory. A read
+//! decodes only bytes appended to the tail since the previous read; sealed
+//! segments are decoded again only when the segment set changes. The cache is
+//! in-process state, not a durability boundary: reopen starts from the files.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::layout::{DatabaseLayout, ShardType};
 use crate::short_id::{Edge, EdgeFamily};
@@ -80,7 +86,36 @@ pub struct CsrStore {
     dir: PathBuf,
 }
 
-type RowKey = ([u8; 16], u16, u32);
+type RowKey = (u16, u32);
+type ScopeRows = HashMap<RowKey, (bool, Vec<Edge>)>;
+
+/// One store directory's decoded state.
+#[derive(Debug, Default)]
+struct StoreCache {
+    /// Segment numbers already folded into `rows`, oldest first.
+    segment_ids: Vec<u64>,
+    /// Newest visible row per scope, keyed by `(family, owner)`.
+    rows: HashMap<[u8; 16], ScopeRows>,
+    /// Bytes of `tail.log` already decoded into `rows`.
+    tail_len: usize,
+    /// Test-only: sealed segments decoded into this cache.
+    #[cfg(test)]
+    segment_reads: u64,
+}
+
+static CACHES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<StoreCache>>>>> = OnceLock::new();
+
+fn cache_for(dir: &Path) -> Arc<Mutex<StoreCache>> {
+    let caches = CACHES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut caches = lock(caches);
+    Arc::clone(caches.entry(dir.to_path_buf()).or_default())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 impl CsrStore {
     /// Address the store for `pool` under `layout`.
@@ -112,9 +147,10 @@ impl CsrStore {
             return Ok(());
         }
         fs::create_dir_all(&self.dir)?;
-        let (_, valid) = self.read_tail()?;
+        let valid = self.cached_tail_len()?;
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(self.tail_path())?;
@@ -132,6 +168,7 @@ impl CsrStore {
         file.write_all(&buffer)?;
         file.sync_data()?;
         self.maybe_seal()?;
+        self.refresh_cached()?;
         Ok(())
     }
 
@@ -143,10 +180,11 @@ impl CsrStore {
         fs::create_dir_all(&self.dir)?;
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(self.tail_path())?;
-        let (_, valid) = self.read_tail()?;
+        let valid = self.cached_tail_len()?;
         let len = file.metadata()?.len();
         if (valid as u64) < len {
             file.set_len(valid as u64)?;
@@ -157,6 +195,7 @@ impl CsrStore {
         write_frame(&mut buffer, &payload);
         file.write_all(&buffer)?;
         file.sync_data()?;
+        self.refresh_cached()?;
         Ok(())
     }
 
@@ -193,7 +232,8 @@ impl CsrStore {
             );
             payload.extend_from_slice(&record.payload);
         }
-        let mut file_bytes = Vec::with_capacity(13 + payload.len() + 4);
+        let mut file_bytes =
+            Vec::with_capacity(13usize.saturating_add(payload.len()).saturating_add(4));
         file_bytes.extend_from_slice(&SEGMENT_MAGIC);
         file_bytes.push(SEGMENT_VERSION);
         file_bytes.extend_from_slice(
@@ -238,26 +278,114 @@ impl CsrStore {
     /// # Errors
     /// I/O errors or a malformed sealed segment.
     pub fn read_scope(&self, scope: ScopeId) -> io::Result<ScopeData> {
-        let mut rows: HashMap<RowKey, (bool, Vec<Edge>)> = HashMap::new();
-        for (seq, path) in self.segments()? {
-            apply_segment(&path, seq, &mut rows)?;
-        }
-        for record in self.read_tail()?.0 {
-            apply_payload(&record.payload, &mut rows)?;
-        }
+        let cache = cache_for(&self.dir);
+        let mut cache = lock(&cache);
+        self.refresh_cache(&mut cache)?;
         let mut out = Vec::new();
-        for ((owner_scope, family, owner), (typed, edges)) in rows {
-            if owner_scope != scope.0 {
-                continue;
+        if let Some(rows) = cache.rows.get(&scope.0) {
+            for (&(family, owner), (typed, edges)) in rows {
+                out.push(StoredRow {
+                    family: EdgeFamily {
+                        id: family,
+                        typed: *typed,
+                    },
+                    owner,
+                    edges: edges.clone(),
+                });
             }
-            out.push(StoredRow {
-                family: EdgeFamily { id: family, typed },
-                owner,
-                edges,
-            });
         }
         out.sort_by_key(|row| (row.family.id, row.owner));
         Ok(ScopeData { rows: out })
+    }
+
+    /// The valid prefix of the tail already decoded into the cache.
+    fn cached_tail_len(&self) -> io::Result<usize> {
+        let cache = cache_for(&self.dir);
+        let mut cache = lock(&cache);
+        self.refresh_cache(&mut cache)?;
+        Ok(cache.tail_len)
+    }
+
+    /// Bring the cache up to date with the files after a write.
+    fn refresh_cached(&self) -> io::Result<()> {
+        let cache = cache_for(&self.dir);
+        let mut cache = lock(&cache);
+        self.refresh_cache(&mut cache)
+    }
+
+    /// Fold new segments and new tail bytes into the cache.
+    fn refresh_cache(&self, cache: &mut StoreCache) -> io::Result<()> {
+        let segments = self.segments()?;
+        let ids: Vec<u64> = segments.iter().map(|(seq, _)| *seq).collect();
+        if ids != cache.segment_ids {
+            if ids.starts_with(&cache.segment_ids) {
+                for (seq, path) in &segments[cache.segment_ids.len()..] {
+                    apply_segment(path, *seq, &mut cache.rows)?;
+                    #[cfg(test)]
+                    {
+                        cache.segment_reads = cache.segment_reads.saturating_add(1);
+                    }
+                }
+            } else {
+                Self::rebuild_cache(cache, &segments)?;
+            }
+            cache.segment_ids = ids;
+            // A new segment normally replaced the tail it was built from.
+            // Re-decoding the tail is idempotent and restores newer rows.
+            cache.tail_len = 0;
+        }
+        let len = self.tail_file_len()?;
+        if len < cache.tail_len {
+            // The tail was truncated, normally by a concurrent seal. Re-list
+            // so the segment that replaced it is included, then replay from 0.
+            let segments = self.segments()?;
+            Self::rebuild_cache(cache, &segments)?;
+        }
+        let len = self.tail_file_len()?;
+        if len > cache.tail_len {
+            match fs::read(self.tail_path()) {
+                Ok(data) => {
+                    let start = cache.tail_len.min(data.len());
+                    let (frames, valid) = decode_frames(&data[start..]);
+                    for frame in &frames {
+                        apply_payload(&frame.payload, &mut cache.rows)?;
+                    }
+                    cache.tail_len = start.saturating_add(valid);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let segments = self.segments()?;
+                    Self::rebuild_cache(cache, &segments)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the cached rows and replay every segment currently on disk.
+    fn rebuild_cache(cache: &mut StoreCache, segments: &[(u64, PathBuf)]) -> io::Result<()> {
+        let mut rows = HashMap::new();
+        for (seq, path) in segments {
+            apply_segment(path, *seq, &mut rows)?;
+        }
+        #[cfg(test)]
+        {
+            cache.segment_reads = cache
+                .segment_reads
+                .saturating_add(u64::try_from(segments.len()).unwrap_or(u64::MAX));
+        }
+        cache.rows = rows;
+        cache.segment_ids = segments.iter().map(|(seq, _)| *seq).collect();
+        cache.tail_len = 0;
+        Ok(())
+    }
+
+    fn tail_file_len(&self) -> io::Result<usize> {
+        match fs::metadata(self.tail_path()) {
+            Ok(meta) => Ok(usize::try_from(meta.len()).unwrap_or(usize::MAX)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
+        }
     }
 
     fn next_segment_number(&self) -> u64 {
@@ -317,24 +445,30 @@ fn write_frame(out: &mut Vec<u8>, payload: &[u8]) {
 fn decode_frames(data: &[u8]) -> (Vec<Frame>, usize) {
     let mut frames = Vec::new();
     let mut at = 0usize;
-    while at.saturating_add(8) <= data.len() {
-        let len = u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize;
-        let crc = u32::from_le_bytes([data[at + 4], data[at + 5], data[at + 6], data[at + 7]]);
-        let start = at + 8;
-        let Some(end) = start.checked_add(len) else {
+    while let Some(rest) = data.get(at..) {
+        let Some(header) = rest.get(..8) else {
             break;
         };
-        if end > data.len() {
+        let len = u32::from_le_bytes(header[..4].try_into().expect("frame length has four bytes"))
+            as usize;
+        let crc = u32::from_le_bytes(
+            header[4..8]
+                .try_into()
+                .expect("frame checksum has four bytes"),
+        );
+        let Some(payload) = rest.get(8..).and_then(|tail| tail.get(..len)) else {
             break;
-        }
-        let payload = &data[start..end];
+        };
         if crc32fast::hash(payload) != crc {
             break;
         }
         frames.push(Frame {
             payload: payload.to_vec(),
         });
-        at = end;
+        let Some(next) = at.checked_add(8).and_then(|n| n.checked_add(len)) else {
+            break;
+        };
+        at = next;
     }
     (frames, at)
 }
@@ -348,7 +482,8 @@ fn encode_row(
 ) -> io::Result<Vec<u8>> {
     let count = u32::try_from(edges.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "csr row has too many edges"))?;
-    let mut out = Vec::with_capacity(RECORD_HEADER.saturating_add(edges.len() * EDGE_SIZE));
+    let mut out =
+        Vec::with_capacity(RECORD_HEADER.saturating_add(edges.len().saturating_mul(EDGE_SIZE)));
     out.extend_from_slice(&scope.0);
     out.extend_from_slice(&family.id.to_le_bytes());
     out.push(u8::from(family.typed));
@@ -388,15 +523,16 @@ fn decode_row(payload: &[u8]) -> io::Result<(ScopeId, EdgeFamily, u32, bool, Vec
     let mut edges = Vec::with_capacity(count);
     let mut at = RECORD_HEADER;
     for _ in 0..count {
-        let target = u32::from_le_bytes([
-            payload[at],
-            payload[at + 1],
-            payload[at + 2],
-            payload[at + 3],
-        ]);
-        let kind = u16::from_le_bytes([payload[at + 4], payload[at + 5]]);
+        let edge = payload
+            .get(at..)
+            .and_then(|rest| rest.get(..EDGE_SIZE))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row ended early"))?;
+        let target = u32::from_le_bytes(edge[..4].try_into().expect("edge target has four bytes"));
+        let kind = u16::from_le_bytes(edge[4..6].try_into().expect("edge kind has two bytes"));
         edges.push(Edge { target, kind });
-        at += EDGE_SIZE;
+        at = at
+            .checked_add(EDGE_SIZE)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row overflows"))?;
     }
     Ok((
         ScopeId(scope),
@@ -407,21 +543,19 @@ fn decode_row(payload: &[u8]) -> io::Result<(ScopeId, EdgeFamily, u32, bool, Vec
     ))
 }
 
-fn apply_payload(payload: &[u8], rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>) -> io::Result<()> {
+fn apply_payload(payload: &[u8], rows: &mut HashMap<[u8; 16], ScopeRows>) -> io::Result<()> {
     let (scope, family, owner, purge, edges) = decode_row(payload)?;
     if purge {
-        rows.retain(|(row_scope, _, _), _| *row_scope != scope.0);
+        rows.remove(&scope.0);
     } else {
-        rows.insert((scope.0, family.id, owner), (family.typed, edges));
+        rows.entry(scope.0)
+            .or_default()
+            .insert((family.id, owner), (family.typed, edges));
     }
     Ok(())
 }
 
-fn apply_segment(
-    path: &Path,
-    seq: u64,
-    rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
-) -> io::Result<()> {
+fn apply_segment(path: &Path, seq: u64, rows: &mut HashMap<[u8; 16], ScopeRows>) -> io::Result<()> {
     let data = fs::read(path)?;
     let corrupt = |what: &str| {
         io::Error::new(
@@ -444,27 +578,28 @@ fn apply_segment(
         return Err(corrupt("length does not match file size"));
     }
     let payload = &data[13..payload_end];
-    let expected_crc = u32::from_le_bytes([
-        data[payload_end],
-        data[payload_end + 1],
-        data[payload_end + 2],
-        data[payload_end + 3],
-    ]);
+    let checksum = data
+        .get(payload_end..)
+        .and_then(|rest| rest.get(..4))
+        .ok_or_else(|| corrupt("missing checksum"))?;
+    let expected_crc = u32::from_le_bytes(
+        checksum
+            .try_into()
+            .map_err(|_| corrupt("missing checksum"))?,
+    );
     if crc32fast::hash(payload) != expected_crc {
         return Err(corrupt("checksum mismatch"));
     }
     let mut at = 0usize;
     for _ in 0..count {
-        if at.saturating_add(4) > payload.len() {
-            return Err(corrupt("truncated row table"));
-        }
-        let len = u32::from_le_bytes([
-            payload[at],
-            payload[at + 1],
-            payload[at + 2],
-            payload[at + 3],
-        ]) as usize;
-        at += 4;
+        let head = payload
+            .get(at..)
+            .and_then(|rest| rest.get(..4))
+            .ok_or_else(|| corrupt("truncated row table"))?;
+        let len = u32::from_le_bytes(head.try_into().expect("row length has four bytes")) as usize;
+        at = at
+            .checked_add(4)
+            .ok_or_else(|| corrupt("row table overflows"))?;
         let end = at
             .checked_add(len)
             .ok_or_else(|| corrupt("row length overflows"))?;
@@ -557,6 +692,51 @@ mod tests {
         assert!(store.read_scope(scope).unwrap().rows.is_empty());
         store.seal().unwrap();
         assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn cached_reads_follow_new_tail_rows_and_seals() {
+        let layout = layout("cache");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([11; 16]);
+        store.append_rows(scope, &[row(2, 1)]).unwrap();
+        assert_eq!(store.read_scope(scope).unwrap().rows[0].edges[0].target, 2);
+        // A later append is visible from the newly decoded tail bytes only.
+        store.append_rows(scope, &[row(6, 7)]).unwrap();
+        let data = store.read_scope(scope).unwrap();
+        assert_eq!(data.rows.len(), 1);
+        assert_eq!(data.rows[0].edges[0].target, 6);
+        // Sealing moves the same rows into a segment; the view must not change.
+        store.seal().unwrap();
+        let data = store.read_scope(scope).unwrap();
+        assert_eq!(data.rows.len(), 1);
+        assert_eq!(data.rows[0].edges[0].target, 6);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn repeated_reads_do_not_redecode_sealed_segments() {
+        let layout = layout("cache_segments");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([12; 16]);
+        let segment_reads = || {
+            let cache = cache_for(&store.dir);
+            let cache = lock(&cache);
+            cache.segment_reads
+        };
+        store.append_rows(scope, &[row(2, 1)]).unwrap();
+        assert_eq!(segment_reads(), 0, "tail rows need no segment decode");
+        store.read_scope(scope).unwrap();
+        assert_eq!(segment_reads(), 0);
+        store.seal().unwrap();
+        store.read_scope(scope).unwrap();
+        assert_eq!(segment_reads(), 1, "the new segment is decoded once");
+        store.read_scope(scope).unwrap();
+        assert_eq!(segment_reads(), 1, "a repeat read reuses the cache");
+        store.append_rows(scope, &[row(3, 1)]).unwrap();
+        store.read_scope(scope).unwrap();
+        assert_eq!(segment_reads(), 1, "a new tail row needs no segment decode");
         let _ = fs::remove_dir_all(layout.root());
     }
 
