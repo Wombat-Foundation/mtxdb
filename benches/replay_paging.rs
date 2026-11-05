@@ -298,7 +298,9 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
                             .sum::<u64>(),
                         Ordering::Relaxed,
                     );
-                    _lease.advance(page.through_lsn);
+                    _lease
+                        .advance(page.through_lsn)
+                        .expect("benchmarks run without a replay-lease cap");
                     cursor = page.next_cursor;
                 } else if done_before_read == worker_count {
                     break;
