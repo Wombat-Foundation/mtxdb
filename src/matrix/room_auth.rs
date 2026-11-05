@@ -443,8 +443,15 @@ impl RoomAuth {
         report.closure_problems = closure.problems;
 
         let next = events.counter(db)?;
+        // Read the AUTH family once. Asking for one row per short id replays
+        // the append-only graph store O(events) times.
+        let auth_rows: HashSet<u32> = adjacency
+            .family_rows(db, AUTH)?
+            .into_iter()
+            .map(|(owner, _)| owner)
+            .collect();
         for short_id in 1..next {
-            if adjacency.family_edges(db, short_id, AUTH)?.is_none() {
+            if !auth_rows.contains(&short_id) {
                 report.missing_parents.push(self.label(db, short_id)?);
             }
         }
