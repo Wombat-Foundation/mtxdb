@@ -3,7 +3,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use crate::database::Database;
+    use crate::database::{Database, DatabaseTransaction};
     use crate::interop::{
         auth_counter_record_id, auth_reverse_record_id, decode_verdict, encode_auth_counter,
         encode_verdict, event_record_id, event_verdict_collection_id, room_auth_collection_id,
@@ -695,13 +695,37 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!gen_swap:example.com";
         let index = RoomFlagIndex::new(room_id);
+        let tx = db.begin_transaction();
+        seed_single_event_room(&tx, room_id);
+        tx.commit().unwrap();
+
+        // Initial unindexed state
+        let initial_meta = index.meta(&db).unwrap();
+        assert_eq!(initial_meta.generation, 1);
+
+        let count = index.rebuild(&db).unwrap();
+        assert_eq!(count, 1);
+        let meta1 = index.meta(&db).unwrap();
+        assert_eq!(meta1.generation, 2);
+        assert_eq!(meta1.max_short_id, 1);
+        assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
+
+        // Second rebuild should increment generation to 3
+        let count2 = index.rebuild(&db).unwrap();
+        assert_eq!(count2, 1);
+        let meta2 = index.meta(&db).unwrap();
+        assert_eq!(meta2.generation, 3);
+        assert_eq!(meta2.max_short_id, 1);
+        assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
+    }
+
+    /// Seeds a room with one event (`$ev1:example.com`, auth counter 1) so the
+    /// rebuild tests start from the same minimal authorised-event state.
+    fn seed_single_event_room(tx: &DatabaseTransaction<'_>, room_id: &[u8]) {
         let auth_col = room_auth_collection_id(room_id);
         let event_col = room_event_collection_id(room_id);
-
         let ev1 = b"$ev1:example.com";
         let node1 = event_record_id(ev1);
-
-        let tx = db.begin_transaction();
         tx.put(
             ShardType::Edges,
             auth_col,
@@ -723,26 +747,6 @@ mod tests {
             &NodeData::new(bytes::Bytes::from_static(b"ev1 body")),
         )
         .unwrap();
-        tx.commit().unwrap();
-
-        // Initial unindexed state
-        let initial_meta = index.meta(&db).unwrap();
-        assert_eq!(initial_meta.generation, 1);
-
-        let count = index.rebuild(&db).unwrap();
-        assert_eq!(count, 1);
-        let meta1 = index.meta(&db).unwrap();
-        assert_eq!(meta1.generation, 2);
-        assert_eq!(meta1.max_short_id, 1);
-        assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
-
-        // Second rebuild should increment generation to 3
-        let count2 = index.rebuild(&db).unwrap();
-        assert_eq!(count2, 1);
-        let meta2 = index.meta(&db).unwrap();
-        assert_eq!(meta2.generation, 3);
-        assert_eq!(meta2.max_short_id, 1);
-        assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
     }
 
     fn assert_noop_stage_is_fenced_by_meta(db: &Database, index: &RoomFlagIndex) {
@@ -794,34 +798,8 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!concurrent:example.com";
         let index = RoomFlagIndex::new(room_id);
-        let auth_col = room_auth_collection_id(room_id);
-        let event_col = room_event_collection_id(room_id);
-
-        let ev1 = b"$ev1:example.com";
-        let node1 = event_record_id(ev1);
-
         let tx = db.begin_transaction();
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_counter_record_id(),
-            &NodeData::new(bytes::Bytes::from(encode_auth_counter(1).to_vec())),
-        )
-        .unwrap();
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_reverse_record_id(1),
-            &NodeData::new(bytes::Bytes::from_static(ev1)),
-        )
-        .unwrap();
-        tx.put(
-            ShardType::EventDag,
-            event_col,
-            node1,
-            &NodeData::new(bytes::Bytes::from_static(b"ev1 body")),
-        )
-        .unwrap();
+        seed_single_event_room(&tx, room_id);
         index
             .stage(&tx, &[FlagChange::set(1, Flag::Present)])
             .unwrap();
@@ -913,34 +891,8 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!rebuild_race:example.com";
         let index = RoomFlagIndex::new(room_id);
-        let auth_col = room_auth_collection_id(room_id);
-        let event_col = room_event_collection_id(room_id);
-
-        let ev1 = b"$ev1:example.com";
-        let node1 = event_record_id(ev1);
-
         let tx = db.begin_transaction();
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_counter_record_id(),
-            &NodeData::new(bytes::Bytes::from(encode_auth_counter(1).to_vec())),
-        )
-        .unwrap();
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_reverse_record_id(1),
-            &NodeData::new(bytes::Bytes::from_static(ev1)),
-        )
-        .unwrap();
-        tx.put(
-            ShardType::EventDag,
-            event_col,
-            node1,
-            &NodeData::new(bytes::Bytes::from_static(b"ev1 body")),
-        )
-        .unwrap();
+        seed_single_event_room(&tx, room_id);
         index
             .stage(&tx, &[FlagChange::set(1, Flag::Present)])
             .unwrap();
@@ -997,34 +949,8 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!crash:example.com";
         let index = RoomFlagIndex::new(room_id);
-        let auth_col = room_auth_collection_id(room_id);
-        let event_col = room_event_collection_id(room_id);
-
-        let ev1 = b"$ev1:example.com";
-        let node1 = event_record_id(ev1);
-
         let tx = db.begin_transaction();
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_counter_record_id(),
-            &NodeData::new(bytes::Bytes::from(encode_auth_counter(1).to_vec())),
-        )
-        .unwrap();
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_reverse_record_id(1),
-            &NodeData::new(bytes::Bytes::from_static(ev1)),
-        )
-        .unwrap();
-        tx.put(
-            ShardType::EventDag,
-            event_col,
-            node1,
-            &NodeData::new(bytes::Bytes::from_static(b"ev1 body")),
-        )
-        .unwrap();
+        seed_single_event_room(&tx, room_id);
         tx.commit().unwrap();
 
         // 1. Target generation for a rebuild starting from default generation 1 is generation 2.
