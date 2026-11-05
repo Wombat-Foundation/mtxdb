@@ -122,10 +122,6 @@ jobs:
         include:
           - arch: ppc64le
             page_size: 4096
-          # Known failing: cargo cannot resolve the pinned rezzy git commit
-          # inside the armv7 QEMU guest ("revspec ... not found"). The guest
-          # also logs EOVERFLOW (os error 75) from rustup, which points at
-          # 32-bit stat() on 64-bit inodes; not yet confirmed as the cause.
           - arch: armv7
             page_size: 4096
           - arch: riscv64
@@ -141,9 +137,17 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
           distro: ubuntu24.04
+          # armv7 runs a 32-bit userspace on the host's 64-bit kernel. The
+          # workspace filesystem hands out inode numbers that don't fit in
+          # 32-bit `ino_t`, so readdir() fails with EOVERFLOW; libgit2 then
+          # walks away thinking the pinned rezzy commit does not exist
+          # ("revspec ... not found"). A tmpfs has small inode numbers, so
+          # keep Cargo's git/registry caches there instead of on the mount.
+          dockerRunArgs: --tmpfs /opt/cargo:size=2g
           env: |
             RUSTUP_TOOLCHAIN: stable
             RUSTC_WRAPPER: ""
+            CARGO_HOME: /opt/cargo
             QEMU_PAGESIZE: ${{ matrix.page_size }}
             CARGO_NET_GIT_FETCH_WITH_CLI: "true"
           install: |
