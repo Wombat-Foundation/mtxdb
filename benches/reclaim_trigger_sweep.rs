@@ -2,11 +2,15 @@
 //! held replay lease, on synthetic data only.
 //!
 //! Per setting it reports writer throughput, `WouldBlock` refusals, reader
-//! latency (p50/p99) and reader `WouldBlock` rate, reclaim count (a sync that
-//! shrank the WAL), reclaim sync time, and peak segment fill. The trigger is
-//! validated against the emergency boundary (three quarters of the cap), so an
-//! unlimited trigger is not expressible: the largest accepted trigger is the
-//! closest control. Results characterize this host, not other hardware.
+//! latency in nanoseconds (p50/p99/max, split by whether a sync was in flight
+//! when the read started), reader `WouldBlock` count, reads that missed the
+//! newest published id ("stale"), syncs where a reclaim was due (WAL above the
+//! trigger) versus those that shrank the WAL, reclaim sync time, and peak
+//! segment fill. `N` readers chase the newest committed ids. A due sync that
+//! did not shrink the WAL is a blocked reclaim, e.g. by a held lease. The
+//! trigger is validated against the emergency boundary (three quarters of the
+//! cap), so an unlimited trigger is not expressible: the largest accepted
+//! trigger is the closest control. Results characterize this host only.
 //!
 //! ```text
 //! MTXDB_BENCH_ROOT=/run/media/shane/shane4tb-ent/bench-scratch \
@@ -14,7 +18,7 @@
 //! ```
 //!
 //! Knobs: `MTXDB_RTS_SECS` (per run, default 6), `MTXDB_RTS_RUNS` (default 3),
-//! `MTXDB_RTS_COMMITS` (commits per sync, default 100), `MTXDB_RTS_BATCH`
+//! `MTXDB_RTS_READERS` (default 2), `MTXDB_RTS_COMMITS` (commits per sync, default 100), `MTXDB_RTS_BATCH`
 //! (default 20), `MTXDB_RTS_PAYLOAD` (default 2048), `MTXDB_BENCH_ROOT`.
 #![allow(
     clippy::arithmetic_side_effects,
@@ -23,7 +27,7 @@
     clippy::uninlined_format_args
 )]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mtxdb::config::RuntimeConfig;
@@ -50,7 +54,7 @@ fn is_would_block(error: &StorageError) -> bool {
     matches!(error, StorageError::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock)
 }
 
-fn pct(sorted: &[u128], p: f64) -> u128 {
+fn pct(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
@@ -64,14 +68,27 @@ struct Run {
     refused_commits: u64,
     reads: u64,
     refused_reads: u64,
-    read_us: Vec<u128>,
+    missing_new: u64,
+    /// Read latencies in nanoseconds, split by whether a sync (and so a
+    /// possible reclaim) was in flight when the read started.
+    calm_ns: Vec<u64>,
+    sync_ns: Vec<u64>,
+    /// Syncs that began with the WAL above the trigger (a reclaim was due).
+    due: u64,
+    /// Due syncs after which the WAL had shrunk.
     reclaims: u64,
     reclaim_ms: Vec<f64>,
     peak_wal: u64,
     secs: f64,
 }
 
-fn run_once(root: &std::path::Path, trigger: u64, lease: bool, secs: u64) -> (Run, u64) {
+fn run_once(
+    root: &std::path::Path,
+    trigger: u64,
+    lease: bool,
+    secs: u64,
+    readers: usize,
+) -> (Run, u64) {
     let _ = std::fs::remove_dir_all(root);
     let config = RuntimeConfig {
         reclaim_trigger_bytes: Some(trigger),
@@ -86,8 +103,6 @@ fn run_once(root: &std::path::Path, trigger: u64, lease: bool, secs: u64) -> (Ru
     let wal = db.layout().shared_wal_path();
     let wal_len = || std::fs::metadata(&wal).map_or(0, |m| m.len());
 
-    // Seed so the reader has something to find, then optionally hold a lease
-    // from a snapshot taken before the measured writes.
     let txn = db.begin_transaction();
     for i in 0..64 {
         txn.put(ShardType::EventDag, COLLECTION, node_id(i), &data)
@@ -103,26 +118,49 @@ fn run_once(root: &std::path::Path, trigger: u64, lease: bool, secs: u64) -> (Ru
     });
 
     let stop = AtomicBool::new(false);
-    let reader_ids: Vec<NodeId> = (0..16).map(node_id).collect();
+    let syncing = AtomicBool::new(false);
+    // Highest id a commit has published. Readers chase it, so they read newly
+    // committed records, and the newest id must be visible once published.
+    let latest = AtomicU64::new(1000);
     let mut run = Run::default();
     let started = Instant::now();
     let deadline = Duration::from_secs(secs);
-    let reader_store = db.pool(ShardType::EventDag);
-    let (reads, refused_reads, read_us) = std::thread::scope(|scope| {
-        let reader = scope.spawn(|| {
-            let (mut reads, mut refused, mut lat) = (0u64, 0u64, Vec::new());
-            while !stop.load(Ordering::Relaxed) {
-                let t = Instant::now();
-                match reader_store.get_read_committed(&COLLECTION, &reader_ids) {
-                    Ok(_) => {}
-                    Err(e) if is_would_block(&e) => refused += 1,
-                    Err(e) => panic!("read: {e}"),
-                }
-                lat.push(t.elapsed().as_micros());
-                reads += 1;
-            }
-            (reads, refused, lat)
-        });
+    let store = db.pool(ShardType::EventDag);
+    let per_reader = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..readers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut r = Run::default();
+                    while !stop.load(Ordering::Relaxed) {
+                        let top = latest.load(Ordering::Acquire);
+                        let ids: Vec<NodeId> =
+                            (top.saturating_sub(15)..=top).map(node_id).collect();
+                        let in_sync = syncing.load(Ordering::Acquire);
+                        let t = Instant::now();
+                        let got = store.get_read_committed(&COLLECTION, &ids);
+                        let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        match got {
+                            Ok(rows) => {
+                                if top > 1000 && rows.last().is_some_and(Option::is_none) {
+                                    r.missing_new += 1;
+                                }
+                            }
+                            Err(e) if is_would_block(&e) => r.refused_reads += 1,
+                            Err(e) => panic!("read: {e}"),
+                        }
+                        // A sync that ended mid-read still counts as calm; the
+                        // split is by the state at read start.
+                        if in_sync || syncing.load(Ordering::Acquire) {
+                            r.sync_ns.push(ns);
+                        } else {
+                            r.calm_ns.push(ns);
+                        }
+                        r.reads += 1;
+                    }
+                    r
+                })
+            })
+            .collect();
         let mut next = 1000u64;
         while started.elapsed() < deadline {
             for _ in 0..commits_per_sync {
@@ -139,7 +177,10 @@ fn run_once(root: &std::path::Path, trigger: u64, lease: bool, secs: u64) -> (Ru
                     next += 1;
                 }
                 match staged.then(|| txn.commit()) {
-                    Some(Ok(())) => run.commits += 1,
+                    Some(Ok(())) => {
+                        run.commits += 1;
+                        latest.store(next - 1, Ordering::Release);
+                    }
                     Some(Err(e)) if is_would_block(&e) => run.refused_commits += 1,
                     Some(Err(e)) => panic!("commit: {e}"),
                     None => run.refused_commits += 1,
@@ -148,22 +189,35 @@ fn run_once(root: &std::path::Path, trigger: u64, lease: bool, secs: u64) -> (Ru
             }
             let before = wal_len();
             run.peak_wal = run.peak_wal.max(before);
+            let due = before > trigger;
             let t = Instant::now();
+            syncing.store(true, Ordering::Release);
             for pool in ShardType::ALL {
                 db.pool(pool).sync_all().expect("sync_all");
             }
-            if wal_len() < before {
-                run.reclaims += 1;
-                run.reclaim_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            syncing.store(false, Ordering::Release);
+            if due {
+                run.due += 1;
+                if wal_len() < before {
+                    run.reclaims += 1;
+                    run.reclaim_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                }
             }
         }
         stop.store(true, Ordering::Relaxed);
-        reader.join().expect("reader")
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("reader"))
+            .collect::<Vec<_>>()
     });
     run.secs = started.elapsed().as_secs_f64();
-    run.reads = reads;
-    run.refused_reads = refused_reads;
-    run.read_us = read_us;
+    for r in per_reader {
+        run.reads += r.reads;
+        run.refused_reads += r.refused_reads;
+        run.missing_new += r.missing_new;
+        run.calm_ns.extend(r.calm_ns);
+        run.sync_ns.extend(r.sync_ns);
+    }
     drop(db);
     (run, cap)
 }
@@ -171,13 +225,15 @@ fn run_once(root: &std::path::Path, trigger: u64, lease: bool, secs: u64) -> (Ru
 fn main() {
     let secs = env_u64("MTXDB_RTS_SECS", 6);
     let runs = env_u64("MTXDB_RTS_RUNS", 3);
+    let readers = usize::try_from(env_u64("MTXDB_RTS_READERS", 2))
+        .unwrap()
+        .max(1);
     let base = std::env::var_os("MTXDB_BENCH_ROOT")
         .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
     std::fs::create_dir_all(&base).expect("bench root");
     let root = base.join(format!("mtxdb_bench_rts_{}", std::process::id()));
 
-    // Probe the live cap, then derive the settings from it.
-    let (_, cap) = run_once(&root, 1 << 20, false, 0);
+    let (_, cap) = run_once(&root, 1 << 20, false, 0, 1);
     let max_trigger = cap - cap / 4 - 1;
     let settings = [
         ("quarter", cap / 4),
@@ -185,28 +241,20 @@ fn main() {
         ("max(~3/4)", max_trigger),
     ];
     println!(
-        "segment cap {} MiB; {secs}s x {runs} runs per row",
+        "segment cap {} MiB; {secs}s x {runs} runs per row; {readers} reader(s); latencies in ns",
         cap >> 20
     );
     println!(
-        "{:<10} {:<5} {:>9} {:>8} {:>8} {:>9} {:>9} {:>8} {:>8} {:>9} {:>9}",
-        "trigger",
-        "lease",
-        "commit/s",
-        "wb-commit",
-        "reclaims",
-        "reclaim ms",
-        "peak MiB",
-        "reads/s",
-        "wb-read",
-        "p50 us",
-        "p99 us"
+        "{:<10} {:<5} {:>8} {:>7} {:>4} {:>4} {:>7} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10}",
+        "trigger", "lease", "commit/s", "wb-cmt", "due", "recl", "recl ms", "peakMiB", "reads/s",
+        "wb-read", "stale", "calm p50", "calm p99", "sync p99", "sync max", "calm max"
     );
     for (name, trigger) in settings {
         for lease in [false, true] {
             for n in 0..runs {
-                let (mut r, _) = run_once(&root, trigger, lease, secs);
-                r.read_us.sort_unstable();
+                let (mut r, _) = run_once(&root, trigger, lease, secs, readers);
+                r.calm_ns.sort_unstable();
+                r.sync_ns.sort_unstable();
                 r.reclaim_ms.sort_by(f64::total_cmp);
                 let med = r
                     .reclaim_ms
@@ -214,18 +262,23 @@ fn main() {
                     .copied()
                     .unwrap_or(0.0);
                 println!(
-                    "{:<10} {:<5} {:>9.0} {:>8} {:>8} {:>9.0} {:>9} {:>8.0} {:>8} {:>9} {:>9}  run {n}",
+                    "{:<10} {:<5} {:>8.0} {:>7} {:>4} {:>4} {:>7.0} {:>7} {:>8.0} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10}  run {n}",
                     name,
                     if lease { "held" } else { "none" },
                     r.commits as f64 / r.secs,
                     r.refused_commits,
+                    r.due,
                     r.reclaims,
                     med,
                     r.peak_wal >> 20,
                     r.reads as f64 / r.secs,
                     r.refused_reads,
-                    pct(&r.read_us, 0.5),
-                    pct(&r.read_us, 0.99),
+                    r.missing_new,
+                    pct(&r.calm_ns, 0.5),
+                    pct(&r.calm_ns, 0.99),
+                    pct(&r.sync_ns, 0.99),
+                    r.sync_ns.last().copied().unwrap_or(0),
+                    r.calm_ns.last().copied().unwrap_or(0),
                 );
             }
         }
