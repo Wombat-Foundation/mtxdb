@@ -115,9 +115,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.9.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877bf67ac8e52449eb2f9e98a344ea163beb70dd1f9eebe3cc5357dcfeaee4df"
+checksum = "375989decec1a0fa424442bed520fa12ede43a48475ce8c7417d2c69b32b5f6b"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -195,9 +195,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.3"
+version = "1.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
+checksum = "5f97d3416d5337d15c4b0d78c8c91df922ca143f57ec20e2d1c188333047ef04"
 dependencies = [
  "cfg-if",
 ]
@@ -513,7 +513,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1172b82a30016ada512cbb4450dccc0b6f64e438"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#aaef4cb9a73127e55bf6a436bf40f35a5c36788c"
 dependencies = [
  "base64",
  "blake3",
@@ -528,7 +528,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1172b82a30016ada512cbb4450dccc0b6f64e438"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#aaef4cb9a73127e55bf6a436bf40f35a5c36788c"
 dependencies = [
  "ryu",
 ]
@@ -536,7 +536,7 @@ dependencies = [
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1172b82a30016ada512cbb4450dccc0b6f64e438"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#aaef4cb9a73127e55bf6a436bf40f35a5c36788c"
 dependencies = [
  "tracing",
 ]
@@ -544,7 +544,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1172b82a30016ada512cbb4450dccc0b6f64e438"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#aaef4cb9a73127e55bf6a436bf40f35a5c36788c"
 dependencies = [
  "base64",
  "rezzy-log",
@@ -622,9 +622,9 @@ checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.3"
+version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
+checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "subtle"

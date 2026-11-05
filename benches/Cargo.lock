@@ -772,7 +772,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1172b82a30016ada512cbb4450dccc0b6f64e438"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#aaef4cb9a73127e55bf6a436bf40f35a5c36788c"
 dependencies = [
  "tracing",
 ]
@@ -780,7 +780,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1172b82a30016ada512cbb4450dccc0b6f64e438"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#aaef4cb9a73127e55bf6a436bf40f35a5c36788c"
 dependencies = [
  "base64 0.23.1",
  "rezzy-log",
