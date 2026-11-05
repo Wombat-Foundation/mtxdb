@@ -2110,7 +2110,9 @@ pub struct JournalCoordinator {
     /// [`RECLAIM_TRIGGER_LEN`].
     reclaim_trigger_len: AtomicU64,
     /// Optional cap, in bytes, on the history one replay lease may retain.
-    /// [`u64::MAX`] means unlimited (the default).
+    /// [`u64::MAX`] means unlimited (the default). Retention is measured from
+    /// the byte after the last complete group at or below the lease's pinned
+    /// LSN through the current end of the segment; the file header is excluded.
     replay_lease_cap: AtomicU64,
     /// Replay leases revoked by the retention cap.
     replay_leases_revoked: AtomicU64,
@@ -3101,7 +3103,8 @@ impl JournalCoordinator {
 
     /// Set the optional cap, in bytes, on the history one replay lease may
     /// retain. `None` keeps retention unlimited, matching `PostgreSQL`'s default
-    /// for `max_slot_wal_keep_size`.
+    /// for `max_slot_wal_keep_size`. See `retained_bytes_from` for the measured
+    /// range and `revoke_over_cap_leases` for the selection.
     pub(crate) fn configure_replay_lease_cap(&self, cap: Option<u64>) {
         self.replay_lease_cap
             .store(cap.unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -3159,9 +3162,11 @@ impl JournalCoordinator {
             .max()
     }
 
-    /// Revoke every active lease whose pinned history exceeds the configured
-    /// cap. Runs with the journal lock held, so it sees a stable segment length
-    /// and shares the reclaim lock order `journal -> pins`.
+    /// Revoke every active lease whose retained suffix exceeds `cap`. Each
+    /// lease is measured independently from its own pin, so a newer lease can
+    /// survive while an older one is revoked. A lease retaining exactly `cap`
+    /// is kept. Runs with the journal lock held, so it sees a stable segment
+    /// length and shares the reclaim lock order `journal -> pins`.
     fn revoke_over_cap_leases(&self, journal: &Journal) {
         let cap = self.replay_lease_cap.load(Ordering::Relaxed);
         if cap == u64::MAX {
@@ -5368,8 +5373,10 @@ impl Journal {
     }
 
     /// Bytes a replay cursor pinned at `lsn` still needs: the retained suffix
-    /// beginning after the last group at or below it. Falls back to the whole
-    /// segment when the directory cannot be trusted.
+    /// beginning after the last group whose `last_lsn` is at or below `lsn`,
+    /// through the current end of the segment. The file header is excluded, and
+    /// a pin at or beyond the last group retains zero. Falls back to the whole
+    /// segment length when the directory cannot be trusted.
     fn retained_bytes_from(&self, lsn: u64) -> u64 {
         if !self.directory_matches_file() {
             return self.file_len;

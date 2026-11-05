@@ -2346,6 +2346,47 @@ fn replay_lease_cap_revokes_a_lease_that_retains_too_much() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
 
+/// The cap is per lease: at the next reclaim, an older lease over the limit is
+/// revoked while a newer lease retaining exactly the cap is kept.
+#[test]
+fn replay_lease_cap_revokes_only_leases_over_the_limit() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_selective");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let newer_cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let newer = coordinator.pin_replay_cursor(&newer_cursor).unwrap();
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    let retained_by_newer = coordinator.replay_lease_lag_bytes().unwrap();
+    assert!(
+        retained_by_newer > 0,
+        "the newer lease retains the new group"
+    );
+
+    // Exactly at the cap: kept. The older lease retains more than that.
+    coordinator.configure_replay_lease_cap(Some(retained_by_newer));
+    let older_cursor = coordinator.replay_cursor(0).unwrap();
+    let older = coordinator.pin_replay_cursor(&older_cursor).unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(older.is_revoked());
+    assert!(!newer.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 1);
+    assert_eq!(coordinator.replay_lease_count(), 1);
+    let error = coordinator.changes_since(&older_cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    // The surviving lease still reads the retained group and can advance.
+    let page = coordinator.changes_since(&newer_cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+    assert_eq!(page.groups[0].last_lsn, second.last_lsn);
+    newer.advance(second.last_lsn).unwrap();
+}
+
 /// Dropping a lease releases its pin without revoking it; the revoked counter
 /// only tracks cap-driven invalidations.
 #[test]
