@@ -101,11 +101,23 @@ const MAX_SEGMENT_LEN: u64 = (256 << 20) + FILE_HEADER_LEN as u64;
 /// [`JournalCoordinator::set_reclaim_trigger_len`].
 pub(crate) const RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN / 4;
 
+/// Segment length at which a stalled reclaim is treated as an emergency: three
+/// quarters of `cap`. Validation and stall reporting share this calculation.
+pub(crate) const fn emergency_len_for_cap(cap: u64) -> u64 {
+    cap.saturating_sub(cap / 4)
+}
+
 /// Largest threshold that ensures forced reclaim starts by the emergency-zone
-/// boundary. The predicate fires only once `len > trigger`, hence the minus 1.
-pub(crate) const MAX_RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN
-    .saturating_sub(MAX_SEGMENT_LEN / 4)
-    .saturating_sub(1);
+/// boundary of `cap`. The predicate fires only once `len > trigger`, hence the
+/// minus 1.
+pub(crate) const fn max_reclaim_trigger_for_cap(cap: u64) -> u64 {
+    emergency_len_for_cap(cap).saturating_sub(1)
+}
+
+/// Largest threshold accepted from runtime configuration for the default
+/// segment cap. [`JournalCoordinator::configure_reclaim_trigger_len`] further
+/// limits it by the coordinator's live cap.
+pub(crate) const MAX_RECLAIM_TRIGGER_LEN: u64 = max_reclaim_trigger_for_cap(MAX_SEGMENT_LEN);
 
 /// A durable mutation represented in a journal group.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2774,7 +2786,7 @@ impl JournalCoordinator {
         let epoch = self.coverage_epoch.load(Ordering::Acquire);
         let mut stall = self.reclaim_stall.lock();
         let previous = *stall;
-        let emergency = len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4);
+        let emergency = len >= emergency_len_for_cap(journal.segment_cap);
         // The first reclaim to leave the segment over the trigger is normal:
         // pools sync one after another, so the first to cross it cannot yet
         // reclaim what the others have not reported. It is only worth saying
@@ -2793,9 +2805,7 @@ impl JournalCoordinator {
             reported: already_reported || report,
         });
         let entered_emergency = emergency
-            && previous.is_some_and(|old| {
-                old.at_len < journal.segment_cap.saturating_sub(journal.segment_cap / 4)
-            });
+            && previous.is_some_and(|old| old.at_len < emergency_len_for_cap(journal.segment_cap));
         if report {
             self.reclaim_stalls.fetch_add(1, Ordering::Relaxed);
         }
@@ -2816,7 +2826,7 @@ impl JournalCoordinator {
             *self.replay_lease_stall.lock() = None;
             return;
         }
-        let emergency = len >= journal.segment_cap.saturating_sub(journal.segment_cap / 4);
+        let emergency = len >= emergency_len_for_cap(journal.segment_cap);
         let mut stall = self.replay_lease_stall.lock();
         let previous = *stall;
         let grace_from = previous.map_or(len, |old| old.grace_from);
@@ -3932,8 +3942,7 @@ impl JournalCoordinator {
     /// The segment length past which a stalled reclaim is treated as an
     /// emergency: three quarters of the cap.
     fn emergency_len(&self) -> u64 {
-        let cap = self.segment_cap();
-        cap.saturating_sub(cap / 4)
+        emergency_len_for_cap(self.segment_cap())
     }
 
     /// Whether the segment has reached the emergency zone, where a checkpoint
@@ -3998,18 +4007,20 @@ impl JournalCoordinator {
     /// Set the segment length above which a sync forces a reclaiming
     /// checkpoint, from runtime configuration. Unlike
     /// [`Self::set_reclaim_trigger_len`] this is always available and rejects
-    /// values outside `1..=MAX_RECLAIM_TRIGGER_LEN`, which keeps the threshold
-    /// below the emergency-zone boundary.
+    /// values outside `1..=MAX_RECLAIM_TRIGGER_LEN`, further limited by this
+    /// coordinator's live segment cap so the threshold stays below its
+    /// emergency-zone boundary.
     ///
     /// # Errors
     /// Returns `InvalidInput` for zero or a threshold at/above the emergency
     /// boundary.
     pub(crate) fn configure_reclaim_trigger_len(&self, len: u64) -> io::Result<()> {
-        if len == 0 || len > MAX_RECLAIM_TRIGGER_LEN {
+        let max = max_reclaim_trigger_for_cap(self.segment_cap()).min(MAX_RECLAIM_TRIGGER_LEN);
+        if len == 0 || len > max {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "reclaim trigger must be in 1..={MAX_RECLAIM_TRIGGER_LEN} bytes (below the emergency-zone boundary), got {len}"
+                    "reclaim trigger must be in 1..={max} bytes (below the emergency-zone boundary), got {len}"
                 ),
             ));
         }

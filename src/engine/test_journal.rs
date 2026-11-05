@@ -1,7 +1,7 @@
 use super::{
     changes_since_full_scans, set_changes_since_before_read_hook,
     set_changes_since_force_untrusted, BackgroundFailure, BackgroundState, GroupCommitConfig,
-    Journal, JournalCoordinator, Mutation,
+    Journal, JournalCoordinator, Mutation, MAX_RECLAIM_TRIGGER_LEN,
 };
 use super::{TxnStage, TxnStageState};
 use std::fs;
@@ -1117,6 +1117,43 @@ fn open_shared_arc(label: &str) -> Arc<JournalCoordinator> {
     let _ = fs::remove_file(&path);
     let (journal, scan) = Journal::open_shared(&path).unwrap();
     Arc::new(JournalCoordinator::new(journal, &scan))
+}
+
+#[test]
+fn configured_reclaim_trigger_stays_below_the_live_emergency_boundary() {
+    let coordinator = open_shared_arc("configured_reclaim_trigger_boundary");
+
+    coordinator
+        .configure_reclaim_trigger_len(MAX_RECLAIM_TRIGGER_LEN)
+        .unwrap();
+    assert_eq!(coordinator.reclaim_trigger_len(), MAX_RECLAIM_TRIGGER_LEN);
+
+    let over = MAX_RECLAIM_TRIGGER_LEN.saturating_add(1);
+    let error = coordinator.configure_reclaim_trigger_len(over).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        coordinator.reclaim_trigger_len(),
+        MAX_RECLAIM_TRIGGER_LEN,
+        "a rejected value must not change the trigger"
+    );
+
+    // A shrunk cap lowers the boundary even for a value below the
+    // compile-time ceiling.
+    coordinator.set_segment_cap(1024);
+    let shrunk_max = super::max_reclaim_trigger_for_cap(1024);
+    coordinator
+        .configure_reclaim_trigger_len(shrunk_max)
+        .unwrap();
+    assert_eq!(coordinator.reclaim_trigger_len(), shrunk_max);
+    assert!(coordinator
+        .configure_reclaim_trigger_len(shrunk_max.saturating_add(1))
+        .is_err());
+    assert!(
+        coordinator
+            .configure_reclaim_trigger_len(MAX_RECLAIM_TRIGGER_LEN)
+            .is_err(),
+        "the compile-time ceiling must not override a shrunk live cap"
+    );
 }
 
 fn publish(coordinator: &JournalCoordinator, node: u8, payload: &[u8]) -> super::CommitReceipt {

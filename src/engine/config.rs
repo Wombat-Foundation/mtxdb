@@ -37,7 +37,8 @@ pub struct RuntimeConfig {
     pub stats_enabled: bool,
     /// Segment length, in bytes, above which a sync forces a reclaiming
     /// checkpoint. `None` keeps the journal's built-in value. Must be in
-    /// `1..=MAX_RECLAIM_TRIGGER_LEN`.
+    /// `1..=MAX_RECLAIM_TRIGGER_LEN` and below the live segment cap's
+    /// emergency boundary.
     pub reclaim_trigger_bytes: Option<u64>,
 }
 
@@ -311,6 +312,11 @@ mod tests {
             ..RuntimeConfig::default()
         };
         assert!(direct.validate().is_err());
+        let direct_over = RuntimeConfig {
+            reclaim_trigger_bytes: Some(MAX_RECLAIM_TRIGGER_LEN.saturating_add(1)),
+            ..RuntimeConfig::default()
+        };
+        assert!(direct_over.validate().is_err());
     }
 
     #[test]
