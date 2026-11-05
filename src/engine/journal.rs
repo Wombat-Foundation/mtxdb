@@ -1835,7 +1835,7 @@ impl JournalCursor {
 /// it pins the original cursor rather than advancing with individual pages, so
 /// an interrupted or partially applied replay can safely resume from its
 /// starting snapshot.
-#[must_use = "dropping the replay lease allows journal reclaim to expire its cursor"]
+#[must_use = "dropping the replay lease removes its pin and lets reclaim pass the cursor"]
 pub struct JournalReplayLease {
     registry: Arc<ReplayLeaseRegistry>,
     id: u64,
@@ -2415,6 +2415,19 @@ impl JournalCoordinator {
         self.publish_signal
             .get()
             .and_then(|result| result.as_ref().ok())
+    }
+
+    /// Run the test-only reclaim hook; a no-op outside tests.
+    #[inline]
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn run_reclaim_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = self.reclaim_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
     }
 
     /// Advance the publish signal so a gated reader rescans. Called on a group
@@ -4441,13 +4454,7 @@ impl JournalCoordinator {
         // and a sync must not flush a handle to the replaced inode.
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
-        #[cfg(test)]
-        {
-            let hook = self.reclaim_hook.lock().clone();
-            if let Some(hook) = hook {
-                hook();
-            }
-        }
+        self.run_reclaim_hook();
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let reclaim = journal.reclaim_through(replay_limit)?;
         // The rewrite replaced the segment inode and moved its base LSN without
@@ -4467,6 +4474,7 @@ impl JournalCoordinator {
     ) -> io::Result<Reclaim> {
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
+        self.run_reclaim_hook();
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let blocked_by = (replay_limit == covered_lsn)
             .then_some(blocked_by)
