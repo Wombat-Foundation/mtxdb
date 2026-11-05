@@ -30,6 +30,11 @@
 //! verified, so a second process appending or truncating the same directory
 //! could leave that offset stale and a later append could cut the other
 //! writer's frames. Readers in other processes only read files and are safe.
+//!
+//! The store does not take that lock itself: [`CsrStore::open`] and the write
+//! methods are public, so the guarantee holds for callers that go through the
+//! `Database` (as the CSR adjacency layer does), not for code that opens a
+//! store directly. Such code must provide its own exclusion.
 //! The in-process tests cover several handles in one process, not two writer
 //! processes.
 //!
