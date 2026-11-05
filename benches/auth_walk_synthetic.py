@@ -80,7 +80,9 @@ class Fixture:
         ]
         self.db = sqlite3.connect(":memory:")
         self.db.executescript("""
-            CREATE TABLE records (short INTEGER PRIMARY KEY, parents BLOB NOT NULL, children BLOB NOT NULL);
+            CREATE TABLE records (
+                short INTEGER PRIMARY KEY, parents BLOB NOT NULL, children BLOB NOT NULL
+            );
             CREATE TABLE event_auth (event_id TEXT NOT NULL, auth_id TEXT NOT NULL);
             CREATE INDEX event_auth_parent ON event_auth(auth_id);
         """)
@@ -239,7 +241,7 @@ def ephemeral(
         candidates, reverse = ancestors(fixture, seeds, True)
     else:
         candidates = cached_candidates
-        reverse: dict[int, list[int]] = {}
+        reverse = {}
         for child in sorted(candidates):
             for parent in fixture.forward(child):
                 reverse.setdefault(parent, []).append(child)
@@ -423,7 +425,9 @@ def main() -> None:
                 "incomplete_percent": args.incomplete_percent,
                 "python": __import__("sys").version,
                 "sqlite": sqlite3.sqlite_version,
-                "scope": "Python helper/algorithm comparison with synthetic SQLite adapter; no homeserver DB, mtxdb or Rust timing, no physical IO measurement",
+                "scope": "Python helper/algorithm comparison with synthetic SQLite "
+                "adapter; no homeserver DB, mtxdb or Rust timing, no physical IO "
+                "measurement",
             },
             indent=2,
         )
