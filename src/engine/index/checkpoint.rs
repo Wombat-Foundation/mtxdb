@@ -516,6 +516,7 @@ pub fn read_checkpoint_with_policy(
             return None;
         }
         body_offset = body_offset.checked_add(slots_len)?;
+        let mut occupied = 0_u32;
         for slot_bytes in buf
             .get(region..region.checked_add(slots_len)?)?
             .as_chunks::<8>()
@@ -525,6 +526,16 @@ pub fn read_checkpoint_with_policy(
             if !super::IndexEntry::valid_raw_slot(raw) {
                 return None;
             }
+            if !super::IndexEntry(raw).is_empty() {
+                occupied = occupied.checked_add(1)?;
+            }
+        }
+        // The body CRC check above normally catches a `slot_count` that
+        // disagrees with the actual slots, but `WriteOnly` skips it. Count the
+        // slots we just walked so an understated value cannot become the
+        // index's `len` and let inserts pass the load-factor threshold.
+        if occupied != entry.slot_count {
+            return None;
         }
         collections.push(LoadedCollection {
             collection_id: entry.collection_id,
@@ -758,6 +769,33 @@ mod tests {
         fs::write(&path, bytes).unwrap();
 
         assert!(read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_only_rejects_a_slot_count_that_understates_the_slots() {
+        let path = temp_checkpoint("understated-slot-count");
+        let index = LossyIndex::with_config(16, IndexConfig::default());
+        index.insert(&[0xA5; 16], 0, 128).unwrap();
+        let blob = index.serialize();
+        write_checkpoint(&path, 0x1234, 10, 0, &[([0xA1; 16], 0, &blob)], &[], &[]).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        let directory_at = CHECKPOINT_HEADER_LEN;
+        let directory_end = directory_at + COLLECTION_DIR_ENTRY_LEN;
+        let mut directory =
+            CollectionDirEntry::decode(&bytes[directory_at..directory_end]).unwrap();
+        assert_eq!(directory.slot_count, 1);
+        directory.slot_count = 0;
+        bytes[directory_at..directory_end].copy_from_slice(&directory.encode());
+        // Leave the body CRC stale: WriteOnly deliberately skips it, which is
+        // exactly the policy this understated count used to slip through.
+        fs::write(&path, bytes).unwrap();
+
+        assert!(
+            read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::WriteOnly).is_none(),
+            "an understated slot_count must not become the loaded index length"
+        );
         let _ = fs::remove_file(path);
     }
 

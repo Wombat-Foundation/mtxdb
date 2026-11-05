@@ -601,19 +601,199 @@ fn measure_forward_wa(
 
         let is_batch_flush = event_index.saturating_add(1).is_multiple_of(batch_size);
         if is_batch_flush || events_in_head == head_capacity {
-            total_written = total_written.saturating_add(current_head_bytes);
+            total_written = total_written
+                .saturating_add(current_head_bytes)
+                .saturating_add(2);
         }
 
         if events_in_head == head_capacity {
-            final_stored_bytes = final_stored_bytes.saturating_add(current_head_bytes);
+            final_stored_bytes = final_stored_bytes
+                .saturating_add(current_head_bytes)
+                .saturating_add(2);
             current_head_bytes = 0;
             events_in_head = 0;
         }
     }
 
-    final_stored_bytes = final_stored_bytes.saturating_add(current_head_bytes);
-    total_written = total_written.saturating_add(current_head_bytes);
+    if events_in_head > 0 {
+        final_stored_bytes = final_stored_bytes
+            .saturating_add(current_head_bytes)
+            .saturating_add(2);
+        total_written = total_written
+            .saturating_add(current_head_bytes)
+            .saturating_add(2);
+    }
     (total_written, final_stored_bytes)
+}
+
+struct ReverseWaState {
+    node_count: usize,
+    hub_threshold: usize,
+    in_degrees: Vec<u32>,
+    last_seen_child: Vec<u32>,
+    row_body_bytes: Vec<usize>,
+    chunk_body_bytes: Vec<usize>,
+    hub_bitmap_sets: HashMap<u32, BitmapSet>,
+    pending_children: HashMap<u32, Vec<u32>>,
+    touched_chunks: Vec<usize>,
+    touched_hubs: Vec<u32>,
+    total_written: usize,
+}
+
+impl ReverseWaState {
+    fn new(node_count: usize, hub_threshold: usize) -> Self {
+        Self {
+            node_count,
+            hub_threshold,
+            in_degrees: vec![0; node_count],
+            last_seen_child: vec![0; node_count],
+            row_body_bytes: vec![0; node_count],
+            chunk_body_bytes: vec![0; node_count.div_ceil(CHUNK_SIZE)],
+            hub_bitmap_sets: HashMap::new(),
+            // At usize::MAX no row can promote, so retaining children is wasteful.
+            pending_children: HashMap::new(),
+            touched_chunks: Vec::new(),
+            touched_hubs: Vec::new(),
+            total_written: 0,
+        }
+    }
+
+    fn add_edge(&mut self, child_short: u32, parent_short: u32) {
+        let parent_index = usize::try_from(parent_short).expect("fits in usize");
+        self.in_degrees[parent_index] = self.in_degrees[parent_index].saturating_add(1);
+        let degree = self.in_degrees[parent_index];
+        if usize::try_from(degree).expect("fits in usize") > self.hub_threshold {
+            self.add_hub_edge(child_short, parent_short, parent_index, degree);
+        } else {
+            self.add_csr_edge(child_short, parent_short, parent_index, degree);
+        }
+    }
+
+    fn add_hub_edge(
+        &mut self,
+        child_short: u32,
+        parent_short: u32,
+        parent_index: usize,
+        degree: u32,
+    ) {
+        let promotion_degree =
+            u32::try_from(self.hub_threshold.saturating_add(1)).unwrap_or(u32::MAX);
+        let bitmap = self
+            .hub_bitmap_sets
+            .entry(parent_short)
+            .or_insert_with(|| BitmapSet::new(BENCH_DOMAIN));
+        if degree == promotion_degree {
+            let chunk_idx = parent_index / CHUNK_SIZE;
+            self.chunk_body_bytes[chunk_idx] =
+                self.chunk_body_bytes[chunk_idx].saturating_sub(self.row_body_bytes[parent_index]);
+            self.row_body_bytes[parent_index] = 0;
+            push_unique(&mut self.touched_chunks, chunk_idx);
+            // Promotion replaces the whole CSR row with a bitmap row.
+            for previous in self
+                .pending_children
+                .remove(&parent_short)
+                .unwrap_or_default()
+            {
+                bitmap.insert(previous);
+            }
+        }
+        bitmap.insert(child_short);
+        push_unique(&mut self.touched_hubs, parent_short);
+    }
+
+    fn add_csr_edge(
+        &mut self,
+        child_short: u32,
+        parent_short: u32,
+        parent_index: usize,
+        degree: u32,
+    ) {
+        let last = if degree == 1 {
+            parent_short
+        } else {
+            self.last_seen_child[parent_index]
+        };
+        let encoded_len = if degree == 1 {
+            varint_length_u64(zigzag_encode(
+                i64::from(child_short)
+                    .checked_sub(i64::from(last))
+                    .expect("u32 difference fits i64"),
+            ))
+        } else {
+            varint_length(
+                child_short
+                    .checked_sub(last)
+                    .expect("children sorted ascending"),
+            )
+        };
+        let chunk_idx = parent_index / CHUNK_SIZE;
+        self.chunk_body_bytes[chunk_idx] =
+            self.chunk_body_bytes[chunk_idx].saturating_add(encoded_len);
+        self.row_body_bytes[parent_index] =
+            self.row_body_bytes[parent_index].saturating_add(encoded_len);
+        self.last_seen_child[parent_index] = child_short;
+        if self.hub_threshold < usize::MAX {
+            self.pending_children
+                .entry(parent_short)
+                .or_default()
+                .push(child_short);
+        }
+        push_unique(&mut self.touched_chunks, chunk_idx);
+    }
+
+    fn flush_batch(&mut self) {
+        for &chunk_idx in &self.touched_chunks {
+            let rows = self.rows_in_chunk(chunk_idx);
+            self.total_written = self
+                .total_written
+                .saturating_add(self.chunk_body_bytes[chunk_idx])
+                .saturating_add(4usize.saturating_mul(rows.saturating_add(1)));
+        }
+        for hub in &self.touched_hubs {
+            self.total_written = self.total_written.saturating_add(
+                self.hub_bitmap_sets[hub]
+                    .encode()
+                    .map_or(0, |bytes| bytes.len()),
+            );
+        }
+        self.touched_chunks.clear();
+        self.touched_hubs.clear();
+    }
+
+    fn rows_in_chunk(&self, chunk_idx: usize) -> usize {
+        self.node_count
+            .saturating_sub(chunk_idx.saturating_mul(CHUNK_SIZE))
+            .min(CHUNK_SIZE)
+    }
+
+    fn finish(mut self) -> (usize, usize) {
+        // Include writes from the final, possibly partial batch.
+        if !self.touched_chunks.is_empty() || !self.touched_hubs.is_empty() {
+            self.flush_batch();
+        }
+        let csr_bytes: usize = self
+            .chunk_body_bytes
+            .iter()
+            .enumerate()
+            .map(|(chunk_idx, &body)| {
+                body.saturating_add(
+                    4usize.saturating_mul(self.rows_in_chunk(chunk_idx).saturating_add(1)),
+                )
+            })
+            .sum();
+        let hub_bytes: usize = self
+            .hub_bitmap_sets
+            .values()
+            .map(|bitmap| bitmap.encode().expect("benchmark bitmap must encode").len())
+            .sum();
+        (self.total_written, csr_bytes.saturating_add(hub_bytes))
+    }
+}
+
+fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
+    if !items.contains(&item) {
+        items.push(item);
+    }
 }
 
 fn measure_reverse_wa(
@@ -622,91 +802,17 @@ fn measure_reverse_wa(
     hub_threshold: usize,
     batch_size: usize,
 ) -> (usize, usize) {
-    let mut in_degrees = vec![0u32; node_count];
-    let mut last_seen_child = vec![0u32; node_count];
-    let chunk_count = node_count.div_ceil(CHUNK_SIZE);
-    let mut chunk_body_bytes = vec![0usize; chunk_count];
-    let mut hub_bitmap_sets: HashMap<(u32, u32), BitmapSet> = HashMap::new();
-    let mut touched_chunks: Vec<usize> = Vec::new();
-    let mut touched_hubs: Vec<(u32, u32)> = Vec::new();
-    let mut total_written = 0usize;
-
+    let mut state = ReverseWaState::new(node_count, hub_threshold);
     for (child_index, target_list) in edge_lists.iter().enumerate() {
         let child_short = u32::try_from(child_index).expect("fits in u32");
         for &parent_short in target_list {
-            let parent_index = usize::try_from(parent_short).expect("fits in usize");
-            in_degrees[parent_index] = in_degrees[parent_index].saturating_add(1);
-
-            if usize::try_from(in_degrees[parent_index]).expect("fits in usize") > hub_threshold {
-                let hub_key = (parent_short, child_short >> 16);
-                hub_bitmap_sets
-                    .entry(hub_key)
-                    .or_insert_with(|| BitmapSet::new(BENCH_DOMAIN))
-                    .insert(child_short);
-
-                if !touched_hubs.contains(&hub_key) {
-                    touched_hubs.push(hub_key);
-                }
-            } else {
-                let last = if in_degrees[parent_index] == 1 {
-                    parent_short
-                } else {
-                    last_seen_child[parent_index]
-                };
-                let encoded_len = if in_degrees[parent_index] == 1 {
-                    varint_length_u64(zigzag_encode(
-                        i64::from(child_short)
-                            .checked_sub(i64::from(last))
-                            .expect("u32 difference fits i64"),
-                    ))
-                } else {
-                    varint_length(
-                        child_short
-                            .checked_sub(last)
-                            .expect("children sorted ascending"),
-                    )
-                };
-                let chunk_idx = parent_index / CHUNK_SIZE;
-                chunk_body_bytes[chunk_idx] =
-                    chunk_body_bytes[chunk_idx].saturating_add(encoded_len);
-                last_seen_child[parent_index] = child_short;
-
-                if !touched_chunks.contains(&chunk_idx) {
-                    touched_chunks.push(chunk_idx);
-                }
-            }
+            state.add_edge(child_short, parent_short);
         }
-
         if child_index.saturating_add(1).is_multiple_of(batch_size) {
-            for &chunk_idx in &touched_chunks {
-                let chunk_overhead = 4usize.saturating_mul(CHUNK_SIZE.saturating_add(1));
-                total_written = total_written
-                    .saturating_add(chunk_body_bytes[chunk_idx])
-                    .saturating_add(chunk_overhead);
-            }
-            for hub_key in &touched_hubs {
-                let size = hub_bitmap_sets[hub_key]
-                    .encode()
-                    .map_or(0, |bytes| bytes.len());
-                total_written = total_written.saturating_add(size);
-            }
-            touched_chunks.clear();
-            touched_hubs.clear();
+            state.flush_batch();
         }
     }
-
-    let final_csr_bytes: usize = chunk_body_bytes
-        .iter()
-        .map(|&body| body.saturating_add(4usize.saturating_mul(CHUNK_SIZE.saturating_add(1))))
-        .sum();
-
-    let final_hub_bytes: usize = hub_bitmap_sets
-        .values()
-        .map(|bitmap| bitmap.encode().expect("benchmark bitmap must encode").len())
-        .sum();
-
-    let final_total = final_csr_bytes.saturating_add(final_hub_bytes);
-    (total_written, final_total)
+    state.finish()
 }
 
 // ---------------------------------------------------------------- timing helper
@@ -945,6 +1051,7 @@ fn main() {
         .get(1)
         .and_then(|arg_str| arg_str.parse().ok())
         .unwrap_or(1_000_000);
+    assert!(event_count >= 3, "event_count must be at least 3");
     let random_seed: u64 = args
         .get(2)
         .and_then(|arg_str| arg_str.parse().ok())

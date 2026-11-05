@@ -35,7 +35,7 @@ use rezzy::{redaction_preserved_keys, LeanEvent, RedactionRule, StateResVersion}
 use crate::export_import;
 use crate::interchange::{self, KeyRecord, RoomEvent, RoomExport};
 use crate::state_policy::{resolution_policy, ResolutionPolicy, StateView};
-use crate::state_resolve::{lean_event, resolve_parents, LeanEventContext, StateEntries};
+use crate::state_resolve::{resolve_parents, LeanEventContext, StateEntries};
 use crate::{Cli, Commands, PacksAction};
 
 const MAX_DEBUG_UNRESOLVED: usize = 20;
@@ -3442,6 +3442,11 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
     Ok(())
 }
 
+/// Query or rebuild a room's flag index.
+///
+/// The flag-index API reads through `Database`, so even `--count` and a named
+/// query open the database and take the exclusive root writer lock. They fail
+/// while another live process holds it; there is no read-only flag path yet.
 fn cmd_flags(
     cli: &Cli,
     room: &str,
@@ -7767,7 +7772,10 @@ fn scan_pack(
         let collection_hex = format_id(collection_id);
         let id_hex = format_id(node_id);
         let should_decode = opts.decode.is_some() || (opts.verbose && !opts.header);
-        let need_record = should_decode || opts.header;
+        // State scans render the event -> state-group mapping inline, so they
+        // read frames even without `--verbose`/`--decode`; other shards keep
+        // the read-free default.
+        let need_record = should_decode || opts.header || shard_type == ShardType::State;
         let data = need_record
             .then(|| ShardPool::read_at_committed(shard, *offset, true))
             .transpose()?;
@@ -8015,6 +8023,11 @@ fn cmd_scan_collection_live_rows(
     selector: &str,
     opts: &ScanOptions,
 ) -> anyhow::Result<([u8; 16], Vec<LiveScanRow>, usize)> {
+    anyhow::ensure!(
+        cli.shard_type.is_some(),
+        "`scan --live` requires a specific shard type (-t state, -t events, or -t edges); \
+         `-t all` cannot select a single live collection index"
+    );
     let collection_id = parse_collection_selector(selector)?;
     let store = open_store_read_only(cli)?;
     let Some(locations) = store.collection_live_locations(&collection_id)? else {
@@ -8084,7 +8097,11 @@ fn cmd_scan_collection_live_rows(
         }
         if read_payload {
             let record = ShardPool::read_at_committed(&shard, offset, true)?;
-            if record.collection_id != collection_id {
+            let removed = record
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.removed);
+            if record.collection_id != collection_id || removed {
                 continue;
             }
             rows.push((shard, offset, record.hash, Some(record)));
@@ -8378,7 +8395,9 @@ fn print_collection_record(
     context: &mut CollectionScanContext,
 ) -> anyhow::Result<()> {
     let should_decode = context.decode.is_some() || (context.mode.verbose() && !context.header);
-    let need_record = should_decode || context.header;
+    // State scans show the event -> state-group pointer without an explicit
+    // verbose/decode request, matching the pack scan.
+    let need_record = should_decode || context.header || context.shard_type == ShardType::State;
     let data = need_record
         .then(|| ShardPool::read_at_committed(shard, offset, true))
         .transpose()?;
@@ -8819,15 +8838,29 @@ fn keys_first(paths: &[PathBuf]) -> Vec<&PathBuf> {
 /// A read or parse failure is left to the normal import pass, which reports it
 /// with the input path.
 fn input_export_format(path: &Path) -> Option<interchange::InputFormat> {
+    const PROBE_BYTES: u64 = 64 * 1024;
     let file = fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.by_ref().take(64 * 1024).read_until(b'\n', &mut line) {
+        match reader
+            .by_ref()
+            .take(PROBE_BYTES)
+            .read_until(b'\n', &mut line)
+        {
             Ok(0) | Err(_) => return None,
             Ok(_) if line.iter().all(u8::is_ascii_whitespace) => {}
-            Ok(_) => return interchange::detect(&line),
+            Ok(_) => {
+                // A line longer than the probe is only partially read. Do not
+                // classify from a truncated JSON object: leave the format
+                // undetermined so a long keys export is not mistaken for a
+                // room/non-export input.
+                if line.len() as u64 >= PROBE_BYTES && !line.ends_with(b"\n") {
+                    return None;
+                }
+                return interchange::detect(&line);
+            }
         }
     }
 }
@@ -10094,7 +10127,17 @@ impl ImportContext<'_> {
                     self.import_room_export(&export, collection_override, None)
                         .with_context(|| format!("importing {}", path.display()))
                 } else if let Some(catalog) = self.signature_catalog {
-                    self.import_room_export(&export, collection_override, Some(catalog))
+                    // The run's keys file does not replace keys already
+                    // stored by an earlier import: verification must see both.
+                    let mut merged = export_import::SignatureKeyCatalog::read_for_room(
+                        self.db.server_info(),
+                        &export,
+                    )
+                    .with_context(|| {
+                        format!("reading signing keys needed by {}", export.room_id)
+                    })?;
+                    merged.extend_from(catalog);
+                    self.import_room_export(&export, collection_override, Some(&merged))
                         .with_context(|| format!("importing {}", path.display()))
                 } else {
                     let catalog = export_import::SignatureKeyCatalog::read_for_room(
@@ -10147,7 +10190,7 @@ impl ImportContext<'_> {
         if events.is_empty() {
             bail!("no events found in {}", path.display());
         }
-        import_pdu_events_with_raw(
+        import_pdu_events_with_raw_state_hamts(
             self.db,
             self.store,
             self.state_store,
@@ -10159,6 +10202,7 @@ impl ImportContext<'_> {
             collection_override,
             self.template,
             self.established_collections,
+            self.write_state_hamts,
         )?;
         Ok(ImportOutcome::default())
     }
@@ -10217,7 +10261,7 @@ impl ImportContext<'_> {
         detected_collection: Option<&str>,
         collection_override: Option<&str>,
     ) -> anyhow::Result<()> {
-        import_pdu_events(
+        import_pdu_events_with_state_hamts(
             self.db,
             self.store,
             self.state_store,
@@ -10228,6 +10272,7 @@ impl ImportContext<'_> {
             collection_override,
             self.template,
             self.established_collections,
+            self.write_state_hamts,
         )
     }
 
@@ -10323,6 +10368,7 @@ impl ImportContext<'_> {
             StateResVersion::from_room_version(&room_version),
             &mut rejected,
             &mut walk_rejections,
+            &HashSet::new(),
         );
         export_import::apply_walk_rejections(export, &mut findings, &walk_rejections);
         if unchecked > 0 {
@@ -10432,6 +10478,7 @@ fn compute_import_auth_before(
     state_version: Option<StateResVersion>,
     rejected: &mut HashSet<String>,
     walk_rejections: &mut HashMap<String, (u8, String)>,
+    already_redacted: &HashSet<String>,
 ) -> (PartialStateComputation, usize) {
     let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
     let Some(state_version) = state_version else {
@@ -10454,10 +10501,13 @@ fn compute_import_auth_before(
         .enumerate()
         .map(|(position, event)| (event.event_id.as_bytes(), position))
         .collect();
-    let lean: Vec<Option<LeanEvent<String>>> = room_events
-        .iter()
-        .map(|event| lean_event(&event.unflagged(room_id), &event.event_id))
-        .collect();
+    // Judge hash-mismatched events in the same canonical redacted form the
+    // findings pass uses, so check 5 cannot reject an event whose redaction
+    // the auth rules accept.
+    let redacted =
+        export_import::redactions_for_export(room_events, room_version, already_redacted);
+    let lean: Vec<Option<LeanEvent<String>>> =
+        export_import::lean_redacted_events(room_events, &redacted, room_id);
     let by_id: HashMap<&str, &RoomEvent> = room_events
         .iter()
         .map(|event| (event.event_id.as_str(), event))
@@ -10737,6 +10787,7 @@ fn import_room_version(
     clippy::too_many_lines,
     reason = "the PDU import phase intentionally owns validation, batching, and state-group work"
 )]
+#[cfg(test)]
 fn import_pdu_events(
     db: &Database,
     store: &PackfileStorage,
@@ -10749,7 +10800,37 @@ fn import_pdu_events(
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
 ) -> anyhow::Result<()> {
-    import_pdu_events_with_raw(
+    import_pdu_events_with_state_hamts(
+        db,
+        store,
+        state_store,
+        path,
+        events,
+        auth_chain,
+        detected_collection,
+        collection_override,
+        template,
+        established_collections,
+        true,
+    )
+}
+
+/// [`import_pdu_events`] with the state-HAMT write setting threaded through.
+#[allow(clippy::too_many_arguments)]
+fn import_pdu_events_with_state_hamts(
+    db: &Database,
+    store: &PackfileStorage,
+    state_store: &PackfileStorage,
+    path: &Path,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+    detected_collection: Option<&str>,
+    collection_override: Option<&str>,
+    template: &CollectionTemplate,
+    established_collections: &mut HashSet<[u8; 16]>,
+    write_state_hamts: bool,
+) -> anyhow::Result<()> {
+    import_pdu_events_with_raw_state_hamts(
         db,
         store,
         state_store,
@@ -10761,6 +10842,7 @@ fn import_pdu_events(
         collection_override,
         template,
         established_collections,
+        write_state_hamts,
     )
 }
 
@@ -10772,6 +10854,7 @@ fn import_pdu_events(
     clippy::too_many_lines,
     reason = "the PDU import phase is one sequential pipeline; splitting it would pass state by hand"
 )]
+#[cfg(test)]
 fn import_pdu_events_with_raw(
     db: &Database,
     store: &PackfileStorage,
@@ -10784,6 +10867,39 @@ fn import_pdu_events_with_raw(
     collection_override: Option<&str>,
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
+) -> anyhow::Result<()> {
+    import_pdu_events_with_raw_state_hamts(
+        db,
+        store,
+        state_store,
+        path,
+        events,
+        auth_chain,
+        raw_adjacency,
+        detected_collection,
+        collection_override,
+        template,
+        established_collections,
+        true,
+    )
+}
+
+/// [`import_pdu_events_with_raw`] with the state-HAMT write setting threaded
+/// through, so `--no-state-hamts` also covers raw JSONL and federation inputs.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn import_pdu_events_with_raw_state_hamts(
+    db: &Database,
+    store: &PackfileStorage,
+    state_store: &PackfileStorage,
+    path: &Path,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+    raw_adjacency: Option<&[rezzy::OwnedMatrixEvent]>,
+    detected_collection: Option<&str>,
+    collection_override: Option<&str>,
+    template: &CollectionTemplate,
+    established_collections: &mut HashSet<[u8; 16]>,
+    write_state_hamts: bool,
 ) -> anyhow::Result<()> {
     if events.is_empty() {
         bail!("no events found in {}", path.display());
@@ -10972,6 +11088,7 @@ fn import_pdu_events_with_raw(
         StateResVersion::from_room_version(&room_version),
         &mut rejected,
         &mut walk_rejections,
+        &already_redacted,
     );
     export_import::apply_walk_rejections(&synthetic, &mut findings, &walk_rejections);
     if unchecked > 0 {
@@ -11006,14 +11123,16 @@ fn import_pdu_events_with_raw(
         );
     }
 
-    repair_import_state_groups(
-        state_store,
-        &all_events,
-        &[],
-        &resolved.canonical_id,
-        &room_version,
-        Some(computation),
-    )?;
+    if write_state_hamts {
+        repair_import_state_groups(
+            state_store,
+            &all_events,
+            &[],
+            &resolved.canonical_id,
+            &room_version,
+            Some(computation),
+        )?;
+    }
 
     if let Some(room_id) = detected_collection {
         eprintln!("{room_id} ({collection_hex})");
@@ -11732,6 +11851,7 @@ fn repair_import_state_groups(
                 StateResVersion::from_room_version(room_version),
                 &mut rejected,
                 &mut walk_rejections,
+                &HashSet::new(),
             );
             if unchecked > 0 {
                 eprintln!(

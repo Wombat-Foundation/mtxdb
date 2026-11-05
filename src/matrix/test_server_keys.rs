@@ -97,7 +97,7 @@ fn key_record_round_trips_and_rejects_damage() {
     let bytes = encode_server_key_record(b"a.example", &key).unwrap();
     assert_eq!(
         decode_server_key_record(&bytes).unwrap(),
-        (b"a.example".to_vec(), key)
+        (b"a.example".to_vec(), key.clone())
     );
 
     assert!(decode_server_key_record(&[]).is_err());
@@ -116,6 +116,9 @@ fn key_record_round_trips_and_rejects_damage() {
     bad_flag[2] = 0x80;
     assert!(decode_server_key_record(&bad_flag).is_err());
     assert!(decode_server_key_record(&bad_tier).is_err());
+    let mut wrong_digest = key.clone();
+    wrong_digest.digest = key_digest(b"different");
+    assert!(encode_server_key_record(b"a.example", &wrong_digest).is_err());
     let mut bad_version = bytes;
     bad_version[0] = 2;
     assert!(decode_server_key_record(&bad_version).is_err());
@@ -367,6 +370,43 @@ fn a_record_in_the_wrong_slot_is_rejected() {
     assert!(read_server_keys(db.server_info(), b"one").is_err());
     assert!(read_server_key(db.server_info(), b"one", b"ed25519:a").is_err());
     let keys = [observed("ed25519:a", b"AAAA", 1)];
+    assert!(merge(&db, &update("one", KeySighting::Direct, "d", &keys, 1)).is_err());
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_record_under_another_keys_slot_is_rejected() {
+    let (db, root) = open("wrong-key-slot");
+    let key = ServerKey {
+        key_id: b"ed25519:a".to_vec(),
+        key: b"AAAA".to_vec(),
+        valid_until_ts: 1,
+        source: b"s".to_vec(),
+        ts_added_ms: 1,
+        tier: KeyTier::Permanent,
+        expired_ts: None,
+        promote_by_ms: 0,
+        digest: key_digest(b"AAAA"),
+        first_seen_ms: 1,
+        last_active_ms: 1,
+        corroborated: false,
+        inferred_retired: false,
+    };
+    // Same origin, but the record naming `ed25519:a` lives in `ed25519:b`'s
+    // slot. Every reader and the merge path must reject the slot mismatch.
+    let tx = db.begin_transaction();
+    tx.put(
+        SERVER_INFO_POOL,
+        origin_keys_collection_id(b"one"),
+        origin_key_record_id(b"ed25519:b"),
+        &NodeData::new(Bytes::from(encode_server_key_record(b"one", &key).unwrap())),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(read_server_keys(db.server_info(), b"one").is_err());
+    assert!(read_server_key(db.server_info(), b"one", b"ed25519:b").is_err());
+    let keys = [observed("ed25519:b", b"AAAA", 1)];
     assert!(merge(&db, &update("one", KeySighting::Direct, "d", &keys, 1)).is_err());
     drop(db);
     let _ = std::fs::remove_dir_all(root);
@@ -758,14 +798,27 @@ fn the_digest_cap_refuses_new_key_ids_per_bucket_and_promotion_moves_one() {
     let direct = merge(&db, &capped(KeySighting::Direct, &b, 3)).unwrap();
     assert_eq!(direct[0].key, b"BBBB");
 
-    // Promotion moves `a` to the direct bucket even though that is full.
-    let promoted = merge(&db, &capped(KeySighting::Direct, &a, 4)).unwrap();
-    assert_eq!(promoted[0].tier, KeyTier::Permanent);
+    // Promotion would move `a` into the already-full direct bucket, so it is
+    // refused and `a` stays provisional.
+    let promoted = update_server_keys(&db, &capped(KeySighting::Direct, &a, 4)).unwrap();
+    assert_eq!(promoted.issues[0].kind, KeyIssueKind::DigestCapReached);
+    assert_eq!(
+        promoted.keys,
+        Vec::new(),
+        "a promotion into a full direct bucket must be refused"
+    );
+    assert_eq!(
+        read_server_key(db.server_info(), b"o", b"ed25519:a")
+            .unwrap()
+            .unwrap()
+            .tier,
+        KeyTier::Provisional
+    );
 
-    // And it freed the notary bucket.
+    // The notary bucket is still full because `a` was not promoted.
     let c = [observed("ed25519:c", b"CCCC", 9_000)];
     let fresh = update_server_keys(&db, &capped(KeySighting::Notary, &c, 5)).unwrap();
-    assert_eq!(fresh.issues.len(), 0);
+    assert_eq!(fresh.issues[0].kind, KeyIssueKind::DigestCapReached);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }

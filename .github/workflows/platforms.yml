@@ -106,7 +106,7 @@ jobs:
           cargo bench --locked --manifest-path benches/Cargo.toml --benches --all-targets 2>&1 | tee bench-output.txt
 
       - name: Upload platform benchmarks
-        if: github.event_name == 'push'
+        if: ${{ !cancelled() && github.event_name == 'push' }}
         uses: actions/upload-artifact@v4
         with:
           name: benchmarks-${{ matrix.os }}

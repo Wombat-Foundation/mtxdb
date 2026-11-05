@@ -323,9 +323,9 @@ pub fn encode_verdict(event_id: &[u8], verdict: &Verdict) -> Result<Vec<u8>, Sto
     out.extend_from_slice(event_id);
     out.extend(verdict.rejection);
     out.extend(verdict.soft_fail);
-    if let Some(arrival) = verdict.arrival_ordering {
-        out.extend_from_slice(&arrival.to_le_bytes());
-    }
+    // Redaction comes before arrival ordering so an older decoder that knows
+    // HAS_REDACTION but not HAS_ARRIVAL still reads `redacted_by` correctly and
+    // ignores the trailing arrival bytes.
     if let Some(redactor) = &verdict.redacted_by {
         out.extend_from_slice(
             &u32::try_from(redactor.len())
@@ -333,6 +333,9 @@ pub fn encode_verdict(event_id: &[u8], verdict: &Verdict) -> Result<Vec<u8>, Sto
                 .to_le_bytes(),
         );
         out.extend_from_slice(redactor);
+    }
+    if let Some(arrival) = verdict.arrival_ordering {
+        out.extend_from_slice(&arrival.to_le_bytes());
     }
     Ok(out)
 }
@@ -380,15 +383,16 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(&[u8], Verdict), StorageError> {
         verdict.soft_fail = Some(code);
         rest = tail;
     }
-    if flags & HAS_ARRIVAL != 0 {
-        let (bytes, tail) = rest.split_first_chunk::<8>().ok_or_else(malformed)?;
-        verdict.arrival_ordering = Some(u64::from_le_bytes(*bytes));
-        rest = tail;
-    }
     if flags & HAS_REDACTION != 0 {
         let (length, header) = take_len(rest)?;
         let tail = rest.get(header..).ok_or_else(malformed)?;
-        verdict.redacted_by = Some(tail.get(..length).ok_or_else(malformed)?.to_vec());
+        let (redactor, tail) = tail.split_at_checked(length).ok_or_else(malformed)?;
+        verdict.redacted_by = Some(redactor.to_vec());
+        rest = tail;
+    }
+    if flags & HAS_ARRIVAL != 0 {
+        let (bytes, _) = rest.split_first_chunk::<8>().ok_or_else(malformed)?;
+        verdict.arrival_ordering = Some(u64::from_le_bytes(*bytes));
     }
     Ok((event_id, verdict))
 }

@@ -3,13 +3,12 @@
 //! * A: one `index.versions` file (`24 B × collections` plus framing), read in
 //!   one sequential pass.
 //! * B: a version in each sealed pack's sidecar header, which requires one
-//!   header read per pack and a max-fold across them.
+//!   header read per pack.
 //!
 //! The harness builds the requested number of sealed packs, then times the
-//! version-recovery step alone. B is measured as `open_for_pack` over every
-//! sidecar — the irreducible per-pack work B needs before it can read a
-//! version — and additionally sums the collection directory, which is the
-//! shape a per-pack version list would take.
+//! sidecar-open work only. B is measured as `open_for_pack` over every sidecar,
+//! summing each index's `entry_count()`. It reads no collection version and
+//! performs no max-fold, so B is a lower bound on the version-recovery cost.
 //!
 //! ```text
 //! MTXDB_VERSIONS_PACKS=1000 MTXDB_VERSIONS_COLLECTIONS=64 \

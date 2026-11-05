@@ -3259,7 +3259,13 @@ impl PackfileStorage {
             if versions_valid || !checkpoint_path.exists() {
                 let _ = fs::remove_file(&checkpoint_path);
             }
-            Self::sweep_orphan_delta_logs(&base_dir, None);
+            // When the versions file could not be produced, the retained
+            // checkpoint (and the delta epoch that extends it) are the only
+            // copy of those versions. Leave both untouched so a refused or
+            // retried open does not destroy durable index state.
+            if versions_valid {
+                Self::sweep_orphan_delta_logs(&base_dir, None);
+            }
         }
         // Capture the journal coverage *before* loading the index, so the bound
         // can never be newer than the index this handle builds. A writer writes
@@ -3281,6 +3287,29 @@ impl PackfileStorage {
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "{} is missing or unreadable, but durable WAL coverage is {read_covered}; refusing to open a writable paged store with an empty version baseline",
+                    Self::index_versions_path(&base_dir).display()
+                ),
+            ));
+        }
+        // A resident writable open restores collection versions from the
+        // versions file or a checkpoint's logical-version section. If neither
+        // exists while the WAL still claims coverage, opening would report
+        // version 0 for reclaimed groups, so a conditional commit expecting 0
+        // could pass against non-empty data. Fail closed instead.
+        if residency == crate::index::IndexResidency::Resident
+            && writable
+            && read_covered > 0
+            // With no pack data there is nothing whose version could be lost.
+            && !open_shards.is_empty()
+            && crate::index::versions::read_versions(&Self::index_versions_path(&base_dir))
+                .is_none()
+            && crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(&base_dir))
+                .is_none()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "no readable version baseline ({} or a checkpoint) while durable WAL coverage is {read_covered}; refusing to open a writable resident store with an empty version baseline",
                     Self::index_versions_path(&base_dir).display()
                 ),
             ));
@@ -4877,19 +4906,17 @@ impl PackfileStorage {
                 }
                 // The resident tail is newer than every sealed pack, so its keys
                 // win. Among sealed packs, iteration is newest-first; keep the
-                // first occurrence of each id and drop removal versions.
-                // Recovering ids for resident entries would require reading their
-                // frames, so a sealed entry that is also resident is yielded
-                // twice. That is harmless for this diagnostic surface (callers
-                // verify the hash), and sealed removals still shadow older sealed
-                // live versions via `seen`.
+                // first occurrence of each id and drop removal versions. A
+                // resident identity (live or removal) also shadows the sealed
+                // version, so only yield a sealed locator when the resident
+                // index has no identity for the key.
                 let mut seen: HashSet<[u8; 16]> =
                     HashSet::with_capacity(g.sealed.len().saturating_mul(64));
                 g.sealed
                     .for_each_in_collection(collection_id, |hit, id| {
                         if hit.removed() {
                             seen.insert(id);
-                        } else if seen.insert(id) {
+                        } else if seen.insert(id) && g.index.lookup_removed(&id).is_none() {
                             locations.push((hit.slot, hit.offset()));
                         }
                     })
@@ -7889,6 +7916,11 @@ impl PackfileStorage {
                     }
                     continue;
                 }
+                // A Paged rebuild trusts the sidecar instead of the frame
+                // scan even under `Full` checksums: the sidecar itself is
+                // CRC-verified, and point reads still verify each resolved
+                // frame. An eager whole-pack CRC sweep remains available as an
+                // explicit scrub.
                 if let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) {
                     if sidecar.collection_entry_count(collection_id).is_some() {
                         let sidecar: Arc<dyn crate::index::sealed::SealedIndex> = Arc::new(sidecar);
@@ -10049,11 +10081,11 @@ impl PackfileStorage {
         }
     }
 
-    /// Block until the in-flight run merge has been built and installed, and
-    /// run the policy again until it has nothing more to merge. Tests use it
-    /// as a deterministic barrier; a sync never waits for a merge.
-    #[cfg(test)]
-    fn settle_run_merges(&self) {
+    /// Block until in-flight run merges have been built and installed, and
+    /// run the policy again until it has nothing more to merge. This is useful
+    /// for deterministic maintenance and measurement barriers; a normal sync
+    /// never waits for a merge.
+    pub fn settle_run_merges(&self) {
         let _ = self.shards.wait_for_run_merge();
         self.run_merge_due.store(true, Ordering::Release);
         loop {
@@ -12023,16 +12055,63 @@ impl PackfileStorage {
                 let (found_collection, found_hash, removed) =
                     self.shards.record_identity_at(shard, offset)?;
                 if &found_collection == collection_id && &found_hash == node_id {
-                    return Ok(Some(removed));
+                    // `record_identity_at` validates the frame's structure but
+                    // not its checksum. Before trusting its removal bit, read
+                    // the exact version under the configured policy so a
+                    // corrupt frame cannot change a collection's length.
+                    if !self.shards.checksum_policy().verifies_reads() {
+                        return Ok(Some(removed));
+                    }
+                    let record = self.read_at(shard, offset, true)?;
+                    if record.collection_id == *collection_id && record.hash == *node_id {
+                        return Ok(Some(
+                            record.metadata.as_ref().is_some_and(|meta| meta.removed),
+                        ));
+                    }
                 }
             }
             return Ok(None);
         }
     }
 
+    /// Count a collection's durable live records, including sealed packs that
+    /// a paged resident index deliberately omits.
+    ///
+    /// Sealed entries are walked newest-first, keeping the first version of
+    /// each id, dropping removal versions, and skipping ids whose newest
+    /// version is already in the resident index (live or removed).
+    fn durable_live_count(
+        generation: &RoomGeneration,
+        collection_id: &[u8; 16],
+    ) -> Result<usize, StorageError> {
+        let resident = generation.index.live_count();
+        if !generation.paged || generation.sealed.is_empty() {
+            return Ok(resident);
+        }
+        let mut seen: HashSet<[u8; 16]> =
+            HashSet::with_capacity(generation.sealed.len().saturating_mul(64));
+        let mut sealed_live = 0usize;
+        generation
+            .sealed
+            .for_each_in_collection(collection_id, |hit, id| {
+                if !seen.insert(id) || hit.removed() {
+                    return;
+                }
+                // A resident version (live or removal) is newer and is
+                // already reflected in `resident`.
+                if generation.index.lookup_removed(&id).is_some() {
+                    return;
+                }
+                sealed_live = sealed_live.saturating_add(1);
+            })
+            .map_err(|error| StorageError::Corrupt(error.to_string()))?;
+        Ok(resident.saturating_add(sealed_live))
+    }
+
     /// Return collection length at read-committed visibility.
     ///
-    /// Explicitly removed keys are excluded from the count. Overlay puts and
+    /// Explicitly removed keys are excluded from the count, and sealed packs
+    /// that a paged resident index omits are included. Overlay puts and
     /// removals are reflected before they reach the durable index. A committed
     /// collection delete hides the durable generation until replacement puts
     /// are applied.
@@ -12051,16 +12130,17 @@ impl PackfileStorage {
         // the durable count below is the whole answer.
         let overlay_guard = self.refresh_read_journal()?;
         let Some(overlay) = overlay_guard.as_ref() else {
-            return Ok(self
-                .generation(collection_id)
-                .map(|generation| generation.index.live_count()));
+            let Some(generation) = self.generation(collection_id) else {
+                return Ok(None);
+            };
+            return Self::durable_live_count(generation.as_ref(), collection_id).map(Some);
         };
         let puts = overlay.puts.get(collection_id);
         let deleted = overlay.delete_lsn.contains_key(collection_id);
         let generation = self.generation(collection_id);
-        let durable_len = generation
-            .as_ref()
-            .map_or(0, |generation| generation.index.live_count());
+        let durable_len = generation.as_ref().map_or(Ok(0), |generation| {
+            Self::durable_live_count(generation.as_ref(), collection_id)
+        })?;
 
         if deleted {
             return Ok(puts

@@ -64,6 +64,18 @@ fn average_lookup(store: &PackfileStorage, ids: &[NodeId]) -> Duration {
     ))
 }
 
+/// Verify probe presence outside the lookup timings.
+fn check_presence(store: &PackfileStorage, ids: &[NodeId], expect_present: bool) {
+    for id in ids {
+        let found = store.get_location(&COLLECTION, id).expect("point lookup");
+        assert_eq!(
+            found.is_some(),
+            expect_present,
+            "unexpected lookup presence for probe {id:02x?}"
+        );
+    }
+}
+
 /// Best `(open, hit, miss)` over `rounds` fresh opens.
 fn measure(
     dir: &Path,
@@ -76,6 +88,8 @@ fn measure(
         let started = Instant::now();
         let store = open(dir);
         best.0 = best.0.min(started.elapsed());
+        check_presence(&store, hits, true);
+        check_presence(&store, misses, false);
         best.1 = best.1.min(average_lookup(&store, hits));
         best.2 = best.2.min(average_lookup(&store, misses));
     }
@@ -115,6 +129,7 @@ fn print_row(label: &str, (open, hit, miss): (Duration, Duration, Duration)) {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let mut args = std::env::args_os().skip(1);
     let dir = PathBuf::from(
@@ -137,6 +152,16 @@ fn main() {
         .trim()
         .parse()
         .expect("record count");
+    let existing_runs: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("read fixture")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "run"))
+        .collect();
+    assert!(
+        existing_runs.is_empty(),
+        "fixture already contains run files that Paged open would load: {existing_runs:?}"
+    );
 
     let hit_range = records.saturating_mul(9) / 10;
     let hits: Vec<NodeId> = (0..PROBES)
@@ -146,27 +171,30 @@ fn main() {
 
     let all = packs(&dir);
     let mut sealed = Vec::new();
-    let mut first_missing: Option<PathBuf> = None;
+    let mut missing: Vec<PathBuf> = Vec::new();
     for (identity, path) in &all {
         match open_for_pack(path) {
             Some(sidecar) => {
-                if let Some(missing) = &first_missing {
+                if let Some(unsealed) = missing.first() {
                     panic!(
                         "sidecar gap: {} has no openable sidecar, but later pack {} does",
-                        missing.display(),
+                        unsealed.display(),
                         path.display()
                     );
                 }
                 sealed.push((*identity, sidecar));
             }
-            None => {
-                first_missing.get_or_insert_with(|| path.clone());
-            }
+            None => missing.push(path.clone()),
         }
     }
     assert!(
         !sealed.is_empty(),
         "fixture has no openable sealed-pack sidecars"
+    );
+    assert!(
+        missing.len() <= 1,
+        "only the active pack may lack a sidecar, but {} trailing packs do: {missing:?}",
+        missing.len()
     );
     let default_unmerged = DEFAULT_UNMERGED_PACKS.min(sealed.len().saturating_sub(1));
     let unmerged = requested_unmerged.unwrap_or(default_unmerged);
@@ -182,6 +210,12 @@ fn main() {
     let last_covered = covered
         .checked_sub(1)
         .expect("at least one pack is covered");
+    // Packs left outside the run, including the active pack without a
+    // sidecar, so the reported label matches the on-disk pack set.
+    let unmerged_total = all
+        .len()
+        .checked_sub(covered)
+        .expect("covered packs come from the fixture");
 
     println!("mode\topen_ms\thit_us\tmiss_us");
     print_row("sidecars", measure(&dir, &hits, &misses, rounds));
@@ -209,7 +243,8 @@ fn main() {
     .expect("merge run")
     .expect("non-empty run");
     println!(
-        "merged {covered} of {} sealed packs in {:.1} ms: {} entries, {} blocks, {:.1} MiB",
+        "merged {covered} of {} packs ({} with sidecars) in {:.1} ms: {} entries, {} blocks, {:.1} MiB",
+        all.len(),
         sealed.len(),
         started.elapsed().as_secs_f64() * 1e3,
         summary.entry_count,
@@ -220,13 +255,20 @@ fn main() {
     drop(sealed);
 
     let with_run = measure(&dir, &hits, &misses, rounds);
-    print_row(&format!("run+{unmerged}"), with_run);
+    print_row(&format!("run+{unmerged_total}"), with_run);
 }
 
 struct RemoveRunOnDrop(PathBuf);
 
 impl Drop for RemoveRunOnDrop {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "failed to remove temporary run {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
     }
 }

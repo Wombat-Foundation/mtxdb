@@ -323,8 +323,15 @@ pub(crate) fn timeline_orderings(
     }
 }
 
-fn exported_rejection(metadata: &EventMetadata) -> bool {
-    metadata.rejected == Some(true) || metadata.rejection_code.is_some()
+/// The rejection the source recorded, or `None` when the export carried no
+/// verdict at all. An absent verdict is not a claim that the event was
+/// accepted, so disagreement reporting must skip it.
+fn exported_rejection(metadata: &EventMetadata) -> Option<bool> {
+    if metadata.rejected == Some(true) || metadata.rejection_code.is_some() {
+        Some(true)
+    } else {
+        metadata.rejected.map(|_| false)
+    }
 }
 
 /// The room's id and the hex ids of its event, auth and prev collections, as
@@ -409,7 +416,7 @@ struct VerificationKeyRecord {
 }
 
 /// The key records visible after the keys-first phase of one import run.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct SignatureKeyCatalog {
     records: HashMap<(String, Vec<u8>), VerificationKeyRecord>,
 }
@@ -423,6 +430,18 @@ impl SignatureKeyCatalog {
 
     pub(crate) fn extend(&mut self, other: Self) {
         self.records.extend(other.records);
+    }
+
+    /// Merge another catalog's records into this one without consuming it.
+    /// A key already stored by an earlier import must remain available when a
+    /// run also brings its own keys file.
+    pub(crate) fn extend_from(&mut self, other: &Self) {
+        self.records.extend(
+            other
+                .records
+                .iter()
+                .map(|(id, record)| (id.clone(), record.clone())),
+        );
     }
 
     fn extend_from_records(&mut self, records: &[KeyRecord]) {
@@ -1098,7 +1117,7 @@ pub(crate) fn apply_walk_rejections(
         .enumerate()
         .map(|(position, event)| (event.event_id.as_str(), position))
         .collect();
-    let exported: Vec<bool> = export
+    let exported: Vec<Option<bool>> = export
         .events
         .iter()
         .map(|event| exported_rejection(&event.metadata))
@@ -1108,9 +1127,12 @@ pub(crate) fn apply_walk_rejections(
             continue;
         };
         findings.forced[position] = Some(*code);
+        findings
+            .passes_but_exported_rejected
+            .retain(|id| id != event_id);
         if *code == RejectionCode::DependsOnRejectedAuthEvent.to_u8() {
             findings.cascaded.push(event_id.clone());
-        } else if !exported[position] {
+        } else if exported[position] == Some(false) {
             findings.fails_but_exported_accepted.push(AuthFailure {
                 event_id: event_id.clone(),
                 reason: reason.clone(),
@@ -1208,7 +1230,7 @@ fn redacted_for_hash(pdu: &OwnedValue, room_version: &str) -> Option<HashMismatc
 }
 
 /// An event whose content hash failed, and its canonical redaction.
-struct HashMismatch {
+pub(crate) struct HashMismatch {
     value: OwnedValue,
     bytes: Vec<u8>,
     stored: String,
@@ -1428,7 +1450,7 @@ struct AuthJudgement {
 ///
 /// Events loaded from this store are already redacted; re-redacting them would
 /// strip the auth projection laid over their stored content.
-fn redactions_for_export(
+pub(crate) fn redactions_for_export(
     events: &[RoomEvent],
     room_version: &str,
     already_redacted: &HashSet<String>,
@@ -1446,7 +1468,7 @@ fn redactions_for_export(
 }
 
 /// The auth-check input for each event, using its redacted form on mismatch.
-fn lean_redacted_events(
+pub(crate) fn lean_redacted_events(
     events: &[RoomEvent],
     redacted: &[Option<HashMismatch>],
     room_id: &str,
@@ -1528,7 +1550,7 @@ fn apply_judgement(
     findings: &mut AuthFindings,
     events: &[RoomEvent],
     judgement: &AuthJudgement,
-    exported: &[bool],
+    exported: &[Option<bool>],
 ) {
     for (position, event) in events.iter().enumerate() {
         if !judgement.checked[position] {
@@ -1537,7 +1559,7 @@ fn apply_judgement(
         if let Some(code) = judgement.refused[position] {
             // The seed kept the cascade from assigning a code.
             findings.forced[position] = Some(code);
-            if !exported[position] {
+            if exported[position] == Some(false) {
                 findings.fails_but_exported_accepted.push(AuthFailure {
                     event_id: event.event_id.clone(),
                     reason: judgement.reason[position]
@@ -1545,7 +1567,7 @@ fn apply_judgement(
                         .unwrap_or_else(|| "unknown auth-check failure".to_owned()),
                 });
             }
-        } else if exported[position] && findings.forced[position].is_none() {
+        } else if exported[position] == Some(true) && findings.forced[position].is_none() {
             // The event passes auth against the state before it, so the
             // export's rejection is not reproduced. Cascade-rejected events
             // remain rejected, matching the verdict that will be stored.
@@ -1734,7 +1756,7 @@ fn derived_auth_findings_inner(
     let redacted = redactions_for_export(events, room_version, already_redacted);
     let lean = lean_redacted_events(events, &redacted, &export.room_id);
     let create = create_position(events).and_then(|position| lean[position].as_ref());
-    let exported: Vec<bool> = events
+    let exported: Vec<Option<bool>> = events
         .iter()
         .map(|event| exported_rejection(&event.metadata))
         .collect();
@@ -1986,7 +2008,9 @@ pub(crate) fn write_room_with_resolved_findings(
         // facts kept from the source. An exported outlier keeps a record with
         // the annotation cleared, so a rebuild can see it was checked without
         // migrating the source's outlier claim.
-        if !verdict.is_empty() || (event.metadata.outlier && !exported_rejection(&event.metadata)) {
+        if !verdict.is_empty()
+            || (event.metadata.outlier && exported_rejection(&event.metadata) != Some(true))
+        {
             tx.put(
                 EVENT_POOL,
                 event_verdict_collection_id(&record),
@@ -2727,6 +2751,39 @@ mod auth_findings_tests {
     }
 
     #[test]
+    fn a_walk_rejection_removes_the_earlier_pass_disagreement() {
+        let mut rejected = message(&["$create", "$join"]);
+        rejected.metadata.rejected = Some(true);
+        rejected.metadata.rejection_code = Some(7);
+        let export = export(vec![
+            event("$create", "m.room.create", &[], &[]),
+            member("$join", "@alice:example.org", &["$create"]),
+            rejected,
+        ]);
+        let mut findings = derived_auth_findings(&export).unwrap();
+        assert_eq!(findings.passes_but_exported_rejected, ["$msg"]);
+
+        let mut rejections = HashMap::new();
+        rejections.insert(
+            "$msg".to_owned(),
+            (
+                RejectionCode::AuthCheckFailed.to_u8(),
+                "state before the event refused it".to_owned(),
+            ),
+        );
+        apply_walk_rejections(&export, &mut findings, &rejections);
+
+        assert_eq!(
+            forced(&findings, 2),
+            Some(RejectionCode::AuthCheckFailed.to_u8())
+        );
+        assert!(
+            findings.passes_but_exported_rejected.is_empty(),
+            "a stored rejection must not still be reported as stored accepted"
+        );
+    }
+
+    #[test]
     fn two_auth_events_for_one_state_key_are_a_duplicate_rejection() {
         let mut msg = message(&["$create", "$join", "$join2"]);
         msg.metadata.rejected = Some(false);
@@ -3456,6 +3513,41 @@ mod signature_window_tests {
         }
     }
 
+    /// A create event at `ts`, signed under each `(key_id, signing key)`.
+    /// Signing a key that is not the registered one makes a bad signature.
+    fn signed_create(ts: u64, signers: &[(&str, &SigningKey)]) -> RoomEvent {
+        let fields = format!(
+            r#""type":"m.room.create","room_id":"!r:{ORIGIN}","sender":"@a:{ORIGIN}","state_key":"","origin_server_ts":{ts},"content":{{"room_version":"10"}},"depth":1,"auth_events":[],"prev_events":[]"#
+        );
+        let unsigned = OwnedValue::parse_bytes(format!("{{{fields}}}").as_bytes()).unwrap();
+        let canonical = rezzy::try_canonical_redacted_json(&unsigned, "10").unwrap();
+        let signatures: Vec<String> = signers
+            .iter()
+            .map(|(key_id, sk)| {
+                use base64::Engine as _;
+                let signature = sk.sign(canonical.as_bytes());
+                let encoded =
+                    base64::engine::general_purpose::STANDARD_NO_PAD.encode(signature.to_bytes());
+                format!(r#""{key_id}":"{encoded}""#)
+            })
+            .collect();
+        let signed = format!(
+            r#"{{{fields},"signatures":{{"{ORIGIN}":{{{}}}}}}}"#,
+            signatures.join(",")
+        );
+        RoomEvent {
+            event_id: "$create".to_owned(),
+            metadata: EventMetadata::default(),
+            prev_events: OwnedValue::Array(Vec::new()),
+            auth_events: OwnedValue::Array(Vec::new()),
+            pdu: OwnedValue::parse_bytes(signed.as_bytes()).unwrap(),
+            pdu_bytes: Bytes::new(),
+            stream_ordering: None,
+            arrival_ordering: None,
+            depth: None,
+        }
+    }
+
     /// A restricted-join event with signatures from arbitrary servers. Each
     /// signer is `(server, key_id, signing key)`.
     fn restricted_join(
@@ -3550,6 +3642,24 @@ mod signature_window_tests {
         let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, None)]);
         let outcome = keys.verify(&signed_event(1_000, &[("ed25519:a", &signer)]), "10");
         assert!(matches!(outcome, SignatureOutcome::Invalid(_)));
+    }
+
+    #[test]
+    fn a_bad_create_signature_forces_the_room_to_fail_closed() {
+        let (signer, registered) = (signing_key(1), signing_key(2));
+        let keys = catalog(&[key_record(&registered, "ed25519:a", 2_000, None)]);
+        let export = RoomExport {
+            server: ORIGIN.to_owned(),
+            room_id: format!("!r:{ORIGIN}"),
+            events: vec![signed_create(1_000, &[("ed25519:a", &signer)])],
+            timeline: false,
+        };
+        let error = derived_auth_findings_with_keys(&export, Some(&keys))
+            .expect_err("a create event with an invalid signature must refuse the room");
+        assert!(
+            format!("{error:#}").contains("cannot be authorized"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

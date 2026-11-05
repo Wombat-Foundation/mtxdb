@@ -1034,15 +1034,28 @@ impl TxnStage {
         if self.state.load(Ordering::Acquire) != Self::ACTIVE {
             return Err(io::Error::other("transaction stage is not active"));
         }
-        if !data
+        if let Some(existing) = data
             .expectations
             .iter()
-            .any(|existing| existing.pool == pool && existing.collection_id == collection_id)
+            .find(|existing| existing.pool == pool && existing.collection_id == collection_id)
         {
-            // Keep the first version observed before this transaction's own
-            // staged writes. Later staged-view reads can return a synthetic
-            // zero token for a fully staged collection and must not replace
-            // the original commit precondition.
+            if existing.expected != expected && expected != 0 {
+                // Keep the first version observed before this transaction's own
+                // staged writes, but reject a second distinct real
+                // precondition: validating only the first would let the later
+                // one silently pass at commit. A synthetic zero token from a
+                // fully staged collection is not a real precondition and must
+                // not replace the original.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "conflicting collection-version expectations for collection \
+                         {collection_id:?}: already staged {}, then {}",
+                        existing.expected, expected
+                    ),
+                ));
+            }
+        } else {
             data.expectations.push(CollectionExpectation {
                 pool,
                 collection_id,
@@ -3749,6 +3762,9 @@ impl JournalCoordinator {
         record_expectations: &[RecordExpectation],
     ) -> io::Result<()> {
         let _publication = self.publication.lock();
+        // An expectation-only commit must fail once a published group failed
+        // to apply, just like a publishing commit does.
+        self.reject_if_apply_failed()?;
         self.validate_expectations(expectations, record_expectations)
     }
 

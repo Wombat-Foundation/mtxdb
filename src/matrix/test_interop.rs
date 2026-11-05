@@ -120,6 +120,24 @@ fn verdicts_round_trip_and_reject_truncation() {
 }
 
 #[test]
+fn arrival_ordering_follows_redaction_in_the_wire_format() {
+    let arrival = 0x1122_3344_5566_7788_u64;
+    let verdict = Verdict {
+        redacted_by: Some(b"$r:x".to_vec()),
+        arrival_ordering: Some(arrival),
+        ..Verdict::default()
+    };
+    let bytes = encode_verdict(b"$e:x", &verdict).unwrap();
+    // version, flags, u32 event-id length, event id, redactor length, redactor,
+    // then the arrival ordering. An older decoder stops after `redacted_by`.
+    let redactor = 6 + b"$e:x".len();
+    assert_eq!(&bytes[redactor..redactor + 4], &4_u32.to_le_bytes());
+    assert_eq!(&bytes[redactor + 4..redactor + 8], b"$r:x");
+    assert_eq!(&bytes[redactor + 8..], &arrival.to_le_bytes());
+    assert_eq!(decode_verdict(&bytes).unwrap().1, verdict);
+}
+
+#[test]
 fn verdict_collections_bucket_within_the_bound() {
     let mut seen = std::collections::HashSet::new();
     for i in 0_u32..4096 {

@@ -68,6 +68,16 @@ fn cursor_encoding_roundtrips() {
 }
 
 #[test]
+fn with_collection_id_uses_the_supplied_id() {
+    let engine = InMemoryStorage::new();
+    let name = "test";
+    let supplied = [0xAB; 16];
+    assert_ne!(supplied, timeline_collection_id(name));
+    let index = TimelineIndex::with_collection_id(&engine, name, supplied);
+    assert_eq!(index.collection_id(), supplied);
+}
+
+#[test]
 fn forward_pages_cover_a_room_in_order() {
     let engine = InMemoryStorage::new();
     let index = TimelineIndex::open(&engine, String::from("test"));

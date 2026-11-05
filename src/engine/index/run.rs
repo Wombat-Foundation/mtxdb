@@ -46,13 +46,13 @@
 //! [`RunCorrupt`], never as a miss, so the caller falls back to sidecars.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use memmap2::Mmap;
 
@@ -362,6 +362,9 @@ impl RunWriter {
         if !offset_in_pack(offset, pack) {
             return Err(RunError::BadLocator);
         }
+        // Track every pushed pair even when explicit stats were supplied
+        // before the first entry: `finish` uses this to reject stats that omit
+        // a pair the run actually contains.
         let count = self
             .seen_stats
             .entry((entry.collection_id, entry.ordinal))
@@ -470,8 +473,8 @@ impl RunWriter {
         if self.stats.is_empty() {
             self.stats = self
                 .seen_stats
-                .into_iter()
-                .map(|((collection_id, ordinal), entry_count)| RunPackStats {
+                .iter()
+                .map(|(&(collection_id, ordinal), &entry_count)| RunPackStats {
                     ordinal,
                     collection_id,
                     entry_count,
@@ -479,6 +482,18 @@ impl RunWriter {
                 })
                 .collect();
             self.stats.sort_unstable_by_key(stats_key);
+        }
+        // Every pushed (collection, pack) pair needs a stats row. Without one,
+        // storage omits the pair from collection membership and disk-byte
+        // accounting even though the run holds its entries.
+        let mut stats_iter = self.stats.iter().peekable();
+        for key in self.seen_stats.keys() {
+            while stats_iter.peek().is_some_and(|row| stats_key(row) < *key) {
+                stats_iter.next();
+            }
+            if stats_iter.peek().map(|row| stats_key(row)) != Some(*key) {
+                return Err(RunError::BadLocator);
+            }
         }
         let pack_count = u32::try_from(self.packs.len()).map_err(|_| RunError::Invalid)?;
         let collection_count =
@@ -1268,6 +1283,23 @@ type Cursor<'a> = Box<dyn Iterator<Item = Result<RunEntry, RunCorrupt>> + 'a>;
 /// then the input index.
 type HeapKey = Reverse<([u8; 16], [u8; 16], Reverse<u16>, usize)>;
 
+/// One lock per output path. `merge_to_path` writes every call through the
+/// same `<path>.tmp`, so concurrent calls for one destination must not
+/// overlap; different destinations still proceed independently.
+fn merge_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
 /// Merge sidecars and runs covering a contiguous pack range into one run at
 /// `path`, keeping the newest version of each key.
 ///
@@ -1282,12 +1314,20 @@ type HeapKey = Reverse<([u8; 16], [u8; 16], Reverse<u16>, usize)>;
 /// # Errors
 /// Returns [`RunError::OverlappingInputs`] if two inputs share a pack or
 /// interleave in pack order, [`RunError::Corrupt`] if an input run fails a
-/// block check, and I/O errors. On error no file is left at `path`.
+/// block check, [`RunError::Cancelled`] if the stop signal is set, and I/O
+/// errors. On error no file is left at `path`.
+///
+/// Concurrent calls for the same `path` are serialized: every call stages
+/// through the same `<path>.tmp` name before its atomic rename.
 pub fn merge_to_path(
     sources: &[MergeSource<'_>],
     options: &MergeOptions,
     path: &Path,
 ) -> Result<Option<RunSummary>, RunError> {
+    let merge_lock = merge_lock(path);
+    let _merge_guard = merge_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut packs: Vec<PackIndexIdentity> = sources.iter().flat_map(MergeSource::packs).collect();
     packs.sort_by_key(pack_order);
     if packs

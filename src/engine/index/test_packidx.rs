@@ -134,11 +134,17 @@ fn dedup_accumulates_superseded_frame_disk_bytes() {
 #[test]
 fn dedup_rejects_disk_byte_overflow() {
     let mut inputs = sample_inputs();
-    inputs[1].disk_bytes = u64::MAX;
-    inputs[2].disk_bytes = 1;
+    // Both extents are individually valid (each ends at u64::MAX), so the
+    // failure must come from the duplicate-frame sum overflowing.
+    inputs[1].disk_bytes = u64::MAX - inputs[1].offset;
+    inputs[2].disk_bytes = u64::MAX - inputs[2].offset;
+    let identity = PackIndexIdentity {
+        pack_file_len: u64::MAX,
+        ..sample_identity()
+    };
     assert!(matches!(
-        PackIndex::build(sample_identity(), inputs).unwrap_err(),
-        PackIndexError::TooLarge | PackIndexError::FrameExtentOutsidePack { .. }
+        PackIndex::build(identity, inputs).unwrap_err(),
+        PackIndexError::TooLarge
     ));
 }
 

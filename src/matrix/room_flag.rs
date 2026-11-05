@@ -400,7 +400,7 @@ impl RoomFlagIndex {
     ///
     /// # Errors
     /// Returns [`StorageError`] on read error or payload encoding failure.
-    pub fn stage_into_collection(
+    pub(crate) fn stage_into_collection(
         &self,
         tx: &DatabaseTransaction<'_>,
         chunk_col: [u8; 16],
@@ -424,7 +424,17 @@ impl RoomFlagIndex {
         let mut mutated = false;
 
         for change in changes {
-            if change.short_id > max_short_seen {
+            if change.short_id == 0 {
+                // Room short IDs start at 1; accepting 0 would store a flag
+                // that `count` and `select` (which start at chunk 0, bit 0)
+                // can enumerate but that has no event to resolve.
+                return Err(StorageError::Corrupt(
+                    "room flag short id 0 is reserved".to_owned(),
+                ));
+            }
+            // Clears never create bits, so they must not raise the index bound
+            // that `count` and `select_shorts_bounded` scan to.
+            if change.set && change.short_id > max_short_seen {
                 max_short_seen = change.short_id;
             }
             let chunk_idx = u16::try_from(change.short_id / CHUNK_CAPACITY)
@@ -438,9 +448,10 @@ impl RoomFlagIndex {
 
         for ((flag, chunk_idx), chunk_changes) in grouped {
             let chunk_id = flag_chunk_node_id(flag, chunk_idx);
-            let (existing_nodes, versions) =
-                tx.get_with_record_versions(self.pool, &chunk_col, &[chunk_id])?;
+            let (existing_nodes, versions, staged) =
+                tx.get_with_record_versions_and_staged(self.pool, &chunk_col, &[chunk_id])?;
             let token = versions.first().copied().unwrap_or(0);
+            let was_staged = staged.first().copied().unwrap_or(false);
             let existing_data = existing_nodes.into_iter().next().flatten();
 
             let mut bitmap = match existing_data.as_ref() {
@@ -471,9 +482,10 @@ impl RoomFlagIndex {
                 &NodeData::new(Bytes::from(encoded)),
             )?;
             mutated = true;
-            // If the record was already staged in this transaction, token is 0.
-            // Avoid adding a bogus version 0 expectation that fails commit.
-            if existing_data.is_none() || token != 0 {
+            // Staged records have no published version token. Live records can
+            // legitimately have token 0 (journal-less frames), so retain that
+            // CAS expectation when the value came from the live store.
+            if !was_staged {
                 tx.expect_record_version(self.pool, chunk_col, chunk_id, token)?;
             }
         }
@@ -499,9 +511,10 @@ impl RoomFlagIndex {
             return Ok(());
         }
 
-        let (meta_nodes, meta_versions) =
-            tx.get_with_record_versions(self.pool, &self.collection, &[FLAG_META_ID])?;
+        let (meta_nodes, meta_versions, meta_staged) =
+            tx.get_with_record_versions_and_staged(self.pool, &self.collection, &[FLAG_META_ID])?;
         let meta_token = meta_versions.first().copied().unwrap_or(0);
+        let meta_was_staged = meta_staged.first().copied().unwrap_or(false);
         let meta_raw = meta_nodes.into_iter().next().flatten();
         let current_meta = match meta_raw.as_ref() {
             Some(data) => decode_meta(&data.bytes)?,
@@ -516,13 +529,16 @@ impl RoomFlagIndex {
         if !mutated {
             // No records are written, but keep the metadata CAS check so a
             // rebuild that published after our read aborts this transaction.
-            if !(meta_raw.is_some() && meta_token == 0) {
+            if !meta_was_staged {
                 tx.expect_record_version(self.pool, self.collection, FLAG_META_ID, meta_token)?;
             }
             return Ok(());
         }
 
-        if !(meta_raw.is_some() && meta_token == 0) {
+        // A live record with token 0 (journal-less frame, or an absent record)
+        // still needs a fence; only a value staged in this transaction is
+        // uncommitted and has no published version to compare against.
+        if !meta_was_staged {
             tx.expect_record_version(self.pool, self.collection, FLAG_META_ID, meta_token)?;
         }
         // Every writer updates this CAS record, including changes that do not
@@ -805,9 +821,14 @@ impl RoomFlagIndex {
                 },
             };
 
-            let (counter_nodes, counter_versions) =
-                tx.get_with_record_versions(self.pool, &self.collection, &[FLAG_COUNTER_ID])?;
+            let (counter_nodes, counter_versions, counter_staged) = tx
+                .get_with_record_versions_and_staged(
+                    self.pool,
+                    &self.collection,
+                    &[FLAG_COUNTER_ID],
+                )?;
             let counter_token = counter_versions.first().copied().unwrap_or(0);
+            let counter_was_staged = counter_staged.first().copied().unwrap_or(false);
             let counter_raw = counter_nodes.into_iter().next().flatten();
             let next_alloc = match counter_raw.as_ref() {
                 Some(data) => decode_counter(&data.bytes)?,
@@ -825,7 +846,7 @@ impl RoomFlagIndex {
                 FLAG_COUNTER_ID,
                 &NodeData::new(Bytes::from(encode_counter(next_counter).to_vec())),
             )?;
-            if !(counter_raw.is_some() && counter_token == 0) {
+            if !counter_was_staged {
                 tx.expect_record_version(
                     self.pool,
                     self.collection,
@@ -898,8 +919,8 @@ impl RoomFlagIndex {
             target_col,
             meta_token,
         };
-        match self.rebuild_generation(db, inputs) {
-            Ok(total) => Ok(total),
+        let (total, max_short_seen) = match self.build_generation(db, &inputs) {
+            Ok(built) => built,
             Err(e) => {
                 let cleanup_tx = db.begin_transaction();
                 if let Err(cleanup_err) = cleanup_tx.delete_collection(self.pool, target_col) {
@@ -907,24 +928,40 @@ impl RoomFlagIndex {
                 } else if let Err(cleanup_err) = cleanup_tx.commit() {
                     eprintln!("room flag rebuild: failed to commit cleanup of target collection {new_gen}: {cleanup_err}");
                 }
-                Err(e)
+                return Err(e);
             }
-        }
+        };
+        // Publication has no cleanup on failure: the journal may already have
+        // made the new generation active, so deleting its collection here
+        // could destroy the live index.
+        self.publish_generation(db, inputs, max_short_seen)?;
+        Ok(total)
     }
 
+    #[cfg(test)]
     pub(crate) fn rebuild_generation(
         &self,
         db: &Database,
         inputs: RebuildInputs,
     ) -> Result<u64, StorageError> {
+        let (total, max_short_seen) = self.build_generation(db, &inputs)?;
+        self.publish_generation(db, inputs, max_short_seen)?;
+        Ok(total)
+    }
+
+    /// Scan and stage the new generation's chunks without publishing it.
+    fn build_generation(
+        &self,
+        db: &Database,
+        inputs: &RebuildInputs,
+    ) -> Result<(u64, u32), StorageError> {
         let timeline_nodes = self.timeline_nodes(db)?;
         let mut total_indexed = 0_u64;
         let mut max_short_seen = 0_u32;
         let mut start_id = 1_u32;
         while start_id <= inputs.counter {
             let end_id = start_id
-                .saturating_add(REBUILD_BATCH_SIZE)
-                .saturating_sub(1)
+                .saturating_add(REBUILD_BATCH_SIZE - 1)
                 .min(inputs.counter);
             let (changes, batch_indexed) =
                 self.scan_short_batch(db, &timeline_nodes, start_id, end_id)?;
@@ -945,8 +982,44 @@ impl RoomFlagIndex {
             start_id = end_id.saturating_add(1);
         }
 
-        self.publish_generation(db, inputs, max_short_seen)?;
-        Ok(total_indexed)
+        // Custom flags are caller-defined and carry no source event to
+        // re-derive them from, so copy their chunks into the new generation.
+        self.copy_custom_flags(db, inputs.target_col, &inputs.current_meta)?;
+
+        Ok((total_indexed, max_short_seen))
+    }
+
+    /// Copy caller-defined flag chunks from `current_meta`'s generation into
+    /// `target_col`. Built-in flags are re-derived from auth/verdict records,
+    /// but custom flags have no source and would otherwise be lost on rebuild.
+    fn copy_custom_flags(
+        &self,
+        db: &Database,
+        target_col: [u8; 16],
+        current_meta: &FlagMeta,
+    ) -> Result<(), StorageError> {
+        if current_meta.max_short_id == 0 {
+            return Ok(());
+        }
+        let source_col = self.chunk_collection(current_meta.generation);
+        let max_chunk = (current_meta.max_short_id / CHUNK_CAPACITY) as u16;
+        let tx = db.begin_transaction();
+        let mut copied = 0_usize;
+        for index in 0..=Flag::MAX_CUSTOM {
+            let flag = Flag::custom(index).expect("custom index is within range");
+            for chunk_idx in 0..=max_chunk {
+                let chunk_id = flag_chunk_node_id(flag, chunk_idx);
+                let Some(data) = db.pool(self.pool).get(&source_col, &chunk_id)? else {
+                    continue;
+                };
+                tx.put(self.pool, target_col, chunk_id, &NodeData::new(data.bytes))?;
+                copied = copied.saturating_add(1);
+            }
+        }
+        if copied > 0 {
+            tx.commit()?;
+        }
+        Ok(())
     }
 
     fn timeline_nodes(&self, db: &Database) -> Result<Vec<NodeId>, StorageError> {
@@ -1055,9 +1128,10 @@ impl RoomFlagIndex {
     ) -> Result<(), StorageError> {
         // Atomically publish new generation via CAS
         let publish_tx = db.begin_transaction();
-        let (meta_nodes, meta_versions) =
-            publish_tx.get_with_record_versions(self.pool, &self.collection, &[FLAG_META_ID])?;
+        let (meta_nodes, meta_versions, meta_staged) = publish_tx
+            .get_with_record_versions_and_staged(self.pool, &self.collection, &[FLAG_META_ID])?;
         let live_meta_token = meta_versions.first().copied().unwrap_or(0);
+        let live_meta_was_staged = meta_staged.first().copied().unwrap_or(false);
         let live_meta_raw = meta_nodes.into_iter().next().flatten();
         let live_meta = match live_meta_raw.as_ref() {
             Some(data) => decode_meta(&data.bytes)?,
@@ -1090,7 +1164,7 @@ impl RoomFlagIndex {
             FLAG_META_ID,
             &NodeData::new(Bytes::from(meta_encoded.to_vec())),
         )?;
-        if !(live_meta_raw.is_some() && inputs.meta_token == 0) {
+        if !live_meta_was_staged {
             publish_tx.expect_record_version(
                 self.pool,
                 self.collection,

@@ -232,6 +232,10 @@ fn main() {
     let scratch = PathBuf::from(args.next().expect(usage));
     let rate = env_u64("MTXDB_PUT_RATE", 5_000);
     let tail = Duration::from_millis(env_u64("MTXDB_PUT_TAIL_MS", 1_000));
+    assert!(
+        tail > Duration::ZERO,
+        "MTXDB_PUT_TAIL_MS must be positive so the put that installs the run is sampled"
+    );
     let records = std::fs::read_to_string(fixture.join("fixture-records"))
         .ok()
         .and_then(|contents| contents.trim().parse().ok())
@@ -263,9 +267,19 @@ fn main() {
 
     let mut sequence = records;
     let (merge, published) = merge_pass(&store, &scratch, &mut sequence, rate, tail);
+    // A run file can appear before its worker reports completion and the
+    // storage generation installs it. Settle all resulting merges before the
+    // control pass so the two samples do not overlap installation.
+    store.settle_run_merges();
     let runs = run_files(&scratch);
-    let control = control_pass(&store, &scratch, &mut sequence, merge.len(), rate);
-    let control_runs = run_files(&scratch);
+    // The control measures puts with no merge in flight, so it is only valid
+    // once a merge has actually published a run.
+    let (control, control_runs) = if published.is_some() {
+        let control = control_pass(&store, &scratch, &mut sequence, merge.len(), rate);
+        (control, run_files(&scratch))
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     match published {
         Some(at) => println!(
@@ -275,18 +289,26 @@ fn main() {
         None => println!("no run published within {MERGE_PASS_LIMIT:?}"),
     }
     for path in &runs {
-        let covered = RunIndex::open(path).map_or(0, |run| run.packs().len());
+        let covered = match RunIndex::open(path) {
+            Ok(run) => run.packs().len(),
+            Err(error) => {
+                eprintln!("could not open published run {}: {error}", path.display());
+                0
+            }
+        };
         println!(
             "run {} covers {covered} packs",
             path.file_name().unwrap_or_default().to_string_lossy()
         );
     }
-    if control_runs != runs {
+    if published.is_some() && control_runs != runs {
         println!("warning: the run set changed during the control pass: {control_runs:?}");
     }
     println!("pass\tputs\tp50_us\tp99_us\tp999_us\tmax_us");
     report("merge", merge);
-    report("control", control);
+    if published.is_some() {
+        report("control", control);
+    }
 
     drop(store);
     if std::env::var_os("MTXDB_KEEP_SCRATCH").is_none() {

@@ -11,6 +11,8 @@
 //! keys are spread over the older 90% of the collection; misses are unique.
 //! `MTXDB_LOOKUP_SHARD_BYTES` changes the seal size, and
 //! `MTXDB_LOOKUP_PACK_COUNTS=1000` runs only a selected pack-count fixture.
+//! `MTXDB_SIDECAR_STALL_TIMEOUT_SECS` sets the fixture's no-progress timeout
+//! for sidecar builds (default 5).
 //! With `MTXDB_LOOKUP_ROOT` set, fixtures are kept there and a complete one
 //! (marked by its `fixture-records` file) is reused by later runs with the same
 //! pack count, seal size and payload size.
@@ -30,11 +32,18 @@ const COLLECTION: [u8; 16] = [0x4D; 16];
 const DEFAULT_SHARD_BYTES: u64 = 8192;
 const PAYLOAD_BYTES: usize = 120;
 const PROBES: usize = 500;
-/// How long to wait for an asynchronous sidecar build before treating it as
-/// stalled. Without this, a failed `mtxdb-pack-index` worker would let the
-/// top-up loop keep growing the fixture until a write or sync fails.
-const SIDECAR_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default no-progress timeout for asynchronous sidecar builds. Override with
+/// `MTXDB_SIDECAR_STALL_TIMEOUT_SECS` for large or slow fixtures.
+const DEFAULT_SIDECAR_STALL_TIMEOUT_SECS: u64 = 5;
 const SIDECAR_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+fn sidecar_stall_timeout() -> Duration {
+    let seconds = std::env::var("MTXDB_SIDECAR_STALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SIDECAR_STALL_TIMEOUT_SECS);
+    Duration::from_secs(seconds)
+}
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -161,6 +170,7 @@ fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64, payload_len:
     // 341), and every sync rewrites the whole index checkpoint, so top up
     // from the measured records per pack instead of syncing once per batch.
     let wanted = u64::try_from(wanted_packs).expect("pack count fits in u64");
+    let stall_timeout = sidecar_stall_timeout();
     let mut last_sealed = 0u64;
     let mut stalled_since = None;
     loop {
@@ -174,7 +184,7 @@ fn build_fixture(dir: &Path, wanted_packs: usize, shard_bytes: u64, payload_len:
         } else {
             let since = *stalled_since.get_or_insert_with(Instant::now);
             assert!(
-                since.elapsed() < SIDECAR_STALL_TIMEOUT,
+                since.elapsed() < stall_timeout,
                 "fixture top-up stalled at {sealed} of {wanted} sidecars; \
                  mtxdb-pack-index may have failed (check its log)"
             );
@@ -296,14 +306,43 @@ fn main() {
                 .expect("rewrite resident checkpoint");
             records
         } else {
-            if base.exists() {
-                std::fs::remove_dir_all(&base).expect("clear incomplete fixture");
-            }
-            std::fs::create_dir_all(&base).expect("create fixture directory");
-            let records = build_fixture(&base, wanted, shard_bytes, payload_len);
-            std::fs::write(base.join(FIXTURE_RECORDS), records.to_string())
+            // Build under a per-run directory and publish it with an atomic
+            // rename. A concurrent run with the same parameters therefore
+            // never sees (or deletes) this directory while it is incomplete.
+            let building = root.join(format!(
+                ".build-{wanted}-s{shard_bytes}-p{payload_len}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&building).expect("create fixture directory");
+            let records = build_fixture(&building, wanted, shard_bytes, payload_len);
+            std::fs::write(building.join(FIXTURE_RECORDS), records.to_string())
                 .expect("record fixture size");
-            records
+            if fixture_records(&base, wanted).is_some() {
+                let _ = std::fs::remove_dir_all(&building);
+                fixture_records(&base, wanted).expect("completed fixture")
+            } else {
+                match std::fs::rename(&building, &base) {
+                    Ok(()) => records,
+                    Err(error) => {
+                        // Another run may have published the completed fixture
+                        // while this one was building.
+                        if let Some(records) = fixture_records(&base, wanted) {
+                            let _ = std::fs::remove_dir_all(&building);
+                            records
+                        } else {
+                            panic!(
+                                "cannot install fixture at {}: {error}; \
+                                 remove an incomplete fixture directory and retry",
+                                base.display()
+                            );
+                        }
+                    }
+                }
+            }
         };
 
         let hit_range = total_records.saturating_mul(9) / 10;

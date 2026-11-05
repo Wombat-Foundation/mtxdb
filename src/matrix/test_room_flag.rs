@@ -15,6 +15,7 @@ mod tests {
         CHUNK_CAPACITY, FLAG_META_ID,
     };
     use crate::storage::{NodeData, StorageEngine};
+    use bytes::Bytes;
 
     struct TestRoot(PathBuf);
 
@@ -128,6 +129,29 @@ mod tests {
             chunks_after, chunks_before,
             "no-op stage rewrote flag chunks"
         );
+    }
+
+    #[test]
+    fn clears_do_not_raise_the_indexed_short_id_bound() {
+        let root = test_root("clear_bound");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
+        let index = RoomFlagIndex::new(b"!clear_bound:example.com");
+
+        let tx = db.begin_transaction();
+        index
+            .stage(
+                &tx,
+                &[
+                    FlagChange::set(1, Flag::Present),
+                    // A clear cannot create a bit, so this high short id must
+                    // not become the metadata's scan bound.
+                    FlagChange::clear(100_000, Flag::Rejected),
+                ],
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(index.meta(&db).unwrap().max_short_id, 1);
     }
 
     #[test]
@@ -468,6 +492,23 @@ mod tests {
         let redacted = index.select(&db, &FlagQuery::has(Flag::Redacted)).unwrap();
         assert_eq!(redacted, vec![ev2.to_vec()]);
 
+        // A caller-defined flag has no event source to re-derive it from, so a
+        // rebuild must carry it into the new generation.
+        let tx_custom = db.begin_transaction();
+        index
+            .stage(
+                &tx_custom,
+                &[FlagChange::set(2, Flag::custom(7).expect("in range"))],
+            )
+            .unwrap();
+        tx_custom.commit().unwrap();
+        assert_eq!(
+            index
+                .count(&db, &FlagQuery::has(Flag::custom(7).expect("in range")))
+                .unwrap(),
+            1
+        );
+
         // Verify rebuild clears stale bits: manually set Rejected on short 1, then rebuild
         let tx_stale = db.begin_transaction();
         index
@@ -483,6 +524,13 @@ mod tests {
         assert_eq!(
             index.count(&db, &FlagQuery::has(Flag::Rejected)).unwrap(),
             0
+        );
+        assert_eq!(
+            index
+                .count(&db, &FlagQuery::has(Flag::custom(7).expect("in range")))
+                .unwrap(),
+            1,
+            "a rebuild must retain caller-defined custom flags"
         );
     }
 
@@ -642,6 +690,94 @@ mod tests {
             index.count(&db, &FlagQuery::has(Flag::Timeline)).unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn stage_guards_live_journal_less_chunk_versions() {
+        let root = test_root("journal_less_chunk_version");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
+        let index = RoomFlagIndex::new(b"!journal-less:example.com");
+        let chunk_col = index.chunk_collection(1);
+        let chunk_id = flag_chunk_node_id(Flag::Present, 0);
+
+        // Seed a pack record outside the transaction journal. Its live record
+        // version is zero, but it still needs a CAS expectation when staged.
+        let mut initial = crate::bitmap_set::BitmapSet::new(index.domain());
+        initial.insert(1);
+        db.pool(ShardType::EventDag)
+            .put(
+                &chunk_col,
+                &chunk_id,
+                &NodeData::new(Bytes::from(initial.encode().unwrap())),
+            )
+            .unwrap();
+        db.pool(ShardType::EventDag).sync().unwrap();
+
+        let staged = db.begin_transaction();
+        index
+            .stage(&staged, &[FlagChange::set(2, Flag::Present)])
+            .unwrap();
+
+        let concurrent = db.begin_transaction();
+        let mut replacement = crate::bitmap_set::BitmapSet::new(index.domain());
+        replacement.insert(3);
+        concurrent
+            .put(
+                ShardType::EventDag,
+                chunk_col,
+                chunk_id,
+                &NodeData::new(Bytes::from(replacement.encode().unwrap())),
+            )
+            .unwrap();
+        concurrent.commit().unwrap();
+
+        assert!(matches!(
+            staged.commit(),
+            Err(crate::storage::StorageError::StaleRead { .. })
+        ));
+    }
+
+    #[test]
+    fn stage_guards_live_journal_less_meta_versions() {
+        let root = test_root("journal_less_meta_version");
+        let db = Database::open(root.path().to_path_buf()).unwrap();
+        let index = RoomFlagIndex::new(b"!journal-less-meta:example.com");
+        let meta = crate::room_flag::encode_meta(crate::room_flag::FlagMeta {
+            generation: 1,
+            max_short_id: 5,
+        });
+
+        // Seed metadata outside the transaction journal. Its live record
+        // version is zero, but it still needs a CAS expectation when staged.
+        db.pool(ShardType::EventDag)
+            .put(
+                index.collection(),
+                &FLAG_META_ID,
+                &NodeData::new(Bytes::from(meta.to_vec())),
+            )
+            .unwrap();
+        db.pool(ShardType::EventDag).sync().unwrap();
+
+        let staged = db.begin_transaction();
+        index
+            .stage(&staged, &[FlagChange::set(6, Flag::Present)])
+            .unwrap();
+
+        let concurrent = db.begin_transaction();
+        concurrent
+            .put(
+                ShardType::EventDag,
+                *index.collection(),
+                FLAG_META_ID,
+                &NodeData::new(Bytes::from(meta.to_vec())),
+            )
+            .unwrap();
+        concurrent.commit().unwrap();
+
+        assert!(matches!(
+            staged.commit(),
+            Err(crate::storage::StorageError::StaleRead { .. })
+        ));
     }
 
     #[test]

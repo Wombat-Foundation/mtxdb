@@ -37,13 +37,18 @@ const COLLECTION: [u8; 16] = [0xC1; 16];
 const BATCH: u64 = 8192;
 
 fn rss_bytes() -> u64 {
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let pages: u64 = statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    pages.saturating_mul(4096)
+    // Read VmRSS in KiB rather than scaling `/proc/self/statm` by a page size:
+    // the kernel reports the resident size directly, so this stays correct on
+    // hosts with 16 KiB or 64 KiB pages.
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("VmRSS:")?;
+            rest.split_ascii_whitespace().next()?.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+        .saturating_mul(1024)
 }
 
 fn id_for(seq: u64) -> [u8; 16] {
@@ -283,6 +288,10 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4_000_000);
+    assert!(
+        records > 0,
+        "MTXDB_MEASURE_RECORDS must be a positive integer"
+    );
     let base: PathBuf = match std::env::var("MTXDB_MEASURE_DIR") {
         Ok(value) => PathBuf::from(value),
         Err(_) => std::env::temp_dir(),
@@ -329,8 +338,9 @@ fn main() {
 
     // Reopen the slots-only checkpoint and measure write costs.
     drop(store);
+    let residency = measure_residency();
     let rss_before = rss_bytes();
-    let store = open_store(dir.clone(), measure_residency());
+    let store = open_store(dir.clone(), residency);
     let (heap, mapped, logical, slots) = index_memory(&store);
     println!(
         "reopen (slots-only): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB ({:.2} B/slot), logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
@@ -372,7 +382,7 @@ fn main() {
         }
     }
     let baseline = rss_bytes();
-    let (store, peak) = peak_rss_during(|| open_store(dir.clone(), measure_residency()));
+    let (store, peak) = peak_rss_during(|| open_store(dir.clone(), residency));
     let (heap, _mapped, _logical, _slots) = index_memory(&store);
     if let Some(timing) = store.open_timings() {
         println!(
@@ -394,8 +404,13 @@ fn main() {
             timing.pack_index_sidecars,
         );
     }
+    let open_label = if residency == mtxdb::index::IndexResidency::Paged {
+        "paged open (sidecars, no checkpoint)"
+    } else {
+        "full-scan open"
+    };
     println!(
-        "full-scan open: peak rss {:.1} MiB (from {:.1} MiB, +{:.1}), final heap {:.1} MiB ({:.2} B/rec)",
+        "{open_label}: peak rss {:.1} MiB (from {:.1} MiB, +{:.1}), final heap {:.1} MiB ({:.2} B/rec)",
         mib(peak),
         mib(baseline),
         mib(peak.saturating_sub(baseline)),

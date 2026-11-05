@@ -12971,6 +12971,11 @@ fn paged_full_scan_uses_sidecars_under_full_checksums() {
         .collection_index_residency(&TEST_COLLECTION)
         .expect("residency");
     assert_eq!(entries, ids.len());
+    assert_eq!(
+        store.collection_len(&TEST_COLLECTION).unwrap(),
+        Some(ids.len()),
+        "a paged length must include sealed live records"
+    );
 
     for id in &ids {
         assert!(
@@ -12978,6 +12983,12 @@ fn paged_full_scan_uses_sidecars_under_full_checksums() {
             "sealed record must resolve from its sidecar"
         );
     }
+    assert!(store.remove(&TEST_COLLECTION, &ids[0]).unwrap());
+    assert_eq!(
+        store.collection_len(&TEST_COLLECTION).unwrap(),
+        Some(ids.len() - 1),
+        "a resident removal must shadow the sealed live version"
+    );
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }

@@ -228,18 +228,43 @@ fn build_pack_index(
     pack_len: u64,
     entries: &[([u8; 16], [u8; 16], u64)],
 ) -> (PathBuf, PackIndexIdentity, u64, Duration, Duration) {
+    // Derive each frame's physical extent from the next frame's offset; the
+    // last frame runs to the end of the pack.
+    let mut frames: Vec<(u64, u64)> = entries.iter().map(|entry| (entry.2, 0)).collect();
+    frames.sort_unstable_by_key(|frame| frame.0);
+    for position in 0..frames.len() {
+        let offset = frames[position].0;
+        let next = frames
+            .get(position.saturating_add(1))
+            .map_or(pack_len, |frame| frame.0);
+        frames[position].1 = next.saturating_sub(offset).max(1);
+    }
+    let expected_disk_bytes = frames
+        .iter()
+        .map(|frame| frame.1)
+        .fold(0_u64, u64::saturating_add);
     let inputs = entries
         .iter()
-        .map(|(collection_id, logical_id, offset)| PackIndexInput {
-            collection_id: *collection_id,
-            logical_id: *logical_id,
-            offset: *offset,
-            removed: false,
-            disk_bytes: 0,
+        .map(|(collection_id, logical_id, offset)| {
+            let frame = frames
+                .binary_search_by_key(offset, |frame| frame.0)
+                .expect("entry has a frame extent");
+            PackIndexInput {
+                collection_id: *collection_id,
+                logical_id: *logical_id,
+                offset: *offset,
+                removed: false,
+                disk_bytes: frames[frame].1,
+            }
         })
         .collect();
     let identity = pack_index_identity(pack, pack_len);
     let (index, build_t) = timed(|| PackIndex::build(identity, inputs).expect("build PackIndex"));
+    assert_eq!(
+        index.collection_disk_bytes(&COLLECTION),
+        Some(expected_disk_bytes),
+        "PackIndex records nonzero physical frame bytes"
+    );
     let bytes = u64::try_from(index.as_bytes().len()).expect("PackIndex length fits u64");
     let path = dir.join("pack.mtxidx");
     let ((), write_t) = timed(|| {

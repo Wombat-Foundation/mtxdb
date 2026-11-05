@@ -52,6 +52,7 @@ impl Default for PoolPolicy {
 }
 
 const POOL_COUNT: usize = ShardType::ALL.len();
+type VersionedStagedRecords = (Vec<Option<crate::storage::NodeData>>, Vec<u64>, Vec<bool>);
 
 /// Policies for every named pool in a database.
 ///
@@ -556,21 +557,40 @@ impl DatabaseTransaction<'_> {
         collection_id: &[u8; 16],
         node_ids: &[NodeId],
     ) -> Result<(Vec<Option<crate::storage::NodeData>>, Vec<u64>), StorageError> {
+        let (records, versions, _) =
+            self.get_with_record_versions_and_staged(pool, collection_id, node_ids)?;
+        Ok((records, versions))
+    }
+
+    /// As [`Self::get_with_record_versions`], also reporting which values came
+    /// from this transaction's staged mutations rather than the live store.
+    pub(crate) fn get_with_record_versions_and_staged(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_ids: &[NodeId],
+    ) -> Result<VersionedStagedRecords, StorageError> {
         let _lifecycle = self.lifecycle.lock();
         let staged = self.stage.lookup_many(pool, collection_id, node_ids);
         let mut results = Vec::with_capacity(node_ids.len());
         let mut versions = vec![0u64; node_ids.len()];
+        let mut is_staged = Vec::with_capacity(node_ids.len());
         let mut live_slots = Vec::new();
         let mut live_ids = Vec::new();
         for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
             match lookup {
                 StagedLookup::Put(payload) => {
+                    is_staged.push(true);
                     results.push(Some(crate::storage::NodeData::new(bytes::Bytes::from(
                         payload,
                     ))));
                 }
-                StagedLookup::Deleted => results.push(None),
+                StagedLookup::Deleted => {
+                    is_staged.push(true);
+                    results.push(None);
+                }
                 StagedLookup::Absent => {
+                    is_staged.push(false);
                     results.push(None);
                     live_slots.push(slot);
                     live_ids.push(*node_id);
@@ -587,7 +607,7 @@ impl DatabaseTransaction<'_> {
                 versions[slot] = version;
             }
         }
-        Ok((results, versions))
+        Ok((results, versions, is_staged))
     }
 
     /// Read node payloads and the collection version without copying the
@@ -717,6 +737,7 @@ impl DatabaseTransaction<'_> {
                 .materialize
                 .add(started.elapsed());
             materialized.map_err(|error| {
+                self.database.note_materialization_failure(&error);
                 StorageError::Internal(format!(
                     "transaction is published but not yet materialized; do not \
                      rewrite it, recover_pending_transactions will finish it: {error}"
@@ -1113,6 +1134,17 @@ impl Database {
         }
     }
 
+    /// Record a materialization failure that a retry cannot fix. A transient
+    /// `WouldBlock` leaves the group queued for the existing retry path; any
+    /// other error means this process's live index no longer matches the WAL,
+    /// so later publications and versioned reads must fail until a reopen.
+    fn note_materialization_failure(&self, error: &StorageError) {
+        if !error.is_would_block() {
+            self.coordinator
+                .fail_apply(format!("transaction materialization failed: {error}"));
+        }
+    }
+
     fn materialize_transaction(&self, stage: &TxnStage) -> Result<(), StorageError> {
         // The published group's last LSN is stamped into each record it writes,
         // so a record's optimistic token survives reclaim of the group's WAL.
@@ -1162,7 +1194,10 @@ impl Database {
             if stage.state() != TxnStageState::Materializing {
                 continue;
             }
-            self.materialize_transaction(&stage)?;
+            if let Err(error) = self.materialize_transaction(&stage) {
+                self.note_materialization_failure(&error);
+                return Err(error);
+            }
             stage.mark_published().map_err(StorageError::Io)?;
             self.finish_recovery_stage(&stage)?;
         }

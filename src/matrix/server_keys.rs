@@ -307,6 +307,11 @@ fn take_field<'a>(rest: &mut &'a [u8], what: &str) -> Result<&'a [u8], StorageEr
 /// # Errors
 /// Returns [`StorageError::Corrupt`] if a field does not fit its length prefix.
 pub fn encode_server_key_record(origin: &[u8], key: &ServerKey) -> Result<Vec<u8>, StorageError> {
+    // An evicted key has no body to hash, but any key that still carries bytes
+    // must agree with its digest binding or the record would fail to read back.
+    if !key.key.is_empty() && key_digest(&key.key) != key.digest {
+        return Err(corrupt("digest does not match the key"));
+    }
     let flags = u8::from(key.expired_ts.is_some())
         | u8::from(key.corroborated) << 1
         | u8::from(key.inferred_retired) << 2;
@@ -525,7 +530,6 @@ pub fn set_verified_observations(
     db: &Database,
     updates: &[VerifiedObservationUpdate<'_>],
 ) -> Result<Vec<usize>, StorageError> {
-    let store = db.server_info();
     let mut missing = Vec::new();
     for (batch_index, batch) in updates.chunks(OBSERVATION_BATCH_SIZE).enumerate() {
         let first_index = batch_index.saturating_mul(OBSERVATION_BATCH_SIZE);
@@ -536,10 +540,28 @@ pub fn set_verified_observations(
                 let mut batch_missing = Vec::new();
                 let mut changed = 0_usize;
                 for (offset, (origin, key_id, observation)) in batch.iter().enumerate() {
-                    let Some(mut key) = read_server_key(store, origin, key_id)? else {
+                    let collection = origin_keys_collection_id(origin);
+                    let id = origin_key_record_id(key_id);
+                    let (records, versions, staged) = tx.get_with_record_versions_and_staged(
+                        SERVER_INFO_POOL,
+                        &collection,
+                        &[id],
+                    )?;
+                    let Some(data) = records.into_iter().next().flatten() else {
                         batch_missing.push(first_index.saturating_add(offset));
                         continue;
                     };
+                    let mut key = decode_for(origin, Some(key_id), &data.bytes)?;
+                    // Only a value staged earlier in this same transaction has
+                    // no published version to fence; a live token-0 record does.
+                    if !staged.first().copied().unwrap_or(false) {
+                        tx.expect_record_version(
+                            SERVER_INFO_POOL,
+                            collection,
+                            id,
+                            versions.first().copied().unwrap_or(0),
+                        )?;
+                    }
                     if let Some((first_seen_ms, last_active_ms)) = observation {
                         key.first_seen_ms = *first_seen_ms;
                         key.last_active_ms = *last_active_ms;
@@ -563,7 +585,10 @@ pub fn set_verified_observations(
                     missing.extend(batch_missing);
                     break;
                 }
-                Err(error) if error.is_would_block() && attempt < OBSERVATION_RETRIES => {
+                Err(error)
+                    if (error.is_stale_read() || error.is_would_block())
+                        && attempt < OBSERVATION_RETRIES =>
+                {
                     let delay = 5_u64
                         .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
                         .unwrap_or(250)
@@ -910,6 +935,12 @@ fn try_update(
             .any(|observed| observed.expired_ts.is_some())
         || ids.iter().any(|id| !current.contains_key(id))
         || current.values().any(ServerKey::is_evicted)
+        // A direct fetch can promote a provisional binding into the direct
+        // bucket, whose cap needs the origin's other keys to count.
+        || (update.sighting == KeySighting::Direct
+            && current
+                .values()
+                .any(|key| key.tier == KeyTier::Provisional))
     {
         let rest: Vec<[u8; 16]> = stored_ids(db, &collection)?
             .into_iter()
@@ -949,7 +980,18 @@ fn try_update(
                 continue;
             }
         }
+        let previous_tier = current.get(&id).map(|key| key.tier);
         let (bound, kind) = bind(current.get(&id), observed, update);
+        // A promotion moves the binding from the notary bucket to the direct
+        // one, so it must fit the direct bucket's cap just like a new key.
+        if previous_tier == Some(KeyTier::Provisional)
+            && bound.tier == KeyTier::Permanent
+            && bucket(KeyTier::Permanent, &current) >= update.limits.digest_cap
+        {
+            issues.push(issue(KeyIssueKind::DigestCapReached));
+            rejected = true;
+            continue;
+        }
         if let Some(kind) = kind {
             rejected |= kind != KeyIssueKind::Displaced;
             issues.push(issue(kind));

@@ -491,7 +491,6 @@ fn sub_flags() -> Command {
         .arg(
             Arg::new("count")
                 .long("count")
-                .short('c')
                 .action(ArgAction::SetTrue)
                 .help("Print only the count of matching events"),
         )

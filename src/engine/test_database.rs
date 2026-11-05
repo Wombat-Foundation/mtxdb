@@ -25,7 +25,9 @@ fn paged_residency_is_rejected_before_the_root_is_created() {
         panic!("paged residency must be rejected");
     };
     assert!(
-        error.to_string().to_ascii_lowercase().contains("paged"),
+        error
+            .to_string()
+            .contains("cannot be used with Database/shared WAL"),
         "unexpected error: {error}"
     );
     assert!(
@@ -46,7 +48,9 @@ fn a_paged_pool_policy_is_rejected_before_the_root_is_created() {
         panic!("paged residency must be rejected");
     };
     assert!(
-        error.to_string().to_ascii_lowercase().contains("paged"),
+        error
+            .to_string()
+            .contains("cannot use shared WAL journaling"),
         "unexpected error: {error}"
     );
     assert!(

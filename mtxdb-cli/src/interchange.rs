@@ -115,6 +115,11 @@ impl RoomEvent {
     /// and clearing incoming verdict flags so auth checks judge it on its own.
     pub(crate) fn from_pdu(pdu: &OwnedValue, room_id: &str) -> Option<Self> {
         let eid = crate::cmd::event_id(pdu)?;
+        if !references_are_well_formed(pdu, "prev_events")
+            || !references_are_well_formed(pdu, "auth_events")
+        {
+            return None;
+        }
         let prev_ids = crate::state_resolve::reference_list(pdu, "prev_events");
         let auth_ids = crate::state_resolve::reference_list(pdu, "auth_events");
         let prev_events = OwnedValue::Array(prev_ids.into_iter().map(OwnedValue::String).collect());
@@ -576,6 +581,23 @@ fn normalize_flag(key: &str) -> String {
     key.trim_start_matches('_').replace('-', "_")
 }
 
+/// Whether a PDU's reference list has only forms [`reference_list`] can read:
+/// a plain event id, or a v1/v2 `[event_id, hashes]` pair. A malformed element
+/// must reject the event rather than be dropped from the analyzed list.
+fn references_are_well_formed(value: &OwnedValue, field: &str) -> bool {
+    match value.get(field) {
+        None => true,
+        Some(OwnedValue::Array(items)) => items.iter().all(|item| match item {
+            OwnedValue::String(_) => true,
+            OwnedValue::Array(pair) => {
+                matches!(pair.first(), Some(OwnedValue::String(_)))
+            }
+            _ => false,
+        }),
+        Some(_) => false,
+    }
+}
+
 /// A record object, or an error naming the line that was not one.
 fn record_object(line: usize, value: &OwnedValue) -> anyhow::Result<&Object> {
     value
@@ -868,6 +890,30 @@ mod tests {
             &event.pdu,
             "soft_failed"
         ));
+    }
+
+    #[test]
+    fn from_pdu_rejects_malformed_reference_elements() {
+        let pdu = OwnedValue::parse_bytes(
+            br#"{"event_id":"$e","room_id":"!room:example.org","type":"m.room.message",
+                 "sender":"@alice:example.org","content":{},"prev_events":[7],
+                 "auth_events":[]}"#,
+        )
+        .expect("test PDU is valid JSON");
+        assert!(
+            RoomEvent::from_pdu(&pdu, "!room:example.org").is_none(),
+            "a non-string prev_events element must reject the event, not be dropped"
+        );
+        let v1_pair = OwnedValue::parse_bytes(
+            br#"{"event_id":"$e","room_id":"!room:example.org","type":"m.room.message",
+                 "sender":"@alice:example.org","content":{},"prev_events":[["$p",{}]],
+                 "auth_events":[]}"#,
+        )
+        .expect("test PDU is valid JSON");
+        assert!(
+            RoomEvent::from_pdu(&v1_pair, "!room:example.org").is_some(),
+            "a v1/v2 pair is a well-formed reference"
+        );
     }
 
     #[test]

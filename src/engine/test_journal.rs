@@ -3430,6 +3430,30 @@ fn expectations_are_staged_and_discarded_with_the_transaction() {
 }
 
 #[test]
+fn conflicting_collection_expectations_are_rejected_but_synthetic_zero_is_ignored() {
+    use crate::layout::ShardType;
+
+    let stage = TxnStage::new();
+    stage
+        .stage_expectation(ShardType::State, [4; 16], 42)
+        .unwrap();
+    // A later staged-view read can report a synthetic zero; it must not
+    // replace the original precondition.
+    stage
+        .stage_expectation(ShardType::State, [4; 16], 0)
+        .unwrap();
+    assert_eq!(stage.expectations().len(), 1);
+    assert_eq!(stage.expectations()[0].expected, 42);
+
+    // A second real token is a conflict, not something to silently drop.
+    let error = stage
+        .stage_expectation(ShardType::State, [4; 16], 43)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(stage.expectations()[0].expected, 42);
+}
+
+#[test]
 fn stale_expectations_reject_the_publish_without_appending() {
     use super::{CollectionExpectation, StaleVersion};
     use crate::layout::ShardType;

@@ -122,7 +122,20 @@ fn test_hit_rate_is_zero_without_hits() {
     let cache = NodeCache::new(1);
     cache.get(&[0x02u8; 16]);
 
-    assert!(cache.hit_rate().abs() < f64::EPSILON);
+    assert_eq!(cache.hit_rate().to_bits(), 0.0_f64.to_bits());
+}
+
+#[test]
+fn test_insert_replaces_cached_node_data() {
+    let cache = NodeCache::new(2);
+    let id = [0x01u8; 16];
+    cache.insert(id, test_data("old"));
+    cache.insert(id, test_data("new"));
+    assert_eq!(
+        cache.get(&id).unwrap().bytes,
+        bytes::Bytes::copy_from_slice(b"new")
+    );
+    assert_eq!(cache.len(), 1);
 }
 
 #[test]

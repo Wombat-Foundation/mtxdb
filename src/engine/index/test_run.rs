@@ -647,6 +647,24 @@ fn writer_rejects_invalid_pack_stats() {
 }
 
 #[test]
+fn finish_rejects_explicit_stats_that_miss_a_pushed_pair() {
+    let dir = TestDir::new();
+    let path = dir.join("missing-pair.run");
+    let mut writer = RunWriter::create(&path, vec![identity(1), identity(2)], 4).unwrap();
+    writer.push(entry(0, 1, 0, 10)).unwrap();
+    writer.push(entry(0, 2, 1, 20)).unwrap();
+    writer
+        .set_pack_stats(vec![RunPackStats {
+            ordinal: 0,
+            collection_id: collection(0),
+            entry_count: 1,
+            disk_bytes: 10,
+        }])
+        .unwrap();
+    assert!(matches!(writer.finish(), Err(RunError::BadLocator)));
+}
+
+#[test]
 fn open_rejects_corrupt_pack_stats() {
     let dir = TestDir::new();
     let path = dir.join("stats.run");
@@ -984,10 +1002,19 @@ fn load_pool_runs_rejects_nonempty_run_without_pack_stats() {
     writer.finish().unwrap().unwrap();
 
     let mut bytes = fs::read(&path).unwrap();
-    // Zero out stats_count in header (bytes 36..40) and reseal
+    // Drop the stats row and shrink meta_len too, so the run parses and only
+    // the missing-stats condition remains.
+    let old_meta_len = usize::try_from(read_u64(&bytes, 48).unwrap()).unwrap();
+    let new_meta_len = old_meta_len.checked_sub(STATS_ENTRY_LEN).unwrap();
+    bytes.truncate(bytes.len().checked_sub(STATS_ENTRY_LEN).unwrap());
     bytes[36..40].copy_from_slice(&0_u32.to_le_bytes());
+    bytes[48..56].copy_from_slice(&u64::try_from(new_meta_len).unwrap().to_le_bytes());
     reseal_meta(&mut bytes);
     fs::write(&path, &bytes).unwrap();
+    assert!(
+        RunIndex::open(&path).is_ok(),
+        "the fixture must parse so the missing-stats gate is what rejects it"
+    );
 
     let pool = vec![identity(1)];
     let kept = load_pool_runs(&dir.0, &pool, true);

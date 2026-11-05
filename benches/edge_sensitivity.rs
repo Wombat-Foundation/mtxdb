@@ -35,8 +35,16 @@ fn pl_hubs() {
             .min()
             .expect("three candidates");
             // Largest run count whose 4 B model still beats each measured encoding.
-            let max_vs_gap = gaps.len().checked_div(4).expect("nonzero divisor");
-            let max_vs_bitmap = bitmap.len().checked_div(4).expect("nonzero divisor");
+            let max_vs_gap = gaps
+                .len()
+                .saturating_sub(1)
+                .checked_div(4)
+                .expect("nonzero divisor");
+            let max_vs_bitmap = bitmap
+                .len()
+                .saturating_sub(1)
+                .checked_div(4)
+                .expect("nonzero divisor");
             println!(
                 "{children}\t{runs}\t{}\t{}\t{run_bytes}\t{winner}\t{max_vs_gap}\t{max_vs_bitmap}",
                 gaps.len(),

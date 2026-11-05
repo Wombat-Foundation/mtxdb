@@ -27,14 +27,11 @@ curl --fail --location --retry 3 -o "$work/base.img" \
 qemu-img create -f qcow2 -F qcow2 -b "$work/base.img" "$work/disk.img" 24G
 ssh_args=(-i "$work/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
 remote() { ssh "${ssh_args[@]}" tester@127.0.0.1 "$@"; }
-boot() {
-    local accelerator=(-accel tcg -cpu max)
-    # KVM requires nested virtualization exposed by the runner provider.
-    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
-        accelerator=(-accel kvm -cpu host)
-    fi
-    printf 'QEMU acceleration: %s\n' "${accelerator[*]}"
-    qemu-system-aarch64 -machine virt "${accelerator[@]}" -smp 4 -m 4096 \
+boot_with_accel() {
+    local accel="$1" cpu="$2"
+    shift 2
+    printf 'QEMU acceleration: -accel %s -cpu %s\n' "$accel" "$cpu"
+    qemu-system-aarch64 -machine virt -accel "$accel" -cpu "$cpu" -smp 4 -m 4096 \
         -drive "if=none,file=$work/disk.img,format=qcow2,id=root" \
         -device virtio-blk-pci,drive=root \
         -drive "if=none,file=$work/seed.img,format=raw,id=seed" \
@@ -50,6 +47,21 @@ boot() {
     done
     cat "$work/serial.log"
     return 1
+}
+
+boot() {
+    # KVM requires nested virtualization exposed by the runner provider. A
+    # present but unusable /dev/kvm must still fall back to TCG.
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+        if boot_with_accel kvm host "$@"; then return; fi
+        echo 'KVM boot failed; retrying with TCG' >&2
+        if [[ -n "$vm_pid" ]]; then
+            kill "$vm_pid" 2>/dev/null || true
+            wait "$vm_pid" 2>/dev/null || true
+            vm_pid=''
+        fi
+    fi
+    boot_with_accel tcg max "$@"
 }
 boot -drive "if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd" \
     -drive "if=pflash,format=raw,file=$work/vars.fd"

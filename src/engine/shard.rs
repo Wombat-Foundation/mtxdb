@@ -2474,14 +2474,6 @@ impl ShardPool {
                     shard.slot
                 )));
             }
-            // Uncompressed upper bound, used only for the pre-append
-            // capacity check below — `write_record` may compress the
-            // payload and write fewer bytes than this, but never more,
-            // so checking against this bound never lets a shard overflow
-            // MAX_SHARD_BYTES; it may just rotate a little earlier than
-            // strictly necessary when compression would have made it fit.
-            let max_record_len = record.serialized_len() as u64;
-
             // `append_lock` serializes writers *and* flushers, and is held
             // from the capacity check through the append, the automatic
             // flush, and (on failure) the rollback. That is what makes the
@@ -2509,6 +2501,19 @@ impl ShardPool {
                     shard.slot
                 )));
             }
+            // Encode before the capacity check so the check uses the frame's
+            // actual on-disk length, including any metadata block that
+            // `serialized_len` does not cover.
+            let frame = packfile::encode_record_with_options(
+                record,
+                self.compress,
+                self.checksum_policy.computes_checksum(),
+            )?;
+            let frame_len = frame.len();
+            let frame_len_u64 = u64::try_from(frame_len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds u64")
+            })?;
+
             // `file_len` is updated at flush time, making the virtual end
             // (committed length plus already-buffered frames) the
             // authoritative next offset. No syscalls happen per append.
@@ -2522,7 +2527,7 @@ impl ShardPool {
             // the virtual end — avoids a TOCTOU race where two threads
             // both pass the check then one exceeds the limit.
             let fits = virtual_end
-                .checked_add(max_record_len)
+                .checked_add(frame_len_u64)
                 .is_some_and(|sum| sum <= self.max_shard_bytes);
             if !fits && committed > packfile::HEADER_LEN as u64 {
                 drop(append_guard);
@@ -2532,13 +2537,6 @@ impl ShardPool {
                 shard = self.rotate_collection_full_home(&record.collection_id, shard.slot)?;
                 continue;
             }
-
-            let frame = packfile::encode_record_with_options(
-                record,
-                self.compress,
-                self.checksum_policy.computes_checksum(),
-            )?;
-            let frame_len = frame.len();
             let pending_start = {
                 let mut pending = shard.pending.lock();
                 let start = pending.len();
@@ -2951,6 +2949,30 @@ impl ShardPool {
                     "unsupported record flags: {flags:#04x}"
                 )));
             }
+            let removed = flags & packfile::FLAG_REMOVED != 0;
+            if removed
+                && self.checksum_policy.verifies_reads()
+                && flags & packfile::FLAG_CRC_DISABLED == 0
+            {
+                // A damaged removal flag must surface as `Corrupt`, not flip
+                // a caller's live count. Only the removal answer is consumed
+                // here, so hash just that case to keep point lookups cheap.
+                let crc_pos = frame_end.checked_sub(4).expect("validated crc range");
+                let mut crc = crc32fast::Hasher::new();
+                crc.update(&mem[offset..prefix_end]);
+                crc.update(&mem[prefix_end..crc_pos]);
+                let expected = crc.finalize();
+                let actual = u32::from_le_bytes(
+                    mem[crc_pos..frame_end]
+                        .try_into()
+                        .expect("validated crc range"),
+                );
+                if expected != actual {
+                    return Err(StorageError::Corrupt(format!(
+                        "CRC mismatch: expected {expected:08x}, got {actual:08x}"
+                    )));
+                }
+            }
             let metadata_start = prefix_end
                 .checked_add(5)
                 .expect("validated record metadata prefix");
@@ -2961,7 +2983,6 @@ impl ShardPool {
             collection_id.copy_from_slice(&mem[metadata_start..collection_end]);
             let mut hash = [0; 16];
             hash.copy_from_slice(&mem[collection_end..metadata_end]);
-            let removed = flags & packfile::FLAG_REMOVED != 0;
             return Ok((collection_id, hash, removed));
         }
         unreachable!("record_identity_at remap-retry is bounded to two iterations")
@@ -3232,6 +3253,22 @@ impl ShardPool {
             }
             self.flush_shard_with_guard(shard, &guard)?;
         }
+        let mut workers = self.seal_workers.lock();
+        let mut pending = Vec::with_capacity(workers.len());
+        for existing in workers.drain(..) {
+            if existing.is_finished() {
+                let _ = existing.join();
+            } else {
+                pending.push(existing);
+            }
+        }
+        // Joining here can delay rotation while the oldest sidecar is built,
+        // but keeps both the active builder count and spawned thread count
+        // bounded. Do this before spawning the replacement worker.
+        while pending.len() >= MAX_SEAL_WORKERS {
+            let oldest = pending.remove(0);
+            let _ = oldest.join();
+        }
         let shard = Arc::clone(shard);
         let sealed_ready = Arc::clone(&self.sealed_ready);
         let worker = std::thread::Builder::new()
@@ -3259,22 +3296,8 @@ impl ShardPool {
                     }
                 }
             })?;
-        let mut workers = self.seal_workers.lock();
-        let mut pending = Vec::with_capacity(workers.len().saturating_add(1));
-        for existing in workers.drain(..) {
-            if existing.is_finished() {
-                let _ = existing.join();
-            } else {
-                pending.push(existing);
-            }
-        }
-        // Bound the number of concurrent builders. Joining the oldest keeps
-        // the active set fixed without dropping a sidecar: its result is
-        // announced through `sealed_ready` exactly as usual.
-        while pending.len() >= MAX_SEAL_WORKERS {
-            let oldest = pending.remove(0);
-            let _ = oldest.join();
-        }
+        // A completed sidecar is announced through `sealed_ready` exactly as
+        // usual, whether it finished before or after the cap was reached.
         pending.push(worker);
         *workers = pending;
         Ok(())

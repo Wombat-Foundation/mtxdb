@@ -7357,7 +7357,7 @@ fn a_failed_key_import_keeps_previously_loaded_signing_keys_available() {
 }
 
 #[test]
-fn a_failed_room_import_does_not_make_signing_keys_available() {
+fn a_malformed_room_import_is_flagged_and_leaves_no_signing_keys() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
     let run = import_inputs(
@@ -8309,6 +8309,16 @@ fn rebuild_fidelity_reproduces_exact_bitmaps_after_wipe() {
     let shorts_timeline_before = flags
         .select_shorts(&db, &FlagQuery::has(Flag::Timeline))
         .unwrap();
+
+    // Wipe the index: remove both its metadata collection and the active
+    // chunk generation, so the rebuild below starts from nothing.
+    let generation = flags.meta(&db).unwrap().generation;
+    let wipe = db.begin_transaction();
+    wipe.delete_collection(flags.pool(), *flags.collection())
+        .unwrap();
+    wipe.delete_collection(flags.pool(), flags.chunk_collection(generation))
+        .unwrap();
+    wipe.commit().unwrap();
 
     // Run rebuild
     let count = flags.rebuild(&db).unwrap();
