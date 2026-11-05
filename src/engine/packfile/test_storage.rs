@@ -708,8 +708,9 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
     fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
     let writer = PackfileStorage::open(dir.clone()).unwrap();
     writer.enable_journal(&wal).unwrap();
-    // Force a checkpoint and reclaim on every sync; otherwise coverage only
-    // advances on a delta rollover and the base never moves.
+    // Make every sync checkpoint and reclaim so each round is deterministic.
+    // Dropping the seed checkpoint is what forces the full-checkpoint path;
+    // this only removes reliance on a delta rollover for coverage.
     writer.journal().unwrap().set_reclaim_trigger_len(1);
 
     let stop = Arc::new(AtomicBool::new(false));
