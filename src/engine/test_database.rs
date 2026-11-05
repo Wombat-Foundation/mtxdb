@@ -4202,3 +4202,25 @@ fn a_full_scan_open_leaves_a_checkpoint_for_the_next_open() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn reclaim_trigger_config_reaches_the_journal_coordinator() {
+    let root = test_root("config-reclaim-trigger");
+    let default_db = Database::open(root.clone()).unwrap();
+    let default_len = default_db.coordinator().reclaim_trigger_len();
+    drop(default_db);
+
+    let config = RuntimeConfig {
+        reclaim_trigger_bytes: Some(default_len / 2),
+        ..RuntimeConfig::default()
+    };
+    let db = Database::open_with_config(root.clone(), config).unwrap();
+    assert_eq!(db.coordinator().reclaim_trigger_len(), default_len / 2);
+    drop(db);
+
+    let bad = RuntimeConfig {
+        reclaim_trigger_bytes: Some(0),
+        ..RuntimeConfig::default()
+    };
+    assert!(Database::open_with_config(root, bad).is_err());
+}

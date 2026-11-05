@@ -10,7 +10,7 @@
 use std::fmt;
 
 use crate::index::IndexResidency;
-use crate::journal::MAX_TXN_STAGE_BYTES;
+use crate::journal::{MAX_RECLAIM_TRIGGER_LEN, MAX_TXN_STAGE_BYTES};
 use crate::packfile::storage::DEFAULT_CACHE_CAPACITY;
 
 /// Runtime knobs that are not part of a per-pool [`crate::PoolPolicy`].
@@ -20,7 +20,8 @@ use crate::packfile::storage::DEFAULT_CACHE_CAPACITY;
 /// - transaction staging: the full 64 MiB engine ceiling;
 /// - index residency: whatever the constructor or pool policy selected
 ///   (`Resident` in practice);
-/// - read-path statistics: off.
+/// - read-path statistics: off;
+/// - WAL reclaim trigger: the journal's built-in quarter of the segment cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
     /// Decoded-node cache entries, applied independently to each collection.
@@ -34,6 +35,10 @@ pub struct RuntimeConfig {
     pub index_residency: Option<IndexResidency>,
     /// Enable the opt-in read-path counters and latency accounting.
     pub stats_enabled: bool,
+    /// Segment length, in bytes, above which a sync forces a reclaiming
+    /// checkpoint. `None` keeps the journal's built-in value. Must be in
+    /// `1..=MAX_RECLAIM_TRIGGER_LEN`.
+    pub reclaim_trigger_bytes: Option<u64>,
 }
 
 impl Default for RuntimeConfig {
@@ -43,6 +48,7 @@ impl Default for RuntimeConfig {
             txn_stage_limit_bytes: MAX_TXN_STAGE_BYTES,
             index_residency: None,
             stats_enabled: false,
+            reclaim_trigger_bytes: None,
         }
     }
 }
@@ -116,11 +122,25 @@ impl RuntimeConfig {
             Some(value) => parse_bool("MTXDB_STATS", &value)?,
         };
 
+        let reclaim_trigger_bytes = match lookup("MTXDB_RECLAIM_TRIGGER_BYTES")? {
+            None => None,
+            Some(value) => {
+                let parsed = value.trim().parse::<u64>().map_err(|_| {
+                    ConfigError::new(format!(
+                        "MTXDB_RECLAIM_TRIGGER_BYTES must be a positive integer, got {value:?}"
+                    ))
+                })?;
+                check_reclaim_trigger(parsed)?;
+                Some(parsed)
+            }
+        };
+
         Ok(Self {
             cache_capacity,
             txn_stage_limit_bytes,
             index_residency,
             stats_enabled,
+            reclaim_trigger_bytes,
         })
     }
 
@@ -135,6 +155,9 @@ impl RuntimeConfig {
                 "transaction staging limit must be in 1..={MAX_TXN_STAGE_BYTES}, got {}",
                 self.txn_stage_limit_bytes
             )));
+        }
+        if let Some(bytes) = self.reclaim_trigger_bytes {
+            check_reclaim_trigger(bytes)?;
         }
         Ok(())
     }
@@ -157,6 +180,15 @@ impl RuntimeConfig {
         }
         Ok(())
     }
+}
+
+fn check_reclaim_trigger(bytes: u64) -> Result<(), ConfigError> {
+    if bytes == 0 || bytes > MAX_RECLAIM_TRIGGER_LEN {
+        return Err(ConfigError::new(format!(
+            "reclaim trigger must be in 1..={MAX_RECLAIM_TRIGGER_LEN}, got {bytes}"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_bool(name: &str, value: &str) -> Result<bool, ConfigError> {
@@ -255,6 +287,23 @@ mod tests {
         .is_err());
         assert!(config(&[("MTXDB_INDEX_RESIDENCY", "mmap")]).is_err());
         assert!(config(&[("MTXDB_STATS", "sometimes")]).is_err());
+    }
+
+    #[test]
+    fn reclaim_trigger_parses_and_is_range_checked() {
+        let parsed = config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", " 4096 ")]).unwrap();
+        assert_eq!(parsed.reclaim_trigger_bytes, Some(4096));
+        assert_eq!(config(&[]).unwrap().reclaim_trigger_bytes, None);
+        assert!(config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", "0")]).is_err());
+        assert!(config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", "-1")]).is_err());
+        assert!(config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", "big")]).is_err());
+        let over = (MAX_RECLAIM_TRIGGER_LEN + 1).to_string();
+        assert!(config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", &over)]).is_err());
+        let direct = RuntimeConfig {
+            reclaim_trigger_bytes: Some(0),
+            ..RuntimeConfig::default()
+        };
+        assert!(direct.validate().is_err());
     }
 
     #[test]

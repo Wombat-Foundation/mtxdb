@@ -850,6 +850,9 @@ impl Database {
         let seed_lsn = shared_wal_seed_lsn(&layout);
         let (journal, scan) = Journal::open_shared_with_base(&wal_path, seed_lsn)?;
         let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+        if let Some(bytes) = config.reclaim_trigger_bytes {
+            coordinator.configure_reclaim_trigger_len(bytes)?;
+        }
 
         let mut pools = Vec::with_capacity(ShardType::ALL.len());
         for shard in ShardType::ALL {

@@ -101,6 +101,10 @@ const MAX_SEGMENT_LEN: u64 = (256 << 20) + FILE_HEADER_LEN as u64;
 /// [`JournalCoordinator::set_reclaim_trigger_len`].
 pub(crate) const RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN / 4;
 
+/// Largest segment length a configured reclaim trigger may name: the segment
+/// cap itself. A trigger at the cap never fires before the segment is full.
+pub(crate) const MAX_RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN;
+
 /// A durable mutation represented in a journal group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mutation {
@@ -3987,6 +3991,24 @@ impl JournalCoordinator {
     #[must_use]
     pub fn reclaim_trigger_len(&self) -> u64 {
         self.reclaim_trigger_len.load(Ordering::Relaxed)
+    }
+
+    /// Set the segment length above which a sync forces a reclaiming
+    /// checkpoint, from runtime configuration. Unlike
+    /// [`Self::set_reclaim_trigger_len`] this is always available and rejects
+    /// values outside `1..=MAX_RECLAIM_TRIGGER_LEN`.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a zero or over-cap value.
+    pub(crate) fn configure_reclaim_trigger_len(&self, len: u64) -> io::Result<()> {
+        if len == 0 || len > MAX_RECLAIM_TRIGGER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("reclaim trigger must be in 1..={MAX_RECLAIM_TRIGGER_LEN}, got {len}"),
+            ));
+        }
+        self.reclaim_trigger_len.store(len, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Test-only: install a hook that runs inside a reclaim while the journal
