@@ -3,7 +3,6 @@ name = "mtxdb"
 version.workspace = true
 edition = "2021"
 rust-version = "1.88"
-publish = false
 # Without this, Cargo auto-discovers benches/*.rs as this package's own bench
 # targets purely by their being physically under benches/ (which is now
 # mtxdb-benches's directory, not this package's) -- explicit [[bench]] entries
