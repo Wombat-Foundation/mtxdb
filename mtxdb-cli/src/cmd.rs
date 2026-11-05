@@ -647,8 +647,8 @@ fn cmd_subprocess_writer(path: &str, sync: bool, seed: bool) -> anyhow::Result<(
 }
 
 fn cmd_subprocess_reader(path: &str) -> anyhow::Result<()> {
-    let store = open_pool_read_only(PathBuf::from(path))
-        .context("failed to open test store read-only")?;
+    let store =
+        open_pool_read_only(PathBuf::from(path)).context("failed to open test store read-only")?;
     store.reset_stats();
     let result = store
         .get_many_with_refresh(&SUBPROCESS_COLLECTION, &[SUBPROCESS_RECORD])
@@ -3250,8 +3250,7 @@ fn read_stats_for_dir(
     if glob_pack_files(dir)?.is_empty() {
         Ok((RuntimeStats::default(), Vec::new()))
     } else {
-        let store =
-            open_pool_read_only(dir.to_path_buf()).context("failed to open store")?;
+        let store = open_pool_read_only(dir.to_path_buf()).context("failed to open store")?;
         let stats = store.stats();
         let summaries = store.shard_summaries();
         Ok((stats, summaries))
@@ -3309,8 +3308,7 @@ fn cmd_memory_single(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Resul
         let Some(pool) = pool else {
             continue;
         };
-        let store =
-            open_pool_read_only(pool.clone()).context("failed to open store")?;
+        let store = open_pool_read_only(pool.clone()).context("failed to open store")?;
         let before = store.resident_cache_stats();
         let evicted = if evict {
             store.evict_resident_caches()
@@ -11041,17 +11039,15 @@ fn import_pdu_events_with_raw(
     Ok(())
 }
 
-/// Persist raw-import reverse edges and the room's set of currently missing
-/// parent node IDs.
+/// Persist the room's set of currently missing parent node IDs.
 ///
 /// Write-only step: dirty-set traversal and `Unchecked` flag propagation are
 /// implemented by later import steps.
 ///
 /// Crash-safety note: these writes are not atomic with the event/projection
-/// writes or with each other. They are applied in the order reverse edges,
-/// waiting removals, then waiting additions. Each collection operation is
-/// idempotent, so a crash can leave partial dependency metadata and re-import
-/// repairs it. No read path consumes these records until a later import step.
+/// writes or with each other. Waiting removals run before waiting additions.
+/// Each collection operation is idempotent, so a crash can leave partial
+/// dependency metadata and re-import repairs it.
 fn record_raw_dependencies_and_waiting<'a>(
     db: &Database,
     event_store: &PackfileStorage,
@@ -11063,15 +11059,12 @@ fn record_raw_dependencies_and_waiting<'a>(
     let graph = collect_raw_dependencies(template, room_id, supplied_events)?;
     let missing = missing_raw_parents(event_store, room_event_collection_id, &graph.candidates)?;
     let edge_store = db.pool(ShardType::Edges);
-    write_raw_reverse_edges(edge_store, graph.prev_edges, graph.auth_edges)?;
     remove_raw_waiting(db, edge_store, room_id, &graph.arrived)?;
     add_raw_waiting(edge_store, room_id, &missing)?;
     Ok(())
 }
 
 struct RawDependencyGraph {
-    prev_edges: BTreeMap<NodeId, Vec<NodeId>>,
-    auth_edges: BTreeMap<NodeId, Vec<NodeId>>,
     arrived: BTreeSet<NodeId>,
     candidates: BTreeSet<NodeId>,
 }
@@ -11099,8 +11092,6 @@ fn collect_raw_dependencies<'a>(
         .map(str::to_owned)
         .collect();
     let mut graph = RawDependencyGraph {
-        prev_edges: BTreeMap::new(),
-        auth_edges: BTreeMap::new(),
         arrived: BTreeSet::new(),
         candidates: BTreeSet::new(),
     };
@@ -11111,16 +11102,10 @@ fn collect_raw_dependencies<'a>(
         let child_node = template_event_id_node_id(template, event_id)?;
         graph.arrived.insert(child_node);
         let fields = MatrixEventFields::from_event(event_id, event);
-        for (parents, edges) in [
-            (&fields.prev, &mut graph.prev_edges),
-            (&fields.auth, &mut graph.auth_edges),
-        ] {
-            for parent_event_id in parents {
-                let parent_node = template_event_id_node_id(template, parent_event_id)?;
-                edges.entry(parent_node).or_default().push(child_node);
-                if !file_event_ids.contains(parent_event_id.as_str()) {
-                    graph.candidates.insert(parent_node);
-                }
+        for parent_event_id in fields.prev.iter().chain(fields.auth.iter()) {
+            let parent_node = template_event_id_node_id(template, parent_event_id)?;
+            if !file_event_ids.contains(parent_event_id.as_str()) {
+                graph.candidates.insert(parent_node);
             }
         }
     }
@@ -11142,36 +11127,6 @@ fn missing_raw_parents(
         .zip(existing)
         .filter_map(|(node, found)| found.is_none().then_some(*node))
         .collect())
-}
-
-fn write_raw_reverse_edges(
-    edge_store: &PackfileStorage,
-    prev_edges: BTreeMap<NodeId, Vec<NodeId>>,
-    auth_edges: BTreeMap<NodeId, Vec<NodeId>>,
-) -> anyhow::Result<()> {
-    for (kind, parents) in [("prev", prev_edges), ("auth", auth_edges)] {
-        for (parent, mut children) in parents {
-            children.sort_unstable();
-            children.dedup();
-            let collection = raw_reverse_edge_collection_id(kind, &parent);
-            for chunk in children.chunks(MAX_BATCH_EVENTS) {
-                let existing = edge_store.get_many(&collection, chunk)?;
-                let additions: Vec<(NodeId, NodeData)> = chunk
-                    .iter()
-                    .zip(existing)
-                    .filter_map(|(child, found)| {
-                        found
-                            .is_none()
-                            .then(|| (*child, NodeData::from_slice(b"RRE1")))
-                    })
-                    .collect();
-                if !additions.is_empty() {
-                    edge_store.put_many(&collection, &additions)?;
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn remove_raw_waiting(
@@ -11225,11 +11180,6 @@ fn add_raw_waiting(
         }
     }
     Ok(())
-}
-
-fn raw_reverse_edge_collection_id(kind: &str, parent: &NodeId) -> [u8; 16] {
-    let canonical = format!("raw-rev-{kind}:{}", format_id(parent));
-    derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_INTL), canonical.as_bytes())
 }
 
 fn raw_waiting_collection_id(room_id: &str) -> [u8; 16] {

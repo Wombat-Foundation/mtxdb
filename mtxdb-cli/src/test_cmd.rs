@@ -12,15 +12,14 @@ use super::{
     matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
     meta_pools, meta_raw, overlay_auth_projection, pack_identity, parse_federation_input,
     parse_pack_id_selector, parse_pack_selectors, prepare_state_collection, pretty_print_payload,
-    raw_auth_projection, raw_auth_projection_collection_id, raw_reverse_edge_collection_id,
-    raw_waiting_collection_id, record_matrix_adjacency, record_raw_dependencies_and_waiting,
-    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-    split_canonical_display, template_collection_id, template_event_id_node_id, template_node_id,
-    topological_event_order, valid_state_group_id, verify_auth_chain_edges,
-    write_raw_auth_projections, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, ScanOptions, SharedState,
-    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
-    STATE_GROUP_NAMESPACE,
+    raw_auth_projection, raw_auth_projection_collection_id, raw_waiting_collection_id,
+    record_matrix_adjacency, record_raw_dependencies_and_waiting, redacted_event_bytes,
+    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
+    template_collection_id, template_event_id_node_id, template_node_id, topological_event_order,
+    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
+    CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension,
+    MetaReport, PackIdentity, ScanOptions, SharedState, StateGroupLoad, StateSet,
+    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -2297,7 +2296,7 @@ fn template_node_id_matches_event_id_derivation() {
 }
 
 #[test]
-fn raw_import_records_reverse_edges_for_file_and_missing_parents() {
+fn raw_import_marks_only_missing_parents_in_waiting() {
     let root = unique_temp_dir().join("raw_file_and_missing");
     let db = Database::open(root).unwrap();
     let template = default_matrix_import_template();
@@ -2331,24 +2330,17 @@ fn raw_import_records_reverse_edges_for_file_and_missing_parents() {
     )
     .unwrap();
 
-    let child_node = template_event_id_node_id(&template, "$child").unwrap();
     let missing_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
     let same_file_node = template_event_id_node_id(&template, "$same-file-auth").unwrap();
 
     let edge_store = db.pool(ShardType::Edges);
-    let prev_collection = raw_reverse_edge_collection_id("prev", &missing_node);
-    let auth_collection = raw_reverse_edge_collection_id("auth", &same_file_node);
     let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
 
-    // Edges written for both missing parent and same-file parent
-    assert!(edge_store
-        .get(&prev_collection, &child_node)
-        .unwrap()
-        .is_some());
-    assert!(edge_store
-        .get(&auth_collection, &child_node)
-        .unwrap()
-        .is_some());
+    assert_eq!(
+        edge_store.collection_ids(),
+        vec![waiting_collection],
+        "dependency bookkeeping must not create a collection per parent"
+    );
 
     // Only genuinely missing parent is in raw_waiting
     assert!(edge_store
@@ -2385,11 +2377,9 @@ fn raw_import_maintains_waiting_set_on_parent_arrival() {
         "[]",
         "[]",
     );
-    let child_node = template_event_id_node_id(&template, "$child").unwrap();
     let parent_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
     let edge_store = db.pool(ShardType::Edges);
     let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
-    let prev_collection = raw_reverse_edge_collection_id("prev", &parent_node);
 
     // File 1 supplies child citing missing parent
     record_raw_dependencies_and_waiting(
@@ -2403,10 +2393,6 @@ fn raw_import_maintains_waiting_set_on_parent_arrival() {
     .unwrap();
     assert!(edge_store
         .get(&waiting_collection, &parent_node)
-        .unwrap()
-        .is_some());
-    assert!(edge_store
-        .get(&prev_collection, &child_node)
         .unwrap()
         .is_some());
 
@@ -2424,14 +2410,10 @@ fn raw_import_maintains_waiting_set_on_parent_arrival() {
         .get(&waiting_collection, &parent_node)
         .unwrap()
         .is_none());
-    assert!(edge_store
-        .get(&prev_collection, &child_node)
-        .unwrap()
-        .is_some());
 }
 
 #[test]
-fn raw_import_reverse_edge_writes_are_idempotent() {
+fn raw_import_waiting_writes_are_idempotent() {
     let root = unique_temp_dir().join("raw_idempotent");
     let db = Database::open(root).unwrap();
     let template = default_matrix_import_template();
@@ -2446,10 +2428,8 @@ fn raw_import_reverse_edge_writes_are_idempotent() {
         "[]",
     );
     let parent_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
-    let child_node = template_event_id_node_id(&template, "$child").unwrap();
     let edge_store = db.pool(ShardType::Edges);
     let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
-    let prev_collection = raw_reverse_edge_collection_id("prev", &parent_node);
 
     edge_store.set_stats_enabled(true);
     record_raw_dependencies_and_waiting(
@@ -2466,9 +2446,6 @@ fn raw_import_reverse_edge_writes_are_idempotent() {
     assert!(baseline_writes.0 > 0, "initial import must perform writes");
     let (_, waiting_ver_before) = edge_store
         .get_with_collection_version(&waiting_collection, &[parent_node])
-        .unwrap();
-    let (_, prev_ver_before) = edge_store
-        .get_with_collection_version(&prev_collection, &[child_node])
         .unwrap();
 
     for _ in 0..2 {
@@ -2490,23 +2467,12 @@ fn raw_import_reverse_edge_writes_are_idempotent() {
         let (_, waiting_ver_after) = edge_store
             .get_with_collection_version(&waiting_collection, &[parent_node])
             .unwrap();
-        let (_, prev_ver_after) = edge_store
-            .get_with_collection_version(&prev_collection, &[child_node])
-            .unwrap();
         assert_eq!(
             waiting_ver_before, waiting_ver_after,
             "raw_waiting collection version must not advance on re-import"
         );
-        assert_eq!(
-            prev_ver_before, prev_ver_after,
-            "prev edges collection version must not advance on re-import"
-        );
         assert!(edge_store
             .get(&waiting_collection, &parent_node)
-            .unwrap()
-            .is_some());
-        assert!(edge_store
-            .get(&prev_collection, &child_node)
             .unwrap()
             .is_some());
     }
@@ -2540,7 +2506,6 @@ fn raw_import_does_not_mark_prior_stored_parent_as_missing() {
         "[]",
     );
     let parent_node = template_event_id_node_id(&template, "$prior-parent").unwrap();
-    let child_node = template_event_id_node_id(&template, "$child").unwrap();
 
     let mut established = HashSet::new();
     established.insert(room_event_coll);
@@ -2572,13 +2537,6 @@ fn raw_import_does_not_mark_prior_stored_parent_as_missing() {
 
     let edge_store = db.pool(ShardType::Edges);
     let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
-    let prev_collection = raw_reverse_edge_collection_id("prev", &parent_node);
-
-    // Reverse edge is recorded
-    assert!(edge_store
-        .get(&prev_collection, &child_node)
-        .unwrap()
-        .is_some());
 
     // Critically: $prior-parent is NOT entered into raw_waiting because point lookup against
     // room_event_coll found it, without requiring any whole-room scan!
@@ -2763,31 +2721,19 @@ impl RawFixtureImporter<'_> {
 fn assert_raw_reimport_keeps_versions(
     edge_store: &PackfileStorage,
     waiting: &[u8; 16],
-    reverse: &[u8; 16],
     waiting_node: NodeId,
-    reverse_node: NodeId,
     reimport: impl FnOnce(),
 ) {
     let (_, waiting_before) = edge_store
         .get_with_collection_version(waiting, &[waiting_node])
         .unwrap();
-    let (_, reverse_before) = edge_store
-        .get_with_collection_version(reverse, &[reverse_node])
-        .unwrap();
     reimport();
     let (_, waiting_after) = edge_store
         .get_with_collection_version(waiting, &[waiting_node])
         .unwrap();
-    let (_, reverse_after) = edge_store
-        .get_with_collection_version(reverse, &[reverse_node])
-        .unwrap();
     assert_eq!(
         waiting_before, waiting_after,
         "re-import must not advance the waiting collection version"
-    );
-    assert_eq!(
-        reverse_before, reverse_after,
-        "re-import must not advance the reverse-edge collection version"
     );
 }
 
@@ -2861,43 +2807,27 @@ fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
     );
 }
 
-fn assert_raw_waiting_and_reverse(
-    edge_store: &PackfileStorage,
-    waiting: &[u8; 16],
-    reverse: &[u8; 16],
-    waiting_node: NodeId,
-    reverse_node: NodeId,
-) {
+fn assert_raw_waiting(edge_store: &PackfileStorage, waiting: &[u8; 16], waiting_node: NodeId) {
     assert!(
         edge_store.get(waiting, &waiting_node).unwrap().is_some(),
         "missing parent must be recorded in raw_waiting"
-    );
-    assert!(
-        edge_store.get(reverse, &reverse_node).unwrap().is_some(),
-        "reverse edge from the missing parent must be present"
     );
 }
 
 fn assert_raw_arrival_clears_waiting(
     edge_store: &PackfileStorage,
     waiting: &[u8; 16],
-    reverse: &[u8; 16],
     waiting_node: NodeId,
-    reverse_node: NodeId,
 ) {
     assert!(
         edge_store.get(waiting, &waiting_node).unwrap().is_none(),
         "arrived parent must be removed from raw_waiting"
     );
-    assert!(
-        edge_store.get(reverse, &reverse_node).unwrap().is_some(),
-        "reverse edge remains durable after the parent arrives"
-    );
 }
 
 #[test]
-fn raw_import_records_reverse_edges_and_waiting_parents() {
-    let dir = unique_temp_dir().join("raw_rev_edges");
+fn raw_import_records_waiting_parents() {
+    let dir = unique_temp_dir().join("raw_waiting_parents");
     let db = Database::open(dir.clone()).unwrap();
     let template = default_matrix_import_template();
     let collection_id = template_collection_id(&template, "!room3");
@@ -2918,7 +2848,6 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
         "string and event node-id helpers must agree"
     );
     let waiting_coll = raw_waiting_collection_id("!room3");
-    let rev_prev_coll = raw_reverse_edge_collection_id("prev", &leave_node);
     let mut fixture = RawFixtureImporter {
         db: &db,
         store,
@@ -2929,44 +2858,21 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
     };
 
     // Import create, join, stale (which cites $leave as prev). $leave is
-    // missing, so it must enter raw_waiting and leave a reverse edge to stale.
+    // missing, so it must enter raw_waiting.
     let initial = [create, join, stale];
     fixture.import(&initial, &[]);
-    assert_raw_waiting_and_reverse(
-        edge_store,
-        &waiting_coll,
-        &rev_prev_coll,
-        leave_node,
-        stale_node,
-    );
+    assert_raw_waiting(edge_store, &waiting_coll, leave_node);
 
     // Re-importing the same file must not change the recorded state or advance
     // collection versions.
-    assert_raw_reimport_keeps_versions(
-        edge_store,
-        &waiting_coll,
-        &rev_prev_coll,
-        leave_node,
-        stale_node,
-        || fixture.import(&initial, &[]),
-    );
-    assert_raw_waiting_and_reverse(
-        edge_store,
-        &waiting_coll,
-        &rev_prev_coll,
-        leave_node,
-        stale_node,
-    );
+    assert_raw_reimport_keeps_versions(edge_store, &waiting_coll, leave_node, || {
+        fixture.import(&initial, &[]);
+    });
+    assert_raw_waiting(edge_store, &waiting_coll, leave_node);
 
-    // Import leave: arrival clears waiting but keeps the reverse edge.
+    // Import leave: arrival clears waiting.
     fixture.import(&[leave], &[]);
-    assert_raw_arrival_clears_waiting(
-        edge_store,
-        &waiting_coll,
-        &rev_prev_coll,
-        leave_node,
-        stale_node,
-    );
+    assert_raw_arrival_clears_waiting(edge_store, &waiting_coll, leave_node);
 
     // A parent stored by an earlier file must not be marked missing again.
     let late = raw_event(
@@ -2990,7 +2896,7 @@ fn raw_import_records_reverse_edges_and_waiting_parents() {
 
 #[test]
 fn raw_import_auth_chain_parent_clears_waiting() {
-    let dir = unique_temp_dir().join("raw_rev_edges_auth_chain");
+    let dir = unique_temp_dir().join("raw_waiting_auth_chain");
     let db = Database::open(dir.clone()).unwrap();
     let template = default_matrix_import_template();
     let collection_id = template_collection_id(&template, "!room3");
@@ -3109,22 +3015,13 @@ fn raw_import_records_dependencies_for_federation_documents() {
     .unwrap();
 
     let leave_node = template_event_id_node_id(&template, "$leave").unwrap();
-    let stale_node = template_event_id_node_id(&template, "$stale").unwrap();
     let waiting_coll = raw_waiting_collection_id("!room3");
-    let stale_edge_coll = raw_reverse_edge_collection_id("prev", &leave_node);
     assert!(
         edge_store
             .get(&waiting_coll, &leave_node)
             .unwrap()
             .is_some(),
         "federation PDUs must record their missing parent"
-    );
-    assert!(
-        edge_store
-            .get(&stale_edge_coll, &stale_node)
-            .unwrap()
-            .is_some(),
-        "federation PDUs must record reverse edges"
     );
 
     let second = dir.join("second.json");
@@ -3143,21 +3040,12 @@ fn raw_import_records_dependencies_for_federation_documents() {
     )
     .unwrap();
 
-    let late_node = template_event_id_node_id(&template, "$late").unwrap();
-    let late_edge_coll = raw_reverse_edge_collection_id("prev", &leave_node);
     assert!(
         edge_store
             .get(&waiting_coll, &leave_node)
             .unwrap()
             .is_none(),
         "an auth-chain parent in a federation document must clear raw_waiting"
-    );
-    assert!(
-        edge_store
-            .get(&late_edge_coll, &late_node)
-            .unwrap()
-            .is_some(),
-        "a federation PDU must record an auth-chain parent edge"
     );
 }
 
