@@ -20,6 +20,23 @@
 //!
 //! A purge is a tombstone record: it clears the scope during replay, so rows
 //! already sealed into shared segments are hidden without rewriting them.
+//!
+//! # Concurrency
+//!
+//! One writer owns a store directory at a time: the database root's writer
+//! lock (`SharedWalLock`, held for the life of the `Database`) keeps a second
+//! writer process out, and CSR writes go through the `Database`. The decoded
+//! tail cache relies on that. It records how much of `tail.log` it has
+//! verified, so a second process appending or truncating the same directory
+//! could leave that offset stale and a later append could cut the other
+//! writer's frames. Readers in other processes only read files and are safe.
+//! The in-process tests cover several handles in one process, not two writer
+//! processes.
+//!
+//! The tail stays under [`SEAL_THRESHOLD`] because both tail writers,
+//! [`CsrStore::append_rows`] and [`CsrStore::purge_scope`], seal after
+//! writing. A new writer path must do the same, or the tail and its cached
+//! rows grow without bound.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -999,8 +1016,14 @@ mod tests {
     use super::*;
 
     fn layout(name: &str) -> DatabaseLayout {
-        let root =
-            std::env::temp_dir().join(format!("mtxdb-csr-store-{name}-{}", std::process::id()));
+        // The counter keeps two tests that pick the same name from deleting
+        // each other's directory when they run in parallel.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "mtxdb-csr-store-{name}-{}-{unique}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         DatabaseLayout::open(root).unwrap()
     }
