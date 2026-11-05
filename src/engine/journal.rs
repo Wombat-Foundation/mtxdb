@@ -2042,6 +2042,10 @@ pub struct JournalCoordinator {
     /// Times a reclaim over the trigger has been found unable to shrink the
     /// segment.
     reclaim_stalls: AtomicU64,
+    /// Test-only: runs inside a reclaim, after the sync and journal locks are
+    /// held and before the segment is rewritten.
+    #[cfg(test)]
+    reclaim_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     /// Checkpoints the pools that hold a stalled reclaim back.
     blocker_remediation: Mutex<Option<BlockerRemediation>>,
     /// `(segment length, coverage epoch)` at the last remediation attempt.
@@ -2309,6 +2313,8 @@ impl JournalCoordinator {
             replay_lease_stall: Mutex::new(None),
             coverage_epoch: AtomicU64::new(0),
             reclaim_stalls: AtomicU64::new(0),
+            #[cfg(test)]
+            reclaim_hook: Mutex::new(None),
             blocker_remediation: Mutex::new(None),
             last_remediation: Mutex::new(None),
             sequence: None,
@@ -3970,6 +3976,13 @@ impl JournalCoordinator {
         self.reclaim_trigger_len.load(Ordering::Relaxed)
     }
 
+    /// Test-only: install a hook that runs inside a reclaim while the journal
+    /// locks are held.
+    #[cfg(test)]
+    pub(crate) fn set_reclaim_hook(&self, hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+        *self.reclaim_hook.lock() = hook;
+    }
+
     /// Set the segment length above which a sync forces a reclaiming
     /// checkpoint. Tests use a small value to cross it without writing tens of
     /// MiB. This is available only to this crate's tests and downstream tests
@@ -4428,6 +4441,13 @@ impl JournalCoordinator {
         // and a sync must not flush a handle to the replaced inode.
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
+        #[cfg(test)]
+        {
+            let hook = self.reclaim_hook.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let reclaim = journal.reclaim_through(replay_limit)?;
         // The rewrite replaced the segment inode and moved its base LSN without
