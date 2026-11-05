@@ -1,6 +1,6 @@
 //! Compressed sparse row graphs plus the pool-scoped store that persists them.
 //!
-//! [`store::CsrStore`] keeps derived graph rows outside the packs, one store per
+//! [`CsrStore`](crate::csr::store::CsrStore) keeps derived graph rows outside the packs, one store per
 //! source pool, addressed by `(collection id, family, owner)`.
 pub mod chunk;
 pub mod store;
