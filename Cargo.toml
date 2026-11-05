@@ -14,7 +14,7 @@ description = "mtxdb: write-once, content-addressed packfile storage engine for 
 license = "MIT OR Apache-2.0"
 authors = ["Shane Jaroch <chown_tee@proton.me>"]
 keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
-categories = ["database-implementations", "storage"]
+categories = ["database-implementations", "filesystem"]
 # Test code is not part of the published surface. Extracted unit-test modules
 # live beside their sources as `src/**/test_*.rs`, and integration tests under
 # `tests/`; exclude both from the packaged archive. Local `cargo test` still

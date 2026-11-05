@@ -9,7 +9,7 @@ description = "mtxdb: CLI and core library components; fast Matrix binary DB."
 license = "MIT OR Apache-2.0"
 authors = ["Shane Jaroch <chown_tee@proton.me>"]
 keywords = ["database", "matrix", "cli"]
-categories = ["database", "cli"]
+categories = ["database", "command-line-utilities"]
 readme = "../README.md"
 # Test code is not part of the published surface. The extracted unit-test
 # module lives beside its source as `src/test_*.rs`, and integration tests
