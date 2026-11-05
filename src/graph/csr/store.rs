@@ -8,9 +8,9 @@
 //!
 //! Storage is an append-only tail log plus immutable sealed segments:
 //!
-//! - [`CsrStore::append_rows`] appends one framed record per changed row and
+//! - [`CsrWriter::append_rows`] appends one framed record per changed row and
 //!   syncs the tail. Rewriting one row never rewrites the others.
-//! - [`CsrStore::seal`] folds the tail into a new immutable `seg-N.csr` file
+//! - [`CsrWriter::seal`] folds the tail into a new immutable `seg-N.csr` file
 //!   (temp file, fsync, rename, directory fsync), then truncates the tail. A
 //!   crash between the rename and the truncate replays the same rows again,
 //!   which is idempotent.
@@ -31,15 +31,12 @@
 //! could leave that offset stale and a later append could cut the other
 //! writer's frames. Readers in other processes only read files and are safe.
 //!
-//! The store does not take that lock itself: [`CsrStore::open`] and the write
-//! methods are public, so the guarantee holds for callers that go through the
-//! `Database` (as the CSR adjacency layer does), not for code that opens a
-//! store directly. Such code must provide its own exclusion.
-//! The in-process tests cover several handles in one process, not two writer
-//! processes.
+//! Writes enforce that: the write methods are crate-private, and the public
+//! [`CsrStore::writer`] needs the owning `Database` (so the lock is held) and
+//! rejects one whose root is not the store's. Direct reads need no lock.
 //!
 //! The tail stays under [`SEAL_THRESHOLD`] because both tail writers,
-//! [`CsrStore::append_rows`] and [`CsrStore::purge_scope`], seal after
+//! `append_rows` and `purge_scope`, seal after
 //! writing. A new writer path must do the same, or the tail and its cached
 //! rows grow without bound.
 
@@ -49,6 +46,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, PoisonError};
 
+use crate::database::Database;
 use crate::layout::{DatabaseLayout, ShardType};
 use crate::short_id::{Edge, EdgeFamily};
 
@@ -113,6 +111,45 @@ pub struct CsrStore {
     dir: PathBuf,
 }
 
+/// Write access to one pool's store, tied to the database that owns it.
+///
+/// The decoded-tail cache assumes a single writer per store directory, and the
+/// database root's writer lock provides it for the life of the [`Database`].
+/// Borrowing the `Database` here makes a write impossible without that lock
+/// held, and [`CsrStore::writer`] refuses a database whose root is not the
+/// store's. The raw write methods on [`CsrStore`] are crate-private.
+#[derive(Clone, Copy)]
+pub struct CsrWriter<'a> {
+    store: &'a CsrStore,
+    _database: &'a Database,
+}
+
+impl CsrWriter<'_> {
+    /// Append one framed record per row to the tail; see the module docs.
+    ///
+    /// # Errors
+    /// I/O errors, or a row with too many edges.
+    pub fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
+        self.store.append_rows(scope, rows)
+    }
+
+    /// Hide every row of `scope` with a tombstone record.
+    ///
+    /// # Errors
+    /// I/O errors.
+    pub fn purge_scope(&self, scope: ScopeId) -> io::Result<()> {
+        self.store.purge_scope(scope)
+    }
+
+    /// Fold the tail into a new immutable segment.
+    ///
+    /// # Errors
+    /// I/O errors.
+    pub fn seal(&self) -> io::Result<()> {
+        self.store.seal()
+    }
+}
+
 type RowKey = ([u8; 16], u16, u32);
 
 impl CsrStore {
@@ -122,6 +159,29 @@ impl CsrStore {
         Self {
             dir: layout.graph_path(pool),
         }
+    }
+
+    /// Write access to this store through the database that owns its root.
+    ///
+    /// # Errors
+    /// `InvalidInput` when this is not one of `database`'s graph stores, since
+    /// that database's writer lock would not cover it. A path-prefix check is
+    /// not enough: a database rooted above this one does not own it.
+    pub fn writer<'a>(&'a self, database: &'a Database) -> io::Result<CsrWriter<'a>> {
+        let layout = database.layout();
+        let owned = ShardType::ALL
+            .into_iter()
+            .any(|pool| layout.graph_path(pool) == self.dir);
+        if !owned {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "csr store does not belong to this database",
+            ));
+        }
+        Ok(CsrWriter {
+            store: self,
+            _database: database,
+        })
     }
 
     /// The store directory.
@@ -140,7 +200,7 @@ impl CsrStore {
     ///
     /// # Errors
     /// I/O errors, or a row with more than `u32::MAX` edges.
-    pub fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
+    pub(crate) fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -173,7 +233,7 @@ impl CsrStore {
     ///
     /// # Errors
     /// I/O errors.
-    pub fn purge_scope(&self, scope: ScopeId) -> io::Result<()> {
+    pub(crate) fn purge_scope(&self, scope: ScopeId) -> io::Result<()> {
         fs::create_dir_all(&self.dir)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -202,7 +262,7 @@ impl CsrStore {
     ///
     /// # Errors
     /// I/O errors or a corrupt frame that is not merely torn at the end.
-    pub fn seal(&self) -> io::Result<()> {
+    pub(crate) fn seal(&self) -> io::Result<()> {
         if !self.dir.is_dir() {
             return Ok(());
         }
@@ -1020,7 +1080,7 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn layout(name: &str) -> DatabaseLayout {
+    fn unique_root(name: &str) -> PathBuf {
         // The counter keeps two tests that pick the same name from deleting
         // each other's directory when they run in parallel.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1030,7 +1090,11 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
-        DatabaseLayout::open(root).unwrap()
+        root
+    }
+
+    fn layout(name: &str) -> DatabaseLayout {
+        DatabaseLayout::open(unique_root(name)).unwrap()
     }
 
     fn row(target: u32, kind: u16) -> RowRecord {
@@ -1039,6 +1103,26 @@ mod tests {
             owner: 1,
             edges: vec![Edge { target, kind }],
         }
+    }
+
+    #[test]
+    fn writer_is_tied_to_the_store_owner() {
+        let root = unique_root("writer");
+        let db = crate::database::Database::open(root.clone()).expect("open database");
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        assert!(store.writer(&db).is_ok(), "the owning database may write");
+
+        // A database rooted inside this store's root keeps its own lock, which
+        // does not cover the parent. The old path-prefix check accepted this.
+        let foreign = DatabaseLayout::open(root.join("nested")).expect("nested layout");
+        let foreign = CsrStore::open(&foreign, ShardType::State);
+        assert!(
+            foreign.writer(&db).is_err(),
+            "a database rooted elsewhere must not authorize this store"
+        );
+
+        drop(db);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1279,6 +1363,32 @@ mod tests {
         assert_eq!(store.segments().unwrap().len(), 1);
         assert!(store.read_scope(scope).unwrap().rows.is_empty());
         let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn a_writer_needs_the_database_that_owns_the_store() {
+        let owner_root = layout("writer_owner").root().to_path_buf();
+        let other_root = layout("writer_other").root().to_path_buf();
+        {
+            let owner = Database::open(owner_root.clone()).unwrap();
+            let other = Database::open(other_root.clone()).unwrap();
+            let store = CsrStore::open(owner.layout(), ShardType::State);
+            let scope = ScopeId([9; 16]);
+
+            let refused = store
+                .writer(&other)
+                .err()
+                .expect("a foreign database is refused");
+            assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+
+            let writer = store.writer(&owner).unwrap();
+            writer.append_rows(scope, &[row(2, 1)]).unwrap();
+            assert_eq!(store.read_scope(scope).unwrap().rows.len(), 1);
+            writer.purge_scope(scope).unwrap();
+            assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        }
+        let _ = fs::remove_dir_all(owner_root);
+        let _ = fs::remove_dir_all(other_root);
     }
 
     #[test]

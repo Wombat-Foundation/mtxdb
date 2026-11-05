@@ -344,8 +344,10 @@ impl CsrAdjacency {
         let ids = self.events.get_or_create(db, &keys)?;
         let (owners, changed_rows) = merge_batch(&mut stored, &prepared, &starts, &ids)?;
         if !changed_rows.is_empty() {
-            self.store(db)
-                .append_rows(self.scope(), &changed_rows)
+            let store = self.store(db);
+            store
+                .writer(db)
+                .and_then(|writer| writer.append_rows(self.scope(), &changed_rows))
                 .map_err(StorageError::Io)?;
         }
         Ok(owners)
@@ -717,8 +719,10 @@ impl CsrAdjacency {
     /// # Errors
     /// Returns an error if the tombstone cannot be appended.
     pub fn purge_graph(&self, db: &Database) -> Result<(), StorageError> {
-        self.store(db)
-            .purge_scope(self.scope())
+        let store = self.store(db);
+        store
+            .writer(db)
+            .and_then(|writer| writer.purge_scope(self.scope()))
             .map_err(StorageError::Io)
     }
 

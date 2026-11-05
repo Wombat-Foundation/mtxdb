@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use mtxdb::csr::store::{CsrStore, RowRecord, ScopeId};
 use mtxdb::short_id::{Edge, EdgeFamily};
-use mtxdb::{DatabaseLayout, ShardType};
+use mtxdb::{Database, ShardType};
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -31,7 +31,14 @@ fn scope_id(n: usize) -> ScopeId {
     ScopeId(bytes)
 }
 
-fn build(store: &CsrStore, scopes: usize, rows: usize, family: EdgeFamily) -> Duration {
+fn build(
+    store: &CsrStore,
+    db: &Database,
+    scopes: usize,
+    rows: usize,
+    family: EdgeFamily,
+) -> Duration {
+    let writer = store.writer(db).expect("writer");
     let started = Instant::now();
     for scope in 0..scopes {
         let batch: Vec<RowRecord> = (0..rows)
@@ -53,9 +60,9 @@ fn build(store: &CsrStore, scopes: usize, rows: usize, family: EdgeFamily) -> Du
                 }
             })
             .collect();
-        store.append_rows(scope_id(scope), &batch).expect("append");
+        writer.append_rows(scope_id(scope), &batch).expect("append");
     }
-    store.seal().expect("seal");
+    writer.seal().expect("seal");
     started.elapsed()
 }
 
@@ -103,8 +110,9 @@ fn whole_scope_reads(store: &CsrStore, scopes: usize, rows: usize) -> (Duration,
     (first, started.elapsed())
 }
 
-fn read_after_seal(store: &CsrStore, family: EdgeFamily, rows: usize) -> Duration {
-    store
+fn read_after_seal(store: &CsrStore, db: &Database, family: EdgeFamily, rows: usize) -> Duration {
+    let writer = store.writer(db).expect("writer");
+    writer
         .append_rows(
             scope_id(0),
             &[RowRecord {
@@ -114,7 +122,7 @@ fn read_after_seal(store: &CsrStore, family: EdgeFamily, rows: usize) -> Duratio
             }],
         )
         .expect("append after seal");
-    store.seal().expect("second seal");
+    writer.seal().expect("second seal");
     let started = Instant::now();
     let data = store
         .read_scope(scope_id(0))
@@ -136,11 +144,11 @@ fn main() {
     std::fs::create_dir_all(&base).expect("bench root");
     let root = base.join(format!("mtxdb-csr-read-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let layout = DatabaseLayout::open(root.clone()).expect("layout");
-    let store = CsrStore::open(&layout, ShardType::State);
+    let db = Database::open(root.clone()).expect("open database");
+    let store = CsrStore::open(db.layout(), ShardType::State);
     let family = EdgeFamily::typed(1);
 
-    let build = build(&store, scopes, rows, family);
+    let build = build(&store, &db, scopes, rows, family);
     let keys: Vec<(EdgeFamily, u32)> = (0..16)
         .map(|owner| (family, u32::try_from(owner).unwrap_or(u32::MAX)))
         .collect();
@@ -149,7 +157,7 @@ fn main() {
     let per_scope = warm_pass
         .checked_div(u32::try_from(scopes.max(1)).unwrap_or(u32::MAX))
         .unwrap_or(Duration::ZERO);
-    let after_seal = read_after_seal(&store, family, rows);
+    let after_seal = read_after_seal(&store, &db, family, rows);
 
     println!(
         "scopes {scopes} x {rows} rows; build+seal {build:?}; {} MiB-ish",
