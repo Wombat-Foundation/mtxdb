@@ -1,8 +1,11 @@
 pub mod chunk;
+pub mod store;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const CSR_VERSION: u8 = 1;
+const CSR_FAMILIES_MAGIC: &[u8; 4] = b"CSRF";
+const CSR_FAMILIES_VERSION: u8 = 1;
 
 /// Compressed sparse row graph for a collection's event DAG.
 ///
@@ -98,6 +101,227 @@ impl CsrFamilies {
     pub fn relation_types(&self, event_id: &[u8; 16]) -> &[u16] {
         self.relation_types.get(event_id).map_or(&[], Vec::as_slice)
     }
+
+    /// Encode the three CSR families and their shared event-id directory.
+    ///
+    /// The segment is versioned and checksummed. Row-presence bytes preserve
+    /// the distinction between an empty family and a missing event row.
+    ///
+    /// # Errors
+    /// Returns [`CsrError::Malformed`] if relation type ids do not align with
+    /// the relation targets or the segment exceeds its length fields.
+    pub fn serialize(&self) -> Result<Vec<u8>, CsrError> {
+        let relation_type_count = self
+            .relation_types
+            .values()
+            .try_fold(0usize, |count, types| {
+                count.checked_add(types.len()).ok_or(CsrError::Malformed)
+            })?;
+        if relation_type_count != self.relations.edge_count()
+            || self.nodes.len() != self.prev.node_count()
+            || self.nodes.len() != self.auth.node_count()
+            || self.nodes.len() != self.relations.node_count()
+        {
+            return Err(CsrError::Malformed);
+        }
+        for (index, node) in self.nodes.iter().enumerate() {
+            let local = u32::try_from(index).map_err(|_| CsrError::Malformed)?;
+            if self.prev.hash_of(local) != Some(node)
+                || self.auth.hash_of(local) != Some(node)
+                || self.relations.hash_of(local) != Some(node)
+            {
+                return Err(CsrError::Malformed);
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(CSR_FAMILIES_MAGIC);
+        out.push(CSR_FAMILIES_VERSION);
+        out.extend_from_slice(
+            &u32::try_from(self.nodes.len())
+                .map_err(|_| CsrError::Malformed)?
+                .to_le_bytes(),
+        );
+        for node in &self.nodes {
+            out.extend_from_slice(node);
+        }
+        for (csr, rows) in [
+            (&self.prev, &self.prev_rows),
+            (&self.auth, &self.auth_rows),
+            (&self.relations, &self.relation_rows),
+        ] {
+            for node in &self.nodes {
+                out.push(u8::from(rows.contains(node)));
+            }
+            let encoded = csr.serialize();
+            out.extend_from_slice(
+                &u32::try_from(encoded.len())
+                    .map_err(|_| CsrError::Malformed)?
+                    .to_le_bytes(),
+            );
+            out.extend_from_slice(&encoded);
+        }
+        for node in &self.nodes {
+            let local = self.relations.local_id(node).ok_or(CsrError::Malformed)?;
+            let target_count = self.relations.neighbors(local).len();
+            let types = self.relation_types.get(node).map_or(&[][..], Vec::as_slice);
+            if target_count != types.len() {
+                return Err(CsrError::Malformed);
+            }
+            for kind in types {
+                out.extend_from_slice(&kind.to_le_bytes());
+            }
+        }
+        let checksum = crc32fast::hash(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        Ok(out)
+    }
+
+    /// Decode a versioned CSR family segment.
+    ///
+    /// # Errors
+    /// Returns [`CsrError::TooShort`], [`CsrError::UnsupportedVersion`], or
+    /// [`CsrError::Malformed`] for an invalid, truncated, or corrupt segment.
+    pub fn deserialize(data: &[u8]) -> Result<Self, CsrError> {
+        if data.len() < 13 {
+            return Err(CsrError::TooShort);
+        }
+        let body_len = data.len().checked_sub(4).ok_or(CsrError::TooShort)?;
+        let expected_crc = u32::from_le_bytes(
+            data[body_len..]
+                .try_into()
+                .map_err(|_| CsrError::TooShort)?,
+        );
+        if crc32fast::hash(&data[..body_len]) != expected_crc {
+            return Err(CsrError::Malformed);
+        }
+        if &data[..4] != CSR_FAMILIES_MAGIC {
+            return Err(CsrError::Malformed);
+        }
+        if data[4] != CSR_FAMILIES_VERSION {
+            return Err(CsrError::UnsupportedVersion(data[4]));
+        }
+        let count =
+            u32::from_le_bytes(data[5..9].try_into().map_err(|_| CsrError::TooShort)?) as usize;
+        let nodes_len = count.checked_mul(16).ok_or(CsrError::Malformed)?;
+        let mut cursor = 9usize;
+        let node_bytes = take(data, &mut cursor, nodes_len)?;
+        let mut nodes = Vec::with_capacity(count);
+        for chunk in node_bytes.chunks_exact(16) {
+            nodes.push(chunk.try_into().map_err(|_| CsrError::Malformed)?);
+        }
+        if nodes.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(CsrError::Malformed);
+        }
+
+        let mut row_sets = Vec::with_capacity(3);
+        let mut decoded = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let flags = take(data, &mut cursor, count)?;
+            if flags.iter().any(|&flag| flag > 1) {
+                return Err(CsrError::Malformed);
+            }
+            row_sets.push(
+                nodes
+                    .iter()
+                    .zip(flags)
+                    .filter_map(|(node, &flag)| (flag == 1).then_some(*node))
+                    .collect::<HashSet<_>>(),
+            );
+            let length = read_u32(data, &mut cursor)? as usize;
+            let bytes = take(data, &mut cursor, length)?;
+            let csr = Csr::deserialize(bytes)?;
+            if csr.node_count() != count {
+                return Err(CsrError::Malformed);
+            }
+            decoded.push(csr);
+        }
+
+        for (csr, rows) in decoded.iter().zip(&row_sets) {
+            for (local, node) in nodes.iter().enumerate() {
+                if !rows.contains(node) && !csr.neighbors(local as u32).is_empty() {
+                    return Err(CsrError::Malformed);
+                }
+            }
+        }
+
+        let relation_edge_count = decoded[2].edge_count();
+        let relation_bytes_len = relation_edge_count
+            .checked_mul(2)
+            .ok_or(CsrError::Malformed)?;
+        let relation_bytes = take(data, &mut cursor, relation_bytes_len)?;
+        if cursor != body_len {
+            return Err(CsrError::Malformed);
+        }
+        let mut all_relation_types = Vec::with_capacity(relation_edge_count);
+        for chunk in relation_bytes.chunks_exact(2) {
+            all_relation_types.push(u16::from_le_bytes(
+                chunk.try_into().map_err(|_| CsrError::Malformed)?,
+            ));
+        }
+
+        let prev = rebuild_with_nodes(&nodes, decoded.remove(0))?;
+        let auth = rebuild_with_nodes(&nodes, decoded.remove(0))?;
+        let relations = rebuild_with_nodes(&nodes, decoded.remove(0))?;
+        let mut relation_types = HashMap::new();
+        let mut type_cursor = 0usize;
+        for (local, node) in nodes.iter().enumerate() {
+            let edge_count = relations.neighbors(local as u32).len();
+            let end = type_cursor
+                .checked_add(edge_count)
+                .ok_or(CsrError::Malformed)?;
+            if row_sets[2].contains(node) {
+                relation_types.insert(*node, all_relation_types[type_cursor..end].to_vec());
+            } else if edge_count != 0 {
+                return Err(CsrError::Malformed);
+            }
+            type_cursor = end;
+        }
+        Ok(Self {
+            prev,
+            auth,
+            relations,
+            nodes,
+            prev_rows: row_sets.remove(0),
+            auth_rows: row_sets.remove(0),
+            relation_rows: row_sets.remove(0),
+            relation_types,
+        })
+    }
+}
+
+fn take<'a>(data: &'a [u8], cursor: &mut usize, length: usize) -> Result<&'a [u8], CsrError> {
+    let end = cursor.checked_add(length).ok_or(CsrError::Malformed)?;
+    let bytes = data.get(*cursor..end).ok_or(CsrError::TooShort)?;
+    *cursor = end;
+    Ok(bytes)
+}
+
+fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32, CsrError> {
+    Ok(u32::from_le_bytes(
+        take(data, cursor, 4)?
+            .try_into()
+            .map_err(|_| CsrError::TooShort)?,
+    ))
+}
+
+fn rebuild_with_nodes(nodes: &[[u8; 16]], decoded: Csr) -> Result<Csr, CsrError> {
+    let mut adjacency = HashMap::new();
+    for (local, source) in nodes.iter().enumerate() {
+        let targets = decoded
+            .neighbors(u32::try_from(local).map_err(|_| CsrError::Malformed)?)
+            .iter()
+            .map(|&target| {
+                nodes
+                    .get(target as usize)
+                    .copied()
+                    .ok_or(CsrError::Malformed)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !targets.is_empty() {
+            adjacency.insert(*source, targets);
+        }
+    }
+    Ok(Csr::build_from_edges(nodes, &adjacency))
 }
 
 impl Csr {
