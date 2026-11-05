@@ -192,3 +192,9 @@ harness = false
 name = "reclaim_trigger_sweep"
 path = "reclaim_trigger_sweep.rs"
 harness = false
+
+# CSR point reads vs first/warm whole-scope reads and post-seal reads.
+[[bench]]
+name = "csr_read_cache"
+path = "csr_read_cache.rs"
+harness = false
