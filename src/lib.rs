@@ -215,7 +215,9 @@ pub use interop::{
     STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS, VERDICT_VERSION,
 };
 pub use journal::SharedWalLock;
-pub use journal::{CollectionExpectation, StagedLookup, TxnStage, TxnStageState};
+pub use journal::{
+    CollectionExpectation, ReplayLeaseRevoked, StagedLookup, TxnStage, TxnStageState,
+};
 pub use journal::{
     DurabilityStats, DurabilityToken, DurableWaitLatency, GroupCommitConfig, GroupDirectoryStats,
 };

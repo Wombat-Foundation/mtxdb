@@ -874,6 +874,7 @@ impl Database {
         if let Some(bytes) = config.reclaim_trigger_bytes {
             coordinator.configure_reclaim_trigger_len(bytes)?;
         }
+        coordinator.configure_replay_lease_cap(config.replay_lease_max_retained_bytes);
 
         let mut pools = Vec::with_capacity(ShardType::ALL.len());
         for shard in ShardType::ALL {

@@ -2260,7 +2260,7 @@ fn replay_lease_advance_lets_reclaim_pass_consumed_pages() {
     assert_eq!(page.groups[0].last_lsn, second.last_lsn);
 
     // Once the page is applied, advancing the floor releases the snapshot.
-    lease.advance(page.through_lsn);
+    lease.advance(page.through_lsn).unwrap();
     coordinator.reclaim_through(second.last_lsn).unwrap();
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -2279,8 +2279,8 @@ fn replay_lease_advance_is_monotonic() {
     let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
     let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
 
-    lease.advance(second.last_lsn);
-    lease.advance(first.last_lsn);
+    lease.advance(second.last_lsn).unwrap();
+    lease.advance(first.last_lsn).unwrap();
 
     // The floor stays at `second`, so reclaim may drop the snapshot and expire
     // the cursor. A lowered floor would clamp the cut to `first` and keep the
@@ -2288,6 +2288,143 @@ fn replay_lease_advance_is_monotonic() {
     coordinator.reclaim_through(second.last_lsn).unwrap();
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// The retention cap is opt-in: with no cap configured, a lease pins its
+/// original cursor however far the segment grows.
+#[test]
+fn replay_lease_cap_is_off_by_default() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_off");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(None);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(!lease.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 0);
+    lease.advance(second.last_lsn).unwrap();
+    let page = coordinator.changes_since(&cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+}
+
+/// A lease pinning more history than the cap allows is revoked by the next
+/// reclaim, which then passes it; reads fall through to the cursor-expired
+/// error and `advance` reports the revocation.
+#[test]
+fn replay_lease_cap_revokes_a_lease_that_retains_too_much() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_breach");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(Some(1));
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    assert_eq!(coordinator.replay_lease_count(), 1);
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(lease.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 1);
+    assert_eq!(coordinator.replay_lease_count(), 0);
+    assert_eq!(
+        lease.advance(second.last_lsn),
+        Err(crate::journal::ReplayLeaseRevoked)
+    );
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// Dropping a lease releases its pin without revoking it; the revoked counter
+/// only tracks cap-driven invalidations.
+#[test]
+fn dropping_a_replay_lease_is_not_a_revocation() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_drop");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(Some(1));
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    drop(lease);
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+    assert_eq!(coordinator.replay_leases_revoked(), 0);
+    assert_eq!(coordinator.replay_lease_count(), 0);
+}
+
+/// A lease that fits under the cap is left active, and its lag is reported so
+/// a stuck lease is visible before it matters.
+#[test]
+fn replay_lease_lag_reports_retained_bytes_within_the_cap() {
+    let dir = ReplayTestDir::new("changes_since_lease_lag");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    coordinator.configure_replay_lease_cap(Some(u64::MAX / 2));
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    let lag = coordinator.replay_lease_lag_bytes().unwrap();
+    assert!(lag > 0, "the second group is retained by the lease");
+    assert!(coordinator.oldest_replay_lease_age().is_some());
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(!lease.is_revoked());
+    lease.advance(second.last_lsn).unwrap();
+}
+
+/// Concurrent `advance` and cap revocation share the pin registry: after the
+/// reclaim revokes the lease, every later `advance` reports it.
+#[test]
+fn replay_lease_advance_observes_concurrent_revocation() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_race");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(Some(1));
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+
+    let revoked = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| loop {
+            if lease.is_revoked() {
+                return lease.advance(first.last_lsn).err();
+            }
+            if let Err(error) = lease.advance(first.last_lsn) {
+                return Some(error);
+            }
+            std::thread::yield_now();
+        });
+        coordinator.reclaim_through(second.last_lsn).unwrap();
+        worker.join().unwrap()
+    });
+
+    assert_eq!(revoked, Some(crate::journal::ReplayLeaseRevoked));
+    assert!(lease.is_revoked());
 }
 
 #[test]
@@ -2321,6 +2458,37 @@ fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
 
     drop(lease);
     coordinator.reclaim_shared().unwrap();
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn shared_reclaim_revokes_a_lease_over_the_cap() {
+    use crate::layout::ShardType;
+
+    let dir = ReplayTestDir::new("shared_replay_lease_cap");
+    let path = dir.journal_path();
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+    coordinator.configure_replay_lease_cap(Some(1));
+
+    let first = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 2, b"replay")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    coordinator.report_pool_coverage(ShardType::State, second.last_lsn);
+    coordinator.reclaim_shared().unwrap();
+
+    assert!(lease.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 1);
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }

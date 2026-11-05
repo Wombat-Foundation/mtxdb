@@ -1835,6 +1835,54 @@ fn a_commit_burst_that_fills_the_segment_is_refused_then_recovers_after_a_sync()
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A transaction refused because the segment is full stays retryable: after a
+/// sync reclaims space, committing the same transaction succeeds and its data
+/// is readable.
+#[test]
+fn a_refused_transaction_retries_after_a_sync() {
+    let (db, root) = small_segment_database("refused_txn_retry");
+    let collection = [0x7e; 16];
+    let mut next = 0u64;
+    let (txn, error) = loop {
+        let txn = db.begin_transaction();
+        for _ in 0..20 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&next.to_le_bytes());
+            next = next.saturating_add(1);
+            txn.put(
+                ShardType::EventDag,
+                collection,
+                id,
+                &NodeData::from_slice(&[0x5a; 256]),
+            )
+            .unwrap();
+        }
+        match txn.commit() {
+            Ok(()) => {}
+            Err(error) => break (txn, error),
+        }
+        assert!(next < 20_000, "the segment never filled");
+    };
+    assert!(
+        error.is_would_block(),
+        "expected a retryable refusal, got {error}"
+    );
+
+    db.pool(ShardType::EventDag).sync_all().unwrap();
+    txn.commit().unwrap();
+
+    let mut last = [0u8; 16];
+    last[..8].copy_from_slice(&(next - 1).to_le_bytes());
+    assert!(db
+        .pool(ShardType::EventDag)
+        .get_read_committed(&collection, &[last])
+        .unwrap()[0]
+        .is_some());
+    drop(txn);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// A transaction group is published to the WAL before its writes are
 /// materialized into the packs. A checkpoint in that window must not record
 /// coverage of frames the packs do not hold yet, or the WAL could be

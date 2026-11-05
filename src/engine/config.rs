@@ -40,6 +40,12 @@ pub struct RuntimeConfig {
     /// `1..=MAX_RECLAIM_TRIGGER_LEN` and below the live segment cap's
     /// emergency boundary.
     pub reclaim_trigger_bytes: Option<u64>,
+    /// Optional cap, in bytes, on the history one replay lease may retain.
+    /// `None` is unlimited (the default), matching `PostgreSQL`'s
+    /// `max_slot_wal_keep_size`. On the next reclaim, a lease pinning more than
+    /// this is revoked; its `advance` returns [`crate::ReplayLeaseRevoked`] and
+    /// reads through its cursor fail closed.
+    pub replay_lease_max_retained_bytes: Option<u64>,
 }
 
 impl Default for RuntimeConfig {
@@ -50,6 +56,7 @@ impl Default for RuntimeConfig {
             index_residency: None,
             stats_enabled: false,
             reclaim_trigger_bytes: None,
+            replay_lease_max_retained_bytes: None,
         }
     }
 }
@@ -136,12 +143,22 @@ impl RuntimeConfig {
             }
         };
 
+        let replay_lease_max_retained_bytes = match lookup("MTXDB_REPLAY_LEASE_MAX_RETAINED_BYTES")? {
+            None => None,
+            Some(value) => Some(value.trim().parse::<u64>().map_err(|_| {
+                ConfigError::new(format!(
+                    "MTXDB_REPLAY_LEASE_MAX_RETAINED_BYTES must be a non-negative integer, got {value:?}"
+                ))
+            })?),
+        };
+
         Ok(Self {
             cache_capacity,
             txn_stage_limit_bytes,
             index_residency,
             stats_enabled,
             reclaim_trigger_bytes,
+            replay_lease_max_retained_bytes,
         })
     }
 
@@ -317,6 +334,17 @@ mod tests {
             ..RuntimeConfig::default()
         };
         assert!(direct_over.validate().is_err());
+    }
+
+    #[test]
+    fn replay_lease_cap_parses_and_defaults_to_unlimited() {
+        assert_eq!(config(&[]).unwrap().replay_lease_max_retained_bytes, None);
+        let parsed = config(&[("MTXDB_REPLAY_LEASE_MAX_RETAINED_BYTES", " 4096 ")]).unwrap();
+        assert_eq!(parsed.replay_lease_max_retained_bytes, Some(4096));
+        let zero = config(&[("MTXDB_REPLAY_LEASE_MAX_RETAINED_BYTES", "0")]).unwrap();
+        assert_eq!(zero.replay_lease_max_retained_bytes, Some(0));
+        assert!(config(&[("MTXDB_REPLAY_LEASE_MAX_RETAINED_BYTES", "-1")]).is_err());
+        assert!(config(&[("MTXDB_REPLAY_LEASE_MAX_RETAINED_BYTES", "big")]).is_err());
     }
 
     #[test]

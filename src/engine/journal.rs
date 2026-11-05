@@ -1872,6 +1872,23 @@ pub struct JournalReplayLease {
     id: u64,
 }
 
+/// A replay lease was revoked because the history it pinned exceeded the
+/// configured retention cap.
+///
+/// This is a lease-state condition, not an I/O failure: the caller must discard
+/// its partial rebuild and take a fresh snapshot. Reads through the lease's
+/// cursor fail with the existing cursor-expired `InvalidData` error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayLeaseRevoked;
+
+impl std::fmt::Display for ReplayLeaseRevoked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("journal replay lease was revoked by the retention cap")
+    }
+}
+
+impl std::error::Error for ReplayLeaseRevoked {}
+
 impl JournalReplayLease {
     /// Raise this lease's floor to `through_lsn`, letting reclaim pass every
     /// group at or below it.
@@ -1882,11 +1899,31 @@ impl JournalReplayLease {
     /// the original snapshot, so only advance past pages that are safely
     /// persisted. The floor is monotonic: a stale or out-of-order call can never
     /// lower it.
-    pub fn advance(&self, through_lsn: u64) {
+    ///
+    /// # Errors
+    /// Returns [`ReplayLeaseRevoked`] when the retention cap revoked this lease.
+    /// A revoked lease cannot be advanced; the caller must discard its partial
+    /// rebuild.
+    pub fn advance(&self, through_lsn: u64) -> Result<(), ReplayLeaseRevoked> {
         let mut pins = self.registry.pins.lock();
-        if let Some(pin) = pins.get_mut(&self.id) {
-            *pin = (*pin).max(through_lsn);
+        let Some(pin) = pins.get_mut(&self.id) else {
+            return Ok(());
+        };
+        if pin.revoked {
+            return Err(ReplayLeaseRevoked);
         }
+        pin.lsn = pin.lsn.max(through_lsn);
+        Ok(())
+    }
+
+    /// Whether the retention cap revoked this lease.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.registry
+            .pins
+            .lock()
+            .get(&self.id)
+            .is_some_and(|pin| pin.revoked)
     }
 }
 
@@ -1898,8 +1935,17 @@ impl Drop for JournalReplayLease {
 
 #[derive(Default)]
 struct ReplayLeaseRegistry {
-    /// Lease ID to the last LSN represented by its snapshot cursor.
-    pins: Mutex<HashMap<u64, u64>>,
+    /// Lease ID to its pinned LSN and whether the retention cap revoked it.
+    pins: Mutex<HashMap<u64, LeasePin>>,
+}
+
+struct LeasePin {
+    /// Last LSN represented by the lease's snapshot cursor.
+    lsn: u64,
+    /// Set by the retention cap. A revoked pin no longer constrains reclaim.
+    revoked: bool,
+    /// When the lease was created, for the oldest-lease age stat.
+    created: std::time::Instant,
 }
 
 /// One bounded page of complete journal groups after a [`JournalCursor`].
@@ -2063,6 +2109,11 @@ pub struct JournalCoordinator {
     /// Segment length above which a sync forces a reclaiming checkpoint; see
     /// [`RECLAIM_TRIGGER_LEN`].
     reclaim_trigger_len: AtomicU64,
+    /// Optional cap, in bytes, on the history one replay lease may retain.
+    /// [`u64::MAX`] means unlimited (the default).
+    replay_lease_cap: AtomicU64,
+    /// Replay leases revoked by the retention cap.
+    replay_leases_revoked: AtomicU64,
     /// Set while a reclaim over the trigger cannot shrink the segment.
     reclaim_stall: Mutex<Option<ReclaimStall>>,
     /// Set when an active replay lease, rather than pool coverage, holds the
@@ -2340,6 +2391,8 @@ impl JournalCoordinator {
             visible_lsn: AtomicU64::new(committed_lsn),
             committed_lsn: AtomicU64::new(committed_lsn),
             reclaim_trigger_len: AtomicU64::new(RECLAIM_TRIGGER_LEN),
+            replay_lease_cap: AtomicU64::new(u64::MAX),
+            replay_leases_revoked: AtomicU64::new(0),
             reclaim_stall: Mutex::new(None),
             replay_lease_stall: Mutex::new(None),
             coverage_epoch: AtomicU64::new(0),
@@ -2701,6 +2754,7 @@ impl JournalCoordinator {
         {
             let _sync = self.sync_lock.lock();
             let mut journal = self.journal.lock();
+            self.revoke_over_cap_leases(&journal);
             let boundary = {
                 let coverage = self.coverage.lock();
                 journal.shared_reclaim_boundary(&coverage.covered)
@@ -3018,7 +3072,14 @@ impl JournalCoordinator {
                 Err(observed) => next = observed,
             }
         };
-        self.replay_leases.pins.lock().insert(id, cursor.lsn);
+        self.replay_leases.pins.lock().insert(
+            id,
+            LeasePin {
+                lsn: cursor.lsn,
+                revoked: false,
+                created: std::time::Instant::now(),
+            },
+        );
         Ok(JournalReplayLease {
             registry: Arc::clone(&self.replay_leases),
             id,
@@ -3026,14 +3087,94 @@ impl JournalCoordinator {
     }
 
     /// Highest LSN reclaim may pass without expiring an active replay cursor.
+    /// Revoked leases no longer constrain the cut.
     fn replay_reclaim_limit(&self, covered_lsn: u64) -> u64 {
         self.replay_leases
             .pins
             .lock()
             .values()
-            .copied()
+            .filter(|pin| !pin.revoked)
+            .map(|pin| pin.lsn)
             .min()
             .map_or(covered_lsn, |pin| covered_lsn.min(pin))
+    }
+
+    /// Set the optional cap, in bytes, on the history one replay lease may
+    /// retain. `None` keeps retention unlimited, matching `PostgreSQL`'s default
+    /// for `max_slot_wal_keep_size`.
+    pub(crate) fn configure_replay_lease_cap(&self, cap: Option<u64>) {
+        self.replay_lease_cap
+            .store(cap.unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Replay leases revoked by the retention cap.
+    #[must_use]
+    pub fn replay_leases_revoked(&self) -> u64 {
+        self.replay_leases_revoked.load(Ordering::Relaxed)
+    }
+
+    /// Number of replay leases currently pinning history.
+    #[must_use]
+    pub fn replay_lease_count(&self) -> usize {
+        self.replay_leases
+            .pins
+            .lock()
+            .values()
+            .filter(|pin| !pin.revoked)
+            .count()
+    }
+
+    /// Oldest pinned LSN among active replay leases, or `None` when none are
+    /// active.
+    #[must_use]
+    pub fn oldest_replay_lease_lsn(&self) -> Option<u64> {
+        self.replay_leases
+            .pins
+            .lock()
+            .values()
+            .filter(|pin| !pin.revoked)
+            .map(|pin| pin.lsn)
+            .min()
+    }
+
+    /// Bytes an active replay lease currently prevents reclaiming, measured
+    /// from the oldest pin to the end of the segment. `None` when no lease is
+    /// active.
+    #[must_use]
+    pub fn replay_lease_lag_bytes(&self) -> Option<u64> {
+        let journal = self.journal.lock();
+        let oldest = self.oldest_replay_lease_lsn()?;
+        Some(journal.retained_bytes_from(oldest))
+    }
+
+    /// Age of the oldest active replay lease, or `None` when none are active.
+    #[must_use]
+    pub fn oldest_replay_lease_age(&self) -> Option<Duration> {
+        self.replay_leases
+            .pins
+            .lock()
+            .values()
+            .filter(|pin| !pin.revoked)
+            .map(|pin| pin.created.elapsed())
+            .max()
+    }
+
+    /// Revoke every active lease whose pinned history exceeds the configured
+    /// cap. Runs with the journal lock held, so it sees a stable segment length
+    /// and shares the reclaim lock order `journal -> pins`.
+    fn revoke_over_cap_leases(&self, journal: &Journal) {
+        let cap = self.replay_lease_cap.load(Ordering::Relaxed);
+        if cap == u64::MAX {
+            return;
+        }
+        let mut pins = self.replay_leases.pins.lock();
+        for pin in pins.values_mut() {
+            if pin.revoked || journal.retained_bytes_from(pin.lsn) <= cap {
+                continue;
+            }
+            pin.revoked = true;
+            self.replay_leases_revoked.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Read a bounded page of complete, durable groups after `cursor`.
@@ -4509,6 +4650,7 @@ impl JournalCoordinator {
         // and a sync must not flush a handle to the replaced inode.
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
+        self.revoke_over_cap_leases(&journal);
         self.run_reclaim_hook();
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let reclaim = journal.reclaim_through(replay_limit)?;
@@ -4529,6 +4671,7 @@ impl JournalCoordinator {
     ) -> io::Result<Reclaim> {
         let _sync = self.sync_lock.lock();
         let mut journal = self.journal.lock();
+        self.revoke_over_cap_leases(&journal);
         self.run_reclaim_hook();
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let blocked_by = (replay_limit == covered_lsn)
@@ -5222,6 +5365,16 @@ impl Journal {
             .checked_sub(1)
             .and_then(|index| self.groups.get(index))
             .map_or(FILE_HEADER_LEN as u64, |group| group.end_offset)
+    }
+
+    /// Bytes a replay cursor pinned at `lsn` still needs: the retained suffix
+    /// beginning after the last group at or below it. Falls back to the whole
+    /// segment when the directory cannot be trusted.
+    fn retained_bytes_from(&self, lsn: u64) -> u64 {
+        if !self.directory_matches_file() {
+            return self.file_len;
+        }
+        self.file_len.saturating_sub(self.resume_offset_for(lsn))
     }
 
     /// The newest LSN through which a shared segment may be reclaimed, given
