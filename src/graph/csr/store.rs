@@ -599,6 +599,11 @@ fn le_u32(data: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
+fn le_u16(data: &[u8], at: usize) -> Option<u16> {
+    let bytes: [u8; 2] = data.get(at..at.checked_add(2)?)?.try_into().ok()?;
+    Some(u16::from_le_bytes(bytes))
+}
+
 fn decode_frames(data: &[u8]) -> (Vec<Frame>, usize) {
     let mut frames = Vec::new();
     let mut at = 0usize;
@@ -711,39 +716,8 @@ fn apply_segment(
     family: Option<EdgeFamily>,
     rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
 ) -> io::Result<()> {
-    let corrupt = |what: &str| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("csr segment {} ({what})", path.display()),
-        )
-    };
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let mut header = [0u8; SEGMENT_HEADER];
-    file.read_exact(&mut header)?;
-    if header[..4] != SEGMENT_MAGIC {
-        return Err(corrupt("bad magic"));
-    }
-    if header[4] != SEGMENT_VERSION {
-        return Err(corrupt("unsupported version"));
-    }
-    let scope_count = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
-    let index_len = scope_count
-        .checked_mul(SCOPE_ENTRY)
-        .ok_or_else(|| corrupt("index overflows"))?;
-    let mut index_bytes = vec![0u8; index_len];
-    file.read_exact(&mut index_bytes)?;
-    let payload_len = u32::from_le_bytes([header[13], header[14], header[15], header[16]]) as usize;
-    let payload_start = SEGMENT_HEADER
-        .checked_add(index_len)
-        .ok_or_else(|| corrupt("index overflows"))?;
-    if (payload_start as u64)
-        .checked_add(payload_len as u64)
-        .and_then(|end| end.checked_add(4))
-        != Some(file_len)
-    {
-        return Err(corrupt("length does not match file size"));
-    }
+    let (mut file, index_bytes, payload_start, payload_len) = open_segment(path)?;
+    let corrupt = |what: &str| segment_error(path, what);
     for entry in index_bytes.chunks_exact(SCOPE_ENTRY) {
         if entry[..16] != scope.0 {
             continue;
@@ -796,27 +770,85 @@ fn apply_segment(
                 rows,
             )?;
         } else {
-            file.seek(SeekFrom::Start(entries_start as u64))?;
-            let mut directory = vec![0u8; count.saturating_mul(DIR_ENTRY)];
-            file.read_exact(&mut directory)?;
-            for item in directory.chunks_exact(DIR_ENTRY) {
-                let (Some(offset), Some(len), Some(crc)) =
-                    (le_u32(item, 6), le_u32(item, 10), le_u32(item, 14))
-                else {
-                    return Err(corrupt("scope directory entry is short"));
-                };
-                read_row_at(
-                    &mut file,
-                    data_start,
-                    data_len,
-                    offset as usize,
-                    len as usize,
-                    crc,
-                    rows,
-                )?;
-            }
+            read_whole_directory(&mut file, entries_start, count, data_start, data_len, rows)
+                .map_err(|e| match e.kind() {
+                    io::ErrorKind::UnexpectedEof => corrupt("scope directory entry is short"),
+                    _ => e,
+                })?;
         }
         return Ok(());
+    }
+    Ok(())
+}
+
+fn segment_error(path: &Path, what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("csr segment {} ({what})", path.display()),
+    )
+}
+
+/// Open a sealed segment and validate its header and length: the file, the
+/// raw scope index, where the payload starts and how long it is.
+fn open_segment(path: &Path) -> io::Result<(File, Vec<u8>, usize, usize)> {
+    let corrupt = |what: &str| segment_error(path, what);
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut header = [0u8; SEGMENT_HEADER];
+    file.read_exact(&mut header)?;
+    if header[..4] != SEGMENT_MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    if header[4] != SEGMENT_VERSION {
+        return Err(corrupt("unsupported version"));
+    }
+    let scope_count = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
+    let index_len = scope_count
+        .checked_mul(SCOPE_ENTRY)
+        .ok_or_else(|| corrupt("index overflows"))?;
+    let mut index_bytes = vec![0u8; index_len];
+    file.read_exact(&mut index_bytes)?;
+    let payload_len = u32::from_le_bytes([header[13], header[14], header[15], header[16]]) as usize;
+    let payload_start = SEGMENT_HEADER
+        .checked_add(index_len)
+        .ok_or_else(|| corrupt("index overflows"))?;
+    if (payload_start as u64)
+        .checked_add(payload_len as u64)
+        .and_then(|end| end.checked_add(4))
+        != Some(file_len)
+    {
+        return Err(corrupt("length does not match file size"));
+    }
+    Ok((file, index_bytes, payload_start, payload_len))
+}
+
+/// Read every row of one scope directory.
+fn read_whole_directory(
+    file: &mut File,
+    entries_start: usize,
+    count: usize,
+    data_start: usize,
+    data_len: usize,
+    rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+) -> io::Result<()> {
+    file.seek(SeekFrom::Start(entries_start as u64))?;
+    let mut directory = vec![0u8; count.saturating_mul(DIR_ENTRY)];
+    file.read_exact(&mut directory)?;
+    for item in directory.chunks_exact(DIR_ENTRY) {
+        let (Some(offset), Some(len), Some(crc)) =
+            (le_u32(item, 6), le_u32(item, 10), le_u32(item, 14))
+        else {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        };
+        read_row_at(
+            file,
+            data_start,
+            data_len,
+            offset as usize,
+            len as usize,
+            crc,
+            rows,
+        )?;
     }
     Ok(())
 }
@@ -836,9 +868,7 @@ fn read_family_directory(
     if lower == upper {
         return Ok(());
     }
-    let byte_len = upper
-        .saturating_sub(lower)
-        .saturating_mul(DIR_ENTRY);
+    let byte_len = upper.saturating_sub(lower).saturating_mul(DIR_ENTRY);
     let mut directory = vec![0u8; byte_len];
     file.seek(SeekFrom::Start(
         entries_start.saturating_add(lower.saturating_mul(DIR_ENTRY)) as u64,
@@ -884,7 +914,10 @@ fn family_bound(
         ))?;
         file.read_exact(&mut entry)?;
         let current = le_u16(&entry, 0).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "csr directory entry is truncated")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "csr directory entry is truncated",
+            )
         })?;
         if current < family_id || (upper && current == family_id) {
             low = mid.saturating_add(1);
@@ -1108,7 +1141,13 @@ mod tests {
             .unwrap();
 
         let rows = store.read_family(scope, EdgeFamily::typed(3)).unwrap();
-        assert_eq!(rows, vec![(1, vec![Edge { target: 2, kind: 1 }]), (5, vec![Edge { target: 6, kind: 2 }])]);
+        assert_eq!(
+            rows,
+            vec![
+                (1, vec![Edge { target: 2, kind: 1 }]),
+                (5, vec![Edge { target: 6, kind: 2 }])
+            ]
+        );
         let plain = store.read_family(scope, EdgeFamily::plain(1)).unwrap();
         assert_eq!(plain, vec![(2, vec![Edge { target: 4, kind: 0 }])]);
         let _ = fs::remove_dir_all(layout.root());
