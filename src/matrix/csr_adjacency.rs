@@ -550,8 +550,9 @@ impl CsrAdjacency {
     /// Every recorded row of one family for this scope, in one store read.
     ///
     /// Use this instead of calling [`Self::family_edges`] in a loop: the store
-    /// is append-only, so one scope read is far cheaper than N point reads that
-    /// each replay the tail.
+    /// is append-only, so one family read is far cheaper than N point reads
+    /// that each replay the tail. Sealed segments seek only this family's
+    /// directory range.
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt segment.
@@ -560,16 +561,9 @@ impl CsrAdjacency {
         db: &Database,
         family: EdgeFamily,
     ) -> Result<Vec<(u32, Vec<Edge>)>, StorageError> {
-        let data = self
-            .store(db)
-            .read_scope(self.scope())
-            .map_err(StorageError::Io)?;
-        Ok(data
-            .rows
-            .into_iter()
-            .filter(|row| row.family.id == family.id && row.family.typed == family.typed)
-            .map(|row| (row.owner, row.edges))
-            .collect())
+        self.store(db)
+            .read_family(self.scope(), family)
+            .map_err(StorageError::Io)
     }
 
     /// The event's relation if it has one and `visibility` shows it.
