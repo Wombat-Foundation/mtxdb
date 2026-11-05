@@ -132,8 +132,6 @@ impl CsrWriter<'_> {
     /// # Errors
     /// I/O errors, or a row with too many edges.
     pub fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
-        let lock = self.store.write_lock();
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.store.append_rows(scope, rows)
     }
 
@@ -142,8 +140,6 @@ impl CsrWriter<'_> {
     /// # Errors
     /// I/O errors.
     pub fn purge_scope(&self, scope: ScopeId) -> io::Result<()> {
-        let lock = self.store.write_lock();
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.store.purge_scope(scope)
     }
 
@@ -152,8 +148,6 @@ impl CsrWriter<'_> {
     /// # Errors
     /// I/O errors.
     pub fn seal(&self) -> io::Result<()> {
-        let lock = self.store.write_lock();
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.store.seal()
     }
 }
@@ -214,6 +208,13 @@ impl CsrStore {
     /// # Errors
     /// I/O errors, or a row with more than `u32::MAX` edges.
     pub(crate) fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
+        let lock = self.write_lock();
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.append_rows_locked(scope, rows)
+    }
+
+    /// Append while the caller holds this directory's write lock.
+    fn append_rows_locked(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -247,6 +248,13 @@ impl CsrStore {
     /// # Errors
     /// I/O errors.
     pub(crate) fn purge_scope(&self, scope: ScopeId) -> io::Result<()> {
+        let lock = self.write_lock();
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.purge_scope_locked(scope)
+    }
+
+    /// Append a purge while the caller holds this directory's write lock.
+    fn purge_scope_locked(&self, scope: ScopeId) -> io::Result<()> {
         fs::create_dir_all(&self.dir)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -276,6 +284,13 @@ impl CsrStore {
     /// # Errors
     /// I/O errors or a corrupt frame that is not merely torn at the end.
     pub(crate) fn seal(&self) -> io::Result<()> {
+        let lock = self.write_lock();
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.seal_locked()
+    }
+
+    /// Seal while the caller holds this directory's write lock.
+    fn seal_locked(&self) -> io::Result<()> {
         if !self.dir.is_dir() {
             return Ok(());
         }
@@ -315,7 +330,7 @@ impl CsrStore {
     /// Seal if the tail is large enough.
     fn maybe_seal(&self) -> io::Result<()> {
         if fs::metadata(self.tail_path()).map(|meta| meta.len())? >= SEAL_THRESHOLD {
-            self.seal()?;
+            self.seal_locked()?;
         }
         Ok(())
     }
