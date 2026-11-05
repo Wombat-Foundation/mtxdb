@@ -3,7 +3,6 @@ name = "mtxdb-cli"
 version = "0.1.0-beta.1"
 edition = "2021"
 rust-version = "1.88"
-publish = false
 
 repository = "https://github.com/Wombat-Foundation/mtxdb"
 description = "mtxdb: CLI and core library components; fast Matrix binary DB."
@@ -77,8 +76,8 @@ bytes = "1.5"
 clap = { version = "=4.6.7", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
 clap_complete = { version = "=4.6.11", optional = true }
 hex = "0.4"
-mtxdb = { path = ".." }
-rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", features = ["signing-consensus"] }
+mtxdb = { path = "..", version = "0.1.0-beta.2" }
+rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", features = ["signing-consensus"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
