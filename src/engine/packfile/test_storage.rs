@@ -640,6 +640,94 @@ fn read_committed_overlay_reloads_after_reclaim_advances_coverage() {
     );
 }
 
+/// A reader streaming `get_read_committed` must not stop the writer's sync from
+/// advancing the checkpoint and reclaiming the journal. Transient `WouldBlock`
+/// is allowed for the reader; a gap or wrong value is not.
+#[test]
+fn streaming_read_committed_does_not_hold_back_reclaim() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let dir = test_dir("read_committed_stream_vs_reclaim");
+    let wal = dir.join("wal.bin");
+    let collection = [0x4Du8; 16];
+    let seed_key = [0x01u8; 16];
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &collection,
+        &seed_key,
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+    let (journal, _) = Journal::open(&wal).unwrap();
+    drop(journal);
+
+    let reader = Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
+    reader.enable_read_journal(&wal).unwrap();
+
+    // Drop the seed checkpoint so the writer's sync writes a full checkpoint
+    // (which reclaims), instead of appending a delta that does not.
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    // Force a checkpoint and reclaim on every sync; otherwise coverage only
+    // advances on a delta rollover and the base never moves.
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let reader = Arc::clone(&reader);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut served = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                match reader.get_read_committed(&collection, &[seed_key]) {
+                    Ok(values) => {
+                        assert_eq!(
+                            values[0].as_ref().map(|data| data.bytes.as_ref()),
+                            Some(&b"seed"[..]),
+                            "a streamed read must never observe a hole"
+                        );
+                        served += 1;
+                    }
+                    // Bounded-retry classification under a racing reclaim.
+                    Err(StorageError::WouldBlock(_)) => {}
+                    Err(err) => panic!("unexpected read error: {err}"),
+                }
+            }
+            served
+        })
+    };
+
+    let mut last_base = Journal::scan_read_only(&wal).unwrap().base_lsn;
+    let mut advanced = false;
+    for i in 0u8..40 {
+        let key = [0x80u8.wrapping_add(i); 16];
+        writer
+            .put(
+                &collection,
+                &key,
+                &NodeData::new(bytes::Bytes::from(vec![i; 8])),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        let base = Journal::scan_read_only(&wal).unwrap().base_lsn;
+        advanced |= base > last_base;
+        last_base = base;
+    }
+    stop.store(true, Ordering::Release);
+    let served = handle.join().unwrap();
+
+    assert!(served > 0, "the reader must have completed some reads");
+    assert!(
+        advanced,
+        "reclaim must keep advancing the journal base while reads stream"
+    );
+}
+
 #[test]
 fn read_committed_reload_skips_the_exact_pack_gate() {
     let dir = test_dir("read_committed_reload_skip_gate");
