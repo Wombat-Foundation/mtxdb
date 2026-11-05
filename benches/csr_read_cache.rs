@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mtxdb::csr::store::{CsrStore, RowRecord, ScopeId};
-use mtxdb::short_id::{Edge, EdgeFamily};
+use mtxdb::csr::{Edge, EdgeFamily};
 use mtxdb::{Database, ShardType};
 
 fn env_usize(name: &str, default: usize) -> usize {

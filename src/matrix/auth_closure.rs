@@ -39,10 +39,10 @@ use crate::storage::StorageError;
 use crate::closure_store::{
     ClosureCoverageBuilder, ClosureHead, ClosureSnapshot, ClosureStore, GenerationBuilder,
 };
+use crate::csr::Edge;
 use crate::csr_adjacency::{CsrAdjacency, AUTH};
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
-use crate::short_id::Edge;
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
 /// Outcome of an ancestors-only auth-closure walk.

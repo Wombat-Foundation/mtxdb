@@ -37,9 +37,10 @@ use std::collections::{BTreeSet, HashMap};
 type ClaimedEdges = BTreeSet<(Vec<u8>, u16)>;
 
 use crate::csr::store::{CsrStore, RowRecord, ScopeId};
+use crate::csr::{Edge, EdgeFamily, EdgeKey};
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
-use crate::short_id::{Edge, EdgeFamily, EdgeKey, ShortIdIndex};
+use crate::short_id::ShortIdIndex;
 use crate::storage::StorageError;
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
@@ -558,6 +559,7 @@ impl CsrAdjacency {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt segment.
+    #[cfg(feature = "bitmaps")]
     pub(crate) fn family_rows(
         &self,
         db: &Database,

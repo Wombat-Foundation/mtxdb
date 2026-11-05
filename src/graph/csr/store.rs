@@ -48,9 +48,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
+use super::{Edge, EdgeFamily};
 use crate::database::Database;
 use crate::layout::{DatabaseLayout, ShardType};
-use crate::short_id::{Edge, EdgeFamily};
 
 const SEGMENT_MAGIC: [u8; 4] = *b"MCSS";
 const SEGMENT_VERSION: u8 = 1;

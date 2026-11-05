@@ -10,6 +10,56 @@ const CSR_VERSION: u8 = 1;
 const CSR_FAMILIES_MAGIC: &[u8; 4] = b"CSRF";
 const CSR_FAMILIES_VERSION: u8 = 1;
 
+/// A named adjacency family within a scope. Its edge lists are immutable once
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeFamily {
+    /// Family number; part of the edge record's address.
+    pub id: u16,
+    /// Whether each edge carries a `u16` kind (otherwise the kind is always 0).
+    pub typed: bool,
+}
+
+impl EdgeFamily {
+    /// An untyped family.
+    #[must_use]
+    pub const fn plain(id: u16) -> Self {
+        Self { id, typed: false }
+    }
+
+    /// A family whose edges each carry a `u16` kind.
+    #[must_use]
+    pub const fn typed(id: u16) -> Self {
+        Self { id, typed: true }
+    }
+}
+
+/// A resolved edge: target short id plus kind (0 for untyped families).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Edge {
+    /// Target short id.
+    pub target: u32,
+    /// Kind id (0 when the family is untyped).
+    pub kind: u16,
+}
+
+/// An edge to a not-yet-resolved key, as supplied by the caller.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeKey<'a> {
+    /// Target key bytes; allocated a short id if new.
+    pub target: &'a [u8],
+    /// Kind id (must be 0 for untyped families).
+    pub kind: u16,
+}
+
+impl<'a> EdgeKey<'a> {
+    /// An untyped edge to `target`.
+    #[must_use]
+    pub const fn plain(target: &'a [u8]) -> Self {
+        Self { target, kind: 0 }
+    }
+}
+
 /// Compressed sparse row graph for a collection's event DAG.
 ///
 /// Stores adjacency information in two flat arrays (`offsets` and `targets`)
