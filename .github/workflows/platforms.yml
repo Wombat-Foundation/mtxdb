@@ -48,11 +48,29 @@ jobs:
         with:
           components: clippy
 
-      - name: Record architecture and page size (Unix)
+      - name: Record and assert architecture and page size (Unix)
         if: runner.os != 'Windows'
         run: |
-          uname -m
-          getconf PAGESIZE
+          arch=$(uname -m)
+          pagesize=$(getconf PAGESIZE)
+          echo "arch: $arch"
+          echo "pagesize: $pagesize"
+
+          if [ "$RUNNER_OS" = macOS ]; then
+            case "$arch" in
+              arm64) expected=16384 ;;
+              x86_64) expected=4096 ;;
+              *)
+                echo "::error::unexpected macOS architecture: $arch"
+                exit 1
+                ;;
+            esac
+            if [ "$pagesize" != "$expected" ]; then
+              echo "::error::expected $expected-byte pages on macOS $arch, got $pagesize"
+              exit 1
+            fi
+          fi
+
           rustc -vV
 
       - name: Toolchain versions
@@ -104,6 +122,10 @@ jobs:
         include:
           - arch: ppc64le
             page_size: 4096
+          # Known failing: cargo cannot resolve the pinned rezzy git commit
+          # inside the armv7 QEMU guest ("revspec ... not found"). The guest
+          # also logs EOVERFLOW (os error 75) from rustup, which points at
+          # 32-bit stat() on 64-bit inodes; not yet confirmed as the cause.
           - arch: armv7
             page_size: 4096
           - arch: riscv64
@@ -112,10 +134,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      # Fetch dependencies natively: git fetches inside the QEMU guest never
-      # resolved the pinned rezzy commit on armv7. The guest builds offline.
-      - name: Pre-fetch dependencies
-        run: CARGO_HOME="$PWD/.cargo-home" cargo fetch --locked
       # User emulation exercises cross-architecture ABI and page alignment.
       # The index format currently rejects big-endian targets at compile time.
       # These containers still use the host kernel; native 64 KiB testing is separate.
@@ -135,8 +153,6 @@ jobs:
           run: |
             set -eu
             export PATH="$HOME/.cargo/bin:$PATH"
-            export CARGO_HOME="$PWD/.cargo-home"
-            export CARGO_NET_OFFLINE=true
             uname -m
             getconf PAGESIZE
             test "$(getconf PAGESIZE)" = "${{ matrix.page_size }}"
@@ -176,6 +192,11 @@ jobs:
 
   arm64-64k:
     name: Linux ARM64 real 64 KiB kernel (full-system VM)
+    # Disabled for PR/push: GitHub-hosted ARM runners have no /dev/kvm, so the
+    # full-system 64 KiB guest runs under TCG and is too slow to run routinely.
+    # Run it manually via workflow_dispatch, or move it to a self-hosted 64K
+    # ARM runner before enabling it again.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     steps:
