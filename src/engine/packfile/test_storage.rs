@@ -14064,11 +14064,11 @@ fn paged_run_install_rechecks_pack_identity_under_the_locks() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Readers chasing the newest committed key while the writer reclaims on every
-/// sync: each reclaim rewrites and renames the WAL segment under the readers.
-/// Every key the writer has finished committing must stay readable with its
-/// value (a transient `WouldBlock` is retried), and the journal base must move
-/// during the run, so the reads overlapped real rewrites rather than idling.
+/// Readers verify every committed key while the writer reclaims on every sync,
+/// so each reclaim rewrites and renames the WAL segment under them. A test-only
+/// counter marks the rewrite window, and the test requires that some reads
+/// were in flight while it was open (started inside it or saw it change), so
+/// the coverage is not vacuous. A transient `WouldBlock` is retried.
 #[test]
 fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
@@ -14081,9 +14081,11 @@ fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
         collection,
         ..
     } = open_reclaim_fixture("reads_across_rewrites");
+    let phase = writer.journal().unwrap().rewrite_phase();
     let committed = AtomicU64::new(0);
     let stop = AtomicBool::new(false);
     let verified = AtomicUsize::new(0);
+    let overlapped = AtomicUsize::new(0);
     let key_for = |i: u8| [0x80u8.wrapping_add(i); 16];
     let value_for = |i: u8| vec![i; 8];
 
@@ -14098,23 +14100,31 @@ fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
                         std::thread::yield_now();
                         continue;
                     }
-                    // `done` keys (0..done) are committed and synced.
-                    let newest = u8::try_from(done - 1).unwrap();
-                    for i in [0, newest / 2, newest] {
-                        loop {
-                            match reader.get_read_committed(&collection, &[key_for(i)]) {
-                                Ok(values) => {
+                    // Keys 0..done are committed and synced; read them all.
+                    let count = u8::try_from(done).unwrap();
+                    let keys: Vec<_> = (0..count).map(key_for).collect();
+                    loop {
+                        let before = phase.load(Ordering::SeqCst);
+                        let got = reader.get_read_committed(&collection, &keys);
+                        let after = phase.load(Ordering::SeqCst);
+                        match got {
+                            Ok(values) => {
+                                for (i, value) in values.iter().enumerate() {
+                                    let i = u8::try_from(i).unwrap();
                                     assert_eq!(
-                                        values[0].as_ref().map(|d| d.bytes.to_vec()),
+                                        value.as_ref().map(|d| d.bytes.to_vec()),
                                         Some(value_for(i)),
                                         "key {i} must stay readable across a rewrite"
                                     );
-                                    verified.fetch_add(1, Ordering::Relaxed);
-                                    break;
                                 }
-                                Err(StorageError::WouldBlock(_)) => std::thread::yield_now(),
-                                Err(err) => panic!("unexpected read error: {err}"),
+                                verified.fetch_add(1, Ordering::Relaxed);
+                                if before % 2 == 1 || before != after {
+                                    overlapped.fetch_add(1, Ordering::Relaxed);
+                                }
+                                break;
                             }
+                            Err(StorageError::WouldBlock(_)) => std::thread::yield_now(),
+                            Err(err) => panic!("unexpected read error: {err}"),
                         }
                     }
                 }
@@ -14144,7 +14154,12 @@ fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
     );
     assert!(
         verified.load(Ordering::Relaxed) > 0,
-        "readers must verify reads during the run"
+        "readers must verify reads"
+    );
+    assert!(
+        overlapped.load(Ordering::Relaxed) > 0,
+        "no read overlapped a rewrite window ({} verified reads)",
+        verified.load(Ordering::Relaxed)
     );
 }
 
@@ -14152,7 +14167,9 @@ fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
 /// snapshot gate, so it completes only after the snapshot drops. This pins the
 /// cost the type's doc warns about, so a change that removes the delay (or
 /// makes it unbounded) shows up here. Reads on the pinned handle are not part
-/// of this: they share the overlay and are covered by the reclaim tests.
+/// of this: they share the overlay and are covered by the reclaim tests. It
+/// pins the blocking behavior, not its typical cost; `read_snapshot_pin_latency`
+/// measures how long snapshots are actually held.
 #[test]
 fn a_held_read_snapshot_delays_a_put_until_it_drops() {
     use std::sync::atomic::AtomicBool;
@@ -14172,10 +14189,12 @@ fn a_held_read_snapshot_delays_a_put_until_it_drops() {
 
     let snapshot = store.read_snapshot().unwrap();
     let put_finished = Arc::new(AtomicBool::new(false));
+    let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
     let writer = {
         let store = Arc::clone(&store);
         let put_finished = Arc::clone(&put_finished);
         std::thread::spawn(move || {
+            attempting_tx.send(()).unwrap();
             store
                 .put(
                     &collection,
@@ -14187,6 +14206,10 @@ fn a_held_read_snapshot_delays_a_put_until_it_drops() {
         })
     };
 
+    // The writer is about to call `put`; the hold below then gives it time to
+    // reach the gate. This cannot prove arrival without a hook after the lock,
+    // but it rules out the thread not having started before the snapshot drops.
+    attempting_rx.recv().unwrap();
     let hold = Duration::from_millis(150);
     std::thread::sleep(hold);
     assert!(

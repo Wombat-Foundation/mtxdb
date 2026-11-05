@@ -1739,6 +1739,30 @@ pub struct Journal {
     /// is still decoded and checked before it is copied, so a damaged group
     /// there is reported instead of being carried into the new segment.
     groups: Vec<GroupMark>,
+    /// Test-only: odd while `install_rebuilt` is replacing the segment, bumped
+    /// on entry and on every exit path, so a test can tell whether a read
+    /// overlapped the rewrite window.
+    #[cfg(test)]
+    rewrite_phase: Arc<AtomicU64>,
+}
+
+/// Marks the rewrite window for [`Journal::rewrite_phase`]: odd while alive.
+#[cfg(test)]
+struct RewritePhaseGuard(Arc<AtomicU64>);
+
+#[cfg(test)]
+impl RewritePhaseGuard {
+    fn enter(phase: &Arc<AtomicU64>) -> Self {
+        phase.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(phase))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RewritePhaseGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// An fsync at least this slow is reported on stderr when it happens.
@@ -4166,6 +4190,13 @@ impl JournalCoordinator {
         self.reclaim_trigger_len.load(Ordering::Relaxed)
     }
 
+    /// Test-only handle on the rewrite-window counter; see
+    /// `Journal::rewrite_phase`.
+    #[cfg(test)]
+    pub(crate) fn rewrite_phase(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.journal.lock().rewrite_phase)
+    }
+
     /// Set the segment length above which a sync forces a reclaiming
     /// checkpoint, from runtime configuration. Unlike
     /// [`Self::set_reclaim_trigger_len`] this is always available and rejects
@@ -4964,6 +4995,8 @@ impl Journal {
             poisoned: false,
             segment_cap: MAX_SEGMENT_LEN,
             groups: marks_from_scan(&scan),
+            #[cfg(test)]
+            rewrite_phase: Arc::new(AtomicU64::new(0)),
         };
         if !scan.groups.is_empty() {
             // Recovery fsynced what it kept above, so record that in the mark.
@@ -5559,6 +5592,8 @@ impl Journal {
         new_base_sequence: u64,
         new_base_lsn: u64,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        let _rewriting = RewritePhaseGuard::enter(&self.rewrite_phase);
         // The rebuilt file is fsynced before it replaces the segment, so all of
         // it is durable. Put its mark inside it, first generation, so the mark
         // is durable with the data and the old segment's marks, which described
