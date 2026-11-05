@@ -1482,9 +1482,14 @@ mod tests {
         const PER_THREAD: u32 = 150;
         let layout = layout("direct_writer_threads");
         let store = CsrStore::open(&layout, ShardType::State);
+        for thread in 0..THREADS {
+            let scope_id = ScopeId([u8::try_from(thread + 10).unwrap(); 16]);
+            store.append_rows(scope_id, &[row(1, 1)]).unwrap();
+        }
+        let purge_barrier = std::sync::Barrier::new(usize::try_from(THREADS).unwrap());
         std::thread::scope(|scope| {
             for thread in 0..THREADS {
-                let store = &store;
+                let (store, purge_barrier) = (&store, &purge_barrier);
                 scope.spawn(move || {
                     let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
                     for owner in 0..PER_THREAD {
@@ -1505,6 +1510,9 @@ mod tests {
                             store.seal().unwrap();
                         }
                     }
+                    purge_barrier.wait();
+                    let purge_scope = ScopeId([u8::try_from(thread + 10).unwrap(); 16]);
+                    store.purge_scope(purge_scope).unwrap();
                 });
             }
         });
@@ -1516,10 +1524,10 @@ mod tests {
                 "scope {thread} lost rows to a direct concurrent writer"
             );
         }
-        // The purge entry point shares the same lock.
-        let purged = ScopeId([0; 16]);
-        store.purge_scope(purged).unwrap();
-        assert!(store.read_scope(purged).unwrap().rows.is_empty());
+        for thread in 0..THREADS {
+            let purge_scope = ScopeId([u8::try_from(thread + 10).unwrap(); 16]);
+            assert!(store.read_scope(purge_scope).unwrap().rows.is_empty());
+        }
         let _ = fs::remove_dir_all(layout.root());
     }
 
