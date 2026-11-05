@@ -678,7 +678,7 @@ fn run_reclaim_rounds(
 /// progress in every round, so the reclaims and reads actually overlap.
 #[test]
 fn streaming_read_committed_does_not_hold_back_reclaim() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
+    use std::sync::atomic::{AtomicBool, AtomicU8};
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -715,13 +715,13 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let published = Arc::new(AtomicU8::new(0));
-    let served = Arc::new(AtomicU64::new(0));
+    let acknowledged = Arc::new(AtomicU8::new(0));
     let (started_tx, started_rx) = mpsc::channel::<()>();
     let handle = {
         let reader = Arc::clone(&reader);
         let stop = Arc::clone(&stop);
         let published = Arc::clone(&published);
-        let served = Arc::clone(&served);
+        let acknowledged = Arc::clone(&acknowledged);
         std::thread::spawn(move || {
             let mut announced = false;
             while !stop.load(Ordering::Acquire) {
@@ -744,8 +744,11 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
                                 Some(&expected[..]),
                                 "a streamed reader must see the newly committed value"
                             );
+                            // Acknowledge the exact round whose key was
+                            // validated, so the writer cannot mistake an older
+                            // in-flight read for progress on this round.
+                            acknowledged.store(newest, Ordering::Release);
                         }
-                        served.fetch_add(1, Ordering::Release);
                         if !announced {
                             let _ = started_tx.send(());
                             announced = true;
@@ -766,13 +769,13 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
         .expect("reader must complete a read before the writer starts");
 
     let advances = run_reclaim_rounds(&writer, &wal, &collection, |i| {
-        published.store(i + 1, Ordering::Release);
-        let before = served.load(Ordering::Acquire);
+        let target = i.wrapping_add(1);
+        published.store(target, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while served.load(Ordering::Acquire) == before {
+        while acknowledged.load(Ordering::Acquire) != target {
             assert!(
                 Instant::now() < deadline,
-                "reader made no progress in round {i}"
+                "reader did not acknowledge the newly committed value in round {i}"
             );
             std::thread::yield_now();
         }
@@ -781,9 +784,9 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
     stop.store(true, Ordering::Release);
     handle.join().unwrap();
 
-    assert!(
-        advances > 1,
-        "reclaim must keep advancing the journal base across rounds, not just once"
+    assert_eq!(
+        advances, 40,
+        "reclaim must advance the journal base on every round while reads stream"
     );
 }
 
@@ -814,9 +817,9 @@ fn reclaim_advances_without_a_streaming_reader() {
     writer.journal().unwrap().set_reclaim_trigger_len(1);
 
     let advances = run_reclaim_rounds(&writer, &wal, &collection, |_| {});
-    assert!(
-        advances > 1,
-        "reclaim must advance the journal base repeatedly without a reader"
+    assert_eq!(
+        advances, 40,
+        "reclaim must advance the journal base on every round without a reader"
     );
 }
 
