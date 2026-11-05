@@ -640,13 +640,48 @@ fn read_committed_overlay_reloads_after_reclaim_advances_coverage() {
     );
 }
 
+/// Run 40 write/sync rounds and return how many times the journal base moved.
+/// `after_sync` runs once per round after the checkpoint lands; the streaming
+/// test uses it to publish the new value and demand reader progress.
+fn run_reclaim_rounds(
+    writer: &PackfileStorage,
+    wal: &std::path::Path,
+    collection: &[u8; 16],
+    mut after_sync: impl FnMut(u8),
+) -> usize {
+    let mut last_base = Journal::scan_read_only(wal).unwrap().base_lsn;
+    let mut advances: usize = 0;
+    for i in 0u8..40 {
+        let key = [0x80u8.wrapping_add(i); 16];
+        writer
+            .put(
+                collection,
+                &key,
+                &NodeData::new(bytes::Bytes::from(vec![i; 8])),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        after_sync(i);
+        let base = Journal::scan_read_only(wal).unwrap().base_lsn;
+        if base > last_base {
+            advances = advances.saturating_add(1);
+            last_base = base;
+        }
+    }
+    advances
+}
+
 /// A reader streaming `get_read_committed` must not stop the writer's sync from
 /// advancing the checkpoint and reclaiming the journal. Transient `WouldBlock`
-/// is allowed for the reader; a gap or wrong value is not.
+/// is allowed for the reader; a gap or wrong value is not. The reader starts
+/// before the first reclaim, reads each newly committed value, and must make
+/// progress in every round, so the reclaims and reads actually overlap.
 #[test]
 fn streaming_read_committed_does_not_hold_back_reclaim() {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
+    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     let dir = test_dir("read_committed_stream_vs_reclaim");
     let wal = dir.join("wal.bin");
@@ -678,53 +713,109 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
     writer.journal().unwrap().set_reclaim_trigger_len(1);
 
     let stop = Arc::new(AtomicBool::new(false));
+    let published = Arc::new(AtomicU8::new(0));
+    let served = Arc::new(AtomicU64::new(0));
+    let (started_tx, started_rx) = mpsc::channel::<()>();
     let handle = {
         let reader = Arc::clone(&reader);
         let stop = Arc::clone(&stop);
+        let published = Arc::clone(&published);
+        let served = Arc::clone(&served);
         std::thread::spawn(move || {
-            let mut served = 0u64;
+            let mut announced = false;
             while !stop.load(Ordering::Acquire) {
-                match reader.get_read_committed(&collection, &[seed_key]) {
+                let newest = published.load(Ordering::Acquire);
+                let mut keys = vec![seed_key];
+                if newest > 0 {
+                    keys.push([0x80u8.wrapping_add(newest - 1); 16]);
+                }
+                match reader.get_read_committed(&collection, &keys) {
                     Ok(values) => {
                         assert_eq!(
                             values[0].as_ref().map(|data| data.bytes.as_ref()),
                             Some(&b"seed"[..]),
                             "a streamed read must never observe a hole"
                         );
-                        served += 1;
+                        if newest > 0 {
+                            let expected = [newest - 1; 8];
+                            assert_eq!(
+                                values[1].as_ref().map(|data| data.bytes.as_ref()),
+                                Some(&expected[..]),
+                                "a streamed reader must see the newly committed value"
+                            );
+                        }
+                        served.fetch_add(1, Ordering::Release);
+                        if !announced {
+                            let _ = started_tx.send(());
+                            announced = true;
+                        }
                     }
                     // Bounded-retry classification under a racing reclaim.
                     Err(StorageError::WouldBlock(_)) => {}
                     Err(err) => panic!("unexpected read error: {err}"),
                 }
             }
-            served
         })
     };
 
-    let mut last_base = Journal::scan_read_only(&wal).unwrap().base_lsn;
-    let mut advanced = false;
-    for i in 0u8..40 {
-        let key = [0x80u8.wrapping_add(i); 16];
-        writer
-            .put(
-                &collection,
-                &key,
-                &NodeData::new(bytes::Bytes::from(vec![i; 8])),
-            )
-            .unwrap();
-        writer.sync().unwrap();
-        let base = Journal::scan_read_only(&wal).unwrap().base_lsn;
-        advanced |= base > last_base;
-        last_base = base;
-    }
-    stop.store(true, Ordering::Release);
-    let served = handle.join().unwrap();
+    // The reader must be live before the first reclaim, not merely at some
+    // point before the loop stops.
+    started_rx
+        .recv()
+        .expect("reader must complete a read before the writer starts");
 
-    assert!(served > 0, "the reader must have completed some reads");
+    let advances = run_reclaim_rounds(&writer, &wal, &collection, |i| {
+        published.store(i + 1, Ordering::Release);
+        let before = served.load(Ordering::Acquire);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while served.load(Ordering::Acquire) == before {
+            assert!(
+                Instant::now() < deadline,
+                "reader made no progress in round {i}"
+            );
+            std::thread::yield_now();
+        }
+    });
+
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap();
+
     assert!(
-        advanced,
-        "reclaim must keep advancing the journal base while reads stream"
+        advances > 1,
+        "reclaim must keep advancing the journal base across rounds, not just once"
+    );
+}
+
+/// The paired no-reader control for the streaming test: the same writer and
+/// reclaim setup advances the base repeatedly without any reader attached.
+#[test]
+fn reclaim_advances_without_a_streaming_reader() {
+    let dir = test_dir("read_committed_reclaim_without_reader");
+    let wal = dir.join("wal.bin");
+    let collection = [0x4Du8; 16];
+    let seed_key = [0x01u8; 16];
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &collection,
+        &seed_key,
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+    let (journal, _) = Journal::open(&wal).unwrap();
+    drop(journal);
+
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+
+    let advances = run_reclaim_rounds(&writer, &wal, &collection, |_| {});
+    assert!(
+        advances > 1,
+        "reclaim must advance the journal base repeatedly without a reader"
     );
 }
 
