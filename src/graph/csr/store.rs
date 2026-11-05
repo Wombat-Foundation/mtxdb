@@ -33,7 +33,9 @@
 //!
 //! Writes enforce that: the write methods are crate-private, and the public
 //! [`CsrStore::writer`] needs the owning `Database` (so the lock is held) and
-//! rejects one whose root is not the store's. Direct reads need no lock.
+//! rejects one whose root is not the store's. Threads sharing one `Database`
+//! are serialized by a per-directory write lock that every mutation holds.
+//! Direct reads need no lock.
 //!
 //! The tail stays under [`SEAL_THRESHOLD`] because both tail writers,
 //! `append_rows` and `purge_scope`, seal after
@@ -44,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use crate::database::Database;
 use crate::layout::{DatabaseLayout, ShardType};
@@ -130,6 +132,8 @@ impl CsrWriter<'_> {
     /// # Errors
     /// I/O errors, or a row with too many edges.
     pub fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
+        let lock = self.store.write_lock();
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.store.append_rows(scope, rows)
     }
 
@@ -138,6 +142,8 @@ impl CsrWriter<'_> {
     /// # Errors
     /// I/O errors.
     pub fn purge_scope(&self, scope: ScopeId) -> io::Result<()> {
+        let lock = self.store.write_lock();
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.store.purge_scope(scope)
     }
 
@@ -146,6 +152,8 @@ impl CsrWriter<'_> {
     /// # Errors
     /// I/O errors.
     pub fn seal(&self) -> io::Result<()> {
+        let lock = self.store.write_lock();
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.store.seal()
     }
 }
@@ -159,6 +167,11 @@ impl CsrStore {
         Self {
             dir: layout.graph_path(pool),
         }
+    }
+
+    fn write_lock(&self) -> Arc<Mutex<()>> {
+        let mut locks = WRITE_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(locks.entry(self.dir.clone()).or_default())
     }
 
     /// Write access to this store through the database that owns its root.
@@ -656,6 +669,16 @@ impl TailState {
 }
 
 static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, TailState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One write lock per store directory, shared by every handle in the process.
+///
+/// The root lock keeps other processes out, but threads sharing one `Database`
+/// can each hold a [`CsrWriter`]. Appends, purges and seals each open the tail,
+/// compare it with the verified length and may truncate or replace it, so two
+/// of them at once would cut each other's frames. Every mutation therefore
+/// holds this lock from the tail check through its seal.
+static WRITE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct Frame {
@@ -1389,6 +1412,50 @@ mod tests {
         }
         let _ = fs::remove_dir_all(owner_root);
         let _ = fs::remove_dir_all(other_root);
+    }
+
+    #[test]
+    fn concurrent_writers_on_one_database_lose_no_rows() {
+        const THREADS: u32 = 4;
+        const PER_THREAD: u32 = 150;
+        let root = layout("writer_threads").root().to_path_buf();
+        {
+            let db = Database::open(root.clone()).unwrap();
+            let store = CsrStore::open(db.layout(), ShardType::State);
+            std::thread::scope(|scope| {
+                for thread in 0..THREADS {
+                    let (store, db) = (&store, &db);
+                    scope.spawn(move || {
+                        let writer = store.writer(db).unwrap();
+                        let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
+                        for owner in 0..PER_THREAD {
+                            let row = RowRecord {
+                                family: EdgeFamily::typed(3),
+                                owner,
+                                edges: vec![
+                                    Edge {
+                                        target: owner,
+                                        kind: 1
+                                    };
+                                    64
+                                ],
+                            };
+                            writer.append_rows(scope_id, &[row]).unwrap();
+                        }
+                    });
+                }
+            });
+            for thread in 0..THREADS {
+                let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
+                let rows = store.read_scope(scope_id).unwrap().rows;
+                assert_eq!(
+                    rows.len(),
+                    usize::try_from(PER_THREAD).unwrap(),
+                    "scope {thread} lost rows to a concurrent writer"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
