@@ -117,6 +117,7 @@ impl CsrStore {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(self.tail_path())?;
         let len = file.metadata()?.len();
         if (valid as u64) < len {
@@ -145,6 +146,7 @@ impl CsrStore {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(self.tail_path())?;
         let (_, valid) = self.read_tail()?;
         let len = file.metadata()?.len();
@@ -193,7 +195,8 @@ impl CsrStore {
             );
             payload.extend_from_slice(&record.payload);
         }
-        let mut file_bytes = Vec::with_capacity(13 + payload.len() + 4);
+        let mut file_bytes =
+            Vec::with_capacity(13usize.saturating_add(payload.len()).saturating_add(4));
         file_bytes.extend_from_slice(&SEGMENT_MAGIC);
         file_bytes.push(SEGMENT_VERSION);
         file_bytes.extend_from_slice(
@@ -314,13 +317,25 @@ fn write_frame(out: &mut Vec<u8>, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
+fn le_u32(data: &[u8], at: usize) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(at..at.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn le_u16(data: &[u8], at: usize) -> Option<u16> {
+    let bytes: [u8; 2] = data.get(at..at.checked_add(2)?)?.try_into().ok()?;
+    Some(u16::from_le_bytes(bytes))
+}
+
 fn decode_frames(data: &[u8]) -> (Vec<Frame>, usize) {
     let mut frames = Vec::new();
     let mut at = 0usize;
     while at.saturating_add(8) <= data.len() {
-        let len = u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize;
-        let crc = u32::from_le_bytes([data[at + 4], data[at + 5], data[at + 6], data[at + 7]]);
-        let start = at + 8;
+        let (Some(len), Some(crc)) = (le_u32(data, at), le_u32(data, at.saturating_add(4))) else {
+            break;
+        };
+        let len = len as usize;
+        let start = at.saturating_add(8);
         let Some(end) = start.checked_add(len) else {
             break;
         };
@@ -348,7 +363,8 @@ fn encode_row(
 ) -> io::Result<Vec<u8>> {
     let count = u32::try_from(edges.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "csr row has too many edges"))?;
-    let mut out = Vec::with_capacity(RECORD_HEADER.saturating_add(edges.len() * EDGE_SIZE));
+    let mut out =
+        Vec::with_capacity(RECORD_HEADER.saturating_add(edges.len().saturating_mul(EDGE_SIZE)));
     out.extend_from_slice(&scope.0);
     out.extend_from_slice(&family.id.to_le_bytes());
     out.push(u8::from(family.typed));
@@ -388,15 +404,16 @@ fn decode_row(payload: &[u8]) -> io::Result<(ScopeId, EdgeFamily, u32, bool, Vec
     let mut edges = Vec::with_capacity(count);
     let mut at = RECORD_HEADER;
     for _ in 0..count {
-        let target = u32::from_le_bytes([
-            payload[at],
-            payload[at + 1],
-            payload[at + 2],
-            payload[at + 3],
-        ]);
-        let kind = u16::from_le_bytes([payload[at + 4], payload[at + 5]]);
+        let (Some(target), Some(kind)) =
+            (le_u32(payload, at), le_u16(payload, at.saturating_add(4)))
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "csr row is shorter than its edge count",
+            ));
+        };
         edges.push(Edge { target, kind });
-        at += EDGE_SIZE;
+        at = at.saturating_add(EDGE_SIZE);
     }
     Ok((
         ScopeId(scope),
@@ -444,12 +461,7 @@ fn apply_segment(
         return Err(corrupt("length does not match file size"));
     }
     let payload = &data[13..payload_end];
-    let expected_crc = u32::from_le_bytes([
-        data[payload_end],
-        data[payload_end + 1],
-        data[payload_end + 2],
-        data[payload_end + 3],
-    ]);
+    let expected_crc = le_u32(&data, payload_end).ok_or_else(|| corrupt("truncated checksum"))?;
     if crc32fast::hash(payload) != expected_crc {
         return Err(corrupt("checksum mismatch"));
     }
@@ -458,13 +470,8 @@ fn apply_segment(
         if at.saturating_add(4) > payload.len() {
             return Err(corrupt("truncated row table"));
         }
-        let len = u32::from_le_bytes([
-            payload[at],
-            payload[at + 1],
-            payload[at + 2],
-            payload[at + 3],
-        ]) as usize;
-        at += 4;
+        let len = le_u32(payload, at).ok_or_else(|| corrupt("truncated row table"))? as usize;
+        at = at.saturating_add(4);
         let end = at
             .checked_add(len)
             .ok_or_else(|| corrupt("row length overflows"))?;

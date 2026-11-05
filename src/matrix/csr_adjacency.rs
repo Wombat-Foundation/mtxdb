@@ -33,6 +33,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+/// The distinct `(target event id, kind)` edges one family claims for an owner.
+type ClaimedEdges = BTreeSet<(Vec<u8>, u16)>;
+
 use crate::csr::store::{CsrStore, RowRecord, ScopeId};
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
@@ -320,6 +323,10 @@ impl CsrAdjacency {
     ///
     /// # Errors
     /// As [`Self::record_event`], applied to the whole batch.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one batch is validated and staged in a single pass so it commits atomically"
+    )]
     pub fn record_events(
         &self,
         db: &Database,
@@ -367,7 +374,7 @@ impl CsrAdjacency {
         // rejected batch records nothing (matching the old transactional write).
         let next = self.events.counter(db)?;
         let mut snapshot = self.load_snapshot(db, next as usize)?;
-        let mut claims: HashMap<&[u8], Vec<BTreeSet<(Vec<u8>, u16)>>> = HashMap::new();
+        let mut claims: HashMap<&[u8], Vec<ClaimedEdges>> = HashMap::new();
         for event in &prepared {
             let wanted = [
                 event_key_set(&event.prev),
@@ -474,7 +481,7 @@ impl CsrAdjacency {
                             ));
                         }
                         if !list.is_empty() && stored.is_empty() {
-                            rows.rows[slot] = list.clone();
+                            rows.rows[slot].clone_from(&list);
                             changed_rows.push(RowRecord {
                                 family: *family,
                                 owner,
@@ -487,7 +494,7 @@ impl CsrAdjacency {
                         ));
                     }
                 } else {
-                    rows.rows[slot] = list.clone();
+                    rows.rows[slot].clone_from(&list);
                     rows.recorded[slot] = true;
                     changed_rows.push(RowRecord {
                         family: *family,
