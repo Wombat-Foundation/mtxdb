@@ -671,11 +671,12 @@ fn record_ids_vary_in_the_bytes_the_index_uses() {
     const IDS: u32 = 10_000;
     let mut buckets = std::collections::HashSet::new();
     let mut tags = std::collections::HashSet::new();
-    for short_id in 1..=IDS {
+    for chunk in 1..=IDS {
+        let short_id = chunk;
         for id in [
             reverse_record_id_for_test(short_id),
-            edges_record_id_for_test(short_id, 1),
-            edges_record_id_for_test(short_id, 2),
+            edges_record_id_for_test(chunk, 1),
+            edges_record_id_for_test(chunk, 2),
         ] {
             buckets.insert(<[u8; 8]>::try_from(&id[..8]).unwrap());
             tags.insert(<[u8; 4]>::try_from(&id[8..12]).unwrap());

@@ -43,6 +43,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 
+use crate::csr::chunk::{chunk_of, ChunkError, EdgeChunk};
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
@@ -56,7 +57,7 @@ pub const SHORT_ID_MAX: u32 = u32::MAX - 1;
 const COUNTER_MAGIC: [u8; 4] = *b"SIDC";
 const FORWARD_MAGIC: [u8; 4] = *b"SIDF";
 const REVERSE_MAGIC: [u8; 4] = *b"SIDR";
-const EDGES_MAGIC: [u8; 4] = *b"SIDE";
+const EDGES_MAGIC: [u8; 4] = *b"SIDC";
 const OWNER_LOG_MAGIC: [u8; 4] = *b"OWNL";
 
 pub(crate) const COUNTER_ID: NodeId = *b"MTXD-SID-CNTR-v1";
@@ -68,8 +69,6 @@ const OWNER_LOG_SCOPE: &[u8] = b"short-id-owner-log";
 /// Forward-record flag: the key has been recorded as an *owner* (an event the
 /// caller holds), as opposed to merely allocated an id as an edge target.
 const FORWARD_OWNER: u8 = 0b01;
-
-const FLAG_TYPED: u8 = 0b01;
 
 /// Maximum optimistic-retry rounds before a stale read is returned.
 pub(crate) const MAX_ATTEMPTS: usize = 64;
@@ -95,22 +94,6 @@ impl EdgeFamily {
     #[must_use]
     pub const fn typed(id: u16) -> Self {
         Self { id, typed: true }
-    }
-
-    const fn flags(self) -> u8 {
-        if self.typed {
-            FLAG_TYPED
-        } else {
-            0
-        }
-    }
-
-    const fn entry_len(self) -> usize {
-        if self.typed {
-            6
-        } else {
-            4
-        }
     }
 }
 
@@ -206,8 +189,10 @@ fn indexed_id(prefix: [u8; 8], short_id: u32) -> NodeId {
     derived_id(prefix, short_id, 0)
 }
 
-fn edges_record_id(short_id: u32, family: u16) -> NodeId {
-    derived_id(EDGES_PREFIX, short_id, family)
+/// The id of the CSR chunk holding `chunk`'s rows of `family`. One record per
+/// `CHUNK_SHORTS` owners, not one per owner.
+fn edges_record_id(chunk: u32, family: u16) -> NodeId {
+    derived_id(EDGES_PREFIX, chunk, family)
 }
 
 /// The id of the reverse record for `short_id`, exposed so a test can check the
@@ -225,8 +210,8 @@ pub(crate) fn owner_log_record_id_for_test(seq: u32) -> NodeId {
 
 /// The id of an edges record, exposed for the same reason.
 #[cfg(test)]
-pub(crate) fn edges_record_id_for_test(short_id: u32, family: u16) -> NodeId {
-    edges_record_id(short_id, family)
+pub(crate) fn edges_record_id_for_test(chunk: u32, family: u16) -> NodeId {
+    edges_record_id(chunk, family)
 }
 
 pub(crate) fn header(magic: [u8; 4]) -> Vec<u8> {
@@ -394,48 +379,26 @@ fn encode_reverse(key: &[u8]) -> Vec<u8> {
     out
 }
 
-fn encode_edges(family: EdgeFamily, edges: &[Edge]) -> Result<Vec<u8>, StorageError> {
-    let count = u32::try_from(edges.len())
-        .map_err(|_| StorageError::Internal("short-id edge list too long".to_owned()))?;
+fn encode_chunk(chunk: &EdgeChunk) -> Vec<u8> {
     let mut out = header(EDGES_MAGIC);
-    out.push(family.flags());
-    out.extend_from_slice(&count.to_be_bytes());
-    for edge in edges {
-        out.extend_from_slice(&edge.target.to_be_bytes());
-        if family.typed {
-            out.extend_from_slice(&edge.kind.to_be_bytes());
-        }
-    }
-    Ok(out)
+    out.extend_from_slice(&chunk.encode());
+    out
 }
 
-fn decode_edges(family: EdgeFamily, bytes: &[u8]) -> Result<Vec<Edge>, StorageError> {
+fn decode_chunk(family: EdgeFamily, bytes: &[u8]) -> Result<EdgeChunk, StorageError> {
     let body = check_header(bytes, EDGES_MAGIC, "edges")?;
-    if body.len() < 5 {
-        return Err(StorageError::Corrupt("short-id edges length".to_owned()));
-    }
-    if body[0] != family.flags() {
-        return Err(StorageError::Collision(format!(
+    EdgeChunk::decode(body, family.typed).map_err(|error| match error {
+        ChunkError::TypingMismatch => StorageError::Collision(format!(
             "short-id family {} was stored with different typing",
             family.id
-        )));
-    }
-    let count = read_u32(&body[1..5], "edges")? as usize;
-    let list = &body[5..];
-    if count.checked_mul(family.entry_len()) != Some(list.len()) {
-        return Err(StorageError::Corrupt("short-id edges length".to_owned()));
-    }
-    list.chunks_exact(family.entry_len())
-        .map(|chunk| {
-            Ok(Edge {
-                target: read_u32(&chunk[..4], "edges")?,
-                kind: if family.typed {
-                    u16::from_be_bytes([chunk[4], chunk[5]])
-                } else {
-                    0
-                },
-            })
-        })
+        )),
+        other => StorageError::Corrupt(format!("short-id edges: {other}")),
+    })
+}
+
+fn row_edges(row: &[(u32, u16)]) -> Vec<Edge> {
+    row.iter()
+        .map(|&(target, kind)| Edge { target, kind })
         .collect()
 }
 
@@ -806,14 +769,14 @@ impl ShortIdIndex {
         let (records, _) = txn.get_with_record_versions(
             self.pool,
             &self.collection_id,
-            &[edges_record_id(short_id, family.id)],
+            &[edges_record_id(chunk_of(short_id), family.id)],
         )?;
-        records
-            .into_iter()
-            .next()
-            .flatten()
-            .map(|record| decode_edges(family, &record.bytes))
-            .transpose()
+        let Some(record) = records.into_iter().next().flatten() else {
+            return Ok(None);
+        };
+        Ok(decode_chunk(family, &record.bytes)?
+            .get(short_id)
+            .map(|row| row_edges(&row)))
     }
 
     /// Resolve short ids back to their key bytes; `None` for an unknown id.
@@ -956,6 +919,7 @@ impl ShortIdIndex {
         }
         let next = counters.next_id;
         let mut owner_bits = 0_u32;
+        let mut chunks: HashMap<(u32, u16), Option<EdgeChunk>> = HashMap::new();
         let get = |id: NodeId| -> Result<Option<NodeData>, StorageError> {
             let (records, _) =
                 txn.get_with_record_versions(self.pool, &self.collection_id, &[id])?;
@@ -988,11 +952,23 @@ impl ShortIdIndex {
                     .push(format!("id {short_id}: reverse has no forward record")),
             }
             for family in families {
-                let Some(edges) = get(edges_record_id(short_id, family.id))? else {
+                let key = (chunk_of(short_id), family.id);
+                if !chunks.contains_key(&key) {
+                    let loaded = match get(edges_record_id(key.0, family.id))? {
+                        Some(record) => Some(decode_chunk(*family, &record.bytes)?),
+                        None => None,
+                    };
+                    chunks.insert(key, loaded);
+                }
+                let Some(row) = chunks
+                    .get(&key)
+                    .and_then(Option::as_ref)
+                    .and_then(|chunk| chunk.get(short_id))
+                else {
                     continue;
                 };
                 report.edge_lists_checked = report.edge_lists_checked.saturating_add(1);
-                for edge in decode_edges(*family, &edges.bytes)? {
+                for edge in row_edges(&row) {
                     if edge.target == 0 || edge.target >= next {
                         report.problems.push(format!(
                             "id {short_id}: family {} target {} is out of range",
@@ -1217,38 +1193,24 @@ impl ShortIdIndex {
         Ok(())
     }
 
-    /// Merge the requested edge lists with what is stored and stage the changes.
+    /// Merge the requested edge lists into the CSR chunks that hold them.
     ///
-    /// The owner is `allocation.ids[start]` and its targets follow it. `claimed`
-    /// holds the lists already staged by earlier events of the same batch, so the
-    /// same owner and family twice either matches or collides rather than staging
-    /// two writes of one record.
+    /// The owner is `allocation.ids[start]` and its targets follow it. `chunks`
+    /// holds every chunk this attempt has loaded, with its CAS token, so the same
+    /// owner and family twice either matches or collides, and each chunk is read
+    /// once and staged once per attempt (see [`Self::flush_chunks`]).
     fn stage_edges(
         &self,
         txn: &DatabaseTransaction<'_>,
-        allocation: &mut Allocation,
+        allocation: &Allocation,
         start: usize,
         families: &[FamilyEdges<'_>],
-        claimed: &mut HashMap<NodeId, (bool, Vec<Edge>)>,
+        chunks: &mut HashMap<NodeId, ChunkState>,
     ) -> Result<Vec<Vec<Edge>>, StorageError> {
         let owner = allocation.ids[start];
-        // Read every existing edge record of the owner in one call, before
-        // staging, so each token matches the data it guards. A freshly
-        // allocated owner has none.
-        let existing: Vec<Option<(Option<NodeData>, u64)>> = if allocation.fresh.contains(&owner) {
-            vec![None; families.len()]
-        } else {
-            let ids: Vec<NodeId> = families
-                .iter()
-                .map(|f| edges_record_id(owner, f.family.id))
-                .collect();
-            let (records, tokens) =
-                txn.get_with_record_versions(self.pool, &self.collection_id, &ids)?;
-            records.into_iter().zip(tokens).map(Some).collect()
-        };
         let mut lists = Vec::with_capacity(families.len());
         let mut cursor = start.saturating_add(1);
-        for (family, existing) in families.iter().zip(existing) {
+        for family in families {
             let mut wanted: BTreeSet<Edge> = BTreeSet::new();
             for edge in family.edges {
                 wanted.insert(Edge {
@@ -1257,39 +1219,63 @@ impl ShortIdIndex {
                 });
                 cursor = cursor.saturating_add(1);
             }
-            let (stored, token) = match existing {
-                Some((Some(record), token)) => (
-                    Some(decode_edges(family.family, &record.bytes)?),
-                    Some(token),
-                ),
-                Some((None, token)) => (None, Some(token)),
-                None => (None, None),
-            };
             let list: Vec<Edge> = wanted.into_iter().collect();
-            if let Some(stored) = &stored {
-                if *stored != list {
-                    return Err(StorageError::Collision(
-                        "short-id edge list differs from the recorded one".to_owned(),
-                    ));
-                }
+            let record = edges_record_id(chunk_of(owner), family.family.id);
+            if !chunks.contains_key(&record) {
+                let (records, tokens) =
+                    txn.get_with_record_versions(self.pool, &self.collection_id, &[record])?;
+                let token = tokens.into_iter().next();
+                let chunk = match records.into_iter().next().flatten() {
+                    Some(stored) => decode_chunk(family.family, &stored.bytes)?,
+                    None => EdgeChunk::new(family.family.typed),
+                };
+                chunks.insert(
+                    record,
+                    ChunkState {
+                        chunk,
+                        token,
+                        dirty: false,
+                    },
+                );
             }
-            let record = edges_record_id(owner, family.family.id);
-            if let Some(earlier) = claimed.get(&record) {
-                // Already staged by an earlier event of this batch.
-                if earlier.0 != family.family.typed || earlier.1 != list {
-                    return Err(StorageError::Collision(
-                        "short-id edge family differs from one already in this batch".to_owned(),
-                    ));
+            let state = chunks
+                .get_mut(&record)
+                .ok_or_else(|| StorageError::Internal("edge chunk state".to_owned()))?;
+            if state.chunk.is_typed() != family.family.typed {
+                return Err(StorageError::Collision(format!(
+                    "short-id family {} was stored with different typing",
+                    family.family.id
+                )));
+            }
+            match state.chunk.get(owner) {
+                Some(stored) => {
+                    if row_edges(&stored) != list {
+                        return Err(StorageError::Collision(
+                            "short-id edge list differs from the recorded one".to_owned(),
+                        ));
+                    }
                 }
-            } else if stored.is_none() {
-                allocation
-                    .staged
-                    .push((record, encode_edges(family.family, &list)?, token));
-                claimed.insert(record, (family.family.typed, list.clone()));
+                None => {
+                    let row: Vec<(u32, u16)> =
+                        list.iter().map(|edge| (edge.target, edge.kind)).collect();
+                    state.chunk.insert(owner, &row);
+                    state.dirty = true;
+                }
             }
             lists.push(list);
         }
         Ok(lists)
+    }
+
+    /// Stage every chunk an attempt changed, guarded by the token it was read at.
+    fn flush_chunks(allocation: &mut Allocation, chunks: HashMap<NodeId, ChunkState>) {
+        for (record, state) in chunks {
+            if state.dirty {
+                allocation
+                    .staged
+                    .push((record, encode_chunk(&state.chunk), state.token));
+            }
+        }
     }
 
     /// One attempt at a whole batch: allocate every key once, stage each event's
@@ -1316,16 +1302,16 @@ impl ShortIdIndex {
             }
         }
         let mut allocation = self.allocate(txn, keys, &owners)?;
-        let mut claimed: HashMap<NodeId, (bool, Vec<Edge>)> = HashMap::new();
+        let mut chunks: HashMap<NodeId, ChunkState> = HashMap::new();
         let mut recorded = Vec::with_capacity(events.len());
         for (event, &start) in events.iter().zip(starts) {
-            let edges =
-                self.stage_edges(txn, &mut allocation, start, event.families, &mut claimed)?;
+            let edges = self.stage_edges(txn, &allocation, start, event.families, &mut chunks)?;
             recorded.push(RecordedEvent {
                 id: allocation.ids[start],
                 edges,
             });
         }
+        Self::flush_chunks(&mut allocation, chunks);
         if allocation.staged.is_empty() {
             return Ok((recorded, false));
         }
@@ -1381,7 +1367,10 @@ impl ShortIdIndex {
         let mut allocation = self.allocate(txn, keys, &HashMap::new())?;
         let edges = match families {
             Some(families) => {
-                self.stage_edges(txn, &mut allocation, 0, families, &mut HashMap::new())?
+                let mut chunks = HashMap::new();
+                let edges = self.stage_edges(txn, &allocation, 0, families, &mut chunks)?;
+                Self::flush_chunks(&mut allocation, chunks);
+                edges
             }
             None => Vec::new(),
         };
@@ -1414,6 +1403,14 @@ struct Allocation {
     owner_log: Vec<(u32, Vec<u8>)>,
     /// `(counter token, counters after this attempt)`.
     counter: (u64, ScopeCounters),
+}
+
+/// One edge chunk loaded during an attempt: its contents, the version token it
+/// was read at (`None`: not stored yet), and whether it needs writing.
+struct ChunkState {
+    chunk: EdgeChunk,
+    token: Option<u64>,
+    dirty: bool,
 }
 
 struct Attempt {

@@ -1,4 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+pub mod chunk;
+
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const CSR_VERSION: u8 = 1;
 
@@ -12,6 +14,90 @@ pub struct Csr {
     targets: Vec<u32>,
     hash_to_local: HashMap<[u8; 16], u32>,
     local_to_hash: Vec<[u8; 16]>,
+}
+
+/// Three forward CSR families sharing one node universe.
+///
+/// Referenced ids are included even when their event body is absent. The row
+/// sets distinguish a known empty row from a referenced-but-missing event.
+#[derive(Debug, Clone)]
+pub struct CsrFamilies {
+    /// Previous-event rows.
+    pub prev: Csr,
+    /// Auth-chain rows.
+    pub auth: Csr,
+    /// Relation rows.
+    pub relations: Csr,
+    nodes: Vec<[u8; 16]>,
+    prev_rows: HashSet<[u8; 16]>,
+    auth_rows: HashSet<[u8; 16]>,
+    relation_rows: HashSet<[u8; 16]>,
+    relation_types: HashMap<[u8; 16], Vec<u16>>,
+}
+
+impl CsrFamilies {
+    /// Build the forward families, retaining every referenced event id.
+    ///
+    /// `relation_types` must contain one type id per target in each relation
+    /// row. A missing type row is treated as an empty type list.
+    #[must_use]
+    pub fn build(
+        event_ids: &[[u8; 16]],
+        prev: &HashMap<[u8; 16], Vec<[u8; 16]>>,
+        auth: &HashMap<[u8; 16], Vec<[u8; 16]>>,
+        relations: &HashMap<[u8; 16], Vec<[u8; 16]>>,
+        relation_types: HashMap<[u8; 16], Vec<u16>>,
+    ) -> Self {
+        let mut nodes = event_ids.to_vec();
+        for rows in [prev, auth, relations] {
+            for (source, targets) in rows {
+                nodes.push(*source);
+                nodes.extend(targets.iter().copied());
+            }
+        }
+        nodes.sort_unstable();
+        nodes.dedup();
+        Self {
+            prev: Csr::build_from_edges(&nodes, prev),
+            auth: Csr::build_from_edges(&nodes, auth),
+            relations: Csr::build_from_edges(&nodes, relations),
+            nodes,
+            prev_rows: prev.keys().copied().collect(),
+            auth_rows: auth.keys().copied().collect(),
+            relation_rows: relations.keys().copied().collect(),
+            relation_types,
+        }
+    }
+
+    /// All event ids in shared local-id order, including missing parents.
+    #[must_use]
+    pub fn nodes(&self) -> &[[u8; 16]] {
+        &self.nodes
+    }
+
+    /// Whether a previous-event row was recorded (possibly empty).
+    #[must_use]
+    pub fn has_prev_row(&self, event_id: &[u8; 16]) -> bool {
+        self.prev_rows.contains(event_id)
+    }
+
+    /// Whether an auth row was recorded (possibly empty).
+    #[must_use]
+    pub fn has_auth_row(&self, event_id: &[u8; 16]) -> bool {
+        self.auth_rows.contains(event_id)
+    }
+
+    /// Whether a relation row was recorded.
+    #[must_use]
+    pub fn has_relation_row(&self, event_id: &[u8; 16]) -> bool {
+        self.relation_rows.contains(event_id)
+    }
+
+    /// Relation type ids aligned with the source row's CSR targets.
+    #[must_use]
+    pub fn relation_types(&self, event_id: &[u8; 16]) -> &[u16] {
+        self.relation_types.get(event_id).map_or(&[], Vec::as_slice)
+    }
 }
 
 impl Csr {
