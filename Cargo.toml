@@ -20,8 +20,15 @@ categories = ["database-implementations", "storage"]
 # live beside their sources as `src/**/test_*.rs`, and integration tests under
 # `tests/`; exclude both from the packaged archive. Local `cargo test` still
 # compiles them through the out-of-line `mod tests;` declarations.
+#
+# The examples are internal measurement harnesses (fixture-driven, several
+# rewrite store metadata), not usage documentation, so they are excluded too.
+# `benches/` is already a nested package and cannot be packaged from here;
+# keep it explicit in case that changes.
 exclude = [
     "tests/",
+    "examples/",
+    "benches/",
     "src/test_*.rs",
     "src/**/test_*.rs",
     "scripts/",
