@@ -170,6 +170,9 @@ impl CsrStore {
         write_frame(&mut buffer, &payload);
         file.write_all(&buffer)?;
         file.sync_data()?;
+        // Tombstones grow the tail like rows do, so a purge-only workload must
+        // seal at the same threshold or the tail and its cache grow unbounded.
+        self.maybe_seal()?;
         Ok(())
     }
 
@@ -1206,6 +1209,46 @@ mod tests {
         store.purge_scope(scope).unwrap();
         assert!(store.read_scope(scope).unwrap().rows.is_empty());
         store.seal().unwrap();
+        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn a_purge_that_crosses_the_threshold_seals_the_tail() {
+        let layout = layout("purge_seals");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([8; 16]);
+        let frame = |owner, edges: &[Edge], purge| {
+            let payload = encode_row(scope, EdgeFamily::typed(3), owner, edges, purge).unwrap();
+            u64::try_from(payload.len()).unwrap() + 8
+        };
+        let tombstone = frame(0, &[], true);
+        let empty_row = frame(1, &[], false);
+        // One row sized so the tail sits just under the threshold, and one
+        // tombstone then carries it over.
+        let edges_needed =
+            (SEAL_THRESHOLD - tombstone - empty_row).div_ceil(u64::try_from(EDGE_SIZE).unwrap());
+        let edges = vec![Edge { target: 0, kind: 0 }; usize::try_from(edges_needed).unwrap()];
+        store
+            .append_rows(
+                scope,
+                &[RowRecord {
+                    family: EdgeFamily::typed(3),
+                    owner: 1,
+                    edges,
+                }],
+            )
+            .unwrap();
+        let tail_len = || fs::metadata(store.tail_path()).map_or(0, |meta| meta.len());
+        assert!(
+            tail_len() > 0 && tail_len() < SEAL_THRESHOLD,
+            "setup is under the threshold"
+        );
+        assert!(store.segments().unwrap().is_empty());
+
+        store.purge_scope(scope).unwrap();
+        assert_eq!(tail_len(), 0, "the purge seals the tail");
+        assert_eq!(store.segments().unwrap().len(), 1);
         assert!(store.read_scope(scope).unwrap().rows.is_empty());
         let _ = fs::remove_dir_all(layout.root());
     }
