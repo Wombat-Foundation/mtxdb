@@ -5,7 +5,8 @@
 //! latency in nanoseconds (p50/p99/max, split by whether a sync was in flight
 //! when the read started), reader `WouldBlock` count, reads that missed the
 //! newest published id ("stale"), syncs where a reclaim was due (WAL above the
-//! trigger) versus those that shrank the WAL, reclaim sync time, and peak
+//! trigger) versus those that shrank the WAL, elapsed time of due syncs that shrank the WAL (all-pool `sync_all`, so
+//! checkpoint and sync work, not reclaim alone), and peak
 //! segment fill. `N` readers chase the newest committed ids. A due sync that
 //! did not shrink the WAL is a blocked reclaim, e.g. by a held lease. The
 //! trigger is validated against the emergency boundary (three quarters of the
@@ -241,13 +242,13 @@ fn main() {
         ("max(~3/4)", max_trigger),
     ];
     println!(
-        "segment cap {} MiB; {secs}s x {runs} runs per row; {readers} reader(s); latencies in ns",
+        "segment cap {} MiB; {secs}s x {runs} runs per row; {readers} reader(s); latencies in ns per 16-key read batch (ids built before the timer)",
         cap >> 20
     );
     println!(
-        "{:<10} {:<5} {:>8} {:>7} {:>4} {:>4} {:>7} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10}",
-        "trigger", "lease", "commit/s", "wb-cmt", "due", "recl", "recl ms", "peakMiB", "reads/s",
-        "wb-read", "stale", "calm p50", "calm p99", "sync p99", "sync max", "calm max"
+        "{:<10} {:<5} {:>8} {:>7} {:>4} {:>4} {:>7} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7}",
+        "trigger", "lease", "commit/s", "wb-cmt", "due", "recl", "dueshrk ms", "peakMiB", "reads/s",
+        "wb-read", "stale", "calm p50", "calm p99", "sync p99", "sync max", "calm max", "calm n", "sync n"
     );
     for (name, trigger) in settings {
         for lease in [false, true] {
@@ -262,7 +263,7 @@ fn main() {
                     .copied()
                     .unwrap_or(0.0);
                 println!(
-                    "{:<10} {:<5} {:>8.0} {:>7} {:>4} {:>4} {:>7.0} {:>7} {:>8.0} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10}  run {n}",
+                    "{:<10} {:<5} {:>8.0} {:>7} {:>4} {:>4} {:>7.0} {:>7} {:>8.0} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7}  run {n}",
                     name,
                     if lease { "held" } else { "none" },
                     r.commits as f64 / r.secs,
@@ -279,6 +280,8 @@ fn main() {
                     pct(&r.sync_ns, 0.99),
                     r.sync_ns.last().copied().unwrap_or(0),
                     r.calm_ns.last().copied().unwrap_or(0),
+                    r.calm_ns.len(),
+                    r.sync_ns.len(),
                 );
             }
         }
