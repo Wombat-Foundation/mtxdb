@@ -81,9 +81,8 @@ fn writable_paged_open_inside_a_database_root_is_rejected_and_keeps_the_checkpoi
         index_residency: Some(IndexResidency::Paged),
         ..RuntimeConfig::default()
     };
-    let error = match PackfileStorage::open_with_config(pool.clone(), &config) {
-        Ok(_) => panic!("a writable paged pool inside a database root must be rejected"),
-        Err(error) => error,
+    let Err(error) = PackfileStorage::open_with_config(pool.clone(), &config) else {
+        panic!("a writable paged pool inside a database root must be rejected")
     };
     assert!(
         error.to_string().to_ascii_lowercase().contains("paged"),
