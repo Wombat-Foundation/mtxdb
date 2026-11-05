@@ -747,8 +747,9 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
                             );
                             // Acknowledge the exact round whose key was
                             // validated, so the writer cannot mistake an older
-                            // in-flight read for progress on this round.
-                            acknowledged.store(newest, Ordering::Release);
+                            // in-flight read for progress on this round. The
+                            // update is monotonic because rounds only advance.
+                            acknowledged.fetch_max(newest, Ordering::Release);
                         }
                         if !announced {
                             let _ = started_tx.send(());
@@ -773,7 +774,7 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
         let target = i.wrapping_add(1);
         published.store(target, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while acknowledged.load(Ordering::Acquire) != target {
+        while acknowledged.load(Ordering::Acquire) < target {
             assert!(
                 Instant::now() < deadline,
                 "reader did not acknowledge the newly committed value in round {i}"
@@ -14014,4 +14015,89 @@ fn paged_run_install_rechecks_pack_identity_under_the_locks() {
     drop(run);
     drop(store);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A read completes while a reclaim is paused inside its critical section
+/// (sync and journal locks held, segment not yet rewritten), so ordinary
+/// committed reads are not blocked by a reclaim in progress.
+#[test]
+fn read_committed_completes_inside_a_paused_reclaim() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    let dir = test_dir("read_committed_inside_reclaim");
+    let wal = dir.join("wal.bin");
+    let collection = [0x4Du8; 16];
+    let seed_key = [0x01u8; 16];
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &collection,
+        &seed_key,
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+    let (journal, _) = Journal::open(&wal).unwrap();
+    drop(journal);
+
+    let reader = Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
+    reader.enable_read_journal(&wal).unwrap();
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    let journal = writer.journal().unwrap();
+    journal.set_reclaim_trigger_len(1);
+
+    let entered = Arc::new(AtomicUsize::new(0));
+    let reads_inside = Arc::new(AtomicUsize::new(0));
+    let hook = {
+        let reader = Arc::clone(&reader);
+        let entered = Arc::clone(&entered);
+        let reads_inside = Arc::clone(&reads_inside);
+        Arc::new(move || {
+            entered.fetch_add(1, Ordering::SeqCst);
+            // The reclaim thread holds the journal locks here. Run the reads
+            // on another thread and require them to finish, not just start.
+            let reader = Arc::clone(&reader);
+            let done = std::thread::spawn(move || {
+                let mut ok = 0;
+                for _ in 0..50 {
+                    match reader.get_read_committed(&collection, &[seed_key]) {
+                        Ok(values) => {
+                            assert_eq!(
+                                values[0].as_ref().map(|d| d.bytes.as_ref()),
+                                Some(&b"seed"[..])
+                            );
+                            ok += 1;
+                        }
+                        Err(StorageError::WouldBlock(_)) => {}
+                        Err(err) => panic!("unexpected read error: {err}"),
+                    }
+                }
+                ok
+            });
+            reads_inside.fetch_add(done.join().unwrap(), Ordering::SeqCst);
+        })
+    };
+    journal.set_reclaim_hook(Some(hook));
+
+    writer
+        .put(
+            &collection,
+            &[0x80u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(&[0u8; 8])),
+        )
+        .unwrap();
+    writer.sync().unwrap();
+
+    assert!(
+        entered.load(Ordering::SeqCst) >= 1,
+        "the reclaim hook must run"
+    );
+    assert!(
+        reads_inside.load(Ordering::SeqCst) > 0,
+        "reads must complete while a reclaim holds its locks"
+    );
 }
