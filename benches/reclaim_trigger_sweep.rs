@@ -93,6 +93,9 @@ struct Run {
     reclaim_ms: Vec<f64>,
     peak_wal: u64,
     secs: f64,
+    /// Nominal payload committed, in bytes, and why the run ended.
+    written: u64,
+    stop: &'static str,
 }
 
 fn run_once(
@@ -181,8 +184,15 @@ fn run_once(
             })
             .collect();
         let mut next = 1000u64;
-        while started.elapsed() < deadline && written < write_target && run.refused_commits < 1000 {
+        let keep_going = |written: u64, refused: u64| {
+            started.elapsed() < deadline && written < write_target && refused < 1000
+        };
+        while keep_going(written, run.refused_commits) {
             for _ in 0..commits_per_sync {
+                // Stop mid-batch too, so a row never overshoots its target.
+                if !keep_going(written, run.refused_commits) {
+                    break;
+                }
                 let txn = db.begin_transaction();
                 let mut staged = true;
                 for _ in 0..batch {
@@ -231,6 +241,14 @@ fn run_once(
             .collect::<Vec<_>>()
     });
     run.secs = started.elapsed().as_secs_f64();
+    run.written = written;
+    run.stop = if written >= write_target {
+        "target"
+    } else if run.refused_commits >= 1000 {
+        "refusals"
+    } else {
+        "time"
+    };
     for r in per_reader {
         run.reads += r.reads;
         run.refused_reads += r.refused_reads;
@@ -297,9 +315,9 @@ fn main() {
         }
     );
     println!(
-        "{:<10} {:<5} {:<12} {:>8} {:>7} {:>4} {:>4} {:>5} {:>7} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7}",
+        "{:<10} {:<5} {:<12} {:>8} {:>7} {:>4} {:>4} {:>5} {:>7} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7} {:>8} {:>8}",
         "trigger", "lease", "lease cap", "commit/s", "wb-cmt", "due", "recl", "revkd", "dueshrk ms", "peakMiB", "reads/s",
-        "wb-read", "stale", "calm p50", "calm p99", "sync p99", "sync max", "calm max", "calm n", "sync n"
+        "wb-read", "stale", "calm p50", "calm p99", "sync p99", "sync max", "calm max", "calm n", "sync n", "doneMiB", "stop"
     );
     for (name, trigger) in settings {
         let mut held_caps = if relative_cap_sweep {
@@ -336,7 +354,7 @@ fn main() {
                     .copied()
                     .unwrap_or(0.0);
                 println!(
-                    "{:<10} {:<5} {:<12} {:>8.0} {:>7} {:>4} {:>4} {:>5} {:>7.0} {:>7} {:>8.0} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7}  run {n}",
+                    "{:<10} {:<5} {:<12} {:>8.0} {:>7} {:>4} {:>4} {:>5} {:>7.0} {:>7} {:>8.0} {:>8} {:>7} {:>9} {:>9} {:>9} {:>10} {:>10} {:>9} {:>7} {:>8} {:>8}  run {n}",
                     name,
                     if lease { "held" } else { "none" },
                     cap_label,
@@ -357,6 +375,8 @@ fn main() {
                     r.calm_ns.last().copied().unwrap_or(0),
                     r.calm_ns.len(),
                     r.sync_ns.len(),
+                    r.written >> 20,
+                    r.stop,
                 );
             }
         }
