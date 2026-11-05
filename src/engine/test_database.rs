@@ -3512,13 +3512,21 @@ fn disjoint_record_writes_do_not_conflict() {
             let key = *key;
             std::thread::spawn(move || {
                 barrier.wait();
-                let txn = db.begin_transaction();
-                let (records, versions) = txn
-                    .get_with_record_versions(pool, &collection, &[key])
-                    .unwrap();
-                assert!(records[0].is_none());
-                txn.expect_record_version(pool, collection, key, versions[0])
-                    .unwrap();
+                let txn = loop {
+                    let txn = db.begin_transaction();
+                    match txn.get_with_record_versions(pool, &collection, &[key]) {
+                        Ok((records, versions)) => {
+                            assert!(records[0].is_none());
+                            txn.expect_record_version(pool, collection, key, versions[0])
+                                .unwrap();
+                            break txn;
+                        }
+                        // A concurrent commit may publish a group whose
+                        // materialization has not reached this reader yet.
+                        Err(error) if error.is_would_block() => {}
+                        Err(error) => panic!("versioned read failed: {error}"),
+                    }
+                };
                 txn.put(
                     pool,
                     collection,
