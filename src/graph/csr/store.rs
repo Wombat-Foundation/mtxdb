@@ -24,7 +24,7 @@
 //! Whole-scope reads cache the decoded sealed rows per store directory, so a
 //! segment is decoded once for all scopes instead of once per scope. Point and
 //! family reads keep using the on-disk `(family, owner)` directory and do not
-//! touch that cache. The cache is bounded by [`SEGMENT_CACHE_BUDGET`] with LRU
+//! touch that cache. The cache is bounded by `SEGMENT_CACHE_BUDGET` with LRU
 //! eviction and is in-process state, not a durability boundary.
 
 use std::collections::{HashMap, HashSet, VecDeque};
