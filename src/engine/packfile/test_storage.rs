@@ -14064,6 +14064,90 @@ fn paged_run_install_rechecks_pack_identity_under_the_locks() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Readers chasing the newest committed key while the writer reclaims on every
+/// sync: each reclaim rewrites and renames the WAL segment under the readers.
+/// Every key the writer has finished committing must stay readable with its
+/// value (a transient `WouldBlock` is retried), and the journal base must move
+/// during the run, so the reads overlapped real rewrites rather than idling.
+#[test]
+fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+
+    const ROUNDS: u8 = 120;
+    let ReclaimFixture {
+        writer,
+        reader,
+        wal,
+        collection,
+        ..
+    } = open_reclaim_fixture("reads_across_rewrites");
+    let committed = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let verified = AtomicUsize::new(0);
+    let key_for = |i: u8| [0x80u8.wrapping_add(i); 16];
+    let value_for = |i: u8| vec![i; 8];
+
+    let mut last_base = Journal::scan_read_only(&wal).unwrap().base_lsn;
+    let mut base_moves = 0usize;
+    std::thread::scope(|scope| {
+        for _ in 0..3 {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    let done = committed.load(Ordering::Acquire);
+                    if done == 0 {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    // `done` keys (0..done) are committed and synced.
+                    let newest = u8::try_from(done - 1).unwrap();
+                    for i in [0, newest / 2, newest] {
+                        loop {
+                            match reader.get_read_committed(&collection, &[key_for(i)]) {
+                                Ok(values) => {
+                                    assert_eq!(
+                                        values[0].as_ref().map(|d| d.bytes.to_vec()),
+                                        Some(value_for(i)),
+                                        "key {i} must stay readable across a rewrite"
+                                    );
+                                    verified.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
+                                Err(StorageError::WouldBlock(_)) => std::thread::yield_now(),
+                                Err(err) => panic!("unexpected read error: {err}"),
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        for i in 0..ROUNDS {
+            writer
+                .put(
+                    &collection,
+                    &key_for(i),
+                    &NodeData::new(bytes::Bytes::from(value_for(i))),
+                )
+                .unwrap();
+            writer.sync().unwrap();
+            committed.store(u64::from(i) + 1, Ordering::Release);
+            let base = Journal::scan_read_only(&wal).unwrap().base_lsn;
+            if base != last_base {
+                base_moves += 1;
+                last_base = base;
+            }
+        }
+        stop.store(true, Ordering::Release);
+    });
+    assert!(
+        base_moves >= usize::from(ROUNDS) / 4,
+        "the segment must be rewritten repeatedly, saw {base_moves} base moves"
+    );
+    assert!(
+        verified.load(Ordering::Relaxed) > 0,
+        "readers must verify reads during the run"
+    );
+}
+
 /// A read completes while a reclaim is paused inside its critical section
 /// (sync and journal locks held, segment not yet rewritten), so ordinary
 /// committed reads are not blocked by a reclaim in progress.
