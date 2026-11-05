@@ -744,9 +744,15 @@ fn a_full_batch_of_realistic_events_fits_one_transaction() {
 
     let recorded = room.record_events(&db, &events).unwrap();
     assert_eq!(recorded.len(), count, "the whole batch is one commit");
-    let last = &ids[count - 1];
-    assert_eq!(room.auth_edges(&db, last).unwrap().len(), 10);
-    assert!(room.verify(&db).unwrap().is_consistent());
+    // Full-room consistency is covered by the dedicated verify tests. Keep
+    // this capacity test focused on the batch write and representative reads.
+    for index in [0, count / 2, count - 1] {
+        assert_eq!(
+            room.auth_edges(&db, &ids[index]).unwrap().len(),
+            index.min(10),
+            "auth edges for event {index}"
+        );
+    }
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
