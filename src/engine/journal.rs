@@ -101,9 +101,11 @@ const MAX_SEGMENT_LEN: u64 = (256 << 20) + FILE_HEADER_LEN as u64;
 /// [`JournalCoordinator::set_reclaim_trigger_len`].
 pub(crate) const RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN / 4;
 
-/// Largest segment length a configured reclaim trigger may name: the segment
-/// cap itself. A trigger at the cap never fires before the segment is full.
-pub(crate) const MAX_RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN;
+/// Largest threshold that ensures forced reclaim starts by the emergency-zone
+/// boundary. The predicate fires only once `len > trigger`, hence the minus 1.
+pub(crate) const MAX_RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN
+    .saturating_sub(MAX_SEGMENT_LEN / 4)
+    .saturating_sub(1);
 
 /// A durable mutation represented in a journal group.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3996,15 +3998,19 @@ impl JournalCoordinator {
     /// Set the segment length above which a sync forces a reclaiming
     /// checkpoint, from runtime configuration. Unlike
     /// [`Self::set_reclaim_trigger_len`] this is always available and rejects
-    /// values outside `1..=MAX_RECLAIM_TRIGGER_LEN`.
+    /// values outside `1..=MAX_RECLAIM_TRIGGER_LEN`, which keeps the threshold
+    /// below the emergency-zone boundary.
     ///
     /// # Errors
-    /// Returns `InvalidInput` for a zero or over-cap value.
+    /// Returns `InvalidInput` for zero or a threshold at/above the emergency
+    /// boundary.
     pub(crate) fn configure_reclaim_trigger_len(&self, len: u64) -> io::Result<()> {
         if len == 0 || len > MAX_RECLAIM_TRIGGER_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("reclaim trigger must be in 1..={MAX_RECLAIM_TRIGGER_LEN}, got {len}"),
+                format!(
+                    "reclaim trigger must be in 1..={MAX_RECLAIM_TRIGGER_LEN} bytes (below the emergency-zone boundary), got {len}"
+                ),
             ));
         }
         self.reclaim_trigger_len.store(len, Ordering::Relaxed);

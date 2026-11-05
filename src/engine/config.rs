@@ -185,7 +185,7 @@ impl RuntimeConfig {
 fn check_reclaim_trigger(bytes: u64) -> Result<(), ConfigError> {
     if bytes == 0 || bytes > MAX_RECLAIM_TRIGGER_LEN {
         return Err(ConfigError::new(format!(
-            "reclaim trigger must be in 1..={MAX_RECLAIM_TRIGGER_LEN}, got {bytes}"
+            "reclaim trigger must be in 1..={MAX_RECLAIM_TRIGGER_LEN} bytes (below the emergency-zone boundary), got {bytes}"
         )));
     }
     Ok(())
@@ -294,6 +294,13 @@ mod tests {
         let parsed = config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", " 4096 ")]).unwrap();
         assert_eq!(parsed.reclaim_trigger_bytes, Some(4096));
         assert_eq!(config(&[]).unwrap().reclaim_trigger_bytes, None);
+        let boundary = MAX_RECLAIM_TRIGGER_LEN.to_string();
+        assert_eq!(
+            config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", &boundary)])
+                .unwrap()
+                .reclaim_trigger_bytes,
+            Some(MAX_RECLAIM_TRIGGER_LEN)
+        );
         assert!(config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", "0")]).is_err());
         assert!(config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", "-1")]).is_err());
         assert!(config(&[("MTXDB_RECLAIM_TRIGGER_BYTES", "big")]).is_err());
