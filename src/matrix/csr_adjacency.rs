@@ -171,6 +171,9 @@ struct Snapshot {
     families: [FamilyRows; 3],
 }
 
+/// Per-family edge sets claimed by one event in a batch.
+type FamilyClaims = Vec<BTreeSet<(Vec<u8>, u16)>>;
+
 impl Snapshot {
     fn empty(ids: usize) -> Self {
         Self {
@@ -328,6 +331,99 @@ impl CsrAdjacency {
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        let prepared = self.prepare_batch(db, events)?;
+
+        // Validate everything that can collide before allocating any id, so a
+        // rejected batch records nothing (matching the old transactional write).
+        let mut snapshot = self.validate_batch(db, &prepared)?;
+
+        // Allocate every id in one call, exactly as the short-id layer did.
+        let mut keys: Vec<&[u8]> = Vec::new();
+        let mut starts: Vec<usize> = Vec::with_capacity(prepared.len());
+        for event in &prepared {
+            starts.push(keys.len());
+            keys.push(event.owner);
+            for family in [&event.prev, &event.auth, &event.relation] {
+                keys.extend(family.iter().map(|edge| edge.target));
+            }
+        }
+        let ids = self.events.get_or_create(db, &keys)?;
+        let after = self.events.counter(db)? as usize;
+        snapshot.resize(after);
+        let mut owners = Vec::with_capacity(prepared.len());
+        let mut changed_rows: Vec<RowRecord> = Vec::new();
+        for (event, &start) in prepared.iter().zip(&starts) {
+            let owner = ids[start];
+            owners.push(owner);
+            let mut cursor = start.saturating_add(1);
+            for (index, family) in FAMILIES.iter().enumerate() {
+                let edges = match index {
+                    0 => &event.prev,
+                    1 => &event.auth,
+                    _ => &event.relation,
+                };
+                let mut wanted: BTreeSet<Edge> = BTreeSet::new();
+                for edge in edges {
+                    wanted.insert(Edge {
+                        target: ids[cursor],
+                        kind: edge.kind,
+                    });
+                    cursor = cursor.saturating_add(1);
+                }
+                // No relation known means no relations row, so a relation can be
+                // added later and a stored one is never contradicted.
+                if family.id == RELATIONS.id && wanted.is_empty() {
+                    continue;
+                }
+                let list: Vec<Edge> = wanted.into_iter().collect();
+                let rows = &mut snapshot.families[index];
+                let slot = owner as usize;
+                if rows.recorded[slot] {
+                    let stored = &rows.rows[slot];
+                    if family.typed {
+                        if !list.is_empty() && !stored.is_empty() && *stored != list {
+                            return Err(StorageError::Collision(
+                                "short-id edge list differs from the recorded one".to_owned(),
+                            ));
+                        }
+                        if !list.is_empty() && stored.is_empty() {
+                            rows.rows[slot].clone_from(&list);
+                            changed_rows.push(RowRecord {
+                                family: *family,
+                                owner,
+                                edges: list,
+                            });
+                        }
+                    } else if *stored != list {
+                        return Err(StorageError::Collision(
+                            "short-id edge list differs from the recorded one".to_owned(),
+                        ));
+                    }
+                } else {
+                    rows.rows[slot].clone_from(&list);
+                    rows.recorded[slot] = true;
+                    changed_rows.push(RowRecord {
+                        family: *family,
+                        owner,
+                        edges: list,
+                    });
+                }
+            }
+        }
+        if !changed_rows.is_empty() {
+            self.store(db)
+                .append_rows(self.scope(), &changed_rows)
+                .map_err(StorageError::Io)?;
+        }
+        Ok(owners)
+    }
+
+    /// Resolve each event's relation kind and turn its ids into borrowed keys.
+    fn prepare_batch<'a>(
+        &self,
+        db: &Database,
+        events: &'a [EventRecord<'a>],
+    ) -> Result<Vec<PreparedEvent<'a>>, StorageError> {
         let mut kinds: HashMap<&str, u16> = HashMap::new();
         let mut prepared = Vec::with_capacity(events.len());
         for event in events {
@@ -362,13 +458,20 @@ impl CsrAdjacency {
                 relation,
             });
         }
+        Ok(prepared)
+    }
 
-        // Validate everything that can collide before allocating any id, so a
-        // rejected batch records nothing (matching the old transactional write).
+    /// Check every row a batch would write against the stored rows and against
+    /// earlier events in the same batch, before any id is allocated.
+    fn validate_batch(
+        &self,
+        db: &Database,
+        prepared: &[PreparedEvent<'_>],
+    ) -> Result<Snapshot, StorageError> {
         let next = self.events.counter(db)?;
-        let mut snapshot = self.load_snapshot(db, next as usize)?;
-        let mut claims: HashMap<&[u8], Vec<BTreeSet<(Vec<u8>, u16)>>> = HashMap::new();
-        for event in &prepared {
+        let snapshot = self.load_snapshot(db, next as usize)?;
+        let mut claims: HashMap<&[u8], FamilyClaims> = HashMap::new();
+        for event in prepared {
             let wanted = [
                 event_key_set(&event.prev),
                 event_key_set(&event.auth),
@@ -423,86 +526,7 @@ impl CsrAdjacency {
                 }
             }
         }
-
-        // Allocate every id in one call, exactly as the short-id layer did.
-        let mut keys: Vec<&[u8]> = Vec::new();
-        let mut starts: Vec<usize> = Vec::with_capacity(prepared.len());
-        for event in &prepared {
-            starts.push(keys.len());
-            keys.push(event.owner);
-            for family in [&event.prev, &event.auth, &event.relation] {
-                keys.extend(family.iter().map(|edge| edge.target));
-            }
-        }
-        let ids = self.events.get_or_create(db, &keys)?;
-        let after = self.events.counter(db)? as usize;
-        snapshot.resize(after);
-        let mut owners = Vec::with_capacity(prepared.len());
-        let mut changed_rows: Vec<RowRecord> = Vec::new();
-        for (event, &start) in prepared.iter().zip(&starts) {
-            let owner = ids[start];
-            owners.push(owner);
-            let mut cursor = start.saturating_add(1);
-            for (index, family) in FAMILIES.iter().enumerate() {
-                let edges = match index {
-                    0 => &event.prev,
-                    1 => &event.auth,
-                    _ => &event.relation,
-                };
-                let mut wanted: BTreeSet<Edge> = BTreeSet::new();
-                for edge in edges {
-                    wanted.insert(Edge {
-                        target: ids[cursor],
-                        kind: edge.kind,
-                    });
-                    cursor = cursor.saturating_add(1);
-                }
-                // No relation known means no relations row, so a relation can be
-                // added later and a stored one is never contradicted.
-                if family.id == RELATIONS.id && wanted.is_empty() {
-                    continue;
-                }
-                let list: Vec<Edge> = wanted.into_iter().collect();
-                let rows = &mut snapshot.families[index];
-                let slot = owner as usize;
-                if rows.recorded[slot] {
-                    let stored = &rows.rows[slot];
-                    if family.typed {
-                        if !list.is_empty() && !stored.is_empty() && *stored != list {
-                            return Err(StorageError::Collision(
-                                "short-id edge list differs from the recorded one".to_owned(),
-                            ));
-                        }
-                        if !list.is_empty() && stored.is_empty() {
-                            rows.rows[slot] = list.clone();
-                            changed_rows.push(RowRecord {
-                                family: *family,
-                                owner,
-                                edges: list,
-                            });
-                        }
-                    } else if *stored != list {
-                        return Err(StorageError::Collision(
-                            "short-id edge list differs from the recorded one".to_owned(),
-                        ));
-                    }
-                } else {
-                    rows.rows[slot] = list.clone();
-                    rows.recorded[slot] = true;
-                    changed_rows.push(RowRecord {
-                        family: *family,
-                        owner,
-                        edges: list,
-                    });
-                }
-            }
-        }
-        if !changed_rows.is_empty() {
-            self.store(db)
-                .append_rows(self.scope(), &changed_rows)
-                .map_err(StorageError::Io)?;
-        }
-        Ok(owners)
+        Ok(snapshot)
     }
 
     /// Resolve a stored row to `(event id bytes, kind)` so it can be compared
