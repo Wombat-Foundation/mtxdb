@@ -236,13 +236,7 @@ impl CsrFamilies {
             decoded.push(csr);
         }
 
-        for (csr, rows) in decoded.iter().zip(&row_sets) {
-            for (local, node) in nodes.iter().enumerate() {
-                if !rows.contains(node) && !csr.neighbors(local as u32).is_empty() {
-                    return Err(CsrError::Malformed);
-                }
-            }
-        }
+        validate_rows(&decoded, &row_sets, &nodes)?;
 
         let relation_edge_count = decoded[2].edge_count();
         let relation_bytes_len = relation_edge_count
@@ -259,13 +253,14 @@ impl CsrFamilies {
             ));
         }
 
-        let prev = rebuild_with_nodes(&nodes, decoded.remove(0))?;
-        let auth = rebuild_with_nodes(&nodes, decoded.remove(0))?;
-        let relations = rebuild_with_nodes(&nodes, decoded.remove(0))?;
+        let prev = rebuild_with_nodes(&nodes, &decoded.remove(0))?;
+        let auth = rebuild_with_nodes(&nodes, &decoded.remove(0))?;
+        let relations = rebuild_with_nodes(&nodes, &decoded.remove(0))?;
         let mut relation_types = HashMap::new();
         let mut type_cursor = 0usize;
         for (local, node) in nodes.iter().enumerate() {
-            let edge_count = relations.neighbors(local as u32).len();
+            let local = u32::try_from(local).map_err(|_| CsrError::Malformed)?;
+            let edge_count = relations.neighbors(local).len();
             let end = type_cursor
                 .checked_add(edge_count)
                 .ok_or(CsrError::Malformed)?;
@@ -289,6 +284,22 @@ impl CsrFamilies {
     }
 }
 
+fn validate_rows(
+    decoded: &[Csr],
+    row_sets: &[HashSet<[u8; 16]>],
+    nodes: &[[u8; 16]],
+) -> Result<(), CsrError> {
+    for (csr, rows) in decoded.iter().zip(row_sets) {
+        for (local, node) in nodes.iter().enumerate() {
+            let local = u32::try_from(local).map_err(|_| CsrError::Malformed)?;
+            if !rows.contains(node) && !csr.neighbors(local).is_empty() {
+                return Err(CsrError::Malformed);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn take<'a>(data: &'a [u8], cursor: &mut usize, length: usize) -> Result<&'a [u8], CsrError> {
     let end = cursor.checked_add(length).ok_or(CsrError::Malformed)?;
     let bytes = data.get(*cursor..end).ok_or(CsrError::TooShort)?;
@@ -304,7 +315,7 @@ fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32, CsrError> {
     ))
 }
 
-fn rebuild_with_nodes(nodes: &[[u8; 16]], decoded: Csr) -> Result<Csr, CsrError> {
+fn rebuild_with_nodes(nodes: &[[u8; 16]], decoded: &Csr) -> Result<Csr, CsrError> {
     let mut adjacency = HashMap::new();
     for (local, source) in nodes.iter().enumerate() {
         let targets = decoded

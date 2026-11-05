@@ -39,6 +39,7 @@
 //! CAS is atomic within the single writer process, through the transaction layer
 //! in [`crate::database`].
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
@@ -953,12 +954,12 @@ impl ShortIdIndex {
             }
             for family in families {
                 let key = (chunk_of(short_id), family.id);
-                if !chunks.contains_key(&key) {
+                if let Entry::Vacant(slot) = chunks.entry(key) {
                     let loaded = match get(edges_record_id(key.0, family.id))? {
                         Some(record) => Some(decode_chunk(*family, &record.bytes)?),
                         None => None,
                     };
-                    chunks.insert(key, loaded);
+                    slot.insert(loaded);
                 }
                 let Some(row) = chunks
                     .get(&key)
@@ -1221,7 +1222,7 @@ impl ShortIdIndex {
             }
             let list: Vec<Edge> = wanted.into_iter().collect();
             let record = edges_record_id(chunk_of(owner), family.family.id);
-            if !chunks.contains_key(&record) {
+            if let Entry::Vacant(slot) = chunks.entry(record) {
                 let (records, tokens) =
                     txn.get_with_record_versions(self.pool, &self.collection_id, &[record])?;
                 let token = tokens.into_iter().next();
@@ -1229,14 +1230,11 @@ impl ShortIdIndex {
                     Some(stored) => decode_chunk(family.family, &stored.bytes)?,
                     None => EdgeChunk::new(family.family.typed),
                 };
-                chunks.insert(
-                    record,
-                    ChunkState {
-                        chunk,
-                        token,
-                        dirty: false,
-                    },
-                );
+                slot.insert(ChunkState {
+                    chunk,
+                    token,
+                    dirty: false,
+                });
             }
             let state = chunks
                 .get_mut(&record)
@@ -1247,20 +1245,17 @@ impl ShortIdIndex {
                     family.family.id
                 )));
             }
-            match state.chunk.get(owner) {
-                Some(stored) => {
-                    if row_edges(&stored) != list {
-                        return Err(StorageError::Collision(
-                            "short-id edge list differs from the recorded one".to_owned(),
-                        ));
-                    }
+            if let Some(stored) = state.chunk.get(owner) {
+                if row_edges(&stored) != list {
+                    return Err(StorageError::Collision(
+                        "short-id edge list differs from the recorded one".to_owned(),
+                    ));
                 }
-                None => {
-                    let row: Vec<(u32, u16)> =
-                        list.iter().map(|edge| (edge.target, edge.kind)).collect();
-                    state.chunk.insert(owner, &row);
-                    state.dirty = true;
-                }
+            } else {
+                let row: Vec<(u32, u16)> =
+                    list.iter().map(|edge| (edge.target, edge.kind)).collect();
+                state.chunk.insert(owner, &row);
+                state.dirty = true;
             }
             lists.push(list);
         }

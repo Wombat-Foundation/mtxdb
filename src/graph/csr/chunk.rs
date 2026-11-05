@@ -88,7 +88,8 @@ impl EdgeChunk {
     #[must_use]
     pub fn get(&self, owner: u32) -> Option<Row> {
         let at = self.owners.binary_search(&owner).ok()?;
-        let (start, end) = (self.offsets[at] as usize, self.offsets[at + 1] as usize);
+        let next = at.checked_add(1)?;
+        let (start, end) = (self.offsets[at] as usize, self.offsets[next] as usize);
         Some(
             (start..end)
                 .map(|i| (self.targets[i], if self.typed { self.kinds[i] } else { 0 }))
@@ -109,15 +110,15 @@ impl EdgeChunk {
     /// # Panics
     /// Panics if the edge count exceeds `u32::MAX`.
     pub fn insert(&mut self, owner: u32, row: &[(u32, u16)]) {
-        let at = match self.owners.binary_search(&owner) {
-            Ok(_) => return,
-            Err(at) => at,
+        let Err(at) = self.owners.binary_search(&owner) else {
+            return;
         };
         let split = self.offsets[at] as usize;
         let n = u32::try_from(row.len()).expect("row too long");
         self.owners.insert(at, owner);
-        self.offsets.insert(at + 1, self.offsets[at]);
-        for off in &mut self.offsets[at + 1..] {
+        let next = at.checked_add(1).expect("row index");
+        self.offsets.insert(next, self.offsets[at]);
+        for off in &mut self.offsets[next..] {
             *off = off.checked_add(n).expect("edge count exceeds u32::MAX");
         }
         self.targets
@@ -129,23 +130,38 @@ impl EdgeChunk {
     }
 
     /// Encode to the wire format.
+    ///
+    /// # Panics
+    /// Panics if the chunk's invariants do not hold: owners are not strictly
+    /// increasing, a row offset decreases, or a row's targets are not sorted.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![u8::from(self.typed)];
         put_varint(&mut out, self.owners.len() as u64);
         let mut prev_owner = 0u32;
         for (at, &owner) in self.owners.iter().enumerate() {
-            put_varint(&mut out, u64::from(owner - prev_owner));
+            let gap = owner
+                .checked_sub(prev_owner)
+                .expect("owners are sorted and distinct");
+            put_varint(&mut out, u64::from(gap));
             prev_owner = owner;
-            let (start, end) = (self.offsets[at] as usize, self.offsets[at + 1] as usize);
-            put_varint(&mut out, (end - start) as u64);
+            let next = at.checked_add(1).expect("row index");
+            let (start, end) = (self.offsets[at] as usize, self.offsets[next] as usize);
+            let count = end
+                .checked_sub(start)
+                .expect("row offsets are nondecreasing");
+            put_varint(&mut out, count as u64);
             let mut prev = 0u32;
             for i in start..end {
                 let target = self.targets[i];
                 if i == start {
-                    put_varint(&mut out, zigzag(i64::from(target) - i64::from(owner)));
+                    let delta = i64::from(target)
+                        .checked_sub(i64::from(owner))
+                        .expect("target and owner fit i64");
+                    put_varint(&mut out, zigzag(delta));
                 } else {
-                    put_varint(&mut out, u64::from(target - prev));
+                    let gap = target.checked_sub(prev).expect("targets are sorted");
+                    put_varint(&mut out, u64::from(gap));
                 }
                 prev = target;
                 if self.typed {
@@ -182,7 +198,9 @@ impl EdgeChunk {
             let mut prev = 0u32;
             for i in 0..count {
                 let target = if i == 0 {
-                    let signed = i64::from(owner) + unzigzag(take_varint(&mut rest)?);
+                    let signed = i64::from(owner)
+                        .checked_add(unzigzag(take_varint(&mut rest)?))
+                        .ok_or(ChunkError::Malformed)?;
                     u32::try_from(signed).map_err(|_| ChunkError::Malformed)?
                 } else {
                     let gap = u32::try_from(take_varint(&mut rest)?)
@@ -213,19 +231,24 @@ impl EdgeChunk {
 }
 
 fn zigzag(value: i64) -> u64 {
-    ((value << 1) ^ (value >> 63)) as u64
+    let bits = u64::from_ne_bytes(value.to_ne_bytes());
+    let sign = 0u64.wrapping_sub(bits.wrapping_shr(63));
+    bits.wrapping_shl(1) ^ sign
 }
 
 fn unzigzag(value: u64) -> i64 {
-    ((value >> 1) as i64) ^ -((value & 1) as i64)
+    let magnitude = value.wrapping_shr(1);
+    let sign = 0u64.wrapping_sub(value & 1);
+    i64::from_ne_bytes((magnitude ^ sign).to_ne_bytes())
 }
 
 fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
-        out.push((value as u8 & 0x7f) | 0x80);
+        let low = u8::try_from(value & 0x7f).expect("seven bits fit u8");
+        out.push(low | 0x80);
         value >>= 7;
     }
-    out.push(value as u8);
+    out.push(u8::try_from(value).expect("high bits consumed"));
 }
 
 fn take_varint(rest: &mut &[u8]) -> Result<u64, ChunkError> {
@@ -264,6 +287,20 @@ mod tests {
                 Some(vec![(5, kind(1)), (1029, kind(2)), (1029, kind(3))])
             );
             assert_eq!(decoded.get(1031), None);
+        }
+    }
+
+    #[test]
+    fn zigzag_and_varint_round_trip_extremes() {
+        for value in [0i64, 1, -1, 2, -2, i64::MAX, i64::MIN] {
+            assert_eq!(unzigzag(zigzag(value)), value, "zigzag {value}");
+        }
+        for value in [0u64, 1, 0x7f, 0x80, u64::MAX] {
+            let mut out = Vec::new();
+            put_varint(&mut out, value);
+            let mut rest = out.as_slice();
+            assert_eq!(take_varint(&mut rest), Ok(value), "varint {value}");
+            assert!(rest.is_empty(), "varint {value} left bytes");
         }
     }
 

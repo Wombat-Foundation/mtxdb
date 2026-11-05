@@ -97,7 +97,10 @@ impl CsrStore {
         let mut numbers = Vec::new();
         for entry in fs::read_dir(dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".tmp") {
+            let is_temp = Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"));
+            if is_temp {
                 let _ = fs::remove_file(dir.join(&name));
             } else if let Some(n) = name
                 .strip_prefix("seg-")
@@ -112,7 +115,12 @@ impl CsrStore {
         for &n in &numbers {
             segments.push((n, read_segment(&segment_path(dir, n))?));
         }
-        let next_segment = numbers.last().map_or(1, |n| n + 1);
+        let next_segment = match numbers.last() {
+            Some(&n) => n
+                .checked_add(1)
+                .ok_or_else(|| CsrStoreError::Corrupt("segment number exhausted".to_owned()))?,
+            None => 1,
+        };
         let mut store = Self {
             dir: dir.to_path_buf(),
             segments,
@@ -133,10 +141,13 @@ impl CsrStore {
         File::open(self.dir.join(TAIL_FILE))?.read_to_end(&mut bytes)?;
         let mut at = 0usize;
         let mut good = 0usize;
-        while bytes.len() - at >= 8 {
-            let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            let sum = u32::from_be_bytes(bytes[at + 4..at + 8].try_into().unwrap());
-            let Some(body) = bytes.get(at + 8..at + 8 + len) else {
+        while let Some(rest) = bytes.get(at..) {
+            let Some(header) = rest.get(..8) else {
+                break;
+            };
+            let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let sum = u32::from_be_bytes(header[4..8].try_into().unwrap());
+            let Some(body) = rest.get(8..).and_then(|tail| tail.get(..len)) else {
                 break;
             };
             if crc(body) != sum {
@@ -146,7 +157,10 @@ impl CsrStore {
                 break;
             };
             self.tail.insert((scope, family, owner), (typed, row));
-            at += 8 + len;
+            let Some(next) = at.checked_add(8).and_then(|n| n.checked_add(len)) else {
+                break;
+            };
+            at = next;
             good = at;
         }
         if good != bytes.len() {
@@ -189,7 +203,7 @@ impl CsrStore {
             };
         }
         let body = encode_record(scope, family, typed, owner, row);
-        let mut framed = Vec::with_capacity(body.len() + 8);
+        let mut framed = Vec::with_capacity(body.len().saturating_add(8));
         framed.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_be_bytes());
         framed.extend_from_slice(&crc(&body).to_be_bytes());
         framed.extend_from_slice(&body);
@@ -244,7 +258,9 @@ impl CsrStore {
         self.log.set_len(0)?;
         self.log.sync_all()?;
         self.segments.push((n, chunks));
-        self.next_segment = n + 1;
+        self.next_segment = n
+            .checked_add(1)
+            .ok_or_else(|| CsrStoreError::Corrupt("segment number exhausted".to_owned()))?;
         self.tail.clear();
         Ok(())
     }
@@ -302,7 +318,8 @@ fn read_segment(path: &Path) -> Result<HashMap<Key, EdgeChunk>, CsrStoreError> {
     if bytes.len() < 13 || bytes[..4] != SEGMENT_MAGIC || bytes[4] != SEGMENT_VERSION {
         return Err(bad("header"));
     }
-    let (payload, sum) = bytes.split_at(bytes.len() - 4);
+    let split = bytes.len().checked_sub(4).ok_or_else(|| bad("header"))?;
+    let (payload, sum) = bytes.split_at(split);
     if crc(payload) != u32::from_be_bytes(sum.try_into().unwrap()) {
         return Err(bad("checksum"));
     }
@@ -310,20 +327,22 @@ fn read_segment(path: &Path) -> Result<HashMap<Key, EdgeChunk>, CsrStoreError> {
     let mut at = 9usize;
     let mut chunks = HashMap::new();
     for _ in 0..count {
-        let head = payload.get(at..at + 26).ok_or_else(|| bad("truncated"))?;
+        let head_end = at.checked_add(26).ok_or_else(|| bad("truncated"))?;
+        let head = payload.get(at..head_end).ok_or_else(|| bad("truncated"))?;
         let scope: Scope = head[..16].try_into().unwrap();
         let family = u16::from_be_bytes(head[16..18].try_into().unwrap());
         let chunk_index = u32::from_be_bytes(head[18..22].try_into().unwrap());
         let len = u32::from_be_bytes(head[22..26].try_into().unwrap()) as usize;
+        let body_end = head_end.checked_add(len).ok_or_else(|| bad("truncated"))?;
         let body = payload
-            .get(at + 26..at + 26 + len)
+            .get(head_end..body_end)
             .ok_or_else(|| bad("truncated"))?;
         let typed = body.first() == Some(&1);
         chunks.insert(
             (scope, family, chunk_index),
             EdgeChunk::decode(body, typed)?,
         );
-        at += 26 + len;
+        at = body_end;
     }
     if at != payload.len() {
         return Err(bad("trailing bytes"));
