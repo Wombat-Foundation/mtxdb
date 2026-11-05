@@ -3143,6 +3143,24 @@ impl PackfileStorage {
         residency: crate::index::IndexResidency,
         take_writer_lock: bool,
     ) -> Result<Self, std::io::Error> {
+        // A writable paged open retires `index.checkpoint` and sweeps the
+        // delta logs. That is correct for a genuinely standalone store, but a
+        // pool inside a database root belongs to the shared-WAL representation,
+        // which requires Resident residency. Reject before any directory or
+        // on-disk mutation so an environment variable cannot silently convert
+        // a root through a maintenance command.
+        if writable && residency == crate::index::IndexResidency::Paged {
+            if let Some(root) = crate::layout::enclosing_root(&base_dir)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} is inside database root {}; a writable paged pool would convert the root's on-disk index representation; use Resident residency",
+                        base_dir.display(),
+                        root.display()
+                    ),
+                ));
+            }
+        }
         // Only a standalone writer creates its directory here. A member of a
         // shared database creates it with its first pack, and a reader never
         // creates anything.

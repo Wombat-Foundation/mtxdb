@@ -56,6 +56,47 @@ fn a_paged_pool_policy_is_rejected_before_the_root_is_created() {
 }
 
 #[test]
+fn writable_paged_open_inside_a_database_root_is_rejected_and_keeps_the_checkpoint() {
+    let root = test_root("writable-paged-inside-root");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0x42_u8; 16];
+    db.event_dag()
+        .put(
+            &collection,
+            &node(1),
+            &NodeData::new(bytes::Bytes::from_static(b"checkpoint me")),
+        )
+        .unwrap();
+    db.event_dag().sync_all().unwrap();
+    let pool = db.layout().pool_path(ShardType::EventDag);
+    drop(db);
+
+    let checkpoint = pool.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE);
+    assert!(
+        checkpoint.exists(),
+        "the fixture did not write a checkpoint"
+    );
+
+    let config = RuntimeConfig {
+        index_residency: Some(IndexResidency::Paged),
+        ..RuntimeConfig::default()
+    };
+    let error = match PackfileStorage::open_with_config(pool.clone(), &config) {
+        Ok(_) => panic!("a writable paged pool inside a database root must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("paged"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        checkpoint.exists(),
+        "rejecting the open must not retire the root's checkpoint"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn configured_transaction_stage_limit_is_visible_on_the_database() {
     let root = test_root("config-stage-limit");
     let config = RuntimeConfig {
