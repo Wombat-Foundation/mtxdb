@@ -1,5 +1,9 @@
 //! Directory-backed CSR edge store: immutable segments plus a durable tail log.
 //!
+//! One store per pool. Rows are keyed by the engine's generic 16-byte scope
+//! (collection id), family and owner, so any number of scopes share the same few
+//! files; nothing is created per scope and nothing here knows what a scope is.
+//!
 //! Lives outside every pack and pool. Forward edge rows are immutable per
 //! `(owner, family)`, so reads take the first hit from the tail, then segments
 //! newest to oldest. `seal` writes the tail as a segment of [`EdgeChunk`]s
@@ -52,14 +56,17 @@ impl std::fmt::Display for CsrStoreError {
 
 impl std::error::Error for CsrStoreError {}
 
-type Key = (u16, u32);
+/// Engine scope: the collection id the rows belong to.
+pub type Scope = [u8; 16];
+
+type Key = (Scope, u16, u32);
 
 /// A directory of CSR segments plus a tail log.
 #[derive(Debug)]
 pub struct CsrStore {
     dir: PathBuf,
     segments: Vec<(u64, HashMap<Key, EdgeChunk>)>,
-    tail: BTreeMap<(u16, u32), (bool, Row)>,
+    tail: BTreeMap<(Scope, u16, u32), (bool, Row)>,
     log: File,
     next_segment: u64,
 }
@@ -135,10 +142,10 @@ impl CsrStore {
             if crc(body) != sum {
                 break;
             }
-            let Some((family, typed, owner, row)) = decode_record(body) else {
+            let Some((scope, family, typed, owner, row)) = decode_record(body) else {
                 break;
             };
-            self.tail.insert((family, owner), (typed, row));
+            self.tail.insert((scope, family, owner), (typed, row));
             at += 8 + len;
             good = at;
         }
@@ -151,11 +158,11 @@ impl CsrStore {
 
     /// The row of `owner` in `family`, if recorded.
     #[must_use]
-    pub fn get(&self, family: u16, owner: u32) -> Option<Row> {
-        if let Some((_, row)) = self.tail.get(&(family, owner)) {
+    pub fn get(&self, scope: Scope, family: u16, owner: u32) -> Option<Row> {
+        if let Some((_, row)) = self.tail.get(&(scope, family, owner)) {
             return Some(row.clone());
         }
-        let key = (family, chunk_of(owner));
+        let key = (scope, family, chunk_of(owner));
         self.segments
             .iter()
             .rev()
@@ -168,25 +175,26 @@ impl CsrStore {
     /// [`CsrStoreError::Collision`] if a different row exists; I/O errors.
     pub fn append(
         &mut self,
+        scope: Scope,
         family: u16,
         typed: bool,
         owner: u32,
         row: &[(u32, u16)],
     ) -> Result<(), CsrStoreError> {
-        if let Some(existing) = self.get(family, owner) {
+        if let Some(existing) = self.get(scope, family, owner) {
             return if existing == row {
                 Ok(())
             } else {
                 Err(CsrStoreError::Collision)
             };
         }
-        let body = encode_record(family, typed, owner, row);
+        let body = encode_record(scope, family, typed, owner, row);
         let mut framed = Vec::with_capacity(body.len() + 8);
         framed.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_be_bytes());
         framed.extend_from_slice(&crc(&body).to_be_bytes());
         framed.extend_from_slice(&body);
         self.log.write_all(&framed)?;
-        self.tail.insert((family, owner), (typed, row.to_vec()));
+        self.tail.insert((scope, family, owner), (typed, row.to_vec()));
         Ok(())
     }
 
@@ -220,9 +228,9 @@ impl CsrStore {
             return Ok(());
         }
         let mut chunks: HashMap<Key, EdgeChunk> = HashMap::new();
-        for (&(family, owner), (typed, row)) in &self.tail {
+        for (&(scope, family, owner), (typed, row)) in &self.tail {
             chunks
-                .entry((family, chunk_of(owner)))
+                .entry((scope, family, chunk_of(owner)))
                 .or_insert_with(|| EdgeChunk::new(*typed))
                 .insert(owner, row);
         }
@@ -241,20 +249,22 @@ impl CsrStore {
     }
 }
 
-fn encode_record(family: u16, typed: bool, owner: u32, row: &[(u32, u16)]) -> Vec<u8> {
+fn encode_record(scope: Scope, family: u16, typed: bool, owner: u32, row: &[(u32, u16)]) -> Vec<u8> {
     let mut chunk = EdgeChunk::new(typed);
     chunk.insert(owner, row);
-    let mut out = family.to_be_bytes().to_vec();
+    let mut out = scope.to_vec();
+    out.extend_from_slice(&family.to_be_bytes());
     out.extend_from_slice(&chunk.encode());
     out
 }
 
-fn decode_record(body: &[u8]) -> Option<(u16, bool, u32, Row)> {
-    let family = u16::from_be_bytes(body.get(..2)?.try_into().ok()?);
-    let typed = *body.get(2)? == 1;
-    let chunk = EdgeChunk::decode(&body[2..], typed).ok()?;
+fn decode_record(body: &[u8]) -> Option<(Scope, u16, bool, u32, Row)> {
+    let scope: Scope = body.get(..16)?.try_into().ok()?;
+    let family = u16::from_be_bytes(body.get(16..18)?.try_into().ok()?);
+    let typed = *body.get(18)? == 1;
+    let chunk = EdgeChunk::decode(&body[18..], typed).ok()?;
     let (owner, row) = chunk.iter().next()?;
-    Some((family, typed, owner, row))
+    Some((scope, family, typed, owner, row))
 }
 
 fn write_segment(path: &Path, chunks: &HashMap<Key, EdgeChunk>) -> Result<(), CsrStoreError> {
@@ -265,8 +275,9 @@ fn write_segment(path: &Path, chunks: &HashMap<Key, EdgeChunk>) -> Result<(), Cs
     out.extend_from_slice(&u32::try_from(keys.len()).unwrap_or(u32::MAX).to_be_bytes());
     for key in keys {
         let body = chunks[key].encode();
-        out.extend_from_slice(&key.0.to_be_bytes());
+        out.extend_from_slice(&key.0);
         out.extend_from_slice(&key.1.to_be_bytes());
+        out.extend_from_slice(&key.2.to_be_bytes());
         out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_be_bytes());
         out.extend_from_slice(&body);
     }
@@ -292,16 +303,17 @@ fn read_segment(path: &Path) -> Result<HashMap<Key, EdgeChunk>, CsrStoreError> {
     let mut at = 9usize;
     let mut chunks = HashMap::new();
     for _ in 0..count {
-        let head = payload.get(at..at + 10).ok_or_else(|| bad("truncated"))?;
-        let family = u16::from_be_bytes(head[..2].try_into().unwrap());
-        let chunk_index = u32::from_be_bytes(head[2..6].try_into().unwrap());
-        let len = u32::from_be_bytes(head[6..10].try_into().unwrap()) as usize;
+        let head = payload.get(at..at + 26).ok_or_else(|| bad("truncated"))?;
+        let scope: Scope = head[..16].try_into().unwrap();
+        let family = u16::from_be_bytes(head[16..18].try_into().unwrap());
+        let chunk_index = u32::from_be_bytes(head[18..22].try_into().unwrap());
+        let len = u32::from_be_bytes(head[22..26].try_into().unwrap()) as usize;
         let body = payload
-            .get(at + 10..at + 10 + len)
+            .get(at + 26..at + 26 + len)
             .ok_or_else(|| bad("truncated"))?;
         let typed = body.first() == Some(&1);
-        chunks.insert((family, chunk_index), EdgeChunk::decode(body, typed)?);
-        at += 10 + len;
+        chunks.insert((scope, family, chunk_index), EdgeChunk::decode(body, typed)?);
+        at += 26 + len;
     }
     if at != payload.len() {
         return Err(bad("trailing bytes"));
@@ -313,6 +325,9 @@ fn read_segment(path: &Path) -> Result<HashMap<Key, EdgeChunk>, CsrStoreError> {
 mod tests {
     use super::*;
 
+    const S: Scope = [7; 16];
+    const T: Scope = [8; 16];
+
     fn dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("mtxdb-csr-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
@@ -323,21 +338,21 @@ mod tests {
     fn tail_survives_reopen_and_seal_moves_it_to_a_segment() {
         let d = dir("seal");
         let mut store = CsrStore::open(&d).unwrap();
-        store.append(1, false, 5, &[(2, 0), (3, 0)]).unwrap();
-        store.append(3, true, 2000, &[(5, 9)]).unwrap();
+        store.append(S, 1, false, 5, &[(2, 0), (3, 0)]).unwrap();
+        store.append(S, 3, true, 2000, &[(5, 9)]).unwrap();
         store.sync().unwrap();
         drop(store);
         let mut store = CsrStore::open(&d).unwrap();
         assert_eq!(store.tail_len(), 2);
-        assert_eq!(store.get(1, 5), Some(vec![(2, 0), (3, 0)]));
+        assert_eq!(store.get(S, 1, 5), Some(vec![(2, 0), (3, 0)]));
         store.seal().unwrap();
         assert_eq!((store.tail_len(), store.segment_count()), (0, 1));
         drop(store);
         let store = CsrStore::open(&d).unwrap();
         assert_eq!(store.tail_len(), 0);
-        assert_eq!(store.get(1, 5), Some(vec![(2, 0), (3, 0)]));
-        assert_eq!(store.get(3, 2000), Some(vec![(5, 9)]));
-        assert_eq!(store.get(1, 6), None);
+        assert_eq!(store.get(S, 1, 5), Some(vec![(2, 0), (3, 0)]));
+        assert_eq!(store.get(S, 3, 2000), Some(vec![(5, 9)]));
+        assert_eq!(store.get(S, 1, 6), None);
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -345,13 +360,13 @@ mod tests {
     fn rows_are_immutable_and_a_torn_tail_record_is_dropped() {
         let d = dir("torn");
         let mut store = CsrStore::open(&d).unwrap();
-        store.append(1, false, 7, &[(1, 0)]).unwrap();
-        store.append(1, false, 7, &[(1, 0)]).unwrap();
+        store.append(S, 1, false, 7, &[(1, 0)]).unwrap();
+        store.append(S, 1, false, 7, &[(1, 0)]).unwrap();
         assert!(matches!(
-            store.append(1, false, 7, &[(2, 0)]),
+            store.append(S, 1, false, 7, &[(2, 0)]),
             Err(CsrStoreError::Collision)
         ));
-        store.append(1, false, 8, &[(1, 0)]).unwrap();
+        store.append(S, 1, false, 8, &[(1, 0)]).unwrap();
         store.sync().unwrap();
         drop(store);
         let log = d.join(TAIL_FILE);
@@ -363,8 +378,22 @@ mod tests {
             .set_len(len - 3)
             .unwrap();
         let store = CsrStore::open(&d).unwrap();
-        assert_eq!(store.get(1, 7), Some(vec![(1, 0)]));
-        assert_eq!(store.get(1, 8), None);
+        assert_eq!(store.get(S, 1, 7), Some(vec![(1, 0)]));
+        assert_eq!(store.get(S, 1, 8), None);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn scopes_share_one_store_without_mixing_rows() {
+        let d = dir("scopes");
+        let mut store = CsrStore::open(&d).unwrap();
+        store.append(S, 1, false, 5, &[(2, 0)]).unwrap();
+        store.append(T, 1, false, 5, &[(3, 0)]).unwrap();
+        store.seal().unwrap();
+        let store = CsrStore::open(&d).unwrap();
+        assert_eq!(store.get(S, 1, 5), Some(vec![(2, 0)]));
+        assert_eq!(store.get(T, 1, 5), Some(vec![(3, 0)]));
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 2, "tail.log + one segment");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -372,14 +401,14 @@ mod tests {
     fn newer_segments_do_not_hide_older_rows() {
         let d = dir("segs");
         let mut store = CsrStore::open(&d).unwrap();
-        store.append(1, false, 1, &[(9, 0)]).unwrap();
+        store.append(S, 1, false, 1, &[(9, 0)]).unwrap();
         store.seal().unwrap();
-        store.append(1, false, 2, &[(8, 0)]).unwrap();
+        store.append(S, 1, false, 2, &[(8, 0)]).unwrap();
         store.seal().unwrap();
         let store = CsrStore::open(&d).unwrap();
         assert_eq!(store.segment_count(), 2);
-        assert_eq!(store.get(1, 1), Some(vec![(9, 0)]));
-        assert_eq!(store.get(1, 2), Some(vec![(8, 0)]));
+        assert_eq!(store.get(S, 1, 1), Some(vec![(9, 0)]));
+        assert_eq!(store.get(S, 1, 2), Some(vec![(8, 0)]));
         let _ = fs::remove_dir_all(&d);
     }
 }
