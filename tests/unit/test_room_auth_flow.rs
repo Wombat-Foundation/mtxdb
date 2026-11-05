@@ -8,9 +8,8 @@
 use std::path::PathBuf;
 
 use mtxdb::room_auth::{NewEvent, RoomAuth, RoomAuthError};
-use mtxdb::{Database, ShardType};
+use mtxdb::Database;
 
-const POOL: ShardType = ShardType::Edges;
 const ROOM: &str = "!flow:example.org";
 const CYCLIC_ROOM: &str = "!cyclic:example.org";
 const EVENTS: usize = 40;
@@ -92,9 +91,9 @@ fn assert_chains(room: &RoomAuth, db: &Database, when: &str) {
     );
 }
 
-/// Rewrite every collection of the edges pool in place, keeping everything.
+/// Rewrite every collection of the state pool in place, keeping everything.
 fn repack(db: &Database) {
-    let storage = db.edges();
+    let storage = db.state();
     for collection in storage.collection_ids() {
         let (_kept, dropped) = storage
             .repack_collection_reachable(&collection, |_, _| Vec::new())
@@ -107,7 +106,7 @@ fn repack(db: &Database) {
 fn import_query_rebuild_reopen_repack_verify() {
     let dir = root("flow");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
 
     // Import, then query before any closure exists: correct through the lazy walk.
     import(&room, &db);
@@ -143,7 +142,7 @@ fn import_query_rebuild_reopen_repack_verify() {
 
     // A rebuild that fails leaves the room exactly as it was. The cyclic room
     // is a separate room, so the first room is the control for "untouched".
-    let cyclic = RoomAuth::new(POOL, CYCLIC_ROOM);
+    let cyclic = RoomAuth::new(CYCLIC_ROOM);
     cyclic
         .record_event(
             &db,
@@ -185,7 +184,7 @@ fn import_query_rebuild_reopen_repack_verify() {
     // Reopen: the same generation resolves, answers and verify are unchanged.
     drop(db);
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     assert_eq!(
         room.snapshot(&db).unwrap().generation(),
         Some(latest.generation)

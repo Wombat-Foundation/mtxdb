@@ -3,10 +3,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
+    use crate::csr_adjacency::CsrAdjacency;
     use crate::database::{Database, DatabaseTransaction};
     use crate::interop::{
-        auth_counter_record_id, auth_reverse_record_id, decode_verdict, encode_auth_counter,
-        encode_verdict, event_record_id, event_verdict_collection_id, room_auth_collection_id,
+        decode_verdict, encode_verdict, event_record_id, event_verdict_collection_id,
         room_event_collection_id, room_flag_collection_id, Verdict,
     };
     use crate::layout::ShardType;
@@ -309,26 +309,11 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!reverse:example.com";
         let index = RoomFlagIndex::new(room_id);
-        let auth_col = room_auth_collection_id(room_id);
 
-        // Populate auth reverse records
-        let tx = db.begin_transaction();
         let ev1 = b"$event_1:example.com";
         let ev2 = b"$event_2:example.com";
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_reverse_record_id(1),
-            &NodeData::new(bytes::Bytes::from_static(ev1)),
-        )
-        .unwrap();
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_reverse_record_id(2),
-            &NodeData::new(bytes::Bytes::from_static(ev2)),
-        )
-        .unwrap();
+        seed_shorts(&db, room_id, &[ev1, ev2]);
+        let tx = db.begin_transaction();
 
         index
             .stage(
@@ -364,7 +349,6 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!rebuild:example.com";
         let index = RoomFlagIndex::new(room_id);
-        let auth_col = room_auth_collection_id(room_id);
         let event_col = room_event_collection_id(room_id);
 
         let ev1 = b"$rebuild_ev1:example.com";
@@ -372,30 +356,8 @@ mod tests {
         let node1 = event_record_id(ev1);
         let node2 = event_record_id(ev2);
 
+        seed_shorts(&db, room_id, &[ev1, ev2]);
         let tx = db.begin_transaction();
-        // 1. Counter = 2
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_counter_record_id(),
-            &NodeData::new(bytes::Bytes::from(encode_auth_counter(2).to_vec())),
-        )
-        .unwrap();
-        // 2. Reverse records
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_reverse_record_id(1),
-            &NodeData::new(bytes::Bytes::from_static(ev1)),
-        )
-        .unwrap();
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_reverse_record_id(2),
-            &NodeData::new(bytes::Bytes::from_static(ev2)),
-        )
-        .unwrap();
         // 3. Event payloads in room_event_collection
         tx.put(
             ShardType::EventDag,
@@ -544,7 +506,6 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!bench:example.com";
         let index = RoomFlagIndex::new(room_id);
-        let auth_col = room_auth_collection_id(room_id);
         let event_col = room_event_collection_id(room_id);
 
         let mut flag_changes = Vec::new();
@@ -557,13 +518,6 @@ mod tests {
             let node_id = event_record_id(&eid_bytes);
             all_event_ids.push((eid_bytes.clone(), node_id));
 
-            tx.put(
-                ShardType::Edges,
-                auth_col,
-                auth_reverse_record_id(i),
-                &NodeData::new(bytes::Bytes::from(eid_bytes.clone())),
-            )
-            .unwrap();
             tx.put(
                 ShardType::EventDag,
                 event_col,
@@ -831,6 +785,7 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!gen_swap:example.com";
         let index = RoomFlagIndex::new(room_id);
+        seed_shorts(&db, room_id, &[b"$ev1:example.com"]);
         let tx = db.begin_transaction();
         seed_single_event_room(&tx, room_id);
         tx.commit().unwrap();
@@ -855,27 +810,23 @@ mod tests {
         assert_eq!(index.count(&db, &FlagQuery::has(Flag::Present)).unwrap(), 1);
     }
 
+    /// Allocate room short ids 1..=n for `ids`, in order, through the room's
+    /// adjacency event scope.
+    fn seed_shorts(db: &Database, room_id: &[u8], ids: &[&[u8]]) {
+        let adjacency = CsrAdjacency::new(std::str::from_utf8(room_id).unwrap());
+        for id in ids {
+            adjacency
+                .record_event(db, std::str::from_utf8(id).unwrap(), &[], &[], None)
+                .unwrap();
+        }
+    }
+
     /// Seeds a room with one event (`$ev1:example.com`, auth counter 1) so the
     /// rebuild tests start from the same minimal authorised-event state.
     fn seed_single_event_room(tx: &DatabaseTransaction<'_>, room_id: &[u8]) {
-        let auth_col = room_auth_collection_id(room_id);
         let event_col = room_event_collection_id(room_id);
         let ev1 = b"$ev1:example.com";
         let node1 = event_record_id(ev1);
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_counter_record_id(),
-            &NodeData::new(bytes::Bytes::from(encode_auth_counter(1).to_vec())),
-        )
-        .unwrap();
-        tx.put(
-            ShardType::Edges,
-            auth_col,
-            auth_reverse_record_id(1),
-            &NodeData::new(bytes::Bytes::from_static(ev1)),
-        )
-        .unwrap();
         tx.put(
             ShardType::EventDag,
             event_col,
@@ -934,6 +885,7 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!concurrent:example.com";
         let index = RoomFlagIndex::new(room_id);
+        seed_shorts(&db, room_id, &[b"$ev1:example.com"]);
         let tx = db.begin_transaction();
         seed_single_event_room(&tx, room_id);
         index
@@ -1027,6 +979,7 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!rebuild_race:example.com";
         let index = RoomFlagIndex::new(room_id);
+        seed_shorts(&db, room_id, &[b"$ev1:example.com"]);
         let tx = db.begin_transaction();
         seed_single_event_room(&tx, room_id);
         index
@@ -1085,6 +1038,7 @@ mod tests {
         let db = Database::open(root.path().to_path_buf()).unwrap();
         let room_id = b"!crash:example.com";
         let index = RoomFlagIndex::new(room_id);
+        seed_shorts(&db, room_id, &[b"$ev1:example.com"]);
         let tx = db.begin_transaction();
         seed_single_event_room(&tx, room_id);
         tx.commit().unwrap();

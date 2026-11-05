@@ -1388,7 +1388,7 @@ fn two_rooted_pools_open_in_one_process_without_self_blocking() {
     let state = ShardPool::open(layout.pool_path(crate::layout::ShardType::State));
     // The first standalone writer owns the root lock; a second one must fail
     // fast rather than block forever on the same file.
-    let second = ShardPool::open(layout.pool_path(crate::layout::ShardType::Edges));
+    let second = ShardPool::open(layout.pool_path(crate::layout::ShardType::ServerInfo));
     assert!(state.is_ok());
     assert_eq!(
         second.err().map(|e| e.kind()),

@@ -22,8 +22,7 @@
 
 use crate::{
     derive_group_full_id, derive_member_collection_id_from_group, storage::StorageError, ShardType,
-    MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT, MEMBER_NAMESPACE_FLAG, MEMBER_NAMESPACE_PREV,
-    MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP,
+    MEMBER_NAMESPACE_EVNT, MEMBER_NAMESPACE_FLAG, MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP,
 };
 
 /// Serialized `rezzy::hamt::RootHandle` length used by the server's state
@@ -458,9 +457,6 @@ pub fn decode_server_key(bytes: &[u8]) -> Result<(&[u8], &[u8]), StorageError> {
 /// Pool holding event bodies, event locators and verdicts.
 pub const EVENT_POOL: ShardType = ShardType::EventDag;
 
-/// Pool holding the prev and auth edge records.
-pub const EDGE_POOL: ShardType = ShardType::Edges;
-
 /// Pool holding signing keys and the import marker.
 pub const SERVER_INFO_POOL: ShardType = ShardType::ServerInfo;
 
@@ -484,18 +480,6 @@ fn room_member_collection(namespace: [u8; 4], room_id: &[u8]) -> [u8; 16] {
 #[must_use]
 pub fn room_event_collection_id(room_id: &[u8]) -> [u8; 16] {
     room_member_collection(MEMBER_NAMESPACE_EVNT, room_id)
-}
-
-/// Derive the collection holding a room's prev-event edge lists.
-#[must_use]
-pub fn room_prev_collection_id(room_id: &[u8]) -> [u8; 16] {
-    room_member_collection(MEMBER_NAMESPACE_PREV, room_id)
-}
-
-/// Derive the collection holding a room's auth-event edge lists.
-#[must_use]
-pub fn room_auth_collection_id(room_id: &[u8]) -> [u8; 16] {
-    room_member_collection(MEMBER_NAMESPACE_AUTH, room_id)
 }
 
 /// Derive the collection holding a room's flag bitmaps.
@@ -556,100 +540,6 @@ pub fn decode_event_locator(bytes: &[u8]) -> Result<(&[u8], &[u8]), StorageError
         return Err(malformed());
     }
     Ok(rest.split_at(length))
-}
-
-/// Encode an edge list (prev or auth) as repeated `[u32 LE length][event id]`.
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] if an id does not fit its length prefix.
-pub fn encode_edges(edges: &[&[u8]]) -> Result<Vec<u8>, StorageError> {
-    let too_large = || StorageError::Corrupt("event edge is too large".to_owned());
-    let mut out = Vec::new();
-    for edge in edges {
-        let length = u32::try_from(edge.len()).map_err(|_| too_large())?;
-        out.extend_from_slice(&length.to_le_bytes());
-        out.extend_from_slice(edge);
-    }
-    Ok(out)
-}
-
-/// Record id of the per-room auth short-id counter (big-endian `u32`).
-#[must_use]
-pub fn auth_counter_record_id() -> [u8; 16] {
-    derive_id(b"authchain:counter", b"")
-}
-
-/// Record id of an event's forward short-id record in the room auth collection.
-#[must_use]
-pub fn auth_forward_record_id(event_id: &[u8]) -> [u8; 16] {
-    derive_id(b"authchain:fwd", event_id)
-}
-
-/// Record id of a short id's reverse record (the event id).
-#[must_use]
-pub fn auth_reverse_record_id(short: u32) -> [u8; 16] {
-    derive_id(b"authchain:rev", &short.to_be_bytes())
-}
-
-/// Record id of a short id's closure bitmap.
-#[must_use]
-pub fn auth_closure_record_id(short: u32) -> [u8; 16] {
-    derive_id(b"authchain:closure", &short.to_be_bytes())
-}
-
-/// Forward short-id record: `[u32 BE short][event id]`. The event id lets a
-/// reader reject a record that merely shares the 128-bit key.
-#[must_use]
-pub fn encode_auth_forward(short: u32, event_id: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(event_id.len().saturating_add(4));
-    out.extend_from_slice(&short.to_be_bytes());
-    out.extend_from_slice(event_id);
-    out
-}
-
-/// Decode a forward short-id record.
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] for a record shorter than its prefix.
-pub fn decode_auth_forward(bytes: &[u8]) -> Result<(u32, &[u8]), StorageError> {
-    let (short, event) = bytes
-        .split_first_chunk::<4>()
-        .ok_or_else(|| StorageError::Corrupt("malformed auth short-id record".to_owned()))?;
-    Ok((u32::from_be_bytes(*short), event))
-}
-
-/// Decode the per-room short-id counter.
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] unless the record is exactly four bytes.
-pub fn decode_auth_counter(bytes: &[u8]) -> Result<u32, StorageError> {
-    <[u8; 4]>::try_from(bytes)
-        .map(u32::from_be_bytes)
-        .map_err(|_| StorageError::Corrupt("malformed auth counter".to_owned()))
-}
-
-/// Encode the per-room short-id counter as big-endian `u32`.
-#[must_use]
-pub const fn encode_auth_counter(value: u32) -> [u8; 4] {
-    value.to_be_bytes()
-}
-
-/// Decode an edge list written by [`encode_edges`].
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] for a truncated record.
-pub fn decode_edges(bytes: &[u8]) -> Result<Vec<Vec<u8>>, StorageError> {
-    let malformed = || StorageError::Corrupt("malformed event edge record".to_owned());
-    let mut edges = Vec::new();
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        let (length, tail) = rest.split_first_chunk::<4>().ok_or_else(malformed)?;
-        let length = usize::try_from(u32::from_le_bytes(*length)).map_err(|_| malformed())?;
-        let (edge, tail) = tail.split_at_checked(length).ok_or_else(malformed)?;
-        edges.push(edge.to_vec());
-        rest = tail;
-    }
-    Ok(edges)
 }
 
 /// Version byte of the import-marker value encoding.

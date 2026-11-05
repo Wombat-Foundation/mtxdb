@@ -251,14 +251,6 @@ fn event_collection_ids_are_pinned() {
         "9507be45c492c4382edb18fc074477cc"
     );
     assert_eq!(
-        hex(&room_prev_collection_id(room)),
-        "fea9a58f0ab869317d696093fd7c6173"
-    );
-    assert_eq!(
-        hex(&room_auth_collection_id(room)),
-        "4842a2eff3cf511f9e48406350253c77"
-    );
-    assert_eq!(
         hex(&event_locator_collection_id(&node)),
         "8630e25f0c7e1a94558485e7176a1bda"
     );
@@ -286,24 +278,6 @@ fn locator_encoding_is_pinned_and_round_trips() {
 }
 
 #[test]
-fn edge_encoding_is_pinned_and_round_trips() {
-    let bytes = encode_edges(&[b"$a", b"$bc"]).unwrap();
-    assert_eq!(
-        bytes,
-        [&[2, 0, 0, 0][..], b"$a", &[3, 0, 0, 0], b"$bc"].concat()
-    );
-    assert_eq!(
-        decode_edges(&bytes).unwrap(),
-        vec![b"$a".to_vec(), b"$bc".to_vec()]
-    );
-    assert_eq!(encode_edges(&[]).unwrap(), Vec::<u8>::new());
-    assert_eq!(decode_edges(&[]).unwrap(), Vec::<Vec<u8>>::new());
-    for cut in [1, 3, 5, 8] {
-        assert!(decode_edges(&bytes[..cut]).is_err(), "cut at {cut}");
-    }
-}
-
-#[test]
 fn outlier_flag_is_part_of_the_verdict_record() {
     let outlier = Verdict {
         outlier: true,
@@ -322,45 +296,6 @@ fn outlier_flag_is_part_of_the_verdict_record() {
             .1
             .outlier
     );
-}
-
-#[test]
-fn auth_chain_records_are_pinned_and_round_trip() {
-    assert_eq!(
-        hex(&auth_counter_record_id()),
-        "82f29a189df9d4f1ce570f12c1d2c503"
-    );
-    assert_eq!(
-        hex(&auth_forward_record_id(b"$e:x")),
-        "a4bcb32a1124a90417ed80a8e041c52e"
-    );
-    assert_eq!(
-        hex(&auth_reverse_record_id(7)),
-        "1c1be185af0d4bceb68f842fb6203b27"
-    );
-    assert_eq!(
-        hex(&auth_closure_record_id(7)),
-        "9f23b01a4899ca947d360350824645da"
-    );
-    assert_ne!(auth_reverse_record_id(7), auth_closure_record_id(7));
-    assert_ne!(auth_reverse_record_id(7), auth_reverse_record_id(8));
-
-    let forward = encode_auth_forward(0x0102_0304, b"$e:x");
-    assert_eq!(forward, [&[1, 2, 3, 4][..], b"$e:x"].concat());
-    assert_eq!(
-        decode_auth_forward(&forward).unwrap(),
-        (0x0102_0304, &b"$e:x"[..])
-    );
-    for cut in 0..4 {
-        assert!(
-            decode_auth_forward(&forward[..cut]).is_err(),
-            "cut at {cut}"
-        );
-    }
-    assert_eq!(decode_auth_counter(&9_u32.to_be_bytes()).unwrap(), 9);
-    assert_eq!(decode_auth_counter(&encode_auth_counter(9)).unwrap(), 9);
-    assert!(decode_auth_counter(&[0, 0, 9]).is_err());
-    assert!(decode_auth_counter(&[0, 0, 0, 0, 9]).is_err());
 }
 
 #[test]

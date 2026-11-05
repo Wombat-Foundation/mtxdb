@@ -595,10 +595,7 @@ fn server_info_is_a_shared_wal_transaction_pool() {
     transaction
         .put(ShardType::State, collection, node(5), &data(b"state"))
         .unwrap();
-    assert_eq!(
-        transaction.stage.touched_pools(),
-        [true, false, false, true]
-    );
+    assert_eq!(transaction.stage.touched_pools(), [true, false, true]);
 
     transaction.commit().unwrap();
     let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
@@ -1369,7 +1366,7 @@ fn repeated_syncs_keep_the_shared_wal_bounded_with_only_event_dag_active() {
 
 #[test]
 fn repeated_syncs_keep_the_shared_wal_bounded_with_only_edges_active() {
-    assert_wal_bounded("wal_bounded_edges", &[ShardType::Edges]);
+    assert_wal_bounded("wal_bounded_edges", &[ShardType::ServerInfo]);
 }
 
 /// With two contributing pools the segment is only reclaimable once both
@@ -1397,11 +1394,11 @@ fn overlay_is_activated_only_on_the_pools_a_transaction_stages() {
     let txn = db.begin_transaction();
     txn.put(ShardType::EventDag, collection, node(1), &data(b"staged"))
         .unwrap();
-    assert_eq!(txn.stage.touched_pools(), [false, true, false, false]);
+    assert_eq!(txn.stage.touched_pools(), [false, true, false]);
     let overlay = activate_for(&db, &txn.stage);
     assert!(db.pool(ShardType::EventDag).read_journal_installed());
     assert!(!db.pool(ShardType::State).read_journal_installed());
-    assert!(!db.pool(ShardType::Edges).read_journal_installed());
+    assert!(!db.pool(ShardType::ServerInfo).read_journal_installed());
     drop(overlay);
     assert!(!db.pool(ShardType::EventDag).read_journal_installed());
     // A transaction that stages for two pools touches exactly those two.
@@ -1410,9 +1407,9 @@ fn overlay_is_activated_only_on_the_pools_a_transaction_stages() {
         .put(ShardType::State, collection, node(2), &data(b"state"))
         .unwrap();
     mixed
-        .put(ShardType::Edges, collection, node(3), &data(b"edge"))
+        .put(ShardType::ServerInfo, collection, node(3), &data(b"info"))
         .unwrap();
-    assert_eq!(mixed.stage.touched_pools(), [true, false, true, false]);
+    assert_eq!(mixed.stage.touched_pools(), [true, false, true]);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2044,7 +2041,7 @@ fn transaction_commit_applies_and_publishes_once() {
 fn versioned_transaction_read_rejects_stale_commit_and_retries() {
     let root = test_root("versioned_transaction_read");
     let db = Database::open(root.clone()).unwrap();
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x73; 16];
     let key = node(1);
     let other_key = node(2);
@@ -2141,7 +2138,7 @@ fn versioned_transaction_read_rejects_stale_commit_and_retries() {
 fn versioned_transaction_byte_read_preserves_payload_without_reencoding() {
     let root = test_root("versioned_transaction_bytes");
     let db = Database::open(root.clone()).unwrap();
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x74; 16];
     let key = node(1);
 
@@ -2166,7 +2163,7 @@ fn versioned_transaction_byte_read_preserves_payload_without_reencoding() {
 fn versioned_read_retries_when_publication_is_not_materialized() {
     let root = test_root("versioned_read_unmaterialized");
     let db = Database::open(root.clone()).unwrap();
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x75; 16];
     let key = node(1);
 
@@ -2196,7 +2193,7 @@ fn versioned_read_retries_when_publication_is_not_materialized() {
 fn versioned_read_after_a_journaled_removal_is_not_left_pending() {
     let root = test_root("versioned_read_after_removal");
     let db = Database::open(root.clone()).unwrap();
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x76; 16];
     let key = node(1);
 
@@ -2225,7 +2222,7 @@ fn versioned_point_reads_match_their_token_during_concurrent_publication() {
 
     let root = test_root("versioned_point_read_concurrent");
     let db = Arc::new(Database::open(root.clone()).unwrap());
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x74; 16];
     let key = node(3);
 
@@ -2612,7 +2609,7 @@ fn replayed_cross_pool_group_lifts_every_touched_pools_boundary() {
         for id in 1..=2u8 {
             transaction
                 .put(
-                    ShardType::Edges,
+                    ShardType::ServerInfo,
                     edge_collection,
                     node(id),
                     &NodeData::new(bytes::Bytes::from_static(b"edge")),
@@ -2627,7 +2624,7 @@ fn replayed_cross_pool_group_lifts_every_touched_pools_boundary() {
     let database = Database::open(root.clone()).unwrap();
     for (pool, collection, id) in [
         (ShardType::EventDag, event_collection, node(1)),
-        (ShardType::Edges, edge_collection, node(2)),
+        (ShardType::ServerInfo, edge_collection, node(2)),
     ] {
         let (records, _) = database
             .pool(pool)
@@ -3169,15 +3166,16 @@ fn open_with_policies_applies_per_pool_settings() {
     let root = test_root("explicit_policies");
     let mut policies = super::PoolPolicies::default();
     policies.for_shard_mut(ShardType::State).compress = false;
-    policies.for_shard_mut(ShardType::Edges).checksum_policy =
-        crate::packfile::ChecksumPolicy::WriteOnly;
+    policies
+        .for_shard_mut(ShardType::ServerInfo)
+        .checksum_policy = crate::packfile::ChecksumPolicy::WriteOnly;
 
     let db = Database::open_with_policies(root.clone(), policies).unwrap();
     assert!(!db.state().is_compression_enabled());
     assert!(db.event_dag().is_compression_enabled());
-    assert!(db.edges().is_compression_enabled());
+    assert!(db.server_info().is_compression_enabled());
     assert_eq!(
-        db.edges().checksum_policy(),
+        db.server_info().checksum_policy(),
         crate::packfile::ChecksumPolicy::WriteOnly
     );
     drop(db);
@@ -3197,7 +3195,7 @@ fn concurrent_versioned_rmw_keeps_every_update() {
 
     let root = test_root("concurrent_versioned_rmw");
     let db = Arc::new(Database::open(root.clone()).unwrap());
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x7au8; 16];
     let key = node(1);
 
@@ -3794,22 +3792,22 @@ fn pools_are_created_by_their_first_write() {
     );
 
     database
-        .pool(ShardType::Edges)
-        .put(&[9; 16], &node(1), &data(b"edge"))
+        .pool(ShardType::ServerInfo)
+        .put(&[9; 16], &node(1), &data(b"info"))
         .unwrap();
-    assert_eq!(pool_dirs(&root), vec!["mtpl-edges".to_owned()]);
+    assert_eq!(pool_dirs(&root), vec!["mtpl-server-info".to_owned()]);
     database.coordinator().sync().unwrap();
     drop(database);
 
     let reopened = Database::open(root.clone()).unwrap();
-    assert_eq!(pool_dirs(&root), vec!["mtpl-edges".to_owned()]);
+    assert_eq!(pool_dirs(&root), vec!["mtpl-server-info".to_owned()]);
     assert_eq!(
         reopened
-            .pool(ShardType::Edges)
+            .pool(ShardType::ServerInfo)
             .get(&[9; 16], &node(1))
             .unwrap()
             .map(|d| d.bytes.to_vec()),
-        Some(b"edge".to_vec())
+        Some(b"info".to_vec())
     );
 }
 
@@ -3991,18 +3989,20 @@ fn a_committed_delete_collection_hides_synced_records() {
     let db = Database::open(root.clone()).unwrap();
     let doomed = [0x71_u8; 16];
     let put = db.begin_transaction();
-    put.put(ShardType::Edges, doomed, node(1), &data(b"doomed"))
+    put.put(ShardType::ServerInfo, doomed, node(1), &data(b"doomed"))
         .unwrap();
     put.commit().unwrap();
-    db.pool(ShardType::Edges).sync_all().unwrap();
+    db.pool(ShardType::ServerInfo).sync_all().unwrap();
 
     let delete = db.begin_transaction();
-    delete.delete_collection(ShardType::Edges, doomed).unwrap();
+    delete
+        .delete_collection(ShardType::ServerInfo, doomed)
+        .unwrap();
     delete.commit().unwrap();
 
     let read = db.begin_transaction();
     let (records, _) = read
-        .get_with_record_versions(ShardType::Edges, &doomed, &[node(1)])
+        .get_with_record_versions(ShardType::ServerInfo, &doomed, &[node(1)])
         .unwrap();
     assert!(records[0].is_none(), "the deleted record is still readable");
     drop(read);
@@ -4017,21 +4017,23 @@ fn repacking_a_deleted_collection_does_not_resurrect_it() {
     let db = Database::open(root.clone()).unwrap();
     let doomed = [0x71_u8; 16];
     let put = db.begin_transaction();
-    put.put(ShardType::Edges, doomed, node(1), &data(b"doomed"))
+    put.put(ShardType::ServerInfo, doomed, node(1), &data(b"doomed"))
         .unwrap();
     put.commit().unwrap();
     let delete = db.begin_transaction();
-    delete.delete_collection(ShardType::Edges, doomed).unwrap();
+    delete
+        .delete_collection(ShardType::ServerInfo, doomed)
+        .unwrap();
     delete.commit().unwrap();
     let read = |db: &Database| {
         db.begin_transaction()
-            .get_with_record_versions(ShardType::Edges, &doomed, &[node(1)])
+            .get_with_record_versions(ShardType::ServerInfo, &doomed, &[node(1)])
             .unwrap()
             .0[0]
             .is_some()
     };
     assert!(!read(&db), "the delete itself must take effect");
-    db.pool(ShardType::Edges)
+    db.pool(ShardType::ServerInfo)
         .repack_collection_reachable(&doomed, |_, _| Vec::new())
         .unwrap();
     assert!(!read(&db), "the repack brought the deleted record back");
@@ -4049,23 +4051,23 @@ fn a_deleted_collection_can_be_recreated_and_read() {
     let collection = [0x71_u8; 16];
     let write = |id: u8, payload: &'static [u8]| {
         let txn = db.begin_transaction();
-        txn.put(ShardType::Edges, collection, node(id), &data(payload))
+        txn.put(ShardType::ServerInfo, collection, node(id), &data(payload))
             .unwrap();
         txn.commit().unwrap();
     };
     let read = |id: u8| {
         db.begin_transaction()
-            .get_with_record_versions(ShardType::Edges, &collection, &[node(id)])
+            .get_with_record_versions(ShardType::ServerInfo, &collection, &[node(id)])
             .unwrap()
             .0[0]
             .as_ref()
             .map(|record| record.bytes.to_vec())
     };
     write(1, b"old");
-    db.pool(ShardType::Edges).sync_all().unwrap();
+    db.pool(ShardType::ServerInfo).sync_all().unwrap();
     let delete = db.begin_transaction();
     delete
-        .delete_collection(ShardType::Edges, collection)
+        .delete_collection(ShardType::ServerInfo, collection)
         .unwrap();
     delete.commit().unwrap();
     assert_eq!(read(1), None);
@@ -4076,12 +4078,12 @@ fn a_deleted_collection_can_be_recreated_and_read() {
         None,
         "the deleted record came back with the new one"
     );
-    db.pool(ShardType::Edges).sync_all().unwrap();
+    db.pool(ShardType::ServerInfo).sync_all().unwrap();
     drop(db);
     let db = Database::open(root.clone()).unwrap();
     let after = db
         .begin_transaction()
-        .get_with_record_versions(ShardType::Edges, &collection, &[node(1), node(2)])
+        .get_with_record_versions(ShardType::ServerInfo, &collection, &[node(1), node(2)])
         .unwrap()
         .0;
     assert!(after[0].is_none() && after[1].is_some());
@@ -4098,18 +4100,18 @@ fn a_miss_after_a_sync_does_not_refresh_the_collection() {
     let collection = [0x74_u8; 16];
     for round in 0..3_u8 {
         let txn = db.begin_transaction();
-        txn.put(ShardType::Edges, collection, node(round), &data(b"x"))
+        txn.put(ShardType::ServerInfo, collection, node(round), &data(b"x"))
             .unwrap();
         txn.commit().unwrap();
-        db.pool(ShardType::Edges).sync_all().unwrap();
+        db.pool(ShardType::ServerInfo).sync_all().unwrap();
         // A first-time key: absent, as every new event's forward record is.
         let missing = db
-            .pool(ShardType::Edges)
+            .pool(ShardType::ServerInfo)
             .get_many_with_refresh(&collection, &[node(100 + round)])
             .unwrap();
         assert!(missing[0].is_none());
     }
-    let stats = db.pool(ShardType::Edges).stats();
+    let stats = db.pool(ShardType::ServerInfo).stats();
     assert_eq!(stats.miss_refreshes, 0, "a miss rescanned the collection");
     drop(db);
     let _ = std::fs::remove_dir_all(&root);

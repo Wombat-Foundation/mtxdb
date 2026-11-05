@@ -12070,7 +12070,7 @@ fn one_pools_undurable_checkpoint_keeps_the_shared_wal_for_the_other_directory()
         .unwrap();
     let store_b = PackfileStorage::open(dir_b.clone()).unwrap();
     store_b
-        .enable_shared_journal(Arc::clone(&coordinator), ShardType::Edges)
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::ServerInfo)
         .unwrap();
     for (store, tag) in [(&store_a, 1_u8), (&store_b, 2_u8)] {
         store
@@ -12110,7 +12110,7 @@ fn one_pools_undurable_checkpoint_keeps_the_shared_wal_for_the_other_directory()
     });
     let reopened = PackfileStorage::open(image_b).unwrap();
     reopened
-        .enable_shared_journal(Arc::clone(&coordinator), ShardType::Edges)
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::ServerInfo)
         .unwrap();
     reopened.replay_journal().unwrap();
     assert_eq!(

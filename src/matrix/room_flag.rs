@@ -10,13 +10,14 @@ use std::collections::HashMap;
 use bytes::Bytes;
 
 use crate::bitmap_set::{BitmapSet, DomainTag};
+use crate::csr_adjacency::CsrAdjacency;
 use crate::database::{Database, DatabaseTransaction};
 use crate::interop::{
-    auth_counter_record_id, auth_reverse_record_id, decode_auth_counter, decode_verdict, derive_id,
-    event_record_id, event_verdict_collection_id, room_auth_collection_id,
+    decode_verdict, derive_id, event_record_id, event_verdict_collection_id,
     room_event_collection_id, room_flag_collection_id,
 };
 use crate::layout::ShardType;
+use crate::short_id::ShortIdIndex;
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
 use crate::timeline::{room_scope_id, TimelineIndex};
 
@@ -284,8 +285,7 @@ impl FlagQuery {
 pub struct RoomFlagIndex {
     pool: ShardType,
     collection: [u8; 16],
-    auth_pool: ShardType,
-    auth_collection: [u8; 16],
+    events: ShortIdIndex,
     domain: DomainTag,
     room_id: Vec<u8>,
 }
@@ -300,7 +300,8 @@ pub(crate) struct RebuildInputs {
 }
 
 impl RoomFlagIndex {
-    /// Create a room flag index using default event pool for flags and edge pool for auth.
+    /// Create a room flag index using the default event pool for flags and the
+    /// state pool for auth sidecars.
     #[must_use]
     pub fn new(room_id: &[u8]) -> Self {
         Self::with_pool(ShardType::EventDag, room_id)
@@ -309,20 +310,14 @@ impl RoomFlagIndex {
     /// Create a room flag index with a specific shard pool for the flags collection.
     #[must_use]
     pub fn with_pool(pool: ShardType, room_id: &[u8]) -> Self {
-        Self::with_pools(pool, ShardType::Edges, room_id)
-    }
-
-    /// Create a room flag index specifying both the flags pool and the auth pool.
-    #[must_use]
-    pub fn with_pools(flag_pool: ShardType, auth_pool: ShardType, room_id: &[u8]) -> Self {
         let collection = room_flag_collection_id(room_id);
-        let auth_collection = room_auth_collection_id(room_id);
-        let domain = DomainTag::for_scope(auth_pool, &auth_collection);
+        let events = CsrAdjacency::new(&String::from_utf8_lossy(room_id)).events_index();
+        let (scope_pool, scope_collection) = events.scope();
+        let domain = DomainTag::for_scope(scope_pool, &scope_collection);
         Self {
-            pool: flag_pool,
+            pool,
             collection,
-            auth_pool,
-            auth_collection,
+            events,
             domain,
             room_id: room_id.to_vec(),
         }
@@ -338,12 +333,6 @@ impl RoomFlagIndex {
     #[must_use]
     pub const fn collection(&self) -> &[u8; 16] {
         &self.collection
-    }
-
-    /// The collection ID for this room's auth / short-id mappings.
-    #[must_use]
-    pub const fn auth_collection(&self) -> &[u8; 16] {
-        &self.auth_collection
     }
 
     /// The domain tag used by this room's bitmap chunks.
@@ -777,16 +766,7 @@ impl RoomFlagIndex {
 
         let mut event_ids = Vec::with_capacity(shorts.len());
         for batch in shorts.chunks(REVERSE_BATCH_SIZE) {
-            let record_ids: Vec<NodeId> = batch
-                .iter()
-                .map(|&short| auth_reverse_record_id(short))
-                .collect();
-            let nodes = db
-                .pool(self.auth_pool)
-                .get_many(&self.auth_collection, &record_ids)?;
-            for node in nodes.into_iter().flatten() {
-                event_ids.push(node.bytes.to_vec());
-            }
+            event_ids.extend(self.events.resolve(db, batch)?.into_iter().flatten());
         }
 
         Ok(event_ids)
@@ -892,13 +872,7 @@ impl RoomFlagIndex {
         // reading the counter afterwards keeps the scan bound consistent with
         // the snapshot the rebuilt index is published against.
         let (current_meta, new_gen, meta_token) = self.reserve_rebuild_generation(db)?;
-        let counter_raw = db
-            .pool(self.auth_pool)
-            .get(&self.auth_collection, &auth_counter_record_id())?;
-        let counter = match counter_raw {
-            Some(data) => decode_auth_counter(&data.bytes)?,
-            None => return Ok(0),
-        };
+        let counter = self.events.counter(db)?.saturating_sub(1);
         if counter == 0 {
             return Ok(0);
         }
@@ -1060,16 +1034,12 @@ impl RoomFlagIndex {
 
         // 1. Fetch reverse records for this batch of shorts
         let shorts: Vec<u32> = (start_id..=end_id).collect();
-        let reverse_keys: Vec<NodeId> = shorts.iter().map(|&s| auth_reverse_record_id(s)).collect();
-        let reverse_nodes = db
-            .pool(self.auth_pool)
-            .get_many(&self.auth_collection, &reverse_keys)?;
+        let reverse_nodes = self.events.resolve(db, &shorts)?;
 
         // 2. Map existing events and check event presence + verdicts
         let mut event_node_pairs = Vec::new();
         for (&short, node_opt) in shorts.iter().zip(reverse_nodes) {
-            if let Some(data) = node_opt {
-                let event_id = data.bytes.to_vec();
+            if let Some(event_id) = node_opt {
                 let node_id = event_record_id(&event_id);
                 event_node_pairs.push((short, event_id, node_id));
             }

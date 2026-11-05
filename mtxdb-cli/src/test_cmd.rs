@@ -13,7 +13,7 @@ use super::{
     meta_pools, meta_raw, overlay_auth_projection, pack_identity, parse_federation_input,
     parse_pack_id_selector, parse_pack_selectors, prepare_state_collection, pretty_print_payload,
     raw_auth_projection, raw_auth_projection_collection_id, raw_waiting_collection_id,
-    record_matrix_adjacency, record_raw_dependencies_and_waiting, redacted_event_bytes,
+    record_csr_adjacency, record_raw_dependencies_and_waiting, redacted_event_bytes,
     resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
     template_collection_id, template_event_id_node_id, template_node_id, topological_event_order,
     valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
@@ -2333,7 +2333,7 @@ fn raw_import_marks_only_missing_parents_in_waiting() {
     let missing_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
     let same_file_node = template_event_id_node_id(&template, "$same-file-auth").unwrap();
 
-    let edge_store = db.pool(ShardType::Edges);
+    let edge_store = db.pool(ShardType::ServerInfo);
     let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
 
     assert_eq!(
@@ -2378,7 +2378,7 @@ fn raw_import_maintains_waiting_set_on_parent_arrival() {
         "[]",
     );
     let parent_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
-    let edge_store = db.pool(ShardType::Edges);
+    let edge_store = db.pool(ShardType::ServerInfo);
     let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
 
     // File 1 supplies child citing missing parent
@@ -2428,7 +2428,7 @@ fn raw_import_waiting_writes_are_idempotent() {
         "[]",
     );
     let parent_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
-    let edge_store = db.pool(ShardType::Edges);
+    let edge_store = db.pool(ShardType::ServerInfo);
     let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
 
     edge_store.set_stats_enabled(true);
@@ -2535,7 +2535,7 @@ fn raw_import_does_not_mark_prior_stored_parent_as_missing() {
     )
     .unwrap();
 
-    let edge_store = db.pool(ShardType::Edges);
+    let edge_store = db.pool(ShardType::ServerInfo);
     let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
 
     // Critically: $prior-parent is NOT entered into raw_waiting because point lookup against
@@ -2834,7 +2834,7 @@ fn raw_import_records_waiting_parents() {
     let path = dir.join("room.jsonl");
     let store = db.event_dag();
     let state_store = db.state().as_ref();
-    let edge_store = db.pool(ShardType::Edges);
+    let edge_store = db.pool(ShardType::ServerInfo);
     let [create, join, stale, leave] = raw_late_parent_fixture();
 
     let mut established = HashSet::new();
@@ -2903,7 +2903,7 @@ fn raw_import_auth_chain_parent_clears_waiting() {
     let path = dir.join("room.jsonl");
     let store = db.event_dag();
     let state_store = db.state().as_ref();
-    let edge_store = db.pool(ShardType::Edges);
+    let edge_store = db.pool(ShardType::ServerInfo);
     let [create, join, stale, leave] = raw_late_parent_fixture();
 
     let mut established = HashSet::new();
@@ -2995,7 +2995,7 @@ fn raw_import_records_dependencies_for_federation_documents() {
     let template = default_matrix_import_template();
     let store = db.event_dag();
     let state_store = db.state().as_ref();
-    let edge_store = db.pool(ShardType::Edges);
+    let edge_store = db.pool(ShardType::ServerInfo);
     let mut established = HashSet::new();
 
     let first = dir.join("first.json");
@@ -3971,7 +3971,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         true,
     )
     .unwrap();
-    let auth_dir = pool_dir.parent().unwrap().join("mtpl-edges");
+    let auth_dir = pool_dir.parent().unwrap().join("mtpl-state");
     let first_import_records = count_pack_records(&auth_dir);
     let first_event_records = count_pack_records(&pool_dir);
     // Declares the create so batch_has_create resolves for any follow-up.
@@ -3999,7 +3999,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         first_event_records,
         "reimport must not append duplicate verdicts or flag chunks"
     );
-    let auth_store = db.edges().as_ref();
+    let auth_store = db.state().as_ref();
     let auth_col = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), b"!room");
     let meta = auth_store
         .get_collection_metadata(&auth_col)
@@ -5055,18 +5055,18 @@ fn adjacency_db(name: &str) -> (Database, PathBuf) {
     (Database::open(root.clone()).unwrap(), root)
 }
 
-fn room_adjacency(room: &str) -> mtxdb::matrix_adjacency::MatrixAdjacency {
-    mtxdb::matrix_adjacency::MatrixAdjacency::new(ShardType::Edges, room)
+fn room_adjacency(room: &str) -> mtxdb::csr_adjacency::CsrAdjacency {
+    mtxdb::csr_adjacency::CsrAdjacency::new(room)
 }
 
 #[test]
-fn matrix_adjacency_records_prev_auth_and_relation() {
+fn csr_adjacency_records_prev_auth_and_relation() {
     let (db, root) = adjacency_db("adjacency_basic");
     let template = default_matrix_import_template();
     let event = owned_value(
         r#"{"event_id":"$source","room_id":"!r:x","type":"m.room.message","prev_events":["$prev1",["$prev2",{}]],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$related"}}}"#,
     );
-    record_matrix_adjacency(&db, &template, std::slice::from_ref(&event)).unwrap();
+    record_csr_adjacency(&db, &template, std::slice::from_ref(&event)).unwrap();
 
     let adjacency = room_adjacency("!r:x");
     assert_eq!(
@@ -5079,7 +5079,7 @@ fn matrix_adjacency_records_prev_auth_and_relation() {
         Some(vec!["$auth".to_owned()])
     );
     let relation = adjacency
-        .relation_of(&db, "$source", &mtxdb::matrix_adjacency::AlwaysVisible)
+        .relation_of(&db, "$source", &mtxdb::csr_adjacency::AlwaysVisible)
         .unwrap()
         .expect("the relation is recorded");
     assert_eq!(
@@ -5088,14 +5088,14 @@ fn matrix_adjacency_records_prev_auth_and_relation() {
     );
 
     // Recording again is a no-op.
-    record_matrix_adjacency(&db, &template, &[event]).unwrap();
+    record_csr_adjacency(&db, &template, &[event]).unwrap();
     assert!(adjacency.verify(&db).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
+fn csr_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
     let (db, root) = adjacency_db("adjacency_leaf");
     let template = default_matrix_import_template();
     let leaf = owned_value(
@@ -5104,7 +5104,7 @@ fn matrix_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
     let child = owned_value(
         r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","prev_events":["$ghost"],"auth_events":["$leaf"]}"#,
     );
-    record_matrix_adjacency(&db, &template, &[leaf, child]).unwrap();
+    record_csr_adjacency(&db, &template, &[leaf, child]).unwrap();
 
     let adjacency = room_adjacency("!r:x");
     assert_eq!(adjacency.auth_of(&db, "$leaf").unwrap(), Some(Vec::new()));
@@ -5119,14 +5119,14 @@ fn matrix_adjacency_keeps_leaf_events_distinct_from_referenced_ones() {
 }
 
 #[test]
-fn matrix_adjacency_groups_duplicates_and_separates_rooms() {
+fn csr_adjacency_groups_duplicates_and_separates_rooms() {
     let (db, root) = adjacency_db("adjacency_rooms");
     let template = default_matrix_import_template();
     let event_a = owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
     let event_a_duplicate =
         owned_value(r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"]}"#);
     let event_b = owned_value(r#"{"event_id":"$same","room_id":"!b:x","prev_events":["$q"]}"#);
-    record_matrix_adjacency(&db, &template, &[event_a, event_a_duplicate, event_b]).unwrap();
+    record_csr_adjacency(&db, &template, &[event_a, event_a_duplicate, event_b]).unwrap();
 
     assert_eq!(
         room_adjacency("!a:x").prev_of(&db, "$same").unwrap(),
@@ -5141,14 +5141,14 @@ fn matrix_adjacency_groups_duplicates_and_separates_rooms() {
 }
 
 #[test]
-fn matrix_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
+fn csr_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
     let (db, root) = adjacency_db("adjacency_conflict");
     let template = default_matrix_import_template();
     let adjacency = room_adjacency("!a:x");
     let original = owned_value(
         r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"]}"#,
     );
-    record_matrix_adjacency(&db, &template, std::slice::from_ref(&original)).unwrap();
+    record_csr_adjacency(&db, &template, std::slice::from_ref(&original)).unwrap();
 
     // A later import whose event differs from the recorded one fails as a unit:
     // the good event before it is not recorded either.
@@ -5156,7 +5156,7 @@ fn matrix_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
     let conflicting = owned_value(
         r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$other"],"auth_events":["$auth"]}"#,
     );
-    let error = record_matrix_adjacency(&db, &template, &[fine, conflicting])
+    let error = record_csr_adjacency(&db, &template, &[fine, conflicting])
         .expect_err("a differing prev edge must be rejected");
     assert!(
         format!("{error:#}").contains("recording auth adjacency for room !a:x"),
@@ -5172,18 +5172,18 @@ fn matrix_adjacency_rejects_a_conflict_without_recording_any_of_the_batch() {
     // Two conflicting copies inside one batch fail the same way.
     let first = owned_value(r#"{"event_id":"$dup","room_id":"!a:x","prev_events":["$p"]}"#);
     let second = owned_value(r#"{"event_id":"$dup","room_id":"!a:x","prev_events":["$q"]}"#);
-    assert!(record_matrix_adjacency(&db, &template, &[first, second]).is_err());
+    assert!(record_csr_adjacency(&db, &template, &[first, second]).is_err());
     assert_eq!(adjacency.short_id(&db, "$dup").unwrap(), None);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_adjacency_keeps_a_relation_across_redacted_copies() {
+fn csr_adjacency_keeps_a_relation_across_redacted_copies() {
     let (db, root) = adjacency_db("adjacency_redaction");
     let template = default_matrix_import_template();
     let adjacency = room_adjacency("!a:x");
-    let visible = mtxdb::matrix_adjacency::AlwaysVisible;
+    let visible = mtxdb::csr_adjacency::AlwaysVisible;
     // Redaction keeps event_id, prev_events and auth_events but empties content.
     let unredacted = owned_value(
         r#"{"event_id":"$same","room_id":"!a:x","prev_events":["$p"],"auth_events":["$auth"],"content":{"m.relates_to":{"rel_type":"m.reference","event_id":"$target"}}}"#,
@@ -5198,8 +5198,8 @@ fn matrix_adjacency_keeps_a_relation_across_redacted_copies() {
             .map(|relation| relation.target)
     };
 
-    record_matrix_adjacency(&db, &template, std::slice::from_ref(&unredacted)).unwrap();
-    record_matrix_adjacency(&db, &template, std::slice::from_ref(&redacted))
+    record_csr_adjacency(&db, &template, std::slice::from_ref(&unredacted)).unwrap();
+    record_csr_adjacency(&db, &template, std::slice::from_ref(&redacted))
         .expect("a redacted re-import must not be rejected");
     assert_eq!(
         target(&db).as_deref(),
@@ -5211,18 +5211,18 @@ fn matrix_adjacency_keeps_a_relation_across_redacted_copies() {
 
     // Seen redacted first, then unredacted in the same input: the relation is added.
     let (db, root) = adjacency_db("adjacency_redaction_order");
-    record_matrix_adjacency(&db, &template, &[redacted, unredacted]).unwrap();
+    record_csr_adjacency(&db, &template, &[redacted, unredacted]).unwrap();
     assert_eq!(target(&db).as_deref(), Some("$target"));
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
+fn csr_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
     let (db, root) = adjacency_db("adjacency_relation_edges");
     let template = default_matrix_import_template();
     let adjacency = room_adjacency("!a:x");
-    let visible = mtxdb::matrix_adjacency::AlwaysVisible;
+    let visible = mtxdb::csr_adjacency::AlwaysVisible;
     // A rich-reply fallback has no `rel_type`, so it is not a relation.
     let reply = owned_value(
         r#"{"event_id":"$reply","room_id":"!a:x","prev_events":["$p"],"content":{"m.relates_to":{"m.in_reply_to":{"event_id":"$target"}}}}"#,
@@ -5232,7 +5232,7 @@ fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
     let long = owned_value(&format!(
         r#"{{"event_id":"$long","room_id":"!a:x","prev_events":["$p"],"content":{{"m.relates_to":{{"rel_type":"{long_rel_type}","event_id":"$target"}}}}}}"#
     ));
-    record_matrix_adjacency(&db, &template, &[reply, long])
+    record_csr_adjacency(&db, &template, &[reply, long])
         .expect("an unrepresentable relation must not fail the import");
 
     for event in ["$reply", "$long"] {
@@ -5251,26 +5251,26 @@ fn matrix_adjacency_ignores_reply_fallbacks_and_overlong_relation_types() {
 }
 
 #[test]
-fn matrix_adjacency_is_not_recorded_for_templates_without_event_id_identity() {
+fn csr_adjacency_is_not_recorded_for_templates_without_event_id_identity() {
     let (db, root) = adjacency_db("adjacency_other_identity");
     // A record identity other than /event_id cannot name a referenced event.
     let template = sender_identity_template();
     let event =
         owned_value(r#"{"event_id":"$e","room_id":"!r:x","sender":"@alice","prev_events":["$p"]}"#);
-    record_matrix_adjacency(&db, &template, &[event]).unwrap();
+    record_csr_adjacency(&db, &template, &[event]).unwrap();
     assert_eq!(room_adjacency("!r:x").short_id(&db, "$e").unwrap(), None);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn matrix_adjacency_skips_events_without_a_room_or_event_id() {
+fn csr_adjacency_skips_events_without_a_room_or_event_id() {
     let (db, root) = adjacency_db("adjacency_skips");
     let template = default_matrix_import_template();
     let no_room = owned_value(r#"{"event_id":"$orphan","prev_events":["$p"]}"#);
     let no_id = owned_value(r#"{"room_id":"!r:x","prev_events":["$p"]}"#);
     let fine = owned_value(r#"{"event_id":"$fine","room_id":"!r:x"}"#);
-    record_matrix_adjacency(&db, &template, &[no_room, no_id, fine]).unwrap();
+    record_csr_adjacency(&db, &template, &[no_room, no_id, fine]).unwrap();
     let adjacency = room_adjacency("!r:x");
     assert!(adjacency.short_id(&db, "$fine").unwrap().is_some());
     assert_eq!(adjacency.short_id(&db, "$orphan").unwrap(), None);
@@ -5279,7 +5279,7 @@ fn matrix_adjacency_skips_events_without_a_room_or_event_id() {
 }
 
 #[test]
-fn matrix_adjacency_splits_a_large_room_into_batches() {
+fn csr_adjacency_splits_a_large_room_into_batches() {
     let (db, root) = adjacency_db("adjacency_large");
     let template = default_matrix_import_template();
     // One more than a batch holds, so the room is recorded in two transactions.
@@ -5296,9 +5296,9 @@ fn matrix_adjacency_splits_a_large_room_into_batches() {
             ))
         })
         .collect();
-    record_matrix_adjacency(&db, &template, &events).unwrap();
+    record_csr_adjacency(&db, &template, &events).unwrap();
 
-    let auth = RoomAuth::new(ShardType::Edges, "!big:x");
+    let auth = RoomAuth::new("!big:x");
     let last = format!("$e{}", count - 1);
     assert_eq!(
         auth.auth_chain(&db, &last).unwrap().len(),
@@ -5352,11 +5352,11 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
         true,
     )
     .unwrap();
-    db.edges().sync_all().unwrap();
+    db.state().sync_all().unwrap();
     drop(db);
 
     let db = Database::open(root.clone()).unwrap();
-    let auth = RoomAuth::new(ShardType::Edges, "!room");
+    let auth = RoomAuth::new("!room");
     let mut edges = auth.auth_edges(&db, "$x").unwrap();
     edges.sort();
     assert_eq!(
@@ -6983,26 +6983,6 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
         .expect("locator");
         assert_eq!(decode_event_locator(&locator).unwrap(), (id, room_bytes));
 
-        // Edges come from the record's own lists.
-        let edges = |collection| {
-            decode_edges(&stored(&db, EDGE_POOL, collection, record).expect("edge record")).unwrap()
-        };
-        let listed = |value: &OwnedValue| -> Vec<Vec<u8>> {
-            value
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|id| id.as_str().unwrap().as_bytes().to_vec())
-                .collect()
-        };
-        assert_eq!(
-            edges(room_prev_collection_id(room_bytes)),
-            listed(&event.prev_events)
-        );
-        assert_eq!(
-            edges(room_auth_collection_id(room_bytes)),
-            listed(&event.auth_events)
-        );
     }
 
     let verdict = |name: &str| {

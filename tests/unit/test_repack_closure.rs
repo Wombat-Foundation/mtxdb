@@ -15,10 +15,9 @@
 use std::path::PathBuf;
 
 use mtxdb::auth_closure::AuthClosure;
-use mtxdb::matrix_adjacency::MatrixAdjacency;
-use mtxdb::{BitmapSet, Database, ShardType};
+use mtxdb::csr_adjacency::CsrAdjacency;
+use mtxdb::{BitmapSet, Database};
 
-const POOL: ShardType = ShardType::Edges;
 const ROOM: &str = "!repack:example.org";
 
 /// `(event id, auth events)` in dependency order: a referenced target is
@@ -48,7 +47,7 @@ struct Observed {
     per_collection: Vec<([u8; 16], usize)>,
 }
 
-fn observe(db: &Database, adjacency: &MatrixAdjacency, closure: &AuthClosure) -> Observed {
+fn observe(db: &Database, adjacency: &CsrAdjacency, closure: &AuthClosure) -> Observed {
     let ids = EVENTS
         .iter()
         .map(|&(id, _)| (id.to_owned(), adjacency.short_id(db, id).unwrap()))
@@ -66,7 +65,7 @@ fn observe(db: &Database, adjacency: &MatrixAdjacency, closure: &AuthClosure) ->
         .map(|&(id, _)| (id.to_owned(), closure.get(db, id).unwrap()))
         .collect();
     let mut per_collection: Vec<([u8; 16], usize)> = db
-        .edges()
+        .state()
         .collection_summaries()
         .into_iter()
         .map(|(id, entries, _memory, _capacity)| (id, entries))
@@ -81,10 +80,10 @@ fn observe(db: &Database, adjacency: &MatrixAdjacency, closure: &AuthClosure) ->
     }
 }
 
-/// Rewrite every collection in the edges pool in place. No live roots are
+/// Rewrite every collection in the state pool in place. No live roots are
 /// configured, so repack must GC nothing and keep every live record.
 fn repack_pool(db: &Database) -> usize {
-    let storage = db.edges();
+    let storage = db.state();
     let collections = storage.collection_ids();
     assert!(
         collections.len() >= 2,
@@ -106,12 +105,12 @@ fn repack_pool(db: &Database) -> usize {
 fn repack_preserves_short_ids_adjacency_and_published_closures() {
     let dir = root("preserve");
     let db = Database::open(dir.clone()).unwrap();
-    let adjacency = MatrixAdjacency::new(POOL, ROOM);
+    let adjacency = CsrAdjacency::new(ROOM);
     for &(id, auth) in EVENTS {
         adjacency.record_event(&db, id, &[], auth, None).unwrap();
     }
 
-    let closure = AuthClosure::new(POOL, ROOM);
+    let closure = AuthClosure::new(ROOM);
     let report = closure.rebuild(&db).unwrap();
     assert!(
         report.is_complete(),

@@ -140,8 +140,8 @@ fn initializes_named_pool_layout() {
         root.join("pools/mtpl-event")
     );
     assert_eq!(
-        layout.pool_dir(ShardType::Edges).unwrap(),
-        root.join("pools/mtpl-edges")
+        layout.pool_dir(ShardType::ServerInfo).unwrap(),
+        root.join("pools/mtpl-server-info")
     );
 }
 

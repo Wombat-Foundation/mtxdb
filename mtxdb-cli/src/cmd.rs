@@ -10,8 +10,7 @@ use anyhow::{anyhow, bail, Context};
 
 use mtxdb::auxiliary::AuxiliaryIndex;
 use mtxdb::export_schema::{RejectionCode, SoftFailCode};
-use mtxdb::interop::room_auth_collection_id;
-use mtxdb::matrix_adjacency::EventRecord;
+use mtxdb::csr_adjacency::EventRecord;
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
@@ -8691,11 +8690,6 @@ fn cmd_import(
             .sync_all()
             .context("persisting state-group summaries")?;
     }
-    if shard != ShardType::Edges {
-        db.pool(ShardType::Edges)
-            .sync_all()
-            .context("persisting auth adjacency and edges summaries")?;
-    }
     if server_keys_imported {
         db.pool(ShardType::ServerInfo)
             .sync_all()
@@ -10287,15 +10281,15 @@ impl ImportContext<'_> {
         dangling: &[(String, String)],
         detected_collection: Option<&str>,
     ) -> anyhow::Result<()> {
-        // The auth chain's event records go to the edges pool, through the
-        // same database as the rest of the import.
-        let auth_store: &PackfileStorage = self.db.edges();
+        // The auth chain's event bodies go to the State pool, in their own
+        // `AUTH`-namespace collections.
+        let auth_store: &PackfileStorage = self.db.state();
         // Carry the caller's `--read-plan` choice over from the event store.
         auth_store.set_read_plan_policy(self.store.read_plan_policy());
         // Record the derived adjacency before writing any auth events, so a
         // structural conflict rejects the import before the edges pool is
         // mutated.
-        record_matrix_adjacency(self.db, self.template, auth_chain)?;
+        record_csr_adjacency(self.db, self.template, auth_chain)?;
         let (by_collection, skipped) =
             group_auth_chain(auth_chain, self.template, detected_collection)?;
         let mut written = 0_u64;
@@ -11025,7 +11019,7 @@ fn import_pdu_events_with_raw_state_hamts(
             to_write.push((id_bytes, data));
         }
     }
-    record_matrix_adjacency_with_raw(db, template, events, raw_adjacency)?;
+    record_csr_adjacency_with_raw(db, template, events, raw_adjacency)?;
 
     // Preserve causal order even when input arrives newest-first.
     sort_events_topologically(&mut to_write, events, template)?;
@@ -11177,7 +11171,7 @@ fn record_raw_dependencies_and_waiting<'a>(
 ) -> anyhow::Result<()> {
     let graph = collect_raw_dependencies(template, room_id, supplied_events)?;
     let missing = missing_raw_parents(event_store, room_event_collection_id, &graph.candidates)?;
-    let edge_store = db.pool(ShardType::Edges);
+    let edge_store = db.server_info();
     remove_raw_waiting(db, edge_store, room_id, &graph.arrived)?;
     add_raw_waiting(edge_store, room_id, &missing)?;
     Ok(())
@@ -11270,7 +11264,7 @@ fn remove_raw_waiting(
     }
     let tx = db.begin_transaction();
     for chunk in removals.chunks(MAX_BATCH_EVENTS) {
-        tx.remove_many(ShardType::Edges, waiting, chunk)?;
+        tx.remove_many(ShardType::ServerInfo, waiting, chunk)?;
     }
     tx.commit()?;
     Ok(())
@@ -11627,13 +11621,12 @@ fn write_raw_verdicts_and_flags(
 
     for (room, rows) in by_room {
         let flag_index = RoomFlagIndex::new(room.as_bytes());
-        ensure_raw_auth_collection(db, &room, template)?;
-        let mut short_ids =
-            export_import::ClosureWriter::new(db, &room, room_auth_collection_id(room.as_bytes()))?;
+        let auth = RoomAuth::new(&room);
+        let ids: Vec<&str> = rows.iter().map(|row| row.0.as_str()).collect();
+        let allocated = auth.short_ids(db, &ids)?;
         let mut changes = Vec::with_capacity(rows.len().saturating_mul(4));
         let tx = db.begin_transaction();
-        for (event_id, node, verdict, write_verdict) in rows {
-            let (short, _) = short_ids.short_for(&tx, event_id.as_bytes())?;
+        for ((event_id, node, verdict, write_verdict), short) in rows.into_iter().zip(allocated) {
 
             // Only overwrite when the derived verdict changed; empty records
             // for unchanged events would grow the store on every reimport.
@@ -11668,33 +11661,9 @@ fn write_raw_verdicts_and_flags(
         // `stage` compares each touched chunk before writing; a reimport thus
         // stages no chunk or metadata writes even though it builds this list.
         flag_index.stage(&tx, &changes)?;
-        short_ids.commit(&tx)?;
+        tx.commit()?;
     }
     Ok((changed_earlier, changed_earlier_rejected))
-}
-
-/// The raw path writes room short ids into the server-layout auth collection
-/// so the flag index can select events by id. That collection needs its
-/// genesis metadata before the first forward/reverse record.
-fn ensure_raw_auth_collection(
-    db: &Database,
-    room: &str,
-    template: &CollectionTemplate,
-) -> anyhow::Result<()> {
-    let collection = room_auth_collection_id(room.as_bytes());
-    let metadata = CollectionMetadata {
-        member_namespace: Some(mtxdb::MEMBER_NAMESPACE_AUTH),
-        collection_canonical_id: room.as_bytes().to_vec(),
-        record_id_rule: template.record_id_rule.clone(),
-        payload: template.payload.clone(),
-        extension: None,
-        role: Some("auth_chain".to_owned()),
-        schema: Some("matrix.event.v1".to_owned()),
-    };
-    db.edges()
-        .create_or_put_established(&collection, &metadata, &[])
-        .with_context(|| format!("creating the auth collection for {room}"))?;
-    Ok(())
 }
 
 fn sort_events_topologically(
@@ -14241,7 +14210,7 @@ impl MatrixEventFields {
             prev,
             auth,
             relation: self.relation.as_ref().map(|(target, rel_type)| {
-                mtxdb::matrix_adjacency::RelationRef {
+                mtxdb::csr_adjacency::RelationRef {
                     target: target.as_str(),
                     rel_type: rel_type.as_str(),
                 }
@@ -14261,15 +14230,15 @@ impl MatrixEventFields {
 /// event is written, and the batch is atomic, so a failure leaves no partial
 /// adjacency. Recording is idempotent, so a later re-import repairs adjacency for
 /// events that were written but not recorded.
-fn record_matrix_adjacency(
+fn record_csr_adjacency(
     db: &Database,
     template: &CollectionTemplate,
     events: &[OwnedValue],
 ) -> anyhow::Result<()> {
-    record_matrix_adjacency_with_raw(db, template, events, None).map(|_| ())
+    record_csr_adjacency_with_raw(db, template, events, None).map(|_| ())
 }
 
-fn record_matrix_adjacency_with_raw(
+fn record_csr_adjacency_with_raw(
     db: &Database,
     template: &CollectionTemplate,
     events: &[OwnedValue],
@@ -14295,7 +14264,7 @@ fn record_matrix_adjacency_with_raw(
         rooms.entry(room_id).or_default().push(fields);
     }
     for (room_id, fields) in rooms {
-        let room = RoomAuth::new(ShardType::Edges, room_id);
+        let room = RoomAuth::new(room_id);
         for chunk in fields.chunks(MAX_BATCH_EVENTS) {
             // One contiguous reference buffer per edge kind avoids a nested
             // Vec allocation for every event while preserving EventRecord's

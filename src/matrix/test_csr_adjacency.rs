@@ -1,6 +1,5 @@
-use super::matrix_adjacency::*;
+use super::csr_adjacency::*;
 use crate::database::Database;
-use crate::layout::ShardType;
 use crate::storage::StorageError;
 use std::path::PathBuf;
 
@@ -12,8 +11,8 @@ fn test_root(name: &str) -> PathBuf {
     path
 }
 
-fn adjacency() -> MatrixAdjacency {
-    MatrixAdjacency::new(ShardType::Edges, ROOM)
+fn adjacency() -> CsrAdjacency {
+    CsrAdjacency::new(ROOM)
 }
 
 #[test]
@@ -283,7 +282,7 @@ fn purge_removes_events_and_the_kind_dictionary_together() {
         }),
     )
     .unwrap();
-    let other_room = MatrixAdjacency::new(ShardType::Edges, "!other:example.org");
+    let other_room = CsrAdjacency::new("!other:example.org");
     other_room.record_event(&db, "$x", &[], &[], None).unwrap();
 
     adj.purge(&db).unwrap();

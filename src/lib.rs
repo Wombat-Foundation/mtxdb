@@ -75,6 +75,9 @@ pub mod config;
 /// Compressed sparse row graph for deterministic topological ordering.
 #[path = "graph/csr/mod.rs"]
 pub mod csr;
+/// Matrix event adjacency (`prev`, `auth`, relations) over the short-id primitives.
+#[path = "matrix/csr_adjacency.rs"]
+pub mod csr_adjacency;
 /// In-memory dependency DAG used to track unresolved node references.
 #[path = "graph/dag/mod.rs"]
 pub mod dag;
@@ -109,9 +112,6 @@ pub mod layout;
 /// Stable logical-ID to current physical-record pointers.
 #[path = "graph/logical_head.rs"]
 pub mod logical_head;
-/// Matrix event adjacency (`prev`, `auth`, relations) over the short-id primitives.
-#[path = "matrix/matrix_adjacency.rs"]
-pub mod matrix_adjacency;
 /// Matrix-specific room-version policy.
 #[path = "matrix/matrix_policy.rs"]
 pub mod matrix_policy;
@@ -169,11 +169,11 @@ mod test_bitmap_set;
 #[path = "graph/test_closure_store.rs"]
 mod test_closure_store;
 #[cfg(test)]
+#[path = "matrix/test_csr_adjacency.rs"]
+mod test_csr_adjacency;
+#[cfg(test)]
 #[path = "graph/test_logical_head.rs"]
 mod test_logical_head;
-#[cfg(test)]
-#[path = "matrix/test_matrix_adjacency.rs"]
-mod test_matrix_adjacency;
 #[cfg(test)]
 #[cfg(feature = "reconcile")]
 #[path = "graph/test_population.rs"]
@@ -203,10 +203,8 @@ pub use database::{
 };
 pub use index::LossyIndex;
 pub use interop::{
-    auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
-    commit_state_batches, decode_auth_counter, decode_auth_forward, decode_import_marker,
-    decode_server_key, decode_state_root_handle_v1, decode_verdict, encode_auth_counter,
-    encode_auth_forward, encode_import_marker, encode_server_key, encode_state_root_handle_v1,
+    commit_state_batches, decode_import_marker, decode_server_key, decode_state_root_handle_v1,
+    decode_verdict, encode_import_marker, encode_server_key, encode_state_root_handle_v1,
     encode_verdict, event_record_id, event_state_root_node_id, event_verdict_collection_id,
     import_marker_collection_id, import_marker_node_id, notary_record_id, room_flag_collection_id,
     room_roots_collection_id, room_state_collection_id, room_state_root_node_id,

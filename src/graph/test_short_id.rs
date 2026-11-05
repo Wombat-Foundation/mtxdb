@@ -4,7 +4,7 @@ use crate::layout::ShardType;
 use crate::storage::StorageError;
 use std::path::PathBuf;
 
-const POOL: ShardType = ShardType::Edges;
+const POOL: ShardType = ShardType::ServerInfo;
 const SCOPE: [u8; 16] = [0x53; 16];
 const PLAIN: EdgeFamily = EdgeFamily::plain(1);
 const TYPED: EdgeFamily = EdgeFamily::typed(3);
@@ -178,7 +178,7 @@ fn corrupt_counter_is_reported_not_repaired() {
         use crate::storage::NodeData;
         let txn = db.begin_transaction();
         txn.put(
-            ShardType::Edges,
+            ShardType::ServerInfo,
             SCOPE,
             *b"MTXD-SID-CNTR-v1",
             &NodeData::new(bytes::Bytes::from_static(b"junk")),
@@ -671,12 +671,11 @@ fn record_ids_vary_in_the_bytes_the_index_uses() {
     const IDS: u32 = 10_000;
     let mut buckets = std::collections::HashSet::new();
     let mut tags = std::collections::HashSet::new();
-    for chunk in 1..=IDS {
-        let short_id = chunk;
+    for short_id in 1..=IDS {
         for id in [
             reverse_record_id_for_test(short_id),
-            edges_record_id_for_test(chunk, 1),
-            edges_record_id_for_test(chunk, 2),
+            edges_record_id_for_test(short_id, 1),
+            edges_record_id_for_test(short_id, 2),
         ] {
             buckets.insert(<[u8; 8]>::try_from(&id[..8]).unwrap());
             tags.insert(<[u8; 4]>::try_from(&id[8..12]).unwrap());

@@ -1131,12 +1131,7 @@ impl TxnStage {
         // Preserve the historical per-pool append order for the existing
         // pools; ServerInfo is appended after them without changing the WAL
         // ordering of the other pools' frames.
-        let pools = [
-            ShardType::Edges,
-            ShardType::EventDag,
-            ShardType::State,
-            ShardType::ServerInfo,
-        ];
+        let pools = [ShardType::EventDag, ShardType::State, ShardType::ServerInfo];
 
         // A shared-WAL database gives every pool the same coordinator. Keep
         // the transaction as one journal group in that case, so readers never
@@ -1223,20 +1218,18 @@ const fn pool_index(pool: ShardType) -> usize {
     match pool {
         ShardType::State => 0,
         ShardType::EventDag => 1,
-        ShardType::Edges => 2,
-        ShardType::ServerInfo => 3,
+        ShardType::ServerInfo => 2,
     }
 }
 
 /// Wire code for a pool tag in a mutation frame's flag byte.
 ///
-/// Every frame carries a pool tag in `1..=4`; `0` is never written.
+/// Every frame carries a pool tag in `1..=3`; `0` is never written.
 pub(crate) const fn pool_tag(pool: ShardType) -> u8 {
     match pool {
         ShardType::State => 1,
         ShardType::EventDag => 2,
-        ShardType::Edges => 3,
-        ShardType::ServerInfo => 4,
+        ShardType::ServerInfo => 3,
     }
 }
 
@@ -1246,8 +1239,7 @@ pub(crate) const fn pool_from_tag(tag: u8) -> Option<ShardType> {
     match tag {
         1 => Some(ShardType::State),
         2 => Some(ShardType::EventDag),
-        3 => Some(ShardType::Edges),
-        4 => Some(ShardType::ServerInfo),
+        3 => Some(ShardType::ServerInfo),
         _ => None,
     }
 }

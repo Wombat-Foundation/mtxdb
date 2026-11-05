@@ -102,7 +102,7 @@ fn shared_segment_round_trips_pool_tags() {
     let tagged = [
         (ShardType::State, put(1, 1, b"state")),
         (ShardType::EventDag, put(2, 2, b"event")),
-        (ShardType::Edges, put(3, 3, b"edges")),
+        (ShardType::ServerInfo, put(3, 3, b"edges")),
     ];
     journal
         .append_group_tagged_with_sequence(&tagged, None)
@@ -118,7 +118,7 @@ fn shared_segment_round_trips_pool_tags() {
         .collect();
     assert_eq!(
         pools,
-        vec![ShardType::State, ShardType::EventDag, ShardType::Edges,]
+        vec![ShardType::State, ShardType::EventDag, ShardType::ServerInfo,]
     );
 
     // Recovery must preserve the tags so each frame can be routed.
@@ -169,7 +169,7 @@ fn shared_committed_watermark_is_per_pool() {
         0,
         "another pool's group must not advance event-DAG's watermark"
     );
-    assert_eq!(coordinator.committed_lsn_for_pool(ShardType::Edges), 0);
+    assert_eq!(coordinator.committed_lsn_for_pool(ShardType::ServerInfo), 0);
 
     // Group two: event-DAG only. State's watermark must stay put.
     let event_receipt = coordinator
@@ -331,7 +331,7 @@ fn coordinator_publishes_tagged_frames() {
     coordinator
         .publish_tagged_groups(&[
             (ShardType::State, &[put(1, 1, b"a")]),
-            (ShardType::Edges, &[put(3, 3, b"c")]),
+            (ShardType::ServerInfo, &[put(3, 3, b"c")]),
         ])
         .unwrap();
     coordinator.sync().unwrap();
@@ -342,7 +342,7 @@ fn coordinator_publishes_tagged_frames() {
         .iter()
         .map(|entry| entry.pool)
         .collect();
-    assert_eq!(pools, vec![ShardType::State, ShardType::Edges]);
+    assert_eq!(pools, vec![ShardType::State, ShardType::ServerInfo]);
     fs::remove_file(path).unwrap();
 }
 
@@ -402,7 +402,7 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
         .stage_put(ShardType::EventDag, [2; 16], [2; 16], b"event".to_vec())
         .unwrap();
     stage
-        .stage_put(ShardType::Edges, [3; 16], [3; 16], b"edge".to_vec())
+        .stage_put(ShardType::ServerInfo, [3; 16], [3; 16], b"edge".to_vec())
         .unwrap();
 
     stage
@@ -421,7 +421,7 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
             .iter()
             .map(|entry| entry.pool)
             .collect::<Vec<_>>(),
-        vec![ShardType::Edges, ShardType::EventDag, ShardType::State]
+        vec![ShardType::EventDag, ShardType::State, ShardType::ServerInfo]
     );
     assert_eq!(stage.state(), TxnStageState::JournalPublished);
     fs::remove_file(path).unwrap();
@@ -3447,7 +3447,7 @@ fn directory_boundary_equals_the_scan_boundary() {
                 for (pool, level) in [
                     (ShardType::State, state),
                     (ShardType::EventDag, event_dag),
-                    (ShardType::Edges, edges),
+                    (ShardType::ServerInfo, edges),
                 ] {
                     if let Some(lsn) = level {
                         covered.insert(pool, lsn);
@@ -3596,7 +3596,7 @@ fn collection_version_is_recovered_from_the_segment() {
     let coordinator = JournalCoordinator::new(journal, &scan);
     coordinator.enable_publish_signal().unwrap();
     let receipt = coordinator
-        .publish_group_tagged(ShardType::Edges, &[put(9, 1, b"edge")])
+        .publish_group_tagged(ShardType::ServerInfo, &[put(9, 1, b"edge")])
         .unwrap();
     coordinator.sync().unwrap();
     drop(coordinator);
@@ -3604,7 +3604,7 @@ fn collection_version_is_recovered_from_the_segment() {
     let (journal, scan) = Journal::open_shared(&path).unwrap();
     let recovered = JournalCoordinator::new(journal, &scan);
     assert_eq!(
-        recovered.collection_version(ShardType::Edges, &[9; 16]),
+        recovered.collection_version(ShardType::ServerInfo, &[9; 16]),
         receipt.last_lsn,
         "a retained group's collection version survives a reopen"
     );

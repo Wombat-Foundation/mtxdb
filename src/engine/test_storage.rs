@@ -623,7 +623,7 @@ fn established_collection_lifecycle_and_validation() {
 
     // 13. Unknown member namespace rejected on establishment
     let meta_unknown = CollectionMetadata {
-        member_namespace: Some(*b"EDGE"),
+        member_namespace: Some(*b"SINF"),
         ..valid_meta.clone()
     };
     let err_unknown = sim_store

@@ -986,12 +986,6 @@ impl Database {
         self.pool(ShardType::EventDag)
     }
 
-    /// The Edges store (`ShardType::Edges`), hosting PREV and AUTH edge collections.
-    #[must_use]
-    pub fn edges(&self) -> &Arc<PackfileStorage> {
-        self.pool(ShardType::Edges)
-    }
-
     /// The server-info store (`ShardType::ServerInfo`).
     #[must_use]
     pub fn server_info(&self) -> &Arc<PackfileStorage> {

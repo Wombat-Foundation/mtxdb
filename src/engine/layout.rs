@@ -256,19 +256,18 @@ pub fn enclosing_root(dir: &Path) -> io::Result<Option<PathBuf>> {
 /// A named independent packfile pool in an mtxdb database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShardType {
-    /// HAMT nodes, roots, and state-group sidecars.
+    /// HAMT nodes, roots, state-group sidecars, and the derived graph sidecars
+    /// (event-id maps, CSR adjacency segments and auth-closure generations).
     State,
-    /// Event JSON plus collection-DAG-oriented event data.
+    /// Plain event records: event JSON plus collection-DAG-oriented event data.
     EventDag,
-    /// Edges pool: houses previous-event edges (`PREV`) and auth-chain edges (`AUTH`).
-    Edges,
     /// Server metadata, including federation signing keys and raw key responses.
     ServerInfo,
 }
 
 impl ShardType {
     /// Every shard type defined by the current database layout.
-    pub const ALL: [Self; 4] = [Self::State, Self::EventDag, Self::Edges, Self::ServerInfo];
+    pub const ALL: [Self; 3] = [Self::State, Self::EventDag, Self::ServerInfo];
 
     /// This pool's position in [`Self::ALL`], the canonical pool order. Use it to
     /// index per-pool arrays so they cannot drift from `ALL` when a pool is added.
@@ -291,7 +290,6 @@ impl ShardType {
         match self {
             Self::State => "mtpl-state",
             Self::EventDag => "mtpl-event",
-            Self::Edges => "mtpl-edges",
             Self::ServerInfo => "mtpl-server-info",
         }
     }
@@ -299,7 +297,7 @@ impl ShardType {
     /// Stable 4-byte physical pool tag used in physical layout and diagnostic labeling.
     ///
     /// # Note
-    /// This is a physical storage pool tag (e.g. `EDGE`), **not** a logical
+    /// This is a physical storage pool tag (e.g. `EVNT`), **not** a logical
     /// member namespace (`PREV` / `AUTH`). Collection derivation MUST use logical
     /// member namespaces, never this physical pool tag.
     #[must_use]
@@ -307,7 +305,6 @@ impl ShardType {
         match self {
             Self::State => *b"STAT",
             Self::EventDag => *b"EVNT",
-            Self::Edges => *b"EDGE",
             Self::ServerInfo => *b"SINF",
         }
     }
@@ -362,6 +359,18 @@ impl DatabaseLayout {
     #[must_use]
     pub fn pool_path(&self, shard_type: ShardType) -> PathBuf {
         self.root.join("pools").join(shard_type.as_str())
+    }
+
+    /// The shared sidecar store for `shard_type`, `<root>/graph/<pool>/`.
+    ///
+    /// Graph sidecars are derived data and live outside every pack. There is
+    /// one store per pool, shared by every collection in it; rows are addressed
+    /// by `(collection id, family, owner)`. No directory is named after a
+    /// domain object, so the file count does not grow with the number of
+    /// collections.
+    #[must_use]
+    pub fn graph_path(&self, shard_type: ShardType) -> PathBuf {
+        self.root.join("graph").join(shard_type.as_str())
     }
 
     /// Return a named pool's directory without creating it or any parent.

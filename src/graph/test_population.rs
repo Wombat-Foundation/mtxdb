@@ -18,7 +18,7 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn index() -> ShortIdIndex {
-    ShortIdIndex::new(ShardType::Edges, SCOPE)
+    ShortIdIndex::new(ShardType::ServerInfo, SCOPE)
 }
 
 /// A spread-out hash for element `i`: distinct digests, varied top bits.
@@ -367,7 +367,11 @@ fn purge_after_compaction_drops_every_run_and_queued_generation() {
     let txn = db.begin_transaction();
     for (collection, _) in &before {
         let (records, _) = txn
-            .get_with_record_versions(ShardType::Edges, collection, &[run_chunk_id_for_test(0)])
+            .get_with_record_versions(
+                ShardType::ServerInfo,
+                collection,
+                &[run_chunk_id_for_test(0)],
+            )
             .unwrap();
         // Only runs have chunk records; a queued generation reads empty here.
         assert!(records[0].is_none());
@@ -375,7 +379,7 @@ fn purge_after_compaction_drops_every_run_and_queued_generation() {
     for epoch in 0..3 {
         let (records, _) = txn
             .get_with_record_versions(
-                ShardType::Edges,
+                ShardType::ServerInfo,
                 &index().owner_log_collection(epoch),
                 &[crate::short_id::owner_log_record_id_for_test(1)],
             )
@@ -403,7 +407,7 @@ fn verify_flags_runs_that_disagree_with_the_log() {
     let counters = index().counters(&db).unwrap();
     let txn = db.begin_transaction();
     txn.put(
-        ShardType::Edges,
+        ShardType::ServerInfo,
         SCOPE,
         super::short_id::COUNTER_ID,
         &crate::storage::NodeData::new(bytes::Bytes::from(super::short_id::encode_counter(
@@ -427,7 +431,7 @@ fn verify_flags_runs_that_disagree_with_the_log() {
 /// and a writer on one scope.
 #[test]
 fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
-    let scope = ShortIdIndex::new(ShardType::Edges, [0x6f; 16]);
+    let scope = ShortIdIndex::new(ShardType::ServerInfo, [0x6f; 16]);
     let root = test_root("leak");
     let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
     let writer = {
@@ -498,7 +502,7 @@ fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
 /// attempt, not publish a manifest naming a deleted run.
 #[test]
 fn a_run_collected_before_the_publish_is_never_published() {
-    let scope = ShortIdIndex::new(ShardType::Edges, [0x70; 16]);
+    let scope = ShortIdIndex::new(ShardType::ServerInfo, [0x70; 16]);
     let root = test_root("collected-run");
     let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
     for i in 0..20_u32 {
@@ -544,12 +548,12 @@ fn a_run_collected_before_the_publish_is_never_published() {
 }
 
 /// The scope's records stay in one pool while the owner log and the runs live
-/// in another: counter, manifests and garbage list in `Edges`; generations and
+/// in another: counter, manifests and garbage list in one pool; generations and
 /// runs in `ServerInfo`.
 #[test]
 fn the_log_and_runs_can_live_in_their_own_pool() {
     let scope =
-        ShortIdIndex::new(ShardType::Edges, [0x75; 16]).with_log_pool(ShardType::ServerInfo);
+        ShortIdIndex::new(ShardType::State, [0x75; 16]).with_log_pool(ShardType::ServerInfo);
     let root = test_root("log-pool");
     let db = Database::open(root.clone()).unwrap();
     let put = |range: std::ops::Range<u32>| {
@@ -578,7 +582,7 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
     let generation0 = scope.owner_log_collection(0);
     let entry1 = crate::short_id::owner_log_record_id_for_test(1);
     assert!(has(ShardType::ServerInfo, generation0, entry1));
-    assert!(!has(ShardType::Edges, generation0, entry1));
+    assert!(!has(ShardType::State, generation0, entry1));
 
     scope.compact(&db, 0, 0, true).unwrap().unwrap();
     put(30..40);
@@ -586,7 +590,7 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
     assert!(runs.iter().any(|(_, present)| *present));
     for (collection, _) in &runs {
         assert!(!has(
-            ShardType::Edges,
+            ShardType::State,
             *collection,
             run_chunk_id_for_test(0)
         ));
@@ -603,7 +607,7 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
     scope.purge(&db).unwrap();
     for (collection, _) in &runs {
         assert!(!has(
-            ShardType::ServerInfo,
+            ShardType::State,
             *collection,
             run_chunk_id_for_test(0)
         ));
@@ -649,7 +653,7 @@ fn a_back_to_back_writer_cannot_starve_compaction() {
 #[test]
 fn a_stale_queue_entry_does_not_shorten_a_retired_runs_grace() {
     const GRACE_MS: u64 = 1_000;
-    let scope = ShortIdIndex::new(ShardType::Edges, [0x72; 16]);
+    let scope = ShortIdIndex::new(ShardType::ServerInfo, [0x72; 16]);
     let root = test_root("stale-queue-grace");
     let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
     let put = |range: std::ops::Range<u32>| {
@@ -695,7 +699,11 @@ fn a_stale_queue_entry_does_not_shorten_a_retired_runs_grace() {
     let db = Database::open(root.clone()).unwrap();
     let present = db
         .begin_transaction()
-        .get_with_record_versions(ShardType::Edges, &first_run, &[run_chunk_id_for_test(0)])
+        .get_with_record_versions(
+            ShardType::ServerInfo,
+            &first_run,
+            &[run_chunk_id_for_test(0)],
+        )
         .unwrap()
         .0[0]
         .is_some();

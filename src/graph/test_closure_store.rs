@@ -8,7 +8,7 @@ use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const POOL: ShardType = ShardType::Edges;
+const POOL: ShardType = ShardType::ServerInfo;
 const SCOPE: [u8; 16] = [0xC1; 16];
 
 fn test_root(name: &str) -> PathBuf {

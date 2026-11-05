@@ -5,13 +5,11 @@
 
 use super::auth_closure::{AuthClosure, ClosureOutcome};
 use super::closure_store::{self, ClosureCoverage};
+use super::csr_adjacency::CsrAdjacency;
 use super::database::Database;
-use super::layout::ShardType;
-use super::matrix_adjacency::MatrixAdjacency;
 use super::storage::StorageError;
 use std::path::PathBuf;
 
-const POOL: ShardType = ShardType::Edges;
 const ROOM: &str = "!closure-room:example.org";
 
 fn test_root(name: &str) -> PathBuf {
@@ -24,8 +22,8 @@ fn test_root(name: &str) -> PathBuf {
 /// A room whose events form a chain off `$create`. `$orphan` references a parent
 /// that was never recorded, so its walk is incomplete and cascades nowhere else
 /// because it is the only event depending on it.
-fn record_room(db: &Database) -> MatrixAdjacency {
-    let adjacency = MatrixAdjacency::new(POOL, ROOM);
+fn record_room(db: &Database) -> CsrAdjacency {
+    let adjacency = CsrAdjacency::new(ROOM);
     adjacency
         .record_event(db, "$create", &[], &[], None)
         .unwrap();
@@ -243,7 +241,7 @@ fn no_generation_yet_is_not_a_failure() {
 fn an_auth_cycle_is_corruption_not_a_gap() {
     let root = test_root("cycle");
     let db = Database::open(root.clone()).unwrap();
-    let adjacency = MatrixAdjacency::new(POOL, ROOM);
+    let adjacency = CsrAdjacency::new(ROOM);
     adjacency
         .record_event(&db, "$a", &[], &["$b"], None)
         .unwrap();
@@ -276,7 +274,7 @@ fn a_cycle_abandons_its_generation_instead_of_leaving_an_orphan() {
     let published = good.rebuild(&db).unwrap();
     let retained_generation = published.generation;
 
-    let cyclic = MatrixAdjacency::new(POOL, ROOM);
+    let cyclic = CsrAdjacency::new(ROOM);
     cyclic.record_event(&db, "$x", &[], &["$y"], None).unwrap();
     cyclic.record_event(&db, "$y", &[], &["$x"], None).unwrap();
     let closure = AuthClosure::from_adjacency(cyclic);
@@ -322,7 +320,7 @@ fn a_cycle_abandons_its_generation_instead_of_leaving_an_orphan() {
 fn verify_reports_an_auth_cycle_as_a_finding_not_an_error() {
     let root = test_root("verify-cycle");
     let db = Database::open(root.clone()).unwrap();
-    let adjacency = MatrixAdjacency::new(POOL, ROOM);
+    let adjacency = CsrAdjacency::new(ROOM);
     adjacency
         .record_event(&db, "$a", &[], &["$b"], None)
         .unwrap();

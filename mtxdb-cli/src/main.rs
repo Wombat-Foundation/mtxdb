@@ -28,7 +28,6 @@ fn shard_type_from_arg(value: &str) -> Option<ShardType> {
     match value {
         "state" => Some(ShardType::State),
         "event" | "events" | "event-dag" => Some(ShardType::EventDag),
-        "edges" => Some(ShardType::Edges),
         "server-info" | "server_info" => Some(ShardType::ServerInfo),
         "all" => None,
         _ => unreachable!("clap validates shard type"),
@@ -52,7 +51,7 @@ impl Cli {
     /// Return the single selected shard type, or bail if `-t all` was used.
     pub(crate) fn require_shard_type(&self) -> anyhow::Result<ShardType> {
         self.shard_type.context(
-            "this command requires a specific shard type (-t state, -t events, or -t edges)",
+            "this command requires a specific shard type (-t state or -t events)",
         )
     }
 
@@ -357,7 +356,6 @@ fn global_args(cmd: Command) -> Command {
                 "event",
                 "events",
                 "event-dag",
-                "edges",
                 "server-info",
                 "server_info",
                 "all",

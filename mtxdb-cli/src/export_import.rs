@@ -1,13 +1,9 @@
 //! Writing an `mtxdb-export/v1` file into the server's own layouts.
 //!
-//! Every record goes where `mtxdb::interop` says the server reads it: the
-//! room's event, prev and auth collections, the bucketed locator and verdict
-//! collections, and the signing-key collection. Nothing here invents a
-//! layout. Each room's auth short ids and closure bitmaps are written here too,
-//! by the same completeness rule the server applies when it writes an event: an
-//! event gets a closure only when every auth event it cites has one. The CLI
-//! import path then reconstructs state groups and HAMT records from the room's
-//! imported PDUs.
+//! Event bodies go to their declared event collections. Room adjacency and auth
+//! closures use the library graph path; locators, verdicts, and signing keys use
+//! their declared collections. The CLI import path then reconstructs state
+//! groups and HAMT records from the room's imported PDUs.
 //!
 //! A run is complete only when the import marker says so. Before the first
 //! record of a run the marker is cleared, data goes in capped batches, and the
@@ -19,22 +15,20 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::{anyhow, bail, Context};
 use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::interop::{
-    auth_closure_record_id, auth_counter_record_id, auth_forward_record_id, auth_reverse_record_id,
-    decode_auth_counter, decode_auth_forward, decode_event_locator, decode_import_marker,
-    encode_auth_forward, encode_edges, encode_event_locator, encode_import_marker,
+    decode_event_locator, decode_import_marker, encode_event_locator, encode_import_marker,
     encode_room_version_record, encode_verdict, event_locator_collection_id, event_record_id,
     event_verdict_collection_id, import_marker_collection_id, import_marker_node_id,
-    room_auth_collection_id, room_event_collection_id, room_prev_collection_id,
-    room_version_collection_id, room_version_node_id, ImportMarker, Verdict, DATA_FORMAT,
-    EDGE_POOL, EVENT_POOL, SERVER_INFO_POOL,
+    room_event_collection_id, room_version_collection_id, room_version_node_id, ImportMarker,
+    Verdict, DATA_FORMAT, EVENT_POOL, SERVER_INFO_POOL,
 };
+use mtxdb::csr_adjacency::EventRecord;
+use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
 use mtxdb::room_flag::{Flag, FlagChange, RoomFlagIndex};
 use mtxdb::server_keys;
 use mtxdb::storage::StorageEngine as _;
 use mtxdb::{Database, NodeData, PackfileStorage};
 use rezzy::auth::{check_auth, StateProvider};
 use rezzy::basespec::event_types::{M_ROOM_CREATE, M_ROOM_MEMBER};
-use rezzy::bitmap::Bitmap;
 use rezzy::json::Value as OwnedValue;
 use rezzy::signing::{
     ed25519_zebra::{Signature, VerificationKey},
@@ -229,7 +223,7 @@ pub(crate) fn write_marker(db: &Database, counts: ImportCounts) -> anyhow::Resul
 /// Make everything written so far durable. Called before the marker commits,
 /// so the marker is never durable ahead of the data it vouches for.
 pub(crate) fn sync_data(db: &Database) -> anyhow::Result<()> {
-    for pool in [EVENT_POOL, EDGE_POOL, SERVER_INFO_POOL] {
+    for pool in [EVENT_POOL, SERVER_INFO_POOL] {
         db.pool(pool)
             .sync_all()
             .with_context(|| format!("persisting the {pool:?} pool"))?;
@@ -339,10 +333,8 @@ fn exported_rejection(metadata: &EventMetadata) -> Option<bool> {
 pub(crate) fn room_collections_line(room_id: &str) -> String {
     let room = room_id.as_bytes();
     format!(
-        "room {room_id} (events 0x{}, auth 0x{}, prev 0x{})",
+        "room {room_id} (events 0x{})",
         hex::encode_upper(room_event_collection_id(room)),
-        hex::encode_upper(room_auth_collection_id(room)),
-        hex::encode_upper(room_prev_collection_id(room)),
     )
 }
 
@@ -1890,11 +1882,9 @@ pub(crate) fn write_room_with_resolved_findings(
     batch_bytes: usize,
     findings: &AuthFindings,
 ) -> anyhow::Result<ImportCounts> {
-    let plan = closure_plan(export)?;
+    precheck_room_auth(export)?;
     let room = export.room_id.as_bytes();
     let event_collection = room_event_collection_id(room);
-    let prev_collection = room_prev_collection_id(room);
-    let auth_collection = room_auth_collection_id(room);
     let version_collection = room_version_collection_id(room);
     let version_node = room_version_node_id();
 
@@ -1924,8 +1914,7 @@ pub(crate) fn write_room_with_resolved_findings(
         let record = event_record_id(event_id);
         let prev = id_list(event, "prev_events")?;
         let auth = id_list(event, "auth_events")?;
-        let prev_bytes = encode_edges(&prev)?;
-        let auth_bytes = encode_edges(&auth)?;
+        let edge_bytes: usize = prev.iter().chain(&auth).map(|id| id.len()).sum();
         let mut verdict = verdict_of(&event.metadata, findings.forced[position]);
         // Arrival ordering is a source-recorded fact that cannot be recomputed,
         // like `redacted_by`, so keep it in the verdict record.
@@ -1956,7 +1945,7 @@ pub(crate) fn write_room_with_resolved_findings(
             event,
             &export.room_id,
             &verdict,
-            prev_bytes.len().saturating_add(auth_bytes.len()),
+            edge_bytes,
         );
         if size > batch_bytes {
             bail!(
@@ -2002,8 +1991,6 @@ pub(crate) fn write_room_with_resolved_findings(
             record,
             &node(encode_event_locator(event_id, room)?),
         )?;
-        tx.put(EDGE_POOL, prev_collection, record, &node(prev_bytes))?;
-        tx.put(EDGE_POOL, auth_collection, record, &node(auth_bytes))?;
         // A verdict record is written for derived rejections and for the
         // facts kept from the source. An exported outlier keeps a record with
         // the annotation cleared, so a rebuild can see it was checked without
@@ -2044,8 +2031,8 @@ pub(crate) fn write_room_with_resolved_findings(
     }
     tx.commit().context("committing an import batch")?;
     reclaim_journal(db)?;
-    let closures = write_auth_closures(db, export, plan, batch_bytes)?;
-    write_room_flags(db, export, findings, batch_bytes)?;
+    let (closures, shorts) = record_room_auth(db, export)?;
+    write_room_flags(db, export, findings, &shorts)?;
 
     Ok(ImportCounts {
         events: written,
@@ -2058,31 +2045,19 @@ fn write_room_flags(
     db: &Database,
     export: &RoomExport,
     findings: &AuthFindings,
-    _batch_bytes: usize,
+    shorts: &[u32],
 ) -> anyhow::Result<()> {
     const FORWARD_BATCH_SIZE: usize = 512;
 
     let flag_index = RoomFlagIndex::new(export.room_id.as_bytes());
-    let auth_col = room_auth_collection_id(export.room_id.as_bytes());
     let mut tx = db.begin_transaction();
     let mut batch_changes = Vec::new();
 
     for (chunk_start, chunk) in export.events.chunks(FORWARD_BATCH_SIZE).enumerate() {
         let base_pos = chunk_start.saturating_mul(FORWARD_BATCH_SIZE);
-        let fwd_keys: Vec<mtxdb::storage::NodeId> = chunk
-            .iter()
-            .map(|e| auth_forward_record_id(e.event_id.as_bytes()))
-            .collect();
-        let fwd_nodes = tx.get(EDGE_POOL, &auth_col, &fwd_keys)?;
-
-        for (offset, (event, node_opt)) in chunk.iter().zip(fwd_nodes).enumerate() {
+        for (offset, event) in chunk.iter().enumerate() {
             let position = base_pos.saturating_add(offset);
-            let Some(node_data) = node_opt else {
-                anyhow::bail!("missing auth forward record for event {}", event.event_id);
-            };
-            let (short, _) = decode_auth_forward(&node_data.bytes).map_err(|e| {
-                anyhow::anyhow!("corrupt auth forward record for {}: {e}", event.event_id)
-            })?;
+            let short = shorts[position];
 
             batch_changes.push(FlagChange::set(short, Flag::Present));
 
@@ -2126,284 +2101,99 @@ fn write_room_flags(
     Ok(())
 }
 
-/// One room's auth short ids and closures, staged into capped batches.
-pub(crate) struct ClosureWriter<'a> {
-    db: &'a Database,
-    room: &'a str,
-    collection: [u8; 16],
-    batch_bytes: usize,
-    initial_counter: u32,
-    counter: u32,
-}
-
-impl<'a> ClosureWriter<'a> {
-    /// Open the room's short-id space without staging a closure batch.
-    pub(crate) fn new(
-        db: &'a Database,
-        room: &'a str,
-        collection: [u8; 16],
-    ) -> anyhow::Result<Self> {
-        let counter = db
-            .pool(mtxdb::ShardType::Edges)
-            .get(&collection, &auth_counter_record_id())?
-            .map(|data| decode_auth_counter(&data.bytes))
-            .transpose()?
-            .unwrap_or(0);
-        Ok(Self {
-            db,
-            room,
-            collection,
-            batch_bytes: 0,
-            initial_counter: counter,
-            counter,
-        })
-    }
-
-    /// The short id for `id`: an existing one is reused, a new one advances the
-    /// counter and stages its forward and reverse records. Returns the bytes
-    /// the new records stage.
-    pub(crate) fn short_for(
-        &mut self,
-        tx: &mtxdb::DatabaseTransaction<'_>,
-        id: &[u8],
-    ) -> anyhow::Result<(u32, usize)> {
-        let forward = tx
-            .get(EDGE_POOL, &self.collection, &[auth_forward_record_id(id)])?
-            .into_iter()
-            .next()
-            .flatten();
-        let mut staged = 0_usize;
-        let mut found = None;
-        if let Some(data) = forward {
-            let (short, stored) = decode_auth_forward(&data.bytes)?;
-            found = (stored == id).then_some(short);
+/// Refuse a room with a repeated event id or an auth cycle before anything is
+/// written, so a refused room leaves nothing behind.
+fn precheck_room_auth(export: &RoomExport) -> anyhow::Result<()> {
+    let events = &export.events;
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(events.len());
+    for (position, event) in events.iter().enumerate() {
+        if index.insert(event.event_id.as_str(), position).is_some() {
+            bail!(
+                "{}: event {} appears more than once; refusing to import the room",
+                export.room_id,
+                event.event_id
+            );
         }
-        let short = if let Some(short) = found {
-            short
-        } else {
-            self.counter = self
-                .counter
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("{}: room short ids exhausted", self.room))?;
-            let short = self.counter;
-            tx.put(
-                EDGE_POOL,
-                self.collection,
-                auth_forward_record_id(id),
-                &node(encode_auth_forward(short, id)),
-            )?;
-            tx.put(
-                EDGE_POOL,
-                self.collection,
-                auth_reverse_record_id(short),
-                &node(id.to_vec()),
-            )?;
-            staged = id
-                .len()
-                .saturating_mul(2)
-                .saturating_add(RECORD_OVERHEAD.saturating_mul(2));
-            short
-        };
-        Ok((short, staged))
     }
-
-    /// Stage the short-id counter when it advanced, then commit the batch.
-    /// A batch that only reuses existing shorts leaves the counter untouched.
-    pub(crate) fn commit(&mut self, tx: &mtxdb::DatabaseTransaction<'_>) -> anyhow::Result<()> {
-        if self.counter != self.initial_counter {
-            tx.put(
-                EDGE_POOL,
-                self.collection,
-                auth_counter_record_id(),
-                &node(self.counter.to_be_bytes().to_vec()),
-            )?;
-        }
-        tx.commit().context("committing auth closures")?;
-        self.initial_counter = self.counter;
-        reclaim_journal(self.db)?;
-        Ok(())
-    }
-
-    /// Stage one event: its short id, its auth events' shorts, and its closure
-    /// when every auth event already has one. Returns the closure's short id if
-    /// it wrote one, and the bytes staged.
-    fn stage_event(
-        &mut self,
-        tx: &mtxdb::DatabaseTransaction<'_>,
-        event_id: &[u8],
-        auth: &[(&[u8], bool)],
-    ) -> anyhow::Result<(bool, usize)> {
-        let (own, mut staged) = self.short_for(tx, event_id)?;
-        let mut closure = Bitmap::new();
-        let mut complete = true;
-        for &(id, has_closure) in auth {
-            let (short, bytes) = self.short_for(tx, id)?;
-            staged = staged.saturating_add(bytes);
-            closure.insert(short);
-            if !has_closure {
-                complete = false;
+    let mut waiting = vec![0_usize; events.len()];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); events.len()];
+    for (child, event) in events.iter().enumerate() {
+        let mut seen = HashSet::new();
+        for id in id_list(event, "auth_events")? {
+            let Ok(id) = std::str::from_utf8(id) else {
                 continue;
-            }
-            let stored = tx
-                .get(
-                    EDGE_POOL,
-                    &self.collection,
-                    &[auth_closure_record_id(short)],
-                )?
-                .into_iter()
-                .next()
-                .flatten()
-                .ok_or_else(|| anyhow!("{}: a closure is missing after staging", self.room))?;
-            closure |= &Bitmap::decode(&stored.bytes)
-                .map_err(|e| anyhow!("{}: auth closure bitmap: {e}", self.room))?;
-        }
-        if !complete {
-            return Ok((false, staged));
-        }
-        let encoded = closure.encode();
-        staged = staged
-            .saturating_add(encoded.len())
-            .saturating_add(RECORD_OVERHEAD);
-        tx.put(
-            EDGE_POOL,
-            self.collection,
-            auth_closure_record_id(own),
-            &node(encoded),
-        )?;
-        Ok((true, staged))
-    }
-}
-
-/// Auth events before the events citing them, over the edges the export
-/// contains. `None` for a cycle, with the position of an event stuck on it.
-fn parents_first(auth: &[Vec<&[u8]>], index: &HashMap<&[u8], usize>) -> Result<Vec<usize>, usize> {
-    let mut waiting: Vec<usize> = auth
-        .iter()
-        .map(|ids| ids.iter().filter(|id| index.contains_key(**id)).count())
-        .collect();
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); auth.len()];
-    for (child, ids) in auth.iter().enumerate() {
-        for id in ids {
-            if let Some(&parent) = index.get(*id) {
-                children[parent].push(child);
+            };
+            if let Some(&parent) = index.get(id) {
+                if seen.insert(parent) {
+                    waiting[child] += 1;
+                    children[parent].push(child);
+                }
             }
         }
     }
-    let mut order: Vec<usize> = (0..auth.len()).filter(|&i| waiting[i] == 0).collect();
-    let mut next = 0_usize;
+    let mut order: Vec<usize> = (0..events.len()).filter(|&i| waiting[i] == 0).collect();
+    let mut next = 0;
     while let Some(&current) = order.get(next) {
-        next = next.saturating_add(1);
+        next += 1;
         for &child in &children[current] {
-            waiting[child] = waiting[child].saturating_sub(1);
+            waiting[child] -= 1;
             if waiting[child] == 0 {
                 order.push(child);
             }
         }
     }
-    if order.len() == auth.len() {
-        Ok(order)
-    } else {
-        Err((0..auth.len()).find(|&i| waiting[i] > 0).unwrap_or(0))
-    }
-}
-
-/// Each event's distinct auth ids, the position of every event id, and the
-/// parents-first visiting order.
-struct ClosurePlan<'a> {
-    index: HashMap<&'a [u8], usize>,
-    auth: Vec<Vec<&'a [u8]>>,
-    order: Vec<usize>,
-}
-
-/// Plan a room's closures, failing on an auth cycle or a repeated event id.
-/// Run before any event is written, so a refused room leaves nothing behind.
-fn closure_plan(export: &RoomExport) -> anyhow::Result<ClosurePlan<'_>> {
-    let events = &export.events;
-    let mut index: HashMap<&[u8], usize> = HashMap::with_capacity(events.len());
-    for (position, event) in events.iter().enumerate() {
-        let id = event.event_id.as_bytes();
-        if index.insert(id, position).is_some() {
-            return Err(anyhow!(
-                "{}: event {} appears more than once; refusing to import the room",
-                export.room_id,
-                event.event_id
-            ));
-        }
-    }
-    let mut auth: Vec<Vec<&[u8]>> = Vec::with_capacity(events.len());
-    for event in events {
-        let mut ids = id_list(event, "auth_events")?;
-        let mut seen = std::collections::HashSet::new();
-        ids.retain(|id| seen.insert(*id));
-        auth.push(ids);
-    }
-    let order = parents_first(&auth, &index).map_err(|stuck| {
-        anyhow!(
+    if order.len() != events.len() {
+        let stuck = (0..events.len()).find(|&i| waiting[i] > 0).unwrap_or(0);
+        bail!(
             "{}: auth events form a cycle (through {}); refusing to import the room",
             export.room_id,
             events[stuck].event_id
-        )
-    })?;
-    Ok(ClosurePlan { index, auth, order })
+        );
+    }
+    Ok(())
 }
 
-/// Write the room's auth short ids and closure bitmaps in the server's layout.
-///
-/// Events are visited parents-first. Each event and each cited auth event gets
-/// a short id (existing ones are reused, so a re-import keeps them), and an
-/// event's closure is the union of its auth events' shorts and closures, written
-/// only when every auth event has a closure. An event citing an auth event
-/// outside the export therefore gets none, and neither do its dependents; the
-/// server falls back to walking edges for them. An auth cycle fails the room.
-fn write_auth_closures(
-    db: &Database,
-    export: &RoomExport,
-    plan: ClosurePlan<'_>,
-    batch_bytes: usize,
-) -> anyhow::Result<u64> {
-    let events = &export.events;
-    let ClosurePlan { index, auth, order } = plan;
-
-    let collection = room_auth_collection_id(export.room_id.as_bytes());
-    let mut tx = db.begin_transaction();
-    let counter = tx
-        .get(EDGE_POOL, &collection, &[auth_counter_record_id()])?
-        .into_iter()
-        .next()
-        .flatten()
-        .map_or(Ok(0), |data| decode_auth_counter(&data.bytes))?;
-    let mut writer = ClosureWriter {
-        db,
-        room: &export.room_id,
-        collection,
-        batch_bytes,
-        initial_counter: counter,
-        counter,
-    };
-    let mut has_closure = vec![false; events.len()];
-    let mut staged_bytes = 0_usize;
-    for &position in &order {
-        let cited: Vec<(&[u8], bool)> = auth[position]
+/// Record the room's `prev`/`auth` edges and build its auth closures through the
+/// library's `RoomAuth`, the same path the raw importer uses. Returns how many
+/// closures were written.
+fn record_room_auth(db: &Database, export: &RoomExport) -> anyhow::Result<(u64, Vec<u32>)> {
+    let room = RoomAuth::new(&export.room_id);
+    let lists: Vec<(Vec<&str>, Vec<&str>)> = export
+        .events
+        .iter()
+        .map(|event| {
+            let ids = |field| -> anyhow::Result<Vec<&str>> {
+                id_list(event, field)?
+                    .into_iter()
+                    .map(|id| std::str::from_utf8(id).map_err(Into::into))
+                    .collect()
+            };
+            Ok((ids("prev_events")?, ids("auth_events")?))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let mut shorts = Vec::with_capacity(export.events.len());
+    for (events, lists) in export
+        .events
+        .chunks(MAX_BATCH_EVENTS)
+        .zip(lists.chunks(MAX_BATCH_EVENTS))
+    {
+        let records: Vec<EventRecord<'_>> = events
             .iter()
-            .map(|id| {
-                (
-                    *id,
-                    index.get(*id).is_some_and(|&parent| has_closure[parent]),
-                )
+            .zip(lists)
+            .map(|(event, (prev, auth))| EventRecord {
+                event_id: &event.event_id,
+                prev,
+                auth,
+                relation: None,
             })
             .collect();
-        let (wrote, staged) =
-            writer.stage_event(&tx, events[position].event_id.as_bytes(), &cited)?;
-        has_closure[position] = wrote;
-        staged_bytes = staged_bytes.saturating_add(staged);
-        if staged_bytes > writer.batch_bytes {
-            writer.commit(&tx)?;
-            tx = writer.db.begin_transaction();
-            staged_bytes = 0;
-        }
+        let recorded = room
+            .record_events(db, &records)
+            .with_context(|| format!("recording auth adjacency for room {}", export.room_id))?;
+        shorts.extend(recorded.iter().map(|r| r.short_id));
     }
-    writer.commit(&tx)?;
-    Ok(u64::try_from(has_closure.iter().filter(|wrote| **wrote).count()).unwrap_or(u64::MAX))
+    let report = room.rebuild(db)?;
+    Ok((u64::from(report.count), shorts))
 }
 
 /// Write a keys export in one transaction: a handful of records, far under
@@ -3098,35 +2888,16 @@ mod auth_findings_tests {
             .map(|data| data.bytes.to_vec())
     }
 
-    fn read(db: &Database, collection: [u8; 16], record: [u8; 16]) -> Option<Vec<u8>> {
-        db.pool(EDGE_POOL)
-            .get(&collection, &record)
-            .unwrap()
-            .map(|data| data.bytes.to_vec())
-    }
-
-    /// The closure the server would serve for `id`: the persisted bitmap
-    /// resolved through the reverse records, or `None` when none was written.
+    /// The chain exposed by the same library API used by the server.
     fn persisted(
         db: &Database,
         room: &str,
         id: &str,
     ) -> Option<std::collections::BTreeSet<String>> {
-        let collection = room_auth_collection_id(room.as_bytes());
-        let forward = read(db, collection, auth_forward_record_id(id.as_bytes()))?;
-        let (short, stored) = decode_auth_forward(&forward).unwrap();
-        assert_eq!(stored, id.as_bytes());
-        let closure =
-            Bitmap::decode(&read(db, collection, auth_closure_record_id(short))?).unwrap();
-        Some(
-            closure
-                .iter()
-                .map(|short| {
-                    let id = read(db, collection, auth_reverse_record_id(short)).unwrap();
-                    String::from_utf8(id).unwrap()
-                })
-                .collect(),
-        )
+        RoomAuth::new(room)
+            .auth_chain(db, id)
+            .ok()
+            .map(|chain| chain.into_iter().collect())
     }
 
     /// Reference: every event reachable through auth edges.
@@ -3166,16 +2937,6 @@ mod auth_findings_tests {
         ])
     }
 
-    fn counter(db: &Database, room: &str) -> u32 {
-        let bytes = read(
-            db,
-            room_auth_collection_id(room.as_bytes()),
-            auth_counter_record_id(),
-        )
-        .unwrap();
-        decode_auth_counter(&bytes).unwrap()
-    }
-
     #[test]
     fn closures_match_a_walk_of_the_auth_edges() {
         let (db, dir) = db();
@@ -3189,7 +2950,6 @@ mod auth_findings_tests {
                 event.event_id
             );
         }
-        assert_eq!(counter(&db, &room.room_id), 4);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3199,33 +2959,18 @@ mod auth_findings_tests {
         let room = diamond();
         // About one event per batch.
         write_room_with_findings(&db, &room, 1200).unwrap();
-        let collection = room_auth_collection_id(room.room_id.as_bytes());
         let before: Vec<_> = room
             .events
             .iter()
-            .map(|e| {
-                read(
-                    &db,
-                    collection,
-                    auth_forward_record_id(e.event_id.as_bytes()),
-                )
-            })
+            .map(|e| persisted(&db, &room.room_id, &e.event_id))
             .collect();
-        assert!(before.iter().all(Option::is_some));
         write_room_with_findings(&db, &room, BATCH_BYTES).unwrap();
         let after: Vec<_> = room
             .events
             .iter()
-            .map(|e| {
-                read(
-                    &db,
-                    collection,
-                    auth_forward_record_id(e.event_id.as_bytes()),
-                )
-            })
+            .map(|e| persisted(&db, &room.room_id, &e.event_id))
             .collect();
-        assert_eq!(before, after, "re-import reuses the stored short ids");
-        assert_eq!(counter(&db, &room.room_id), 4);
+        assert_eq!(before, after, "re-import preserves auth-chain results");
         for event in &room.events {
             assert_eq!(
                 persisted(&db, &room.room_id, &event.event_id),
@@ -3295,9 +3040,6 @@ mod auth_findings_tests {
             persisted(&db, &room.room_id, "$fine"),
             Some(walked(&room, "$fine"))
         );
-        // The unknown auth event still has a short id, as it would on the server.
-        let collection = room_auth_collection_id(room.room_id.as_bytes());
-        assert!(read(&db, collection, auth_forward_record_id(b"$gone")).is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 
