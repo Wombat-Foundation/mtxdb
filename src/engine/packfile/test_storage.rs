@@ -640,6 +640,55 @@ fn read_committed_overlay_reloads_after_reclaim_advances_coverage() {
     );
 }
 
+/// Seeds a committed value, opens a read-only streaming reader and a writer,
+/// drops the seed checkpoint so the writer's next sync takes the full
+/// checkpoint path, and makes every sync reclaim.
+struct ReclaimFixture {
+    writer: PackfileStorage,
+    reader: std::sync::Arc<PackfileStorage>,
+    wal: PathBuf,
+    collection: [u8; 16],
+    seed_key: [u8; 16],
+}
+
+fn open_reclaim_fixture(label: &str) -> ReclaimFixture {
+    let dir = test_dir(label);
+    let wal = dir.join("wal.bin");
+    let collection = [0x4Du8; 16];
+    let seed_key = [0x01u8; 16];
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &collection,
+        &seed_key,
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+    let (journal, _) = Journal::open(&wal).unwrap();
+    drop(journal);
+
+    let reader = std::sync::Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
+    reader.enable_read_journal(&wal).unwrap();
+
+    // Drop the seed checkpoint so the writer's sync writes a full checkpoint
+    // (which reclaims), instead of appending a delta that does not.
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    // Make every sync checkpoint and reclaim so each round is deterministic.
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+
+    ReclaimFixture {
+        writer,
+        reader,
+        wal,
+        collection,
+        seed_key,
+    }
+}
+
 /// Run 40 write/sync rounds and return how many times the journal base moved.
 /// `after_sync` runs once per round after the checkpoint lands; the streaming
 /// test uses it to publish the new value and demand reader progress.
@@ -684,35 +733,13 @@ fn streaming_read_committed_does_not_hold_back_reclaim() {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    let dir = test_dir("read_committed_stream_vs_reclaim");
-    let wal = dir.join("wal.bin");
-    let collection = [0x4Du8; 16];
-    let seed_key = [0x01u8; 16];
-
-    let seed = PackfileStorage::open(dir.clone()).unwrap();
-    seed.put(
-        &collection,
-        &seed_key,
-        &NodeData::new(bytes::Bytes::from_static(b"seed")),
-    )
-    .unwrap();
-    seed.sync().unwrap();
-    drop(seed);
-    let (journal, _) = Journal::open(&wal).unwrap();
-    drop(journal);
-
-    let reader = Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
-    reader.enable_read_journal(&wal).unwrap();
-
-    // Drop the seed checkpoint so the writer's sync writes a full checkpoint
-    // (which reclaims), instead of appending a delta that does not.
-    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
-    let writer = PackfileStorage::open(dir.clone()).unwrap();
-    writer.enable_journal(&wal).unwrap();
-    // Make every sync checkpoint and reclaim so each round is deterministic.
-    // Dropping the seed checkpoint is what forces the full-checkpoint path;
-    // this only removes reliance on a delta rollover for coverage.
-    writer.journal().unwrap().set_reclaim_trigger_len(1);
+    let ReclaimFixture {
+        writer,
+        reader,
+        wal,
+        collection,
+        seed_key,
+    } = open_reclaim_fixture("read_committed_stream_vs_reclaim");
 
     let stop = Arc::new(AtomicBool::new(false));
     let published = Arc::new(AtomicU8::new(0));
@@ -14025,30 +14052,14 @@ fn read_committed_completes_inside_a_paused_reclaim() {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
-    let dir = test_dir("read_committed_inside_reclaim");
-    let wal = dir.join("wal.bin");
-    let collection = [0x4Du8; 16];
-    let seed_key = [0x01u8; 16];
-
-    let seed = PackfileStorage::open(dir.clone()).unwrap();
-    seed.put(
-        &collection,
-        &seed_key,
-        &NodeData::new(bytes::Bytes::from_static(b"seed")),
-    )
-    .unwrap();
-    seed.sync().unwrap();
-    drop(seed);
-    let (journal, _) = Journal::open(&wal).unwrap();
-    drop(journal);
-
-    let reader = Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
-    reader.enable_read_journal(&wal).unwrap();
-    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
-    let writer = PackfileStorage::open(dir.clone()).unwrap();
-    writer.enable_journal(&wal).unwrap();
+    let ReclaimFixture {
+        writer,
+        reader,
+        collection,
+        seed_key,
+        ..
+    } = open_reclaim_fixture("read_committed_inside_reclaim");
     let journal = writer.journal().unwrap();
-    journal.set_reclaim_trigger_len(1);
 
     let entered = Arc::new(AtomicUsize::new(0));
     let reads_inside = Arc::new(AtomicUsize::new(0));
