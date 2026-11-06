@@ -12,7 +12,7 @@
 //! and numbering can never restart beneath it; see `shared_wal_seed_lsn`.
 //! Callers that need to drive a single pool directly can still use
 //! [`crate::journal::SharedWalLock`] with
-//! [`PackfileStorage::enable_shared_journal`].
+//! [`PackfileStorage::enable_shared_journal`](crate::PackfileStorage::enable_shared_journal).
 
 use std::io;
 use std::path::PathBuf;

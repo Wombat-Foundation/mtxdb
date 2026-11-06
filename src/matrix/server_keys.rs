@@ -8,7 +8,7 @@
 //! one exception: it lives beside the keys as verbatim bytes, since any
 //! re-encoding would invalidate its signature.
 //!
-//! [`update_server_keys`] is the write path. It reads the records of the keys
+//! [`update_server_keys`](crate::server_keys::update_server_keys) is the write path. It reads the records of the keys
 //! it was handed (their ids are derived from the key id), applies the MSC4499
 //! binding rules, and commits the changed records, and the Notary payload when
 //! one is given, in one transaction guarded by per-record version checks. A

@@ -58,7 +58,7 @@ const FORWARD_OWNER: u8 = 0b01;
 /// Maximum optimistic-retry rounds before a stale read is returned.
 pub(crate) const MAX_ATTEMPTS: usize = 64;
 
-/// One event of a [`ShortIdIndex::record_events`]
+/// One event of a [`ShortIdIndex::record_events`](crate::short_id::ShortIdIndex::record_events)
 /// batch: an owner key and its optional owner-log payload.
 #[derive(Debug, Clone, Copy)]
 pub struct BatchEvent<'a> {
