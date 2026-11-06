@@ -1,27 +1,27 @@
 //! Public façade over a room's auth data: adjacency, closures and their
 //! lifecycle behind one handle and one error type.
 //!
-//! Callers use [`RoomAuth`](crate::room_auth::RoomAuth) and never coordinate the short-id index, the
+//! Callers use [`RoomAuth`] and never coordinate the short-id index, the
 //! adjacency, the closure generations or the bitmaps by hand:
 //!
-//! - **Ingest** with [`RoomAuth::record_event`](crate::room_auth::RoomAuth::record_event) / [`RoomAuth::record_events`](crate::room_auth::RoomAuth::record_events).
+//! - **Ingest** with [`RoomAuth::record_event`] / [`RoomAuth::record_events`].
 //!   Ingestion commits the event's `prev`, `auth` and relation data; it does
 //!   not touch closures. A query for a recent event is still correct, because
-//!   [`RoomAuth::auth_chain`](crate::room_auth::RoomAuth::auth_chain) walks only the events newer than the published
+//!   [`RoomAuth::auth_chain`] walks only the events newer than the published
 //!   generation and stops at any parent the generation already covers.
-//! - **Query** with [`RoomAuth::auth_edges`](crate::room_auth::RoomAuth::auth_edges), [`RoomAuth::auth_chain`](crate::room_auth::RoomAuth::auth_chain) and
-//!   [`RoomAuth::is_in_auth_chain`](crate::room_auth::RoomAuth::is_in_auth_chain), or pin a generation with
-//!   [`RoomAuth::snapshot`](crate::room_auth::RoomAuth::snapshot) to make several queries against one consistent
+//! - **Query** with [`RoomAuth::auth_edges`], [`RoomAuth::auth_chain`] and
+//!   [`RoomAuth::is_in_auth_chain`], or pin a generation with
+//!   [`RoomAuth::snapshot`] to make several queries against one consistent
 //!   generation.
-//! - **Maintain** with [`RoomAuth::rebuild`](crate::room_auth::RoomAuth::rebuild), [`RoomAuth::retire_old_generations`](crate::room_auth::RoomAuth::retire_old_generations),
-//!   [`RoomAuth::verify`](crate::room_auth::RoomAuth::verify) and [`RoomAuth::purge`](crate::room_auth::RoomAuth::purge). Each is an explicit call; none
+//! - **Maintain** with [`RoomAuth::rebuild`], [`RoomAuth::retire_old_generations`],
+//!   [`RoomAuth::verify`] and [`RoomAuth::purge`]. Each is an explicit call; none
 //!   happens implicitly.
 //!
 //! # What the visibility filter does and does not do
 //!
 //! Redaction, rejection and soft-fail change what a *relationship* query may
-//! show, so [`RoomAuth::relation_of`](crate::room_auth::RoomAuth::relation_of) takes an
-//! [`EventVisibility`](crate::csr_adjacency::EventVisibility). They never
+//! show, so [`RoomAuth::relation_of`] takes an
+//! [`EventVisibility`]. They never
 //! change the auth chain: a redacted event keeps its `auth_events`, and an
 //! auth chain computed against a different disposition would be wrong. So
 //! `auth_edges`, `auth_chain` and `is_in_auth_chain` take no filter, by design.

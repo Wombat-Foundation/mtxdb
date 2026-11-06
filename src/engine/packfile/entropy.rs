@@ -4,7 +4,7 @@
 //! unstabilized `edition2024` feature. Cargo parses every target's dependency
 //! graph when it resolves, so merely depending on `getrandom` makes the 1.81
 //! MSRV build fail before any mtxdb code compiles. The crate only ever needs
-//! 16 bytes to seed a [`PackId`](super::PackId), so the supported platforms are
+//! 16 bytes to seed a [`PackId`], so the supported platforms are
 //! handled directly: `/dev/urandom` on unix and `BCryptGenRandom` on Windows.
 
 use std::io;
@@ -31,7 +31,7 @@ pub(super) fn fill(dest: &mut [u8]) -> io::Result<()> {
 ///
 /// # Panics
 /// Panics if the destination is longer than a `u32`; callers only ever pass a
-/// 16-byte [`PackId`](super::PackId), so this is unreachable in practice.
+/// 16-byte [`PackId`], so this is unreachable in practice.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub(super) fn fill(dest: &mut [u8]) -> io::Result<()> {

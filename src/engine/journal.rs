@@ -1,7 +1,7 @@
 //! Append-only, checksummed commit journal used by the packfile WAL path.
 //!
 //! This module owns the journal's disk framing and durability boundary. It
-//! also provides [`JournalCoordinator`](crate::journal::JournalCoordinator),
+//! also provides [`JournalCoordinator`],
 //! which captures each sync caller's
 //! target LSN and releases it only after a durable group covers that target.
 

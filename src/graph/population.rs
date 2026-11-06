@@ -2,12 +2,12 @@
 //! compacted runs.
 //!
 //! The owner log holds one entry per event the room's holder owns, each with
-//! the 32-byte payload from [`encode_owner_payload`](crate::population::encode_owner_payload). Compaction folds the
+//! the 32-byte payload from [`encode_owner_payload`]. Compaction folds the
 //! log into immutable sorted *runs* and publishes them under a *manifest*; the
 //! counter record carries `(log_epoch, log_epoch_start_seq, manifest_version)`
 //! together, so one read yields a manifest and the log tail it pairs with.
 //!
-//! A [`PopulationSnapshot`](crate::population::PopulationSnapshot) is a cached, shared base (the runs merged into a
+//! A [`PopulationSnapshot`] is a cached, shared base (the runs merged into a
 //! sorted population) plus a small tail (the log entries since the last
 //! compaction), pinned at an `owner_seq_ceiling`. It is materialized in
 //! memory, so an exchange keeps answering from one population while writers
@@ -16,10 +16,10 @@
 //! Layout, all in the scope's pool:
 //! - manifest `v`: a record in the scope's collection, immutable once
 //!   written, holding the kernel at the folded watermark and the run list;
-//! - one collection per run, holding sorted [`RUN_CHUNK_ENTRIES`](crate::population::RUN_CHUNK_ENTRIES)-entry chunk
+//! - one collection per run, holding sorted [`RUN_CHUNK_ENTRIES`]-entry chunk
 //!   records, so a retired run is dropped with one `delete_collection`;
 //! - a mutable garbage list of collections awaiting deletion after a grace
-//!   period, which [`ShortIdIndex::collect_garbage`](crate::short_id::ShortIdIndex::collect_garbage) works through.
+//!   period, which [`ShortIdIndex::collect_garbage`] works through.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
