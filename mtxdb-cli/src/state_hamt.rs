@@ -327,15 +327,15 @@ mod tests {
     ///
     /// Not a correctness test: run with
     /// `cargo test --release -- --ignored --nocapture state_keyframe_measure`.
-    /// `MEASURE_EVENTS` overrides the event count. Replay is a full rebuild of
-    /// the keyframe's entries plus the deltas, an upper bound; the incremental
-    /// `HamtMutator` path is not measured. Every event is a state event; the
+    /// `MEASURE_EVENTS` overrides the event count. Replay latency and
+    /// per-event path-copy (logical) node bytes are not measured: both need
+    /// the incremental `HamtMutator` path, and this test rebuilds the full
+    /// trie at each sampled group. Unique bytes are valid either way, since
+    /// they count distinct content-addressed nodes. Every event is a state event; the
     /// disposition mix is the share of rejected events, which apply no tuple.
     #[test]
     #[ignore = "measurement, not a correctness test"]
     fn state_keyframe_measure() {
-        use std::time::Instant;
-
         const STGP_PAYLOAD: usize = 73;
         let room = "!space:example.org";
         let prefix = room_hamt_prefix(room);
@@ -377,26 +377,13 @@ mod tests {
                 .iter()
                 .map(|(t, k, e)| t.len() + k.len() + e.len() + 6)
                 .sum();
-            let mut micros = Vec::new();
-            if let Some(k) = keyframe {
-                for count in (k..=applied).step_by(1.max(applied / 64)) {
-                    let base = count - count % k;
-                    let started = Instant::now();
-                    let built = build_state_hamt(room, &prefix, &tuples[..count]).unwrap();
-                    std::hint::black_box(&built);
-                    let _ = base;
-                    micros.push(started.elapsed().as_micros());
-                }
-                micros.sort_unstable();
-            }
-            let pct = |q: usize| {
-                micros
-                    .get(micros.len().saturating_sub(1) * q / 100)
-                    .copied()
+            // Bytes per event as fixed-point tenths, avoiding float casts.
+            let per = |bytes: usize| {
+                let tenths = bytes.saturating_mul(10) / events.max(1);
+                format!("{}.{}", tenths / 10, tenths % 10)
             };
-            let per = |b: usize| b as f64 / events as f64;
             println!(
-                "{}\t{}%\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:?}\t{:?}",
+                "{}\t{}%\t{}\t{}\t{}\t{}\t{}",
                 keyframe.map_or("every".to_owned(), |k| format!("K={k}")),
                 mix,
                 groups,
@@ -406,14 +393,12 @@ mod tests {
                 if keyframe.is_some() {
                     per(delta_bytes)
                 } else {
-                    0.0
+                    "0.0".to_owned()
                 },
-                pct(50),
-                pct(99),
             );
         };
 
-        println!("config\treject\tgroups\tstgp_B_ev\troot_rec_B_ev\tstat_unique_B_ev\tdelta_B_ev\treplay_p50_us\treplay_p99_us");
+        println!("config\treject\tgroups\tstgp_B_ev\troot_rec_B_ev\tstat_unique_B_ev\tdelta_B_ev");
         for mix in [0, 1, 10] {
             measure(mix, None);
             for k in [16, 64, 256] {
