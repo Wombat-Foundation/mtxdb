@@ -453,6 +453,11 @@ thread_local! {
     /// before it queues its run for deletion.
     pub(crate) static BEFORE_QUEUE: std::cell::RefCell<Option<PublishHook>> =
         const { std::cell::RefCell::new(None) };
+    /// Runs once, between writing the run and publishing it. It must sit
+    /// there to simulate a GC pass in that window, so it runs while this
+    /// scope's compaction lock is held: it must not call `compact` on the
+    /// same scope (the lock is not reentrant). `collect_garbage` is fine.
+    /// Hooks that need to compact use `BEFORE_QUEUE`, which runs before the lock.
     pub(crate) static BEFORE_PUBLISH: std::cell::RefCell<Option<PublishHook>> =
         const { std::cell::RefCell::new(None) };
 }
