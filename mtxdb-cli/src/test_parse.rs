@@ -285,3 +285,22 @@ fn test_shard_type_flag_accepts_server_info() {
         assert_eq!(shard_type_from_arg(val), Some(ShardType::ServerInfo));
     }
 }
+
+#[test]
+fn search_requires_a_term_and_defaults_its_limit() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "search", "0x01"])
+        .is_err());
+    let matches = build_cli()
+        .try_get_matches_from([
+            "mtxdb", "search", "0x01", "--term", "hi", "--template", "t.json",
+        ])
+        .unwrap();
+    let sub = matches.subcommand_matches("search").unwrap();
+    assert_eq!(sub.get_one::<String>("term").map(String::as_str), Some("hi"));
+    assert_eq!(
+        sub.get_one::<String>("template").map(String::as_str),
+        Some("t.json")
+    );
+    assert!(sub.get_one::<i64>("limit").is_some());
+}

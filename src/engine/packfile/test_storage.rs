@@ -8589,7 +8589,7 @@ fn shared_wal_lock_child_cannot_acquire_held_lock() {
 fn shared_wal_lock_is_exclusive_across_processes() {
     let root = test_dir("shared_wal_lock_process_exclusive");
     let _layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
-    let _lock = crate::journal::SharedWalLock::acquire(&root).unwrap();
+    let lock = crate::journal::SharedWalLock::acquire(&root).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -8610,6 +8610,8 @@ fn shared_wal_lock_is_exclusive_across_processes() {
         b"blocked",
         "the re-executed test must actually perform the lock assertion"
     );
+    drop(lock);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

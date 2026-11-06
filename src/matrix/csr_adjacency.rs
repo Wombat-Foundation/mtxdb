@@ -603,7 +603,8 @@ impl CsrAdjacency {
 
     /// Build a sparse parent-to-children CSR view for one forward family.
     ///
-    /// This reads the family's visible rows once and is intended for a batch
+    /// This reads the family's stored rows once (no event-visibility filter:
+    /// for `RELATIONS` the caller must check each child's visibility) and is intended for a batch
     /// of reverse lookups; callers should reuse the returned view rather than
     /// rebuilding it per parent. Reverse rows are derived from the canonical
     /// forward rows, so purges and relation unions are reflected automatically.

@@ -94,7 +94,8 @@ fn reverse_family_transposes_persisted_rows() {
     assert_eq!(prev.children_of(msg).unwrap()[0].target, react);
     assert_eq!(auth.child_count(create), Some(2));
     assert_eq!(
-        auth.children_of(create).unwrap()[..]
+        auth.children_of(create)
+            .unwrap()
             .iter()
             .map(|edge| edge.target)
             .collect::<Vec<_>>(),
@@ -102,7 +103,10 @@ fn reverse_family_transposes_persisted_rows() {
     );
     assert_eq!(relations.child_count(msg), Some(1));
     assert_eq!(relations.children_of(msg).unwrap()[0].target, react);
-    assert_ne!(relations.children_of(msg).unwrap()[0].kind, 0);
+    assert_eq!(
+        relations.children_of(msg).unwrap()[0].kind,
+        adj.kind_id(&db, "m.annotation").unwrap()
+    );
 
     drop(db);
     let _ = std::fs::remove_dir_all(&root);

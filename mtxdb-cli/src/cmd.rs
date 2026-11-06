@@ -412,7 +412,6 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             | Commands::Get { .. }
             | Commands::Sync { .. }
             | Commands::Scan { .. }
-            | Commands::Search { .. }
             | Commands::Info { .. }
             | Commands::Packs { .. }
             | Commands::Repack { out: Some(_), .. } => {}
@@ -7564,7 +7563,6 @@ fn search_template(path: Option<&Path>) -> anyhow::Result<SearchTemplate> {
     let Some(path) = path else {
         return Ok(SearchTemplate {
             fields: vec![
-                "/content/body".to_owned(),
                 "/type".to_owned(),
                 "/sender".to_owned(),
             ],
@@ -7620,10 +7618,10 @@ fn valid_json_pointer(pointer: &str) -> bool {
 }
 
 fn search_record_matches(record: &OwnedValue, fields: &[String], term: &str) -> bool {
-    let needle = term.to_ascii_lowercase();
+    let needle = term.to_lowercase();
     fields.iter().any(|pointer| {
         extract_pointer_string(record, pointer)
-            .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
+            .is_some_and(|value| value.to_lowercase().contains(&needle))
     })
 }
 
@@ -7670,7 +7668,7 @@ fn cmd_search_single(
             .identity
             .as_deref()
             .and_then(|pointer| extract_pointer_string(&record, pointer))
-            .map_or_else(|| format!("0x{}", hex::encode(node_id)), str::to_owned);
+            .map_or_else(|| format_id(&node_id), str::to_owned);
         println!("{id}");
         results = results.saturating_add(1);
         if max_results != 0 && results >= max_results {
