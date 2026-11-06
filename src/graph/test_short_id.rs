@@ -37,6 +37,34 @@ fn allocation_is_dense_stable_and_idempotent() {
 }
 
 #[test]
+fn previous_short_id_wire_version_is_rejected() {
+    let root = test_root("old-format");
+    let db = Database::open(root.clone()).unwrap();
+    let txn = db.begin_transaction();
+    let mut old_counter = header(*b"SIDC");
+    old_counter[4] = SHORT_ID_FORMAT_VERSION - 1;
+    old_counter.extend_from_slice(&1_u32.to_be_bytes());
+    old_counter.extend_from_slice(&1_u32.to_be_bytes());
+    old_counter.extend_from_slice(&0_u32.to_be_bytes());
+    old_counter.extend_from_slice(&1_u32.to_be_bytes());
+    old_counter.extend_from_slice(&0_u32.to_be_bytes());
+    txn.put(
+        POOL,
+        SCOPE,
+        COUNTER_ID,
+        &crate::storage::NodeData::new(bytes::Bytes::from(old_counter)),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    assert!(matches!(
+        index().counter(&db),
+        Err(StorageError::Corrupt(_))
+    ));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn reopen_preserves_ids_and_purge_resets_the_scope() {
     let root = test_root("reopen");
     {

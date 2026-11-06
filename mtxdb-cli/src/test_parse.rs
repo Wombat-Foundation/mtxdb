@@ -302,5 +302,5 @@ fn search_requires_a_term_and_defaults_its_limit() {
         sub.get_one::<String>("template").map(String::as_str),
         Some("t.json")
     );
-    assert!(sub.get_one::<i64>("limit").is_some());
+    assert_eq!(sub.get_one::<i64>("limit"), Some(&50));
 }

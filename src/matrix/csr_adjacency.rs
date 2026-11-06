@@ -332,26 +332,32 @@ impl CsrAdjacency {
         if events.is_empty() {
             return Ok(Vec::new());
         }
-        let prepared = self.prepare_events(db, events)?;
+        let store = self.store(db);
+        // The read, merge and append must be one critical section: two
+        // recordings that both read the same stored row would otherwise each
+        // validate against the old state, and the later append would silently
+        // replace the earlier one.
+        store.with_write_lock(|| {
+            let prepared = self.prepare_events(db, events)?;
 
-        // Validate everything that can collide before allocating any id, so a
-        // rejected batch records nothing. Only the batch's own owners are read;
-        // the rest of the collection is not touched.
-        let (owner_ids, mut stored) = self.load_stored(db, &prepared)?;
-        self.check_conflicts(db, &prepared, &owner_ids, &stored)?;
+            // Validate everything that can collide before allocating any id,
+            // so a rejected batch records nothing. Only the batch's own owners
+            // are read; the rest of the collection is not touched.
+            let (owner_ids, mut stored) = self.load_stored(db, &prepared)?;
+            self.check_conflicts(db, &prepared, &owner_ids, &stored)?;
 
-        // Allocate every id in one call, exactly as the short-id layer did.
-        let (keys, starts) = batch_keys(&prepared);
-        let ids = self.events.get_or_create(db, &keys)?;
-        let (owners, changed_rows) = merge_batch(&mut stored, &prepared, &starts, &ids)?;
-        if !changed_rows.is_empty() {
-            let store = self.store(db);
-            store
-                .writer(db)
-                .and_then(|writer| writer.append_rows(self.scope(), &changed_rows))
-                .map_err(StorageError::Io)?;
-        }
-        Ok(owners)
+            // Allocate every id in one call, exactly as the short-id layer did.
+            let (keys, starts) = batch_keys(&prepared);
+            let ids = self.events.get_or_create(db, &keys)?;
+            let (owners, changed_rows) = merge_batch(&mut stored, &prepared, &starts, &ids)?;
+            if !changed_rows.is_empty() {
+                store
+                    .writer(db)
+                    .and_then(|writer| writer.append_rows_locked(self.scope(), &changed_rows))
+                    .map_err(StorageError::Io)?;
+            }
+            Ok(owners)
+        })
     }
 
     /// Turn each event into edge keys, allocating relation kind ids once per
@@ -416,7 +422,7 @@ impl CsrAdjacency {
         }
         let rows = self
             .store(db)
-            .read_rows(self.scope(), &stored_keys)
+            .read_rows_locked(self.scope(), &stored_keys)
             .map_err(StorageError::Io)?;
         let mut stored: StoredRows = HashMap::new();
         for ((family, owner), row) in stored_keys.iter().zip(rows) {

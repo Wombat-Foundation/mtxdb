@@ -1,6 +1,6 @@
 //! Measure the CSR store read paths: on-disk point lookups, the first
-//! whole-scope read (which warms the sealed-row cache), later whole-scope
-//! reads, and the first whole-scope read after a new seal.
+//! whole-scope read, the total for one pass over all scopes, and the first
+//! whole-scope read after a new seal.
 //!
 //! ```text
 //! MTXDB_BENCH_ROOT=/tmp/mtxdb-csr-read \
@@ -86,6 +86,7 @@ fn point_reads(
                 keys.len(),
                 "read_rows must return one entry per key"
             );
+            assert!(found.iter().all(Option::is_some), "point reads must hit");
         }
     }
     (
@@ -139,6 +140,7 @@ fn read_after_seal(store: &CsrStore, db: &Database, family: EdgeFamily, rows: us
 fn main() {
     let scopes = env_usize("MTXDB_CSR_SCOPES", 1024);
     let rows = env_usize("MTXDB_CSR_ROWS", 128);
+    assert!(scopes > 0 && rows > 0, "scope and row counts must be nonzero");
     let rounds = env_usize("MTXDB_CSR_ROUNDS", 5).max(1);
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     std::fs::create_dir_all(&base).expect("bench root");
@@ -149,12 +151,12 @@ fn main() {
     let family = EdgeFamily::typed(1);
 
     let build = build(&store, &db, scopes, rows, family);
-    let keys: Vec<(EdgeFamily, u32)> = (0..16)
+    let keys: Vec<(EdgeFamily, u32)> = (0..rows.min(16))
         .map(|owner| (family, u32::try_from(owner).unwrap_or(u32::MAX)))
         .collect();
     let (point_per_op, point_ops) = point_reads(&store, &keys, scopes, rounds);
-    let (first_scope, warm_pass) = whole_scope_reads(&store, scopes, rows);
-    let per_scope = warm_pass
+    let (first_scope, all_scopes) = whole_scope_reads(&store, scopes, rows);
+    let per_scope = all_scopes
         .checked_div(u32::try_from(scopes.max(1)).unwrap_or(u32::MAX))
         .unwrap_or(Duration::ZERO);
     let after_seal = read_after_seal(&store, &db, family, rows);
@@ -169,7 +171,7 @@ fn main() {
         scopes.min(64)
     );
     println!(
-        "read_scope: first {first_scope:?}, all {scopes} scopes {warm_pass:?} ({per_scope:?}/scope)"
+        "read_scope: first {first_scope:?}, all {scopes} scopes {all_scopes:?} ({per_scope:?}/scope)"
     );
     println!("read_scope after a new seal: {after_seal:?}");
 

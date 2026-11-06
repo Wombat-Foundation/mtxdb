@@ -43,6 +43,14 @@ fn test_dir(name: &str) -> PathBuf {
     }
 }
 
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn read_committed_overlay_sees_a_committed_but_unflushed_group() {
     let dir = test_dir("read_committed_unflushed");
@@ -8588,6 +8596,7 @@ fn shared_wal_lock_child_cannot_acquire_held_lock() {
 #[test]
 fn shared_wal_lock_is_exclusive_across_processes() {
     let root = test_dir("shared_wal_lock_process_exclusive");
+    let _cleanup = RemoveDirOnDrop(root.clone());
     let _layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
     let lock = crate::journal::SharedWalLock::acquire(&root).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -8611,7 +8620,6 @@ fn shared_wal_lock_is_exclusive_across_processes() {
         "the re-executed test must actually perform the lock assertion"
     );
     drop(lock);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

@@ -527,3 +527,33 @@ fn a_relation_can_be_added_later_but_never_changed_or_removed() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn concurrent_recordings_of_one_event_cannot_both_succeed() {
+    let root = test_root("concurrent-same-owner");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    let (first, second) = std::thread::scope(|scope| {
+        let one = scope.spawn(|| adj.record_event(&db, "$e", &["$a"], &[], None));
+        let two = scope.spawn(|| adj.record_event(&db, "$e", &["$b"], &[], None));
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    assert_eq!(
+        usize::from(first.is_ok()) + usize::from(second.is_ok()),
+        1,
+        "two different prev sets for one event must not both win"
+    );
+    let error = first
+        .err()
+        .or_else(|| second.err())
+        .expect("exactly one recording failed");
+    assert!(matches!(error, StorageError::Collision(_)), "{error}");
+    let stored = adj.prev_of(&db, "$e").unwrap().unwrap();
+    assert!(
+        stored == ["$a".to_owned()] || stored == ["$b".to_owned()],
+        "the winner's edges must survive intact: {stored:?}"
+    );
+    assert!(adj.verify(&db).unwrap().is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}

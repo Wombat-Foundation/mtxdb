@@ -36,8 +36,10 @@ use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
-/// Wire version shared by every short-id record.
-pub const SHORT_ID_FORMAT_VERSION: u8 = 1;
+/// Wire version shared by every short-id record. Version 2 intentionally
+/// rejects the pre-CSR format, whose `SIDE` adjacency records are no longer
+/// read or migrated.
+pub const SHORT_ID_FORMAT_VERSION: u8 = 2;
 /// Largest id that may be allocated.
 pub const SHORT_ID_MAX: u32 = u32::MAX - 1;
 
@@ -596,7 +598,10 @@ impl ShortIdIndex {
         txn.commit()
     }
 
-    /// Remove the whole scope (counter, mappings and edges) in one commit.
+    /// Remove the scope's counter, id mappings, and owner log in one commit.
+    ///
+    /// Adjacency is stored separately; callers that own the graph must also
+    /// tombstone its rows with `CsrAdjacency::purge_graph`.
     ///
     /// # Errors
     /// Returns an error if the delete cannot be staged or committed.
@@ -606,8 +611,9 @@ impl ShortIdIndex {
         txn.commit()
     }
 
-    /// Stage the scope's removal into `txn`, so it commits atomically with
-    /// other deletes (for example the scope's closure generations).
+    /// Stage removal of this index's counter, id mappings, and owner log into
+    /// `txn`. CSR adjacency rows are tombstoned separately by
+    /// `CsrAdjacency::purge_graph`.
     ///
     /// # Errors
     /// Returns an error if the delete cannot be staged.

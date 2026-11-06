@@ -35,7 +35,8 @@
 //! [`CsrStore::writer`] needs the owning `Database` (so the lock is held) and
 //! rejects one whose root is not the store's. Threads sharing one `Database`
 //! are serialized by a per-directory write lock that every mutation holds.
-//! Direct reads need no lock.
+//! Reads and writes share the per-directory lock so a reader cannot observe a
+//! seal between segment enumeration and tail-cache replay.
 //!
 //! The tail stays under [`SEAL_THRESHOLD`] because both tail writers,
 //! `append_rows` and `purge_scope`, seal after
@@ -46,8 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use super::{Edge, EdgeFamily};
 use crate::database::Database;
@@ -138,6 +138,11 @@ impl CsrWriter<'_> {
         self.store.append_rows(scope, rows)
     }
 
+    /// Append while the caller holds [`CsrStore::with_write_lock`].
+    pub(crate) fn append_rows_locked(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
+        self.store.append_rows_locked(scope, rows)
+    }
+
     /// Hide every row of `scope` with a tombstone record.
     ///
     /// # Errors
@@ -162,13 +167,28 @@ impl CsrStore {
     #[must_use]
     pub fn open(layout: &DatabaseLayout, pool: ShardType) -> Self {
         Self {
-            dir: layout.graph_path(pool),
+            dir: physical_path(&layout.graph_path(pool)),
         }
     }
 
     fn write_lock(&self) -> Arc<Mutex<()>> {
         let mut locks = WRITE_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(locks.entry(self.dir.clone()).or_default())
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&self.dir).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(self.dir.clone(), Arc::downgrade(&lock));
+        lock
+    }
+
+    /// Run an operation while excluding reads and mutations on this store.
+    /// Compound adjacency writes use this to keep their read/merge/append
+    /// sequence atomic with respect to other writers.
+    pub(crate) fn with_write_lock<R>(&self, operation: impl FnOnce() -> R) -> R {
+        let lock = self.write_lock();
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        operation()
     }
 
     /// Write access to this store through the database that owns its root.
@@ -181,7 +201,7 @@ impl CsrStore {
         let layout = database.layout();
         let owned = ShardType::ALL
             .into_iter()
-            .any(|pool| layout.graph_path(pool) == self.dir);
+            .any(|pool| physical_path(&layout.graph_path(pool)) == self.dir);
         if !owned {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -326,12 +346,7 @@ impl CsrStore {
         fs::rename(&temp, &target)?;
         sync_dir(&self.dir)?;
         // The segment is durable; only now is it safe to drop the tail.
-        // Bump around the truncate: a reader that decoded the old tail must
-        // not cache it as a prefix of whatever is appended next.
-        TAIL_EPOCH.fetch_add(1, AtomicOrdering::SeqCst);
-        let truncated = OpenOptions::new().write(true).open(&tail)?.set_len(0);
-        TAIL_EPOCH.fetch_add(1, AtomicOrdering::SeqCst);
-        truncated?;
+        OpenOptions::new().write(true).open(&tail)?.set_len(0)?;
         Ok(())
     }
 
@@ -348,6 +363,10 @@ impl CsrStore {
     /// # Errors
     /// I/O errors or a malformed sealed segment.
     pub fn read_scope(&self, scope: ScopeId) -> io::Result<ScopeData> {
+        self.with_write_lock(|| self.read_scope_locked(scope))
+    }
+
+    fn read_scope_locked(&self, scope: ScopeId) -> io::Result<ScopeData> {
         let mut rows: HashMap<RowKey, (bool, Vec<Edge>)> = HashMap::new();
         for (_, path) in self.segments()? {
             apply_segment(&path, scope, None, None, &mut rows)?;
@@ -384,6 +403,14 @@ impl CsrStore {
     /// # Errors
     /// I/O errors or a malformed sealed segment.
     pub fn read_rows(
+        &self,
+        scope: ScopeId,
+        keys: &[(EdgeFamily, u32)],
+    ) -> io::Result<Vec<Option<Vec<Edge>>>> {
+        self.with_write_lock(|| self.read_rows_locked(scope, keys))
+    }
+
+    pub(crate) fn read_rows_locked(
         &self,
         scope: ScopeId,
         keys: &[(EdgeFamily, u32)],
@@ -425,6 +452,14 @@ impl CsrStore {
     /// # Errors
     /// I/O errors or a malformed sealed segment.
     pub fn read_family(
+        &self,
+        scope: ScopeId,
+        family: EdgeFamily,
+    ) -> io::Result<Vec<(u32, Vec<Edge>)>> {
+        self.with_write_lock(|| self.read_family_locked(scope, family))
+    }
+
+    fn read_family_locked(
         &self,
         scope: ScopeId,
         family: EdgeFamily,
@@ -490,7 +525,6 @@ impl CsrStore {
     /// since the last call. A file shorter than what was decoded (a seal)
     /// discards the cache.
     fn with_tail<R>(&self, read: impl FnOnce(&TailState) -> R) -> io::Result<R> {
-        let epoch = TAIL_EPOCH.load(AtomicOrdering::SeqCst);
         let len = match fs::metadata(self.tail_path()) {
             Ok(meta) => meta.len(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
@@ -502,10 +536,9 @@ impl CsrStore {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.dir);
         let mut state = match cached {
-            Some(state) if state.valid <= len && state.epoch == epoch => state,
+            Some(state) if state.valid <= len => state,
             _ => TailState::default(),
         };
-        state.epoch = epoch;
         if state.valid < len {
             let (frames, valid) = self.read_tail_from(state.valid)?;
             for frame in &frames {
@@ -514,14 +547,10 @@ impl CsrStore {
             state.valid = state.valid.saturating_add(valid as u64);
         }
         let result = read(&state);
-        // A seal since `epoch` was read may have replaced the tail under this
-        // state; caching it would make later reads skip the new bytes.
-        if TAIL_EPOCH.load(AtomicOrdering::SeqCst) == epoch {
-            TAIL_CACHE
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(self.dir.clone(), state);
-        }
+        TAIL_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(self.dir.clone(), state);
         Ok(result)
     }
 
@@ -677,8 +706,6 @@ fn encode_segment(groups: &mut [([u8; 16], ScopeGroup)], records: usize) -> io::
 /// of rows. Sealed segments are not cached; they are read by directory.
 #[derive(Default)]
 struct TailState {
-    /// The `TAIL_EPOCH` this state was decoded under.
-    epoch: u64,
     valid: u64,
     rows: HashMap<RowKey, (bool, Vec<Edge>)>,
     purged: HashSet<[u8; 16]>,
@@ -699,10 +726,6 @@ impl TailState {
     }
 }
 
-/// Bumped before and after every seal truncates a tail, so a cached decode
-/// from before the seal is never extended with bytes from after it.
-static TAIL_EPOCH: AtomicU64 = AtomicU64::new(0);
-
 static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, TailState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -714,8 +737,30 @@ static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, TailState>>> =
 /// length and may truncate or replace it, so two of them at once would cut
 /// each other's frames. Every mutation therefore holds this lock from the tail
 /// check through its seal.
-static WRITE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+static WRITE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve existing symlinks in a store path while preserving nonexistent
+/// suffixes (stores are created lazily with their first write).
+fn physical_path(path: &Path) -> PathBuf {
+    let mut suffix = Vec::new();
+    let mut ancestor = path;
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            return path.to_path_buf();
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        ancestor = parent;
+    }
+    let mut resolved = fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    for component in suffix.into_iter().rev() {
+        resolved.push(component);
+    }
+    resolved
+}
 
 struct Frame {
     payload: Vec<u8>,
@@ -1187,6 +1232,22 @@ mod tests {
 
         drop(db);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_layouts_share_the_physical_store_lock() {
+        let root = unique_root("symlink-owner");
+        let alias = root.with_extension("alias");
+        let layout = DatabaseLayout::open(root.clone()).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let alias_layout = DatabaseLayout::open(alias.clone()).unwrap();
+        let real = CsrStore::open(&layout, ShardType::State);
+        let linked = CsrStore::open(&alias_layout, ShardType::State);
+        assert_eq!(real.dir(), linked.dir());
+        assert!(Arc::ptr_eq(&real.write_lock(), &linked.write_lock()));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(alias);
     }
 
     #[test]
