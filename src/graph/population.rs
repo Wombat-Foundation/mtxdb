@@ -623,9 +623,15 @@ impl ShortIdIndex {
             chunk = end;
         }
         if out.len() != run.entries as usize {
-            return Err(StorageError::Corrupt(
-                "short-id run entry count disagrees with its manifest".to_owned(),
-            ));
+            return Err(StorageError::Corrupt(format!(
+                "short-id run entry count disagrees with its manifest: run v{} token {} \
+                 read {} entries, manifest says {} entries in {} chunks",
+                run.version,
+                run.token,
+                out.len(),
+                run.entries,
+                run.chunks,
+            )));
         }
         Ok(out)
     }

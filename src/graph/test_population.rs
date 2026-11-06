@@ -708,3 +708,42 @@ fn a_stale_queue_entry_does_not_shorten_a_retired_runs_grace() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A compactor overtaken before it queues its run adds the winner's published
+/// run to the garbage list. That run is live, so garbage collection must never
+/// delete it, however long after the stale entry's deadline it runs.
+#[test]
+fn a_stale_queue_entry_never_deletes_a_live_run() {
+    const GRACE_MS: u64 = 1_000;
+    let scope = ShortIdIndex::new(ShardType::ServerInfo, [0x73; 16]);
+    let root = test_root("stale-queue-live");
+    let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
+    for i in 0..20_u32 {
+        let key = format!("$e{i}").into_bytes();
+        let payload = encode_owner_payload(hash(i));
+        record_retrying(
+            &scope,
+            &db,
+            &[BatchEvent {
+                owner: &key,
+                owner_payload: Some(&payload),
+            }],
+        );
+    }
+    let hook_db = db.clone();
+    BEFORE_QUEUE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            scope.compact(&hook_db, 0, GRACE_MS, true).unwrap().unwrap();
+        }));
+    });
+    scope.compact(&db, 0, GRACE_MS, true).unwrap();
+
+    // Long past the stale entry's deadline, with the run still live.
+    scope.collect_garbage(&db, 1_000_000).unwrap();
+    drop(db);
+    let db = Database::open(root.clone()).unwrap();
+    let snapshot = scope.population_snapshot(&db).unwrap();
+    assert_serves(&snapshot, 0..20);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
