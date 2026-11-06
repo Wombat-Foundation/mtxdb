@@ -709,11 +709,10 @@ fn a_stale_queue_entry_does_not_shorten_a_retired_runs_grace() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A compactor overtaken before it queues its run adds the winner's published
-/// run to the garbage list. That run is live, so garbage collection must never
-/// delete it, however long after the stale entry's deadline it runs.
+/// A compactor overtaken before it queues its run must detect the newer
+/// manifest before writing or queueing the same deterministic run collection.
 #[test]
-fn a_stale_queue_entry_never_deletes_a_live_run() {
+fn a_stale_compactor_does_not_requeue_the_winners_run() {
     const GRACE_MS: u64 = 1_000;
     let scope = ShortIdIndex::new(ShardType::ServerInfo, [0x73; 16]);
     let root = test_root("stale-queue-live");
@@ -738,7 +737,23 @@ fn a_stale_queue_entry_never_deletes_a_live_run() {
     });
     scope.compact(&db, 0, GRACE_MS, true).unwrap();
 
-    // Long past the stale entry's deadline, with the run still live.
+    let run = WRITTEN_RUNS
+        .lock()
+        .iter()
+        .find(|(owner, _)| *owner == [0x73; 16])
+        .map(|(_, run)| *run)
+        .expect("the winning compactor wrote a run");
+    let collections = scope.run_collections_for_test(&db).unwrap();
+    assert_eq!(
+        collections
+            .iter()
+            .filter(|(collection, _)| *collection == run)
+            .count(),
+        1,
+        "the stale attempt must not enqueue or rewrite the winner's run"
+    );
+
+    // Long past the grace deadline, with the run still live.
     scope.collect_garbage(&db, 1_000_000).unwrap();
     drop(db);
     let db = Database::open(root.clone()).unwrap();
