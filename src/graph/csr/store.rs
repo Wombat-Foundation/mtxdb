@@ -1115,8 +1115,11 @@ fn read_row_at(
     apply_payload(&row, rows).map_err(|_| corrupt("malformed csr row"))
 }
 
+/// Flush the directory's entries. The engine's helper opens the handle in the
+/// way each platform allows; a plain `File::open` on a directory fails with
+/// "Access is denied" on Windows.
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+    crate::shard::sync_directory(dir)
 }
 
 #[cfg(test)]
