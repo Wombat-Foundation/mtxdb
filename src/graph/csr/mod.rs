@@ -4,7 +4,7 @@
 //! source pool, addressed by `(collection id, family, owner)`.
 pub mod store;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 const CSR_VERSION: u8 = 1;
 const CSR_FAMILIES_MAGIC: &[u8; 4] = b"CSRF";
@@ -50,6 +50,99 @@ pub struct EdgeKey<'a> {
     pub target: &'a [u8],
     /// Kind id (must be 0 for untyped families).
     pub kind: u16,
+}
+
+/// Sparse reverse CSR for one edge family, built from its forward rows.
+///
+/// `parents` is a sorted sparse directory; `offsets` and `counts` identify
+/// each parent's row in the flat `children` column. Typed families retain a
+/// parallel `kind` value on each reverse edge. Build this once for a query
+/// batch rather than once per parent lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReverseCsr {
+    family: EdgeFamily,
+    parents: Vec<u32>,
+    offsets: Vec<u32>,
+    counts: Vec<u32>,
+    children: Vec<Edge>,
+}
+
+impl ReverseCsr {
+    /// Transpose forward rows `(child, parents)` into sparse parent rows.
+    ///
+    /// Child ids are sorted within each row and duplicate `(child, kind)`
+    /// edges are collapsed. `counts` stores each row's cardinality so callers
+    /// can answer count queries without decoding or scanning its children.
+    ///
+    /// # Errors
+    /// Returns [`CsrError::Malformed`] if the reverse index exceeds `u32`
+    /// address space.
+    pub fn from_forward_rows(
+        family: EdgeFamily,
+        rows: &[(u32, Vec<Edge>)],
+    ) -> Result<Self, CsrError> {
+        let mut by_parent: BTreeMap<u32, BTreeSet<(u32, u16)>> = BTreeMap::new();
+        for (child, parents) in rows {
+            for edge in parents {
+                by_parent
+                    .entry(edge.target)
+                    .or_default()
+                    .insert((*child, edge.kind));
+            }
+        }
+
+        let mut parents = Vec::with_capacity(by_parent.len());
+        let mut offsets = Vec::with_capacity(by_parent.len().saturating_add(1));
+        let mut counts = Vec::with_capacity(by_parent.len());
+        let mut children = Vec::new();
+        offsets.push(0);
+        for (parent, row) in by_parent {
+            let count = u32::try_from(row.len()).map_err(|_| CsrError::Malformed)?;
+            parents.push(parent);
+            counts.push(count);
+            children.extend(row.into_iter().map(|(child, kind)| Edge {
+                target: child,
+                kind,
+            }));
+            offsets.push(u32::try_from(children.len()).map_err(|_| CsrError::Malformed)?);
+        }
+
+        Ok(Self {
+            family,
+            parents,
+            offsets,
+            counts,
+            children,
+        })
+    }
+
+    /// The forward family this index transposes.
+    #[must_use]
+    pub const fn family(&self) -> EdgeFamily {
+        self.family
+    }
+
+    /// Sorted parent ids represented in this sparse directory.
+    #[must_use]
+    pub fn parents(&self) -> &[u32] {
+        &self.parents
+    }
+
+    /// The parent row's children, sorted by child id and then edge kind.
+    #[must_use]
+    pub fn children_of(&self, parent: u32) -> Option<&[Edge]> {
+        let index = self.parents.binary_search(&parent).ok()?;
+        let start = *self.offsets.get(index)? as usize;
+        let end = *self.offsets.get(index.saturating_add(1))? as usize;
+        self.children.get(start..end)
+    }
+
+    /// O(1) cardinality after the sparse parent lookup.
+    #[must_use]
+    pub fn child_count(&self, parent: u32) -> Option<u32> {
+        let index = self.parents.binary_search(&parent).ok()?;
+        self.counts.get(index).copied()
+    }
 }
 
 impl<'a> EdgeKey<'a> {

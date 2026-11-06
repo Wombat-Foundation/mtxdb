@@ -379,6 +379,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Put { .. } => "put",
         Commands::Get { .. } => "get",
         Commands::Scan { .. } => "scan",
+        Commands::Search { .. } => "search",
         Commands::Delete { .. } => "delete",
         Commands::Tombstones { .. } => "tombstones",
         Commands::Remove { .. } => "remove",
@@ -411,6 +412,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             | Commands::Get { .. }
             | Commands::Sync { .. }
             | Commands::Scan { .. }
+            | Commands::Search { .. }
             | Commands::Info { .. }
             | Commands::Packs { .. }
             | Commands::Repack { out: Some(_), .. } => {}
@@ -534,6 +536,12 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             *reverse,
             *live,
         ),
+        Commands::Search {
+            collection,
+            template,
+            term,
+            limit,
+        } => cmd_search(cli, collection, template.as_deref(), term, *limit),
         Commands::Import {
             paths,
             collection,
@@ -7543,6 +7551,131 @@ fn cmd_scan_coalesced(
             matching_dirs.len(),
             valid_dirs.len()
         );
+    }
+    Ok(())
+}
+
+struct SearchTemplate {
+    fields: Vec<String>,
+    identity: Option<String>,
+}
+
+fn search_template(path: Option<&Path>) -> anyhow::Result<SearchTemplate> {
+    let Some(path) = path else {
+        return Ok(SearchTemplate {
+            fields: vec![
+                "/content/body".to_owned(),
+                "/type".to_owned(),
+                "/sender".to_owned(),
+            ],
+            identity: Some("/event_id".to_owned()),
+        });
+    };
+    let bytes = fs::read(path).with_context(|| format!("reading template {}", path.display()))?;
+    let value = OwnedValue::parse_bytes(&bytes)
+        .with_context(|| format!("template {} is not valid JSON", path.display()))?;
+    let fields = match value.get("search").and_then(|search| search.get("fields")) {
+        Some(OwnedValue::Array(fields)) => fields
+            .iter()
+            .map(|field| match field {
+                OwnedValue::String(pointer) if valid_json_pointer(pointer) => Ok(pointer.clone()),
+                other => bail!(
+                    "template {} search.fields entries must be valid JSON pointers; got {other:?}",
+                    path.display()
+                ),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        _ => bail!(
+            "template {} must declare search.fields as an array of JSON pointers",
+            path.display()
+        ),
+    };
+    if fields.is_empty() {
+        bail!(
+            "template {} search.fields must not be empty",
+            path.display()
+        );
+    }
+    let identity =
+        template_string_at(&value, &["record", "identity", "extract", "path"]).map(str::to_owned);
+    Ok(SearchTemplate { fields, identity })
+}
+
+fn valid_json_pointer(pointer: &str) -> bool {
+    if pointer.is_empty() {
+        return true;
+    }
+    let Some(rest) = pointer.strip_prefix('/') else {
+        return false;
+    };
+    for segment in rest.split('/') {
+        let mut chars = segment.chars();
+        while let Some(character) = chars.next() {
+            if character == '~' && !matches!(chars.next(), Some('0' | '1')) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn search_record_matches(record: &OwnedValue, fields: &[String], term: &str) -> bool {
+    let needle = term.to_ascii_lowercase();
+    fields.iter().any(|pointer| {
+        extract_pointer_string(record, pointer)
+            .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
+    })
+}
+
+fn cmd_search(
+    cli: &Cli,
+    collection: &str,
+    template_path: Option<&Path>,
+    term: &str,
+    limit: i64,
+) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| {
+        cmd_search_single(sub_cli, collection, template_path, term, limit)
+    })
+}
+
+fn cmd_search_single(
+    cli: &Cli,
+    collection: &str,
+    template_path: Option<&Path>,
+    term: &str,
+    limit: i64,
+) -> anyhow::Result<()> {
+    if term.is_empty() {
+        bail!("search term must not be empty");
+    }
+    let spec = search_template(template_path)?;
+    let collection_id = parse_collection_selector(collection)?;
+    let layout = open_layout(cli)?;
+    let store = open_pool_read_only(pool_dir(&layout, ShardType::EventDag)?)
+        .context("failed to open EventDag store")?;
+    let max_results = scan_limit(limit);
+    let mut results = 0usize;
+    for entry in store.scan_collection(&collection_id)? {
+        let (node_id, data) = entry?;
+        if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+            continue;
+        }
+        let record = OwnedValue::parse_bytes(&data.bytes)
+            .with_context(|| format!("record {} is not valid JSON", hex::encode(node_id)))?;
+        if !search_record_matches(&record, &spec.fields, term) {
+            continue;
+        }
+        let id = spec
+            .identity
+            .as_deref()
+            .and_then(|pointer| extract_pointer_string(&record, pointer))
+            .map_or_else(|| format!("0x{}", hex::encode(node_id)), str::to_owned);
+        println!("{id}");
+        results = results.saturating_add(1);
+        if max_results != 0 && results >= max_results {
+            break;
+        }
     }
     Ok(())
 }

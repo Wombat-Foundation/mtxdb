@@ -63,6 +63,52 @@ fn records_and_reads_prev_auth_and_relation() {
 }
 
 #[test]
+fn reverse_family_transposes_persisted_rows() {
+    let root = test_root("reverse-family");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    adj.record_event(&db, "$msg", &["$create"], &["$create"], None)
+        .unwrap();
+    adj.record_event(
+        &db,
+        "$react",
+        &["$msg"],
+        &["$create"],
+        Some(RelationRef {
+            target: "$msg",
+            rel_type: "m.annotation",
+        }),
+    )
+    .unwrap();
+
+    let create = adj.short_id(&db, "$create").unwrap().unwrap();
+    let msg = adj.short_id(&db, "$msg").unwrap().unwrap();
+    let react = adj.short_id(&db, "$react").unwrap().unwrap();
+    let prev = adj.reverse_family(&db, PREV).unwrap();
+    let auth = adj.reverse_family(&db, AUTH).unwrap();
+    let relations = adj.reverse_family(&db, RELATIONS).unwrap();
+
+    assert_eq!(prev.child_count(create), Some(1));
+    assert_eq!(prev.children_of(create).unwrap()[0].target, msg);
+    assert_eq!(prev.children_of(msg).unwrap()[0].target, react);
+    assert_eq!(auth.child_count(create), Some(2));
+    assert_eq!(
+        auth.children_of(create).unwrap()[..]
+            .iter()
+            .map(|edge| edge.target)
+            .collect::<Vec<_>>(),
+        vec![msg, react]
+    );
+    assert_eq!(relations.child_count(msg), Some(1));
+    assert_eq!(relations.children_of(msg).unwrap()[0].target, react);
+    assert_ne!(relations.children_of(msg).unwrap()[0].kind, 0);
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn recording_is_idempotent_but_an_event_never_changes() {
     let root = test_root("idempotent");
     let db = Database::open(root.clone()).unwrap();

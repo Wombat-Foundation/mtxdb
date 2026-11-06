@@ -37,7 +37,7 @@ use std::collections::{BTreeSet, HashMap};
 type ClaimedEdges = BTreeSet<(Vec<u8>, u16)>;
 
 use crate::csr::store::{CsrStore, RowRecord, ScopeId};
-use crate::csr::{Edge, EdgeFamily, EdgeKey};
+use crate::csr::{Edge, EdgeFamily, EdgeKey, ReverseCsr};
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::short_id::ShortIdIndex;
@@ -599,6 +599,29 @@ impl CsrAdjacency {
                     .and_then(|bytes| utf8(bytes, "event id"))
             })
             .collect()
+    }
+
+    /// Build a sparse parent-to-children CSR view for one forward family.
+    ///
+    /// This reads the family's visible rows once and is intended for a batch
+    /// of reverse lookups; callers should reuse the returned view rather than
+    /// rebuilding it per parent. Reverse rows are derived from the canonical
+    /// forward rows, so purges and relation unions are reflected automatically.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure, corrupt segment, or an index too
+    /// large for `u32` offsets.
+    pub fn reverse_family(
+        &self,
+        db: &Database,
+        family: EdgeFamily,
+    ) -> Result<ReverseCsr, StorageError> {
+        let rows = self
+            .store(db)
+            .read_family(self.scope(), family)
+            .map_err(StorageError::Io)?;
+        ReverseCsr::from_forward_rows(family, &rows)
+            .map_err(|error| StorageError::Corrupt(format!("could not build reverse CSR: {error}")))
     }
 
     /// The event's relation if it has one and `visibility` shows it.

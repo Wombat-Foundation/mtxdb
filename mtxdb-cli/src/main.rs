@@ -182,6 +182,12 @@ pub(crate) enum Commands {
         reverse: bool,
         live: bool,
     },
+    Search {
+        collection: String,
+        template: Option<PathBuf>,
+        term: String,
+        limit: i64,
+    },
     Import {
         paths: Vec<PathBuf>,
         collection: Option<String>,
@@ -307,6 +313,7 @@ fn build_cli() -> Command {
         .subcommand(sub_export())
         .subcommand(sub_packs())
         .subcommand(sub_repack())
+        .subcommand(sub_search())
         .subcommand(sub_scan())
         .subcommand(sub_info())
         .subcommand(sub_delete())
@@ -747,6 +754,36 @@ fn sub_scan() -> Command {
                 .long("reverse")
                 .action(ArgAction::SetTrue)
                 .help("Reverse the sort order (descending) when used with -s"),
+        )
+        .arg(limit_arg())
+}
+
+fn sub_search() -> Command {
+    Command::new("search")
+        .about("Search template-declared string fields in a collection")
+        .long_about(
+            "Stream the collection's JSON event records and match a case-insensitive substring \
+             against the RFC 6901 pointers in the template's `search.fields` array. This reads \
+             the primary collection directly; query time grows with collection size.",
+        )
+        .arg(
+            Arg::new("collection")
+                .required(true)
+                .value_name("COLLECTION")
+                .help("Collection ID (0x-prefixed) or canonical Matrix room ID"),
+        )
+        .arg(
+            Arg::new("term")
+                .long("term")
+                .required(true)
+                .value_name("TEXT")
+                .help("Case-insensitive substring to find in searchable fields"),
+        )
+        .arg(
+            Arg::new("template")
+                .long("template")
+                .value_name("FILE")
+                .help("Collection template declaring searchable JSON pointers"),
         )
         .arg(limit_arg())
 }
@@ -1397,6 +1434,14 @@ fn parse_cli() -> Cli {
             sort: m.get_one::<String>("sort").cloned(),
             reverse: m.get_flag("reverse"),
             live: m.get_flag("live"),
+            limit: *m
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
+        },
+        Some(("search", m)) => Commands::Search {
+            collection: m.get_one::<String>("collection").unwrap().clone(),
+            template: m.get_one::<String>("template").map(PathBuf::from),
+            term: m.get_one::<String>("term").unwrap().clone(),
             limit: *m
                 .get_one::<i64>("limit")
                 .expect("clap supplies a default limit"),

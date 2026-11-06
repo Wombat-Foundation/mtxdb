@@ -14,12 +14,12 @@ use super::{
     parse_pack_id_selector, parse_pack_selectors, prepare_state_collection, pretty_print_payload,
     raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
     redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-    split_canonical_display, template_collection_id, template_event_id_node_id, template_node_id,
-    topological_event_order, valid_state_group_id, verify_auth_chain_edges,
-    write_raw_auth_projections, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, ScanOptions, SharedState,
-    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
-    STATE_GROUP_NAMESPACE,
+    search_record_matches, search_template, split_canonical_display, template_collection_id,
+    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
+    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
+    CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension,
+    MetaReport, PackIdentity, ScanOptions, SharedState, StateGroupLoad, StateSet,
+    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -2293,6 +2293,31 @@ fn template_node_id_matches_event_id_derivation() {
     custom.record_id_rule.policy = FrameIdPolicy::Payload;
     assert!(template_event_id_node_id(&custom, "$test_event:server.name").is_err());
     assert!(template_node_id(&custom, &event).is_err());
+}
+
+#[test]
+fn search_reads_only_template_declared_fields() {
+    let path = unique_temp_dir().join("search-template.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"search":{"fields":["/content/body"]},"record":{"identity":{"extract":{"path":"/event_id"}}}}"#,
+    )
+    .unwrap();
+    let spec = search_template(Some(&path)).unwrap();
+    let event = owned_value(
+        r#"{"event_id":"$one","type":"m.room.message","content":{"body":"Hello, World"}}"#,
+    );
+
+    assert!(search_record_matches(&event, &spec.fields, "world"));
+    assert!(!search_record_matches(
+        &event,
+        &spec.fields,
+        "m.room.message"
+    ));
+    assert_eq!(spec.identity.as_deref(), Some("/event_id"));
+    assert!(!valid_json_pointer("/content/~2body"));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 /// The room's missing parents, derived the way a consumer would: every event
