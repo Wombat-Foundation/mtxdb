@@ -46,6 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use super::{Edge, EdgeFamily};
@@ -325,7 +326,12 @@ impl CsrStore {
         fs::rename(&temp, &target)?;
         sync_dir(&self.dir)?;
         // The segment is durable; only now is it safe to drop the tail.
-        OpenOptions::new().write(true).open(&tail)?.set_len(0)?;
+        // Bump around the truncate: a reader that decoded the old tail must
+        // not cache it as a prefix of whatever is appended next.
+        TAIL_EPOCH.fetch_add(1, AtomicOrdering::SeqCst);
+        let truncated = OpenOptions::new().write(true).open(&tail)?.set_len(0);
+        TAIL_EPOCH.fetch_add(1, AtomicOrdering::SeqCst);
+        truncated?;
         Ok(())
     }
 
@@ -484,6 +490,7 @@ impl CsrStore {
     /// since the last call. A file shorter than what was decoded (a seal)
     /// discards the cache.
     fn with_tail<R>(&self, read: impl FnOnce(&TailState) -> R) -> io::Result<R> {
+        let epoch = TAIL_EPOCH.load(AtomicOrdering::SeqCst);
         let len = match fs::metadata(self.tail_path()) {
             Ok(meta) => meta.len(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
@@ -495,9 +502,10 @@ impl CsrStore {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.dir);
         let mut state = match cached {
-            Some(state) if state.valid <= len => state,
+            Some(state) if state.valid <= len && state.epoch == epoch => state,
             _ => TailState::default(),
         };
+        state.epoch = epoch;
         if state.valid < len {
             let (frames, valid) = self.read_tail_from(state.valid)?;
             for frame in &frames {
@@ -506,10 +514,14 @@ impl CsrStore {
             state.valid = state.valid.saturating_add(valid as u64);
         }
         let result = read(&state);
-        TAIL_CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(self.dir.clone(), state);
+        // A seal since `epoch` was read may have replaced the tail under this
+        // state; caching it would make later reads skip the new bytes.
+        if TAIL_EPOCH.load(AtomicOrdering::SeqCst) == epoch {
+            TAIL_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(self.dir.clone(), state);
+        }
         Ok(result)
     }
 
@@ -665,6 +677,8 @@ fn encode_segment(groups: &mut [([u8; 16], ScopeGroup)], records: usize) -> io::
 /// of rows. Sealed segments are not cached; they are read by directory.
 #[derive(Default)]
 struct TailState {
+    /// The `TAIL_EPOCH` this state was decoded under.
+    epoch: u64,
     valid: u64,
     rows: HashMap<RowKey, (bool, Vec<Edge>)>,
     purged: HashSet<[u8; 16]>,
@@ -684,6 +698,10 @@ impl TailState {
         Ok(())
     }
 }
+
+/// Bumped before and after every seal truncates a tail, so a cached decode
+/// from before the seal is never extended with bytes from after it.
+static TAIL_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, TailState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
