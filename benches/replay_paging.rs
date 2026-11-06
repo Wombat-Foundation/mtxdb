@@ -437,7 +437,11 @@ fn run_reclaim_fallback_arm() -> Result<(), Box<dyn Error>> {
     // ServerInfo is seeded last, so its pool watermark reaches the shared WAL
     // tail. Using EventDag here would leave later pools' seed groups after the
     // cursor and make the fallback page contain more than the test group.
-    let (scans, cursor, lease) = db.stores[3]
+    let server_info = POOLS
+        .iter()
+        .position(|pool| *pool == ShardType::ServerInfo)
+        .ok_or("ServerInfo pool missing from POOLS")?;
+    let (scans, cursor, lease) = db.stores[server_info]
         .scan_collections_at_snapshot(&db.collections)
         .expect("take fallback-arm snapshot");
     drop(scans);
