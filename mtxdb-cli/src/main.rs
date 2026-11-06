@@ -50,9 +50,8 @@ pub(crate) struct Cli {
 impl Cli {
     /// Return the single selected shard type, or bail if `-t all` was used.
     pub(crate) fn require_shard_type(&self) -> anyhow::Result<ShardType> {
-        self.shard_type.context(
-            "this command requires a specific shard type (-t state or -t events)",
-        )
+        self.shard_type
+            .context("this command requires a specific shard type (-t state or -t events)")
     }
 
     /// Iterate over the selected shard types (one if specific, all three if `-t all`).

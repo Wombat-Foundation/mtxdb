@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -9,8 +9,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context};
 
 use mtxdb::auxiliary::AuxiliaryIndex;
-use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::csr_adjacency::EventRecord;
+use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
@@ -9390,6 +9390,7 @@ fn template_pointer_node_id(
 }
 
 /// Produce the node ID for an event ID string under the template's record-identity rule.
+#[cfg(test)]
 fn template_event_id_node_id(
     template: &CollectionTemplate,
     event_id: &str,
@@ -11042,23 +11043,6 @@ fn import_pdu_events_with_raw_state_hamts(
         events,
         auth_chain,
     )?;
-    // Dependency recording is for raw Matrix PDUs keyed by event ID. JSONL and
-    // federation readers both reach this point; gate on the template identity
-    // rule rather than on whether adjacency happened to be parsed.
-    if matches!(
-        &template.record_id_rule.policy,
-        FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
-    ) {
-        record_raw_dependencies_and_waiting(
-            db,
-            store,
-            &collection_id,
-            template,
-            &resolved.canonical_id,
-            events.iter().chain(auth_chain),
-        )?;
-    }
-
     let room_events: Vec<RoomEvent> = all_events
         .iter()
         .filter_map(|event| RoomEvent::from_pdu(event, &resolved.canonical_id))
@@ -11150,154 +11134,6 @@ fn import_pdu_events_with_raw_state_hamts(
     }
 
     Ok(())
-}
-
-/// Persist the room's set of currently missing parent node IDs.
-///
-/// Write-only step: dirty-set traversal and `Unchecked` flag propagation are
-/// implemented by later import steps.
-///
-/// Crash-safety note: these writes are not atomic with the event/projection
-/// writes or with each other. Waiting removals run before waiting additions.
-/// Each collection operation is idempotent, so a crash can leave partial
-/// dependency metadata and re-import repairs it.
-fn record_raw_dependencies_and_waiting<'a>(
-    db: &Database,
-    event_store: &PackfileStorage,
-    room_event_collection_id: &[u8; 16],
-    template: &CollectionTemplate,
-    room_id: &str,
-    supplied_events: impl Iterator<Item = &'a OwnedValue>,
-) -> anyhow::Result<()> {
-    let graph = collect_raw_dependencies(template, room_id, supplied_events)?;
-    let missing = missing_raw_parents(event_store, room_event_collection_id, &graph.candidates)?;
-    let edge_store = db.server_info();
-    remove_raw_waiting(db, edge_store, room_id, &graph.arrived)?;
-    add_raw_waiting(edge_store, room_id, &missing)?;
-    Ok(())
-}
-
-struct RawDependencyGraph {
-    arrived: BTreeSet<NodeId>,
-    candidates: BTreeSet<NodeId>,
-}
-
-fn collect_raw_dependencies<'a>(
-    template: &CollectionTemplate,
-    room_id: &str,
-    supplied_events: impl Iterator<Item = &'a OwnedValue>,
-) -> anyhow::Result<RawDependencyGraph> {
-    let FrameIdPolicy::Pointer { pointer } = &template.record_id_rule.policy else {
-        bail!(
-            "record identity policy {:?} is not supported by the raw importer",
-            template.record_id_rule.policy
-        );
-    };
-    if pointer != "/event_id" {
-        bail!("raw Matrix import requires record identity pointer '/event_id', got '{pointer}'");
-    }
-    let events: Vec<&OwnedValue> = supplied_events
-        .filter(|event| event_room_id(event).is_none_or(|room| room == room_id))
-        .collect();
-    let file_event_ids: HashSet<String> = events
-        .iter()
-        .filter_map(|event| event_id(event))
-        .map(str::to_owned)
-        .collect();
-    let mut graph = RawDependencyGraph {
-        arrived: BTreeSet::new(),
-        candidates: BTreeSet::new(),
-    };
-    for event in events {
-        let Some(event_id) = event_id(event) else {
-            continue;
-        };
-        let child_node = template_event_id_node_id(template, event_id)?;
-        graph.arrived.insert(child_node);
-        let fields = MatrixEventFields::from_event(event_id, event);
-        for parent_event_id in fields.prev.iter().chain(fields.auth.iter()) {
-            let parent_node = template_event_id_node_id(template, parent_event_id)?;
-            if !file_event_ids.contains(parent_event_id.as_str()) {
-                graph.candidates.insert(parent_node);
-            }
-        }
-    }
-    Ok(graph)
-}
-
-fn missing_raw_parents(
-    event_store: &PackfileStorage,
-    room_event_collection_id: &[u8; 16],
-    candidates: &BTreeSet<NodeId>,
-) -> anyhow::Result<BTreeSet<NodeId>> {
-    if candidates.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let candidates: Vec<NodeId> = candidates.iter().copied().collect();
-    let existing = event_store.get_many(room_event_collection_id, &candidates)?;
-    Ok(candidates
-        .iter()
-        .zip(existing)
-        .filter_map(|(node, found)| found.is_none().then_some(*node))
-        .collect())
-}
-
-fn remove_raw_waiting(
-    db: &Database,
-    edge_store: &PackfileStorage,
-    room_id: &str,
-    arrived: &BTreeSet<NodeId>,
-) -> anyhow::Result<()> {
-    let waiting = raw_waiting_collection_id(room_id);
-    let arrived: Vec<NodeId> = arrived.iter().copied().collect();
-    if arrived.is_empty() {
-        return Ok(());
-    }
-    let existing = edge_store.get_many(&waiting, &arrived)?;
-    let removals: Vec<NodeId> = arrived
-        .iter()
-        .zip(existing)
-        .filter_map(|(node, found)| found.is_some().then_some(*node))
-        .collect();
-    if removals.is_empty() {
-        return Ok(());
-    }
-    let tx = db.begin_transaction();
-    for chunk in removals.chunks(MAX_BATCH_EVENTS) {
-        tx.remove_many(ShardType::ServerInfo, waiting, chunk)?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-fn add_raw_waiting(
-    edge_store: &PackfileStorage,
-    room_id: &str,
-    missing: &BTreeSet<NodeId>,
-) -> anyhow::Result<()> {
-    let waiting = raw_waiting_collection_id(room_id);
-    let missing: Vec<NodeId> = missing.iter().copied().collect();
-    for chunk in missing.chunks(MAX_BATCH_EVENTS) {
-        let existing = edge_store.get_many(&waiting, chunk)?;
-        let additions: Vec<(NodeId, NodeData)> = chunk
-            .iter()
-            .zip(existing)
-            .filter_map(|(parent, found)| {
-                found
-                    .is_none()
-                    .then(|| (*parent, NodeData::from_slice(b"RWT1")))
-            })
-            .collect();
-        if !additions.is_empty() {
-            edge_store.put_many(&waiting, &additions)?;
-        }
-    }
-    Ok(())
-}
-
-fn raw_waiting_collection_id(room_id: &str) -> [u8; 16] {
-    let canonical = format!("sys:matrix-raw-waiting:v1:{room_id}");
-    derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_INTL), canonical.as_bytes())
 }
 
 /// The sidecar collection holding unredacted auth-relevant fields, keyed by
@@ -11627,7 +11463,6 @@ fn write_raw_verdicts_and_flags(
         let mut changes = Vec::with_capacity(rows.len().saturating_mul(4));
         let tx = db.begin_transaction();
         for ((event_id, node, verdict, write_verdict), short) in rows.into_iter().zip(allocated) {
-
             // Only overwrite when the derived verdict changed; empty records
             // for unchanged events would grow the store on every reimport.
             if write_verdict {

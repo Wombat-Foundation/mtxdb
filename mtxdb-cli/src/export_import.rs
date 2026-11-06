@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context};
+use mtxdb::csr_adjacency::EventRecord;
 use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::interop::{
     decode_event_locator, decode_import_marker, encode_event_locator, encode_import_marker,
@@ -21,7 +22,6 @@ use mtxdb::interop::{
     room_event_collection_id, room_version_collection_id, room_version_node_id, ImportMarker,
     Verdict, DATA_FORMAT, EVENT_POOL, SERVER_INFO_POOL,
 };
-use mtxdb::csr_adjacency::EventRecord;
 use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
 use mtxdb::room_flag::{Flag, FlagChange, RoomFlagIndex};
 use mtxdb::server_keys;
@@ -1940,13 +1940,7 @@ pub(crate) fn write_room_with_resolved_findings(
             .get(position)
             .and_then(Option::as_deref)
             .unwrap_or(&event.pdu_bytes);
-        let size = estimate(
-            stored.len(),
-            event,
-            &export.room_id,
-            &verdict,
-            edge_bytes,
-        );
+        let size = estimate(stored.len(), event, &export.room_id, &verdict, edge_bytes);
         if size > batch_bytes {
             bail!(
                 "{}: about {size} bytes of records exceed the {batch_bytes}-byte batch limit",

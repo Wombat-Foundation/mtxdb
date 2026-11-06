@@ -12,14 +12,14 @@ use super::{
     matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
     meta_pools, meta_raw, overlay_auth_projection, pack_identity, parse_federation_input,
     parse_pack_id_selector, parse_pack_selectors, prepare_state_collection, pretty_print_payload,
-    raw_auth_projection, raw_auth_projection_collection_id, raw_waiting_collection_id,
-    record_csr_adjacency, record_raw_dependencies_and_waiting, redacted_event_bytes,
-    resolve_import_collection, run, scan_payload_suffix, split_canonical_display,
-    template_collection_id, template_event_id_node_id, template_node_id, topological_event_order,
-    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
-    CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension,
-    MetaReport, PackIdentity, ScanOptions, SharedState, StateGroupLoad, StateSet,
-    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
+    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+    split_canonical_display, template_collection_id, template_event_id_node_id, template_node_id,
+    topological_event_order, valid_state_group_id, verify_auth_chain_edges,
+    write_raw_auth_projections, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
+    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, ScanOptions, SharedState,
+    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -2295,12 +2295,70 @@ fn template_node_id_matches_event_id_derivation() {
     assert!(template_node_id(&custom, &event).is_err());
 }
 
+/// The room's missing parents, derived the way a consumer would: every event
+/// id its CSR rows reference whose body is stored nowhere. A body is stored in
+/// the room's event collection, in the State pool's auth-chain collection, or
+/// (for raw auth-chain events) as an auth projection.
+fn missing_parents(
+    db: &Database,
+    template: &CollectionTemplate,
+    room_id: &str,
+) -> std::collections::BTreeSet<NodeId> {
+    let nodes: Vec<NodeId> = RoomAuth::new(room_id)
+        .referenced_event_ids(db)
+        .unwrap()
+        .iter()
+        .map(|event_id| template_event_id_node_id(template, event_id).unwrap())
+        .collect();
+    let auth_collection =
+        derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
+    let places = [
+        (db.event_dag(), template_collection_id(template, room_id)),
+        (db.state(), auth_collection),
+        (db.event_dag(), raw_auth_projection_collection_id(room_id)),
+    ];
+    let mut present = std::collections::HashSet::new();
+    for (store, collection) in places {
+        let found = store.get_many(&collection, &nodes).unwrap();
+        present.extend(nodes.iter().zip(found).filter_map(|(n, f)| f.map(|_| *n)));
+    }
+    nodes.into_iter().filter(|n| !present.contains(n)).collect()
+}
+
+fn import_raw_events(
+    db: &Database,
+    template: &CollectionTemplate,
+    room_id: &str,
+    events: &[OwnedValue],
+    auth_chain: &[OwnedValue],
+) {
+    let path = unique_temp_dir().join("room.jsonl");
+    let mut established = HashSet::new();
+    established.insert(template_collection_id(template, room_id));
+    RawFixtureImporter {
+        db,
+        store: db.event_dag(),
+        state_store: db.state().as_ref(),
+        path: &path,
+        template,
+        established: &mut established,
+    }
+    .import(events, auth_chain);
+}
+
 #[test]
-fn raw_import_marks_only_missing_parents_in_waiting() {
-    let root = unique_temp_dir().join("raw_file_and_missing");
-    let db = Database::open(root).unwrap();
+fn raw_import_marks_only_missing_parents_as_missing() {
+    let db = Database::open(unique_temp_dir().join("raw_file_and_missing")).unwrap();
     let template = default_matrix_import_template();
-    let room_event_coll = template_collection_id(&template, FIXTURE_ROOM);
+    let create = raw_event(
+        FIXTURE_ROOM,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
     let child = raw_event(
         FIXTURE_ROOM,
         "$child",
@@ -2320,45 +2378,39 @@ fn raw_import_marks_only_missing_parents_in_waiting() {
         "[]",
     );
 
-    record_raw_dependencies_and_waiting(
+    import_raw_events(
         &db,
-        db.event_dag(),
-        &room_event_coll,
         &template,
         FIXTURE_ROOM,
-        [&child, &same_file_auth].into_iter(),
-    )
-    .unwrap();
-
-    let missing_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
-    let same_file_node = template_event_id_node_id(&template, "$same-file-auth").unwrap();
-
-    let edge_store = db.pool(ShardType::ServerInfo);
-    let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
-
-    assert_eq!(
-        edge_store.collection_ids(),
-        vec![waiting_collection],
-        "dependency bookkeeping must not create a collection per parent"
+        &[create, child, same_file_auth],
+        &[],
     );
 
-    // Only genuinely missing parent is in raw_waiting
-    assert!(edge_store
-        .get(&waiting_collection, &missing_node)
-        .unwrap()
-        .is_some());
-    assert!(edge_store
-        .get(&waiting_collection, &same_file_node)
-        .unwrap()
-        .is_none());
+    let missing_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
+    assert_eq!(
+        missing_parents(&db, &template, FIXTURE_ROOM),
+        [missing_node].into(),
+        "only the parent no file supplied is missing"
+    );
+    assert!(
+        db.server_info().collection_ids().is_empty(),
+        "missing parents are derived from the CSR, not stored"
+    );
 }
 
 #[test]
-fn raw_import_maintains_waiting_set_on_parent_arrival() {
-    let root = unique_temp_dir().join("raw_waiting_arrival");
-    let db = Database::open(root).unwrap();
+fn raw_import_missing_parent_leaves_the_set_when_it_arrives() {
+    let db = Database::open(unique_temp_dir().join("raw_waiting_arrival")).unwrap();
     let template = default_matrix_import_template();
-    let room_event_coll = template_collection_id(&template, FIXTURE_ROOM);
+    let create = raw_event(
+        FIXTURE_ROOM,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
     let child = raw_event(
         FIXTURE_ROOM,
         "$child",
@@ -2378,118 +2430,21 @@ fn raw_import_maintains_waiting_set_on_parent_arrival() {
         "[]",
     );
     let parent_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
-    let edge_store = db.pool(ShardType::ServerInfo);
-    let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
 
-    // File 1 supplies child citing missing parent
-    record_raw_dependencies_and_waiting(
-        &db,
-        db.event_dag(),
-        &room_event_coll,
-        &template,
-        FIXTURE_ROOM,
-        [&child].into_iter(),
-    )
-    .unwrap();
-    assert!(edge_store
-        .get(&waiting_collection, &parent_node)
-        .unwrap()
-        .is_some());
+    import_raw_events(&db, &template, FIXTURE_ROOM, &[create, child], &[]);
+    assert!(missing_parents(&db, &template, FIXTURE_ROOM).contains(&parent_node));
 
-    // File 2 supplies parent
-    record_raw_dependencies_and_waiting(
-        &db,
-        db.event_dag(),
-        &room_event_coll,
-        &template,
-        FIXTURE_ROOM,
-        [&parent].into_iter(),
-    )
-    .unwrap();
-    assert!(edge_store
-        .get(&waiting_collection, &parent_node)
-        .unwrap()
-        .is_none());
+    import_raw_events(&db, &template, FIXTURE_ROOM, &[parent], &[]);
+    assert!(missing_parents(&db, &template, FIXTURE_ROOM).is_empty());
 }
 
 #[test]
-fn raw_import_waiting_writes_are_idempotent() {
-    let root = unique_temp_dir().join("raw_idempotent");
-    let db = Database::open(root).unwrap();
+fn raw_import_reimport_leaves_the_missing_set_unchanged() {
+    let db = Database::open(unique_temp_dir().join("raw_idempotent")).unwrap();
     let template = default_matrix_import_template();
-    let room_event_coll = template_collection_id(&template, FIXTURE_ROOM);
-    let child = raw_event(
+    let create = raw_event(
         FIXTURE_ROOM,
-        "$child",
-        "m.room.message",
-        "",
-        "{}",
-        r#"["$missing-prev"]"#,
-        "[]",
-    );
-    let parent_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
-    let edge_store = db.pool(ShardType::ServerInfo);
-    let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
-
-    edge_store.set_stats_enabled(true);
-    record_raw_dependencies_and_waiting(
-        &db,
-        db.event_dag(),
-        &room_event_coll,
-        &template,
-        FIXTURE_ROOM,
-        [&child].into_iter(),
-    )
-    .unwrap();
-    let baseline = edge_store.stats();
-    let baseline_writes = (baseline.put_many_calls, baseline.put_many_records);
-    assert!(baseline_writes.0 > 0, "initial import must perform writes");
-    let (_, waiting_ver_before) = edge_store
-        .get_with_collection_version(&waiting_collection, &[parent_node])
-        .unwrap();
-
-    for _ in 0..2 {
-        record_raw_dependencies_and_waiting(
-            &db,
-            db.event_dag(),
-            &room_event_coll,
-            &template,
-            FIXTURE_ROOM,
-            [&child].into_iter(),
-        )
-        .unwrap();
-        let stats = edge_store.stats();
-        assert_eq!(
-            (stats.put_many_calls, stats.put_many_records),
-            baseline_writes,
-            "re-import must not write dependency records again"
-        );
-        let (_, waiting_ver_after) = edge_store
-            .get_with_collection_version(&waiting_collection, &[parent_node])
-            .unwrap();
-        assert_eq!(
-            waiting_ver_before, waiting_ver_after,
-            "raw_waiting collection version must not advance on re-import"
-        );
-        assert!(edge_store
-            .get(&waiting_collection, &parent_node)
-            .unwrap()
-            .is_some());
-    }
-}
-
-#[test]
-fn raw_import_does_not_mark_prior_stored_parent_as_missing() {
-    let dir = unique_temp_dir().join("raw_prior_stored");
-    let db = Database::open(dir.clone()).unwrap();
-    let template = default_matrix_import_template();
-    let room_event_coll = template_collection_id(&template, FIXTURE_ROOM);
-    let path = dir.join("room.jsonl");
-    let store = db.event_dag();
-    let state_store = db.state().as_ref();
-    let parent = raw_event(
-        FIXTURE_ROOM,
-        "$prior-parent",
+        "$create",
         "m.room.create",
         "",
         r#"{"room_version":"11"}"#,
@@ -2502,51 +2457,24 @@ fn raw_import_does_not_mark_prior_stored_parent_as_missing() {
         "m.room.message",
         "",
         "{}",
-        r#"["$prior-parent"]"#,
+        r#"["$missing-prev"]"#,
         "[]",
     );
-    let parent_node = template_event_id_node_id(&template, "$prior-parent").unwrap();
+    let parent_node = template_event_id_node_id(&template, "$missing-prev").unwrap();
 
-    let mut established = HashSet::new();
-    established.insert(room_event_coll);
-    // File 1 imports the parent, storing it into the room's event collection
-    import_pdu_events(
-        &db,
-        store,
-        state_store,
-        &path,
-        &[parent],
-        &[],
-        None,
-        None,
-        &template,
-        &mut established,
-    )
-    .unwrap();
-
-    // Now import a subsequent file supplying only $child (which cites $prior-parent)
-    record_raw_dependencies_and_waiting(
-        &db,
-        db.event_dag(),
-        &room_event_coll,
-        &template,
-        FIXTURE_ROOM,
-        [&child].into_iter(),
-    )
-    .unwrap();
-
-    let edge_store = db.pool(ShardType::ServerInfo);
-    let waiting_collection = raw_waiting_collection_id(FIXTURE_ROOM);
-
-    // Critically: $prior-parent is NOT entered into raw_waiting because point lookup against
-    // room_event_coll found it, without requiring any whole-room scan!
-    assert!(
-        edge_store
-            .get(&waiting_collection, &parent_node)
-            .unwrap()
-            .is_none(),
-        "prior stored parent must not be marked missing in raw_waiting"
-    );
+    for _ in 0..3 {
+        import_raw_events(
+            &db,
+            &template,
+            FIXTURE_ROOM,
+            &[create.clone(), child.clone()],
+            &[],
+        );
+        assert_eq!(
+            missing_parents(&db, &template, FIXTURE_ROOM),
+            [parent_node].into()
+        );
+    }
 }
 
 #[test]
@@ -2718,25 +2646,6 @@ impl RawFixtureImporter<'_> {
     }
 }
 
-fn assert_raw_reimport_keeps_versions(
-    edge_store: &PackfileStorage,
-    waiting: &[u8; 16],
-    waiting_node: NodeId,
-    reimport: impl FnOnce(),
-) {
-    let (_, waiting_before) = edge_store
-        .get_with_collection_version(waiting, &[waiting_node])
-        .unwrap();
-    reimport();
-    let (_, waiting_after) = edge_store
-        .get_with_collection_version(waiting, &[waiting_node])
-        .unwrap();
-    assert_eq!(
-        waiting_before, waiting_after,
-        "re-import must not advance the waiting collection version"
-    );
-}
-
 #[test]
 fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
     use mtxdb::room_flag::*;
@@ -2807,74 +2716,38 @@ fn raw_import_updates_earlier_verdicts_when_a_late_parent_arrives() {
     );
 }
 
-fn assert_raw_waiting(edge_store: &PackfileStorage, waiting: &[u8; 16], waiting_node: NodeId) {
-    assert!(
-        edge_store.get(waiting, &waiting_node).unwrap().is_some(),
-        "missing parent must be recorded in raw_waiting"
-    );
-}
-
-fn assert_raw_arrival_clears_waiting(
-    edge_store: &PackfileStorage,
-    waiting: &[u8; 16],
-    waiting_node: NodeId,
-) {
-    assert!(
-        edge_store.get(waiting, &waiting_node).unwrap().is_none(),
-        "arrived parent must be removed from raw_waiting"
-    );
-}
-
 #[test]
-fn raw_import_records_waiting_parents() {
-    let dir = unique_temp_dir().join("raw_waiting_parents");
-    let db = Database::open(dir.clone()).unwrap();
+fn raw_import_tracks_missing_parents_across_files() {
+    let db = Database::open(unique_temp_dir().join("raw_waiting_parents")).unwrap();
     let template = default_matrix_import_template();
-    let collection_id = template_collection_id(&template, "!room3");
-    let path = dir.join("room.jsonl");
-    let store = db.event_dag();
-    let state_store = db.state().as_ref();
-    let edge_store = db.pool(ShardType::ServerInfo);
     let [create, join, stale, leave] = raw_late_parent_fixture();
-
-    let mut established = HashSet::new();
-    established.insert(collection_id);
-
     let leave_node = template_event_id_node_id(&template, "$leave").unwrap();
-    let stale_node = template_event_id_node_id(&template, "$stale").unwrap();
     assert_eq!(
-        stale_node,
+        template_event_id_node_id(&template, "$stale").unwrap(),
         template_node_id(&template, &stale).unwrap().unwrap(),
         "string and event node-id helpers must agree"
     );
-    let waiting_coll = raw_waiting_collection_id("!room3");
-    let mut fixture = RawFixtureImporter {
-        db: &db,
-        store,
-        state_store,
-        path: &path,
-        template: &template,
-        established: &mut established,
-    };
 
-    // Import create, join, stale (which cites $leave as prev). $leave is
-    // missing, so it must enter raw_waiting.
+    // $stale cites $leave as prev, and $leave is not supplied yet.
     let initial = [create, join, stale];
-    fixture.import(&initial, &[]);
-    assert_raw_waiting(edge_store, &waiting_coll, leave_node);
+    import_raw_events(&db, &template, "!room3", &initial, &[]);
+    assert_eq!(
+        missing_parents(&db, &template, "!room3"),
+        [leave_node].into()
+    );
 
-    // Re-importing the same file must not change the recorded state or advance
-    // collection versions.
-    assert_raw_reimport_keeps_versions(edge_store, &waiting_coll, leave_node, || {
-        fixture.import(&initial, &[]);
-    });
-    assert_raw_waiting(edge_store, &waiting_coll, leave_node);
+    // Re-importing the same file changes nothing.
+    import_raw_events(&db, &template, "!room3", &initial, &[]);
+    assert_eq!(
+        missing_parents(&db, &template, "!room3"),
+        [leave_node].into()
+    );
 
-    // Import leave: arrival clears waiting.
-    fixture.import(&[leave], &[]);
-    assert_raw_arrival_clears_waiting(edge_store, &waiting_coll, leave_node);
+    // The parent arriving clears it.
+    import_raw_events(&db, &template, "!room3", &[leave], &[]);
+    assert!(missing_parents(&db, &template, "!room3").is_empty());
 
-    // A parent stored by an earlier file must not be marked missing again.
+    // A later child of a parent stored by an earlier file does not re-add it.
     let late = raw_event(
         "!room3",
         "$late",
@@ -2884,76 +2757,9 @@ fn raw_import_records_waiting_parents() {
         r#"["$leave"]"#,
         r#"["$create","$join"]"#,
     );
-    fixture.import(&[late], &[]);
-    assert!(
-        edge_store
-            .get(&waiting_coll, &leave_node)
-            .unwrap()
-            .is_none(),
-        "an earlier file's stored parent must not re-enter raw_waiting"
-    );
-}
-
-#[test]
-fn raw_import_auth_chain_parent_clears_waiting() {
-    let dir = unique_temp_dir().join("raw_waiting_auth_chain");
-    let db = Database::open(dir.clone()).unwrap();
-    let template = default_matrix_import_template();
-    let collection_id = template_collection_id(&template, "!room3");
-    let path = dir.join("room.jsonl");
-    let store = db.event_dag();
-    let state_store = db.state().as_ref();
-    let edge_store = db.pool(ShardType::ServerInfo);
-    let [create, join, stale, leave] = raw_late_parent_fixture();
-
-    let mut established = HashSet::new();
-    established.insert(collection_id);
-    let mut import = |events: &[OwnedValue], auth_chain: &[OwnedValue]| {
-        import_pdu_events_with_raw(
-            &db,
-            store,
-            state_store,
-            &path,
-            events,
-            auth_chain,
-            Some(&[]),
-            None,
-            None,
-            &template,
-            &mut established,
-        )
-        .unwrap();
-    };
-
-    let leave_node = template_event_id_node_id(&template, "$leave").unwrap();
-    let waiting_coll = raw_waiting_collection_id("!room3");
-
-    import(&[create, join, stale], &[]);
-    assert!(
-        edge_store
-            .get(&waiting_coll, &leave_node)
-            .unwrap()
-            .is_some(),
-        "missing parent $leave must be recorded in raw_waiting"
-    );
-
-    let late = raw_event(
-        "!room3",
-        "$late",
-        "m.room.message",
-        "@alice:test",
-        "{}",
-        r#"["$leave"]"#,
-        r#"["$create","$join"]"#,
-    );
-    import(&[late], &[leave]);
-    assert!(
-        edge_store
-            .get(&waiting_coll, &leave_node)
-            .unwrap()
-            .is_none(),
-        "a parent supplied only through auth_chain must leave raw_waiting"
-    );
+    import_raw_events(&db, &template, "!room3", &[late], &[]);
+    assert!(missing_parents(&db, &template, "!room3").is_empty());
+    assert!(db.server_info().collection_ids().is_empty());
 }
 
 const FEDERATION_FIRST_DOC: &str = r#"{
@@ -2989,13 +2795,12 @@ const FEDERATION_SECOND_DOC: &str = r#"{
 }"#;
 
 #[test]
-fn raw_import_records_dependencies_for_federation_documents() {
+fn raw_import_derives_missing_parents_for_federation_documents() {
     let dir = unique_temp_dir().join("raw_federation_dependencies");
     let db = Database::open(dir.clone()).unwrap();
     let template = default_matrix_import_template();
     let store = db.event_dag();
     let state_store = db.state().as_ref();
-    let edge_store = db.pool(ShardType::ServerInfo);
     let mut established = HashSet::new();
 
     let first = dir.join("first.json");
@@ -3015,13 +2820,10 @@ fn raw_import_records_dependencies_for_federation_documents() {
     .unwrap();
 
     let leave_node = template_event_id_node_id(&template, "$leave").unwrap();
-    let waiting_coll = raw_waiting_collection_id("!room3");
-    assert!(
-        edge_store
-            .get(&waiting_coll, &leave_node)
-            .unwrap()
-            .is_some(),
-        "federation PDUs must record their missing parent"
+    assert_eq!(
+        missing_parents(&db, &template, "!room3"),
+        [leave_node].into(),
+        "federation PDUs must leave their missing parent derivable from the CSR"
     );
 
     let second = dir.join("second.json");
@@ -3041,11 +2843,8 @@ fn raw_import_records_dependencies_for_federation_documents() {
     .unwrap();
 
     assert!(
-        edge_store
-            .get(&waiting_coll, &leave_node)
-            .unwrap()
-            .is_none(),
-        "an auth-chain parent in a federation document must clear raw_waiting"
+        missing_parents(&db, &template, "!room3").is_empty(),
+        "an auth-chain parent in a federation document must not be missing"
     );
 }
 
@@ -6982,7 +6781,6 @@ fn imported_room_export_is_readable_in_the_servers_layout() {
         )
         .expect("locator");
         assert_eq!(decode_event_locator(&locator).unwrap(), (id, room_bytes));
-
     }
 
     let verdict = |name: &str| {

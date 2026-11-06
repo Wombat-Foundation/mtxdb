@@ -31,7 +31,7 @@
 //! The chain of an event excludes the event itself, so
 //! `is_in_auth_chain(e, e)` is `false`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use crate::auth_closure::{AuthClosure, RebuildReport};
@@ -314,6 +314,16 @@ impl RoomAuth {
             .into_iter()
             .map(|short_id| RecordedEvent { short_id })
             .collect())
+    }
+
+    /// Every event id the room's `prev_events` and `auth_events` point at,
+    /// stored or not. Missing parents are this set minus the events the caller
+    /// holds; nothing records them separately.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt row.
+    pub fn referenced_event_ids(&self, db: &Database) -> Result<BTreeSet<String>, RoomAuthError> {
+        Ok(self.closure.adjacency().referenced_event_ids(db)?)
     }
 
     /// The event's `auth_events`.

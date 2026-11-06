@@ -570,6 +570,37 @@ impl CsrAdjacency {
             .map_err(StorageError::Io)
     }
 
+    /// Every event id the room's `prev_events` and `auth_events` rows point
+    /// at, whether or not that event has been stored.
+    ///
+    /// A caller that wants the *missing* parents checks this set against its
+    /// event store: "referenced but not present" is derived, never stored.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure, a corrupt segment, or a target that
+    /// does not resolve to an event id.
+    pub fn referenced_event_ids(&self, db: &Database) -> Result<BTreeSet<String>, StorageError> {
+        let store = self.store(db);
+        let mut targets = BTreeSet::new();
+        for family in [PREV, AUTH] {
+            for (_, edges) in store
+                .read_family(self.scope(), family)
+                .map_err(StorageError::Io)?
+            {
+                targets.extend(edges.iter().map(|edge| edge.target));
+            }
+        }
+        let ids: Vec<u32> = targets.into_iter().collect();
+        self.events
+            .resolve(db, &ids)?
+            .into_iter()
+            .map(|key| {
+                key.ok_or_else(|| StorageError::Corrupt("edge target does not resolve".to_owned()))
+                    .and_then(|bytes| utf8(bytes, "event id"))
+            })
+            .collect()
+    }
+
     /// The event's relation if it has one and `visibility` shows it.
     ///
     /// # Errors
