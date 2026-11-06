@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
 
 use super::{Edge, EdgeFamily};
 use crate::database::Database;
@@ -171,23 +171,31 @@ impl CsrStore {
         }
     }
 
-    fn write_lock(&self) -> Arc<Mutex<()>> {
+    fn store_lock(&self) -> Arc<RwLock<()>> {
         let mut locks = WRITE_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
         locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = locks.get(&self.dir).and_then(Weak::upgrade) {
             return lock;
         }
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(RwLock::new(()));
         locks.insert(self.dir.clone(), Arc::downgrade(&lock));
         lock
     }
 
-    /// Run an operation while excluding reads and mutations on this store.
+    /// Run a mutation while excluding reads and other mutations on this store.
     /// Compound adjacency writes use this to keep their read/merge/append
     /// sequence atomic with respect to other writers.
     pub(crate) fn with_write_lock<R>(&self, operation: impl FnOnce() -> R) -> R {
-        let lock = self.write_lock();
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let lock = self.store_lock();
+        let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
+        operation()
+    }
+
+    /// Read while no mutation (seal, append, purge) can change the files.
+    /// Readers may overlap each other.
+    fn with_read_lock<R>(&self, operation: impl FnOnce() -> R) -> R {
+        let lock = self.store_lock();
+        let _guard = lock.read().unwrap_or_else(PoisonError::into_inner);
         operation()
     }
 
@@ -231,8 +239,8 @@ impl CsrStore {
     /// # Errors
     /// I/O errors, or a row with more than `u32::MAX` edges.
     pub(crate) fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
-        let lock = self.write_lock();
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let lock = self.store_lock();
+        let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
         self.append_rows_locked(scope, rows)
     }
 
@@ -271,8 +279,8 @@ impl CsrStore {
     /// # Errors
     /// I/O errors.
     pub(crate) fn purge_scope(&self, scope: ScopeId) -> io::Result<()> {
-        let lock = self.write_lock();
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let lock = self.store_lock();
+        let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
         self.purge_scope_locked(scope)
     }
 
@@ -307,8 +315,8 @@ impl CsrStore {
     /// # Errors
     /// I/O errors or a corrupt frame that is not merely torn at the end.
     pub(crate) fn seal(&self) -> io::Result<()> {
-        let lock = self.write_lock();
-        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let lock = self.store_lock();
+        let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
         self.seal_locked()
     }
 
@@ -363,7 +371,7 @@ impl CsrStore {
     /// # Errors
     /// I/O errors or a malformed sealed segment.
     pub fn read_scope(&self, scope: ScopeId) -> io::Result<ScopeData> {
-        self.with_write_lock(|| self.read_scope_locked(scope))
+        self.with_read_lock(|| self.read_scope_locked(scope))
     }
 
     fn read_scope_locked(&self, scope: ScopeId) -> io::Result<ScopeData> {
@@ -407,7 +415,7 @@ impl CsrStore {
         scope: ScopeId,
         keys: &[(EdgeFamily, u32)],
     ) -> io::Result<Vec<Option<Vec<Edge>>>> {
-        self.with_write_lock(|| self.read_rows_locked(scope, keys))
+        self.with_read_lock(|| self.read_rows_locked(scope, keys))
     }
 
     pub(crate) fn read_rows_locked(
@@ -456,7 +464,7 @@ impl CsrStore {
         scope: ScopeId,
         family: EdgeFamily,
     ) -> io::Result<Vec<(u32, Vec<Edge>)>> {
-        self.with_write_lock(|| self.read_family_locked(scope, family))
+        self.with_read_lock(|| self.read_family_locked(scope, family))
     }
 
     fn read_family_locked(
@@ -729,15 +737,17 @@ impl TailState {
 static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, TailState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// One write lock per store directory, shared by every handle in the process.
+/// One read/write lock per store directory, shared by every handle in the
+/// process.
 ///
 /// The root lock keeps other processes out, but threads can write to one store
 /// through a [`CsrWriter`] or, inside the crate, the store's own methods.
 /// Appends, purges and seals each open the tail, compare it with the verified
 /// length and may truncate or replace it, so two of them at once would cut
-/// each other's frames. Every mutation therefore holds this lock from the tail
-/// check through its seal.
-static WRITE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+/// each other's frames. Every mutation therefore holds the write side from the
+/// tail check through its seal, and every read holds the read side so it cannot
+/// see a seal between enumerating segments and replaying the tail.
+static WRITE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Resolve existing symlinks in a store path while preserving nonexistent
@@ -1245,7 +1255,7 @@ mod tests {
         let real = CsrStore::open(&layout, ShardType::State);
         let linked = CsrStore::open(&alias_layout, ShardType::State);
         assert_eq!(real.dir(), linked.dir());
-        assert!(Arc::ptr_eq(&real.write_lock(), &linked.write_lock()));
+        assert!(Arc::ptr_eq(&real.store_lock(), &linked.store_lock()));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(alias);
     }
