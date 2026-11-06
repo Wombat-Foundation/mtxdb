@@ -140,7 +140,10 @@ fn read_after_seal(store: &CsrStore, db: &Database, family: EdgeFamily, rows: us
 fn main() {
     let scopes = env_usize("MTXDB_CSR_SCOPES", 1024);
     let rows = env_usize("MTXDB_CSR_ROWS", 128);
-    assert!(scopes > 0 && rows > 0, "scope and row counts must be nonzero");
+    assert!(
+        scopes > 0 && rows > 0,
+        "scope and row counts must be nonzero"
+    );
     let rounds = env_usize("MTXDB_CSR_ROUNDS", 5).max(1);
     let base = std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(std::env::temp_dir, PathBuf::from);
     std::fs::create_dir_all(&base).expect("bench root");

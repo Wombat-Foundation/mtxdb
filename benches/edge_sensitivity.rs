@@ -7,6 +7,114 @@ pub(super) fn run() {
     holes();
     forward();
     roots();
+    state_anchors();
+}
+
+/// State-group annotation density and run fragmentation on a synthetic DAG.
+///
+/// This is a size model, not a workload measurement. Events are assigned to
+/// `branches` concurrent tips round-robin; every `merge_period` events a merge
+/// joins all live tips. A state event starts a new group, a non-state event
+/// inherits its single parent's group, and a merge whose parent groups differ
+/// starts a new group (content deduplication is deliberately not modelled).
+/// Anchors are the DAG facts; runs are the exact RLE of the resulting
+/// per-event sequence in short-id order.
+fn state_anchors() {
+    println!(
+        "# state_anchors: 8192-event synthetic DAG; 32-byte group tokens; 8 B/run model; no content dedupe"
+    );
+    println!(
+        "branches\tstate_pct\tevents\tstate_events\tmerge_events\tmerge_anchors\tanchors\truns\truns_per_1024\tdistinct_groups\tflat_B\tpacked_B\trle_B\trle_B_per_event"
+    );
+    for branches in [1usize, 2, 4, 8, 16] {
+        for state_percent in [0u32, 1, 5, 20, 100] {
+            state_anchor_row(branches, state_percent);
+        }
+    }
+}
+
+fn state_anchor_row(branches: usize, state_percent: u32) {
+    const EVENTS: usize = 8192;
+    const MERGE_PERIOD: usize = 256;
+    let mut rng = super::PseudoRng(
+        0x5EED ^ u64::try_from(branches).expect("branches fit") ^ (u64::from(state_percent) << 32),
+    );
+    let mut groups: Vec<u32> = Vec::with_capacity(EVENTS);
+    let mut tips: Vec<Option<u32>> = vec![None; branches];
+    let mut next_group = 0u32;
+    let mut state_events = 0usize;
+    let mut merge_events = 0usize;
+    let mut merge_anchors = 0usize;
+
+    for event in 0..EVENTS {
+        if event > 0 && event % MERGE_PERIOD == 0 {
+            merge_events = merge_events.saturating_add(1);
+            let mut parent_groups = tips.iter().flatten().copied();
+            let first = parent_groups.next();
+            let all_equal = first.is_none_or(|group| parent_groups.all(|other| other == group));
+            let group = if all_equal {
+                first.unwrap_or(0)
+            } else {
+                merge_anchors = merge_anchors.saturating_add(1);
+                let group = next_group;
+                next_group = next_group.saturating_add(1);
+                group
+            };
+            groups.push(group);
+            tips.fill(Some(group));
+            continue;
+        }
+
+        let branch = event
+            .checked_rem(branches)
+            .expect("branch count is nonzero");
+        let is_state = rng.below(100) < u64::from(state_percent);
+        let group = match (is_state, tips[branch]) {
+            (true, _) => {
+                state_events = state_events.saturating_add(1);
+                let group = next_group;
+                next_group = next_group.saturating_add(1);
+                group
+            }
+            (false, Some(parent)) => parent,
+            (false, None) => {
+                let group = next_group;
+                next_group = next_group.saturating_add(1);
+                group
+            }
+        };
+        groups.push(group);
+        tips[branch] = Some(group);
+    }
+
+    let runs = groups
+        .windows(2)
+        .filter(|pair| pair[0] != pair[1])
+        .count()
+        .saturating_add(usize::from(!groups.is_empty()));
+    let anchors = state_events.saturating_add(merge_anchors);
+    let distinct = usize::try_from(next_group).expect("group count fits");
+    let bits = usize::BITS
+        .checked_sub(distinct.saturating_sub(1).leading_zeros())
+        .expect("bit width fits");
+    let dictionary = distinct.checked_mul(32).expect("size fits");
+    let flat_bytes = EVENTS.checked_mul(32).expect("size fits");
+    let packed_bytes = dictionary
+        .checked_add(
+            EVENTS
+                .checked_mul(usize::try_from(bits).expect("bits fit"))
+                .expect("size fits")
+                .div_ceil(8),
+        )
+        .expect("size fits");
+    let rle_bytes = dictionary
+        .checked_add(runs.checked_mul(8).expect("runs fit"))
+        .expect("size fits");
+    let runs_per_1024 = runs.saturating_mul(1024) / EVENTS;
+    println!(
+        "{branches}\t{state_percent}\t{EVENTS}\t{state_events}\t{merge_events}\t{merge_anchors}\t{anchors}\t{runs}\t{runs_per_1024}\t{distinct}\t{flat_bytes}\t{packed_bytes}\t{rle_bytes}\t{:.2}",
+        super::len_f64(rle_bytes) / super::len_f64(EVENTS)
+    );
 }
 
 /// Power-level-like rows: a few contiguous authorization intervals per hub,
