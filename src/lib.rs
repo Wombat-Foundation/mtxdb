@@ -39,6 +39,9 @@
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(clippy::module_name_repetitions)]
+// Stable rustdoc needs the explicit targets (module docs render at the re-export
+// site); nightly resolves the bare labels and flags them as redundant.
+#![allow(rustdoc::redundant_explicit_links)]
 
 // On disk the source is grouped by layer, with each module's tests beside it:
 //   engine/  the storage engine: packfiles, shards, journal, database, layout,
