@@ -7562,10 +7562,7 @@ struct SearchTemplate {
 fn search_template(path: Option<&Path>) -> anyhow::Result<SearchTemplate> {
     let Some(path) = path else {
         return Ok(SearchTemplate {
-            fields: vec![
-                "/type".to_owned(),
-                "/sender".to_owned(),
-            ],
+            fields: vec!["/type".to_owned(), "/sender".to_owned()],
             identity: Some("/event_id".to_owned()),
         });
     };

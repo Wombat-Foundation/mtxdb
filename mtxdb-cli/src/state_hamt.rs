@@ -322,4 +322,103 @@ mod tests {
         use base64::Engine as _;
         URL_SAFE_NO_PAD.encode(bytes)
     }
+
+    /// Linear-space measurement for keyframe + delta state storage.
+    ///
+    /// Not a correctness test: run with
+    /// `cargo test --release -- --ignored --nocapture state_keyframe_measure`.
+    /// `MEASURE_EVENTS` overrides the event count. Replay is a full rebuild of
+    /// the keyframe's entries plus the deltas, an upper bound; the incremental
+    /// `HamtMutator` path is not measured. Every event is a state event; the
+    /// disposition mix is the share of rejected events, which apply no tuple.
+    #[test]
+    #[ignore = "measurement, not a correctness test"]
+    fn state_keyframe_measure() {
+        use std::time::Instant;
+
+        const STGP_PAYLOAD: usize = 73;
+        let room = "!space:example.org";
+        let prefix = room_hamt_prefix(room);
+        let events: usize = std::env::var("MEASURE_EVENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+
+        let measure = |mix: usize, keyframe: Option<usize>| {
+            // Applied tuples after skipping rejected events.
+            let mut tuples: Vec<(String, String, String)> = Vec::new();
+            for event in 0..events {
+                if mix > 0 && event % 100 < mix {
+                    continue;
+                }
+                tuples.push((
+                    "m.space.child".to_owned(),
+                    format!("!child{event}:example.org"),
+                    format!("${event:043}"),
+                ));
+            }
+            let applied = tuples.len();
+            let mut seen = HashSet::new();
+            let (mut unique_bytes, mut root_bytes, mut groups) = (0usize, 0usize, 0usize);
+            for count in 1..=applied {
+                if keyframe.is_some_and(|k| count % k != 0) {
+                    continue;
+                }
+                let built = build_state_hamt(room, &prefix, &tuples[..count]).unwrap();
+                groups += 1;
+                root_bytes += built.root_record.len();
+                for (hash, bytes) in &built.nodes {
+                    if seen.insert(*hash) {
+                        unique_bytes += bytes.len();
+                    }
+                }
+            }
+            let delta_bytes: usize = tuples
+                .iter()
+                .map(|(t, k, e)| t.len() + k.len() + e.len() + 6)
+                .sum();
+            let mut micros = Vec::new();
+            if let Some(k) = keyframe {
+                for count in (k..=applied).step_by(1.max(applied / 64)) {
+                    let base = count - count % k;
+                    let started = Instant::now();
+                    let built = build_state_hamt(room, &prefix, &tuples[..count]).unwrap();
+                    std::hint::black_box(&built);
+                    let _ = base;
+                    micros.push(started.elapsed().as_micros());
+                }
+                micros.sort_unstable();
+            }
+            let pct = |q: usize| {
+                micros
+                    .get(micros.len().saturating_sub(1) * q / 100)
+                    .copied()
+            };
+            let per = |b: usize| b as f64 / events as f64;
+            println!(
+                "{}\t{}%\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:?}\t{:?}",
+                keyframe.map_or("every".to_owned(), |k| format!("K={k}")),
+                mix,
+                groups,
+                per(groups * STGP_PAYLOAD),
+                per(root_bytes),
+                per(unique_bytes),
+                if keyframe.is_some() {
+                    per(delta_bytes)
+                } else {
+                    0.0
+                },
+                pct(50),
+                pct(99),
+            );
+        };
+
+        println!("config\treject\tgroups\tstgp_B_ev\troot_rec_B_ev\tstat_unique_B_ev\tdelta_B_ev\treplay_p50_us\treplay_p99_us");
+        for mix in [0, 1, 10] {
+            measure(mix, None);
+            for k in [16, 64, 256] {
+                measure(mix, Some(k));
+            }
+        }
+    }
 }
