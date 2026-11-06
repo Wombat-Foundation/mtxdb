@@ -8564,6 +8564,54 @@ fn shared_wal_lock_is_exclusive() {
     );
 }
 
+/// Child-process half of `shared_wal_lock_is_exclusive_across_processes`.
+#[test]
+fn shared_wal_lock_child_cannot_acquire_held_lock() {
+    let Ok(root) = std::env::var("MTXDB_SHARED_WAL_LOCK_CHILD_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let result = crate::journal::SharedWalLock::acquire(&root);
+    match result {
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "child must fail with WouldBlock while the parent owns the root lock"
+        ),
+        Ok(_lock) => panic!("child acquired the root lock while the parent owns it"),
+    }
+    std::fs::write(root.join("child-checked-lock"), b"blocked").unwrap();
+}
+
+/// The OS-level root lock excludes a second writer process, not just another
+/// lock attempt in the same process.
+#[test]
+fn shared_wal_lock_is_exclusive_across_processes() {
+    let root = test_dir("shared_wal_lock_process_exclusive");
+    let _layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
+    let _lock = crate::journal::SharedWalLock::acquire(&root).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "packfile::storage::tests::shared_wal_lock_child_cannot_acquire_held_lock",
+            "--test-threads=1",
+        ])
+        .env("MTXDB_SHARED_WAL_LOCK_CHILD_ROOT", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child lock assertion failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(root.join("child-checked-lock")).unwrap(),
+        b"blocked",
+        "the re-executed test must actually perform the lock assertion"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn packfile_storage_create_or_upsert_established_validated_contract() {
