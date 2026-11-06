@@ -452,9 +452,9 @@ impl CsrStore {
     }
 
     fn next_segment_number(&self) -> u64 {
-        self.segments()
-            .map(|segments| segments.last().map_or(0, |(seq, _)| seq.saturating_add(1)))
-            .unwrap_or(0)
+        self.segments().map_or(0, |segments| {
+            segments.last().map_or(0, |(seq, _)| seq.saturating_add(1))
+        })
     }
 
     fn segments(&self) -> io::Result<Vec<(u64, PathBuf)>> {
@@ -806,7 +806,9 @@ fn decode_row(payload: &[u8]) -> io::Result<(ScopeId, EdgeFamily, u32, bool, Vec
     }
     // The length check above makes the body exactly `count` whole edges.
     let edges: Vec<Edge> = payload[RECORD_HEADER..]
-        .chunks_exact(EDGE_SIZE)
+        .as_chunks::<EDGE_SIZE>()
+        .0
+        .iter()
         .map(|edge| Edge {
             target: u32::from_le_bytes([edge[0], edge[1], edge[2], edge[3]]),
             kind: u16::from_le_bytes([edge[4], edge[5]]),
@@ -844,7 +846,7 @@ fn apply_segment(
 ) -> io::Result<()> {
     let (mut file, index_bytes, payload_start, payload_len) = open_segment(path)?;
     let corrupt = |what: &str| segment_error(path, what);
-    for entry in index_bytes.chunks_exact(SCOPE_ENTRY) {
+    for entry in index_bytes.as_chunks::<SCOPE_ENTRY>().0 {
         if entry[..16] != scope.0 {
             continue;
         }
@@ -960,7 +962,7 @@ fn read_whole_directory(
     file.seek(SeekFrom::Start(entries_start as u64))?;
     let mut directory = vec![0u8; count.saturating_mul(DIR_ENTRY)];
     file.read_exact(&mut directory)?;
-    for item in directory.chunks_exact(DIR_ENTRY) {
+    for item in directory.as_chunks::<DIR_ENTRY>().0 {
         let (Some(offset), Some(len), Some(crc)) =
             (le_u32(item, 6), le_u32(item, 10), le_u32(item, 14))
         else {
@@ -1000,7 +1002,7 @@ fn read_family_directory(
         entries_start.saturating_add(lower.saturating_mul(DIR_ENTRY)) as u64,
     ))?;
     file.read_exact(&mut directory)?;
-    for item in directory.chunks_exact(DIR_ENTRY) {
+    for item in directory.as_chunks::<DIR_ENTRY>().0 {
         let (Some(offset), Some(len), Some(crc)) =
             (le_u32(item, 6), le_u32(item, 10), le_u32(item, 14))
         else {
@@ -1397,7 +1399,11 @@ mod tests {
             tail_len() > 0 && tail_len() < SEAL_THRESHOLD,
             "setup is under the threshold"
         );
-        assert!(store.segments().unwrap().is_empty());
+        assert_eq!(
+            store.segments().unwrap().len(),
+            0,
+            "the setup must not seal a segment"
+        );
 
         store.purge_scope(scope).unwrap();
         assert_eq!(tail_len(), 0, "the purge seals the tail");

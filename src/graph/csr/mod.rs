@@ -259,8 +259,8 @@ impl CsrFamilies {
         let mut cursor = 9usize;
         let node_bytes = take(data, &mut cursor, nodes_len)?;
         let mut nodes = Vec::with_capacity(count);
-        for chunk in node_bytes.chunks_exact(16) {
-            nodes.push(chunk.try_into().map_err(|_| CsrError::Malformed)?);
+        for chunk in node_bytes.as_chunks::<16>().0 {
+            nodes.push(*chunk);
         }
         if nodes.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(CsrError::Malformed);
@@ -300,10 +300,8 @@ impl CsrFamilies {
             return Err(CsrError::Malformed);
         }
         let mut all_relation_types = Vec::with_capacity(relation_edge_count);
-        for chunk in relation_bytes.chunks_exact(2) {
-            all_relation_types.push(u16::from_le_bytes(
-                chunk.try_into().map_err(|_| CsrError::Malformed)?,
-            ));
+        for chunk in relation_bytes.as_chunks::<2>().0 {
+            all_relation_types.push(u16::from_le_bytes(*chunk));
         }
 
         let prev = rebuild_with_nodes(&nodes, &decoded.remove(0))?;
