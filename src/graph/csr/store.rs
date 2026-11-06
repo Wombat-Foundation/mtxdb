@@ -1501,25 +1501,32 @@ mod tests {
                 let (store, purge_barrier) = (&store, &purge_barrier);
                 scope.spawn(move || {
                     let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
-                    for owner in 0..PER_THREAD {
-                        let row = RowRecord {
-                            family: EdgeFamily::typed(3),
-                            owner,
-                            edges: vec![
-                                Edge {
-                                    target: owner,
-                                    kind: 1
-                                };
-                                64
-                            ],
-                        };
-                        store.append_rows(scope_id, &[row]).unwrap();
-                        // Seal while the other threads are still appending.
-                        if owner % 50 == 49 {
-                            store.seal().unwrap();
+                    // A failure here must still reach the barrier, or the
+                    // other workers would block forever instead of reporting.
+                    let appended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        for owner in 0..PER_THREAD {
+                            let row = RowRecord {
+                                family: EdgeFamily::typed(3),
+                                owner,
+                                edges: vec![
+                                    Edge {
+                                        target: owner,
+                                        kind: 1
+                                    };
+                                    64
+                                ],
+                            };
+                            store.append_rows(scope_id, &[row]).unwrap();
+                            // Seal while the other threads are still appending.
+                            if owner % 50 == 49 {
+                                store.seal().unwrap();
+                            }
                         }
-                    }
+                    }));
                     purge_barrier.wait();
+                    if let Err(panic) = appended {
+                        std::panic::resume_unwind(panic);
+                    }
                     let purge_scope = ScopeId([u8::try_from(thread + 10).unwrap(); 16]);
                     store.purge_scope(purge_scope).unwrap();
                 });
