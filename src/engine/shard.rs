@@ -2,8 +2,6 @@ use fs2::FileExt as _;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, Write};
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -201,8 +199,8 @@ pub const MAX_SHARD_BYTES: u64 = crate::index::IndexEntry::MAX_OFFSET;
 
 /// Default in-memory threshold before a shard's buffered frames are written
 /// to disk as one positioned write. Keeps bulk writes from paying a
-/// `pwrite` (plus the per-record `try_clone` and file-length store) for
-/// every single record — the whole remaining bulk-write gap vs the bench's
+/// `pwrite` (plus the per-record lock and file-length store) for every
+/// single record — the whole remaining bulk-write gap vs the bench's
 /// mdbx (which writes a memory-mapped in-memory transaction and pays
 /// persistence once at commit). The default [`AppendPolicy`] is
 /// [`AppendPolicy::Eager`], so this threshold only applies to pools opened
@@ -214,6 +212,14 @@ pub const MAX_SHARD_BYTES: u64 = crate::index::IndexEntry::MAX_OFFSET;
 /// buffer is currently near full contributes this much, and `MAX_SHARDS`
 /// bounds how many can do so at once.
 pub(crate) const PENDING_FLUSH_BYTES: usize = 1 << 20;
+
+/// Block-reservation granularity for append growth.
+///
+/// Pack files are append-only, so reserving a little space past the current
+/// logical end with `fallocate(FALLOC_FL_KEEP_SIZE)` lets the filesystem place
+/// the next frames contiguously without changing the file's size (and therefore
+/// without changing what a scanner sees). Best-effort only.
+const PREALLOC_CHUNK_BYTES: u64 = 1 << 20;
 
 /// When a shard's appended frames are written to its underlying pack file.
 ///
@@ -341,6 +347,14 @@ pub struct Shard {
     /// only schedules fsyncs (see [`Shard::unsynced_bytes`]); no durability claim
     /// is derived from it, and a checkpoint still fsyncs every shard.
     synced_len: AtomicU64,
+    /// Logical file length through which blocks have already been reserved.
+    /// This is deliberately separate from `file_len`: reservation uses
+    /// `FALLOC_FL_KEEP_SIZE`, so the file stays at `file_len` and only the
+    /// allocator state runs ahead.
+    preallocated_len: AtomicU64,
+    /// Set once block reservation fails, so an unsupported filesystem pays for
+    /// the failed probe only once instead of on every flush.
+    prealloc_disabled: AtomicBool,
     /// Set when a failed flush could not be rolled back (the tail-truncating
     /// `set_len` itself failed), leaving torn, undeclared bytes past
     /// `file_len` on disk. Once set, every further append/flush on this
@@ -525,6 +539,8 @@ impl Shard {
             bytes_written: AtomicU64::new(0),
             sync_count: AtomicU64::new(0),
             synced_len: AtomicU64::new(file_len),
+            preallocated_len: AtomicU64::new(file_len),
+            prealloc_disabled: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
         }
     }
@@ -587,6 +603,34 @@ impl Shard {
         }
         self.synced_len.fetch_max(covered, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Reserve allocator space through at least `end`, best-effort.
+    ///
+    /// The file's logical length is untouched (`FALLOC_FL_KEEP_SIZE`), so this
+    /// cannot create a zero-filled tail that recovery would have to interpret.
+    /// A failure disables further attempts for this shard; the caller's write
+    /// still proceeds normally and the filesystem allocates on demand.
+    fn reserve_append_space(&self, end: u64) {
+        if self.prealloc_disabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let reserved = self.preallocated_len.load(Ordering::Relaxed);
+        if end <= reserved {
+            return;
+        }
+        let target = end
+            .saturating_add(PREALLOC_CHUNK_BYTES - 1)
+            .saturating_div(PREALLOC_CHUNK_BYTES)
+            .saturating_mul(PREALLOC_CHUNK_BYTES)
+            .max(end);
+        if crate::io::reserve_append_space(&self.file, reserved, target.saturating_sub(reserved))
+            .is_ok()
+        {
+            self.preallocated_len.store(target, Ordering::Relaxed);
+        } else {
+            self.prealloc_disabled.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Restore counters from a persisted snapshot. Only called at startup,
@@ -2692,23 +2736,10 @@ impl ShardPool {
             // next flush attempt instead of silently discarding already
             // "successful" puts whose offsets the index has already
             // handed out.
-            // On Windows this is a seek followed by write_all rather than an
-            // append write. It is safe because append_lock serializes every
-            // flush and no other path moves the shared file pointer. The
-            // committed file_len is initialized from file metadata on reopen
-            // and advanced only after a successful flush, so this cannot
-            // overwrite data or leave a gap at the on-disk EOF frontier.
-            let file = shard.file.try_clone()?;
-            #[cfg(unix)]
-            file.write_all_at(&pending_guard, committed)?;
-            #[cfg(not(unix))]
-            {
-                let mut file = file;
-                file.seek(io::SeekFrom::Start(committed))?;
-                file.write_all(&pending_guard)?;
-            }
-            #[cfg(target_os = "linux")]
-            kick_writeback(&file, committed, pending_guard.len() as u64);
+            // Positioned writes avoid a seek and do not depend on the shared
+            // file cursor. Windows uses `seek_write`; Unix uses `pwrite`.
+            // `append_lock` still serializes writers, so the committed offset
+            // is stable for the duration of this call.
             let new_len = pending_guard.len() as u64;
             let file_len = committed.checked_add(new_len).ok_or_else(|| {
                 io::Error::new(
@@ -2716,6 +2747,10 @@ impl ShardPool {
                     "committed + buffered len overflow",
                 )
             })?;
+            shard.reserve_append_space(file_len);
+            crate::io::write_all_at(&shard.file, &pending_guard, committed)?;
+            #[cfg(target_os = "linux")]
+            kick_writeback(&shard.file, committed, new_len);
             pending_guard.clear();
             drop(pending_guard);
             shard.file_len.store(file_len, Ordering::Release);

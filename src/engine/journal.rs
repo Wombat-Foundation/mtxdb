@@ -5104,6 +5104,11 @@ impl Journal {
     /// Shared implementation for a group of mutations, each paired with its
     /// optional pool tag. The tag must match the segment's dialect (see
     /// the journal's single v1 format.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the group framing, capacity check, LSN assignment and write must \
+                  stay in one order-sensitive block"
+    )]
     fn append_group_inner(
         &mut self,
         mutations: &[(ShardType, Mutation)],
@@ -5187,19 +5192,33 @@ impl Journal {
             .ok_or_else(|| io::Error::other("journal LSN exhausted"))?;
 
         // One write per group: every autocommit publish lands here, so the
-        // group goes out as a single contiguous buffer instead of three
-        // syscalls. A torn write still leaves an incomplete tail that recovery
-        // truncates, exactly as before.
-        let mut frame = Vec::with_capacity(
-            header
-                .len()
-                .saturating_add(payload.len())
-                .saturating_add(trailer.len()),
-        );
-        frame.extend_from_slice(&header);
-        frame.extend_from_slice(&payload);
-        frame.extend_from_slice(&trailer);
-        let write_result = self.file.write_all(&frame);
+        // group goes out as one syscall. Unix uses `writev` so the large
+        // payload is not copied into a second frame buffer; Windows keeps the
+        // contiguous buffer because its `write_vectored` is not a true gather.
+        // A torn write still leaves an incomplete tail that recovery truncates,
+        // exactly as before.
+        #[cfg(unix)]
+        let write_result = {
+            let bufs = [
+                io::IoSlice::new(&header),
+                io::IoSlice::new(&payload),
+                io::IoSlice::new(&trailer),
+            ];
+            crate::io::write_all_vectored(&mut self.file, &bufs)
+        };
+        #[cfg(not(unix))]
+        let write_result = {
+            let mut frame = Vec::with_capacity(
+                header
+                    .len()
+                    .saturating_add(payload.len())
+                    .saturating_add(trailer.len()),
+            );
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(&trailer);
+            self.file.write_all(&frame)
+        };
         if let Err(error) = write_result {
             self.poisoned = true;
             return Err(error);

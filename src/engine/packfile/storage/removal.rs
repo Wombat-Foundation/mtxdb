@@ -132,7 +132,7 @@ impl PackfileStorage {
             node_id: *node_id,
         };
         let published = self.publish_mutation(|| mutation)?;
-        let published_lsn = published.as_ref().map_or(0, |published| published.lsn);
+        let published_lsn = published.as_ref().map_or(0, |published| published.last_lsn);
         self.apply_remove_record_locked(collection_id, node_id, published_lsn)?;
         self.note_published_materialized(published);
         Ok(true)

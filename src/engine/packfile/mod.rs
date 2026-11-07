@@ -462,7 +462,7 @@ pub struct PackfileScanner {
 /// be read or validated, or its length cannot be obtained. A file that
 /// [`read_header`] identifies as a non-packfile yields an empty scanner.
 pub fn scan_packfile_iter(path: &Path, verify_payload: bool) -> io::Result<PackfileScanner> {
-    let file = File::open(path)?;
+    let file = crate::io::open_read_sequential(path)?;
     scan_packfile_iter_from_file(file, verify_payload)
 }
 
@@ -1811,15 +1811,10 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
 pub fn open_packfile(path: &Path, writable: bool, pack_id: &PackId) -> io::Result<File> {
     let file = if writable {
         let mut options = OpenOptions::new();
-        options.read(true);
-        // See `open_packfile_with_creation_seq` for the per-platform handle.
-        #[cfg(unix)]
-        options.append(true);
-        #[cfg(not(unix))]
-        options.write(true);
+        options.read(true).write(true);
         options.open(path)?
     } else {
-        File::open(path)?
+        crate::io::open_read_sequential(path)?
     };
     validate_header_identity(&file, path, pack_id)?;
     Ok(file)
@@ -1862,15 +1857,12 @@ pub fn open_packfile_with_creation_seq(
     creation_seq: u32,
 ) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.read(true).create(true);
-    // Unix flushes use positioned writes through the append-capable
-    // handle. Windows' append access masks FILE_WRITE_DATA, which is
-    // required by set_len during torn-tail rollback; its write path
-    // therefore opens an ordinary writable handle instead.
-    #[cfg(unix)]
-    options.append(true);
-    #[cfg(not(unix))]
-    options.write(true);
+    // Positioned writes do not need `O_APPEND`, and on Linux `pwrite` on an
+    // append-mode descriptor ignores its offset and appends at EOF. Opening a
+    // plain writable handle makes the offset authoritative on every platform.
+    // It also keeps `FILE_WRITE_DATA`, which `set_len` needs during torn-tail
+    // rollback on Windows.
+    options.read(true).write(true).create(true);
     let mut file = options.open(path)?;
 
     if file.metadata()?.len() == 0 {
@@ -1896,7 +1888,7 @@ pub fn open_packfile_with_creation_seq(
 /// Returns `io::Error` on I/O failure during open or header read, or on
 /// any read-loop error other than `UnexpectedEof`.
 pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
-    let file = File::open(path)?;
+    let file = crate::io::open_read_sequential(path)?;
     let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     let mut entries = Vec::new();
 
@@ -1931,7 +1923,7 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
 /// Returns an I/O error on failure to open, read, seek, or validate the
 /// packfile.
 pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
-    let file = File::open(path)?;
+    let file = crate::io::open_read_sequential(path)?;
     let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     let mut entries = Vec::new();
 
@@ -1968,7 +1960,7 @@ pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
 /// # Errors
 /// Returns `io::Error` on I/O failure other than `UnexpectedEof`.
 pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<ScanEntry>> {
-    let file = File::open(path)?;
+    let file = crate::io::open_read_sequential(path)?;
     let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
 
     // Seek past the reserved header (HEADER_LEN bytes) to the first
@@ -2042,7 +2034,7 @@ pub(crate) fn scan_packfile_from_with_removal_visit(
     verify_checksum: bool,
     mut visit: impl FnMut(ScanEntryWithRemoval),
 ) -> io::Result<()> {
-    let file = File::open(path)?;
+    let file = crate::io::open_read_sequential(path)?;
     let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     if start_offset == 0 {
         if read_header(&mut reader)?.is_none() {
@@ -2120,7 +2112,7 @@ impl RecordScanner {
 /// be read, and [`io::ErrorKind::InvalidData`] if the file does not start with
 /// an mtxdb packfile header (rather than silently yielding an empty stream).
 pub fn scan_records_iter(path: &Path) -> io::Result<RecordScanner> {
-    let file = File::open(path)?;
+    let file = crate::io::open_read_sequential(path)?;
     let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     match read_header(&mut reader)? {
         Some(_) => Ok(RecordScanner {
@@ -2270,7 +2262,7 @@ pub fn extract_packfile_collection(
     target_collection: &[u8; 16],
     dest_pack_id: &PackId,
 ) -> io::Result<PackExtractStats> {
-    let src_file = File::open(source_path)?;
+    let src_file = crate::io::open_read_sequential(source_path)?;
     let mut reader = BufReader::with_capacity(RECOVERY_BUFFER_BYTES, src_file);
 
     let Some(source_header) = read_header(&mut reader)? else {
@@ -2452,7 +2444,7 @@ where
     E: From<io::Error>,
     F: FnMut(ScanEntryWithRemoval) -> Result<(), E>,
 {
-    let file = File::open(path).map_err(E::from)?;
+    let file = crate::io::open_read_sequential(path).map_err(E::from)?;
     let mut reader = CountingReader {
         inner: BufReader::with_capacity(RECOVERY_BUFFER_BYTES, file),
         position: 0,

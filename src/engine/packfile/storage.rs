@@ -18,7 +18,7 @@ use crate::index::{EntryUndo, InsertError, LossyIndex};
 use crate::journal::pool_tag;
 use crate::journal::{
     pool_from_tag, DurabilityToken, GroupCommitConfig, Journal, JournalCoordinator, JournalCursor,
-    JournalReplayLease, Mutation as JournalMutation,
+    JournalReplayLease, Mutation as JournalMutation, TXN_STAGE_PUT_OVERHEAD_BYTES,
 };
 use crate::packfile::{self, FrameMetadata, PackId, Record};
 use crate::shard;
@@ -1925,15 +1925,18 @@ struct RecordLocator {
 /// apply left the version ahead of the data and every versioned read of the
 /// collection blocked.
 pub(crate) struct Published {
-    pub(crate) lsn: u64,
+    /// First LSN in the group. Journal floors and reclaim are keyed by this.
+    pub(crate) first_lsn: u64,
+    /// Last LSN in the group. A pool's materialized watermark advances to this.
+    pub(crate) last_lsn: u64,
     journal: Option<Arc<JournalCoordinator>>,
 }
 
 impl Published {
     fn complete(mut self, store: &PackfileStorage) {
-        store.note_materialized_lsn(self.lsn);
+        store.note_materialized_lsn(self.last_lsn);
         if let Some(journal) = self.journal.take() {
-            journal.transaction_materialized(self.lsn);
+            journal.transaction_materialized(self.first_lsn);
         }
     }
 }
@@ -1942,14 +1945,26 @@ impl Drop for Published {
     fn drop(&mut self) {
         if let Some(journal) = self.journal.take() {
             let cause = format!(
-                "autocommit group at lsn {} was published but its apply failed or panicked",
-                self.lsn
+                "autocommit group at lsn {}{} was published but its apply failed or panicked",
+                self.first_lsn,
+                if self.last_lsn == self.first_lsn {
+                    String::new()
+                } else {
+                    format!("..{}", self.last_lsn)
+                }
             );
             eprintln!("mtxdb: {cause}; failing the database until it is reopened");
             journal.fail_apply(cause);
         }
     }
 }
+
+/// Largest batch whose WAL payload is published as one group.
+///
+/// Kept well below the journal's 256 MiB group ceiling so framing and
+/// concurrent mutations always fit. Larger batches fall back to the historical
+/// one-group-per-record path rather than failing.
+const PUT_MANY_JOURNAL_GROUP_LIMIT_BYTES: usize = 64 << 20;
 
 struct PutManyProgress {
     generation: u64,
@@ -1962,7 +1977,11 @@ struct PutManyProgress {
     pending_shard_collection_counts: Vec<PackId>,
     invalidate_delta: bool,
     undo_log: Vec<EntryUndo>,
+    /// Per-entry publications used when the batch is too large to publish as
+    /// one WAL group (or when journaling is inactive).
     pending_materialized: Vec<Option<Published>>,
+    /// One publication covering the whole batch, when it fits the group limit.
+    published_group: Option<Published>,
 }
 
 /// A snapshot-consistent, lazily-read scan over one collection's live records.
@@ -10705,6 +10724,11 @@ impl PackfileStorage {
 }
 
 impl PackfileStorage {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the batch LSN is kept separate from the shared progress so the \
+                  per-record fallback and the one-group path stay explicit"
+    )]
     fn append_put_many_entry(
         &self,
         collection_id: &[u8; 16],
@@ -10712,14 +10736,22 @@ impl PackfileStorage {
         data: &NodeData,
         metadata: Option<FrameMetadata>,
         old_gen: Option<&RoomGeneration>,
+        batch_lsn: Option<u64>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
-        let published = self.publish_mutation(|| JournalMutation::Put {
-            collection_id: *collection_id,
-            node_id: *id,
-            payload: data.bytes.to_vec(),
-        })?;
-        let receipt_lsn = published.as_ref().map(|published| published.lsn);
+        // A batch publication already assigned this entry's group LSN. Only
+        // the oversized-batch fallback publishes per record.
+        let published = if batch_lsn.is_some() {
+            None
+        } else {
+            self.publish_mutation(|| JournalMutation::Put {
+                collection_id: *collection_id,
+                node_id: *id,
+                payload: data.bytes.to_vec(),
+            })?
+        };
+        let receipt_lsn =
+            batch_lsn.or_else(|| published.as_ref().map(|published| published.last_lsn));
         let metadata = Self::stamp_last_write_lsn(metadata, receipt_lsn);
         let record = Record {
             collection_id: *collection_id,
@@ -10854,7 +10886,7 @@ impl PackfileStorage {
         })?;
         record.metadata = Self::stamp_last_write_lsn(
             record.metadata,
-            published.as_ref().map(|published| published.lsn),
+            published.as_ref().map(|published| published.last_lsn),
         );
         let (slot, offset, disk_bytes) = self.shards.put_record_with_len(&record)?;
         Ok((slot, offset, disk_bytes, published))
@@ -10974,6 +11006,7 @@ impl PackfileStorage {
             invalidate_delta: false,
             undo_log: Vec::new(),
             pending_materialized: Vec::with_capacity(entries_len),
+            published_group: None,
         }
     }
 
@@ -11009,9 +11042,51 @@ impl PackfileStorage {
         old_gen: Option<&RoomGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
+        // Publish the whole batch as one group when it fits. This is the same
+        // atomicity model as a transaction's shared-WAL group: every entry is
+        // visible at once and a later materialization failure fails the
+        // database rather than leaving a partially published batch.
+        let batch_lsn = if self.journaling_active() {
+            let payload_bytes = entries.iter().fold(0_usize, |total, (_, data)| {
+                total
+                    .saturating_add(data.bytes.len())
+                    .saturating_add(TXN_STAGE_PUT_OVERHEAD_BYTES)
+            });
+            if payload_bytes <= PUT_MANY_JOURNAL_GROUP_LIMIT_BYTES {
+                let mutations: Vec<JournalMutation> = entries
+                    .iter()
+                    .map(|(id, data)| JournalMutation::Put {
+                        collection_id: *collection_id,
+                        node_id: *id,
+                        payload: data.bytes.to_vec(),
+                    })
+                    .collect();
+                match self.publish_mutations(&mutations)? {
+                    Some(published) => {
+                        let lsn = published.last_lsn;
+                        progress.published_group = Some(published);
+                        Some(lsn)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         for (index, (id, data)) in entries.iter().enumerate() {
             let metadata = metadatas.and_then(|m| m.get(index)).cloned().flatten();
-            self.append_put_many_entry(collection_id, id, data, metadata, old_gen, progress)?;
+            self.append_put_many_entry(
+                collection_id,
+                id,
+                data,
+                metadata,
+                old_gen,
+                batch_lsn,
+                progress,
+            )?;
         }
 
         if progress.index_needs_rebuild {
@@ -11098,6 +11173,9 @@ impl PackfileStorage {
             &progress.pending_shard_collections,
         );
 
+        if let Some(published) = progress.published_group.take() {
+            published.complete(self);
+        }
         for published in progress.pending_materialized.drain(..) {
             self.note_published_materialized(published);
         }
@@ -12955,9 +13033,51 @@ impl PackfileStorage {
         .map_err(StorageError::Io)?;
         self.record_published_mutation(started);
         Ok(Some(Published {
-            lsn: result,
+            first_lsn: result,
+            last_lsn: result,
             journal: Some(journal),
         }))
+    }
+
+    /// Publish several mutations as one visible journal group.
+    ///
+    /// Used by `put_many` so a batch does not pay one group frame, one set of
+    /// LSN bookkeeping updates, and one publication lock round-trip per
+    /// record. The caller stamps every frame with the group's `last_lsn`,
+    /// matching the transaction materialization path.
+    pub(crate) fn publish_mutations(
+        &self,
+        mutations: &[JournalMutation],
+    ) -> Result<Option<Published>, StorageError> {
+        let started = std::time::Instant::now();
+        if mutations.is_empty()
+            || JOURNAL_SUPPRESSED.with(Cell::get)
+            || self.replaying.load(Ordering::Relaxed)
+        {
+            return Ok(None);
+        }
+        let Some(journal) = self.journal() else {
+            self.record_published_mutation(started);
+            return Ok(None);
+        };
+        let result = match pool_from_tag(self.journal_pool.load(Ordering::Acquire)) {
+            Some(pool) => journal.publish_group_tagged(pool, mutations),
+            None => journal.publish_group(mutations),
+        }
+        .map_err(StorageError::Io)?;
+        self.record_published_mutation(started);
+        Ok(Some(Published {
+            first_lsn: result.first_lsn,
+            last_lsn: result.last_lsn,
+            journal: Some(journal),
+        }))
+    }
+
+    /// Whether a new put would publish to the journal right now.
+    fn journaling_active(&self) -> bool {
+        !JOURNAL_SUPPRESSED.with(Cell::get)
+            && !self.replaying.load(Ordering::Relaxed)
+            && self.journal().is_some()
     }
 
     /// Retire a published autocommit mutation whose apply has completed, so

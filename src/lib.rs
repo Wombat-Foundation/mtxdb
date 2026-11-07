@@ -99,6 +99,9 @@ pub mod index;
 /// signing keys, and the import marker.
 #[path = "matrix/interop.rs"]
 pub mod interop;
+/// Platform-specific positioned, vectored, and advisory I/O primitives.
+#[path = "engine/io.rs"]
+mod io;
 /// Checksummed append-only journal primitives for durable group commits.
 ///
 /// This module itself stays always-on: the write-ahead journal

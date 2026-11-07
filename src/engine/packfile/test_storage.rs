@@ -4504,6 +4504,54 @@ fn collection_len_overlay_handles_slots_only_tombstone_put_and_remove() {
 }
 
 #[test]
+fn put_many_publishes_one_journal_group_for_the_whole_batch() {
+    // A batch is one atomic publication, not one journal group per record.
+    // This is the same visibility model DatabaseTransaction uses, and it keeps
+    // the WAL framing and version bookkeeping proportional to batches rather
+    // than records.
+    let dir = test_dir("put_many_one_wal_group");
+    let wal = dir.join("wal.bin");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.enable_journal(&wal).unwrap();
+
+    let entries: Vec<_> = (0..64u8)
+        .map(|byte| {
+            (
+                distinct_id(byte),
+                NodeData::new(bytes::Bytes::from(format!("entry-{byte}"))),
+            )
+        })
+        .collect();
+    store.put_many(&TEST_COLLECTION, &entries).unwrap();
+    store.flush_durable().unwrap();
+
+    let scan = crate::journal::Journal::scan_read_only(&wal).unwrap();
+    assert_eq!(
+        scan.groups.len(),
+        1,
+        "put_many must publish one journal group, got {}",
+        scan.groups.len()
+    );
+    assert_eq!(
+        scan.groups[0]
+            .last_lsn
+            .saturating_sub(scan.groups[0].first_lsn)
+            .saturating_add(1),
+        entries.len() as u64
+    );
+
+    for (id, data) in &entries {
+        assert_eq!(
+            store.get(&TEST_COLLECTION, id).unwrap().unwrap().bytes,
+            data.bytes
+        );
+    }
+
+    drop(store);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn test_put_many_publishes_successive_batches() {
     // Regression coverage for successful copy-on-write batch publication:
     // every record remains readable across several batches that need no
@@ -10402,7 +10450,7 @@ fn changes_since_includes_removals_and_pages_across_groups() {
         .unwrap()
         .expect("journal is enabled");
     store
-        .apply_transaction_mutation(&removal, published.lsn)
+        .apply_transaction_mutation(&removal, published.last_lsn)
         .unwrap();
     store.note_published_materialized(Some(published));
     store

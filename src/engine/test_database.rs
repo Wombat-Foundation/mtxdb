@@ -2735,7 +2735,10 @@ fn concurrent_writers_see_a_failed_apply_promptly_and_reopen_keeps_published() {
                         if writer == 0 && index == 10 {
                             drop(published); // the apply fails
                         } else {
-                            let lsn = published.as_ref().map(|published| published.lsn).unwrap();
+                            let lsn = published
+                                .as_ref()
+                                .map(|published| published.last_lsn)
+                                .unwrap();
                             store.apply_transaction_mutation(&mutation, lsn).unwrap();
                             store.note_published_materialized(published);
                         }
