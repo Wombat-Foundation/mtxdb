@@ -695,7 +695,11 @@ mod tests {
         events: usize,
     ) {
         println!("K\tcheckpoints\tstgp_B_ev\troot_rec_B_ev\tkey_stat_B_ev\tdir_total_B\tdir_B_ev");
-        for k in [usize::from(mtxdb::STATE_LATTICE_KEYFRAME_HOPS), 1000] {
+        for k in [
+            usize::try_from(mtxdb::STATE_LATTICE_KEYFRAME_HOPS)
+                .expect("keyframe hop count fits usize"),
+            1000,
+        ] {
             let mut seen: HashSet<[u8; 32]> = fx.base_nodes.keys().copied().collect();
             let (mut stat_bytes, mut checkpoints) = (0usize, 0usize);
             let mut checkpoint_groups = HashSet::new();
@@ -1093,7 +1097,12 @@ mod tests {
             rebuild[div(mul(rebuild.len().saturating_sub(1), 99), 100)],
             applied_through(tuples, tuples.len()),
         );
-        for k in [0usize, usize::from(mtxdb::STATE_LATTICE_KEYFRAME_HOPS), 1000] {
+        for k in [
+            0usize,
+            usize::try_from(mtxdb::STATE_LATTICE_KEYFRAME_HOPS)
+                .expect("keyframe hop count fits usize"),
+            1000,
+        ] {
             for shape in ["root", "entries"] {
                 for cache in ["cold", "hot"] {
                     let mut hot = Source::new(store);
@@ -1361,7 +1370,12 @@ mod tests {
             let (steps, store) = chain_row(&fx, &tuples, events, &format!("{mode}{mix}%"));
             if mix == 0 {
                 put_many_rows(&fx, &[], &[], &fx.base_nodes, 1, "baseline-only");
-                for k in [1usize, usize::from(mtxdb::STATE_LATTICE_KEYFRAME_HOPS), 1000] {
+                for k in [
+                    1usize,
+                    usize::try_from(mtxdb::STATE_LATTICE_KEYFRAME_HOPS)
+                        .expect("keyframe hop count fits usize"),
+                    1000,
+                ] {
                     let label = if k == 1 {
                         "direct".to_owned()
                     } else {
