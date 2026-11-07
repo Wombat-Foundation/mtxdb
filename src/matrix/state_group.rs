@@ -47,7 +47,7 @@ pub const STATE_GROUP_DOMAIN_PREFIX: &[u8] = b"mtxdb/state-group/v1";
 /// for a cold lattice read. 500 is the shared default across mtxdb and the
 /// homeserver integration; Synapse's `MAX_STATE_DELTA_HOPS` of 100 applies to
 /// full state rows and is not the right bound for compact lattice deltas.
-pub const STATE_LATTICE_KEYFRAME_HOPS: usize = 500;
+pub const STATE_LATTICE_KEYFRAME_HOPS: u32 = 500;
 
 /// A 128-bit state-group instance id (also a record/node id).
 pub type StateGroupId = [u8; 16];
