@@ -357,6 +357,17 @@ mod tests {
         &steps[sub(count, 1)]
     }
 
+    /// The `m.space.child` state key: a full child room id. By default a
+    /// 43-character hash-style localpart plus a server name (about 56 B);
+    /// `MEASURE_KEY=short` restores the earlier 22 B `!child{n}:example.org`.
+    fn child_state_key(ordinal: usize) -> String {
+        if std::env::var("MEASURE_KEY").is_ok_and(|style| style == "short") {
+            return format!("!child{ordinal}:example.org");
+        }
+        let bytes = DigestAlgorithm::Sha256.digest(&add(ordinal, 1_000_000).to_be_bytes());
+        format!("!{}:example.org", encode_base64(&bytes))
+    }
+
     fn event_id(ordinal: usize) -> String {
         let bytes = DigestAlgorithm::Sha256.digest(&ordinal.to_be_bytes());
         format!("${}", encode_base64(&bytes))
@@ -554,7 +565,7 @@ mod tests {
             };
             tuples.push((
                 "m.space.child".to_owned(),
-                format!("!child{event}:example.org"),
+                child_state_key(event),
                 event_id(add(event, 10)),
                 disposition,
             ));
@@ -931,43 +942,122 @@ mod tests {
         use mtxdb::StorageEngine;
 
         let targets = sample_targets(tuples.len());
-        for cache in ["cold", "hot"] {
-            let mut micros = Vec::new();
-            let passes = if cache == "cold" { 1 } else { 2 };
-            for pass in 0..passes {
-                for &target in &targets {
-                    let event_id = mtxdb::event_record_id(tuples[sub(target, 1)].2.as_bytes());
-                    let started = Instant::now();
-                    let directory = store
-                        .get_many_bytes(keyf, &[event_id])
-                        .unwrap()
-                        .pop()
-                        .flatten()
-                        .expect("direct event directory record");
-                    let root_id: [u8; 16] = directory[..16].try_into().unwrap();
-                    let root_record = store
-                        .get_many_bytes(stat, &[root_id])
-                        .unwrap()
-                        .pop()
-                        .flatten()
-                        .expect("direct state root record");
-                    assert!(root_record.starts_with(b"MTHR\x01"));
-                    let elapsed = started.elapsed().as_nanos();
-                    if cache == "cold" || pass == 1 {
-                        micros.push(elapsed);
+        for shape in ["root", "entries"] {
+            for cache in ["cold", "hot"] {
+                let mut hot_decoded = HashMap::<[u8; 16], Node>::new();
+                let mut timings = Vec::new();
+                let passes = if cache == "cold" { 1 } else { 2 };
+                for pass in 0..passes {
+                    for &target in &targets {
+                        let event_node =
+                            mtxdb::event_record_id(tuples[sub(target, 1)].2.as_bytes());
+                        let started = Instant::now();
+                        let directory = store
+                            .get_many_bytes(keyf, &[event_node])
+                            .unwrap()
+                            .pop()
+                            .flatten()
+                            .expect("direct event directory record");
+                        let root_id: [u8; 16] = directory[..16].try_into().unwrap();
+                        let root_record = store
+                            .get_many_bytes(stat, &[root_id])
+                            .unwrap()
+                            .pop()
+                            .flatten()
+                            .expect("direct state root record");
+                        let root_hash = decode_root_hash(&root_record);
+                        if shape == "entries" {
+                            let mut cold_decoded = HashMap::new();
+                            let decoded = if cache == "hot" {
+                                &mut hot_decoded
+                            } else {
+                                &mut cold_decoded
+                            };
+                            let root = packfile_node(store, stat, &root_hash, decoded);
+                            let mut seen = HashSet::new();
+                            let count =
+                                packfile_entry_count(store, stat, &root, decoded, &mut seen);
+                            assert_eq!(count, add(5, target));
+                        }
+                        if cache == "cold" || pass == 1 {
+                            timings.push(started.elapsed().as_nanos());
+                        }
                     }
                 }
+                timings.sort_unstable();
+                let pick = |quantile: usize| {
+                    timings[div(mul(timings.len().saturating_sub(1), quantile), 100)]
+                };
+                println!(
+                    "# direct_packfile_read shape={shape} cache={cache} p50_ns={} p99_ns={} samples={}",
+                    pick(50),
+                    pick(99),
+                    timings.len(),
+                );
             }
-            micros.sort_unstable();
-            let pick =
-                |quantile: usize| micros[div(mul(micros.len().saturating_sub(1), quantile), 100)];
-            println!(
-                "# direct_packfile_lookup cache={cache} p50_ns={} p99_ns={} samples={}",
-                pick(50),
-                pick(99),
-                micros.len(),
-            );
         }
+    }
+
+    fn decode_root_hash(record: &[u8]) -> [u8; 32] {
+        assert!(record.starts_with(b"MTHR\x01"));
+        let prefix_len = usize::from(u16::from_be_bytes([record[5], record[6]]));
+        let room_len_at = add(7, prefix_len);
+        let room_len = usize::from(u16::from_be_bytes([
+            record[room_len_at],
+            record[add(room_len_at, 1)],
+        ]));
+        let hash_at = add(add(room_len_at, 2), room_len);
+        record[hash_at..add(hash_at, 32)].try_into().unwrap()
+    }
+
+    fn packfile_node(
+        store: &mtxdb::PackfileStorage,
+        stat: &[u8; 16],
+        hash: &[u8; 32],
+        cache: &mut HashMap<[u8; 16], Node>,
+    ) -> Node {
+        use mtxdb::StorageEngine;
+
+        let mut id = [0; 16];
+        id.copy_from_slice(&hash[..16]);
+        if let Some(node) = cache.get(&id) {
+            return Arc::clone(node);
+        }
+        let bytes = store
+            .get_many_bytes(stat, &[id])
+            .unwrap()
+            .pop()
+            .flatten()
+            .expect("direct STAT node record");
+        let node = Arc::new(
+            PersistedInternalNode::<String, String>::decode_v1_verified(
+                &bytes,
+                ROOM.as_bytes(),
+                *hash,
+            )
+            .unwrap(),
+        );
+        cache.insert(id, Arc::clone(&node));
+        node
+    }
+
+    fn packfile_entry_count(
+        store: &mtxdb::PackfileStorage,
+        stat: &[u8; 16],
+        node: &Node,
+        cache: &mut HashMap<[u8; 16], Node>,
+        seen: &mut HashSet<[u8; 32]>,
+    ) -> usize {
+        if !seen.insert(node.structural_hash) {
+            return 0;
+        }
+        let mut count = node.leaves.len();
+        for child in &node.children {
+            let hash = child.structural_hash();
+            let next = packfile_node(store, stat, &hash, cache);
+            count = add(count, packfile_entry_count(store, stat, &next, cache, seen));
+        }
+        count
     }
 
     /// Replay from the nearest keyframe to sampled historical events.
