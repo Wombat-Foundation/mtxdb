@@ -40,7 +40,7 @@ pub const SERVER_KEY_VERSION: u8 = 1;
 
 /// How many times [`update_server_keys`] re-runs after losing a race before it
 /// returns the stale-read error.
-const UPDATE_ATTEMPTS: usize = 32;
+const UPDATE_ATTEMPTS: usize = 256;
 /// Retry storage's explicitly transient read-committed reload failures.
 const OBSERVATION_RETRIES: usize = 8;
 const OBSERVATION_BATCH_SIZE: usize = 256;
@@ -869,11 +869,17 @@ fn retry_transient_update<T>(
                     && attempt < UPDATE_ATTEMPTS =>
             {
                 attempt = attempt.saturating_add(1);
-                let backoff = std::time::Duration::from_micros(
-                    u64::try_from(attempt.min(16))
-                        .unwrap_or(16)
-                        .saturating_mul(50),
-                );
+                // Per-thread jitter: identical backoffs keep contending
+                // writers in lockstep, so one can lose every attempt on a
+                // slow (emulated) CPU.
+                let mut hasher = std::hash::DefaultHasher::new();
+                std::hash::Hash::hash(&(std::thread::current().id(), attempt), &mut hasher);
+                let cap = u64::try_from(attempt.min(16)).unwrap_or(16);
+                let base = cap.saturating_mul(50);
+                let jitter = std::hash::Hasher::finish(&hasher)
+                    .checked_rem(base.saturating_add(1))
+                    .unwrap_or(0);
+                let backoff = std::time::Duration::from_micros(base.saturating_add(jitter));
                 std::thread::sleep(backoff);
             }
             result => return result,
