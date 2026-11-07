@@ -115,9 +115,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.11.0"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "375989decec1a0fa424442bed520fa12ede43a48475ce8c7417d2c69b32b5f6b"
+checksum = "4ff2a8126fff0f8c839080d619675a585e61720bb12d2baceae45769fd66f155"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -513,7 +513,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#557e8c8a899a06c0ec83ce2b79f64d378ec46f28"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#af5c94d87755ecd35a1d1e1566226a1bdc1168f7"
 dependencies = [
  "base64",
  "blake3",
@@ -528,7 +528,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#557e8c8a899a06c0ec83ce2b79f64d378ec46f28"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#af5c94d87755ecd35a1d1e1566226a1bdc1168f7"
 dependencies = [
  "ryu",
 ]
@@ -536,7 +536,7 @@ dependencies = [
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#557e8c8a899a06c0ec83ce2b79f64d378ec46f28"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#af5c94d87755ecd35a1d1e1566226a1bdc1168f7"
 dependencies = [
  "tracing",
 ]
@@ -544,7 +544,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#557e8c8a899a06c0ec83ce2b79f64d378ec46f28"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#af5c94d87755ecd35a1d1e1566226a1bdc1168f7"
 dependencies = [
  "base64",
  "rezzy-log",
@@ -622,9 +622,9 @@ checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.4"
+version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "subtle"
