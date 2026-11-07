@@ -2784,7 +2784,7 @@ fn raw_import_tracks_missing_parents_across_files() {
     );
     import_raw_events(&db, &template, "!room3", &[late], &[]);
     assert!(missing_parents(&db, &template, "!room3").is_empty());
-    assert!(db.server_info().collection_ids().is_empty());
+    assert_eq!(db.server_info().collection_ids(), Vec::<[u8; 16]>::new());
 }
 
 const FEDERATION_FIRST_DOC: &str = r#"{

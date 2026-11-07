@@ -10,9 +10,9 @@
 //! records are the raw 2 KiB lattice written before tagging; decoding accepts
 //! both so an upgrade does not need a migration.
 //!
-//! The interval comes from `STATE_LATTICE_KEYFRAME_HOPS`, so the live server,
-//! the importer, and the measurement harness all agree on the same checkpoint
-//! cadence.
+//! The interval comes from `STATE_LATTICE_KEYFRAME_HOPS` so the server and
+//! importer can share one cadence when the codec is wired. Measurement sweeps
+//! pin their own intervals instead of reading this production setting.
 
 use std::sync::Arc;
 
@@ -322,6 +322,43 @@ mod tests {
             state_key: "@alice:example.org".to_owned(),
             event_id: event.to_owned(),
         }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn benchmark_lattice_chain_apply_per_delta() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 250_000;
+        let chain = LatticeChain {
+            base: [1; 32],
+            parent: [2; 32],
+            hops: 1,
+            deltas: vec![LatticeDelta::Insert {
+                event_type: "m.space.child".to_owned(),
+                state_key: "!abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJK:example.org"
+                    .to_owned(),
+                event_id: "$abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL".to_owned(),
+            }],
+        };
+        let parent = LtHash::default();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(chain.apply(black_box(&parent)));
+        }
+        let elapsed_ns = started.elapsed().as_nanos();
+        let tenths_ns = elapsed_ns
+            .checked_mul(10)
+            .expect("benchmark elapsed time fits u128")
+            .checked_div(u128::try_from(ITERATIONS).unwrap())
+            .expect("iteration count is nonzero");
+        println!(
+            "LatticeChain::apply: {}/{} ns per one-delta apply ({} iterations)",
+            tenths_ns / 10,
+            tenths_ns % 10,
+            ITERATIONS
+        );
     }
 
     #[test]
