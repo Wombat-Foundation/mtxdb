@@ -45,6 +45,7 @@ fn state_anchor_row(branches: usize, state_percent: u32) {
     let mut state_events = 0usize;
     let mut merge_events = 0usize;
     let mut merge_anchors = 0usize;
+    let mut root_anchors = 0usize;
 
     for event in 0..EVENTS {
         if event > 0 && event % MERGE_PERIOD == 0 {
@@ -78,6 +79,7 @@ fn state_anchor_row(branches: usize, state_percent: u32) {
             }
             (false, Some(parent)) => parent,
             (false, None) => {
+                root_anchors = root_anchors.saturating_add(1);
                 let group = next_group;
                 next_group = next_group.saturating_add(1);
                 group
@@ -92,7 +94,10 @@ fn state_anchor_row(branches: usize, state_percent: u32) {
         .filter(|pair| pair[0] != pair[1])
         .count()
         .saturating_add(usize::from(!groups.is_empty()));
-    let anchors = state_events.saturating_add(merge_anchors);
+    // Parentless first events on a branch open a group too, so they anchor.
+    let anchors = state_events
+        .saturating_add(merge_anchors)
+        .saturating_add(root_anchors);
     let distinct = usize::try_from(next_group).expect("group count fits");
     let bits = usize::BITS
         .checked_sub(distinct.saturating_sub(1).leading_zeros())
