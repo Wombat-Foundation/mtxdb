@@ -105,7 +105,7 @@ verbose_file_reads = "warn"
 path = "src/lib.rs"
 
 [features]
-default = ["zstd", "bitmaps"]
+default = ["zstd", "bitmaps", "state-lattice"]
 # Record-payload compression. On by default, so stores keep writing and reading
 # zstd frames; disable (with `default-features = false`) for builds that must
 # not carry zstd. A build without it always
@@ -136,6 +136,10 @@ bitmaps = ["dep:rezzy-recon"]
 # sorted runs, resident kernel): element hashing, kernels and the `Population`
 # trait come from `rezzy-recon`. Off by default; carries that dependency.
 reconcile = ["dep:rezzy-recon"]
+
+# MSC4500 content-addressed state lattice checkpoint/chain codec. On by
+# default; the accumulator comes from `rezzy-recon`.
+state-lattice = ["dep:rezzy-recon"]
 
 [dependencies]
 arc-swap = "1"

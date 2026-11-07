@@ -149,6 +149,10 @@ pub mod shard;
 /// Room-scoped dense `u32` short ids and compact adjacency lists.
 #[path = "graph/short_id.rs"]
 pub mod short_id;
+/// Content-addressed state lattice checkpoint/chain codec.
+#[cfg(feature = "state-lattice")]
+#[path = "matrix/lattice.rs"]
+pub mod lattice;
 /// Matrix state-group instance identity and record layout.
 #[path = "matrix/state_group.rs"]
 pub mod state_group;
