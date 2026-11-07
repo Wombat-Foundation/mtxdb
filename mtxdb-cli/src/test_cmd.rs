@@ -11,15 +11,16 @@ use super::{
     listing_shard_types, load_collection_events, load_state_groups, matrix_batch_has_create,
     matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
     meta_pools, meta_raw, overlay_auth_projection, pack_identity, parse_federation_input,
-    parse_pack_id_selector, parse_pack_selectors, prepare_state_collection, pretty_print_payload,
-    raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
-    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-    search_record_matches, search_template, split_canonical_display, template_collection_id,
-    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
-    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
-    CollectionOptions, CollectionTemplate, ImportRun, JsonValueExt, MatrixRoomExtension,
-    MetaReport, PackIdentity, ScanOptions, SharedState, StateGroupLoad, StateSet,
-    MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    parse_pack_id_selector, parse_pack_selectors, partial_topo_sort_dag, prepare_state_collection,
+    pretty_print_payload, raw_auth_projection, raw_auth_projection_collection_id,
+    record_csr_adjacency, redacted_event_bytes, resolve_import_collection, run,
+    scan_payload_suffix, search_record_matches, search_template, split_canonical_display,
+    template_collection_id, template_event_id_node_id, template_node_id, topological_event_order,
+    valid_json_pointer, valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections,
+    CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache,
+    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions,
+    SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -2499,6 +2500,329 @@ fn raw_import_reimport_leaves_the_missing_set_unchanged() {
             missing_parents(&db, &template, FIXTURE_ROOM),
             [parent_node].into()
         );
+    }
+}
+
+/// A seeded external parent is not a gap: the direct path judges only this
+/// file's events, and every parent whose after-state was seeded contributes no
+/// in-batch ordering edge. Without the seed the node and its descendants are
+/// unresolved.
+#[test]
+fn seeded_topo_sort_treats_seeded_external_parents_as_resolved() {
+    use mtxdb::dag::ActiveRoomFrontier;
+
+    let mut frontier = ActiveRoomFrontier::new();
+    let first = frontier.insert_event(1, &[10], &[]);
+    let second = frontier.insert_event(2, &[1], &[]);
+    let external_local = frontier.register_id(10);
+    let reverse_map: std::collections::HashMap<u64, String> = [
+        (1, "$first".to_owned()),
+        (2, "$second".to_owned()),
+        (10, "$external".to_owned()),
+    ]
+    .into();
+
+    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map, &HashSet::new());
+    assert!(sorted.is_empty());
+    assert_eq!(unresolved, ["$first".to_owned(), "$second".to_owned()]);
+
+    let seeds: HashSet<_> = [external_local].into();
+    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map, &seeds);
+    assert_eq!(sorted, [first, second]);
+    assert!(unresolved.is_empty());
+}
+
+/// An auth-chain body can satisfy check 4, but it has no state group and can
+/// never be a parent state base. The two waiting families must reflect that.
+#[test]
+fn waiting_set_families_clear_on_the_right_kind_of_arrival() {
+    let no_timeline = HashSet::new();
+    let no_anywhere = HashSet::new();
+    let mut waiting = RoomWaiting::from_scratch(
+        "!room",
+        ["$both".to_owned()],
+        ["$both".to_owned(), "$auth-only".to_owned()],
+        &no_timeline,
+        &no_anywhere,
+    );
+    assert!(waiting.prev.contains("$both"));
+    assert!(waiting.auth.contains("$both"));
+
+    // An auth-chain-only body clears `auth`, never `prev`.
+    let auth_arrived: HashSet<String> = ["$both".to_owned(), "$auth-only".to_owned()].into();
+    waiting.observe_written(
+        &HashSet::new(),
+        &auth_arrived,
+        [],
+        &no_timeline,
+        &no_anywhere,
+    );
+    assert!(
+        waiting.prev.contains("$both"),
+        "an auth body cannot satisfy a prev reference"
+    );
+    assert!(!waiting.auth.contains("$both"));
+    assert!(!waiting.auth.contains("$auth-only"));
+
+    // A timeline body clears both.
+    let timeline_arrived: HashSet<String> = ["$both".to_owned()].into();
+    waiting.observe_written(
+        &timeline_arrived,
+        &HashSet::new(),
+        [],
+        &no_timeline,
+        &no_anywhere,
+    );
+    assert!(waiting.prev.is_empty());
+    assert!(waiting.auth.is_empty());
+}
+
+/// Adding references uses the canonical presence predicate per family: an id
+/// with only an auth body is present for `auth` but still absent for `prev`.
+#[test]
+fn waiting_set_adds_references_against_the_canonical_presence() {
+    let mut timeline_present = HashSet::new();
+    let mut anywhere_present = HashSet::new();
+    anywhere_present.insert("$auth-body".to_owned());
+    timeline_present.insert("$timeline-body".to_owned());
+    anywhere_present.insert("$timeline-body".to_owned());
+
+    let mut waiting = RoomWaiting::default();
+    let auth_arrived: HashSet<String> = ["$auth-body".to_owned()].into();
+    waiting.observe_written(
+        &HashSet::new(),
+        &auth_arrived,
+        [
+            ("$auth-body".to_owned(), true),
+            ("$auth-body".to_owned(), false),
+            ("$timeline-body".to_owned(), true),
+            ("$timeline-body".to_owned(), false),
+            ("$absent".to_owned(), true),
+            ("$absent".to_owned(), false),
+        ],
+        &timeline_present,
+        &anywhere_present,
+    );
+    assert_eq!(
+        waiting.prev,
+        ["$auth-body".to_owned(), "$absent".to_owned()].into(),
+        "an auth-chain body is not a timeline body, even in the same file"
+    );
+    assert_eq!(
+        waiting.auth,
+        ["$absent".to_owned()].into(),
+        "an auth body satisfies auth"
+    );
+}
+
+/// The run-scoped set is only allowed to be an optimisation if it always
+/// agrees with a from-scratch rebuild of the room's CSR rows. Drive real files
+/// through the importer and compare after every one.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture sequence is the test; splitting it hides the ordering"
+)]
+fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
+    let dir = unique_temp_dir().join("waiting_incremental");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, FIXTURE_ROOM);
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let mut established = HashSet::new();
+    let mut cache = ImportRunCache::default();
+
+    let event = |id: &str, kind: &str, state_key: &str, content: &str, prev: &str, auth: &str| {
+        raw_event(FIXTURE_ROOM, id, kind, state_key, content, prev, auth)
+    };
+    let create = event(
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let first = event(
+        "$first",
+        "m.room.message",
+        "",
+        r#"{"body":"first"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    // `cites_gaps` names `$later-auth` as both a prev and an auth reference,
+    // so a later auth-chain-only arrival must clear only the auth gap.
+    let later_prev = event(
+        "$later-prev",
+        "m.room.message",
+        "",
+        r#"{"body":"late parent"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let later_auth = event(
+        "$later-auth",
+        "m.room.member",
+        "@later:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let later_child = event(
+        "$later-child",
+        "m.room.message",
+        "",
+        r#"{"body":"still later"}"#,
+        r#"["$cites-gaps","$still-later"]"#,
+        r#"["$create","$later-auth"]"#,
+    );
+    let cites_gaps = event(
+        "$cites-gaps",
+        "m.room.message",
+        "",
+        r#"{"body":"gaps"}"#,
+        r#"["$first","$later-prev","$later-auth"]"#,
+        r#"["$create","$later-auth"]"#,
+    );
+
+    // Each file carries timeline events and, for federation documents,
+    // auth-chain-only providers.
+    let files: Vec<(Vec<OwnedValue>, Vec<OwnedValue>)> = vec![
+        (vec![create, first], vec![]),
+        (vec![cites_gaps.clone()], vec![]),
+        // A federation response: `$later-prev` is a timeline row and
+        // `$later-auth` only an auth-chain provider.
+        (vec![later_prev], vec![later_auth.clone()]),
+        // A duplicate-heavy reimport changes no bodies.
+        (vec![cites_gaps], vec![]),
+        (vec![later_auth, later_child], vec![]),
+    ];
+
+    for (index, (events, auth_chain)) in files.iter().enumerate() {
+        let path = if auth_chain.is_empty() {
+            dir.join(format!("chunk-{index}.jsonl"))
+        } else {
+            dir.join(format!("chunk-{index}.json"))
+        };
+        if auth_chain.is_empty() {
+            let mut text = String::new();
+            for event in events {
+                text.push_str(&event.encode());
+                text.push('\n');
+            }
+            std::fs::write(&path, text).unwrap();
+        } else {
+            let pdus: Vec<String> = events.iter().map(JsonValueExt::encode).collect();
+            let auth: Vec<String> = auth_chain.iter().map(JsonValueExt::encode).collect();
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"pdus":[{}],"auth_chain":[{}]}}"#,
+                    pdus.join(","),
+                    auth.join(",")
+                ),
+            )
+            .unwrap();
+        }
+        cmd_import_file(
+            &db,
+            store,
+            state_store,
+            &path,
+            None,
+            &template,
+            &mut established,
+            false,
+            None,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+
+        // Apply the file explicitly too, so the comparison holds whether or
+        // not the direct-import gate is on.
+        let arrived: HashSet<String> = events
+            .iter()
+            .filter_map(event_id)
+            .map(str::to_owned)
+            .collect();
+        let auth_arrived: HashSet<String> = auth_chain
+            .iter()
+            .filter_map(event_id)
+            .map(str::to_owned)
+            .collect();
+        cache
+            .observe_written(
+                &db,
+                store,
+                state_store,
+                &template,
+                &collection_id,
+                FIXTURE_ROOM,
+                &arrived,
+                &auth_arrived,
+                events,
+                auth_chain,
+            )
+            .unwrap();
+
+        let incremental = cache.waiting.get(&collection_id).cloned();
+        {
+            let rebuilt = cache
+                .rebuild_waiting(
+                    &db,
+                    store,
+                    state_store,
+                    &template,
+                    &collection_id,
+                    FIXTURE_ROOM,
+                )
+                .unwrap();
+            assert_eq!(
+                incremental.as_ref(),
+                Some(rebuilt),
+                "incremental waiting set diverged after file {index}"
+            );
+        }
+
+        let waiting = &cache.waiting[&collection_id];
+        match index {
+            0 => {
+                assert!(waiting.prev.is_empty());
+                assert!(waiting.auth.is_empty());
+            }
+            1 => {
+                assert!(waiting.prev.contains("$later-prev"));
+                assert!(waiting.prev.contains("$later-auth"));
+                assert!(waiting.auth.contains("$later-auth"));
+            }
+            2 => {
+                assert!(
+                    !waiting.prev.contains("$later-prev"),
+                    "a timeline body clears the prev gap"
+                );
+                assert!(
+                    waiting.prev.contains("$later-auth"),
+                    "an auth-chain-only body must not clear a prev gap"
+                );
+                assert!(
+                    !waiting.auth.contains("$later-auth"),
+                    "an auth-chain body satisfies the auth gap"
+                );
+            }
+            3 => {
+                assert!(waiting.prev.contains("$later-auth"));
+                assert!(waiting.auth.is_empty());
+            }
+            _ => {
+                assert!(waiting.prev.contains("$still-later"));
+                assert!(!waiting.prev.contains("$later-auth"));
+                assert!(waiting.auth.is_empty());
+            }
+        }
     }
 }
 

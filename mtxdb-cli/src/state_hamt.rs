@@ -16,6 +16,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::time::Instant;
 
+use mtxdb::storage::StorageEngine;
 use mtxdb::{derive_group_member_collection_id, DigestAlgorithm, MEMBER_NAMESPACE_STAT};
 use rezzy::hamt::{build_hamt_root_handle, HamtNode, NodeRef, PersistedInternalNode};
 use rezzy::incremental::LtHash;
@@ -209,6 +210,198 @@ pub(crate) fn state_group_id(entries: &[(String, String, String)]) -> [u8; 32] {
         lattice.insert(event_type, state_key, event_id);
     }
     rezzy::hamt::state_group_id_from_lthash(&lattice)
+}
+
+/// The root identity decoded from an `MTHR\x01` record: the structural hash of
+/// the root node and the state-set `LtHash` digest.
+pub(crate) struct DecodedStateHamtRoot {
+    /// Structural hash of the root `MTHN` node.
+    pub(crate) root_hash: [u8; 32],
+    /// Unkeyed `LtHash` digest of the state set.
+    pub(crate) state_group_id: [u8; 32],
+}
+
+/// Decode the identity of a persisted `MTHR\x01` root record.
+///
+/// Returns `None` when the bytes are not a v1 root record. The caller already
+/// knows the room and node id; this only extracts the root hash and lattice
+/// digest needed to load the tree.
+#[must_use]
+pub(crate) fn decode_state_hamt_root(bytes: &[u8]) -> Option<DecodedStateHamtRoot> {
+    const MAGIC: &[u8; 4] = b"MTHR";
+    const ROOT_HASH_LEN: usize = 32;
+    const LATTICE_BYTES: usize = 2048;
+
+    if bytes.get(..MAGIC.len())? != MAGIC.as_slice() || bytes.get(4).copied()? != 0x01 {
+        return None;
+    }
+    let prefix_len = usize::from(u16::from_be_bytes(bytes.get(5..7)?.try_into().ok()?));
+    let prefix_end = 7usize.checked_add(prefix_len)?;
+    let room_id_len = usize::from(u16::from_be_bytes(
+        bytes
+            .get(prefix_end..prefix_end.checked_add(2)?)?
+            .try_into()
+            .ok()?,
+    ));
+    let room_id_start = prefix_end.checked_add(2)?;
+    let root_hash_start = room_id_start.checked_add(room_id_len)?;
+    let lattice_start = root_hash_start.checked_add(ROOT_HASH_LEN)?;
+    let end = lattice_start.checked_add(LATTICE_BYTES)?;
+    if bytes.len() != end {
+        return None;
+    }
+    let mut root_hash = [0u8; ROOT_HASH_LEN];
+    root_hash.copy_from_slice(bytes.get(root_hash_start..lattice_start)?);
+
+    let mut lanes = [0u16; 1024];
+    for (lane, chunk) in lanes
+        .iter_mut()
+        .zip(bytes.get(lattice_start..end)?.as_chunks::<2>().0)
+    {
+        *lane = u16::from_le_bytes(*chunk);
+    }
+    let lattice = rezzy::incremental::LtLattice::<1024>::from(lanes);
+    Some(DecodedStateHamtRoot {
+        root_hash,
+        state_group_id: rezzy::hamt::state_group_id_from_lthash(&lattice),
+    })
+}
+
+/// On-demand reader for one room's persisted state HAMTs.
+///
+/// Nodes are content-addressed by their 32-byte structural hash; the room's
+/// `STAT` collection stores each under `hash[..16]`. The reader resolves only
+/// the nodes a traversal touches, so it never materializes the whole trie.
+pub(crate) struct StateHamtReader<'a> {
+    store: &'a mtxdb::PackfileStorage,
+    collection: [u8; 16],
+    structural_key: Vec<u8>,
+    cache: std::collections::HashMap<[u8; 32], Arc<HamtNode<String, String>>>,
+}
+
+impl<'a> StateHamtReader<'a> {
+    /// Open the reader for `room_id`. Returns `None` when the room's `STAT`
+    /// collection cannot be derived.
+    #[must_use]
+    pub(crate) fn new(store: &'a mtxdb::PackfileStorage, room_id: &str) -> Option<Self> {
+        Some(Self {
+            store,
+            collection: state_hamt_collection_id(room_id)?,
+            structural_key: room_id.as_bytes().to_vec(),
+            cache: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Load the node with `hash`, verifying that its contents reproduce it.
+    fn node(&mut self, hash: &[u8; 32]) -> anyhow::Result<Arc<HamtNode<String, String>>> {
+        if let Some(node) = self.cache.get(hash) {
+            return Ok(Arc::clone(node));
+        }
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&hash[..16]);
+        let record = self
+            .store
+            .get(&self.collection, &id)?
+            .ok_or_else(|| anyhow::anyhow!("missing HAMT node {}", hex::encode(id)))?;
+        let node = PersistedInternalNode::<String, String>::decode_v1_verified(
+            &record.bytes,
+            &self.structural_key,
+            *hash,
+        )
+        .map_err(|error| anyhow::anyhow!("invalid HAMT node {}: {error}", hex::encode(id)))?;
+        let node = Arc::new(node);
+        self.cache.insert(*hash, Arc::clone(&node));
+        Ok(node)
+    }
+
+    /// Collect every `(event_type, state_key, event_id)` entry under `root_hash`.
+    ///
+    /// # Errors
+    /// Returns an error when a node is absent, corrupt, or stores a leaf key
+    /// that is not the expected two-element JSON array.
+    pub(crate) fn collect_entries(
+        &mut self,
+        root_hash: &[u8; 32],
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        let mut entries = Vec::new();
+        let mut stack = vec![self.node(root_hash)?];
+        while let Some(node) = stack.pop() {
+            for (key, event_id) in &node.leaves {
+                let (event_type, state_key) = decode_leaf_key(key)?;
+                entries.push((event_type, state_key, event_id.clone()));
+            }
+            for child in &node.children {
+                match child {
+                    NodeRef::Resolved(child) => stack.push(Arc::clone(child)),
+                    NodeRef::Lazy(hash) => stack.push(self.node(hash)?),
+                }
+            }
+        }
+        Ok(entries)
+    }
+}
+
+/// Decode a persisted leaf key (`["event.type","state key"]`).
+fn decode_leaf_key(key: &str) -> anyhow::Result<(String, String)> {
+    let value = rezzy::json::Value::parse(key)
+        .map_err(|error| anyhow::anyhow!("invalid HAMT leaf key {key:?}: {error:?}"))?;
+    let rezzy::json::Value::Array(elements) = value else {
+        anyhow::bail!("HAMT leaf key is not a JSON array: {key:?}");
+    };
+    let [event_type, state_key] = elements.as_slice() else {
+        anyhow::bail!("HAMT leaf key is not a two-element array: {key:?}");
+    };
+    let (Some(event_type), Some(state_key)) = (event_type.as_str(), state_key.as_str()) else {
+        anyhow::bail!("HAMT leaf key elements must be strings: {key:?}");
+    };
+    Ok((event_type.to_owned(), state_key.to_owned()))
+}
+
+/// Load the full state set of a persisted state group.
+///
+/// Returns `None` when the group has no `STGP` record or no materialized root
+/// (an unresolved group). A present group missing a node is an error: its root
+/// claims content that is not durable.
+///
+/// # Errors
+/// Returns an error for an unreadable record or a root that references a
+/// missing or corrupt node.
+pub(crate) fn load_state_group_entries(
+    store: &mtxdb::PackfileStorage,
+    room_id: &str,
+    state_group_id: &[u8; 16],
+) -> anyhow::Result<Option<Vec<(String, String, String)>>> {
+    let Some(stgp_collection) = mtxdb::state_group_collection_id(room_id) else {
+        return Ok(None);
+    };
+    let Some(group) = store.get(&stgp_collection, state_group_id)? else {
+        return Ok(None);
+    };
+    let instance = mtxdb::decode_state_group_record(&group.bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid state-group record {}: {error}",
+            hex::encode(state_group_id)
+        )
+    })?;
+    let Some(mut reader) = StateHamtReader::new(store, room_id) else {
+        return Ok(None);
+    };
+    let Some(root) = store.get(&reader.collection, &instance.root_id)? else {
+        return Ok(None);
+    };
+    let Some(decoded) = decode_state_hamt_root(&root.bytes) else {
+        anyhow::bail!(
+            "state-group root {} is not an MTHR v1 record",
+            hex::encode(instance.root_id)
+        );
+    };
+    if decoded.state_group_id != instance.lthash {
+        anyhow::bail!(
+            "state-group root {} does not match its STGP lattice digest",
+            hex::encode(instance.root_id)
+        );
+    }
+    Ok(Some(reader.collect_entries(&decoded.root_hash)?))
 }
 
 /// `serde_json::to_string(&(event_type, state_key))`, i.e. a two-element JSON

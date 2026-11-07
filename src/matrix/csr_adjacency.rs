@@ -586,15 +586,43 @@ impl CsrAdjacency {
     /// Returns an error on a read failure, a corrupt segment, or a target that
     /// does not resolve to an event id.
     pub fn referenced_event_ids(&self, db: &Database) -> Result<BTreeSet<String>, StorageError> {
+        let (mut prev, auth) = self.referenced_event_ids_by_family(db)?;
+        prev.extend(auth);
+        Ok(prev)
+    }
+
+    /// Every event id the room's `prev_events` and `auth_events` point at,
+    /// separated by family.
+    ///
+    /// A consumer that tracks "referenced but absent" work per family needs to
+    /// know which edges a late arrival would satisfy: a `prev` arrival changes
+    /// descendant state groups, an `auth` arrival changes verdicts.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure, a corrupt segment, or a target that
+    /// does not resolve to an event id.
+    pub fn referenced_event_ids_by_family(
+        &self,
+        db: &Database,
+    ) -> Result<(BTreeSet<String>, BTreeSet<String>), StorageError> {
+        Ok((
+            self.resolved_family_targets(db, PREV)?,
+            self.resolved_family_targets(db, AUTH)?,
+        ))
+    }
+
+    fn resolved_family_targets(
+        &self,
+        db: &Database,
+        family: EdgeFamily,
+    ) -> Result<BTreeSet<String>, StorageError> {
         let store = self.store(db);
         let mut targets = BTreeSet::new();
-        for family in [PREV, AUTH] {
-            for (_, edges) in store
-                .read_family(self.scope(), family)
-                .map_err(StorageError::Io)?
-            {
-                targets.extend(edges.iter().map(|edge| edge.target));
-            }
+        for (_, edges) in store
+            .read_family(self.scope(), family)
+            .map_err(StorageError::Io)?
+        {
+            targets.extend(edges.iter().map(|edge| edge.target));
         }
         let ids: Vec<u32> = targets.into_iter().collect();
         self.events

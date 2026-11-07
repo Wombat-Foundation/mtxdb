@@ -3,8 +3,9 @@
 //! A state lattice is small enough to copy, but writing all 2 KiB on every
 //! state event is wasted work: most roots differ from their parent by one
 //! `(event_type, state_key, event_id)` entry. This module stores every
-//! [`CHECKPOINT_INTERVAL`]-th root as a full lattice and the roots between
-//! checkpoints as a linked list of one-transition deltas.
+//! [`CHECKPOINT_INTERVAL`](crate::lattice::CHECKPOINT_INTERVAL)-th root as a
+//! full lattice and the roots between checkpoints as a linked list of
+//! one-transition deltas.
 //!
 //! A record is either a tagged full lattice or a tagged delta chain. Legacy
 //! records are the raw 2 KiB lattice written before tagging; decoding accepts

@@ -9125,7 +9125,7 @@ fn import_data(
     let mut key_state_checked = false;
     let mut key_import_failed = false;
     let mut signature_checks_enabled = false;
-    let mut room_cache = RoomEventCache::new();
+    let mut room_cache = ImportRunCache::default();
     for (index, path) in keys_first(paths).into_iter().enumerate() {
         if index != 0 {
             eprintln!();
@@ -9584,7 +9584,6 @@ fn template_pointer_node_id(
 }
 
 /// Produce the node ID for an event ID string under the template's record-identity rule.
-#[cfg(test)]
 fn template_event_id_node_id(
     template: &CollectionTemplate,
     event_id: &str,
@@ -10240,7 +10239,282 @@ struct ImportOutcome {
 /// earlier chunk from disk for each new file. The cache holds the authoritative
 /// stored timeline events (redacted, with auth projections overlaid), so later
 /// files start from memory. It lives only for one command invocation.
-type RoomEventCache = HashMap<[u8; 16], Vec<OwnedValue>>;
+///
+/// The same cache owns the run-scoped **waiting set**: ids the room references
+/// but no store holds yet, split by the edge family that cites them. Building
+/// it is one O(N) pass over the room's CSR rows; after that, each file asks a
+/// file-sized question ("does this file supply a waiting id?") instead of
+/// rescanning every stored event's references.
+#[derive(Default)]
+struct ImportRunCache {
+    rooms: HashMap<[u8; 16], Vec<OwnedValue>>,
+    waiting: HashMap<[u8; 16], RoomWaiting>,
+}
+
+/// Ids a room references that no store holds yet, split by edge family.
+///
+/// `prev` and `auth` entries have different dirty closures. Satisfying a
+/// `prev` id can change the state groups of the citing event's descendants;
+/// satisfying an `auth` id changes only the verdicts of the events that cite
+/// it, never their state. Keeping the families apart is what lets a file
+/// decide, in O(|F|), whether it can touch earlier events at all.
+///
+/// Only a stored timeline body satisfies `prev`: an auth-chain body has no
+/// state group, so it can never serve as a parent state base. Any body
+/// (timeline, auth chain, or auth projection) satisfies `auth`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RoomWaiting {
+    room_id: String,
+    prev: HashSet<String>,
+    auth: HashSet<String>,
+}
+
+/// The waiting ids a file supplies, by family.
+#[derive(Debug, Default, Clone)]
+struct WaitingHits {
+    prev: HashSet<String>,
+    auth: HashSet<String>,
+}
+
+impl RoomWaiting {
+    /// Build the set from references and the bodies that exist right now.
+    fn from_scratch(
+        room_id: &str,
+        prev_refs: impl IntoIterator<Item = String>,
+        auth_refs: impl IntoIterator<Item = String>,
+        timeline_present: &HashSet<String>,
+        anywhere_present: &HashSet<String>,
+    ) -> Self {
+        Self {
+            room_id: room_id.to_owned(),
+            prev: prev_refs
+                .into_iter()
+                .filter(|id| !timeline_present.contains(id))
+                .collect(),
+            auth: auth_refs
+                .into_iter()
+                .filter(|id| !anywhere_present.contains(id))
+                .collect(),
+        }
+    }
+
+    /// Answer "does this file supply an id an earlier event cited without
+    /// having the body?" without rescanning the room.
+    fn hits<'a>(&self, supplied: impl IntoIterator<Item = &'a String>) -> WaitingHits {
+        let mut hits = WaitingHits::default();
+        for id in supplied {
+            if self.prev.contains(id) {
+                hits.prev.insert(id.clone());
+            }
+            if self.auth.contains(id) {
+                hits.auth.insert(id.clone());
+            }
+        }
+        hits
+    }
+
+    /// Apply one successfully written file to the set.
+    ///
+    /// `timeline_arrived` are ids whose timeline body is now stored;
+    /// `auth_arrived` are ids whose body is now in the auth collection but
+    /// which are not timeline rows. A reference only enters the set when its
+    /// body is stored nowhere, which is why the presence sets are passed in.
+    fn observe_written(
+        &mut self,
+        timeline_arrived: &HashSet<String>,
+        auth_arrived: &HashSet<String>,
+        references: impl IntoIterator<Item = (String, bool)>,
+        timeline_present: &HashSet<String>,
+        anywhere_present: &HashSet<String>,
+    ) {
+        // A timeline body is also an auth body, so it clears both families.
+        for id in timeline_arrived {
+            self.prev.remove(id);
+            self.auth.remove(id);
+        }
+        // An auth-chain body can satisfy check 4, but it has no state group and
+        // must not clear a `prev` reference.
+        for id in auth_arrived {
+            self.auth.remove(id);
+        }
+        for (id, is_prev) in references {
+            if timeline_arrived.contains(&id) {
+                // A timeline body satisfies both families; it also cannot be a
+                // gap for this file's own references.
+                continue;
+            }
+            if is_prev {
+                // An auth-chain body is still not a timeline body: it cannot
+                // seed a descendant's state group, so the prev gap remains.
+                if !timeline_present.contains(&id) {
+                    self.prev.insert(id);
+                }
+            } else if !anywhere_present.contains(&id) {
+                self.auth.insert(id);
+            }
+        }
+    }
+}
+
+/// Ids among `ids` whose body is stored in the timeline collection, and ids
+/// whose body is stored anywhere a raw import can read one: timeline, auth
+/// chain, or an auth-only projection.
+fn stored_body_ids(
+    store: &PackfileStorage,
+    state_store: &PackfileStorage,
+    template: &CollectionTemplate,
+    collection_id: &[u8; 16],
+    room_id: &str,
+    ids: &HashSet<String>,
+) -> anyhow::Result<(HashSet<String>, HashSet<String>)> {
+    if ids.is_empty() {
+        return Ok((HashSet::new(), HashSet::new()));
+    }
+    let mut ordered: Vec<(String, NodeId)> = Vec::with_capacity(ids.len());
+    for id in ids {
+        ordered.push((id.clone(), template_event_id_node_id(template, id)?));
+    }
+    let nodes: Vec<NodeId> = ordered.iter().map(|(_, node)| *node).collect();
+    let timeline = store.get_many(collection_id, &nodes)?;
+    let auth_collection =
+        derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
+    let auth = state_store.get_many(&auth_collection, &nodes)?;
+    let projections = store.get_many(&raw_auth_projection_collection_id(room_id), &nodes)?;
+    let mut timeline_present = HashSet::with_capacity(ordered.len());
+    let mut anywhere_present = HashSet::with_capacity(ordered.len());
+    for (((id, _), timeline), (auth, projection)) in ordered
+        .iter()
+        .zip(timeline)
+        .zip(auth.into_iter().zip(projections))
+    {
+        if timeline.is_some() {
+            timeline_present.insert(id.clone());
+        }
+        if timeline.is_some() || auth.is_some() || projection.is_some() {
+            anywhere_present.insert(id.clone());
+        }
+    }
+    Ok((timeline_present, anywhere_present))
+}
+
+impl ImportRunCache {
+    /// Rebuild the waiting set for a collection from the room's CSR rows and
+    /// the three stores that can hold an event body.
+    fn rebuild_waiting(
+        &mut self,
+        db: &Database,
+        store: &PackfileStorage,
+        state_store: &PackfileStorage,
+        template: &CollectionTemplate,
+        collection_id: &[u8; 16],
+        room_id: &str,
+    ) -> anyhow::Result<&RoomWaiting> {
+        let (prev_refs, auth_refs) = RoomAuth::new(room_id).referenced_event_ids_by_family(db)?;
+        let mut all: HashSet<String> = prev_refs.iter().cloned().collect();
+        all.extend(auth_refs.iter().cloned());
+        let (timeline_present, anywhere_present) =
+            stored_body_ids(store, state_store, template, collection_id, room_id, &all)?;
+        let entry = RoomWaiting::from_scratch(
+            room_id,
+            prev_refs,
+            auth_refs,
+            &timeline_present,
+            &anywhere_present,
+        );
+        Ok(self.waiting.entry(*collection_id).or_insert(entry))
+    }
+
+    /// The collection's waiting set, rebuilt once per run if it is not there.
+    fn ensure_waiting(
+        &mut self,
+        db: &Database,
+        store: &PackfileStorage,
+        state_store: &PackfileStorage,
+        template: &CollectionTemplate,
+        collection_id: &[u8; 16],
+        room_id: &str,
+    ) -> anyhow::Result<&RoomWaiting> {
+        let stale = self
+            .waiting
+            .get(collection_id)
+            .is_none_or(|entry| entry.room_id != room_id);
+        if stale {
+            return self.rebuild_waiting(db, store, state_store, template, collection_id, room_id);
+        }
+        Ok(self
+            .waiting
+            .get(collection_id)
+            .expect("waiting set was just checked"))
+    }
+
+    /// Fold one written file into the waiting set. Rebuilds first if this run
+    /// has not touched the collection yet, so the first file's own references
+    /// are accounted for.
+    #[allow(clippy::too_many_arguments)]
+    fn observe_written(
+        &mut self,
+        db: &Database,
+        store: &PackfileStorage,
+        state_store: &PackfileStorage,
+        template: &CollectionTemplate,
+        collection_id: &[u8; 16],
+        room_id: &str,
+        timeline_arrived: &HashSet<String>,
+        auth_arrived: &HashSet<String>,
+        events: &[OwnedValue],
+        auth_chain: &[OwnedValue],
+    ) -> anyhow::Result<()> {
+        self.ensure_waiting(db, store, state_store, template, collection_id, room_id)?;
+        let mut references: Vec<(String, bool)> = Vec::new();
+        let mut candidates: HashSet<String> = HashSet::new();
+        for event in events.iter().chain(auth_chain) {
+            // The adjacency recorder skips events without an event id; the
+            // waiting set must describe exactly the rows it wrote.
+            if event_id(event).is_none() {
+                continue;
+            }
+            for field in ["prev_events", "auth_events"] {
+                let Some(list) = event.get(field).and_then(OwnedValue::as_array) else {
+                    continue;
+                };
+                for reference in list {
+                    let id = match reference {
+                        OwnedValue::String(id) => Some(id.as_str()),
+                        OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
+                        _ => None,
+                    };
+                    let Some(id) = id else { continue };
+                    let is_prev = field == "prev_events";
+                    if timeline_arrived.contains(id) || auth_arrived.contains(id) {
+                        continue;
+                    }
+                    references.push((id.to_owned(), is_prev));
+                    candidates.insert(id.to_owned());
+                }
+            }
+        }
+        let (timeline_present, anywhere_present) = stored_body_ids(
+            store,
+            state_store,
+            template,
+            collection_id,
+            room_id,
+            &candidates,
+        )?;
+        let entry = self
+            .waiting
+            .get_mut(collection_id)
+            .expect("waiting set was ensured above");
+        entry.observe_written(
+            timeline_arrived,
+            auth_arrived,
+            references,
+            &timeline_present,
+            &anywhere_present,
+        );
+        Ok(())
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_import_file(
@@ -10254,7 +10528,7 @@ fn cmd_import_file(
     signature_checks_enabled: bool,
     signature_catalog: Option<&export_import::SignatureKeyCatalog>,
     write_state_hamts: bool,
-    room_cache: Option<&mut RoomEventCache>,
+    room_cache: Option<&mut ImportRunCache>,
 ) -> anyhow::Result<ImportOutcome> {
     let mut context = ImportContext {
         db,
@@ -10286,7 +10560,7 @@ struct ImportContext<'a> {
     signature_checks_enabled: bool,
     signature_catalog: Option<&'a export_import::SignatureKeyCatalog>,
     write_state_hamts: bool,
-    room_cache: Option<&'a mut RoomEventCache>,
+    room_cache: Option<&'a mut ImportRunCache>,
 }
 
 impl ImportContext<'_> {
@@ -10696,6 +10970,7 @@ fn compute_import_auth_before(
                 room_id,
                 policy,
                 Some(rejected),
+                &HashMap::new(),
                 |_, _, _, _, _| None,
             ),
             0,
@@ -10741,6 +11016,7 @@ fn compute_import_auth_before(
         room_id,
         policy,
         Some(rejected),
+        &HashMap::new(),
         |event_id, event, base, base_complete, current| {
             // Only events whose inputs can have changed need judging; the
             // walk still derives state for every event so later events get
@@ -10997,6 +11273,13 @@ fn import_room_version(
     Ok(version)
 }
 
+/// Whether the direct per-file import is enabled. It stays opt-in until the
+/// chunk-permutation differential suite proves byte-identical output against
+/// the whole-room path; otherwise every import keeps the current behaviour.
+fn direct_import_enabled() -> bool {
+    std::env::var_os("MTXDB_DIRECT_IMPORT").is_some()
+}
+
 /// Import PDU events through the normal event-DAG path.
 #[allow(
     clippy::too_many_arguments,
@@ -11121,7 +11404,7 @@ fn import_pdu_events_with_raw_state_hamts(
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
     write_state_hamts: bool,
-    mut room_cache: Option<&mut RoomEventCache>,
+    mut room_cache: Option<&mut ImportRunCache>,
 ) -> anyhow::Result<()> {
     if events.is_empty() {
         bail!("no events found in {}", path.display());
@@ -11205,6 +11488,12 @@ fn import_pdu_events_with_raw_state_hamts(
     };
 
     let probe_ids: Vec<[u8; 16]> = first.iter().map(|(id, _, _)| *id).collect();
+    // Ids whose timeline body this file supplies (newly written or already
+    // stored). Only these can satisfy a `prev` reference.
+    let body_ids: HashSet<String> = first
+        .iter()
+        .map(|(_, event_id, _)| event_id.clone())
+        .collect();
     let existing = store.get_many(&collection_id, &probe_ids)?;
     let mut to_write: Vec<([u8; 16], NodeData)> = Vec::new();
     for ((id_bytes, incoming_event_id, index), existing_opt) in first.into_iter().zip(existing) {
@@ -11223,6 +11512,30 @@ fn import_pdu_events_with_raw_state_hamts(
             to_write.push((id_bytes, NodeData::new(event_bytes)));
         }
     }
+    // A file that supplies an id an earlier file referenced but did not have
+    // can change that earlier event. The run-scoped waiting set answers that
+    // in O(file) instead of rescanning every stored event's references. Probe
+    // before this file's own edges are recorded, so an id cited only by
+    // another event in this file is not a late arrival.
+    let direct_identity = matches!(
+        &template.record_id_rule.policy,
+        FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
+    );
+    let mut local_cache = ImportRunCache::default();
+    let waiting_hits = if direct_import_enabled() && direct_identity && !to_write.is_empty() {
+        let cache = room_cache.as_deref_mut().unwrap_or(&mut local_cache);
+        let waiting = cache.ensure_waiting(
+            db,
+            store,
+            state_store,
+            template,
+            &collection_id,
+            &resolved.canonical_id,
+        )?;
+        waiting.hits(current_ids.iter())
+    } else {
+        WaitingHits::default()
+    };
     record_csr_adjacency_with_raw(db, template, events, raw_adjacency)?;
 
     // Preserve causal order even when input arrives newest-first.
@@ -11246,13 +11559,65 @@ fn import_pdu_events_with_raw_state_hamts(
         events,
         auth_chain,
     )?;
+    // Fold the successfully written bodies into the run-scoped waiting set
+    // after the writes, never before: a record that was skipped or rejected by
+    // the collision check must stay waiting for a later file.
+    if direct_import_enabled() && direct_identity {
+        if let Some(cache) = room_cache.as_mut() {
+            let auth_arrived: HashSet<String> = auth_chain
+                .iter()
+                .filter(|event| template_node_id(template, event).ok().flatten().is_some())
+                .filter_map(event_id)
+                .map(str::to_owned)
+                .collect();
+            cache.observe_written(
+                db,
+                store,
+                state_store,
+                template,
+                &collection_id,
+                &resolved.canonical_id,
+                &body_ids,
+                &auth_arrived,
+                events,
+                auth_chain,
+            )?;
+        }
+    }
     // A file whose events are all stored already, whose auth chain is empty,
     // and whose projections are all present carries no new information. Every
     // prior verdict, flag and state group is still valid, so skip reloading,
     // re-judging and repairing the whole room. Reimports stay O(file), not
     // O(room).
     let skip_judging = to_write.is_empty() && auth_chain.is_empty() && new_projections == 0;
-    if !skip_judging {
+    // A clean append (nothing this file supplies was missing before) only
+    // changes this file's own verdicts. Judge it directly against the stored
+    // prev state groups and fall back to the whole-room walk on any condition
+    // the direct path cannot prove.
+    let direct_handled = direct_import_enabled()
+        && !skip_judging
+        && write_state_hamts
+        && auth_chain.is_empty()
+        && !resolved.batch_has_create
+        && try_direct_raw_import(
+            db,
+            store,
+            state_store,
+            template,
+            &collection_id,
+            &resolved.canonical_id,
+            &room_version,
+            events,
+            &existed_before,
+            &waiting_hits,
+        )?;
+    if direct_handled {
+        if let Some(cache) = room_cache.as_mut() {
+            cache.rooms.remove(&collection_id);
+        }
+        eprintln!("  raw import: direct incremental path");
+    }
+    if !skip_judging && !direct_handled {
         // Existing records are part of the state the new batch inherits. Reading
         // them back is the simplest way to let check 5 run across separate files:
         // the walk sees the whole room, not just this file. Events written by
@@ -11260,7 +11625,7 @@ fn import_pdu_events_with_raw_state_hamts(
         // authoritative and still carry the unredacted auth fields.
         let stored_events = match room_cache
             .as_mut()
-            .and_then(|cache| cache.remove(&collection_id))
+            .and_then(|cache| cache.rooms.remove(&collection_id))
         {
             Some(cached) => cached,
             None => load_collection_events(store, &collection_id, &resolved.canonical_id)?,
@@ -11421,11 +11786,7 @@ fn import_pdu_events_with_raw_state_hamts(
                 |id| needed.contains(id),
             )
         } else {
-            export_import::lean_redacted_events(
-                &synthetic.events,
-                &redacted,
-                &synthetic.room_id,
-            )
+            export_import::lean_redacted_events(&synthetic.events, &redacted, &synthetic.room_id)
         };
         let mut findings = export_import::derived_auth_findings_for_raw_with_inputs(
             &synthetic,
@@ -11514,11 +11875,11 @@ fn import_pdu_events_with_raw_state_hamts(
                 .filter(|id| !current_ids.contains(*id))
                 .collect();
             if auth_only.is_empty() {
-                cache.insert(collection_id, all_events);
+                cache.rooms.insert(collection_id, all_events);
             } else {
                 let mut entry = all_events;
                 entry.retain(|event| event_id(event).is_none_or(|id| !auth_only.contains(id)));
-                cache.insert(collection_id, entry);
+                cache.rooms.insert(collection_id, entry);
             }
         }
     }
@@ -11751,9 +12112,415 @@ fn overlay_auth_projection(event: &mut OwnedValue, projection: OwnedValue) {
     }
 }
 
-/// Read back the events already in a raw-import collection, so a later file
-/// can be judged against the state its earlier files produced. The redacted
-/// record is overlaid with the auth projection written at first import.
+/// The event ids an event cites in `prev_events` and `auth_events`.
+fn event_reference_ids(event: &OwnedValue) -> Vec<String> {
+    let mut ids = Vec::new();
+    for field in ["prev_events", "auth_events"] {
+        let Some(references) = event.get(field).and_then(OwnedValue::as_array) else {
+            continue;
+        };
+        for reference in references {
+            let id = match reference {
+                OwnedValue::String(id) => Some(id.as_str()),
+                OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
+                _ => None,
+            };
+            if let Some(id) = id {
+                ids.push(id.to_owned());
+            }
+        }
+    }
+    ids
+}
+
+/// Load event bodies by event id from the room's timeline collection, its
+/// `auth_chain` collection, or an auth-only projection, overlaying the
+/// projection on each stored (redacted) body.
+fn load_event_bodies(
+    store: &PackfileStorage,
+    template: &CollectionTemplate,
+    room_id: &str,
+    collection_id: &[u8; 16],
+    ids: &HashSet<String>,
+) -> anyhow::Result<HashMap<String, OwnedValue>> {
+    let mut out = HashMap::with_capacity(ids.len());
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let mut ordered: Vec<(String, [u8; 16])> = Vec::with_capacity(ids.len());
+    for id in ids {
+        ordered.push((id.clone(), template_event_id_node_id(template, id)?));
+    }
+    let nodes: Vec<[u8; 16]> = ordered.iter().map(|(_, node)| *node).collect();
+    let timeline = store.get_many(collection_id, &nodes)?;
+    let auth_collection =
+        derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
+    let auth = store.get_many(&auth_collection, &nodes)?;
+    let projections = store.get_many(&raw_auth_projection_collection_id(room_id), &nodes)?;
+    for (((id, node), timeline), (auth, projection)) in ordered
+        .into_iter()
+        .zip(timeline)
+        .zip(auth.into_iter().zip(projections))
+    {
+        let Some(record) = timeline.or(auth) else {
+            continue;
+        };
+        let Ok(mut value) = OwnedValue::parse_bytes(&record.bytes) else {
+            continue;
+        };
+        if let Some(projection) = projection {
+            if let Ok(projection) = OwnedValue::parse_bytes(&projection.bytes) {
+                overlay_auth_projection(&mut value, projection);
+            }
+        }
+        let _ = node;
+        out.insert(id, value);
+    }
+    Ok(out)
+}
+
+fn state_set_from_entries(entries: Vec<(String, String, String)>) -> StateSet {
+    let mut set = StateSet::new();
+    for (event_type, state_key, event_id) in entries {
+        set.set(&event_type, &state_key, event_id);
+    }
+    set
+}
+
+/// Try to import a clean append without reloading or re-walking the room.
+///
+/// Returns `true` when the file was fully handled. `false` means some
+/// precondition the direct path cannot prove holds (a late parent, a merge
+/// that needs the room's auth closure, a missing body, an unchecked event), so
+/// the caller must use the whole-room path. The direct path never writes a
+/// partial result: all judging happens before any verdict or flag is staged.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the direct path owns seeding, local judging, and delta writes"
+)]
+fn try_direct_raw_import(
+    db: &Database,
+    store: &PackfileStorage,
+    state_store: &PackfileStorage,
+    template: &CollectionTemplate,
+    collection_id: &[u8; 16],
+    room_id: &str,
+    room_version: &str,
+    events: &[OwnedValue],
+    existed_before: &HashSet<String>,
+    waiting_hits: &WaitingHits,
+) -> anyhow::Result<bool> {
+    if !matches!(
+        &template.record_id_rule.policy,
+        FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
+    ) {
+        return Ok(false);
+    }
+    let Some(state_version) = StateResVersion::from_room_version(room_version) else {
+        return Ok(false);
+    };
+    let mut new_ids: HashSet<String> = HashSet::new();
+    let mut new_events: Vec<OwnedValue> = Vec::new();
+    for event in events {
+        let Some(id) = event_id(event) else {
+            return Ok(false);
+        };
+        if existed_before.contains(id) || !new_ids.insert(id.to_owned()) {
+            continue;
+        }
+        new_events.push(event.clone());
+    }
+    if new_events.is_empty() {
+        return Ok(false);
+    }
+    // Supplying an id an earlier event cited without having the body changes
+    // that earlier event: a `prev` arrival can change descendant state groups,
+    // an `auth` arrival can change verdicts. The reverse-edge dirty closure is
+    // not part of this pass, so hand both to the whole-room path.
+    let direct_debug = std::env::var_os("MTXDB_DIRECT_DEBUG").is_some();
+    let prev_hits = waiting_hits.prev.intersection(&new_ids).count();
+    let auth_hits = waiting_hits.auth.intersection(&new_ids).count();
+    if prev_hits > 0 || auth_hits > 0 {
+        if direct_debug {
+            eprintln!("direct: fallback, waiting hits prev={prev_hits} auth={auth_hits}");
+        }
+        return Ok(false);
+    }
+
+    let aux = AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
+    // Every citation must already be present, or be in this file.
+    let mut external_refs: HashSet<String> = HashSet::new();
+    for event in &new_events {
+        for reference in event_reference_ids(event) {
+            if !new_ids.contains(&reference) {
+                external_refs.insert(reference);
+            }
+        }
+    }
+    let external = load_event_bodies(store, template, room_id, collection_id, &external_refs)?;
+    if external.len() != external_refs.len() {
+        return Ok(false);
+    }
+
+    // Load the after-state of every parent outside this file.
+    let mut seed_groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
+    for event in &new_events {
+        let Some(prevs) = event.get("prev_events").and_then(OwnedValue::as_array) else {
+            continue;
+        };
+        for reference in prevs {
+            let id = match reference {
+                OwnedValue::String(id) => Some(id.as_str()),
+                OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
+                _ => None,
+            };
+            let Some(id) = id else { continue };
+            if !new_ids.contains(id) {
+                seed_groups.insert(id.to_owned(), [0u8; STATE_GROUP_ID_LENGTH]);
+            }
+        }
+    }
+    let seed_ids: Vec<String> = seed_groups.keys().cloned().collect();
+    let keys: Vec<&[u8]> = seed_ids.iter().map(String::as_bytes).collect();
+    let loaded = aux.get_many(&keys)?;
+    let mut seeds: HashMap<String, Arc<SharedState>> = HashMap::with_capacity(seed_ids.len());
+    for (id, value) in seed_ids.iter().zip(loaded) {
+        let Some(value) = value else {
+            return Ok(false);
+        };
+        if !valid_state_group_id(&value) {
+            return Ok(false);
+        }
+        let mut group = [0u8; STATE_GROUP_ID_LENGTH];
+        group.copy_from_slice(&value);
+        let Some(entries) =
+            crate::state_hamt::load_state_group_entries(state_store, room_id, &group)?
+        else {
+            return Ok(false);
+        };
+        let set = state_set_from_entries(entries);
+        seeds.insert(id.clone(), SharedState::new(set, group, true));
+    }
+
+    // Auth-relevant state keys read by check 5 for this file's events. Only
+    // these state bodies are needed from the seed; everything else in the
+    // state set is carried through the walk but never materialized as an
+    // event body in this file.
+    let mut needed_keys: HashSet<(String, String)> = HashSet::new();
+    needed_keys.insert(("m.room.create".to_owned(), String::new()));
+    for event in &new_events {
+        let event_type = event.get("type").and_then(OwnedValue::as_str).unwrap_or("");
+        let sender = event
+            .get("sender")
+            .and_then(OwnedValue::as_str)
+            .unwrap_or("");
+        let state_key = event.get("state_key").and_then(OwnedValue::as_str);
+        let content = event
+            .get("content")
+            .cloned()
+            .unwrap_or_else(|| OwnedValue::Object(Object::default()));
+        needed_keys.extend(auth_types_for_event(
+            event_type,
+            sender,
+            state_key,
+            &content,
+            state_version,
+            room_version,
+        ));
+    }
+    for seed in seeds.values() {
+        for (key, event_id) in &seed.set.entries {
+            if needed_keys.contains(key) && !new_ids.contains(event_id) {
+                external_refs.insert(event_id.clone());
+            }
+        }
+    }
+
+    // Build the local event universe: this file, its cited events, and the
+    // seed state entries the auth rules read.
+    let mut local: HashMap<String, OwnedValue> =
+        HashMap::with_capacity(new_events.len().saturating_add(external_refs.len()));
+    for event in &new_events {
+        if let Some(id) = event_id(event) {
+            local.insert(id.to_owned(), event.clone());
+        }
+    }
+    for (id, event) in external {
+        local.entry(id).or_insert(event);
+    }
+    let missing: HashSet<String> = external_refs
+        .iter()
+        .filter(|id| !local.contains_key(*id))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let loaded = load_event_bodies(store, template, room_id, collection_id, &missing)?;
+        if loaded.len() != missing.len() {
+            return Ok(false);
+        }
+        for (id, event) in loaded {
+            local.insert(id, event);
+        }
+    }
+
+    let stored_ids: HashSet<String> = local
+        .keys()
+        .filter(|id| !new_ids.contains(*id))
+        .cloned()
+        .collect();
+    let mut local_events: Vec<OwnedValue> = Vec::with_capacity(local.len());
+    let mut local_positions: HashMap<String, usize> = HashMap::with_capacity(local.len());
+    for (id, event) in &local {
+        local_positions.insert(id.clone(), local_events.len());
+        local_events.push(event.clone());
+    }
+    let local_rooms: Vec<RoomEvent> = local_events
+        .iter()
+        .filter_map(|event| RoomEvent::from_pdu(event, room_id))
+        .collect();
+    if local_rooms.len() != local_events.len() {
+        return Ok(false);
+    }
+    let index: HashMap<&[u8], usize> = local_rooms
+        .iter()
+        .enumerate()
+        .map(|(position, event)| (event.event_id.as_bytes(), position))
+        .collect();
+    let redacted = export_import::redactions_for_export(&local_rooms, room_version, &stored_ids);
+    let lean = export_import::lean_redacted_events(&local_rooms, &redacted, room_id);
+    let create = local_rooms
+        .iter()
+        .position(|event| {
+            event.pdu.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
+                && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
+        })
+        .and_then(|position| lean[position].as_ref());
+
+    let mut rejected: HashSet<String> = RoomFlagIndex::new(room_id.as_bytes())
+        .select(db, &FlagQuery::has(Flag::Rejected))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| String::from_utf8(id).ok())
+        .collect();
+    let mut walk_rejections: HashMap<String, (u8, String)> = HashMap::new();
+    let mut unchecked = 0_usize;
+    let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
+    let computation = compute_state_groups_partial_with(
+        &new_events,
+        &[],
+        StateView::Federated,
+        room_id,
+        policy,
+        Some(&mut rejected),
+        &seeds,
+        |event_id, event, base, base_complete, current| {
+            let Some(&position) = index.get(event_id.as_bytes()) else {
+                unchecked = unchecked.saturating_add(1);
+                return None;
+            };
+            if let Some(current) = current {
+                let cites_rejected = event
+                    .get("auth_events")
+                    .and_then(OwnedValue::as_array)
+                    .is_some_and(|ids| {
+                        ids.iter()
+                            .any(|id| id.as_str().is_some_and(|id| current.contains(id)))
+                    });
+                if cites_rejected {
+                    let code = RejectionCode::DependsOnRejectedAuthEvent.to_u8();
+                    let reason = "auth_events cites a rejected event".to_owned();
+                    walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
+                    return Some((code, reason));
+                }
+            }
+            if !base_complete {
+                unchecked = unchecked.saturating_add(1);
+                return None;
+            }
+            let entries = auth_entries_from_base(event, base, state_version, room_version);
+            match export_import::judge_event_with_state(
+                &local_rooms[position],
+                lean[position].as_ref(),
+                &index,
+                &lean,
+                create,
+                state_version,
+                &entries,
+            ) {
+                Ok(export_import::EventAuthOutcome::Refused { code, reason }) => {
+                    walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
+                    Some((code, reason))
+                }
+                Ok(export_import::EventAuthOutcome::Passed) => None,
+                Ok(export_import::EventAuthOutcome::Unchecked) => {
+                    unchecked = unchecked.saturating_add(1);
+                    None
+                }
+                Err(error) => {
+                    eprintln!("  warning: error judging event {event_id}: {error}");
+                    unchecked = unchecked.saturating_add(1);
+                    None
+                }
+            }
+        },
+    );
+    if unchecked > 0 || !computation.incomplete.is_empty() {
+        return Ok(false);
+    }
+    for event in &new_events {
+        let Some(id) = event_id(event) else {
+            return Ok(false);
+        };
+        if !computation.groups.contains_key(id) {
+            return Ok(false);
+        }
+    }
+
+    // Publish content-addressed nodes and records before any mapping points at
+    // them, then publish the event -> group mappings.
+    if !computation.instances.is_empty() {
+        materialize_state_hamts(state_store, room_id, &computation.instances)?;
+    }
+    let mappings: Vec<(String, [u8; STATE_GROUP_ID_LENGTH])> = computation
+        .groups
+        .iter()
+        .map(|(id, group)| (id.clone(), *group))
+        .collect();
+    let entries: Vec<(&[u8], &[u8])> = mappings
+        .iter()
+        .map(|(id, group)| (id.as_bytes(), group.as_slice()))
+        .collect();
+    if !entries.is_empty() {
+        aux.put_many(&entries)
+            .context("persisting direct-import state-group mappings")?;
+    }
+
+    let new_rooms: Vec<RoomEvent> = new_events
+        .iter()
+        .filter_map(|event| RoomEvent::from_pdu(event, room_id))
+        .collect();
+    if new_rooms.len() != new_events.len() {
+        return Ok(false);
+    }
+    let forced: Vec<Option<u8>> = new_rooms
+        .iter()
+        .map(|event| walk_rejections.get(&event.event_id).map(|(code, _)| *code))
+        .collect();
+    write_raw_verdicts_and_flags(
+        db,
+        &new_rooms,
+        &forced,
+        &new_ids,
+        &new_ids,
+        &new_ids,
+        &HashSet::new(),
+        template,
+        room_id,
+    )?;
+    Ok(true)
+}
+
 fn load_collection_events(
     store: &PackfileStorage,
     collection_id: &[u8; 16],
@@ -12029,8 +12796,7 @@ fn repair_import_state_groups(
         .collect::<Vec<_>>();
     let aux = AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     let cached = load_cached_state_groups(&aux, &graph_event_ids);
-    let cached_subset =
-        load_cached_state_group_subset(&aux, &graph_event_ids).unwrap_or_default();
+    let cached_subset = load_cached_state_group_subset(&aux, &graph_event_ids).unwrap_or_default();
     let loaded = cached.is_some();
     let mut state_groups = cached.unwrap_or_default();
     let mut computed_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> =
@@ -12152,9 +12918,7 @@ fn repair_import_state_groups(
         // amplification.
         let entries: Vec<(&[u8], &[u8])> = state_groups
             .iter()
-            .filter(|(event_id, instance_id)| {
-                cached_subset.get(*event_id) != Some(*instance_id)
-            })
+            .filter(|(event_id, instance_id)| cached_subset.get(*event_id) != Some(*instance_id))
             .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
             .collect();
         if !entries.is_empty() {
@@ -12821,6 +13585,7 @@ fn compute_state_groups_partial_in_view(
         room_id,
         batch_resolution_policy(events),
         None,
+        &HashMap::new(),
         |_, _, _, _, _| None,
     )
 }
@@ -12873,6 +13638,10 @@ fn auth_entries_from_base(
     .collect()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the walk needs the DAG, the view, the seed states, and its base-state observer"
+)]
 fn compute_state_groups_partial_with(
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
@@ -12880,6 +13649,7 @@ fn compute_state_groups_partial_with(
     room_id: &str,
     policy: ResolutionPolicy,
     rejected: Option<&mut HashSet<String>>,
+    seed_states: &HashMap<String, Arc<SharedState>>,
     judge: impl FnMut(
         &str,
         &OwnedValue,
@@ -12917,7 +13687,11 @@ fn compute_state_groups_partial_with(
         };
     }
 
-    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map);
+    let seed_locals: HashSet<mtxdb::dag::LocalId> = seed_states
+        .keys()
+        .filter_map(|id| frontier.id_remap.get(&event_short_id(id)).copied())
+        .collect();
+    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map, &seed_locals);
 
     let mut events_by_sid: HashMap<u64, &OwnedValue> = HashMap::new();
     for ev in all_owned {
@@ -12932,11 +13706,13 @@ fn compute_state_groups_partial_with(
         room_id,
         &frontier,
         &sorted,
+        &id_map,
         &reverse_map,
         &events_by_sid,
         view,
         policy,
         rejected,
+        seed_states,
         judge,
     );
 
@@ -12957,11 +13733,13 @@ fn walk_state_groups(
     room_id: &str,
     frontier: &mtxdb::dag::ActiveRoomFrontier,
     sorted: &[usize],
+    id_map: &HashMap<String, u64>,
     reverse_map: &HashMap<u64, String>,
     events_by_sid: &HashMap<u64, &OwnedValue>,
     view: StateView,
     policy: ResolutionPolicy,
     mut rejected: Option<&mut HashSet<String>>,
+    seed_states: &HashMap<String, Arc<SharedState>>,
     mut judge: impl FnMut(
         &str,
         &OwnedValue,
@@ -12986,6 +13764,8 @@ fn walk_state_groups(
     let mut state_at: HashMap<u64, Arc<SharedState>> = HashMap::new();
     let mut result: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
     let mut instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> = HashMap::new();
+    let seed_instances: HashSet<[u8; STATE_GROUP_ID_LENGTH]> =
+        seed_states.values().map(|seed| seed.instance).collect();
 
     for &idx in sorted {
         let short_id = frontier.nodes[idx].short_id;
@@ -12994,7 +13774,7 @@ fn walk_state_groups(
             ev.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
                 && ev.get("state_key").and_then(OwnedValue::as_str) == Some("")
         });
-        let claimed_prev_ids: HashSet<&str> = event_value
+        let claimed_prev_ids: Vec<&str> = event_value
             .and_then(|ev| ev.get("prev_events"))
             .and_then(OwnedValue::as_array)
             .map(|arr| {
@@ -13011,25 +13791,34 @@ fn walk_state_groups(
         let mut parents: Vec<Arc<SharedState>> = Vec::new();
         let mut parent_instances: Vec<[u8; STATE_GROUP_ID_LENGTH]> = Vec::new();
         let mut base_incomplete = false;
-        for edge in frontier.prev_edges(idx) {
-            if !edge.is_resident() {
-                base_incomplete = true;
-                continue;
-            }
-            let parent_id = frontier.nodes[edge.arena_index()].short_id;
-            parent_ids.push(parent_id);
-            if let Some(parent_state) = state_at.get(&parent_id) {
-                parent_instances.push(parent_state.instance);
-                parents.push(Arc::clone(parent_state));
+        let mut seen_parents: HashSet<u64> = HashSet::new();
+        for prev_id in &claimed_prev_ids {
+            if let Some(&parent_id) = id_map.get(*prev_id) {
+                if !seen_parents.insert(parent_id) {
+                    continue;
+                }
+                parent_ids.push(parent_id);
+                if let Some(parent_state) = state_at.get(&parent_id) {
+                    parent_instances.push(parent_state.instance);
+                    parents.push(Arc::clone(parent_state));
+                } else {
+                    base_incomplete = true;
+                }
+            } else if let Some(seed) = seed_states.get(*prev_id) {
+                let parent_id = event_short_id(prev_id);
+                if !seen_parents.insert(parent_id) {
+                    continue;
+                }
+                parent_instances.push(seed.instance);
+                parents.push(Arc::clone(seed));
             } else {
                 base_incomplete = true;
             }
         }
-        let unique_parents: HashSet<u64> = parent_ids.iter().copied().collect();
         if !is_create && parents.is_empty() {
             base_incomplete = true;
         }
-        if unique_parents.len() != claimed_prev_ids.len() {
+        if seen_parents.len() != claimed_prev_ids.len() {
             base_incomplete = true;
         }
         // Incompleteness is inherited: a child of an event with a gapped base
@@ -13094,14 +13883,16 @@ fn walk_state_groups(
             !base_incomplete,
         );
 
-        instances
-            .entry(state.instance)
-            .or_insert_with(|| StateInstance {
-                parents: canonical_parents(&parent_instances),
-                lthash: state.lthash,
-                set: state.set.clone(),
-                derivation: policy.derivation,
-            });
+        if !seed_instances.contains(&state.instance) {
+            instances
+                .entry(state.instance)
+                .or_insert_with(|| StateInstance {
+                    parents: canonical_parents(&parent_instances),
+                    lthash: state.lthash,
+                    set: state.set.clone(),
+                    derivation: policy.derivation,
+                });
+        }
 
         if let Some(eid) = reverse_map.get(&short_id) {
             result.insert(eid.clone(), state.instance);
@@ -13307,6 +14098,7 @@ fn missing_prev_event_ids(events: &[OwnedValue]) -> Vec<String> {
 fn partial_topo_sort_dag(
     frontier: &mtxdb::dag::ActiveRoomFrontier,
     reverse_map: &HashMap<u64, String>,
+    seed_locals: &HashSet<mtxdb::dag::LocalId>,
 ) -> (Vec<usize>, Vec<String>) {
     let n = frontier.nodes.len();
     let mut in_degree = vec![0usize; n];
@@ -13320,6 +14112,9 @@ fn partial_topo_sort_dag(
                 let parent_idx = edge.arena_index();
                 children[parent_idx].push(idx);
                 in_degree[idx] = in_degree[idx].saturating_add(1);
+            } else if seed_locals.contains(&edge.local_id()) {
+                // An external parent whose after-state was seeded is not a
+                // gap: it contributes no in-batch ordering edge.
             } else if !blocked[idx] {
                 blocked[idx] = true;
                 blocked_queue.push_back(idx);

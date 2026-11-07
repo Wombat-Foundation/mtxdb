@@ -1796,10 +1796,7 @@ pub(crate) fn derived_auth_findings_for_raw_with_inputs(
 
 /// Precomputed redaction and lean-event inputs shared by the findings pass and
 /// the state walk.
-type JudgeInputs<'a> = (
-    &'a [Option<HashMismatch>],
-    &'a [Option<LeanEvent<String>>],
-);
+type JudgeInputs<'a> = (&'a [Option<HashMismatch>], &'a [Option<LeanEvent<String>>]);
 
 #[allow(clippy::too_many_arguments)]
 fn derived_auth_findings_inner(
@@ -2425,14 +2422,9 @@ mod auth_findings_tests {
         let export = export(vec![create, rules, join_bob]);
         let already_redacted = HashSet::from(["$create".to_owned()]);
 
-        let findings = derived_auth_findings_for_raw(
-            &export,
-            "10",
-            &already_redacted,
-            None,
-            &HashSet::new(),
-        )
-        .unwrap();
+        let findings =
+            derived_auth_findings_for_raw(&export, "10", &already_redacted, None, &HashSet::new())
+                .unwrap();
         assert_eq!(
             forced(&findings, 2),
             Some(RejectionCode::AuthCheckFailed.to_u8()),

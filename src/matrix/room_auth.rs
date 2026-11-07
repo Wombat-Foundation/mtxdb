@@ -326,6 +326,21 @@ impl RoomAuth {
         Ok(self.closure.adjacency().referenced_event_ids(db)?)
     }
 
+    /// Every event id the room's `prev_events` and `auth_events` point at,
+    /// separated into `(prev, auth)`.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt row.
+    pub fn referenced_event_ids_by_family(
+        &self,
+        db: &Database,
+    ) -> Result<(BTreeSet<String>, BTreeSet<String>), RoomAuthError> {
+        Ok(self
+            .closure
+            .adjacency()
+            .referenced_event_ids_by_family(db)?)
+    }
+
     /// The event's `auth_events`.
     ///
     /// An event recorded with an empty `auth` list returns an empty list. That
