@@ -15,7 +15,7 @@ use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, Collectio
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
-use mtxdb::room_flag::{Flag, FlagChange, RoomFlagIndex};
+use mtxdb::room_flag::{Flag, FlagChange, FlagQuery, RoomFlagIndex};
 use mtxdb::server_keys::KeyTier;
 use mtxdb::shard::ShardPool;
 use mtxdb::state_group::{StateGroupDerivation, StateGroupTrust};
@@ -129,6 +129,40 @@ fn load_state_groups(
     let keys = event_ids.iter().map(String::as_bytes).collect::<Vec<_>>();
     let values = aux.get_many(&keys)?;
     Ok(state_groups_from_values(event_ids, values))
+}
+
+/// Load whichever mappings are already cached, without requiring every id to
+/// be present.
+///
+/// Repair recomputes the whole batch when any mapping is missing, but the
+/// mappings it already has are immutable and need not be written again. This
+/// returns the present subset so publication can touch only new or changed
+/// entries instead of rewriting one record per stored event on every file.
+fn load_cached_state_group_subset(
+    aux: &AuxiliaryIndex<'_, PackfileStorage>,
+    event_ids: &[String],
+) -> Result<HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>, mtxdb::storage::StorageError> {
+    if event_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let keys = event_ids.iter().map(String::as_bytes).collect::<Vec<_>>();
+    let values = aux.get_many(&keys)?;
+    if values.len() != event_ids.len() {
+        return Ok(HashMap::new());
+    }
+    let mut groups = HashMap::with_capacity(event_ids.len());
+    for (event_id, value) in event_ids.iter().zip(values) {
+        let Some(value) = value else {
+            continue;
+        };
+        if !valid_state_group_id(&value) {
+            continue;
+        }
+        let mut id = [0u8; STATE_GROUP_ID_LENGTH];
+        id.copy_from_slice(&value);
+        groups.insert(event_id.clone(), id);
+    }
+    Ok(groups)
 }
 
 /// Human-readable byte count (`512 B`, `4.3 KB`, `1.2 MB`, `2.1 GB`) —
@@ -6530,6 +6564,7 @@ fn collection_metadata_for(
 /// structural-hash nodes cannot collide. A record already present with
 /// identical bytes is skipped; a different value under the same id is a hard
 /// error.
+#[allow(clippy::too_many_lines)]
 fn materialize_state_hamts(
     state_store: &PackfileStorage,
     room_id: &str,
@@ -6549,11 +6584,40 @@ fn materialize_state_hamts(
     let mut stgp_records: Vec<(NodeId, NodeData)> = Vec::new();
     let mut content_done: HashSet<[u8; 32]> = HashSet::new();
 
+    // A group's content is immutable and addressed by its lattice digest, so a
+    // root that already exists means every node under it was already written.
+    // Rebuilding the tree to discover that is the dominant per-file cost when
+    // the same room arrives in many chunks: check the roots in one batch first
+    // and skip the build for content this store already has.
+    let mut existing_roots: HashSet<NodeId> = HashSet::new();
+    if !instances.is_empty() && state_store.collection_exists(&stat_collection) {
+        let mut root_ids = Vec::with_capacity(instances.len());
+        let mut seen_content = HashSet::with_capacity(instances.len());
+        for instance in instances.values() {
+            if instance.set.entries.is_empty() || !seen_content.insert(instance.lthash) {
+                continue;
+            }
+            root_ids.push(crate::state_hamt::state_hamt_root_node_id(
+                room_id,
+                &instance.lthash,
+            ));
+        }
+        for (node, record) in root_ids
+            .iter()
+            .zip(state_store.get_many(&stat_collection, &root_ids)?)
+        {
+            if record.is_some() {
+                existing_roots.insert(*node);
+            }
+        }
+    }
+
     for (instance_id, instance) in instances {
         if instance.set.entries.is_empty() {
             continue;
         }
-        if content_done.insert(instance.lthash) {
+        let content_root = crate::state_hamt::state_hamt_root_node_id(room_id, &instance.lthash);
+        if content_done.insert(instance.lthash) && !existing_roots.contains(&content_root) {
             let mut entries: Vec<(String, String, String)> = instance
                 .set
                 .entries
@@ -9061,6 +9125,7 @@ fn import_data(
     let mut key_state_checked = false;
     let mut key_import_failed = false;
     let mut signature_checks_enabled = false;
+    let mut room_cache = RoomEventCache::new();
     for (index, path) in keys_first(paths).into_iter().enumerate() {
         if index != 0 {
             eprintln!();
@@ -9114,6 +9179,7 @@ fn import_data(
             signature_checks_enabled,
             run.signature_catalog.as_ref(),
             write_state_hamts,
+            Some(&mut room_cache),
         ) {
             Ok(outcome) => absorb_outcome(&mut run, outcome),
             Err(error) => {
@@ -10168,6 +10234,15 @@ struct ImportOutcome {
 
 /// Import one input file through the state the batch shares with its readers.
 #[allow(clippy::too_many_arguments)]
+/// Matrix events already loaded for a room during this `import` run.
+///
+/// A run that imports many chunks otherwise rescans and re-parses every
+/// earlier chunk from disk for each new file. The cache holds the authoritative
+/// stored timeline events (redacted, with auth projections overlaid), so later
+/// files start from memory. It lives only for one command invocation.
+type RoomEventCache = HashMap<[u8; 16], Vec<OwnedValue>>;
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_import_file(
     db: &Database,
     store: &PackfileStorage,
@@ -10179,6 +10254,7 @@ fn cmd_import_file(
     signature_checks_enabled: bool,
     signature_catalog: Option<&export_import::SignatureKeyCatalog>,
     write_state_hamts: bool,
+    room_cache: Option<&mut RoomEventCache>,
 ) -> anyhow::Result<ImportOutcome> {
     let mut context = ImportContext {
         db,
@@ -10189,6 +10265,7 @@ fn cmd_import_file(
         signature_checks_enabled,
         signature_catalog,
         write_state_hamts,
+        room_cache,
     };
     context.import(path, collection_override)
 }
@@ -10209,6 +10286,7 @@ struct ImportContext<'a> {
     signature_checks_enabled: bool,
     signature_catalog: Option<&'a export_import::SignatureKeyCatalog>,
     write_state_hamts: bool,
+    room_cache: Option<&'a mut RoomEventCache>,
 }
 
 impl ImportContext<'_> {
@@ -10326,6 +10404,7 @@ impl ImportContext<'_> {
             self.template,
             self.established_collections,
             self.write_state_hamts,
+            self.room_cache.as_deref_mut(),
         )?;
         Ok(ImportOutcome::default())
     }
@@ -10492,6 +10571,8 @@ impl ImportContext<'_> {
             &mut rejected,
             &mut walk_rejections,
             &HashSet::new(),
+            None,
+            None,
         );
         export_import::apply_walk_rejections(export, &mut findings, &walk_rejections);
         if unchecked > 0 {
@@ -10602,6 +10683,8 @@ fn compute_import_auth_before(
     rejected: &mut HashSet<String>,
     walk_rejections: &mut HashMap<String, (u8, String)>,
     already_redacted: &HashSet<String>,
+    judge_only: Option<&HashSet<String>>,
+    lean_input: Option<&[Option<LeanEvent<String>>]>,
 ) -> (PartialStateComputation, usize) {
     let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
     let Some(state_version) = state_version else {
@@ -10626,11 +10709,18 @@ fn compute_import_auth_before(
         .collect();
     // Judge hash-mismatched events in the same canonical redacted form the
     // findings pass uses, so check 5 cannot reject an event whose redaction
-    // the auth rules accept.
-    let redacted =
-        export_import::redactions_for_export(room_events, room_version, already_redacted);
-    let lean: Vec<Option<LeanEvent<String>>> =
-        export_import::lean_redacted_events(room_events, &redacted, room_id);
+    // the auth rules accept. The incremental import computes this once and
+    // passes it in; otherwise build it here.
+    let redacted_buf;
+    let lean_buf;
+    let lean: &[Option<LeanEvent<String>>] = if let Some(lean) = lean_input {
+        lean
+    } else {
+        redacted_buf =
+            export_import::redactions_for_export(room_events, room_version, already_redacted);
+        lean_buf = export_import::lean_redacted_events(room_events, &redacted_buf, room_id);
+        &lean_buf
+    };
     let by_id: HashMap<&str, &RoomEvent> = room_events
         .iter()
         .map(|event| (event.event_id.as_str(), event))
@@ -10652,6 +10742,12 @@ fn compute_import_auth_before(
         policy,
         Some(rejected),
         |event_id, event, base, base_complete, current| {
+            // Only events whose inputs can have changed need judging; the
+            // walk still derives state for every event so later events get
+            // the right base.
+            if judge_only.is_some_and(|only| !only.contains(event_id)) {
+                return None;
+            }
             let Some(room_event) = by_id.get(event_id) else {
                 unchecked = unchecked.saturating_add(1);
                 return None;
@@ -10691,7 +10787,7 @@ fn compute_import_auth_before(
                 room_event,
                 lean[position].as_ref(),
                 &index,
-                &lean,
+                lean,
                 create,
                 state_version,
                 &entries,
@@ -10966,6 +11062,7 @@ fn import_pdu_events_with_state_hamts(
         template,
         established_collections,
         write_state_hamts,
+        None,
     )
 }
 
@@ -11004,6 +11101,7 @@ fn import_pdu_events_with_raw(
         template,
         established_collections,
         true,
+        None,
     )
 }
 
@@ -11023,6 +11121,7 @@ fn import_pdu_events_with_raw_state_hamts(
     template: &CollectionTemplate,
     established_collections: &mut HashSet<[u8; 16]>,
     write_state_hamts: bool,
+    mut room_cache: Option<&mut RoomEventCache>,
 ) -> anyhow::Result<()> {
     if events.is_empty() {
         bail!("no events found in {}", path.display());
@@ -11031,6 +11130,9 @@ fn import_pdu_events_with_raw_state_hamts(
     let mut skipped = 0u64;
     let mut already_present = 0u64;
     let mut already_present_ids = Vec::with_capacity(3);
+    // Input event ids that already have a stored record. New records have no
+    // verdict or flags yet, so the writer can skip a point lookup for them.
+    let mut existed_before: HashSet<String> = HashSet::new();
 
     let resolved = resolve_import_collection(
         events,
@@ -11060,47 +11162,20 @@ fn import_pdu_events_with_raw_state_hamts(
 
     let collection_hex = format_id(&collection_id);
 
-    // Existing records are part of the state the new batch inherits. Reading
-    // them back is the simplest way to let check 5 run across separate files:
-    // the walk sees the whole room, not just this file.
-    let prior = load_collection_events(store, &collection_id, &resolved.canonical_id)?;
-    let mut stored_ids: HashSet<String> = prior
+    // Ids supplied by this file. Computed before the room is reloaded so the
+    // reload can exclude them: the input copies are authoritative for the
+    // current batch, and replacing them with their redacted stored form would
+    // drop the unredacted auth fields the checks read.
+    let current_ids: HashSet<String> = events
         .iter()
         .filter_map(event_id)
         .map(str::to_owned)
         .collect();
-    // These events are already stored in redacted form. Their content hash
-    // intentionally no longer matches, so re-redacting them would strip the
-    // auth projection that load_collection_events just laid over them.
-    let already_redacted = stored_ids.clone();
-    let mut all_events: Vec<OwnedValue> = prior;
-    let mut seen_event_ids: HashSet<String> = all_events
-        .iter()
-        .filter_map(event_id)
-        .map(str::to_owned)
-        .collect();
-    for event in events.iter().chain(auth_chain) {
-        let Some(id) = event_id(event) else {
-            continue;
-        };
-        if seen_event_ids.insert(id.to_owned()) {
-            all_events.push(event.clone());
-        }
-    }
-    // auth_chain events are judged but are not necessarily stored, so they
-    // must not acquire flags or verdicts of their own.
-    let mut current_ids = HashSet::new();
-    for event in events {
-        if let Some(id) = event_id(event) {
-            stored_ids.insert(id.to_owned());
-            current_ids.insert(id.to_owned());
-        }
-    }
 
-    let first: Vec<([u8; 16], String, NodeData)> = {
+    let first: Vec<([u8; 16], String, usize)> = {
         let mut first = Vec::with_capacity(events.len());
         let mut seen_ids: HashMap<[u8; 16], String> = HashMap::with_capacity(events.len());
-        for ev in events {
+        for (index, ev) in events.iter().enumerate() {
             let Some(incoming_event_id) = event_id(ev) else {
                 skipped = skipped.saturating_add(1);
                 continue;
@@ -11124,12 +11199,7 @@ fn import_pdu_events_with_raw_state_hamts(
                 continue;
             }
             seen_ids.insert(id_bytes, incoming_event_id.to_owned());
-            let event_bytes = redacted_event_bytes(ev, &room_version)?;
-            first.push((
-                id_bytes,
-                incoming_event_id.to_owned(),
-                NodeData::new(event_bytes),
-            ));
+            first.push((id_bytes, incoming_event_id.to_owned(), index));
         }
         first
     };
@@ -11137,15 +11207,20 @@ fn import_pdu_events_with_raw_state_hamts(
     let probe_ids: Vec<[u8; 16]> = first.iter().map(|(id, _, _)| *id).collect();
     let existing = store.get_many(&collection_id, &probe_ids)?;
     let mut to_write: Vec<([u8; 16], NodeData)> = Vec::new();
-    for ((id_bytes, incoming_event_id, data), existing_opt) in first.into_iter().zip(existing) {
+    for ((id_bytes, incoming_event_id, index), existing_opt) in first.into_iter().zip(existing) {
         if let Some(existing_record) = existing_opt {
             reject_cross_record_collision(&id_bytes, &incoming_event_id, &existing_record)?;
+            existed_before.insert(incoming_event_id.clone());
             already_present = already_present.saturating_add(1);
             if already_present_ids.len() < 3 {
                 already_present_ids.push(incoming_event_id);
             }
         } else {
-            to_write.push((id_bytes, data));
+            // Redaction is only needed for records this import will write. A
+            // reimport or a duplicate-heavy batch must not pay to re-redact
+            // every event before discovering it is already stored.
+            let event_bytes = redacted_event_bytes(&events[index], &room_version)?;
+            to_write.push((id_bytes, NodeData::new(event_bytes)));
         }
     }
     record_csr_adjacency_with_raw(db, template, events, raw_adjacency)?;
@@ -11163,7 +11238,7 @@ fn import_pdu_events_with_raw_state_hamts(
         store.put_many(&collection_id, &to_write)?;
         event_count = event_count.saturating_add(to_write.len() as u64);
     }
-    write_raw_auth_projections(
+    let new_projections = write_raw_auth_projections(
         store,
         &resolved.canonical_id,
         template,
@@ -11171,73 +11246,281 @@ fn import_pdu_events_with_raw_state_hamts(
         events,
         auth_chain,
     )?;
-    let room_events: Vec<RoomEvent> = all_events
-        .iter()
-        .filter_map(|event| RoomEvent::from_pdu(event, &resolved.canonical_id))
-        .collect();
-    let synthetic = RoomExport {
-        server: "raw-import".to_owned(),
-        room_id: resolved.canonical_id.clone(),
-        events: room_events,
-        timeline: false,
-    };
-    let mut findings =
-        export_import::derived_auth_findings_for_raw(&synthetic, &room_version, &already_redacted)?;
-    let mut rejected = export_import::rejected_event_ids(&synthetic, &findings);
-    let mut walk_rejections = HashMap::new();
-    let (computation, unchecked) = compute_import_auth_before(
-        &all_events,
-        &[],
-        &synthetic.events,
-        &synthetic.room_id,
-        &room_version,
-        StateResVersion::from_room_version(&room_version),
-        &mut rejected,
-        &mut walk_rejections,
-        &already_redacted,
-    );
-    export_import::apply_walk_rejections(&synthetic, &mut findings, &walk_rejections);
-    if unchecked > 0 {
-        eprintln!(
-            "  warning: {unchecked} event(s) could not be checked against the state before them"
-        );
-    }
-    for warning in findings.current_warnings(&current_ids) {
-        eprintln!("  warning: {warning}");
-    }
-    let rejected_total = synthetic
-        .events
-        .iter()
-        .zip(&findings.forced)
-        .filter(|(event, forced)| forced.is_some() && current_ids.contains(&event.event_id))
-        .count();
-    if rejected_total > 0 {
-        eprintln!("  derived rejections: {rejected_total} events");
-    }
-    let (changed_earlier, changed_earlier_rejected) = write_raw_verdicts_and_flags(
-        db,
-        &synthetic.events,
-        &findings.forced,
-        &stored_ids,
-        &current_ids,
-        template,
-        &resolved.canonical_id,
-    )?;
-    if changed_earlier > 0 {
-        eprintln!(
-            "  updated earlier verdicts: {changed_earlier} events ({changed_earlier_rejected} rejected)"
-        );
-    }
+    // A file whose events are all stored already, whose auth chain is empty,
+    // and whose projections are all present carries no new information. Every
+    // prior verdict, flag and state group is still valid, so skip reloading,
+    // re-judging and repairing the whole room. Reimports stay O(file), not
+    // O(room).
+    let skip_judging = to_write.is_empty() && auth_chain.is_empty() && new_projections == 0;
+    if !skip_judging {
+        // Existing records are part of the state the new batch inherits. Reading
+        // them back is the simplest way to let check 5 run across separate files:
+        // the walk sees the whole room, not just this file. Events written by
+        // this file are excluded from the reloaded set: their input copies are
+        // authoritative and still carry the unredacted auth fields.
+        let stored_events = match room_cache
+            .as_mut()
+            .and_then(|cache| cache.remove(&collection_id))
+        {
+            Some(cached) => cached,
+            None => load_collection_events(store, &collection_id, &resolved.canonical_id)?,
+        };
+        let prior: Vec<OwnedValue> = stored_events
+            .into_iter()
+            .filter(|event| event_id(event).is_none_or(|id| !current_ids.contains(id)))
+            .collect();
+        let mut stored_ids: HashSet<String> = prior
+            .iter()
+            .filter_map(event_id)
+            .map(str::to_owned)
+            .collect();
+        stored_ids.extend(current_ids.iter().cloned());
+        // These events are already stored in redacted form. Their content hash
+        // intentionally no longer matches, so re-redacting them would strip the
+        // auth projection that load_collection_events just laid over them.
+        let already_redacted: HashSet<String> = prior
+            .iter()
+            .filter_map(event_id)
+            .map(str::to_owned)
+            .collect();
+        let mut all_events: Vec<OwnedValue> = prior;
+        let mut seen_event_ids: HashSet<String> = all_events
+            .iter()
+            .filter_map(event_id)
+            .map(str::to_owned)
+            .collect();
+        for event in events.iter().chain(auth_chain) {
+            let Some(id) = event_id(event) else {
+                continue;
+            };
+            if seen_event_ids.insert(id.to_owned()) {
+                all_events.push(event.clone());
+            }
+        }
 
-    if write_state_hamts {
-        repair_import_state_groups(
-            state_store,
+        // An earlier event can only change if this file supplies an id that was
+        // missing from the room before it arrived. Appending to a complete DAG
+        // supplies none, so only this file's events need judging, verdict
+        // writes and flag writes. A late parent still falls back to the full
+        // set.
+        let supplied: HashSet<&str> = current_ids
+            .iter()
+            .map(String::as_str)
+            .chain(auth_chain.iter().filter_map(event_id))
+            .collect();
+        let mut missing_before: HashSet<&str> = HashSet::new();
+        for event in &all_events {
+            let Some(id) = event_id(event) else {
+                continue;
+            };
+            if !already_redacted.contains(id) {
+                continue;
+            }
+            for field in ["prev_events", "auth_events"] {
+                let Some(references) = event.get(field).and_then(OwnedValue::as_array) else {
+                    continue;
+                };
+                for reference in references {
+                    if let Some(referenced) = reference.as_str() {
+                        if !already_redacted.contains(referenced) {
+                            missing_before.insert(referenced);
+                        }
+                    }
+                }
+            }
+        }
+        let clean_append = !supplied.iter().any(|id| missing_before.contains(id));
+        let rewrite_ids: &HashSet<String> = if clean_append {
+            &current_ids
+        } else {
+            &stored_ids
+        };
+        let judge_only = clean_append.then_some(&current_ids);
+        // Prior rejections are still cascade inputs for this file's events even
+        // when prior events are not re-judged. Read them from the room flag
+        // index in one query rather than re-deriving every stored verdict.
+        let prior_rejected: HashSet<String> = if clean_append {
+            RoomFlagIndex::new(resolved.canonical_id.as_bytes())
+                .select(db, &FlagQuery::has(Flag::Rejected))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|id| String::from_utf8(id).ok())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        let room_events: Vec<RoomEvent> = all_events
+            .iter()
+            .filter_map(|event| RoomEvent::from_pdu(event, &resolved.canonical_id))
+            .collect();
+        let synthetic = RoomExport {
+            server: "raw-import".to_owned(),
+            room_id: resolved.canonical_id.clone(),
+            events: room_events,
+            timeline: false,
+        };
+        let redacted = export_import::redactions_for_export(
+            &synthetic.events,
+            &room_version,
+            &already_redacted,
+        );
+        // The findings pass and the state walk both read the same lean events.
+        // On a clean append only this file's events and their transitive auth
+        // closure are judged, so do not rebuild a lean event for the whole room.
+        let needed_lean: Option<HashSet<String>> = judge_only.map(|seeds| {
+            let by_id: HashMap<&str, &OwnedValue> = all_events
+                .iter()
+                .filter_map(|event| event_id(event).map(|id| (id, event)))
+                .collect();
+            let mut needed: HashSet<String> = seeds.iter().cloned().collect();
+            let mut stack: Vec<String> = seeds.iter().cloned().collect();
+            // Check 5 looks up every entry of the state before the event, and
+            // those entries are state events. Include all of them so an entry
+            // does not resolve to an empty lean slot.
+            for event in &all_events {
+                if event.get("state_key").is_some() {
+                    if let Some(id) = event_id(event) {
+                        needed.insert(id.to_owned());
+                    }
+                }
+            }
+            if let Some(create) = all_events.iter().find(|event| {
+                event.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
+                    && event.get("state_key").and_then(OwnedValue::as_str) == Some("")
+            }) {
+                if let Some(id) = event_id(create) {
+                    if needed.insert(id.to_owned()) {
+                        stack.push(id.to_owned());
+                    }
+                }
+            }
+            while let Some(id) = stack.pop() {
+                let Some(event) = by_id.get(id.as_str()) else {
+                    continue;
+                };
+                let Some(auth_events) = event.get("auth_events").and_then(OwnedValue::as_array)
+                else {
+                    continue;
+                };
+                for auth in auth_events {
+                    if let Some(auth_id) = auth.as_str() {
+                        if needed.insert(auth_id.to_owned()) {
+                            stack.push(auth_id.to_owned());
+                        }
+                    }
+                }
+            }
+            needed
+        });
+        let lean = if let Some(needed) = &needed_lean {
+            export_import::lean_redacted_events_for(
+                &synthetic.events,
+                &redacted,
+                &synthetic.room_id,
+                |id| needed.contains(id),
+            )
+        } else {
+            export_import::lean_redacted_events(
+                &synthetic.events,
+                &redacted,
+                &synthetic.room_id,
+            )
+        };
+        let mut findings = export_import::derived_auth_findings_for_raw_with_inputs(
+            &synthetic,
+            &room_version,
+            &already_redacted,
+            judge_only,
+            &prior_rejected,
+            &redacted,
+            &lean,
+        )?;
+        let mut rejected = export_import::rejected_event_ids(&synthetic, &findings);
+        rejected.extend(prior_rejected.iter().cloned());
+        let mut walk_rejections = HashMap::new();
+        let (computation, unchecked) = compute_import_auth_before(
             &all_events,
             &[],
-            &resolved.canonical_id,
+            &synthetic.events,
+            &synthetic.room_id,
             &room_version,
-            Some(computation),
+            StateResVersion::from_room_version(&room_version),
+            &mut rejected,
+            &mut walk_rejections,
+            &already_redacted,
+            judge_only,
+            Some(&lean),
+        );
+        export_import::apply_walk_rejections(&synthetic, &mut findings, &walk_rejections);
+        if unchecked > 0 {
+            eprintln!(
+                "  warning: {unchecked} event(s) could not be checked against the state before them"
+            );
+        }
+        for warning in findings.current_warnings(&current_ids) {
+            eprintln!("  warning: {warning}");
+        }
+        let rejected_total = synthetic
+            .events
+            .iter()
+            .zip(&findings.forced)
+            .filter(|(event, forced)| forced.is_some() && current_ids.contains(&event.event_id))
+            .count();
+        if rejected_total > 0 {
+            eprintln!("  derived rejections: {rejected_total} events");
+        }
+
+        let existing_ids: HashSet<&str> = already_redacted
+            .iter()
+            .map(String::as_str)
+            .chain(existed_before.iter().map(String::as_str))
+            .collect();
+        let (changed_earlier, changed_earlier_rejected) = write_raw_verdicts_and_flags(
+            db,
+            &synthetic.events,
+            &findings.forced,
+            &stored_ids,
+            &current_ids,
+            rewrite_ids,
+            &existing_ids,
+            template,
+            &resolved.canonical_id,
         )?;
+        if changed_earlier > 0 {
+            eprintln!(
+                "  updated earlier verdicts: {changed_earlier} events ({changed_earlier_rejected} rejected)"
+            );
+        }
+
+        if write_state_hamts {
+            repair_import_state_groups(
+                state_store,
+                &all_events,
+                &[],
+                &resolved.canonical_id,
+                &room_version,
+                Some(computation),
+            )?;
+        }
+
+        // Keep the room in memory for the next file in this run. Only stored
+        // timeline events are cached: auth-chain-only events must not become
+        // flags or verdict rows on a later file.
+        if let Some(cache) = room_cache {
+            let auth_only: HashSet<&str> = auth_chain
+                .iter()
+                .filter_map(event_id)
+                .filter(|id| !current_ids.contains(*id))
+                .collect();
+            if auth_only.is_empty() {
+                cache.insert(collection_id, all_events);
+            } else {
+                let mut entry = all_events;
+                entry.retain(|event| event_id(event).is_none_or(|id| !auth_only.contains(id)));
+                cache.insert(collection_id, entry);
+            }
+        }
     }
 
     if let Some(room_id) = detected_collection {
@@ -11374,7 +11657,7 @@ fn write_raw_auth_projections(
     room_version: &str,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     // Never guess at an unknown version. The establishment validator rejects
     // these before an import, but the projection writer is also called
     // directly by tests and future callers.
@@ -11386,6 +11669,12 @@ fn write_raw_auth_projections(
     let mut seen = HashSet::new();
     let mut records = Vec::new();
     for event in events.iter().chain(auth_chain) {
+        // Cheap field check first: only a handful of event types carry auth
+        // fields redaction can drop, and content hashing every stored event on
+        // every file is pure waste when most events can never project.
+        let Some(projection) = raw_auth_projection(event, room_version) else {
+            continue;
+        };
         // A projection is auth input. It may only be taken from content whose
         // hash verifies; otherwise a forged event could seed the fields that
         // later files overlay onto their redacted copy.
@@ -11394,9 +11683,6 @@ fn write_raw_auth_projections(
         }
         // auth_chain-only events are projected too: step 3 will use them as
         // edge and state providers without storing them as timeline events.
-        let Some(projection) = raw_auth_projection(event, room_version) else {
-            continue;
-        };
         let Some(node) = template_node_id(template, event)? else {
             continue;
         };
@@ -11413,7 +11699,7 @@ fn write_raw_auth_projections(
         ));
     }
     if records.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let collection = raw_auth_projection_collection_id(room_id);
     let ids: Vec<[u8; 16]> = records.iter().map(|(id, _, _)| *id).collect();
@@ -11444,7 +11730,7 @@ fn write_raw_auth_projections(
             .create_or_put_established(&collection, &metadata, &to_write)
             .context("storing raw auth projections")?;
     }
-    Ok(())
+    Ok(to_write.len())
 }
 
 fn overlay_auth_projection(event: &mut OwnedValue, projection: OwnedValue) {
@@ -11522,6 +11808,8 @@ fn write_raw_verdicts_and_flags(
     forced: &[Option<u8>],
     stored_ids: &HashSet<String>,
     current_ids: &HashSet<String>,
+    rewrite_ids: &HashSet<String>,
+    existing_ids: &HashSet<&str>,
     template: &CollectionTemplate,
     canonical_id: &str,
 ) -> anyhow::Result<(usize, usize)> {
@@ -11541,7 +11829,7 @@ fn write_raw_verdicts_and_flags(
     let mut changed_earlier_rejected = 0_usize;
     let mut by_room: BTreeMap<String, Vec<RawFlagRow>> = BTreeMap::new();
     for event in all_events {
-        if !stored_ids.contains(&event.event_id) {
+        if !stored_ids.contains(&event.event_id) || !rewrite_ids.contains(&event.event_id) {
             continue;
         }
         let Some(node) = template_node_id(template, &event.pdu)? else {
@@ -11554,11 +11842,16 @@ fn write_raw_verdicts_and_flags(
             .unwrap_or(canonical_id)
             .to_owned();
         let forced = forced_by_id.get(event.event_id.as_str()).copied().flatten();
-        let existing = db
-            .pool(ShardType::EventDag)
-            .get(&event_verdict_collection_id(&node), &node)?
-            .map(|data| decode_verdict(&data.bytes).map(|(_, verdict)| verdict))
-            .transpose()?;
+        // A record written by this file has no verdict or flags yet, so there
+        // is nothing to read back and compare against.
+        let existing = if existing_ids.contains(event.event_id.as_str()) {
+            db.pool(ShardType::EventDag)
+                .get(&event_verdict_collection_id(&node), &node)?
+                .map(|data| decode_verdict(&data.bytes).map(|(_, verdict)| verdict))
+                .transpose()?
+        } else {
+            None
+        };
         let mut verdict = Verdict {
             rejection: forced,
             outlier: forced.is_some(),
@@ -11634,6 +11927,11 @@ fn sort_events_topologically(
     events: &[OwnedValue],
     template: &CollectionTemplate,
 ) -> anyhow::Result<()> {
+    // A single record has no order to preserve; an empty batch has nothing to
+    // sort. Avoid building a full-room DAG for the common incremental append.
+    if to_write.len() <= 1 {
+        return Ok(());
+    }
     let Some(order) = topological_event_order_with_template(events, template)? else {
         return Ok(());
     };
@@ -11731,6 +12029,8 @@ fn repair_import_state_groups(
         .collect::<Vec<_>>();
     let aux = AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     let cached = load_cached_state_groups(&aux, &graph_event_ids);
+    let cached_subset =
+        load_cached_state_group_subset(&aux, &graph_event_ids).unwrap_or_default();
     let loaded = cached.is_some();
     let mut state_groups = cached.unwrap_or_default();
     let mut computed_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> =
@@ -11784,6 +12084,8 @@ fn repair_import_state_groups(
                 &mut rejected,
                 &mut walk_rejections,
                 &HashSet::new(),
+                None,
+                None,
             );
             if unchecked > 0 {
                 eprintln!(
@@ -11843,12 +12145,22 @@ fn repair_import_state_groups(
         // Publish mappings only after their target HAMTs are durable. A later
         // replay must not mistake a partially materialized repair for a
         // complete cached result.
+        // Publish mappings only after their target HAMTs are durable. A later
+        // replay must not mistake a partially materialized repair for a
+        // complete cached result. Only new or changed mappings are written;
+        // rewriting one record per stored event on every file is pure write
+        // amplification.
         let entries: Vec<(&[u8], &[u8])> = state_groups
             .iter()
+            .filter(|(event_id, instance_id)| {
+                cached_subset.get(*event_id) != Some(*instance_id)
+            })
             .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
             .collect();
-        aux.put_many(&entries)
-            .context("persisting imported state-group mappings")?;
+        if !entries.is_empty() {
+            aux.put_many(&entries)
+                .context("persisting imported state-group mappings")?;
+        }
     }
     Ok(())
 }

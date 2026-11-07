@@ -1465,10 +1465,27 @@ pub(crate) fn lean_redacted_events(
     redacted: &[Option<HashMismatch>],
     room_id: &str,
 ) -> Vec<Option<LeanEvent<String>>> {
+    lean_redacted_events_for(events, redacted, room_id, |_| true)
+}
+
+/// Build lean events only for the ids in `needed`.
+///
+/// An incremental import judges this file's events and reads their auth
+/// events; it does not need a second full-room `LeanEvent` copy for events
+/// that keep their stored verdicts. Positions outside `needed` stay `None`.
+pub(crate) fn lean_redacted_events_for(
+    events: &[RoomEvent],
+    redacted: &[Option<HashMismatch>],
+    room_id: &str,
+    mut needed: impl FnMut(&str) -> bool,
+) -> Vec<Option<LeanEvent<String>>> {
     events
         .iter()
         .zip(redacted)
         .map(|(event, redacted)| {
+            if !needed(&event.event_id) {
+                return None;
+            }
             let value = match redacted {
                 Some(mismatch) => event.unflagged_from(&mismatch.value, room_id),
                 None => event.unflagged(room_id),
@@ -1484,11 +1501,18 @@ fn judge_events(
     index: &HashMap<&[u8], usize>,
     create: Option<&LeanEvent<String>>,
     version: StateResVersion,
+    judge_only: Option<&HashSet<String>>,
 ) -> anyhow::Result<AuthJudgement> {
     let mut checked = vec![false; events.len()];
     let mut refused: Vec<Option<u8>> = vec![None; events.len()];
     let mut reasons: Vec<Option<String>> = vec![None; events.len()];
     for (position, event) in events.iter().enumerate() {
+        // Incremental imports only need to judge the events whose inputs can
+        // have changed. Earlier events keep their stored verdicts, so running
+        // the auth rules over the whole room again is pure duplicate work.
+        if judge_only.is_some_and(|only| !only.contains(&event.event_id)) {
+            continue;
+        }
         match judge_event_auth(
             event,
             lean[position].as_ref(),
@@ -1704,7 +1728,16 @@ pub(crate) fn derived_auth_findings_with_keys(
     export: &RoomExport,
     keys: Option<&SignatureKeyCatalog>,
 ) -> anyhow::Result<AuthFindings> {
-    derived_auth_findings_inner(export, keys, true, None, &HashSet::new())
+    derived_auth_findings_inner(
+        export,
+        keys,
+        true,
+        None,
+        &HashSet::new(),
+        None,
+        &HashSet::new(),
+        None,
+    )
 }
 
 /// [`derived_auth_findings_with_keys`] for a partial raw import: a batch may
@@ -1716,20 +1749,68 @@ pub(crate) fn derived_auth_findings_with_keys(
 /// names events loaded from this store: their content hash intentionally no
 /// longer matches because the stored form is redacted, so they must not be
 /// redacted again or their auth projection would be lost.
+#[cfg(test)]
 pub(crate) fn derived_auth_findings_for_raw(
     export: &RoomExport,
     room_version: &str,
     already_redacted: &HashSet<String>,
+    judge_only: Option<&HashSet<String>>,
+    prior_rejected: &HashSet<String>,
 ) -> anyhow::Result<AuthFindings> {
-    derived_auth_findings_inner(export, None, false, Some(room_version), already_redacted)
+    derived_auth_findings_inner(
+        export,
+        None,
+        false,
+        Some(room_version),
+        already_redacted,
+        judge_only,
+        prior_rejected,
+        None,
+    )
 }
 
+/// [`derived_auth_findings_for_raw`] with the redaction and lean-event inputs
+/// the caller already computed. The incremental import also needs them for the
+/// state walk, and rebuilding one `LeanEvent` per stored event twice per file
+/// is a large duplicate cost.
+pub(crate) fn derived_auth_findings_for_raw_with_inputs(
+    export: &RoomExport,
+    room_version: &str,
+    already_redacted: &HashSet<String>,
+    judge_only: Option<&HashSet<String>>,
+    prior_rejected: &HashSet<String>,
+    redacted: &[Option<HashMismatch>],
+    lean: &[Option<LeanEvent<String>>],
+) -> anyhow::Result<AuthFindings> {
+    derived_auth_findings_inner(
+        export,
+        None,
+        false,
+        Some(room_version),
+        already_redacted,
+        judge_only,
+        prior_rejected,
+        Some((redacted, lean)),
+    )
+}
+
+/// Precomputed redaction and lean-event inputs shared by the findings pass and
+/// the state walk.
+type JudgeInputs<'a> = (
+    &'a [Option<HashMismatch>],
+    &'a [Option<LeanEvent<String>>],
+);
+
+#[allow(clippy::too_many_arguments)]
 fn derived_auth_findings_inner(
     export: &RoomExport,
     keys: Option<&SignatureKeyCatalog>,
     require_create_authorized: bool,
     room_version_override: Option<&str>,
     already_redacted: &HashSet<String>,
+    judge_only: Option<&HashSet<String>>,
+    prior_rejected: &HashSet<String>,
+    precomputed: Option<JudgeInputs<'_>>,
 ) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let Some(room_version) = room_version_override.or_else(|| create_room_version(events)) else {
@@ -1745,14 +1826,21 @@ fn derived_auth_findings_inner(
         .collect();
     // An event whose content hash fails is judged in its redacted form, unless
     // it is a stored event that was redacted on import.
-    let redacted = redactions_for_export(events, room_version, already_redacted);
-    let lean = lean_redacted_events(events, &redacted, &export.room_id);
+    let redacted_buf;
+    let lean_buf;
+    let (redacted, lean): JudgeInputs<'_> = if let Some((redacted, lean)) = precomputed {
+        (redacted, lean)
+    } else {
+        redacted_buf = redactions_for_export(events, room_version, already_redacted);
+        lean_buf = lean_redacted_events(events, &redacted_buf, &export.room_id);
+        (&redacted_buf, &lean_buf)
+    };
     let create = create_position(events).and_then(|position| lean[position].as_ref());
     let exported: Vec<Option<bool>> = events
         .iter()
         .map(|event| exported_rejection(&event.metadata))
         .collect();
-    let judgement = judge_events(events, &lean, &index, create, version)?;
+    let judgement = judge_events(events, lean, &index, create, version, judge_only)?;
 
     // Only a derived refusal seeds the cascade. The exported verdicts are
     // compared below for the report and are never stored.
@@ -1768,6 +1856,7 @@ fn derived_auth_findings_inner(
         .enumerate()
         .map(|(position, refusal)| {
             refusal.is_some()
+                || prior_rejected.contains(&events[position].event_id)
                 || matches!(
                     signature_outcomes
                         .as_ref()
@@ -1779,14 +1868,14 @@ fn derived_auth_findings_inner(
     let mut findings = auth_findings_seeded(export, &seeds)?;
     findings.hash_mismatched = events
         .iter()
-        .zip(&redacted)
+        .zip(redacted)
         .filter(|(_, redacted)| redacted.is_some())
         .map(|(event, _)| event.event_id.clone())
         .collect();
-    findings.hash_audit = audit_hash_mismatches(events, &redacted, &export.room_id, room_version);
+    findings.hash_audit = audit_hash_mismatches(events, redacted, &export.room_id, room_version);
     findings.redactions_failed = events
         .iter()
-        .zip(&redacted)
+        .zip(redacted)
         .filter(|(_, mismatch)| {
             mismatch
                 .as_ref()
@@ -1795,8 +1884,8 @@ fn derived_auth_findings_inner(
         .map(|(event, _)| event.event_id.clone())
         .collect();
     findings.redacted_pdus = redacted
-        .into_iter()
-        .map(|redacted| redacted.map(|m| m.bytes))
+        .iter()
+        .map(|redacted| redacted.as_ref().map(|m| m.bytes.clone()))
         .collect();
     apply_judgement(&mut findings, events, &judgement, &exported);
     if let (Some(outcomes), Some(keys)) = (signature_outcomes, keys) {
@@ -2336,7 +2425,14 @@ mod auth_findings_tests {
         let export = export(vec![create, rules, join_bob]);
         let already_redacted = HashSet::from(["$create".to_owned()]);
 
-        let findings = derived_auth_findings_for_raw(&export, "10", &already_redacted).unwrap();
+        let findings = derived_auth_findings_for_raw(
+            &export,
+            "10",
+            &already_redacted,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(
             forced(&findings, 2),
             Some(RejectionCode::AuthCheckFailed.to_u8()),

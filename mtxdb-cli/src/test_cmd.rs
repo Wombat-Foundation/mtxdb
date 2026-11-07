@@ -2841,6 +2841,7 @@ fn raw_import_derives_missing_parents_for_federation_documents() {
         false,
         None,
         true,
+        None,
     )
     .unwrap();
 
@@ -2864,6 +2865,7 @@ fn raw_import_derives_missing_parents_for_federation_documents() {
         false,
         None,
         true,
+        None,
     )
     .unwrap();
 
@@ -3793,6 +3795,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         false,
         None,
         true,
+        None,
     )
     .unwrap();
     let auth_dir = pool_dir.parent().unwrap().join("mtpl-state");
@@ -3810,6 +3813,7 @@ fn auth_chain_reimport_writes_nothing_new() {
         false,
         None,
         true,
+        None,
     )
     .unwrap();
 
@@ -3872,6 +3876,7 @@ fn import_establishment_persists_the_matrix_extension() {
         false,
         None,
         true,
+        None,
     )
     .unwrap();
 
@@ -4242,6 +4247,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         false,
         None,
         true,
+        None,
     )
     .unwrap();
 
@@ -4279,6 +4285,7 @@ fn import_v12_followup_batch_lands_in_the_create_collection() {
         false,
         None,
         true,
+        None,
     )
     .unwrap();
 
@@ -4318,6 +4325,7 @@ fn import_real_v12_room_slice_uses_the_normalized_collection_identity() {
         false,
         None,
         true,
+        None,
     )
     .unwrap();
 
@@ -5174,6 +5182,7 @@ fn an_import_records_auth_adjacency_that_survives_a_reopen() {
         false,
         None,
         true,
+        None,
     )
     .unwrap();
     db.state().sync_all().unwrap();
