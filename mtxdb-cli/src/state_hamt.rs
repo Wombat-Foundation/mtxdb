@@ -335,6 +335,11 @@ mod tests {
     // One explicit directory entry: 16-byte checkpoint event id + u32 ordinal.
     const DIRECTORY_ENTRY: usize = 20;
     const ROOM: &str = "!space:example.org";
+    /// Explicit sweep parameters. The production
+    /// `STATE_LATTICE_KEYFRAME_HOPS` configures keyframe spacing in the
+    /// writer; it must not drive the experiment, or changing the writer
+    /// silently changes what was measured.
+    const KEYFRAME_SWEEP: [usize; 3] = [16, 64, 256];
 
     fn add(left: usize, right: usize) -> usize {
         left.checked_add(right).expect("sum fits")
@@ -695,11 +700,7 @@ mod tests {
         events: usize,
     ) {
         println!("K\tcheckpoints\tstgp_B_ev\troot_rec_B_ev\tkey_stat_B_ev\tdir_total_B\tdir_B_ev");
-        for k in [
-            usize::try_from(mtxdb::STATE_LATTICE_KEYFRAME_HOPS)
-                .expect("keyframe hop count fits usize"),
-            1000,
-        ] {
+        for k in KEYFRAME_SWEEP {
             let mut seen: HashSet<[u8; 32]> = fx.base_nodes.keys().copied().collect();
             let (mut stat_bytes, mut checkpoints) = (0usize, 0usize);
             let mut checkpoint_groups = HashSet::new();
@@ -1097,12 +1098,7 @@ mod tests {
             rebuild[div(mul(rebuild.len().saturating_sub(1), 99), 100)],
             applied_through(tuples, tuples.len()),
         );
-        for k in [
-            0usize,
-            usize::try_from(mtxdb::STATE_LATTICE_KEYFRAME_HOPS)
-                .expect("keyframe hop count fits usize"),
-            1000,
-        ] {
+        for k in std::iter::once(0usize).chain(KEYFRAME_SWEEP) {
             for shape in ["root", "entries"] {
                 for cache in ["cold", "hot"] {
                     let mut hot = Source::new(store);
@@ -1370,12 +1366,7 @@ mod tests {
             let (steps, store) = chain_row(&fx, &tuples, events, &format!("{mode}{mix}%"));
             if mix == 0 {
                 put_many_rows(&fx, &[], &[], &fx.base_nodes, 1, "baseline-only");
-                for k in [
-                    1usize,
-                    usize::try_from(mtxdb::STATE_LATTICE_KEYFRAME_HOPS)
-                        .expect("keyframe hop count fits usize"),
-                    1000,
-                ] {
+                for k in std::iter::once(1usize).chain(KEYFRAME_SWEEP) {
                     let label = if k == 1 {
                         "direct".to_owned()
                     } else {
