@@ -9551,7 +9551,7 @@ fn parse_array_index(segment: &str) -> Option<usize> {
 /// # Key width
 ///
 /// The selected algorithm computes a full 32-byte digest, but only the first
-/// 16 bytes are returned as the routing [`crate::storage::NodeId`].
+/// 16 bytes are returned as the routing [`NodeId`].
 fn derive_template_key(algorithm: &str, extracted: &str) -> anyhow::Result<[u8; 16]> {
     let digest_algorithm = digest_algorithm_for(algorithm)?;
     Ok(record_logical_id(&mtxdb::content_digest(
@@ -11493,7 +11493,7 @@ fn import_pdu_events_with_raw(
     )
 }
 
-/// [`import_pdu_events_with_raw`] with the state-HAMT write setting threaded
+/// Like `import_pdu_events`, with the state-HAMT write setting threaded
 /// through, so `--no-state-hamts` also covers raw JSONL and federation inputs.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn import_pdu_events_with_raw_state_hamts(
@@ -13577,7 +13577,7 @@ fn event_short_id(event_id: &str) -> u64 {
 /// Build an in-memory event DAG from a set of events.
 ///
 /// Each event is hashed to a `u64` `short_id` via [`event_short_id`], then
-/// inserted into an [`ActiveRoomFrontier`] with its `prev_events` and
+/// inserted into an [`mtxdb::dag::ActiveRoomFrontier`] with its `prev_events` and
 /// `auth_events` edges resolved to the same `short_id` space.
 ///
 /// Returns the frontier and the bidirectional id maps.

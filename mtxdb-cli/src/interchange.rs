@@ -160,7 +160,7 @@ impl RoomEvent {
         })
     }
 
-    /// [`Self::annotated`] without the source's verdicts: the `rejected` and
+    /// The `annotated` form without the source's verdicts: the `rejected` and
     /// `soft_failed` flags are removed, so an auth check judges the event by
     /// its own contents and cannot read the answer the exporting server
     /// already gave.
@@ -581,7 +581,7 @@ fn normalize_flag(key: &str) -> String {
     key.trim_start_matches('_').replace('-', "_")
 }
 
-/// Whether a PDU's reference list has only forms [`reference_list`] can read:
+/// Whether a PDU's reference list has only forms `reference_list` can read:
 /// a plain event id, or a v1/v2 `[event_id, hashes]` pair. A malformed element
 /// must reject the event rather than be dropped from the analyzed list.
 fn references_are_well_formed(value: &OwnedValue, field: &str) -> bool {

@@ -3,7 +3,7 @@
 //! mtxdb walks the room's event DAG itself and keeps one state set per
 //! frontier event. When a node has more than one resident parent those sets
 //! have to be merged, and this module owns that merge: it converts mtxdb's
-//! state sets into rezzy's persistent [`SharedState`] maps, feeds rezzy the
+//! state sets into rezzy's persistent `SharedState` maps, feeds rezzy the
 //! events its auth rules read, and converts the resolved map back.
 //!
 //! Two properties are load-bearing.
@@ -36,7 +36,7 @@ use crate::state_policy::{event_disposition, EventDisposition, ResolutionPolicy}
 
 /// mtxdb's state set, keyed by `(type, state_key)` and valued by event id.
 ///
-/// This is the shape [`crate::cmd::StateSet::entries`] stores; it is spelled
+/// This is the shape `crate::cmd::StateSet::entries` stores; it is spelled
 /// out here so the adapter can be written and tested against mtxdb's own type
 /// without widening that module's API.
 pub(crate) type StateEntries = HashMap<(String, String), String>;

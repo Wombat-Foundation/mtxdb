@@ -1785,7 +1785,7 @@ pub(crate) fn derived_auth_findings_for_raw(
     )
 }
 
-/// [`derived_auth_findings_for_raw`] with the redaction and lean-event inputs
+/// [`derived_auth_findings_for_raw_with_inputs`] with the redaction and lean-event inputs
 /// the caller already computed. The incremental import also needs them for the
 /// state walk, and rebuilding one `LeanEvent` per stored event twice per file
 /// is a large duplicate cost.
