@@ -8,7 +8,7 @@ use super::{
     event_short_id, export_envelope_line, extract_pointer_string, finish_import,
     fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id, glob_pack_files,
     import_data, import_pdu_events, import_pdu_events_with_raw, interleaving_worth_noting,
-    is_server_keys_export, keys_first, listing_shard_types, load_collection_events,
+    is_server_keys_export, json_string, keys_first, listing_shard_types, load_collection_events,
     load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
     matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
     overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
@@ -1977,6 +1977,11 @@ fn imported_event_payload_uses_rezzy_redaction() {
     let bytes = redacted_event_bytes(&event, "11").unwrap();
     let json = bytes.to_vec();
     let redacted = OwnedValue::parse_bytes(&json).unwrap();
+    assert_eq!(
+        rezzy::json::to_canonical_bytes(&redacted).unwrap(),
+        json,
+        "persisted redaction bytes are canonical when the input has no legacy numbers"
+    );
     assert!(redacted.get("unsigned").is_none());
     assert!(redacted.get("__pdu_count").is_none());
     assert!(redacted.get("__soft_failed").is_none());
@@ -1987,6 +1992,25 @@ fn imported_event_payload_uses_rezzy_redaction() {
         }),
         Some(true)
     );
+}
+
+#[test]
+fn imported_event_payload_keeps_legacy_float_for_storage() {
+    let event = owned_value(
+        r#"{
+            "event_id":"$legacy",
+            "room_id":"!room",
+            "sender":"@alice",
+            "type":"m.room.message",
+            "depth":1.5,
+            "content":{"body":"hi","msgtype":"m.text"}
+        }"#,
+    );
+    // Pre-v6 rooms can contain historic floats. The storage writer must keep
+    // them rather than fail the import; only signing/hashing bytes are strict.
+    let bytes = redacted_event_bytes(&event, "5").unwrap();
+    let parsed = OwnedValue::parse_bytes(&bytes).unwrap();
+    assert_eq!(parsed.get("depth").and_then(OwnedValue::as_f64), Some(1.5));
 }
 
 #[test]
@@ -5960,7 +5984,8 @@ fn encode_lps(s: &str) -> Vec<u8> {
 }
 
 /// Matches `synapse/rust/src/state_hamt.rs`'s
-/// `serde_json::to_string(&(event_type, state_key))` -- the real K
+/// `serde_json::to_string(&(event_type, state_key))` (produced here by
+/// `rezzy::json`, byte-identical) -- the real K
 /// encoding is a single JSON 2-element array string, not a raw tuple
 /// codec.
 fn hamt_leaf_key_json(event_type: &str, state_key: &str) -> String {
@@ -9609,4 +9634,28 @@ fn evict_database_pages_succeeds_on_valid_store() {
     let (files, bytes) = crate::cmd::evict_database_pages(&root).unwrap();
     assert!(files > 0);
     assert!(bytes > 0);
+}
+
+#[test]
+fn json_string_matches_rezzy_json_escaper() {
+    for text in [
+        "plain",
+        "quote\" backslash\\",
+        "line\nfeed\r\tend",
+        "\u{0}\u{8}\u{c}\u{1f}\u{7f}",
+        "unicode é 😀 \u{2028}",
+    ] {
+        let encoded = json_string(text);
+        let parsed = OwnedValue::parse(&encoded).expect("valid JSON string literal");
+        assert_eq!(parsed.as_str(), Some(text), "{text:?}");
+    }
+    // Pin the exact escapes rezzy-json emits, so this stays a real
+    // cross-implementation check rather than a tautology.
+    assert_eq!(json_string("plain"), "\"plain\"");
+    assert_eq!(json_string("a\"b\\c"), r#""a\"b\\c""#);
+    assert_eq!(
+        json_string("\u{0}\u{8}\u{c}\u{1f}"),
+        r#""\u0000\b\f\u001f""#
+    );
+    assert_eq!(json_string("\u{7f}é😀\u{2028}"), "\"\u{7f}é😀\u{2028}\"");
 }

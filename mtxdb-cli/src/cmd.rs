@@ -1759,7 +1759,8 @@ fn decode_hamt_root(bytes: &[u8]) -> Option<Vec<u8>> {
 /// [17..21]  child_count (u32 LE)
 /// [21..]    inline leaves (K,V pairs in datamap bit order)
 ///           Each leaf: two length-prefixed UTF-8 strings
-///           K = serde_json::to_string(&(EventType, StateKey))
+///           K = JSON array string of (EventType, StateKey), the same bytes as
+///               Synapse's `serde_json::to_string`, written by `rezzy::json`
 ///               (a JSON 2-element array, e.g. `["m.room.member","@a:b"]`)
 ///           V = EventId, as a plain string
 /// [...]     child hashes (child_count x 32 bytes in nodemap bit order)
@@ -1898,7 +1899,8 @@ fn decode_state_group(bytes: &[u8]) -> Option<Vec<u8>> {
 /// JSON-encoded `(EventType, StateKey)` array) and V (`EventId`). Advances
 /// `cursor` past the leaf on success. This matches
 /// `synapse/rust/src/state_hamt.rs`'s `HamtNode<String, String>`, where K is
-/// `serde_json::to_string(&(event_type, state_key))`, not a raw tuple
+/// Synapse's `serde_json::to_string(&(event_type, state_key))` (written here by
+/// `rezzy::json`), not a raw tuple
 /// codec -- there are exactly two length-prefixed strings per leaf on disk.
 #[allow(clippy::arithmetic_side_effects)]
 fn skip_hamt_leaf_value(bytes: &[u8], cursor: &mut usize) -> bool {
@@ -4317,25 +4319,13 @@ fn ms_json(duration: std::time::Duration) -> String {
     format!("{:.3}", duration.as_secs_f64() * 1000.0)
 }
 
-/// A JSON string literal (no quotes added — callers pass raw text).
+/// A quoted, escaped JSON string literal for `text` (callers pass unescaped text).
 fn json_string_raw(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len().saturating_add(2));
-    escaped.push('"');
-    for character in text.chars() {
-        match character {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            character if character <= '\u{1f}' => {
-                let _ = write!(escaped, "\\u{:04x}", character as u32);
-            }
-            character => escaped.push(character),
-        }
-    }
-    escaped.push('"');
-    escaped
+    // Reuse rezzy-json's string encoder rather than maintaining a second one.
+    // (`write_json_string` replaces the allocation here once the pinned rezzy
+    // revision is bumped; `write_string_value` exists on the current rev.)
+    rezzy::json::write_string_value(&rezzy::json::Value::String(text.to_owned()))
+        .expect("writing a JSON string to a String cannot fail")
 }
 
 /// A JSON string value including surrounding quotes.
@@ -7762,7 +7752,7 @@ fn cmd_search_single(
                         .or_insert_with(|| OwnedValue::String(id.clone()));
                 }
                 println!("{view}");
-            },
+            }
             "text" => {
                 let sender = extract_pointer_string(&record, "/sender").unwrap_or("?");
                 let kind = extract_pointer_string(&record, "/type").unwrap_or("?");
@@ -7777,7 +7767,7 @@ fn cmd_search_single(
                 {
                     println!("  {body}");
                 }
-            },
+            }
             _ => println!("{id}"),
         }
         results = results.saturating_add(1);
@@ -11604,10 +11594,10 @@ fn reject_cross_record_collision(
 /// The importer still keeps the original value in memory for collection and
 /// DAG/state analysis; only the stored payload is redacted.
 fn redacted_event_bytes(event: &OwnedValue, room_version: &str) -> anyhow::Result<bytes::Bytes> {
-    let source = event.encode();
-    let value = rezzy::JsonValue::parse(&source)
-        .map_err(|error| anyhow::anyhow!("invalid event JSON for redaction: {error:?}"))?;
-    let redacted = rezzy::redact_json(&value, room_version);
+    let redacted = rezzy::redact_json(event, room_version);
+    // This is a storage boundary, not a signing boundary. Keep the permissive
+    // writer so legacy (<v6) events carrying historic floats still import;
+    // rezzy's strict canonical writer is for bytes that are hashed or signed.
     let encoded = rezzy::json::write_string_value(&redacted)
         .map_err(|error| anyhow::anyhow!("failed to encode redacted event: {error:?}"))?;
     Ok(bytes::Bytes::from(encoded.into_bytes()))

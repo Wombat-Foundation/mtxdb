@@ -308,9 +308,10 @@ pub(crate) fn load_state_group_entries(
     Ok(Some(reader.collect_entries(&decoded.root_hash)?))
 }
 
-/// `serde_json::to_string(&(event_type, state_key))`, i.e. a two-element JSON
-/// array, via `rezzy`'s codec so the escaping stays pinned to `serde_json`'s
-/// default.
+/// A two-element JSON array string of `(event_type, state_key)`, written by
+/// `rezzy`'s codec. It is byte-identical to Synapse's
+/// `serde_json::to_string(&(event_type, state_key))`; this crate has no
+/// `serde_json` dependency.
 #[must_use]
 pub(crate) fn state_hamt_leaf_key(event_type: &str, state_key: &str) -> String {
     rezzy::hamt::state_hamt_leaf_key(event_type, state_key)
