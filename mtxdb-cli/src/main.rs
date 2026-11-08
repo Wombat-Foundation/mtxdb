@@ -38,6 +38,63 @@ pub(crate) fn debug_enabled() -> bool {
     DEBUG_ENABLED.get().copied().unwrap_or(false)
 }
 
+/// Remove leftover test databases from runs whose process is gone.
+///
+/// The test helpers only clear their own path before creating it, so a crashed
+/// or interrupted `cargo test` leaves a database behind and back-to-back runs
+/// eventually fill the temp filesystem. Sweep once per test process and drop
+/// directories whose owning PID is dead. The current PID is skipped, which
+/// keeps concurrently running test binaries safe.
+#[cfg(test)]
+pub(crate) fn sweep_stale_test_dirs() {
+    use std::sync::Once;
+    static SWEEP: Once = Once::new();
+    SWEEP.call_once(|| {
+        const PREFIXES: [&str; 6] = [
+            "mtxdb-cli-test-",
+            "mtxdb-closure-test-",
+            "mtxdb-state-keyframes-",
+            "mtxdb-run-test-",
+            "mtxdb-packidx-test-",
+            "mtxdb-test-room-flag-",
+        ];
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let current = std::process::id();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(rest) = PREFIXES.iter().find_map(|prefix| name.strip_prefix(prefix)) else {
+                continue;
+            };
+            let Some(pid) = rest
+                .split('-')
+                .next()
+                .and_then(|pid| pid.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == current || test_process_is_alive(pid) {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    });
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn test_process_is_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+fn test_process_is_alive(_pid: u32) -> bool {
+    // There is no cheap portable liveness probe, so leave other processes'
+    // directories alone rather than risk deleting a live test database.
+    true
+}
+
 #[derive(Clone)]
 pub(crate) struct Cli {
     pub(crate) dirs: Vec<PathBuf>,

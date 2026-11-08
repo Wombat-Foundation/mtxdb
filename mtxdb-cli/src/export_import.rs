@@ -2965,6 +2965,7 @@ mod auth_findings_tests {
     fn db() -> (Database, std::path::PathBuf) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);
+        crate::sweep_stale_test_dirs();
         let dir = std::env::temp_dir().join(format!(
             "mtxdb-closure-test-{}-{}",
             std::process::id(),

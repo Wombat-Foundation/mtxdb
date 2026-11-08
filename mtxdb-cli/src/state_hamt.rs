@@ -957,6 +957,7 @@ mod tests {
             StateGroupTrust, StorageEngine,
         };
 
+        crate::sweep_stale_test_dirs();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
