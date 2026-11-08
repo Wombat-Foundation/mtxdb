@@ -74,6 +74,14 @@ impl JsonValueExt for OwnedValue {
 /// state content reached through different parents stays distinct.
 const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
 
+/// Event -> state-group instance id for events whose base state is missing
+/// history (an ancestor body absent from the source). The state is derived
+/// from the events that are present, so it can lack changes made by the absent
+/// ancestors. Nothing seeds a walk from this namespace and replay does not
+/// treat it as a cached complete result; it exists so readers get a best-effort
+/// state instead of none.
+const PARTIAL_STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups-partial:v1";
+
 /// Whether `value` is a well-formed 128-bit STGP state-group instance id.
 fn valid_state_group_id(value: &[u8]) -> bool {
     value.len() == STATE_GROUP_ID_LENGTH
@@ -13492,6 +13500,7 @@ fn repair_import_state_groups(
     // first-parent group under a resolver-tagged id; caching it would hide the
     // fact that a fuller import can compute the real resolution instead.
     let mut publishable = true;
+    let mut partial_groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
     let unresolved_count = if loaded {
         0
     } else {
@@ -13552,9 +13561,11 @@ fn repair_import_state_groups(
         warn_incomplete_merges(&state_computation.incomplete);
         state_groups = state_computation.groups;
         computed_instances = state_computation.instances;
+        computed_instances.extend(state_computation.partial_instances);
+        partial_groups = state_computation.partial;
         if !unresolved.is_empty() {
             eprintln!(
-                "warning: partial state-group computation: {} event(s) have missing parents or are in cycles; resolvable events were retained",
+                "warning: {} event(s) are in parent cycles and have no derived state",
                 unresolved.len()
             );
             if crate::debug_enabled() {
@@ -13576,10 +13587,14 @@ fn repair_import_state_groups(
     let graph_event_count = graph_event_ids.len();
     let mapped_event_count = state_groups.len();
     let unique_state_group_count = state_groups.values().collect::<HashSet<_>>().len();
-    let stateless_event_count = graph_event_count.saturating_sub(mapped_event_count);
+    let partial_event_count = partial_groups.len();
+    let stateless_event_count = graph_event_count
+        .saturating_sub(mapped_event_count)
+        .saturating_sub(partial_event_count);
     let source = if loaded { "loaded" } else { "computed" };
     eprintln!(
-        "  state groups: {source} {unique_state_group_count} state groups across {mapped_event_count} events, {stateless_event_count} events unmapped ({unresolved_count} unresolved)"
+        "  state groups: {source} {unique_state_group_count} state groups; state derived for {} of {graph_event_count} events ({mapped_event_count} complete, {partial_event_count} partial: an ancestor body is absent), {stateless_event_count} without state ({unresolved_count} in cycles)",
+        mapped_event_count.saturating_add(partial_event_count)
     );
     let mut materialized = computed_instances.is_empty();
     if !computed_instances.is_empty() {
@@ -13612,6 +13627,16 @@ fn repair_import_state_groups(
             aux.put_many(&entries)
                 .context("persisting imported state-group mappings")?;
         }
+    }
+    if materialized && !loaded && !partial_groups.is_empty() {
+        let partial_aux = AuxiliaryIndex::open(state_store, PARTIAL_STATE_GROUP_NAMESPACE);
+        let entries: Vec<(&[u8], &[u8])> = partial_groups
+            .iter()
+            .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
+            .collect();
+        partial_aux
+            .put_many(&entries)
+            .context("persisting partial state-group mappings")?;
     }
     Ok(())
 }
@@ -14206,15 +14231,18 @@ struct PartialStateComputation {
     /// materialize its `STGP` record and (deduplicated) `STAT` content.
     instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
     /// Events whose base state was incomplete because a `prev_events` entry was
-    /// missing or itself gapped. Their derived groups are omitted from
-    /// `groups`: publishing one would let a later import seed a walk with a
-    /// group it believes complete.
+    /// missing or itself gapped. Their derived groups are in `partial`, not
+    /// `groups`, so a later import with the ancestor present can publish the
+    /// complete group without colliding with a cached partial one.
     gapped: Vec<String>,
     /// Event ids at least one merge could not resolve because this batch does
     /// not carry their auth closure. Non-empty means those merges fell back to
     /// the first-parent rule, so `groups` must not be cached as though
     /// the real resolver had run — a later, fuller import recomputes them.
     incomplete: Vec<String>,
+    /// Groups derived on a base missing history (see [`StateGroupWalk`]).
+    partial: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
+    partial_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
 }
 
 /// What one DAG walk produced: the per-event group map, the derived instances
@@ -14223,8 +14251,14 @@ struct PartialStateComputation {
 struct StateGroupWalk {
     groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
     instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+    /// Events whose base was gapped; their groups are in `partial`.
     gapped: Vec<String>,
     incomplete: Vec<String>,
+    /// Groups derived on a base missing history, keyed by event. Never read as
+    /// a seed: they are coverage evidence, not a complete state.
+    partial: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
+    /// Instances behind `partial`, for HAMT materialization.
+    partial_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
 }
 
 /// One resolved state-group derivation: the parent instance ids it descends
@@ -14378,14 +14412,12 @@ fn compute_state_groups_partial_with(
             instances: HashMap::new(),
             gapped: Vec::new(),
             incomplete: Vec::new(),
+            partial: HashMap::new(),
+            partial_instances: HashMap::new(),
         };
     }
 
-    let seed_locals: HashSet<mtxdb::dag::LocalId> = seed_states
-        .keys()
-        .filter_map(|id| frontier.id_remap.get(&event_short_id(id)).copied())
-        .collect();
-    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map, &seed_locals);
+    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map);
 
     let mut events_by_sid: HashMap<u64, &OwnedValue> = HashMap::new();
     for ev in all_owned {
@@ -14416,6 +14448,8 @@ fn compute_state_groups_partial_with(
         instances: result.instances,
         gapped: result.gapped,
         incomplete: result.incomplete,
+        partial: result.partial,
+        partial_instances: result.partial_instances,
     }
 }
 
@@ -14450,6 +14484,8 @@ fn walk_state_groups(
     let mut context = LeanEventContext::new(events_by_sid.values().copied());
     let mut incomplete: HashSet<String> = HashSet::new();
     let mut gapped: HashSet<String> = HashSet::new();
+    let mut partial: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
+    let mut partial_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> = HashMap::new();
 
     let empty_set = StateSet::new();
     let empty = SharedState::new(
@@ -14584,6 +14620,16 @@ fn walk_state_groups(
             !base_incomplete,
         );
 
+        if base_gapped {
+            partial_instances
+                .entry(state.instance)
+                .or_insert_with(|| StateInstance {
+                    parents: canonical_parents(&parent_instances),
+                    lthash: state.lthash,
+                    set: state.set.clone(),
+                    derivation: policy.derivation,
+                });
+        }
         if !base_gapped && !seed_instances.contains(&state.instance) {
             instances
                 .entry(state.instance)
@@ -14602,6 +14648,7 @@ fn walk_state_groups(
                 // complete. The whole-room path must leave the same set
                 // unmapped so the two paths agree.
                 gapped.insert(eid.clone());
+                partial.insert(eid.clone(), state.instance);
             } else {
                 result.insert(eid.clone(), state.instance);
             }
@@ -14627,6 +14674,8 @@ fn walk_state_groups(
         instances,
         gapped,
         incomplete,
+        partial,
+        partial_instances,
     }
 }
 
@@ -14804,19 +14853,19 @@ fn missing_prev_event_ids(events: &[OwnedValue]) -> Vec<String> {
     missing
 }
 
-/// Sort the resolvable portion of a DAG. Nodes with an absent parent, and all
-/// of their descendants, are excluded; a cycle and its descendants are also
-/// excluded. Independent components continue to be processed normally.
+/// Sort the DAG's resident events. A parent absent from the batch contributes
+/// no ordering edge: the state walk marks the event's base as missing history
+/// (a partial state) instead of dropping it and all of its descendants. Only a
+/// cycle and its descendants stay unresolved. Independent components continue
+/// to be processed normally.
 fn partial_topo_sort_dag(
     frontier: &mtxdb::dag::ActiveRoomFrontier,
     reverse_map: &HashMap<u64, String>,
-    seed_locals: &HashSet<mtxdb::dag::LocalId>,
 ) -> (Vec<usize>, Vec<String>) {
     let n = frontier.nodes.len();
     let mut in_degree = vec![0usize; n];
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut blocked = vec![false; n];
-    let mut blocked_queue = VecDeque::new();
+    let blocked = vec![false; n];
 
     for (idx, _node) in frontier.nodes.iter().enumerate() {
         for edge in frontier.prev_edges(idx) {
@@ -14824,21 +14873,6 @@ fn partial_topo_sort_dag(
                 let parent_idx = edge.arena_index();
                 children[parent_idx].push(idx);
                 in_degree[idx] = in_degree[idx].saturating_add(1);
-            } else if seed_locals.contains(&edge.local_id()) {
-                // An external parent whose after-state was seeded is not a
-                // gap: it contributes no in-batch ordering edge.
-            } else if !blocked[idx] {
-                blocked[idx] = true;
-                blocked_queue.push_back(idx);
-            }
-        }
-    }
-
-    while let Some(idx) = blocked_queue.pop_front() {
-        for &child in &children[idx] {
-            if !blocked[child] {
-                blocked[child] = true;
-                blocked_queue.push_back(child);
             }
         }
     }

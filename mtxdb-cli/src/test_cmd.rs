@@ -2551,18 +2551,15 @@ fn raw_import_reimport_leaves_the_missing_set_unchanged() {
     }
 }
 
-/// A seeded external parent is not a gap: the direct path judges only this
-/// file's events, and every parent whose after-state was seeded contributes no
-/// in-batch ordering edge. Without the seed the node and its descendants are
-/// unresolved.
+/// An absent external parent contributes no ordering edge, so its children
+/// are still sorted and the state walk marks their base as partial.
 #[test]
-fn seeded_topo_sort_treats_seeded_external_parents_as_resolved() {
+fn topo_sort_keeps_events_with_absent_parents() {
     use mtxdb::dag::ActiveRoomFrontier;
 
     let mut frontier = ActiveRoomFrontier::new();
     let first = frontier.insert_event(1, &[10], &[]);
     let second = frontier.insert_event(2, &[1], &[]);
-    let external_local = frontier.register_id(10);
     let reverse_map: std::collections::HashMap<u64, String> = [
         (1, "$first".to_owned()),
         (2, "$second".to_owned()),
@@ -2570,12 +2567,7 @@ fn seeded_topo_sort_treats_seeded_external_parents_as_resolved() {
     ]
     .into();
 
-    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map, &HashSet::new());
-    assert!(sorted.is_empty());
-    assert_eq!(unresolved, ["$first".to_owned(), "$second".to_owned()]);
-
-    let seeds: HashSet<_> = [external_local].into();
-    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map, &seeds);
+    let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map);
     assert_eq!(sorted, [first, second]);
     assert!(unresolved.is_empty());
 }
@@ -3061,11 +3053,11 @@ fn direct_and_whole_room_agree_on_auth_pool_only_citations() {
     );
 }
 
-/// A group whose base is missing history must not be published: a later direct
-/// import would seed it as complete. The whole-room walk and the direct walk
-/// share this walk, so both leave the event and its descendants unmapped.
+/// A group whose base is missing history goes to the partial namespace, never
+/// the complete one: a later import that has the ancestor recomputes and
+/// publishes the complete group under its own instance id.
 #[test]
-fn gapped_groups_are_not_published_for_a_prev_less_event_or_its_child() {
+fn gapped_groups_are_not_published_as_complete_for_a_prev_less_event_or_its_child() {
     let parent = owned_value(
         r#"{"event_id":"$parent","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":[],"content":{}}"#,
     );
@@ -6802,7 +6794,11 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     );
     let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[], "!r:x");
     assert!(!first.groups.contains_key("$child"));
-    assert_ne!(first.unresolved, Vec::<String>::new());
+    assert!(first.unresolved.is_empty());
+    assert!(
+        first.partial.contains_key("$child"),
+        "the event is still sorted with an unknown base and gets a partial group"
+    );
     assert_eq!(aux.get(b"$child").unwrap(), None);
 
     let parent = owned_value(
@@ -6968,9 +6964,15 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
     assert_ne!(base.groups["$merge"], base.groups["$branch-b"]);
     assert!(without_branch_b.groups.contains_key("$branch-a"));
     assert!(!without_branch_b.groups.contains_key("$merge"));
-    assert!(without_branch_b.unresolved.iter().any(|id| id == "$merge"));
+    assert!(
+        without_branch_b.partial.contains_key("$merge"),
+        "a merge with an absent parent is derived with an unknown base"
+    );
     assert!(!with_orphan.groups.contains_key("$orphan"));
-    assert!(with_orphan.unresolved.iter().any(|id| id == "$orphan"));
+    assert!(
+        with_orphan.partial.contains_key("$orphan"),
+        "an orphan is derived with an unknown base instead of dropped"
+    );
 }
 
 #[test]
