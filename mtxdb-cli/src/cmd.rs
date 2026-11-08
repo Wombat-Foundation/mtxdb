@@ -10245,10 +10245,27 @@ struct ImportOutcome {
 /// it is one O(N) pass over the room's CSR rows; after that, each file asks a
 /// file-sized question ("does this file supply a waiting id?") instead of
 /// rescanning every stored event's references.
-#[derive(Default)]
+///
+/// It also carries the direct-path switch and a count of files the direct path
+/// handled. The switch defaults to `MTXDB_DIRECT_IMPORT` but a caller (a test,
+/// or a future caller that wants the fast path unconditionally) can set it
+/// explicitly, so the gate is not a process-global side effect.
 struct ImportRunCache {
     rooms: HashMap<[u8; 16], Vec<OwnedValue>>,
     waiting: HashMap<[u8; 16], RoomWaiting>,
+    direct: bool,
+    direct_files: usize,
+}
+
+impl Default for ImportRunCache {
+    fn default() -> Self {
+        Self {
+            rooms: HashMap::new(),
+            waiting: HashMap::new(),
+            direct: direct_import_enabled(),
+            direct_files: 0,
+        }
+    }
 }
 
 /// Ids a room references that no store holds yet, split by edge family.
@@ -10459,7 +10476,7 @@ impl ImportRunCache {
     /// has not touched the collection yet, so the first file's own references
     /// are accounted for.
     #[allow(clippy::too_many_arguments)]
-    fn observe_written(
+    fn observe_written<'a>(
         &mut self,
         db: &Database,
         store: &PackfileStorage,
@@ -10469,13 +10486,12 @@ impl ImportRunCache {
         room_id: &str,
         timeline_arrived: &HashSet<String>,
         auth_arrived: &HashSet<String>,
-        events: &[OwnedValue],
-        auth_chain: &[OwnedValue],
+        written_events: impl IntoIterator<Item = &'a OwnedValue>,
     ) -> anyhow::Result<()> {
         self.ensure_waiting(db, store, state_store, template, collection_id, room_id)?;
         let mut references: Vec<(String, bool)> = Vec::new();
         let mut candidates: HashSet<String> = HashSet::new();
-        for event in events.iter().chain(auth_chain) {
+        for event in written_events {
             // The adjacency recorder skips events without an event id; the
             // waiting set must describe exactly the rows it wrote.
             if event_id(event).is_none() {
@@ -10770,8 +10786,14 @@ impl ImportContext<'_> {
     /// Auth-chain events may span several rooms, so they are grouped first
     /// and then probed and written one batch per room rather than one round
     /// trip per event.
+    ///
+    /// A document with auth-chain bodies and no PDUs still carries information
+    /// the waiting set needs: those bodies satisfy `auth` references and their
+    /// own references can create new gaps. Fold them in after the writes, one
+    /// room's worth at a time, so references from another room are not
+    /// attributed to this room's timeline collection.
     fn import_auth_chain(
-        &self,
+        &mut self,
         auth_chain: &[OwnedValue],
         dangling: &[(String, String)],
         detected_collection: Option<&str>,
@@ -10787,15 +10809,47 @@ impl ImportContext<'_> {
         record_csr_adjacency(self.db, self.template, auth_chain)?;
         let (by_collection, skipped) =
             group_auth_chain(auth_chain, self.template, detected_collection)?;
+        let direct = self
+            .room_cache
+            .as_deref()
+            .map_or_else(direct_import_enabled, |cache| cache.direct);
+        let direct_identity = matches!(
+            &self.template.record_id_rule.policy,
+            FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
+        );
+        let mut events_by_room: HashMap<String, Vec<&OwnedValue>> = HashMap::new();
+        for event in auth_chain {
+            if let Some(room_id) = auth_chain_event_room(event, detected_collection) {
+                events_by_room.entry(room_id).or_default().push(event);
+            }
+        }
         let mut written = 0_u64;
         for ((collection_id, room_id), entries) in by_collection {
+            let auth_arrived: HashSet<String> =
+                entries.iter().map(|(_, id, _)| id.clone()).collect();
             written = written.saturating_add(write_auth_collection(
                 auth_store,
                 self.template,
                 collection_id,
-                room_id,
+                room_id.clone(),
                 entries,
             )?);
+            if direct && direct_identity {
+                if let Some(cache) = self.room_cache.as_deref_mut() {
+                    let timeline_collection = template_collection_id(self.template, &room_id);
+                    cache.observe_written(
+                        self.db,
+                        self.store,
+                        self.state_store,
+                        self.template,
+                        &timeline_collection,
+                        &room_id,
+                        &HashSet::new(),
+                        &auth_arrived,
+                        events_by_room.get(&room_id).into_iter().flatten().copied(),
+                    )?;
+                }
+            }
         }
         auth_store.sync_all()?;
         eprintln!(
@@ -11107,6 +11161,20 @@ fn compute_import_auth_before(
 ///
 /// Returns the entries to write per collection, and how many events had no
 /// usable identity to group them by.
+/// The room an auth-chain event belongs to, matching the grouping rule.
+fn auth_chain_event_room(event: &OwnedValue, detected_collection: Option<&str>) -> Option<String> {
+    event_room_id(event)
+        .map(str::to_owned)
+        .or_else(|| {
+            if matrix_create_event_id(event).is_some() {
+                establishment_identity(event)
+            } else {
+                None
+            }
+        })
+        .or_else(|| detected_collection.map(str::to_owned))
+}
+
 fn group_auth_chain(
     auth_chain: &[OwnedValue],
     template: &CollectionTemplate,
@@ -11123,17 +11191,7 @@ fn group_auth_chain(
             skipped = skipped.saturating_add(1);
             continue;
         };
-        let room_id = event_room_id(event)
-            .map(str::to_owned)
-            .or_else(|| {
-                if matrix_create_event_id(event).is_some() {
-                    establishment_identity(event)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| detected_collection.map(str::to_owned));
-        let Some(room_id) = room_id else {
+        let Some(room_id) = auth_chain_event_room(event, detected_collection) else {
             skipped = skipped.saturating_add(1);
             continue;
         };
@@ -11537,8 +11595,13 @@ fn import_pdu_events_with_raw_state_hamts(
         &template.record_id_rule.policy,
         FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
     );
+    // The run cache carries the direct-path switch so a test can exercise the
+    // fast path without mutating a process-global environment variable.
+    let direct = room_cache
+        .as_deref()
+        .map_or_else(direct_import_enabled, |cache| cache.direct);
     let mut local_cache = ImportRunCache::default();
-    let waiting_hits = if direct_import_enabled() && direct_identity && !to_write.is_empty() {
+    let waiting_hits = if direct && direct_identity && !to_write.is_empty() {
         let cache = room_cache.as_deref_mut().unwrap_or(&mut local_cache);
         let waiting = cache.ensure_waiting(
             db,
@@ -11575,10 +11638,18 @@ fn import_pdu_events_with_raw_state_hamts(
         events,
         auth_chain,
     )?;
+    // A projection for an event this file also supplies is part of that
+    // event's own raw input, not a repair. Only a projection written for an
+    // id that was already stored can change an earlier verdict, so only that
+    // case disables the direct path.
+    let repaired_projections = new_projections
+        .iter()
+        .filter(|id| existed_before.contains(*id))
+        .count();
     // Fold the successfully written bodies into the run-scoped waiting set
     // after the writes, never before: a record that was skipped or rejected by
     // the collision check must stay waiting for a later file.
-    if direct_import_enabled() && direct_identity {
+    if direct && direct_identity {
         if let Some(cache) = room_cache.as_mut() {
             let auth_arrived: HashSet<String> = auth_chain
                 .iter()
@@ -11595,8 +11666,7 @@ fn import_pdu_events_with_raw_state_hamts(
                 &resolved.canonical_id,
                 &body_ids,
                 &auth_arrived,
-                events,
-                auth_chain,
+                events.iter().chain(auth_chain.iter()),
             )?;
         }
     }
@@ -11611,13 +11681,13 @@ fn import_pdu_events_with_raw_state_hamts(
     // unjudged.
     let skip_judging = to_write.is_empty()
         && auth_chain.is_empty()
-        && new_projections == 0
+        && new_projections.is_empty()
         && all_verdicts_present(db, template, &current_ids)?;
     // A clean append (nothing this file supplies was missing before) only
     // changes this file's own verdicts. Judge it directly against the stored
     // prev state groups and fall back to the whole-room walk on any condition
     // the direct path cannot prove.
-    let direct_handled = direct_import_enabled()
+    let direct_handled = direct
         && !skip_judging
         && write_state_hamts
         && auth_chain.is_empty()
@@ -11633,11 +11703,12 @@ fn import_pdu_events_with_raw_state_hamts(
             events,
             &existed_before,
             &waiting_hits,
-            new_projections,
+            repaired_projections,
         )?;
     if direct_handled {
         if let Some(cache) = room_cache.as_mut() {
             cache.rooms.remove(&collection_id);
+            cache.direct_files = cache.direct_files.saturating_add(1);
         }
         eprintln!("  raw import: direct incremental path");
     }
@@ -12043,7 +12114,7 @@ fn write_raw_auth_projections(
     room_version: &str,
     events: &[OwnedValue],
     auth_chain: &[OwnedValue],
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<Vec<String>> {
     // Never guess at an unknown version. The establishment validator rejects
     // these before an import, but the projection writer is also called
     // directly by tests and future callers.
@@ -12085,12 +12156,13 @@ fn write_raw_auth_projections(
         ));
     }
     if records.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let collection = raw_auth_projection_collection_id(room_id);
     let ids: Vec<[u8; 16]> = records.iter().map(|(id, _, _)| *id).collect();
     let existing = store.get_many(&collection, &ids)?;
     let mut to_write = Vec::with_capacity(records.len());
+    let mut written_ids = Vec::with_capacity(records.len());
     for ((node, id, data), existing) in records.into_iter().zip(existing) {
         if let Some(existing) = existing {
             if existing.bytes != data.bytes {
@@ -12101,6 +12173,7 @@ fn write_raw_auth_projections(
             continue;
         }
         to_write.push((node, data));
+        written_ids.push(id);
     }
     if !to_write.is_empty() {
         let metadata = CollectionMetadata {
@@ -12116,7 +12189,7 @@ fn write_raw_auth_projections(
             .create_or_put_established(&collection, &metadata, &to_write)
             .context("storing raw auth projections")?;
     }
-    Ok(to_write.len())
+    Ok(written_ids)
 }
 
 fn overlay_auth_projection(event: &mut OwnedValue, projection: OwnedValue) {
@@ -12158,12 +12231,18 @@ fn event_reference_ids(event: &OwnedValue) -> Vec<String> {
     ids
 }
 
-/// Load event bodies by event id from the room's timeline collection, its
-/// `auth_chain` collection, or an auth-only projection, overlaying the
-/// projection on each stored (redacted) body.
+/// Load event bodies by event id from the room's timeline collection,
+/// overlaying an auth-only projection on each stored (redacted) body.
+///
+/// The timeline collection is the whole-room path's only body source
+/// (`load_collection_events`), so the direct path must not read the auth pool
+/// here either: a body stored only by an earlier file's `auth_chain` is not
+/// visible to `load_collection_events`, and reading it would make the two
+/// paths derive different verdicts. Cross-file auth-chain visibility is a
+/// separate step; until it lands, both paths report `MissingAuthEvent` for
+/// such a citation.
 fn load_event_bodies(
     store: &PackfileStorage,
-    state_store: &PackfileStorage,
     template: &CollectionTemplate,
     room_id: &str,
     collection_id: &[u8; 16],
@@ -12179,16 +12258,10 @@ fn load_event_bodies(
     }
     let nodes: Vec<[u8; 16]> = ordered.iter().map(|(_, node)| *node).collect();
     let timeline = store.get_many(collection_id, &nodes)?;
-    let auth_collection =
-        derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
-    let auth = state_store.get_many(&auth_collection, &nodes)?;
     let projections = store.get_many(&raw_auth_projection_collection_id(room_id), &nodes)?;
-    for (((id, _node), timeline), (auth, projection)) in ordered
-        .into_iter()
-        .zip(timeline)
-        .zip(auth.into_iter().zip(projections))
+    for (((id, _node), timeline), projection) in ordered.into_iter().zip(timeline).zip(projections)
     {
-        let Some(record) = timeline.or(auth) else {
+        let Some(record) = timeline else {
             continue;
         };
         let Ok(mut value) = OwnedValue::parse_bytes(&record.bytes) else {
@@ -12281,7 +12354,7 @@ fn try_direct_raw_import(
     events: &[OwnedValue],
     existed_before: &HashSet<String>,
     waiting_hits: &WaitingHits,
-    new_projections: usize,
+    repaired_projections: usize,
 ) -> anyhow::Result<bool> {
     if !matches!(
         &template.record_id_rule.policy,
@@ -12295,10 +12368,11 @@ fn try_direct_raw_import(
     let direct_debug = std::env::var_os("MTXDB_DIRECT_DEBUG").is_some();
     // A file that repairs an existing event's auth projection can change that
     // event's verdict, so the whole-room path (which re-judges every id in the
-    // file) must handle it even when new events are also present.
-    if new_projections > 0 {
+    // file) must handle it even when new events are also present. A projection
+    // for a new event is part of that event's own input and does not count.
+    if repaired_projections > 0 {
         if direct_debug {
-            eprintln!("direct: fallback, {new_projections} new auth projection(s)");
+            eprintln!("direct: fallback, {repaired_projections} repaired auth projection(s)");
         }
         return Ok(false);
     }
@@ -12343,14 +12417,7 @@ fn try_direct_raw_import(
     // A missing `prev` leaves its child unseeded (the topo sort blocks it); a
     // missing `auth` makes the findings pass report `MissingAuthEvent`. Both
     // match what the whole-room path derives from the same room.
-    let external = load_event_bodies(
-        store,
-        state_store,
-        template,
-        room_id,
-        collection_id,
-        &external_refs,
-    )?;
+    let external = load_event_bodies(store, template, room_id, collection_id, &external_refs)?;
 
     // Load the after-state of every parent outside this file. A parent with no
     // stored group is left unseeded: the topological sort then blocks it and
@@ -12458,14 +12525,7 @@ fn try_direct_raw_import(
         .cloned()
         .collect();
     if !missing.is_empty() {
-        let loaded = load_event_bodies(
-            store,
-            state_store,
-            template,
-            room_id,
-            collection_id,
-            &missing,
-        )?;
+        let loaded = load_event_bodies(store, template, room_id, collection_id, &missing)?;
         if loaded.len() != missing.len() {
             return Ok(false);
         }
@@ -12480,8 +12540,13 @@ fn try_direct_raw_import(
         .cloned()
         .collect();
     let mut local_events: Vec<OwnedValue> = Vec::with_capacity(local.len());
-    for event in local.values() {
-        local_events.push(event.clone());
+    // Sort by event id: `local` is a hash map, and findings warnings are
+    // emitted in encounter order. A stable universe keeps diagnostics stable
+    // across runs and across gate-on/gate-off comparisons.
+    let mut local_ids: Vec<&String> = local.keys().collect();
+    local_ids.sort();
+    for id in local_ids {
+        local_events.push(local[id].clone());
     }
     let local_rooms: Vec<RoomEvent> = local_events
         .iter()
@@ -12567,10 +12632,11 @@ fn try_direct_raw_import(
     }
     if direct_debug {
         eprintln!(
-            "direct: |F|={}, |D|={}, seeds={}, unchecked={unchecked}, unmapped={}",
+            "direct: |F|={}, |mapped|={}, seeds={}, unchecked={unchecked}, gapped={}, unmapped={}",
             new_events.len(),
             computation.groups.len(),
             seeds.len(),
+            computation.gapped.len(),
             new_ids.len().saturating_sub(computation.groups.len()),
         );
     }
@@ -12886,10 +12952,11 @@ fn repair_import_state_groups(
     // incomplete, but a complete replay should not rebuild the whole DAG.
     // Read the existing mappings in one backend batch and only walk the DAG
     // when at least one resolved mapping is absent. Resolved mappings are
-    // trusted as immutable federated-import results; unresolved events are
-    // deliberately left absent so a later import can repair them. Batches
-    // with unresolved events therefore pay the DAG-walk cost again on replay;
-    // skipping that safely would require persisting the missing-parent set.
+    // trusted as immutable federated-import results; unresolved events and
+    // events whose base is missing history are deliberately left absent so a
+    // later import can repair them. Batches with such events therefore pay the
+    // DAG-walk cost again on replay; skipping that safely would require
+    // persisting the missing-parent set.
     let mut seen_state_event_ids = HashSet::new();
     let graph_event_ids = events
         .iter()
@@ -13623,6 +13690,11 @@ struct PartialStateComputation {
     /// One record per derived state-group instance, retained so an import can
     /// materialize its `STGP` record and (deduplicated) `STAT` content.
     instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+    /// Events whose base state was incomplete because a `prev_events` entry was
+    /// missing or itself gapped. Their derived groups are omitted from
+    /// `groups`: publishing one would let a later import seed a walk with a
+    /// group it believes complete.
+    gapped: Vec<String>,
     /// Event ids at least one merge could not resolve because this batch does
     /// not carry their auth closure. Non-empty means those merges fell back to
     /// the first-parent rule, so `groups` must not be cached as though
@@ -13631,10 +13703,12 @@ struct PartialStateComputation {
 }
 
 /// What one DAG walk produced: the per-event group map, the derived instances
-/// worth materializing, and any auth-closure gap that forced a fallback.
+/// worth materializing, events whose base was gapped, and any auth-closure gap
+/// that forced a fallback.
 struct StateGroupWalk {
     groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
     instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
+    gapped: Vec<String>,
     incomplete: Vec<String>,
 }
 
@@ -13788,6 +13862,7 @@ fn compute_state_groups_partial_with(
             groups: HashMap::new(),
             unresolved: Vec::new(),
             instances: HashMap::new(),
+            gapped: Vec::new(),
             incomplete: Vec::new(),
         };
     }
@@ -13825,6 +13900,7 @@ fn compute_state_groups_partial_with(
         groups: result.groups,
         unresolved,
         instances: result.instances,
+        gapped: result.gapped,
         incomplete: result.incomplete,
     }
 }
@@ -13859,6 +13935,7 @@ fn walk_state_groups(
     // are materialized lazily and each id is walked at most once.
     let mut context = LeanEventContext::new(events_by_sid.values().copied());
     let mut incomplete: HashSet<String> = HashSet::new();
+    let mut gapped: HashSet<String> = HashSet::new();
 
     let empty_set = StateSet::new();
     let empty = SharedState::new(
@@ -13929,6 +14006,11 @@ fn walk_state_groups(
         // Incompleteness is inherited: a child of an event with a gapped base
         // has a gapped base too, even when all of its own parents are present.
         base_incomplete = base_is_incomplete(base_incomplete, &parents);
+        // Keep the gap before a resolver fallback can add to it: only a base
+        // missing history makes the resulting group unsafe to publish. A merge
+        // fallback is reported through `incomplete` instead, which already
+        // keeps the whole batch from being cached.
+        let base_gapped = base_incomplete;
 
         // State-resolution merge. Parents that already agree share their state
         // instead of copying it, so a plain message event costs no allocation;
@@ -13988,7 +14070,7 @@ fn walk_state_groups(
             !base_incomplete,
         );
 
-        if !seed_instances.contains(&state.instance) {
+        if !base_gapped && !seed_instances.contains(&state.instance) {
             instances
                 .entry(state.instance)
                 .or_insert_with(|| StateInstance {
@@ -14000,7 +14082,15 @@ fn walk_state_groups(
         }
 
         if let Some(eid) = reverse_map.get(&short_id) {
-            result.insert(eid.clone(), state.instance);
+            if base_gapped {
+                // No state group is published for an event whose base is
+                // missing history: a later direct import would seed it as
+                // complete. The whole-room path must leave the same set
+                // unmapped so the two paths agree.
+                gapped.insert(eid.clone());
+            } else {
+                result.insert(eid.clone(), state.instance);
+            }
         }
         for parent_id in parent_ids {
             if let Some(count) = remaining_children.get_mut(&parent_id) {
@@ -14016,9 +14106,12 @@ fn walk_state_groups(
     }
     let mut incomplete: Vec<String> = incomplete.into_iter().collect();
     incomplete.sort();
+    let mut gapped: Vec<String> = gapped.into_iter().collect();
+    gapped.sort();
     StateGroupWalk {
         groups: result,
         instances,
+        gapped,
         incomplete,
     }
 }

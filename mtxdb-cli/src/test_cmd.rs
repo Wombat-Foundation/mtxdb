@@ -2012,12 +2012,18 @@ fn import_dedups_repeated_event_id_within_one_input() {
     .unwrap();
     let stats = store.stats();
     assert_eq!(
-        stats.put_many_calls, 2,
-        "the event batch and the state-group batch must each use one write"
+        stats.put_many_calls, 1,
+        "the repeated event_id needs only the event batch"
     );
     assert_eq!(
-        stats.put_many_records, 2,
-        "the repeated event_id must not be written twice, and its state mapping is one record"
+        stats.put_many_records, 1,
+        "the repeated event_id must not be written twice"
+    );
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(db.state().as_ref(), STATE_GROUP_NAMESPACE);
+    assert_eq!(
+        aux.get(b"$a").unwrap(),
+        None,
+        "a message with no prev_events has no complete base, so it must stay unmapped"
     );
     let node_id = template_node_id(&template, &events[0]).unwrap().unwrap();
     assert!(
@@ -2196,7 +2202,9 @@ fn importer_ignores_the_previous_unversioned_state_group_cache() {
     old_aux.put(b"$cached", &stale).unwrap();
     let new_aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
 
-    let event = import_event("$cached", "@alice", "!room");
+    let event = owned_value(
+        r#"{"event_id":"$cached","sender":"@alice","room_id":"!room","type":"m.room.create","state_key":"","prev_events":[],"content":{"room_version":"11"}}"#,
+    );
     let mut established = HashSet::new();
     established.insert(collection_id);
     import_pdu_events(
@@ -2231,6 +2239,9 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     let state_store = db.state().as_ref();
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     aux.ensure_metadata().unwrap();
+    let root = owned_value(
+        r#"{"event_id":"$root","sender":"@server","room_id":"!room","type":"m.room.create","state_key":"","prev_events":[],"content":{"room_version":"11"}}"#,
+    );
     let child = owned_value(
         r#"{"event_id":"$child","sender":"@alice","room_id":"!room","type":"m.room.message","prev_events":["$parent"],"content":{"room_version":"11"}}"#,
     );
@@ -2241,7 +2252,7 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
         store,
         state_store,
         &path,
-        std::slice::from_ref(&child),
+        &[root, child.clone()],
         &[],
         None,
         None,
@@ -2252,7 +2263,7 @@ fn importer_repairs_unresolved_state_group_on_a_later_complete_import() {
     assert_eq!(aux.get(b"$child").unwrap(), None);
 
     let repaired_parent = owned_value(
-        r#"{"event_id":"$parent","sender":"@server","room_id":"!room","type":"m.room.create","content":{"room_version":"11"}}"#,
+        r#"{"event_id":"$parent","sender":"@bob","room_id":"!room","type":"m.room.message","prev_events":["$root"],"content":{"room_version":"11"}}"#,
     );
     import_pdu_events(
         &db,
@@ -2768,8 +2779,7 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
                     FIXTURE_ROOM,
                     &arrived,
                     &auth_arrived,
-                    events,
-                    auth_chain,
+                    events.iter().chain(auth_chain.iter()),
                 )
                 .unwrap();
         }
@@ -2837,6 +2847,332 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
 /// A gapped append must not fall back and must not invent a state group: the
 /// event is stored, judged, and left unmapped exactly as the whole-room walk
 /// leaves it.
+/// The direct path judges against a local universe built from the timeline
+/// collection. A body that an earlier file supplied only in its `auth_chain`
+/// is not visible there, exactly as `load_collection_events` cannot see it, so
+/// both paths must report the same missing-auth verdict.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one loop imports the same fixture through both paths"
+)]
+fn direct_and_whole_room_agree_on_auth_pool_only_citations() {
+    use mtxdb::room_flag::{Flag, FlagQuery, RoomFlagIndex};
+
+    let room = "!auth_pool_universe:test";
+    let mut results = Vec::new();
+    for direct in [false, true] {
+        let dir = unique_temp_dir().join(format!("auth_pool_universe_{direct}"));
+        let db = Database::open(dir.clone()).unwrap();
+        let template = default_matrix_import_template();
+        let collection_id = template_collection_id(&template, room);
+        let store = db.event_dag();
+        let state_store = db.state().as_ref();
+        let mut established = HashSet::new();
+        let mut cache = ImportRunCache {
+            direct,
+            ..ImportRunCache::default()
+        };
+
+        let create = raw_event(
+            room,
+            "$create",
+            "m.room.create",
+            "",
+            r#"{"room_version":"10"}"#,
+            "[]",
+            "[]",
+        );
+        let first = raw_event(
+            room,
+            "$first",
+            "m.room.message",
+            "",
+            r#"{"body":"first"}"#,
+            r#"["$create"]"#,
+            r#"["$create"]"#,
+        );
+        // This join is only ever written to the State pool's auth collection.
+        let auth_only = raw_event(
+            room,
+            "$auth-only",
+            "m.room.member",
+            "@alice:test",
+            r#"{"membership":"join"}"#,
+            r#"["$create"]"#,
+            r#"["$create"]"#,
+        );
+        let federation_path = dir.join("room.json");
+        std::fs::write(
+            &federation_path,
+            format!(
+                r#"{{"pdus":[{},{}],"auth_chain":[{}]}}"#,
+                create.encode(),
+                first.encode(),
+                auth_only.encode()
+            ),
+        )
+        .unwrap();
+        cmd_import_file(
+            &db,
+            store,
+            state_store,
+            &federation_path,
+            None,
+            &template,
+            &mut established,
+            false,
+            None,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+
+        let cites_auth_only = raw_event(
+            room,
+            "$cites-auth-only",
+            "m.room.message",
+            "",
+            r#"{"body":"cites an auth-chain-only body"}"#,
+            r#"["$first"]"#,
+            r#"["$create","$auth-only"]"#,
+        );
+        let jsonl_path = dir.join("cites.jsonl");
+        std::fs::write(&jsonl_path, format!("{}\n", cites_auth_only.encode())).unwrap();
+        cmd_import_file(
+            &db,
+            store,
+            state_store,
+            &jsonl_path,
+            None,
+            &template,
+            &mut established,
+            false,
+            None,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+
+        let rejected = RoomFlagIndex::new(room.as_bytes())
+            .select(&db, &FlagQuery::has(Flag::Rejected))
+            .unwrap();
+        results.push((direct, cache.direct_files, rejected, collection_id));
+    }
+
+    let (_, off_direct_files, off_rejected, off_collection) = &results[0];
+    let (_, on_direct_files, on_rejected, on_collection) = &results[1];
+    assert_eq!(
+        off_direct_files, &0,
+        "the whole-room run never uses the gate"
+    );
+    assert_eq!(
+        on_direct_files, &1,
+        "the citing file must take the direct path so the test compares the two paths"
+    );
+    assert_eq!(off_collection, on_collection, "same room, same collection");
+    assert_eq!(
+        off_rejected, on_rejected,
+        "a citation visible only in the auth pool must get the same verdict either way"
+    );
+    assert!(
+        off_rejected
+            .iter()
+            .any(|id| id.as_slice() == b"$cites-auth-only"),
+        "the missing auth body must force MissingAuthEvent"
+    );
+}
+
+/// A group whose base is missing history must not be published: a later direct
+/// import would seed it as complete. The whole-room walk and the direct walk
+/// share this walk, so both leave the event and its descendants unmapped.
+#[test]
+fn gapped_groups_are_not_published_for_a_prev_less_event_or_its_child() {
+    let parent = owned_value(
+        r#"{"event_id":"$parent","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":[],"content":{}}"#,
+    );
+    let child = owned_value(
+        r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","sender":"@a:x","prev_events":["$parent"],"content":{}}"#,
+    );
+
+    let result = compute_state_groups_partial(&[parent, child], &[], "!r:x");
+    assert!(
+        !result.groups.contains_key("$parent"),
+        "a non-create event with no prev_events has no complete base"
+    );
+    assert!(
+        !result.groups.contains_key("$child"),
+        "incompleteness is inherited by descendants"
+    );
+    assert_eq!(
+        result.gapped,
+        vec!["$child".to_owned(), "$parent".to_owned()],
+        "both events are reported as gapped so diagnostics can explain the gap"
+    );
+    assert!(
+        result.instances.is_empty(),
+        "no instance should be retained for a group that cannot be published"
+    );
+}
+
+/// A projection written for a brand-new event is part of that event's own
+/// input; it must not be mistaken for a repair and disable the direct path.
+#[test]
+fn direct_import_runs_when_a_new_event_has_an_auth_projection() {
+    let dir = unique_temp_dir().join("direct_new_projection");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, FIXTURE_ROOM);
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut cache = ImportRunCache {
+        direct: true,
+        ..ImportRunCache::default()
+    };
+
+    let create = raw_event(
+        FIXTURE_ROOM,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let alice = raw_event(
+        FIXTURE_ROOM,
+        "$alice",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let third_party = with_content_hash(
+        raw_event(
+            FIXTURE_ROOM,
+            "$third-party",
+            "m.room.third_party_invite",
+            "token",
+            r#"{"public_key":"key","public_keys":[{"public_key":"key"}]}"#,
+            r#"["$alice"]"#,
+            r#"["$create","$alice"]"#,
+        ),
+        "11",
+    );
+
+    let first_path = dir.join("first.jsonl");
+    std::fs::write(
+        &first_path,
+        format!("{}\n{}\n", create.encode(), alice.encode()),
+    )
+    .unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        state_store,
+        &first_path,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+        Some(&mut cache),
+    )
+    .unwrap();
+
+    let second_path = dir.join("second.jsonl");
+    std::fs::write(&second_path, format!("{}\n", third_party.encode())).unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        state_store,
+        &second_path,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+        Some(&mut cache),
+    )
+    .unwrap();
+
+    assert_eq!(
+        cache.direct_files, 1,
+        "a new event's own projection must not force a whole-room fallback"
+    );
+    let ids: HashSet<String> = ["$third-party".to_owned()].into();
+    assert!(all_verdicts_present(&db, &template, &ids).unwrap());
+}
+
+/// A federation document with auth-chain bodies but no PDUs still updates the
+/// run-scoped waiting set. The PDUs path does that scan before the auth bodies
+/// are written; without an explicit fold here, an auth-only document would
+/// leave the set untouched.
+#[test]
+fn auth_only_federation_document_updates_the_waiting_set() {
+    let dir = unique_temp_dir().join("auth_only_waiting");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, FIXTURE_ROOM);
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let mut established = HashSet::new();
+    let mut cache = ImportRunCache {
+        direct: true,
+        ..ImportRunCache::default()
+    };
+
+    let provider = raw_event(
+        FIXTURE_ROOM,
+        "$provider",
+        "m.room.message",
+        "",
+        r#"{"body":"auth-chain only"}"#,
+        r#"["$missing-prev"]"#,
+        r#"["$missing-auth"]"#,
+    );
+    let path = dir.join("auth-only.json");
+    std::fs::write(
+        &path,
+        format!(r#"{{"pdus":[],"auth_chain":[{}]}}"#, provider.encode()),
+    )
+    .unwrap();
+    cmd_import_file(
+        &db,
+        store,
+        state_store,
+        &path,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+        Some(&mut cache),
+    )
+    .unwrap();
+
+    let waiting = cache
+        .waiting
+        .get(&collection_id)
+        .expect("the auth-only document must have installed a waiting set");
+    assert!(
+        waiting.prev.contains("$missing-prev"),
+        "an auth-chain-only body has no state group, so its prev gap stays"
+    );
+    assert!(
+        waiting.auth.contains("$missing-auth"),
+        "its auth reference is waiting because no store holds that body"
+    );
+}
+
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -2852,7 +3188,12 @@ fn direct_import_leaves_a_gapped_append_unmapped() {
     let state_store = db.state().as_ref();
     let mut established = HashSet::new();
     established.insert(collection_id);
-    let mut cache = ImportRunCache::default();
+    // Exercise the direct path explicitly instead of depending on the
+    // process-wide gate, so this test means the same thing in either mode.
+    let mut cache = ImportRunCache {
+        direct: true,
+        ..ImportRunCache::default()
+    };
 
     let create = raw_event(
         FIXTURE_ROOM,
@@ -2924,6 +3265,10 @@ fn direct_import_leaves_a_gapped_append_unmapped() {
         Some(&mut cache),
     )
     .unwrap();
+    assert_eq!(
+        cache.direct_files, 1,
+        "the second file must have taken the direct path, not the whole-room fallback"
+    );
 
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     let mapped = |id: &str| {
@@ -5875,7 +6220,7 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     assert_eq!(aux.get(b"$child").unwrap(), None);
 
     let parent = owned_value(
-        r#"{"event_id":"$parent","room_id":"!r:x","type":"m.room.create","content":{}}"#,
+        r#"{"event_id":"$parent","room_id":"!r:x","type":"m.room.create","state_key":"","content":{}}"#,
     );
     let repaired = compute_state_groups_partial(&[parent, incomplete], &[], "!r:x");
     assert!(repaired.groups.contains_key("$child"));
