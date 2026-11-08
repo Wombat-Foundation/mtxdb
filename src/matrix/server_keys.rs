@@ -16,15 +16,19 @@
 //! records, since retiring omitted keys, the digest-cap buckets and the
 //! retired-key ceiling are judged across them. A concurrent writer that touched
 //! any record read makes the commit fail with a stale read, and the whole
-//! read-resolve-write is retried.
+//! read-resolve-write is retried. Updates for the same origin collection are
+//! serialized in process, while version checks still protect against writes
+//! outside this path.
 //!
 //! A key's record is also its digest binding: evicting a retired key clears
 //! its bytes and keeps the record, so a later body for the key id still
 //! collides.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 use crate::database::{Database, DatabaseTransaction};
@@ -40,10 +44,21 @@ pub const SERVER_KEY_VERSION: u8 = 1;
 
 /// How many times [`update_server_keys`] re-runs after losing a race before it
 /// returns the stale-read error.
-const UPDATE_ATTEMPTS: usize = 256;
+const UPDATE_ATTEMPTS: usize = 32;
 /// Retry storage's explicitly transient read-committed reload failures.
 const OBSERVATION_RETRIES: usize = 8;
 const OBSERVATION_BATCH_SIZE: usize = 256;
+const UPDATE_LOCK_STRIPES: usize = 64;
+
+/// Fixed process-local lock stripes for origin updates. Different origins can
+/// occasionally share a stripe, avoiding an unbounded per-origin registry.
+static UPDATE_LOCKS: LazyLock<[Mutex<()>; UPDATE_LOCK_STRIPES]> =
+    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
+
+fn update_lock(collection: &[u8; 16]) -> &'static Mutex<()> {
+    let stripe = usize::from(collection[0] ^ collection[7] ^ collection[15]) % UPDATE_LOCK_STRIPES;
+    &UPDATE_LOCKS[stripe]
+}
 
 /// How firmly a key is bound to its origin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -842,10 +857,9 @@ fn stored_ids(db: &Database, collection: &[u8; 16]) -> Result<Vec<[u8; 16]>, Sto
 /// consistent with what is bound.
 ///
 /// # Errors
-/// Returns an error if the update fails validation, if a stored
-/// record is corrupt, if the pool cannot be read or written, or the stale-read
-/// stale-read or `WouldBlock` error if every attempt failed because of a race
-/// or a full journal segment.
+/// Returns an error if the update fails validation, if a stored record is
+/// corrupt, if the pool cannot be read or written, or if retries are exhausted
+/// because of a stale read or a full journal segment.
 pub fn update_server_keys(db: &Database, update: &KeyUpdate<'_>) -> Result<KeyMerge, StorageError> {
     validate(update)?;
     if update.observed.is_empty() && update.notary.is_none() && !update.snapshot {
@@ -855,6 +869,8 @@ pub fn update_server_keys(db: &Database, update: &KeyUpdate<'_>) -> Result<KeyMe
         });
     }
     let collection = origin_keys_collection_id(update.origin);
+    let collection_lock = update_lock(&collection);
+    let _update_guard = collection_lock.lock();
     retry_transient_update(|| try_update(db, update, collection))
 }
 
