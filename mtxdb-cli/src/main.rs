@@ -243,6 +243,7 @@ pub(crate) enum Commands {
         collection: String,
         template: Option<PathBuf>,
         term: String,
+        format: String,
         limit: i64,
     },
     Import {
@@ -841,6 +842,18 @@ fn sub_search() -> Command {
                 .long("template")
                 .value_name("FILE")
                 .help("Collection template declaring searchable JSON pointers"),
+        )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_name("FORMAT")
+                .default_value("id")
+                .value_parser(["id", "json", "text"])
+                .help(
+                    "Output per match: `id` prints the Matrix event ID (falling back to the \
+                     node ID), `json` prints the full event, `text` prints \
+                     `<timestamp> <sender> <type>` followed by the message body",
+                ),
         )
         .arg(limit_arg())
 }
@@ -1499,6 +1512,10 @@ fn parse_cli() -> Cli {
             collection: m.get_one::<String>("collection").unwrap().clone(),
             template: m.get_one::<String>("template").map(PathBuf::from),
             term: m.get_one::<String>("term").unwrap().clone(),
+            format: m
+                .get_one::<String>("format")
+                .expect("clap supplies a default format")
+                .clone(),
             limit: *m
                 .get_one::<i64>("limit")
                 .expect("clap supplies a default limit"),

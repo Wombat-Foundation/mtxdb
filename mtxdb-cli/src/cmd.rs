@@ -574,8 +574,9 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             collection,
             template,
             term,
+            format,
             limit,
-        } => cmd_search(cli, collection, template.as_deref(), term, *limit),
+        } => cmd_search(cli, collection, template.as_deref(), term, format, *limit),
         Commands::Import {
             paths,
             collection,
@@ -7627,7 +7628,14 @@ struct SearchTemplate {
 fn search_template(path: Option<&Path>) -> anyhow::Result<SearchTemplate> {
     let Some(path) = path else {
         return Ok(SearchTemplate {
-            fields: vec!["/type".to_owned(), "/sender".to_owned()],
+            fields: vec![
+                "/type".to_owned(),
+                "/sender".to_owned(),
+                "/content/body".to_owned(),
+                "/content/name".to_owned(),
+                "/content/topic".to_owned(),
+                "/content/displayname".to_owned(),
+            ],
             identity: Some("/event_id".to_owned()),
         });
     };
@@ -7692,10 +7700,11 @@ fn cmd_search(
     collection: &str,
     template_path: Option<&Path>,
     term: &str,
+    format: &str,
     limit: i64,
 ) -> anyhow::Result<()> {
     run_multi_dir(cli, |sub_cli| {
-        cmd_search_single(sub_cli, collection, template_path, term, limit)
+        cmd_search_single(sub_cli, collection, template_path, term, format, limit)
     })
 }
 
@@ -7704,6 +7713,7 @@ fn cmd_search_single(
     collection: &str,
     template_path: Option<&Path>,
     term: &str,
+    format: &str,
     limit: i64,
 ) -> anyhow::Result<()> {
     if term.is_empty() {
@@ -7726,12 +7736,50 @@ fn cmd_search_single(
         if !search_record_matches(&record, &spec.fields, term) {
             continue;
         }
+        // Records carry no `event_id` field, so the Matrix event ID comes from the
+        // event locator, as `timeline` does; the node ID is the last resort.
         let id = spec
             .identity
             .as_deref()
             .and_then(|pointer| extract_pointer_string(&record, pointer))
-            .map_or_else(|| format_id(&node_id), str::to_owned);
-        println!("{id}");
+            .map(str::to_owned)
+            .or_else(|| {
+                let locator_col = mtxdb::interop::event_locator_collection_id(&node_id);
+                let located = store.get(&locator_col, &node_id).ok().flatten()?;
+                let (eid, _) = mtxdb::interop::decode_event_locator(&located.bytes).ok()?;
+                std::str::from_utf8(eid).ok().map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| format_id(&node_id));
+        if format == "text" && results != 0 {
+            println!();
+        }
+        match format {
+            "json" => {
+                let mut view = record.clone();
+                if let Some(object) = view.as_object_mut() {
+                    object
+                        .entry("event_id".to_owned())
+                        .or_insert_with(|| OwnedValue::String(id.clone()));
+                }
+                println!("{view}");
+            },
+            "text" => {
+                let sender = extract_pointer_string(&record, "/sender").unwrap_or("?");
+                let kind = extract_pointer_string(&record, "/type").unwrap_or("?");
+                let when = record
+                    .get("origin_server_ts")
+                    .and_then(OwnedValue::as_i64)
+                    .map_or_else(|| "-".to_owned(), format_matrix_timestamp);
+                println!("{when} {sender} {kind} {id}");
+                if let Some(body) = ["/content/body", "/content/name", "/content/topic"]
+                    .iter()
+                    .find_map(|pointer| extract_pointer_string(&record, pointer))
+                {
+                    println!("  {body}");
+                }
+            },
+            _ => println!("{id}"),
+        }
         results = results.saturating_add(1);
         if max_results != 0 && results >= max_results {
             break;
