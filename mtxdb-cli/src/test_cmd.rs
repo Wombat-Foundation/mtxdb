@@ -3671,7 +3671,9 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
     .into_iter()
     .map(|event| {
         (
-            event_id(&event).expect("fixture event has an id").to_owned(),
+            event_id(&event)
+                .expect("fixture event has an id")
+                .to_owned(),
             event,
         )
     })
