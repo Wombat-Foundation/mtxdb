@@ -13593,7 +13593,7 @@ fn repair_import_state_groups(
         .saturating_sub(partial_event_count);
     let source = if loaded { "loaded" } else { "computed" };
     eprintln!(
-        "  state groups: {source} {unique_state_group_count} state groups; state derived for {} of {graph_event_count} events ({mapped_event_count} complete, {partial_event_count} partial: an ancestor body is absent), {stateless_event_count} without state ({unresolved_count} in cycles)",
+        "  state groups: {source} {unique_state_group_count} state groups; state: {} of {graph_event_count} events have a stored state group ({mapped_event_count} complete, {partial_event_count} partial forward extremities; an ancestor body is absent), {stateless_event_count} without ({unresolved_count} in cycles)",
         mapped_event_count.saturating_add(partial_event_count)
     );
     let mut materialized = computed_instances.is_empty();
@@ -14620,7 +14620,13 @@ fn walk_state_groups(
             !base_incomplete,
         );
 
-        if base_gapped {
+        // A partial state is kept only where nothing descends from the event
+        // (a forward extremity): that is the room's best-effort current state.
+        // Keeping one for every event copies the whole state map per state
+        // event, which is quadratic in memory on rooms with many members.
+        let keep_partial = base_gapped
+            && remaining_children.get(&short_id).copied().unwrap_or(0) == 0;
+        if keep_partial {
             partial_instances
                 .entry(state.instance)
                 .or_insert_with(|| StateInstance {
@@ -14648,7 +14654,9 @@ fn walk_state_groups(
                 // complete. The whole-room path must leave the same set
                 // unmapped so the two paths agree.
                 gapped.insert(eid.clone());
-                partial.insert(eid.clone(), state.instance);
+                if keep_partial {
+                    partial.insert(eid.clone(), state.instance);
+                }
             } else {
                 result.insert(eid.clone(), state.instance);
             }
