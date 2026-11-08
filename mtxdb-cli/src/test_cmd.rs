@@ -25,6 +25,7 @@ use super::{
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
+use mtxdb::export_schema::RejectionCode;
 use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::RoomAuth;
@@ -34,8 +35,8 @@ use mtxdb::template::{
     CollectionKeyRule, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
 };
 use mtxdb::{
-    content_digest, derive_collection_id, Database, DatabaseLayout, DigestAlgorithm,
-    MatrixRoomVersion, ShardType,
+    content_digest, decode_verdict, derive_collection_id, event_verdict_collection_id, Database,
+    DatabaseLayout, DigestAlgorithm, MatrixRoomVersion, ShardType,
 };
 use rezzy::json::Value as OwnedValue;
 use std::collections::HashSet;
@@ -2954,32 +2955,74 @@ fn direct_and_whole_room_agree_on_auth_pool_only_citations() {
         )
         .unwrap();
 
+        let rejected_while_auth_only = RoomFlagIndex::new(room.as_bytes())
+            .select(&db, &FlagQuery::has(Flag::Rejected))
+            .unwrap();
+        assert!(
+            rejected_while_auth_only
+                .iter()
+                .any(|id| id.as_slice() == b"$cites-auth-only"),
+            "the citing event is rejected: its prev state has no sender membership"
+        );
+
+        // Supply the same event as a timeline row. It is the same event id,
+        // so the auth gap was already closed by the auth-chain body; this is
+        // not a late arrival for `auth`. The direct path and the whole-room
+        // path must agree on that, even though the pass-1 judging universe
+        // still cannot read the prior auth-chain body.
+        let timeline_path = dir.join("auth-only-timeline.jsonl");
+        std::fs::write(&timeline_path, format!("{}\n", auth_only.encode())).unwrap();
+        cmd_import_file(
+            &db,
+            store,
+            state_store,
+            &timeline_path,
+            None,
+            &template,
+            &mut established,
+            false,
+            None,
+            true,
+            Some(&mut cache),
+        )
+        .unwrap();
+
+        let node = template_event_id_node_id(&template, "$cites-auth-only").unwrap();
+        let code = db
+            .pool(ShardType::EventDag)
+            .get(&event_verdict_collection_id(&node), &node)
+            .unwrap()
+            .map(|data| decode_verdict(&data.bytes).unwrap().1.rejection)
+            .expect("verdict record for $cites-auth-only");
         let rejected = RoomFlagIndex::new(room.as_bytes())
             .select(&db, &FlagQuery::has(Flag::Rejected))
             .unwrap();
-        results.push((direct, cache.direct_files, rejected, collection_id));
+        results.push((direct, cache.direct_files, rejected, collection_id, code));
     }
 
-    let (_, off_direct_files, off_rejected, off_collection) = &results[0];
-    let (_, on_direct_files, on_rejected, on_collection) = &results[1];
+    let (_, off_direct_files, off_rejected, off_collection, off_code) = &results[0];
+    let (_, on_direct_files, on_rejected, on_collection, on_code) = &results[1];
     assert_eq!(
         off_direct_files, &0,
         "the whole-room run never uses the gate"
     );
     assert_eq!(
-        on_direct_files, &1,
-        "the citing file must take the direct path so the test compares the two paths"
+        on_direct_files, &2,
+        "both JSONL files take the direct path; the timeline copy is not a late arrival"
     );
     assert_eq!(off_collection, on_collection, "same room, same collection");
     assert_eq!(
         off_rejected, on_rejected,
         "a citation visible only in the auth pool must get the same verdict either way"
     );
-    assert!(
-        off_rejected
-            .iter()
-            .any(|id| id.as_slice() == b"$cites-auth-only"),
-        "the missing auth body must force MissingAuthEvent"
+    assert_eq!(
+        off_code, on_code,
+        "the timeline copy of an already-present auth body must not change the verdict"
+    );
+    assert_eq!(
+        *off_code,
+        Some(RejectionCode::AuthCheckFailed.to_u8()),
+        "the auth-chain body satisfied check 4; check 5 rejects for missing membership"
     );
 }
 

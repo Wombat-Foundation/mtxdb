@@ -10276,9 +10276,11 @@ impl Default for ImportRunCache {
 /// it, never their state. Keeping the families apart is what lets a file
 /// decide, in O(|F|), whether it can touch earlier events at all.
 ///
-/// Only a stored timeline body satisfies `prev`: an auth-chain body has no
-/// state group, so it can never serve as a parent state base. Any body
-/// (timeline, auth chain, or auth projection) satisfies `auth`.
+/// A stored timeline body satisfies both families. An auth-chain body
+/// satisfies `auth` — it is the same event, merely stored as a provider — but
+/// not `prev`, because it has no state group and cannot be a parent state
+/// base. A projection is an overlay on a body, not a body, so it satisfies
+/// neither family.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct RoomWaiting {
     room_id: String,
@@ -10333,9 +10335,9 @@ impl RoomWaiting {
     /// Apply one successfully written file to the set.
     ///
     /// `timeline_arrived` are ids whose timeline body is now stored;
-    /// `auth_arrived` are ids whose body is now in the auth collection but
-    /// which are not timeline rows. A reference only enters the set when its
-    /// body is stored nowhere, which is why the presence sets are passed in.
+    /// `auth_arrived` are ids whose body is now in the auth-chain collection.
+    /// Only a timeline arrival clears `prev`; either arrival clears `auth`. A
+    /// reference enters a family when that family's body store has no record.
     fn observe_written(
         &mut self,
         timeline_arrived: &HashSet<String>,
@@ -10374,8 +10376,11 @@ impl RoomWaiting {
 }
 
 /// Ids among `ids` whose body is stored in the timeline collection, and ids
-/// whose body is stored anywhere a raw import can read one: timeline, auth
-/// chain, or an auth-only projection.
+/// whose body is stored in either body store a raw import can read: the
+/// timeline collection or the `AUTH`-namespace auth-chain collection.
+///
+/// A projection is an overlay on a body, not a body: it never makes an event
+/// readable on its own, so it is deliberately not counted here.
 fn stored_body_ids(
     store: &PackfileStorage,
     state_store: &PackfileStorage,
@@ -10396,22 +10401,48 @@ fn stored_body_ids(
     let auth_collection =
         derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
     let auth = state_store.get_many(&auth_collection, &nodes)?;
-    let projections = store.get_many(&raw_auth_projection_collection_id(room_id), &nodes)?;
     let mut timeline_present = HashSet::with_capacity(ordered.len());
-    let mut anywhere_present = HashSet::with_capacity(ordered.len());
-    for (((id, _), timeline), (auth, projection)) in ordered
-        .iter()
-        .zip(timeline)
-        .zip(auth.into_iter().zip(projections))
-    {
+    let mut body_present = HashSet::with_capacity(ordered.len());
+    for (((id, _), timeline), auth) in ordered.iter().zip(timeline).zip(auth) {
         if timeline.is_some() {
             timeline_present.insert(id.clone());
         }
-        if timeline.is_some() || auth.is_some() || projection.is_some() {
-            anywhere_present.insert(id.clone());
+        if timeline.is_some() || auth.is_some() {
+            body_present.insert(id.clone());
         }
     }
-    Ok((timeline_present, anywhere_present))
+    Ok((timeline_present, body_present))
+}
+
+/// Ids among `ids` whose body is stored in the room's auth-chain collection.
+///
+/// This is the prior-file presence probe for `auth_events` references. A
+/// timeline body is not included because an id already in the stored timeline
+/// is excluded from the candidate set before this is called.
+fn auth_pool_ids(
+    state_store: &PackfileStorage,
+    template: &CollectionTemplate,
+    room_id: &str,
+    ids: &HashSet<String>,
+) -> anyhow::Result<HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut ordered: Vec<(String, NodeId)> = Vec::with_capacity(ids.len());
+    for id in ids {
+        ordered.push((id.clone(), template_event_id_node_id(template, id)?));
+    }
+    let nodes: Vec<NodeId> = ordered.iter().map(|(_, node)| *node).collect();
+    let auth_collection =
+        derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
+    let records = state_store.get_many(&auth_collection, &nodes)?;
+    let mut present = HashSet::with_capacity(ordered.len());
+    for ((id, _), record) in ordered.iter().zip(records) {
+        if record.is_some() {
+            present.insert(id.clone());
+        }
+    }
+    Ok(present)
 }
 
 impl ImportRunCache {
@@ -11768,7 +11799,13 @@ fn import_pdu_events_with_raw_state_hamts(
             .map(String::as_str)
             .chain(auth_chain.iter().filter_map(event_id))
             .collect();
-        let mut missing_before: HashSet<&str> = HashSet::new();
+        // The two reference families use the same presence rule as the
+        // waiting set. A `prev` citation needs a timeline body: that is the
+        // state base. An `auth` citation is satisfied by a body in either the
+        // timeline or the auth-chain store: it is the same event, only the
+        // reference kind differs. Projections are overlays, not bodies.
+        let mut missing_prev: HashSet<&str> = HashSet::new();
+        let mut missing_auth: HashSet<&str> = HashSet::new();
         for event in &all_events {
             let Some(id) = event_id(event) else {
                 continue;
@@ -11776,20 +11813,75 @@ fn import_pdu_events_with_raw_state_hamts(
             if !already_redacted.contains(id) {
                 continue;
             }
-            for field in ["prev_events", "auth_events"] {
+            for (field, target) in [
+                ("prev_events", &mut missing_prev),
+                ("auth_events", &mut missing_auth),
+            ] {
                 let Some(references) = event.get(field).and_then(OwnedValue::as_array) else {
                     continue;
                 };
                 for reference in references {
                     if let Some(referenced) = reference.as_str() {
                         if !already_redacted.contains(referenced) {
-                            missing_before.insert(referenced);
+                            target.insert(referenced);
                         }
                     }
                 }
             }
         }
-        let clean_append = !supplied.iter().any(|id| missing_before.contains(id));
+        // A body that already existed before this file is not new information
+        // when the same event id is supplied again. Probe only the auth-chain
+        // store here: a candidate is by construction absent from the prior
+        // timeline, and the current file's timeline writes must remain "new"
+        // even though they are already durable when this runs.
+        if direct_identity {
+            let auth_candidates: HashSet<String> =
+                missing_auth.iter().map(|id| (*id).to_owned()).collect();
+            let prior_auth = auth_pool_ids(
+                state_store,
+                template,
+                &resolved.canonical_id,
+                &auth_candidates,
+            )?;
+            missing_auth.retain(|id| !prior_auth.contains(*id));
+        }
+        let clean_append = !supplied
+            .iter()
+            .any(|id| missing_prev.contains(id) || missing_auth.contains(id));
+
+        // Bodies cited by this room that live only in an earlier federation
+        // import's auth-chain collection are part of the local judging
+        // universe, exactly as the direct path includes them. They are not
+        // timeline rows and not state-DAG nodes: only the findings/check-4
+        // index sees them.
+        let known: HashSet<String> = all_events
+            .iter()
+            .filter_map(event_id)
+            .map(str::to_owned)
+            .collect();
+        let mut cited_external: HashSet<String> = HashSet::new();
+        for event in &all_events {
+            for reference in event_reference_ids(event) {
+                if !known.contains(&reference) {
+                    cited_external.insert(reference);
+                }
+            }
+        }
+        let external_auth: Vec<OwnedValue> = if !direct_identity || cited_external.is_empty() {
+            Vec::new()
+        } else {
+            load_event_bodies(
+                store,
+                state_store,
+                template,
+                &resolved.canonical_id,
+                &collection_id,
+                &cited_external,
+            )?
+            .0
+            .into_values()
+            .collect()
+        };
         let rewrite_ids: &HashSet<String> = if clean_append {
             &current_ids
         } else {
@@ -11812,6 +11904,7 @@ fn import_pdu_events_with_raw_state_hamts(
 
         let room_events: Vec<RoomEvent> = all_events
             .iter()
+            .chain(external_auth.iter())
             .filter_map(|event| RoomEvent::from_pdu(event, &resolved.canonical_id))
             .collect();
         let synthetic = RoomExport {
@@ -12231,26 +12324,25 @@ fn event_reference_ids(event: &OwnedValue) -> Vec<String> {
     ids
 }
 
-/// Load event bodies by event id from the room's timeline collection,
-/// overlaying an auth-only projection on each stored (redacted) body.
+/// Load event bodies by event id from the room's timeline collection or its
+/// auth-chain collection, overlaying the auth projection on either one.
 ///
-/// The timeline collection is the whole-room path's only body source
-/// (`load_collection_events`), so the direct path must not read the auth pool
-/// here either: a body stored only by an earlier file's `auth_chain` is not
-/// visible to `load_collection_events`, and reading it would make the two
-/// paths derive different verdicts. Cross-file auth-chain visibility is a
-/// separate step; until it lands, both paths report `MissingAuthEvent` for
-/// such a citation.
+/// Returns the bodies and, separately, the ids whose body came from the
+/// timeline collection. Only that second set is a stored *redacted* timeline
+/// row; an auth-chain body is stored raw and must still be redacted when its
+/// content hash fails. A projection is an overlay, never a body source.
 fn load_event_bodies(
     store: &PackfileStorage,
+    state_store: &PackfileStorage,
     template: &CollectionTemplate,
     room_id: &str,
     collection_id: &[u8; 16],
     ids: &HashSet<String>,
-) -> anyhow::Result<HashMap<String, OwnedValue>> {
+) -> anyhow::Result<(HashMap<String, OwnedValue>, HashSet<String>)> {
     let mut out = HashMap::with_capacity(ids.len());
+    let mut timeline_ids = HashSet::with_capacity(ids.len());
     if ids.is_empty() {
-        return Ok(out);
+        return Ok((out, timeline_ids));
     }
     let mut ordered: Vec<(String, [u8; 16])> = Vec::with_capacity(ids.len());
     for id in ids {
@@ -12258,10 +12350,17 @@ fn load_event_bodies(
     }
     let nodes: Vec<[u8; 16]> = ordered.iter().map(|(_, node)| *node).collect();
     let timeline = store.get_many(collection_id, &nodes)?;
+    let auth_collection =
+        derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
+    let auth = state_store.get_many(&auth_collection, &nodes)?;
     let projections = store.get_many(&raw_auth_projection_collection_id(room_id), &nodes)?;
-    for (((id, _node), timeline), projection) in ordered.into_iter().zip(timeline).zip(projections)
+    for (((id, _node), timeline), (auth, projection)) in ordered
+        .into_iter()
+        .zip(timeline)
+        .zip(auth.into_iter().zip(projections))
     {
-        let Some(record) = timeline else {
+        let from_timeline = timeline.is_some();
+        let Some(record) = timeline.or(auth) else {
             continue;
         };
         let Ok(mut value) = OwnedValue::parse_bytes(&record.bytes) else {
@@ -12272,9 +12371,12 @@ fn load_event_bodies(
                 overlay_auth_projection(&mut value, projection);
             }
         }
+        if from_timeline {
+            timeline_ids.insert(id.clone());
+        }
         out.insert(id, value);
     }
-    Ok(out)
+    Ok((out, timeline_ids))
 }
 
 fn state_set_from_entries(entries: Vec<(String, String, String)>) -> StateSet {
@@ -12416,8 +12518,17 @@ fn try_direct_raw_import(
     // Cited events that no store holds stay absent from the local universe.
     // A missing `prev` leaves its child unseeded (the topo sort blocks it); a
     // missing `auth` makes the findings pass report `MissingAuthEvent`. Both
-    // match what the whole-room path derives from the same room.
-    let external = load_event_bodies(store, template, room_id, collection_id, &external_refs)?;
+    // match what the whole-room path derives from the same room. A body held
+    // only by a previous federation import's auth-chain collection is a valid
+    // auth provider, not a gap.
+    let (external, external_timeline) = load_event_bodies(
+        store,
+        state_store,
+        template,
+        room_id,
+        collection_id,
+        &external_refs,
+    )?;
 
     // Load the after-state of every parent outside this file. A parent with no
     // stored group is left unseeded: the topological sort then blocks it and
@@ -12524,21 +12635,30 @@ fn try_direct_raw_import(
         .filter(|id| !local.contains_key(*id))
         .cloned()
         .collect();
+    let mut seed_timeline: HashSet<String> = HashSet::new();
     if !missing.is_empty() {
-        let loaded = load_event_bodies(store, template, room_id, collection_id, &missing)?;
+        let (loaded, loaded_timeline) = load_event_bodies(
+            store,
+            state_store,
+            template,
+            room_id,
+            collection_id,
+            &missing,
+        )?;
         if loaded.len() != missing.len() {
             return Ok(false);
         }
         for (id, event) in loaded {
             local.insert(id, event);
         }
+        seed_timeline = loaded_timeline;
     }
 
-    let stored_ids: HashSet<String> = local
-        .keys()
-        .filter(|id| !new_ids.contains(*id))
-        .cloned()
-        .collect();
+    // Only a timeline body is stored in the redacted timeline form. An
+    // auth-chain body is raw and must still be redacted when its hash fails.
+    let mut already_redacted: HashSet<String> = external_timeline;
+    already_redacted.extend(seed_timeline);
+    already_redacted.retain(|id| !new_ids.contains(id));
     let mut local_events: Vec<OwnedValue> = Vec::with_capacity(local.len());
     // Sort by event id: `local` is a hash map, and findings warnings are
     // emitted in encounter order. A stable universe keeps diagnostics stable
@@ -12555,7 +12675,8 @@ fn try_direct_raw_import(
     if local_rooms.len() != local_events.len() {
         return Ok(false);
     }
-    let redacted = export_import::redactions_for_export(&local_rooms, room_version, &stored_ids);
+    let redacted =
+        export_import::redactions_for_export(&local_rooms, room_version, &already_redacted);
     let lean = export_import::lean_redacted_events(&local_rooms, &redacted, room_id);
     let local_export = RoomExport {
         server: "raw-import".to_owned(),
@@ -12586,7 +12707,7 @@ fn try_direct_raw_import(
     let mut findings = export_import::derived_auth_findings_for_raw_with_inputs(
         &local_export,
         room_version,
-        &stored_ids,
+        &already_redacted,
         Some(&new_ids),
         &prior_rejected,
         &redacted,
@@ -12604,7 +12725,7 @@ fn try_direct_raw_import(
         Some(state_version),
         &mut rejected,
         &mut walk_rejections,
-        &stored_ids,
+        &already_redacted,
         Some(&new_ids),
         Some(&lean),
         &seeds,
