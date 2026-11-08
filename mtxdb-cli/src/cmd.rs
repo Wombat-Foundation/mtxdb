@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context};
 
@@ -9085,7 +9086,8 @@ fn has_signing_key_material(store: &PackfileStorage) -> anyhow::Result<bool> {
 /// stops after this leaves the database visibly incomplete.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the data pass shares every open pool and batch option with its file reader"
+    clippy::too_many_lines,
+    reason = "the data pass shares every open pool and batch option with its file reader, and its loop carries the per-file timing probe"
 )]
 fn import_data(
     db: &Database,
@@ -9168,6 +9170,7 @@ fn import_data(
                 key_pool_ready && run.signature_keys_available && !key_import_failed;
         }
         let is_keys_input = input_export_format(path) == Some(interchange::InputFormat::Keys);
+        let file_started = Instant::now();
         match cmd_import_file(
             db,
             store,
@@ -9190,6 +9193,13 @@ fn import_data(
                     key_import_failed = true;
                 }
             }
+        }
+        if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
+            eprintln!(
+                "import: {} took {:?}",
+                path.display(),
+                file_started.elapsed()
+            );
         }
     }
     reconcile_verified_key_observations(db, &mut run);
@@ -10283,12 +10293,26 @@ impl Default for ImportRunCache {
 /// not `prev`, because it has no state group and cannot be a parent state
 /// base. A projection is an overlay on a body, not a body, so it satisfies
 /// neither family.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 struct RoomWaiting {
     room_id: String,
     prev: HashSet<String>,
     auth: HashSet<String>,
+    /// Timeline bodies the rebuild saw referenced. A cheap lower bound on the
+    /// room's stored events, used only to bound the direct path's dirty set.
+    stored_events: usize,
 }
+
+/// Two waiting sets are equal when they wait for the same ids. The
+/// `stored_events` hint describes the room at the time it was built, so an
+/// incrementally updated set and a rebuild need not agree on it.
+impl PartialEq for RoomWaiting {
+    fn eq(&self, other: &Self) -> bool {
+        self.room_id == other.room_id && self.prev == other.prev && self.auth == other.auth
+    }
+}
+
+impl Eq for RoomWaiting {}
 
 /// The waiting ids a file supplies, by family.
 #[derive(Debug, Default, Clone)]
@@ -10316,6 +10340,7 @@ impl RoomWaiting {
                 .into_iter()
                 .filter(|id| !anywhere_present.contains(id))
                 .collect(),
+            stored_events: timeline_present.len(),
         }
     }
 
@@ -10615,8 +10640,14 @@ impl ImportRunCache {
         let mut queue: VecDeque<String> = VecDeque::new();
         for hit in hits.prev.iter().chain(hits.auth.iter()) {
             for edges in [
-                hits.prev.contains(hit).then(|| reverse.prev.get(hit)).flatten(),
-                hits.auth.contains(hit).then(|| reverse.auth.get(hit)).flatten(),
+                hits.prev
+                    .contains(hit)
+                    .then(|| reverse.prev.get(hit))
+                    .flatten(),
+                hits.auth
+                    .contains(hit)
+                    .then(|| reverse.auth.get(hit))
+                    .flatten(),
             ]
             .into_iter()
             .flatten()
@@ -10684,10 +10715,12 @@ impl ImportRunCache {
                         _ => None,
                     };
                     let Some(id) = id else { continue };
-                    let children = map.entry(id.to_owned()).or_default();
-                    if !children.iter().any(|known| known == child) {
-                        children.push(child.to_owned());
-                    }
+                    // Append without a duplicate scan: each event is normally
+                    // written once per run, and a duplicate child only costs a
+                    // repeated visit that the closure's `HashSet` collapses.
+                    // Scanning the whole child list per edge made this O(n²)
+                    // across a run and dominated the gapped import.
+                    map.entry(id.to_owned()).or_default().push(child.to_owned());
                 }
             }
         }
@@ -11822,7 +11855,7 @@ fn import_pdu_events_with_raw_state_hamts(
         .as_deref()
         .map_or_else(direct_import_enabled, |cache| cache.direct);
     let mut local_cache = ImportRunCache::default();
-    let waiting_hits = if direct && direct_identity && !to_write.is_empty() {
+    let (waiting_hits, stored_events_hint) = if direct && direct_identity && !to_write.is_empty() {
         let cache = room_cache.as_deref_mut().unwrap_or(&mut local_cache);
         let waiting = cache.ensure_waiting(
             db,
@@ -11832,38 +11865,56 @@ fn import_pdu_events_with_raw_state_hamts(
             &collection_id,
             &resolved.canonical_id,
         )?;
-        waiting.hits(current_ids.iter())
+        (waiting.hits(current_ids.iter()), waiting.stored_events)
     } else {
-        WaitingHits::default()
+        (WaitingHits::default(), 0)
     };
     // The reverse-edge closure of the waiting hits is the set of stored events
     // this file can change. Computing it before the writes keeps the closure
     // to the edges that existed before this file arrived.
-    let mut dirty_closure_failed = false;
+    let mut dirty_closure_bailed = false;
+    let closure_started = Instant::now();
     let dirty_ids = if direct
         && direct_identity
         && !to_write.is_empty()
         && (!waiting_hits.prev.is_empty() || !waiting_hits.auth.is_empty())
     {
         let cache = room_cache.as_deref_mut().unwrap_or(&mut local_cache);
-        match cache.dirty_closure(
-            db,
-            &collection_id,
-            &resolved.canonical_id,
-            &waiting_hits,
-        ) {
+        match cache.dirty_closure(db, &collection_id, &resolved.canonical_id, &waiting_hits) {
+            Ok(ids)
+                if stored_events_hint > 0 && ids.len().saturating_mul(2) > stored_events_hint =>
+            {
+                // Re-judging most of the room costs more than the whole-room
+                // path it would replace. Bail before loading bodies or
+                // walking; the transpose has already been paid once.
+                if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
+                    eprintln!(
+                        "direct: fallback, |D|={} exceeds half of {stored_events_hint} stored event(s)",
+                        ids.len()
+                    );
+                }
+                dirty_closure_bailed = true;
+                HashSet::new()
+            }
             Ok(ids) => ids,
             Err(error) => {
                 eprintln!(
                     "  warning: raw import reverse-edge lookup failed; using the whole-room path: {error:#}"
                 );
-                dirty_closure_failed = true;
+                dirty_closure_bailed = true;
                 HashSet::new()
             }
         }
     } else {
         HashSet::new()
     };
+    if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
+        eprintln!(
+            "direct: closure took {:?} for {} id(s)",
+            closure_started.elapsed(),
+            dirty_ids.len()
+        );
+    }
     record_csr_adjacency_with_raw(db, template, events, raw_adjacency)?;
 
     // Preserve causal order even when input arrives newest-first.
@@ -11906,6 +11957,7 @@ fn import_pdu_events_with_raw_state_hamts(
                 .filter_map(event_id)
                 .map(str::to_owned)
                 .collect();
+            let observe_started = Instant::now();
             cache.observe_written(
                 db,
                 store,
@@ -11917,7 +11969,15 @@ fn import_pdu_events_with_raw_state_hamts(
                 &auth_arrived,
                 events.iter().chain(auth_chain.iter()),
             )?;
+            let written_at = Instant::now();
             cache.observe_adjacency(&collection_id, &resolved.canonical_id, events.iter());
+            if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
+                eprintln!(
+                    "direct: observe waiting {:?}, adjacency {:?}",
+                    written_at.duration_since(observe_started),
+                    written_at.elapsed()
+                );
+            }
         }
     }
     // A file whose events are all stored already, whose auth chain is empty,
@@ -11938,7 +11998,7 @@ fn import_pdu_events_with_raw_state_hamts(
     // prev state groups and fall back to the whole-room walk on any condition
     // the direct path cannot prove.
     let direct_handled = direct
-        && !dirty_closure_failed
+        && !dirty_closure_bailed
         && !skip_judging
         && write_state_hamts
         && auth_chain.is_empty()
@@ -12690,6 +12750,7 @@ fn try_direct_raw_import(
         return Ok(false);
     };
     let direct_debug = std::env::var_os("MTXDB_DIRECT_DEBUG").is_some();
+    let direct_started = Instant::now();
     // A file that repairs an existing event's auth projection can change that
     // event's verdict, so the whole-room path (which re-judges every id in the
     // file) must handle it even when new events are also present. A projection
@@ -12756,6 +12817,13 @@ fn try_direct_raw_import(
         }
         dirty_timeline = loaded_timeline;
     }
+    if direct_debug {
+        eprintln!(
+            "direct: loaded {} dirty body(ies) in {:?}",
+            dirty_events.len(),
+            direct_started.elapsed()
+        );
+    }
     let mut rejudge_ids = new_ids.clone();
     rejudge_ids.extend(dirty_ids.iter().cloned());
     // The state walk needs both the new file and the stored events it can
@@ -12813,12 +12881,11 @@ fn try_direct_raw_import(
     let keys: Vec<&[u8]> = seed_ids.iter().map(String::as_bytes).collect();
     let loaded = aux.get_many(&keys)?;
     let mut seeds: HashMap<String, Arc<SharedState>> = HashMap::with_capacity(seed_ids.len());
+    let mut unseeded = 0_usize;
     for (id, value) in seed_ids.iter().zip(loaded) {
         let Some(value) = value else {
             // Referenced but never resolved; no state group to seed.
-            if direct_debug {
-                eprintln!("direct: no stored group for prev {id}");
-            }
+            unseeded = unseeded.saturating_add(1);
             continue;
         };
         if !valid_state_group_id(&value) {
@@ -12836,6 +12903,9 @@ fn try_direct_raw_import(
         // computation was complete (the writer suppresses publication when
         // `incomplete` is non-empty), so a stored group is a sound seed.
         seeds.insert(id.clone(), SharedState::new(set, group, true));
+    }
+    if direct_debug && unseeded > 0 {
+        eprintln!("direct: {unseeded} prev id(s) have no stored state group to seed");
     }
 
     // Auth-relevant state keys read by check 5 for this file's events. Only
@@ -12963,6 +13033,14 @@ fn try_direct_raw_import(
     // not a cascade input. Rejections outside the dirty set stay seeds.
     prior_rejected.retain(|id| !rejudge_ids.contains(id));
 
+    let judged_at = Instant::now();
+    if direct_debug {
+        eprintln!(
+            "direct: built a {}-event universe in {:?}",
+            local_events.len(),
+            judged_at.duration_since(direct_started)
+        );
+    }
     // Check 4 (state-before-event) and the hash/signature audits run over this
     // file against the local universe. The state walk contributes check 5
     // only, through the same helper the whole-room path uses.
@@ -12977,6 +13055,13 @@ fn try_direct_raw_import(
     )?;
     let mut rejected = export_import::rejected_event_ids(&local_export, &findings);
     rejected.extend(prior_rejected.iter().cloned());
+    let walk_started = Instant::now();
+    if direct_debug {
+        eprintln!(
+            "direct: findings took {:?}",
+            walk_started.duration_since(judged_at)
+        );
+    }
     let mut walk_rejections: HashMap<String, (u8, String)> = HashMap::new();
     let (computation, unchecked) = compute_import_auth_before(
         &walked_events,
@@ -12992,6 +13077,13 @@ fn try_direct_raw_import(
         Some(&lean),
         &seeds,
     );
+    if direct_debug {
+        eprintln!(
+            "direct: walk took {:?} for {} judged id(s)",
+            walk_started.elapsed(),
+            rejudge_ids.len()
+        );
+    }
     export_import::apply_walk_rejections(&local_export, &mut findings, &walk_rejections);
     for warning in findings.current_warnings(&new_ids) {
         eprintln!("  warning: {warning}");
@@ -13029,6 +13121,7 @@ fn try_direct_raw_import(
 
     // Publish content-addressed nodes and records before any mapping points at
     // them, then publish the event -> group mappings.
+    let publish_started = Instant::now();
     if !computation.instances.is_empty() {
         materialize_state_hamts(state_store, room_id, &computation.instances)?;
     }
@@ -13045,11 +13138,15 @@ fn try_direct_raw_import(
         aux.put_many(&entries)
             .context("persisting direct-import state-group mappings")?;
     }
+    if direct_debug {
+        eprintln!("direct: publish took {:?}", publish_started.elapsed());
+    }
 
     // `existing_ids` is D only: those records already have a verdict whose
     // soft-fail claim must survive this re-judge. The new file's events were
     // just written and have nothing to read back.
     let existing_ids: HashSet<&str> = dirty_ids.iter().map(String::as_str).collect();
+    let write_started = Instant::now();
     write_raw_verdicts_and_flags(
         db,
         &local_export.events,
@@ -13061,6 +13158,13 @@ fn try_direct_raw_import(
         template,
         room_id,
     )?;
+    if direct_debug {
+        eprintln!(
+            "direct: write took {:?}, total {:?}",
+            write_started.elapsed(),
+            direct_started.elapsed()
+        );
+    }
     Ok(true)
 }
 

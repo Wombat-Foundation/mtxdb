@@ -3368,14 +3368,10 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
             ..ImportRunCache::default()
         };
 
-        let event = |id: &str,
-                     kind: &str,
-                     state_key: &str,
-                     content: &str,
-                     prev: &str,
-                     auth: &str| {
-            raw_event(room, id, kind, state_key, content, prev, auth)
-        };
+        let event =
+            |id: &str, kind: &str, state_key: &str, content: &str, prev: &str, auth: &str| {
+                raw_event(room, id, kind, state_key, content, prev, auth)
+            };
         let create = event(
             "$create",
             "m.room.create",
@@ -3465,10 +3461,7 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
         };
         for path in [
             write("first.jsonl", &[&create, &join, &base]),
-            write(
-                "second.jsonl",
-                &[&early, &later, &child, &grandchild],
-            ),
+            write("second.jsonl", &[&early, &later, &child, &grandchild]),
             write("third.jsonl", &[&late_auth, &late_prev]),
         ] {
             cmd_import_file(
