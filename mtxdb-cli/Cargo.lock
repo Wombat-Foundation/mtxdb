@@ -513,7 +513,7 @@ dependencies = [
 [[package]]
 name = "rezzy"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#a0300e5d68c6435368ddf7951e1ab573ad39893b"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#bd1638277c4858532e5535eea08136384b898453"
 dependencies = [
  "base64",
  "blake3",
@@ -528,7 +528,7 @@ dependencies = [
 [[package]]
 name = "rezzy-json"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#a0300e5d68c6435368ddf7951e1ab573ad39893b"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#bd1638277c4858532e5535eea08136384b898453"
 dependencies = [
  "ryu",
 ]
@@ -536,7 +536,7 @@ dependencies = [
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#a0300e5d68c6435368ddf7951e1ab573ad39893b"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#bd1638277c4858532e5535eea08136384b898453"
 dependencies = [
  "tracing",
 ]
@@ -544,7 +544,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#a0300e5d68c6435368ddf7951e1ab573ad39893b"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#bd1638277c4858532e5535eea08136384b898453"
 dependencies = [
  "base64",
  "blake3",
