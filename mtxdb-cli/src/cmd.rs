@@ -10421,10 +10421,18 @@ impl ImportRunCache {
             &timeline_present,
             &anywhere_present,
         );
-        Ok(self.waiting.entry(*collection_id).or_insert(entry))
+        self.waiting.insert(*collection_id, entry);
+        Ok(self
+            .waiting
+            .get(collection_id)
+            .expect("entry was just inserted"))
     }
 
     /// The collection's waiting set, rebuilt once per run if it is not there.
+    ///
+    /// The only staleness check is the room id: an import run never deletes,
+    /// removes or repacks a room between files, so CSR rows only grow. A caller
+    /// that adds such an operation between files must rebuild instead.
     fn ensure_waiting(
         &mut self,
         db: &Database,
@@ -10485,7 +10493,10 @@ impl ImportRunCache {
                     };
                     let Some(id) = id else { continue };
                     let is_prev = field == "prev_events";
-                    if timeline_arrived.contains(id) || auth_arrived.contains(id) {
+                    // A timeline body is present for both families. An
+                    // auth-chain body is present only for `auth`; a `prev`
+                    // reference to it stays a gap and must still be recorded.
+                    if timeline_arrived.contains(id) || (!is_prev && auth_arrived.contains(id)) {
                         continue;
                     }
                     references.push((id.to_owned(), is_prev));
@@ -10737,18 +10748,20 @@ impl ImportContext<'_> {
         detected_collection: Option<&str>,
         collection_override: Option<&str>,
     ) -> anyhow::Result<()> {
-        import_pdu_events_with_state_hamts(
+        import_pdu_events_with_raw_state_hamts(
             self.db,
             self.store,
             self.state_store,
             path,
             pdus,
             auth_chain,
+            None,
             detected_collection,
             collection_override,
             self.template,
             self.established_collections,
             self.write_state_hamts,
+            self.room_cache.as_deref_mut(),
         )
     }
 
@@ -10847,6 +10860,7 @@ impl ImportContext<'_> {
             &HashSet::new(),
             None,
             None,
+            &HashMap::new(),
         );
         export_import::apply_walk_rejections(export, &mut findings, &walk_rejections);
         if unchecked > 0 {
@@ -10959,6 +10973,7 @@ fn compute_import_auth_before(
     already_redacted: &HashSet<String>,
     judge_only: Option<&HashSet<String>>,
     lean_input: Option<&[Option<LeanEvent<String>>]>,
+    seeds: &HashMap<String, Arc<SharedState>>,
 ) -> (PartialStateComputation, usize) {
     let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
     let Some(state_version) = state_version else {
@@ -10970,7 +10985,7 @@ fn compute_import_auth_before(
                 room_id,
                 policy,
                 Some(rejected),
-                &HashMap::new(),
+                seeds,
                 |_, _, _, _, _| None,
             ),
             0,
@@ -11016,7 +11031,7 @@ fn compute_import_auth_before(
         room_id,
         policy,
         Some(rejected),
-        &HashMap::new(),
+        seeds,
         |event_id, event, base, base_complete, current| {
             // Only events whose inputs can have changed need judging; the
             // walk still derives state for every event so later events get
@@ -11318,6 +11333,7 @@ fn import_pdu_events(
 }
 
 /// [`import_pdu_events`] with the state-HAMT write setting threaded through.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn import_pdu_events_with_state_hamts(
     db: &Database,
@@ -11589,7 +11605,14 @@ fn import_pdu_events_with_raw_state_hamts(
     // prior verdict, flag and state group is still valid, so skip reloading,
     // re-judging and repairing the whole room. Reimports stay O(file), not
     // O(room).
-    let skip_judging = to_write.is_empty() && auth_chain.is_empty() && new_projections == 0;
+    //
+    // Verify the verdicts actually exist first: a crash between the event
+    // write and the verdict write would otherwise leave this file permanently
+    // unjudged.
+    let skip_judging = to_write.is_empty()
+        && auth_chain.is_empty()
+        && new_projections == 0
+        && all_verdicts_present(db, template, &current_ids)?;
     // A clean append (nothing this file supplies was missing before) only
     // changes this file's own verdicts. Judge it directly against the stored
     // prev state groups and fall back to the whole-room walk on any condition
@@ -11610,6 +11633,7 @@ fn import_pdu_events_with_raw_state_hamts(
             events,
             &existed_before,
             &waiting_hits,
+            new_projections,
         )?;
     if direct_handled {
         if let Some(cache) = room_cache.as_mut() {
@@ -11812,6 +11836,7 @@ fn import_pdu_events_with_raw_state_hamts(
             &already_redacted,
             judge_only,
             Some(&lean),
+            &HashMap::new(),
         );
         export_import::apply_walk_rejections(&synthetic, &mut findings, &walk_rejections);
         if unchecked > 0 {
@@ -12138,6 +12163,7 @@ fn event_reference_ids(event: &OwnedValue) -> Vec<String> {
 /// projection on each stored (redacted) body.
 fn load_event_bodies(
     store: &PackfileStorage,
+    state_store: &PackfileStorage,
     template: &CollectionTemplate,
     room_id: &str,
     collection_id: &[u8; 16],
@@ -12155,9 +12181,9 @@ fn load_event_bodies(
     let timeline = store.get_many(collection_id, &nodes)?;
     let auth_collection =
         derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room_id.as_bytes());
-    let auth = store.get_many(&auth_collection, &nodes)?;
+    let auth = state_store.get_many(&auth_collection, &nodes)?;
     let projections = store.get_many(&raw_auth_projection_collection_id(room_id), &nodes)?;
-    for (((id, node), timeline), (auth, projection)) in ordered
+    for (((id, _node), timeline), (auth, projection)) in ordered
         .into_iter()
         .zip(timeline)
         .zip(auth.into_iter().zip(projections))
@@ -12173,7 +12199,6 @@ fn load_event_bodies(
                 overlay_auth_projection(&mut value, projection);
             }
         }
-        let _ = node;
         out.insert(id, value);
     }
     Ok(out)
@@ -12199,6 +12224,52 @@ fn state_set_from_entries(entries: Vec<(String, String, String)>) -> StateSet {
     clippy::too_many_lines,
     reason = "the direct path owns seeding, local judging, and delta writes"
 )]
+/// Whether every id already has a stored verdict record.
+///
+/// The reimport fast path skips judging when a file has no new bytes. That is
+/// only safe if the previous import actually finished writing verdicts; a
+/// crash between the event write and the verdict write must not make the file
+/// permanently unjudged.
+fn all_verdicts_present(
+    db: &Database,
+    template: &CollectionTemplate,
+    ids: &HashSet<String>,
+) -> anyhow::Result<bool> {
+    if ids.is_empty() {
+        return Ok(true);
+    }
+    if !matches!(
+        &template.record_id_rule.policy,
+        FrameIdPolicy::Pointer { pointer } if pointer == "/event_id"
+    ) {
+        return Ok(false);
+    }
+    let mut by_collection: HashMap<[u8; 16], Vec<NodeId>> = HashMap::new();
+    for id in ids {
+        let node = template_event_id_node_id(template, id)?;
+        by_collection
+            .entry(event_verdict_collection_id(&node))
+            .or_default()
+            .push(node);
+    }
+    let store = db.pool(ShardType::EventDag);
+    for (collection, nodes) in by_collection {
+        if store
+            .get_many(&collection, &nodes)?
+            .iter()
+            .any(Option::is_none)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the direct path owns seeding, local judging, and delta writes"
+)]
 fn try_direct_raw_import(
     db: &Database,
     store: &PackfileStorage,
@@ -12210,6 +12281,7 @@ fn try_direct_raw_import(
     events: &[OwnedValue],
     existed_before: &HashSet<String>,
     waiting_hits: &WaitingHits,
+    new_projections: usize,
 ) -> anyhow::Result<bool> {
     if !matches!(
         &template.record_id_rule.policy,
@@ -12220,6 +12292,16 @@ fn try_direct_raw_import(
     let Some(state_version) = StateResVersion::from_room_version(room_version) else {
         return Ok(false);
     };
+    let direct_debug = std::env::var_os("MTXDB_DIRECT_DEBUG").is_some();
+    // A file that repairs an existing event's auth projection can change that
+    // event's verdict, so the whole-room path (which re-judges every id in the
+    // file) must handle it even when new events are also present.
+    if new_projections > 0 {
+        if direct_debug {
+            eprintln!("direct: fallback, {new_projections} new auth projection(s)");
+        }
+        return Ok(false);
+    }
     let mut new_ids: HashSet<String> = HashSet::new();
     let mut new_events: Vec<OwnedValue> = Vec::new();
     for event in events {
@@ -12238,7 +12320,6 @@ fn try_direct_raw_import(
     // that earlier event: a `prev` arrival can change descendant state groups,
     // an `auth` arrival can change verdicts. The reverse-edge dirty closure is
     // not part of this pass, so hand both to the whole-room path.
-    let direct_debug = std::env::var_os("MTXDB_DIRECT_DEBUG").is_some();
     let prev_hits = waiting_hits.prev.intersection(&new_ids).count();
     let auth_hits = waiting_hits.auth.intersection(&new_ids).count();
     if prev_hits > 0 || auth_hits > 0 {
@@ -12258,13 +12339,24 @@ fn try_direct_raw_import(
             }
         }
     }
-    let external = load_event_bodies(store, template, room_id, collection_id, &external_refs)?;
-    if external.len() != external_refs.len() {
-        return Ok(false);
-    }
+    // Cited events that no store holds stay absent from the local universe.
+    // A missing `prev` leaves its child unseeded (the topo sort blocks it); a
+    // missing `auth` makes the findings pass report `MissingAuthEvent`. Both
+    // match what the whole-room path derives from the same room.
+    let external = load_event_bodies(
+        store,
+        state_store,
+        template,
+        room_id,
+        collection_id,
+        &external_refs,
+    )?;
 
-    // Load the after-state of every parent outside this file.
-    let mut seed_groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
+    // Load the after-state of every parent outside this file. A parent with no
+    // stored group is left unseeded: the topological sort then blocks it and
+    // its descendants, so they get no group, exactly as the whole-room path
+    // leaves a gapped ancestry unmapped.
+    let mut seed_ids: HashSet<String> = HashSet::new();
     for event in &new_events {
         let Some(prevs) = event.get("prev_events").and_then(OwnedValue::as_array) else {
             continue;
@@ -12277,17 +12369,21 @@ fn try_direct_raw_import(
             };
             let Some(id) = id else { continue };
             if !new_ids.contains(id) {
-                seed_groups.insert(id.to_owned(), [0u8; STATE_GROUP_ID_LENGTH]);
+                seed_ids.insert(id.to_owned());
             }
         }
     }
-    let seed_ids: Vec<String> = seed_groups.keys().cloned().collect();
+    let seed_ids: Vec<String> = seed_ids.into_iter().collect();
     let keys: Vec<&[u8]> = seed_ids.iter().map(String::as_bytes).collect();
     let loaded = aux.get_many(&keys)?;
     let mut seeds: HashMap<String, Arc<SharedState>> = HashMap::with_capacity(seed_ids.len());
     for (id, value) in seed_ids.iter().zip(loaded) {
         let Some(value) = value else {
-            return Ok(false);
+            // Referenced but never resolved; no state group to seed.
+            if direct_debug {
+                eprintln!("direct: no stored group for prev {id}");
+            }
+            continue;
         };
         if !valid_state_group_id(&value) {
             return Ok(false);
@@ -12300,6 +12396,9 @@ fn try_direct_raw_import(
             return Ok(false);
         };
         let set = state_set_from_entries(entries);
+        // A stored group is only published by the whole-room path when its
+        // computation was complete (the writer suppresses publication when
+        // `incomplete` is non-empty), so a stored group is a sound seed.
         seeds.insert(id.clone(), SharedState::new(set, group, true));
     }
 
@@ -12329,10 +12428,14 @@ fn try_direct_raw_import(
             room_version,
         ));
     }
+    // Seed state bodies are different: a published state group must name
+    // events that exist somewhere. If one cannot be loaded the store is
+    // inconsistent, so fall back rather than judge against a partial state.
+    let mut seed_refs: HashSet<String> = HashSet::new();
     for seed in seeds.values() {
         for (key, event_id) in &seed.set.entries {
             if needed_keys.contains(key) && !new_ids.contains(event_id) {
-                external_refs.insert(event_id.clone());
+                seed_refs.insert(event_id.clone());
             }
         }
     }
@@ -12349,13 +12452,20 @@ fn try_direct_raw_import(
     for (id, event) in external {
         local.entry(id).or_insert(event);
     }
-    let missing: HashSet<String> = external_refs
+    let missing: HashSet<String> = seed_refs
         .iter()
         .filter(|id| !local.contains_key(*id))
         .cloned()
         .collect();
     if !missing.is_empty() {
-        let loaded = load_event_bodies(store, template, room_id, collection_id, &missing)?;
+        let loaded = load_event_bodies(
+            store,
+            state_store,
+            template,
+            room_id,
+            collection_id,
+            &missing,
+        )?;
         if loaded.len() != missing.len() {
             return Ok(false);
         }
@@ -12370,9 +12480,7 @@ fn try_direct_raw_import(
         .cloned()
         .collect();
     let mut local_events: Vec<OwnedValue> = Vec::with_capacity(local.len());
-    let mut local_positions: HashMap<String, usize> = HashMap::with_capacity(local.len());
-    for (id, event) in &local {
-        local_positions.insert(id.clone(), local_events.len());
+    for event in local.values() {
         local_events.push(event.clone());
     }
     let local_rooms: Vec<RoomEvent> = local_events
@@ -12382,99 +12490,89 @@ fn try_direct_raw_import(
     if local_rooms.len() != local_events.len() {
         return Ok(false);
     }
-    let index: HashMap<&[u8], usize> = local_rooms
-        .iter()
-        .enumerate()
-        .map(|(position, event)| (event.event_id.as_bytes(), position))
-        .collect();
     let redacted = export_import::redactions_for_export(&local_rooms, room_version, &stored_ids);
     let lean = export_import::lean_redacted_events(&local_rooms, &redacted, room_id);
-    let create = local_rooms
-        .iter()
-        .position(|event| {
-            event.pdu.get("type").and_then(OwnedValue::as_str) == Some("m.room.create")
-                && event.pdu.get("state_key").and_then(OwnedValue::as_str) == Some("")
-        })
-        .and_then(|position| lean[position].as_ref());
+    let local_export = RoomExport {
+        server: "raw-import".to_owned(),
+        room_id: room_id.to_owned(),
+        events: local_rooms,
+        timeline: false,
+    };
 
-    let mut rejected: HashSet<String> = RoomFlagIndex::new(room_id.as_bytes())
-        .select(db, &FlagQuery::has(Flag::Rejected))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|id| String::from_utf8(id).ok())
-        .collect();
+    // Prior rejections are cascade inputs. The direct path depends on them, so
+    // an unreadable flag index must fall back rather than look unrejected.
+    let prior_rejected: HashSet<String> =
+        match RoomFlagIndex::new(room_id.as_bytes()).select(db, &FlagQuery::has(Flag::Rejected)) {
+            Ok(ids) => ids
+                .into_iter()
+                .filter_map(|id| String::from_utf8(id).ok())
+                .collect(),
+            Err(error) => {
+                if direct_debug {
+                    eprintln!("direct: fallback, rejection flags unreadable: {error}");
+                }
+                return Ok(false);
+            }
+        };
+
+    // Check 4 (state-before-event) and the hash/signature audits run over this
+    // file against the local universe. The state walk contributes check 5
+    // only, through the same helper the whole-room path uses.
+    let mut findings = export_import::derived_auth_findings_for_raw_with_inputs(
+        &local_export,
+        room_version,
+        &stored_ids,
+        Some(&new_ids),
+        &prior_rejected,
+        &redacted,
+        &lean,
+    )?;
+    let mut rejected = export_import::rejected_event_ids(&local_export, &findings);
+    rejected.extend(prior_rejected.iter().cloned());
     let mut walk_rejections: HashMap<String, (u8, String)> = HashMap::new();
-    let mut unchecked = 0_usize;
-    let policy = resolution_policy(room_version, StateGroupTrust::TrustedImport);
-    let computation = compute_state_groups_partial_with(
+    let (computation, unchecked) = compute_import_auth_before(
         &new_events,
         &[],
-        StateView::Federated,
+        &local_export.events,
         room_id,
-        policy,
-        Some(&mut rejected),
+        room_version,
+        Some(state_version),
+        &mut rejected,
+        &mut walk_rejections,
+        &stored_ids,
+        Some(&new_ids),
+        Some(&lean),
         &seeds,
-        |event_id, event, base, base_complete, current| {
-            let Some(&position) = index.get(event_id.as_bytes()) else {
-                unchecked = unchecked.saturating_add(1);
-                return None;
-            };
-            if let Some(current) = current {
-                let cites_rejected = event
-                    .get("auth_events")
-                    .and_then(OwnedValue::as_array)
-                    .is_some_and(|ids| {
-                        ids.iter()
-                            .any(|id| id.as_str().is_some_and(|id| current.contains(id)))
-                    });
-                if cites_rejected {
-                    let code = RejectionCode::DependsOnRejectedAuthEvent.to_u8();
-                    let reason = "auth_events cites a rejected event".to_owned();
-                    walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
-                    return Some((code, reason));
-                }
-            }
-            if !base_complete {
-                unchecked = unchecked.saturating_add(1);
-                return None;
-            }
-            let entries = auth_entries_from_base(event, base, state_version, room_version);
-            match export_import::judge_event_with_state(
-                &local_rooms[position],
-                lean[position].as_ref(),
-                &index,
-                &lean,
-                create,
-                state_version,
-                &entries,
-            ) {
-                Ok(export_import::EventAuthOutcome::Refused { code, reason }) => {
-                    walk_rejections.insert(event_id.to_owned(), (code, reason.clone()));
-                    Some((code, reason))
-                }
-                Ok(export_import::EventAuthOutcome::Passed) => None,
-                Ok(export_import::EventAuthOutcome::Unchecked) => {
-                    unchecked = unchecked.saturating_add(1);
-                    None
-                }
-                Err(error) => {
-                    eprintln!("  warning: error judging event {event_id}: {error}");
-                    unchecked = unchecked.saturating_add(1);
-                    None
-                }
-            }
-        },
     );
-    if unchecked > 0 || !computation.incomplete.is_empty() {
+    export_import::apply_walk_rejections(&local_export, &mut findings, &walk_rejections);
+    for warning in findings.current_warnings(&new_ids) {
+        eprintln!("  warning: {warning}");
+    }
+    if unchecked > 0 {
+        eprintln!(
+            "  warning: {unchecked} event(s) could not be checked against the state before them"
+        );
+    }
+    // A merge that fell back because the walk was missing part of the auth
+    // closure is not provable with this file's event pool; the whole-room path
+    // has the full set.
+    if !computation.incomplete.is_empty() {
+        if direct_debug {
+            eprintln!(
+                "direct: fallback, incomplete merges: {:?}",
+                computation.incomplete
+            );
+        }
         return Ok(false);
     }
-    for event in &new_events {
-        let Some(id) = event_id(event) else {
-            return Ok(false);
-        };
-        if !computation.groups.contains_key(id) {
-            return Ok(false);
-        }
+    if direct_debug {
+        eprintln!(
+            "direct: |F|={}, |D|={}, seeds={}, unchecked={unchecked}, unmapped={}",
+            new_events.len(),
+            computation.groups.len(),
+            seeds.len(),
+            new_ids.len().saturating_sub(computation.groups.len()),
+        );
     }
 
     // Publish content-addressed nodes and records before any mapping points at
@@ -12503,9 +12601,15 @@ fn try_direct_raw_import(
     if new_rooms.len() != new_events.len() {
         return Ok(false);
     }
+    let forced_by_id: HashMap<&str, Option<u8>> = local_export
+        .events
+        .iter()
+        .zip(&findings.forced)
+        .map(|(event, forced)| (event.event_id.as_str(), *forced))
+        .collect();
     let forced: Vec<Option<u8>> = new_rooms
         .iter()
-        .map(|event| walk_rejections.get(&event.event_id).map(|(code, _)| *code))
+        .map(|event| forced_by_id.get(event.event_id.as_str()).copied().flatten())
         .collect();
     write_raw_verdicts_and_flags(
         db,
@@ -12852,6 +12956,7 @@ fn repair_import_state_groups(
                 &HashSet::new(),
                 None,
                 None,
+                &HashMap::new(),
             );
             if unchecked > 0 {
                 eprintln!(

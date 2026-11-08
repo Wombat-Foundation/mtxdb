@@ -1,25 +1,26 @@
 use super::{
-    base_is_incomplete, build_event_dag, canonical_column_width, cmd_collections, cmd_flags,
-    cmd_get, cmd_import, cmd_import_file, cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan,
-    cmd_scan_collection_live_rows, cmd_shards, cmd_stats, cmd_sync, cmd_tombstones,
-    collection_canonical_id, compile_import_template, compute_state_groups_partial,
+    all_verdicts_present, base_is_incomplete, build_event_dag, canonical_column_width,
+    cmd_collections, cmd_flags, cmd_get, cmd_import, cmd_import_file, cmd_info, cmd_remove,
+    cmd_repack_coalesced, cmd_scan, cmd_scan_collection_live_rows, cmd_shards, cmd_stats, cmd_sync,
+    cmd_tombstones, collection_canonical_id, compile_import_template, compute_state_groups_partial,
     decode_event_json_record, decode_hamt_node, decode_hamt_root, default_matrix_import_template,
-    derive_template_key, display_collection_role, event_id, event_room_id, event_short_id,
-    export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
-    format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
-    import_pdu_events_with_raw, interleaving_worth_noting, is_server_keys_export, keys_first,
-    listing_shard_types, load_collection_events, load_state_groups, matrix_batch_has_create,
-    matrix_room_collection_id, matrix_room_extension_from_store, meta_checkpoints, meta_lock_line,
-    meta_pools, meta_raw, overlay_auth_projection, pack_identity, parse_federation_input,
-    parse_pack_id_selector, parse_pack_selectors, partial_topo_sort_dag, prepare_state_collection,
-    pretty_print_payload, raw_auth_projection, raw_auth_projection_collection_id,
-    record_csr_adjacency, redacted_event_bytes, resolve_import_collection, run,
-    scan_payload_suffix, search_record_matches, search_template, split_canonical_display,
-    template_collection_id, template_event_id_node_id, template_node_id, topological_event_order,
-    valid_json_pointer, valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections,
-    CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache,
-    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions,
-    SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    derive_template_key, direct_import_enabled, display_collection_role, event_id, event_room_id,
+    event_short_id, export_envelope_line, extract_pointer_string, finish_import,
+    fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id, glob_pack_files,
+    import_data, import_pdu_events, import_pdu_events_with_raw, interleaving_worth_noting,
+    is_server_keys_export, keys_first, listing_shard_types, load_collection_events,
+    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
+    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
+    overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
+    parse_pack_selectors, partial_topo_sort_dag, prepare_state_collection, pretty_print_payload,
+    raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
+    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+    search_record_matches, search_template, split_canonical_display, template_collection_id,
+    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
+    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
+    CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache, JsonValueExt,
+    MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions, SharedState,
+    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
     STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
@@ -2653,14 +2654,16 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
         r#"["$create"]"#,
         r#"["$create"]"#,
     );
-    // `cites_gaps` names `$later-auth` as both a prev and an auth reference,
-    // so a later auth-chain-only arrival must clear only the auth gap.
+    // `cites_gaps` cites `$later-auth` only from `auth_events`. The
+    // federation file below makes a `pdus` event cite it from `prev_events`
+    // while providing it only in `auth_chain`; that must still leave a prev
+    // gap, because an auth body cannot seed a state group.
     let later_prev = event(
         "$later-prev",
         "m.room.message",
         "",
         r#"{"body":"late parent"}"#,
-        r#"["$create"]"#,
+        r#"["$create","$later-auth"]"#,
         r#"["$create"]"#,
     );
     let later_auth = event(
@@ -2684,7 +2687,7 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
         "m.room.message",
         "",
         r#"{"body":"gaps"}"#,
-        r#"["$first","$later-prev","$later-auth"]"#,
+        r#"["$first","$later-prev"]"#,
         r#"["$create","$later-auth"]"#,
     );
 
@@ -2742,8 +2745,8 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
         )
         .unwrap();
 
-        // Apply the file explicitly too, so the comparison holds whether or
-        // not the direct-import gate is on.
+        // Apply the file explicitly when the importer's gate is off, so the
+        // comparison holds in both modes without encoding a double apply.
         let arrived: HashSet<String> = events
             .iter()
             .filter_map(event_id)
@@ -2754,20 +2757,22 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
             .filter_map(event_id)
             .map(str::to_owned)
             .collect();
-        cache
-            .observe_written(
-                &db,
-                store,
-                state_store,
-                &template,
-                &collection_id,
-                FIXTURE_ROOM,
-                &arrived,
-                &auth_arrived,
-                events,
-                auth_chain,
-            )
-            .unwrap();
+        if !direct_import_enabled() {
+            cache
+                .observe_written(
+                    &db,
+                    store,
+                    state_store,
+                    &template,
+                    &collection_id,
+                    FIXTURE_ROOM,
+                    &arrived,
+                    &auth_arrived,
+                    events,
+                    auth_chain,
+                )
+                .unwrap();
+        }
 
         let incremental = cache.waiting.get(&collection_id).cloned();
         {
@@ -2796,7 +2801,10 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
             }
             1 => {
                 assert!(waiting.prev.contains("$later-prev"));
-                assert!(waiting.prev.contains("$later-auth"));
+                assert!(
+                    !waiting.prev.contains("$later-auth"),
+                    "an auth reference alone is not a prev gap"
+                );
                 assert!(waiting.auth.contains("$later-auth"));
             }
             2 => {
@@ -2806,7 +2814,7 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
                 );
                 assert!(
                     waiting.prev.contains("$later-auth"),
-                    "an auth-chain-only body must not clear a prev gap"
+                    "an auth-chain-only body must not suppress a prev gap made in the same file"
                 );
                 assert!(
                     !waiting.auth.contains("$later-auth"),
@@ -2824,6 +2832,127 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
             }
         }
     }
+}
+
+/// A gapped append must not fall back and must not invent a state group: the
+/// event is stored, judged, and left unmapped exactly as the whole-room walk
+/// leaves it.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the two-file setup is the scenario; splitting it hides the ordering"
+)]
+fn direct_import_leaves_a_gapped_append_unmapped() {
+    let dir = unique_temp_dir().join("direct_gapped_append");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Database::open(dir.clone()).unwrap();
+    let template = default_matrix_import_template();
+    let collection_id = template_collection_id(&template, FIXTURE_ROOM);
+    let store = db.event_dag();
+    let state_store = db.state().as_ref();
+    let mut established = HashSet::new();
+    established.insert(collection_id);
+    let mut cache = ImportRunCache::default();
+
+    let create = raw_event(
+        FIXTURE_ROOM,
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let first = raw_event(
+        FIXTURE_ROOM,
+        "$first",
+        "m.room.message",
+        "",
+        r#"{"body":"first"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let gapped = raw_event(
+        FIXTURE_ROOM,
+        "$gapped",
+        "m.room.message",
+        "",
+        r#"{"body":"gapped"}"#,
+        r#"["$first","$missing-prev"]"#,
+        r#"["$create","$first"]"#,
+    );
+
+    let write = |name: &str, events: &[OwnedValue]| {
+        let path = dir.join(name);
+        let mut text = String::new();
+        for event in events {
+            text.push_str(&event.encode());
+            text.push('\n');
+        }
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+
+    let first_path = write("first.jsonl", &[create, first]);
+    cmd_import_file(
+        &db,
+        store,
+        state_store,
+        &first_path,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+        Some(&mut cache),
+    )
+    .unwrap();
+
+    let gapped_path = write("gapped.jsonl", std::slice::from_ref(&gapped));
+    cmd_import_file(
+        &db,
+        store,
+        state_store,
+        &gapped_path,
+        None,
+        &template,
+        &mut established,
+        false,
+        None,
+        true,
+        Some(&mut cache),
+    )
+    .unwrap();
+
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
+    let mapped = |id: &str| {
+        aux.get_many(&[id.as_bytes()])
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .is_some()
+    };
+    assert!(
+        mapped("$first"),
+        "the anchored prefix keeps its state group"
+    );
+    assert!(
+        !mapped("$gapped"),
+        "an event blocked by an unseeded prev has no state group"
+    );
+
+    let node = template_event_id_node_id(&template, "$gapped").unwrap();
+    assert!(
+        store.get(&collection_id, &node).unwrap().is_some(),
+        "the blocked event is still stored"
+    );
+    let ids: HashSet<String> = ["$gapped".to_owned()].into();
+    assert!(
+        all_verdicts_present(&db, &template, &ids).unwrap(),
+        "the blocked event still gets a check-4 verdict"
+    );
 }
 
 #[test]

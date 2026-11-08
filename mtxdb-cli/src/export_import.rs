@@ -1017,18 +1017,24 @@ impl AuthFindings {
 /// to `DependsOnRejectedAuthEvent`, transitively. The exported verdicts are not
 /// read. The room fails as a whole when its `m.room.create` would be forced.
 pub(crate) fn auth_findings(export: &RoomExport) -> anyhow::Result<AuthFindings> {
-    auth_findings_seeded(export, &vec![false; export.events.len()])
+    auth_findings_seeded(export, &vec![false; export.events.len()], None)
 }
 
 /// [`auth_findings`] with the rejections that start the cascade supplied by
 /// the caller, by position in the export.
-fn auth_findings_seeded(export: &RoomExport, seeds: &[bool]) -> anyhow::Result<AuthFindings> {
+fn auth_findings_seeded(
+    export: &RoomExport,
+    seeds: &[bool],
+    judge_only: Option<&HashSet<String>>,
+) -> anyhow::Result<AuthFindings> {
     let events = &export.events;
     let index: HashMap<&[u8], usize> = events
         .iter()
         .enumerate()
         .map(|(position, event)| (event.event_id.as_bytes(), position))
         .collect();
+    let in_scope =
+        |position: usize| judge_only.is_none_or(|only| only.contains(&events[position].event_id));
     let mut findings = AuthFindings {
         forced: vec![None; events.len()],
         ..AuthFindings::default()
@@ -1050,7 +1056,11 @@ fn auth_findings_seeded(export: &RoomExport, seeds: &[bool]) -> anyhow::Result<A
                 None => missing = true,
             }
         }
-        if missing && !rejected[position] {
+        // A judged event whose own auth cites an id the export lacks really is
+        // missing auth. An event outside the judged set may only look missing
+        // because the caller supplied a partial event universe (the direct
+        // path loads just this file's citations); that must not seed a cascade.
+        if missing && !rejected[position] && in_scope(position) {
             findings.forced[position] = Some(RejectionCode::MissingAuthEvent.to_u8());
             rejected[position] = true;
             findings.missing_auth.push(event.event_id.clone());
@@ -1061,9 +1071,15 @@ fn auth_findings_seeded(export: &RoomExport, seeds: &[bool]) -> anyhow::Result<A
     while let Some(parent) = pending.pop() {
         for &child in &dependents[parent] {
             if !rejected[child] {
-                findings.forced[child] = Some(RejectionCode::DependsOnRejectedAuthEvent.to_u8());
                 rejected[child] = true;
-                findings.cascaded.push(events[child].event_id.clone());
+                // Propagate through out-of-scope events so a rejection can
+                // still reach a judged descendant, but only record verdicts
+                // for events this pass was asked to judge.
+                if in_scope(child) {
+                    findings.forced[child] =
+                        Some(RejectionCode::DependsOnRejectedAuthEvent.to_u8());
+                    findings.cascaded.push(events[child].event_id.clone());
+                }
                 pending.push(child);
             }
         }
@@ -1862,7 +1878,7 @@ fn derived_auth_findings_inner(
                 )
         })
         .collect();
-    let mut findings = auth_findings_seeded(export, &seeds)?;
+    let mut findings = auth_findings_seeded(export, &seeds, judge_only)?;
     findings.hash_mismatched = events
         .iter()
         .zip(redacted)

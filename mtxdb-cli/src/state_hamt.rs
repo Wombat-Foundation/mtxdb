@@ -363,6 +363,11 @@ fn decode_leaf_key(key: &str) -> anyhow::Result<(String, String)> {
 /// (an unresolved group). A present group missing a node is an error: its root
 /// claims content that is not durable.
 ///
+/// A loaded group is *complete* by construction: the writer suppresses
+/// publication whenever the state computation fell back, so no incomplete
+/// group is ever stored. Callers may therefore seed a walk with one and mark
+/// the resulting `SharedState` complete.
+///
 /// # Errors
 /// Returns an error for an unreadable record or a root that references a
 /// missing or corrupt node.
