@@ -3530,6 +3530,325 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
     );
 }
 
+/// The same room split into files in several orders must converge to one
+/// database, and the direct path must land on the same one as the whole-room
+/// path. This is the gate the dirty-set design needs before default-on: a
+/// chunk boundary that hides a `prev` or `auth` body must not change the
+/// final verdicts, flags, or state-group mappings.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture is exercised under six chunk plans and both import paths"
+)]
+fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
+    use mtxdb::auxiliary::AuxiliaryIndex;
+    use mtxdb::room_flag::{Flag, FlagQuery, RoomFlagIndex};
+
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "the snapshot mirrors the four independent flag bits it compares"
+    )]
+    struct Row {
+        rejection: Option<u8>,
+        soft_fail: Option<u8>,
+        outlier: bool,
+        mapping: Option<String>,
+        present: bool,
+        rejected: bool,
+        outlier_flag: bool,
+        soft_failed: bool,
+    }
+
+    let room = "!permutations:test";
+    let template = default_matrix_import_template();
+    let event = |id: &str, kind: &str, state_key: &str, content: &str, prev: &str, auth: &str| {
+        raw_event(room, id, kind, state_key, content, prev, auth)
+    };
+    let create = event(
+        "$create",
+        "m.room.create",
+        "",
+        r#"{"room_version":"11"}"#,
+        "[]",
+        "[]",
+    );
+    let join = event(
+        "$join",
+        "m.room.member",
+        "@alice:test",
+        r#"{"membership":"join"}"#,
+        r#"["$create"]"#,
+        r#"["$create"]"#,
+    );
+    let power = event(
+        "$pl",
+        "m.room.power_levels",
+        "",
+        r#"{"users":{"@alice:test":100}}"#,
+        r#"["$join"]"#,
+        r#"["$create","$join"]"#,
+    );
+    let m1 = event(
+        "$m1",
+        "m.room.message",
+        "",
+        r#"{"body":"one"}"#,
+        r#"["$join"]"#,
+        r#"["$create","$join"]"#,
+    );
+    let m2 = event(
+        "$m2",
+        "m.room.message",
+        "",
+        r#"{"body":"two"}"#,
+        r#"["$m1"]"#,
+        r#"["$create","$join"]"#,
+    );
+    let m3 = event(
+        "$m3",
+        "m.room.message",
+        "",
+        r#"{"body":"three"}"#,
+        r#"["$m2"]"#,
+        r#"["$create","$join"]"#,
+    );
+    // Supplied after earlier files already cite it as auth.
+    let late = event(
+        "$late",
+        "m.room.message",
+        "",
+        r#"{"body":"late auth"}"#,
+        r#"["$m2"]"#,
+        r#"["$create","$join"]"#,
+    );
+    let early = event(
+        "$early",
+        "m.room.message",
+        "",
+        r#"{"body":"cites late"}"#,
+        r#"["$m3"]"#,
+        r#"["$create","$join","$late"]"#,
+    );
+    // Supplied after earlier files already cite it as prev.
+    let absent = event(
+        "$absent",
+        "m.room.message",
+        "",
+        r#"{"body":"late prev"}"#,
+        r#"["$m3"]"#,
+        r#"["$create","$join"]"#,
+    );
+    let gap = event(
+        "$gap",
+        "m.room.message",
+        "",
+        r#"{"body":"gapped"}"#,
+        r#"["$absent"]"#,
+        r#"["$create","$join"]"#,
+    );
+    let child = event(
+        "$child",
+        "m.room.message",
+        "",
+        r#"{"body":"child"}"#,
+        r#"["$gap"]"#,
+        r#"["$create","$join"]"#,
+    );
+    // A stable rejection: Alice cannot join Bob without an invite.
+    let bad = event(
+        "$bad",
+        "m.room.member",
+        "@bob:test",
+        r#"{"membership":"join"}"#,
+        r#"["$m3"]"#,
+        r#"["$create","$join"]"#,
+    );
+
+    let events: std::collections::HashMap<String, OwnedValue> = [
+        create, join, power, m1, m2, m3, late, early, absent, gap, child, bad,
+    ]
+    .into_iter()
+    .map(|event| {
+        (
+            event_id(&event).expect("fixture event has an id").to_owned(),
+            event,
+        )
+    })
+    .collect();
+    let ids: Vec<String> = events.keys().cloned().collect();
+    let chunk = |names: &[&str]| -> Vec<OwnedValue> {
+        names.iter().map(|name| events[*name].clone()).collect()
+    };
+    let plans: Vec<Vec<Vec<OwnedValue>>> = vec![
+        // Causal.
+        vec![
+            chunk(&["$create", "$join", "$pl"]),
+            chunk(&["$m1", "$m2", "$m3"]),
+            chunk(&["$late", "$early", "$absent", "$gap", "$child", "$bad"]),
+        ],
+        // Late auth and prev split across the first two tail files.
+        vec![
+            chunk(&["$create", "$join", "$pl", "$m1"]),
+            chunk(&["$late", "$early", "$absent"]),
+            chunk(&["$m2", "$m3", "$gap", "$child", "$bad"]),
+        ],
+        // Late bodies before their citers.
+        vec![
+            chunk(&["$create", "$join"]),
+            chunk(&["$late", "$early", "$absent", "$gap"]),
+            chunk(&["$pl", "$m1", "$m2", "$m3", "$child", "$bad"]),
+        ],
+        // Descendants first, ancestors last.
+        vec![
+            chunk(&["$create", "$join"]),
+            chunk(&["$child", "$gap", "$absent", "$late", "$early", "$bad"]),
+            chunk(&["$m1", "$m2", "$m3", "$pl"]),
+        ],
+        // One file for the whole tail.
+        vec![
+            chunk(&["$create", "$join", "$pl"]),
+            chunk(&[
+                "$m1", "$m2", "$m3", "$late", "$early", "$absent", "$gap", "$child", "$bad",
+            ]),
+        ],
+        // Control: the whole room in one file (the direct path declines it).
+        vec![chunk(&[
+            "$create", "$join", "$pl", "$m1", "$m2", "$m3", "$late", "$early", "$absent", "$gap",
+            "$child", "$bad",
+        ])],
+    ];
+
+    let mut snapshots: Vec<(usize, bool, usize, std::collections::BTreeMap<String, Row>)> =
+        Vec::new();
+    for (plan_index, plan) in plans.iter().enumerate() {
+        for direct in [false, true] {
+            let dir = unique_temp_dir().join(format!("permutation_{plan_index}_{direct}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = Database::open(dir.clone()).unwrap();
+            let store = db.event_dag();
+            let state_store = db.state().as_ref();
+            let mut established = HashSet::new();
+            let mut cache = ImportRunCache {
+                direct,
+                ..ImportRunCache::default()
+            };
+            for (file_index, chunk_events) in plan.iter().enumerate() {
+                let path = dir.join(format!("chunk-{file_index:02}.jsonl"));
+                let mut text = String::new();
+                for event in chunk_events {
+                    text.push_str(&event.encode());
+                    text.push('\n');
+                }
+                std::fs::write(&path, text).unwrap();
+                cmd_import_file(
+                    &db,
+                    store,
+                    state_store,
+                    &path,
+                    None,
+                    &template,
+                    &mut established,
+                    false,
+                    None,
+                    true,
+                    Some(&mut cache),
+                )
+                .unwrap();
+            }
+
+            let aux = AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
+            let flags = RoomFlagIndex::new(room.as_bytes());
+            let flag_set = |flag: Flag| -> HashSet<Vec<u8>> {
+                flags
+                    .select(&db, &FlagQuery::has(flag))
+                    .unwrap()
+                    .into_iter()
+                    .collect()
+            };
+            let present = flag_set(Flag::Present);
+            let rejected = flag_set(Flag::Rejected);
+            let outlier = flag_set(Flag::Outlier);
+            let soft_failed = flag_set(Flag::SoftFailed);
+
+            let mut rows = std::collections::BTreeMap::new();
+            for id in &ids {
+                let node = template_event_id_node_id(&template, id).unwrap();
+                let verdict = db
+                    .pool(ShardType::EventDag)
+                    .get(&event_verdict_collection_id(&node), &node)
+                    .unwrap()
+                    .map(|data| decode_verdict(&data.bytes).unwrap().1);
+                let mapping = aux
+                    .get_many(&[id.as_bytes()])
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .map(hex::encode);
+                rows.insert(
+                    id.clone(),
+                    Row {
+                        rejection: verdict.as_ref().and_then(|verdict| verdict.rejection),
+                        soft_fail: verdict.as_ref().and_then(|verdict| verdict.soft_fail),
+                        outlier: verdict.as_ref().is_some_and(|verdict| verdict.outlier),
+                        mapping,
+                        present: present.contains(id.as_bytes()),
+                        rejected: rejected.contains(id.as_bytes()),
+                        outlier_flag: outlier.contains(id.as_bytes()),
+                        soft_failed: soft_failed.contains(id.as_bytes()),
+                    },
+                );
+            }
+            snapshots.push((plan_index, direct, cache.direct_files, rows));
+        }
+    }
+
+    let (base_plan, base_direct, _, baseline) = &snapshots[0];
+    for (plan_index, direct, _, rows) in &snapshots {
+        assert_eq!(
+            rows, baseline,
+            "plan {plan_index} direct={direct} diverged from plan {base_plan} direct={base_direct}"
+        );
+    }
+    let direct_files: usize = snapshots
+        .iter()
+        .filter(|(_, direct, _, _)| *direct)
+        .map(|(_, _, files, _)| files)
+        .sum();
+    assert!(
+        direct_files >= 8,
+        "the multi-file plans should exercise the direct path, got {direct_files} direct files"
+    );
+    for (plan_index, direct, files, _) in &snapshots {
+        if !*direct {
+            assert_eq!(*files, 0, "the whole-room run never uses the gate");
+        } else if *plan_index == plans.len() - 1 {
+            assert_eq!(
+                *files, 0,
+                "a file that carries the create event declines the direct path"
+            );
+        } else {
+            assert!(
+                *files > 0,
+                "plan {plan_index} never took the direct path ({files} files)"
+            );
+        }
+    }
+    assert!(
+        baseline["$bad"].rejected,
+        "the fixture must contain a stable rejection for the flag comparison"
+    );
+    assert!(
+        baseline["$early"].rejection.is_none() && baseline["$early"].mapping.is_some(),
+        "the late auth body must clear the earlier rejection and keep its mapping"
+    );
+    assert!(
+        baseline["$child"].mapping.is_some(),
+        "the late prev body must map the previously gapped descendant"
+    );
+}
+
 #[test]
 fn raw_import_derives_rejections_and_writes_flags() {
     use mtxdb::room_flag::*;
