@@ -28,7 +28,7 @@ use mtxdb::{
     EstablishmentRule, FrameIdInput, FrameIdPolicy, MatrixRoomVersion, PackfileStorage,
     PayloadPolicy, RecordIdentityRule, ShardType, Verdict,
 };
-use rezzy::auth::auth_types_for_event;
+use rezzy::auth::auth_types_for_event_ref;
 use rezzy::json::{self, Object, Value as OwnedValue};
 use rezzy::{redaction_preserved_keys, LeanEvent, RedactionRule, StateResVersion};
 
@@ -12914,6 +12914,7 @@ fn try_direct_raw_import(
     // event body in this file.
     let mut needed_keys: HashSet<(String, String)> = HashSet::new();
     needed_keys.insert(("m.room.create".to_owned(), String::new()));
+    let empty_content = OwnedValue::Object(Object::default());
     for event in &walked_events {
         let event_type = event.get("type").and_then(OwnedValue::as_str).unwrap_or("");
         let sender = event
@@ -12921,18 +12922,19 @@ fn try_direct_raw_import(
             .and_then(OwnedValue::as_str)
             .unwrap_or("");
         let state_key = event.get("state_key").and_then(OwnedValue::as_str);
-        let content = event
-            .get("content")
-            .cloned()
-            .unwrap_or_else(|| OwnedValue::Object(Object::default()));
-        needed_keys.extend(auth_types_for_event(
-            event_type,
-            sender,
-            state_key,
-            &content,
-            state_version,
-            room_version,
-        ));
+        let content = event.get("content").unwrap_or(&empty_content);
+        needed_keys.extend(
+            auth_types_for_event_ref(
+                event_type,
+                sender,
+                state_key,
+                content,
+                state_version,
+                room_version,
+            )
+            .into_iter()
+            .map(|(event_type, state_key)| (event_type.to_owned(), state_key.to_owned())),
+        );
     }
     // Seed state bodies are different: a published state group must name
     // events that exist somewhere. If one cannot be loaded the store is
@@ -14273,23 +14275,22 @@ fn auth_entries_from_base(
         .and_then(OwnedValue::as_str)
         .unwrap_or_default();
     let state_key = event.get("state_key").and_then(OwnedValue::as_str);
-    let content = event
-        .get("content")
-        .cloned()
-        .unwrap_or_else(|| OwnedValue::Object(Object::default()));
-    auth_types_for_event(
+    let empty_content = OwnedValue::Object(Object::default());
+    let content = event.get("content").unwrap_or(&empty_content);
+    auth_types_for_event_ref(
         event_type,
         sender,
         state_key,
-        &content,
+        content,
         version,
         room_version,
     )
     .into_iter()
     .filter_map(|(event_type, state_key)| {
+        let key = (event_type.to_owned(), state_key.to_owned());
         base.entries
-            .get(&(event_type.clone(), state_key.clone()))
-            .map(|event_id| (event_type, state_key, event_id.clone()))
+            .get(&key)
+            .map(|event_id| (key.0, key.1, event_id.clone()))
     })
     .collect()
 }

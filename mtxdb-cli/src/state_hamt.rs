@@ -21,10 +21,6 @@ use mtxdb::{derive_group_member_collection_id, DigestAlgorithm, MEMBER_NAMESPACE
 use rezzy::hamt::{build_hamt_root_handle, HamtNode, NodeRef, PersistedInternalNode};
 use rezzy::incremental::LtHash;
 
-/// Little-endian byte length of the retained `LtHash` lattice (1024 `u16`
-/// lanes) stored in every root record.
-const LATTICE_BYTES: usize = 2048;
-
 /// A materialized room state HAMT: its encoded root record and every
 /// content-addressed node reachable from it.
 pub(crate) struct BuiltStateHamt {
@@ -114,36 +110,14 @@ fn collect_persisted_nodes(
 /// Byte-compatible with `_encode_state_hamt_root` in Synapse and its Rust
 /// mirror.
 #[must_use]
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "fixed-width record layout arithmetic cannot overflow"
-)]
 pub(crate) fn encode_state_hamt_root(
     room_prefix: &[u8],
     room_id: &str,
     root_hash: &[u8; 32],
     lattice: &LtHash,
 ) -> Vec<u8> {
-    let prefix_len = u16::try_from(room_prefix.len()).expect("room prefix fits u16");
-    let room_id_len = u16::try_from(room_id.len()).expect("room id fits u16");
-
-    let mut out = Vec::new();
-    out.extend_from_slice(b"MTHR");
-    out.push(0x01);
-    out.extend_from_slice(&prefix_len.to_be_bytes());
-    out.extend_from_slice(room_prefix);
-    out.extend_from_slice(&room_id_len.to_be_bytes());
-    out.extend_from_slice(room_id.as_bytes());
-    out.extend_from_slice(root_hash);
-    for lane in lattice.as_ref() {
-        out.extend_from_slice(&lane.to_le_bytes());
-    }
-    debug_assert_eq!(
-        out.len(),
-        7 + room_prefix.len() + 2 + room_id.len() + 32 + LATTICE_BYTES,
-        "MTHR root record length"
-    );
-    out
+    rezzy::hamt::encode_state_hamt_root(room_prefix, room_id, root_hash, lattice)
+        .expect("room prefix and room id fit the u16 length fields")
 }
 
 /// The room-scoped prefix stored in root records. MSC4291 room ids are the
@@ -212,59 +186,14 @@ pub(crate) fn state_group_id(entries: &[(String, String, String)]) -> [u8; 32] {
     rezzy::hamt::state_group_id_from_lthash(&lattice)
 }
 
-/// The root identity decoded from an `MTHR\x01` record: the structural hash of
-/// the root node and the state-set `LtHash` digest.
-pub(crate) struct DecodedStateHamtRoot {
-    /// Structural hash of the root `MTHN` node.
-    pub(crate) root_hash: [u8; 32],
-    /// Unkeyed `LtHash` digest of the state set.
-    pub(crate) state_group_id: [u8; 32],
-}
-
-/// Decode the identity of a persisted `MTHR\x01` root record.
+/// Decode a persisted `MTHR\x01` root record.
 ///
 /// Returns `None` when the bytes are not a v1 root record. The caller already
-/// knows the room and node id; this only extracts the root hash and lattice
-/// digest needed to load the tree.
+/// knows the room and node id; this extracts the root hash and lattice digest
+/// needed to load the tree, plus the room identity for a consistency check.
 #[must_use]
-pub(crate) fn decode_state_hamt_root(bytes: &[u8]) -> Option<DecodedStateHamtRoot> {
-    const MAGIC: &[u8; 4] = b"MTHR";
-    const ROOT_HASH_LEN: usize = 32;
-    const LATTICE_BYTES: usize = 2048;
-
-    if bytes.get(..MAGIC.len())? != MAGIC.as_slice() || bytes.get(4).copied()? != 0x01 {
-        return None;
-    }
-    let prefix_len = usize::from(u16::from_be_bytes(bytes.get(5..7)?.try_into().ok()?));
-    let prefix_end = 7usize.checked_add(prefix_len)?;
-    let room_id_len = usize::from(u16::from_be_bytes(
-        bytes
-            .get(prefix_end..prefix_end.checked_add(2)?)?
-            .try_into()
-            .ok()?,
-    ));
-    let room_id_start = prefix_end.checked_add(2)?;
-    let root_hash_start = room_id_start.checked_add(room_id_len)?;
-    let lattice_start = root_hash_start.checked_add(ROOT_HASH_LEN)?;
-    let end = lattice_start.checked_add(LATTICE_BYTES)?;
-    if bytes.len() != end {
-        return None;
-    }
-    let mut root_hash = [0u8; ROOT_HASH_LEN];
-    root_hash.copy_from_slice(bytes.get(root_hash_start..lattice_start)?);
-
-    let mut lanes = [0u16; 1024];
-    for (lane, chunk) in lanes
-        .iter_mut()
-        .zip(bytes.get(lattice_start..end)?.as_chunks::<2>().0)
-    {
-        *lane = u16::from_le_bytes(*chunk);
-    }
-    let lattice = rezzy::incremental::LtLattice::<1024>::from(lanes);
-    Some(DecodedStateHamtRoot {
-        root_hash,
-        state_group_id: rezzy::hamt::state_group_id_from_lthash(&lattice),
-    })
+pub(crate) fn decode_state_hamt_root(bytes: &[u8]) -> Option<rezzy::hamt::StateHamtRoot> {
+    rezzy::hamt::decode_state_hamt_root(bytes).ok()
 }
 
 /// On-demand reader for one room's persisted state HAMTs.
@@ -276,7 +205,6 @@ pub(crate) struct StateHamtReader<'a> {
     store: &'a mtxdb::PackfileStorage,
     collection: [u8; 16],
     structural_key: Vec<u8>,
-    cache: std::collections::HashMap<[u8; 32], Arc<HamtNode<String, String>>>,
 }
 
 impl<'a> StateHamtReader<'a> {
@@ -288,30 +216,7 @@ impl<'a> StateHamtReader<'a> {
             store,
             collection: state_hamt_collection_id(room_id)?,
             structural_key: room_id.as_bytes().to_vec(),
-            cache: std::collections::HashMap::new(),
         })
-    }
-
-    /// Load the node with `hash`, verifying that its contents reproduce it.
-    fn node(&mut self, hash: &[u8; 32]) -> anyhow::Result<Arc<HamtNode<String, String>>> {
-        if let Some(node) = self.cache.get(hash) {
-            return Ok(Arc::clone(node));
-        }
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&hash[..16]);
-        let record = self
-            .store
-            .get(&self.collection, &id)?
-            .ok_or_else(|| anyhow::anyhow!("missing HAMT node {}", hex::encode(id)))?;
-        let node = PersistedInternalNode::<String, String>::decode_v1_verified(
-            &record.bytes,
-            &self.structural_key,
-            *hash,
-        )
-        .map_err(|error| anyhow::anyhow!("invalid HAMT node {}: {error}", hex::encode(id)))?;
-        let node = Arc::new(node);
-        self.cache.insert(*hash, Arc::clone(&node));
-        Ok(node)
     }
 
     /// Collect every `(event_type, state_key, event_id)` entry under `root_hash`.
@@ -323,38 +228,31 @@ impl<'a> StateHamtReader<'a> {
         &mut self,
         root_hash: &[u8; 32],
     ) -> anyhow::Result<Vec<(String, String, String)>> {
-        let mut entries = Vec::new();
-        let mut stack = vec![self.node(root_hash)?];
-        while let Some(node) = stack.pop() {
-            for (key, event_id) in &node.leaves {
-                let (event_type, state_key) = decode_leaf_key(key)?;
-                entries.push((event_type, state_key, event_id.clone()));
-            }
-            for child in &node.children {
-                match child {
-                    NodeRef::Resolved(child) => stack.push(Arc::clone(child)),
-                    NodeRef::Lazy(hash) => stack.push(self.node(hash)?),
-                }
-            }
-        }
-        Ok(entries)
+        let store = self.store;
+        let collection = self.collection;
+        let mut reader = rezzy::hamt::PersistedHamtReader::<String, String, _, _>::new(
+            &self.structural_key,
+            |hash: &[u8; 32]| {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&hash[..16]);
+                Ok::<_, mtxdb::storage::StorageError>(
+                    store
+                        .get(&collection, &id)?
+                        .map(|record| record.bytes.to_vec()),
+                )
+            },
+        );
+        let raw = reader
+            .collect_entries(*root_hash)
+            .map_err(|error| anyhow::anyhow!("could not read a state HAMT node: {error}"))?;
+        raw.into_iter()
+            .map(|(key, event_id)| {
+                let (event_type, state_key) = rezzy::hamt::decode_state_hamt_leaf_key(&key)
+                    .map_err(|error| anyhow::anyhow!("invalid HAMT leaf key {key:?}: {error}"))?;
+                Ok((event_type, state_key, event_id))
+            })
+            .collect()
     }
-}
-
-/// Decode a persisted leaf key (`["event.type","state key"]`).
-fn decode_leaf_key(key: &str) -> anyhow::Result<(String, String)> {
-    let value = rezzy::json::Value::parse(key)
-        .map_err(|error| anyhow::anyhow!("invalid HAMT leaf key {key:?}: {error:?}"))?;
-    let rezzy::json::Value::Array(elements) = value else {
-        anyhow::bail!("HAMT leaf key is not a JSON array: {key:?}");
-    };
-    let [event_type, state_key] = elements.as_slice() else {
-        anyhow::bail!("HAMT leaf key is not a two-element array: {key:?}");
-    };
-    let (Some(event_type), Some(state_key)) = (event_type.as_str(), state_key.as_str()) else {
-        anyhow::bail!("HAMT leaf key elements must be strings: {key:?}");
-    };
-    Ok((event_type.to_owned(), state_key.to_owned()))
 }
 
 /// Load the full state set of a persisted state group.
@@ -411,39 +309,11 @@ pub(crate) fn load_state_group_entries(
 }
 
 /// `serde_json::to_string(&(event_type, state_key))`, i.e. a two-element JSON
-/// array. Implemented directly so the CLI need not pull in `serde_json` and so
-/// the escaping is pinned to `serde_json`'s default.
+/// array, via `rezzy`'s codec so the escaping stays pinned to `serde_json`'s
+/// default.
 #[must_use]
 pub(crate) fn state_hamt_leaf_key(event_type: &str, state_key: &str) -> String {
-    let mut out = String::new();
-    out.push('[');
-    push_json_string(&mut out, event_type);
-    out.push(',');
-    push_json_string(&mut out, state_key);
-    out.push(']');
-    out
-}
-
-fn push_json_string(out: &mut String, value: &str) {
-    use std::fmt::Write as _;
-
-    out.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            control if u32::from(control) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", u32::from(control));
-            }
-            other => out.push(other),
-        }
-    }
-    out.push('"');
+    rezzy::hamt::state_hamt_leaf_key(event_type, state_key)
 }
 
 #[cfg(test)]
