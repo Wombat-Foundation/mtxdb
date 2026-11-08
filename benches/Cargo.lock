@@ -25,9 +25,9 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.9.3"
+version = "1.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
+checksum = "db4c94f57a570fce5d381be3289b3f79aef6332d72948fe82ab5772e423ccf92"
 dependencies = [
  "rustversion",
 ]
@@ -772,7 +772,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#af5c94d87755ecd35a1d1e1566226a1bdc1168f7"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#a0300e5d68c6435368ddf7951e1ab573ad39893b"
 dependencies = [
  "tracing",
 ]
@@ -780,9 +780,10 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#af5c94d87755ecd35a1d1e1566226a1bdc1168f7"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#a0300e5d68c6435368ddf7951e1ab573ad39893b"
 dependencies = [
  "base64 0.23.1",
+ "blake3",
  "rezzy-log",
  "sha2",
 ]
