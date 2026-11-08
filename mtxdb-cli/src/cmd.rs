@@ -1007,8 +1007,8 @@ fn pool_dir(layout: &DatabaseLayout, shard_type: ShardType) -> anyhow::Result<Pa
     Ok(layout.pool_path(shard_type))
 }
 
-/// Return a pool that exists on disk, or `None` for one never written (or one a
-/// database predates, such as `mtpl-server-info`). `-t all` skips those, and
+/// Return a pool that exists on disk, or `None` for one never written. `-t all`
+/// skips those, and
 /// read-only inspection must not create them.
 #[allow(
     clippy::unnecessary_wraps,
@@ -5257,7 +5257,7 @@ impl MetaReport {
 fn meta_pool_dirs(root: &Path) -> impl Iterator<Item = (ShardType, PathBuf)> + '_ {
     ShardType::ALL
         .into_iter()
-        .map(|pool| (pool, root.join("pools").join(pool.as_str())))
+        .map(|pool| (pool, root.join(pool.as_str())))
 }
 
 fn meta_sidecars(root: &Path, report: &mut MetaReport) {

@@ -35,7 +35,7 @@ fn reader_process_enters_and_reads() {
         return;
     };
     let root = PathBuf::from(root);
-    let pool_dir = root.join("pools").join(ShardType::State.as_str());
+    let pool_dir = root.join(ShardType::State.as_str());
     let wal_path = root.join("wal.bin");
 
     let reader = PackfileStorage::open_read_committed_shared(pool_dir, wal_path, ShardType::State)
@@ -62,7 +62,7 @@ fn stale_reader_process_baselines_then_rereads_after_publish() {
         return;
     };
     let root = PathBuf::from(root);
-    let pool_dir = root.join("pools").join(ShardType::State.as_str());
+    let pool_dir = root.join(ShardType::State.as_str());
     let wal_path = root.join("wal.bin");
     let baseline_done = root.join("baseline.done");
     let published = root.join("published.done");
@@ -101,7 +101,7 @@ fn transaction_reader_process_reads_before_during_and_after_commit() {
         return;
     };
     let root = PathBuf::from(root);
-    let pool_dir = root.join("pools").join(ShardType::State.as_str());
+    let pool_dir = root.join(ShardType::State.as_str());
     let wal_path = root.join("wal.bin");
     let reader = PackfileStorage::open_read_committed_shared(pool_dir, wal_path, ShardType::State)
         .expect("reader process must open the shared WAL read-only");

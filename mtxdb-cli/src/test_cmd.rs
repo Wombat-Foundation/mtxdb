@@ -312,7 +312,7 @@ fn meta_json_summary_has_numeric_severity_counts() {
 #[test]
 fn meta_raw_paginates_across_files() {
     let root = unique_temp_dir();
-    let state = root.join("pools/mtpl-state");
+    let state = root.join("mtpl-state");
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(root.join("db.meta"), (0_u8..32).collect::<Vec<_>>()).unwrap();
     std::fs::write(state.join("pool.meta"), (32_u8..64).collect::<Vec<_>>()).unwrap();
@@ -359,7 +359,7 @@ fn meta_lock_reports_full_confidence_for_starttime_marker() {
 #[test]
 fn noncanonical_pack_identity_is_a_note() {
     let root = unique_temp_dir();
-    let state = root.join("pools/mtpl-state");
+    let state = root.join("mtpl-state");
     std::fs::create_dir_all(&state).unwrap();
     let path = state.join("foreign.pack");
     std::fs::write(&path, b"not a canonical pack").unwrap();
@@ -376,7 +376,7 @@ fn noncanonical_pack_identity_is_a_note() {
 #[test]
 fn checkpoint_pack_comparison_excludes_noncanonical_pack_but_checks_valid_set() {
     let root = unique_temp_dir();
-    let state = root.join("pools/mtpl-state");
+    let state = root.join("mtpl-state");
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("foreign.pack"), b"not a canonical pack").unwrap();
     mtxdb::index::checkpoint::write_checkpoint(
@@ -409,7 +409,7 @@ fn checkpoint_pack_comparison_excludes_noncanonical_pack_but_checks_valid_set() 
 #[test]
 fn checkpoint_pack_comparison_is_quiet_when_packs_match() {
     let root = unique_temp_dir();
-    let state = root.join("pools/mtpl-state");
+    let state = root.join("mtpl-state");
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("foreign.pack"), b"not a canonical pack").unwrap();
     mtxdb::index::checkpoint::write_checkpoint(
@@ -436,7 +436,7 @@ fn checkpoint_pack_comparison_is_quiet_when_packs_match() {
 #[test]
 fn checkpoint_pack_comparison_skips_invalid_pack_with_explicit_note() {
     let root = unique_temp_dir();
-    let state = root.join("pools/mtpl-state");
+    let state = root.join("mtpl-state");
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("pack_0000000000000001.pack"), b"not a pack").unwrap();
     mtxdb::index::checkpoint::write_checkpoint(
@@ -5134,7 +5134,7 @@ fn count_pack_records(pool_dir: &Path) -> u64 {
 #[test]
 fn auth_chain_reimport_writes_nothing_new() {
     let root = unique_temp_dir();
-    let pool_dir = root.join("pools").join("mtpl-event");
+    let pool_dir = root.join("mtpl-event");
     let db = Database::open(root.clone()).unwrap();
     let store = db.event_dag();
     let input = root.join("export.json");

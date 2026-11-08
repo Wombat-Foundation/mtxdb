@@ -27,7 +27,7 @@
 //! auth-closure layer must read only [`CsrAdjacency::auth_of`](crate::csr_adjacency::CsrAdjacency::auth_of), never relations.
 //!
 //! Rows live in the State pool's shared graph store,
-//! `<db_root>/graph/state/`, keyed by `(collection id, family, owner)`.
+//! `<db_root>/mtgr-state/`, keyed by `(collection id, family, owner)`.
 //! Referenced but not-yet-observed parents are ordinary nodes: every target is
 //! allocated a short id, so the row set never drops an edge to a missing body.
 
@@ -202,7 +202,7 @@ impl CsrAdjacency {
     ///
     /// The event-id maps and relation-kind dictionary live in the
     /// [`ShardType::State`] pool. CSR rows live in that pool's shared graph
-    /// store, `<db_root>/graph/state/`, outside the packs. Event bodies stay in
+    /// store, `<db_root>/mtgr-state/`, outside the packs. Event bodies stay in
     /// `EventDag`.
     #[must_use]
     pub fn new(room_id: &str) -> Self {

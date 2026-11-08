@@ -1,6 +1,6 @@
 //! Pool-scoped CSR graph store outside the packs.
 //!
-//! There is one store per source pool at `<db_root>/graph/<pool>/`, shared by
+//! There is one store per source pool at `<db_root>/mtgr-<pool>/`, shared by
 //! every collection in that pool. A row is addressed by
 //! `(scope, family, owner)`, where `scope` is the engine's generic 16-byte
 //! collection id, `family` is an [`EdgeFamily`], and `owner` is a dense local

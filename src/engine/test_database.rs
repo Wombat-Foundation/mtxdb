@@ -3061,7 +3061,7 @@ fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
         );
     }
 
-    let before = PackfileStorage::read_journal_lsn(&root.join("pools/mtpl-state"));
+    let before = PackfileStorage::read_journal_lsn(&root.join("mtpl-state"));
     assert!(
         before > 0,
         "state's durable checkpoint coverage must survive the reclaim"
@@ -3073,7 +3073,7 @@ fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
     let db = Database::open(root.clone()).unwrap();
     db.pool(ShardType::State).force_index_checkpoint().unwrap();
     assert_eq!(
-        PackfileStorage::read_journal_lsn(&root.join("pools/mtpl-state")),
+        PackfileStorage::read_journal_lsn(&root.join("mtpl-state")),
         before,
         "a checkpoint must never regress its covered LSN to zero"
     );
@@ -3089,12 +3089,8 @@ fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
 fn a_missing_wal_is_seeded_above_the_pools_recorded_coverage() {
     let root = test_root("seed_missing_wal");
     drop(crate::layout::DatabaseLayout::open(root.clone()).unwrap());
-    std::fs::create_dir_all(root.join("pools/mtpl-state")).unwrap();
-    std::fs::write(
-        root.join("pools/mtpl-state/journal.lsn"),
-        7u64.to_le_bytes(),
-    )
-    .unwrap();
+    std::fs::create_dir_all(root.join("mtpl-state")).unwrap();
+    std::fs::write(root.join("mtpl-state/journal.lsn"), 7u64.to_le_bytes()).unwrap();
     assert!(!root.join("wal.bin").exists());
 
     let db = Database::open(root.clone()).unwrap();
@@ -3136,7 +3132,7 @@ fn a_per_pool_journal_is_refused_inside_a_shared_root() {
     let db = Database::open(root.clone()).unwrap();
     let err = db
         .pool(ShardType::State)
-        .enable_journal(root.join("pools/mtpl-state/wal.bin"))
+        .enable_journal(root.join("mtpl-state/wal.bin"))
         .unwrap_err();
     assert!(
         err.to_string().contains("inside database root"),
@@ -3763,10 +3759,14 @@ fn pools_written_through_a_shared_database_read_back_read_only() {
 }
 
 fn pool_dirs(root: &std::path::Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(root.join("pools"))
+    let mut names: Vec<String> = std::fs::read_dir(root)
         .map(|entries| {
             entries
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    (entry.file_type().ok()?.is_dir() && name.starts_with("mtpl-")).then_some(name)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -3798,12 +3798,12 @@ fn pools_are_created_by_their_first_write() {
         .pool(ShardType::ServerInfo)
         .put(&[9; 16], &node(1), &data(b"info"))
         .unwrap();
-    assert_eq!(pool_dirs(&root), vec!["mtpl-server-info".to_owned()]);
+    assert_eq!(pool_dirs(&root), vec!["mtpl-srvinfo".to_owned()]);
     database.coordinator().sync().unwrap();
     drop(database);
 
     let reopened = Database::open(root.clone()).unwrap();
-    assert_eq!(pool_dirs(&root), vec!["mtpl-server-info".to_owned()]);
+    assert_eq!(pool_dirs(&root), vec!["mtpl-srvinfo".to_owned()]);
     assert_eq!(
         reopened
             .pool(ShardType::ServerInfo)
@@ -4239,7 +4239,7 @@ fn a_full_scan_open_leaves_a_checkpoint_for_the_next_open() {
     }
     // Simulate a store whose checkpoint went stale or was never written.
     let checkpoint = root
-        .join("pools/mtpl-state")
+        .join("mtpl-state")
         .join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE);
     std::fs::remove_file(&checkpoint).unwrap();
 
