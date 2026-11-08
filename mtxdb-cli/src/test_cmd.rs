@@ -2014,6 +2014,16 @@ fn imported_event_payload_keeps_legacy_float_for_storage() {
 }
 
 #[test]
+fn imported_event_payload_rejects_float_from_room_version_6() {
+    let event = owned_value(
+        r#"{"event_id":"$new","room_id":"!room","sender":"@alice","type":"m.room.message","depth":1.5,"content":{"body":"hi"}}"#,
+    );
+    assert!(redacted_event_bytes(&event, "6").is_err());
+    assert!(redacted_event_bytes(&event, "10").is_err());
+    assert!(redacted_event_bytes(&event, "5").is_ok());
+}
+
+#[test]
 fn import_dedups_repeated_event_id_within_one_input() {
     let (db, _dir, path, template, collection_id) = import_fixture("import_dedup");
     let store = db.event_dag();

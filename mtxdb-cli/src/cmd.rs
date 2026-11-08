@@ -11594,15 +11594,13 @@ fn reject_cross_record_collision(
 /// The importer still keeps the original value in memory for collection and
 /// DAG/state analysis; only the stored payload is redacted.
 fn redacted_event_bytes(event: &OwnedValue, room_version: &str) -> anyhow::Result<bytes::Bytes> {
-    let redacted = rezzy::redact_json(event, room_version);
-    // This is a storage boundary, not a signing boundary. Keep the permissive
-    // writer so legacy (<v6) events carrying historic floats still import;
-    // rezzy's strict canonical writer is for bytes that are hashed or signed.
-    let encoded = rezzy::json::write_string_value(&redacted)
-        .map_err(|error| anyhow::anyhow!("failed to encode redacted event: {error:?}"))?;
+    // Rezzy applies the room-version redaction rules and number policy:
+    // v1-v5 retain historical non-canonical numbers; v6+ enforce canonical JSON.
+    let encoded = rezzy::try_canonical_redacted_json(event, room_version).map_err(|error| {
+        anyhow::anyhow!("failed to redact event for room version {room_version}: {error}")
+    })?;
     Ok(bytes::Bytes::from(encoded.into_bytes()))
 }
-
 fn import_room_version(
     store: &PackfileStorage,
     collection_id: &[u8; 16],
