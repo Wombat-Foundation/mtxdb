@@ -514,6 +514,31 @@ impl CsrAdjacency {
         self.events.lookup(db, event_id.as_bytes())
     }
 
+    /// Resolve room-local short ids back to event ids; `None` for an unknown
+    /// id.
+    ///
+    /// This is the reverse direction of [`Self::short_id`] for callers that
+    /// walk a [`ReverseCsr`](crate::csr::ReverseCsr) built by
+    /// [`Self::reverse_family`].
+    ///
+    /// # Errors
+    /// Returns an error on a read failure, a corrupt reverse record, or a
+    /// stored key that is not UTF-8.
+    pub fn resolve_event_ids(
+        &self,
+        db: &Database,
+        short_ids: &[u32],
+    ) -> Result<Vec<Option<String>>, StorageError> {
+        self.events
+            .resolve(db, short_ids)?
+            .into_iter()
+            .map(|key| match key {
+                None => Ok(None),
+                Some(bytes) => utf8(bytes, "event id").map(Some),
+            })
+            .collect()
+    }
+
     /// The event's `prev_events`, or `None` if the event was never recorded.
     ///
     /// # Errors

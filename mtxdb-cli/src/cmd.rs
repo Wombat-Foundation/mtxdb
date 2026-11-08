@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context};
 
 use mtxdb::auxiliary::AuxiliaryIndex;
-use mtxdb::csr_adjacency::EventRecord;
+use mtxdb::csr_adjacency::{CsrAdjacency, EventRecord, AUTH, PREV};
 use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
@@ -10253,6 +10253,7 @@ struct ImportOutcome {
 struct ImportRunCache {
     rooms: HashMap<[u8; 16], Vec<OwnedValue>>,
     waiting: HashMap<[u8; 16], RoomWaiting>,
+    reverse: HashMap<[u8; 16], RoomReverse>,
     direct: bool,
     direct_files: usize,
 }
@@ -10262,6 +10263,7 @@ impl Default for ImportRunCache {
         Self {
             rooms: HashMap::new(),
             waiting: HashMap::new(),
+            reverse: HashMap::new(),
             direct: direct_import_enabled(),
             direct_files: 0,
         }
@@ -10373,6 +10375,63 @@ impl RoomWaiting {
             }
         }
     }
+}
+
+/// Reverse edges for one room in the direct import's own id space.
+///
+/// Built from the same CSR rows the waiting set reads, then updated with each
+/// file's timeline edges. The direct path needs the children of a late arrival
+/// to decide which stored events to re-judge; the CSR store keeps only forward
+/// rows, so this is the transpose held for the lifetime of one `import` run.
+/// It is keyed by event id (not by either short-id space) because that is what
+/// verdicts, projections and state-group mappings use.
+#[derive(Debug, Default, Clone)]
+struct RoomReverse {
+    room_id: String,
+    prev: HashMap<String, Vec<String>>,
+    auth: HashMap<String, Vec<String>>,
+}
+
+/// Build one family's parent-event-id -> child-event-id map from the CSR
+/// snapshot.
+fn reverse_edges_by_event_id(
+    db: &Database,
+    adjacency: &CsrAdjacency,
+    family: mtxdb::csr::EdgeFamily,
+) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    let reverse = adjacency.reverse_family(db, family)?;
+    let parents = reverse.parents().to_vec();
+    let mut short_ids = parents.clone();
+    for parent in &parents {
+        if let Some(children) = reverse.children_of(*parent) {
+            short_ids.extend(children.iter().map(|edge| edge.target));
+        }
+    }
+    short_ids.sort_unstable();
+    short_ids.dedup();
+    let resolved = adjacency.resolve_event_ids(db, &short_ids)?;
+    let names: HashMap<u32, String> = short_ids
+        .iter()
+        .copied()
+        .zip(resolved)
+        .filter_map(|(short, name)| name.map(|name| (short, name)))
+        .collect();
+    let mut edges = HashMap::with_capacity(parents.len());
+    for parent in parents {
+        let Some(parent_name) = names.get(&parent) else {
+            continue;
+        };
+        let mut children: Vec<String> = reverse
+            .children_of(parent)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|edge| names.get(&edge.target).cloned())
+            .collect();
+        children.sort();
+        children.dedup();
+        edges.insert(parent_name.clone(), children);
+    }
+    Ok(edges)
 }
 
 /// Ids among `ids` whose body is stored in the timeline collection, and ids
@@ -10501,6 +10560,137 @@ impl ImportRunCache {
             .waiting
             .get(collection_id)
             .expect("waiting set was just checked"))
+    }
+
+    /// The collection's reverse edges, transposed from the CSR store once per
+    /// run.
+    fn ensure_reverse(
+        &mut self,
+        db: &Database,
+        collection_id: &[u8; 16],
+        room_id: &str,
+    ) -> anyhow::Result<&RoomReverse> {
+        let stale = self
+            .reverse
+            .get(collection_id)
+            .is_none_or(|entry| entry.room_id != room_id);
+        if stale {
+            let adjacency = CsrAdjacency::new(room_id);
+            let prev = reverse_edges_by_event_id(db, &adjacency, PREV)?;
+            let auth = reverse_edges_by_event_id(db, &adjacency, AUTH)?;
+            self.reverse.insert(
+                *collection_id,
+                RoomReverse {
+                    room_id: room_id.to_owned(),
+                    prev,
+                    auth,
+                },
+            );
+        }
+        Ok(self
+            .reverse
+            .get(collection_id)
+            .expect("reverse edges were just checked"))
+    }
+
+    /// The stored events a file's late arrivals can change: the direct citers
+    /// of every supplied waiting id, plus all of their `prev` descendants.
+    ///
+    /// An `auth` arrival changes the citer's verdict, which may change the
+    /// state it contributes; a `prev` arrival changes the citer's base state.
+    /// Both effects propagate to descendants through `prev_events`, never
+    /// through `auth_events`, because a verdict is not an auth input.
+    fn dirty_closure(
+        &mut self,
+        db: &Database,
+        collection_id: &[u8; 16],
+        room_id: &str,
+        hits: &WaitingHits,
+    ) -> anyhow::Result<HashSet<String>> {
+        if hits.prev.is_empty() && hits.auth.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let reverse = self.ensure_reverse(db, collection_id, room_id)?;
+        let mut dirty: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        for hit in hits.prev.iter().chain(hits.auth.iter()) {
+            for edges in [
+                hits.prev.contains(hit).then(|| reverse.prev.get(hit)).flatten(),
+                hits.auth.contains(hit).then(|| reverse.auth.get(hit)).flatten(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for child in edges {
+                    if dirty.insert(child.clone()) {
+                        queue.push_back(child.clone());
+                    }
+                }
+            }
+        }
+        // The citers are the roots. Two relations propagate the change and
+        // must both be followed to a fixpoint:
+        // - `prev`: a changed verdict or a newly complete base changes the
+        //   state this event contributes to its descendants.
+        // - `auth`: a changed verdict can flip the `DependsOnRejectedAuthEvent`
+        //   cascade for every event that cites it.
+        while let Some(parent) = queue.pop_front() {
+            for child in reverse
+                .prev
+                .get(&parent)
+                .into_iter()
+                .chain(reverse.auth.get(&parent))
+                .flatten()
+            {
+                if dirty.insert(child.clone()) {
+                    queue.push_back(child.clone());
+                }
+            }
+        }
+        Ok(dirty)
+    }
+
+    /// Add one written file's timeline edges to the cached reverse maps.
+    ///
+    /// A no-op when no late arrival has forced the transpose yet: the next
+    /// caller builds from the CSR store, which already includes these rows.
+    fn observe_adjacency<'a>(
+        &mut self,
+        collection_id: &[u8; 16],
+        room_id: &str,
+        written_events: impl IntoIterator<Item = &'a OwnedValue>,
+    ) {
+        let Some(reverse) = self.reverse.get_mut(collection_id) else {
+            return;
+        };
+        if reverse.room_id != room_id {
+            return;
+        }
+        for event in written_events {
+            let Some(child) = event_id(event) else {
+                continue;
+            };
+            for (field, map) in [
+                ("prev_events", &mut reverse.prev),
+                ("auth_events", &mut reverse.auth),
+            ] {
+                let Some(list) = event.get(field).and_then(OwnedValue::as_array) else {
+                    continue;
+                };
+                for reference in list {
+                    let id = match reference {
+                        OwnedValue::String(id) => Some(id.as_str()),
+                        OwnedValue::Array(parts) => parts.first().and_then(OwnedValue::as_str),
+                        _ => None,
+                    };
+                    let Some(id) = id else { continue };
+                    let children = map.entry(id.to_owned()).or_default();
+                    if !children.iter().any(|known| known == child) {
+                        children.push(child.to_owned());
+                    }
+                }
+            }
+        }
     }
 
     /// Fold one written file into the waiting set. Rebuilds first if this run
@@ -11646,6 +11836,34 @@ fn import_pdu_events_with_raw_state_hamts(
     } else {
         WaitingHits::default()
     };
+    // The reverse-edge closure of the waiting hits is the set of stored events
+    // this file can change. Computing it before the writes keeps the closure
+    // to the edges that existed before this file arrived.
+    let mut dirty_closure_failed = false;
+    let dirty_ids = if direct
+        && direct_identity
+        && !to_write.is_empty()
+        && (!waiting_hits.prev.is_empty() || !waiting_hits.auth.is_empty())
+    {
+        let cache = room_cache.as_deref_mut().unwrap_or(&mut local_cache);
+        match cache.dirty_closure(
+            db,
+            &collection_id,
+            &resolved.canonical_id,
+            &waiting_hits,
+        ) {
+            Ok(ids) => ids,
+            Err(error) => {
+                eprintln!(
+                    "  warning: raw import reverse-edge lookup failed; using the whole-room path: {error:#}"
+                );
+                dirty_closure_failed = true;
+                HashSet::new()
+            }
+        }
+    } else {
+        HashSet::new()
+    };
     record_csr_adjacency_with_raw(db, template, events, raw_adjacency)?;
 
     // Preserve causal order even when input arrives newest-first.
@@ -11699,6 +11917,7 @@ fn import_pdu_events_with_raw_state_hamts(
                 &auth_arrived,
                 events.iter().chain(auth_chain.iter()),
             )?;
+            cache.observe_adjacency(&collection_id, &resolved.canonical_id, events.iter());
         }
     }
     // A file whose events are all stored already, whose auth chain is empty,
@@ -11719,6 +11938,7 @@ fn import_pdu_events_with_raw_state_hamts(
     // prev state groups and fall back to the whole-room walk on any condition
     // the direct path cannot prove.
     let direct_handled = direct
+        && !dirty_closure_failed
         && !skip_judging
         && write_state_hamts
         && auth_chain.is_empty()
@@ -11734,6 +11954,7 @@ fn import_pdu_events_with_raw_state_hamts(
             events,
             &existed_before,
             &waiting_hits,
+            &dirty_ids,
             repaired_projections,
         )?;
     if direct_handled {
@@ -12456,6 +12677,7 @@ fn try_direct_raw_import(
     events: &[OwnedValue],
     existed_before: &HashSet<String>,
     waiting_hits: &WaitingHits,
+    dirty_ids: &HashSet<String>,
     repaired_projections: usize,
 ) -> anyhow::Result<bool> {
     if !matches!(
@@ -12492,25 +12714,61 @@ fn try_direct_raw_import(
     if new_events.is_empty() {
         return Ok(false);
     }
-    // Supplying an id an earlier event cited without having the body changes
-    // that earlier event: a `prev` arrival can change descendant state groups,
-    // an `auth` arrival can change verdicts. The reverse-edge dirty closure is
-    // not part of this pass, so hand both to the whole-room path.
-    let prev_hits = waiting_hits.prev.intersection(&new_ids).count();
-    let auth_hits = waiting_hits.auth.intersection(&new_ids).count();
-    if prev_hits > 0 || auth_hits > 0 {
-        if direct_debug {
-            eprintln!("direct: fallback, waiting hits prev={prev_hits} auth={auth_hits}");
+    // D is the reverse-edge closure the caller computed from the waiting hits:
+    // the direct citers of a late body and their `prev` descendants. Every id
+    // in D was already stored, so its timeline body (with any auth projection)
+    // is the authoritative input, exactly as the whole-room path reloads it.
+    let dirty_ids: HashSet<String> = dirty_ids
+        .iter()
+        .filter(|id| !new_ids.contains(*id))
+        .cloned()
+        .collect();
+    let mut dirty_events: Vec<OwnedValue> = Vec::new();
+    let mut dirty_timeline: HashSet<String> = HashSet::new();
+    if !dirty_ids.is_empty() {
+        let (loaded, loaded_timeline) = load_event_bodies(
+            store,
+            state_store,
+            template,
+            room_id,
+            collection_id,
+            &dirty_ids,
+        )?;
+        // A reverse row can name an auth-chain-only body, which has no verdict
+        // and cannot seed a state group. The whole-room path never re-judges
+        // those either, so fall back rather than invent a timeline event.
+        if loaded_timeline.len() != dirty_ids.len() {
+            if direct_debug {
+                eprintln!(
+                    "direct: fallback, {} of {} dirty ids have no timeline body",
+                    dirty_ids.len().saturating_sub(loaded_timeline.len()),
+                    dirty_ids.len()
+                );
+            }
+            return Ok(false);
         }
-        return Ok(false);
+        let mut ordered: Vec<&String> = dirty_ids.iter().collect();
+        ordered.sort();
+        for id in ordered {
+            if let Some(event) = loaded.get(id) {
+                dirty_events.push(event.clone());
+            }
+        }
+        dirty_timeline = loaded_timeline;
     }
+    let mut rejudge_ids = new_ids.clone();
+    rejudge_ids.extend(dirty_ids.iter().cloned());
+    // The state walk needs both the new file and the stored events it can
+    // change. The findings pass sees the same union through the export below.
+    let mut walked_events = new_events.clone();
+    walked_events.extend(dirty_events);
 
     let aux = AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     // Every citation must already be present, or be in this file.
     let mut external_refs: HashSet<String> = HashSet::new();
-    for event in &new_events {
+    for event in &walked_events {
         for reference in event_reference_ids(event) {
-            if !new_ids.contains(&reference) {
+            if !rejudge_ids.contains(&reference) {
                 external_refs.insert(reference);
             }
         }
@@ -12535,7 +12793,7 @@ fn try_direct_raw_import(
     // its descendants, so they get no group, exactly as the whole-room path
     // leaves a gapped ancestry unmapped.
     let mut seed_ids: HashSet<String> = HashSet::new();
-    for event in &new_events {
+    for event in &walked_events {
         let Some(prevs) = event.get("prev_events").and_then(OwnedValue::as_array) else {
             continue;
         };
@@ -12546,7 +12804,7 @@ fn try_direct_raw_import(
                 _ => None,
             };
             let Some(id) = id else { continue };
-            if !new_ids.contains(id) {
+            if !rejudge_ids.contains(id) {
                 seed_ids.insert(id.to_owned());
             }
         }
@@ -12586,7 +12844,7 @@ fn try_direct_raw_import(
     // event body in this file.
     let mut needed_keys: HashSet<(String, String)> = HashSet::new();
     needed_keys.insert(("m.room.create".to_owned(), String::new()));
-    for event in &new_events {
+    for event in &walked_events {
         let event_type = event.get("type").and_then(OwnedValue::as_str).unwrap_or("");
         let sender = event
             .get("sender")
@@ -12612,7 +12870,7 @@ fn try_direct_raw_import(
     let mut seed_refs: HashSet<String> = HashSet::new();
     for seed in seeds.values() {
         for (key, event_id) in &seed.set.entries {
-            if needed_keys.contains(key) && !new_ids.contains(event_id) {
+            if needed_keys.contains(key) && !rejudge_ids.contains(event_id) {
                 seed_refs.insert(event_id.clone());
             }
         }
@@ -12621,8 +12879,8 @@ fn try_direct_raw_import(
     // Build the local event universe: this file, its cited events, and the
     // seed state entries the auth rules read.
     let mut local: HashMap<String, OwnedValue> =
-        HashMap::with_capacity(new_events.len().saturating_add(external_refs.len()));
-    for event in &new_events {
+        HashMap::with_capacity(walked_events.len().saturating_add(external_refs.len()));
+    for event in &walked_events {
         if let Some(id) = event_id(event) {
             local.insert(id.to_owned(), event.clone());
         }
@@ -12657,6 +12915,7 @@ fn try_direct_raw_import(
     // Only a timeline body is stored in the redacted timeline form. An
     // auth-chain body is raw and must still be redacted when its hash fails.
     let mut already_redacted: HashSet<String> = external_timeline;
+    already_redacted.extend(dirty_timeline);
     already_redacted.extend(seed_timeline);
     already_redacted.retain(|id| !new_ids.contains(id));
     let mut local_events: Vec<OwnedValue> = Vec::with_capacity(local.len());
@@ -12687,7 +12946,7 @@ fn try_direct_raw_import(
 
     // Prior rejections are cascade inputs. The direct path depends on them, so
     // an unreadable flag index must fall back rather than look unrejected.
-    let prior_rejected: HashSet<String> =
+    let mut prior_rejected: HashSet<String> =
         match RoomFlagIndex::new(room_id.as_bytes()).select(db, &FlagQuery::has(Flag::Rejected)) {
             Ok(ids) => ids
                 .into_iter()
@@ -12700,6 +12959,9 @@ fn try_direct_raw_import(
                 return Ok(false);
             }
         };
+    // A re-judged event must start from a clean slate; its old rejection is
+    // not a cascade input. Rejections outside the dirty set stay seeds.
+    prior_rejected.retain(|id| !rejudge_ids.contains(id));
 
     // Check 4 (state-before-event) and the hash/signature audits run over this
     // file against the local universe. The state walk contributes check 5
@@ -12708,7 +12970,7 @@ fn try_direct_raw_import(
         &local_export,
         room_version,
         &already_redacted,
-        Some(&new_ids),
+        Some(&rejudge_ids),
         &prior_rejected,
         &redacted,
         &lean,
@@ -12717,7 +12979,7 @@ fn try_direct_raw_import(
     rejected.extend(prior_rejected.iter().cloned());
     let mut walk_rejections: HashMap<String, (u8, String)> = HashMap::new();
     let (computation, unchecked) = compute_import_auth_before(
-        &new_events,
+        &walked_events,
         &[],
         &local_export.events,
         room_id,
@@ -12726,7 +12988,7 @@ fn try_direct_raw_import(
         &mut rejected,
         &mut walk_rejections,
         &already_redacted,
-        Some(&new_ids),
+        Some(&rejudge_ids),
         Some(&lean),
         &seeds,
     );
@@ -12753,12 +13015,15 @@ fn try_direct_raw_import(
     }
     if direct_debug {
         eprintln!(
-            "direct: |F|={}, |mapped|={}, seeds={}, unchecked={unchecked}, gapped={}, unmapped={}",
+            "direct: |F|={}, |D|={}, waited prev={} auth={}, |mapped|={}, seeds={}, unchecked={unchecked}, gapped={}, unmapped={}",
             new_events.len(),
+            dirty_ids.len(),
+            waiting_hits.prev.len(),
+            waiting_hits.auth.len(),
             computation.groups.len(),
             seeds.len(),
             computation.gapped.len(),
-            new_ids.len().saturating_sub(computation.groups.len()),
+            rejudge_ids.len().saturating_sub(computation.groups.len()),
         );
     }
 
@@ -12781,31 +13046,18 @@ fn try_direct_raw_import(
             .context("persisting direct-import state-group mappings")?;
     }
 
-    let new_rooms: Vec<RoomEvent> = new_events
-        .iter()
-        .filter_map(|event| RoomEvent::from_pdu(event, room_id))
-        .collect();
-    if new_rooms.len() != new_events.len() {
-        return Ok(false);
-    }
-    let forced_by_id: HashMap<&str, Option<u8>> = local_export
-        .events
-        .iter()
-        .zip(&findings.forced)
-        .map(|(event, forced)| (event.event_id.as_str(), *forced))
-        .collect();
-    let forced: Vec<Option<u8>> = new_rooms
-        .iter()
-        .map(|event| forced_by_id.get(event.event_id.as_str()).copied().flatten())
-        .collect();
+    // `existing_ids` is D only: those records already have a verdict whose
+    // soft-fail claim must survive this re-judge. The new file's events were
+    // just written and have nothing to read back.
+    let existing_ids: HashSet<&str> = dirty_ids.iter().map(String::as_str).collect();
     write_raw_verdicts_and_flags(
         db,
-        &new_rooms,
-        &forced,
+        &local_export.events,
+        &findings.forced,
+        &rejudge_ids,
         &new_ids,
-        &new_ids,
-        &new_ids,
-        &HashSet::new(),
+        &rejudge_ids,
+        &existing_ids,
         template,
         room_id,
     )?;

@@ -3343,6 +3343,199 @@ fn direct_import_leaves_a_gapped_append_unmapped() {
     );
 }
 
+/// A late body only changes the events that cite it and their dependents.
+/// Re-judging that dirty set must reach the same verdicts and state mappings
+/// as the whole-room walk, including the `auth` cascade.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "three-file fixture with both edge families and a cascade; splitting hides the ordering"
+)]
+fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
+    let room = "!dirty_closure:test";
+    let mut snapshots = Vec::new();
+    for direct in [false, true] {
+        let dir = unique_temp_dir().join(format!("dirty_closure_{direct}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(dir.clone()).unwrap();
+        let template = default_matrix_import_template();
+        let collection_id = template_collection_id(&template, room);
+        let store = db.event_dag();
+        let state_store = db.state().as_ref();
+        let mut established = HashSet::new();
+        let mut cache = ImportRunCache {
+            direct,
+            ..ImportRunCache::default()
+        };
+
+        let event = |id: &str,
+                     kind: &str,
+                     state_key: &str,
+                     content: &str,
+                     prev: &str,
+                     auth: &str| {
+            raw_event(room, id, kind, state_key, content, prev, auth)
+        };
+        let create = event(
+            "$create",
+            "m.room.create",
+            "",
+            r#"{"room_version":"11"}"#,
+            "[]",
+            "[]",
+        );
+        let join = event(
+            "$join",
+            "m.room.member",
+            "@alice:test",
+            r#"{"membership":"join"}"#,
+            r#"["$create"]"#,
+            r#"["$create"]"#,
+        );
+        let base = event(
+            "$base",
+            "m.room.message",
+            "",
+            r#"{"body":"base"}"#,
+            r#"["$join"]"#,
+            r#"["$create","$join"]"#,
+        );
+        // Supplied only by the third file, though the second already cites
+        // them.
+        let late_auth = event(
+            "$late-auth",
+            "m.room.message",
+            "",
+            r#"{"body":"late auth"}"#,
+            r#"["$base"]"#,
+            r#"["$create","$join"]"#,
+        );
+        let late_prev = event(
+            "$late-prev",
+            "m.room.message",
+            "",
+            r#"{"body":"late prev"}"#,
+            r#"["$base"]"#,
+            r#"["$create","$join"]"#,
+        );
+        let early = event(
+            "$early",
+            "m.room.message",
+            "",
+            r#"{"body":"cites late auth"}"#,
+            r#"["$base"]"#,
+            r#"["$create","$join","$late-auth"]"#,
+        );
+        // Cites a rejected event as both prev and auth, so the closure must
+        // follow auth dependents as well as prev descendants.
+        let later = event(
+            "$later",
+            "m.room.message",
+            "",
+            r#"{"body":"depends on early"}"#,
+            r#"["$early"]"#,
+            r#"["$create","$join","$early"]"#,
+        );
+        let child = event(
+            "$child",
+            "m.room.message",
+            "",
+            r#"{"body":"gapped child"}"#,
+            r#"["$late-prev"]"#,
+            r#"["$create","$join"]"#,
+        );
+        let grandchild = event(
+            "$grandchild",
+            "m.room.message",
+            "",
+            r#"{"body":"gapped grandchild"}"#,
+            r#"["$child"]"#,
+            r#"["$create","$join"]"#,
+        );
+
+        let write = |name: &str, events: &[&OwnedValue]| {
+            let path = dir.join(name);
+            let mut text = String::new();
+            for event in events {
+                text.push_str(&event.encode());
+                text.push('\n');
+            }
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        for path in [
+            write("first.jsonl", &[&create, &join, &base]),
+            write(
+                "second.jsonl",
+                &[&early, &later, &child, &grandchild],
+            ),
+            write("third.jsonl", &[&late_auth, &late_prev]),
+        ] {
+            cmd_import_file(
+                &db,
+                store,
+                state_store,
+                &path,
+                None,
+                &template,
+                &mut established,
+                false,
+                None,
+                true,
+                Some(&mut cache),
+            )
+            .unwrap();
+        }
+
+        let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
+        let mapped = |id: &str| {
+            aux.get_many(&[id.as_bytes()])
+                .unwrap()
+                .into_iter()
+                .next()
+                .flatten()
+                .is_some()
+        };
+        let code = |id: &str| {
+            let node = template_event_id_node_id(&template, id).unwrap();
+            db.pool(ShardType::EventDag)
+                .get(&event_verdict_collection_id(&node), &node)
+                .unwrap()
+                .map(|data| decode_verdict(&data.bytes).unwrap().1.rejection)
+        };
+        let mut rows = Vec::new();
+        for id in ["$early", "$later", "$child", "$grandchild"] {
+            rows.push((id.to_owned(), code(id), mapped(id)));
+        }
+        let _ = collection_id;
+        snapshots.push((cache.direct_files, rows));
+    }
+
+    let (off_files, off_rows) = &snapshots[0];
+    let (on_files, on_rows) = &snapshots[1];
+    assert_eq!(*off_files, 0, "the whole-room run never uses the gate");
+    assert_eq!(
+        *on_files, 2,
+        "the late-body file must re-judge its dirty closure directly"
+    );
+    assert_eq!(
+        off_rows, on_rows,
+        "the dirty closure must match the whole-room verdicts and state mappings"
+    );
+    assert!(
+        on_rows.iter().any(|(id, code, _)| {
+            (id == "$early" || id == "$later") && matches!(code, Some(None))
+        }),
+        "the late auth body and the cascade must clear the earlier rejections"
+    );
+    assert!(
+        on_rows
+            .iter()
+            .all(|(id, _, mapped)| { !matches!(id.as_str(), "$child" | "$grandchild") || *mapped }),
+        "the late prev body must map the previously gapped child and grandchild"
+    );
+}
+
 #[test]
 fn raw_import_derives_rejections_and_writes_flags() {
     use mtxdb::room_flag::*;
