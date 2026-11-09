@@ -14283,6 +14283,13 @@ struct PartialStateComputation {
     /// the first-parent rule, so `groups` must not be cached as though
     /// the real resolver had run — a later, fuller import recomputes them.
     incomplete: Vec<String>,
+    /// State-resolution merges the walk ran. Zero past a gap: nothing is
+    /// resolved or derived for an event whose base is missing history.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "asserted by the gap and fork walk tests")
+    )]
+    merges: usize,
 }
 
 /// What one DAG walk produced: the per-event group map, the derived instances
@@ -14295,6 +14302,7 @@ struct StateGroupWalk {
     /// arrives.
     gapped: Vec<String>,
     incomplete: Vec<String>,
+    merges: usize,
 }
 
 /// One resolved state-group derivation: the parent instance ids it descends
@@ -14448,6 +14456,7 @@ fn compute_state_groups_partial_with(
             instances: HashMap::new(),
             gapped: Vec::new(),
             incomplete: Vec::new(),
+            merges: 0,
         };
     }
 
@@ -14482,6 +14491,7 @@ fn compute_state_groups_partial_with(
         instances: result.instances,
         gapped: result.gapped,
         incomplete: result.incomplete,
+        merges: result.merges,
     }
 }
 
@@ -14720,6 +14730,7 @@ fn walk_state_groups(
         instances,
         gapped,
         incomplete,
+        merges: merge_count,
     }
 }
 
