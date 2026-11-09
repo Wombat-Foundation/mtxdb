@@ -14283,6 +14283,12 @@ struct PartialStateComputation {
     /// the first-parent rule, so `groups` must not be cached as though
     /// the real resolver had run — a later, fuller import recomputes them.
     incomplete: Vec<String>,
+    /// Exposed only to the fixture tests; production imports report these
+    /// values through `MTXDB_IMPORT_TIMINGS`.
+    #[cfg(test)]
+    merge_count: usize,
+    #[cfg(test)]
+    merge_phases: crate::state_resolve::MergePhaseTimes,
 }
 
 /// What one DAG walk produced: the per-event group map, the derived instances
@@ -14295,6 +14301,10 @@ struct StateGroupWalk {
     /// arrives.
     gapped: Vec<String>,
     incomplete: Vec<String>,
+    #[cfg(test)]
+    merge_count: usize,
+    #[cfg(test)]
+    merge_phases: crate::state_resolve::MergePhaseTimes,
 }
 
 /// One resolved state-group derivation: the parent instance ids it descends
@@ -14448,6 +14458,10 @@ fn compute_state_groups_partial_with(
             instances: HashMap::new(),
             gapped: Vec::new(),
             incomplete: Vec::new(),
+            #[cfg(test)]
+            merge_count: 0,
+            #[cfg(test)]
+            merge_phases: crate::state_resolve::MergePhaseTimes::default(),
         };
     }
 
@@ -14482,6 +14496,10 @@ fn compute_state_groups_partial_with(
         instances: result.instances,
         gapped: result.gapped,
         incomplete: result.incomplete,
+        #[cfg(test)]
+        merge_count: result.merge_count,
+        #[cfg(test)]
+        merge_phases: result.merge_phases,
     }
 }
 
@@ -14720,6 +14738,10 @@ fn walk_state_groups(
         instances,
         gapped,
         incomplete,
+        #[cfg(test)]
+        merge_count,
+        #[cfg(test)]
+        merge_phases,
     }
 }
 
@@ -16377,3 +16399,7 @@ fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "test_cmd.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "gapped_bench.rs"]
+mod gapped_bench;
