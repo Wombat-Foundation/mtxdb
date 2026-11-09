@@ -1418,6 +1418,64 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_between_the_seal_rename_and_the_tail_truncate_replays_to_the_same_rows() {
+        let layout = layout("seal-window");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([6; 16]);
+        for owner in 1..=3 {
+            store
+                .with_write_lock(|| {
+                    store.append_rows_locked(scope, &[row_for(owner, 10 + owner)], false)
+                })
+                .unwrap();
+        }
+        store.sync_tail().unwrap();
+        let tail = store.tail_path();
+        let full_tail = fs::read(&tail).unwrap();
+        let resolved = |store: &CsrStore| {
+            let mut rows: Vec<(u32, Vec<(u32, u16)>)> = store
+                .read_scope(scope)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.owner,
+                        r.edges.iter().map(|e| (e.target, e.kind)).collect(),
+                    )
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        let before = resolved(&store);
+        assert_eq!(before.len(), 3);
+        store.seal().unwrap();
+        // The segment is durable but the truncate was lost: the old frames are
+        // back in the tail next to the sealed segment holding the same rows.
+        fs::write(&tail, &full_tail).unwrap();
+        TAIL_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&store.dir);
+        let reopened = CsrStore::open(&layout, ShardType::State);
+        assert_eq!(
+            resolved(&reopened),
+            before,
+            "replay must resolve to the same rows"
+        );
+        // Re-importing the same rows changes nothing, and a later seal keeps it so.
+        for owner in 1..=3 {
+            reopened
+                .append_rows(scope, &[row_for(owner, 10 + owner)])
+                .unwrap();
+        }
+        reopened.seal().unwrap();
+        assert_eq!(resolved(&reopened), before);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
     fn appends_and_reads_one_scope() {
         let layout = layout("roundtrip");
         let store = CsrStore::open(&layout, ShardType::State);
