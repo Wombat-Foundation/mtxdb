@@ -13630,13 +13630,18 @@ fn repair_import_state_groups(
     }
     if materialized && !loaded && !partial_groups.is_empty() {
         let partial_aux = AuxiliaryIndex::open(state_store, PARTIAL_STATE_GROUP_NAMESPACE);
+        let cached_partial =
+            load_cached_state_group_subset(&partial_aux, &graph_event_ids).unwrap_or_default();
         let entries: Vec<(&[u8], &[u8])> = partial_groups
             .iter()
+            .filter(|(event_id, instance_id)| cached_partial.get(*event_id) != Some(*instance_id))
             .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
             .collect();
-        partial_aux
-            .put_many(&entries)
-            .context("persisting partial state-group mappings")?;
+        if !entries.is_empty() {
+            partial_aux
+                .put_many(&entries)
+                .context("persisting partial state-group mappings")?;
+        }
     }
     Ok(())
 }
@@ -14624,13 +14629,13 @@ fn walk_state_groups(
         // (a forward extremity): that is the room's best-effort current state.
         // Keeping one for every event copies the whole state map per state
         // event, which is quadratic in memory on rooms with many members.
-        let keep_partial = base_gapped
-            && remaining_children.get(&short_id).copied().unwrap_or(0) == 0;
+        let keep_partial =
+            base_gapped && remaining_children.get(&short_id).copied().unwrap_or(0) == 0;
         if keep_partial {
             partial_instances
                 .entry(state.instance)
                 .or_insert_with(|| StateInstance {
-                    parents: canonical_parents(&parent_instances),
+                    parents: canonical_parents(&state.parents),
                     lthash: state.lthash,
                     set: state.set.clone(),
                     derivation: policy.derivation,
@@ -14640,7 +14645,7 @@ fn walk_state_groups(
             instances
                 .entry(state.instance)
                 .or_insert_with(|| StateInstance {
-                    parents: canonical_parents(&parent_instances),
+                    parents: canonical_parents(&state.parents),
                     lthash: state.lthash,
                     set: state.set.clone(),
                     derivation: policy.derivation,
@@ -14752,16 +14757,24 @@ fn derive_state(
                 &set.lthash(),
                 policy.derivation,
             );
-            SharedState::new(set, instance, base_complete)
+            SharedState::with_parents(set, instance, base_complete, parent_instances.to_vec())
         }
         _ if distinct_instances(parent_instances) > 1 => {
             let instance =
                 state_group_instance_id(room_id, parent_instances, &base.lthash, policy.derivation);
-            SharedState::new(base.set.clone(), instance, base_complete)
+            SharedState::with_parents(
+                base.set.clone(),
+                instance,
+                base_complete,
+                parent_instances.to_vec(),
+            )
         }
-        _ if base_complete != base.complete => {
-            SharedState::new(base.set.clone(), base.instance, base_complete)
-        }
+        _ if base_complete != base.complete => SharedState::with_parents(
+            base.set.clone(),
+            base.instance,
+            base_complete,
+            base.parents.clone(),
+        ),
         _ => Arc::clone(base),
     }
 }
@@ -14793,7 +14806,7 @@ fn merge_parent_states(
         parents.iter().map(|parent| &parent.set.entries).collect();
     let mut fallback = false;
     let merged = match resolve_parents(context, &parent_entries, policy) {
-        Ok(entries) => StateSet { entries },
+        Ok(entries) => StateSet::from_entries(entries),
         Err(gap) => {
             fallback = true;
             incomplete.extend(gap.missing);
@@ -14811,7 +14824,10 @@ fn merge_parent_states(
         policy.derivation,
     );
     let complete = !fallback && parents.iter().all(|parent| parent.complete);
-    (SharedState::new(merged, instance, complete), fallback)
+    (
+        SharedState::with_parents(merged, instance, complete, parent_instances.to_vec()),
+        fallback,
+    )
 }
 
 /// Number of distinct instance ids in `instances`.
@@ -14942,38 +14958,69 @@ struct SharedState {
     /// missing parent or a resolution fallback marks the whole subtree, so
     /// descendants are not judged against state built on a gap.
     complete: bool,
+    /// The parent instances this state's own instance record names. A state
+    /// shared by descendants (a message event reuses its parent's state) keeps
+    /// the parents of the event that created it, so any holder can publish the
+    /// correct record rather than one that points the instance at itself.
+    parents: Vec<[u8; STATE_GROUP_ID_LENGTH]>,
 }
 
 impl SharedState {
     fn new(set: StateSet, instance: [u8; STATE_GROUP_ID_LENGTH], complete: bool) -> Arc<Self> {
+        Self::with_parents(set, instance, complete, Vec::new())
+    }
+
+    fn with_parents(
+        set: StateSet,
+        instance: [u8; STATE_GROUP_ID_LENGTH],
+        complete: bool,
+        parents: Vec<[u8; STATE_GROUP_ID_LENGTH]>,
+    ) -> Arc<Self> {
         let lthash = set.lthash();
         Arc::new(Self {
             set,
             lthash,
             instance,
             complete,
+            parents,
         })
     }
 }
 
 /// A set of state events keyed by (type, `state_key`).
+///
+/// The entries are a persistent map and the `LtHash` is maintained alongside
+/// them, so cloning a set is O(1) and a state event updates the digest with one
+/// remove and one insert instead of rehashing every entry.
 #[derive(Debug, Clone, Default)]
 struct StateSet {
-    entries: HashMap<(String, String), String>,
+    entries: StateEntries,
+    lattice: rezzy::incremental::LtHash,
 }
 
 impl StateSet {
     fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
+        Self::default()
+    }
+
+    /// Wrap resolved entries, hashing them once.
+    fn from_entries(entries: StateEntries) -> Self {
+        let mut lattice = rezzy::incremental::LtHash::default();
+        for ((event_type, state_key), event_id) in &entries {
+            lattice.insert(event_type, state_key, event_id);
         }
+        Self { entries, lattice }
     }
 
     fn set(&mut self, event_type: &str, state_key: &str, event_id: String) {
-        self.entries
-            .insert((event_type.to_owned(), state_key.to_owned()), event_id);
+        self.lattice.insert(event_type, state_key, &event_id);
+        if let Some(old) = self
+            .entries
+            .insert((event_type.to_owned(), state_key.to_owned()), event_id)
+        {
+            self.lattice.remove(event_type, state_key, &old);
+        }
     }
-
     /// Union another state set into this one, keeping the existing entry when
     /// both sets name different event ids for the same `(type, state_key)`.
     ///
@@ -14983,9 +15030,9 @@ impl StateSet {
     /// through [`merge_parent_states`] instead.
     fn merge(&mut self, other: &StateSet) {
         for (key, eid) in &other.entries {
-            self.entries
-                .entry(key.clone())
-                .or_insert_with(|| eid.clone());
+            if !self.entries.contains_key(key) {
+                self.set(&key.0, &key.1, eid.clone());
+            }
         }
     }
 
@@ -14996,14 +15043,7 @@ impl StateSet {
     /// matches `sithnapse`'s state identity and the lattice embedded in every
     /// materialized `MTHR` root.
     fn lthash(&self) -> [u8; 32] {
-        let entries: Vec<(String, String, String)> = self
-            .entries
-            .iter()
-            .map(|((event_type, state_key), event_id)| {
-                (event_type.clone(), state_key.clone(), event_id.clone())
-            })
-            .collect();
-        crate::state_hamt::state_group_id(&entries)
+        self.lattice.digest()
     }
 
     /// The `LtHash` digest as unpadded base64url, for golden tests.

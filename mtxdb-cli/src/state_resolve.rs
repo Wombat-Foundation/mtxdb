@@ -39,7 +39,10 @@ use crate::state_policy::{event_disposition, EventDisposition, ResolutionPolicy}
 /// This is the shape `crate::cmd::StateSet::entries` stores; it is spelled
 /// out here so the adapter can be written and tested against mtxdb's own type
 /// without widening that module's API.
-pub(crate) type StateEntries = HashMap<(String, String), String>;
+///
+/// A persistent map: cloning is O(1) and a write copies only its root-to-leaf
+/// path, so a state event costs O(log n) instead of a copy of the whole state.
+pub(crate) type StateEntries = rezzy::PersistentOrdMap<(String, String), String>;
 
 /// A merge that could not be resolved because the import batch does not carry
 /// everything the resolver reads.

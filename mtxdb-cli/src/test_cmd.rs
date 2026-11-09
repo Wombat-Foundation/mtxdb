@@ -2048,18 +2048,26 @@ fn import_dedups_repeated_event_id_within_one_input() {
     .unwrap();
     let stats = store.stats();
     assert_eq!(
-        stats.put_many_calls, 1,
-        "the repeated event_id needs only the event batch"
+        stats.put_many_calls, 2,
+        "the repeated event_id needs one event batch; the prev-less event also needs one partial mapping batch"
     );
     assert_eq!(
-        stats.put_many_records, 1,
-        "the repeated event_id must not be written twice"
+        stats.put_many_records, 2,
+        "the repeated event_id must not be written twice: one event record and one partial mapping"
     );
-    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(db.state().as_ref(), STATE_GROUP_NAMESPACE);
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(store.as_ref(), STATE_GROUP_NAMESPACE);
     assert_eq!(
         aux.get(b"$a").unwrap(),
         None,
-        "a message with no prev_events has no complete base, so it must stay unmapped"
+        "a message with no prev_events has no complete base, so it must stay out of the complete namespace"
+    );
+    let partial_aux = mtxdb::auxiliary::AuxiliaryIndex::open(
+        store.as_ref(),
+        super::PARTIAL_STATE_GROUP_NAMESPACE,
+    );
+    assert!(
+        partial_aux.get(b"$a").unwrap().is_some(),
+        "its best-effort state is published under the partial namespace instead"
     );
     let node_id = template_node_id(&template, &events[0]).unwrap().unwrap();
     assert!(
