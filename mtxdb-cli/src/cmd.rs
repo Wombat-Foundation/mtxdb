@@ -82,6 +82,20 @@ const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
 /// state instead of none.
 const PARTIAL_STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups-partial:v1";
 
+/// Whether the importer should print per-phase timings. Off by default so a
+/// normal import log stays stable for the tests and for readers who only want
+/// counts; set `MTXDB_IMPORT_TIMINGS=1` to see where the seconds go.
+fn import_timings_enabled() -> bool {
+    std::env::var_os("MTXDB_IMPORT_TIMINGS").is_some()
+}
+
+/// Print one completed import phase when timings are enabled.
+fn report_import_phase(phase: &str, elapsed: std::time::Duration) {
+    if import_timings_enabled() {
+        eprintln!("  timing: {phase} {elapsed:?}");
+    }
+}
+
 /// Whether `value` is a well-formed 128-bit STGP state-group instance id.
 fn valid_state_group_id(value: &[u8]) -> bool {
     value.len() == STATE_GROUP_ID_LENGTH
@@ -8839,6 +8853,7 @@ fn cmd_import(
     template: Option<&Path>,
     no_state_hamts: bool,
 ) -> anyhow::Result<()> {
+    let import_started = Instant::now();
     let import_template = compile_import_template(template)?;
     // One writer owns the entire batch: it prevents another writer from
     // interleaving halfway through a shell glob, and lets us publish one
@@ -8935,6 +8950,9 @@ fn cmd_import(
             .context("persisting imported signing keys")?;
     }
     finish_import(&db, &run)?;
+    if import_timings_enabled() {
+        eprintln!("import: wall time {:?}", import_started.elapsed());
+    }
     if failures != 0 {
         bail!("import completed with {failures} failed input file(s)");
     }
@@ -9240,7 +9258,7 @@ fn import_data(
                 }
             }
         }
-        if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
+        if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() || import_timings_enabled() {
             eprintln!(
                 "import: {} took {:?}",
                 path.display(),
@@ -11178,11 +11196,16 @@ impl ImportContext<'_> {
         if collection_override.is_some() {
             bail!("--collection does not apply to an mtxdb export: the server's layout derives the room's collections itself");
         }
+        let phase_start = Instant::now();
+        let mut lap = phase_start;
+        let mut phases: Vec<(&str, std::time::Duration)> = Vec::new();
         let events: Vec<OwnedValue> = export
             .events
             .iter()
             .map(|event| event.unflagged(&export.room_id))
             .collect();
+        phases.push(("unflag", lap.elapsed()));
+        lap = Instant::now();
         if !events
             .iter()
             .any(|event| matrix_create_event_id(event).is_some())
@@ -11199,8 +11222,12 @@ impl ImportContext<'_> {
             .and_then(|event| nested_event_string_field(event, "content", "room_version"))
             .unwrap_or_default()
             .to_owned();
+        phases.push(("validate", lap.elapsed()));
+        lap = Instant::now();
         let mut findings = export_import::derived_auth_findings_with_keys(export, signature_keys)?;
         let mut rejected = export_import::rejected_event_ids(export, &findings);
+        phases.push(("findings(hash+sig+judge)", lap.elapsed()));
+        lap = Instant::now();
         let mut walk_rejections = HashMap::new();
         let (computation, unchecked) = compute_import_auth_before(
             &events,
@@ -11216,6 +11243,8 @@ impl ImportContext<'_> {
             None,
             &HashMap::new(),
         );
+        phases.push(("state walk+judge", lap.elapsed()));
+        lap = Instant::now();
         export_import::apply_walk_rejections(export, &mut findings, &walk_rejections);
         if unchecked > 0 {
             eprintln!(
@@ -11229,6 +11258,8 @@ impl ImportContext<'_> {
             export_import::BATCH_BYTES,
             &findings,
         )?;
+        phases.push(("write records", lap.elapsed()));
+        lap = Instant::now();
         if self.write_state_hamts {
             repair_import_state_groups(
                 self.state_store,
@@ -11238,6 +11269,19 @@ impl ImportContext<'_> {
                 &room_version,
                 Some(computation),
             )?;
+        }
+        phases.push(("state HAMT+map", lap.elapsed()));
+        if crate::debug_enabled() {
+            let parts: Vec<String> = phases
+                .iter()
+                .map(|(name, took)| format!("{name} {}ms", took.as_millis()))
+                .collect();
+            eprintln!(
+                "  timing: {} events in {}ms: {}",
+                export.events.len(),
+                phase_start.elapsed().as_millis(),
+                parts.join(", ")
+            );
         }
         eprintln!(
             "  {}",
@@ -12069,6 +12113,7 @@ fn import_pdu_events_with_raw_state_hamts(
         eprintln!("  raw import: direct incremental path");
     }
     if !skip_judging && !direct_handled {
+        let phase_loaded = Instant::now();
         // Existing records are part of the state the new batch inherits. Reading
         // them back is the simplest way to let check 5 run across separate files:
         // the walk sees the whole room, not just this file. Events written by
@@ -12081,6 +12126,9 @@ fn import_pdu_events_with_raw_state_hamts(
             Some(cached) => cached,
             None => load_collection_events(store, &collection_id, &resolved.canonical_id)?,
         };
+        if import_timings_enabled() {
+            eprintln!("  timing: load room {:?}", phase_loaded.elapsed());
+        }
         let prior: Vec<OwnedValue> = stored_events
             .into_iter()
             .filter(|event| event_id(event).is_none_or(|id| !current_ids.contains(id)))
@@ -12238,6 +12286,7 @@ fn import_pdu_events_with_raw_state_hamts(
             events: room_events,
             timeline: false,
         };
+        let phase_redact = Instant::now();
         let redacted = export_import::redactions_for_export(
             &synthetic.events,
             &room_version,
@@ -12301,6 +12350,8 @@ fn import_pdu_events_with_raw_state_hamts(
         } else {
             export_import::lean_redacted_events(&synthetic.events, &redacted, &synthetic.room_id)
         };
+        report_import_phase("redaction/lean", phase_redact.elapsed());
+        let phase_findings = Instant::now();
         let mut findings = export_import::derived_auth_findings_for_raw_with_inputs(
             &synthetic,
             &room_version,
@@ -12312,6 +12363,8 @@ fn import_pdu_events_with_raw_state_hamts(
         )?;
         let mut rejected = export_import::rejected_event_ids(&synthetic, &findings);
         rejected.extend(prior_rejected.iter().cloned());
+        report_import_phase("auth findings", phase_findings.elapsed());
+        let phase_walk = Instant::now();
         let mut walk_rejections = HashMap::new();
         let (computation, unchecked) = compute_import_auth_before(
             &all_events,
@@ -12328,6 +12381,7 @@ fn import_pdu_events_with_raw_state_hamts(
             &HashMap::new(),
         );
         export_import::apply_walk_rejections(&synthetic, &mut findings, &walk_rejections);
+        report_import_phase("state/auth walk", phase_walk.elapsed());
         if unchecked > 0 {
             eprintln!(
                 "  warning: {unchecked} event(s) could not be checked against the state before them"
@@ -12351,6 +12405,7 @@ fn import_pdu_events_with_raw_state_hamts(
             .map(String::as_str)
             .chain(existed_before.iter().map(String::as_str))
             .collect();
+        let phase_verdicts = Instant::now();
         let (changed_earlier, changed_earlier_rejected) = write_raw_verdicts_and_flags(
             db,
             &synthetic.events,
@@ -12367,8 +12422,10 @@ fn import_pdu_events_with_raw_state_hamts(
                 "  updated earlier verdicts: {changed_earlier} events ({changed_earlier_rejected} rejected)"
             );
         }
+        report_import_phase("verdicts/flags", phase_verdicts.elapsed());
 
         if write_state_hamts {
+            let phase_publish = Instant::now();
             repair_import_state_groups(
                 state_store,
                 &all_events,
@@ -12377,6 +12434,7 @@ fn import_pdu_events_with_raw_state_hamts(
                 &room_version,
                 Some(computation),
             )?;
+            report_import_phase("state publish (total)", phase_publish.elapsed());
         }
 
         // Keep the room in memory for the next file in this run. Only stored
@@ -13488,10 +13546,12 @@ fn repair_import_state_groups(
         .map(str::to_owned)
         .filter(|event_id| seen_state_event_ids.insert(event_id.clone()))
         .collect::<Vec<_>>();
+    let phase_cache = Instant::now();
     let aux = AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
     let cached = load_cached_state_groups(&aux, &graph_event_ids);
     let cached_subset = load_cached_state_group_subset(&aux, &graph_event_ids).unwrap_or_default();
     let loaded = cached.is_some();
+    report_import_phase("state cache load", phase_cache.elapsed());
     let mut state_groups = cached.unwrap_or_default();
     let mut computed_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> =
         HashMap::new();
@@ -13501,6 +13561,7 @@ fn repair_import_state_groups(
     // fact that a fuller import can compute the real resolution instead.
     let mut publishable = true;
     let mut partial_groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
+    let phase_walk = Instant::now();
     let unresolved_count = if loaded {
         0
     } else {
@@ -13585,6 +13646,7 @@ fn repair_import_state_groups(
         unresolved.len()
     };
     let graph_event_count = graph_event_ids.len();
+    report_import_phase("state walk/repair", phase_walk.elapsed());
     let mapped_event_count = state_groups.len();
     let unique_state_group_count = state_groups.values().collect::<HashSet<_>>().len();
     let partial_event_count = partial_groups.len();
@@ -13596,6 +13658,7 @@ fn repair_import_state_groups(
         "  state groups: {source} {unique_state_group_count} state groups; state: {} of {graph_event_count} events have a stored state group ({mapped_event_count} complete, {partial_event_count} partial forward extremities; an ancestor body is absent), {stateless_event_count} without ({unresolved_count} in cycles)",
         mapped_event_count.saturating_add(partial_event_count)
     );
+    let phase_hamt = Instant::now();
     let mut materialized = computed_instances.is_empty();
     if !computed_instances.is_empty() {
         match materialize_state_hamts(state_store, canonical_id, &computed_instances) {
@@ -13609,6 +13672,8 @@ fn repair_import_state_groups(
             Err(error) => return Err(error).context("persisting imported state HAMTs"),
         }
     }
+    report_import_phase("state HAMT materialize", phase_hamt.elapsed());
+    let phase_mappings = Instant::now();
     if materialized && !loaded && !state_groups.is_empty() && publishable {
         // Publish mappings only after their target HAMTs are durable. A later
         // replay must not mistake a partially materialized repair for a
@@ -13643,6 +13708,7 @@ fn repair_import_state_groups(
                 .context("persisting partial state-group mappings")?;
         }
     }
+    report_import_phase("state mappings publish", phase_mappings.elapsed());
     Ok(())
 }
 
@@ -14503,6 +14569,8 @@ fn walk_state_groups(
     let mut instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> = HashMap::new();
     let seed_instances: HashSet<[u8; STATE_GROUP_ID_LENGTH]> =
         seed_states.values().map(|seed| seed.instance).collect();
+    let mut merge_time = std::time::Duration::ZERO;
+    let mut merge_count = 0usize;
 
     for &idx in sorted {
         let short_id = frontier.nodes[idx].short_id;
@@ -14585,6 +14653,7 @@ fn walk_state_groups(
                 Arc::clone(first)
             }
             [..] => {
+                let merge_started = Instant::now();
                 let (merged, fallback) = merge_parent_states(
                     &mut context,
                     &parents,
@@ -14593,6 +14662,8 @@ fn walk_state_groups(
                     policy,
                     &mut incomplete,
                 );
+                merge_time = merge_time.saturating_add(merge_started.elapsed());
+                merge_count = merge_count.saturating_add(1);
                 base_incomplete |= fallback;
                 merged
             }
@@ -14682,6 +14753,9 @@ fn walk_state_groups(
     incomplete.sort();
     let mut gapped: Vec<String> = gapped.into_iter().collect();
     gapped.sort();
+    if merge_count > 0 {
+        report_import_phase(&format!("state merges ({merge_count})"), merge_time);
+    }
     StateGroupWalk {
         groups: result,
         instances,
