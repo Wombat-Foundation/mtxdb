@@ -265,7 +265,6 @@ pub(crate) enum Commands {
         packs: Vec<String>,
         all: bool,
         root: Vec<String>,
-        no_topo: bool,
         out: Option<PathBuf>,
         yes: bool,
     },
@@ -1122,12 +1121,6 @@ fn sub_repack() -> Command {
         )
         .arg(Arg::new("root").short('o').long("root").num_args(1..))
         .arg(
-            Arg::new("no_topo")
-                .long("no-topo")
-                .action(ArgAction::SetTrue)
-                .help("Ignore the pool's ordering policy and write records in id order (also disables --root GC)"),
-        )
-        .arg(
             Arg::new("out")
                 .long("out")
                 .value_name("DIR")
@@ -1574,7 +1567,6 @@ fn parse_cli() -> Cli {
                 .flatten()
                 .cloned()
                 .collect(),
-            no_topo: m.get_flag("no_topo"),
             out: m.get_one::<String>("out").map(PathBuf::from),
             yes: m.get_flag("yes"),
         },
