@@ -2048,26 +2048,18 @@ fn import_dedups_repeated_event_id_within_one_input() {
     .unwrap();
     let stats = store.stats();
     assert_eq!(
-        stats.put_many_calls, 2,
-        "the repeated event_id needs one event batch; the prev-less event also needs one partial mapping batch"
+        stats.put_many_calls, 1,
+        "the repeated event_id needs one event batch and no state mapping"
     );
     assert_eq!(
-        stats.put_many_records, 2,
-        "the repeated event_id must not be written twice: one event record and one partial mapping"
+        stats.put_many_records, 1,
+        "the repeated event_id must not be written twice and must stay unmapped"
     );
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(store.as_ref(), STATE_GROUP_NAMESPACE);
     assert_eq!(
         aux.get(b"$a").unwrap(),
         None,
-        "a message with no prev_events has no complete base, so it must stay out of the complete namespace"
-    );
-    let partial_aux = mtxdb::auxiliary::AuxiliaryIndex::open(
-        store.as_ref(),
-        super::PARTIAL_STATE_GROUP_NAMESPACE,
-    );
-    assert!(
-        partial_aux.get(b"$a").unwrap().is_some(),
-        "its best-effort state is published under the partial namespace instead"
+        "a message with no prev_events has no complete base, so it stays unmapped"
     );
     let node_id = template_node_id(&template, &events[0]).unwrap().unwrap();
     assert!(
@@ -6804,8 +6796,8 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     assert!(!first.groups.contains_key("$child"));
     assert!(first.unresolved.is_empty());
     assert!(
-        first.partial.contains_key("$child"),
-        "the event is still sorted with an unknown base and gets a partial group"
+        first.gapped.contains(&"$child".to_owned()),
+        "the event is gapped and stays unmapped until its parent arrives"
     );
     assert_eq!(aux.get(b"$child").unwrap(), None);
 
@@ -6973,13 +6965,13 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
     assert!(without_branch_b.groups.contains_key("$branch-a"));
     assert!(!without_branch_b.groups.contains_key("$merge"));
     assert!(
-        without_branch_b.partial.contains_key("$merge"),
-        "a merge with an absent parent is derived with an unknown base"
+        without_branch_b.gapped.contains(&"$merge".to_owned()),
+        "a merge with an absent parent is gapped and stays unmapped"
     );
     assert!(!with_orphan.groups.contains_key("$orphan"));
     assert!(
-        with_orphan.partial.contains_key("$orphan"),
-        "an orphan is derived with an unknown base instead of dropped"
+        with_orphan.gapped.contains(&"$orphan".to_owned()),
+        "an orphan is gapped and stays unmapped instead of getting a guessed group"
     );
 }
 
