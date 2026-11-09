@@ -458,9 +458,16 @@ impl SignatureKeyCatalog {
             .any(|record| !record.key.key.is_empty())
     }
 
+    /// Stored signing keys for the servers one room's events name.
+    ///
+    /// Reading one server's keys scans the whole server-info pool, so
+    /// `stored_keys` remembers each server's keys for the rest of the run: a
+    /// run that imports many rooms reads each distinct server once, not once
+    /// per room. The caller drops the memo whenever keys are imported.
     pub(crate) fn read_for_room(
         store: &PackfileStorage,
         export: &RoomExport,
+        stored_keys: &mut HashMap<String, Vec<mtxdb::server_keys::ServerKey>>,
     ) -> anyhow::Result<Self> {
         let mut catalog = Self::default();
         let Some(room_version) = create_room_version(&export.events) else {
@@ -480,13 +487,17 @@ impl SignatureKeyCatalog {
             }
         }
         for server in servers {
-            for key in server_keys::read_server_keys(store, server.as_bytes())? {
+            if !stored_keys.contains_key(&server) {
+                let keys = server_keys::read_server_keys(store, server.as_bytes())?;
+                stored_keys.insert(server.clone(), keys);
+            }
+            for key in &stored_keys[&server] {
                 catalog.records.insert(
                     (server.to_ascii_lowercase(), key.key_id.clone()),
                     VerificationKeyRecord {
                         origin: server.clone(),
                         parsed_key: VerificationKey::try_from(key.key.as_slice()).ok(),
-                        key,
+                        key: key.clone(),
                     },
                 );
             }

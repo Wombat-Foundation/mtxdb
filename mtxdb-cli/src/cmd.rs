@@ -10359,6 +10359,10 @@ struct ImportRunCache {
     reverse: HashMap<[u8; 16], RoomReverse>,
     direct: bool,
     direct_files: usize,
+    /// Stored signing keys by server for this run. Each lookup scans the whole
+    /// server-info pool, so rooms share one read per server. Cleared when a
+    /// keys file is imported.
+    server_keys: HashMap<String, Vec<mtxdb::server_keys::ServerKey>>,
 }
 
 impl Default for ImportRunCache {
@@ -10369,6 +10373,7 @@ impl Default for ImportRunCache {
             reverse: HashMap::new(),
             direct: direct_import_enabled(),
             direct_files: 0,
+            server_keys: HashMap::new(),
         }
     }
 }
@@ -10978,24 +10983,12 @@ impl ImportContext<'_> {
                 } else if let Some(catalog) = self.signature_catalog {
                     // The run's keys file does not replace keys already
                     // stored by an earlier import: verification must see both.
-                    let mut merged = export_import::SignatureKeyCatalog::read_for_room(
-                        self.db.server_info(),
-                        &export,
-                    )
-                    .with_context(|| {
-                        format!("reading signing keys needed by {}", export.room_id)
-                    })?;
+                    let mut merged = self.read_stored_keys_for_room(&export)?;
                     merged.extend_from(catalog);
                     self.import_room_export(&export, collection_override, Some(&merged))
                         .with_context(|| format!("importing {}", path.display()))
                 } else {
-                    let catalog = export_import::SignatureKeyCatalog::read_for_room(
-                        self.db.server_info(),
-                        &export,
-                    )
-                    .with_context(|| {
-                        format!("reading signing keys needed by {}", export.room_id)
-                    })?;
+                    let catalog = self.read_stored_keys_for_room(&export)?;
                     self.import_room_export(&export, collection_override, Some(&catalog))
                         .with_context(|| format!("importing {}", path.display()))
                 }
@@ -11005,6 +10998,10 @@ impl ImportContext<'_> {
                     .with_context(|| format!("reading {}", path.display()))?;
                 let signature_catalog = export_import::SignatureKeyCatalog::from_records(&records);
                 let key_bindings = self.import_keys_export(path, &records)?;
+                // The stored keys just changed; anything remembered is stale.
+                if let Some(cache) = self.room_cache.as_deref_mut() {
+                    cache.server_keys.clear();
+                }
                 Ok(ImportOutcome {
                     server_keys: true,
                     signature_catalog: Some(signature_catalog),
@@ -11015,6 +11012,21 @@ impl ImportContext<'_> {
                 })
             }
         }
+    }
+
+    /// Signing keys already stored for the servers `export` names, reusing
+    /// what earlier rooms of this run read.
+    fn read_stored_keys_for_room(
+        &mut self,
+        export: &interchange::RoomExport,
+    ) -> anyhow::Result<export_import::SignatureKeyCatalog> {
+        let mut unshared = HashMap::new();
+        let memo = match self.room_cache.as_deref_mut() {
+            Some(cache) => &mut cache.server_keys,
+            None => &mut unshared,
+        };
+        export_import::SignatureKeyCatalog::read_for_room(self.db.server_info(), export, memo)
+            .with_context(|| format!("reading signing keys needed by {}", export.room_id))
     }
 
     /// A `.jsonl` file: one event per line, or a federation document for the
