@@ -220,12 +220,37 @@ pub(crate) fn write_marker(db: &Database, counts: ImportCounts) -> anyhow::Resul
     Ok(())
 }
 
+/// Test-only seam for the pre-marker barrier. A test can force the adjacency
+/// sync to fail without relying on file modes, which a privileged user (or a
+/// process with `CAP_DAC_OVERRIDE`) would ignore.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_ADJACENCY_SYNC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make the next barrier on this thread report a failed adjacency sync.
+    pub(crate) fn fail_adjacency_sync() {
+        FAIL_ADJACENCY_SYNC.with(|flag| flag.set(true));
+    }
+
+    pub(crate) fn take_adjacency_sync_failure() -> bool {
+        FAIL_ADJACENCY_SYNC.with(|flag| flag.replace(false))
+    }
+}
+
 /// Make everything written so far durable. Called before the marker commits,
 /// so the marker is never durable ahead of the data it vouches for.
 pub(crate) fn sync_data(db: &Database) -> anyhow::Result<()> {
     // Adjacency rows live in graph stores outside the packs. Rooms may defer
     // their syncs, so this barrier, not the room writer, is what guarantees
     // the marker never covers a row that is only in the page cache.
+    #[cfg(test)]
+    if test_hooks::take_adjacency_sync_failure() {
+        anyhow::bail!("persisting the adjacency tails: injected failure");
+    }
     mtxdb::csr_adjacency::sync_all_tails(db).context("persisting the adjacency tails")?;
     for pool in [EVENT_POOL, SERVER_INFO_POOL] {
         db.pool(pool)

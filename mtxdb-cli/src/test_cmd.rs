@@ -8581,8 +8581,6 @@ fn an_import_stopped_before_the_marker_is_visibly_incomplete() {
 
 #[test]
 fn a_failed_adjacency_sync_leaves_no_marker() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
     let run = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
@@ -8590,14 +8588,10 @@ fn a_failed_adjacency_sync_leaves_no_marker() {
     assert!(tail.exists(), "the import should have written adjacency");
 
     // The barrier runs before the marker, so a tail that cannot be synced must
-    // stop the run with the marker still absent.
-    std::fs::set_permissions(&tail, std::fs::Permissions::from_mode(0o000)).unwrap();
-    if std::fs::File::open(&tail).is_ok() {
-        // Running as a user that ignores file modes: the failure cannot be
-        // staged this way.
-        std::fs::set_permissions(&tail, std::fs::Permissions::from_mode(0o644)).unwrap();
-        return;
-    }
+    // stop the run with the marker still absent. Inject the failure through
+    // the test seam: file modes are ignored by root and would skip the test in
+    // exactly the environment where it matters.
+    export_import::test_hooks::fail_adjacency_sync();
     let error = finish_import(&db, &run).unwrap_err();
     assert!(
         format!("{error:#}").contains("adjacency tails"),
@@ -8605,7 +8599,6 @@ fn a_failed_adjacency_sync_leaves_no_marker() {
     );
     assert_eq!(marker(&db), None, "no marker after a failed barrier");
 
-    std::fs::set_permissions(&tail, std::fs::Permissions::from_mode(0o644)).unwrap();
     finish_import(&db, &run).unwrap();
     assert!(marker(&db).is_some());
 }
