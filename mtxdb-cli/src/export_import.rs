@@ -461,7 +461,7 @@ impl SignatureKeyCatalog {
     /// Stored signing keys named by one room's required signatures.
     ///
     /// Keys are fetched by indexed `(origin, key_id)` lookups rather than by
-    /// scanning the ServerInfo packs. `stored_keys` remembers loaded key ids
+    /// scanning the `ServerInfo` packs. `stored_keys` remembers loaded key ids
     /// for the rest of the run. The caller drops the memo whenever keys are
     /// imported.
     pub(crate) fn read_for_room(
@@ -2068,7 +2068,12 @@ mod memoized_server_keys_tests {
             &mut loaded_ids,
         );
         assert_eq!(first.len(), 2);
-        let second = load_and_count(&mut memo, "A.EXAMPLE", &[a1.clone()], &mut loaded_ids);
+        let second = load_and_count(
+            &mut memo,
+            "A.EXAMPLE",
+            std::slice::from_ref(&a1),
+            &mut loaded_ids,
+        );
         assert_eq!(second.len(), 1);
         load_and_count(
             &mut memo,
@@ -2076,11 +2081,21 @@ mod memoized_server_keys_tests {
             &[a1.clone(), a3.clone()],
             &mut loaded_ids,
         );
-        load_and_count(&mut memo, "b.example", &[b1.clone()], &mut loaded_ids);
+        load_and_count(
+            &mut memo,
+            "b.example",
+            std::slice::from_ref(&b1),
+            &mut loaded_ids,
+        );
         assert_eq!(loaded_ids, vec![a1.clone(), a2, a3, b1.clone()]);
 
         memo.clear();
-        load_and_count(&mut memo, "a.example", &[a1.clone()], &mut loaded_ids);
+        load_and_count(
+            &mut memo,
+            "a.example",
+            std::slice::from_ref(&a1),
+            &mut loaded_ids,
+        );
         assert_eq!(
             loaded_ids.last(),
             Some(&a1),
