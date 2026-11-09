@@ -9331,7 +9331,7 @@ fn finish_import(db: &Database, run: &ImportRun) -> anyhow::Result<()> {
         .filter(|binding| run.imported_key_bindings.contains(*binding))
         .count();
     eprintln!(
-        "signature checks: {} events with no usable key; {} without signature material; {} invalid signatures; {} verified late (past their key's cached valid_until_ts); {} of {} keys corroborated",
+        "signature checks: {} events with no usable key; {} without signature material; {} invalid signatures; {} verified late (past their key's cached valid_until_ts); {} of {} keys corroborated (at least one in-window verifying signature)",
         run.signature_no_key,
         run.signature_no_material,
         run.signature_invalid,
