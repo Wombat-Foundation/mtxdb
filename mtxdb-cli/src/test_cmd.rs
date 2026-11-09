@@ -39,7 +39,7 @@ use mtxdb::{
     DatabaseLayout, DigestAlgorithm, MatrixRoomVersion, ShardType,
 };
 use rezzy::json::Value as OwnedValue;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -9678,4 +9678,390 @@ fn json_string_matches_rezzy_json_escaper() {
         r#""\u0000\b\f\u001f""#
     );
     assert_eq!(json_string("\u{7f}é😀\u{2028}"), "\"\u{7f}é😀\u{2028}\"");
+}
+
+// ---------------------------------------------------------------------------
+// Real-data validation against a legacy Conduwuit `shortstatehash` dump.
+//
+// The source maps are exported with:
+//   ldb --db=<rocksdb> --column_family=<cf> dump --hex
+// for eventid_shorteventid, shorteventid_shortstatehash,
+// shortstatehash_statediff, statekey_shortstatekey, roomid_shortroomid.
+// Run with:
+//   MTXDB_SHORTSTATE_DB=<mtxdb root> \
+//   MTXDB_SHORTSTATE_DUMP=<dump dir> \
+//   cargo test -p mtxdb-cli --lib -- --ignored validate_complete_state_groups
+// ---------------------------------------------------------------------------
+
+/// One `0xKEY ==> 0xVALUE` row from `ldb ... dump --hex`.
+fn legacy_dump_rows(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(" ==> ") else {
+            continue;
+        };
+        let key = key.trim_start_matches("0x");
+        let value = value.trim_start_matches("0x");
+        rows.push((
+            hex::decode(key).unwrap_or_else(|error| panic!("bad key {key:?}: {error}")),
+            hex::decode(value).unwrap_or_else(|error| panic!("bad value {value:?}: {error}")),
+        ));
+    }
+    rows
+}
+
+fn legacy_u64(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes(
+        bytes
+            .try_into()
+            .unwrap_or_else(|_| panic!("expected 8-byte legacy short id, got {bytes:?}")),
+    )
+}
+
+struct LegacyDiff {
+    parent: Option<u64>,
+    added: Vec<(u64, u64)>,
+    removed: Vec<(u64, u64)>,
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "fixed-width legacy record offsets cannot overflow"
+)]
+fn legacy_diffs(path: &Path) -> HashMap<u64, LegacyDiff> {
+    legacy_dump_rows(path)
+        .into_iter()
+        .map(|(key, value)| {
+            assert!(value.len() >= 8, "statediff value too short: {value:?}");
+            let parent = legacy_u64(&value[..8]);
+            let mut add_mode = true;
+            let mut added = Vec::new();
+            let mut removed = Vec::new();
+            let mut offset = 8;
+            while offset + 16 <= value.len() {
+                let chunk = &value[offset..offset + 16];
+                if add_mode && chunk[..8] == [0u8; 8] {
+                    add_mode = false;
+                    // The separator is one 8-byte word, not a full pair.
+                    offset += 8;
+                    continue;
+                }
+                let pair = (legacy_u64(&chunk[..8]), legacy_u64(&chunk[8..]));
+                if add_mode {
+                    added.push(pair);
+                } else {
+                    removed.push(pair);
+                }
+                offset += 16;
+            }
+            (
+                legacy_u64(&key),
+                LegacyDiff {
+                    parent: (parent != 0).then_some(parent),
+                    added,
+                    removed,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Replay a `shortstatehash` chain from its root and apply each diff.
+fn legacy_materialize(
+    target: u64,
+    diffs: &HashMap<u64, LegacyDiff>,
+) -> Option<BTreeSet<(u64, u64)>> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = target;
+    loop {
+        if !seen.insert(current) {
+            return None;
+        }
+        let diff = diffs.get(&current)?;
+        chain.push(current);
+        match diff.parent {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    chain.reverse();
+
+    let mut state = BTreeSet::new();
+    for id in chain {
+        let diff = diffs.get(&id).expect("chain is built from diffs");
+        for pair in &diff.added {
+            state.insert(*pair);
+        }
+        for pair in &diff.removed {
+            state.remove(pair);
+        }
+    }
+    Some(state)
+}
+
+#[test]
+#[ignore = "real-data check; set MTXDB_SHORTSTATE_DB and MTXDB_SHORTSTATE_DUMP"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ignored diagnostic keeps the source dumps and imported groups in one place"
+)]
+fn validate_complete_state_groups_against_source_shortstate() {
+    let Ok(db_dir) = std::env::var("MTXDB_SHORTSTATE_DB") else {
+        eprintln!("skipped: MTXDB_SHORTSTATE_DB is not set");
+        return;
+    };
+    let Ok(dump_dir) = std::env::var("MTXDB_SHORTSTATE_DUMP") else {
+        eprintln!("skipped: MTXDB_SHORTSTATE_DUMP is not set");
+        return;
+    };
+    let dump_dir = PathBuf::from(dump_dir);
+
+    let layout = DatabaseLayout::open(PathBuf::from(db_dir)).expect("open mtxdb layout");
+    let state_store = PackfileStorage::open_read_only(
+        layout
+            .pool_dir(ShardType::State)
+            .expect("layout has a state pool"),
+    )
+    .expect("open state pool");
+    let event_store = PackfileStorage::open_read_only(
+        layout
+            .pool_dir(ShardType::EventDag)
+            .expect("layout has an event pool"),
+    )
+    .expect("open event pool");
+
+    let event_to_short: HashMap<String, u64> =
+        legacy_dump_rows(&dump_dir.join("eventid_shorteventid.txt"))
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    String::from_utf8(key).expect("event id is UTF-8"),
+                    legacy_u64(&value),
+                )
+            })
+            .collect();
+    let short_to_event: HashMap<u64, String> =
+        legacy_dump_rows(&dump_dir.join("shorteventid_eventid.txt"))
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    legacy_u64(&key),
+                    String::from_utf8(value).expect("event id is UTF-8"),
+                )
+            })
+            .collect();
+    let short_to_state: HashMap<u64, u64> =
+        legacy_dump_rows(&dump_dir.join("shorteventid_shortstatehash.txt"))
+            .into_iter()
+            .map(|(key, value)| (legacy_u64(&key), legacy_u64(&value)))
+            .collect();
+    let diffs = legacy_diffs(&dump_dir.join("shortstatehash_statediff.txt"));
+    // `statekey_shortstatekey` is keyed by `type\xFFstate_key` and stores the
+    // short state key. Invert it so a materialized legacy state can be keyed
+    // the same way as the imported HAMT.
+    let short_statekey_to_pair: HashMap<u64, (String, String)> =
+        legacy_dump_rows(&dump_dir.join("statekey_shortstatekey.txt"))
+            .into_iter()
+            .map(|(key, value)| {
+                let separator = key
+                    .iter()
+                    .position(|byte| *byte == 0xFF)
+                    .expect("statekey row has a 0xFF separator");
+                let event_type =
+                    String::from_utf8(key[..separator].to_vec()).expect("event type is UTF-8");
+                let state_key =
+                    String::from_utf8(key[separator + 1..].to_vec()).expect("state key is UTF-8");
+                (legacy_u64(&value), (event_type, state_key))
+            })
+            .collect();
+    let rooms: Vec<String> = legacy_dump_rows(&dump_dir.join("roomid_shortroomid.txt"))
+        .into_iter()
+        .map(|(key, _)| String::from_utf8(key).expect("room id is UTF-8"))
+        .collect();
+    let room_collections: Vec<(String, [u8; 16])> = rooms
+        .iter()
+        .map(|room| (room.clone(), matrix_room_collection_id(room)))
+        .collect();
+
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+    let event_ids: Vec<String> = event_to_short.keys().cloned().collect();
+
+    let mut mapped: Vec<(String, [u8; 16])> = Vec::new();
+    for batch in event_ids.chunks(4096) {
+        let keys: Vec<&[u8]> = batch.iter().map(String::as_bytes).collect();
+        let values = aux.get_many(&keys).expect("read state-group index");
+        for (event_id, value) in batch.iter().zip(values) {
+            let Some(value) = value else { continue };
+            assert_eq!(
+                value.len(),
+                STATE_GROUP_ID_LENGTH,
+                "invalid state-group id for {event_id}"
+            );
+            let mut id = [0u8; STATE_GROUP_ID_LENGTH];
+            id.copy_from_slice(&value);
+            mapped.push((event_id.clone(), id));
+        }
+    }
+
+    let outliers: HashSet<String> = {
+        let path = dump_dir.join("eventid_outlierpdu.txt");
+        if path.exists() {
+            legacy_dump_rows(&path)
+                .into_iter()
+                .filter_map(|(key, _)| String::from_utf8(key).ok())
+                .collect()
+        } else {
+            HashSet::new()
+        }
+    };
+
+    let mut matched = 0usize;
+    let mut matched_after_outlier_filter = 0usize;
+    let mut missing_source_state = 0usize;
+    let mut missing_room = 0usize;
+    let mut unresolved_source = 0usize;
+    let mut residual_count = 0usize;
+    let mut residual = Vec::new();
+    let mut extra_seen_before = 0usize;
+    let mut extra_seen_after = 0usize;
+    let mut missing_seen_before = 0usize;
+    let mut missing_seen_after = 0usize;
+
+    for (event_id, group_id) in &mapped {
+        let Some(&short_event) = event_to_short.get(event_id) else {
+            missing_source_state += 1;
+            continue;
+        };
+        let Some(&short_state) = short_to_state.get(&short_event) else {
+            missing_source_state += 1;
+            continue;
+        };
+        let room = room_collections.iter().find_map(|(room, collection)| {
+            let node = super::matrix_event_node_id(event_id).ok()?;
+            event_store
+                .get(collection, &node)
+                .ok()
+                .flatten()
+                .map(|_| room.clone())
+        });
+        let Some(room) = room else {
+            missing_room += 1;
+            continue;
+        };
+
+        let Some(entries) =
+            crate::state_hamt::load_state_group_entries(&state_store, &room, group_id)
+                .expect("load imported state group")
+        else {
+            residual_count += 1;
+            if residual.len() < 20 {
+                residual.push(format!(
+                    "{event_id}: group {} has no resolvable STGP/STAT entry",
+                    hex::encode(group_id)
+                ));
+            }
+            continue;
+        };
+        let imported: HashSet<String> = entries.iter().map(|(_, _, event)| event.clone()).collect();
+
+        let Some(source_state) = legacy_materialize(short_state, &diffs) else {
+            residual_count += 1;
+            if residual.len() < 20 {
+                residual.push(format!(
+                    "{event_id}: source state {short_state} has a missing or cyclic statediff chain"
+                ));
+            }
+            continue;
+        };
+        let mut expected = HashSet::new();
+        let mut unresolved = 0usize;
+        for (_, event_short) in &source_state {
+            match short_to_event.get(event_short) {
+                Some(event) => {
+                    expected.insert(event.clone());
+                }
+                None => unresolved += 1,
+            }
+        }
+        if unresolved > 0 {
+            unresolved_source += 1;
+            continue;
+        }
+
+        // The legacy map stores the state *before* the event; the imported
+        // group is the state *after* it. Apply the event's own state change
+        // before comparing.
+        if entries.iter().any(|(_, _, event)| event == event_id) {
+            expected.insert(event_id.clone());
+        }
+        if imported == expected {
+            matched += 1;
+            continue;
+        }
+
+        // The source's state rows were written when the event was first
+        // applied. Events it later reclassified as outliers, or backfilled
+        // after that snapshot, are not evidence of a resolver difference.
+        let filtered_imported: HashSet<String> = imported
+            .iter()
+            .filter(|event| !outliers.contains(*event))
+            .cloned()
+            .collect();
+        let filtered_expected: HashSet<String> = expected
+            .iter()
+            .filter(|event| !outliers.contains(*event))
+            .cloned()
+            .collect();
+        if filtered_imported == filtered_expected {
+            matched_after_outlier_filter += 1;
+            continue;
+        }
+
+        for extra in filtered_imported.difference(&filtered_expected) {
+            match event_to_short.get(extra) {
+                Some(&short) if short > short_event => extra_seen_after += 1,
+                _ => extra_seen_before += 1,
+            }
+        }
+        for missing in filtered_expected.difference(&filtered_imported) {
+            match event_to_short.get(missing) {
+                Some(&short) if short > short_event => missing_seen_after += 1,
+                _ => missing_seen_before += 1,
+            }
+        }
+        residual_count += 1;
+        if residual.len() < 20 {
+            residual.push(format!(
+                "{event_id} room {room}: imported {} source {} extra {:?} missing {:?}",
+                filtered_imported.len(),
+                filtered_expected.len(),
+                filtered_imported
+                    .difference(&filtered_expected)
+                    .take(4)
+                    .collect::<Vec<_>>(),
+                filtered_expected
+                    .difference(&filtered_imported)
+                    .take(4)
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    eprintln!(
+        "shortstate validation: {} indexed events, {matched} exact, {matched_after_outlier_filter} exact after removing source outliers, {missing_source_state} without source state, {missing_room} without an imported room, {unresolved_source} with unresolved source events, {residual_count} residual",
+        mapped.len()
+    );
+    eprintln!(
+        "  residual extras: seen-before={extra_seen_before} seen-after={extra_seen_after}; missing: seen-before={missing_seen_before} seen-after={missing_seen_after}"
+    );
+    for mismatch in &residual {
+        eprintln!("  residual: {mismatch}");
+    }
+    assert!(
+        std::env::var_os("MTXDB_SHORTSTATE_STRICT").is_none() || residual_count == 0,
+        "{residual_count} complete groups still differ after the source-snapshot and boundary adjustments"
+    );
 }
