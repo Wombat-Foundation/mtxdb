@@ -341,9 +341,26 @@ pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
         compress: false,
         checksum_policy: crate::packfile::ChecksumPolicy::Full,
         index_residency: crate::index::IndexResidency::Resident,
+        ordering: crate::record_class::OrderingPolicy::None,
     };
+    // State groups, HAMT roots and nodes, and events are DAGs: repack lays
+    // them out dependencies-first. Server keys have no dependency structure.
+    let topological = crate::record_class::OrderingPolicy::Topological;
     PoolPolicies::default()
-        .with(ShardType::State, uncompressed)
+        .with(
+            ShardType::State,
+            PoolPolicy {
+                ordering: topological,
+                ..uncompressed
+            },
+        )
+        .with(
+            ShardType::EventDag,
+            PoolPolicy {
+                ordering: topological,
+                ..PoolPolicy::default()
+            },
+        )
         .with(ShardType::ServerInfo, uncompressed)
 }
 

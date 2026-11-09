@@ -39,6 +39,12 @@ pub struct PoolPolicy {
     /// Whether sealed packs keep their locators in the resident index or are
     /// served from their sidecars.
     pub index_residency: crate::index::IndexResidency,
+    /// Physical layout repack gives this pool's records. A topological
+    /// policy writes each record after the records it depends on (events
+    /// after their `prev_events`, state groups after their parents and HAMT
+    /// root, HAMT nodes after their children); any other policy keeps id
+    /// order. Logical ordering only: it never changes what is stored.
+    pub ordering: crate::record_class::OrderingPolicy,
 }
 
 impl Default for PoolPolicy {
@@ -47,6 +53,7 @@ impl Default for PoolPolicy {
             compress: true,
             checksum_policy: crate::packfile::ChecksumPolicy::Full,
             index_residency: crate::index::IndexResidency::Resident,
+            ordering: crate::record_class::OrderingPolicy::None,
         }
     }
 }

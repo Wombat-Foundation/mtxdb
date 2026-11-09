@@ -265,7 +265,7 @@ pub(crate) enum Commands {
         packs: Vec<String>,
         all: bool,
         root: Vec<String>,
-        topo: bool,
+        no_topo: bool,
         out: Option<PathBuf>,
         yes: bool,
     },
@@ -1125,7 +1125,7 @@ fn sub_repack() -> Command {
             Arg::new("no_topo")
                 .long("no-topo")
                 .action(ArgAction::SetTrue)
-                .help("Skip dependency layout: write records in id order (also disables --root GC)"),
+                .help("Ignore the pool's ordering policy and write records in id order (also disables --root GC)"),
         )
         .arg(
             Arg::new("out")
@@ -1574,7 +1574,7 @@ fn parse_cli() -> Cli {
                 .flatten()
                 .cloned()
                 .collect(),
-            topo: !m.get_flag("no_topo"),
+            no_topo: m.get_flag("no_topo"),
             out: m.get_one::<String>("out").map(PathBuf::from),
             yes: m.get_flag("yes"),
         },

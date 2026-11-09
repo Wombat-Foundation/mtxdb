@@ -628,10 +628,11 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             packs,
             all,
             root,
-            topo,
+            no_topo,
             out,
             yes,
         } => {
+            let topo = repack_uses_dependency_layout(cli, *no_topo)?;
             if let Some(out_dir) = out {
                 cmd_repack_coalesced(
                     cli,
@@ -640,12 +641,12 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
                     packs,
                     *all,
                     root,
-                    *topo,
+                    topo,
                     *yes,
                 )
             } else {
                 cli.require_single_dir("repack")?;
-                cmd_repack(cli, collection.as_deref(), packs, *all, root, *topo, *yes)
+                cmd_repack(cli, collection.as_deref(), packs, *all, root, topo, *yes)
             }
         }
         Commands::Delete { collections, yes } => {
@@ -15290,7 +15291,7 @@ fn cmd_repack_coalesced(
             bail!("--root requires --collection — live roots are per-collection, not meaningful for --all");
         }
         if !topo {
-            bail!("--root requires dependency edges; drop --no-topo so reachability can be computed");
+            bail!("--root needs dependency edges: this pool's ordering policy is not topological (or --no-topo was given), so reachability cannot be computed");
         }
     }
     if topo {
@@ -15298,7 +15299,7 @@ fn cmd_repack_coalesced(
             println!("note: no --root given; all records preserved, laid out dependencies first");
         }
     } else {
-        println!("note: --no-topo; records written in id order, no dependency layout");
+        println!("note: this pool's ordering policy is not topological (or --no-topo was given); records written in id order");
     }
 
     let valid_dirs = valid_database_dirs(cli)?;
@@ -15684,7 +15685,7 @@ fn cmd_repack(
                 );
             }
             RepackTarget::Collection(_) if !topo => {
-                bail!("--root requires dependency edges; drop --no-topo so reachability can be computed");
+                bail!("--root needs dependency edges: this pool's ordering policy is not topological (or --no-topo was given), so reachability cannot be computed");
             }
             RepackTarget::Collection(_) => {
                 // Allowed
@@ -15696,7 +15697,7 @@ fn cmd_repack(
             println!("note: no --root given; all records preserved, laid out dependencies first");
         }
     } else {
-        println!("note: --no-topo; records written in id order, no dependency layout");
+        println!("note: this pool's ordering policy is not topological (or --no-topo was given); records written in id order");
     }
     cmd_repack_target(cli, &target, topo, roots, yes)
 }
@@ -15921,6 +15922,22 @@ fn repack_preview(
         collections,
         pack_ids,
     }))
+}
+
+/// Whether repack lays out the selected pool's records by dependency.
+///
+/// The pool's [`mtxdb::PoolPolicy::ordering`] decides: a topological policy
+/// (`State`, `EventDag`) gets edge extraction and a roots-first layout; others
+/// (`ServerInfo`) keep id order. `--no-topo` overrides the policy.
+fn repack_uses_dependency_layout(cli: &Cli, no_topo: bool) -> anyhow::Result<bool> {
+    if no_topo {
+        return Ok(false);
+    }
+    let shard = cli.require_shard_type()?;
+    Ok(mtxdb::matrix_pool_policies()
+        .for_shard(shard)
+        .ordering
+        .is_topological())
 }
 
 fn repack_collections(
