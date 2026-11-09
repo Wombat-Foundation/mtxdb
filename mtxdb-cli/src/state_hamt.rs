@@ -177,6 +177,7 @@ pub(crate) fn encode_state_group_id(id: &[u8; 32]) -> String {
 }
 
 /// The state-group id (unkeyed `LtHash` digest) for a set of logical entries.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn state_group_id(entries: &[(String, String, String)]) -> [u8; 32] {
     let mut lattice = LtHash::default();
