@@ -2048,26 +2048,18 @@ fn import_dedups_repeated_event_id_within_one_input() {
     .unwrap();
     let stats = store.stats();
     assert_eq!(
-        stats.put_many_calls, 2,
-        "the repeated event_id needs one event batch; the prev-less event also needs one partial mapping batch"
+        stats.put_many_calls, 1,
+        "the repeated event_id needs one event batch and no state mapping"
     );
     assert_eq!(
-        stats.put_many_records, 2,
-        "the repeated event_id must not be written twice: one event record and one partial mapping"
+        stats.put_many_records, 1,
+        "the repeated event_id must not be written twice and must stay unmapped"
     );
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(store.as_ref(), STATE_GROUP_NAMESPACE);
     assert_eq!(
         aux.get(b"$a").unwrap(),
         None,
-        "a message with no prev_events has no complete base, so it must stay out of the complete namespace"
-    );
-    let partial_aux = mtxdb::auxiliary::AuxiliaryIndex::open(
-        store.as_ref(),
-        super::PARTIAL_STATE_GROUP_NAMESPACE,
-    );
-    assert!(
-        partial_aux.get(b"$a").unwrap().is_some(),
-        "its best-effort state is published under the partial namespace instead"
+        "a message with no prev_events has no complete base, so it stays unmapped"
     );
     let node_id = template_node_id(&template, &events[0]).unwrap().unwrap();
     assert!(
@@ -6804,8 +6796,8 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     assert!(!first.groups.contains_key("$child"));
     assert!(first.unresolved.is_empty());
     assert!(
-        first.partial.contains_key("$child"),
-        "the event is still sorted with an unknown base and gets a partial group"
+        first.gapped.contains(&"$child".to_owned()),
+        "the event is gapped and stays unmapped until its parent arrives"
     );
     assert_eq!(aux.get(b"$child").unwrap(), None);
 
@@ -6973,13 +6965,13 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
     assert!(without_branch_b.groups.contains_key("$branch-a"));
     assert!(!without_branch_b.groups.contains_key("$merge"));
     assert!(
-        without_branch_b.partial.contains_key("$merge"),
-        "a merge with an absent parent is derived with an unknown base"
+        without_branch_b.gapped.contains(&"$merge".to_owned()),
+        "a merge with an absent parent is gapped and stays unmapped"
     );
     assert!(!with_orphan.groups.contains_key("$orphan"));
     assert!(
-        with_orphan.partial.contains_key("$orphan"),
-        "an orphan is derived with an unknown base instead of dropped"
+        with_orphan.gapped.contains(&"$orphan".to_owned()),
+        "an orphan is gapped and stays unmapped instead of getting a guessed group"
     );
 }
 
@@ -7911,6 +7903,177 @@ fn merges_with_a_gap_in_the_auth_closure_fall_back_and_refuse_to_cache() {
             .map(String::as_str),
         Some("$topic-a"),
         "the fallback keeps the first parent, as the retired merge did"
+    );
+}
+
+/// A room with a real fork: two admin topics on separate branches off the
+/// power levels, then `$child` descending from both and any `extra_prevs`.
+fn fork_room(extra_prevs: &[&str]) -> Vec<OwnedValue> {
+    let create = owned_value(
+        r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10"}}"#,
+    );
+    let power_levels = owned_value(
+        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"users":{"@admin:x":100}}}"#,
+    );
+    let topic_a = owned_value(
+        r#"{"event_id":"$topic-a","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"first"}}"#,
+    );
+    let topic_b = owned_value(
+        r#"{"event_id":"$topic-b","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"second"}}"#,
+    );
+    let prevs = ["$topic-a", "$topic-b"]
+        .iter()
+        .chain(extra_prevs)
+        .map(|id| format!("\"{id}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let child = owned_value(&format!(
+        r#"{{"event_id":"$child","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":4,"prev_events":[{prevs}],"auth_events":["$create","$pl"],"content":{{}}}}"#
+    ));
+    let grandchild = owned_value(
+        r#"{"event_id":"$grandchild","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":5,"prev_events":["$child"],"auth_events":["$create","$pl"],"content":{}}"#,
+    );
+    vec![create, power_levels, topic_a, topic_b, child, grandchild]
+}
+
+/// A derivation-skip test, not a write-suppression test: refusing to publish
+/// a gapped group alone leaves the event unmapped too, so only the merge count
+/// tells "skip the resolution past a gap" from "resolve, then throw it away".
+/// `$child` forks two present branches and also names a `prev_events` entry
+/// the batch does not carry, so its base is gapped; nothing may be resolved
+/// for it or for the `$grandchild` that inherits the gap.
+#[test]
+fn gapped_merge_skips_resolution_and_stays_unmapped() {
+    let events = fork_room(&["$gap"]);
+    let result = compute_state_groups_partial(&events, &[], "!r:x");
+
+    assert_eq!(
+        result.merges, 0,
+        "no resolver runs once a base is missing history"
+    );
+    assert_eq!(
+        result.gapped,
+        vec!["$child".to_owned(), "$grandchild".to_owned()],
+        "the gap is inherited by every descendant"
+    );
+    for id in ["$child", "$grandchild"] {
+        assert!(
+            !result.groups.contains_key(id),
+            "{id} has a gapped base and must stay unmapped"
+        );
+    }
+    for id in ["$create", "$pl", "$topic-a", "$topic-b"] {
+        assert!(
+            result.groups.contains_key(id),
+            "{id} is ahead of the gap and keeps its group"
+        );
+    }
+}
+
+/// The control for the gap test: the same fork with nothing missing still
+/// resolves and publishes, so a faster walk can never mean it stopped merging
+/// legitimate forks.
+#[test]
+fn fork_merge_still_runs_and_publishes() {
+    let events = fork_room(&[]);
+    let result = compute_state_groups_partial(&events, &[], "!r:x");
+
+    assert!(
+        result.gapped.is_empty(),
+        "nothing is missing: {:?}",
+        result.gapped
+    );
+    assert_eq!(
+        result.merges, 1,
+        "the one real fork is resolved exactly once"
+    );
+    for id in ["$child", "$grandchild"] {
+        assert!(
+            result.groups.contains_key(id),
+            "{id} has a complete base and must be published"
+        );
+    }
+}
+
+/// A fork whose one branch descends from a missing prev must not run the
+/// resolver at all. `$gapped-topic` carries an incomplete placeholder into
+/// `$merge`, so the strict walk skips the merge and leaves the fork event
+/// unmapped. `c1834a5` suppressed the write but still merged the placeholder
+/// (`merges == 1`); the counter is what distinguishes the two behaviors.
+#[test]
+fn gapped_fork_merge_skips_resolution_and_stays_unmapped() {
+    let create = owned_value(
+        r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10"}}"#,
+    );
+    let power_levels = owned_value(
+        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"users":{"@admin:x":100}}}"#,
+    );
+    let topic_a = owned_value(
+        r#"{"event_id":"$topic-a","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"first"}}"#,
+    );
+    // `$gap` is absent from the batch, so this branch's base state is
+    // incomplete even though the event itself is present at the fork.
+    let gapped_topic = owned_value(
+        r#"{"event_id":"$gapped-topic","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$gap"],"auth_events":["$create","$pl"],"content":{"topic":"gapped"}}"#,
+    );
+    let merge = owned_value(
+        r#"{"event_id":"$merge","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":4,"prev_events":["$topic-a","$gapped-topic"],"auth_events":["$create","$pl"],"content":{}}"#,
+    );
+    let events = vec![create, power_levels, topic_a, gapped_topic, merge];
+
+    let result = compute_state_groups_partial(&events, &[], "!r:x");
+    assert_eq!(
+        result.merges, 0,
+        "a merge past a gapped base must not resolve or derive state"
+    );
+    assert!(
+        result.gapped.iter().any(|event| event == "$merge"),
+        "the fork event must be reported as gapped"
+    );
+    assert!(
+        !result.groups.contains_key("$merge"),
+        "the fork event must stay unmapped"
+    );
+    assert!(
+        result.groups.contains_key("$topic-a"),
+        "the complete branch remains mapped"
+    );
+}
+
+/// The positive control: a fork with two complete branches must still merge.
+/// Without this, a regression that suppresses every merge would pass the
+/// gapped test.
+#[test]
+fn complete_fork_merge_runs_and_publishes() {
+    let create = owned_value(
+        r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10"}}"#,
+    );
+    let power_levels = owned_value(
+        r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"users":{"@admin:x":100}}}"#,
+    );
+    let topic_a = owned_value(
+        r#"{"event_id":"$topic-a","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"first"}}"#,
+    );
+    let topic_b = owned_value(
+        r#"{"event_id":"$topic-b","room_id":"!r:x","type":"m.room.topic","state_key":"","sender":"@admin:x","depth":3,"prev_events":["$pl"],"auth_events":["$create","$pl"],"content":{"topic":"second"}}"#,
+    );
+    let merge = owned_value(
+        r#"{"event_id":"$merge-fork","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":4,"prev_events":["$topic-a","$topic-b"],"auth_events":["$create","$pl"],"content":{}}"#,
+    );
+    let events = vec![create, power_levels, topic_a, topic_b, merge];
+
+    let result = compute_state_groups_partial(&events, &[], "!r:x");
+    assert_eq!(
+        result.merges, 1,
+        "two complete divergent branches must merge exactly once"
+    );
+    assert!(
+        result.groups.contains_key("$merge-fork"),
+        "the resolved fork event must be mapped"
+    );
+    assert!(
+        result.gapped.is_empty(),
+        "a complete fork must not report a gapped base"
     );
 }
 
