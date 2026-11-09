@@ -72,6 +72,13 @@ pub(crate) struct LeanEventContext<'a> {
     /// Ids that resolve to nothing in this batch. Monotone, so reporting the
     /// whole set on every call stays correct.
     missing: BTreeSet<String>,
+    /// The room-wide reachability index and the resolver's memoization,
+    /// built on the first real merge and reused by every later one. Rebuilding
+    /// them per merge made each merge cost O(room).
+    resolve_state: Option<(
+        rezzy::resolve::reachability::RangePrefilterReachability<String>,
+        rezzy::ForkResolveCaches<String, rezzy::JsonValue>,
+    )>,
 }
 
 impl<'a> LeanEventContext<'a> {
@@ -88,6 +95,41 @@ impl<'a> LeanEventContext<'a> {
             events: HashMap::new(),
             verified: HashSet::new(),
             missing: BTreeSet::new(),
+            resolve_state: None,
+        }
+    }
+
+    /// Resolve `maps` with rezzy, sharing one reachability index and one set
+    /// of caches across every merge in the walk.
+    ///
+    /// The first call materializes every batch event so the index covers the
+    /// whole room; later [`Self::ensure`] calls then find them already built.
+    /// Dangling `auth_events` references are skipped by the index, so a batch
+    /// with absent ancestors cannot make it panic.
+    pub(crate) fn resolve(
+        &mut self,
+        maps: &[RezzyState],
+        version: rezzy::StateResVersion,
+    ) -> RezzyState {
+        if self.resolve_state.is_none() {
+            let ids: Vec<&'a str> = self.values.keys().copied().collect();
+            for id in ids {
+                if !self.events.contains_key(id) {
+                    if let Some(event) = self.values.get(id).and_then(|v| lean_event(v, id)) {
+                        self.events.insert(id.to_owned(), event);
+                    }
+                }
+            }
+            let index = rezzy::resolve::reachability::RangePrefilterReachability::<String>::build(
+                &self.events,
+            );
+            self.resolve_state = Some((index, rezzy::ForkResolveCaches::new(version)));
+        }
+        match self.resolve_state.as_mut() {
+            Some((index, caches)) => {
+                rezzy::resolve_state_maps_cached(maps, &self.events, version, index, caches)
+            }
+            None => rezzy::resolve_state_maps(maps, &self.events, version),
         }
     }
 
@@ -136,6 +178,7 @@ impl<'a> LeanEventContext<'a> {
     }
 
     /// The materialized events, ready to pass as `event_context`.
+    #[cfg(test)]
     pub(crate) fn map(&self) -> &HashMap<String, LeanEvent<String>> {
         &self.events
     }
@@ -167,6 +210,20 @@ pub(crate) fn from_rezzy_state(state: &RezzyState) -> StateEntries {
         .collect()
 }
 
+/// Time spent inside each part of one merge, so an import can report where a
+/// slow gapped room actually spends its state-walk seconds.
+#[derive(Debug, Default)]
+pub(crate) struct MergePhaseTimes {
+    /// Converting mtxdb's state maps into rezzy's key type.
+    pub(crate) convert: std::time::Duration,
+    /// Materializing the auth closure the resolver reads.
+    pub(crate) ensure: std::time::Duration,
+    /// `rezzy::resolve_state_maps`.
+    pub(crate) resolve: std::time::Duration,
+    /// Converting the resolved map back into mtxdb's type.
+    pub(crate) back: std::time::Duration,
+}
+
 /// Resolve one multi-parent merge with rezzy.
 ///
 /// # Errors
@@ -177,20 +234,30 @@ pub(crate) fn resolve_parents(
     context: &mut LeanEventContext<'_>,
     parent_entries: &[&StateEntries],
     policy: ResolutionPolicy,
+    phases: &mut MergePhaseTimes,
 ) -> Result<StateEntries, IncompleteResolution> {
     let Some(version) = policy.rezzy_version else {
         // No recognized room version means no auth rules; the derivation
         // already records `FirstParent`, so the caller uses the first-parent merge.
         return Err(IncompleteResolution::default());
     };
+    let convert_started = std::time::Instant::now();
     let maps: Vec<RezzyState> = parent_entries.iter().map(|e| to_rezzy_state(e)).collect();
     let roots = referenced_ids(&maps);
+    phases.convert = phases.convert.saturating_add(convert_started.elapsed());
+    let ensure_started = std::time::Instant::now();
     let missing = context.ensure(&roots);
+    phases.ensure = phases.ensure.saturating_add(ensure_started.elapsed());
     if !missing.is_empty() {
         return Err(IncompleteResolution { missing });
     }
-    let resolved = rezzy::resolve_state_maps(&maps, context.map(), version);
-    Ok(from_rezzy_state(&resolved))
+    let resolve_started = std::time::Instant::now();
+    let resolved = context.resolve(&maps, version);
+    phases.resolve = phases.resolve.saturating_add(resolve_started.elapsed());
+    let back_started = std::time::Instant::now();
+    let entries = from_rezzy_state(&resolved);
+    phases.back = phases.back.saturating_add(back_started.elapsed());
+    Ok(entries)
 }
 
 /// Every event id any parent state map points at, deduplicated in first-seen

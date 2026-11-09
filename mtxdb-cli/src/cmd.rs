@@ -11187,6 +11187,10 @@ impl ImportContext<'_> {
     /// running the auth rules over the events; the export's own rejection
     /// flags are not trusted. State groups and their HAMTs are reconstructed
     /// from the imported room events before this import can complete.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the export import keeps its validation, state reconstruction, and verdict stages together"
+    )]
     fn import_room_export(
         &mut self,
         export: &RoomExport,
@@ -14571,6 +14575,7 @@ fn walk_state_groups(
         seed_states.values().map(|seed| seed.instance).collect();
     let mut merge_time = std::time::Duration::ZERO;
     let mut merge_count = 0usize;
+    let mut merge_phases = crate::state_resolve::MergePhaseTimes::default();
 
     for &idx in sorted {
         let short_id = frontier.nodes[idx].short_id;
@@ -14661,6 +14666,7 @@ fn walk_state_groups(
                     room_id,
                     policy,
                     &mut incomplete,
+                    &mut merge_phases,
                 );
                 merge_time = merge_time.saturating_add(merge_started.elapsed());
                 merge_count = merge_count.saturating_add(1);
@@ -14755,6 +14761,10 @@ fn walk_state_groups(
     gapped.sort();
     if merge_count > 0 {
         report_import_phase(&format!("state merges ({merge_count})"), merge_time);
+        report_import_phase("state merges convert", merge_phases.convert);
+        report_import_phase("state merges ensure", merge_phases.ensure);
+        report_import_phase("state merges resolve", merge_phases.resolve);
+        report_import_phase("state merges back", merge_phases.back);
     }
     StateGroupWalk {
         groups: result,
@@ -14875,11 +14885,12 @@ fn merge_parent_states(
     room_id: &str,
     policy: ResolutionPolicy,
     incomplete: &mut HashSet<String>,
+    phases: &mut crate::state_resolve::MergePhaseTimes,
 ) -> (Arc<SharedState>, bool) {
     let parent_entries: Vec<&StateEntries> =
         parents.iter().map(|parent| &parent.set.entries).collect();
     let mut fallback = false;
-    let merged = match resolve_parents(context, &parent_entries, policy) {
+    let merged = match resolve_parents(context, &parent_entries, policy, phases) {
         Ok(entries) => StateSet::from_entries(entries),
         Err(gap) => {
             fallback = true;
@@ -15284,7 +15295,6 @@ fn cmd_repack_coalesced(
     }
     if topo {
         println!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
-    } else {
         println!("warning: --topo without --root means no GC; all records preserved");
     }
 
@@ -15681,7 +15691,6 @@ fn cmd_repack(
     }
     if topo {
         println!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
-    } else {
         println!("warning: --topo without --root means no GC; all records preserved");
     }
     cmd_repack_target(cli, &target, topo, roots, yes)

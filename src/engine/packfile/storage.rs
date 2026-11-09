@@ -9336,7 +9336,11 @@ impl PackfileStorage {
 
         let mut new_offsets: RepackOffsets = Vec::with_capacity(topo.len());
         let mut new_disk_bytes = HashMap::new();
-        for &local in &topo {
+        // `extract_edges` for Matrix events points from an event to its
+        // `prev_events` (its dependencies). CSR's topological order places a
+        // node before its outgoing targets, so write the reverse order to put
+        // ancestors before descendants in the pack.
+        for &local in topo.iter().rev() {
             let hash = csr
                 .hash_of(local)
                 .expect("topo order contains valid local IDs");
@@ -9567,7 +9571,9 @@ impl PackfileStorage {
 
         let mut new_offsets = Vec::with_capacity(topo.len().saturating_add(removed_markers.len()));
         let mut new_disk_bytes = HashMap::new();
-        for &local in &topo {
+        // Edges point from each event to its `prev_events`; reverse the CSR
+        // order so parent events are physically written before their children.
+        for &local in topo.iter().rev() {
             let hash = csr
                 .hash_of(local)
                 .expect("topo order contains valid local IDs");
