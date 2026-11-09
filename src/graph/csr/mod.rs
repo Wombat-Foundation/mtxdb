@@ -603,6 +603,42 @@ impl Csr {
         order
     }
 
+    /// Layered storage order, dependencies first.
+    ///
+    /// Edges are read as `node -> dependency` (an event points at its
+    /// `prev_events`). A node's `topo_depth` is the length of the longest
+    /// dependency chain beneath it, so nodes with no dependencies are level 0.
+    /// Nodes are returned sorted by `(topo_depth, hash)`: every dependency
+    /// precedes its dependents, and nodes within a level fall back to their
+    /// id, which makes the order deterministic and independent of insertion
+    /// or traversal order. Disconnected components interleave by level.
+    ///
+    /// Returns `None` if the graph has a cycle.
+    #[must_use]
+    pub fn layered_order(&self) -> Option<Vec<u32>> {
+        let topo = self.topo_order();
+        if topo.len() != self.node_count() {
+            return None;
+        }
+        let mut depth = vec![0u32; self.node_count()];
+        // `topo` lists a node before its targets, so walking it backwards
+        // finalizes every dependency before its dependents.
+        for &node in topo.iter().rev() {
+            let mut level = 0u32;
+            for &dep in self.neighbors(node) {
+                level = level.max(depth[dep as usize].saturating_add(1));
+            }
+            depth[node as usize] = level;
+        }
+        let mut order = topo;
+        order.sort_unstable_by(|&a, &b| {
+            depth[a as usize]
+                .cmp(&depth[b as usize])
+                .then_with(|| self.local_to_hash[a as usize].cmp(&self.local_to_hash[b as usize]))
+        });
+        Some(order)
+    }
+
     /// Serialize the CSR to a byte buffer (mmap-compatible).
     ///
     /// Format: `[version:u8=1][nodes:u32 LE][edges:u32 LE][offsets...][targets...]`
@@ -742,3 +778,7 @@ impl std::fmt::Display for CsrError {
 }
 
 impl std::error::Error for CsrError {}
+
+#[cfg(test)]
+#[path = "test_layered.rs"]
+mod test_layered;

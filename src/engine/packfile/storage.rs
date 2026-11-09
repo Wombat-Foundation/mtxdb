@@ -9312,15 +9312,13 @@ impl PackfileStorage {
         }
 
         let csr = Csr::build_from_edges(&live_hashes, &adjacency);
-        let topo = csr.topo_order();
-
-        if topo.len() != live_hashes.len() {
+        // Dependencies first, level by level, ties broken by node id.
+        let Some(topo) = csr.layered_order() else {
             return Err(StorageError::Corrupt(format!(
-                "repack: cyclic graph detected — topo_order produced {} nodes from {} live hashes",
-                topo.len(),
+                "repack: cyclic graph detected among {} live hashes",
                 live_hashes.len(),
             )));
-        }
+        };
 
         // Copy into a non-source destination shard, never back into the
         // collection's current generation. Once the new index is published below,
@@ -9560,14 +9558,13 @@ impl PackfileStorage {
         }
 
         let csr = Csr::build_from_edges(&live_hashes, &adjacency);
-        let topo = csr.topo_order();
-        if topo.len() != live_hashes.len() {
+        // Dependencies first, level by level, ties broken by node id.
+        let Some(topo) = csr.layered_order() else {
             return Err(StorageError::Corrupt(format!(
-                "repack: cyclic graph detected — topo_order produced {} nodes from {} live hashes",
-                topo.len(),
+                "repack: cyclic graph detected among {} live hashes",
                 live_hashes.len(),
             )));
-        }
+        };
 
         let mut new_offsets = Vec::with_capacity(topo.len().saturating_add(removed_markers.len()));
         let mut new_disk_bytes = HashMap::new();
