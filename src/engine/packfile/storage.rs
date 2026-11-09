@@ -9313,12 +9313,14 @@ impl PackfileStorage {
 
         let csr = Csr::build_from_edges(&live_hashes, &adjacency);
         // Dependencies first, level by level, ties broken by node id.
-        let Some(topo) = csr.layered_order() else {
-            return Err(StorageError::Corrupt(format!(
-                "repack: cyclic graph detected among {} live hashes",
+        let (topo, cyclic) = csr.layered_or_id_order();
+        if cyclic {
+            eprintln!(
+                "mtxdb: repack: dependency cycle among {} records in collection {}; writing them in id order",
                 live_hashes.len(),
-            )));
-        };
+                collection_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            );
+        }
 
         // Copy into a non-source destination shard, never back into the
         // collection's current generation. Once the new index is published below,
@@ -9334,11 +9336,7 @@ impl PackfileStorage {
 
         let mut new_offsets: RepackOffsets = Vec::with_capacity(topo.len());
         let mut new_disk_bytes = HashMap::new();
-        // `extract_edges` for Matrix events points from an event to its
-        // `prev_events` (its dependencies). CSR's topological order places a
-        // node before its outgoing targets, so write the reverse order to put
-        // ancestors before descendants in the pack.
-        for &local in topo.iter().rev() {
+        for &local in &topo {
             let hash = csr
                 .hash_of(local)
                 .expect("topo order contains valid local IDs");
@@ -9559,18 +9557,18 @@ impl PackfileStorage {
 
         let csr = Csr::build_from_edges(&live_hashes, &adjacency);
         // Dependencies first, level by level, ties broken by node id.
-        let Some(topo) = csr.layered_order() else {
-            return Err(StorageError::Corrupt(format!(
-                "repack: cyclic graph detected among {} live hashes",
+        let (topo, cyclic) = csr.layered_or_id_order();
+        if cyclic {
+            eprintln!(
+                "mtxdb: repack: dependency cycle among {} records in collection {}; writing them in id order",
                 live_hashes.len(),
-            )));
-        };
+                collection_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            );
+        }
 
         let mut new_offsets = Vec::with_capacity(topo.len().saturating_add(removed_markers.len()));
         let mut new_disk_bytes = HashMap::new();
-        // Edges point from each event to its `prev_events`; reverse the CSR
-        // order so parent events are physically written before their children.
-        for &local in topo.iter().rev() {
+        for &local in &topo {
             let hash = csr
                 .hash_of(local)
                 .expect("topo order contains valid local IDs");

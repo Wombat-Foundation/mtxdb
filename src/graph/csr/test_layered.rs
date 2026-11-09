@@ -34,3 +34,16 @@ fn layered_order_rejects_cycles() {
     adj.insert(id(2), vec![id(1)]);
     assert!(Csr::build_from_edges(&nodes, &adj).layered_order().is_none());
 }
+
+#[test]
+fn a_cycle_falls_back_to_id_order_instead_of_failing() {
+    let nodes = [id(3), id(1), id(2)];
+    let mut adj: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
+    adj.insert(id(1), vec![id(2)]);
+    adj.insert(id(2), vec![id(1)]);
+    let csr = Csr::build_from_edges(&nodes, &adj);
+    let (order, cyclic) = csr.layered_or_id_order();
+    assert!(cyclic);
+    let ids: Vec<[u8; 16]> = order.into_iter().map(|l| *csr.hash_of(l).unwrap()).collect();
+    assert_eq!(ids, vec![id(1), id(2), id(3)]);
+}

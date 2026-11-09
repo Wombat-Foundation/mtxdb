@@ -639,6 +639,25 @@ impl Csr {
         Some(order)
     }
 
+    /// [`Self::layered_order`], or, if the graph has a cycle, plain id order.
+    ///
+    /// The flag is `true` when the fallback was taken. A cycle only means the
+    /// layout cannot follow dependencies; callers writing records can still
+    /// proceed.
+    #[must_use]
+    pub fn layered_or_id_order(&self) -> (Vec<u32>, bool) {
+        if let Some(order) = self.layered_order() {
+            return (order, false);
+        }
+        let mut order: Vec<u32> = (0..self.node_count())
+            .filter_map(|i| u32::try_from(i).ok())
+            .collect();
+        order.sort_unstable_by(|&a, &b| {
+            self.local_to_hash[a as usize].cmp(&self.local_to_hash[b as usize])
+        });
+        (order, true)
+    }
+
     /// Serialize the CSR to a byte buffer (mmap-compatible).
     ///
     /// Format: `[version:u8=1][nodes:u32 LE][edges:u32 LE][offsets...][targets...]`
