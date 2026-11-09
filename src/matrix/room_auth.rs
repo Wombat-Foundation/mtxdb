@@ -37,7 +37,7 @@ use std::fmt;
 use crate::auth_closure::{AuthClosure, RebuildReport};
 use crate::bitmap_set::BitmapSet;
 use crate::closure_store::{ClosureCoverage, ClosureSnapshot};
-use crate::csr_adjacency::{EventRecord, EventVisibility, Relation, AUTH};
+use crate::csr_adjacency::{AppendDurability, EventRecord, EventVisibility, Relation, AUTH};
 use crate::database::Database;
 use crate::storage::StorageError;
 
@@ -302,6 +302,21 @@ impl RoomAuth {
         db: &Database,
         events: &[NewEvent<'_>],
     ) -> Result<Vec<RecordedEvent>, RoomAuthError> {
+        self.record_events_with(db, events, AppendDurability::Durable)
+    }
+
+    /// [`Self::record_events`] with an explicit durability. After deferred
+    /// batches, call [`Self::sync_adjacency`] before publishing any claim that
+    /// covers them.
+    ///
+    /// # Errors
+    /// As [`Self::record_events`].
+    pub fn record_events_with(
+        &self,
+        db: &Database,
+        events: &[NewEvent<'_>],
+        durability: AppendDurability,
+    ) -> Result<Vec<RecordedEvent>, RoomAuthError> {
         if events.len() > MAX_BATCH_EVENTS {
             return Err(RoomAuthError::BatchTooLarge {
                 limit: MAX_BATCH_EVENTS,
@@ -310,10 +325,18 @@ impl RoomAuth {
         Ok(self
             .closure
             .adjacency()
-            .record_events(db, events)?
+            .record_events_with(db, events, durability)?
             .into_iter()
             .map(|short_id| RecordedEvent { short_id })
             .collect())
+    }
+
+    /// Make every adjacency row recorded so far durable.
+    ///
+    /// # Errors
+    /// Returns an error if the sync fails.
+    pub fn sync_adjacency(&self, db: &Database) -> Result<(), RoomAuthError> {
+        Ok(self.closure.adjacency().sync_tail(db)?)
     }
 
     /// Every event id the room's `prev_events` and `auth_events` point at,

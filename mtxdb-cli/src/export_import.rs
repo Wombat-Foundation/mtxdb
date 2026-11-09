@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context};
-use mtxdb::csr_adjacency::EventRecord;
+use mtxdb::csr_adjacency::{AppendDurability, EventRecord};
 use mtxdb::export_schema::{RejectionCode, SoftFailCode};
 use mtxdb::interop::{
     decode_event_locator, decode_import_marker, encode_event_locator, encode_import_marker,
@@ -2456,11 +2456,17 @@ fn record_room_auth(db: &Database, export: &RoomExport) -> anyhow::Result<(u64, 
                 relation: None,
             })
             .collect();
+        // Every chunk is deferred; the one sync below makes the room's whole
+        // adjacency durable before this function returns, so a room never
+        // pays one fsync per chunk. The import marker is committed only after
+        // every room has returned, so it cannot precede these rows.
         let recorded = room
-            .record_events(db, &records)
+            .record_events_with(db, &records, AppendDurability::Deferred)
             .with_context(|| format!("recording auth adjacency for room {}", export.room_id))?;
         shorts.extend(recorded.iter().map(|r| r.short_id));
     }
+    room.sync_adjacency(db)
+        .with_context(|| format!("syncing auth adjacency for room {}", export.room_id))?;
     let report = room.rebuild(db)?;
     Ok((u64::from(report.count), shorts))
 }
