@@ -267,8 +267,9 @@ impl CsrStore {
         self.append_rows_locked(scope, rows, true)
     }
 
-    /// Make the tail and its directory entry durable. A store that has no tail
-    /// yet has nothing to sync. Safe to call when nothing is pending.
+    /// Make the tail's contents durable. Its directory entry was made durable
+    /// when the tail was created. A store that has no tail yet has nothing to
+    /// sync. Safe to call when nothing is pending.
     ///
     /// # Errors
     /// I/O errors.
@@ -282,7 +283,7 @@ impl CsrStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
         }
-        sync_dir(&self.dir)
+        Ok(())
     }
 
     /// Append while the caller holds this directory's write lock. `sync`
@@ -292,7 +293,9 @@ impl CsrStore {
         if rows.is_empty() {
             return Ok(());
         }
+        let created_dir = !self.dir.is_dir();
         fs::create_dir_all(&self.dir)?;
+        let created_tail = !self.tail_path().exists();
         let valid = self.with_tail(|tail| tail.valid)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -300,6 +303,17 @@ impl CsrStore {
             .write(true)
             .truncate(false)
             .open(self.tail_path())?;
+        // A synced file is not reachable after a crash until its directory
+        // entry is durable. Entries change only when something is created, so
+        // sync the directory then, not on every append.
+        if created_tail {
+            sync_dir(&self.dir)?;
+        }
+        if created_dir {
+            if let Some(parent) = self.dir.parent() {
+                sync_dir(parent)?;
+            }
+        }
         let len = file.metadata()?.len();
         if valid < len {
             // Drop a torn final frame so new records follow a valid boundary.
