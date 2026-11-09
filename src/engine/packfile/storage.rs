@@ -9318,7 +9318,7 @@ impl PackfileStorage {
             eprintln!(
                 "mtxdb: repack: dependency cycle among {} records in collection {}; writing them in id order",
                 live_hashes.len(),
-                collection_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                crate::storage::hex16(collection_id),
             );
         }
 
@@ -9562,7 +9562,7 @@ impl PackfileStorage {
             eprintln!(
                 "mtxdb: repack: dependency cycle among {} records in collection {}; writing them in id order",
                 live_hashes.len(),
-                collection_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                crate::storage::hex16(collection_id),
             );
         }
 
