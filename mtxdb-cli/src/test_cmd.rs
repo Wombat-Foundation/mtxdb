@@ -9931,6 +9931,10 @@ fn validate_complete_state_groups_against_source_shortstate() {
     let mut missing_room = 0usize;
     let mut unresolved_source = 0usize;
     let mut residual_count = 0usize;
+    let mut compared_by_room: HashMap<String, usize> = HashMap::new();
+    let mut exact_by_room: HashMap<String, usize> = HashMap::new();
+    let mut exact_after_filter_by_room: HashMap<String, usize> = HashMap::new();
+    let mut residual_by_room: HashMap<String, usize> = HashMap::new();
     let mut residual = Vec::new();
     let mut extra_seen_before = 0usize;
     let mut extra_seen_after = 0usize;
@@ -9964,6 +9968,7 @@ fn validate_complete_state_groups_against_source_shortstate() {
                 .expect("load imported state group")
         else {
             residual_count += 1;
+            *residual_by_room.entry(room.clone()).or_default() += 1;
             if residual.len() < 20 {
                 residual.push(format!(
                     "{event_id}: group {} has no resolvable STGP/STAT entry",
@@ -9985,6 +9990,7 @@ fn validate_complete_state_groups_against_source_shortstate() {
 
         let Some(source_state) = legacy_materialize(short_state, &diffs) else {
             residual_count += 1;
+            *residual_by_room.entry(room.clone()).or_default() += 1;
             if residual.len() < 20 {
                 residual.push(format!(
                     "{event_id}: source state {short_state} has a missing or cyclic statediff chain"
@@ -10009,6 +10015,7 @@ fn validate_complete_state_groups_against_source_shortstate() {
             unresolved_source += 1;
             continue;
         }
+        *compared_by_room.entry(room.clone()).or_default() += 1;
 
         // The legacy map is written by two paths: incoming federated events
         // store the state *after* the event (`set_event_state`), while locally
@@ -10023,6 +10030,7 @@ fn validate_complete_state_groups_against_source_shortstate() {
         }
         if imported == expected {
             matched += 1;
+            *exact_by_room.entry(room.clone()).or_default() += 1;
             continue;
         }
 
@@ -10041,6 +10049,7 @@ fn validate_complete_state_groups_against_source_shortstate() {
             .collect();
         if filtered_imported == filtered_expected {
             matched_after_outlier_filter += 1;
+            *exact_after_filter_by_room.entry(room.clone()).or_default() += 1;
             continue;
         }
 
@@ -10067,6 +10076,7 @@ fn validate_complete_state_groups_against_source_shortstate() {
             }
         }
         residual_count += 1;
+        *residual_by_room.entry(room.clone()).or_default() += 1;
         if residual.len() < 20 {
             residual.push(format!(
                 "{event_id} room {room}: imported {} source {} extra {:?} missing {:?}",
@@ -10085,6 +10095,22 @@ fn validate_complete_state_groups_against_source_shortstate() {
     eprintln!(
         "  residual extras: seen-before={extra_seen_before} seen-after={extra_seen_after}; missing: seen-before={missing_seen_before} seen-after={missing_seen_after}"
     );
+    let mut rooms_seen: Vec<String> = compared_by_room
+        .keys()
+        .chain(residual_by_room.keys())
+        .cloned()
+        .collect();
+    rooms_seen.sort();
+    rooms_seen.dedup();
+    for room in rooms_seen {
+        let compared = compared_by_room.get(&room).copied().unwrap_or(0);
+        let exact = exact_by_room.get(&room).copied().unwrap_or(0);
+        let after_filter = exact_after_filter_by_room.get(&room).copied().unwrap_or(0);
+        let residual = residual_by_room.get(&room).copied().unwrap_or(0);
+        eprintln!(
+            "  room {room}: compared={compared} exact={exact} exact_after_outlier={after_filter} residual={residual}"
+        );
+    }
     for mismatch in &residual {
         eprintln!("  residual: {mismatch}");
     }
