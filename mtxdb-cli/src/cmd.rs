@@ -14519,7 +14519,7 @@ fn walk_state_groups(
 
     let empty_set = StateSet::new();
     let empty = SharedState::new(
-        empty_set,
+        empty_set.clone(),
         state_group_instance_id(room_id, &[], &StateSet::new().lthash(), policy.derivation),
         true,
     );
@@ -14589,44 +14589,53 @@ fn walk_state_groups(
         // Incompleteness is inherited: a child of an event with a gapped base
         // has a gapped base too, even when all of its own parents are present.
         base_incomplete = base_is_incomplete(base_incomplete, &parents);
-        // Keep the gap before a resolver fallback can add to it: only a base
-        // missing history makes the resulting group unsafe to publish. A merge
-        // fallback is reported through `incomplete` instead, which already
-        // keeps the whole batch from being cached.
+        // A base missing history is never published, and every descendant
+        // inherits the gap, so there is no point resolving or deriving state
+        // past it. Keep an incomplete placeholder so the walk can propagate
+        // the gap; `judge` returns unchecked without reading its set.
         let base_gapped = base_incomplete;
-
-        // State-resolution merge. Parents that already agree share their state
-        // instead of copying it, so a plain message event costs no allocation;
-        // only genuine divergence reaches rezzy. When rezzy cannot run — no
-        // recognized room version, or the batch is missing part of the auth
-        // closure it reads — the union falls back to the first-parent
-        // rule and the gap is recorded so the result is not cached as a
-        // real resolution.
-        let base: Arc<SharedState> = match parents.as_slice() {
-            [] => Arc::clone(&empty),
-            [only] => Arc::clone(only),
-            [first, rest @ ..]
-                if rest
-                    .iter()
-                    .all(|p| Arc::ptr_eq(p, first) || p.lthash == first.lthash) =>
-            {
-                Arc::clone(first)
-            }
-            [..] => {
-                let merge_started = Instant::now();
-                let (merged, fallback) = merge_parent_states(
-                    &mut context,
-                    &parents,
-                    &parent_instances,
-                    room_id,
-                    policy,
-                    &mut incomplete,
-                    &mut merge_phases,
-                );
-                merge_time = merge_time.saturating_add(merge_started.elapsed());
-                merge_count = merge_count.saturating_add(1);
-                base_incomplete |= fallback;
-                merged
+        let skip_merge = base_gapped;
+        let base: Arc<SharedState> = if skip_merge {
+            SharedState::with_parents(
+                empty_set.clone(),
+                empty.instance,
+                false,
+                parent_instances.clone(),
+            )
+        } else {
+            // State-resolution merge. Parents that already agree share their
+            // state instead of copying it, so a plain message event costs no
+            // allocation; only genuine divergence reaches rezzy. When rezzy
+            // cannot run — no recognized room version, or the batch is missing
+            // part of the auth closure it reads — the union falls back to the
+            // first-parent rule and the gap is recorded so the result is not
+            // cached as a real resolution.
+            match parents.as_slice() {
+                [] => Arc::clone(&empty),
+                [only] => Arc::clone(only),
+                [first, rest @ ..]
+                    if rest
+                        .iter()
+                        .all(|p| Arc::ptr_eq(p, first) || p.lthash == first.lthash) =>
+                {
+                    Arc::clone(first)
+                }
+                [..] => {
+                    let merge_started = Instant::now();
+                    let (merged, fallback) = merge_parent_states(
+                        &mut context,
+                        &parents,
+                        &parent_instances,
+                        room_id,
+                        policy,
+                        &mut incomplete,
+                        &mut merge_phases,
+                    );
+                    merge_time = merge_time.saturating_add(merge_started.elapsed());
+                    merge_count = merge_count.saturating_add(1);
+                    base_incomplete |= fallback;
+                    merged
+                }
             }
         };
 
@@ -14645,17 +14654,21 @@ fn walk_state_groups(
             }
         }
 
-        let state = derive_state(
-            event_value,
-            event_id.map(String::as_str),
-            &base,
-            view,
-            &parent_instances,
-            room_id,
-            policy,
-            rejected.as_deref(),
-            !base_incomplete,
-        );
+        let state = if base_gapped {
+            Arc::clone(&base)
+        } else {
+            derive_state(
+                event_value,
+                event_id.map(String::as_str),
+                &base,
+                view,
+                &parent_instances,
+                room_id,
+                policy,
+                rejected.as_deref(),
+                !base_incomplete,
+            )
+        };
 
         if !base_gapped && !seed_instances.contains(&state.instance) {
             instances
