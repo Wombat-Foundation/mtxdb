@@ -449,6 +449,9 @@ pub struct PackfileScanner {
     file_end: u64,
     verify_payload: bool,
     done: bool,
+    /// Offset of the next frame. Tracked here because asking a
+    /// `BufReader<File>` for its position is an `lseek` per call.
+    pos: u64,
 }
 
 /// Open a streaming scanner for a packfile.
@@ -481,11 +484,13 @@ pub(crate) fn scan_packfile_iter_from_file(
     let file_end = file.metadata()?.len();
     let mut reader = BufReader::with_capacity(HEADER_LEN, file);
     let done = read_header(&mut reader)?.is_none();
+    let pos = reader.stream_position()?;
     Ok(PackfileScanner {
         reader,
         file_end,
         verify_payload,
         done,
+        pos,
     })
 }
 
@@ -506,29 +511,30 @@ impl PackfileScanner {
         if self.done {
             return None;
         }
-        let offset = match self.reader.stream_position() {
-            Ok(offset) => offset,
-            Err(error) => {
-                self.done = true;
-                return Some(Err(error));
-            }
-        };
+        let offset = self.pos;
         let result = if self.verify_payload {
             read_record_metadata_with_len(&mut self.reader)
         } else {
-            read_record_metadata_skip_payload_with_end_and_len(&mut self.reader, self.file_end)
+            read_record_metadata_skip_payload_with_end_and_len(
+                &mut self.reader,
+                offset,
+                self.file_end,
+            )
         };
         match result {
-            Ok(Some((metadata, disk_bytes))) => Some(Ok(ScanEntryWithRemoval {
-                collection_id: metadata.collection_id,
-                hash: metadata.hash,
-                offset,
-                removed: metadata
-                    .metadata
-                    .as_ref()
-                    .is_some_and(|frame| frame.removed),
-                disk_bytes,
-            })),
+            Ok(Some((metadata, disk_bytes))) => {
+                self.pos = offset.saturating_add(disk_bytes);
+                Some(Ok(ScanEntryWithRemoval {
+                    collection_id: metadata.collection_id,
+                    hash: metadata.hash,
+                    offset,
+                    removed: metadata
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|frame| frame.removed),
+                    disk_bytes,
+                }))
+            }
             Ok(None) => {
                 self.done = true;
                 None
@@ -1492,22 +1498,26 @@ fn read_record_metadata_scratch_with_len(
 pub fn read_record_metadata_skip_payload(
     reader: &mut (impl Read + Seek + SkipForward),
 ) -> io::Result<Option<RecordMetadata>> {
-    let payload_start = reader.stream_position()?;
+    let record_start = reader.stream_position()?;
     let file_end = reader.seek(io::SeekFrom::End(0))?;
-    reader.seek(io::SeekFrom::Start(payload_start))?;
-    read_record_metadata_skip_payload_with_end(reader, file_end)
+    reader.seek(io::SeekFrom::Start(record_start))?;
+    read_record_metadata_skip_payload_with_end(reader, record_start, file_end)
 }
 
 fn read_record_metadata_skip_payload_with_end<R: Read + Seek + SkipForward>(
     reader: &mut R,
+    record_start: u64,
     file_end: u64,
 ) -> io::Result<Option<RecordMetadata>> {
-    read_record_metadata_skip_payload_with_end_and_len(reader, file_end)
+    read_record_metadata_skip_payload_with_end_and_len(reader, record_start, file_end)
         .map(|result| result.map(|(metadata, _)| metadata))
 }
 
+/// `record_start` is the offset of the frame's length prefix. Callers know it
+/// already, and deriving the payload offset from it saves an `lseek` per frame.
 fn read_record_metadata_skip_payload_with_end_and_len<R: Read + Seek + SkipForward>(
     reader: &mut R,
+    record_start: u64,
     file_end: u64,
 ) -> io::Result<Option<(RecordMetadata, u64)>> {
     let Some(header) = read_frame_header(reader)? else {
@@ -1527,7 +1537,12 @@ fn read_record_metadata_skip_payload_with_end_and_len<R: Read + Seek + SkipForwa
     )
     .checked_add(4)
     .expect("frame payload length fits u64");
-    let payload_start = reader.stream_position()?;
+    // Length prefix, fixed fields and metadata block are already consumed.
+    let payload_start = record_start
+        .checked_add(4)
+        .and_then(|at| at.checked_add(u64::from(FRAME_FIXED_LEN)))
+        .and_then(|at| at.checked_add(header.metadata_block.len() as u64))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record start overflows u64"))?;
     let frame_end = payload_start
         .checked_add(skip)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record end overflows u64"))?;
@@ -1933,7 +1948,7 @@ pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let file_end = reader.get_ref().metadata()?.len();
     loop {
         let offset = reader.stream_position()?;
-        match read_record_metadata_skip_payload_with_end(&mut reader, file_end) {
+        match read_record_metadata_skip_payload_with_end(&mut reader, offset, file_end) {
             Ok(Some(meta)) => entries.push((meta.collection_id, meta.hash, offset)),
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -2058,7 +2073,7 @@ pub(crate) fn scan_packfile_from_with_removal_visit(
         let metadata = if verify_checksum {
             read_record_metadata_with_len(&mut reader)
         } else {
-            read_record_metadata_skip_payload_with_end_and_len(&mut reader, file_end)
+            read_record_metadata_skip_payload_with_end_and_len(&mut reader, offset, file_end)
         };
         match metadata {
             Ok(Some((metadata, disk_bytes))) => {

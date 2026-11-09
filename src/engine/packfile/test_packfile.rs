@@ -1050,6 +1050,49 @@ fn test_scan_packfile_skip_payload_matches_scan_packfile() {
     assert_eq!(skipped.len(), 2);
 }
 
+/// The streaming scanner tracks its own offset instead of asking the file for
+/// it before every frame. Both modes must still report the offsets the
+/// seek-based scan does, across payloads smaller and larger than the read
+/// buffer, and the offsets must tile the file exactly.
+#[test]
+fn test_scanner_tracked_offsets_match_seek_based_scan() {
+    let dir = test_dir("scanner_tracked_offsets");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shard_00.pack");
+    let mut buf = Vec::new();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
+    for (i, size) in [0usize, 17, 4096, 70_000, 3, 200_000, 1]
+        .into_iter()
+        .enumerate()
+    {
+        let tag = u8::try_from(i).unwrap();
+        write_record(
+            &mut buf,
+            &test_record([tag; 16], [tag.wrapping_add(0x40); 16], &vec![tag; size]),
+        )
+        .unwrap();
+    }
+    std::fs::write(&path, &buf).unwrap();
+
+    let expected = scan_packfile(&path).unwrap();
+    assert_eq!(expected.len(), 7);
+    for verify_payload in [false, true] {
+        let scanned: Vec<_> = scan_packfile_iter(&path, verify_payload)
+            .unwrap()
+            .collect::<io::Result<_>>()
+            .unwrap();
+        assert_eq!(scanned, expected, "verify_payload = {verify_payload}");
+        let mut frames = scan_packfile_iter(&path, verify_payload).unwrap();
+        let mut end = expected[0].2;
+        while let Some(entry) = frames.next_with_removal() {
+            let entry = entry.unwrap();
+            assert_eq!(entry.offset, end, "frames tile the file with no gap");
+            end = entry.offset + entry.disk_bytes;
+        }
+        assert_eq!(end, u64::try_from(buf.len()).unwrap());
+    }
+}
+
 #[test]
 fn test_scan_packfile_skip_payload_empty_file() {
     let dir = test_dir("scan_skip_payload_empty");
