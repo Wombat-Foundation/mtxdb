@@ -1463,16 +1463,40 @@ pub(crate) fn redactions_for_export(
     room_version: &str,
     already_redacted: &HashSet<String>,
 ) -> Vec<Option<HashMismatch>> {
-    events
-        .iter()
-        .map(|event| {
-            if already_redacted.contains(&event.event_id) {
-                None
-            } else {
-                redacted_for_hash(&event.pdu, room_version)
-            }
-        })
-        .collect()
+    par_map(events, |event| {
+        if already_redacted.contains(&event.event_id) {
+            None
+        } else {
+            redacted_for_hash(&event.pdu, room_version)
+        }
+    })
+}
+
+/// Below this many items the thread start-up costs more than it saves.
+const PAR_MIN_ITEMS: usize = 512;
+
+/// Map `work` over `items` on every available core, keeping input order.
+///
+/// Used for the per-event checks that read only the event and shared,
+/// immutable state (content hashes, signatures). Small inputs run inline.
+pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    if threads < 2 || items.len() < PAR_MIN_ITEMS {
+        return items.iter().map(&work).collect();
+    }
+    let chunk = items.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let work = &work;
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().map(work).collect::<Vec<R>>()))
+            .collect();
+        let mut out = Vec::with_capacity(items.len());
+        for handle in handles {
+            out.extend(handle.join().expect("per-event worker panicked"));
+        }
+        out
+    })
 }
 
 /// The auth-check input for each event, using its redacted form on mismatch.
@@ -1857,12 +1881,8 @@ fn derived_auth_findings_inner(
 
     // Only a derived refusal seeds the cascade. The exported verdicts are
     // compared below for the report and are never stored.
-    let signature_outcomes = keys.map(|keys| {
-        events
-            .iter()
-            .map(|event| keys.verify(event, room_version))
-            .collect::<Vec<_>>()
-    });
+    let signature_outcomes =
+        keys.map(|keys| par_map(events, |event| keys.verify(event, room_version)));
     let seeds: Vec<bool> = judgement
         .refused
         .iter()
