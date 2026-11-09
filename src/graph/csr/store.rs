@@ -140,7 +140,19 @@ impl CsrWriter<'_> {
 
     /// Append while the caller holds [`CsrStore::with_write_lock`].
     pub(crate) fn append_rows_locked(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
-        self.store.append_rows_locked(scope, rows)
+        self.store.append_rows_locked(scope, rows, true)
+    }
+
+    /// Append without syncing the tail, while the caller holds
+    /// [`CsrStore::with_write_lock`]. The rows are readable at once but are
+    /// not durable until [`CsrStore::sync_tail`] returns; the caller must not
+    /// publish any claim that covers them before then.
+    pub(crate) fn append_rows_deferred_locked(
+        &self,
+        scope: ScopeId,
+        rows: &[RowRecord],
+    ) -> io::Result<()> {
+        self.store.append_rows_locked(scope, rows, false)
     }
 
     /// Hide every row of `scope` with a tombstone record.
@@ -161,6 +173,17 @@ impl CsrWriter<'_> {
 }
 
 type RowKey = ([u8; 16], u16, u32);
+
+#[cfg(test)]
+thread_local! {
+    /// Tail syncs issued by this thread; tests assert on the count.
+    static TAIL_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_tail_sync() {
+    TAIL_SYNCS.with(|count| count.set(count.get().saturating_add(1)));
+}
 
 impl CsrStore {
     /// Address the store for `pool` under `layout`.
@@ -241,11 +264,31 @@ impl CsrStore {
     pub(crate) fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
         let lock = self.store_lock();
         let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
-        self.append_rows_locked(scope, rows)
+        self.append_rows_locked(scope, rows, true)
     }
 
-    /// Append while the caller holds this directory's write lock.
-    fn append_rows_locked(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
+    /// Make the tail and its directory entry durable. A store that has no tail
+    /// yet has nothing to sync. Safe to call when nothing is pending.
+    ///
+    /// # Errors
+    /// I/O errors.
+    pub(crate) fn sync_tail(&self) -> io::Result<()> {
+        match File::open(self.tail_path()) {
+            Ok(file) => {
+                file.sync_data()?;
+                #[cfg(test)]
+                count_tail_sync();
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        sync_dir(&self.dir)
+    }
+
+    /// Append while the caller holds this directory's write lock. `sync`
+    /// makes the tail durable before returning; sealing stays durable either
+    /// way, because it syncs the segment before it truncates the tail.
+    fn append_rows_locked(&self, scope: ScopeId, rows: &[RowRecord], sync: bool) -> io::Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -269,7 +312,11 @@ impl CsrStore {
             write_frame(&mut buffer, &payload);
         }
         file.write_all(&buffer)?;
-        file.sync_data()?;
+        if sync {
+            file.sync_data()?;
+            #[cfg(test)]
+            count_tail_sync();
+        }
         self.maybe_seal()?;
         Ok(())
     }
@@ -811,6 +858,13 @@ fn decode_frames(data: &[u8]) -> (Vec<Frame>, usize) {
             break;
         };
         let len = len as usize;
+        // Every real payload carries a row header, so a zero-length frame is
+        // an unwritten hole, not a record. The CRC-32 of nothing is 0, so a
+        // zero-filled gap would otherwise pass the checksum as a run of empty
+        // frames and poison every later read.
+        if len == 0 {
+            break;
+        }
         let start = at.saturating_add(8);
         let Some(end) = start.checked_add(len) else {
             break;
@@ -1258,6 +1312,109 @@ mod tests {
         assert!(Arc::ptr_eq(&real.store_lock(), &linked.store_lock()));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(alias);
+    }
+
+    fn tail_syncs() -> usize {
+        TAIL_SYNCS.with(std::cell::Cell::get)
+    }
+
+    fn row_for(owner: u32, target: u32) -> RowRecord {
+        RowRecord {
+            family: EdgeFamily::typed(3),
+            owner,
+            edges: vec![Edge { target, kind: 1 }],
+        }
+    }
+
+    #[test]
+    fn durable_appends_sync_once_per_call() {
+        let layout = layout("durable-count");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([3; 16]);
+        let before = tail_syncs();
+        for owner in 1..=3 {
+            store.append_rows(scope, &[row_for(owner, 9)]).unwrap();
+        }
+        assert_eq!(tail_syncs() - before, 3);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn deferred_appends_sync_only_at_the_barrier() {
+        let layout = layout("deferred-count");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([4; 16]);
+        let before = tail_syncs();
+        for owner in 1..=3 {
+            store
+                .with_write_lock(|| store.append_rows_locked(scope, &[row_for(owner, 9)], false))
+                .unwrap();
+        }
+        assert_eq!(tail_syncs() - before, 0, "deferred appends must not sync");
+        // Readable at once, before any sync.
+        assert_eq!(store.read_scope(scope).unwrap().rows.len(), 3);
+        store.sync_tail().unwrap();
+        assert_eq!(tail_syncs() - before, 1, "the barrier syncs exactly once");
+        // A store with no tail has nothing to sync.
+        let empty_layout = self::layout("deferred-empty");
+        CsrStore::open(&empty_layout, ShardType::State)
+            .sync_tail()
+            .unwrap();
+        let reopened = CsrStore::open(&layout, ShardType::State);
+        assert_eq!(reopened.read_scope(scope).unwrap().rows.len(), 3);
+        let _ = fs::remove_dir_all(layout.root());
+        let _ = fs::remove_dir_all(empty_layout.root());
+    }
+
+    #[test]
+    fn a_damaged_deferred_tail_replays_only_its_valid_prefix() {
+        // A crash can persist later pages while losing earlier ones, and can
+        // cut a frame short. Each case gets its own store because the tail
+        // cache assumes nothing else edits the file.
+        for case in 0..3 {
+            let layout = layout(&format!("deferred-torn-{case}"));
+            let store = CsrStore::open(&layout, ShardType::State);
+            let scope = ScopeId([5; 16]);
+            for owner in 1..=3 {
+                store
+                    .with_write_lock(|| {
+                        store.append_rows_locked(scope, &[row_for(owner, 9)], false)
+                    })
+                    .unwrap();
+            }
+            store.sync_tail().unwrap();
+            drop(store);
+            let tail = CsrStore::open(&layout, ShardType::State).tail_path();
+            let mut bytes = fs::read(&tail).unwrap();
+            let frame = bytes.len() / 3;
+            match case {
+                0 => bytes.truncate(bytes.len() - 3),
+                1 => bytes[frame..2 * frame].fill(0),
+                _ => bytes[frame + frame / 2] ^= 0xFF,
+            }
+            fs::write(&tail, &bytes).unwrap();
+            // A restart starts with no decoded tail cache.
+            TAIL_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&tail.parent().unwrap().to_path_buf());
+            let reopened = CsrStore::open(&layout, ShardType::State);
+            let owners: Vec<u32> = reopened
+                .read_scope(scope)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| r.owner)
+                .collect();
+            assert!(owners.len() < 3, "case {case}: damage replayed: {owners:?}");
+            assert!(owners.contains(&1), "case {case}: valid prefix lost");
+            // Appending after the damage recovers and keeps the prefix.
+            reopened.append_rows(scope, &[row_for(7, 9)]).unwrap();
+            let after = reopened.read_scope(scope).unwrap().rows;
+            assert!(after.iter().any(|r| r.owner == 7));
+            assert!(after.iter().any(|r| r.owner == 1));
+            let _ = fs::remove_dir_all(layout.root());
+        }
     }
 
     #[test]

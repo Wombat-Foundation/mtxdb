@@ -44,6 +44,16 @@ use crate::short_id::ShortIdIndex;
 use crate::storage::StorageError;
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
+/// Whether an append waits for its rows to reach stable storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendDurability {
+    /// Sync the tail before returning. The default for every caller.
+    Durable,
+    /// Leave the rows in the page cache. The caller owes a
+    /// [`CsrAdjacency::sync_tail`] before it publishes any claim covering them.
+    Deferred,
+}
+
 /// Family of an event's `prev_events`.
 pub const PREV: EdgeFamily = EdgeFamily::plain(1);
 /// Family of an event's `auth_events`.
@@ -329,6 +339,23 @@ impl CsrAdjacency {
         db: &Database,
         events: &[EventRecord<'_>],
     ) -> Result<Vec<u32>, StorageError> {
+        self.record_events_with(db, events, AppendDurability::Durable)
+    }
+
+    /// [`Self::record_events`] with an explicit durability for the appended rows.
+    ///
+    /// Under [`AppendDurability::Deferred`] the rows are readable immediately
+    /// but are not durable until [`Self::sync_tail`] returns; the caller must
+    /// call it before publishing any claim that covers them.
+    ///
+    /// # Errors
+    /// As [`Self::record_event`], applied to the whole batch.
+    pub fn record_events_with(
+        &self,
+        db: &Database,
+        events: &[EventRecord<'_>],
+        durability: AppendDurability,
+    ) -> Result<Vec<u32>, StorageError> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
@@ -353,11 +380,31 @@ impl CsrAdjacency {
             if !changed_rows.is_empty() {
                 store
                     .writer(db)
-                    .and_then(|writer| writer.append_rows_locked(self.scope(), &changed_rows))
+                    .and_then(|writer| match durability {
+                        AppendDurability::Durable => {
+                            writer.append_rows_locked(self.scope(), &changed_rows)
+                        }
+                        AppendDurability::Deferred => {
+                            writer.append_rows_deferred_locked(self.scope(), &changed_rows)
+                        }
+                    })
                     .map_err(StorageError::Io)?;
             }
             Ok(owners)
         })
+    }
+
+    /// Make every row appended so far durable, including rows written under
+    /// [`AppendDurability::Deferred`]. Idempotent, and cheap when nothing is
+    /// pending.
+    ///
+    /// # Errors
+    /// I/O errors.
+    pub fn sync_tail(&self, db: &Database) -> Result<(), StorageError> {
+        let store = self.store(db);
+        store
+            .with_write_lock(|| store.sync_tail())
+            .map_err(StorageError::Io)
     }
 
     /// Turn each event into edge keys, allocating relation kind ids once per
