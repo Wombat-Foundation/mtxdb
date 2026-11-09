@@ -8883,6 +8883,7 @@ fn cmd_import(
     no_state_hamts: bool,
 ) -> anyhow::Result<()> {
     let import_started = Instant::now();
+    let setup_started = Instant::now();
     let import_template = compile_import_template(template)?;
     // One writer owns the entire batch: it prevents another writer from
     // interleaving halfway through a shell glob, and lets us publish one
@@ -8912,6 +8913,8 @@ fn cmd_import(
     if no_state_hamts {
         eprintln!("state HAMTs: skipped (--no-state-hamts)");
     }
+    report_import_phase("setup", setup_started.elapsed());
+    let data_started = Instant::now();
     let mut run = import_data(
         &db,
         store,
@@ -8922,6 +8925,11 @@ fn cmd_import(
         &mut established_collections,
         !no_state_hamts,
     );
+    report_import_phase(
+        "data pass (inputs and key reconciliation)",
+        data_started.elapsed(),
+    );
+    let audit_started = Instant::now();
     let hash_audit_path = layout.root().join("content-hash-mismatches.jsonl");
     if let Err(error) = write_hash_audit(&hash_audit_path, &run.hash_audit) {
         eprintln!("writing {}: {error:#}", hash_audit_path.display());
@@ -8964,21 +8972,30 @@ fn cmd_import(
     for (code, count) in run.rejection_counts.iter().filter(|(_, count)| **count > 0) {
         eprintln!("  {count:>8}  {}", RejectionCode::from_u8(*code).tag());
     }
+    report_import_phase("audit sidecars and summary", audit_started.elapsed());
     let (failures, server_keys_imported) = (run.failures, run.server_keys);
+    let sync_started = Instant::now();
     store
         .sync_all()
         .context("persisting import shard and collection summaries")?;
+    report_import_phase("primary pool sync", sync_started.elapsed());
     if shard != ShardType::State {
+        let sync_started = Instant::now();
         state_store
             .sync_all()
             .context("persisting state-group summaries")?;
+        report_import_phase("state pool sync", sync_started.elapsed());
     }
     if server_keys_imported {
+        let sync_started = Instant::now();
         db.pool(ShardType::ServerInfo)
             .sync_all()
             .context("persisting imported signing keys")?;
+        report_import_phase("server-info pool sync", sync_started.elapsed());
     }
+    let finish_started = Instant::now();
     finish_import(&db, &run)?;
+    report_import_phase("finish marker", finish_started.elapsed());
     if import_timings_enabled() {
         eprintln!("import: wall time {:?}", import_started.elapsed());
     }
@@ -9295,7 +9312,12 @@ fn import_data(
             );
         }
     }
+    let reconciliation_started = Instant::now();
     reconcile_verified_key_observations(db, &mut run);
+    report_import_phase(
+        "verified-key reconciliation",
+        reconciliation_started.elapsed(),
+    );
     run
 }
 

@@ -458,12 +458,12 @@ impl SignatureKeyCatalog {
             .any(|record| !record.key.key.is_empty())
     }
 
-    /// Stored signing keys for the servers one room's events name.
+    /// Stored signing keys named by one room's required signatures.
     ///
-    /// Reading one server's keys scans the whole server-info pool, so
-    /// `stored_keys` remembers each server's keys for the rest of the run: a
-    /// run that imports many rooms reads each distinct server once, not once
-    /// per room. The caller drops the memo whenever keys are imported.
+    /// Keys are fetched by indexed `(origin, key_id)` lookups rather than by
+    /// scanning the ServerInfo packs. `stored_keys` remembers loaded key ids
+    /// for the rest of the run. The caller drops the memo whenever keys are
+    /// imported.
     pub(crate) fn read_for_room(
         store: &PackfileStorage,
         export: &RoomExport,
@@ -473,22 +473,49 @@ impl SignatureKeyCatalog {
         let Some(room_version) = create_room_version(&export.events) else {
             return Ok(catalog);
         };
-        // Required signers are the event origin and, for a restricted join,
-        // the homeserver of `join_authorised_via_users_server`.
-        let mut servers: HashSet<String> = export
-            .events
-            .iter()
-            .filter_map(|event| event_origin(&event.pdu, room_version))
-            .map(str::to_owned)
-            .collect();
+        // Collect only the key ids present for required signers. The origin
+        // and, for a restricted join, the authoriser's homeserver are the
+        // only signatures consulted by `SignatureKeyCatalog::verify`.
+        let mut servers: HashMap<String, (String, HashSet<Vec<u8>>)> = HashMap::new();
         for event in &export.events {
-            if let Some(server) = restricted_join_authoriser_server(&event.pdu) {
-                servers.insert(server.to_owned());
+            let required = [
+                event_origin(&event.pdu, room_version),
+                restricted_join_authoriser_server(&event.pdu),
+            ];
+            let Some(signatures) = event.pdu.get("signatures").and_then(OwnedValue::as_object)
+            else {
+                continue;
+            };
+            for server in required.into_iter().flatten() {
+                let entry = servers
+                    .entry(server.to_ascii_lowercase())
+                    .or_insert_with(|| (server.to_owned(), HashSet::new()));
+                for (signature_server, signature_map) in signatures {
+                    if !signature_server.eq_ignore_ascii_case(server) {
+                        continue;
+                    }
+                    if let Some(signature_map) = signature_map.as_object() {
+                        entry.1.extend(
+                            signature_map
+                                .keys()
+                                .map(|key_id| key_id.as_bytes().to_vec()),
+                        );
+                    }
+                }
             }
         }
-        for server in servers {
-            let keys = memoized_server_keys(stored_keys, &server, || {
-                Ok(server_keys::read_server_keys(store, server.as_bytes())?)
+        for (_, (server, key_ids)) in servers {
+            if key_ids.is_empty() {
+                continue;
+            }
+            let mut key_ids: Vec<_> = key_ids.into_iter().collect();
+            key_ids.sort_unstable();
+            let keys = memoized_server_keys(stored_keys, &server, &key_ids, |missing| {
+                Ok(server_keys::read_server_keys_by_ids(
+                    store,
+                    server.as_bytes(),
+                    missing,
+                )?)
             })?;
             for key in keys {
                 catalog.records.insert(
@@ -1980,16 +2007,46 @@ fn estimate(
 ///
 /// Each rejection is derived by running the auth rules over the room's events
 /// (see [`derived_auth_findings`]); the export's rejections are not trusted.
-/// One server's keys from `memo`, calling `load` only on the first request.
-fn memoized_server_keys<'a>(
-    memo: &'a mut HashMap<String, Vec<mtxdb::server_keys::ServerKey>>,
+/// Load the missing key ids for `server` and return the requested cached keys.
+fn memoized_server_keys(
+    memo: &mut HashMap<String, Vec<mtxdb::server_keys::ServerKey>>,
     server: &str,
-    load: impl FnOnce() -> anyhow::Result<Vec<mtxdb::server_keys::ServerKey>>,
-) -> anyhow::Result<&'a [mtxdb::server_keys::ServerKey]> {
-    if !memo.contains_key(server) {
-        memo.insert(server.to_owned(), load()?);
+    key_ids: &[Vec<u8>],
+    load: impl FnOnce(&[Vec<u8>]) -> anyhow::Result<Vec<mtxdb::server_keys::ServerKey>>,
+) -> anyhow::Result<Vec<mtxdb::server_keys::ServerKey>> {
+    let normalized_server = server.to_ascii_lowercase();
+    let missing: Vec<_> = key_ids
+        .iter()
+        .filter(|key_id| {
+            !memo.get(&normalized_server).is_some_and(|cached| {
+                cached
+                    .iter()
+                    .any(|key| key.key_id.as_slice() == key_id.as_slice())
+            })
+        })
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let loaded = load(&missing)?;
+        let cached = memo.entry(normalized_server.clone()).or_default();
+        for key in loaded {
+            if !cached.iter().any(|known| known.key_id == key.key_id) {
+                cached.push(key);
+            }
+        }
     }
-    Ok(&memo[server])
+    let Some(cached) = memo.get(&normalized_server) else {
+        return Ok(Vec::new());
+    };
+    Ok(cached
+        .iter()
+        .filter(|key| {
+            key_ids
+                .iter()
+                .any(|key_id| key.key_id.as_slice() == key_id.as_slice())
+        })
+        .cloned()
+        .collect())
 }
 
 #[cfg(test)]
@@ -1997,24 +2054,72 @@ mod memoized_server_keys_tests {
     use super::*;
 
     #[test]
-    fn each_server_is_loaded_once_per_memo() {
+    fn each_server_key_id_is_loaded_once_per_memo() {
         let mut memo = HashMap::new();
-        let mut loads = 0;
-        for server in ["a.example", "a.example", "b.example", "a.example"] {
-            memoized_server_keys(&mut memo, server, || {
-                loads += 1;
-                Ok(Vec::new())
-            })
-            .unwrap();
-        }
-        assert_eq!(loads, 2);
+        let mut loaded_ids = Vec::new();
+        let a1 = b"ed25519:a1".to_vec();
+        let a2 = b"ed25519:a2".to_vec();
+        let a3 = b"ed25519:a3".to_vec();
+        let b1 = b"ed25519:b1".to_vec();
+        let first = load_and_count(
+            &mut memo,
+            "a.example",
+            &[a1.clone(), a2.clone()],
+            &mut loaded_ids,
+        );
+        assert_eq!(first.len(), 2);
+        let second = load_and_count(&mut memo, "A.EXAMPLE", &[a1.clone()], &mut loaded_ids);
+        assert_eq!(second.len(), 1);
+        load_and_count(
+            &mut memo,
+            "a.example",
+            &[a1.clone(), a3.clone()],
+            &mut loaded_ids,
+        );
+        load_and_count(&mut memo, "b.example", &[b1.clone()], &mut loaded_ids);
+        assert_eq!(loaded_ids, vec![a1.clone(), a2, a3, b1.clone()]);
+
         memo.clear();
-        memoized_server_keys(&mut memo, "a.example", || {
-            loads += 1;
-            Ok(Vec::new())
+        load_and_count(&mut memo, "a.example", &[a1.clone()], &mut loaded_ids);
+        assert_eq!(
+            loaded_ids.last(),
+            Some(&a1),
+            "clearing memo reloads the key"
+        );
+    }
+
+    fn test_server_key(key_id: &[u8]) -> mtxdb::server_keys::ServerKey {
+        mtxdb::server_keys::ServerKey {
+            key_id: key_id.to_vec(),
+            key: Vec::new(),
+            valid_until_ts: 0,
+            source: Vec::new(),
+            ts_added_ms: 0,
+            tier: mtxdb::server_keys::KeyTier::Permanent,
+            digest: [0; 32],
+            first_seen_ms: 0,
+            last_active_ms: 0,
+            corroborated: false,
+            promote_by_ms: 0,
+            expired_ts: None,
+            inferred_retired: false,
+        }
+    }
+
+    fn load_and_count(
+        memo: &mut HashMap<String, Vec<mtxdb::server_keys::ServerKey>>,
+        server: &str,
+        key_ids: &[Vec<u8>],
+        loaded_ids: &mut Vec<Vec<u8>>,
+    ) -> Vec<mtxdb::server_keys::ServerKey> {
+        memoized_server_keys(memo, server, key_ids, |missing| {
+            loaded_ids.extend_from_slice(missing);
+            Ok(missing
+                .iter()
+                .map(|key_id| test_server_key(key_id))
+                .collect())
         })
-        .unwrap();
-        assert_eq!(loads, 3, "a cleared memo must reload");
+        .unwrap()
     }
 }
 

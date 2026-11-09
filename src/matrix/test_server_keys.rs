@@ -147,6 +147,31 @@ fn first_key_seen_wins_and_tier_follows_the_sighting() {
 }
 
 #[test]
+fn selected_server_keys_are_read_by_indexed_key_id() {
+    let (db, root) = open("selected-read");
+    let keys = [
+        observed("ed25519:a", b"AAAA", 100),
+        observed("ed25519:b", b"BBBB", 100),
+    ];
+    merge(&db, &update("o", KeySighting::Direct, "origin", &keys, 1)).unwrap();
+
+    let selected = read_server_keys_by_ids(
+        db.server_info(),
+        b"o",
+        &[b"ed25519:b".to_vec(), b"ed25519:missing".to_vec()],
+    )
+    .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].key_id, b"ed25519:b");
+    assert!(read_server_keys_by_ids(db.server_info(), b"o", &[])
+        .unwrap()
+        .is_empty());
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn the_same_body_refreshes_times_and_keeps_the_source() {
     let (db, root) = open("same");
     let keys = [observed("ed25519:a", b"AAAA", 100)];

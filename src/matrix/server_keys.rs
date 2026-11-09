@@ -471,6 +471,38 @@ pub fn read_server_keys(
     Ok(keys)
 }
 
+/// Read selected keys of `origin` by their indexed key ids.
+///
+/// This avoids scanning every shard when a caller only needs the keys named
+/// by signatures in an input batch.
+///
+/// # Errors
+/// Returns an error if the pool cannot be read or a selected record is corrupt.
+pub fn read_server_keys_by_ids(
+    store: &PackfileStorage,
+    origin: &[u8],
+    key_ids: &[Vec<u8>],
+) -> Result<Vec<ServerKey>, StorageError> {
+    if key_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let collection = origin_keys_collection_id(origin);
+    let record_ids: Vec<_> = key_ids
+        .iter()
+        .map(|key_id| origin_key_record_id(key_id))
+        .collect();
+    let found = store.get_many(&collection, &record_ids)?;
+    let mut keys = Vec::with_capacity(found.len());
+    for (key_id, data) in key_ids.iter().zip(found) {
+        let Some(data) = data else {
+            continue;
+        };
+        keys.push(decode_for(origin, Some(key_id), &data.bytes)?);
+    }
+    keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+    Ok(keys)
+}
+
 /// Read the verbatim Notary payload stored for `origin`.
 ///
 /// # Errors
