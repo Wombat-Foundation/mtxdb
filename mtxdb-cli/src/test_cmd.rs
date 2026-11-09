@@ -9684,13 +9684,20 @@ fn json_string_matches_rezzy_json_escaper() {
 // Real-data validation against a legacy Conduwuit `shortstatehash` dump.
 //
 // The source maps are exported with:
-//   ldb --db=<rocksdb> --column_family=<cf> dump --hex
-// for eventid_shorteventid, shorteventid_shortstatehash,
+//   ldb --db=<rocksdb> --column_family=<cf> dump --hex > <cf>.txt
+// for eventid_shorteventid, shorteventid_eventid, shorteventid_shortstatehash,
 // shortstatehash_statediff, statekey_shortstatekey, roomid_shortroomid.
+// eventid_outlierpdu is optional and, when present, is used to discount rows
+// the source itself later reclassified.
+//
+// The comparison is diagnostic by default. Set MTXDB_SHORTSTATE_STRICT=1 to
+// fail on any residual instead.
+//
 // Run with:
 //   MTXDB_SHORTSTATE_DB=<mtxdb root> \
 //   MTXDB_SHORTSTATE_DUMP=<dump dir> \
-//   cargo test -p mtxdb-cli --lib -- --ignored validate_complete_state_groups
+//   cargo test -p mtxdb-cli --bin mtxdb -- --ignored --nocapture \
+//     validate_complete_state_groups_against_source_shortstate
 // ---------------------------------------------------------------------------
 
 /// One `0xKEY ==> 0xVALUE` row from `ldb ... dump --hex`.
@@ -9965,7 +9972,16 @@ fn validate_complete_state_groups_against_source_shortstate() {
             }
             continue;
         };
-        let imported: HashSet<String> = entries.iter().map(|(_, _, event)| event.clone()).collect();
+        // Compare keyed state, not bare event-id sets: the same
+        // `(type, state_key)` may resolve to different events on either side
+        // of the boundary, and a set difference would report that as both an
+        // extra and a missing entry.
+        let imported: HashMap<(String, String), String> = entries
+            .iter()
+            .map(|(event_type, state_key, event)| {
+                ((event_type.clone(), state_key.clone()), event.clone())
+            })
+            .collect();
 
         let Some(source_state) = legacy_materialize(short_state, &diffs) else {
             residual_count += 1;
@@ -9976,14 +9992,17 @@ fn validate_complete_state_groups_against_source_shortstate() {
             }
             continue;
         };
-        let mut expected = HashSet::new();
+        let mut expected: HashMap<(String, String), String> = HashMap::new();
         let mut unresolved = 0usize;
-        for (_, event_short) in &source_state {
-            match short_to_event.get(event_short) {
-                Some(event) => {
-                    expected.insert(event.clone());
+        for (state_key_short, event_short) in &source_state {
+            match (
+                short_statekey_to_pair.get(state_key_short),
+                short_to_event.get(event_short),
+            ) {
+                (Some(key), Some(event)) => {
+                    expected.insert(key.clone(), event.clone());
                 }
-                None => unresolved += 1,
+                _ => unresolved += 1,
             }
         }
         if unresolved > 0 {
@@ -9991,11 +10010,16 @@ fn validate_complete_state_groups_against_source_shortstate() {
             continue;
         }
 
-        // The legacy map stores the state *before* the event; the imported
-        // group is the state *after* it. Apply the event's own state change
-        // before comparing.
-        if entries.iter().any(|(_, _, event)| event == event_id) {
-            expected.insert(event_id.clone());
+        // The legacy map is written by two paths: incoming federated events
+        // store the state *after* the event (`set_event_state`), while locally
+        // built events store the room state *before* it (`append_to_state`).
+        // Normalize to after-state by pinning the event's own key to the event
+        // when the imported group already places it there. Assigning by key
+        // replaces the superseded value the before-state carried.
+        for (key, event) in &imported {
+            if event == event_id {
+                expected.insert(key.clone(), event_id.clone());
+            }
         }
         if imported == expected {
             matched += 1;
@@ -10005,28 +10029,38 @@ fn validate_complete_state_groups_against_source_shortstate() {
         // The source's state rows were written when the event was first
         // applied. Events it later reclassified as outliers, or backfilled
         // after that snapshot, are not evidence of a resolver difference.
-        let filtered_imported: HashSet<String> = imported
+        let filtered_imported: HashMap<(String, String), String> = imported
             .iter()
-            .filter(|event| !outliers.contains(*event))
-            .cloned()
+            .filter(|(_, event)| !outliers.contains(*event))
+            .map(|(key, event)| (key.clone(), event.clone()))
             .collect();
-        let filtered_expected: HashSet<String> = expected
+        let filtered_expected: HashMap<(String, String), String> = expected
             .iter()
-            .filter(|event| !outliers.contains(*event))
-            .cloned()
+            .filter(|(_, event)| !outliers.contains(*event))
+            .map(|(key, event)| (key.clone(), event.clone()))
             .collect();
         if filtered_imported == filtered_expected {
             matched_after_outlier_filter += 1;
             continue;
         }
 
-        for extra in filtered_imported.difference(&filtered_expected) {
+        let keyed_extra: Vec<_> = filtered_imported
+            .iter()
+            .filter(|(key, event)| filtered_expected.get(*key) != Some(*event))
+            .map(|(key, event)| (key.clone(), event.clone()))
+            .collect();
+        let keyed_missing: Vec<_> = filtered_expected
+            .iter()
+            .filter(|(key, event)| filtered_imported.get(*key) != Some(*event))
+            .map(|(key, event)| (key.clone(), event.clone()))
+            .collect();
+        for (_, extra) in &keyed_extra {
             match event_to_short.get(extra) {
                 Some(&short) if short > short_event => extra_seen_after += 1,
                 _ => extra_seen_before += 1,
             }
         }
-        for missing in filtered_expected.difference(&filtered_imported) {
+        for (_, missing) in &keyed_missing {
             match event_to_short.get(missing) {
                 Some(&short) if short > short_event => missing_seen_after += 1,
                 _ => missing_seen_before += 1,
@@ -10038,14 +10072,8 @@ fn validate_complete_state_groups_against_source_shortstate() {
                 "{event_id} room {room}: imported {} source {} extra {:?} missing {:?}",
                 filtered_imported.len(),
                 filtered_expected.len(),
-                filtered_imported
-                    .difference(&filtered_expected)
-                    .take(4)
-                    .collect::<Vec<_>>(),
-                filtered_expected
-                    .difference(&filtered_imported)
-                    .take(4)
-                    .collect::<Vec<_>>()
+                keyed_extra.iter().take(4).collect::<Vec<_>>(),
+                keyed_missing.iter().take(4).collect::<Vec<_>>()
             ));
         }
     }
