@@ -54,6 +54,24 @@ pub enum AppendDurability {
     Deferred,
 }
 
+/// Make every adjacency tail in `db` durable, whichever pool holds it.
+///
+/// A run that publishes a completion claim calls this first, so the claim
+/// never covers rows that exist only in the page cache. It is idempotent and
+/// cheap when nothing is pending.
+///
+/// # Errors
+/// I/O errors from any tail.
+pub fn sync_all_tails(db: &Database) -> Result<(), StorageError> {
+    for pool in ShardType::ALL {
+        let store = CsrStore::open(db.layout(), pool);
+        store
+            .with_write_lock(|| store.sync_tail())
+            .map_err(StorageError::Io)?;
+    }
+    Ok(())
+}
+
 /// Family of an event's `prev_events`.
 pub const PREV: EdgeFamily = EdgeFamily::plain(1);
 /// Family of an event's `auth_events`.

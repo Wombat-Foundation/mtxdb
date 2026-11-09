@@ -8580,6 +8580,37 @@ fn an_import_stopped_before_the_marker_is_visibly_incomplete() {
 }
 
 #[test]
+fn a_failed_adjacency_sync_leaves_no_marker() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = unique_temp_dir();
+    let db = Database::open(root.clone()).unwrap();
+    let run = import_inputs(&db, &root, &[("room.jsonl", ROOM_EXPORT_FIXTURE)]);
+    let tail = root.join("mtgr-state").join("tail.log");
+    assert!(tail.exists(), "the import should have written adjacency");
+
+    // The barrier runs before the marker, so a tail that cannot be synced must
+    // stop the run with the marker still absent.
+    std::fs::set_permissions(&tail, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&tail).is_ok() {
+        // Running as a user that ignores file modes: the failure cannot be
+        // staged this way.
+        std::fs::set_permissions(&tail, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    let error = finish_import(&db, &run).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("adjacency tails"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(marker(&db), None, "no marker after a failed barrier");
+
+    std::fs::set_permissions(&tail, std::fs::Permissions::from_mode(0o644)).unwrap();
+    finish_import(&db, &run).unwrap();
+    assert!(marker(&db).is_some());
+}
+
+#[test]
 fn a_new_run_withdraws_the_previous_marker_until_it_finishes() {
     let root = unique_temp_dir();
     let db = Database::open(root.clone()).unwrap();
