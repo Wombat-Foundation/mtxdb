@@ -831,9 +831,37 @@ fn parse_collection_selector(selector: &str) -> anyhow::Result<[u8; 16]> {
     }
 }
 
+/// Parse the `MTXDB_COMPRESS` override for writable opens.
+///
+/// `Ok(None)` means the variable is unset and the pool policies decide.
+fn compression_override() -> anyhow::Result<Option<bool>> {
+    let Ok(value) = std::env::var("MTXDB_COMPRESS") else {
+        return Ok(None);
+    };
+    let compress = match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => anyhow::bail!(
+            "MTXDB_COMPRESS must be a boolean (0/1, false/true, no/yes, off/on), got {value:?}"
+        ),
+    };
+    Ok(Some(compress))
+}
+
 /// Open a writable pool with the CLI's resolved runtime config.
 fn open_pool(dir: PathBuf) -> io::Result<PackfileStorage> {
-    PackfileStorage::open_with_config(dir, crate::runtime_config())
+    if let Some(compress) = compression_override()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?
+    {
+        PackfileStorage::open_with_cache_and_policies(
+            dir,
+            crate::runtime_config().cache_capacity,
+            compress,
+            mtxdb::packfile::ChecksumPolicy::Full,
+        )
+    } else {
+        PackfileStorage::open_with_config(dir, crate::runtime_config())
+    }
 }
 
 /// Open a read-only pool with the CLI's resolved runtime config.
@@ -841,9 +869,18 @@ fn open_pool_read_only(dir: PathBuf) -> io::Result<PackfileStorage> {
     PackfileStorage::open_read_only_with_config(dir, crate::runtime_config())
 }
 
-/// Open a shared-WAL database with the CLI's resolved runtime config.
-fn open_database(dir: PathBuf) -> Result<Database, mtxdb::storage::StorageError> {
-    Database::open_with_config(dir, *crate::runtime_config())
+/// Open a shared-WAL database with the Matrix pool policies and CLI runtime
+/// config. `MTXDB_COMPRESS` overrides every pool's compression choice for
+/// controlled format/performance comparisons; unset keeps the Matrix defaults.
+fn open_database(dir: PathBuf) -> anyhow::Result<Database> {
+    let mut policies = mtxdb::matrix_pool_policies();
+    if let Some(compress) = compression_override()? {
+        for shard in ShardType::ALL {
+            policies.for_shard_mut(shard).compress = compress;
+        }
+    }
+    Database::open_with_policies_and_config(dir, policies, *crate::runtime_config())
+        .map_err(Into::into)
 }
 
 /// Open the store as its exclusive writer. Fails fast if another process
