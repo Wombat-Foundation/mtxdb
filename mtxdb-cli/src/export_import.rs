@@ -487,11 +487,10 @@ impl SignatureKeyCatalog {
             }
         }
         for server in servers {
-            if !stored_keys.contains_key(&server) {
-                let keys = server_keys::read_server_keys(store, server.as_bytes())?;
-                stored_keys.insert(server.clone(), keys);
-            }
-            for key in &stored_keys[&server] {
+            let keys = memoized_server_keys(stored_keys, &server, || {
+                Ok(server_keys::read_server_keys(store, server.as_bytes())?)
+            })?;
+            for key in keys {
                 catalog.records.insert(
                     (server.to_ascii_lowercase(), key.key_id.clone()),
                     VerificationKeyRecord {
@@ -1981,6 +1980,44 @@ fn estimate(
 ///
 /// Each rejection is derived by running the auth rules over the room's events
 /// (see [`derived_auth_findings`]); the export's rejections are not trusted.
+/// One server's keys from `memo`, calling `load` only on the first request.
+fn memoized_server_keys<'a>(
+    memo: &'a mut HashMap<String, Vec<mtxdb::server_keys::ServerKey>>,
+    server: &str,
+    load: impl FnOnce() -> anyhow::Result<Vec<mtxdb::server_keys::ServerKey>>,
+) -> anyhow::Result<&'a [mtxdb::server_keys::ServerKey]> {
+    if !memo.contains_key(server) {
+        memo.insert(server.to_owned(), load()?);
+    }
+    Ok(&memo[server])
+}
+
+#[cfg(test)]
+mod memoized_server_keys_tests {
+    use super::*;
+
+    #[test]
+    fn each_server_is_loaded_once_per_memo() {
+        let mut memo = HashMap::new();
+        let mut loads = 0;
+        for server in ["a.example", "a.example", "b.example", "a.example"] {
+            memoized_server_keys(&mut memo, server, || {
+                loads += 1;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        }
+        assert_eq!(loads, 2);
+        memo.clear();
+        memoized_server_keys(&mut memo, "a.example", || {
+            loads += 1;
+            Ok(Vec::new())
+        })
+        .unwrap();
+        assert_eq!(loads, 3, "a cleared memo must reload");
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn write_room_with_findings(
     db: &Database,
