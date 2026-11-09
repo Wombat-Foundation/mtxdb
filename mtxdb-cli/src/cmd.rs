@@ -14290,8 +14290,6 @@ struct PartialStateComputation {
         allow(dead_code, reason = "asserted by the gap and fork walk tests")
     )]
     merges: usize,
-    #[cfg(test)]
-    merge_phases: crate::state_resolve::MergePhaseTimes,
 }
 
 /// What one DAG walk produced: the per-event group map, the derived instances
@@ -14305,8 +14303,6 @@ struct StateGroupWalk {
     gapped: Vec<String>,
     incomplete: Vec<String>,
     merges: usize,
-    #[cfg(test)]
-    merge_phases: crate::state_resolve::MergePhaseTimes,
 }
 
 /// One resolved state-group derivation: the parent instance ids it descends
@@ -14461,8 +14457,6 @@ fn compute_state_groups_partial_with(
             gapped: Vec::new(),
             incomplete: Vec::new(),
             merges: 0,
-            #[cfg(test)]
-            merge_phases: crate::state_resolve::MergePhaseTimes::default(),
         };
     }
 
@@ -14498,8 +14492,6 @@ fn compute_state_groups_partial_with(
         gapped: result.gapped,
         incomplete: result.incomplete,
         merges: result.merges,
-        #[cfg(test)]
-        merge_phases: result.merge_phases,
     }
 }
 
@@ -14739,8 +14731,6 @@ fn walk_state_groups(
         gapped,
         incomplete,
         merges: merge_count,
-        #[cfg(test)]
-        merge_phases,
     }
 }
 
@@ -16423,7 +16413,3 @@ fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "test_cmd.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "gapped_bench.rs"]
-mod gapped_bench;
