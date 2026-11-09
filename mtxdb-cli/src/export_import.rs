@@ -223,6 +223,10 @@ pub(crate) fn write_marker(db: &Database, counts: ImportCounts) -> anyhow::Resul
 /// Make everything written so far durable. Called before the marker commits,
 /// so the marker is never durable ahead of the data it vouches for.
 pub(crate) fn sync_data(db: &Database) -> anyhow::Result<()> {
+    // Adjacency rows live in graph stores outside the packs. Rooms may defer
+    // their syncs, so this barrier, not the room writer, is what guarantees
+    // the marker never covers a row that is only in the page cache.
+    mtxdb::csr_adjacency::sync_all_tails(db).context("persisting the adjacency tails")?;
     for pool in [EVENT_POOL, SERVER_INFO_POOL] {
         db.pool(pool)
             .sync_all()
