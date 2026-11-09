@@ -14,6 +14,9 @@ use anyhow::Context as _;
 use clap::{Arg, ArgAction, Command};
 use mtxdb::{ReadPlanPolicy, ShardType};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 static DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 /// Parsed once from `MTXDB_*` in `main`. Tests that call `cmd::run` directly
 /// fall back to the library defaults instead of reading the ambient
