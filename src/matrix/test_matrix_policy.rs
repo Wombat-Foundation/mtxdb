@@ -92,8 +92,14 @@ fn matrix_pools_declare_which_layout_repack_gives_them() {
     use crate::layout::ShardType;
     use crate::record_class::OrderingPolicy;
     let policies = super::matrix_pool_policies();
-    assert!(policies.for_shard(ShardType::State).ordering.is_topological());
-    assert!(policies.for_shard(ShardType::EventDag).ordering.is_topological());
+    assert!(policies
+        .for_shard(ShardType::State)
+        .ordering
+        .is_topological());
+    assert!(policies
+        .for_shard(ShardType::EventDag)
+        .ordering
+        .is_topological());
     assert_eq!(
         policies.for_shard(ShardType::ServerInfo).ordering,
         OrderingPolicy::None
