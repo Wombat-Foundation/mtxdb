@@ -197,6 +197,41 @@ pub(crate) fn decode_state_hamt_root(bytes: &[u8]) -> Option<rezzy::hamt::StateH
     rezzy::hamt::decode_state_hamt_root(bytes).ok()
 }
 
+/// Repack edges for the state-side record kinds, or `None` when `data` is not
+/// one of them (so the caller can try it as an event).
+///
+/// Edges point from a record to what it depends on, so that dependencies are
+/// written first:
+/// - `STGP` state group -> its parent groups, then its HAMT root record;
+/// - `MTHR` root record -> its root HAMT node;
+/// - HAMT internal node -> its child nodes.
+///
+/// Targets are the stored record ids: a state group's 16-byte instance id, a
+/// root record's id (`root_id` in the group), and `structural_hash[..16]` for
+/// nodes. Dispatch is by record magic, so one extractor serves every
+/// collection without knowing which one a record came from.
+#[must_use]
+pub(crate) fn extract_state_edges(data: &[u8]) -> Option<Vec<[u8; 16]>> {
+    if let Ok(instance) = mtxdb::decode_state_group_record(data) {
+        let mut edges = instance.parents;
+        edges.push(instance.root_id);
+        return Some(edges);
+    }
+    if data.get(..4) == Some(rezzy::hamt::HAMT_NODE_MAGIC.as_slice()) {
+        let node =
+            rezzy::hamt::PersistedInternalNode::<String, String>::decode_v1_unverified(data)
+                .ok()?;
+        return Some(
+            node.child_hashes
+                .iter()
+                .map(mtxdb::state_hamt_node_id)
+                .collect(),
+        );
+    }
+    let root = decode_state_hamt_root(data)?;
+    Some(vec![mtxdb::state_hamt_node_id(&root.root_hash)])
+}
+
 /// On-demand reader for one room's persisted state HAMTs.
 ///
 /// Nodes are content-addressed by their 32-byte structural hash; the room's
@@ -357,6 +392,76 @@ mod tests {
             .nodes
             .iter()
             .all(|(_, payload)| payload.starts_with(b"MTHN\x01")));
+    }
+
+    /// Repack must lay a state group's records out dependencies-first:
+    /// HAMT nodes (deepest first), then the root record, then the group, with
+    /// a child group after its parent.
+    #[test]
+    fn repack_edges_order_state_records_dependencies_first() {
+        use mtxdb::csr::Csr;
+        use mtxdb::{
+            encode_state_group_record, state_hamt_node_id, StateGroupDerivation,
+            StateGroupInstance, StateGroupResolver, StateGroupTrust,
+        };
+
+        let room = "!room:example.org";
+        let big: Vec<(String, String, String)> = (0..400)
+            .map(|i| ("m.room.member".to_owned(), format!("@u{i}:x"), format!("$e{i}")))
+            .collect();
+        let built = build_state_hamt(room, &room_hamt_prefix(room), &big).unwrap();
+        assert!(built.nodes.len() > 1, "fixture must nest");
+
+        let root_id = state_hamt_root_node_id("ns", &built.state_group_id);
+        let derivation =
+            StateGroupDerivation::new(StateGroupResolver::V2, StateGroupTrust::TrustedImport);
+        let parent_group = StateGroupInstance {
+            parents: Vec::new(),
+            lthash: built.state_group_id,
+            root_id,
+            derivation,
+        };
+        let parent_id = [0xA1; 16];
+        let child_group = StateGroupInstance {
+            parents: vec![parent_id],
+            lthash: built.state_group_id,
+            root_id,
+            derivation,
+        };
+        let child_id = [0xA2; 16];
+
+        let mut records: Vec<([u8; 16], Vec<u8>)> = built
+            .nodes
+            .iter()
+            .map(|(hash, payload)| (state_hamt_node_id(hash), payload.clone()))
+            .collect();
+        records.push((root_id, built.root_record.clone()));
+        records.push((child_id, encode_state_group_record(&child_group)));
+        records.push((parent_id, encode_state_group_record(&parent_group)));
+        records.reverse(); // dependents first, the worst case for a naive order
+
+        let ids: Vec<[u8; 16]> = records.iter().map(|(id, _)| *id).collect();
+        let adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = records
+            .iter()
+            .map(|(id, data)| (*id, extract_state_edges(data).expect("state record")))
+            .collect();
+        let csr = Csr::build_from_edges(&ids, &adjacency);
+        let order: Vec<[u8; 16]> = csr
+            .layered_order()
+            .expect("acyclic")
+            .into_iter()
+            .map(|local| *csr.hash_of(local).unwrap())
+            .collect();
+        let position = |id: &[u8; 16]| order.iter().position(|x| x == id).unwrap();
+
+        for (id, targets) in &adjacency {
+            for target in targets.iter().filter(|t| ids.contains(t)) {
+                assert!(position(target) < position(id), "dependency must come first");
+            }
+        }
+        assert!(position(&root_id) > position(&state_hamt_node_id(&built.root_hash)));
+        assert!(position(&parent_id) > position(&root_id));
+        assert_eq!(order.last(), Some(&child_id));
     }
 
     #[test]

@@ -620,10 +620,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             packs,
             all,
             root,
-            topo,
             out,
             yes,
         } => {
+            let topo = repack_uses_dependency_layout(cli)?;
             if let Some(out_dir) = out {
                 cmd_repack_coalesced(
                     cli,
@@ -632,12 +632,12 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
                     packs,
                     *all,
                     root,
-                    *topo,
+                    topo,
                     *yes,
                 )
             } else {
                 cli.require_single_dir("repack")?;
-                cmd_repack(cli, collection.as_deref(), packs, *all, root, *topo, *yes)
+                cmd_repack(cli, collection.as_deref(), packs, *all, root, topo, *yes)
             }
         }
         Commands::Delete { collections, yes } => {
@@ -15248,12 +15248,15 @@ fn cmd_repack_coalesced(
             bail!("--root requires --collection — live roots are per-collection, not meaningful for --all");
         }
         if !topo {
-            bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
+            bail!("--root needs dependency edges: this pool's ordering policy is not topological, so reachability cannot be computed");
         }
     }
     if topo {
-        println!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
-        println!("warning: --topo without --root means no GC; all records preserved");
+        if roots.is_empty() {
+            println!("note: no --root given; all records preserved, laid out dependencies first");
+        }
+    } else {
+        println!("note: this pool's ordering policy is not topological; records written in id order");
     }
 
     let valid_dirs = valid_database_dirs(cli)?;
@@ -15520,9 +15523,8 @@ fn cmd_repack_coalesced(
             let mut live_hashes: Vec<[u8; 16]> = resolved_nodes.keys().copied().collect();
             live_hashes.sort_unstable();
             let csr = mtxdb::csr::Csr::build_from_edges(&live_hashes, &adjacency);
-            let topo_order = csr.topo_order();
-            if topo_order.len() == live_hashes.len() {
-                topo_order
+            if let Some(layered) = csr.layered_order() {
+                layered
                     .into_iter()
                     .map(|idx| *csr.hash_of(idx).expect("valid local id"))
                     .collect()
@@ -15640,7 +15642,7 @@ fn cmd_repack(
                 );
             }
             RepackTarget::Collection(_) if !topo => {
-                bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
+                bail!("--root needs dependency edges: this pool's ordering policy is not topological, so reachability cannot be computed");
             }
             RepackTarget::Collection(_) => {
                 // Allowed
@@ -15648,8 +15650,11 @@ fn cmd_repack(
         }
     }
     if topo {
-        println!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
-        println!("warning: --topo without --root means no GC; all records preserved");
+        if roots.is_empty() {
+            println!("note: no --root given; all records preserved, laid out dependencies first");
+        }
+    } else {
+        println!("note: this pool's ordering policy is not topological; records written in id order");
     }
     cmd_repack_target(cli, &target, topo, roots, yes)
 }
@@ -15667,7 +15672,7 @@ fn cmd_repack(
 /// involved and the expected pack count/slack after compaction, then
 /// prompts for confirmation before performing any real repack. `--root`
 /// doesn't apply here since live roots are inherently per-collection — the
-/// same `--topo`/no-`--topo` edge-extraction choice applies uniformly
+/// same default edge-extraction choice applies uniformly
 /// across every collection the closure touches.
 ///
 /// The preflight runs against a **read-only** open, not the exclusive
@@ -15876,6 +15881,19 @@ fn repack_preview(
     }))
 }
 
+/// Whether repack lays out the selected pool's records by dependency.
+///
+/// The pool's [`mtxdb::PoolPolicy::ordering`] decides: a topological policy
+/// (`State`, `EventDag`) gets edge extraction and a roots-first layout; others
+/// (`ServerInfo`) keep id order.
+fn repack_uses_dependency_layout(cli: &Cli) -> anyhow::Result<bool> {
+    let shard = cli.require_shard_type()?;
+    Ok(mtxdb::matrix_pool_policies()
+        .for_shard(shard)
+        .ordering
+        .is_topological())
+}
+
 fn repack_collections(
     store: &PackfileStorage,
     collections: &[[u8; 16]],
@@ -16004,6 +16022,9 @@ fn cmd_repack_target(
 }
 
 fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
+    if let Some(edges) = crate::state_hamt::extract_state_edges(data) {
+        return edges;
+    }
     let input = data.to_vec();
     let val: OwnedValue = match OwnedValue::parse_bytes(&input) {
         Ok(v) => v,

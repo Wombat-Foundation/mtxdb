@@ -7428,7 +7428,6 @@ fn coalesce_safeguards_reject_unsupported_commands() {
             packs: vec![],
             all: true,
             root: vec![],
-            topo: false,
             out: None,
             yes: true,
         },
@@ -7496,7 +7495,6 @@ fn coalesced_repack_materializes_canonical_database() {
             packs: vec![],
             all: true,
             root: vec![],
-            topo: false,
             out: Some(out_dir.clone()),
             yes: true,
         },
@@ -7555,7 +7553,6 @@ fn coalesced_repack_accepts_matrix_room_selectors() {
             packs: vec![],
             all: false,
             root: vec![],
-            topo: false,
             out: Some(out_dir.clone()),
             yes: true,
         },
@@ -10281,4 +10278,189 @@ fn validate_complete_state_groups_against_source_shortstate() {
         std::env::var_os("MTXDB_SHORTSTATE_STRICT").is_none() || residual_count == 0,
         "{residual_count} complete groups still differ after the source-snapshot and boundary adjustments"
     );
+}
+
+// ---- repack layout follows each pool's ordering policy -------------------
+
+fn repack_cli(dir: &Path, shard_type: ShardType) -> Cli {
+    Cli {
+        dirs: vec![dir.to_path_buf()],
+        shard_type: Some(shard_type),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Repack {
+            collection: None,
+            packs: vec![],
+            all: true,
+            root: vec![],
+            out: None,
+            yes: true,
+        },
+    }
+}
+
+/// The ids of every record in the packs that `repack` created, in the order
+/// they were physically written.
+fn repacked_record_order(pool_dir: &Path, before: &HashSet<PackId>) -> Vec<[u8; 16]> {
+    let mut packs: Vec<_> = glob_pack_files(pool_dir)
+        .unwrap()
+        .into_iter()
+        .filter(|(pack_id, _, _)| !before.contains(pack_id))
+        .collect();
+    packs.sort_by_key(|(pack_id, _, _)| pack_id.filename());
+    let mut order = Vec::new();
+    for (pack_id, _, _) in packs {
+        let file = std::fs::File::open(pool_dir.join(pack_id.filename())).unwrap();
+        let mut reader = std::io::BufReader::new(file);
+        if mtxdb::packfile::read_header(&mut reader).unwrap().is_none() {
+            continue;
+        }
+        while let Some(record) = mtxdb::packfile::read_record(&mut reader).unwrap() {
+            order.push(record.hash);
+        }
+    }
+    order
+}
+
+fn pack_ids(pool_dir: &Path) -> HashSet<PackId> {
+    glob_pack_files(pool_dir)
+        .unwrap()
+        .into_iter()
+        .map(|(pack_id, _, _)| pack_id)
+        .collect()
+}
+
+/// Write `records` into `collection` of `shard_type`'s pool, run the real
+/// `repack --all` command for that pool, and return the repacked write order.
+fn repack_and_read_order(
+    shard_type: ShardType,
+    collection: [u8; 16],
+    records: &[([u8; 16], Vec<u8>)],
+) -> Vec<[u8; 16]> {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let pool_dir = layout.pool_dir(shard_type).unwrap();
+    {
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        for (id, bytes) in records {
+            store
+                .put(&collection, id, &NodeData::new(Bytes::from(bytes.clone())))
+                .unwrap();
+        }
+        store.sync().unwrap();
+    }
+    let before = pack_ids(&pool_dir);
+    run(&repack_cli(&dir, shard_type)).unwrap();
+    let order = repacked_record_order(&pool_dir, &before);
+    drop(layout);
+    std::fs::remove_dir_all(&dir).ok();
+    order
+}
+
+#[test]
+fn repack_layout_is_chosen_by_the_selected_pools_ordering_policy() {
+    for shard_type in ShardType::ALL {
+        let cli = repack_cli(Path::new("/unused"), shard_type);
+        assert_eq!(
+            super::repack_uses_dependency_layout(&cli).unwrap(),
+            shard_type != ShardType::ServerInfo,
+            "{}",
+            shard_type.as_str()
+        );
+    }
+    let mut cli = repack_cli(Path::new("/unused"), ShardType::State);
+    cli.shard_type = None;
+    assert!(super::repack_uses_dependency_layout(&cli).is_err());
+}
+
+fn chain_event(name: &str, parent: Option<&str>) -> ([u8; 16], Vec<u8>) {
+    let prev = parent.map_or_else(String::new, |p| format!("\"{p}\""));
+    (
+        super::matrix_event_node_id(name).unwrap(),
+        format!(r#"{{"event_id":"{name}","prev_events":[{prev}]}}"#).into_bytes(),
+    )
+}
+
+#[test]
+fn event_pool_repack_writes_ancestors_before_descendants() {
+    // Ids are hashes, so id order is unrelated to the chain; written tip-first.
+    let names: Vec<String> = (0..10).map(|i| format!("$e{i}")).collect();
+    let mut records: Vec<_> = (0..names.len())
+        .map(|i| chain_event(&names[i], i.checked_sub(1).map(|p| names[p].as_str())))
+        .collect();
+    records.reverse();
+    let order = repack_and_read_order(ShardType::EventDag, [0x11; 16], &records);
+    let ids: Vec<_> = names
+        .iter()
+        .map(|n| super::matrix_event_node_id(n).unwrap())
+        .collect();
+    let at = |id: &[u8; 16]| order.iter().position(|x| x == id).expect("record kept");
+    assert_eq!(order.len(), names.len());
+    for pair in ids.windows(2) {
+        assert!(at(&pair[0]) < at(&pair[1]), "parent must precede child");
+    }
+}
+
+#[test]
+fn state_pool_repack_writes_hamt_children_before_parents_and_the_root_last() {
+    let room = "!room:example.org";
+    let entries: Vec<(String, String, String)> = (0..400)
+        .map(|i| {
+            (
+                "m.room.member".to_owned(),
+                format!("@u{i}:x"),
+                format!("$e{i}"),
+            )
+        })
+        .collect();
+    let built = crate::state_hamt::build_state_hamt(
+        room,
+        &crate::state_hamt::room_hamt_prefix(room),
+        &entries,
+    )
+    .unwrap();
+    assert!(built.nodes.len() > 1, "fixture must nest");
+    let root_id = [0xCC; 16];
+    let mut records: Vec<([u8; 16], Vec<u8>)> = built
+        .nodes
+        .iter()
+        .map(|(hash, bytes)| (mtxdb::state_hamt_node_id(hash), bytes.clone()))
+        .collect();
+    records.push((root_id, built.root_record.clone()));
+    records.reverse();
+
+    let order = repack_and_read_order(ShardType::State, [0x22; 16], &records);
+    let at = |id: &[u8; 16]| order.iter().position(|x| x == id).expect("record kept");
+    assert_eq!(order.len(), records.len());
+    for (hash, bytes) in &built.nodes {
+        let node =
+            rezzy::hamt::PersistedInternalNode::<String, String>::decode_v1_unverified(bytes)
+                .unwrap();
+        for child in &node.child_hashes {
+            assert!(
+                at(&mtxdb::state_hamt_node_id(child)) < at(&mtxdb::state_hamt_node_id(hash)),
+                "child node must precede its parent"
+            );
+        }
+    }
+    assert_eq!(
+        order.last(),
+        Some(&root_id),
+        "root record follows its nodes"
+    );
+}
+
+#[test]
+fn server_info_pool_repack_keeps_id_order_even_for_linked_records() {
+    // Records that *would* yield edges if extracted: the pool's policy is not
+    // topological, so repack must ignore them and keep id order.
+    let names: Vec<String> = (0..10).map(|i| format!("$s{i}")).collect();
+    let records: Vec<_> = (0..names.len())
+        .map(|i| chain_event(&names[i], i.checked_sub(1).map(|p| names[p].as_str())))
+        .collect();
+    let order = repack_and_read_order(ShardType::ServerInfo, [0x33; 16], &records);
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(order.len(), names.len());
+    assert_eq!(order, sorted, "server info is written in id order");
 }
