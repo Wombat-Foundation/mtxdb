@@ -218,9 +218,8 @@ pub(crate) fn extract_state_edges(data: &[u8]) -> Option<Vec<[u8; 16]>> {
         return Some(edges);
     }
     if data.get(..4) == Some(rezzy::hamt::HAMT_NODE_MAGIC.as_slice()) {
-        let node =
-            rezzy::hamt::PersistedInternalNode::<String, String>::decode_v1_unverified(data)
-                .ok()?;
+        let node = rezzy::hamt::PersistedInternalNode::<String, String>::decode_v1_unverified(data)
+            .ok()?;
         return Some(
             node.child_hashes
                 .iter()
@@ -407,7 +406,13 @@ mod tests {
 
         let room = "!room:example.org";
         let big: Vec<(String, String, String)> = (0..400)
-            .map(|i| ("m.room.member".to_owned(), format!("@u{i}:x"), format!("$e{i}")))
+            .map(|i| {
+                (
+                    "m.room.member".to_owned(),
+                    format!("@u{i}:x"),
+                    format!("$e{i}"),
+                )
+            })
             .collect();
         let built = build_state_hamt(room, &room_hamt_prefix(room), &big).unwrap();
         assert!(built.nodes.len() > 1, "fixture must nest");
@@ -456,7 +461,10 @@ mod tests {
 
         for (id, targets) in &adjacency {
             for target in targets.iter().filter(|t| ids.contains(t)) {
-                assert!(position(target) < position(id), "dependency must come first");
+                assert!(
+                    position(target) < position(id),
+                    "dependency must come first"
+                );
             }
         }
         assert!(position(&root_id) > position(&state_hamt_node_id(&built.root_hash)));

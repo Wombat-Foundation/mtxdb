@@ -15256,7 +15256,9 @@ fn cmd_repack_coalesced(
             println!("note: no --root given; all records preserved, laid out dependencies first");
         }
     } else {
-        println!("note: this pool's ordering policy is not topological; records written in id order");
+        println!(
+            "note: this pool's ordering policy is not topological; records written in id order"
+        );
     }
 
     let valid_dirs = valid_database_dirs(cli)?;
@@ -15654,7 +15656,9 @@ fn cmd_repack(
             println!("note: no --root given; all records preserved, laid out dependencies first");
         }
     } else {
-        println!("note: this pool's ordering policy is not topological; records written in id order");
+        println!(
+            "note: this pool's ordering policy is not topological; records written in id order"
+        );
     }
     cmd_repack_target(cli, &target, topo, roots, yes)
 }
