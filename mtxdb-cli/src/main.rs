@@ -1122,10 +1122,10 @@ fn sub_repack() -> Command {
         )
         .arg(Arg::new("root").short('o').long("root").num_args(1..))
         .arg(
-            Arg::new("topo")
-                .long("topo")
+            Arg::new("no_topo")
+                .long("no-topo")
                 .action(ArgAction::SetTrue)
-                .help("Repack in topological order (requires edge-capable data format)"),
+                .help("Skip dependency layout: write records in id order (also disables --root GC)"),
         )
         .arg(
             Arg::new("out")
@@ -1574,7 +1574,7 @@ fn parse_cli() -> Cli {
                 .flatten()
                 .cloned()
                 .collect(),
-            topo: m.get_flag("topo"),
+            topo: !m.get_flag("no_topo"),
             out: m.get_one::<String>("out").map(PathBuf::from),
             yes: m.get_flag("yes"),
         },

@@ -15290,12 +15290,15 @@ fn cmd_repack_coalesced(
             bail!("--root requires --collection — live roots are per-collection, not meaningful for --all");
         }
         if !topo {
-            bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
+            bail!("--root requires dependency edges; drop --no-topo so reachability can be computed");
         }
     }
     if topo {
-        println!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
-        println!("warning: --topo without --root means no GC; all records preserved");
+        if roots.is_empty() {
+            println!("note: no --root given; all records preserved, laid out dependencies first");
+        }
+    } else {
+        println!("note: --no-topo; records written in id order, no dependency layout");
     }
 
     let valid_dirs = valid_database_dirs(cli)?;
@@ -15562,9 +15565,8 @@ fn cmd_repack_coalesced(
             let mut live_hashes: Vec<[u8; 16]> = resolved_nodes.keys().copied().collect();
             live_hashes.sort_unstable();
             let csr = mtxdb::csr::Csr::build_from_edges(&live_hashes, &adjacency);
-            let topo_order = csr.topo_order();
-            if topo_order.len() == live_hashes.len() {
-                topo_order
+            if let Some(layered) = csr.layered_order() {
+                layered
                     .into_iter()
                     .map(|idx| *csr.hash_of(idx).expect("valid local id"))
                     .collect()
@@ -15682,7 +15684,7 @@ fn cmd_repack(
                 );
             }
             RepackTarget::Collection(_) if !topo => {
-                bail!("--root requires --topo; without --topo there are no edges so only the specified roots would be kept");
+                bail!("--root requires dependency edges; drop --no-topo so reachability can be computed");
             }
             RepackTarget::Collection(_) => {
                 // Allowed
@@ -15690,8 +15692,11 @@ fn cmd_repack(
         }
     }
     if topo {
-        println!("warning: edge extraction is approximate; prev_events event IDs are not resolved to stored node hashes");
-        println!("warning: --topo without --root means no GC; all records preserved");
+        if roots.is_empty() {
+            println!("note: no --root given; all records preserved, laid out dependencies first");
+        }
+    } else {
+        println!("note: --no-topo; records written in id order, no dependency layout");
     }
     cmd_repack_target(cli, &target, topo, roots, yes)
 }
@@ -15709,7 +15714,7 @@ fn cmd_repack(
 /// involved and the expected pack count/slack after compaction, then
 /// prompts for confirmation before performing any real repack. `--root`
 /// doesn't apply here since live roots are inherently per-collection — the
-/// same `--topo`/no-`--topo` edge-extraction choice applies uniformly
+/// same default (`--no-topo` to opt out) edge-extraction choice applies uniformly
 /// across every collection the closure touches.
 ///
 /// The preflight runs against a **read-only** open, not the exclusive
@@ -16046,6 +16051,9 @@ fn cmd_repack_target(
 }
 
 fn extract_matrix_edges(_hash: &[u8; 16], data: &[u8]) -> Vec<mtxdb::NodeId> {
+    if let Some(edges) = crate::state_hamt::extract_state_edges(data) {
+        return edges;
+    }
     let input = data.to_vec();
     let val: OwnedValue = match OwnedValue::parse_bytes(&input) {
         Ok(v) => v,
