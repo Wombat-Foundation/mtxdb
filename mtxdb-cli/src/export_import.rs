@@ -244,20 +244,32 @@ pub(crate) mod test_hooks {
 /// Make everything written so far durable. Called before the marker commits,
 /// so the marker is never durable ahead of the data it vouches for.
 pub(crate) fn sync_data(db: &Database) -> anyhow::Result<()> {
-    // Adjacency rows live in graph stores outside the packs. Rooms may defer
-    // their syncs, so this barrier, not the room writer, is what guarantees
-    // the marker never covers a row that is only in the page cache.
-    #[cfg(test)]
-    if test_hooks::take_adjacency_sync_failure() {
-        anyhow::bail!("persisting the adjacency tails: injected failure");
-    }
-    mtxdb::csr_adjacency::sync_all_tails(db).context("persisting the adjacency tails")?;
+    sync_adjacency_tails(db)?;
     for pool in [EVENT_POOL, SERVER_INFO_POOL] {
         db.pool(pool)
             .sync_all()
             .with_context(|| format!("persisting the {pool:?} pool"))?;
     }
     Ok(())
+}
+
+/// Sync every graph tail. This is a separate call so the test seam at the tail
+/// sync also guards the call: remove `sync_adjacency_tails` from `sync_data`
+/// and the injected failure never fires, so the ordering test fails.
+fn sync_adjacency_tails(db: &Database) -> anyhow::Result<()> {
+    // Adjacency rows live in graph stores outside the packs. Rooms may defer
+    // their syncs, so this barrier, not the room writer, is what guarantees
+    // the marker never covers a row that is only in the page cache.
+    //
+    // Bind the sync result before consulting the test seam: if the call is
+    // deleted, `synced` is undefined and the CLI no longer compiles. The
+    // injected failure therefore cannot outlive the call it guards.
+    let synced = mtxdb::csr_adjacency::sync_all_tails(db);
+    #[cfg(test)]
+    if test_hooks::take_adjacency_sync_failure() {
+        anyhow::bail!("persisting the adjacency tails: injected failure");
+    }
+    synced.context("persisting the adjacency tails")
 }
 
 fn id_list<'a>(event: &'a RoomEvent, field: &str) -> anyhow::Result<Vec<&'a [u8]>> {
