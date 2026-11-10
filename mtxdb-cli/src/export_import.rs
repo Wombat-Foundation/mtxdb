@@ -53,17 +53,30 @@ pub(crate) const BATCH_BYTES: usize = 32 << 20;
 /// reclaimed once every pool the writer touched has synced and so reported
 /// coverage. An import that syncs only at the end fills the segment and every
 /// later commit fails with "journal segment is full". Once the segment passes
-/// `trigger` bytes, sync every pool, one after another; the last pool's
-/// coverage lets the journal shrink. At or below `trigger` this does nothing.
+/// `trigger` bytes, sync the pools the journal is waiting on, one after
+/// another; the last pool's coverage lets the journal shrink. At or below
+/// `trigger` this does nothing.
+///
+/// `should_sync` decides which pools are worth a sync. A pool whose frames the
+/// segment does not need to drop for this cut would rewrite a full checkpoint
+/// and report an LSN it already reported, so skipping it costs nothing. A pool
+/// that is blocking the reclaim must answer `true`: its sync is what unblocks
+/// it. The coordinator's own back-off (`should_force_reclaim_checkpoint`)
+/// already encodes both rules, including the retry after the segment has grown
+/// by an eighth of the trigger without coverage moving.
 pub(crate) fn reclaim_journal_with(
     segment_len: u64,
     trigger: u64,
+    mut should_sync: impl FnMut(mtxdb::ShardType) -> bool,
     mut sync_pool: impl FnMut(mtxdb::ShardType) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     if segment_len <= trigger {
         return Ok(());
     }
     for pool in mtxdb::ShardType::ALL {
+        if !should_sync(pool) {
+            continue;
+        }
         sync_pool(pool)?;
     }
     Ok(())
@@ -76,6 +89,7 @@ pub(crate) fn reclaim_journal(db: &Database) -> anyhow::Result<()> {
     reclaim_journal_with(
         coordinator.segment_len(),
         coordinator.reclaim_trigger_len(),
+        |pool| coordinator.should_force_reclaim_checkpoint(Some(pool)),
         |pool| {
             let segment_before = coordinator.segment_len();
             let started = std::time::Instant::now();
@@ -3506,10 +3520,15 @@ mod auth_findings_tests {
     fn the_journal_is_left_alone_at_or_below_the_reclaim_trigger() {
         let mut synced = Vec::new();
         for segment_len in [10, 11] {
-            reclaim_journal_with(segment_len, 11, |pool| {
-                synced.push(pool);
-                Ok(())
-            })
+            reclaim_journal_with(
+                segment_len,
+                11,
+                |_| true,
+                |pool| {
+                    synced.push(pool);
+                    Ok(())
+                },
+            )
             .unwrap();
         }
         assert_eq!(synced, Vec::<mtxdb::ShardType>::new());
@@ -3519,28 +3538,122 @@ mod auth_findings_tests {
     fn every_pool_syncs_once_the_journal_passes_the_trigger() {
         for segment_len in [12, 13, u64::MAX] {
             let mut synced = Vec::new();
-            reclaim_journal_with(segment_len, 11, |pool| {
-                synced.push(pool);
-                Ok(())
-            })
+            reclaim_journal_with(
+                segment_len,
+                11,
+                |_| true,
+                |pool| {
+                    synced.push(pool);
+                    Ok(())
+                },
+            )
             .unwrap();
             assert_eq!(synced, mtxdb::ShardType::ALL, "segment {segment_len}");
         }
     }
 
     #[test]
+    fn only_the_pools_the_journal_is_waiting_on_are_synced() {
+        let skipped = mtxdb::ShardType::ALL[0];
+        let mut synced = Vec::new();
+        reclaim_journal_with(
+            100,
+            11,
+            |pool| pool != skipped,
+            |pool| {
+                synced.push(pool);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            !synced.contains(&skipped),
+            "the skipped pool was synced anyway"
+        );
+        assert_eq!(
+            synced.len(),
+            mtxdb::ShardType::ALL.len() - 1,
+            "every other pool still syncs"
+        );
+    }
+
+    #[test]
     fn a_failed_pool_sync_stops_the_import() {
         let mut synced = Vec::new();
-        let error = reclaim_journal_with(100, 1, |pool| {
-            synced.push(pool);
-            if synced.len() == 2 {
-                anyhow::bail!("disk full");
-            }
-            Ok(())
-        })
+        let error = reclaim_journal_with(
+            100,
+            1,
+            |_| true,
+            |pool| {
+                synced.push(pool);
+                if synced.len() == 2 {
+                    anyhow::bail!("disk full");
+                }
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert!(error.to_string().contains("disk full"));
         assert_eq!(synced.len(), 2, "no pool is synced after the failure");
+    }
+
+    /// A reclaim must do what it claims: shrink the segment back under the
+    /// trigger and leave no pool blocking it. The reopen test proves the data
+    /// survives, which is a different property and passed while the coverage
+    /// path was broken.
+    #[test]
+    fn a_reclaim_shrinks_the_segment_and_clears_its_blockers() {
+        crate::sweep_stale_test_dirs();
+        let dir =
+            std::env::temp_dir().join(format!("mtxdb-reclaim-outcome-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The trigger has to sit above an empty segment's header, or the
+        // segment could never come back under it.
+        let empty = {
+            let db = Database::open(dir.clone()).unwrap();
+            db.coordinator().segment_len().max(1)
+        };
+        let config = mtxdb::RuntimeConfig {
+            reclaim_trigger_bytes: Some(empty),
+            ..mtxdb::RuntimeConfig::default()
+        };
+        let db = Database::open_with_config(dir.clone(), config).unwrap();
+        let collection = [0x5Au8; 16];
+        let tx = db.begin_transaction();
+        for index in 0..64u8 {
+            let mut id = [0u8; 16];
+            id[0] = index;
+            tx.put(
+                mtxdb::ShardType::EventDag,
+                collection,
+                id,
+                &node(vec![7u8; 1024]),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let before = db.coordinator().segment_len();
+        assert!(
+            before > db.coordinator().reclaim_trigger_len(),
+            "records did not cross the reclaim trigger: {before}"
+        );
+        reclaim_journal(&db).unwrap();
+        let after = db.coordinator().segment_len();
+        assert!(
+            after < before,
+            "reclaim did not shrink the segment: {before} -> {after}"
+        );
+        assert!(
+            after <= db.coordinator().reclaim_trigger_len(),
+            "reclaim left the segment at {after}, still over the trigger"
+        );
+        assert!(
+            db.coordinator().reclaim_blockers().is_empty(),
+            "reclaim left pools blocking: {:?}",
+            db.coordinator().reclaim_blockers()
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
