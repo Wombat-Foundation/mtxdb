@@ -10599,3 +10599,239 @@ fn seeded_gap_root_keeps_identity_and_stays_out_of_the_complete_map() {
         "the seeded state is not in the complete instance map"
     );
 }
+
+/// Real-data experiment, not part of the normal suite: walk every minic10y
+/// room twice with the real state walk, once as the importer does today and
+/// once with fill-only auth-event seeding at missing-prev gap roots, and
+/// compare the forward extremities and the complete map. All rows (timeline
+/// and outlier) are walked as events, matching the whole-room import.
+/// Run with: `cargo test seeding_experiment_on_minic10y -- --ignored --nocapture`
+#[test]
+#[ignore = "real-data experiment: reads the local minic10y export"]
+#[allow(
+    clippy::too_many_lines,
+    clippy::arithmetic_side_effects,
+    reason = "a one-off experiment that prints its own report"
+)]
+fn seeding_experiment_on_minic10y() {
+    use super::seed_experiment::{arm, disarm};
+    // Test-only fixture path. The test is `#[ignore]`d and skips when the
+    // export is absent, so the suite never depends on a machine-local path.
+    let dir = std::env::var_os("MTXDB_GAP_SEED_EXPORT").map_or_else(
+        || {
+            std::path::PathBuf::from(
+                "/run/media/shane/shane4tb-ent/.mtxdb-export-minic10y-2026-11-08/export/mtxdb",
+            )
+        },
+        std::path::PathBuf::from,
+    );
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!(
+            "skipping: no export at {} (set MTXDB_GAP_SEED_EXPORT)",
+            dir.display()
+        );
+        return;
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("room-") && !n.contains("216542675a43"))
+        })
+        .collect();
+    files.sort();
+
+    let mut total = [0u64; 12];
+    let mut rejected_total = 0u64;
+    let (mut sec_base, mut sec_seed) = ([0u64; 3], [0u64; 3]);
+    for path in files {
+        let content = std::fs::read(&path).unwrap();
+        let export = crate::interchange::parse_room(&content).expect("room export");
+        let room = export.room_id.clone();
+        let events: Vec<OwnedValue> = export
+            .events
+            .iter()
+            .map(|event| event.unflagged(&room))
+            .collect();
+        let policy = super::batch_resolution_policy(&events);
+        let room_version = events
+            .iter()
+            .find(|event| super::matrix_create_event_id(event).is_some())
+            .and_then(|event| super::nested_event_string_field(event, "content", "room_version"))
+            .unwrap_or_default()
+            .to_owned();
+        let by_id: HashMap<&str, &OwnedValue> = events
+            .iter()
+            .filter_map(|e| super::event_id(e).map(|id| (id, e)))
+            .collect();
+
+        // Baseline: the findings plus judged walk the importer runs, so the
+        // seed filter sees the final verdict set rather than an empty guess.
+        let findings = crate::export_import::derived_auth_findings_with_keys(&export, None)
+            .expect("auth findings");
+        let mut baseline_rejected = crate::export_import::rejected_event_ids(&export, &findings);
+        let mut baseline_walk_rejections = HashMap::new();
+        let (baseline, _) = super::compute_import_auth_before(
+            &events,
+            &[],
+            &export.events,
+            &room,
+            &room_version,
+            super::StateResVersion::from_room_version(&room_version),
+            &mut baseline_rejected,
+            &mut baseline_walk_rejections,
+            &HashSet::new(),
+            None,
+            None,
+            &HashMap::new(),
+        );
+        let final_rejected = baseline_rejected.clone();
+
+        // Seeded: the same inputs and judge, armed with the baseline's verdicts.
+        let mut seeded_rejected = crate::export_import::rejected_event_ids(&export, &findings);
+        let mut seeded_walk_rejections = HashMap::new();
+        arm(final_rejected.clone());
+        let (seeded, _) = super::compute_import_auth_before(
+            &events,
+            &[],
+            &export.events,
+            &room,
+            &room_version,
+            super::StateResVersion::from_room_version(&room_version),
+            &mut seeded_rejected,
+            &mut seeded_walk_rejections,
+            &HashSet::new(),
+            None,
+            None,
+            &HashMap::new(),
+        );
+        let stats = disarm();
+        assert_eq!(
+            final_rejected, seeded_rejected,
+            "{room}: the seed changed the verdict set"
+        );
+        rejected_total = rejected_total.saturating_add(final_rejected.len() as u64);
+
+        assert_eq!(
+            baseline.groups, seeded.groups,
+            "{room}: complete map differs"
+        );
+        assert_eq!(baseline.gapped, seeded.gapped, "{room}: gapped set differs");
+        assert_eq!(baseline.unresolved, seeded.unresolved);
+        assert_eq!(baseline.incomplete, seeded.incomplete);
+        assert_eq!(baseline.partial.len(), seeded.partial.len());
+
+        let (mut added, mut displaced, mut with_add) = (0u64, 0u64, 0u64);
+        let mut bad_identity = 0u64;
+        for (head, b_inst) in &baseline.partial {
+            let s_inst = seeded.partial[head];
+            let (before, seeded_state) = (
+                &baseline.partial_instances[b_inst].set.entries,
+                &seeded.partial_instances[&s_inst],
+            );
+            let after = &seeded_state.set.entries;
+            let gained = after.keys().filter(|k| !before.contains_key(*k)).count() as u64;
+            let replaced = before
+                .iter()
+                .filter(|(k, v)| after.get(*k).is_some_and(|sv| sv != *v))
+                .count() as u64;
+            added += gained;
+            displaced += replaced;
+            if gained > 0 {
+                with_add += 1;
+            }
+            if s_inst
+                != super::state_group_instance_id(
+                    &room,
+                    &seeded_state.parents,
+                    &seeded_state.set.lthash(),
+                    policy.derivation,
+                )
+                || seeded_state.lthash != seeded_state.set.lthash()
+            {
+                bad_identity += 1;
+            }
+            // Agreement with the head's own citations, where it supplied no seed.
+            if !stats.suppliers.contains(head) {
+                if let Some(ev) = by_id.get(head.as_str()) {
+                    let cited = ev
+                        .get("auth_events")
+                        .and_then(OwnedValue::as_array)
+                        .map(|a| a.iter().filter_map(OwnedValue::as_str).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    for id in cited {
+                        let Some(body) = by_id.get(id) else { continue };
+                        if !super::is_state_event(body) {
+                            continue;
+                        }
+                        let key = (
+                            super::event_string_field(body, "type")
+                                .unwrap_or("")
+                                .to_owned(),
+                            super::state_key(body),
+                        );
+                        let class = |found: Option<&String>| match found {
+                            None => 1,
+                            Some(v) if v == id => 0,
+                            Some(_) => 2,
+                        };
+                        sec_base[class(before.get(&key))] += 1;
+                        sec_seed[class(after.get(&key))] += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "{:<28} heads={:<4} +added={:<5} displaced={:<3} heads_with_add={:<4} roots={:<4} filled={:<5} bad_identity={}",
+            room.chars().take(28).collect::<String>(),
+            baseline.partial.len(), added, displaced, with_add, stats.gap_roots, stats.filled, bad_identity
+        );
+        for (i, v) in [
+            baseline.partial.len() as u64,
+            added,
+            displaced,
+            with_add,
+            stats.gap_roots,
+            stats.filled,
+            stats.cited,
+            stats.missing_body,
+            stats.non_state,
+            stats.rejected,
+            stats.conflicts,
+            stats.differs_from_inherited,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            total[i] += v;
+        }
+        assert_eq!(
+            bad_identity, 0,
+            "{room}: a seeded head's instance id is inconsistent"
+        );
+    }
+    println!(
+        "TOTAL heads={} added={} displaced={} heads_with_add={} gap_roots={} filled={} cited={} \
+         skipped(missing_body={} non_state={} rejected={} conflicts={}) differs_from_inherited={} \
+         verdicts={}",
+        total[0],
+        total[1],
+        total[2],
+        total[3],
+        total[4],
+        total[5],
+        total[6],
+        total[7],
+        total[8],
+        total[9],
+        total[10],
+        total[11],
+        rejected_total
+    );
+    println!("complete map, gapped set, unresolved and incomplete: identical in every room");
+    println!(
+        "heads' own citations (suppliers excluded), baseline agree/missing/differs = {sec_base:?}, seeded = {sec_seed:?}"
+    );
+}
