@@ -8041,6 +8041,13 @@ fn gapped_fork_merge_keeps_partial_state_and_stays_unmapped() {
         !result.groups.contains_key("$merge"),
         "the fork event must stay unmapped"
     );
+    assert_eq!(
+        result.partial_instances[&result.partial["$merge"]]
+            .set
+            .entries[&("m.room.topic".to_owned(), String::new())],
+        "$topic-a",
+        "the gapped merge uses the first-parent union fallback"
+    );
     assert!(
         result.groups.contains_key("$topic-a"),
         "the complete branch remains mapped"
