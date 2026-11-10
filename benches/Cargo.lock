@@ -160,9 +160,9 @@ checksum = "ea0095f6103c2a8b44acd6fd15960c801dafebf02e21940360833e0673f48ba7"
 
 [[package]]
 name = "const-oid"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+checksum = "be95d4a884358a21a199689323c29e9256b4a1b315e22f183d155422041d3a9a"
 
 [[package]]
 name = "constant_time_eq"
@@ -772,7 +772,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1efdd1f8cd36b5dd837e7f64f79135a069b8947d"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#ab3aed082b596ef2ab61b327c1b7c65439a4e540"
 dependencies = [
  "tracing",
 ]
@@ -780,7 +780,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1efdd1f8cd36b5dd837e7f64f79135a069b8947d"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#ab3aed082b596ef2ab61b327c1b7c65439a4e540"
 dependencies = [
  "base64 0.23.1",
  "blake3",

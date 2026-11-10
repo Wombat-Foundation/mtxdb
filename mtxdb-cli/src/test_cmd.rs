@@ -2063,7 +2063,7 @@ fn import_dedups_repeated_event_id_within_one_input() {
     );
     let partial_aux = mtxdb::auxiliary::AuxiliaryIndex::open(
         store.as_ref(),
-        super::PARTIAL_STATE_GROUP_NAMESPACE,
+        super::STATE_GROUP_BEST_EFFORT_NAMESPACE,
     );
     assert!(
         partial_aux.get(b"$a").unwrap().is_some(),
@@ -10094,7 +10094,10 @@ fn validate_complete_state_groups_against_source_shortstate() {
         .map(|room| (room.clone(), matrix_room_collection_id(room)))
         .collect();
 
-    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(
+        &state_store,
+        super::STATE_GROUP_BEST_EFFORT_NAMESPACE,
+    );
     let event_ids: Vec<String> = event_to_short.keys().cloned().collect();
 
     let mut mapped: Vec<(String, [u8; 16])> = Vec::new();

@@ -74,13 +74,14 @@ impl JsonValueExt for OwnedValue {
 /// state content reached through different parents stays distinct.
 const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
 
-/// Event -> state-group instance id for events whose base state is missing
+/// Event -> best-effort state-group instance id for events whose base is missing
 /// history (an ancestor body absent from the source). The state is derived
 /// from the events that are present, so it can lack changes made by the absent
 /// ancestors. Nothing seeds a walk from this namespace and replay does not
 /// treat it as a cached complete result; it exists so readers get a best-effort
-/// state instead of none.
-const PARTIAL_STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups-partial:v1";
+/// state instead of none. Keep the persisted namespace stable for existing
+/// databases; its `partial` label predates this clearer code-level name.
+const STATE_GROUP_BEST_EFFORT_NAMESPACE: &str = "sys:matrix-state-groups-best-effort:v1";
 
 /// Whether the importer should print per-phase timings. Off by default so a
 /// normal import log stays stable for the tests and for readers who only want
@@ -13769,16 +13770,18 @@ fn repair_import_state_groups(
         }
     }
     if materialized && !loaded && !partial_groups.is_empty() {
-        let partial_aux = AuxiliaryIndex::open(state_store, PARTIAL_STATE_GROUP_NAMESPACE);
+        let sg_best_effort_aux_idx =
+            AuxiliaryIndex::open(state_store, STATE_GROUP_BEST_EFFORT_NAMESPACE);
         let cached_partial =
-            load_cached_state_group_subset(&partial_aux, &graph_event_ids).unwrap_or_default();
+            load_cached_state_group_subset(&sg_best_effort_aux_idx, &graph_event_ids)
+                .unwrap_or_default();
         let entries: Vec<(&[u8], &[u8])> = partial_groups
             .iter()
             .filter(|(event_id, instance_id)| cached_partial.get(*event_id) != Some(*instance_id))
             .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
             .collect();
         if !entries.is_empty() {
-            partial_aux
+            sg_best_effort_aux_idx
                 .put_many(&entries)
                 .context("persisting partial state-group mappings")?;
         }
