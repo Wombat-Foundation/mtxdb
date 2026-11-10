@@ -190,9 +190,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.4"
+version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f97d3416d5337d15c4b0d78c8c91df922ca143f57ec20e2d1c188333047ef04"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
 dependencies = [
  "cfg-if",
 ]
@@ -772,7 +772,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#3856f3db4d314c4c89a6d32b910dc91f23e139a2"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#a8ffce667bde3795953233f093310d67e82bb7d9"
 dependencies = [
  "tracing",
 ]
@@ -780,7 +780,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#3856f3db4d314c4c89a6d32b910dc91f23e139a2"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#a8ffce667bde3795953233f093310d67e82bb7d9"
 dependencies = [
  "base64 0.23.1",
  "blake3",
