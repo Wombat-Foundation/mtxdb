@@ -74,6 +74,14 @@ impl JsonValueExt for OwnedValue {
 /// state content reached through different parents stays distinct.
 const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
 
+/// Event -> state-group instance id for events whose base state is missing
+/// history (an ancestor body absent from the source). The state is derived
+/// from the events that are present, so it can lack changes made by the absent
+/// ancestors. Nothing seeds a walk from this namespace and replay does not
+/// treat it as a cached complete result; it exists so readers get a best-effort
+/// state instead of none.
+const PARTIAL_STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups-partial:v1";
+
 /// Whether the importer should print per-phase timings. Off by default so a
 /// normal import log stays stable for the tests and for readers who only want
 /// counts; set `MTXDB_IMPORT_TIMINGS=1` to see where the seconds go.
@@ -13627,6 +13635,7 @@ fn repair_import_state_groups(
     // first-parent group under a resolver-tagged id; caching it would hide the
     // fact that a fuller import can compute the real resolution instead.
     let mut publishable = true;
+    let mut partial_groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
     let phase_walk = Instant::now();
     let unresolved_count = if loaded {
         0
@@ -13688,6 +13697,8 @@ fn repair_import_state_groups(
         warn_incomplete_merges(&state_computation.incomplete);
         state_groups = state_computation.groups;
         computed_instances = state_computation.instances;
+        computed_instances.extend(state_computation.partial_instances);
+        partial_groups = state_computation.partial;
         if !unresolved.is_empty() {
             eprintln!(
                 "warning: {} event(s) are in parent cycles and have no derived state",
@@ -13713,10 +13724,14 @@ fn repair_import_state_groups(
     report_import_phase("state walk/repair", phase_walk.elapsed());
     let mapped_event_count = state_groups.len();
     let unique_state_group_count = state_groups.values().collect::<HashSet<_>>().len();
-    let stateless_event_count = graph_event_count.saturating_sub(mapped_event_count);
+    let partial_event_count = partial_groups.len();
+    let stateless_event_count = graph_event_count
+        .saturating_sub(mapped_event_count)
+        .saturating_sub(partial_event_count);
     let source = if loaded { "loaded" } else { "computed" };
     eprintln!(
-        "  state groups: {source} {unique_state_group_count} state groups; state: {mapped_event_count} of {graph_event_count} events have a complete state group, {stateless_event_count} without ({unresolved_count} in cycles)"
+        "  state groups: {source} {unique_state_group_count} state groups; state: {} of {graph_event_count} events have a stored state group ({mapped_event_count} complete, {partial_event_count} partial forward extremities; an ancestor body is absent), {stateless_event_count} without ({unresolved_count} in cycles)",
+        mapped_event_count.saturating_add(partial_event_count)
     );
     let phase_hamt = Instant::now();
     let mut materialized = computed_instances.is_empty();
@@ -13751,6 +13766,21 @@ fn repair_import_state_groups(
         if !entries.is_empty() {
             aux.put_many(&entries)
                 .context("persisting imported state-group mappings")?;
+        }
+    }
+    if materialized && !loaded && !partial_groups.is_empty() {
+        let partial_aux = AuxiliaryIndex::open(state_store, PARTIAL_STATE_GROUP_NAMESPACE);
+        let cached_partial =
+            load_cached_state_group_subset(&partial_aux, &graph_event_ids).unwrap_or_default();
+        let entries: Vec<(&[u8], &[u8])> = partial_groups
+            .iter()
+            .filter(|(event_id, instance_id)| cached_partial.get(*event_id) != Some(*instance_id))
+            .map(|(event_id, instance_id)| (event_id.as_bytes(), instance_id.as_slice()))
+            .collect();
+        if !entries.is_empty() {
+            partial_aux
+                .put_many(&entries)
+                .context("persisting partial state-group mappings")?;
         }
     }
     report_import_phase("state mappings publish", phase_mappings.elapsed());
@@ -14347,20 +14377,24 @@ struct PartialStateComputation {
     /// materialize its `STGP` record and (deduplicated) `STAT` content.
     instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
     /// Events whose base state was incomplete because a `prev_events` entry was
-    /// missing or itself gapped. They stay unmapped until the ancestor arrives.
+    /// missing or itself gapped. Their derived groups are in `partial`, not
+    /// `groups`, so a later import with the ancestor present can publish the
+    /// complete group without colliding with a cached partial one.
     gapped: Vec<String>,
     /// Event ids at least one merge could not resolve because this batch does
     /// not carry their auth closure. Non-empty means those merges fell back to
     /// the first-parent rule, so `groups` must not be cached as though
     /// the real resolver had run — a later, fuller import recomputes them.
     incomplete: Vec<String>,
-    /// State-resolution merges the walk ran. Zero past a gap: nothing is
-    /// resolved or derived for an event whose base is missing history.
+    /// State-resolution merges the walk ran.
     #[cfg_attr(
         not(test),
         allow(dead_code, reason = "asserted by the gap and fork walk tests")
     )]
     merges: usize,
+    /// Groups derived on a base missing history (see [`StateGroupWalk`]).
+    partial: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
+    partial_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
 }
 
 /// What one DAG walk produced: the per-event group map, the derived instances
@@ -14369,11 +14403,15 @@ struct PartialStateComputation {
 struct StateGroupWalk {
     groups: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
     instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
-    /// Events whose base was gapped; they stay unmapped until the ancestor
-    /// arrives.
+    /// Events whose base was gapped; their groups are in `partial`.
     gapped: Vec<String>,
     incomplete: Vec<String>,
     merges: usize,
+    /// Groups derived on a base missing history, keyed by event. Never read as
+    /// a seed: they are coverage evidence, not a complete state.
+    partial: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]>,
+    /// Instances behind `partial`, for HAMT materialization.
+    partial_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance>,
 }
 
 /// One resolved state-group derivation: the parent instance ids it descends
@@ -14528,6 +14566,8 @@ fn compute_state_groups_partial_with(
             gapped: Vec::new(),
             incomplete: Vec::new(),
             merges: 0,
+            partial: HashMap::new(),
+            partial_instances: HashMap::new(),
         };
     }
 
@@ -14563,6 +14603,8 @@ fn compute_state_groups_partial_with(
         gapped: result.gapped,
         incomplete: result.incomplete,
         merges: result.merges,
+        partial: result.partial,
+        partial_instances: result.partial_instances,
     }
 }
 
@@ -14597,10 +14639,12 @@ fn walk_state_groups(
     let mut context = LeanEventContext::new(events_by_sid.values().copied());
     let mut incomplete: HashSet<String> = HashSet::new();
     let mut gapped: HashSet<String> = HashSet::new();
+    let mut partial: HashMap<String, [u8; STATE_GROUP_ID_LENGTH]> = HashMap::new();
+    let mut partial_instances: HashMap<[u8; STATE_GROUP_ID_LENGTH], StateInstance> = HashMap::new();
 
     let empty_set = StateSet::new();
     let empty = SharedState::new(
-        empty_set.clone(),
+        empty_set,
         state_group_instance_id(room_id, &[], &StateSet::new().lthash(), policy.derivation),
         true,
     );
@@ -14670,53 +14714,44 @@ fn walk_state_groups(
         // Incompleteness is inherited: a child of an event with a gapped base
         // has a gapped base too, even when all of its own parents are present.
         base_incomplete = base_is_incomplete(base_incomplete, &parents);
-        // A base missing history is never published, and every descendant
-        // inherits the gap, so there is no point resolving or deriving state
-        // past it. Keep an incomplete placeholder so the walk can propagate
-        // the gap; `judge` returns unchecked without reading its set.
+        // Keep the gap before a resolver fallback can add to it: only a base
+        // missing history makes the resulting group unsafe to publish. A merge
+        // fallback is reported through `incomplete` instead, which already
+        // keeps the whole batch from being cached.
         let base_gapped = base_incomplete;
-        let skip_merge = base_gapped;
-        let base: Arc<SharedState> = if skip_merge {
-            SharedState::with_parents(
-                empty_set.clone(),
-                empty.instance,
-                false,
-                parent_instances.clone(),
-            )
-        } else {
-            // State-resolution merge. Parents that already agree share their
-            // state instead of copying it, so a plain message event costs no
-            // allocation; only genuine divergence reaches rezzy. When rezzy
-            // cannot run — no recognized room version, or the batch is missing
-            // part of the auth closure it reads — the union falls back to the
-            // first-parent rule and the gap is recorded so the result is not
-            // cached as a real resolution.
-            match parents.as_slice() {
-                [] => Arc::clone(&empty),
-                [only] => Arc::clone(only),
-                [first, rest @ ..]
-                    if rest
-                        .iter()
-                        .all(|p| Arc::ptr_eq(p, first) || p.lthash == first.lthash) =>
-                {
-                    Arc::clone(first)
-                }
-                [..] => {
-                    let merge_started = Instant::now();
-                    let (merged, fallback) = merge_parent_states(
-                        &mut context,
-                        &parents,
-                        &parent_instances,
-                        room_id,
-                        policy,
-                        &mut incomplete,
-                        &mut merge_phases,
-                    );
-                    merge_time = merge_time.saturating_add(merge_started.elapsed());
-                    merge_count = merge_count.saturating_add(1);
-                    base_incomplete |= fallback;
-                    merged
-                }
+
+        // State-resolution merge. Parents that already agree share their state
+        // instead of copying it, so a plain message event costs no allocation;
+        // only genuine divergence reaches rezzy. When rezzy cannot run — no
+        // recognized room version, or the batch is missing part of the auth
+        // closure it reads — the union falls back to the first-parent
+        // rule and the gap is recorded so the result is not cached as a
+        // real resolution.
+        let base: Arc<SharedState> = match parents.as_slice() {
+            [] => Arc::clone(&empty),
+            [only] => Arc::clone(only),
+            [first, rest @ ..]
+                if rest
+                    .iter()
+                    .all(|p| Arc::ptr_eq(p, first) || p.lthash == first.lthash) =>
+            {
+                Arc::clone(first)
+            }
+            [..] => {
+                let merge_started = Instant::now();
+                let (merged, fallback) = merge_parent_states(
+                    &mut context,
+                    &parents,
+                    &parent_instances,
+                    room_id,
+                    policy,
+                    &mut incomplete,
+                    &mut merge_phases,
+                );
+                merge_time = merge_time.saturating_add(merge_started.elapsed());
+                merge_count = merge_count.saturating_add(1);
+                base_incomplete |= fallback;
+                merged
             }
         };
 
@@ -14735,22 +14770,34 @@ fn walk_state_groups(
             }
         }
 
-        let state = if base_gapped {
-            Arc::clone(&base)
-        } else {
-            derive_state(
-                event_value,
-                event_id.map(String::as_str),
-                &base,
-                view,
-                &parent_instances,
-                room_id,
-                policy,
-                rejected.as_deref(),
-                !base_incomplete,
-            )
-        };
+        let state = derive_state(
+            event_value,
+            event_id.map(String::as_str),
+            &base,
+            view,
+            &parent_instances,
+            room_id,
+            policy,
+            rejected.as_deref(),
+            !base_incomplete,
+        );
 
+        // A partial state is kept only where nothing descends from the event
+        // (a forward extremity): that is the room's best-effort current state.
+        // Keeping one for every event copies the whole state map per state
+        // event, which is quadratic in memory on rooms with many members.
+        let keep_partial =
+            base_gapped && remaining_children.get(&short_id).copied().unwrap_or(0) == 0;
+        if keep_partial {
+            partial_instances
+                .entry(state.instance)
+                .or_insert_with(|| StateInstance {
+                    parents: canonical_parents(&state.parents),
+                    lthash: state.lthash,
+                    set: state.set.clone(),
+                    derivation: policy.derivation,
+                });
+        }
         if !base_gapped && !seed_instances.contains(&state.instance) {
             instances
                 .entry(state.instance)
@@ -14769,6 +14816,9 @@ fn walk_state_groups(
                 // complete. The whole-room path must leave the same set
                 // unmapped so the two paths agree.
                 gapped.insert(eid.clone());
+                if keep_partial {
+                    partial.insert(eid.clone(), state.instance);
+                }
             } else {
                 result.insert(eid.clone(), state.instance);
             }
@@ -14802,6 +14852,8 @@ fn walk_state_groups(
         gapped,
         incomplete,
         merges: merge_count,
+        partial,
+        partial_instances,
     }
 }
 

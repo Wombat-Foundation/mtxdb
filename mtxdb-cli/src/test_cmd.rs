@@ -2048,18 +2048,26 @@ fn import_dedups_repeated_event_id_within_one_input() {
     .unwrap();
     let stats = store.stats();
     assert_eq!(
-        stats.put_many_calls, 1,
-        "the repeated event_id needs one event batch and no state mapping"
+        stats.put_many_calls, 2,
+        "the repeated event_id needs one event batch; the prev-less event also needs one partial mapping batch"
     );
     assert_eq!(
-        stats.put_many_records, 1,
-        "the repeated event_id must not be written twice and must stay unmapped"
+        stats.put_many_records, 2,
+        "the repeated event_id must not be written twice: one event record and one partial mapping"
     );
     let aux = mtxdb::auxiliary::AuxiliaryIndex::open(store.as_ref(), STATE_GROUP_NAMESPACE);
     assert_eq!(
         aux.get(b"$a").unwrap(),
         None,
-        "a message with no prev_events has no complete base, so it stays unmapped"
+        "a message with no prev_events has no complete base, so it must stay out of the complete namespace"
+    );
+    let partial_aux = mtxdb::auxiliary::AuxiliaryIndex::open(
+        store.as_ref(),
+        super::PARTIAL_STATE_GROUP_NAMESPACE,
+    );
+    assert!(
+        partial_aux.get(b"$a").unwrap().is_some(),
+        "its best-effort state is published under the partial namespace instead"
     );
     let node_id = template_node_id(&template, &events[0]).unwrap().unwrap();
     assert!(
@@ -6796,8 +6804,8 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     assert!(!first.groups.contains_key("$child"));
     assert!(first.unresolved.is_empty());
     assert!(
-        first.gapped.contains(&"$child".to_owned()),
-        "the event is gapped and stays unmapped until its parent arrives"
+        first.partial.contains_key("$child"),
+        "the event is still sorted with an unknown base and gets a partial group"
     );
     assert_eq!(aux.get(b"$child").unwrap(), None);
 
@@ -6965,13 +6973,13 @@ fn compute_state_groups_is_stable_across_overlapping_batches() {
     assert!(without_branch_b.groups.contains_key("$branch-a"));
     assert!(!without_branch_b.groups.contains_key("$merge"));
     assert!(
-        without_branch_b.gapped.contains(&"$merge".to_owned()),
-        "a merge with an absent parent is gapped and stays unmapped"
+        without_branch_b.partial.contains_key("$merge"),
+        "a merge with an absent parent is derived with an unknown base"
     );
     assert!(!with_orphan.groups.contains_key("$orphan"));
     assert!(
-        with_orphan.gapped.contains(&"$orphan".to_owned()),
-        "an orphan is gapped and stays unmapped instead of getting a guessed group"
+        with_orphan.partial.contains_key("$orphan"),
+        "an orphan is derived with an unknown base instead of dropped"
     );
 }
 
@@ -7933,20 +7941,23 @@ fn fork_room(extra_prevs: &[&str]) -> Vec<OwnedValue> {
     vec![create, power_levels, topic_a, topic_b, child, grandchild]
 }
 
-/// A derivation-skip test, not a write-suppression test: refusing to publish
-/// a gapped group alone leaves the event unmapped too, so only the merge count
-/// tells "skip the resolution past a gap" from "resolve, then throw it away".
-/// `$child` forks two present branches and also names a `prev_events` entry
-/// the batch does not carry, so its base is gapped; nothing may be resolved
-/// for it or for the `$grandchild` that inherits the gap.
+/// A gapped base is partial input, not a reason to drop state. `$child` forks
+/// two present branches and also names a `prev_events` entry the batch does
+/// not carry, so its base is gapped: it and the `$grandchild` that inherits
+/// the gap stay out of the complete `groups` map, and only the forward
+/// extremity (`$grandchild`) keeps a derived group in `partial`.
 #[test]
-fn gapped_merge_skips_resolution_and_stays_unmapped() {
+fn gapped_merge_keeps_partial_state_and_stays_unmapped() {
     let events = fork_room(&["$gap"]);
     let result = compute_state_groups_partial(&events, &[], "!r:x");
 
-    assert_eq!(
-        result.merges, 0,
-        "no resolver runs once a base is missing history"
+    assert!(
+        result.partial.contains_key("$grandchild"),
+        "the forward extremity keeps a partial group"
+    );
+    assert!(
+        !result.partial.contains_key("$child"),
+        "partial state is kept only at forward extremities"
     );
     assert_eq!(
         result.gapped,
@@ -7992,13 +8003,12 @@ fn fork_merge_still_runs_and_publishes() {
     }
 }
 
-/// A fork whose one branch descends from a missing prev must not run the
-/// resolver at all. `$gapped-topic` carries an incomplete placeholder into
-/// `$merge`, so the strict walk skips the merge and leaves the fork event
-/// unmapped. `c1834a5` suppressed the write but still merged the placeholder
-/// (`merges == 1`); the counter is what distinguishes the two behaviors.
+/// A fork whose one branch descends from a missing prev still derives a state
+/// for the fork event. `$gapped-topic` carries an incomplete base into
+/// `$merge`, so `$merge` gets a partial group and stays out of the complete
+/// `groups` map.
 #[test]
-fn gapped_fork_merge_skips_resolution_and_stays_unmapped() {
+fn gapped_fork_merge_keeps_partial_state_and_stays_unmapped() {
     let create = owned_value(
         r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10"}}"#,
     );
@@ -8019,9 +8029,9 @@ fn gapped_fork_merge_skips_resolution_and_stays_unmapped() {
     let events = vec![create, power_levels, topic_a, gapped_topic, merge];
 
     let result = compute_state_groups_partial(&events, &[], "!r:x");
-    assert_eq!(
-        result.merges, 0,
-        "a merge past a gapped base must not resolve or derive state"
+    assert!(
+        result.partial.contains_key("$merge"),
+        "a merge past a gapped base keeps a partial group"
     );
     assert!(
         result.gapped.iter().any(|event| event == "$merge"),
