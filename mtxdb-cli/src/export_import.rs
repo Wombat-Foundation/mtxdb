@@ -72,15 +72,58 @@ pub(crate) fn reclaim_journal_with(
 /// [`reclaim_journal_with`] against the database's own journal and pools.
 pub(crate) fn reclaim_journal(db: &Database) -> anyhow::Result<()> {
     let coordinator = db.coordinator();
+    let diagnose = crate::cmd::import_timings_enabled();
     reclaim_journal_with(
         coordinator.segment_len(),
         coordinator.reclaim_trigger_len(),
         |pool| {
+            let segment_before = coordinator.segment_len();
+            let started = std::time::Instant::now();
             db.pool(pool)
                 .sync_all()
-                .with_context(|| format!("syncing the {pool:?} pool to reclaim the journal"))
+                .with_context(|| format!("syncing the {pool:?} pool to reclaim the journal"))?;
+            if diagnose {
+                report_reclaim_sync(db, pool, segment_before, started.elapsed());
+            }
+            Ok(())
         },
     )
+}
+
+/// One line per pool sync a journal reclaim ran: where its time went, and how
+/// far the segment shrank. Only printed under `MTXDB_IMPORT_TIMINGS`.
+fn report_reclaim_sync(
+    db: &Database,
+    pool: mtxdb::ShardType,
+    segment_before: u64,
+    wall: std::time::Duration,
+) {
+    let segment_after = db.coordinator().segment_len();
+    let Some(t) = db.pool(pool).stats().last_sync_timings else {
+        eprintln!("  timing: reclaim sync {pool:?} {wall:?}, no sync timings recorded");
+        return;
+    };
+    eprintln!(
+        "  timing: reclaim sync {pool:?} wall {wall:?}: pack flush {:?} fsync {:?}, \
+         sidecar {:?}, delta log {:?}, checkpoint {:?}, reclaim {:?} (copy {:?}, fsync {:?}, \
+         retained {} B, blocked by {:?}), remediation {:?}, wal {:?} (fsync {:?}, {} sync calls, \
+         {} records); segment {segment_before} -> {segment_after} B",
+        t.pack_flush,
+        t.pack_fsync,
+        t.sidecar,
+        t.delta_log,
+        t.checkpoint,
+        t.reclaim,
+        t.reclaim_copy,
+        t.reclaim_fsync,
+        t.reclaim_retained_bytes,
+        t.reclaim_blocked_by,
+        t.remediation,
+        t.wal,
+        t.journal_fsync,
+        t.journal_sync_calls,
+        t.journal_records,
+    );
 }
 
 /// Allowance per staged record for keys and framing, on top of its value.

@@ -77,7 +77,7 @@ const STATE_GROUP_NAMESPACE: &str = "sys:matrix-state-groups:v1";
 /// Whether the importer should print per-phase timings. Off by default so a
 /// normal import log stays stable for the tests and for readers who only want
 /// counts; set `MTXDB_IMPORT_TIMINGS=1` to see where the seconds go.
-fn import_timings_enabled() -> bool {
+pub(crate) fn import_timings_enabled() -> bool {
     std::env::var_os("MTXDB_IMPORT_TIMINGS").is_some()
 }
 
