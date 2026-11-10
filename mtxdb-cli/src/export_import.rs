@@ -2214,6 +2214,7 @@ pub(crate) fn write_room_with_resolved_findings(
     findings: &AuthFindings,
 ) -> anyhow::Result<ImportCounts> {
     precheck_room_auth(export)?;
+    let events_started = std::time::Instant::now();
     let room = export.room_id.as_bytes();
     let event_collection = room_event_collection_id(room);
     let version_collection = room_version_collection_id(room);
@@ -2356,8 +2357,14 @@ pub(crate) fn write_room_with_resolved_findings(
     }
     tx.commit().context("committing an import batch")?;
     reclaim_journal(db)?;
+    crate::cmd::report_import_phase(
+        "write: events, locators, verdicts, timeline",
+        events_started.elapsed(),
+    );
     let (closures, shorts) = record_room_auth(db, export)?;
+    let flags_started = std::time::Instant::now();
     write_room_flags(db, export, findings, &shorts)?;
+    crate::cmd::report_import_phase("write: room flags", flags_started.elapsed());
 
     Ok(ImportCounts {
         events: written,
@@ -2496,6 +2503,7 @@ fn record_room_auth(db: &Database, export: &RoomExport) -> anyhow::Result<(u64, 
             Ok((ids("prev_events")?, ids("auth_events")?))
         })
         .collect::<anyhow::Result<_>>()?;
+    let record_started = std::time::Instant::now();
     let mut shorts = Vec::with_capacity(export.events.len());
     for (events, lists) in export
         .events
@@ -2521,9 +2529,14 @@ fn record_room_auth(db: &Database, export: &RoomExport) -> anyhow::Result<(u64, 
             .with_context(|| format!("recording auth adjacency for room {}", export.room_id))?;
         shorts.extend(recorded.iter().map(|r| r.short_id));
     }
+    crate::cmd::report_import_phase("write: auth adjacency record", record_started.elapsed());
+    let sync_started = std::time::Instant::now();
     room.sync_adjacency(db)
         .with_context(|| format!("syncing auth adjacency for room {}", export.room_id))?;
+    crate::cmd::report_import_phase("write: auth adjacency sync", sync_started.elapsed());
+    let rebuild_started = std::time::Instant::now();
     let report = room.rebuild(db)?;
+    crate::cmd::report_import_phase("write: auth closure rebuild", rebuild_started.elapsed());
     Ok((u64::from(report.count), shorts))
 }
 

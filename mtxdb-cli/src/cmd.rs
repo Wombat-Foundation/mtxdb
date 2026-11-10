@@ -82,7 +82,7 @@ fn import_timings_enabled() -> bool {
 }
 
 /// Print one completed import phase when timings are enabled.
-fn report_import_phase(phase: &str, elapsed: std::time::Duration) {
+pub(crate) fn report_import_phase(phase: &str, elapsed: std::time::Duration) {
     if import_timings_enabled() {
         eprintln!("  timing: {phase} {elapsed:?}");
     }
