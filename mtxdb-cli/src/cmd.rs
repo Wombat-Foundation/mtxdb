@@ -14386,7 +14386,7 @@ struct PartialStateComputation {
     /// the first-parent rule, so `groups` must not be cached as though
     /// the real resolver had run — a later, fuller import recomputes them.
     incomplete: Vec<String>,
-    /// State-resolution merges the walk ran.
+    /// Divergent parent merges the walk processed, including union fallbacks.
     #[cfg_attr(
         not(test),
         allow(dead_code, reason = "asserted by the gap and fork walk tests")
@@ -14714,19 +14714,15 @@ fn walk_state_groups(
         // Incompleteness is inherited: a child of an event with a gapped base
         // has a gapped base too, even when all of its own parents are present.
         base_incomplete = base_is_incomplete(base_incomplete, &parents);
-        // Keep the gap before a resolver fallback can add to it: only a base
-        // missing history makes the resulting group unsafe to publish. A merge
-        // fallback is reported through `incomplete` instead, which already
-        // keeps the whole batch from being cached.
+        // Keep the gap before a resolver fallback can add to it: a gapped
+        // merge uses the union estimate below, but only a missing auth closure
+        // on a complete base makes the whole batch's other groups unsafe.
         let base_gapped = base_incomplete;
 
-        // State-resolution merge. Parents that already agree share their state
-        // instead of copying it, so a plain message event costs no allocation;
-        // only genuine divergence reaches rezzy. When rezzy cannot run — no
-        // recognized room version, or the batch is missing part of the auth
-        // closure it reads — the union falls back to the first-parent
-        // rule and the gap is recorded so the result is not cached as a
-        // real resolution.
+        // Parents that already agree share their state, so a plain message
+        // event costs no allocation. A divergent complete base goes through
+        // state resolution. A gapped base takes the existing union fallback:
+        // its result is partial and never published as complete.
         let base: Arc<SharedState> = match parents.as_slice() {
             [] => Arc::clone(&empty),
             [only] => Arc::clone(only),
@@ -14745,6 +14741,7 @@ fn walk_state_groups(
                     &parent_instances,
                     room_id,
                     policy,
+                    base_gapped,
                     &mut incomplete,
                     &mut merge_phases,
                 );
@@ -14944,17 +14941,16 @@ fn derive_state(
     }
 }
 
-/// Resolve one genuinely divergent merge: the parents' states no longer agree,
-/// so this is where state resolution runs.
+/// Process one divergent merge: complete bases use state resolution, while a
+/// gapped base takes the union fallback because its result stays partial.
 ///
 /// Parents that already agree reach `walk_state_groups`'s earlier arms and
 /// never get here, so this is only ever called with at least two distinct
-/// states. When rezzy cannot run — no recognized room version, or the batch
-/// is missing part of the auth closure it reads — the union falls back to the
-/// first-parent rule and the gap is recorded so the result is not
-/// cached as a real resolution. A room with no resolver at all falls back
-/// without a gap: the derivation already says `FirstParent`, so that is the
-/// recorded behavior rather than a shortfall.
+/// states. For complete bases, when rezzy cannot run — no recognized room
+/// version or missing auth closure — the union fallback records the missing
+/// auth references so the batch cannot cache the result as a real resolution.
+/// For gapped bases the same union operation is an intentional best-effort
+/// estimate, and the gap itself prevents publication as complete.
 #[allow(
     clippy::too_many_arguments,
     reason = "the merge needs the context, the parents, and the identity inputs together"
@@ -14965,22 +14961,34 @@ fn merge_parent_states(
     parent_instances: &[[u8; STATE_GROUP_ID_LENGTH]],
     room_id: &str,
     policy: ResolutionPolicy,
+    force_union: bool,
     incomplete: &mut HashSet<String>,
     phases: &mut crate::state_resolve::MergePhaseTimes,
 ) -> (Arc<SharedState>, bool) {
     let parent_entries: Vec<&StateEntries> =
         parents.iter().map(|parent| &parent.set.entries).collect();
     let mut fallback = false;
-    let merged = match resolve_parents(context, &parent_entries, policy, phases) {
-        Ok(entries) => StateSet::from_entries(entries),
-        Err(gap) => {
-            fallback = true;
-            incomplete.extend(gap.missing);
-            let mut merged = StateSet::new();
-            for parent in parents {
-                merged.merge(&parent.set);
+    let union = |parents: &[Arc<SharedState>]| {
+        let mut merged = StateSet::new();
+        for parent in parents {
+            merged.merge(&parent.set);
+        }
+        merged
+    };
+    let merged = if force_union {
+        // A merge whose base is gapped is never published as complete and
+        // judges leniently, so it takes the union instead of paying for a
+        // state resolution whose result is only a best-effort estimate.
+        fallback = true;
+        union(parents)
+    } else {
+        match resolve_parents(context, &parent_entries, policy, phases) {
+            Ok(entries) => StateSet::from_entries(entries),
+            Err(gap) => {
+                fallback = true;
+                incomplete.extend(gap.missing);
+                union(parents)
             }
-            merged
         }
     };
     let instance = state_group_instance_id(
