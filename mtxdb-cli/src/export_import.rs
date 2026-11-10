@@ -70,19 +70,6 @@ pub(crate) fn reclaim_journal_with(
 }
 
 /// [`reclaim_journal_with`] against the database's own journal and pools.
-///
-/// Each pool is asked for a coverage checkpoint, not a durability barrier:
-/// its dirty pack shards are fsynced, and its index checkpoint runs on the
-/// pool's background worker, which reports coverage once that image is
-/// durable. The journal then shrinks without the WAL being fsynced first, and
-/// without the clean shards being fsynced at all. A `sync_all` here paid for
-/// both, plus every pool's checkpoint inline: on a 16k-event room that was
-/// 1.8 s, of which about a third was a WAL fsync of frames the reclaim was
-/// about to discard.
-///
-/// Nothing the import promises rests on this call. The import's durability
-/// point is the pre-marker barrier ([`sync_data`]), which still syncs fully;
-/// the marker is committed after it.
 pub(crate) fn reclaim_journal(db: &Database) -> anyhow::Result<()> {
     let coordinator = db.coordinator();
     let diagnose = crate::cmd::import_timings_enabled();
@@ -93,20 +80,50 @@ pub(crate) fn reclaim_journal(db: &Database) -> anyhow::Result<()> {
             let segment_before = coordinator.segment_len();
             let started = std::time::Instant::now();
             db.pool(pool)
-                .force_index_checkpoint_detached()
-                .with_context(|| {
-                    format!("checkpointing the {pool:?} pool to reclaim the journal")
-                })?;
+                .sync_all()
+                .with_context(|| format!("syncing the {pool:?} pool to reclaim the journal"))?;
             if diagnose {
-                eprintln!(
-                    "  timing: reclaim checkpoint {pool:?} {:?}; segment {segment_before} -> {} B",
-                    started.elapsed(),
-                    coordinator.segment_len()
-                );
+                report_reclaim_sync(db, pool, segment_before, started.elapsed());
             }
             Ok(())
         },
     )
+}
+
+/// One line per pool sync a journal reclaim ran: where its time went, and how
+/// far the segment shrank. Only printed under `MTXDB_IMPORT_TIMINGS`.
+fn report_reclaim_sync(
+    db: &Database,
+    pool: mtxdb::ShardType,
+    segment_before: u64,
+    wall: std::time::Duration,
+) {
+    let segment_after = db.coordinator().segment_len();
+    let Some(t) = db.pool(pool).stats().last_sync_timings else {
+        eprintln!("  timing: reclaim sync {pool:?} {wall:?}, no sync timings recorded");
+        return;
+    };
+    eprintln!(
+        "  timing: reclaim sync {pool:?} wall {wall:?}: pack flush {:?} fsync {:?}, \
+         sidecar {:?}, delta log {:?}, checkpoint {:?}, reclaim {:?} (copy {:?}, fsync {:?}, \
+         retained {} B, blocked by {:?}), remediation {:?}, wal {:?} (fsync {:?}, {} sync calls, \
+         {} records); segment {segment_before} -> {segment_after} B",
+        t.pack_flush,
+        t.pack_fsync,
+        t.sidecar,
+        t.delta_log,
+        t.checkpoint,
+        t.reclaim,
+        t.reclaim_copy,
+        t.reclaim_fsync,
+        t.reclaim_retained_bytes,
+        t.reclaim_blocked_by,
+        t.remediation,
+        t.wal,
+        t.journal_fsync,
+        t.journal_sync_calls,
+        t.journal_records,
+    );
 }
 
 /// Allowance per staged record for keys and framing, on top of its value.
@@ -3539,11 +3556,10 @@ mod auth_findings_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A room written past the reclaim trigger, reclaimed through the
-    /// coverage-only checkpoint, survives a reopen with every event readable,
+    /// A room written past the reclaim trigger, reclaimed, survives a reopen with every event readable,
     /// both with and without the pre-marker barrier in between.
     #[test]
-    fn events_survive_a_reopen_after_a_coverage_only_reclaim() {
+    fn events_survive_a_reopen_after_a_reclaim() {
         for barrier in [false, true] {
             crate::sweep_stale_test_dirs();
             let dir = std::env::temp_dir().join(format!(
