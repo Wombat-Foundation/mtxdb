@@ -2380,10 +2380,19 @@ fn write_room_flags(
     shorts: &[u32],
 ) -> anyhow::Result<()> {
     const FORWARD_BATCH_SIZE: usize = 512;
+    // Changes accumulated before a flush. Every flush rewrites each touched
+    // bitmap chunk and commits through the journal, so the threshold is in
+    // changes (six per event), not events: 1,024 flushed after every 512-event
+    // chunk, one commit per 170 events' worth of work at 16k events.
+    const FLUSH_CHANGES: usize = 1 << 16;
 
     let flag_index = RoomFlagIndex::new(export.room_id.as_bytes());
     let mut tx = db.begin_transaction();
     let mut batch_changes = Vec::new();
+    let mut stage_time = std::time::Duration::ZERO;
+    let mut commit_time = std::time::Duration::ZERO;
+    let mut reclaim_time = std::time::Duration::ZERO;
+    let mut flushes = 0_u32;
 
     for (chunk_start, chunk) in export.events.chunks(FORWARD_BATCH_SIZE).enumerate() {
         let base_pos = chunk_start.saturating_mul(FORWARD_BATCH_SIZE);
@@ -2416,20 +2425,40 @@ fn write_room_flags(
             }
         }
 
-        if batch_changes.len() >= 1024 {
+        if batch_changes.len() >= FLUSH_CHANGES {
+            let started = std::time::Instant::now();
             flag_index.stage(&tx, &batch_changes)?;
             batch_changes.clear();
+            stage_time = stage_time.saturating_add(started.elapsed());
+            let started = std::time::Instant::now();
             tx.commit().context("committing room flag batch")?;
+            commit_time = commit_time.saturating_add(started.elapsed());
+            let started = std::time::Instant::now();
             reclaim_journal(db)?;
+            reclaim_time = reclaim_time.saturating_add(started.elapsed());
+            flushes = flushes.saturating_add(1);
             tx = db.begin_transaction();
         }
     }
 
+    let started = std::time::Instant::now();
     if !batch_changes.is_empty() {
         flag_index.stage(&tx, &batch_changes)?;
     }
+    stage_time = stage_time.saturating_add(started.elapsed());
+    let started = std::time::Instant::now();
     tx.commit().context("committing final room flag batch")?;
+    commit_time = commit_time.saturating_add(started.elapsed());
+    let started = std::time::Instant::now();
     reclaim_journal(db)?;
+    reclaim_time = reclaim_time.saturating_add(started.elapsed());
+    flushes = flushes.saturating_add(1);
+    crate::cmd::report_import_phase(
+        &format!("write: room flags stage ({flushes} commits)"),
+        stage_time,
+    );
+    crate::cmd::report_import_phase("write: room flags commit", commit_time);
+    crate::cmd::report_import_phase("write: room flags journal reclaim", reclaim_time);
     Ok(())
 }
 
