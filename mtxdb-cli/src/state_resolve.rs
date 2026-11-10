@@ -79,6 +79,11 @@ pub(crate) struct LeanEventContext<'a> {
         rezzy::resolve::reachability::RangePrefilterReachability<String>,
         rezzy::ForkResolveCaches<String, rezzy::JsonValue>,
     )>,
+    /// Per-event auth-chain bitmaps over every event in the batch, built with
+    /// the reachability index. Present only when the batch's auth graph is
+    /// complete: the difference it yields is exact only then, so a gapped
+    /// batch falls back to the resolver's own walk.
+    auth_graph: Option<rezzy::auth::roaring::AuthGraph<String>>,
 }
 
 impl<'a> LeanEventContext<'a> {
@@ -96,6 +101,7 @@ impl<'a> LeanEventContext<'a> {
             verified: HashSet::new(),
             missing: BTreeSet::new(),
             resolve_state: None,
+            auth_graph: None,
         }
     }
 
@@ -124,11 +130,30 @@ impl<'a> LeanEventContext<'a> {
                 &self.events,
             );
             self.resolve_state = Some((index, rezzy::ForkResolveCaches::new(version)));
+            self.auth_graph = rezzy::auth::roaring::AuthGraph::try_build(&self.events)
+                .ok()
+                .filter(rezzy::auth::roaring::AuthGraph::is_complete);
         }
+        // The merge's auth difference from the bitmaps, when every state event
+        // is in a complete graph; otherwise the resolver walks the auth lists.
+        let auth_diff = self
+            .auth_graph
+            .as_ref()
+            .and_then(|graph| graph.try_state_auth_difference(maps).ok());
         match self.resolve_state.as_mut() {
-            Some((index, caches)) => {
-                rezzy::resolve_state_maps_cached(maps, &self.events, version, index, caches)
-            }
+            Some((index, caches)) => match auth_diff {
+                Some(diff) => rezzy::resolve_state_maps_cached_with_auth_diff(
+                    maps,
+                    &self.events,
+                    version,
+                    index,
+                    caches,
+                    &diff,
+                ),
+                None => {
+                    rezzy::resolve_state_maps_cached(maps, &self.events, version, index, caches)
+                }
+            },
             None => rezzy::resolve_state_maps(maps, &self.events, version),
         }
     }
@@ -388,6 +413,200 @@ mod tests {
             context.ensure(&["$present".to_owned()]),
             vec!["$absent".to_owned()]
         );
+    }
+
+    fn room_event(
+        id: &str,
+        kind: &str,
+        state_key: &str,
+        sender: &str,
+        depth: u32,
+        content: &str,
+        auth: &[&str],
+    ) -> OwnedValue {
+        let auth = auth
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        value(&format!(
+            r#"{{"event_id":"{id}","type":"{kind}","state_key":"{state_key}","sender":"{sender}",
+                 "depth":{depth},"origin_server_ts":{depth},"content":{content},
+                 "auth_events":[{auth}],"prev_events":[]}}"#
+        ))
+    }
+
+    fn state(rows: &[(&str, &str, &str)]) -> RezzyState {
+        let mut entries = StateEntries::new();
+        for (kind, key, id) in rows {
+            entries.insert(((*kind).to_owned(), (*key).to_owned()), (*id).to_owned());
+        }
+        to_rezzy_state(&entries)
+    }
+
+    /// A merge resolved with the room's auth bitmaps must equal the same merge
+    /// resolved by the resolver's own auth-list walk.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture lists each event of the two forks"
+    )]
+    fn a_merge_resolved_from_the_bitmaps_equals_the_walked_one() {
+        let events = [
+            room_event(
+                "$create",
+                "m.room.create",
+                "",
+                "@a:x",
+                1,
+                r#"{"creator":"@a:x"}"#,
+                &[],
+            ),
+            room_event(
+                "$alice",
+                "m.room.member",
+                "@a:x",
+                "@a:x",
+                2,
+                r#"{"membership":"join"}"#,
+                &["$create"],
+            ),
+            room_event(
+                "$pl",
+                "m.room.power_levels",
+                "",
+                "@a:x",
+                3,
+                r#"{"users":{"@a:x":100}}"#,
+                &["$create", "$alice"],
+            ),
+            room_event(
+                "$jr",
+                "m.room.join_rules",
+                "",
+                "@a:x",
+                4,
+                r#"{"join_rule":"public"}"#,
+                &["$create", "$alice", "$pl"],
+            ),
+            room_event(
+                "$topic_a",
+                "m.room.topic",
+                "",
+                "@a:x",
+                5,
+                r#"{"topic":"a"}"#,
+                &["$create", "$alice", "$pl"],
+            ),
+            room_event(
+                "$bob_a",
+                "m.room.member",
+                "@b:x",
+                "@b:x",
+                5,
+                r#"{"membership":"join"}"#,
+                &["$create", "$jr", "$pl"],
+            ),
+            room_event(
+                "$topic_b",
+                "m.room.topic",
+                "",
+                "@a:x",
+                6,
+                r#"{"topic":"b"}"#,
+                &["$create", "$alice", "$pl"],
+            ),
+            room_event(
+                "$carol_b",
+                "m.room.member",
+                "@c:x",
+                "@c:x",
+                6,
+                r#"{"membership":"join"}"#,
+                &["$create", "$jr", "$pl"],
+            ),
+        ];
+        let shared = [
+            ("m.room.create", "", "$create"),
+            ("m.room.member", "@a:x", "$alice"),
+            ("m.room.power_levels", "", "$pl"),
+            ("m.room.join_rules", "", "$jr"),
+        ];
+        let mut fork_a = shared.to_vec();
+        fork_a.extend([
+            ("m.room.topic", "", "$topic_a"),
+            ("m.room.member", "@b:x", "$bob_a"),
+        ]);
+        let mut fork_b = shared.to_vec();
+        fork_b.extend([
+            ("m.room.topic", "", "$topic_b"),
+            ("m.room.member", "@c:x", "$carol_b"),
+        ]);
+        let maps = [state(&fork_a), state(&fork_b)];
+
+        for version in [rezzy::StateResVersion::V2, rezzy::StateResVersion::V2_1] {
+            let mut context = LeanEventContext::new(events.iter());
+            let resolved = context.resolve(&maps, version);
+            assert!(
+                context.auth_graph.is_some(),
+                "a complete batch must build the bitmap graph"
+            );
+            let walked = rezzy::resolve_state_maps(&maps, context.map(), version);
+            assert_eq!(resolved, walked, "{version:?}");
+        }
+    }
+
+    /// A batch with a dangling auth reference has no bitmap graph, so the
+    /// merge falls back to the walk instead of using an inexact difference.
+    /// The gap sits on an event outside both forks, as `ensure` has already
+    /// refused any merge whose own auth closure is gapped.
+    #[test]
+    fn a_gapped_batch_builds_no_bitmap_graph_and_still_resolves() {
+        let events = [
+            room_event("$create", "m.room.create", "", "@a:x", 1, "{}", &[]),
+            room_event(
+                "$t1",
+                "m.room.topic",
+                "",
+                "@a:x",
+                2,
+                r#"{"topic":"1"}"#,
+                &["$create"],
+            ),
+            room_event(
+                "$t2",
+                "m.room.topic",
+                "",
+                "@a:x",
+                2,
+                r#"{"topic":"2"}"#,
+                &["$create"],
+            ),
+            room_event(
+                "$orphan",
+                "m.room.name",
+                "",
+                "@a:x",
+                2,
+                r#"{"name":"n"}"#,
+                &["$missing"],
+            ),
+        ];
+        let maps = [
+            state(&[
+                ("m.room.create", "", "$create"),
+                ("m.room.topic", "", "$t1"),
+            ]),
+            state(&[
+                ("m.room.create", "", "$create"),
+                ("m.room.topic", "", "$t2"),
+            ]),
+        ];
+        let mut context = LeanEventContext::new(events.iter());
+        let resolved = context.resolve(&maps, rezzy::StateResVersion::V2);
+        assert!(context.auth_graph.is_none());
+        let walked = rezzy::resolve_state_maps(&maps, context.map(), rezzy::StateResVersion::V2);
+        assert_eq!(resolved, walked);
     }
 
     #[test]
