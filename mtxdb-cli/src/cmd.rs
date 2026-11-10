@@ -14972,8 +14972,14 @@ fn merge_parent_states(
         parents.iter().map(|parent| &parent.set.entries).collect();
     let mut fallback = false;
     let union = |parents: &[Arc<SharedState>]| {
-        let mut merged = StateSet::new();
-        for parent in parents {
+        // Start from the first parent's persistent set (an O(1) clone) and add
+        // only what the others contribute: the same first-parent-wins result as
+        // inserting every parent's entries into an empty set.
+        let Some((first, rest)) = parents.split_first() else {
+            return StateSet::new();
+        };
+        let mut merged = first.set.clone();
+        for parent in rest {
             merged.merge(&parent.set);
         }
         merged
