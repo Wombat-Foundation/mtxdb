@@ -101,6 +101,12 @@ const MAX_SEGMENT_LEN: u64 = (256 << 20) + FILE_HEADER_LEN as u64;
 /// [`JournalCoordinator::set_reclaim_trigger_len`].
 pub(crate) const RECLAIM_TRIGGER_LEN: u64 = MAX_SEGMENT_LEN / 4;
 
+/// A reclaim that would copy at least this many suffix bytes is skipped when it
+/// would drop under `1 / UNPROFITABLE_REWRITE_RATIO` of that suffix.
+const UNPROFITABLE_REWRITE_MIN_COPY: u64 = 1 << 20;
+/// See [`UNPROFITABLE_REWRITE_MIN_COPY`].
+const UNPROFITABLE_REWRITE_RATIO: u64 = 8;
+
 /// Segment length at which a stalled reclaim is treated as an emergency: three
 /// quarters of `cap`. Validation and stall reporting share this calculation.
 pub(crate) const fn emergency_len_for_cap(cap: u64) -> u64 {
@@ -5496,6 +5502,25 @@ impl Journal {
         let copy_started = std::time::Instant::now();
         let header_len = FILE_HEADER_LEN as u64;
         let cut_offset = last_dropped.end_offset;
+        // A rewrite copies the retained suffix. Dropping a sliver while copying
+        // a large suffix costs more than it frees, and the pool whose coverage
+        // completes the cut reports moments later and drops it with no copy.
+        // The emergency zone stays an exception so the segment cannot fill
+        // while this waits. Skipping only leaves disk in use; it cannot lose
+        // data.
+        let dropped_bytes = cut_offset.saturating_sub(header_len);
+        let suffix_bytes = self.file_len.saturating_sub(cut_offset);
+        if suffix_bytes >= UNPROFITABLE_REWRITE_MIN_COPY
+            && suffix_bytes > dropped_bytes.saturating_mul(UNPROFITABLE_REWRITE_RATIO)
+            && self.file_len < emergency_len_for_cap(self.segment_cap)
+        {
+            return Ok(Reclaim {
+                retained_groups: u64::try_from(self.groups.len()).unwrap_or(u64::MAX),
+                reclaimed_bytes: 0,
+                retained_bytes: suffix_bytes,
+                ..Default::default()
+            });
+        }
         let retained = self.groups.get(cut..).unwrap_or_default();
         let (new_base_sequence, new_base_lsn) = retained
             .first()

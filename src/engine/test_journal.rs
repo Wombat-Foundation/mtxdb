@@ -1869,6 +1869,38 @@ fn reclaim_below_base_is_a_noop() {
     fs::remove_file(path).unwrap();
 }
 
+/// Dropping a sliver while copying a large suffix is skipped, and the cut that
+/// later covers the rest drops the whole segment with no copy.
+#[test]
+fn reclaim_skips_a_sliver_that_would_copy_a_large_suffix() {
+    let path = temp_path("reclaim_unprofitable");
+    let _ = fs::remove_file(&path);
+    let (mut journal, _) = Journal::open(&path).unwrap();
+    let first = journal.commit_group(&[put(1, 1, b"small")]).unwrap();
+    let big = vec![7u8; 2 << 20];
+    let second = journal.commit_group(&[put(1, 2, &big)]).unwrap();
+    let before = fs::metadata(&path).unwrap().len();
+
+    let skipped = journal.reclaim_through(first.last_lsn).unwrap();
+    assert_eq!(skipped.reclaimed_bytes, 0);
+    assert_eq!(skipped.retained_groups, 2);
+    assert_eq!(
+        fs::metadata(&path).unwrap().len(),
+        before,
+        "the file is unchanged"
+    );
+
+    let dropped = journal.reclaim_through(second.last_lsn).unwrap();
+    assert_eq!(dropped.retained_groups, 0);
+    assert!(dropped.reclaimed_bytes > 0);
+    assert!(
+        fs::metadata(&path).unwrap().len() < 64 * 1024,
+        "only the header and marks remain"
+    );
+    drop(journal);
+    fs::remove_file(path).unwrap();
+}
+
 /// The coordinator exposes reclamation without disturbing its LSN counters:
 /// a publish after reclaim still continues the sequence.
 #[test]
