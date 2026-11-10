@@ -10094,10 +10094,7 @@ fn validate_complete_state_groups_against_source_shortstate() {
         .map(|room| (room.clone(), matrix_room_collection_id(room)))
         .collect();
 
-    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(
-        &state_store,
-        super::STATE_GROUP_BEST_EFFORT_NAMESPACE,
-    );
+    let aux = mtxdb::auxiliary::AuxiliaryIndex::open(&state_store, STATE_GROUP_NAMESPACE);
     let event_ids: Vec<String> = event_to_short.keys().cloned().collect();
 
     let mut mapped: Vec<(String, [u8; 16])> = Vec::new();
