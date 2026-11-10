@@ -378,8 +378,9 @@ pub struct SyncTimings {
     /// Breakdown of [`Self::reclaim`]: writing, fsyncing and renaming the
     /// rebuilt segment into place. The likely disk cost.
     pub reclaim_fsync: std::time::Duration,
-    /// Bytes the last reclaim rewrite moved and fsynced: the retained suffix.
-    /// This is what `reclaim_copy`/`reclaim_fsync` scale with.
+    /// Size of the suffix left by the last reclaim cut: what
+    /// `reclaim_copy`/`reclaim_fsync` would scale with. On a skipped reclaim
+    /// nothing was copied, but this still reports the retained suffix size.
     pub reclaim_retained_bytes: u64,
     /// The pool whose missing coverage stopped the last reclaim cut, so the
     /// suffix could not be dropped sooner. None when the whole segment was

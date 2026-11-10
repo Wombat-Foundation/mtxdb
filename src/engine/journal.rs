@@ -1669,9 +1669,11 @@ pub struct Reclaim {
     pub retained_groups: u64,
     /// Bytes removed from the segment.
     pub reclaimed_bytes: u64,
-    /// Bytes the rewrite moved and fsynced: the retained suffix, i.e. the
-    /// rebuilt segment minus its header. This is what makes `copy`/`fsync`
-    /// scale with segment size, so it is the number to bound.
+    /// Size of the retained suffix, i.e. the rebuilt segment minus its header.
+    /// This is what a rewrite would copy and fsync, and what makes `copy` /
+    /// `fsync` scale with segment size, so it is the number to bound. On a
+    /// skipped reclaim nothing is copied, but this still reports the suffix
+    /// size that made the rewrite unprofitable.
     pub retained_bytes: u64,
     /// The pool whose missing coverage stopped the cut, so the suffix could not
     /// be dropped. None when the whole segment was droppable, or the caller
