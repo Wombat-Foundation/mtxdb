@@ -14755,6 +14755,31 @@ fn walk_state_groups(
             }
         };
 
+        // Test-only experiment: fill-only auth-event seeding at missing-prev gap
+        // roots. Compiled out of every non-test build and inert unless a test
+        // arms it.
+        #[cfg(test)]
+        let base = {
+            let missing_prev_root = !claimed_prev_ids.is_empty()
+                && claimed_prev_ids
+                    .iter()
+                    .any(|prev| !id_map.contains_key(*prev) && !seed_states.contains_key(*prev));
+            if missing_prev_root {
+                seed_experiment::seed_gap_root(
+                    &base,
+                    event_value,
+                    id_map,
+                    events_by_sid,
+                    &parent_instances,
+                    room_id,
+                    policy,
+                )
+                .unwrap_or(base)
+            } else {
+                base
+            }
+        };
+
         let event_id = reverse_map.get(&short_id);
         if let (Some(event_id), Some(event_value)) = (event_id, event_value) {
             let already_rejected = rejected
@@ -16553,3 +16578,152 @@ fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "test_cmd.rs"]
 mod tests;
+
+/// Test-only experiment: fill-only seeding of a missing-prev gap root's base
+/// state from the `(type, state_key)` keys its cited `auth_events` name. It
+/// fills only keys the inherited base lacks, skips conflicting, unresolvable,
+/// non-state and rejected citations (counting each), and builds the seeded base
+/// incomplete with a fresh instance id from its own content and the real prev
+/// parents. It never exists in a non-test build.
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test-only experiment counters"
+)]
+pub(super) mod seed_experiment {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Counters for one armed run.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub(crate) struct SeedStats {
+        pub(crate) gap_roots: u64,
+        pub(crate) cited: u64,
+        pub(crate) filled: u64,
+        pub(crate) agree_with_inherited: u64,
+        pub(crate) differs_from_inherited: u64,
+        pub(crate) missing_body: u64,
+        pub(crate) non_state: u64,
+        pub(crate) rejected: u64,
+        pub(crate) conflicts: u64,
+        /// Event ids whose own citations supplied a seed.
+        pub(crate) suppliers: HashSet<String>,
+    }
+
+    struct Armed {
+        rejected: HashSet<String>,
+        stats: SeedStats,
+    }
+
+    thread_local! {
+        static ARMED: RefCell<Option<Armed>> = const { RefCell::new(None) };
+    }
+
+    /// Arm seeding for this thread with the baseline walk's final rejections.
+    pub(crate) fn arm(rejected: HashSet<String>) {
+        ARMED.with(|cell| {
+            *cell.borrow_mut() = Some(Armed {
+                rejected,
+                stats: SeedStats::default(),
+            });
+        });
+    }
+
+    /// Disarm and return what the armed run counted.
+    pub(crate) fn disarm() -> SeedStats {
+        ARMED.with(|cell| {
+            cell.borrow_mut()
+                .take()
+                .map(|a| a.stats)
+                .unwrap_or_default()
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "mirrors the walk's own inputs")]
+    pub(super) fn seed_gap_root(
+        base: &Arc<SharedState>,
+        event: Option<&OwnedValue>,
+        id_map: &HashMap<String, u64>,
+        events_by_sid: &HashMap<u64, &OwnedValue>,
+        parent_instances: &[[u8; STATE_GROUP_ID_LENGTH]],
+        room_id: &str,
+        policy: ResolutionPolicy,
+    ) -> Option<Arc<SharedState>> {
+        ARMED.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let armed = guard.as_mut()?;
+            let event = event?;
+            armed.stats.gap_roots += 1;
+            let supplier = event_id(event).unwrap_or("").to_owned();
+            let cited_ids: Vec<&str> = event
+                .get("auth_events")
+                .and_then(OwnedValue::as_array)
+                .map(|a| a.iter().filter_map(OwnedValue::as_str).collect())
+                .unwrap_or_default();
+            let mut keyed: std::collections::BTreeMap<(String, String), String> =
+                std::collections::BTreeMap::new();
+            let mut conflicted: HashSet<(String, String)> = HashSet::new();
+            for id in cited_ids {
+                armed.stats.cited += 1;
+                if armed.rejected.contains(id) {
+                    armed.stats.rejected += 1;
+                    continue;
+                }
+                let Some(body) = id_map.get(id).and_then(|sid| events_by_sid.get(sid)) else {
+                    armed.stats.missing_body += 1;
+                    continue;
+                };
+                if !is_state_event(body) {
+                    armed.stats.non_state += 1;
+                    continue;
+                }
+                let key = (
+                    event_string_field(body, "type").unwrap_or("").to_owned(),
+                    state_key(body),
+                );
+                match keyed.get(&key) {
+                    Some(existing) if existing != id => {
+                        if conflicted.insert(key) {
+                            armed.stats.conflicts += 1;
+                        }
+                    }
+                    _ => {
+                        keyed.insert(key, id.to_owned());
+                    }
+                }
+            }
+            let mut seeded = base.set.clone();
+            let mut changed = false;
+            for (key, id) in keyed {
+                if conflicted.contains(&key) {
+                    continue;
+                }
+                match seeded.entries.get(&key) {
+                    None => {
+                        seeded.set(&key.0, &key.1, id);
+                        armed.stats.filled += 1;
+                        changed = true;
+                    }
+                    Some(existing) if *existing == id => armed.stats.agree_with_inherited += 1,
+                    Some(_) => armed.stats.differs_from_inherited += 1,
+                }
+            }
+            if !changed {
+                return None;
+            }
+            armed.stats.suppliers.insert(supplier);
+            let instance = state_group_instance_id(
+                room_id,
+                parent_instances,
+                &seeded.lthash(),
+                policy.derivation,
+            );
+            Some(SharedState::with_parents(
+                seeded,
+                instance,
+                false,
+                parent_instances.to_vec(),
+            ))
+        })
+    }
+}

@@ -10505,3 +10505,97 @@ fn server_info_pool_repack_keeps_id_order_even_for_linked_records() {
     assert_eq!(order.len(), names.len());
     assert_eq!(order, sorted, "server info is written in id order");
 }
+
+/// A non-state gap root (`$root`, whose only prev is missing) with a present
+/// create and power levels in its citations, and a child that is the forward
+/// extremity.
+fn seeded_gap_room() -> Vec<OwnedValue> {
+    vec![
+        owned_value(
+            r#"{"event_id":"$create","room_id":"!r:x","type":"m.room.create","state_key":"","sender":"@admin:x","depth":1,"prev_events":[],"auth_events":[],"content":{"room_version":"10"}}"#,
+        ),
+        owned_value(
+            r#"{"event_id":"$pl","room_id":"!r:x","type":"m.room.power_levels","state_key":"","sender":"@admin:x","depth":2,"prev_events":["$create"],"auth_events":["$create"],"content":{"users":{"@admin:x":100}}}"#,
+        ),
+        owned_value(
+            r#"{"event_id":"$root","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":9,"prev_events":["$missing"],"auth_events":["$create","$pl"],"content":{}}"#,
+        ),
+        owned_value(
+            r#"{"event_id":"$child","room_id":"!r:x","type":"m.room.message","sender":"@admin:x","depth":10,"prev_events":["$root"],"auth_events":["$create","$pl"],"content":{}}"#,
+        ),
+    ]
+}
+
+/// Fill-only seeding at a non-state, missing-prev gap root changes the
+/// forward extremity's state and instance id; the id still matches the state
+/// and the real prev parents, only the extremity gets a best-effort mapping,
+/// and neither the root nor its descendant reaches the complete map.
+#[test]
+fn seeded_gap_root_keeps_identity_and_stays_out_of_the_complete_map() {
+    use super::seed_experiment::{arm, disarm};
+    let events = seeded_gap_room();
+    let derivation = super::batch_resolution_policy(&events).derivation;
+
+    let baseline = compute_state_groups_partial(&events, &[], "!r:x");
+    arm(HashSet::new());
+    let seeded = compute_state_groups_partial(&events, &[], "!r:x");
+    let stats = disarm();
+
+    assert_eq!(stats.gap_roots, 1, "one missing-prev gap root");
+    assert_eq!(
+        stats.filled, 2,
+        "create and power levels fill an empty base"
+    );
+    assert_eq!(stats.missing_body + stats.rejected + stats.conflicts, 0);
+
+    // Only the forward extremity keeps a best-effort mapping, in both walks.
+    for run in [&baseline, &seeded] {
+        assert!(run.partial.contains_key("$child"));
+        assert!(!run.partial.contains_key("$root"));
+        assert_eq!(run.gapped, vec!["$child".to_owned(), "$root".to_owned()]);
+        for id in ["$root", "$child"] {
+            assert!(!run.groups.contains_key(id), "{id} must stay unmapped");
+        }
+    }
+    // The complete map is identical: the seed touches nothing published.
+    assert_eq!(baseline.groups, seeded.groups);
+    assert_eq!(baseline.instances.len(), seeded.instances.len());
+
+    let base_instance = baseline.partial["$child"];
+    let seed_instance = seeded.partial["$child"];
+    assert_ne!(
+        base_instance, seed_instance,
+        "the fill changes the instance id"
+    );
+    let base_state = &baseline.partial_instances[&base_instance];
+    let seed_state = &seeded.partial_instances[&seed_instance];
+    assert!(base_state.set.entries.is_empty(), "no seed: an empty base");
+    assert_eq!(seed_state.set.entries.len(), 2);
+    assert_eq!(
+        seed_state
+            .set
+            .entries
+            .get(&("m.room.power_levels".to_owned(), String::new()))
+            .map(String::as_str),
+        Some("$pl")
+    );
+
+    // The id is a function of the state's own content and its recorded real
+    // parents (none: the root's only prev is missing), not of the seed.
+    assert!(seed_state.parents.is_empty());
+    assert_eq!(
+        seed_instance,
+        super::state_group_instance_id(
+            "!r:x",
+            &seed_state.parents,
+            &seed_state.set.lthash(),
+            derivation
+        ),
+        "the instance id matches the state and its real parents"
+    );
+    assert_eq!(seed_state.lthash, seed_state.set.lthash());
+    assert!(
+        !seeded.instances.contains_key(&seed_instance),
+        "the seeded state is not in the complete instance map"
+    );
+}
