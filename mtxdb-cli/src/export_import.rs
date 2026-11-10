@@ -138,6 +138,33 @@ fn report_reclaim_sync(
         t.journal_sync_calls,
         t.journal_records,
     );
+    // A full checkpoint is the largest single phase of a reclaim and the
+    // engine already records where its time went. Print it only when this
+    // sync actually wrote one, so a stale breakdown is never attributed to
+    // the current reclaim.
+    if t.checkpoint.is_zero() {
+        return;
+    }
+    let Some(c) = db.pool(pool).checkpoint_breakdown() else {
+        return;
+    };
+    eprintln!(
+        "  timing: reclaim checkpoint {pool:?}: pre sync {:?}, lock wait {:?}, locked sync {:?}, \
+         snapshot {:?}, serialize {:?}, write {:?}, dir sync {:?}, journal lsn {:?}, \
+         reclaim {:?}, retire {:?}, unaccounted {:?}, {} bytes",
+        c.pre_sync,
+        c.lock_wait,
+        c.locked_sync,
+        c.snapshot,
+        c.serialize,
+        c.write,
+        c.directory_sync,
+        c.journal_lsn,
+        c.reclaim,
+        c.retire,
+        c.unaccounted(),
+        c.checkpoint_bytes,
+    );
 }
 
 /// Allowance per staged record for keys and framing, on top of its value.
