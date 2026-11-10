@@ -8,7 +8,7 @@ printf '%-12s %7s %6s %8s %8s %8s %8s %6s %7s %7s %5s\n' label events users wall
 for spec in "$@"; do
   IFS=: read -r label mode events users <<<"$spec"
   rm -rf "$W/in" "$W/db"
-  "$GEN" --mode "$mode" --events "$events" --users "$users" --out "$W/in" 2>/dev/null
+  "$GEN" --mode "$mode" --events "$events" --users "$users" ${GEN_FLAGS:-} --out "$W/in" 2>/dev/null
   "$BIN" -d "$W/db" init >/dev/null 2>&1
   MTXDB_IMPORT_TIMINGS=1 "$BIN" -d "$W/db" import "$W/in/server-keys.jsonl" "$W/in/room-gen.jsonl" >"$W/log.txt" 2>&1 &
   pid=$!; peak=0

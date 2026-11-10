@@ -13,6 +13,8 @@
 //! `room` mirrors the large real rooms: nearly every event is an
 //! `m.room.member` state event, mostly profile updates by users who already
 //! joined, with a few topic/name events, forks and up to three `prev_events`.
+//! `--message-per-mille` mixes in `m.room.message` timeline events, which is
+//! the shape of the message-heavy real rooms (about 20% state).
 //! `chain` emits one `m.room.power_levels` update after another, each naming
 //! the last as an auth event, so auth-closure size grows with the chain.
 
@@ -152,6 +154,7 @@ fn main() {
     let mut seed = 1u64;
     let mut fork_per_mille = 40u64;
     let mut state_per_mille = 1u64;
+    let mut message_per_mille = 0u64;
     let mut out_dir = PathBuf::from("gen-out");
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -163,6 +166,9 @@ fn main() {
             "--seed" => seed = value.parse().expect("--seed"),
             "--fork-per-mille" => fork_per_mille = value.parse().expect("--fork-per-mille"),
             "--state-per-mille" => state_per_mille = value.parse().expect("--state-per-mille"),
+            "--message-per-mille" => {
+                message_per_mille = value.parse().expect("--message-per-mille");
+            }
             "--out" => out_dir = PathBuf::from(value),
             other => panic!("unknown flag {other}"),
         }
@@ -287,6 +293,22 @@ fn main() {
                 obj(vec![(field, s(&format!("{field} {revision}")))]),
                 &prev_tips,
                 &[create.id.clone(), power.id.clone(), creator_join.id.clone()],
+            );
+        } else if joined >= 2 && rng.chance(message_per_mille) {
+            // A timeline event: no state key, so it leaves the state as it was.
+            let who = rng.below(joined);
+            let sender = user(who);
+            let previous = member[who].clone().expect("joined user has a member event");
+            made = gen.event(
+                "m.room.message",
+                None,
+                &sender,
+                obj(vec![
+                    ("body", s(&format!("message {revision}"))),
+                    ("msgtype", s("m.text")),
+                ]),
+                &prev_tips,
+                &[create.id.clone(), power.id.clone(), previous.0],
             );
         } else if joined < users && (joined < 2 || rng.chance(150)) {
             let who = joined;
