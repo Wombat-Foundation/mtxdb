@@ -1,4 +1,4 @@
-//! Materialize Matrix room state HAMTs in the Synapse/sithnapse wire format.
+//! Materialize Matrix room state HAMTs using rezzy's typed leaf codec.
 //!
 //! This mirrors the flat path of `sithnapse/rust/src/state_hamt.rs`: every
 //! distinct state set becomes a `MTHR\x01` root record whose internal nodes are
@@ -6,10 +6,8 @@
 //! unkeyed [`LtHash`] over the logical `(event_type, state_key, event_id)`
 //! entries is the state-group id, both in the aux index and inside the root.
 //!
-//! The record bytes are portable to Synapse; only the collection/node key
-//! layout is CLI-owned (`sithnapse` additionally keeps an integer state-group
-//! sequence, `room_index`, and reference-count nodes that this importer has no
-//! need for).
+//! Leaves store `(EventType, String)` keys with length-prefixed encoding.
+//! Collection and node addressing are owned by the CLI.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,7 +16,7 @@ use std::time::Instant;
 
 use mtxdb::storage::StorageEngine;
 use mtxdb::{derive_group_member_collection_id, DigestAlgorithm, MEMBER_NAMESPACE_STAT};
-use rezzy::hamt::{build_hamt_root_handle, HamtNode, NodeRef, PersistedInternalNode};
+use rezzy::hamt::{build_hamt_root_handle, HamtNode, NodeRef, PersistedInternalNode, StateHamtKey};
 use rezzy::incremental::LtHash;
 
 /// A materialized room state HAMT: its encoded root record and every
@@ -37,9 +35,8 @@ pub(crate) struct BuiltStateHamt {
 
 /// Build the flat state HAMT for one state set.
 ///
-/// `entry` triples are `(event_type, state_key, event_id)`. The leaf key is
-/// `serde_json`'s encoding of `(event_type, state_key)` so the on-disk bytes
-/// match Synapse exactly.
+/// `entry` triples are `(event_type, state_key, event_id)`. Leaf keys use
+/// rezzy's typed, length-prefixed `(EventType, String)` codec.
 ///
 /// # Errors
 /// Returns a description if `rezzy` cannot build the trie (e.g. a hash
@@ -78,7 +75,7 @@ pub(crate) fn build_state_hamt(
 /// Post-order walk collecting `(structural_hash, encoded node)` exactly once.
 /// Mirrors sithnapse's `collect_persisted_nodes`.
 fn collect_persisted_nodes(
-    node: &Arc<HamtNode<String, String>>,
+    node: &Arc<HamtNode<StateHamtKey, String>>,
     seen: &mut HashSet<[u8; 32]>,
     nodes: &mut Vec<([u8; 32], Vec<u8>)>,
 ) {
@@ -90,7 +87,7 @@ fn collect_persisted_nodes(
             collect_persisted_nodes(child_node, seen, nodes);
         }
     }
-    let persisted: PersistedInternalNode<String, String> = node.as_ref().into();
+    let persisted: PersistedInternalNode<StateHamtKey, String> = node.as_ref().into();
     nodes.push((node.structural_hash, persisted.encode_v1()));
 }
 
@@ -218,8 +215,9 @@ pub(crate) fn extract_state_edges(data: &[u8]) -> Option<Vec<[u8; 16]>> {
         return Some(edges);
     }
     if data.get(..4) == Some(rezzy::hamt::HAMT_NODE_MAGIC.as_slice()) {
-        let node = rezzy::hamt::PersistedInternalNode::<String, String>::decode_v1_unverified(data)
-            .ok()?;
+        let node =
+            rezzy::hamt::PersistedInternalNode::<StateHamtKey, String>::decode_v1_unverified(data)
+                .ok()?;
         return Some(
             node.child_hashes
                 .iter()
@@ -257,15 +255,14 @@ impl<'a> StateHamtReader<'a> {
     /// Collect every `(event_type, state_key, event_id)` entry under `root_hash`.
     ///
     /// # Errors
-    /// Returns an error when a node is absent, corrupt, or stores a leaf key
-    /// that is not the expected two-element JSON array.
+    /// Returns an error when a node is absent or corrupt.
     pub(crate) fn collect_entries(
         &mut self,
         root_hash: &[u8; 32],
     ) -> anyhow::Result<Vec<(String, String, String)>> {
         let store = self.store;
         let collection = self.collection;
-        let mut reader = rezzy::hamt::PersistedHamtReader::<String, String, _, _>::new(
+        let mut reader = rezzy::hamt::PersistedHamtReader::<StateHamtKey, String, _, _>::new(
             &self.structural_key,
             |hash: &[u8; 32]| {
                 let mut id = [0u8; 16];
@@ -280,13 +277,12 @@ impl<'a> StateHamtReader<'a> {
         let raw = reader
             .collect_entries(*root_hash)
             .map_err(|error| anyhow::anyhow!("could not read a state HAMT node: {error}"))?;
-        raw.into_iter()
-            .map(|(key, event_id)| {
-                let (event_type, state_key) = rezzy::hamt::decode_state_hamt_leaf_key(&key)
-                    .map_err(|error| anyhow::anyhow!("invalid HAMT leaf key {key:?}: {error}"))?;
-                Ok((event_type, state_key, event_id))
+        Ok(raw
+            .into_iter()
+            .map(|((event_type, state_key), event_id)| {
+                (event_type.as_str().to_owned(), state_key, event_id)
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -343,13 +339,10 @@ pub(crate) fn load_state_group_entries(
     Ok(Some(reader.collect_entries(&decoded.root_hash)?))
 }
 
-/// A two-element JSON array string of `(event_type, state_key)`, written by
-/// `rezzy`'s codec. It is byte-identical to Synapse's
-/// `serde_json::to_string(&(event_type, state_key))`; this crate has no
-/// `serde_json` dependency.
+/// The typed state key encoded by rezzy's length-prefixed HAMT codec.
 #[must_use]
-pub(crate) fn state_hamt_leaf_key(event_type: &str, state_key: &str) -> String {
-    rezzy::hamt::state_hamt_leaf_key(event_type, state_key)
+pub(crate) fn state_hamt_leaf_key(event_type: &str, state_key: &str) -> StateHamtKey {
+    (event_type.into(), state_key.to_owned())
 }
 
 #[cfg(test)]
@@ -488,10 +481,10 @@ mod tests {
     }
 
     #[test]
-    fn leaf_keys_match_json_array_encoding() {
+    fn leaf_keys_preserve_type_and_state_key() {
         assert_eq!(
             state_hamt_leaf_key("m.room\"name", "line\nkey"),
-            r#"["m.room\"name","line\nkey"]"#
+            ("m.room\"name".into(), "line\nkey".to_owned())
         );
         assert_eq!(room_hamt_prefix("!room:example.org").len(), 8);
     }
@@ -511,7 +504,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    type Node = Arc<HamtNode<String, String>>;
+    type Node = Arc<HamtNode<StateHamtKey, String>>;
     type Tuple = (String, String, String, u8);
     type Store = HashMap<[u8; 32], Vec<u8>>;
 
@@ -636,7 +629,7 @@ mod tests {
             .collect()
     }
 
-    fn mutations(tuples: &[Tuple]) -> Vec<(String, Option<String>)> {
+    fn mutations(tuples: &[Tuple]) -> Vec<(StateHamtKey, Option<String>)> {
         tuples
             .iter()
             .filter(|tuple| tuple.3 != 2)
@@ -669,7 +662,7 @@ mod tests {
             self.reads = add(self.reads, 1);
             let bytes = self.bytes.get(hash).expect("node stored");
             let node: Node = Arc::new(
-                PersistedInternalNode::<String, String>::decode_v1_verified(
+                PersistedInternalNode::<StateHamtKey, String>::decode_v1_verified(
                     bytes,
                     ROOM.as_bytes(),
                     *hash,
@@ -769,7 +762,7 @@ mod tests {
         tuples: &[Tuple],
         events: usize,
         label: &str,
-    ) -> (Vec<rezzy::hamt::ChainStep<String, String>>, Store) {
+    ) -> (Vec<rezzy::hamt::ChainStep<StateHamtKey, String>>, Store) {
         let applied = tuples.iter().filter(|tuple| tuple.3 != 2).count();
         let mut unresolved = |_: &[u8; 32]| -> Result<Node, ()> { Err(()) };
         let steps = rezzy::hamt::persist_chain(
@@ -879,7 +872,7 @@ mod tests {
     fn keyframe_rows(
         fx: &Fixture,
         tuples: &[Tuple],
-        steps: &[rezzy::hamt::ChainStep<String, String>],
+        steps: &[rezzy::hamt::ChainStep<StateHamtKey, String>],
         store: &Store,
         events: usize,
     ) {
@@ -902,7 +895,7 @@ mod tests {
                     }
                     let bytes = store.get(&hash).expect("reachable node stored");
                     stat_bytes = add(stat_bytes, bytes.len());
-                    let node = PersistedInternalNode::<String, String>::decode_v1_verified(
+                    let node = PersistedInternalNode::<StateHamtKey, String>::decode_v1_verified(
                         bytes,
                         ROOM.as_bytes(),
                         hash,
@@ -931,7 +924,7 @@ mod tests {
     fn put_many_rows(
         fx: &Fixture,
         tuples: &[Tuple],
-        steps: &[rezzy::hamt::ChainStep<String, String>],
+        steps: &[rezzy::hamt::ChainStep<StateHamtKey, String>],
         stored_nodes: &Store,
         k: usize,
         label: &str,
@@ -1083,7 +1076,7 @@ mod tests {
                 let mut id = [0; 16];
                 id.copy_from_slice(&hash[..16]);
                 stat_records.push((id, mtxdb::NodeData::from_slice(bytes)));
-                let node = PersistedInternalNode::<String, String>::decode_v1_verified(
+                let node = PersistedInternalNode::<StateHamtKey, String>::decode_v1_verified(
                     bytes,
                     ROOM.as_bytes(),
                     hash,
@@ -1220,7 +1213,7 @@ mod tests {
             .flatten()
             .expect("direct STAT node record");
         let node = Arc::new(
-            PersistedInternalNode::<String, String>::decode_v1_verified(
+            PersistedInternalNode::<StateHamtKey, String>::decode_v1_verified(
                 &bytes,
                 ROOM.as_bytes(),
                 *hash,
@@ -1254,7 +1247,7 @@ mod tests {
     fn replay_rows(
         fx: &Fixture,
         tuples: &[Tuple],
-        steps: &[rezzy::hamt::ChainStep<String, String>],
+        steps: &[rezzy::hamt::ChainStep<StateHamtKey, String>],
         store: &Store,
     ) {
         println!("K\tshape\tcache\tp50_us\tp99_us\tinserts_avg\tnode_reads_avg");
@@ -1345,7 +1338,7 @@ mod tests {
     struct ReplayContext<'a> {
         fx: &'a Fixture,
         tuples: &'a [Tuple],
-        steps: &'a [rezzy::hamt::ChainStep<String, String>],
+        steps: &'a [rezzy::hamt::ChainStep<StateHamtKey, String>],
         applied_by_event: Vec<usize>,
     }
 
@@ -1353,7 +1346,7 @@ mod tests {
         fn new(
             fx: &'a Fixture,
             tuples: &'a [Tuple],
-            steps: &'a [rezzy::hamt::ChainStep<String, String>],
+            steps: &'a [rezzy::hamt::ChainStep<StateHamtKey, String>],
         ) -> Self {
             let mut applied_by_event = Vec::with_capacity(add(tuples.len(), 1));
             applied_by_event.push(0);
@@ -1476,7 +1469,7 @@ mod tests {
 
     fn root_hash_at(
         fx: &Fixture,
-        steps: &[rezzy::hamt::ChainStep<String, String>],
+        steps: &[rezzy::hamt::ChainStep<StateHamtKey, String>],
         applied: usize,
     ) -> [u8; 32] {
         if applied == 0 {
