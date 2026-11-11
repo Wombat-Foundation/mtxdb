@@ -1869,6 +1869,28 @@ fn reclaim_below_base_is_a_noop() {
     fs::remove_file(path).unwrap();
 }
 
+/// A reclaim boundary past the last committed LSN would drop data no
+/// checkpoint covers; it is rejected and the segment is left untouched.
+#[test]
+fn reclaim_refuses_an_lsn_past_the_committed_frontier() {
+    let path = temp_path("reclaim_uncommitted");
+    let _ = fs::remove_file(&path);
+    let (mut journal, _) = Journal::open(&path).unwrap();
+    let only = journal.commit_group(&[put(1, 1, b"only")]).unwrap();
+    let before = fs::metadata(&path).unwrap().len();
+
+    let error = journal
+        .reclaim_through(only.last_lsn.saturating_add(1))
+        .expect_err("an uncommitted LSN cannot be reclaimed");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(fs::metadata(&path).unwrap().len(), before);
+
+    drop(journal);
+    let (_journal, scan) = Journal::open(&path).unwrap();
+    assert_eq!(scan.groups.len(), 1);
+    fs::remove_file(path).unwrap();
+}
+
 /// Dropping a sliver while copying a large suffix is skipped, and the cut that
 /// later covers the rest drops the whole segment with no copy.
 #[test]
@@ -3835,6 +3857,9 @@ fn a_failed_directory_sync_after_the_rewrite_poisons_the_journal() {
     journal
         .commit_group(&[put(1, 3, b"third")])
         .expect_err("a poisoned handle acknowledges nothing");
+    journal
+        .reclaim_through(first.last_lsn)
+        .expect_err("a poisoned handle must not rewrite the segment either");
     assert!(!path.with_extension("rotate").exists(), "no temp file left");
     drop(journal);
 

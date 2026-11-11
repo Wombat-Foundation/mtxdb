@@ -8,6 +8,7 @@ catch a module silently losing its tests, they do not ask for tests of
 defensive or unreachable lines. Raise a floor when coverage genuinely improves;
 never lower one to land a change without saying why in the commit.
 """
+
 import json
 import os
 import sys

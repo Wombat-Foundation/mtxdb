@@ -182,6 +182,127 @@ fn record_disk_len_rejects_truncated_frame_body() {
     ));
 }
 
+/// Overwrite bytes in a committed pack behind the mmap, so the next read sees
+/// them. Clearing the mapping first keeps the old snapshot from answering.
+fn corrupt_committed_bytes(shard: &Shard, offset: u64, bytes: &[u8]) {
+    *shard.mmap.write() = None;
+    crate::io::write_all_at(&shard.file, bytes, offset).unwrap();
+}
+
+fn frame_len_at(shard: &Shard, offset: u64) -> u32 {
+    let guard = shard.mmap().unwrap();
+    let mapping = guard.as_ref().expect("committed frame must be mapped");
+    let start = usize::try_from(offset).unwrap();
+    let prefix = mapping
+        .get(start..)
+        .and_then(|tail| tail.get(..4))
+        .expect("committed frame must have a length prefix");
+    u32::from_le_bytes(prefix.try_into().unwrap())
+}
+
+#[test]
+fn record_disk_len_rejects_an_impossible_length_prefix() {
+    let dir = test_dir("disk_len_bad_prefix");
+    let pool = ShardPool::open(dir).unwrap();
+    let (slot, offset) = pool
+        .put_record(&test_record(0x01, 0xAA, b"bad prefix"))
+        .unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    pool.flush_all().unwrap();
+
+    // A zero length can never hold the fixed frame header.
+    corrupt_committed_bytes(&shard, offset, &0_u32.to_le_bytes());
+    let error = ShardPool::record_disk_len_at(&shard, offset)
+        .expect_err("an impossible length prefix must be corrupt");
+    assert!(matches!(error, crate::storage::StorageError::Corrupt(_)));
+
+    // An offset at or past the committed frontier has no prefix at all.
+    let past_end = shard.file_len();
+    let error = ShardPool::record_disk_len_at(&shard, past_end)
+        .expect_err("a prefix past the frontier must be corrupt");
+    assert!(matches!(error, crate::storage::StorageError::Corrupt(_)));
+}
+
+#[test]
+fn read_at_committed_rejects_bad_prefixes_flags_and_truncation() {
+    let dir = test_dir("committed_read_corruption");
+    let pool = ShardPool::open(dir).unwrap();
+    let (slot, offset) = pool
+        .put_record(&test_record(0x01, 0xAA, b"corrupt me"))
+        .unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    pool.flush_all().unwrap();
+    let good_len = frame_len_at(&shard, offset);
+
+    corrupt_committed_bytes(&shard, offset, &0_u32.to_le_bytes());
+    let error = ShardPool::read_at_committed(&shard, offset, false)
+        .expect_err("a zero length prefix must be corrupt");
+    assert!(matches!(error, crate::storage::StorageError::Corrupt(_)));
+
+    corrupt_committed_bytes(&shard, offset, &u32::MAX.to_le_bytes());
+    let error = ShardPool::read_at_committed(&shard, offset, false)
+        .expect_err("an oversized length prefix must be corrupt");
+    assert!(matches!(error, crate::storage::StorageError::Corrupt(_)));
+
+    // Restore a valid length, then poison the frame's flags byte.
+    corrupt_committed_bytes(&shard, offset, &good_len.to_le_bytes());
+    corrupt_committed_bytes(&shard, offset + 4, &[0xFF]);
+    let error = ShardPool::read_at_committed(&shard, offset, false)
+        .expect_err("unknown flag bits must be corrupt");
+    assert!(matches!(
+        error,
+        crate::storage::StorageError::Corrupt(ref message)
+            if message.contains("unsupported record flags")
+    ));
+
+    // A frame that runs past the committed frontier is truncated.
+    let past_end = shard.file_len();
+    let error = ShardPool::read_at_committed(&shard, past_end, false)
+        .expect_err("a read past the frontier must be corrupt");
+    assert!(matches!(
+        error,
+        crate::storage::StorageError::Corrupt(ref message)
+            if message.contains("truncated length prefix")
+    ));
+
+    let len = shard.file.metadata().unwrap().len();
+    shard.file.set_len(len - 1).unwrap();
+    *shard.mmap.write() = None;
+    let error = ShardPool::read_at_committed(&shard, offset, false)
+        .expect_err("a frame whose tail is gone must be corrupt");
+    assert!(matches!(
+        error,
+        crate::storage::StorageError::Corrupt(ref message) if message.contains("truncated frame")
+    ));
+}
+
+#[test]
+fn record_identity_at_rejects_a_damaged_removal_crc() {
+    let dir = test_dir("identity_removal_crc");
+    let pool = ShardPool::open(dir).unwrap();
+    let mut record = test_record(0x02, 0xBB, b"");
+    record.metadata = Some(crate::packfile::FrameMetadata {
+        removed: true,
+        ..crate::packfile::FrameMetadata::default()
+    });
+    let (slot, offset) = pool.put_record(&record).unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    pool.flush_all().unwrap();
+
+    // The removal answer alone is CRC-checked, so a damaged removal flag must
+    // fail closed rather than report a live record as removed (or vice versa).
+    let frame_len = frame_len_at(&shard, offset);
+    let crc_pos = offset + 4 + u64::from(frame_len);
+    corrupt_committed_bytes(&shard, crc_pos, &[0xFF]);
+    let error = pool
+        .record_identity_at(&shard, offset)
+        .expect_err("a damaged removal CRC must be corrupt");
+    assert!(matches!(
+        error,
+        crate::storage::StorageError::Corrupt(ref message) if message.contains("CRC mismatch")
+    ));
+}
+
 #[test]
 fn test_sync_dirty_noop_when_nothing_written() {
     let dir = test_dir("sync_dirty_noop");

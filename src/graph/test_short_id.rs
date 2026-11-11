@@ -17,6 +17,21 @@ fn index() -> ShortIdIndex {
     ShortIdIndex::new(POOL, SCOPE)
 }
 
+/// Retry the engine's retryable `WouldBlock`, as a caller must when another
+/// writer is mid-commit. The stress tests below deliberately create that
+/// contention; the retry budget inside `get_or_create`/`record_events` is
+/// finite, so they cannot treat exhaustion as a test failure.
+fn retry_would_block<T>(mut operation: impl FnMut() -> Result<T, StorageError>) -> T {
+    for _ in 0..1_000 {
+        match operation() {
+            Ok(value) => return value,
+            Err(error) if error.is_would_block() => std::thread::yield_now(),
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+    panic!("the operation kept reporting WouldBlock");
+}
+
 #[test]
 fn allocation_is_dense_stable_and_idempotent() {
     let root = test_root("alloc");
@@ -96,7 +111,11 @@ fn concurrent_allocators_never_share_or_duplicate_ids() {
                     for round in 0..20 {
                         // Overlapping keys across threads.
                         let key = format!("$k{}", (round + thread) % 25);
-                        let id = index().get_or_create(db, &[key.as_bytes()]).unwrap()[0];
+                        let id = retry_would_block(|| {
+                            index()
+                                .get_or_create(db, &[key.as_bytes()])
+                                .map(|ids| ids[0])
+                        });
                         out.push((key, id));
                     }
                     out
@@ -365,7 +384,7 @@ fn racing_writers_log_each_owner_once() {
             let keys = keys.clone();
             std::thread::spawn(move || {
                 for key in &keys {
-                    index().record_events(&db, &[owned(key, key)]).unwrap();
+                    retry_would_block(|| index().record_events(&db, &[owned(key, key)]));
                 }
             })
         })

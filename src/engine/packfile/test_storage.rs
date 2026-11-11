@@ -2048,6 +2048,59 @@ fn test_walk_ancestors_stops_at_boundary() {
 }
 
 #[test]
+fn test_walk_ancestors_of_an_unknown_collection_is_empty() {
+    let dir = test_dir("walk_unknown_collection");
+    let store = PackfileStorage::open(dir).unwrap();
+
+    let mut walk = store
+        .walk_ancestors(
+            &[0x77; 16],
+            &[distinct_id(1)],
+            &[],
+            |_, _| Vec::new(),
+            WalkLimits::default(),
+        )
+        .unwrap();
+    assert!(
+        walk.next().is_none(),
+        "a collection the store has never seen walks to nothing, not an error"
+    );
+}
+
+#[test]
+fn test_walk_ancestors_rejects_a_cyclic_graph() {
+    let dir = test_dir("walk_cycle");
+    let store = PackfileStorage::open(dir).unwrap();
+    let a = distinct_id(1);
+    let b = distinct_id(2);
+    for id in [a, b] {
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"cycle")),
+            )
+            .unwrap();
+    }
+
+    // Two nodes that name each other: an event graph must be acyclic, and a
+    // corrupt edge set must fail closed instead of looping or ordering nodes
+    // that have no valid replay order.
+    let extract = |hash: &[u8; 16], _data: &[u8]| {
+        if *hash == a {
+            vec![b]
+        } else {
+            vec![a]
+        }
+    };
+    let result = store.walk_ancestors(&TEST_COLLECTION, &[a], &[], extract, WalkLimits::default());
+    let Err(error) = result else {
+        panic!("a cyclic adjacency must be reported as corruption");
+    };
+    assert!(matches!(error, StorageError::Corrupt(_)));
+}
+
+#[test]
 fn test_walk_ancestors_branching_dag() {
     let dir = test_dir("walk_branch");
     let store = PackfileStorage::open(dir).unwrap();
