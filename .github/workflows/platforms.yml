@@ -151,9 +151,32 @@ jobs:
             QEMU_PAGESIZE: ${{ matrix.page_size }}
             CARGO_NET_GIT_FETCH_WITH_CLI: "true"
           install: |
-            apt-get update
-            apt-get install -y build-essential curl ca-certificates git pkg-config libzstd-dev
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            set -eu
+            # This step runs inside `docker build`, which resolves package
+            # hosts through the runner's resolver. That resolver occasionally
+            # fails to resolve ports.ubuntu.com for a few seconds and turns a
+            # transient network hiccup into a failed job, so retry the index
+            # fetch and the downloads instead of failing on the first error.
+            apt_retry() {
+              attempt=1
+              while ! apt-get -o Acquire::Retries=5 "$@"; do
+                if [ "$attempt" -ge 5 ]; then
+                  return 1
+                fi
+                attempt=$((attempt + 1))
+                sleep 10
+              done
+            }
+            apt_retry update
+            apt_retry install -y build-essential curl ca-certificates git pkg-config libzstd-dev
+            attempt=1
+            while ! curl --retry 5 --retry-delay 5 --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; do
+              if [ "$attempt" -ge 3 ]; then
+                exit 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 10
+            done
           run: |
             set -eu
             export PATH="/opt/cargo/bin:$HOME/.cargo/bin:$PATH"
