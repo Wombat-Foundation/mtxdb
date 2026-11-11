@@ -552,6 +552,8 @@ impl PackIndex {
     /// renaming it fails. On Unix, a parent-directory sync error may be
     /// returned after the new file is visible.
     pub fn write_atomic(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("sidecar.publish", path);
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

@@ -31,3 +31,4 @@ docs/*.md
 *.pack
 *.idx
 db.meta
+/*.log

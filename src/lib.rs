@@ -304,3 +304,6 @@ pub use timeline::{
     event_id_ref, room_scope_id, timeline_collection_id, EventRef, TimelineCursor, TimelineEntry,
     TimelineIndex, TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
 };
+
+#[cfg(test)]
+mod test_trace;

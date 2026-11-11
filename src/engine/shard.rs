@@ -595,6 +595,8 @@ impl Shard {
     /// the fsync began, so the fsync covers it, while bytes appended during the
     /// fsync stay owed to the next one.
     fn fsync_advancing_watermark(&self, data_only: bool) -> io::Result<()> {
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("pack.fsync", &self.path);
         let covered = self.file_len();
         if data_only {
             self.file.sync_data()?;
@@ -2252,6 +2254,8 @@ impl ShardPool {
         siblings: &[packfile::PackId],
         creation_seq: u32,
     ) -> io::Result<(File, PathBuf, packfile::PackId)> {
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("pack.create", base_dir);
         let pack_id = packfile::PackId::random();
         let path = Self::pack_path(base_dir, &pack_id, siblings);
         let unique = PACK_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);

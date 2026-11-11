@@ -483,6 +483,8 @@ impl CsrStore {
         scope: ScopeId,
         keys: &[(EdgeFamily, u32)],
     ) -> io::Result<Vec<Option<Vec<Edge>>>> {
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("csr.read_rows_with_lock", self.dir());
         self.with_read_lock(|| self.read_rows_locked(scope, keys))
     }
 
