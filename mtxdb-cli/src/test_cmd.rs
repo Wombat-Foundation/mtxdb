@@ -9843,6 +9843,7 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     assert_eq!(page.entries, page_after.entries);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn evict_database_pages_succeeds_on_valid_store() {
     let root = unique_temp_dir();
@@ -9855,6 +9856,16 @@ fn evict_database_pages_succeeds_on_valid_store() {
     let (files, bytes) = crate::cmd::evict_database_pages(&root).unwrap();
     assert!(files > 0);
     assert!(bytes > 0);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn evict_database_pages_reports_unsupported_platform() {
+    let error = crate::cmd::evict_database_pages(Path::new(".")).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "`memory --evict-pages` is currently supported only on Linux"
+    );
 }
 
 #[test]
