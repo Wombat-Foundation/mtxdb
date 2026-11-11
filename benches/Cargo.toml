@@ -29,7 +29,7 @@ memmap2 = "0.9"
 fjall = "2.11.2"
 libmdbx = "0.6"
 base64 = "0.22"
-mtxdb = { path = "..", features = ["reconcile"] }
+mtxdb = { path = "..", features = ["reconcile", "test-util"] }
 rusqlite = "0.32"
 
 [target.'cfg(windows)'.dependencies]
@@ -161,6 +161,12 @@ harness = false
 [[bench]]
 name = "index_segments"
 path = "index_segments.rs"
+harness = false
+
+# Does a rotation wait for a pack-index build when builders fall behind?
+[[bench]]
+name = "seal_rotation"
+path = "seal_rotation.rs"
 harness = false
 
 # Append-path A/B: eager vs buffered pack writes, per-record vs batched WAL.

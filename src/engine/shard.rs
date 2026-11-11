@@ -1,5 +1,5 @@
 use fs2::FileExt as _;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memmap2::Mmap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::index::{packidx, run};
 use crate::packfile::{self, PackId, Record};
@@ -729,8 +729,8 @@ pub struct ShardPool {
     bucket_seed: u64,
     /// Shard IDs written to since the last sync, for scoped fsync.
     dirty: parking_lot::Mutex<HashSet<u16>>,
-    /// Detached sidecar builders; joined on clean pool shutdown.
-    seal_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Fixed worker pool that builds pack-index sidecars off the write path.
+    seal_queue: Arc<SealQueue>,
     /// Packs whose sidecar has been durably published since the last drain.
     ///
     /// A pack is marked `sealed` before its sidecar exists, so this queue is
@@ -794,7 +794,7 @@ pub struct ShardPool {
     run_merge_active: Arc<AtomicBool>,
     /// Cancellation signal for any in-flight run merge.
     run_merge_stop: Arc<AtomicBool>,
-    /// The in-flight run merge, if any. Kept apart from `seal_workers` so a
+    /// The in-flight run merge, if any. Kept apart from `seal_queue` so a
     /// sync, which waits for sidecar builders, never waits for a merge.
     run_merge_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Fully published run files waiting for the storage layer to validate
@@ -1525,6 +1525,7 @@ impl ShardPool {
             .saturating_add(timings.metadata_restore);
         timings.unattributed = timings.total.saturating_sub(named_phases);
 
+        let sealed_ready = Arc::new(Mutex::new(Vec::new()));
         Self {
             shards: RwLock::new(shards),
             active_write: parking_lot::Mutex::new(highest_active),
@@ -1534,8 +1535,8 @@ impl ShardPool {
             max_shard_bytes,
             bucket_seed,
             dirty: parking_lot::Mutex::new(HashSet::new()),
-            seal_workers: Mutex::new(Vec::new()),
-            sealed_ready: Arc::new(Mutex::new(Vec::new())),
+            seal_queue: SealQueue::new(Arc::clone(&sealed_ready)),
+            sealed_ready,
             retired_count: AtomicU64::new(0),
             stats_snapshots: AtomicU64::new(0),
             collection_home: RwLock::new(HashMap::new()),
@@ -3288,66 +3289,29 @@ impl ShardPool {
             }
             self.flush_shard_with_guard(shard, &guard)?;
         }
-        let mut workers = self.seal_workers.lock();
-        let mut pending = Vec::with_capacity(workers.len());
-        for existing in workers.drain(..) {
-            if existing.is_finished() {
-                let _ = existing.join();
-            } else {
-                pending.push(existing);
-            }
-        }
-        // When all builder slots are occupied, rotation waits for the oldest
-        // sidecar build here. A build scans the whole pack (up to
-        // `MAX_SHARD_BYTES`), so this can stall the rotating writer; that is
-        // the accepted cost of bounding both active builders and spawned
-        // threads. Do this before spawning the replacement worker. Moving the
-        // join off the write path is specified in
-        // `docs/docs/2026-11-11-seal-rotation-stall.md`.
-        while pending.len() >= MAX_SEAL_WORKERS {
-            let oldest = pending.remove(0);
-            let _ = oldest.join();
-        }
-        let shard = Arc::clone(shard);
-        let sealed_ready = Arc::clone(&self.sealed_ready);
-        let worker = std::thread::Builder::new()
-            .name("mtxdb-pack-index".to_owned())
-            .spawn(move || {
-                if !shard.is_current.load(Ordering::Acquire) {
-                    return;
-                }
-                let result = {
-                    let _sync_guard = shard.sync_lock.lock();
-                    shard.fsync_advancing_watermark(false)
-                }
-                .and_then(|()| packidx::build_and_write(&shard.path, true));
-                match result {
-                    // The sidecar's rename is durable; a reader can find this
-                    // pack now. Announce it only at that point.
-                    Ok(()) => sealed_ready.lock().push((shard.slot, shard.pack_id)),
-                    Err(error) => {
-                        if shard.is_current.load(Ordering::Acquire) {
-                            eprintln!(
-                                "mtxdb: pack index for {} could not be written: {error}",
-                                shard.path.display()
-                            );
-                        }
-                    }
-                }
-            })?;
-        // A completed sidecar is announced through `sealed_ready` exactly as
-        // usual, whether it finished before or after the cap was reached.
-        pending.push(worker);
-        *workers = pending;
-        Ok(())
+        // Queue the sidecar build and return: the writer never waits for a
+        // pack scan. Neither `rotation_lock` nor the queue lock is held
+        // across the fsync or the scan, which run on the pool's workers.
+        self.seal_queue.submit(shard)
     }
 
-    /// Block until all in-flight background pack index sidecars have been written.
+    /// Snapshot of the background sidecar build queue.
+    pub fn seal_backlog(&self) -> SealBacklog {
+        self.seal_queue.backlog()
+    }
+
+    /// Delay every sidecar build by `delay` so a benchmark can make builders
+    /// fall behind writers reproducibly. Not for production use.
+    #[cfg(feature = "test-util")]
+    pub fn set_seal_build_delay(&self, delay: Duration) {
+        let ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.seal_queue.build_delay_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Block until every sidecar build submitted before this call has
+    /// completed or been skipped. Later submissions do not extend the wait.
     pub fn wait_for_seals(&self) {
-        let workers = std::mem::take(&mut *self.seal_workers.lock());
-        for worker in workers {
-            let _ = worker.join();
-        }
+        self.seal_queue.wait();
     }
 
     /// Drain packs whose sidecars were durably published since the last call.
@@ -3817,12 +3781,224 @@ impl ShardPool {
     }
 }
 
+/// One queued sidecar build.
+struct SealJob {
+    seq: u64,
+    shard: Arc<Shard>,
+}
+
+#[derive(Default)]
+struct SealState {
+    queue: VecDeque<SealJob>,
+    /// Sequence numbers of queued or running jobs, with their packs.
+    pending: BTreeMap<u64, PackId>,
+    /// Packs with a queued or running job; a pack has at most one.
+    outstanding: HashSet<PackId>,
+    running: usize,
+    next_seq: u64,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    stop: bool,
+    /// Test hook: workers leave queued jobs alone while set.
+    #[cfg(test)]
+    held: bool,
+}
+
+/// Fixed pool of at most [`MAX_SEAL_WORKERS`] threads that fsync sealed packs
+/// and build their sidecars, fed by a FIFO queue deduplicated by [`PackId`].
+///
+/// The sidecar is disposable (packs stay authoritative), so a skipped or
+/// failed job costs read speed only. Queue length is bounded by the number
+/// of distinct packs: a pack is queued at most once and a retired pack's job
+/// is dropped when dequeued.
+struct SealQueue {
+    state: Mutex<SealState>,
+    /// Signals workers that a job (or stop) is available.
+    work: Condvar,
+    /// Signals waiters that a job finished.
+    done: Condvar,
+    sealed_ready: Arc<Mutex<Vec<(u16, PackId)>>>,
+    /// Artificial delay before each build, in milliseconds. Lets a benchmark
+    /// saturate the workers reproducibly.
+    #[cfg(feature = "test-util")]
+    build_delay_ms: AtomicU64,
+}
+
+/// Point-in-time view of the sidecar build queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SealBacklog {
+    /// Jobs waiting for a worker.
+    pub queued: usize,
+    /// Jobs a worker is running.
+    pub running: usize,
+    /// Worker threads started so far (at most `MAX_SEAL_WORKERS`).
+    pub workers: usize,
+}
+
+impl SealQueue {
+    fn new(sealed_ready: Arc<Mutex<Vec<(u16, PackId)>>>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SealState::default()),
+            work: Condvar::new(),
+            done: Condvar::new(),
+            sealed_ready,
+            #[cfg(feature = "test-util")]
+            build_delay_ms: AtomicU64::new(0),
+        })
+    }
+
+    fn backlog(&self) -> SealBacklog {
+        let state = self.state.lock();
+        SealBacklog {
+            queued: state.queue.len(),
+            running: state.running,
+            workers: state.workers.len(),
+        }
+    }
+
+    /// Queue a build for `shard` and return without waiting for it.
+    fn submit(self: &Arc<Self>, shard: &Arc<Shard>) -> io::Result<()> {
+        let mut state = self.state.lock();
+        if state.stop || state.outstanding.contains(&shard.pack_id) {
+            return Ok(());
+        }
+        let seq = state.next_seq;
+        // Sequence numbers fence `wait`; reusing one would let a job escape
+        // it, so exhaustion is an error rather than a wrap or a saturation.
+        state.next_seq = seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("seal job sequence exhausted"))?;
+        state.outstanding.insert(shard.pack_id);
+        state.pending.insert(seq, shard.pack_id);
+        state.queue.push_back(SealJob {
+            seq,
+            shard: Arc::clone(shard),
+        });
+        let busy = state.running.saturating_add(state.queue.len());
+        if state.workers.len() < MAX_SEAL_WORKERS && busy > state.workers.len() {
+            let queue = Arc::clone(self);
+            match std::thread::Builder::new()
+                .name("mtxdb-pack-index".to_owned())
+                .spawn(move || queue.worker_loop())
+            {
+                Ok(handle) => state.workers.push(handle),
+                Err(error) if state.workers.is_empty() => {
+                    // Nothing will ever run this job; do not strand it.
+                    state.queue.pop_back();
+                    state.pending.remove(&seq);
+                    state.outstanding.remove(&shard.pack_id);
+                    return Err(error);
+                }
+                // An existing worker will get to it.
+                Err(_) => {}
+            }
+        }
+        drop(state);
+        self.work.notify_one();
+        Ok(())
+    }
+
+    fn worker_loop(self: Arc<Self>) {
+        loop {
+            let job = {
+                let mut state = self.state.lock();
+                loop {
+                    #[cfg(test)]
+                    if state.held && !state.stop {
+                        self.work.wait(&mut state);
+                        continue;
+                    }
+                    if let Some(job) = state.queue.pop_front() {
+                        state.running = state.running.saturating_add(1);
+                        break job;
+                    }
+                    if state.stop {
+                        return;
+                    }
+                    self.work.wait(&mut state);
+                }
+            };
+            // A panic in the build must not strand the job or shrink the pool.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run(&job.shard)));
+            let mut state = self.state.lock();
+            state.running = state.running.saturating_sub(1);
+            state.pending.remove(&job.seq);
+            state.outstanding.remove(&job.shard.pack_id);
+            drop(state);
+            self.done.notify_all();
+        }
+    }
+
+    fn run(&self, shard: &Arc<Shard>) {
+        // A pack retired while queued is skipped, not announced.
+        if !shard.is_current.load(Ordering::Acquire) {
+            return;
+        }
+        #[cfg(feature = "test-util")]
+        {
+            let delay = self.build_delay_ms.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
+        let result = {
+            let _sync_guard = shard.sync_lock.lock();
+            shard.fsync_advancing_watermark(false)
+        }
+        .and_then(|()| packidx::build_and_write(&shard.path, true));
+        match result {
+            // The sidecar's rename is durable; a reader can find this pack
+            // now. Announce it only at that point, and only if it is still
+            // the pack that owns the slot.
+            Ok(()) if shard.is_current.load(Ordering::Acquire) => {
+                self.sealed_ready.lock().push((shard.slot, shard.pack_id));
+            }
+            Ok(()) => {}
+            Err(error) => {
+                if shard.is_current.load(Ordering::Acquire) {
+                    eprintln!(
+                        "mtxdb: pack index for {} could not be written: {error}",
+                        shard.path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Wait for every job submitted so far (the fence) to finish.
+    fn wait(&self) {
+        let mut state = self.state.lock();
+        let fence = state.next_seq;
+        while state.pending.keys().next().is_some_and(|&seq| seq < fence) {
+            self.done.wait(&mut state);
+        }
+    }
+
+    /// Drain submitted work, stop the workers and join them.
+    fn shutdown(&self) {
+        #[cfg(test)]
+        {
+            self.state.lock().held = false;
+            self.work.notify_all();
+        }
+        self.wait();
+        let workers = {
+            let mut state = self.state.lock();
+            state.stop = true;
+            std::mem::take(&mut state.workers)
+        };
+        self.work.notify_all();
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl Drop for ShardPool {
     /// Best-effort final flush of IO/sync stats. Errors are swallowed —
     /// a failed stats write on shutdown must never panic or mask the
     /// original error path the caller was already on.
     fn drop(&mut self) {
-        self.wait_for_seals();
+        self.seal_queue.shutdown();
         self.stop_run_merge();
         let _ = self.wait_for_run_merge();
         self.persist_stats_best_effort();

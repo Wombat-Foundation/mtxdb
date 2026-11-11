@@ -1839,3 +1839,111 @@ fn lock_holder_info_parses_markers_and_rejects_garbage() {
     fs::write(&path, format!("{} 12345", std::process::id())).unwrap();
     assert!(ShardPool::lock_holder_info(&path).unwrap().has_starttime);
 }
+
+/// Rotate `n` times and return the packs left behind, each with a record so
+/// there is something to index.
+fn rotate_out_packs(pool: &ShardPool, n: u8) -> Vec<Arc<Shard>> {
+    (0..n)
+        .map(|i| {
+            let (slot, _) = pool
+                .put_record(&test_record(i.saturating_add(1), i, b"sealed by rotation"))
+                .unwrap();
+            let shard = pool.get_shard(slot).unwrap();
+            pool.rotate().unwrap();
+            shard
+        })
+        .collect()
+}
+
+fn hold_seal_workers(pool: &ShardPool, held: bool) {
+    pool.seal_queue.state.lock().held = held;
+    pool.seal_queue.work.notify_all();
+}
+
+/// With every worker blocked, sealing more packs than there are workers must
+/// not make the writer wait, and every pack is announced once released.
+#[test]
+fn seal_queue_does_not_block_the_writer_and_drains_later() {
+    let pool = ShardPool::open(test_dir("seal_queue_blocked")).unwrap();
+    hold_seal_workers(&pool, true);
+    let packs = rotate_out_packs(&pool, u8::try_from(MAX_SEAL_WORKERS).unwrap() + 3);
+    // Sealing twice is still one job.
+    for shard in &packs {
+        pool.seal_pack(shard).unwrap();
+        pool.seal_pack(shard).unwrap();
+    }
+    assert_eq!(pool.seal_queue.state.lock().pending.len(), packs.len());
+    assert!(pool.take_sealed_ready().is_empty());
+
+    hold_seal_workers(&pool, false);
+    pool.wait_for_seals();
+    let ready = pool.take_sealed_ready();
+    assert_eq!(ready.len(), packs.len());
+    for shard in &packs {
+        assert!(ready.contains(&(shard.slot, shard.pack_id)));
+        assert!(packidx::pack_index_path(&shard.path).exists());
+    }
+    assert!(pool.seal_queue.state.lock().workers.len() <= MAX_SEAL_WORKERS);
+}
+
+/// A pack retired while its job is queued is skipped and never announced; the
+/// other queued packs are still built.
+#[test]
+fn seal_queue_skips_a_pack_retired_while_queued() {
+    let pool = ShardPool::open(test_dir("seal_queue_retired")).unwrap();
+    hold_seal_workers(&pool, true);
+    let packs = rotate_out_packs(&pool, 2);
+    for shard in &packs {
+        pool.seal_pack(shard).unwrap();
+    }
+    packs[0].is_current.store(false, Ordering::Release);
+    hold_seal_workers(&pool, false);
+    pool.wait_for_seals();
+    let ready = pool.take_sealed_ready();
+    assert_eq!(ready, vec![(packs[1].slot, packs[1].pack_id)]);
+    assert!(pool.seal_queue.state.lock().pending.is_empty());
+    assert!(pool.seal_queue.state.lock().outstanding.is_empty());
+}
+
+/// Dropping the pool drains submitted work and joins the workers.
+#[test]
+fn seal_queue_shutdown_drains_and_joins() {
+    let dir = test_dir("seal_queue_shutdown");
+    let pool = ShardPool::open(dir).unwrap();
+    hold_seal_workers(&pool, true);
+    let packs = rotate_out_packs(&pool, 3);
+    for shard in &packs {
+        pool.seal_pack(shard).unwrap();
+    }
+    let paths: Vec<_> = packs.iter().map(|s| s.path.clone()).collect();
+    drop(packs);
+    drop(pool);
+    for path in paths {
+        assert!(packidx::pack_index_path(&path).exists());
+    }
+}
+
+/// Killed with sidecars never built, reopen recovers through the frame
+/// scanner and the data is intact.
+#[test]
+fn seal_queue_unbuilt_sidecar_recovers_by_scan() {
+    let dir = test_dir("seal_queue_crash");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let record = test_record(1, 7, b"survives a missing sidecar");
+    let (slot, offset) = pool.put_record(&record).unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    pool.rotate().unwrap();
+    pool.sync_all().unwrap();
+    let path = shard.path.clone();
+    // Rotation alone does not seal, so no sidecar was ever built.
+    drop(shard);
+    drop(pool);
+    assert!(!packidx::pack_index_path(&path).exists());
+
+    let pool = ShardPool::open(dir).unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    assert_eq!(
+        pool.read_at(&shard, offset, true).unwrap().data,
+        record.data
+    );
+}

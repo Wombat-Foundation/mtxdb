@@ -361,6 +361,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "fs2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -413,6 +419,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "hashlink"
@@ -601,6 +610,7 @@ name = "mtxdb"
 version = "0.1.0-beta.3"
 dependencies = [
  "arc-swap",
+ "base64 0.23.1",
  "blake3",
  "bytes",
  "crc32fast",
@@ -608,6 +618,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "parking_lot",
+ "rezzy",
  "rezzy-recon",
  "sha2",
  "zstd",
@@ -770,9 +781,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rezzy"
+version = "0.6.0-rc.1"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1bc16afd10f7b68b7ecd9fdd0e813c7211615bea"
+dependencies = [
+ "base64 0.23.1",
+ "blake3",
+ "hashbrown 0.17.1",
+ "rezzy-json",
+ "rezzy-log",
+ "rezzy-recon",
+ "sha2",
+]
+
+[[package]]
+name = "rezzy-json"
+version = "0.6.0-rc.1"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1bc16afd10f7b68b7ecd9fdd0e813c7211615bea"
+dependencies = [
+ "ryu",
+]
+
+[[package]]
 name = "rezzy-log"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#e2e521e698f91afda576596a299803e5ea4b59d7"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1bc16afd10f7b68b7ecd9fdd0e813c7211615bea"
 dependencies = [
  "tracing",
 ]
@@ -780,7 +813,7 @@ dependencies = [
 [[package]]
 name = "rezzy-recon"
 version = "0.6.0-rc.1"
-source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#e2e521e698f91afda576596a299803e5ea4b59d7"
+source = "git+https://gitlab.com/wombat-foundation/rezzy.git?branch=dev#1bc16afd10f7b68b7ecd9fdd0e813c7211615bea"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -835,6 +868,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "scopeguard"
