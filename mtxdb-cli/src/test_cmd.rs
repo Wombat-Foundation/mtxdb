@@ -10642,6 +10642,10 @@ fn seeding_experiment_on_minic10y() {
         })
         .collect();
     files.sort();
+    assert_eq!(files.len(), 16, "expected the 16 minic10y room exports");
+    let key_bytes = std::fs::read(dir.join("server-keys.jsonl")).expect("signing key export");
+    let key_records = crate::interchange::parse_keys(&key_bytes).expect("signing key records");
+    let signature_keys = crate::export_import::SignatureKeyCatalog::from_records(&key_records);
 
     let mut total = [0u64; 12];
     let mut rejected_total = 0u64;
@@ -10669,8 +10673,9 @@ fn seeding_experiment_on_minic10y() {
 
         // Baseline: the findings plus judged walk the importer runs, so the
         // seed filter sees the final verdict set rather than an empty guess.
-        let findings = crate::export_import::derived_auth_findings_with_keys(&export, None)
-            .expect("auth findings");
+        let findings =
+            crate::export_import::derived_auth_findings_with_keys(&export, Some(&signature_keys))
+                .expect("auth findings");
         let mut baseline_rejected = crate::export_import::rejected_event_ids(&export, &findings);
         let mut baseline_walk_rejections = HashMap::new();
         let (baseline, _) = super::compute_import_auth_before(
@@ -10712,6 +10717,7 @@ fn seeding_experiment_on_minic10y() {
             final_rejected, seeded_rejected,
             "{room}: the seed changed the verdict set"
         );
+        assert_eq!(baseline_walk_rejections, seeded_walk_rejections);
         rejected_total = rejected_total.saturating_add(final_rejected.len() as u64);
 
         assert_eq!(
