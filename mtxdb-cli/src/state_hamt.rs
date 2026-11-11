@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use mtxdb::storage::StorageEngine;
 use mtxdb::{derive_group_member_collection_id, DigestAlgorithm, MEMBER_NAMESPACE_STAT};
-use rezzy::hamt::{build_hamt_root_handle, HamtNode, NodeRef, PersistedInternalNode, StateHamtKey};
+use rezzy::hamt::{HamtNode, NodeRef, PersistedInternalNode, StateHamtKey};
 use rezzy::incremental::LtHash;
 
 /// A materialized room state HAMT: its encoded root record and every
@@ -46,7 +46,7 @@ pub(crate) fn build_state_hamt(
     room_prefix: &[u8],
     entries: &[(String, String, String)],
 ) -> Result<BuiltStateHamt, String> {
-    let structural_key = room_id.as_bytes();
+    let structural_key = room_structural_key(room_id);
     let mut lattice = LtHash::default();
     for (event_type, state_key, event_id) in entries {
         lattice.insert(event_type, state_key, event_id);
@@ -55,8 +55,11 @@ pub(crate) fn build_state_hamt(
     let hamt_entries = entries.iter().map(|(event_type, state_key, event_id)| {
         (state_hamt_leaf_key(event_type, state_key), event_id.clone())
     });
-    let (handle, root) = build_hamt_root_handle(structural_key, &lattice, hamt_entries)
-        .map_err(|error| format!("failed to build state HAMT for {room_id}: {error:?}"))?;
+    let root = rezzy::hamt::build_hamt_with_key_hash(&structural_key, hamt_entries, |key| {
+        rezzy::hamt::canonical_key_path_hash(&structural_key, key)
+    })
+    .map_err(|error| format!("failed to build state HAMT for {room_id}: {error:?}"))?;
+    let handle = rezzy::hamt::RootHandle::from_lthash(root.structural_hash, &lattice);
 
     let mut seen = HashSet::new();
     let mut nodes = Vec::new();
@@ -115,6 +118,21 @@ pub(crate) fn encode_state_hamt_root(
 ) -> Vec<u8> {
     rezzy::hamt::encode_state_hamt_root(room_prefix, room_id, root_hash, lattice)
         .expect("room prefix and room id fit the u16 length fields")
+}
+
+/// The structural key for a room's state HAMT.
+///
+/// This is the same derivation congruent uses, so a tree built here has the
+/// same routing and structural hashes as one built at runtime.
+#[must_use]
+pub(crate) fn room_structural_key(room_id: &str) -> [u8; 32] {
+    let mut hasher = DigestAlgorithm::Sha256.hasher();
+    hasher.update(b"congruent state hamt structural key\0");
+    hasher.update(room_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest[..32]);
+    key
 }
 
 /// The room-scoped prefix stored in root records. MSC4291 room ids are the
@@ -248,7 +266,7 @@ impl<'a> StateHamtReader<'a> {
         Some(Self {
             store,
             collection: state_hamt_collection_id(room_id)?,
-            structural_key: room_id.as_bytes().to_vec(),
+            structural_key: room_structural_key(room_id).to_vec(),
         })
     }
 
