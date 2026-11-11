@@ -15,7 +15,7 @@ use crate::{PackfileStorage, SearchDocument, SearchIndexes, SearchQuery};
 fn test_dir(name: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::test_scratch::root().join(format!(
         "mdb_test_search_{name}_{}_{id}",
         std::process::id()
     ));

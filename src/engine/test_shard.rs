@@ -5,8 +5,8 @@ fn test_dir(name: &str) -> PathBuf {
     use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("mdb_test_shard_{name}_{}_{id}", std::process::id()));
+    let dir = crate::test_scratch::root()
+        .join(format!("mdb_test_shard_{name}_{}_{id}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir

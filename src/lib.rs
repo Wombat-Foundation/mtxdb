@@ -207,6 +207,8 @@ mod test_room_auth;
 #[path = "matrix/test_room_flag.rs"]
 mod test_room_flag;
 #[cfg(test)]
+mod test_scratch;
+#[cfg(test)]
 #[path = "test_search.rs"]
 mod test_search;
 #[cfg(test)]
