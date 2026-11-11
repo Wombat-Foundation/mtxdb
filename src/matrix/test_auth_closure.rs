@@ -39,6 +39,133 @@ fn record_room(db: &Database) -> CsrAdjacency {
     adjacency
 }
 
+/// A gap-free chain: `$create` is the only root, and both messages auth it.
+fn record_clean_room(db: &Database) -> CsrAdjacency {
+    let adjacency = CsrAdjacency::new(ROOM);
+    adjacency
+        .record_event(db, "$create", &[], &[], None)
+        .unwrap();
+    adjacency
+        .record_event(db, "$m1", &[], &["$create"], None)
+        .unwrap();
+    adjacency
+        .record_event(db, "$m2", &[], &["$create"], None)
+        .unwrap();
+    adjacency
+}
+
+/// Publish a hand-built generation for `source_next` ids, with `entries`
+/// overriding the blob written for a short id. Ids in `skipped` are declared
+/// skipped instead of stored.
+fn publish_hand_built(
+    closure: &AuthClosure,
+    db: &Database,
+    source_next: u32,
+    entries: &[(u32, Vec<u8>)],
+    skipped: &[u32],
+) {
+    let store = closure.store_for_test();
+    let mut builder = store.begin(db).unwrap();
+    let refs: Vec<(u32, &[u8])> = entries
+        .iter()
+        .map(|(id, blob)| (*id, blob.as_slice()))
+        .collect();
+    builder.add(db, &refs).unwrap();
+    builder.publish(db, source_next, skipped).unwrap();
+}
+
+#[test]
+fn verify_reports_a_closure_record_that_disagrees_with_the_edges() {
+    let root = test_root("verify-disagree");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_clean_room(&db));
+    let graph = closure.graph(&db).unwrap();
+    let mut entries = Vec::new();
+    for id in 1..4 {
+        let ClosureOutcome::Complete(mut set) = graph.compute_at(id).unwrap() else {
+            panic!("the clean room has no gaps");
+        };
+        if id == 2 {
+            let _ = set.insert(999);
+        }
+        entries.push((id, set.encode().unwrap()));
+    }
+    publish_hand_built(&closure, &db, 4, &entries, &[]);
+
+    let report = closure.verify(&db).unwrap();
+    assert!(!report.is_consistent());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("disagrees with its direct auth edges")),
+        "{:?}",
+        report.problems
+    );
+}
+
+#[test]
+fn verify_reports_an_undecodable_closure_record() {
+    let root = test_root("verify-undecodable");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_clean_room(&db));
+    let graph = closure.graph(&db).unwrap();
+    let mut entries = Vec::new();
+    for id in 1..4 {
+        let ClosureOutcome::Complete(set) = graph.compute_at(id).unwrap() else {
+            panic!("the clean room has no gaps");
+        };
+        entries.push((
+            id,
+            if id == 2 {
+                b"not-a-bitmap".to_vec()
+            } else {
+                set.encode().unwrap()
+            },
+        ));
+    }
+    publish_hand_built(&closure, &db, 4, &entries, &[]);
+
+    let report = closure.verify(&db).unwrap();
+    assert!(!report.is_consistent());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("undecodable closure")),
+        "{:?}",
+        report.problems
+    );
+}
+
+#[test]
+fn verify_reports_a_complete_walk_marked_skipped() {
+    let root = test_root("verify-skipped-complete");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_clean_room(&db));
+    let graph = closure.graph(&db).unwrap();
+    let mut entries = Vec::new();
+    for id in [1, 3] {
+        let ClosureOutcome::Complete(set) = graph.compute_at(id).unwrap() else {
+            panic!("the clean room has no gaps");
+        };
+        entries.push((id, set.encode().unwrap()));
+    }
+    // Claim id 2 was skipped even though its walk is complete.
+    publish_hand_built(&closure, &db, 4, &entries, &[2]);
+
+    let report = closure.verify(&db).unwrap();
+    assert!(!report.is_consistent());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("marks it skipped but its walk is complete")),
+        "{:?}",
+        report.problems
+    );
+}
+
 #[test]
 fn rebuild_publishes_per_event_and_reports_the_skipped_one() {
     let root = test_root("partial");

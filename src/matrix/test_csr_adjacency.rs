@@ -63,6 +63,27 @@ fn records_and_reads_prev_auth_and_relation() {
 }
 
 #[test]
+fn resolve_event_ids_round_trips_short_ids_and_reports_absent_ones() {
+    let root = test_root("resolve_ids");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    adj.record_event(&db, "$msg", &["$create"], &["$create"], None)
+        .unwrap();
+    let create = adj.short_id(&db, "$create").unwrap().unwrap();
+    let msg = adj.short_id(&db, "$msg").unwrap().unwrap();
+    let absent = u32::MAX;
+
+    assert_eq!(
+        adj.resolve_event_ids(&db, &[msg, absent, create]).unwrap(),
+        vec![Some("$msg".to_owned()), None, Some("$create".to_owned()),],
+        "order is preserved and an unassigned id resolves to None"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn reverse_family_transposes_persisted_rows() {
     let root = test_root("reverse-family");
     let db = Database::open(root.clone()).unwrap();
