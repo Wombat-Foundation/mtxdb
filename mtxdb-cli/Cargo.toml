@@ -17,9 +17,17 @@ readme = "../README.md"
 # still compiles them through the out-of-line `mod tests;` declaration.
 exclude = ["docs/", "tests/", "src/test_*.rs", "src/**/test_*.rs"]
 
+[lib]
+name = "mtxdb_cli"
+path = "src/cli.rs"
+
 [[bin]]
 name = "mtxdb"
 path = "src/main.rs"
+# The binary shares the root library's crate name (`mtxdb`). Documenting it
+# would write into the same target/doc/mtxdb directory and hit cargo #6313;
+# the mtxdb_cli library target carries the CLI documentation instead.
+doc = false
 
 [features]
 default = ["completions"]

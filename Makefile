@@ -59,11 +59,9 @@ fix: ##H Apply auto-fixes with clippy across workspace crates
 .PHONY: doc
 doc: ##H Build docs
 	$(CARGO) test --workspace --doc
-	# Document the library only — the mtxdb-cli binary shares the name
-	# "mtxdb" with the root library, hitting cargo #6313.  Skip it;
-	# CLI usage is covered by `mtxdb --help`.
-	$(CARGO) doc -p mtxdb --no-deps
-	echo '<meta http-equiv="refresh" content="0;url=mtxdb/index.html">' > target/doc/index.html
+	$(CARGO) doc --workspace --no-deps
+	$(CARGO) rustdoc -p mtxdb-cli --lib -- --document-private-items
+	echo '<!doctype html><title>mtxdb documentation</title><h1>mtxdb documentation</h1><ul><li><a href="mtxdb/index.html">mtxdb library</a></li><li><a href="mtxdb_cli/index.html">mtxdb-cli</a></li></ul>' > target/doc/index.html
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

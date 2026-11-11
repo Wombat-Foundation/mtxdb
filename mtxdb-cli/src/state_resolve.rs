@@ -161,8 +161,8 @@ impl<'a> LeanEventContext<'a> {
     /// Materialize `roots` and their transitive `auth_events` closure.
     ///
     /// Returns every id this context knows to be absent from the batch, sorted.
-    /// An empty result means [`Self::map`] is complete enough to hand to
-    /// `rezzy::resolve_state_maps`.
+    /// An empty result means the materialized event map is complete enough
+    /// to hand to `rezzy::resolve_state_maps`.
     pub(crate) fn ensure(&mut self, roots: &[String]) -> Vec<String> {
         let mut queue: VecDeque<String> = roots
             .iter()

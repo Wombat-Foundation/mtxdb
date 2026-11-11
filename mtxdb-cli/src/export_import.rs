@@ -2131,7 +2131,7 @@ fn estimate(
 /// records were written. The marker is the caller's to commit.
 ///
 /// Each rejection is derived by running the auth rules over the room's events
-/// (see [`derived_auth_findings`]); the export's rejections are not trusted.
+/// (see [`derived_auth_findings_with_keys`]); the export's rejections are not trusted.
 /// Load the missing key ids for `server` and return the requested cached keys.
 fn memoized_server_keys(
     memo: &mut HashMap<String, Vec<mtxdb::server_keys::ServerKey>>,
