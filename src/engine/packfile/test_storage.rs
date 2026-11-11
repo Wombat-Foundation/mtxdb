@@ -20,6 +20,20 @@ fn distinct_id(byte: u8) -> [u8; 16] {
 }
 const OTHER_COLLECTION: [u8; 16] = [0x02; 16];
 
+/// Path to re-execute this test binary.
+///
+/// Coverage builds (and concurrent rebuilds) relink the on-disk test binary
+/// into the same target directory, so the path returned by `current_exe()` can
+/// be replaced or briefly absent when the child is spawned. On Linux
+/// `/proc/self/exe` names the running image itself, which survives that.
+fn test_binary_path() -> PathBuf {
+    let running = std::path::Path::new("/proc/self/exe");
+    if running.exists() {
+        return running.to_path_buf();
+    }
+    std::env::current_exe().unwrap()
+}
+
 fn test_dir(name: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -8700,7 +8714,7 @@ fn shared_wal_lock_is_exclusive_across_processes() {
     let _cleanup = RemoveDirOnDrop(root.clone());
     let _layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
     let lock = crate::journal::SharedWalLock::acquire(&root).unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let output = std::process::Command::new(test_binary_path())
         .args([
             "--exact",
             "packfile::storage::tests::shared_wal_lock_child_cannot_acquire_held_lock",
@@ -13095,7 +13109,7 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
 
     let root = test_dir("versions_crash");
     fs::create_dir_all(&root).unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
+    let output = Command::new(test_binary_path())
         .args([
             "--exact",
             "packfile::storage::tests::versions_crash_child",
