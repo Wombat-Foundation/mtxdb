@@ -49,10 +49,9 @@ fn env_u64(key: &str, default: u64) -> u64 {
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(default)
+    std::env::var(key).ok().map_or(default, |value| {
+        matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    })
 }
 
 fn key(index: u64) -> [u8; 16] {
@@ -71,27 +70,37 @@ fn key(index: u64) -> [u8; 16] {
     out
 }
 
+/// Bench counts and byte totals stay below 4 GiB / 4G entries. Clamping keeps
+/// the reporting conversion lossless for the actual workload and avoids a
+/// `u64 as f64` cast.
+fn f64_of_u64(value: u64) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+fn f64_of_usize(value: usize) -> f64 {
+    f64_of_u64(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
 }
 
 fn us_per(duration: Duration, count: u64) -> f64 {
-    duration.as_secs_f64() * 1e6 / count.max(1) as f64
+    duration.as_secs_f64() * 1e6 / f64_of_u64(count.max(1))
 }
 
 fn ns_per(duration: Duration, count: u64) -> f64 {
-    duration.as_secs_f64() * 1e9 / count.max(1) as f64
+    duration.as_secs_f64() * 1e9 / f64_of_u64(count.max(1))
 }
 
 fn mib(bytes: u64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0)
+    f64_of_u64(bytes) / (1024.0 * 1024.0)
 }
 
 fn unique_dir(root: &Path, label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_nanos());
     root.join(format!("{label}-{}-{stamp}", std::process::id()))
 }
 
@@ -104,17 +113,20 @@ fn write_all_sync(path: &Path, bytes: &[u8], fsync: bool) -> std::io::Result<()>
     Ok(())
 }
 
+/// Run a fixed lookup workload and return (elapsed, candidate count).
 fn lookup_workload(
+    entries: u64,
     count: u64,
     hits: bool,
     lookup: impl Fn(&[u8; 16]) -> Option<u64>,
 ) -> (Duration, u64) {
-    // Warm the index and the mapping before timing.
-    for i in 0..(count / 16).max(1024) {
+    let present = entries.max(1);
+    let warm = (count >> 4).max(1024);
+    for i in 0..warm {
         let id = if hits {
-            key(i % count.max(1))
+            key(i.checked_rem(present).unwrap_or(0))
         } else {
-            key(count.saturating_add(i))
+            key(present.saturating_add(i))
         };
         black_box(lookup(&id));
     }
@@ -122,9 +134,12 @@ fn lookup_workload(
     let started = Instant::now();
     for i in 0..count {
         let id = if hits {
-            key((i.wrapping_mul(2_654_435_761)) % count.max(1))
+            key(i
+                .wrapping_mul(2_654_435_761)
+                .checked_rem(present)
+                .unwrap_or(0))
         } else {
-            key(count.saturating_add(i))
+            key(present.saturating_add(i))
         };
         if black_box(lookup(&id)).is_some() {
             found = found.saturating_add(1);
@@ -134,9 +149,9 @@ fn lookup_workload(
 }
 
 struct CurrentResult {
-    append_insert: Duration,
-    append_image: Duration,
-    append_bytes: u64,
+    insert: Duration,
+    image: Duration,
+    bytes: u64,
 }
 
 fn bench_current(
@@ -153,7 +168,7 @@ fn bench_current(
     let index = LossyIndex::with_config(capacity, IndexConfig::default());
     for i in 0..entries {
         index
-            .insert(&key(i), (i % 4096) as u16, i)
+            .insert(&key(i), u16::try_from(i & 4095).expect("slot fits u16"), i)
             .expect("insert into pre-sized index");
     }
     let insert = started.elapsed();
@@ -164,8 +179,8 @@ fn bench_current(
     );
     println!(
         "resident          {:>10.1} MiB  {:>7.1} B/record  (capacity {} slots)",
-        mib(index.resident_bytes() as u64),
-        index.resident_bytes() as f64 / entries as f64,
+        mib(u64::try_from(index.resident_bytes()).unwrap_or(u64::MAX)),
+        f64_of_usize(index.resident_bytes()) / f64_of_u64(entries),
         index.capacity()
     );
 
@@ -174,7 +189,7 @@ fn bench_current(
     let serialize = started.elapsed();
     println!(
         "serialize         {:>10.1} MiB  {:>9.1} ms  {:>7.1} ns/record",
-        mib(image.len() as u64),
+        mib(u64::try_from(image.len()).unwrap_or(u64::MAX)),
         ms(serialize),
         ns_per(serialize, entries)
     );
@@ -185,7 +200,7 @@ fn bench_current(
     let write = started.elapsed();
     println!(
         "write+fsync       {:>10.1} MiB  {:>9.1} ms  ({})",
-        mib(image.len() as u64),
+        mib(u64::try_from(image.len()).unwrap_or(u64::MAX)),
         ms(write),
         if fsync { "fsync" } else { "no fsync" }
     );
@@ -195,15 +210,15 @@ fn bench_current(
     let reopen = started.elapsed();
     println!(
         "reopen            {:>10.1} MiB  {:>9.1} ms  -> {:>6.1} MiB heap",
-        mib(image.len() as u64),
+        mib(u64::try_from(image.len()).unwrap_or(u64::MAX)),
         ms(reopen),
-        mib(reopened.resident_bytes() as u64)
+        mib(u64::try_from(reopened.resident_bytes()).unwrap_or(u64::MAX))
     );
 
-    let (hit_time, hits) = lookup_workload(lookups, true, |id| {
+    let (hit_time, hits) = lookup_workload(entries, lookups, true, |id| {
         reopened.lookup(id).map(|(_, offset)| offset)
     });
-    let (miss_time, misses) = lookup_workload(lookups, false, |id| {
+    let (miss_time, misses) = lookup_workload(entries, lookups, false, |id| {
         reopened.lookup(id).map(|(_, offset)| offset)
     });
     println!(
@@ -221,58 +236,114 @@ fn bench_current(
     // than pretending the raw image is exact.
     println!(
         "miss candidates   {misses:>10}  ({:.1} ppm; slots-only image has no identities)",
-        misses as f64 * 1e6 / lookups.max(1) as f64
+        f64_of_u64(misses) * 1e6 / f64_of_u64(lookups.max(1))
     );
-    drop(reopened);
 
-    // Incremental append on the live, identity-hydrated table, then a fresh
-    // whole image. Slots-only serialization cannot accept writes until its
-    // identities are hydrated from the pack files.
+    drop(reopened);
+    bench_current_append(root, &index, entries, append, fsync)
+}
+
+fn bench_current_append(
+    root: &Path,
+    index: &LossyIndex,
+    entries: u64,
+    append: u64,
+    fsync: bool,
+) -> CurrentResult {
+    // Incremental append: more inserts, then a fresh whole image.
     let started = Instant::now();
     for j in 0..append {
+        let next = entries.saturating_add(j);
         index
             .insert(
-                &key(entries.saturating_add(j)),
-                ((entries + j) % 4096) as u16,
-                entries + j,
+                &key(next),
+                u16::try_from(next & 4095).expect("slot fits u16"),
+                next,
             )
             .expect("append insert");
     }
     let append_insert = started.elapsed();
     let started = Instant::now();
-    let image2 = index.serialize();
+    let image = index.serialize();
     let serialized = started.elapsed();
-    let image2_path = root.join("current-image-append.bin");
+    let image_path = root.join("current-image-append.bin");
     let started = Instant::now();
-    write_all_sync(&image2_path, &image2, fsync).expect("write appended image");
+    write_all_sync(&image_path, &image, fsync).expect("write appended image");
     let written = started.elapsed();
     println!(
         "append {append:>7} + image   insert {:>7.1} ms, serialize {:>7.1} ms, write {:>7.1} ms, {:>7.1} MiB rewritten",
         ms(append_insert),
         ms(serialized),
         ms(written),
-        mib(image2.len() as u64)
+        mib(u64::try_from(image.len()).unwrap_or(u64::MAX))
     );
     CurrentResult {
-        append_insert,
-        append_image: serialized + written,
-        append_bytes: image2.len() as u64,
+        insert: append_insert,
+        image: serialized.saturating_add(written),
+        bytes: u64::try_from(image.len()).unwrap_or(u64::MAX),
     }
 }
 
-fn bench_segmented(
-    root: &Path,
-    entries: u64,
-    lookups: u64,
-    flush_entries: usize,
-    fsync: bool,
-) -> SegmentedOptions {
+fn print_segmented_build(index: &SegmentedIndex, entries: u64, build: Duration, fsync: bool) {
+    let stats = index.stats();
+    println!(
+        "insert+flush      {entries:>10}  {:>9.1} ms  {:>7.1} ns/op  (fsync={fsync})",
+        ms(build),
+        ns_per(build, entries)
+    );
+    println!(
+        "segments          {:>10}        {:>7} tail entries",
+        index.segment_count(),
+        index.tail_len()
+    );
+    println!(
+        "loaded            {:>10.1} MiB  {:>7.2} B/record",
+        mib(index.resident_bytes()),
+        f64_of_u64(index.resident_bytes()) / f64_of_u64(entries)
+    );
+    println!(
+        "durable           {:>10.1} MiB  (segment writes {} / {:.1} MiB, manifests {} / {} B, tail log {:.1} MiB)",
+        mib(index.disk_bytes()),
+        stats.segment_writes,
+        mib(stats.segment_bytes),
+        stats.manifest_writes,
+        stats.manifest_bytes,
+        mib(stats.tail_log_bytes)
+    );
+    println!(
+        "flushes           {:>10}        {:>7.1} ms total build",
+        stats.flushes,
+        ms(build)
+    );
+}
+
+fn print_lookup_pair(label: &str, index: &SegmentedIndex, entries: u64, lookups: u64) {
+    let (hit_time, hits) = lookup_workload(entries, lookups, true, |id| index.lookup(id));
+    let (miss_time, misses) = lookup_workload(entries, lookups, false, |id| index.lookup(id));
+    println!(
+        "{label} hit        {hits:>10}  {:>9.1} ns/op",
+        ns_per(hit_time, lookups)
+    );
+    println!(
+        "{label} miss       {misses:>10}  {:>9.1} ns/op",
+        ns_per(miss_time, lookups)
+    );
+    assert_eq!(
+        hits, lookups,
+        "{label}: segmented index must find every hit"
+    );
+    assert_eq!(
+        misses, 0,
+        "{label}: segmented index must find no absent key"
+    );
+}
+
+fn bench_segmented(root: &Path, entries: u64, lookups: u64, flush_entries: usize, fsync: bool) {
     println!("\n=== segmented: flush={flush_entries} bloom=10 bits/key fsync={fsync} ===");
     let dir = unique_dir(root, &format!("seg-{flush_entries}"));
     let options = SegmentedOptions {
         flush_entries,
         bloom_bits_per_key: 10,
-        compact_threshold: usize::MAX,
         fsync,
     };
 
@@ -285,49 +356,8 @@ fn bench_segmented(
     }
     index.sync().expect("sync segmented index");
     let build = started.elapsed();
-    let stats = index.stats();
-    println!(
-        "insert+flush      {entries:>10}  {:>9.1} ms  {:>7.1} ns/op",
-        ms(build),
-        ns_per(build, entries)
-    );
-    println!(
-        "segments          {:>10}        {:>7} tail entries",
-        index.segment_count(),
-        index.tail_len()
-    );
-    println!(
-        "mapped            {:>10.1} MiB  {:>7.2} B/record",
-        mib(index.mapped_bytes()),
-        index.mapped_bytes() as f64 / entries as f64
-    );
-    println!(
-        "durable           {:>10.1} MiB  (segment writes {} / {:.1} MiB, manifests {} / {} B, tail log {:.1} MiB)",
-        mib(index.disk_bytes()),
-        stats.segment_writes,
-        mib(stats.segment_bytes),
-        stats.manifest_writes,
-        stats.manifest_bytes,
-        mib(stats.tail_log_bytes)
-    );
-    println!(
-        "syncs             {:>10}        {:>7.1} ms total build",
-        stats.flushes,
-        ms(build)
-    );
-
-    let (hit_time, hits) = lookup_workload(lookups, true, |id| index.lookup(id));
-    let (miss_time, misses) = lookup_workload(lookups, false, |id| index.lookup(id));
-    println!(
-        "lookup hit        {hits:>10}  {:>9.1} ns/op",
-        ns_per(hit_time, lookups)
-    );
-    println!(
-        "lookup miss       {misses:>10}  {:>9.1} ns/op",
-        ns_per(miss_time, lookups)
-    );
-    assert_eq!(hits, lookups, "segmented index must find every hit");
-    assert_eq!(misses, 0, "segmented index must find no absent key");
+    print_segmented_build(&index, entries, build, fsync);
+    print_lookup_pair("lookup", &index, entries, lookups);
 
     drop(index);
     let started = Instant::now();
@@ -337,34 +367,15 @@ fn bench_segmented(
     reopened.verify_all().expect("verify segmented");
     let verify = started.elapsed();
     println!(
-        "reopen trusted    {:>10.1} MiB  {:>9.3} ms  ({} segments, {} tail)",
-        mib(reopened.mapped_bytes()),
+        "reopen loaded     {:>10.1} MiB  {:>9.3} ms  ({} segments, {} tail)",
+        mib(reopened.resident_bytes()),
         ms(reopen),
         reopened.segment_count(),
         reopened.tail_len()
     );
     println!("reopen + verify   {:>10}        {:>9.1} ms", "", ms(verify));
+    print_lookup_pair("reopen", &reopened, entries, lookups);
 
-    let (hit_time, hits) = lookup_workload(lookups, true, |id| reopened.lookup(id));
-    let (miss_time, misses) = lookup_workload(lookups, false, |id| reopened.lookup(id));
-    println!(
-        "reopen hit        {hits:>10}  {:>9.1} ns/op",
-        ns_per(hit_time, lookups)
-    );
-    println!(
-        "reopen miss       {misses:>10}  {:>9.1} ns/op",
-        ns_per(miss_time, lookups)
-    );
-    assert_eq!(
-        hits, lookups,
-        "reopened segmented index must find every hit"
-    );
-    assert_eq!(
-        misses, 0,
-        "reopened segmented index must find no absent key"
-    );
-
-    // Full-merge compaction, measured explicitly.
     if reopened.segment_count() > 1 {
         let before_segments = reopened.segment_count();
         let started = Instant::now();
@@ -375,33 +386,26 @@ fn bench_segmented(
             mib(bytes),
             ms(compaction)
         );
-        let (hit_time, hits) = lookup_workload(lookups, true, |id| reopened.lookup(id));
-        let (miss_time, misses) = lookup_workload(lookups, false, |id| reopened.lookup(id));
-        println!(
-            "compact hit       {hits:>10}  {:>9.1} ns/op",
-            ns_per(hit_time, lookups)
-        );
-        println!(
-            "compact miss      {misses:>10}  {:>9.1} ns/op",
-            ns_per(miss_time, lookups)
-        );
-        assert_eq!(hits, lookups);
-        assert_eq!(misses, 0);
+        print_lookup_pair("compact", &reopened, entries, lookups);
     }
 
     if !env_bool("MTXDB_IS_KEEP", false) {
         let _ = fs::remove_dir_all(&dir);
     }
-    options
 }
 
-fn bench_segmented_append(root: &Path, entries: u64, append: u64, fsync: bool) -> (Duration, u64) {
-    println!("\n=== segmented incremental append ({append} keys) ===");
+fn bench_segmented_append(
+    root: &Path,
+    entries: u64,
+    append: u64,
+    fsync: bool,
+    flush_entries: usize,
+) -> (Duration, u64) {
+    println!("\n=== segmented incremental append ({append} keys, flush={flush_entries}) ===");
     let dir = unique_dir(root, "seg-append");
     let options = SegmentedOptions {
-        flush_entries: 65_536,
+        flush_entries,
         bloom_bits_per_key: 10,
-        compact_threshold: usize::MAX,
         fsync,
     };
     let mut index = SegmentedIndex::create(dir.clone(), options).expect("create segmented");
@@ -413,9 +417,8 @@ fn bench_segmented_append(root: &Path, entries: u64, append: u64, fsync: bool) -
 
     let started = Instant::now();
     for j in 0..append {
-        index
-            .insert(key(entries.saturating_add(j)), entries + j)
-            .expect("append insert");
+        let next = entries.saturating_add(j);
+        index.insert(key(next), next).expect("append insert");
     }
     index.sync().expect("append sync");
     let append_time = started.elapsed();
@@ -433,11 +436,92 @@ fn bench_segmented_append(root: &Path, entries: u64, append: u64, fsync: bool) -
         before.segment_writes,
         after.segment_writes
     );
-    assert_eq!(index.lookup(&key(entries)), Some(entries));
+    assert_eq!(
+        index.lookup(&key(entries)),
+        Some(entries),
+        "appended key must be findable"
+    );
     if !env_bool("MTXDB_IS_KEEP", false) {
         let _ = fs::remove_dir_all(&dir);
     }
     (append_time, written)
+}
+
+fn prototype_self_check(root: &Path, fsync: bool) {
+    let dir = unique_dir(root, "self-check");
+    let options = SegmentedOptions {
+        flush_entries: 4,
+        bloom_bits_per_key: 10,
+        fsync,
+    };
+    let mut index = SegmentedIndex::create(dir.clone(), options).expect("create self-check");
+    index.insert(key(0), 10).expect("insert k0");
+    index.insert(key(1), 11).expect("insert k1");
+    index.insert(key(0), 12).expect("overwrite k0 in tail");
+    index.sync().expect("first segment");
+    assert_eq!(
+        index.lookup(&key(0)),
+        Some(12),
+        "newest tail value must win"
+    );
+    assert_eq!(
+        index.lookup(&key(1)),
+        Some(11),
+        "unrelated key must survive"
+    );
+    assert_eq!(index.lookup(&key(2)), None, "absent key must miss");
+
+    // Leave a tail record un-synced, then reopen: the tail log must replay it.
+    index.insert(key(2), 13).expect("insert k2");
+    drop(index);
+    let mut index = SegmentedIndex::open(dir.clone(), options).expect("reopen self-check");
+    assert_eq!(
+        index.lookup(&key(0)),
+        Some(12),
+        "segment value across reopen"
+    );
+    assert_eq!(index.lookup(&key(2)), Some(13), "tail replay across reopen");
+
+    // A second segment and a full merge must keep the newest version.
+    index.insert(key(0), 14).expect("overwrite k0 in new tail");
+    index.sync().expect("second segment");
+    assert_eq!(index.lookup(&key(0)), Some(14), "newer segment must win");
+    index.compact().expect("self-check compact");
+    assert_eq!(
+        index.lookup(&key(0)),
+        Some(14),
+        "compaction must keep newest"
+    );
+    assert_eq!(
+        index.lookup(&key(1)),
+        Some(11),
+        "compaction must keep all keys"
+    );
+    assert_eq!(
+        index.lookup(&key(2)),
+        Some(13),
+        "compaction must keep tail keys"
+    );
+    drop(index);
+    let index = SegmentedIndex::open(dir.clone(), options).expect("reopen after compact");
+    assert_eq!(
+        index.lookup(&key(0)),
+        Some(14),
+        "compacted value across reopen"
+    );
+    assert_eq!(
+        index.lookup(&key(1)),
+        Some(11),
+        "compacted key across reopen"
+    );
+    assert_eq!(
+        index.lookup(&key(2)),
+        Some(13),
+        "compacted tail key across reopen"
+    );
+    drop(index);
+    let _ = fs::remove_dir_all(&dir);
+    println!("self-check: overwrite, tail replay, segment ordering and compaction OK");
 }
 
 fn main() {
@@ -445,40 +529,44 @@ fn main() {
     let lookups = env_u64("MTXDB_IS_LOOKUPS", 1_000_000);
     let append = env_u64("MTXDB_IS_APPEND", 65_536);
     let fsync = env_bool("MTXDB_IS_FSYNC", true);
-    let bench_root = std::env::var("MTXDB_BENCH_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/opencode/mtxdb-index-segments"));
+    let bench_root = std::env::var("MTXDB_BENCH_ROOT").map_or_else(
+        |_| PathBuf::from("/tmp/opencode/mtxdb-index-segments"),
+        PathBuf::from,
+    );
     fs::create_dir_all(&bench_root).expect("bench root");
     let root = unique_dir(&bench_root, "index-segments-run");
     fs::create_dir_all(&root).expect("run root");
 
     println!(
-        "workload: {entries} keys (16B id -> u64 locator), {lookups} lookups, {} MiB index target",
+        "workload: {entries} keys (16B id -> u64 locator), {lookups} lookups, {} MiB segment target",
         mib(entries.saturating_mul(24))
     );
     println!("root: {}", root.display());
+    prototype_self_check(&root, fsync);
 
     let current = bench_current(&root, entries, lookups, append, fsync);
     println!(
         "\ncurrent append summary: insert {:>7.1} ms, image {:>7.1} ms, {:>7.1} MiB rewritten",
-        ms(current.append_insert),
-        ms(current.append_image),
-        mib(current.append_bytes)
+        ms(current.insert),
+        ms(current.image),
+        mib(current.bytes)
     );
 
     for flush in [65_536_usize, 262_144, 1_048_576] {
         bench_segmented(&root, entries, lookups, flush, fsync);
     }
 
-    let (seg_append, seg_bytes) = bench_segmented_append(&root, entries, append, fsync);
-    println!(
-        "\nappend comparison: current rewrites {:.1} MiB in {:.1} ms; segmented writes {:.2} MiB in {:.1} ms (insert+sync, {:.1} us/op)",
-        mib(current.append_bytes),
-        ms(current.append_image),
-        mib(seg_bytes),
-        ms(seg_append),
-        us_per(seg_append, append)
-    );
+    for flush in [65_536_usize, 262_144, 1_048_576] {
+        let (seg_append, seg_bytes) = bench_segmented_append(&root, entries, append, fsync, flush);
+        println!(
+            "append comparison flush={flush}: current rewrites {:.1} MiB in {:.1} ms; segmented writes {:.2} MiB in {:.1} ms (insert+sync, {:.1} us/op)",
+            mib(current.bytes),
+            ms(current.image),
+            mib(seg_bytes),
+            ms(seg_append),
+            us_per(seg_append, append)
+        );
+    }
 
     if !env_bool("MTXDB_IS_KEEP", false) {
         let _ = fs::remove_dir_all(&root);
