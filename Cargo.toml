@@ -136,6 +136,7 @@ state-lattice = ["dep:rezzy-recon"]
 
 [dependencies]
 arc-swap = "1"
+base64 = "0.23.1"
 blake3 = "1.8.7"
 bytes = "1.5"
 crc32fast = "1.4"
@@ -149,6 +150,10 @@ sha2 = "0.11"
 zstd = { version = "0.14", default-features = false, optional = true }
 
 [target.'cfg(not(target_arch = "x86"))'.dependencies]
+# The content-addressed HAMT (`mtxdb::hamt`) and the Matrix state layer on top
+# of it (`mtxdb::state_hamt`). Always on except 32-bit x86, where `rezzy`'s
+# `std` build pulls the x86_64-only accelerated `rezzy-recon` path.
+rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1" }
 rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", optional = true }
 
 # `zstd`/`zstd-safe` don't forward a "pkg-config"/"vendored" feature of their
