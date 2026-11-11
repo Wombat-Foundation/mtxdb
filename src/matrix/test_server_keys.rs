@@ -163,9 +163,10 @@ fn selected_server_keys_are_read_by_indexed_key_id() {
     .unwrap();
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].key_id, b"ed25519:b");
-    assert!(read_server_keys_by_ids(db.server_info(), b"o", &[])
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        read_server_keys_by_ids(db.server_info(), b"o", &[]).unwrap(),
+        Vec::new()
+    );
 
     drop(db);
     let _ = std::fs::remove_dir_all(root);
