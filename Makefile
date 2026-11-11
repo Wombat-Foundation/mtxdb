@@ -99,9 +99,17 @@ cov: ##H Run code coverage and generate HTML report
 	$(CARGO) llvm-cov report $(MTXDB_TEST_PROFILE_FLAG) -p mtxdb \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*' \
 		--codecov --output-path .coverage/codecov.json
+	# JSON summary for the coverage gate (`make cov-check`)
+	$(CARGO) llvm-cov report $(MTXDB_TEST_PROFILE_FLAG) -p mtxdb \
+		--ignore-filename-regex 'src/bin/.*|scripts/.*' \
+		--json --output-path .coverage/summary.json
 	@echo DONE. You may open it with:
 	@echo firefox .coverage/html/index.html
 
+
+.PHONY: cov-check
+cov-check: ##H Fail if production coverage drops below the floors in scripts/check_coverage.py (run `make cov` first)
+	python3 scripts/check_coverage.py .coverage/summary.json
 
 .PHONY: bench
 bench: ##H Run benchmarks and append results to the CSV history in benches/csv/

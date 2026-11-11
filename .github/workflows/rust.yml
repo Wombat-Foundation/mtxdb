@@ -172,6 +172,9 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: nightly
 
+      - name: Coverage floors
+        run: make cov-check
+
       - name: Upload Test Results
         if: always()
         uses: actions/upload-artifact@v4
