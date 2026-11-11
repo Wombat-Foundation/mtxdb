@@ -3181,7 +3181,69 @@ fn open_with_policies_applies_per_pool_settings() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Every concurrent versioned read-modify-write must survive. The version
+/// Append policy is per pool like every other policy field, and the default
+/// stays the historical eager behavior.
+#[test]
+fn open_with_policies_applies_append_policy_per_pool() {
+    let root = test_root("append_policy_policy");
+    let mut policies = PoolPolicies::default();
+    policies.for_shard_mut(ShardType::State).append_policy = crate::shard::AppendPolicy::buffered();
+
+    let db = Database::open_with_policies(root.clone(), policies).unwrap();
+    assert_eq!(
+        db.pool(ShardType::State).append_policy(),
+        crate::shard::AppendPolicy::buffered()
+    );
+    for shard in ShardType::ALL {
+        if shard != ShardType::State {
+            assert_eq!(
+                db.pool(shard).append_policy(),
+                crate::shard::AppendPolicy::Eager,
+                "{shard:?} must keep the eager default"
+            );
+        }
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A buffered pool must still lose nothing at a sync boundary: the sync
+/// flushes buffered frames before it makes the WAL group durable, so a reopen
+/// sees the committed transaction.
+#[test]
+fn buffered_append_policy_survives_sync_and_reopen() {
+    let root = test_root("append_policy_reopen");
+    let policies = PoolPolicies::uniform(PoolPolicy {
+        append_policy: crate::shard::AppendPolicy::buffered(),
+        ..PoolPolicy::default()
+    });
+    let collection = [0x5Au8; 16];
+    {
+        let db = Database::open_with_policies(root.clone(), policies).unwrap();
+        let transaction = db.begin_transaction();
+        transaction
+            .put(
+                ShardType::State,
+                collection,
+                node(1),
+                &data(b"buffered-commit"),
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        for shard in ShardType::ALL {
+            db.pool(shard).sync_all().unwrap();
+        }
+    }
+
+    let reopened = Database::open_with_policies(root.clone(), policies).unwrap();
+    assert_eq!(
+        live_get(&reopened, ShardType::State, collection, node(1)),
+        Some(b"buffered-commit".to_vec()),
+        "a synced buffered write must be visible after reopen"
+    );
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&root);
+}
 /// token has to cover the data it is paired with: if a reader can observe a
 /// just-published version alongside pre-publication data, its conditional
 /// commit validates against that version and overwrites another writer's

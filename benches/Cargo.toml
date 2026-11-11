@@ -163,6 +163,12 @@ name = "index_segments"
 path = "index_segments.rs"
 harness = false
 
+# Append-path A/B: eager vs buffered pack writes, per-record vs batched WAL.
+[[bench]]
+name = "io_append"
+path = "io_append.rs"
+harness = false
+
 # Where the time of a pack recovery scan goes.
 [[bench]]
 name = "pack_scan_profile"

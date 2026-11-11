@@ -45,6 +45,20 @@ pub struct PoolPolicy {
     /// root, HAMT nodes after their children); any other policy keeps id
     /// order. Logical ordering only: it never changes what is stored.
     pub ordering: crate::record_class::OrderingPolicy,
+    /// When appended frames reach the pack file.
+    ///
+    /// The default [`crate::shard::AppendPolicy::Eager`] writes each frame as
+    /// part of the mutation that produced it. [`crate::shard::AppendPolicy::Buffered`]
+    /// accumulates frames per shard and writes them with one positioned write
+    /// per flush, which is substantially faster for bulk load.
+    ///
+    /// Buffered changes the crash boundary: frames since the last flush live
+    /// only in process memory. The shared WAL still makes a synced transaction
+    /// recoverable, because `sync`/`sync_all` flush every shard before the WAL
+    /// fsync, but an unsynced commit can be lost if this process exits. Opt in
+    /// only for workloads whose own durability schedule already ends in a
+    /// sync, such as a bulk import.
+    pub append_policy: crate::shard::AppendPolicy,
 }
 
 impl Default for PoolPolicy {
@@ -54,6 +68,7 @@ impl Default for PoolPolicy {
             checksum_policy: crate::packfile::ChecksumPolicy::Full,
             index_residency: crate::index::IndexResidency::Resident,
             ordering: crate::record_class::OrderingPolicy::None,
+            append_policy: crate::shard::AppendPolicy::Eager,
         }
     }
 }
@@ -893,7 +908,8 @@ impl Database {
                 policy.compress,
                 policy.checksum_policy,
                 policy.index_residency,
-            )?;
+            )?
+            .with_append_policy(policy.append_policy);
             store.set_stats_enabled(config.stats_enabled);
             // This process holds the exclusive WAL lock, so its in-memory
             // index is authoritative and a negative lookup is a true miss.

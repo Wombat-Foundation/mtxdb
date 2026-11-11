@@ -13777,6 +13777,14 @@ impl PackfileStorage {
         self
     }
 
+    /// This store's current append policy.
+    ///
+    /// See [`Self::with_append_policy`] for the trade each policy makes.
+    #[must_use]
+    pub fn append_policy(&self) -> shard::AppendPolicy {
+        self.shards.append_policy()
+    }
+
     /// Best-effort, rate-limited flush of the shard→collection directory for a
     /// writer's own periodic tick — same contract as
     /// `ShardPool::maybe_persist_stats`: a no-op if called again before

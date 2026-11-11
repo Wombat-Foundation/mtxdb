@@ -342,6 +342,7 @@ pub fn matrix_pool_policies() -> crate::database::PoolPolicies {
         checksum_policy: crate::packfile::ChecksumPolicy::Full,
         index_residency: crate::index::IndexResidency::Resident,
         ordering: crate::record_class::OrderingPolicy::None,
+        ..PoolPolicy::default()
     };
     // State groups, HAMT roots and nodes, and events are DAGs: repack lays
     // them out dependencies-first. Server keys have no dependency structure.
