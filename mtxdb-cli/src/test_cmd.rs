@@ -2577,7 +2577,7 @@ fn topo_sort_keeps_events_with_absent_parents() {
 
     let (sorted, unresolved) = partial_topo_sort_dag(&frontier, &reverse_map);
     assert_eq!(sorted, [first, second]);
-    assert!(unresolved.is_empty());
+    assert_eq!(unresolved, Vec::<String>::new());
 }
 
 /// An auth-chain body can satisfy check 4, but it has no state group and can
@@ -6802,7 +6802,7 @@ fn partial_state_groups_repair_when_a_missing_parent_arrives() {
     );
     let first = compute_state_groups_partial(std::slice::from_ref(&incomplete), &[], "!r:x");
     assert!(!first.groups.contains_key("$child"));
-    assert!(first.unresolved.is_empty());
+    assert_eq!(first.unresolved, Vec::<String>::new());
     assert!(
         first.partial.contains_key("$child"),
         "the event is still sorted with an unknown base and gets a partial group"
@@ -10582,7 +10582,7 @@ fn seeded_gap_root_keeps_identity_and_stays_out_of_the_complete_map() {
 
     // The id is a function of the state's own content and its recorded real
     // parents (none: the root's only prev is missing), not of the seed.
-    assert!(seed_state.parents.is_empty());
+    assert_eq!(seed_state.parents, Vec::<[u8; 16]>::new());
     assert_eq!(
         seed_instance,
         super::state_group_instance_id(
