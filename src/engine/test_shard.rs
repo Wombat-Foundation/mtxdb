@@ -173,8 +173,9 @@ fn record_disk_len_rejects_truncated_frame_body() {
     pool.flush_all().unwrap();
 
     let len = shard.file.metadata().unwrap().len();
-    shard.file.set_len(len - 1).unwrap();
+    // Windows refuses to truncate a file while any view of it is mapped.
     *shard.mmap.write() = None;
+    shard.file.set_len(len - 1).unwrap();
 
     assert!(matches!(
         ShardPool::record_disk_len_at(&shard, offset),
@@ -266,8 +267,9 @@ fn read_at_committed_rejects_bad_prefixes_flags_and_truncation() {
     ));
 
     let len = shard.file.metadata().unwrap().len();
-    shard.file.set_len(len - 1).unwrap();
+    // Windows refuses to truncate a file while any view of it is mapped.
     *shard.mmap.write() = None;
+    shard.file.set_len(len - 1).unwrap();
     let error = ShardPool::read_at_committed(&shard, offset, false)
         .expect_err("a frame whose tail is gone must be corrupt");
     assert!(matches!(

@@ -274,7 +274,14 @@ impl CsrStore {
     /// # Errors
     /// I/O errors.
     pub(crate) fn sync_tail(&self) -> io::Result<()> {
-        match File::open(self.tail_path()) {
+        // FlushFileBuffers on Windows requires a handle opened for writing;
+        // a read-only File::open handle makes sync_data fail with
+        // ERROR_ACCESS_DENIED even though the tail itself is writable.
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.tail_path())
+        {
             Ok(file) => {
                 file.sync_data()?;
                 #[cfg(test)]

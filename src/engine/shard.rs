@@ -3301,7 +3301,9 @@ impl ShardPool {
         // sidecar build here. A build scans the whole pack (up to
         // `MAX_SHARD_BYTES`), so this can stall the rotating writer; that is
         // the accepted cost of bounding both active builders and spawned
-        // threads. Do this before spawning the replacement worker.
+        // threads. Do this before spawning the replacement worker. Moving the
+        // join off the write path is specified in
+        // `docs/docs/2026-11-11-seal-rotation-stall.md`.
         while pending.len() >= MAX_SEAL_WORKERS {
             let oldest = pending.remove(0);
             let _ = oldest.join();
