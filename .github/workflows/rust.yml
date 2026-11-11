@@ -158,19 +158,20 @@ jobs:
       - name: Lint (Clippy)
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
-      - name: Install nightly toolchain (for llvm-cov)
-        run: rustup toolchain install nightly --profile minimal
-
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Test Suite
         run: set -o pipefail; cargo test --locked --all-features --lib --tests 2>&1 | tee test-results.txt
 
+      # Run coverage on the same stable toolchain as the tests. Under nightly,
+      # cargo-llvm-cov defines `coverage_nightly`, which turns on
+      # `coverage(off)` for the `test_*.rs` modules. Production lines inlined
+      # into those modules then lose their counters, and the gate under-reports
+      # by several points even though the full suite ran. Test modules are
+      # already excluded from the production gate by check_coverage.py.
       - name: Code Coverage
         run: make cov
-        env:
-          RUSTUP_TOOLCHAIN: nightly
 
       - name: Coverage floors
         run: make cov-check
