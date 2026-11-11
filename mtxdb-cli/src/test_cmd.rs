@@ -10475,7 +10475,7 @@ fn state_pool_repack_writes_hamt_children_before_parents_and_the_root_last() {
     assert_eq!(order.len(), records.len());
     for (hash, bytes) in &built.nodes {
         let node =
-            rezzy::hamt::PersistedInternalNode::<String, String>::decode_v1_unverified(bytes)
+            rezzy::hamt::PersistedInternalNode::<rezzy::hamt::StateHamtKey, String>::decode_v1_unverified(bytes)
                 .unwrap();
         for child in &node.child_hashes {
             assert!(
@@ -10649,6 +10649,11 @@ fn seeding_experiment_on_minic10y() {
 
     let mut total = [0u64; 12];
     let mut rejected_total = 0u64;
+    // (room, type, state_key, baseline id, seeded id) -> heads that inherit it.
+    let mut displacements: std::collections::BTreeMap<
+        (String, String, String, String, String),
+        Vec<String>,
+    > = std::collections::BTreeMap::new();
     let (mut sec_base, mut sec_seed) = ([0u64; 3], [0u64; 3]);
     for path in files {
         let content = std::fs::read(&path).unwrap();
@@ -10745,6 +10750,22 @@ fn seeding_experiment_on_minic10y() {
                 .count() as u64;
             added += gained;
             displaced += replaced;
+            for (key, base_id) in before {
+                if let Some(seed_id) = after.get(key) {
+                    if seed_id != base_id {
+                        displacements
+                            .entry((
+                                room.clone(),
+                                key.0.clone(),
+                                key.1.clone(),
+                                base_id.clone(),
+                                seed_id.clone(),
+                            ))
+                            .or_default()
+                            .push(head.clone());
+                    }
+                }
+            }
             if gained > 0 {
                 with_add += 1;
             }
@@ -10818,6 +10839,36 @@ fn seeding_experiment_on_minic10y() {
             "{room}: a seeded head's instance id is inconsistent"
         );
     }
+    {
+        let mut rows: Vec<_> = displacements.iter().collect();
+        rows.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+        let by_type = rows.iter().fold(
+            std::collections::BTreeMap::<String, (usize, usize)>::new(),
+            |mut acc, (key, heads)| {
+                let entry = acc.entry(key.1.clone()).or_default();
+                entry.0 += 1;
+                entry.1 += heads.len();
+                acc
+            },
+        );
+        println!(
+            "displaced values: {} distinct replacements across {} (head, key) pairs; by type (replacements, head pairs) = {by_type:?}",
+            rows.len(),
+            rows.iter().map(|(_, h)| h.len()).sum::<usize>()
+        );
+        for ((room, kind, state_key, base_id, seed_id), heads) in rows {
+            println!(
+                "  x{:<3} {} {} [{}]  baseline {} -> seeded {}  (first head {})",
+                heads.len(),
+                room.chars().take(14).collect::<String>(),
+                kind,
+                state_key,
+                base_id,
+                seed_id,
+                heads[0]
+            );
+        }
+    }
     println!(
         "TOTAL heads={} added={} displaced={} heads_with_add={} gap_roots={} filled={} cited={} \
          skipped(missing_body={} non_state={} rejected={} conflicts={}) differs_from_inherited={} \
@@ -10839,5 +10890,35 @@ fn seeding_experiment_on_minic10y() {
     println!("complete map, gapped set, unresolved and incomplete: identical in every room");
     println!(
         "heads' own citations (suppliers excluded), baseline agree/missing/differs = {sec_base:?}, seeded = {sec_seed:?}"
+    );
+}
+
+/// The seed skips a cited event that the importer has rejected: it neither
+/// fills that key nor contributes to the extremity's state, and the skip is
+/// counted by reason.
+#[test]
+fn seeded_gap_root_skips_a_rejected_citation() {
+    use super::seed_experiment::{arm, disarm};
+    let events = seeded_gap_room();
+
+    arm(HashSet::from(["$pl".to_owned()]));
+    let seeded = compute_state_groups_partial(&events, &[], "!r:x");
+    let stats = disarm();
+
+    assert_eq!(stats.rejected, 1, "the rejected power levels are skipped");
+    assert_eq!(stats.filled, 1, "only the create event fills a key");
+    let head = &seeded.partial_instances[&seeded.partial["$child"]];
+    assert!(
+        head.set
+            .entries
+            .contains_key(&("m.room.create".to_owned(), String::new())),
+        "the accepted citation still fills"
+    );
+    assert!(
+        !head
+            .set
+            .entries
+            .contains_key(&("m.room.power_levels".to_owned(), String::new())),
+        "the rejected citation must not reach the state"
     );
 }
