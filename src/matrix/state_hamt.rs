@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use rezzy::hamt::{StateHamtKey, StateHamtRoot};
+use rezzy::hamt_root::{StateHamtKey, StateHamtRoot};
 use rezzy::incremental::LtHash;
 
 use crate::hamt_store::{self, HamtCollection};
@@ -139,7 +139,7 @@ pub fn encode_state_hamt_root(
     root_hash: &[u8; 32],
     lattice: &LtHash,
 ) -> Vec<u8> {
-    rezzy::hamt::encode_state_hamt_root(room_prefix, room_id, root_hash, lattice)
+    rezzy::hamt_root::encode_state_hamt_root(room_prefix, room_id, root_hash, lattice)
         .expect("room prefix and room id fit the u16 length fields")
 }
 
@@ -147,7 +147,7 @@ pub fn encode_state_hamt_root(
 /// one.
 #[must_use]
 pub fn decode_state_hamt_root(bytes: &[u8]) -> Option<StateHamtRoot> {
-    rezzy::hamt::decode_state_hamt_root(bytes).ok()
+    rezzy::hamt_root::decode_state_hamt_root(bytes).ok()
 }
 
 /// The structural key for a room's state HAMT.

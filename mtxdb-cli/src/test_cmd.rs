@@ -10475,7 +10475,7 @@ fn state_pool_repack_writes_hamt_children_before_parents_and_the_root_last() {
     assert_eq!(order.len(), records.len());
     for (hash, bytes) in &built.nodes {
         let node =
-            rezzy::hamt::PersistedInternalNode::<rezzy::hamt::StateHamtKey, String>::decode_v1_unverified(bytes)
+            rezzy::hamt::PersistedInternalNode::<rezzy::hamt_root::StateHamtKey, String>::decode_v1_unverified(bytes)
                 .unwrap();
         for child in &node.child_hashes {
             assert!(

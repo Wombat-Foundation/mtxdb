@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(test)]
-use rezzy::hamt::{HamtNode, NodeRef, PersistedInternalNode, StateHamtKey};
+use rezzy::hamt::{HamtNode, NodeRef, PersistedInternalNode};
+#[cfg(test)]
+use rezzy::hamt_root::StateHamtKey;
 #[cfg(test)]
 use rezzy::incremental::LtHash;
 
