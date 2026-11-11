@@ -93,7 +93,18 @@ jobs:
 
       - name: Install vmtouch (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes vmtouch
+        run: |
+          # The runner's resolver occasionally fails for a few minutes; retry
+          # the index fetch and the download instead of failing the job.
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get -o Acquire::Retries=5 update \
+              && sudo apt-get -o Acquire::Retries=5 install --yes vmtouch; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying" >&2
+            sleep 15
+          done
+          exit 1
 
       - name: Run benchmarks
         if: github.event_name == 'push'
