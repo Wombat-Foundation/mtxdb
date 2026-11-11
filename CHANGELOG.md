@@ -19,6 +19,5 @@ mtxdb bundles `rezzy`'s persistent HAMT (CHAMP) for content-addressed trees:
 
 ### Platform support
 
-- The HAMT modules are not built on 32-bit x86, where `rezzy`'s standard build
-  needs an x86_64-only `rezzy-recon` path. The rest of the crate still builds
-  there.
+- The HAMT modules build on every target, including 32-bit x86: `rezzy` and
+  `rezzy-recon` are regular dependencies with their default features there too.

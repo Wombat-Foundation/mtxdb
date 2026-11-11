@@ -94,7 +94,6 @@ pub mod export_schema;
 pub mod frontier;
 /// Persisted, content-addressed HAMTs in an mtxdb collection, generic over
 /// key and value types; nodes are verified on read and routed canonically.
-#[cfg(not(target_arch = "x86"))]
 #[path = "graph/hamt_store.rs"]
 pub mod hamt_store;
 /// Lossy, append-only index mapping content hashes to packfile locations.
@@ -167,7 +166,6 @@ pub mod state_group;
 /// Matrix room state HAMTs built on [`hamt_store`]: the `MTHR`/`MTHN` records
 /// in a room's `STAT` collection, shared by the importer and server
 /// integrations.
-#[cfg(not(target_arch = "x86"))]
 #[path = "matrix/state_hamt.rs"]
 pub mod state_hamt;
 /// Core node/storage types and the top-level `StorageEngine`.
@@ -193,7 +191,6 @@ mod test_closure_store;
 #[path = "matrix/test_csr_adjacency.rs"]
 mod test_csr_adjacency;
 #[cfg(test)]
-#[cfg(not(target_arch = "x86"))]
 #[path = "graph/test_hamt_store.rs"]
 mod test_hamt_store;
 #[cfg(test)]
@@ -268,7 +265,6 @@ pub use record_class::{Durability, OrderingPolicy, RecordClass, Retention};
 /// [`hamt::diff_hamt_nodes`] skips identical subtrees by hash.
 /// [`hamt_store`] persists these trees in mtxdb collections, and
 /// [`state_hamt`] is the Matrix room-state layer on top.
-#[cfg(not(target_arch = "x86"))]
 pub use rezzy::hamt;
 #[cfg(feature = "reconcile")]
 pub use rezzy_recon as recon;

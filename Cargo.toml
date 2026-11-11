@@ -146,15 +146,12 @@ fs2 = "0.4"
 memchr = "2.7"
 memmap2 = "0.9.11"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
-sha2 = "0.11"
-zstd = { version = "0.14", default-features = false, optional = true }
-
-[target.'cfg(not(target_arch = "x86"))'.dependencies]
 # The content-addressed HAMT (`mtxdb::hamt`) and the Matrix state layer on top
-# of it (`mtxdb::state_hamt`). Always on except 32-bit x86, where `rezzy`'s
-# `std` build pulls the x86_64-only accelerated `rezzy-recon` path.
+# of it (`mtxdb::state_hamt`).
 rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1" }
 rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", optional = true }
+sha2 = "0.11"
+zstd = { version = "0.14", default-features = false, optional = true }
 
 # `zstd`/`zstd-safe` don't forward a "pkg-config"/"vendored" feature of their
 # own, so reach `zstd-sys` directly at the same version zstd-safe resolves to
@@ -166,12 +163,6 @@ rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch =
 # the crate, so the choice is made here with two cfg tables.
 [target.'cfg(not(windows))'.dependencies]
 zstd-sys = { version = "2.1", features = ["pkg-config"], optional = true }
-
-# rezzy-recon's accelerated GF64 implementation currently imports an x86_64-only
-# intrinsic from `core::arch::x86`. Keep 32-bit x86 on its portable backend;
-# other targets retain the dependency's default `std` acceleration.
-[target.'cfg(target_arch = "x86")'.dependencies]
-rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 zstd-sys = { version = "2.1", features = ["vendored"], optional = true }
