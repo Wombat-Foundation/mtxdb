@@ -267,7 +267,6 @@ pub(crate) enum Commands {
         collection: Option<String>,
         packs: Vec<String>,
         all: bool,
-        root: Vec<String>,
         out: Option<PathBuf>,
         yes: bool,
     },
@@ -1122,7 +1121,6 @@ fn sub_repack() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Repack every collection in every active pack"),
         )
-        .arg(Arg::new("root").short('o').long("root").num_args(1..))
         .arg(
             Arg::new("out")
                 .long("out")
@@ -1564,12 +1562,6 @@ fn parse_cli() -> Cli {
                 .cloned()
                 .collect(),
             all: m.get_flag("all"),
-            root: m
-                .get_many::<String>("root")
-                .into_iter()
-                .flatten()
-                .cloned()
-                .collect(),
             out: m.get_one::<String>("out").map(PathBuf::from),
             yes: m.get_flag("yes"),
         },

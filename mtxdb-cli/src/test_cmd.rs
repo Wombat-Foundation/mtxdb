@@ -14,13 +14,13 @@ use super::{
     overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
     parse_pack_selectors, partial_topo_sort_dag, prepare_state_collection, pretty_print_payload,
     raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
-    redacted_event_bytes, resolve_import_collection, resolve_repack_roots, run,
-    scan_payload_suffix, search_record_matches, search_template, split_canonical_display,
-    template_collection_id, template_event_id_node_id, template_node_id, topological_event_order,
-    valid_json_pointer, valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections,
-    CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache,
-    JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions,
-    SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+    search_record_matches, search_template, split_canonical_display, template_collection_id,
+    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
+    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
+    CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache, JsonValueExt,
+    MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions, SharedState,
+    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
     STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
@@ -7435,7 +7435,6 @@ fn coalesce_safeguards_reject_unsupported_commands() {
             collection: None,
             packs: vec![],
             all: true,
-            root: vec![],
             out: None,
             yes: true,
         },
@@ -7502,14 +7501,13 @@ fn coalesced_repack_materializes_canonical_database() {
             collection: None,
             packs: vec![],
             all: true,
-            root: vec![],
             out: Some(out_dir.clone()),
             yes: true,
         },
     };
 
     // Run coalescing repack
-    cmd_repack_coalesced(&cli, &out_dir, None, &[], true, &[], false, true).unwrap();
+    cmd_repack_coalesced(&cli, &out_dir, None, &[], true, false, true).unwrap();
 
     // Target directory must be a valid canonical database
     let out_layout = DatabaseLayout::open_read_only(out_dir.clone()).unwrap();
@@ -7560,12 +7558,11 @@ fn coalesced_repack_accepts_matrix_room_selectors() {
             collection: Some(room.to_owned()),
             packs: vec![],
             all: false,
-            root: vec![],
             out: Some(out_dir.clone()),
             yes: true,
         },
     };
-    cmd_repack_coalesced(&cli, &out_dir, Some(room), &[], false, &[], false, true).unwrap();
+    cmd_repack_coalesced(&cli, &out_dir, Some(room), &[], false, false, true).unwrap();
 
     let out_layout = DatabaseLayout::open_read_only(out_dir.clone()).unwrap();
     let out_pool = out_layout.pool_dir(ShardType::EventDag).unwrap();
@@ -10344,7 +10341,6 @@ fn repack_cli(dir: &Path, shard_type: ShardType) -> Cli {
             collection: None,
             packs: vec![],
             all: true,
-            root: vec![],
             out: None,
             yes: true,
         },
@@ -11050,38 +11046,4 @@ fn seeded_gap_root_skips_a_rejected_citation() {
             .contains_key(&("m.room.power_levels".to_owned(), String::new())),
         "the rejected citation must not reach the state"
     );
-}
-
-#[test]
-fn repack_roots_accept_record_ids_and_event_ids_and_refuse_missing_ones() {
-    let dir = unique_temp_dir();
-    let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let store = PackfileStorage::open(layout.pool_dir(ShardType::State).unwrap()).unwrap();
-    let collection = [0x5A; 16];
-    let record_id = [0x7C; 16];
-    let event_node = derive_template_key("blake3-128", "$event:example.org").unwrap();
-    for id in [record_id, event_node] {
-        store
-            .put(&collection, &id, &NodeData::new(Bytes::from_static(b"x")))
-            .unwrap();
-    }
-
-    let record_hex = format!("0x{}", hex::encode(record_id));
-    let roots = resolve_repack_roots(
-        &store,
-        &collection,
-        &[record_hex, "$event:example.org".to_owned()],
-    )
-    .unwrap();
-    assert_eq!(roots, vec![record_id, event_node]);
-
-    let missing = format!("0x{}", hex::encode([0x01; 16]));
-    let error = resolve_repack_roots(&store, &collection, &[missing]).unwrap_err();
-    assert!(error.to_string().contains("refusing to repack"), "{error}");
-    assert!(
-        resolve_repack_roots(&store, &collection, &["$absent:example.org".to_owned()]).is_err()
-    );
-
-    drop(store);
-    let _ = std::fs::remove_dir_all(dir);
 }

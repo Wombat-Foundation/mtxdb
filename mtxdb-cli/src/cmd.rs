@@ -628,25 +628,15 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             collection,
             packs,
             all,
-            root,
             out,
             yes,
         } => {
             let topo = repack_uses_dependency_layout(cli)?;
             if let Some(out_dir) = out {
-                cmd_repack_coalesced(
-                    cli,
-                    out_dir,
-                    collection.as_deref(),
-                    packs,
-                    *all,
-                    root,
-                    topo,
-                    *yes,
-                )
+                cmd_repack_coalesced(cli, out_dir, collection.as_deref(), packs, *all, topo, *yes)
             } else {
                 cli.require_single_dir("repack")?;
-                cmd_repack(cli, collection.as_deref(), packs, *all, root, topo, *yes)
+                cmd_repack(cli, collection.as_deref(), packs, *all, topo, *yes)
             }
         }
         Commands::Delete { collections, yes } => {
@@ -815,9 +805,9 @@ fn blake3_digest(data: &[u8]) -> [u8; 32] {
 }
 
 /// Derive a 128-bit lookup ID from the BLAKE3 digest of the complete event ID
-/// supplied by the caller, including any `$` sigil. Repack edge extraction,
-/// `--root`, and Matrix records imported with the bundled template use this
-/// same derivation.
+/// supplied by the caller, including any `$` sigil. Repack edge extraction
+/// and Matrix records imported with the bundled template use this same
+/// derivation.
 fn matrix_event_node_id(event_id: &str) -> anyhow::Result<[u8; 16]> {
     derive_template_key("blake3-128", event_id)
 }
@@ -15395,7 +15385,6 @@ fn cmd_repack_coalesced(
     collection: Option<&str>,
     packs: &[String],
     all: bool,
-    roots: &[String],
     topo: bool,
     yes: bool,
 ) -> anyhow::Result<()> {
@@ -15408,18 +15397,8 @@ fn cmd_repack_coalesced(
     if collection.is_none() && !all {
         bail!("coalescing repack requires --all or --collection <collection>");
     }
-    if !roots.is_empty() {
-        if collection.is_none() {
-            bail!("--root requires --collection — live roots are per-collection, not meaningful for --all");
-        }
-        if !topo {
-            bail!("--root needs dependency edges: this pool's ordering policy is not topological, so reachability cannot be computed");
-        }
-    }
     if topo {
-        if roots.is_empty() {
-            println!("note: no --root given; all records preserved, laid out dependencies first");
-        }
+        println!("note: all records preserved, laid out dependencies first");
     } else {
         println!(
             "note: this pool's ordering policy is not topological; records written in id order"
@@ -15652,35 +15631,6 @@ fn cmd_repack_coalesced(
             resolved_nodes.insert(node_id, data);
         }
 
-        if !roots.is_empty() {
-            let mut root_ids = Vec::new();
-            for r in roots {
-                root_ids.push(matrix_event_node_id(r)?);
-            }
-            let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
-            for (node_id, data) in &resolved_nodes {
-                let edges = extract_matrix_edges(node_id, &data.bytes);
-                adjacency.insert(*node_id, edges);
-            }
-            let mut visited = HashSet::new();
-            let mut queue = VecDeque::new();
-            for rid in &root_ids {
-                if resolved_nodes.contains_key(rid) && visited.insert(*rid) {
-                    queue.push_back(*rid);
-                }
-            }
-            while let Some(curr) = queue.pop_front() {
-                if let Some(edges) = adjacency.get(&curr) {
-                    for edge in edges {
-                        if resolved_nodes.contains_key(edge) && visited.insert(*edge) {
-                            queue.push_back(*edge);
-                        }
-                    }
-                }
-            }
-            resolved_nodes.retain(|k, _| visited.contains(k));
-        }
-
         let ordered_hashes: Vec<[u8; 16]> = if topo {
             let mut adjacency: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
             for (node_id, data) in &resolved_nodes {
@@ -15748,14 +15698,6 @@ fn cmd_repack_coalesced(
             target_store.put_many(&collection_id, chunk)?;
         }
 
-        if !roots.is_empty() {
-            let mut root_ids = Vec::new();
-            for r in roots {
-                root_ids.push(matrix_event_node_id(r)?);
-            }
-            target_store.set_live_roots(&collection_id, root_ids);
-        }
-
         written_collections = written_collections.saturating_add(1);
         written_nodes = written_nodes.saturating_add(node_count);
     }
@@ -15782,7 +15724,6 @@ fn cmd_repack(
     collection: Option<&str>,
     packs: &[String],
     all: bool,
-    roots: &[String],
     topo: bool,
     yes: bool,
 ) -> anyhow::Result<()> {
@@ -15801,31 +15742,14 @@ fn cmd_repack(
         }
     };
 
-    if !roots.is_empty() {
-        match &target {
-            RepackTarget::Packs(_) | RepackTarget::All => {
-                bail!(
-                    "--root requires --collection — live roots are per-collection, not meaningful for --pack"
-                );
-            }
-            RepackTarget::Collection(_) if !topo => {
-                bail!("--root needs dependency edges: this pool's ordering policy is not topological, so reachability cannot be computed");
-            }
-            RepackTarget::Collection(_) => {
-                // Allowed
-            }
-        }
-    }
     if topo {
-        if roots.is_empty() {
-            println!("note: no --root given; all records preserved, laid out dependencies first");
-        }
+        println!("note: all records preserved, laid out dependencies first");
     } else {
         println!(
             "note: this pool's ordering policy is not topological; records written in id order"
         );
     }
-    cmd_repack_target(cli, &target, topo, roots, yes)
+    cmd_repack_target(cli, &target, topo, yes)
 }
 
 /// Compacts every pack transitively touched by collections referencing a
@@ -15839,10 +15763,9 @@ fn cmd_repack(
 /// Runs a non-mutating preflight first (`PackfileStorage::plan_collection_repack`
 /// per collection in the closure): prints how many collections and packs are
 /// involved and the expected pack count/slack after compaction, then
-/// prompts for confirmation before performing any real repack. `--root`
-/// doesn't apply here since live roots are inherently per-collection — the
-/// same default edge-extraction choice applies uniformly
-/// across every collection the closure touches.
+/// prompts for confirmation before performing any real repack. Repack keeps
+/// every record: the same edge extraction lays out every collection the closure
+/// touches, dependencies first, and nothing is dropped as unreachable.
 ///
 /// The preflight runs against a **read-only** open, not the exclusive
 /// writer — an interactive confirmation pause can take arbitrarily long,
@@ -15937,53 +15860,13 @@ fn resolve_repack_slots(
     ))
 }
 
-/// Resolve `--root` values for a collection repack.
-///
-/// A root is a `0x`-prefixed record ID (for example a state group's `MTHR`
-/// root record in a `STAT` collection) or a Matrix event ID, hashed the way
-/// import stores events. Every root must be stored in the collection: a root
-/// that is not reaches nothing, so the repack would drop every record. That is
-/// refused here instead of discovered afterwards.
-fn resolve_repack_roots(
-    store: &PackfileStorage,
-    collection_id: &[u8; 16],
-    roots: &[String],
-) -> anyhow::Result<Vec<[u8; 16]>> {
-    roots
-        .iter()
-        .map(|root| {
-            let id = if root.starts_with("0x") {
-                parse_node_id(root)?
-            } else {
-                matrix_event_node_id(root)?
-            };
-            if store.get(collection_id, &id)?.is_none() {
-                bail!(
-                    "--root {root} ({}) is not stored in collection {}; refusing to repack, \
-                     which would treat every record as unreachable",
-                    format_id(&id),
-                    format_id(collection_id)
-                );
-            }
-            Ok(id)
-        })
-        .collect()
-}
-
 fn repack_preview(
     cli: &Cli,
     target: &RepackTarget,
     topo: bool,
-    roots: &[String],
 ) -> anyhow::Result<Option<RepackPreview>> {
     println!("preflight: scanning packs and rebuilding live indexes...");
     let preview_store = open_store_read_only(cli)?;
-    if let RepackTarget::Collection(collection_id) = target {
-        if !roots.is_empty() {
-            let root_ids = resolve_repack_roots(&preview_store, collection_id, roots)?;
-            preview_store.set_live_roots(collection_id, root_ids);
-        }
-    }
     println!("preflight: resolving pack closure...");
     let (collections, shards) = resolve_repack_target(&preview_store, target)?;
     if collections.is_empty() {
@@ -16161,10 +16044,9 @@ fn cmd_repack_target(
     cli: &Cli,
     target: &RepackTarget,
     topo: bool,
-    roots: &[String],
     yes: bool,
 ) -> anyhow::Result<()> {
-    let Some(preview) = repack_preview(cli, target, topo, roots)? else {
+    let Some(preview) = repack_preview(cli, target, topo)? else {
         return Ok(());
     };
 
@@ -16178,12 +16060,6 @@ fn cmd_repack_target(
     // read-only preview above is, by construction, a snapshot that could
     // be arbitrarily stale by the time a human finishes reading it.
     let store = open_store(cli)?;
-    if let RepackTarget::Collection(collection_id) = target {
-        if !roots.is_empty() {
-            let root_ids = resolve_repack_roots(&store, collection_id, roots)?;
-            store.set_live_roots(collection_id, root_ids);
-        }
-    }
     let (collections, touched_shards) = resolve_repack_target(&store, target)?;
     if collections.is_empty() {
         println!("repack target is no longer referenced by any collection — nothing to do");
