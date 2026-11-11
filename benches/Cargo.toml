@@ -157,6 +157,12 @@ name = "reopen_cost"
 path = "reopen_cost.rs"
 harness = false
 
+# Prototype: immutable sorted segments + manifest vs the resident LossyIndex image.
+[[bench]]
+name = "index_segments"
+path = "index_segments.rs"
+harness = false
+
 # Where the time of a pack recovery scan goes.
 [[bench]]
 name = "pack_scan_profile"
