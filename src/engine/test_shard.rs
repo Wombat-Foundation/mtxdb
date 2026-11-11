@@ -1887,6 +1887,7 @@ fn seal_queue_does_not_block_the_writer_and_drains_later() {
     let returned = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
     // Always release the workers, so a failure cannot leave threads parked.
     let backlog = pool.seal_backlog();
+    let ready_while_held = pool.take_sealed_ready();
     hold_seal_workers(&pool, false);
     assert!(
         returned,
@@ -1896,7 +1897,7 @@ fn seal_queue_does_not_block_the_writer_and_drains_later() {
     // Nothing started while held: every pack was queued, none running.
     assert_eq!(backlog.queued, packs.len());
     assert_eq!(backlog.running, 0);
-    assert!(pool.take_sealed_ready().is_empty());
+    assert!(ready_while_held.is_empty());
 
     pool.wait_for_seals();
     let ready = pool.take_sealed_ready();
