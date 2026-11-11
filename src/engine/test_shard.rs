@@ -1861,21 +1861,43 @@ fn hold_seal_workers(pool: &ShardPool, held: bool) {
 }
 
 /// With every worker blocked, sealing more packs than there are workers must
-/// not make the writer wait, and every pack is announced once released.
+/// return without waiting for any build, and every pack is announced once the
+/// workers are released. The sealing runs on its own thread under a watchdog so
+/// a regression (the old join-the-oldest-builder behaviour) fails the test
+/// instead of hanging it.
 #[test]
 fn seal_queue_does_not_block_the_writer_and_drains_later() {
-    let pool = ShardPool::open(test_dir("seal_queue_blocked")).unwrap();
+    let pool = Arc::new(ShardPool::open(test_dir("seal_queue_blocked")).unwrap());
     hold_seal_workers(&pool, true);
-    let packs = rotate_out_packs(&pool, u8::try_from(MAX_SEAL_WORKERS).unwrap() + 3);
-    // Sealing twice is still one job.
-    for shard in &packs {
-        pool.seal_pack(shard).unwrap();
-        pool.seal_pack(shard).unwrap();
-    }
-    assert_eq!(pool.seal_queue.state.lock().pending.len(), packs.len());
+    let count = u8::try_from(MAX_SEAL_WORKERS).unwrap().saturating_add(3);
+    let packs = rotate_out_packs(&pool, count);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let sealer = {
+        let (pool, packs) = (Arc::clone(&pool), packs.clone());
+        std::thread::spawn(move || {
+            for shard in &packs {
+                pool.seal_pack(shard).unwrap();
+                // Sealing twice is still one job.
+                pool.seal_pack(shard).unwrap();
+            }
+            done_tx.send(()).unwrap();
+        })
+    };
+    let returned = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+    // Always release the workers, so a failure cannot leave threads parked.
+    let backlog = pool.seal_backlog();
+    hold_seal_workers(&pool, false);
+    assert!(
+        returned,
+        "sealing more packs than workers waited for a held build"
+    );
+    sealer.join().unwrap();
+    // Nothing started while held: every pack was queued, none running.
+    assert_eq!(backlog.queued, packs.len());
+    assert_eq!(backlog.running, 0);
     assert!(pool.take_sealed_ready().is_empty());
 
-    hold_seal_workers(&pool, false);
     pool.wait_for_seals();
     let ready = pool.take_sealed_ready();
     assert_eq!(ready.len(), packs.len());
@@ -1883,7 +1905,9 @@ fn seal_queue_does_not_block_the_writer_and_drains_later() {
         assert!(ready.contains(&(shard.slot, shard.pack_id)));
         assert!(packidx::pack_index_path(&shard.path).exists());
     }
-    assert!(pool.seal_queue.state.lock().workers.len() <= MAX_SEAL_WORKERS);
+    let after = pool.seal_backlog();
+    assert_eq!((after.queued, after.running), (0, 0));
+    assert!(after.workers <= MAX_SEAL_WORKERS);
 }
 
 /// A pack retired while its job is queued is skipped and never announced; the
