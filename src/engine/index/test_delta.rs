@@ -1015,3 +1015,157 @@ fn a_torn_or_damaged_coverage_batch_claims_nothing() {
     assert!(read_delta_log(&path).is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn scratch_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("mtxdb_delta_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn list_epochs_returns_sorted_well_formed_names_only() {
+    let dir = scratch_dir("epochs");
+    for name in [
+        "index.delta.00000000000000ff",
+        "index.delta.0000000000000001",
+        "index.delta.short",
+        "index.delta.zzzzzzzzzzzzzzzz",
+        "index.delta",
+        "unrelated.file",
+    ] {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+    let epochs = list_epochs(&dir).unwrap();
+    let fingerprints: Vec<u64> = epochs.iter().map(|(fp, _)| *fp).collect();
+    assert_eq!(fingerprints, vec![1, 0xff]);
+    assert!(list_epochs(&dir.join("missing")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fingerprint_errors_render_their_context() {
+    let path = Path::new("/x/index.delta");
+    let invalid = invalid(path, "bad thing");
+    assert_eq!(
+        invalid.to_string(),
+        "invalid delta fingerprint /x/index.delta: bad thing"
+    );
+    let io = io_error(path, "open delta log", io::Error::other("boom"));
+    assert_eq!(io.to_string(), "open delta log /x/index.delta: boom");
+}
+
+#[test]
+fn replay_errors_render_their_context() {
+    let cases = [
+        (
+            DeltaReplayError::FrameOutOfBounds {
+                bucket: 9,
+                capacity: 4,
+            },
+            "delta frame bucket 9 exceeds index capacity 4",
+        ),
+        (
+            DeltaReplayError::RequiresOwnedIndex,
+            "delta replay requires an owned index",
+        ),
+        (
+            DeltaReplayError::EmptySlot { bucket: 3 },
+            "delta frame at bucket 3 carries the empty-slot sentinel",
+        ),
+    ];
+    for (error, text) in cases {
+        assert_eq!(error.to_string(), text);
+    }
+    let slot = DeltaReplayError::SlotOutOfRange { bucket: 1, slot: 7 }.to_string();
+    assert!(slot.contains("bucket 1") && slot.contains("slot 7"));
+}
+
+#[test]
+fn tail_fingerprint_reader_handles_each_log_shape() {
+    let dir = scratch_dir("tailfp");
+    let path = dir.join(INDEX_DELTA_FILE);
+
+    assert!(read_delta_tail_fingerprint(&path).unwrap().is_none());
+
+    std::fs::write(&path, [0u8; 4]).unwrap();
+    assert!(read_delta_tail_fingerprint(&path).is_err());
+
+    let mut bad_magic = v1_log(&sample_v1_operations(), 0x77);
+    bad_magic[0] = b'X';
+    std::fs::write(&path, &bad_magic).unwrap();
+    assert!(read_delta_tail_fingerprint(&path).is_err());
+
+    let mut bad_version = v1_log(&sample_v1_operations(), 0x77);
+    bad_version[4] = 9;
+    std::fs::write(&path, &bad_version).unwrap();
+    assert!(read_delta_tail_fingerprint(&path).is_err());
+
+    let good = v1_log(&sample_v1_operations(), 0x77);
+    std::fs::write(&path, &good).unwrap();
+    let fp = read_delta_tail_fingerprint(&path).unwrap().unwrap();
+    assert_eq!((fp.base_fingerprint, fp.tail_fingerprint), (0xABC, 0x77));
+    assert!(!fp.torn_tail);
+
+    let mut torn = good.clone();
+    torn.extend_from_slice(&[1, 2, 3]);
+    std::fs::write(&path, &torn).unwrap();
+    assert!(
+        read_delta_tail_fingerprint(&path)
+            .unwrap()
+            .unwrap()
+            .torn_tail
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn length_helpers_agree_with_encoded_sizes() {
+    assert_eq!(
+        batch_len(2),
+        Some(DELTA_BATCH_HEADER_LEN + 2 * DELTA_FRAME_LEN + DELTA_LOG_TRAILER_LEN)
+    );
+    assert_eq!(batch_len(usize::MAX), None);
+    assert_eq!(v1_frame_len(usize::MAX), None);
+    let ops = sample_v1_operations();
+    assert_eq!(v1_batch_len(&ops), Some(v1_batch_bytes(&ops, 1).len()),);
+    assert_eq!(v1_empty_batch_len(), v1_batch_bytes(&[], 1).len());
+    for (op, len) in [
+        (
+            DeltaOperation::Coverage { covered_lsn: 1 },
+            v1_coverage_frame_len(),
+        ),
+        (
+            DeltaOperation::CollectionTombstone {
+                collection_id: [1; 16],
+                generation: 1,
+            },
+            v1_tombstone_frame_len(),
+        ),
+    ] {
+        assert_eq!(encode_frame(&op).unwrap().len(), len);
+    }
+    assert_eq!(
+        encode_frame(&DeltaOperation::Incremental(test_frame(1, 1)))
+            .unwrap()
+            .len(),
+        v1_incremental_frame_len()
+    );
+    assert_eq!(
+        encode_frame(&redo_set([1; 16], [2; 16], 1)).unwrap().len(),
+        v1_redo_frame_len()
+    );
+    assert_eq!(
+        v1_snapshot_frame_len(4),
+        Some(
+            encode_frame(&DeltaOperation::CollectionSnapshot {
+                collection_id: [1; 16],
+                generation: 1,
+                order_key: 1,
+                index_blob: vec![0; 4],
+            })
+            .unwrap()
+            .len()
+        )
+    );
+}
