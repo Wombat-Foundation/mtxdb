@@ -168,18 +168,22 @@ jobs:
             # fails to resolve ports.ubuntu.com for a few seconds and turns a
             # transient network hiccup into a failed job, so retry the index
             # fetch and the downloads instead of failing on the first error.
-            apt_retry() {
-              attempt=1
-              while ! apt-get -o Acquire::Retries=5 "$@"; do
-                if [ "$attempt" -ge 5 ]; then
-                  return 1
-                fi
-                attempt=$((attempt + 1))
-                sleep 10
-              done
+            # `apt-get update` exits 0 when every index fails to download, so
+            # the later install then reports "Unable to locate package". Make
+            # fetch failures fatal and retry update and install as one unit so
+            # a resolver outage re-fetches the indexes too.
+            apt_setup() {
+              apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update &&
+                apt-get -o Acquire::Retries=5 install -y build-essential curl ca-certificates git pkg-config libzstd-dev
             }
-            apt_retry update
-            apt_retry install -y build-essential curl ca-certificates git pkg-config libzstd-dev
+            attempt=1
+            while ! apt_setup; do
+              if [ "$attempt" -ge 6 ]; then
+                exit 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 20
+            done
             attempt=1
             while ! curl --retry 5 --retry-delay 5 --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; do
               if [ "$attempt" -ge 3 ]; then
