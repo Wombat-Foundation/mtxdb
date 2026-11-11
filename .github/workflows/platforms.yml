@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-26, ubuntu-24.04-arm]
+        os: [windows-latest, macos-latest, ubuntu-24.04-arm]
     env:
       # Workflow declares `stable`, but the committed rust-toolchain.toml pin
       # (1.89.0) outranks the installed default; RUSTUP_TOOLCHAIN wins over the
