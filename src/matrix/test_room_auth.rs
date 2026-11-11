@@ -813,3 +813,100 @@ fn a_batch_over_the_transaction_stage_limit_is_a_typed_error_and_records_nothing
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn batch_helpers_and_short_ids_agree_with_single_event_recording() {
+    use crate::csr_adjacency::AppendDurability;
+    let dir = root("batch-helpers");
+    let db = Database::open(dir.clone()).unwrap();
+    let room = RoomAuth::new(ROOM);
+
+    let recorded = room
+        .record_events_with(
+            &db,
+            &[event("$a", &[]), event("$b", &["$a"])],
+            AppendDurability::Durable,
+        )
+        .unwrap();
+    assert_eq!(recorded.len(), 2);
+    room.sync_adjacency(&db).unwrap();
+
+    let ids = room.short_ids(&db, &["$a", "$b", "$fresh"]).unwrap();
+    assert_eq!(ids.len(), 3);
+    assert_eq!(room.short_id(&db, "$a").unwrap(), Some(ids[0]));
+    assert_eq!(
+        room.short_ids(&db, &["$fresh"]).unwrap(),
+        vec![ids[2]],
+        "asking again returns the allocated id"
+    );
+
+    let (prev, auth) = room.referenced_event_ids_by_family(&db).unwrap();
+    assert!(prev.is_empty());
+    assert_eq!(auth.into_iter().collect::<Vec<_>>(), vec!["$a".to_owned()]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_error_variant_renders_and_only_storage_has_a_source() {
+    use std::error::Error;
+    let cases = [
+        (RoomAuthError::BatchTooLarge { limit: 3 }, "at most 3"),
+        (
+            RoomAuthError::BatchExceedsTransactionLimit {
+                staged_bytes: 9,
+                limit_bytes: 4,
+            },
+            "9 bytes",
+        ),
+        (RoomAuthError::OrdinalExhausted, "exhausted"),
+        (
+            RoomAuthError::UnknownEvent {
+                event_id: "$x".into(),
+            },
+            "unknown event $x",
+        ),
+        (
+            RoomAuthError::EventNotRecorded {
+                event_id: "$x".into(),
+            },
+            "never recorded",
+        ),
+        (
+            RoomAuthError::MissingParent {
+                event_id: "$x".into(),
+            },
+            "unrecorded event $x",
+        ),
+        (
+            RoomAuthError::StaleGeneration {
+                pinned: 1,
+                current: Some(2),
+            },
+            "current generation is 2",
+        ),
+        (
+            RoomAuthError::StaleGeneration {
+                pinned: 1,
+                current: None,
+            },
+            "no generation is published",
+        ),
+        (RoomAuthError::RebuildConflict, "another rebuild"),
+        (RoomAuthError::WrongDomain, "different domain"),
+        (RoomAuthError::Corruption("bad".into()), "corrupt: bad"),
+        (
+            RoomAuthError::IncompleteClosure {
+                missing: vec!["$m".into()],
+            },
+            "missing",
+        ),
+    ];
+    for (error, needle) in cases {
+        assert!(error.to_string().contains(needle), "{error}");
+        assert!(error.source().is_none());
+    }
+    let storage = RoomAuthError::Storage(StorageError::Corrupt("c".into()));
+    assert!(storage.source().is_some());
+    assert!(!storage.to_string().is_empty());
+}

@@ -348,3 +348,67 @@ fn verify_reports_an_auth_cycle_as_a_finding_not_an_error() {
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn union_covers_known_events_and_names_everything_missing() {
+    let root = test_root("union");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_room(&db));
+    let create = closure
+        .adjacency()
+        .short_id(&db, "$create")
+        .unwrap()
+        .unwrap();
+    let m1 = closure.adjacency().short_id(&db, "$m1").unwrap().unwrap();
+    let m2 = closure.adjacency().short_id(&db, "$m2").unwrap().unwrap();
+
+    let ClosureOutcome::Complete(plain) = closure.union_of(&db, &["$m1", "$m2"], false).unwrap()
+    else {
+        panic!("both walks are complete");
+    };
+    assert_eq!(plain.iter().collect::<Vec<_>>(), vec![create]);
+
+    let ClosureOutcome::Complete(given) = closure.union_of(&db, &["$m1", "$m2"], true).unwrap()
+    else {
+        panic!("both walks are complete");
+    };
+    let mut want = vec![create, m1, m2];
+    want.sort_unstable();
+    assert_eq!(given.iter().collect::<Vec<_>>(), want);
+
+    // An unknown id and an event with a gap each make the union incomplete,
+    // and both are reported.
+    let ClosureOutcome::Incomplete { missing } = closure
+        .union_of(&db, &["$m1", "$orphan", "$never-seen"], false)
+        .unwrap()
+    else {
+        panic!("a union with a gap must be incomplete");
+    };
+    assert!(missing.contains(&"$never-seen".to_owned()), "{missing:?}");
+    assert!(
+        missing.contains(&"$never-recorded".to_owned()),
+        "{missing:?}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn persisted_closure_is_absent_until_a_generation_covers_the_event() {
+    let root = test_root("get-at");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_room(&db));
+    let m1 = closure.adjacency().short_id(&db, "$m1").unwrap().unwrap();
+
+    assert!(closure.get_at(&db, m1).unwrap().is_none());
+    assert!(closure.get(&db, "$never-seen").unwrap().is_none());
+    closure.rebuild(&db).unwrap();
+    let set = closure
+        .get_at(&db, m1)
+        .unwrap()
+        .expect("covered after rebuild");
+    assert_eq!(set.len(), 1);
+    assert!(closure.get_at(&db, 9999).unwrap().is_none());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
