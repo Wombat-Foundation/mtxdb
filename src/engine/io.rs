@@ -216,3 +216,18 @@ pub(crate) fn open_read_sequential(path: &std::path::Path) -> io::Result<File> {
     advise_sequential(&file);
     Ok(file)
 }
+
+/// Path to re-execute this test binary.
+///
+/// Coverage builds (and concurrent rebuilds) relink the on-disk test binary
+/// into the same target directory, so the path returned by `current_exe()` can
+/// be replaced or briefly absent when the child is spawned. On Linux
+/// `/proc/self/exe` names the running image itself, which survives that.
+#[cfg(test)]
+pub(crate) fn test_binary_path() -> std::path::PathBuf {
+    let running = std::path::Path::new("/proc/self/exe");
+    if running.exists() {
+        return running.to_path_buf();
+    }
+    std::env::current_exe().unwrap()
+}

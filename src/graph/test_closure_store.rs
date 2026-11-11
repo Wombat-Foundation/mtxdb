@@ -815,25 +815,11 @@ fn open_db(root: &Path) -> Database {
     panic!("open {}: {:?}", root.display(), last);
 }
 
-/// Path to re-execute this test binary.
-///
-/// Coverage builds (and concurrent rebuilds) relink the on-disk test binary
-/// into the same target directory, so the path returned by `current_exe()` can
-/// be replaced or briefly absent when the child is spawned. On Linux
-/// `/proc/self/exe` names the running image itself, which survives that.
-fn test_binary_path() -> std::path::PathBuf {
-    let running = std::path::Path::new("/proc/self/exe");
-    if running.exists() {
-        return running.to_path_buf();
-    }
-    std::env::current_exe().unwrap()
-}
-
 /// Run `scenario` in a child that stops at `crash_at`; returns whether it exited
 /// with `CRASH_EXIT_CODE` (the injected crash), as opposed to a panic or a clean
 /// exit.
 fn run_child(root: &PathBuf, scenario: &str, crash_at: &str) -> bool {
-    let output = std::process::Command::new(test_binary_path())
+    let output = std::process::Command::new(crate::io::test_binary_path())
         .args([
             "--exact",
             "test_closure_store::crash_child",

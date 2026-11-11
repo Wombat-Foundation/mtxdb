@@ -117,7 +117,7 @@ fn csr_deserialize_rejects_bad_buffers() {
         CsrError::UnsupportedVersion(3),
         CsrError::Malformed,
     ] {
-        assert!(!error.to_string().is_empty());
+        assert_ne!(error.to_string(), "");
     }
 }
 
@@ -131,7 +131,7 @@ fn csr_families_round_trip_preserves_rows_and_relation_types() {
     assert!(!families.has_auth_row(&id(4)));
     assert!(families.has_relation_row(&id(3)));
     assert_eq!(families.relation_types(&id(3)), &[7]);
-    assert!(families.relation_types(&id(1)).is_empty());
+    assert_eq!(families.relation_types(&id(1)), []);
 
     let decoded = super::CsrFamilies::deserialize(&families.serialize().unwrap()).unwrap();
     assert_eq!(decoded.nodes(), families.nodes());

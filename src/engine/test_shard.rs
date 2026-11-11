@@ -1775,7 +1775,7 @@ fn discover_rejects_malformed_pack_names_but_ignores_foreign_packs() {
     let dir = test_dir("discover_names");
     fs::write(dir.join("foreign.pack"), b"not ours").unwrap();
     // A foreign `.pack` file is skipped, not an error.
-    assert!(ShardPool::discover_pack_files(&dir).unwrap().is_empty());
+    assert_eq!(ShardPool::discover_pack_files(&dir).unwrap().len(), 0);
     fs::write(dir.join("pack_ZZZ.pack"), b"bad").unwrap();
     let error =
         ShardPool::discover_pack_files(&dir).expect_err("malformed pack_ name must be rejected");

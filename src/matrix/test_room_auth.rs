@@ -908,5 +908,5 @@ fn every_error_variant_renders_and_only_storage_has_a_source() {
     }
     let storage = RoomAuthError::Storage(StorageError::Corrupt("c".into()));
     assert!(storage.source().is_some());
-    assert!(!storage.to_string().is_empty());
+    assert_ne!(storage.to_string(), "");
 }
