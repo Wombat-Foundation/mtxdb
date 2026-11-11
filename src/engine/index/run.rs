@@ -277,8 +277,12 @@ struct BlockMeta {
 
 /// Streams sorted entries into a run file.
 ///
-/// Memory is one block of entries plus the metadata: 48 bytes per block and
-/// 32 per collection, so O(entries / B) rather than O(entries).
+/// Memory is one block of entries plus metadata: 48 bytes per block, 32 per
+/// collection, and one counter per `(collection, pack)` pair in `seen_stats`.
+/// `finish` uses those counters to reject explicit pack stats that omit a pair
+/// the run holds, and to derive stats when the caller supplied none. For `N`
+/// entries, block size `B`, `C` collections, `P` collection-pack pairs, and
+/// `K` packs, memory is O(B + N/B + C + P + K); `P` can be O(N).
 #[derive(Debug)]
 pub struct RunWriter {
     file: BufWriter<File>,

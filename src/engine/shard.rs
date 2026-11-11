@@ -3297,9 +3297,11 @@ impl ShardPool {
                 pending.push(existing);
             }
         }
-        // Joining here can delay rotation while the oldest sidecar is built,
-        // but keeps both the active builder count and spawned thread count
-        // bounded. Do this before spawning the replacement worker.
+        // When all builder slots are occupied, rotation waits for the oldest
+        // sidecar build here. A build scans the whole pack (up to
+        // `MAX_SHARD_BYTES`), so this can stall the rotating writer; that is
+        // the accepted cost of bounding both active builders and spawned
+        // threads. Do this before spawning the replacement worker.
         while pending.len() >= MAX_SEAL_WORKERS {
             let oldest = pending.remove(0);
             let _ = oldest.join();

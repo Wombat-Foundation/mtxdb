@@ -423,6 +423,17 @@ fn decode_for(
     Ok(key)
 }
 
+/// Decode `bytes` and check it is the record of `origin` at slot `id`.
+fn decode_at(origin: &[u8], id: &[u8; 16], bytes: &[u8]) -> Result<ServerKey, StorageError> {
+    let key = decode_for(origin, None, bytes)?;
+    if origin_key_record_id(&key.key_id) != *id {
+        return Err(StorageError::Collision(
+            "signing-key record does not belong to its slot".to_owned(),
+        ));
+    }
+    Ok(key)
+}
+
 /// Read one key of `origin` from `store`.
 ///
 /// # Errors
@@ -459,12 +470,7 @@ pub fn read_server_keys(
     let mut keys = Vec::new();
     for item in store.scan_collection(&origin_keys_collection_id(origin))? {
         let (node_id, data) = item?;
-        let key = decode_for(origin, None, &data.bytes)?;
-        if origin_key_record_id(&key.key_id) != node_id {
-            return Err(StorageError::Collision(
-                "signing-key record does not belong to its slot".to_owned(),
-            ));
-        }
+        let key = decode_at(origin, &node_id, &data.bytes)?;
         keys.push(key);
     }
     keys.sort_by(|a, b| a.key_id.cmp(&b.key_id));
@@ -947,12 +953,7 @@ fn load(
     for ((id, record), version) in ids.iter().zip(&records).zip(&versions) {
         tx.expect_record_version(SERVER_INFO_POOL, collection, *id, *version)?;
         if let Some(data) = record {
-            let key = decode_for(origin, None, &data.bytes)?;
-            if origin_key_record_id(&key.key_id) != *id {
-                return Err(StorageError::Collision(
-                    "signing-key record does not belong to its slot".to_owned(),
-                ));
-            }
+            let key = decode_at(origin, id, &data.bytes)?;
             current.insert(*id, key);
         }
     }

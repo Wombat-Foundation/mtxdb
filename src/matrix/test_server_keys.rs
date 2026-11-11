@@ -433,7 +433,10 @@ fn a_record_under_another_keys_slot_is_rejected() {
     assert!(read_server_keys(db.server_info(), b"one").is_err());
     assert!(read_server_key(db.server_info(), b"one", b"ed25519:b").is_err());
     let keys = [observed("ed25519:b", b"AAAA", 1)];
-    assert!(merge(&db, &update("one", KeySighting::Direct, "d", &keys, 1)).is_err());
+    assert!(matches!(
+        update_server_keys(&db, &update("one", KeySighting::Direct, "d", &keys, 1)),
+        Err(StorageError::Collision(_))
+    ));
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
