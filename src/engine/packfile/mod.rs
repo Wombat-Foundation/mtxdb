@@ -1882,6 +1882,8 @@ pub fn open_packfile_with_creation_seq(
 
     if file.metadata()?.len() == 0 {
         write_header_with_creation_seq(&mut file, pack_id, creation_seq)?;
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("pack.header_fsync", path);
         file.sync_all()?;
     } else {
         validate_header_identity(&file, path, pack_id)?;
@@ -2451,10 +2453,7 @@ fn recover_packfile_with(
 /// an index insert) must be able to abort on a semantic error without first
 /// materializing the whole pack. Returning `Err` stops the walk; a torn tail
 /// found before that point is not truncated, because the open fails anyway.
-pub(crate) fn try_recover_packfile_with<E, F>(
-    path: &Path,
-    mut on_record: F,
-) -> Result<PackRecovery, E>
+pub(crate) fn try_recover_packfile_with<E, F>(path: &Path, on_record: F) -> Result<PackRecovery, E>
 where
     E: From<io::Error>,
     F: FnMut(ScanEntryWithRemoval) -> Result<(), E>,
@@ -2464,13 +2463,47 @@ where
         inner: BufReader::with_capacity(RECOVERY_BUFFER_BYTES, file),
         position: 0,
     };
+    let recovery = {
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("recovery.scan", path);
+        walk_packfile(&mut reader, on_record)?
+    };
+
+    // Only truncate if we actually hit a torn tail — not on clean EOF
+    // or mid-file corruption (which was propagated as an error above).
+    if recovery.truncated {
+        drop(reader);
+        let file = OpenOptions::new().write(true).open(path).map_err(E::from)?;
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("recovery.truncate_sync", path);
+        file.set_len(recovery.valid_len).map_err(E::from)?;
+        file.sync_all().map_err(E::from)?;
+    }
+
+    Ok(recovery)
+}
+
+/// The recovery walk over an already-open reader: validates the header and
+/// every frame, calls `on_record` for each valid record, and reports where the
+/// valid data ends. It never touches the file, so the caller decides what to do
+/// with `truncated`; an in-memory reader exercises exactly the production
+/// parsing.
+fn walk_packfile<R, E, F>(
+    reader: &mut CountingReader<R>,
+    mut on_record: F,
+) -> Result<PackRecovery, E>
+where
+    R: Read,
+    E: From<io::Error>,
+    F: FnMut(ScanEntryWithRemoval) -> Result<(), E>,
+{
     let mut recovery = PackRecovery {
         records: 0,
         valid_len: 0,
         truncated: false,
     };
 
-    if read_header(&mut reader).map_err(E::from)?.is_none() {
+    if read_header(&mut *reader).map_err(E::from)?.is_none() {
         return Ok(recovery);
     }
 
@@ -2478,7 +2511,7 @@ where
     let mut scratch = [0u8; SCAN_DISCARD_BUF_LEN];
     loop {
         let offset = reader.position;
-        match read_record_metadata_scratch_with_len(&mut reader, &mut scratch) {
+        match read_record_metadata_scratch_with_len(&mut *reader, &mut scratch) {
             Ok(Some((meta, disk_bytes))) => {
                 on_record(ScanEntryWithRemoval {
                     collection_id: meta.collection_id,
@@ -2492,9 +2525,9 @@ where
             }
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                // Torn tail: a write crashed mid-frame. Truncate to the
-                // last valid record boundary so future appends don't land
-                // after a corrupt frame.
+                // Torn tail: a write crashed mid-frame. The caller truncates
+                // to the last valid record boundary so future appends don't
+                // land after a corrupt frame.
                 recovery.truncated = true;
                 break;
             }
@@ -2506,16 +2539,6 @@ where
             }
         }
     }
-
-    // Only truncate if we actually hit a torn tail — not on clean EOF
-    // or mid-file corruption (which was propagated as an error above).
-    if recovery.truncated {
-        drop(reader);
-        let file = OpenOptions::new().write(true).open(path).map_err(E::from)?;
-        file.set_len(recovery.valid_len).map_err(E::from)?;
-        file.sync_all().map_err(E::from)?;
-    }
-
     Ok(recovery)
 }
 
