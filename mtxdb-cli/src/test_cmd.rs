@@ -10649,6 +10649,9 @@ fn seeding_experiment_on_minic10y() {
 
     let mut total = [0u64; 12];
     let mut rejected_total = 0u64;
+    // Head-only variant: [filled, conflicts, existing-differs (kept), rejected,
+    // missing body, non-state, heads with a fill, agrees with existing].
+    let mut head_only = [0u64; 8];
     // (room, type, state_key, baseline id, seeded id) -> heads that inherit it.
     let mut displacements: std::collections::BTreeMap<
         (String, String, String, String, String),
@@ -10810,6 +10813,108 @@ fn seeding_experiment_on_minic10y() {
                 }
             }
         }
+        // Head-only variant: no seed enters the walk. After the baseline walk,
+        // fill each best-effort head's missing keys from the citations of the
+        // gap roots in its own ancestry. Existing entries always win; a key
+        // with two different candidate ids stays unfilled and is a conflict.
+        let gap_root_set: HashSet<&str> = by_id
+            .iter()
+            .filter(|(_, ev)| {
+                ev.get("prev_events")
+                    .and_then(OwnedValue::as_array)
+                    .is_some_and(|prevs| {
+                        prevs
+                            .iter()
+                            .filter_map(OwnedValue::as_str)
+                            .any(|p| !by_id.contains_key(p))
+                    })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for head in baseline.partial.keys() {
+            let before = &baseline.partial_instances[&baseline.partial[head]]
+                .set
+                .entries;
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut stack: Vec<&str> = vec![head.as_str()];
+            let mut roots_in_ancestry: Vec<&str> = Vec::new();
+            while let Some(id) = stack.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                if gap_root_set.contains(id) {
+                    roots_in_ancestry.push(id);
+                }
+                if let Some(ev) = by_id.get(id) {
+                    for prev in ev
+                        .get("prev_events")
+                        .and_then(OwnedValue::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(OwnedValue::as_str)
+                    {
+                        if by_id.contains_key(prev) {
+                            stack.push(prev);
+                        }
+                    }
+                }
+            }
+            let mut candidates: std::collections::BTreeMap<(String, String), HashSet<&str>> =
+                std::collections::BTreeMap::new();
+            let mut cited_seen: HashSet<&str> = HashSet::new();
+            for root in roots_in_ancestry {
+                let cited = by_id[root]
+                    .get("auth_events")
+                    .and_then(OwnedValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(OwnedValue::as_str);
+                for id in cited {
+                    if !cited_seen.insert(id) {
+                        continue;
+                    }
+                    if final_rejected.contains(id) {
+                        head_only[3] += 1;
+                        continue;
+                    }
+                    let Some(body) = by_id.get(id) else {
+                        head_only[4] += 1;
+                        continue;
+                    };
+                    if !super::is_state_event(body) {
+                        head_only[5] += 1;
+                        continue;
+                    }
+                    candidates
+                        .entry((
+                            super::event_string_field(body, "type")
+                                .unwrap_or("")
+                                .to_owned(),
+                            super::state_key(body),
+                        ))
+                        .or_default()
+                        .insert(id);
+                }
+            }
+            let mut filled_here = 0u64;
+            for (key, ids) in &candidates {
+                if let Some(existing) = before.get(key) {
+                    if ids.len() == 1 && ids.iter().next() == Some(&existing.as_str()) {
+                        head_only[7] += 1;
+                    } else {
+                        head_only[2] += 1;
+                    }
+                } else if ids.len() == 1 {
+                    filled_here += 1;
+                } else {
+                    head_only[1] += 1;
+                }
+            }
+            head_only[0] += filled_here;
+            if filled_here > 0 {
+                head_only[6] += 1;
+            }
+        }
         println!(
             "{:<28} heads={:<4} +added={:<5} displaced={:<3} heads_with_add={:<4} roots={:<4} filled={:<5} bad_identity={}",
             room.chars().take(28).collect::<String>(),
@@ -10886,6 +10991,19 @@ fn seeding_experiment_on_minic10y() {
         total[10],
         total[11],
         rejected_total
+    );
+    println!(
+        "HEAD-ONLY variant: filled={} (propagated seed added {}) heads_with_fill={} conflicts_unfilled={} \
+         existing_kept_differs={} agrees_with_existing={} skipped(rejected={} missing_body={} non_state={}) displaced=0 by construction",
+        head_only[0],
+        total[1],
+        head_only[6],
+        head_only[1],
+        head_only[2],
+        head_only[7],
+        head_only[3],
+        head_only[4],
+        head_only[5]
     );
     println!("complete map, gapped set, unresolved and incomplete: identical in every room");
     println!(
