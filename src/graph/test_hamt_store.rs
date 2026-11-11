@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use crate::database::Database;
-use crate::hamt::{diff_hamt_nodes, HamtNode};
-use crate::hamt_store::{build_canonical, encode_nodes, node_edges, put_nodes, HamtCollection};
+use crate::hamt::{build_hamt, diff_hamt_nodes, HamtNode};
+use crate::hamt_store::{encode_nodes, node_edges, put_nodes, HamtCollection};
 use crate::layout::ShardType;
 
 const POOL: ShardType = ShardType::State;
@@ -32,7 +32,7 @@ fn round_trips_point_reads_and_scans_for_any_codec_types() {
     let root_dir = test_root("round-trip");
     let db = Database::open(root_dir.clone()).unwrap();
     let input = entries(500);
-    let root = build_canonical::<u64, Vec<u8>, _>(KEY, input.clone()).unwrap();
+    let root = build_hamt::<u64, Vec<u8>, _>(KEY, input.clone()).unwrap();
     let nodes = encode_nodes(&root);
     assert!(nodes.len() > 1, "500 entries span more than one node");
     publish(&db, &nodes);
@@ -64,7 +64,7 @@ fn round_trips_point_reads_and_scans_for_any_codec_types() {
 
 #[test]
 fn encoded_nodes_list_children_first_and_edges_name_stored_ids() {
-    let root = build_canonical::<u64, Vec<u8>, _>(KEY, entries(300)).unwrap();
+    let root = build_hamt::<u64, Vec<u8>, _>(KEY, entries(300)).unwrap();
     let nodes = encode_nodes(&root);
     assert_eq!(
         nodes.last().unwrap().0,
@@ -87,7 +87,7 @@ fn encoded_nodes_list_children_first_and_edges_name_stored_ids() {
 fn a_tree_from_another_structural_key_fails_verification() {
     let root_dir = test_root("wrong-key");
     let db = Database::open(root_dir.clone()).unwrap();
-    let root = build_canonical::<u64, Vec<u8>, _>(KEY, entries(200)).unwrap();
+    let root = build_hamt::<u64, Vec<u8>, _>(KEY, entries(200)).unwrap();
     publish(&db, &encode_nodes(&root));
 
     let wrong = HamtCollection::new(db.pool(POOL), COLLECTION, b"another-key".as_slice());
@@ -100,11 +100,11 @@ fn a_tree_from_another_structural_key_fails_verification() {
 
 #[test]
 fn persisted_trees_diff_like_in_memory_ones() {
-    let a = build_canonical::<u64, Vec<u8>, _>(KEY, entries(400)).unwrap();
+    let a = build_hamt::<u64, Vec<u8>, _>(KEY, entries(400)).unwrap();
     let mut changed = entries(400);
     changed[7].1 = b"changed".to_vec();
     changed.push((1_000, b"new".to_vec()));
-    let b = build_canonical::<u64, Vec<u8>, _>(KEY, changed).unwrap();
+    let b = build_hamt::<u64, Vec<u8>, _>(KEY, changed).unwrap();
     let mut unreachable = |_: &[u8; 32]| -> Result<std::sync::Arc<HamtNode<u64, Vec<u8>>>, ()> {
         unreachable!("trees are fully resolved")
     };

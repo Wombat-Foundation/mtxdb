@@ -98,7 +98,7 @@ pub fn build_state_hamt(
     let hamt_entries = entries.iter().map(|(event_type, state_key, event_id)| {
         (state_hamt_leaf_key(event_type, state_key), event_id.clone())
     });
-    let root = hamt_store::build_canonical(&structural_key, hamt_entries)
+    let root = rezzy::hamt::build_hamt(&structural_key, hamt_entries)
         .map_err(|error| format!("failed to build state HAMT for {room_id}: {error:?}"))?;
     let handle = rezzy::hamt::RootHandle::from_lthash(root.structural_hash, &lattice);
 

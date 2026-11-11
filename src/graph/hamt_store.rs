@@ -7,11 +7,9 @@
 //! every loaded node against the full hash, so a truncated-id collision is an
 //! error, never a silently wrong tree.
 //!
-//! Trees route keys with
-//! [`canonical_key_path_hash`](crate::hamt::canonical_key_path_hash), which hashes the
-//! persisted key encoding. Node bytes therefore depend only on the logical
-//! content and the structural key, never on a Rust `Hash` implementation, and
-//! every point read here uses the same routing.
+//! Build trees with [`crate::hamt::build_hamt`]: `rezzy`'s HAMT routes keys by
+//! their encoded bytes by default, so node bytes depend only on the logical
+//! content and the structural key, and every read here routes the same way.
 //!
 //! Root records, collection choice, and what a key or value means are left to
 //! the caller; [`crate::state_hamt`] is the Matrix room-state layer built on
@@ -22,8 +20,8 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use rezzy::hamt::{
-    canonical_key_path_hash, HamtBuildError, HamtCodec, HamtNode, HamtReadError, NodeRef,
-    PersistedHamtReader, PersistedInternalNode, StructuralHash,
+    HamtCodec, HamtNode, HamtReadError, NodeRef, PersistedHamtReader, PersistedInternalNode,
+    StructuralHash,
 };
 
 use crate::storage::{NodeData, StorageEngine, StorageError};
@@ -39,24 +37,6 @@ pub type HamtReader<'a, K, V> = PersistedHamtReader<'a, K, V, StorageError, Node
 
 /// Why a persisted HAMT read failed.
 pub type HamtStoreError = HamtReadError<StorageError>;
-
-/// Build a tree routed with [`canonical_key_path_hash`].
-///
-/// # Errors
-/// Returns [`HamtBuildError`] if the input exhausts the trie depth.
-pub fn build_canonical<K, V, I>(
-    structural_key: &[u8],
-    entries: I,
-) -> Result<Arc<HamtNode<K, V>>, HamtBuildError>
-where
-    K: Hash + HamtCodec,
-    V: HamtCodec,
-    I: IntoIterator<Item = (K, V)>,
-{
-    rezzy::hamt::build_hamt_with_key_hash(structural_key, entries, |key| {
-        canonical_key_path_hash(structural_key, key)
-    })
-}
 
 /// Encode every node of a fully resolved tree exactly once, children before
 /// parents, as `(structural_hash, MTHN record)`.
@@ -189,7 +169,7 @@ impl<'a> HamtCollection<'a> {
         PersistedHamtReader::new(&self.structural_key, load)
     }
 
-    /// Look up `key` under `root`, routing canonically.
+    /// Look up `key` under `root`.
     ///
     /// # Errors
     /// Returns an error when a node on the path is missing, unreadable, or
@@ -199,11 +179,7 @@ impl<'a> HamtCollection<'a> {
         K: HamtCodec + Hash + Eq,
         V: HamtCodec + Hash + Clone,
     {
-        let structural_key = self.structural_key.as_slice();
-        self.reader::<K, V>()
-            .get_with_key_hash(root, key, |key: &K| {
-                canonical_key_path_hash(structural_key, key)
-            })
+        self.reader::<K, V>().get(root, key)
     }
 
     /// Every entry under `root`, in trie order.
