@@ -27,6 +27,12 @@ FILE_FLOORS = {
     "engine/index/delta.rs": 75.0,
     "engine/index/checkpoint.rs": 88.0,
     "graph/csr/mod.rs": 95.0,
+    # Auth decisions and the adjacency/closure views they read. These now
+    # exercise their integrity checks (disagreement, undecodable closures,
+    # false skips) and short-id round trips, not just the happy path.
+    "matrix/auth_closure.rs": 84.0,
+    "matrix/room_auth.rs": 86.0,
+    "matrix/csr_adjacency.rs": 86.0,
 }
 
 
