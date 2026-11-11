@@ -9672,6 +9672,70 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
     );
 }
 
+/// A delta log holding an incremental frame stamped with a generation the
+/// collection does not have is stale: it is rejected by name and the open
+/// rescans without losing a record. Frames for a collection that was deleted
+/// in the same log are skipped rather than rejected.
+#[test]
+fn a_stale_incremental_frame_is_rejected_and_the_open_rescans() {
+    let dir = test_dir("stale_incremental_frame");
+    let collection = [0xDA; 16];
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(&collection, &batch_node(0), &NodeData::from_slice(b"base"))
+        .unwrap();
+    store.sync_all().unwrap();
+    for id in 1..=3 {
+        store
+            .put(&collection, &batch_node(id), &NodeData::from_slice(b"redo"))
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    let base = store.delta_state.lock().base_fingerprint.unwrap();
+    drop(store);
+
+    let path = PackfileStorage::delta_path(&dir, base);
+    let log = delta::read_delta_log(&path).unwrap();
+    let mut operations = log.operations;
+    operations.push(DeltaOperation::Incremental(
+        crate::index::format::DeltaFrame {
+            collection_id: collection,
+            bucket: 0,
+            generation: u64::MAX,
+            slot: 1,
+        },
+    ));
+    fs::remove_file(&path).unwrap();
+    delta::append_batch_with_durability(
+        &path,
+        true,
+        log.base_fingerprint,
+        &operations,
+        log.tail_fingerprint,
+        false,
+    )
+    .unwrap();
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let timings = reopened.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert_eq!(
+        timings.checkpoint_reject,
+        Some(CheckpointReject::DeltaGenerationMismatch)
+    );
+    for id in 0..=3 {
+        assert!(
+            reopened
+                .get(&collection, &batch_node(id))
+                .unwrap()
+                .is_some(),
+            "record {id} survives the rescan"
+        );
+    }
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// A checkpoint whose bridging delta log has vanished — the state a store is
 /// left in when the background checkpoint worker fails to append the log, or
 /// its append is interrupted — is rejected by name (`DeltaLogMissing`) and the

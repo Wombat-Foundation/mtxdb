@@ -4006,3 +4006,147 @@ fn staged_lookup_index_matches_a_full_scan() {
     stage.discard();
     assert_eq!(stage.state(), TxnStageState::Discarded);
 }
+
+#[test]
+fn inactive_stage_rejects_every_staging_call_without_changing_state() {
+    use crate::layout::ShardType;
+
+    let stage = TxnStage::new();
+    stage
+        .stage_put(ShardType::State, [1; 16], [1; 16], b"v".to_vec())
+        .unwrap();
+    stage.discard();
+    assert_eq!(stage.state(), TxnStageState::Discarded);
+
+    assert!(stage.ensure_capacity(1).is_err());
+    assert!(stage
+        .stage_remove_record(ShardType::State, [1; 16], [1; 16])
+        .is_err());
+    assert!(stage
+        .stage_remove_records(ShardType::State, [1; 16], &[[1; 16]])
+        .is_err());
+    assert!(stage
+        .forget_staged_record(ShardType::State, [1; 16], [1; 16])
+        .is_err());
+    // An empty removal batch is a no-op even on an inactive stage.
+    stage
+        .stage_remove_records(ShardType::State, [1; 16], &[])
+        .unwrap();
+    assert!(stage.is_empty());
+}
+
+#[test]
+fn stage_budget_is_enforced_and_released_by_forgetting() {
+    use crate::layout::ShardType;
+
+    // Each removal marker is charged 64 bytes.
+    let stage = TxnStage::with_limit(64 * 3);
+    stage
+        .stage_remove_records(ShardType::State, [1; 16], &[[1; 16], [2; 16], [3; 16]])
+        .unwrap();
+    // The stage is exactly full: more of either shape is refused and nothing
+    // is staged on failure.
+    assert!(stage
+        .stage_remove_records(ShardType::State, [1; 16], &[[4; 16]])
+        .is_err());
+    assert!(stage
+        .stage_remove_record(ShardType::State, [1; 16], [4; 16])
+        .is_err());
+    assert!(stage.ensure_capacity(1).is_err());
+    assert_eq!(
+        stage.snapshot_mutations()[0..]
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        3
+    );
+
+    // Forgetting one staged key releases its budget for reuse.
+    stage
+        .forget_staged_record(ShardType::State, [1; 16], [2; 16])
+        .unwrap();
+    stage.ensure_capacity(64).unwrap();
+    stage
+        .stage_remove_record(ShardType::State, [1; 16], [4; 16])
+        .unwrap();
+    assert_eq!(
+        stage
+            .snapshot_mutations()
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        3
+    );
+}
+
+#[test]
+fn publish_refuses_cross_pool_stage_without_a_shared_coordinator() {
+    use crate::layout::ShardType;
+
+    let first_path = temp_path("txn_stage_split_a");
+    let second_path = temp_path("txn_stage_split_b");
+    let _ = fs::remove_file(&first_path);
+    let _ = fs::remove_file(&second_path);
+    let (first_journal, first_scan) = Journal::open_shared(&first_path).unwrap();
+    let (second_journal, second_scan) = Journal::open_shared(&second_path).unwrap();
+    let first = JournalCoordinator::new(first_journal, &first_scan);
+    let second = JournalCoordinator::new(second_journal, &second_scan);
+
+    let stage = TxnStage::new();
+    stage
+        .stage_put(ShardType::EventDag, [1; 16], [1; 16], b"e".to_vec())
+        .unwrap();
+    stage
+        .stage_put(ShardType::State, [2; 16], [2; 16], b"s".to_vec())
+        .unwrap();
+    let mut coordinators: [Option<&JournalCoordinator>; ShardType::ALL.len()] =
+        ShardType::ALL.map(|_| None);
+    coordinators[ShardType::EventDag as usize] = Some(&first);
+    coordinators[ShardType::State as usize] = Some(&second);
+    let error = stage.publish(coordinators).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(stage.state(), TxnStageState::Active);
+
+    let _ = fs::remove_file(first_path);
+    let _ = fs::remove_file(second_path);
+}
+
+#[test]
+fn publish_reports_a_staged_pool_with_no_journal() {
+    use crate::layout::ShardType;
+
+    let path = temp_path("txn_stage_unconnected");
+    let _ = fs::remove_file(&path);
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+
+    let stage = TxnStage::new();
+    stage
+        .stage_put(ShardType::State, [1; 16], [1; 16], b"s".to_vec())
+        .unwrap();
+    // Some other pool is journaled, but the touched pool is not.
+    let mut coordinators: [Option<&JournalCoordinator>; ShardType::ALL.len()] =
+        ShardType::ALL.map(|_| None);
+    coordinators[ShardType::EventDag as usize] = Some(&coordinator);
+    let error = stage.publish(coordinators).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+
+    // With journaling disabled everywhere the stage is simply published.
+    let no_journal = TxnStage::new();
+    no_journal
+        .stage_put(ShardType::State, [1; 16], [1; 16], b"s".to_vec())
+        .unwrap();
+    no_journal.publish(ShardType::ALL.map(|_| None)).unwrap();
+    assert_eq!(no_journal.state(), TxnStageState::Published);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn shared_wal_lock_refuses_a_directory_that_is_not_a_database_root() {
+    let dir = ReplayTestDir::new("wal_lock_not_root");
+    let Err(error) = super::SharedWalLock::acquire(&dir.0) else {
+        panic!("a plain directory must not be lockable as a database root");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("not an mtxdb database root"));
+}

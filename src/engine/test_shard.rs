@@ -1637,3 +1637,82 @@ fn test_run_merge_worker_stops_when_signalled() {
     assert!(!pool.run_merge_active());
     assert!(worker_stopped.load(Ordering::Acquire));
 }
+
+#[test]
+fn open_with_max_shard_bytes_rejects_unusable_thresholds() {
+    for bad in [0, 1, MAX_SHARD_BYTES + 1] {
+        let dir = test_dir("bad_shard_size");
+        let Err(error) = ShardPool::open_with_max_shard_bytes(dir, bad) else {
+            panic!("threshold {bad} must be rejected");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{bad}");
+    }
+}
+
+#[test]
+fn discover_rejects_malformed_pack_names_but_ignores_foreign_packs() {
+    let dir = test_dir("discover_names");
+    fs::write(dir.join("foreign.pack"), b"not ours").unwrap();
+    // A foreign `.pack` file is skipped, not an error.
+    assert!(ShardPool::discover_pack_files(&dir).unwrap().is_empty());
+    fs::write(dir.join("pack_ZZZ.pack"), b"bad").unwrap();
+    let error =
+        ShardPool::discover_pack_files(&dir).expect_err("malformed pack_ name must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("invalid pack filename"));
+}
+
+#[test]
+fn read_only_open_of_a_directory_with_no_pool_fails_as_not_found() {
+    let dir = test_dir("read_only_empty");
+    let Err(error) = ShardPool::open_read_only(dir) else {
+        panic!("an empty directory has nothing to read");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn damaged_pool_meta_is_reported_instead_of_ignored() {
+    let dir = test_dir("pool_meta_damage");
+    {
+        let pool = ShardPool::open(dir.clone()).unwrap();
+        pool.put_record(&test_record(1, 1, b"x")).unwrap();
+        pool.sync_all().unwrap();
+    }
+    let meta = dir.join(POOL_META_FILENAME);
+    let good = fs::read(&meta).expect("pool.meta is written for a used pool");
+    assert!(good.len() >= POOL_META_FIXED_LEN);
+
+    let truncated = good[..POOL_META_FIXED_LEN - 1].to_vec();
+    let mut bad_magic = good.clone();
+    bad_magic[0] ^= 0xff;
+    let mut bad_version = good.clone();
+    bad_version[4] = POOL_META_VERSION.wrapping_add(1);
+    for (bytes, kind) in [
+        (truncated, io::ErrorKind::InvalidData),
+        (bad_magic, io::ErrorKind::InvalidData),
+        (bad_version, io::ErrorKind::Unsupported),
+    ] {
+        fs::write(&meta, bytes).unwrap();
+        let error =
+            ShardPool::restore_pool_meta(&dir).expect_err("damaged pool.meta must be an error");
+        assert_eq!(error.kind(), kind);
+    }
+    fs::remove_file(&meta).unwrap();
+    assert!(ShardPool::restore_pool_meta(&dir).unwrap().is_none());
+}
+
+#[test]
+fn lock_holder_info_parses_markers_and_rejects_garbage() {
+    let dir = test_dir("lock_info");
+    let path = dir.join("marker.lock");
+    assert!(ShardPool::lock_holder_info(&path).is_none());
+    fs::write(&path, "not-a-pid").unwrap();
+    assert!(ShardPool::lock_holder_info(&path).is_none());
+    fs::write(&path, format!("{}", std::process::id())).unwrap();
+    let info = ShardPool::lock_holder_info(&path).unwrap();
+    assert_eq!(info.pid, std::process::id());
+    assert!(!info.has_starttime);
+    fs::write(&path, format!("{} 12345", std::process::id())).unwrap();
+    assert!(ShardPool::lock_holder_info(&path).unwrap().has_starttime);
+}
