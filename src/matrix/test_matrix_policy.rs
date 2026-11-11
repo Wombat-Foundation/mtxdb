@@ -130,7 +130,15 @@ fn room_version_strings_parse_and_unknown_ones_do_not() {
         MatrixRoomVersion::parse("12.1"),
         Some(MatrixRoomVersion::V12)
     );
-    for bad in ["", "0", "99", "v4", "04", "4 ", "org.example.custom"] {
+    for bad in [
+        "",
+        "0",
+        "unknown_roomversion_99",
+        "v4",
+        "04",
+        "4 ",
+        "org.example.custom",
+    ] {
         assert_eq!(MatrixRoomVersion::parse(bad), None, "{bad:?}");
     }
 }
