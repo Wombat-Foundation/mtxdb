@@ -424,8 +424,13 @@ fn decode_for(
 }
 
 /// Decode `bytes` and check it is the record of `origin` at slot `id`.
-fn decode_at(origin: &[u8], id: &[u8; 16], bytes: &[u8]) -> Result<ServerKey, StorageError> {
-    let key = decode_for(origin, None, bytes)?;
+fn decode_at(
+    origin: &[u8],
+    expected_key_id: Option<&[u8]>,
+    id: &[u8; 16],
+    bytes: &[u8],
+) -> Result<ServerKey, StorageError> {
+    let key = decode_for(origin, expected_key_id, bytes)?;
     if origin_key_record_id(&key.key_id) != *id {
         return Err(StorageError::Collision(
             "signing-key record does not belong to its slot".to_owned(),
@@ -443,15 +448,13 @@ pub fn read_server_key(
     origin: &[u8],
     key_id: &[u8],
 ) -> Result<Option<ServerKey>, StorageError> {
-    let found = store.get_many(
-        &origin_keys_collection_id(origin),
-        &[origin_key_record_id(key_id)],
-    )?;
+    let slot = origin_key_record_id(key_id);
+    let found = store.get_many(&origin_keys_collection_id(origin), &[slot])?;
     found
         .into_iter()
         .next()
         .flatten()
-        .map(|data| decode_for(origin, Some(key_id), &data.bytes))
+        .map(|data| decode_at(origin, Some(key_id), &slot, &data.bytes))
         .transpose()
 }
 
@@ -470,7 +473,7 @@ pub fn read_server_keys(
     let mut keys = Vec::new();
     for item in store.scan_collection(&origin_keys_collection_id(origin))? {
         let (node_id, data) = item?;
-        let key = decode_at(origin, &node_id, &data.bytes)?;
+        let key = decode_at(origin, None, &node_id, &data.bytes)?;
         keys.push(key);
     }
     keys.sort_by(|a, b| a.key_id.cmp(&b.key_id));
@@ -499,11 +502,11 @@ pub fn read_server_keys_by_ids(
         .collect();
     let found = store.get_many(&collection, &record_ids)?;
     let mut keys = Vec::with_capacity(found.len());
-    for (key_id, data) in key_ids.iter().zip(found) {
+    for ((key_id, slot), data) in key_ids.iter().zip(&record_ids).zip(found) {
         let Some(data) = data else {
             continue;
         };
-        keys.push(decode_for(origin, Some(key_id), &data.bytes)?);
+        keys.push(decode_at(origin, Some(key_id), slot, &data.bytes)?);
     }
     keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
     Ok(keys)
@@ -604,7 +607,7 @@ pub fn set_verified_observations(
                         batch_missing.push(first_index.saturating_add(offset));
                         continue;
                     };
-                    let mut key = decode_for(origin, Some(key_id), &data.bytes)?;
+                    let mut key = decode_at(origin, Some(key_id), &id, &data.bytes)?;
                     // Only a value staged earlier in this same transaction has
                     // no published version to fence; a live token-0 record does.
                     if !staged.first().copied().unwrap_or(false) {
@@ -953,7 +956,7 @@ fn load(
     for ((id, record), version) in ids.iter().zip(&records).zip(&versions) {
         tx.expect_record_version(SERVER_INFO_POOL, collection, *id, *version)?;
         if let Some(data) = record {
-            let key = decode_at(origin, id, &data.bytes)?;
+            let key = decode_at(origin, None, id, &data.bytes)?;
             current.insert(*id, key);
         }
     }
