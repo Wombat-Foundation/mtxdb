@@ -15937,6 +15937,39 @@ fn resolve_repack_slots(
     ))
 }
 
+/// Resolve `--root` values for a collection repack.
+///
+/// A root is a `0x`-prefixed record ID (for example a state group's `MTHR`
+/// root record in a `STAT` collection) or a Matrix event ID, hashed the way
+/// import stores events. Every root must be stored in the collection: a root
+/// that is not reaches nothing, so the repack would drop every record. That is
+/// refused here instead of discovered afterwards.
+fn resolve_repack_roots(
+    store: &PackfileStorage,
+    collection_id: &[u8; 16],
+    roots: &[String],
+) -> anyhow::Result<Vec<[u8; 16]>> {
+    roots
+        .iter()
+        .map(|root| {
+            let id = if root.starts_with("0x") {
+                parse_node_id(root)?
+            } else {
+                matrix_event_node_id(root)?
+            };
+            if store.get(collection_id, &id)?.is_none() {
+                bail!(
+                    "--root {root} ({}) is not stored in collection {}; refusing to repack, \
+                     which would treat every record as unreachable",
+                    format_id(&id),
+                    format_id(collection_id)
+                );
+            }
+            Ok(id)
+        })
+        .collect()
+}
+
 fn repack_preview(
     cli: &Cli,
     target: &RepackTarget,
@@ -15947,10 +15980,7 @@ fn repack_preview(
     let preview_store = open_store_read_only(cli)?;
     if let RepackTarget::Collection(collection_id) = target {
         if !roots.is_empty() {
-            let mut root_ids = Vec::new();
-            for root in roots {
-                root_ids.push(matrix_event_node_id(root)?);
-            }
+            let root_ids = resolve_repack_roots(&preview_store, collection_id, roots)?;
             preview_store.set_live_roots(collection_id, root_ids);
         }
     }
@@ -16150,10 +16180,7 @@ fn cmd_repack_target(
     let store = open_store(cli)?;
     if let RepackTarget::Collection(collection_id) = target {
         if !roots.is_empty() {
-            let mut root_ids = Vec::new();
-            for root in roots {
-                root_ids.push(matrix_event_node_id(root)?);
-            }
+            let root_ids = resolve_repack_roots(&store, collection_id, roots)?;
             store.set_live_roots(collection_id, root_ids);
         }
     }
