@@ -283,6 +283,8 @@ impl CsrStore {
             .open(self.tail_path())
         {
             Ok(file) => {
+                #[cfg(test)]
+                let _trace = crate::test_trace::span("csr.tail_sync", &self.dir);
                 file.sync_data()?;
                 #[cfg(test)]
                 count_tail_sync();
@@ -334,6 +336,8 @@ impl CsrStore {
         }
         file.write_all(&buffer)?;
         if sync {
+            #[cfg(test)]
+            let _trace = crate::test_trace::span("csr.tail_sync", &self.dir);
             file.sync_data()?;
             #[cfg(test)]
             count_tail_sync();
@@ -1772,6 +1776,10 @@ mod tests {
     fn concurrent_writers_on_one_database_lose_no_rows() {
         const THREADS: u32 = 4;
         const PER_THREAD: u32 = 150;
+        // Per-call durable appends cost an fsync each, so the bulk goes through
+        // the deferred path (the same lock and tail, no per-append sync) and a
+        // few durable appends per thread keep that path concurrent too.
+        const DURABLE: u32 = 4;
         let root = layout("writer_threads").root().to_path_buf();
         {
             let db = Database::open(root.clone()).unwrap();
@@ -1782,29 +1790,44 @@ mod tests {
                     scope.spawn(move || {
                         let writer = store.writer(db).unwrap();
                         let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
+                        let make_row = |owner: u32| RowRecord {
+                            family: EdgeFamily::typed(3),
+                            owner,
+                            edges: vec![
+                                Edge {
+                                    target: owner,
+                                    kind: 1
+                                };
+                                64
+                            ],
+                        };
                         for owner in 0..PER_THREAD {
-                            let row = RowRecord {
-                                family: EdgeFamily::typed(3),
-                                owner,
-                                edges: vec![
-                                    Edge {
-                                        target: owner,
-                                        kind: 1
-                                    };
-                                    64
-                                ],
-                            };
-                            writer.append_rows(scope_id, &[row]).unwrap();
+                            store
+                                .with_write_lock(|| {
+                                    writer.append_rows_deferred_locked(scope_id, &[make_row(owner)])
+                                })
+                                .unwrap();
                         }
+                        let before = tail_syncs();
+                        for owner in PER_THREAD..PER_THREAD.saturating_add(DURABLE) {
+                            writer.append_rows(scope_id, &[make_row(owner)]).unwrap();
+                        }
+                        assert_eq!(
+                            tail_syncs().saturating_sub(before),
+                            usize::try_from(DURABLE).unwrap(),
+                            "each durable append syncs the tail once"
+                        );
                     });
                 }
             });
+            // The deferred rows are readable already; make them durable too.
+            store.sync_tail().unwrap();
             for thread in 0..THREADS {
                 let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
                 let rows = store.read_scope(scope_id).unwrap().rows;
                 assert_eq!(
                     rows.len(),
-                    usize::try_from(PER_THREAD).unwrap(),
+                    usize::try_from(PER_THREAD.saturating_add(DURABLE)).unwrap(),
                     "scope {thread} lost rows to a concurrent writer"
                 );
             }
@@ -1816,6 +1839,10 @@ mod tests {
     fn concurrent_direct_mutations_serialize_on_the_store() {
         const THREADS: u32 = 4;
         const PER_THREAD: u32 = 150;
+        // The bulk goes through the deferred append path: the same per-store
+        // write lock and tail as a durable append, without one fsync per call.
+        // `concurrent_durable_appends_sync_their_own_tail` keeps the durable
+        // path concurrent.
         let layout = layout("direct_writer_threads");
         let store = CsrStore::open(&layout, ShardType::State);
         for thread in 0..THREADS {
@@ -1843,7 +1870,11 @@ mod tests {
                                     64
                                 ],
                             };
-                            store.append_rows(scope_id, &[row]).unwrap();
+                            store
+                                .with_write_lock(|| {
+                                    store.append_rows_locked(scope_id, &[row], false)
+                                })
+                                .unwrap();
                             // Seal while the other threads are still appending.
                             if owner % 50 == 49 {
                                 store.seal().unwrap();
@@ -1859,6 +1890,8 @@ mod tests {
                 });
             }
         });
+        // Deferred rows are readable already; make them durable too.
+        store.sync_tail().unwrap();
         for thread in 0..THREADS {
             let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
             assert_eq!(
@@ -1870,6 +1903,43 @@ mod tests {
         for thread in 0..THREADS {
             let purge_scope = ScopeId([u8::try_from(thread + 10).unwrap(); 16]);
             assert!(store.read_scope(purge_scope).unwrap().rows.is_empty());
+        }
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    /// The per-call durable path under concurrency: every thread's append syncs
+    /// the tail once, and no row is lost. Small on purpose: each append is an
+    /// fsync.
+    #[test]
+    fn concurrent_durable_appends_sync_their_own_tail() {
+        const THREADS: u32 = 4;
+        const PER_THREAD: u32 = 6;
+        let layout = layout("durable_writer_threads");
+        let store = CsrStore::open(&layout, ShardType::State);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let store = &store;
+                scope.spawn(move || {
+                    let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
+                    let before = tail_syncs();
+                    for owner in 0..PER_THREAD {
+                        store.append_rows(scope_id, &[row_for(owner, 9)]).unwrap();
+                    }
+                    assert_eq!(
+                        tail_syncs().saturating_sub(before),
+                        usize::try_from(PER_THREAD).unwrap(),
+                        "each durable append syncs the tail once"
+                    );
+                });
+            }
+        });
+        for thread in 0..THREADS {
+            let scope_id = ScopeId([u8::try_from(thread).unwrap(); 16]);
+            assert_eq!(
+                store.read_scope(scope_id).unwrap().rows.len(),
+                usize::try_from(PER_THREAD).unwrap(),
+                "scope {thread} lost rows to a durable concurrent writer"
+            );
         }
         let _ = fs::remove_dir_all(layout.root());
     }
