@@ -636,6 +636,58 @@ fn collections_dash_t_all_iterates_every_pool_without_the_all_flag() {
 }
 
 #[test]
+fn collections_rebuilds_after_a_corrupt_shard_collections_sidecar() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let pool_dir = layout.pool_dir(ShardType::State).unwrap();
+    {
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        store
+            .put(
+                &[0x11; 16],
+                &[0x22; 16],
+                &NodeData::new(Bytes::from_static(b"visible")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
+    }
+    let sidecar = pool_dir.join("shard_collections.bin");
+    let mut bytes = std::fs::read(&sidecar).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&sidecar, bytes).unwrap();
+
+    let cli = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: Some(ShardType::State),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Collections {
+            per_db: false,
+            all: false,
+            layout: false,
+            canonical: false,
+            sort: None,
+            limit: -1,
+        },
+    };
+    // A rejected sidecar must fall back to opening the store, not error out or
+    // report the collection as absent.
+    cmd_collections(
+        &cli,
+        &CollectionOptions {
+            flags: CollectionFlags::from_bools([false, false, false, false]),
+            sort: None,
+            limit: -1,
+        },
+    )
+    .unwrap();
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn shards_dash_t_all_iterates_every_pool_without_the_all_flag() {
     let dir = unique_temp_dir();
     DatabaseLayout::open(dir.clone()).unwrap();

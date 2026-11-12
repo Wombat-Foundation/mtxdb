@@ -1387,10 +1387,14 @@ fn disk_bytes_from_physical(
 const SHARD_ROOMS_MAGIC: &[u8; 4] = b"MSRM";
 /// The current format carries physical bytes and pins the reduced bookkeeping
 /// to the exact `(pack_id, file_len)` set using the same `pack_fingerprint` as
-/// the index checkpoint.
-const SHARD_ROOMS_VERSION: u8 = 1;
-/// Header size: magic(4) + version(1) + `pack_fingerprint(8)` + `persisted_at(8)`.
-const SHARD_ROOMS_HEADER_LEN: usize = 4 + 1 + 8 + 8;
+/// the index checkpoint. Version 2 adds a CRC over the complete file so a torn
+/// or bit-flipped sidecar is rejected rather than served as real accounting.
+const SHARD_ROOMS_VERSION: u8 = 2;
+/// Offset of the CRC32 field: magic(4) + version(1) + `pack_fingerprint(8)` +
+/// `persisted_at(8)`.
+const SHARD_ROOMS_CRC_OFFSET: usize = 4 + 1 + 8 + 8;
+/// Header size: the fields above plus the CRC32(4).
+const SHARD_ROOMS_HEADER_LEN: usize = SHARD_ROOMS_CRC_OFFSET + 4;
 /// One entry: `pack_id`(16) + `collection_id`(16) + count(8) + the
 /// collection's stable insertion ordinal(8) + disk bytes(8).
 const SHARD_ROOMS_RECORD_LEN: usize = crate::packfile::PACK_ID_LEN + 16 + 8 + 8 + 8;
@@ -1757,6 +1761,17 @@ pub struct PersistedShardDirectory {
     pub records: Vec<PersistedShardRoom>,
 }
 
+/// CRC32 over the complete sidecar with its CRC field treated as zero, so it
+/// covers the header fields and every record. A torn or bit-flipped file fails
+/// this check and is treated exactly like a missing one.
+fn shard_rooms_crc(buf: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&buf[..SHARD_ROOMS_CRC_OFFSET]);
+    hasher.update(&[0u8; 4]);
+    hasher.update(&buf[SHARD_ROOMS_HEADER_LEN..]);
+    hasher.finalize()
+}
+
 /// Decode the small inspection sidecar. This is deliberately shared by all
 /// read-only CLI summary helpers so they agree on validation and format
 /// compatibility.
@@ -1769,6 +1784,14 @@ pub fn read_persisted_shard_collections(
         || &buf[0..4] != SHARD_ROOMS_MAGIC
         || buf[4] != SHARD_ROOMS_VERSION
     {
+        return None;
+    }
+    let stored_crc = u32::from_le_bytes(
+        buf[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN]
+            .try_into()
+            .ok()?,
+    );
+    if shard_rooms_crc(&buf) != stored_crc {
         return None;
     }
     let body = &buf[SHARD_ROOMS_HEADER_LEN..];
@@ -6111,6 +6134,8 @@ impl PackfileStorage {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         buf.extend_from_slice(&persisted_at.to_le_bytes());
+        // CRC placeholder; patched after the records are appended.
+        buf.extend_from_slice(&[0u8; 4]);
         let records = {
             let tables = self.index_tables.read();
             let collection_order: HashMap<[u8; 16], u64> = tables
@@ -6167,6 +6192,11 @@ impl PackfileStorage {
             buf.extend_from_slice(&order.to_le_bytes());
             buf.extend_from_slice(&disk_bytes.to_le_bytes());
         }
+        // CRC over the complete file with the CRC field still zero. A torn or
+        // bit-flipped sidecar fails the reader's check and is treated as
+        // missing, so this file can be published without its own data sync.
+        let crc = crc32fast::hash(&buf);
+        buf[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
 
         let unique = SHARD_ROOMS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = Self::shard_collections_path(&self.base_dir)
@@ -6174,13 +6204,11 @@ impl PackfileStorage {
         let final_path = Self::shard_collections_path(&self.base_dir);
         let write_result = (|| -> std::io::Result<()> {
             let mut tmp = fs::File::create(&tmp_path)?;
-            std::io::Write::write_all(&mut tmp, &buf)?;
-            // See the matching comment in `checkpoint::write_checkpoint`:
-            // this tmp file is renamed away immediately below and never
-            // reopened by this name, so only its data need survive —
-            // `sync_data` (fdatasync) skips the timestamp-only metadata
-            // flush `sync_all` (fsync) would also perform.
-            tmp.sync_data()
+            // No data sync: this is rebuildable acceleration data, and the
+            // reader now rejects a torn or damaged file via its CRC. A crash
+            // may leave the old name, a valid new file, or a rejected remnant;
+            // all three are safe. (The rename is not directory-synced either.)
+            std::io::Write::write_all(&mut tmp, &buf)
         })();
         if let Err(e) = write_result {
             let _ = fs::remove_file(&tmp_path);

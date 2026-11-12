@@ -2569,6 +2569,155 @@ fn previous_version_shard_collections_sidecar_is_rejected_and_rebuilt() {
     assert_eq!(rebuilt[4], SHARD_ROOMS_VERSION);
 }
 
+/// Build a syntactically valid header-only v2 sidecar. A header-only file can
+/// legitimately mean zero records; only a populated file truncated to this
+/// length is damaged.
+fn header_only_shard_collections() -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(SHARD_ROOMS_MAGIC);
+    buf.push(SHARD_ROOMS_VERSION);
+    buf.extend_from_slice(&0x1234_u64.to_le_bytes());
+    buf.extend_from_slice(&1_u64.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 4]);
+    let crc = crc32fast::hash(&buf);
+    buf[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+#[test]
+fn shard_collections_checksum_rejects_damage_and_rebuilds_accounting() {
+    let dir = test_dir("shard_collections_checksum");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    for i in 0..3u8 {
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(i),
+                &NodeData::new(bytes::Bytes::from(vec![i])),
+            )
+            .unwrap();
+    }
+    for i in 0..2u8 {
+        store
+            .put(
+                &OTHER_COLLECTION,
+                &distinct_id(100 + i),
+                &NodeData::new(bytes::Bytes::from(vec![i])),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    store.persist_shard_collections().unwrap();
+    drop(store);
+
+    let sidecar = PackfileStorage::shard_collections_path(&dir);
+    let good = std::fs::read(&sidecar).unwrap();
+    assert_eq!(good[4], SHARD_ROOMS_VERSION);
+
+    // Damage each part of the complete contents independently: body, magic,
+    // fingerprint, timestamp, CRC field, and truncations.
+    let mut variants = Vec::new();
+    let mut body = good.clone();
+    let last = body.len() - 1;
+    body[last] ^= 0xff;
+    variants.push(("body", body));
+    let mut magic = good.clone();
+    magic[0] ^= 0xff;
+    variants.push(("magic", magic));
+    let mut fingerprint = good.clone();
+    fingerprint[5] ^= 0xff;
+    variants.push(("fingerprint", fingerprint));
+    let mut timestamp = good.clone();
+    timestamp[13] ^= 0xff;
+    variants.push(("timestamp", timestamp));
+    let mut crc = good.clone();
+    crc[SHARD_ROOMS_CRC_OFFSET] ^= 0xff;
+    variants.push(("crc", crc));
+    variants.push((
+        "truncated-header-1",
+        good[..SHARD_ROOMS_HEADER_LEN - 1].to_vec(),
+    ));
+    variants.push(("truncated-header", good[..SHARD_ROOMS_HEADER_LEN].to_vec()));
+    variants.push(("truncated-record", good[..good.len() - 1].to_vec()));
+
+    for (name, bytes) in &variants {
+        std::fs::write(&sidecar, bytes).unwrap();
+        assert!(
+            read_persisted_shard_collections(&dir).is_none(),
+            "{name}: damaged sidecar must be rejected"
+        );
+        assert!(
+            PackfileStorage::collection_directory_from_disk(&dir).is_empty(),
+            "{name}: a rejected sidecar yields no directory"
+        );
+        assert!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir).is_none(),
+            "{name}: a rejected sidecar yields no byte totals"
+        );
+    }
+
+    // Leave the body-corrupt file in place and recover through a reopen.
+    std::fs::write(&sidecar, &variants[0].1).unwrap();
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let mut summaries: Vec<([u8; 16], u64)> = reopened
+        .collection_summaries()
+        .into_iter()
+        .map(|(id, count, _mem, _cap)| (id, count as u64))
+        .collect();
+    summaries.sort_unstable_by_key(|(id, _)| *id);
+    assert!(summaries.contains(&(TEST_COLLECTION, 3)));
+    assert!(summaries.contains(&(OTHER_COLLECTION, 2)));
+    assert!(
+        read_persisted_shard_collections(&dir).is_none(),
+        "the reopen must not accept the damaged sidecar"
+    );
+
+    reopened.persist_shard_collections().unwrap();
+    drop(reopened);
+
+    let rebuilt = read_persisted_shard_collections(&dir).expect("rewritten v2 sidecar");
+    assert_eq!(
+        rebuilt.records.len(),
+        (good.len() - SHARD_ROOMS_HEADER_LEN) / SHARD_ROOMS_RECORD_LEN
+    );
+    let mut from_disk = PackfileStorage::collection_directory_from_disk(&dir);
+    from_disk.sort_unstable_by_key(|(id, _)| *id);
+    assert_eq!(
+        from_disk, summaries,
+        "rebuilt counts match the reopened store"
+    );
+    let bytes = PackfileStorage::collection_disk_bytes_from_disk(&dir).expect("byte totals");
+    assert!(bytes.get(&TEST_COLLECTION).copied().unwrap_or(0) > 0);
+    assert!(bytes.get(&OTHER_COLLECTION).copied().unwrap_or(0) > 0);
+}
+
+#[test]
+fn header_only_shard_collections_is_valid_but_truncating_a_populated_one_is_not() {
+    let dir = test_dir("shard_collections_header_only");
+    let _store = PackfileStorage::open(dir.clone()).unwrap();
+    let sidecar = PackfileStorage::shard_collections_path(&dir);
+
+    // A header-only v2 file with a correct CRC is a valid empty directory.
+    std::fs::write(&sidecar, header_only_shard_collections()).unwrap();
+    assert!(
+        read_persisted_shard_collections(&dir).is_some(),
+        "a header-only zero-record sidecar is valid"
+    );
+    assert!(PackfileStorage::collection_directory_from_disk(&dir).is_empty());
+
+    // A populated file cut to the same header is damaged: its original CRC
+    // covered the records that are now gone.
+    let mut populated = header_only_shard_collections();
+    populated.extend_from_slice(&[0xAB; SHARD_ROOMS_RECORD_LEN]);
+    let crc = crc32fast::hash(&populated);
+    populated[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&sidecar, &populated[..SHARD_ROOMS_HEADER_LEN]).unwrap();
+    assert!(
+        read_persisted_shard_collections(&dir).is_none(),
+        "truncating a populated sidecar must fail its CRC"
+    );
+}
+
 #[test]
 fn test_walk_ancestors_pins_shards_against_a_mid_walk_repack() {
     // The walk freezes one generation, but a concurrent repack can still
