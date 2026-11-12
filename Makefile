@@ -75,9 +75,17 @@ ifneq ($(strip $(MTXDB_TEST_PROFILE)),)
 MTXDB_TEST_PROFILE_FLAG := --profile $(MTXDB_TEST_PROFILE)
 endif
 
+# Extra arguments for the test binaries (passed after `--`). For per-test
+# durations, set `-Z unstable-options --report-time` in `.env`; each result line
+# then ends with `<seconds>`. libtest gates that flag behind RUSTC_BOOTSTRAP, so
+# it is set for this recipe only, and only when a `-Z` argument is present.
+MTXDB_TEST_ARGS ?=
+MTXDB_TEST_ARGS_FLAG := $(if $(strip $(MTXDB_TEST_ARGS)),-- $(MTXDB_TEST_ARGS))
+MTXDB_TEST_ENV := $(if $(findstring -Z,$(MTXDB_TEST_ARGS)),RUSTC_BOOTSTRAP=1)
+
 .PHONY: test
 test: ##H Run library and workspace tests
-	$(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings
+	$(MTXDB_TEST_ENV) $(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings $(MTXDB_TEST_ARGS_FLAG)
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false

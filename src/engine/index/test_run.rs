@@ -105,10 +105,12 @@ fn write_sidecar(dir: &TestDir, seq: u64, model: &PackModel) -> MappedPackIndex 
         )
         .collect();
     let path = dir.join(&format!("pack-{seq}.idx"));
-    PackIndex::build(pack, inputs)
-        .unwrap()
-        .write_atomic(&path)
-        .unwrap();
+    let index = PackIndex::build(pack, inputs).unwrap();
+    // These are merge inputs: they only have to be readable through the same
+    // mmap reader. An atomic publish (file fsync, rename, directory fsync) is
+    // covered by the packidx tests, and cost about 0.14 s per input on a
+    // spinning disk, hundreds of times per run of the model tests.
+    fs::write(&path, index.as_bytes()).unwrap();
     PackIndex::open_mmap(&path, pack).unwrap()
 }
 
