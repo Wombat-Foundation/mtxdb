@@ -4348,11 +4348,13 @@ fn a_version_1_journal_header_reads_as_unavailable_evidence() {
 /// the coverage injected here; the real-stack tests in `test_database.rs` keep
 /// that short and scaled down.
 struct PolicyHarness {
-    coordinator: JournalCoordinator,
+    coordinator: Arc<JournalCoordinator>,
     path: PathBuf,
     /// Each pool's newest published LSN and the coverage it last reported.
     published: [u64; 3],
     reported: [u64; 3],
+    /// Pools a remediation asked to checkpoint, in order.
+    remediated: Arc<std::sync::Mutex<Vec<crate::layout::ShardType>>>,
 }
 
 impl PolicyHarness {
@@ -4360,14 +4362,43 @@ impl PolicyHarness {
         let path = temp_path(label);
         let _ = fs::remove_file(&path);
         let (journal, scan) = Journal::open_shared(&path).unwrap();
-        let coordinator = JournalCoordinator::new(journal, &scan);
+        let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
         coordinator.set_segment_cap(segment_cap);
         Self {
             coordinator,
             path,
             published: [0; 3],
             reported: [0; 3],
+            remediated: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// A pool's checkpoint reports its coverage and reclaims, which is what a
+    /// real checkpoint does for the pool that owns it. This is the only way
+    /// coverage advances here, so a pool that never "syncs" stays silent.
+    fn checkpoint(&mut self, pool: crate::layout::ShardType) {
+        let index = pool.index();
+        self.reported[index] = self.published[index];
+        self.coordinator
+            .report_pool_coverage(pool, self.published[index]);
+        self.coordinator.reclaim_shared().unwrap();
+    }
+
+    /// Make a lagging pool checkpoint when reclaim reaches the emergency zone,
+    /// the same role the database's remediation closure has for real pools.
+    /// The ask is recorded so a test can assert it happened.
+    fn remediate_laggards(&self) {
+        let coordinator = Arc::clone(&self.coordinator);
+        let remediated = Arc::clone(&self.remediated);
+        self.coordinator.set_blocker_remediation(move |pool| {
+            remediated.lock().unwrap().push(pool);
+            coordinator.report_pool_coverage(pool, coordinator.published_lsn());
+            let _ = coordinator.reclaim_shared();
+        });
+    }
+
+    fn remediated(&self) -> Vec<crate::layout::ShardType> {
+        self.remediated.lock().unwrap().clone()
     }
 
     /// One commit's worth for `pool`: twenty 256-byte puts in one group, about
@@ -4384,20 +4415,18 @@ impl PolicyHarness {
 
     /// `pool` syncs: when the policy would force a checkpoint for it (the
     /// segment is over the trigger, the stall gate permits it, and it has
-    /// something uncovered) it reports what it has published and reclaims.
+    /// something uncovered) it checkpoints. Then, like a real sync, it gives
+    /// the coordinator a chance to remediate pools holding reclaim back.
     /// Returns whether the checkpoint was forced.
     fn sync(&mut self, pool: crate::layout::ShardType) -> bool {
         let index = pool.index();
-        if !self.coordinator.should_force_reclaim_checkpoint(Some(pool))
-            || self.published[index] <= self.reported[index]
-        {
-            return false;
+        let forced = self.coordinator.should_force_reclaim_checkpoint(Some(pool))
+            && self.published[index] > self.reported[index];
+        if forced {
+            self.checkpoint(pool);
         }
-        self.reported[index] = self.published[index];
-        self.coordinator
-            .report_pool_coverage(pool, self.published[index]);
-        self.coordinator.reclaim_shared().unwrap();
-        true
+        self.coordinator.remediate_blockers(Some(pool));
+        forced
     }
 }
 
@@ -4453,4 +4482,161 @@ fn a_silent_pool_is_reported_only_after_the_grace_period() {
         vec![crate::layout::ShardType::State],
         "the silent pool is the one named"
     );
+}
+
+/// `State` and `EventDag` both commit, but only `EventDag` ever syncs and
+/// nothing remediates the lag. Reclaim stalls, is reported once with the pool
+/// named, and `EventDag` stops repeating a checkpoint that cannot help. The
+/// commit that finally hits the hard limit says which pool it waits on.
+#[test]
+fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_lagging_no_remediation", 1 << 20);
+    let coordinator = Arc::clone(&harness.coordinator);
+    let emergency = coordinator.segment_cap() - coordinator.segment_cap() / 4;
+    let trigger = coordinator.reclaim_trigger_len();
+    let mut backed_off_syncs = 0usize;
+    let mut backed_off_checkpoints = 0usize;
+    let mut rounds = 0usize;
+    let failure = loop {
+        let failure = harness
+            .commit(State)
+            .and_then(|()| harness.commit(EventDag));
+        if let Err(error) = failure {
+            break error;
+        }
+        let in_back_off_zone =
+            coordinator.is_reclaim_stalled() && coordinator.segment_len() < emergency;
+        let forced = harness.sync(EventDag);
+        if in_back_off_zone {
+            backed_off_syncs += 1;
+            if forced {
+                backed_off_checkpoints += 1;
+            }
+        }
+        rounds += 1;
+        assert!(rounds < 400, "the segment never filled");
+    };
+    let message = failure.to_string();
+    assert!(message.contains("segment is full"), "{message}");
+    assert!(
+        message.contains("waiting on pools") && message.contains("State"),
+        "the error must name the lagging pool: {message}"
+    );
+    assert!(coordinator.is_reclaim_stalled());
+    assert_eq!(coordinator.reclaim_stalls(), 1, "one stall, reported once");
+    assert_eq!(coordinator.reclaim_blockers(), vec![State]);
+    // The segment may only retry after growing by an eighth of the trigger,
+    // so the zone allows at most (emergency - trigger) / (trigger / 8)
+    // retries however many syncs happen in it.
+    let bound = usize::try_from((emergency - trigger) / (trigger / 8)).unwrap() + 2;
+    assert!(
+        backed_off_checkpoints <= bound,
+        "{backed_off_checkpoints} forced checkpoints in the back-off zone; at most {bound}"
+    );
+    assert!(
+        backed_off_checkpoints * 2 < backed_off_syncs,
+        "EventDag checkpointed {backed_off_checkpoints} times in {backed_off_syncs} syncs"
+    );
+}
+
+/// Pools sync one after another, so the first to cross the trigger cannot yet
+/// reclaim what the others have not reported. That is normal: it must neither
+/// be counted nor logged as a stall, and the later pool's coverage clears the
+/// pending state.
+#[test]
+fn a_healthy_sequential_sync_is_not_reported_as_a_stall() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_healthy_sequential", 1 << 20);
+    let coordinator = Arc::clone(&harness.coordinator);
+    let mut saw_pending = false;
+    for round in 0..150 {
+        harness
+            .commit(State)
+            .and_then(|()| harness.commit(EventDag))
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        harness.sync(EventDag);
+        saw_pending |= coordinator.is_reclaim_stalled();
+        harness.sync(State);
+        assert_eq!(
+            coordinator.reclaim_stalls(),
+            0,
+            "round {round}: a healthy crossing was reported as a stall"
+        );
+    }
+    assert!(
+        saw_pending,
+        "the first pool to cross must have seen a pending stall, or this proves nothing"
+    );
+    assert!(
+        !coordinator.is_reclaim_stalled(),
+        "the second pool's coverage must clear it"
+    );
+    assert!(coordinator.reclaim_trigger_len() > 0);
+}
+
+/// With a pool that stays silent, reclaim reaches the emergency zone, asks
+/// that pool to checkpoint, and succeeds. The segment never fills and no
+/// commit is refused, however many rounds run.
+#[test]
+fn a_lagging_pool_is_checkpointed_before_the_segment_fills() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_lagging_remediated", 1 << 20);
+    let coordinator = Arc::clone(&harness.coordinator);
+    harness.remediate_laggards();
+    for round in 0..120 {
+        harness
+            .commit(State)
+            .and_then(|()| harness.commit(EventDag))
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        harness.sync(EventDag);
+        assert!(
+            coordinator.segment_len() < coordinator.segment_cap(),
+            "round {round}: the segment reached its cap"
+        );
+    }
+    assert!(
+        coordinator.reclaim_stalls() >= 1,
+        "a stall must have been seen"
+    );
+    assert!(
+        harness.remediated().contains(&State),
+        "State was never asked to checkpoint"
+    );
+}
+
+/// Pools sync one after another, so the first to cross the trigger cannot yet
+/// reclaim what the others have not reported. That is normal: it must neither be
+/// counted nor logged as a stall, and the later pool's coverage clears the
+/// pending state. Full scale, no fsyncs.
+#[test]
+fn a_healthy_sequential_pool_sync_is_not_a_stall() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_healthy_sequential", 1 << 20);
+    let mut saw_pending = false;
+    for round in 0..150 {
+        harness
+            .commit(State)
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        harness
+            .commit(EventDag)
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        harness.sync(EventDag);
+        saw_pending |= harness.coordinator.is_reclaim_stalled();
+        harness.sync(State);
+        assert_eq!(
+            harness.coordinator.reclaim_stalls(),
+            0,
+            "round {round}: a healthy crossing was reported as a stall"
+        );
+    }
+    assert!(
+        saw_pending,
+        "the first pool to cross must have seen a pending stall, or this proves nothing"
+    );
+    assert!(
+        !harness.coordinator.is_reclaim_stalled(),
+        "the second pool's coverage must clear it"
+    );
+    assert!(harness.coordinator.reclaim_trigger_len() > 0);
 }

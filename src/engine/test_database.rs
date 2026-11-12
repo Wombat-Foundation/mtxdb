@@ -1449,28 +1449,48 @@ fn small_segment_database(name: &str) -> (Database, PathBuf) {
     (db, root)
 }
 
-/// `State` and `EventDag` both have committed frames, but only `EventDag` is ever
-/// synced. With nothing to remediate the lag, reclaim stalls: it must be
-/// reported with the pool named, `EventDag` must stop repeating a checkpoint
-/// that cannot help, and a commit that finally hits the hard limit must say
-/// which pool it is waiting on instead of failing silently.
+/// The real-stack counterpart of
+/// `a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing` in
+/// the journal tests, which runs the same policy at full scale without fsyncs.
+/// Here a real `EventDag` sync must stop repeating a checkpoint that cannot
+/// help while `State` stays silent, and the commit that finally hits the hard
+/// limit must name the pool it waits on. A small cap reaches both the
+/// back-off zone and the limit in a handful of real commits and syncs; the
+/// proportions are unchanged.
 #[test]
 fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
     let (db, root) = small_segment_database("lagging_no_remediation");
+    db.coordinator().set_segment_cap(1 << 18);
     db.coordinator().set_blocker_remediation(|_| {});
     let pools = [ShardType::State, ShardType::EventDag];
     let coordinator = db.coordinator();
     let emergency = coordinator.segment_cap() - coordinator.segment_cap() / 4;
     let trigger = coordinator.reclaim_trigger_len();
     let mut next = 0u64;
+    let collection = [0x7d; 16];
+    // Each round must grow the segment by less than the retry growth (an
+    // eighth of the trigger), or every sync is legitimately allowed to retry
+    // and the back-off never has a chance to apply.
+    let commit_small = |next: &mut u64| {
+        let txn = db.begin_transaction();
+        for _ in 0..8 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&next.to_le_bytes());
+            *next = next.saturating_add(1);
+            for pool in pools {
+                txn.put(pool, collection, id, &NodeData::from_slice(&[0x5a; 256]))
+                    .unwrap();
+            }
+        }
+        txn.commit()
+    };
     // Syncs and checkpoints taken while the segment is stalled but short of
     // the emergency line, where the back-off applies.
     let mut backed_off_syncs = 0usize;
     let mut backed_off_checkpoints = 0usize;
     let mut rounds = 0usize;
     let failure = loop {
-        // About 10 KiB per round: well under the retry growth (32 KiB).
-        if let Err(error) = commit_batch(&db, &pools, &mut next, 1) {
+        if let Err(error) = commit_small(&mut next) {
             break error;
         }
         let in_back_off_zone =
@@ -1489,7 +1509,7 @@ fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
             }
         }
         rounds += 1;
-        assert!(rounds < 400, "the segment never filled");
+        assert!(rounds < 100, "the segment never filled");
     };
     let message = failure.to_string();
     assert!(message.contains("segment is full"), "{message}");
@@ -1516,18 +1536,22 @@ fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Pools sync one after another, so the first to cross the trigger cannot
-/// yet reclaim what the others have not reported. That is normal: it must
-/// neither be counted nor logged as a stall, and the later pool's coverage
-/// clears the pending state.
+/// The real-stack counterpart of `a_healthy_sequential_pool_sync_is_not_a_stall`
+/// in the journal tests, which runs 150 rounds at full scale without fsyncs.
+/// Pools sync one after another, so the first to cross the trigger cannot yet
+/// reclaim what the others have not reported. That is normal: it must neither be
+/// counted nor logged as a stall, and the later pool's coverage clears the
+/// pending state. A small trigger makes the crossing a few real commits and
+/// syncs; the proportions are the same.
 #[test]
 fn a_healthy_sequential_sync_is_not_reported_as_a_stall() {
     let (db, root) = small_segment_database("healthy_sequential");
+    db.coordinator().set_reclaim_trigger_len(16 << 10);
     let pools = [ShardType::State, ShardType::EventDag];
     let coordinator = db.coordinator();
     let mut next = 0u64;
     let mut saw_pending = false;
-    for round in 0..150 {
+    for round in 0..6 {
         commit_batch(&db, &pools, &mut next, 1)
             .unwrap_or_else(|error| panic!("round {round}: {error}"));
         db.pool(ShardType::EventDag).sync_all().unwrap();
@@ -1778,29 +1802,38 @@ fn a_power_cut_image_never_loses_a_record_a_claim_covered() {
 
 /// The same lag, but the database can make the silent pool checkpoint. Once
 /// the segment reaches the emergency zone it does, reclaim succeeds, and no
-/// commit ever fails.
+/// commit ever fails. The full-scale policy loop lives in
+/// `a_lagging_pool_is_checkpointed_before_the_segment_fills` in the journal
+/// tests; this keeps the production remediation wiring and a real checkpoint
+/// in the loop, with a small cap so it reaches the emergency zone quickly.
 #[test]
 fn a_lagging_pool_is_checkpointed_for_the_caller_before_the_segment_fills() {
     use crate::PackfileStorage;
     let (db, root) = small_segment_database("lagging_remediated");
+    db.coordinator().set_segment_cap(1 << 18);
     let pools = [ShardType::State, ShardType::EventDag];
     let state_lsn =
         || PackfileStorage::read_journal_lsn(&db.layout().pool_dir(ShardType::State).unwrap());
     let mut next = 0u64;
-    for round in 0..120 {
-        commit_batch(&db, &pools, &mut next, 2)
-            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+    let mut rounds = 0;
+    // Keep going past the first stall: remediation runs once reclaim reaches
+    // the emergency zone, and the detached checkpoint writes its LSN file a
+    // little later.
+    while state_lsn() == 0 {
+        assert!(rounds < 60, "State was never made to checkpoint");
+        commit_batch(&db, &pools, &mut next, 1)
+            .unwrap_or_else(|error| panic!("round {rounds}: {error}"));
         db.pool(ShardType::EventDag).sync_all().unwrap();
         assert!(
             db.coordinator().segment_len() < db.coordinator().segment_cap(),
-            "round {round}: the segment reached its cap"
+            "round {rounds}: the segment reached its cap"
         );
+        rounds += 1;
     }
     assert!(
         db.coordinator().reclaim_stalls() >= 1,
         "a stall must have been seen"
     );
-    assert!(state_lsn() > 0, "State was never made to checkpoint");
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }

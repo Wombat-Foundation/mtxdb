@@ -14377,14 +14377,21 @@ fn rewrite_test_reader(
     intervals
 }
 
-/// Readers verify every committed key while the writer reclaims on every sync,
-/// so each reclaim rewrites and renames the WAL segment under them. A test-only
-/// recorder timestamps each rewrite window, and the test requires that at least
-/// one read's own time interval intersects one of those windows, so the
-/// coverage is not vacuous. A transient `WouldBlock` is retried.
+/// Readers verify every committed key while the writer reclaims repeatedly, so
+/// each reclaim rewrites and renames the WAL segment under them. The reclaim is
+/// driven deterministically rather than by the fixture's reclaim trigger: the
+/// journal group is made durable, then a forced checkpoint makes the packs
+/// durable and reclaims through the group. A test-only recorder timestamps each
+/// rewrite window, and the test requires that at least one read's own time
+/// interval intersects one of those windows, so the coverage is not vacuous. A
+/// transient `WouldBlock` is retried.
 #[test]
 fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
     const ROUNDS: u8 = 120;
+    // A checkpoint and its reclaim cost a real fsync; batch a few rounds so
+    // the test spends its time under readers instead of in barriers. Every
+    // batch still commits and reclaims, so the segment is rewritten throughout.
+    const ROUNDS_PER_BARRIER: u8 = 3;
     let ReclaimFixture {
         writer,
         reader,
@@ -14419,12 +14426,18 @@ fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
                     &NodeData::new(bytes::Bytes::from(rewrite_test_value(i))),
                 )
                 .unwrap();
-            writer.sync().unwrap();
-            committed.store(u64::from(i) + 1, Ordering::Release);
-            let base = Journal::scan_read_only(&wal).unwrap().base_lsn;
-            if base != last_base {
-                base_moves += 1;
-                last_base = base;
+            let round = i + 1;
+            if round % ROUNDS_PER_BARRIER == 0 || round == ROUNDS {
+                // The WAL group is durable now; the forced checkpoint makes the
+                // packs durable and reclaims through it, rewriting the segment.
+                writer.journal().unwrap().sync().unwrap();
+                writer.force_index_checkpoint().unwrap();
+                committed.store(u64::from(round), Ordering::Release);
+                let base = Journal::scan_read_only(&wal).unwrap().base_lsn;
+                if base != last_base {
+                    base_moves += 1;
+                    last_base = base;
+                }
             }
         }
         stop.store(true, Ordering::Release);
