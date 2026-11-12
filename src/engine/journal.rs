@@ -3752,7 +3752,14 @@ impl JournalCoordinator {
         let hooked = self.run_fsync_hook();
         #[cfg(not(test))]
         let hooked: io::Result<()> = Ok(());
-        if let Err(error) = hooked.and_then(|()| capture.file.sync_all()) {
+        // A group commit only appends to an already-published segment, so
+        // `sync_data` is sufficient: it persists the appended bytes and the
+        // file size they live beyond, which is the metadata a later read needs.
+        // The creation, truncation and replacement paths still use `sync_all`
+        // (see `open_shared_with_base` and `install_rebuilt`), because those
+        // change the inode's publication state. Skipping unrelated metadata
+        // here removes work without changing the barrier count.
+        if let Err(error) = hooked.and_then(|()| capture.file.sync_data()) {
             // Never retry a failed fsync and report success: the kernel may
             // have dropped the dirty pages. Poison until reopen and rescan.
             self.poisoned.store(true, Ordering::Release);
