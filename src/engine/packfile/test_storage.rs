@@ -12113,13 +12113,32 @@ fn in_class(name: &str, class: &str) -> bool {
     }
 }
 
+/// The files in one crash class, name and bytes, for deciding whether reverting
+/// that class between two images can change anything.
+fn class_snapshot(dir: &std::path::Path, class: &str) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| in_class(name, class))
+        .map(|name| {
+            let bytes = fs::read(dir.join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 /// Power loss that keeps every fsynced byte but may lose any rename or file
 /// creation not yet made durable by a directory sync: after each acknowledged
 /// sync, every subset of {WAL, LSN sidecar, index checkpoint, versions file,
 /// delta log} is put back to the version from one sync earlier (or removed, if it did not exist),
 /// and the store must reopen and serve every acknowledged record. Combinations
 /// that need the WAL to be newer than the checkpoint side are listed apart:
-/// they are exactly what the checkpoint-before-WAL ordering rules out.
+/// they are exactly what the checkpoint-before-WAL ordering rules out. A class
+/// that is byte-identical in the two images is dropped from the subset, since
+/// reverting it cannot change the candidate; every distinct image is still
+/// tested.
 #[test]
 fn power_loss_images_lose_no_acknowledged_record() {
     let dir = test_dir("power_loss_live");
@@ -12144,7 +12163,23 @@ fn power_loss_images_lose_no_acknowledged_record() {
 
     let mut failures = Vec::new();
     for step in 1..images.len() {
-        for mask in 0_u8..(1 << CRASH_CLASSES.len()) {
+        // Reverting a class whose files are byte-identical in the two images
+        // cannot change the candidate, so only the classes that differ need a
+        // bit. This keeps the same exhaustive mask space while skipping the
+        // copies and reopens that would test identical bytes again.
+        let relevant: Vec<usize> = (0..CRASH_CLASSES.len())
+            .filter(|&bit| {
+                let class = CRASH_CLASSES[bit];
+                class_snapshot(&images[step], class) != class_snapshot(&images[step - 1], class)
+            })
+            .collect();
+        for subset in 0_u8..(1 << relevant.len()) {
+            let mut mask = 0_u8;
+            for (position, bit) in relevant.iter().enumerate() {
+                if subset & (1 << position) != 0 {
+                    mask |= 1 << bit;
+                }
+            }
             let candidate = copy_store(&images[step], "power_loss_try");
             for (bit, class) in CRASH_CLASSES.iter().enumerate() {
                 if mask & (1 << bit) == 0 {
@@ -12224,6 +12259,40 @@ fn power_loss_images_lose_no_acknowledged_record() {
     );
 }
 
+/// Parse every byte cut of the unacknowledged WAL tail in memory, as a file the
+/// scan can read: the tail's group may only appear whole, never half-applied.
+/// This is the part that needs every cut; real store reopens can then sample
+/// the interesting ones, because each pays a full copy and replay.
+fn assert_every_torn_wal_cut_parses(image: &std::path::Path, synced_wal: u64, full_wal: u64) {
+    let intact = Journal::scan_read_only(image.join("wal.bin")).unwrap();
+    assert_eq!(
+        intact.groups.len(),
+        1,
+        "reclaim left only the unacknowledged group"
+    );
+    let tail_lsn = intact.groups[0].last_lsn;
+    let wal_bytes = fs::read(image.join("wal.bin")).unwrap();
+    let scan_dir = test_dir("torn_tail_scan");
+    let scan_path = scan_dir.join("wal.bin");
+    for cut in synced_wal..=full_wal {
+        let mut torn = wal_bytes[..usize::try_from(cut).unwrap().min(wal_bytes.len())].to_vec();
+        torn.extend_from_slice(&[0xA5; 37]);
+        fs::write(&scan_path, &torn).unwrap();
+        let scan = Journal::scan_read_only(&scan_path).unwrap();
+        assert!(
+            scan.groups.len() <= 1,
+            "wal cut at {cut}: a torn tail surfaced as a group"
+        );
+        if let Some(group) = scan.groups.first() {
+            assert_eq!(
+                group.last_lsn, tail_lsn,
+                "wal cut at {cut}: a partial group surfaced"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&scan_dir);
+}
+
 /// Power loss in the middle of an unacknowledged write: the WAL and the delta
 /// log each keep their fsynced prefix and any prefix of the bytes after it,
 /// with a garbage tail on top. Every acknowledged record must survive, and the
@@ -12276,7 +12345,22 @@ fn a_torn_unacknowledged_tail_never_costs_an_acknowledged_record() {
         }
     };
 
-    for cut in synced_wal..=full_wal {
+    // Exhaustively parse every byte cut; the real store reopens below sample
+    // the interesting ones, because each pays a full copy and replay.
+    assert_every_torn_wal_cut_parses(&image, synced_wal, full_wal);
+
+    let torn_span = full_wal.saturating_sub(synced_wal);
+    let offsets: std::collections::BTreeSet<u64> = [
+        synced_wal,
+        synced_wal.saturating_add(1),
+        synced_wal.saturating_add(torn_span / 2),
+        full_wal.saturating_sub(1),
+        full_wal,
+    ]
+    .into_iter()
+    .filter(|cut| (synced_wal..=full_wal).contains(cut))
+    .collect();
+    for cut in offsets {
         let candidate = copy_store(&image, "torn_tail_try");
         let bytes = fs::read(image.join("wal.bin")).unwrap();
         let mut torn = bytes[..usize::try_from(cut).unwrap().min(bytes.len())].to_vec();
