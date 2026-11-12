@@ -800,6 +800,75 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_rejects_duplicate_pack_slots_and_addresses() {
+        let path = temp_checkpoint("duplicate-pack-table");
+        for packs in [
+            [(1, PackId([0xB1; 16])), (1, PackId([0xB2; 16]))],
+            [(1, PackId([0xB1; 16])), (2, PackId([0xB1; 16]))],
+        ] {
+            write_slots_only_checkpoint(&path, &packs);
+            assert!(
+                read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_none(),
+                "duplicate pack identity must be rejected even with a valid checksum: {packs:?}"
+            );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn checkpoint_rejects_unordered_or_uncovered_collection_versions() {
+        let path = temp_checkpoint("invalid-version-table");
+        let index = LossyIndex::with_config(16, IndexConfig::default());
+        let blob = index.serialize();
+        for versions in [
+            [([0xA1; 16], 7), ([0xA1; 16], 8)],
+            [([0xA2; 16], 7), ([0xA1; 16], 8)],
+            [([0xA1; 16], 7), ([0xA2; 16], 11)],
+        ] {
+            let error = write_checkpoint(
+                &path,
+                0x1234,
+                10,
+                0,
+                &[([0xA1; 16], 0, &blob)],
+                &[],
+                &versions,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            // Start with a readable, checksummed table, then model malformed
+            // metadata independently of checksum corruption.
+            write_checkpoint(
+                &path,
+                0x1234,
+                10,
+                0,
+                &[([0xA1; 16], 0, &blob)],
+                &[],
+                &[([0xA1; 16], 7), ([0xA2; 16], 8)],
+            )
+            .unwrap();
+            assert!(read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_some());
+            let mut bytes = fs::read(&path).unwrap();
+            let table_start = bytes.len() - 2 * COLLECTION_VERSION_ENTRY_LEN;
+            for (i, (collection_id, last_write_lsn)) in versions.into_iter().enumerate() {
+                let offset = table_start + i * COLLECTION_VERSION_ENTRY_LEN;
+                bytes[offset..offset + COLLECTION_VERSION_ENTRY_LEN].copy_from_slice(
+                    &CollectionVersionEntry {
+                        collection_id,
+                        last_write_lsn,
+                    }
+                    .encode(),
+                );
+            }
+            rewrite_crc(&mut bytes);
+            fs::write(&path, bytes).unwrap();
+            assert!(read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_none());
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn failed_insert_on_checkpoint_mapping_does_not_allocate_identity_tables() {
         let path = temp_checkpoint("mapped-insert");
         write_slots_only_checkpoint(&path, &[]);
