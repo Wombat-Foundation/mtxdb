@@ -134,8 +134,8 @@ pub(crate) fn write_all_vectored(file: &mut File, bufs: &[io::IoSlice<'_>]) -> i
 ///
 /// Linux uses `fallocate(FALLOC_FL_KEEP_SIZE)`. This is a best-effort latency
 /// optimization: unsupported filesystems return an error that callers ignore,
-/// and the file's size (and therefore the pack scanner) is unchanged. Set
-/// `MTXDB_PREALLOC=0` to disable it, e.g. to A/B the cost on a given device.
+/// and the file's size (and therefore the pack scanner) is unchanged. Disabled
+/// by default; set `MTXDB_PREALLOC=1` to enable it on a measured workload.
 ///
 /// # Errors
 /// Returns the platform error; callers treat it as a hint failure.
@@ -150,11 +150,11 @@ pub(crate) fn reserve_append_space(file: &File, offset: u64, len: u64) -> io::Re
         fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
     }
 
-    // `MTXDB_PREALLOC=0` disables reservation so a benchmark or a filesystem
-    // with poor `fallocate` behavior can opt out without a rebuild. Read once:
+    // Reservation is opt-in: it slowed concurrent pack writers on the measured
+    // HDD workload. Read once:
     // every flush would otherwise pay for an environment lookup.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var("MTXDB_PREALLOC").as_deref() != Ok("0")) {
+    if !*ENABLED.get_or_init(|| std::env::var("MTXDB_PREALLOC").as_deref() == Ok("1")) {
         return Ok(());
     }
 

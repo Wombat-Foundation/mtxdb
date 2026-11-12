@@ -34,8 +34,8 @@
 //! - `MTXDB_IO_JOURNAL=0` — omit the shared-WAL path entirely, isolating pack
 //!   append cost
 //! - `MTXDB_BENCH_COMPRESS=0` — disable per-record zstd (default on)
-//! - `MTXDB_PREALLOC=0` — disable Linux `fallocate` block reservation, so a
-//!   run can be repeated with and without it
+//! - `MTXDB_PREALLOC=1` — enable Linux `fallocate` block reservation (off by
+//!   default), so a run can be repeated with and without it
 //! - `MTXDB_BENCH_ROOT` — scratch root (defaults to the system temp dir)
 #![allow(
     clippy::arithmetic_side_effects,
@@ -252,8 +252,8 @@ fn print_header(config: Config) {
     println!(
         "  prealloc:  {}",
         match std::env::var("MTXDB_PREALLOC").as_deref() {
-            Ok("0") => "off (MTXDB_PREALLOC=0)",
-            _ => "on where supported (Linux fallocate)",
+            Ok("1") => "on (MTXDB_PREALLOC=1; Linux fallocate)",
+            _ => "off (default)",
         }
     );
     println!();
