@@ -3849,7 +3849,27 @@ fn a_fresh_shared_database_creates_only_the_files_it_needs() {
         .pool(ShardType::State)
         .put(&[1; 16], &node(1), &data(b"x"))
         .unwrap();
-    // A new pack is staged until its first durability barrier publishes it.
+    // A new pack is physically created by the write but stays under its
+    // non-discoverable staging name until its first durability barrier.
+    let mut staged = Vec::new();
+    files_under(&root, &mut staged);
+    assert!(
+        staged
+            .iter()
+            .any(|name| { name.starts_with("pack_") && name.contains(".tmp.") }),
+        "the written pool's new pack must be staged before sync: {staged:?}"
+    );
+    assert_eq!(
+        staged
+            .iter()
+            .filter(|name| std::path::Path::new(name)
+                .extension()
+                .is_some_and(|e| e == "pack"))
+            .count(),
+        0,
+        "a staged pack must not be canonically discoverable: {staged:?}"
+    );
+
     database.pool(ShardType::State).sync_all().unwrap();
     let mut after = Vec::new();
     files_under(&root, &mut after);
@@ -3861,7 +3881,13 @@ fn a_fresh_shared_database_creates_only_the_files_it_needs() {
                 .is_some_and(|e| e == "pack"))
             .count(),
         1,
-        "only the written pool gets a pack: {after:?}"
+        "the first barrier publishes only the written pool's pack: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|name| { name.starts_with("pack_") && name.contains(".tmp.") }),
+        "publication must consume the staging name: {after:?}"
     );
 }
 
