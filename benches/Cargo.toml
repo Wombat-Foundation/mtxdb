@@ -216,3 +216,8 @@ harness = false
 name = "csr_read_cache"
 path = "csr_read_cache.rs"
 harness = false
+
+[[bench]]
+name = "bitmap_membership"
+path = "bitmap_membership.rs"
+harness = false
