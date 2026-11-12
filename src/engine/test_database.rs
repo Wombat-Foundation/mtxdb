@@ -3849,6 +3849,8 @@ fn a_fresh_shared_database_creates_only_the_files_it_needs() {
         .pool(ShardType::State)
         .put(&[1; 16], &node(1), &data(b"x"))
         .unwrap();
+    // A new pack is staged until its first durability barrier publishes it.
+    database.pool(ShardType::State).sync_all().unwrap();
     let mut after = Vec::new();
     files_under(&root, &mut after);
     assert_eq!(
@@ -3884,6 +3886,11 @@ fn pools_written_through_a_shared_database_read_back_read_only() {
                 .unwrap();
         }
         database.coordinator().sync().unwrap();
+        // The durable read-only path observes published packs only; publish
+        // each pool's first pack before reopening it.
+        for shard in ShardType::ALL {
+            database.pool(shard).sync_all().unwrap();
+        }
     }
     let mut names = Vec::new();
     files_under(&root, &mut names);

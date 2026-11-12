@@ -6988,7 +6988,10 @@ impl PackfileStorage {
     #[cfg(test)]
     pub(crate) fn test_cut_packs_to_synced(&self, image_dir: &Path) {
         for (_, shard) in self.shards.all_shards() {
-            let name = shard.path.file_name().expect("a pack has a file name");
+            // A pack that has not reached a durability barrier exists only
+            // under its staging name in the image; cut that copy instead.
+            let name = shard.data_path();
+            let name = name.file_name().expect("a pack has a file name");
             let file = fs::OpenOptions::new()
                 .write(true)
                 .open(image_dir.join(name))
