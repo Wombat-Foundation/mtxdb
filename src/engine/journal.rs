@@ -3721,6 +3721,8 @@ impl JournalCoordinator {
     ) -> io::Result<()> {
         let fsync_started = std::time::Instant::now();
         #[cfg(test)]
+        let _trace = crate::test_trace::span("wal.group_fsync", std::path::Path::new("wal"));
+        #[cfg(test)]
         let hooked = self.run_fsync_hook();
         #[cfg(not(test))]
         let hooked: io::Result<()> = Ok(());
@@ -5260,6 +5262,8 @@ impl Journal {
                 "journal handle is poisoned after an earlier failed commit",
             ));
         }
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("wal.make_durable", std::path::Path::new("wal"));
         if let Err(error) = self.file.sync_all() {
             self.poisoned = true;
             return Err(error);

@@ -595,8 +595,19 @@ impl Shard {
     /// the fsync began, so the fsync covers it, while bytes appended during the
     /// fsync stay owed to the next one.
     fn fsync_advancing_watermark(&self, data_only: bool) -> io::Result<()> {
+        // Test builds only: count fsyncs of a pack with no bytes beyond its
+        // last known-synced length separately, to size what a proven-durable
+        // watermark could skip. `synced_len` starts at the opened length, which
+        // is an assumption about an earlier process, so this may overcount.
         #[cfg(test)]
-        let _trace = crate::test_trace::span("pack.fsync", &self.path);
+        let _trace = crate::test_trace::span(
+            if self.file_len() <= self.synced_len() {
+                "pack.fsync_clean"
+            } else {
+                "pack.fsync"
+            },
+            &self.path,
+        );
         let covered = self.file_len();
         if data_only {
             self.file.sync_data()?;
@@ -3553,6 +3564,8 @@ impl ShardPool {
     /// # Errors
     /// Returns `io::Error` on sync failure.
     pub fn sync_all(&self) -> io::Result<()> {
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("pool.sync_all", &self.base_dir);
         let flush_started = Instant::now();
         self.flush_all()?;
         let flush_elapsed = flush_started.elapsed();
