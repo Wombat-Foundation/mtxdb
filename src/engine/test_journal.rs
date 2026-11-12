@@ -4339,3 +4339,118 @@ fn a_version_1_journal_header_reads_as_unavailable_evidence() {
     );
     fs::remove_file(path).unwrap();
 }
+
+/// Policy harness: the coordinator driven the way a pool's forced checkpoint
+/// drives it. A forced checkpoint reports the pool's coverage and reclaims the
+/// shared segment; everything else a commit does is an append, so groups are
+/// published with no fsync at all, and the real `should_force_reclaim_checkpoint`
+/// decides when a pool "syncs". What this cannot show is that a real sync reports
+/// the coverage injected here; the real-stack tests in `test_database.rs` keep
+/// that short and scaled down.
+struct PolicyHarness {
+    coordinator: JournalCoordinator,
+    path: PathBuf,
+    /// Each pool's newest published LSN and the coverage it last reported.
+    published: [u64; 3],
+    reported: [u64; 3],
+}
+
+impl PolicyHarness {
+    fn new(label: &str, segment_cap: u64) -> Self {
+        let path = temp_path(label);
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = JournalCoordinator::new(journal, &scan);
+        coordinator.set_segment_cap(segment_cap);
+        Self {
+            coordinator,
+            path,
+            published: [0; 3],
+            reported: [0; 3],
+        }
+    }
+
+    /// One commit's worth for `pool`: twenty 256-byte puts in one group, about
+    /// what a real batch writes per pool. `Err` once the segment cannot take it.
+    fn commit(&mut self, pool: crate::layout::ShardType) -> std::io::Result<()> {
+        let mutations: Vec<Mutation> = (0..20_u8)
+            .map(|node| put(0x7c, node, &[0x5a; 256]))
+            .collect();
+        let receipt = self.coordinator.publish_group_tagged(pool, &mutations)?;
+        self.coordinator.transaction_materialized(receipt.first_lsn);
+        self.published[pool.index()] = receipt.last_lsn;
+        Ok(())
+    }
+
+    /// `pool` syncs: when the policy would force a checkpoint for it (the
+    /// segment is over the trigger, the stall gate permits it, and it has
+    /// something uncovered) it reports what it has published and reclaims.
+    /// Returns whether the checkpoint was forced.
+    fn sync(&mut self, pool: crate::layout::ShardType) -> bool {
+        let index = pool.index();
+        if !self.coordinator.should_force_reclaim_checkpoint(Some(pool))
+            || self.published[index] <= self.reported[index]
+        {
+            return false;
+        }
+        self.reported[index] = self.published[index];
+        self.coordinator
+            .report_pool_coverage(pool, self.published[index]);
+        self.coordinator.reclaim_shared().unwrap();
+        true
+    }
+}
+
+impl Drop for PolicyHarness {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A pool that stays silent is reported, but only after the segment has grown by
+/// an eighth of the trigger past the first failed reclaim, and only once. The
+/// full-scale arithmetic (1 MiB segment, 256 KiB trigger), with no fsyncs.
+#[test]
+fn a_silent_pool_is_reported_only_after_the_grace_period() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_stall_grace", 1 << 20);
+    harness.coordinator.set_blocker_remediation(|_| {});
+    let grace = harness.coordinator.reclaim_trigger_len() / 8;
+    let mut first_len = None;
+    let mut reported_at = None;
+    for _ in 0..200 {
+        // State commits and never syncs; EventDag commits and syncs.
+        if harness.commit(State).is_err() || harness.commit(EventDag).is_err() {
+            break;
+        }
+        harness.sync(EventDag);
+        if first_len.is_none() && harness.coordinator.is_reclaim_stalled() {
+            first_len = Some(harness.coordinator.segment_len());
+            assert_eq!(
+                harness.coordinator.reclaim_stalls(),
+                0,
+                "reported with no grace"
+            );
+        }
+        if reported_at.is_none() && harness.coordinator.reclaim_stalls() > 0 {
+            reported_at = Some(harness.coordinator.segment_len());
+        }
+    }
+    let first_len = first_len.expect("the pending stall was never seen");
+    let reported_at = reported_at.expect("a silent pool was never reported");
+    assert!(
+        reported_at >= first_len + grace,
+        "reported at {reported_at}, only {} past the first failure",
+        reported_at - first_len
+    );
+    assert_eq!(
+        harness.coordinator.reclaim_stalls(),
+        1,
+        "one stall, reported once"
+    );
+    assert_eq!(
+        harness.coordinator.reclaim_blockers(),
+        vec![crate::layout::ShardType::State],
+        "the silent pool is the one named"
+    );
+}

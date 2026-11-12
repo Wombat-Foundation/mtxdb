@@ -1552,19 +1552,27 @@ fn a_healthy_sequential_sync_is_not_reported_as_a_stall() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A pool that stays silent is reported, but only after the segment has
-/// grown by an eighth of the trigger past the first failed reclaim.
+/// The real-stack counterpart of `a_silent_pool_is_reported_only_after_the_grace_period`
+/// in the journal tests, which proves the grace arithmetic at full scale without
+/// fsyncs. This one proves a real `sync_all` reports the coverage that policy
+/// consumes: a pool that stays silent is reported, but only after the segment
+/// has grown by an eighth of the trigger past the first failed reclaim, and
+/// once. The trigger is small so that grace (an eighth of it) is reached in a
+/// few real commits and syncs instead of a hundred; the proportions are the
+/// same.
 #[test]
 fn a_silent_contributor_is_reported_after_the_grace_period() {
     let (db, root) = small_segment_database("stall_grace");
     db.coordinator().set_blocker_remediation(|_| {});
+    db.coordinator().set_reclaim_trigger_len(16 << 10);
     let pools = [ShardType::State, ShardType::EventDag];
     let coordinator = db.coordinator();
     let grace = coordinator.reclaim_trigger_len() / 8;
     let mut next = 0u64;
     let mut first_len = None;
     let mut reported_at = None;
-    for _ in 0..200 {
+    let mut rounds_after_report = 0;
+    for _ in 0..60 {
         if commit_batch(&db, &pools, &mut next, 1).is_err() {
             break;
         }
@@ -1575,6 +1583,13 @@ fn a_silent_contributor_is_reported_after_the_grace_period() {
         }
         if reported_at.is_none() && coordinator.reclaim_stalls() > 0 {
             reported_at = Some(coordinator.segment_len());
+        }
+        if reported_at.is_some() {
+            // Keep going a little: a stall that repeats would show here.
+            rounds_after_report += 1;
+            if rounds_after_report >= 6 {
+                break;
+            }
         }
     }
     let first_len = first_len.expect("the pending stall was never seen");
