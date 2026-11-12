@@ -14697,3 +14697,224 @@ fn retiring_a_delta_epoch_never_unlinks_the_live_log() {
     assert!(live.exists(), "the live epoch's log was unlinked");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// What a shared-WAL store leaves after its first sync reclaimed the WAL groups
+/// that carried its collection versions: the published store directory, the
+/// reclaimed WAL, and each collection's record count and logical version.
+struct ReclaimedVersions {
+    store: PathBuf,
+    wal: Vec<u8>,
+    expected: [([u8; 16], u64, u64); 2],
+}
+
+const VERSIONS_SECOND_COLLECTION: [u8; 16] = [0x77; 16];
+const VERSION_FILES: [&str; 3] = ["index.checkpoint", "index.versions", "journal.lsn"];
+
+fn version_test_value(collection: &[u8; 16], i: u8) -> Vec<u8> {
+    vec![i ^ collection[0]; 8]
+}
+
+/// Commit mutations to two collections, record their logical versions, sync,
+/// and capture the published files and the reclaimed WAL.
+fn reclaimed_versions_fixture() -> ReclaimedVersions {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("versions_reclaim_wal");
+    let store_dir = test_dir("versions_reclaim_store");
+    let wal = wal_dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    for (collection, count) in [(TEST_COLLECTION, 5_u8), (VERSIONS_SECOND_COLLECTION, 3_u8)] {
+        for i in 0..count {
+            store
+                .put(
+                    &collection,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(version_test_value(&collection, i))),
+                )
+                .unwrap();
+        }
+    }
+    coordinator.sync().unwrap();
+    let expected = [
+        (
+            TEST_COLLECTION,
+            5_u64,
+            coordinator.collection_version(ShardType::State, &TEST_COLLECTION),
+        ),
+        (
+            VERSIONS_SECOND_COLLECTION,
+            3_u64,
+            coordinator.collection_version(ShardType::State, &VERSIONS_SECOND_COLLECTION),
+        ),
+    ];
+    assert!(
+        expected.iter().all(|(_, _, version)| *version > 0),
+        "the mutations must have produced versions: {expected:?}"
+    );
+    assert!(
+        !Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
+        "before the sync the WAL still holds the groups"
+    );
+    store.sync_all().unwrap();
+    assert!(
+        Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
+        "the sync reclaimed the covered groups"
+    );
+    let reclaimed = fs::read(&wal).unwrap();
+    let published = copy_store(&store_dir, "versions_reclaim_after");
+    for file in VERSION_FILES {
+        assert!(published.join(file).exists(), "{file} was not published");
+    }
+    drop(store);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&store_dir);
+    let _ = fs::remove_dir_all(&wal_dir);
+    ReclaimedVersions {
+        store: published,
+        wal: reclaimed,
+        expected,
+    }
+}
+
+/// Reopen the published store with only the files in `surviving` (bit 0 the
+/// checkpoint, bit 1 the versions file, bit 2 `journal.lsn`) beside the
+/// reclaimed WAL; every record and each collection's version, or the open's
+/// error.
+fn reopen_with_surviving_files(
+    fixture: &ReclaimedVersions,
+    surviving: u8,
+) -> Result<Vec<u64>, String> {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let store = copy_store(&fixture.store, "versions_reclaim_try");
+    for (bit, file) in VERSION_FILES.iter().enumerate() {
+        if surviving & (1 << bit) == 0 {
+            fs::remove_file(store.join(file)).unwrap();
+        }
+    }
+    let wal_dir = test_dir("versions_reclaim_try_wal");
+    let wal = wal_dir.join("shared.wal");
+    fs::write(&wal, &fixture.wal).unwrap();
+    let outcome = (|| -> Result<Vec<u64>, String> {
+        let (journal, scan) = Journal::open_shared(&wal).map_err(|error| error.to_string())?;
+        let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+        let reopened = PackfileStorage::open(store.clone()).map_err(|error| error.to_string())?;
+        reopened
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+            .map_err(|error| error.to_string())?;
+        for (collection, count, _) in &fixture.expected {
+            for i in 0..u8::try_from(*count).unwrap() {
+                let got = reopened
+                    .get(collection, &distinct_id(i))
+                    .map_err(|error| error.to_string())?;
+                if got.map(|data| data.bytes.to_vec()) != Some(version_test_value(collection, i)) {
+                    return Err(format!("record {i} of {:02x} lost", collection[0]));
+                }
+            }
+        }
+        Ok(fixture
+            .expected
+            .iter()
+            .map(|(collection, _, _)| recovered.collection_version(ShardType::State, collection))
+            .collect())
+    })();
+    let _ = fs::remove_dir_all(&store);
+    let _ = fs::remove_dir_all(&wal_dir);
+    outcome
+}
+
+/// Collection versions survive a reclaim: the WAL groups that carried them are
+/// dropped once `index.checkpoint`, `index.versions` and `journal.lsn` are
+/// published, so what is left on disk must restore every version exactly.
+///
+/// Every candidate keeps the reclaimed WAL, so the WAL cannot supply a version
+/// the files lost, and every combination of which of the three files survive
+/// is reopened (the empty combination has its own test below).
+///
+/// Which states a crash can leave follows from the publication order: the
+/// checkpoint and the versions file are renamed and made durable by one
+/// directory barrier, then `journal.lsn` is renamed and made durable, and only
+/// after that does the WAL rewrite that drops the groups begin. A durable
+/// reclaimed WAL therefore implies all three files are durable, so exactly one
+/// state is reachable beside it: it must reopen with every record and the exact
+/// versions. The others are not states the order leaves. Those that keep a
+/// readable baseline (the checkpoint or the versions file) still restore the
+/// exact versions; with no baseline left, a surviving `journal.lsn` makes the
+/// open refuse with the explicit guard instead of starting from an empty
+/// version baseline.
+#[test]
+fn collection_versions_survive_reclaim_for_every_surviving_file_combination() {
+    let fixture = reclaimed_versions_fixture();
+    let exact: Vec<u64> = fixture
+        .expected
+        .iter()
+        .map(|(_, _, version)| *version)
+        .collect();
+    for mask in 1_u8..8 {
+        let label = format!("surviving files mask={mask:03b} (checkpoint, versions, lsn)");
+        let outcome = reopen_with_surviving_files(&fixture, mask);
+        if mask & 0b011 != 0 {
+            // The reachable state (all three) and every other combination that
+            // keeps a readable baseline restore the exact versions.
+            assert_eq!(outcome, Ok(exact.clone()), "{label}");
+        } else {
+            // Only `journal.lsn` left: coverage claimed, versions unrecoverable.
+            let message = outcome.expect_err(&label);
+            assert!(
+                message.contains("no readable version baseline"),
+                "{label}: refused for another reason: {message}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&fixture.store);
+}
+
+/// With the reclaimed WAL and no version baseline at all (no checkpoint, no
+/// versions file, no `journal.lsn`), the store must not open and report every
+/// collection at version zero: the WAL groups that carried the versions are
+/// gone, so a silent open turns versions `[5, 8]` into `[0, 0]`.
+///
+/// Not a state the publication order leaves, but losing the baseline must never
+/// reset versions quietly. Today the open succeeds with zero versions: nothing
+/// on disk records that coverage was ever claimed, so the guard (which keys on
+/// durable coverage) does not fire. Kept as a regression test for that gap and
+/// ignored until recovery fails closed here; the expectation is the strict one.
+///
+/// What a fix can and cannot rely on. Refusing on "no baseline and no recovered
+/// group for this pool" is too broad: an imported or quiet pool meets it, and a
+/// few surviving groups do not prove earlier history was kept. The pool's pack
+/// frames carry the LSN of the group that last wrote them, which can show that
+/// some reclaimed history existed, but not every case: a collection deletion
+/// advances a version without leaving a surviving record, and versions must not
+/// be rebuilt from those LSNs. So a pack-LSN check is a conservative safeguard,
+/// not a complete one. Complete detection needs durable per-pool evidence of
+/// reclaimed coverage, written when the history is dropped.
+///
+/// Limitation, for the follow-up refusal: a pack's `last_write_lsn` can show
+/// that some history was reclaimed (a tagged LSN below the WAL base), but it
+/// cannot show that all history survived. A collection delete advances the
+/// logical version without leaving a surviving record whose LSN could be
+/// compared, so the frame check is a conservative safeguard, not a complete
+/// detector. Complete detection needs durable per-pool evidence that coverage
+/// was reclaimed, independent of the three baseline files.
+#[test]
+#[ignore = "known gap: a store with every version baseline lost opens with zero versions"]
+fn losing_every_version_baseline_beside_a_reclaimed_wal_fails_closed() {
+    let fixture = reclaimed_versions_fixture();
+    let outcome = reopen_with_surviving_files(&fixture, 0);
+    let _ = fs::remove_dir_all(&fixture.store);
+    let message = outcome.expect_err("the open reported versions it could not restore");
+    assert!(
+        message.contains("no readable version baseline"),
+        "refused for another reason: {message}"
+    );
+}
