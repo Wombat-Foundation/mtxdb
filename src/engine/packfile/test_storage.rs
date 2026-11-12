@@ -14559,3 +14559,109 @@ fn read_committed_completes_inside_a_paused_reclaim() {
         "reads must complete while a reclaim holds its locks"
     );
 }
+
+/// Every combination of absent, previous and new for the three files a
+/// checkpoint replaces (`index.checkpoint`, `index.versions`, `journal.lsn`):
+/// the states a crash can leave when their directory entries are made durable
+/// by fewer barriers than renames. Recovery must read coverage that is never
+/// above what the surviving files back, and a valid `index.versions` must
+/// decide it however `journal.lsn` looks: that is what lets the checkpoint and
+/// versions renames share one directory sync and `journal.lsn` follow it.
+#[test]
+fn recovery_coverage_is_safe_for_every_combination_of_the_checkpoint_files() {
+    const PREVIOUS: u64 = 100;
+    const NEW: u64 = 200;
+    // 0 = absent, 1 = the previous checkpoint's file, 2 = the new one's.
+    let lsn_of = |state: usize| match state {
+        1 => Some(PREVIOUS),
+        2 => Some(NEW),
+        _ => None,
+    };
+    for checkpoint in 0..3_usize {
+        for versions in 0..3_usize {
+            for journal_lsn in 0..3_usize {
+                let dir = test_dir(&format!(
+                    "coverage_matrix_{checkpoint}{versions}{journal_lsn}"
+                ));
+                if let Some(lsn) = lsn_of(checkpoint) {
+                    crate::index::checkpoint::write_checkpoint(
+                        &PackfileStorage::index_checkpoint_path(&dir),
+                        0xfeed,
+                        lsn,
+                        0,
+                        &[],
+                        &[],
+                        &[],
+                    )
+                    .unwrap();
+                }
+                if let Some(lsn) = lsn_of(versions) {
+                    crate::index::versions::write_versions(
+                        &PackfileStorage::index_versions_path(&dir),
+                        &[],
+                        lsn,
+                    )
+                    .unwrap();
+                }
+                if let Some(lsn) = lsn_of(journal_lsn) {
+                    std::fs::write(PackfileStorage::journal_lsn_path(&dir), lsn.to_le_bytes())
+                        .unwrap();
+                }
+                let got = PackfileStorage::read_journal_lsn(&dir);
+                let checkpoint_coverage = lsn_of(checkpoint).unwrap_or(0);
+                let journal_coverage = lsn_of(journal_lsn).unwrap_or(0);
+                let expected = match lsn_of(versions) {
+                    // A valid versions file decides; `journal.lsn` cannot raise it.
+                    Some(versions_coverage) => versions_coverage.max(checkpoint_coverage),
+                    // Without one, `journal.lsn` is trusted. A checkpoint writer
+                    // makes the versions file durable before `journal.lsn`, so
+                    // this row (a new `journal.lsn` with no versions and an older
+                    // checkpoint) cannot be left by a crash while the versions
+                    // and checkpoint renames are durable before it.
+                    None => journal_coverage.max(checkpoint_coverage),
+                };
+                assert_eq!(
+                    got, expected,
+                    "checkpoint={checkpoint} versions={versions} journal.lsn={journal_lsn}"
+                );
+                // However the files are combined, nothing reads above the newest
+                // coverage any of them was written with.
+                assert!(got <= NEW);
+                // A new `journal.lsn` beside a valid versions file never raises
+                // the coverage past what the versions and checkpoint carry.
+                if journal_lsn == 2 && versions != 0 {
+                    assert_eq!(got, lsn_of(versions).unwrap().max(checkpoint_coverage));
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+}
+
+/// Retiring the previous delta epoch must never unlink the epoch now in use. A
+/// checkpoint taken with the packs unchanged has the same fingerprint as its
+/// predecessor, so the previous epoch's file is the live one; a different
+/// fingerprint is retired as before, and no previous epoch is a no-op.
+#[test]
+fn retiring_a_delta_epoch_never_unlinks_the_live_log() {
+    let dir = test_dir("retire_live_epoch");
+    let previous = PackfileStorage::delta_path(&dir, 1);
+    let live = PackfileStorage::delta_path(&dir, 2);
+    std::fs::write(&previous, b"previous epoch").unwrap();
+    std::fs::write(&live, b"live epoch").unwrap();
+
+    // Same fingerprint: the "old" epoch is the live one.
+    super::retire_delta_epoch_file(&dir, Some(2), 2);
+    assert!(live.exists(), "the live epoch's log was unlinked");
+    assert!(previous.exists());
+
+    // No previous epoch (opened by a rescan): nothing to retire.
+    super::retire_delta_epoch_file(&dir, None, 2);
+    assert!(live.exists() && previous.exists());
+
+    // A different fingerprint is the superseded epoch and goes.
+    super::retire_delta_epoch_file(&dir, Some(1), 2);
+    assert!(!previous.exists(), "the superseded epoch was not retired");
+    assert!(live.exists(), "the live epoch's log was unlinked");
+    let _ = std::fs::remove_dir_all(&dir);
+}

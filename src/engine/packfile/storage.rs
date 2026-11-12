@@ -6933,7 +6933,7 @@ impl PackfileStorage {
         )
         .map_err(StorageError::Io)?;
         let _ = crate::shard::sync_directory(&self.base_dir);
-        self.retire_delta_epoch(old_base_fingerprint);
+        self.retire_delta_epoch(old_base_fingerprint, fingerprint);
         let guards = lock_arcs.iter().map(|m| m.lock()).collect::<Vec<_>>();
         let has_unfinished_work = {
             let state = self.delta_state.lock();
@@ -7026,8 +7026,8 @@ impl PackfileStorage {
     /// epoch's file on disk, which is always safe (see `delta_path`) — it
     /// simply names a fingerprint no future checkpoint will ever carry again.
     #[cfg(test)]
-    fn retire_delta_epoch(&self, old_base_fingerprint: Option<u64>) {
-        retire_delta_epoch_file(&self.base_dir, old_base_fingerprint);
+    fn retire_delta_epoch(&self, old_base_fingerprint: Option<u64>, live_fingerprint: u64) {
+        retire_delta_epoch_file(&self.base_dir, old_base_fingerprint, live_fingerprint);
     }
 
     /// Append the pending delta operations and clear the dirty flag. The
@@ -14409,17 +14409,28 @@ fn write_journal_lsn_file(
 /// Remove the superseded delta-log epoch once the checkpoint that makes it safe
 /// to discard is durably renamed. Best-effort: a leftover file names a
 /// fingerprint no future checkpoint carries, so it is inert.
-fn retire_delta_epoch_file(base_dir: &Path, old_base_fingerprint: Option<u64>) {
+fn retire_delta_epoch_file(
+    base_dir: &Path,
+    old_base_fingerprint: Option<u64>,
+    live_fingerprint: u64,
+) {
     let Some(old_base_fingerprint) = old_base_fingerprint else {
         return;
     };
-    let path = PackfileStorage::delta_path(base_dir, old_base_fingerprint);
-    if fs::remove_file(&path).is_ok() {
-        // The checkpoint rename's own durability is already covered by the
-        // directory fsync after `write_checkpoint`; this one covers the unlink,
-        // so the retired file does not linger past a crash.
-        let _ = crate::shard::sync_directory(base_dir);
+    // A checkpoint taken with the packs unchanged (for example a retry after a
+    // failed tail) has the same fingerprint as its predecessor, so the "old"
+    // epoch's file is the live one: its name is the new checkpoint's. Unlinking
+    // it would discard the frames this epoch has already appended.
+    if old_base_fingerprint == live_fingerprint {
+        return;
     }
+    let path = PackfileStorage::delta_path(base_dir, old_base_fingerprint);
+    // No directory sync after the unlink: if a crash restores the file it is
+    // inert. Its name and header carry a fingerprint no future checkpoint will
+    // match, and `sweep_orphan_delta_logs` removes it at the next open. The
+    // checkpoint rename's durability is already covered by the directory sync
+    // in `CheckpointTail::run`, before this runs.
+    let _ = fs::remove_file(&path);
 }
 
 /// Tell the journal a pool's packs durably cover its frames through `lsn`, and
@@ -14522,32 +14533,33 @@ impl CheckpointTail {
         .map_err(StorageError::Io)?;
         done.write = write_started.elapsed();
         done.checkpoint_bytes = fs::metadata(&path).map_or(0, |meta| meta.len());
-        // The rename is only durable once the directory is synced. Without a
-        // coverage claim this is best-effort: a crash before it either observes
-        // the rename or falls back to the still-valid predecessor checkpoint,
-        // never a torn one. A coverage claim lets the journal drop the WAL
-        // behind it, including the collection versions only the checkpoint
-        // carries, so the claim must not be made on a rename that may not be
-        // durable: a failure here abandons the checkpoint and keeps the WAL.
-        let directory_started = std::time::Instant::now();
-        let directory_synced = crate::shard::sync_directory(&self.base_dir);
-        done.directory_sync = directory_started.elapsed();
-        if self.journal.is_some() && self.covered_lsn.is_some() {
-            directory_synced.map_err(StorageError::Io)?;
-        }
         // Collection versions are not reconstructible from sealed packs: a
-        // reclaimed WAL group has no frame-level version tag. Make the
-        // versions file durable before the coverage claim below can let the
+        // reclaimed WAL group has no frame-level version tag. The versions file
+        // is synced and renamed here, before any coverage claim below can let the
         // journal drop the groups that still carry them.
-        crate::index::versions::write_versions(
+        crate::index::versions::write_versions_deferring_directory_sync(
             &PackfileStorage::index_versions_path(&self.base_dir),
             &self.logical_versions,
             self.covered_lsn.unwrap_or(0),
         )
         .map_err(StorageError::Io)?;
-        // The versions are durable; the coverage claim below may now reclaim
-        // the WAL. Crash tests stop between the two to prove the versions file
-        // alone is enough to restore versions and coverage.
+        // One directory barrier makes both renames (index.checkpoint and
+        // index.versions) durable. Each file's data was synced before its own
+        // rename, and neither writer advanced a durable watermark or retired
+        // anything, so a crash before this point can leave either, both or
+        // neither rename durable with the WAL still intact. Recovery handles
+        // every such combination: a missing or old file only lowers the coverage
+        // it reads, and the versions and coverage in whichever file survives are
+        // valid on their own (see `read_journal_lsn` and `durable_index_state`).
+        // A failure abandons the checkpoint before `journal.lsn`, the coverage
+        // acknowledgement and the reclaim, keeping the WAL.
+        let directory_started = std::time::Instant::now();
+        crate::shard::sync_directory(&self.base_dir).map_err(StorageError::Io)?;
+        done.directory_sync = directory_started.elapsed();
+        // The versions file and the checkpoint are durable; the coverage claim
+        // below may now reclaim the WAL. Crash tests stop between the two to
+        // prove the versions file alone is enough to restore versions and
+        // coverage.
         versions_crash_point("after-versions-fsync");
         // The image is durable; record the LSN it covers so a reopen replays only
         // what follows, and let the journal drop what the packs now cover. The
@@ -14563,7 +14575,7 @@ impl CheckpointTail {
             done.reclaim = reclaim_started.elapsed();
         }
         let retire_started = std::time::Instant::now();
-        retire_delta_epoch_file(&self.base_dir, self.old_base_fingerprint);
+        retire_delta_epoch_file(&self.base_dir, self.old_base_fingerprint, self.fingerprint);
         done.retire = retire_started.elapsed();
         done.total = tail_started.elapsed();
         Ok(done)

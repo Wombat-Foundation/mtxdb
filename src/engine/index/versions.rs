@@ -81,6 +81,29 @@ pub fn write_versions(
     versions: &[([u8; 16], u64)],
     covered_lsn: u64,
 ) -> std::io::Result<()> {
+    write_versions_deferring_directory_sync(path, versions, covered_lsn)?;
+    if let Some(dir) = path.parent() {
+        crate::shard::sync_directory(dir)?;
+    }
+    Ok(())
+}
+
+/// [`write_versions`] without the final directory sync: the file is synced and
+/// renamed into place, but the rename is not yet durable.
+///
+/// For a caller that publishes several files in one directory and syncs the
+/// directory once after the last rename (see `CheckpointTail::run`). It must
+/// not acknowledge anything that depends on this file, such as a WAL coverage
+/// claim, until that directory sync has succeeded.
+///
+/// # Errors
+/// Returns an I/O error if the temporary file cannot be created, written,
+/// synced or renamed.
+pub fn write_versions_deferring_directory_sync(
+    path: &Path,
+    versions: &[([u8; 16], u64)],
+    covered_lsn: u64,
+) -> std::io::Result<()> {
     let mut sorted = versions.to_vec();
     sorted.sort_unstable_by_key(|(collection_id, _)| *collection_id);
 
@@ -120,9 +143,6 @@ pub fn write_versions(
     if let Err(error) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
-    }
-    if let Some(dir) = path.parent() {
-        crate::shard::sync_directory(dir)?;
     }
     Ok(())
 }
