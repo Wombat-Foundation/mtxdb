@@ -2703,7 +2703,11 @@ fn header_only_shard_collections_is_valid_but_truncating_a_populated_one_is_not(
         read_persisted_shard_collections(&dir).is_some(),
         "a header-only zero-record sidecar is valid"
     );
-    assert!(PackfileStorage::collection_directory_from_disk(&dir).is_empty());
+    assert_eq!(
+        PackfileStorage::collection_directory_from_disk(&dir),
+        Vec::new(),
+        "a header-only zero-record sidecar yields no directory entries"
+    );
 
     // A populated file cut to the same header is damaged: its original CRC
     // covered the records that are now gone.
