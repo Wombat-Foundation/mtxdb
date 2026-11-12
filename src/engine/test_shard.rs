@@ -1897,7 +1897,11 @@ fn seal_queue_does_not_block_the_writer_and_drains_later() {
     // Nothing started while held: every pack was queued, none running.
     assert_eq!(backlog.queued, packs.len());
     assert_eq!(backlog.running, 0);
-    assert!(ready_while_held.is_empty());
+    assert_eq!(
+        ready_while_held.len(),
+        0,
+        "nothing is ready while the build is held"
+    );
 
     pool.wait_for_seals();
     let ready = pool.take_sealed_ready();
