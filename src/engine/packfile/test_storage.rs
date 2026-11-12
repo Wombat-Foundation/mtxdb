@@ -12161,19 +12161,43 @@ fn power_loss_images_lose_no_acknowledged_record() {
                     }
                 }
             }
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let reopened = PackfileStorage::open(candidate.clone()).unwrap();
-                reopened.enable_journal(candidate.join("wal.bin")).unwrap();
-                reopened.replay_journal().unwrap();
-                (1..=u8::try_from(step).unwrap()).all(|index| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<bool, String> {
+                    let reopened = PackfileStorage::open(candidate.clone())
+                        .map_err(|error| error.to_string())?;
                     reopened
-                        .get(&[0x4Du8; 16], &[index; 16])
-                        .unwrap()
-                        .map(|data| data.bytes.to_vec())
-                        == Some(vec![index; 16])
-                })
-            }));
-            if !matches!(outcome, Ok(true)) {
+                        .enable_journal(candidate.join("wal.bin"))
+                        .map_err(|error| error.to_string())?;
+                    reopened
+                        .replay_journal()
+                        .map_err(|error| error.to_string())?;
+                    Ok((1..=u8::try_from(step).unwrap()).all(|index| {
+                        reopened
+                            .get(&[0x4Du8; 16], &[index; 16])
+                            .unwrap()
+                            .map(|data| data.bytes.to_vec())
+                            == Some(vec![index; 16])
+                    }))
+                },
+            ));
+            // One state may refuse to open instead of serving the records: the
+            // checkpoint and the versions file both gone while `journal.lsn`
+            // still claims coverage, which only exists at the first checkpoint,
+            // where there is no earlier version of either to revert to. The
+            // publication order (checkpoint and versions made durable by one
+            // directory barrier, only then `journal.lsn`) never leaves it, and a
+            // store that cannot restore its collection versions must not open
+            // with an empty baseline. So the refusal must be that explicit
+            // guard, and only when neither baseline file is left; any other
+            // error, panic or lost record is a failure.
+            let refused_without_a_baseline = matches!(
+                &outcome,
+                Ok(Err(message))
+                    if message.contains("no readable version baseline")
+                        && !candidate.join("index.versions").exists()
+                        && !candidate.join("index.checkpoint").exists()
+            );
+            if !matches!(outcome, Ok(Ok(true))) && !refused_without_a_baseline {
                 let lost: Vec<&str> = CRASH_CLASSES
                     .iter()
                     .enumerate()
