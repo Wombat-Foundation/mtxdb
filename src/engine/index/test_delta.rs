@@ -1462,3 +1462,33 @@ fn compaction_keeps_only_the_newest_table() {
     ));
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A durable append syncs the parent directory unless the caller has already
+/// established that the log's current directory entry is durable. A caller
+/// that is unsure must still pay for it, and a failed sync surfaces as an
+/// error rather than being swallowed.
+#[test]
+fn a_durable_append_skips_the_parent_sync_only_when_the_entry_is_known_durable() {
+    let dir = coverage_log_dir("dir-durable");
+    let path = dir.join(INDEX_DELTA_FILE);
+    let operations = [DeltaOperation::Incremental(test_frame(1, 1))];
+    append_batch_with_durability(&path, true, 0xABC, &operations, 0x111, true).unwrap();
+
+    crate::shard::fail_directory_sync_after(&dir, 0);
+    // The wrapper does not claim the entry is durable, so it must sync and
+    // the injected failure must reach the caller.
+    assert!(
+        append_batch_with_durability(&path, false, 0xABC, &operations, 0x222, true).is_err(),
+        "an unproven directory entry must still be synced"
+    );
+    // With the entry known durable, the bytes are still synced but the parent
+    // is not, so the injected failure does not apply.
+    append_batch_with_durability_and_directory(&path, false, 0xABC, &operations, 0x333, true, true)
+        .unwrap();
+    crate::shard::clear_directory_sync_failure(&dir);
+
+    let log = read_delta_log(&path).unwrap();
+    assert_eq!(log.tail_fingerprint, 0x333);
+    assert_eq!(log.operations.len(), 3);
+    fs::remove_dir_all(&dir).unwrap();
+}

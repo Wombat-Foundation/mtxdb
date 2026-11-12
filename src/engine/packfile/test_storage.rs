@@ -12628,6 +12628,55 @@ fn a_coverage_batch_syncs_the_directory_of_a_log_an_earlier_batch_created() {
     crate::shard::clear_directory_sync_failure(&dir);
 }
 
+/// Once a durable batch has synced the delta log's directory entry, later
+/// coverage batches append to the same name and must not pay for another
+/// parent sync. Injecting a directory-sync failure proves the skip: the claim
+/// still advances, which it could not do if a sync were still attempted.
+#[test]
+fn a_coverage_batch_skips_the_directory_sync_once_the_log_entry_is_durable() {
+    let store_dir = test_dir("delta_dirsync_once_store");
+    // Keep the WAL outside the store directory: a reclaim rewrites the WAL and
+    // syncs its own parent, which must not be confused with the log's entry.
+    let wal = test_dir("delta_dirsync_once_wal").join("wal.bin");
+    let writer = PackfileStorage::open(store_dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+    let put = |i: u8| {
+        writer
+            .put(
+                &[0x4Eu8; 16],
+                &[i; 16],
+                &NodeData::new(bytes::Bytes::from(vec![i; 16])),
+            )
+            .unwrap();
+    };
+    // The first sync has no checkpoint base, so it rewrites one and rotates
+    // onto a fresh delta epoch; the second writes the epoch's first durable
+    // coverage batch and therefore syncs its directory entry.
+    put(1);
+    writer.sync().unwrap();
+    put(2);
+    writer.sync().unwrap();
+    let before = writer.durable_coverage();
+    let appends = writer.stats().delta_appends;
+    assert!(before > 0, "the first durable coverage batch reported");
+
+    crate::shard::fail_directory_sync_after(&store_dir, 0);
+    put(3);
+    writer
+        .sync()
+        .expect("the durable directory entry needs no second sync");
+    assert!(
+        writer.durable_coverage() > before,
+        "the coverage batch advanced without a directory sync"
+    );
+    assert!(
+        writer.stats().delta_appends > appends,
+        "the advancing claim came from a delta coverage batch, not a checkpoint"
+    );
+    crate::shard::clear_directory_sync_failure(&store_dir);
+}
+
 #[test]
 fn slots_only_reopen_counts_identity_reads_for_a_tag_collision() {
     let dir = test_dir("slots_only_identity_reads");

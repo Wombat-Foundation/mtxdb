@@ -1525,6 +1525,39 @@ pub fn append_batch_with_durability(
     tail_fingerprint: u64,
     durable: bool,
 ) -> std::io::Result<usize> {
+    append_batch_with_durability_and_directory(
+        path,
+        write_header,
+        base_fingerprint,
+        operations,
+        tail_fingerprint,
+        durable,
+        false,
+    )
+}
+
+/// [`append_batch_with_durability`] with caller-held knowledge that the log's
+/// current directory entry is already durable.
+///
+/// `directory_entry_durable` is the caller's assertion that a previous durable
+/// batch already synced the parent directory for this exact path. A caller that
+/// is not certain must pass `false`: the file name is then synced on every
+/// durable append, as [`append_batch_with_durability`] always does. Passing
+/// `true` only skips the parent-directory sync; the batch's own bytes are still
+/// synced.
+///
+/// # Errors
+/// Returns an error if the operation count exceeds `u32`, a frame fails to
+/// encode, or a write, data sync, or required directory sync fails.
+pub fn append_batch_with_durability_and_directory(
+    path: &Path,
+    write_header: bool,
+    base_fingerprint: u64,
+    operations: &[DeltaOperation],
+    tail_fingerprint: u64,
+    durable: bool,
+    directory_entry_durable: bool,
+) -> std::io::Result<usize> {
     let operation_count = u32::try_from(operations.len())
         .map_err(|_| std::io::Error::other("delta batch exceeds u32 operation count"))?;
     let mut appended = 0usize;
@@ -1553,10 +1586,14 @@ pub fn append_batch_with_durability(
     appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
     if durable {
         file.sync_data()?;
-        // Always, not only with the header: an earlier non-durable batch may
-        // have created the file, and this batch's claim rests on it existing.
-        if let Some(parent) = path.parent() {
-            crate::shard::sync_directory(parent)?;
+        // An earlier non-durable batch may have created the file without
+        // making its name durable, and this batch's claim rests on it
+        // existing after a power loss. Skip the parent sync only when the
+        // caller knows a previous durable batch synced this exact name.
+        if !directory_entry_durable {
+            if let Some(parent) = path.parent() {
+                crate::shard::sync_directory(parent)?;
+            }
         }
     }
     Ok(appended)

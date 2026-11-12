@@ -2089,6 +2089,13 @@ struct DeltaLogState {
     /// coverage batch, which must be durable, would pay for every batch written
     /// since the epoch began in one fsync.
     log_synced_bytes: u64,
+    /// Whether a directory sync has successfully completed for the current
+    /// epoch file's name. A file that merely exists does not prove its entry is
+    /// durable: a non-durable batch may have created it, and a power loss could
+    /// then lose the name. Starts `false` (a reopen cannot tell how the entry
+    /// became visible) and resets on every epoch rotation, so the first
+    /// durable batch of a session or epoch syncs the parent once.
+    log_dir_durable: bool,
     /// The highest redo `delta_seq` assigned so far in this pool. It resumes above
     /// the checkpoint's base sequence at open and is written into the next
     /// checkpoint as its base, so the ordering key survives reopen and rotation.
@@ -4760,6 +4767,10 @@ impl PackfileStorage {
             // What was on disk at open is treated as durable; only what this
             // session appends is owed an fsync.
             log_synced_bytes: log_bytes_on_disk,
+            // A visible file does not prove its directory entry survived a
+            // power loss (a non-durable batch may have created it), so the
+            // first durable batch of this session syncs the parent once.
+            log_dir_durable: false,
             delta_seq_high: last_delta_seq,
             log_version: replay_log_version,
             base_pack_ids: checkpoint
@@ -6888,6 +6899,9 @@ impl PackfileStorage {
         state.pending.clear();
         state.log_bytes = 0;
         state.log_synced_bytes = 0;
+        // The rotated epoch names a new file, so no directory sync has yet
+        // completed for that name.
+        state.log_dir_durable = false;
         state.log_version = 1;
         old_base_fingerprint
     }
@@ -7242,13 +7256,14 @@ impl PackfileStorage {
                 },
             )));
         }
-        let bytes_written = delta::append_batch_with_durability(
+        let bytes_written = delta::append_batch_with_durability_and_directory(
             &path,
             write_header,
             base_fingerprint,
             operations,
             tail_fingerprint,
             durable,
+            state.log_dir_durable,
         )
         .map_err(StorageError::Io)?;
         state.log_bytes = state
@@ -7256,6 +7271,10 @@ impl PackfileStorage {
             .saturating_add(u64::try_from(bytes_written).unwrap_or(u64::MAX));
         if durable {
             state.log_synced_bytes = state.log_bytes;
+            // The append returned `Ok` only after syncing the entry (or
+            // skipping it because it was already durable). A failed sync
+            // returns `Err`, leaving the flag unset for the next attempt.
+            state.log_dir_durable = true;
         } else {
             // Pay for the log's durability in slices as it grows. Best effort:
             // the log is acceleration, and a coverage batch fsyncs it again.
