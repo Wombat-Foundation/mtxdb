@@ -370,10 +370,12 @@ fn parse_versions_payload(payload: &[u8]) -> Option<(u64, VersionEntries)> {
         return None;
     }
     let mut entries: Vec<([u8; 16], u64)> = Vec::with_capacity(count);
-    for chunk in payload
-        .get(V1_VERSIONS_FIXED_LEN..)?
-        .chunks_exact(V1_VERSION_ENTRY_LEN)
-    {
+    let body = payload.get(V1_VERSIONS_FIXED_LEN..)?;
+    let (chunks, remainder) = body.as_chunks::<V1_VERSION_ENTRY_LEN>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    for chunk in chunks {
         let id: [u8; 16] = chunk.get(..16)?.try_into().ok()?;
         let version = u64::from_le_bytes(chunk.get(16..24)?.try_into().ok()?);
         if entries.last().is_some_and(|(previous, _)| *previous >= id) {
