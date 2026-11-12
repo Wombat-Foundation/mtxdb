@@ -12093,7 +12093,15 @@ fn copy_store(from: &std::path::Path, label: &str) -> PathBuf {
 }
 
 /// The file classes whose directory entry or contents move at a sync.
-const CRASH_CLASSES: [&str; 4] = ["wal.bin", "journal.lsn", "index.checkpoint", "index.delta."];
+/// `index.versions` is published with `index.checkpoint` under one directory
+/// barrier, so a crash can keep either, both or neither of the two renames.
+const CRASH_CLASSES: [&str; 5] = [
+    "wal.bin",
+    "journal.lsn",
+    "index.checkpoint",
+    "index.versions",
+    "index.delta.",
+];
 
 fn in_class(name: &str, class: &str) -> bool {
     if class.ends_with(['.', '_']) {
@@ -12105,8 +12113,8 @@ fn in_class(name: &str, class: &str) -> bool {
 
 /// Power loss that keeps every fsynced byte but may lose any rename or file
 /// creation not yet made durable by a directory sync: after each acknowledged
-/// sync, every subset of {WAL, LSN sidecar, index checkpoint, delta log} is put
-/// back to the version from one sync earlier (or removed, if it did not exist),
+/// sync, every subset of {WAL, LSN sidecar, index checkpoint, versions file,
+/// delta log} is put back to the version from one sync earlier (or removed, if it did not exist),
 /// and the store must reopen and serve every acknowledged record. Combinations
 /// that need the WAL to be newer than the checkpoint side are listed apart:
 /// they are exactly what the checkpoint-before-WAL ordering rules out.
@@ -12134,7 +12142,7 @@ fn power_loss_images_lose_no_acknowledged_record() {
 
     let mut failures = Vec::new();
     for step in 1..images.len() {
-        for mask in 0_u8..16 {
+        for mask in 0_u8..(1 << CRASH_CLASSES.len()) {
             let candidate = copy_store(&images[step], "power_loss_try");
             for (bit, class) in CRASH_CLASSES.iter().enumerate() {
                 if mask & (1 << bit) == 0 {
