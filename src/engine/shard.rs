@@ -1792,7 +1792,12 @@ impl ShardPool {
                     file.set_len(0)?;
                     let marker = Self::own_lock_marker();
                     file.write_all(format!("{marker}\n").as_bytes())?;
-                    file.sync_all()?;
+                    // No `sync_all`: the marker is advisory. The kernel drops the
+                    // `flock` when its holder dies, so a torn or missing marker
+                    // after a crash never blocks the next writer, and
+                    // `lock_holder_is_dead` already fails closed on an
+                    // unparsable file. There is no correctness reason to pay an
+                    // fsync on every lock acquisition.
                     return Ok(WriterLock { _file: file });
                 }
                 Err(error)
@@ -1852,14 +1857,6 @@ impl ShardPool {
         }
     }
 
-    /// Atomically create the lock file and write our `{pid, starttime}`
-    /// into it (Linux) or just our PID (elsewhere, where starttime can't be
-    /// read and `lock_holder_is_dead` never trusts a bare PID anyway). No
-    /// `sync_all` here: this is advisory only, and `lock_holder_is_dead`
-    /// already fails closed (treats an unparsable file as "might be
-    /// alive") on a torn write from a crash mid-write — there's no
-    /// correctness reason to pay an fsync on every lock acquisition to
-    /// protect against that.
     /// Reads field 22 (`starttime`, clock ticks since boot) out of
     /// `/proc/<pid_or_self>/stat`. Parses from the *last* `)` rather than
     /// splitting on whitespace from the start: the second field (`comm`,
