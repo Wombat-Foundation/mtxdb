@@ -3,11 +3,13 @@ name: Rust Docs
 
 on:
   push:
-    branches: ["master"]
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 concurrency:
   group: pages
@@ -19,7 +21,7 @@ env:
 
 jobs:
   docs:
-    if: github.ref_name == 'master'
+    if: github.ref_name == 'main' || github.ref_name == 'master'
     runs-on: ubuntu-latest
     env:
       # Override the committed rust-toolchain.toml pin so rustdoc matches the
@@ -40,10 +42,18 @@ jobs:
           test -s target/doc/mtxdb_cli/index.html
           cp -a target/doc _site
 
-      - name: Publish to gh-pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: gh-pages
-          publish_dir: _site
-          destination_dir: .
+          path: _site
+
+  deploy:
+    needs: docs
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
