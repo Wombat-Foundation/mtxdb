@@ -25,15 +25,11 @@ const FILE_MAGIC: &[u8; 8] = b"MTXWAL01";
 const GROUP_MAGIC: &[u8; 4] = b"MWG1";
 const GROUP_COMMIT_MAGIC: &[u8; 4] = b"CMIT";
 
-/// The current on-disk journal format version. Every mutation carries its
+/// The sole on-disk journal format version. Every mutation carries its
 /// physical pool tag, even when a journal currently serves only one pool. Its
 /// header also records, per pool, the newest LSN of history a reclaim removed
 /// ([`ReclaimedHistory`]).
-const JOURNAL_VERSION: u32 = 2;
-/// The earlier format, whose header carries no reclaimed-history marks. It is
-/// still readable, and reads as "evidence unavailable": nothing in it proves
-/// that no history was ever reclaimed.
-const JOURNAL_VERSION_V1: u32 = 1;
+const JOURNAL_VERSION: u32 = 1;
 
 /// Per pool (indexed by [`ShardType::index`]), the newest LSN of a committed
 /// group that touched the pool and that a reclaim rewrite removed from the
@@ -47,14 +43,11 @@ const FH_MAGIC: std::ops::Range<usize> = 0..8;
 const FH_VERSION: std::ops::Range<usize> = 8..12;
 const FH_BASE_SEQUENCE: std::ops::Range<usize> = 12..20;
 const FH_BASE_LSN: std::ops::Range<usize> = 20..28;
-const FH_BASE_CRC: std::ops::Range<usize> = 28..32;
-/// Header bytes covered by the immutable base CRC.
-const FH_BASE_CRC_COVERED: std::ops::Range<usize> = 0..FH_BASE_CRC.start;
-// Version 2 keeps the base fields above, then holds the number of reclaimed-
-// history slots (0 when the evidence is unavailable, otherwise one per pool),
-// the marks (`u64` each), and a CRC32 over every header byte before it.
-const FH_V2_SLOTS: std::ops::Range<usize> = 28..32;
-const FH_V2_MARKS_AT: usize = 32;
+// Version 1 keeps the base fields above, then holds the number of
+// reclaimed-history slots (one per pool), the marks (`u64` each), and a CRC32
+// over every header byte before it.
+const FH_SLOTS: std::ops::Range<usize> = 28..32;
+const FH_MARKS_AT: usize = 32;
 const POOL_SLOTS: usize = ShardType::ALL.len();
 
 /// Size of the unit a torn write can damage. 4096 matches common 4 KiB
@@ -1735,9 +1728,8 @@ pub struct Journal {
     /// Base sequence and LSN from the file header.
     base_sequence: u64,
     base_lsn: u64,
-    /// What reclaim rewrites removed, per pool, as recorded in the header
-    /// (`None` when the header cannot say).
-    reclaimed_history: Option<ReclaimedHistory>,
+    /// What reclaim rewrites removed, per pool, as recorded in the header.
+    reclaimed_history: ReclaimedHistory,
     /// Generation of the newest durability mark written to this segment; the
     /// next mark uses the next generation, in the other slot.
     mark_generation: u64,
@@ -2549,11 +2541,8 @@ impl JournalCoordinator {
     /// A pool must restore its collection versions through this LSN from its
     /// own files, since the groups that carried them are gone.
     #[must_use]
-    pub fn reclaimed_history_through(&self, pool: ShardType) -> Option<u64> {
-        self.journal
-            .lock()
-            .reclaimed_history
-            .map(|marks| marks[pool.index()])
+    pub fn reclaimed_history_through(&self, pool: ShardType) -> u64 {
+        self.journal.lock().reclaimed_history[pool.index()]
     }
 
     /// Snapshot cumulative replay paging path counters for this coordinator.
@@ -5022,7 +5011,7 @@ impl Journal {
             // failing open forever on a partial header.
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
-            write_file_header(&mut file, 1, base_lsn, Some([0; POOL_SLOTS]))?;
+            write_file_header(&mut file, 1, base_lsn, [0; POOL_SLOTS])?;
             file.sync_all()?;
             sync_parent_dir(&path)?;
         }
@@ -5643,13 +5632,9 @@ impl Journal {
 
     /// The reclaimed-history marks after a rewrite that drops `dropped` (each
     /// group's pool bitmask and last LSN): the current marks carried forward and
-    /// raised to the newest dropped group of each pool. `None` stays `None`: a
-    /// segment whose earlier history is unknown cannot become known.
-    fn reclaimed_after(
-        &self,
-        dropped: impl Iterator<Item = (u8, u64)>,
-    ) -> Option<ReclaimedHistory> {
-        let mut marks = self.reclaimed_history?;
+    /// raised to the newest dropped group of each pool.
+    fn reclaimed_after(&self, dropped: impl Iterator<Item = (u8, u64)>) -> ReclaimedHistory {
+        let mut marks = self.reclaimed_history;
         for (pools, last_lsn) in dropped {
             for (index, mark) in marks.iter_mut().enumerate() {
                 if pools & (1_u8 << index) != 0 {
@@ -5657,7 +5642,7 @@ impl Journal {
                 }
             }
         }
-        Some(marks)
+        marks
     }
 
     /// Reclaim by reading and decoding the whole segment. Used when the group
@@ -5830,30 +5815,23 @@ fn read_range_into(path: &Path, start: u64, len: u64, out: &mut Vec<u8>) -> io::
 struct FileHeader {
     base_sequence: u64,
     base_lsn: u64,
-    /// `None` when the header cannot say what was reclaimed (a version 1 header,
-    /// or a rewrite of one): not proof that nothing was.
-    reclaimed: Option<ReclaimedHistory>,
+    /// Per pool, the newest reclaimed-history LSN recorded in this header.
+    reclaimed: ReclaimedHistory,
 }
 
-fn file_header_bytes(
-    base_sequence: u64,
-    base_lsn: u64,
-    reclaimed: Option<ReclaimedHistory>,
-) -> Vec<u8> {
+fn file_header_bytes(base_sequence: u64, base_lsn: u64, reclaimed: ReclaimedHistory) -> Vec<u8> {
     let mut header = vec![0_u8; FILE_HEADER_LEN];
     header[FH_MAGIC].copy_from_slice(FILE_MAGIC);
     header[FH_VERSION].copy_from_slice(&JOURNAL_VERSION.to_le_bytes());
     header[FH_BASE_SEQUENCE].copy_from_slice(&base_sequence.to_le_bytes());
     header[FH_BASE_LSN].copy_from_slice(&base_lsn.to_le_bytes());
-    let mut end = FH_V2_MARKS_AT;
-    if let Some(marks) = reclaimed {
-        let slots = u32::try_from(POOL_SLOTS).unwrap_or(u32::MAX);
-        header[FH_V2_SLOTS].copy_from_slice(&slots.to_le_bytes());
-        for mark in marks {
-            let next = end.saturating_add(8);
-            header[end..next].copy_from_slice(&mark.to_le_bytes());
-            end = next;
-        }
+    let slots = u32::try_from(POOL_SLOTS).unwrap_or(u32::MAX);
+    header[FH_SLOTS].copy_from_slice(&slots.to_le_bytes());
+    let mut end = FH_MARKS_AT;
+    for mark in reclaimed {
+        let next = end.saturating_add(8);
+        header[end..next].copy_from_slice(&mark.to_le_bytes());
+        end = next;
     }
     let mut crc = Hasher::new();
     crc.update(&header[..end]);
@@ -5866,16 +5844,15 @@ fn write_file_header(
     file: &mut File,
     base_sequence: u64,
     base_lsn: u64,
-    reclaimed: Option<ReclaimedHistory>,
+    reclaimed: ReclaimedHistory,
 ) -> io::Result<()> {
     file.write_all(&file_header_bytes(base_sequence, base_lsn, reclaimed))
 }
 
 /// Validate the file header and decode it. A rotated segment records the first
 /// surviving group's numbers here so scanning never has to assume the sequence
-/// begins at 1. A version 1 header is accepted and decodes with no reclaimed
-/// history; every other fault, including a bad checksum over the marks, is an
-/// error.
+/// begins at 1. The header always names one reclaimed-history slot per pool;
+/// any fault, including a bad checksum over the marks, is an error.
 fn read_file_header(bytes: &[u8]) -> io::Result<FileHeader> {
     let Some(header) = bytes.get(..FILE_HEADER_LEN) else {
         return Err(invalid_data("truncated journal file header"));
@@ -5884,32 +5861,17 @@ fn read_file_header(bytes: &[u8]) -> io::Result<FileHeader> {
         return Err(invalid_data("invalid journal magic"));
     }
     let version = u32::from_le_bytes(header[FH_VERSION].try_into().expect("fixed slice"));
-    let base_sequence =
-        u64::from_le_bytes(header[FH_BASE_SEQUENCE].try_into().expect("fixed slice"));
-    let base_lsn = u64::from_le_bytes(header[FH_BASE_LSN].try_into().expect("fixed slice"));
-    if version == JOURNAL_VERSION_V1 {
-        let mut crc = Hasher::new();
-        crc.update(&header[FH_BASE_CRC_COVERED]);
-        if u32::from_le_bytes(header[FH_BASE_CRC].try_into().expect("fixed slice"))
-            != crc.finalize()
-        {
-            return Err(invalid_data("journal header checksum mismatch"));
-        }
-        return Ok(FileHeader {
-            base_sequence,
-            base_lsn,
-            reclaimed: None,
-        });
-    }
     if version != JOURNAL_VERSION {
         return Err(invalid_data("unsupported journal version"));
     }
-    let slots = u32::from_le_bytes(header[FH_V2_SLOTS].try_into().expect("fixed slice"));
-    let slots = usize::try_from(slots).unwrap_or(usize::MAX);
-    if slots != 0 && slots != POOL_SLOTS {
+    let base_sequence =
+        u64::from_le_bytes(header[FH_BASE_SEQUENCE].try_into().expect("fixed slice"));
+    let base_lsn = u64::from_le_bytes(header[FH_BASE_LSN].try_into().expect("fixed slice"));
+    let slots = u32::from_le_bytes(header[FH_SLOTS].try_into().expect("fixed slice"));
+    if usize::try_from(slots).unwrap_or(usize::MAX) != POOL_SLOTS {
         return Err(invalid_data("journal header names an unknown pool count"));
     }
-    let end = FH_V2_MARKS_AT.saturating_add(slots.saturating_mul(8));
+    let end = FH_MARKS_AT.saturating_add(POOL_SLOTS.saturating_mul(8));
     let crc_end = end.saturating_add(4);
     let Some(stored) = header.get(end..crc_end) else {
         return Err(invalid_data("truncated journal file header"));
@@ -5919,15 +5881,12 @@ fn read_file_header(bytes: &[u8]) -> io::Result<FileHeader> {
     if u32::from_le_bytes(stored.try_into().expect("fixed slice")) != crc.finalize() {
         return Err(invalid_data("journal header checksum mismatch"));
     }
-    let reclaimed = (slots != 0).then(|| {
-        let mut marks = [0_u64; POOL_SLOTS];
-        for (index, mark) in marks.iter_mut().enumerate() {
-            let at = FH_V2_MARKS_AT.saturating_add(index.saturating_mul(8));
-            let next = at.saturating_add(8);
-            *mark = u64::from_le_bytes(header[at..next].try_into().expect("fixed slice"));
-        }
-        marks
-    });
+    let mut reclaimed = [0_u64; POOL_SLOTS];
+    for (index, mark) in reclaimed.iter_mut().enumerate() {
+        let at = FH_MARKS_AT.saturating_add(index.saturating_mul(8));
+        let next = at.saturating_add(8);
+        *mark = u64::from_le_bytes(header[at..next].try_into().expect("fixed slice"));
+    }
     Ok(FileHeader {
         base_sequence,
         base_lsn,

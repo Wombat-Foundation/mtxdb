@@ -1299,7 +1299,7 @@ fn mark_slots(path: &Path) -> [Option<(u64, u64)>; 2] {
 #[test]
 fn groups_start_after_a_reserved_sector_aligned_mark_region() {
     assert_eq!(super::FILE_HEADER_LEN % super::MARK_SECTOR_LEN, 0);
-    const { assert!(super::FH_BASE_CRC.end <= super::MARK_SECTOR_LEN) };
+    const { assert!(super::FH_SLOTS.end <= super::MARK_SECTOR_LEN) };
     for offset in super::MARK_SLOT_OFFSETS {
         assert_eq!(offset % super::MARK_SECTOR_LEN, 0, "slot starts a sector");
         assert!(offset >= super::MARK_SECTOR_LEN, "not in the header sector");
@@ -4186,9 +4186,42 @@ fn publish_for(coordinator: &JournalCoordinator, pool: crate::layout::ShardType,
     receipt.last_lsn
 }
 
-fn reclaimed_marks(coordinator: &JournalCoordinator) -> [Option<u64>; 3] {
+fn reclaimed_marks(coordinator: &JournalCoordinator) -> [u64; 3] {
     use crate::layout::ShardType;
     ShardType::ALL.map(|pool| coordinator.reclaimed_history_through(pool))
+}
+
+/// The version table a coverage claim carries is snapshotted through exactly
+/// the claimed LSN, so a group published after that boundary is never claimed
+/// as durable in the delta batch.
+#[test]
+fn collection_versions_through_stops_at_the_covered_boundary() {
+    use crate::layout::ShardType::{EventDag, State};
+    let path = temp_path("versions_boundary");
+    let _ = fs::remove_file(&path);
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    let first = publish_for(&coordinator, State, 1);
+    let second = publish_for(&coordinator, State, 1);
+    let later = publish_for(&coordinator, EventDag, 2);
+    coordinator.sync().unwrap();
+    assert!(first < second && second < later);
+
+    assert_eq!(
+        coordinator.collection_versions_through(State, first),
+        Vec::new(),
+        "the only known state version is the later write, above the boundary"
+    );
+    assert_eq!(
+        coordinator.collection_versions_through(State, second),
+        vec![([1; 16], second)]
+    );
+    assert_eq!(
+        coordinator.collection_versions_through(EventDag, second),
+        Vec::new(),
+        "another pool's group is never claimed through this pool's boundary"
+    );
+    fs::remove_file(path).unwrap();
 }
 
 /// A reclaim records, per pool, only the history it removed, never the coverage a
@@ -4204,7 +4237,7 @@ fn reclaimed_history_marks_record_only_removed_history_and_only_grow() {
     let coordinator = JournalCoordinator::new(journal, &scan);
     assert_eq!(
         reclaimed_marks(&coordinator),
-        [Some(0); 3],
+        [0; 3],
         "a fresh journal has reclaimed nothing"
     );
 
@@ -4222,7 +4255,7 @@ fn reclaimed_history_marks_record_only_removed_history_and_only_grow() {
     // The cut falls before EventDag's second group: the first three go.
     assert_eq!(
         reclaimed_marks(&coordinator),
-        [Some(first[2]), Some(first[1]), Some(0)],
+        [first[2], first[1], 0],
         "State's mark is its newest removed group, not its reported coverage"
     );
 
@@ -4235,7 +4268,7 @@ fn reclaimed_history_marks_record_only_removed_history_and_only_grow() {
     coordinator.sync().unwrap();
     coordinator.report_pool_coverage(EventDag, second[0]);
     assert!(coordinator.reclaim_shared().unwrap().is_some());
-    let expected = [Some(first[2]), Some(second[0]), Some(0)];
+    let expected = [first[2], second[0], 0];
     assert_eq!(reclaimed_marks(&coordinator), expected);
     // Nothing more to remove: the marks do not move.
     coordinator.report_pool_coverage(EventDag, second[0]);
@@ -4250,7 +4283,7 @@ fn reclaimed_history_marks_record_only_removed_history_and_only_grow() {
         expected,
         "marks survive a reopen"
     );
-    assert_eq!(reopened.reclaimed_history_through(ServerInfo), Some(0));
+    assert_eq!(reopened.reclaimed_history_through(ServerInfo), 0);
     fs::remove_file(path).unwrap();
 }
 
@@ -4272,10 +4305,10 @@ fn a_damaged_reclaimed_history_header_fails_to_open() {
     drop(coordinator);
     let good = fs::read(&path).unwrap();
 
-    let slots_at = super::FH_V2_SLOTS.start;
-    let crc_at = super::FH_V2_MARKS_AT + 3 * 8;
+    let slots_at = super::FH_SLOTS.start;
+    let crc_at = super::FH_MARKS_AT + 3 * 8;
     for (what, at) in [
-        ("a mark", super::FH_V2_MARKS_AT),
+        ("a mark", super::FH_MARKS_AT),
         ("the slot count", slots_at),
         ("the checksum", crc_at),
     ] {
@@ -4291,52 +4324,6 @@ fn a_damaged_reclaimed_history_header_fails_to_open() {
     }
     fs::write(&path, &good).unwrap();
     assert!(Journal::open_shared(&path).is_ok());
-    fs::remove_file(path).unwrap();
-}
-
-/// A version 1 header carries no marks. It stays readable, and reads as
-/// "evidence unavailable" (`None`), not as "nothing was reclaimed"; a rewrite of
-/// it cannot learn the earlier history, so it stays unavailable.
-#[test]
-fn a_version_1_journal_header_reads_as_unavailable_evidence() {
-    use crate::layout::ShardType::State;
-    let path = temp_path("reclaimed_history_v1");
-    let _ = fs::remove_file(&path);
-    drop(Journal::open_shared(&path).unwrap());
-    let mut bytes = fs::read(&path).unwrap();
-    bytes[super::FH_VERSION].copy_from_slice(&1_u32.to_le_bytes());
-    for byte in &mut bytes[super::FH_V2_SLOTS.start..super::FH_V2_MARKS_AT + 3 * 8 + 4] {
-        *byte = 0;
-    }
-    let crc = crc32fast::hash(&bytes[super::FH_BASE_CRC_COVERED]);
-    bytes[super::FH_BASE_CRC].copy_from_slice(&crc.to_le_bytes());
-    fs::write(&path, &bytes).unwrap();
-
-    let (journal, scan) = Journal::open_shared(&path).unwrap();
-    let coordinator = JournalCoordinator::new(journal, &scan);
-    assert_eq!(reclaimed_marks(&coordinator), [None; 3]);
-    let last = publish_for(&coordinator, State, 1);
-    publish_for(&coordinator, State, 2);
-    coordinator.sync().unwrap();
-    coordinator.report_pool_coverage(State, last);
-    assert!(coordinator.reclaim_shared().unwrap().is_some());
-    assert_eq!(
-        reclaimed_marks(&coordinator),
-        [None; 3],
-        "a rewrite cannot learn what an earlier segment reclaimed"
-    );
-    drop(coordinator);
-    let (journal, scan) = Journal::open_shared(&path).unwrap();
-    assert_eq!(
-        reclaimed_marks(&JournalCoordinator::new(journal, &scan)),
-        [None; 3]
-    );
-    let rewritten = fs::read(&path).unwrap();
-    assert_eq!(
-        u32::from_le_bytes(rewritten[super::FH_VERSION].try_into().unwrap()),
-        2,
-        "the rewrite writes the current format"
-    );
     fs::remove_file(path).unwrap();
 }
 

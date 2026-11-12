@@ -1834,6 +1834,19 @@ fn a_lagging_pool_is_checkpointed_for_the_caller_before_the_segment_fills() {
         db.coordinator().reclaim_stalls() >= 1,
         "a stall must have been seen"
     );
+    // The delta coverage path carries the version table, so reclaiming the
+    // shared segment no longer requires an EventDag checkpoint per sync.
+    let stats = db.pool(ShardType::EventDag).stats();
+    eprintln!(
+        "lagging-pool measurement: eventdag_checkpoints={} delta_appends={}",
+        stats.checkpoint_writes, stats.delta_appends
+    );
+    assert!(
+        stats.checkpoint_writes <= 2,
+        "reclaim must not force a full checkpoint on every sync ({} seen)",
+        stats.checkpoint_writes
+    );
+    assert!(stats.delta_appends > 0, "the delta coverage path must run");
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1973,6 +1986,18 @@ fn a_checkpoint_does_not_claim_an_unmaterialized_transaction() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Read this pool's current delta log. The test checks the version table the
+/// coverage batch carries.
+fn pool_delta_log(db: &Database, pool: ShardType) -> crate::index::delta::DeltaLog {
+    let dir = db.layout().pool_dir(pool).unwrap();
+    let name = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| name.starts_with("index.delta."))
+        .expect("a delta coverage batch writes a log");
+    crate::index::delta::read_delta_log(&dir.join(name)).expect("the delta log reads")
+}
+
 /// Shared-WAL coverage advances only after each pool writes the checkpoint
 /// version table. The shared segment is reclaimed only once both have
 /// reported: after the first pool's step the second still holds it, and after
@@ -1996,8 +2021,14 @@ fn shared_reclaim_waits_for_every_pools_version_checkpoint() {
     db.pool(ShardType::EventDag).sync_all().unwrap();
     let timings = db.pool(ShardType::EventDag).sync_timings().unwrap();
     assert!(
-        !timings.checkpoint.is_zero(),
-        "EventDag coverage must anchor its logical-version table"
+        !timings.delta_log.is_zero(),
+        "EventDag coverage travels in a delta batch"
+    );
+    assert!(
+        pool_delta_log(&db, ShardType::EventDag)
+            .version_table
+            .is_some(),
+        "the delta coverage batch carries EventDag's logical-version table"
     );
     assert_eq!(
         coordinator.segment_len(),
@@ -2009,8 +2040,14 @@ fn shared_reclaim_waits_for_every_pools_version_checkpoint() {
     db.pool(ShardType::State).sync_all().unwrap();
     let timings = db.pool(ShardType::State).sync_timings().unwrap();
     assert!(
-        !timings.checkpoint.is_zero(),
-        "State coverage must anchor its logical-version table"
+        !timings.delta_log.is_zero(),
+        "State coverage travels in a delta batch"
+    );
+    assert!(
+        pool_delta_log(&db, ShardType::State)
+            .version_table
+            .is_some(),
+        "the delta coverage batch carries State's logical-version table"
     );
     assert!(
         coordinator.segment_len() < before,

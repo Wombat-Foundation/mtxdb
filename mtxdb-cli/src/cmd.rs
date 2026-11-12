@@ -5860,6 +5860,13 @@ fn format_delta_operation(operation: &mtxdb::index::delta::DeltaOperation) -> St
         DeltaOperation::Coverage { covered_lsn } => {
             format!("kind=coverage covered_lsn={covered_lsn}")
         }
+        DeltaOperation::Versions {
+            covered_lsn,
+            entries,
+        } => format!(
+            "kind=versions covered_lsn={covered_lsn} collections={}",
+            entries.len()
+        ),
         DeltaOperation::Redo(record) => {
             use mtxdb::index::redo::RedoOp;
             let detail = match record.op {

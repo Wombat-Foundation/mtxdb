@@ -3891,6 +3891,24 @@ impl PackfileStorage {
         }
     }
 
+    /// The newest complete version table carried by the delta log that
+    /// continues this store's checkpoint, if it covers exactly the coverage the
+    /// log claims. A table from an epoch that does not name the current
+    /// checkpoint (or that disagrees with the claim) restores nothing.
+    fn delta_version_table(base_dir: &std::path::Path) -> Option<delta::VersionTable> {
+        let summary = crate::index::checkpoint::read_checkpoint_summary(
+            &Self::index_checkpoint_path(base_dir),
+        )
+        .ok()
+        .flatten()?;
+        let log = delta::read_delta_log(&Self::delta_path(base_dir, summary.fingerprint))?;
+        if log.base_fingerprint != summary.fingerprint {
+            return None;
+        }
+        let table = log.version_table?;
+        (log.coverage == Some(table.covered_lsn)).then_some(table)
+    }
+
     /// The journal LSN this pool's packs are known to durably cover, held in
     /// memory. What [`Self::read_journal_lsn`] said at open, moved forward by
     /// every checkpoint and coverage batch this handle wrote since.
@@ -4448,7 +4466,7 @@ impl PackfileStorage {
                 }
                 // A coverage claim changes no index state; it is read
                 // separately (see `durable_coverage_from_disk`).
-                DeltaOperation::Coverage { .. } => {}
+                DeltaOperation::Coverage { .. } | DeltaOperation::Versions { .. } => {}
             }
         }
 
@@ -7346,9 +7364,16 @@ impl PackfileStorage {
                 "v1 delta state changed while snapshot batch was prepared",
             )));
         }
-        // The claim is the batch's last operation, so a reader that applies the
-        // operations up to it holds exactly the index the claim describes.
+        // The claim is the batch's last operation, directly after the version
+        // table that keeps the pool's collection clocks once the reclaimed WAL
+        // groups are gone. A reader applies the operations up to the claim and
+        // holds exactly the index and versions it describes.
         if let Some(covered_lsn) = covered {
+            let entries = self.checkpoint_logical_versions(Some(covered_lsn));
+            operations.push(DeltaOperation::Versions {
+                covered_lsn,
+                entries,
+            });
             operations.push(DeltaOperation::Coverage { covered_lsn });
         }
         self.write_v1_delta_batch(
@@ -12709,6 +12734,7 @@ impl PackfileStorage {
         // A read-only handle only reads, and a journal that cannot say what it
         // reclaimed (an older header) proves nothing either way.
         if self.shards.is_writable() {
+            let delta_versions = Self::delta_version_table(&self.base_dir);
             let baseline_covered = snapshot
                 .as_ref()
                 .map_or(0, |snapshot| snapshot.covered_lsn)
@@ -12716,27 +12742,28 @@ impl PackfileStorage {
                     checkpoint
                         .as_ref()
                         .map_or(0, |checkpoint| checkpoint.covered_lsn),
-                );
-            if let Some(reclaimed) = journal
-                .reclaimed_history_through(pool)
-                .filter(|reclaimed| *reclaimed > 0)
-            {
-                if baseline_covered < reclaimed {
-                    return Err(StorageError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "no readable version baseline covering the history the shared WAL reclaimed for this pool through LSN {reclaimed}: {} and the checkpoint cover through {baseline_covered}; refusing to open a writable store that cannot restore its collection versions",
-                            Self::index_versions_path(&self.base_dir).display()
-                        ),
-                    )));
-                }
+                )
+                .max(delta_versions.as_ref().map_or(0, |table| table.covered_lsn));
+            let reclaimed = journal.reclaimed_history_through(pool);
+            if reclaimed > 0 && baseline_covered < reclaimed {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "no readable version baseline covering the history the shared WAL reclaimed for this pool through LSN {reclaimed}: {} and the checkpoint cover through {baseline_covered}; refusing to open a writable store that cannot restore its collection versions",
+                        Self::index_versions_path(&self.base_dir).display()
+                    ),
+                )));
             }
         }
+        let delta_versions = Self::delta_version_table(&self.base_dir);
         if let Some(snapshot) = snapshot {
             journal.restore_collection_versions(pool, &snapshot.versions);
         }
         if let Some(checkpoint) = checkpoint {
             journal.restore_collection_versions(pool, &checkpoint.logical_versions);
+        }
+        if let Some(table) = delta_versions {
+            journal.restore_collection_versions(pool, &table.entries);
         }
         self.journal_pool.store(pool_tag(pool), Ordering::Release);
         journal.report_pool_coverage(pool, self.durable_coverage());
@@ -13619,16 +13646,11 @@ impl PackfileStorage {
                 self.delta_log_cap()
             );
         }
-        // Shared-WAL reclaim must anchor collection logical versions in the
-        // checkpoint itself. A delta-only coverage claim currently carries
-        // index redo but not the version table, so using it here could reclaim
-        // the only WAL copy of a collection's latest version. Until version
-        // tables are included in delta batches, require the full checkpoint
-        // path whenever shared-WAL version tracking is enabled.
-        let checkpoint_versions_require_anchor =
-            pool_from_tag(self.journal_pool.load(Ordering::Acquire)).is_some();
+        // A coverage batch now carries the pool's complete collection-version
+        // table, so shared-WAL reclaim no longer needs a full checkpoint to
+        // preserve logical clocks. The same ordering still applies: packs
+        // durable, then the batch (table and claim) durable, then reclaim.
         if journal_needs_reclaim
-            && !checkpoint_versions_require_anchor
             && !rotating
             && self.delta_base_is_usable()
             && self.packs_match_checkpoint_table()

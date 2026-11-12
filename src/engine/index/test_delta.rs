@@ -66,6 +66,15 @@ fn redo_set(collection_id: [u8; 16], full_hash: [u8; 16], delta_seq: u64) -> Del
     })
 }
 
+/// An empty version table for a coverage claim at `covered_lsn`: the shape the
+/// writer produces is the table, then the claim.
+fn table(covered_lsn: u64) -> DeltaOperation {
+    DeltaOperation::Versions {
+        covered_lsn,
+        entries: Vec::new(),
+    }
+}
+
 fn replay_incremental_snapshot_model(
     operations: &[DeltaOperation],
 ) -> HashMap<[u8; 16], Vec<DeltaOperation>> {
@@ -85,7 +94,9 @@ fn replay_incremental_snapshot_model(
             DeltaOperation::CollectionTombstone { collection_id, .. } => {
                 state.remove(collection_id);
             }
-            DeltaOperation::Coverage { .. } | DeltaOperation::Redo(_) => {}
+            DeltaOperation::Coverage { .. }
+            | DeltaOperation::Versions { .. }
+            | DeltaOperation::Redo(_) => {}
         }
     }
     state
@@ -97,12 +108,20 @@ fn compaction_keeps_the_newest_redo_and_the_final_coverage() {
     let redo_a = redo_set(collection, [1; 16], 1);
     let redo_b = redo_set(collection, [2; 16], 2);
     let redo_a_newer = redo_set(collection, [1; 16], 3);
+    let versions = table(42);
     let coverage = DeltaOperation::Coverage { covered_lsn: 42 };
-    let operations = vec![redo_a, redo_b, redo_a_newer, coverage.clone()];
+    let operations = vec![
+        redo_a,
+        redo_b,
+        redo_a_newer,
+        versions.clone(),
+        coverage.clone(),
+    ];
 
     let compacted = compact_operations(&operations);
-    assert_eq!(compacted.len(), 3);
-    assert_eq!(compacted[2], coverage);
+    assert_eq!(compacted.len(), 4);
+    assert_eq!(compacted[2], versions);
+    assert_eq!(compacted[3], coverage);
     match &compacted[1] {
         DeltaOperation::Redo(record) => {
             assert_eq!(
@@ -128,17 +147,19 @@ fn compaction_drops_everything_before_a_collection_cut() {
             generation: 2,
         },
         redo_set(collection, [2; 16], 2),
+        table(9),
         DeltaOperation::Coverage { covered_lsn: 9 },
     ];
 
     let compacted = compact_operations(&operations);
-    assert_eq!(compacted.len(), 3);
+    assert_eq!(compacted.len(), 4);
     assert!(matches!(
         compacted[0],
         DeltaOperation::CollectionTombstone { .. }
     ));
     assert!(matches!(compacted[1], DeltaOperation::Redo(_)));
-    assert!(matches!(compacted[2], DeltaOperation::Coverage { .. }));
+    assert!(matches!(compacted[2], DeltaOperation::Versions { .. }));
+    assert!(matches!(compacted[3], DeltaOperation::Coverage { .. }));
 }
 
 #[test]
@@ -153,6 +174,7 @@ fn compact_delta_log_rewrites_in_place_and_preserves_the_claim() {
         redo_set(collection, [1; 16], 1),
         redo_set(collection, [2; 16], 2),
         redo_set(collection, [1; 16], 3),
+        table(77),
         DeltaOperation::Coverage { covered_lsn: 77 },
     ];
     std::fs::write(&path, v1_log(&operations, 0x5151)).unwrap();
@@ -167,11 +189,22 @@ fn compact_delta_log_rewrites_in_place_and_preserves_the_claim() {
     assert_eq!(decoded.base_fingerprint, 0xABC);
     assert_eq!(decoded.tail_fingerprint, 0x5151);
     assert_eq!(decoded.coverage, Some(77));
-    assert_eq!(decoded.operations.len(), 3);
+    assert_eq!(
+        decoded.operations.len(),
+        4,
+        "two redos, the table, the claim"
+    );
     assert!(matches!(
         decoded.operations.last(),
         Some(DeltaOperation::Coverage { covered_lsn: 77 })
     ));
+    assert_eq!(
+        decoded
+            .version_table
+            .as_ref()
+            .map(|table| table.covered_lsn),
+        Some(77)
+    );
 
     // A second pass has nothing left to remove.
     assert_eq!(compact_delta_log(&path).unwrap(), None);
@@ -194,6 +227,7 @@ fn compact_delta_log_skips_a_log_with_marginal_savings() {
         operations.push(redo_set(collection, [index; 16], u64::from(index)));
     }
     operations.push(redo_set(collection, [0; 16], 99));
+    operations.push(table(100));
     operations.push(DeltaOperation::Coverage { covered_lsn: 100 });
     std::fs::write(&path, v1_log(&operations, 0x6161)).unwrap();
     let before = std::fs::read(&path).unwrap();
@@ -224,6 +258,7 @@ fn compact_delta_log_reaps_a_crash_leftover_temp() {
         redo_set(collection, [1; 16], 1),
         redo_set(collection, [2; 16], 2),
         redo_set(collection, [1; 16], 3),
+        table(77),
         DeltaOperation::Coverage { covered_lsn: 77 },
     ];
     std::fs::write(&path, v1_log(&operations, 0x7171)).unwrap();
@@ -235,7 +270,7 @@ fn compact_delta_log_reaps_a_crash_leftover_temp() {
 
     let compacted = read_delta_log(&path).expect("live log remains readable");
     assert_eq!(compacted.coverage, Some(77));
-    assert_eq!(compacted.operations.len(), 3);
+    assert_eq!(compacted.operations.len(), 4);
     assert!(!stale.exists(), "a crash leftover is removed before reuse");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -659,7 +694,11 @@ fn readers_report_the_newest_committed_coverage() {
         &path,
         false,
         0xABC,
-        &[incremental(3), DeltaOperation::Coverage { covered_lsn: 40 }],
+        &[
+            incremental(3),
+            table(40),
+            DeltaOperation::Coverage { covered_lsn: 40 },
+        ],
         0x222,
         true,
     )
@@ -669,10 +708,10 @@ fn readers_report_the_newest_committed_coverage() {
     let log = read_delta_log(&path).unwrap();
     assert_eq!(log.coverage, Some(40));
     assert_eq!(
-        log.coverage_prefix_ops, 4,
-        "two + one + the coverage op itself"
+        log.coverage_prefix_ops, 5,
+        "two + one + the table + the coverage op itself"
     );
-    assert_eq!(log.operations.len(), 5);
+    assert_eq!(log.operations.len(), 6);
     assert_eq!(
         read_delta_tail_fingerprint(&path)
             .unwrap()
@@ -685,13 +724,18 @@ fn readers_report_the_newest_committed_coverage() {
         &path,
         false,
         0xABC,
-        &[DeltaOperation::Coverage { covered_lsn: 10 }],
+        &[table(10), DeltaOperation::Coverage { covered_lsn: 10 }],
         0x444,
     )
     .unwrap();
     let log = read_delta_log(&path).unwrap();
     assert_eq!(log.coverage, Some(40));
-    assert_eq!(log.coverage_prefix_ops, 6);
+    assert_eq!(log.coverage_prefix_ops, 8);
+    assert_eq!(
+        log.version_table.as_ref().map(|table| table.covered_lsn),
+        Some(40),
+        "a lower claim's table never replaces the newer one"
+    );
     assert_eq!(
         read_delta_tail_fingerprint(&path)
             .unwrap()
@@ -723,12 +767,14 @@ fn projected_frame_lengths_match_the_built_batch() {
             collection_id: [3; 16],
             generation: 4,
         },
+        table(5),
         DeltaOperation::Coverage { covered_lsn: 5 },
     ];
     let projected = v1_empty_batch_len()
         + v1_incremental_frame_len()
         + v1_snapshot_frame_len(blob.len()).unwrap()
         + v1_tombstone_frame_len()
+        + v1_versions_frame_len(0).unwrap()
         + v1_coverage_frame_len();
     assert_eq!(v1_batch_len(&operations), Some(projected));
     let dir = coverage_log_dir("projected_len");
@@ -759,7 +805,11 @@ fn the_buffered_tail_scanner_agrees_with_the_full_reader_at_every_cut() {
         &path,
         false,
         0xABC,
-        &[incremental(2), DeltaOperation::Coverage { covered_lsn: 9 }],
+        &[
+            incremental(2),
+            table(9),
+            DeltaOperation::Coverage { covered_lsn: 9 },
+        ],
         0x222,
         false,
     )
@@ -771,6 +821,7 @@ fn the_buffered_tail_scanner_agrees_with_the_full_reader_at_every_cut() {
         &[
             incremental(3),
             incremental(4),
+            table(20),
             DeltaOperation::Coverage { covered_lsn: 20 },
         ],
         0x333,
@@ -809,15 +860,22 @@ fn a_misplaced_or_repeated_coverage_claim_is_rejected() {
         generation: 1,
         slot: 5,
     });
-    let bad_batches: [Vec<DeltaOperation>; 2] = [
-        vec![
-            DeltaOperation::Coverage { covered_lsn: 50 },
-            incremental.clone(),
-        ],
-        vec![
-            DeltaOperation::Coverage { covered_lsn: 50 },
-            DeltaOperation::Coverage { covered_lsn: 60 },
-        ],
+    let claim = |covered_lsn| DeltaOperation::Coverage { covered_lsn };
+    let bad_batches: [Vec<DeltaOperation>; 7] = [
+        // A claim that is not last.
+        vec![table(50), claim(50), incremental.clone()],
+        // Two claims.
+        vec![table(50), claim(50), claim(60)],
+        // A claim with no table.
+        vec![incremental.clone(), claim(50)],
+        // A table with no claim.
+        vec![incremental.clone(), table(50)],
+        // A table that disagrees with its claim.
+        vec![table(40), claim(50)],
+        // Two tables.
+        vec![table(50), table(50), claim(50)],
+        // A table that is not directly before the claim.
+        vec![table(50), incremental.clone(), claim(50)],
     ];
     for (index, bad) in bad_batches.iter().enumerate() {
         let dir = coverage_log_dir(&format!("misplaced-{index}"));
@@ -828,6 +886,7 @@ fn a_misplaced_or_repeated_coverage_claim_is_rejected() {
             0xABC,
             &[
                 incremental.clone(),
+                table(7),
                 DeltaOperation::Coverage { covered_lsn: 7 },
             ],
             0x111,
@@ -837,8 +896,13 @@ fn a_misplaced_or_repeated_coverage_claim_is_rejected() {
         append_batch_with_durability(&path, false, 0xABC, bad, 0x222, true).unwrap();
         let log = read_delta_log(&path).unwrap();
         assert_eq!(log.coverage, Some(7), "case {index}");
-        assert_eq!(log.coverage_prefix_ops, 2, "case {index}");
-        assert_eq!(log.operations.len(), 2, "case {index}");
+        assert_eq!(log.coverage_prefix_ops, 3, "case {index}");
+        assert_eq!(log.operations.len(), 3, "case {index}");
+        assert_eq!(
+            log.version_table.as_ref().map(|table| table.covered_lsn),
+            Some(7),
+            "case {index}: a damaged batch's table is never exposed"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
@@ -856,11 +920,15 @@ fn the_tail_scanner_and_the_full_reader_agree_on_coverage() {
         slot: 5,
     });
     let claim = |covered_lsn| DeltaOperation::Coverage { covered_lsn };
-    let cases: [Vec<DeltaOperation>; 4] = [
+    let cases: [Vec<DeltaOperation>; 8] = [
+        vec![incremental.clone(), table(50), claim(50)],
         vec![incremental.clone(), claim(50)],
-        vec![claim(50), incremental.clone()],
-        vec![claim(50), claim(60)],
+        vec![table(50), claim(50), incremental.clone()],
+        vec![table(50), claim(50), claim(60)],
         vec![incremental.clone()],
+        vec![incremental.clone(), table(50)],
+        vec![table(40), claim(50)],
+        vec![table(50), incremental.clone(), claim(50)],
     ];
     for (index, batch) in cases.iter().enumerate() {
         let dir = coverage_log_dir(&format!("agree-{index}"));
@@ -869,7 +937,7 @@ fn the_tail_scanner_and_the_full_reader_agree_on_coverage() {
             &path,
             true,
             0xABC,
-            &[incremental.clone(), claim(7)],
+            &[incremental.clone(), table(7), claim(7)],
             0x111,
             true,
         )
@@ -907,14 +975,18 @@ fn a_reader_that_does_not_know_the_coverage_kind_stops_at_that_batch() {
         &path,
         false,
         0xABC,
-        &[incremental(2), DeltaOperation::Coverage { covered_lsn: 9 }],
+        &[
+            incremental(2),
+            table(9),
+            DeltaOperation::Coverage { covered_lsn: 9 },
+        ],
         0x222,
         true,
     )
     .unwrap();
     let intact = read_delta_log(&path).unwrap();
     assert_eq!(intact.coverage, Some(9));
-    assert_eq!(intact.operations.len(), 3);
+    assert_eq!(intact.operations.len(), 4);
 
     let mut bytes = fs::read(&path).unwrap();
     let frame_len = V1_FRAME_HEADER_LEN + V1_COVERAGE_LEN + V1_FRAME_TRAILER_LEN;
@@ -961,6 +1033,7 @@ fn a_torn_or_damaged_coverage_batch_claims_nothing() {
         0xABC,
         &[
             incremental.clone(),
+            table(7),
             DeltaOperation::Coverage { covered_lsn: 7 },
         ],
         0x111,
@@ -972,7 +1045,11 @@ fn a_torn_or_damaged_coverage_batch_claims_nothing() {
         &path,
         false,
         0xABC,
-        &[incremental, DeltaOperation::Coverage { covered_lsn: 99 }],
+        &[
+            incremental,
+            table(99),
+            DeltaOperation::Coverage { covered_lsn: 99 },
+        ],
         0x222,
         true,
     )
@@ -1168,4 +1245,220 @@ fn length_helpers_agree_with_encoded_sizes() {
             .len()
         )
     );
+}
+
+/// A raw version-table frame around `payload`, with a valid frame checksum, so a
+/// test can hand the decoder a payload the encoder would never produce.
+fn raw_versions_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![V1_VERSIONS];
+    frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(&crc32fast::hash(&frame).to_le_bytes());
+    frame
+}
+
+fn versions_payload(revision: u8, covered_lsn: u64, count: u32, ids: &[[u8; 16]]) -> Vec<u8> {
+    let mut payload = vec![revision];
+    payload.extend_from_slice(&covered_lsn.to_le_bytes());
+    payload.extend_from_slice(&count.to_le_bytes());
+    for (index, id) in ids.iter().enumerate() {
+        payload.extend_from_slice(id);
+        let version = u64::try_from(index).unwrap().saturating_add(1);
+        payload.extend_from_slice(&version.to_le_bytes());
+    }
+    payload
+}
+
+#[test]
+fn a_version_table_frame_round_trips_and_rejects_every_malformed_table() {
+    let entries = vec![([1; 16], 3_u64), ([2; 16], 9), ([9; 16], 12)];
+    let operation = DeltaOperation::Versions {
+        covered_lsn: 40,
+        entries: entries.clone(),
+    };
+    let encoded = encode_frame(&operation).unwrap();
+    assert_eq!(encoded.len(), v1_versions_frame_len(3).unwrap());
+    assert_eq!(decode_frame(&encoded), Some((operation, encoded.len())));
+    // An empty table is valid: a pool with no collections still claims coverage.
+    let empty = DeltaOperation::Versions {
+        covered_lsn: 1,
+        entries: Vec::new(),
+    };
+    let encoded = encode_frame(&empty).unwrap();
+    assert_eq!(decode_frame(&encoded), Some((empty, encoded.len())));
+
+    // The encoder refuses a table it could not decode.
+    for bad in [
+        vec![([2; 16], 1_u64), ([1; 16], 2)],
+        vec![([1; 16], 1), ([1; 16], 2)],
+    ] {
+        assert!(
+            encode_frame(&DeltaOperation::Versions {
+                covered_lsn: 5,
+                entries: bad,
+            })
+            .is_err(),
+            "an unsorted or duplicated table must not encode"
+        );
+    }
+
+    // The decoder rejects what the encoder never writes.
+    let ascending = [[1; 16], [2; 16], [3; 16]];
+    let good = versions_payload(1, 7, 3, &ascending);
+    assert!(decode_frame(&raw_versions_frame(&good)).is_some());
+    let cases: [(&str, Vec<u8>); 7] = [
+        ("an unknown revision", versions_payload(2, 7, 3, &ascending)),
+        (
+            "a count that disagrees with the length",
+            versions_payload(1, 7, 4, &ascending),
+        ),
+        (
+            "a count below the entries present",
+            versions_payload(1, 7, 2, &ascending),
+        ),
+        (
+            "descending ids",
+            versions_payload(1, 7, 3, &[[3; 16], [2; 16], [1; 16]]),
+        ),
+        (
+            "a duplicate id",
+            versions_payload(1, 7, 3, &[[1; 16], [2; 16], [2; 16]]),
+        ),
+        ("a truncated header", good[..9].to_vec()),
+        ("an empty payload", Vec::new()),
+    ];
+    for (what, payload) in cases {
+        assert!(
+            decode_frame(&raw_versions_frame(&payload)).is_none(),
+            "{what} must not decode"
+        );
+    }
+}
+
+/// A coverage claim and the version table it carries are one thing: whatever a
+/// reader sees of the second batch, torn at any byte or damaged by any flipped
+/// bit, it never exposes the claim without its table or the table without its
+/// claim, and both readers decide the same.
+#[test]
+fn a_version_table_and_its_claim_are_exposed_together_or_not_at_all() {
+    let dir = coverage_log_dir("table-atomic");
+    let path = dir.join(INDEX_DELTA_FILE);
+    let incremental = DeltaOperation::Incremental(DeltaFrame {
+        collection_id: [2; 16],
+        bucket: 1,
+        generation: 1,
+        slot: 5,
+    });
+    let first = vec![
+        DeltaOperation::Versions {
+            covered_lsn: 7,
+            entries: vec![([2; 16], 4)],
+        },
+        DeltaOperation::Coverage { covered_lsn: 7 },
+    ];
+    let second = vec![
+        incremental.clone(),
+        DeltaOperation::Versions {
+            covered_lsn: 99,
+            entries: vec![([2; 16], 4), ([7; 16], 98)],
+        },
+        DeltaOperation::Coverage { covered_lsn: 99 },
+    ];
+    append_batch_with_durability(&path, true, 0xABC, &first, 0x111, true).unwrap();
+    let intact_len = usize::try_from(fs::metadata(&path).unwrap().len()).unwrap();
+    append_batch_with_durability(&path, false, 0xABC, &second, 0x222, true).unwrap();
+    let full = fs::read(&path).unwrap();
+
+    let check = |bytes: &[u8], expect_second: bool, what: &str| {
+        fs::write(&path, bytes).unwrap();
+        let log = read_delta_log(&path).unwrap();
+        let tail = read_delta_tail_fingerprint(&path).unwrap().unwrap();
+        let (coverage, table_lsn, entries) = if expect_second {
+            (99, 99, 2)
+        } else {
+            (7, 7, 1)
+        };
+        assert_eq!(log.coverage, Some(coverage), "{what}");
+        assert_eq!(tail.coverage, Some(coverage), "{what}: light reader");
+        let table = log
+            .version_table
+            .as_ref()
+            .expect("a claim carries its table");
+        assert_eq!(table.covered_lsn, table_lsn, "{what}");
+        assert_eq!(table.entries.len(), entries, "{what}");
+    };
+    check(&full, true, "intact");
+    for cut in (intact_len + 1)..full.len() {
+        check(&full[..cut], false, &format!("cut at {cut}"));
+    }
+    // Two bit positions per byte (the lowest and the highest): the batch checksum
+    // covers every byte, and each flip is a file write and two reads.
+    for at in intact_len..full.len() {
+        for bit in [0, 7] {
+            let mut damaged = full.clone();
+            damaged[at] ^= 1 << bit;
+            check(&damaged, false, &format!("bit {bit} of byte {at}"));
+        }
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Each table is a complete snapshot, so compaction keeps only the newest,
+/// directly before the claim it belongs to.
+#[test]
+fn compaction_keeps_only_the_newest_table() {
+    let dir = coverage_log_dir("table-compaction");
+    let path = dir.join(INDEX_DELTA_FILE);
+    let collection = [0x42; 16];
+    let first = vec![
+        redo_set(collection, [1; 16], 1),
+        redo_set(collection, [2; 16], 2),
+        DeltaOperation::Versions {
+            covered_lsn: 10,
+            entries: vec![([1; 16], 1)],
+        },
+        DeltaOperation::Coverage { covered_lsn: 10 },
+    ];
+    let second = vec![
+        redo_set(collection, [1; 16], 3),
+        redo_set(collection, [2; 16], 4),
+        DeltaOperation::Versions {
+            covered_lsn: 20,
+            entries: vec![([1; 16], 2), ([5; 16], 18)],
+        },
+        DeltaOperation::Coverage { covered_lsn: 20 },
+    ];
+    append_batch_with_durability(&path, true, 0xABC, &first, 0x111, true).unwrap();
+    append_batch_with_durability(&path, false, 0xABC, &second, 0x222, true).unwrap();
+    let before = read_delta_log(&path).unwrap();
+    assert_eq!(before.version_table.as_ref().unwrap().covered_lsn, 20);
+
+    compact_delta_log(&path)
+        .expect("compaction succeeds")
+        .expect("the superseded operations were released");
+    let after = read_delta_log(&path).expect("the compacted log reads");
+    assert_eq!(after.coverage, Some(20));
+    assert_eq!(after.version_table, before.version_table);
+    assert_eq!(
+        after
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation, DeltaOperation::Versions { .. }))
+            .count(),
+        1,
+        "only the newest table survives"
+    );
+    let n = after.operations.len();
+    assert!(matches!(
+        after.operations[n - 2],
+        DeltaOperation::Versions {
+            covered_lsn: 20,
+            ..
+        }
+    ));
+    assert!(matches!(
+        after.operations[n - 1],
+        DeltaOperation::Coverage { covered_lsn: 20 }
+    ));
+    fs::remove_dir_all(&dir).unwrap();
 }

@@ -8269,6 +8269,122 @@ fn shared_checkpoint_preserves_collection_versions_after_reclaim() {
     drop(reopened);
 }
 
+/// A delta coverage batch is enough to reclaim a shared segment: the stores
+/// keep a full checkpoint as their base, record later coverage and the complete
+/// version table in the log, and a reopen restores the exact clocks from it.
+/// The clocks include a deleted collection's delete LSN.
+#[test]
+fn delta_coverage_reclaim_restores_exact_collection_versions() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store("delta_versions_reclaim");
+    shared.coordinator.set_reclaim_trigger_len(1);
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    let checkpoints_after_first = shared.store.stats().checkpoint_writes;
+
+    // The second sync can continue the delta epoch, so it reclaims with a
+    // coverage batch instead of rewriting the checkpoint.
+    shared.put(&TEST_COLLECTION, 3..6);
+    shared.sync_and_reclaim();
+    assert!(
+        Journal::scan_read_only(&shared.wal)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "the delta coverage batch reclaimed the WAL group"
+    );
+    assert_eq!(
+        shared.store.stats().checkpoint_writes,
+        checkpoints_after_first,
+        "reclaim must not force another full checkpoint"
+    );
+    assert!(
+        shared.store.stats().delta_appends >= 1,
+        "the sync appended a coverage batch"
+    );
+    let live_version = shared
+        .coordinator
+        .collection_version(ShardType::State, &TEST_COLLECTION);
+    assert!(live_version > 0);
+
+    // A deletion advances the collection's clock without leaving a record in
+    // any pack, and the next coverage batch must carry it too.
+    shared.store.delete_collection(&TEST_COLLECTION).unwrap();
+    shared.sync_and_reclaim();
+    let deleted_version = shared
+        .coordinator
+        .collection_version(ShardType::State, &TEST_COLLECTION);
+    assert!(
+        deleted_version > live_version,
+        "the deletion must advance the clock"
+    );
+    let coverage = shared.store.durable_coverage();
+    let wal = fs::read(&shared.wal).unwrap();
+    let delta_dir = copy_store(&shared.store_dir, "delta_versions_reclaim_copy");
+    // A later full checkpoint must anchor the delta-carried clocks and retire
+    // the epoch; recovery then depends on the checkpoint alone.
+    shared.store.force_index_checkpoint().unwrap();
+    let checkpoints = crate::index::versions::read_versions(&PackfileStorage::index_versions_path(
+        &shared.store_dir,
+    ))
+    .expect("the handoff writes the versions file");
+    assert_eq!(checkpoints.covered_lsn, coverage);
+    assert_eq!(
+        checkpoints
+            .versions
+            .iter()
+            .find(|(id, _)| id == &TEST_COLLECTION)
+            .map(|(_, version)| *version),
+        Some(deleted_version),
+        "the checkpoint anchors the deleted collection's clock"
+    );
+    let checkpoint_dir = copy_store(&shared.store_dir, "delta_versions_reclaim_handoff");
+    assert!(
+        !fs::read_dir(&checkpoint_dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("index.delta.")),
+        "the full checkpoint retires the delta epoch"
+    );
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    for (dir, what) in [
+        (delta_dir, "the delta-carried table"),
+        (checkpoint_dir, "the checkpoint handoff"),
+    ] {
+        let wal_path = test_dir("delta_versions_reclaim_wal").join("shared.wal");
+        fs::write(&wal_path, &wal).unwrap();
+        let (journal, scan) = Journal::open_shared(&wal_path).unwrap();
+        let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+        let reopened = PackfileStorage::open(dir).unwrap();
+        reopened
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+            .unwrap();
+        assert_eq!(
+            recovered.collection_version(ShardType::State, &TEST_COLLECTION),
+            deleted_version,
+            "{what} restores the deleted collection's clock"
+        );
+        assert_eq!(
+            reopened.durable_coverage(),
+            coverage,
+            "{what} covers exactly the claimed LSN"
+        );
+        assert_eq!(
+            recovered.reclaimed_history_through(ShardType::State),
+            coverage,
+            "{what}: the mark matches the reclaimed coverage"
+        );
+    }
+}
+
 /// A shared segment may only be reclaimed up to the minimum durable
 /// coverage across every pool that has frames in it.
 #[test]
@@ -9539,9 +9655,15 @@ fn the_one_pass_durable_state_matches_for_a_foreign_or_torn_log() {
         &log_path,
         true,
         checkpoint.fingerprint ^ 1,
-        &[delta::DeltaOperation::Coverage {
-            covered_lsn: u64::MAX,
-        }],
+        &[
+            delta::DeltaOperation::Versions {
+                covered_lsn: u64::MAX,
+                entries: Vec::new(),
+            },
+            delta::DeltaOperation::Coverage {
+                covered_lsn: u64::MAX,
+            },
+        ],
         0x99,
         false,
     )
@@ -15076,6 +15198,17 @@ fn remove_baseline_files(store: &Path) {
     }
 }
 
+/// Remove every delta log, the third place collection versions can survive a
+/// reclaim now that coverage batches carry a version table.
+fn remove_delta_logs(store: &Path) {
+    for entry in fs::read_dir(store).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if name.starts_with("index.delta.") {
+            let _ = fs::remove_file(store.join(&name));
+        }
+    }
+}
+
 fn assert_refuses_without_a_baseline(outcome: &Result<PackfileStorage, String>, what: &str) {
     match outcome {
         Ok(_) => panic!("{what}: the store opened without a version baseline"),
@@ -15104,8 +15237,7 @@ fn a_stale_version_baseline_beside_a_newer_reclaim_fails_closed() {
     let first_files = copy_store(&shared.store_dir, "stale_baseline_first");
     let first_mark = shared
         .coordinator
-        .reclaimed_history_through(ShardType::State)
-        .unwrap();
+        .reclaimed_history_through(ShardType::State);
     shared.put(&TEST_COLLECTION, 3..6);
     shared.sync_and_reclaim();
     assert!(
@@ -15119,7 +15251,6 @@ fn a_stale_version_baseline_beside_a_newer_reclaim_fails_closed() {
         shared
             .coordinator
             .reclaimed_history_through(ShardType::State)
-            .unwrap()
             > first_mark,
         "the second reclaim removed newer history than the first baseline covers"
     );
@@ -15138,6 +15269,9 @@ fn a_stale_version_baseline_beside_a_newer_reclaim_fails_closed() {
     for file in VERSION_FILES {
         fs::copy(first_files.join(file), current.join(file)).unwrap();
     }
+    // The delta log is version evidence now; drop it so the stale files are
+    // all that is left to restore the newer reclaim.
+    remove_delta_logs(&current);
     let stale = reopen_state_pool(&current, &wal);
     assert_refuses_without_a_baseline(&stale, "the first sync's baseline");
 }
@@ -15236,14 +15370,12 @@ fn imported_and_quiet_pools_open_beside_a_reclaimed_wal() {
     let (journal, scan) = Journal::open_shared(&wal_path).unwrap();
     let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
     assert!(
-        coordinator
-            .reclaimed_history_through(ShardType::State)
-            .is_some_and(|mark| mark > 0),
+        coordinator.reclaimed_history_through(ShardType::State) > 0,
         "the State pool's history was reclaimed"
     );
     assert_eq!(
         coordinator.reclaimed_history_through(ShardType::EventDag),
-        Some(0)
+        0
     );
     for dir in [imported_dir, quiet_dir] {
         let pool = PackfileStorage::open(dir).unwrap();
