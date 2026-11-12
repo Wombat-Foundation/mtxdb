@@ -5570,7 +5570,9 @@ impl PackfileStorage {
         shards
             .iter()
             .map(|(_, shard)| {
-                let file = std::fs::File::open(&shard.path)?;
+                // Scan the physical file: a newly created pack may still be
+                // staged until its first durability barrier publishes it.
+                let file = std::fs::File::open(shard.data_path())?;
                 let end = shard.file_len();
                 let scanner = packfile::scan_packfile_iter_from_file(file, false)?;
                 Ok((end, scanner))
@@ -5650,7 +5652,7 @@ impl PackfileStorage {
         let mut scanned = Vec::new();
         for (slot, shard) in self.shards.all_shards() {
             for entry in packfile::scan_packfile_with_removal(
-                &shard.path,
+                &shard.data_path(),
                 self.shards.checksum_policy().verifies_reads(),
             )? {
                 if entry.collection_id == *collection_id {
@@ -5668,7 +5670,7 @@ impl PackfileStorage {
         let mut scanned = Vec::new();
         for (slot, shard) in self.shards.all_shards() {
             let entries = packfile::scan_packfile_with_removal(
-                &shard.path,
+                &shard.data_path(),
                 self.shards.checksum_policy().verifies_reads(),
             )?
             .into_iter()
@@ -5698,7 +5700,7 @@ impl PackfileStorage {
             .collect();
         for (slot, shard) in self.shards.all_shards() {
             for entry in packfile::scan_packfile_with_removal(
-                &shard.path,
+                &shard.data_path(),
                 self.shards.checksum_policy().verifies_reads(),
             )? {
                 if wanted.contains(&entry.collection_id) {
@@ -8001,7 +8003,7 @@ impl PackfileStorage {
                 }
             }
             let mut scanner = packfile::scan_packfile_iter(
-                &shard.path,
+                &shard.data_path(),
                 self.shards.checksum_policy().verifies_reads(),
             )?;
             while let Some(record) = scanner.next_with_removal() {
@@ -8119,7 +8121,7 @@ impl PackfileStorage {
             }
 
             let mut scanner = packfile::scan_packfile_iter(
-                &shard.path,
+                &shard.data_path(),
                 self.shards.checksum_policy().verifies_reads(),
             )?;
             while let Some(record) = scanner.next_with_removal() {
@@ -8678,7 +8680,7 @@ impl PackfileStorage {
                     .filter(|(pack_id, _)| *pack_id == shard.pack_id)
                     .map_or(0, |(_, offset)| *offset);
                 let entries = packfile::scan_packfile_from_with_removal(
-                    &shard.path,
+                    &shard.data_path(),
                     start,
                     self.shards.checksum_policy().verifies_reads(),
                 )
@@ -13814,9 +13816,12 @@ impl PackfileStorage {
     /// Under [`crate::shard::AppendPolicy::Buffered`], a put's bytes live
     /// only in process memory until a flush, and only in the page cache
     /// until a `sync_all`. This is the explicit way to advance that boundary
-    /// for all shards. A flushed store also means a subsequent
-    /// `PackfileStorage::open`/`open_read_only` against the same directory
-    /// sees the data.
+    /// for all shards. A flushed store already published by an earlier
+    /// durability barrier means a subsequent `PackfileStorage::open`/
+    /// `open_read_only` against the same directory sees the appended data. A
+    /// brand-new pack stays under a non-discoverable staging name until its
+    /// first durability barrier publishes it, so flushing its frames alone does
+    /// not make that new pack visible to a fresh open.
     ///
     /// # Errors
     /// Returns `StorageError` on I/O failure.

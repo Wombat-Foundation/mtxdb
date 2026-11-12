@@ -179,8 +179,12 @@ impl PackfileStorage {
         let mut stats = RemovalStats::default();
         let mut newest: HashMap<NodeId, Newest> = HashMap::new();
         for (_, shard) in self.shards.all_shards() {
-            let file_len = std::fs::metadata(&shard.path)?.len();
-            let mut entries = packfile::scan_packfile(&shard.path)?;
+            // The active pack may still be staged; scan its physical file so an
+            // in-process repack plan sees everything already flushed, while
+            // path/pub consumers keep using the canonical name.
+            let path = shard.data_path();
+            let file_len = std::fs::metadata(&path)?.len();
+            let mut entries = packfile::scan_packfile(&path)?;
             entries.sort_unstable_by_key(|(_, _, offset)| *offset);
             for (index, (rid, hash, offset)) in entries.iter().enumerate() {
                 if rid != collection_id {

@@ -160,6 +160,73 @@ fn injected_directory_sync_failure(dir: &Path) -> Option<io::Error> {
     Some(io::Error::other("injected directory sync failure"))
 }
 
+/// Test-only: pack files whose next file sync fails, keyed by canonical path.
+#[cfg(test)]
+static PACK_FSYNC_FAILURES: parking_lot::Mutex<Vec<(std::path::PathBuf, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Test-only: make the next file sync of the pack at `path` fail once `allow`
+/// calls have passed.
+#[cfg(test)]
+pub(crate) fn fail_pack_fsync_after(path: &Path, allow: usize) {
+    let mut failures = PACK_FSYNC_FAILURES.lock();
+    failures.retain(|(entry, _)| entry != path);
+    failures.push((path.to_path_buf(), allow));
+}
+
+/// Test-only: stop injecting file-sync failures for `path`.
+#[cfg(test)]
+pub(crate) fn clear_pack_fsync_failure(path: &Path) {
+    PACK_FSYNC_FAILURES
+        .lock()
+        .retain(|(entry, _)| entry != path);
+}
+
+#[cfg(test)]
+fn injected_pack_fsync_failure(path: &Path) -> Option<io::Error> {
+    let mut failures = PACK_FSYNC_FAILURES.lock();
+    let (_, allow) = failures.iter_mut().find(|(entry, _)| entry == path)?;
+    if *allow > 0 {
+        *allow = allow.saturating_sub(1);
+        return None;
+    }
+    Some(io::Error::other("injected pack file sync failure"))
+}
+
+/// Test-only: pack files whose next publication rename fails, keyed by
+/// canonical path.
+#[cfg(test)]
+static PACK_RENAME_FAILURES: parking_lot::Mutex<Vec<(std::path::PathBuf, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Test-only: make the next publication rename of the pack at `path` fail once
+/// `allow` calls have passed.
+#[cfg(test)]
+pub(crate) fn fail_pack_rename_after(path: &Path, allow: usize) {
+    let mut failures = PACK_RENAME_FAILURES.lock();
+    failures.retain(|(entry, _)| entry != path);
+    failures.push((path.to_path_buf(), allow));
+}
+
+/// Test-only: stop injecting rename failures for `path`.
+#[cfg(test)]
+pub(crate) fn clear_pack_rename_failure(path: &Path) {
+    PACK_RENAME_FAILURES
+        .lock()
+        .retain(|(entry, _)| entry != path);
+}
+
+#[cfg(test)]
+fn injected_pack_rename_failure(path: &Path) -> Option<io::Error> {
+    let mut failures = PACK_RENAME_FAILURES.lock();
+    let (_, allow) = failures.iter_mut().find(|(entry, _)| entry == path)?;
+    if *allow > 0 {
+        *allow = allow.saturating_sub(1);
+        return None;
+    }
+    Some(io::Error::other("injected pack publication rename failure"))
+}
+
 /// Maximum number of shards in the pool.
 ///
 /// This is a runtime policy cap, not a format limit: the shard slot is a
@@ -274,7 +341,23 @@ impl AppendPolicy {
 pub type ShardEntry = ([u8; 16], [u8; 16], u64);
 type DiscoveredPack = (packfile::PackId, PathBuf, u32);
 
-/// A single global shard file shared across all collections.
+/// Physical publication state of a pack's canonical name.
+///
+/// A new pack is written under a staging name that canonical discovery ignores.
+/// Its first file barrier syncs the header and frames, renames the staging file
+/// to the canonical `.pack` name, and then syncs the pool directory. Only a
+/// `Published` pack may back a durable coverage claim.
+enum PackPublication {
+    /// Still under its staging name; the canonical path does not exist.
+    Staged(PathBuf),
+    /// Renamed to the canonical name, but the directory barrier is still owed.
+    Renamed,
+    /// Canonical name and its directory entry are durable, or this pack was
+    /// recovered from a canonical file that predates this process.
+    Published,
+}
+
+/// A single open pack file shared across all collections in a pool.
 pub struct Shard {
     /// Pool-local allocator slot (index into the open-shard table).
     /// Ephemeral, recycled on retire. Never shown to operators.
@@ -290,6 +373,10 @@ pub struct Shard {
     pub file: File,
     /// Filesystem path to this shard's file.
     pub path: PathBuf,
+    /// Where the file physically lives until its first durability barrier
+    /// publishes it under [`Self::path`]. Recovered canonical packs start
+    /// `Published`.
+    publication: Mutex<PackPublication>,
     /// Lazily-created mmap. Remapped when the file grows.
     // Keep mappings reference-counted: a raw, uncompressed `Bytes` returned
     // from `read_at` owns an `Arc` to the mapping it points into.  A later
@@ -526,6 +613,7 @@ impl Shard {
             creation_seq,
             file,
             path,
+            publication: Mutex::new(PackPublication::Published),
             mmap: RwLock::new(None),
             append_lock: parking_lot::Mutex::new(()),
             sync_lock: parking_lot::Mutex::new(()),
@@ -590,10 +678,64 @@ impl Shard {
         self.file_len().saturating_sub(self.synced_len())
     }
 
+    /// The path the file currently lives under: the staging name until the
+    /// first durability barrier publishes it, then the canonical pack path.
+    ///
+    /// Use this for live in-process scans. Canonical-path consumers (sidecars,
+    /// checkpoint fingerprints, discovery) must use [`Self::path`] and must
+    /// only run after publication.
+    #[must_use]
+    pub(crate) fn data_path(&self) -> PathBuf {
+        match &*self.publication.lock() {
+            PackPublication::Staged(path) => path.clone(),
+            PackPublication::Renamed | PackPublication::Published => self.path.clone(),
+        }
+    }
+
+    /// Mark a newly created shard as staged under `staging_path`. Only the
+    /// creation paths call this, before the shard is shared with any scanner.
+    fn mark_staged(&self, staging_path: PathBuf) {
+        *self.publication.lock() = PackPublication::Staged(staging_path);
+    }
+
+    /// Complete publication after the file's bytes are durable: rename the
+    /// staging file to its canonical name, then sync the pool directory so the
+    /// name survives a crash.
+    ///
+    /// A failed rename leaves the staging state so a later barrier retries it;
+    /// a failed directory sync leaves `Renamed` so a retry finishes only the
+    /// directory barrier. Publication is never skipped just because one earlier
+    /// step succeeded.
+    fn publish_after_file_sync(&self) -> io::Result<()> {
+        let mut publication = self.publication.lock();
+        let staging = match &*publication {
+            PackPublication::Staged(path) => Some(path.clone()),
+            PackPublication::Renamed | PackPublication::Published => None,
+        };
+        if let Some(staging) = staging {
+            #[cfg(test)]
+            if let Some(error) = injected_pack_rename_failure(&self.path) {
+                return Err(error);
+            }
+            fs::rename(&staging, &self.path)?;
+            *publication = PackPublication::Renamed;
+        }
+        if matches!(*publication, PackPublication::Renamed) {
+            let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+            sync_directory(parent)?;
+            *publication = PackPublication::Published;
+        }
+        Ok(())
+    }
+
     /// fsync the file, then advance the durable watermark to the length read
     /// *before* the fsync started: every byte at or below it was written before
     /// the fsync began, so the fsync covers it, while bytes appended during the
     /// fsync stay owed to the next one.
+    ///
+    /// If this is the pack's first barrier, the same call publishes it: the
+    /// header and initial frames become durable together, replacing the
+    /// separate header sync a new pack used to pay at creation.
     fn fsync_advancing_watermark(&self, data_only: bool) -> io::Result<()> {
         // Test builds only: count fsyncs of a pack with no bytes beyond its
         // last known-synced length separately, to size what a proven-durable
@@ -609,12 +751,21 @@ impl Shard {
             &self.path,
         );
         let covered = self.file_len();
+        #[cfg(test)]
+        if let Some(error) = injected_pack_fsync_failure(&self.path) {
+            return Err(error);
+        }
         if data_only {
             self.file.sync_data()?;
         } else {
             self.file.sync_all()?;
         }
         self.synced_len.fetch_max(covered, Ordering::AcqRel);
+        // The bytes are durable now, so the canonical name may be published.
+        // If this fails, the caller reports the barrier as failed and the
+        // shard remains staged (or renamed-but-not-directory-durable) for the
+        // next attempt; no coverage may be claimed from it meanwhile.
+        self.publish_after_file_sync()?;
         Ok(())
     }
 
@@ -683,6 +834,11 @@ impl Drop for Shard {
         if !self.is_current.load(Ordering::Acquire) {
             let _ = fs::remove_file(&self.path);
             let _ = fs::remove_file(packidx::pack_index_path(&self.path));
+            // A pack retired before its first barrier exists only under its
+            // staging name; remove that too so a discarded pack leaves nothing.
+            if let PackPublication::Staged(staging) = &*self.publication.get_mut() {
+                let _ = fs::remove_file(staging);
+            }
         }
     }
 }
@@ -1117,6 +1273,36 @@ impl ShardPool {
             pack_files.push((header.pack_id, path, header));
         }
         Ok(pack_files)
+    }
+
+    /// Remove staging pack files left by a crashed writer.
+    ///
+    /// Only a writable opener reaches this, and it holds the exclusive writer
+    /// lock for the pool (or the database root), so no live producer can be
+    /// writing one of these names. A read-only opener never deletes anything;
+    /// staging files are invisible to canonical discovery, so leaving them is
+    /// inert rather than unsafe.
+    fn sweep_staging_packs(base_dir: &Path) -> io::Result<()> {
+        let entries = match fs::read_dir(base_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "pack") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            // Our staging name: pack_<hex>.tmp.<pid>.<counter>
+            if name.starts_with("pack_") && name.contains(".tmp.") {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        Ok(())
     }
 
     /// Creation-order sort key: the persisted pool-local sequence, with the
@@ -1656,6 +1842,9 @@ impl ShardPool {
 
         let discovery_started = Instant::now();
         let (pack_files, next_creation_seq) = Self::discover_pack_files_sorted(&base_dir)?;
+        if writable {
+            Self::sweep_staging_packs(&base_dir)?;
+        }
         let discovery_time = discovery_started.elapsed();
 
         let runs = Self::load_runs(&base_dir, &pack_files, writable);
@@ -2250,37 +2439,44 @@ impl ShardPool {
         base_dir.join(pack_id.filename_for(siblings))
     }
 
-    /// Initialize a pack under a non-discoverable temporary name, then rename
-    /// it into place. Directory scanners consequently observe either no pack
-    /// or a fully written header, never a partially initialized canonical file.
+    /// Initialize a pack under a non-discoverable staging name.
+    ///
+    /// The header is written but not synced, and the file is not renamed: the
+    /// pack stays invisible to canonical discovery until its first durability
+    /// barrier syncs the header and frames, renames it into place, and syncs
+    /// the directory. Directory scanners consequently observe either no pack
+    /// or a fully durable one, never a partially initialized canonical file.
     ///
     /// A fresh random [`packfile::PackId`] is chosen for the new pack; the
     /// sibling ids are consulted only to pick an unambiguous filename.
-    /// Returns the opened file, its final path, and its id.
+    /// Returns the opened file, its final path, its staging path, and its id.
     fn create_packfile_atomically(
         base_dir: &Path,
         siblings: &[packfile::PackId],
         creation_seq: u32,
-    ) -> io::Result<(File, PathBuf, packfile::PackId)> {
+    ) -> io::Result<(File, PathBuf, PathBuf, packfile::PackId)> {
         #[cfg(test)]
         let _trace = crate::test_trace::span("pack.create", base_dir);
         let pack_id = packfile::PackId::random();
         let path = Self::pack_path(base_dir, &pack_id, siblings);
         let unique = PACK_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("tmp.{}.{unique}", std::process::id()));
-        let file =
-            match packfile::open_packfile_with_creation_seq(&tmp_path, &pack_id, creation_seq) {
-                Ok(file) => file,
-                Err(error) => {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(error);
-                }
-            };
-        if let Err(error) = fs::rename(&tmp_path, &path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(error);
-        }
-        Ok((file, path, pack_id))
+        // The staging name is ours while we hold the writer lock, but a crashed
+        // process with a reused pid can leave one behind. Start from an empty
+        // file rather than validating a stale header.
+        let _ = fs::remove_file(&tmp_path);
+        let file = match packfile::open_staged_packfile_with_creation_seq(
+            &tmp_path,
+            &pack_id,
+            creation_seq,
+        ) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(error);
+            }
+        };
+        Ok((file, path, tmp_path, pack_id))
     }
 
     fn next_creation_seq(&self) -> io::Result<u32> {
@@ -2436,7 +2632,7 @@ impl ShardPool {
         let slot = *self.active_write.lock();
         create_dir_all_durable(&self.base_dir)?;
         let creation_seq = self.next_creation_seq()?;
-        let (file, path, pack_id) =
+        let (file, path, staging_path, pack_id) =
             Self::create_packfile_atomically(&self.base_dir, &[], creation_seq)?;
         let file_len = file.metadata()?.len();
         let shard = Arc::new(Shard::new(
@@ -2447,7 +2643,9 @@ impl ShardPool {
             path,
             file_len,
         ));
-        sync_directory(&self.base_dir)?;
+        shard.mark_staged(staging_path);
+        // No directory sync here: the pack has no canonical name yet. Its first
+        // durability barrier publishes it (file sync, rename, directory sync).
         self.shards.write()[slot as usize] = Some(Arc::clone(&shard));
         Ok(shard)
     }
@@ -2502,7 +2700,10 @@ impl ShardPool {
     /// Under the default [`AppendPolicy::Eager`] the frame is written to the
     /// page cache immediately — one positioned write per put, the historical
     /// behavior (unsynced bytes survive this process exiting; durability on
-    /// crash/power loss still requires a `sync_*`). Under
+    /// crash/power loss still requires a `sync_*`). A brand-new pack is staged
+    /// under a non-discoverable name until its first durability barrier, so a
+    /// fresh process does not observe a *new* pack's unsynced frames; frames
+    /// appended to an already-published pack remain visible after a flush. Under
     /// [`AppendPolicy::Buffered`] the frame is appended to the shard's
     /// in-memory pending region instead: offsets are handed out into the
     /// virtual `[file_len, file_len + pending)` range and committed by a
@@ -3376,17 +3577,19 @@ impl ShardPool {
                 let sibling_ids: Vec<packfile::PackId> =
                     shards.iter().flatten().map(|s| s.pack_id).collect();
                 let creation_seq = self.next_creation_seq()?;
-                let (file, path, pack_id) =
+                let (file, path, staging_path, pack_id) =
                     Self::create_packfile_atomically(&self.base_dir, &sibling_ids, creation_seq)?;
                 let file_len = file.metadata()?.len();
-                shards[candidate as usize] = Some(Arc::new(Shard::new(
+                let shard = Arc::new(Shard::new(
                     candidate,
                     pack_id,
                     creation_seq,
                     file,
                     path,
                     file_len,
-                )));
+                ));
+                shard.mark_staged(staging_path);
+                shards[candidate as usize] = Some(shard);
                 drop(shards);
                 *self.active_write.lock() = candidate;
                 self.maybe_seal_pack(current);

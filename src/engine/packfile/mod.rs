@@ -1871,6 +1871,26 @@ pub fn open_packfile_with_creation_seq(
     pack_id: &PackId,
     creation_seq: u32,
 ) -> io::Result<File> {
+    open_packfile_with_creation_seq_inner(path, pack_id, creation_seq, true)
+}
+
+/// Like [`open_packfile_with_creation_seq`], but a newly written header is not
+/// synced. The caller owns publication: it must sync the file at the pack's
+/// first durability barrier, before the file is renamed to its canonical name.
+pub(crate) fn open_staged_packfile_with_creation_seq(
+    path: &Path,
+    pack_id: &PackId,
+    creation_seq: u32,
+) -> io::Result<File> {
+    open_packfile_with_creation_seq_inner(path, pack_id, creation_seq, false)
+}
+
+fn open_packfile_with_creation_seq_inner(
+    path: &Path,
+    pack_id: &PackId,
+    creation_seq: u32,
+    durable_header: bool,
+) -> io::Result<File> {
     let mut options = OpenOptions::new();
     // Positioned writes do not need `O_APPEND`, and on Linux `pwrite` on an
     // append-mode descriptor ignores its offset and appends at EOF. Opening a
@@ -1882,9 +1902,11 @@ pub fn open_packfile_with_creation_seq(
 
     if file.metadata()?.len() == 0 {
         write_header_with_creation_seq(&mut file, pack_id, creation_seq)?;
-        #[cfg(test)]
-        let _trace = crate::test_trace::span("pack.header_fsync", path);
-        file.sync_all()?;
+        if durable_header {
+            #[cfg(test)]
+            let _trace = crate::test_trace::span("pack.header_fsync", path);
+            file.sync_all()?;
+        }
     } else {
         validate_header_identity(&file, path, pack_id)?;
     }

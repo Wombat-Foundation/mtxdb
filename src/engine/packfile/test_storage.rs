@@ -8961,7 +8961,9 @@ fn packfile_storage_create_or_upsert_established_validated_contract() {
         b"val2_updated"[..]
     );
 
-    // 6. Persistence across reopen
+    // 6. Persistence across reopen. A reopen observes only published packs, so
+    // the records must cross a durability barrier first.
+    store.sync_all().unwrap();
     drop(store);
     let reopened = PackfileStorage::open(dir).unwrap();
     assert_eq!(
@@ -13335,6 +13337,176 @@ fn paged_coverage_is_capped_by_the_versions_file() {
     drop(reopened);
     fs::remove_dir_all(&wal_dir).ok();
     fs::remove_dir_all(&store_dir).ok();
+}
+
+#[cfg(feature = "multi-reader")]
+/// Child half of [`a_second_process_reads_a_committed_record_before_its_pack_is_published`].
+///
+/// Opens the writer's store read-only and reads through the shared-WAL
+/// read-committed overlay. It must observe the committed record even though the
+/// writer's pack is still staged and no canonical pack exists yet.
+#[test]
+fn second_process_wal_reader_child() {
+    use crate::layout::ShardType;
+
+    let Ok(root) = std::env::var("MTXDB_STAGED_READER_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let reader = PackfileStorage::open_read_committed_shared(
+        root.join("state"),
+        root.join("shared.wal"),
+        ShardType::State,
+    )
+    .unwrap();
+    let got = reader
+        .get_read_committed(&TEST_COLLECTION, &[distinct_id(42)])
+        .unwrap();
+    let got = got[0]
+        .as_ref()
+        .expect("a committed record must be visible through the WAL overlay");
+    assert_eq!(got.bytes.as_ref(), b"staged-visible");
+    std::fs::write(root.join("child-read"), b"visible").unwrap();
+}
+
+#[cfg(feature = "multi-reader")]
+/// A real second process sees a committed record through the shared-WAL overlay
+/// while the writer's pack is still staged, then the record and its collection
+/// version survive publication and WAL reclaim.
+#[test]
+fn a_second_process_reads_a_committed_record_before_its_pack_is_published() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let root = test_dir("staged_second_process_reader");
+    let wal = root.join("shared.wal");
+    let store_dir = root.join("state");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(42),
+            &NodeData::new(bytes::Bytes::from_static(b"staged-visible")),
+        )
+        .unwrap();
+    // Only the WAL group is durable; the first pack has no canonical name.
+    coordinator.sync().unwrap();
+    let canonical_packs = fs::read_dir(&store_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .count();
+    assert_eq!(canonical_packs, 0, "the pack must still be staged");
+    let expected_version = coordinator.collection_version(ShardType::State, &TEST_COLLECTION);
+
+    let output = std::process::Command::new(crate::io::test_binary_path())
+        .args([
+            "--exact",
+            "packfile::storage::tests::second_process_wal_reader_child",
+            "--test-threads=1",
+        ])
+        .env("MTXDB_STAGED_READER_ROOT", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "second-process reader failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(root.join("child-read")).unwrap(),
+        b"visible",
+        "the child must actually perform the overlay read"
+    );
+
+    // Publish the pack, then checkpoint so coverage reclaims the WAL group.
+    store.sync_all().unwrap();
+    drop(store);
+    drop(coordinator);
+    let (journal, scan) = Journal::open_shared(&wal).unwrap();
+    assert!(
+        scan.groups.is_empty(),
+        "the checkpoint must reclaim the WAL group"
+    );
+    let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+    let reopened = PackfileStorage::open(store_dir.clone()).unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+        .unwrap();
+    let got = reopened
+        .get(&TEST_COLLECTION, &distinct_id(42))
+        .unwrap()
+        .expect("the published pack serves the record without the WAL");
+    assert_eq!(got.bytes.as_ref(), b"staged-visible");
+    assert_eq!(
+        recovered.collection_version(ShardType::State, &TEST_COLLECTION),
+        expected_version,
+        "the exact collection version survives reclaim"
+    );
+}
+
+#[test]
+fn a_failed_publication_does_not_advance_coverage_until_retry() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let root = test_dir("failed_publication_coverage");
+    let wal = root.join("shared.wal");
+    let store_dir = root.join("state");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(7),
+            &NodeData::new(bytes::Bytes::from_static(b"owed-publication")),
+        )
+        .unwrap();
+    // The WAL group is acknowledged, but the pack is still staged.
+    coordinator.sync().unwrap();
+    assert_eq!(store.durable_coverage(), 0);
+
+    // Fail the directory barrier that completes publication. The checkpoint
+    // may report the failure best-effort, but no coverage may be claimed from
+    // the unpublished name.
+    crate::shard::fail_directory_sync_after(&store_dir, 0);
+    store
+        .sync_all()
+        .expect("checkpoint persistence is best-effort; the WAL still holds the group");
+    assert_eq!(
+        store.durable_coverage(),
+        0,
+        "no coverage may advance while publication is incomplete"
+    );
+
+    crate::shard::clear_directory_sync_failure(&store_dir);
+    store.sync_all().unwrap();
+    assert!(
+        store.durable_coverage() > 0,
+        "the retry publishes the pack and records its coverage"
+    );
+    drop(store);
+    drop(coordinator);
+
+    let (_, scan) = Journal::open_shared(&wal).unwrap();
+    assert!(
+        scan.groups.is_empty(),
+        "withheld coverage must keep the group; the retry then reclaims it"
+    );
 }
 
 /// Child half of [`versions_fsync_precedes_wal_reclaim_crash_safe`]: write,
