@@ -693,7 +693,9 @@ impl AuthSnapshot<'_> {
                 event_id: event_id.to_owned(),
             });
         };
-        if adjacency.family_edges(db, root, AUTH)?.is_none() {
+        if self.coverage(root) != ClosureCoverage::Complete
+            && adjacency.family_edges(db, root, AUTH)?.is_none()
+        {
             return Err(RoomAuthError::EventNotRecorded {
                 event_id: event_id.to_owned(),
             });
@@ -712,11 +714,28 @@ impl AuthSnapshot<'_> {
         ancestor: &str,
         event: &str,
     ) -> Result<bool, RoomAuthError> {
+        let adjacency = self.room.closure.adjacency();
+        let Some(root) = adjacency.short_id(db, event)? else {
+            return Err(RoomAuthError::UnknownEvent {
+                event_id: event.to_owned(),
+            });
+        };
+        if self.coverage(root) == ClosureCoverage::Complete {
+            // Coverage proves this event was recorded. Read the pinned record to
+            // preserve retirement/corruption errors, without probing CSR rows.
+            let blob = self.persisted_blob(db, root)?;
+            let ancestor_id = adjacency.short_id(db, ancestor)?;
+            let found = BitmapSet::contains_encoded(
+                &blob,
+                self.room.closure.domain(),
+                ancestor_id.unwrap_or(root),
+            )
+            .map_err(domain_error)?;
+            return Ok(ancestor_id.is_some_and(|id| id != root) && found);
+        }
+        // Preserve missing-event and incomplete-history errors on the lazy path.
         let chain = self.auth_chain_ids(db, event)?;
-        Ok(self
-            .room
-            .closure
-            .adjacency()
+        Ok(adjacency
             .short_id(db, ancestor)?
             .is_some_and(|id| chain.contains(id)))
     }
@@ -840,6 +859,11 @@ impl AuthSnapshot<'_> {
 
     /// The persisted closure of a `Complete` id, from the pinned generation.
     fn persisted(&self, db: &Database, short_id: u32) -> Result<BitmapSet, RoomAuthError> {
+        let blob = self.persisted_blob(db, short_id)?;
+        BitmapSet::decode_in_domain(&blob, self.room.closure.domain()).map_err(domain_error)
+    }
+
+    fn persisted_blob(&self, db: &Database, short_id: u32) -> Result<Vec<u8>, RoomAuthError> {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return Err(RoomAuthError::Corruption(
                 "a closure was expected but no generation is pinned".to_owned(),
@@ -859,7 +883,7 @@ impl AuthSnapshot<'_> {
                     snapshot.head.generation
                 ))
             })?;
-        BitmapSet::decode_in_domain(&blob, self.room.closure.domain()).map_err(domain_error)
+        Ok(blob)
     }
 }
 
