@@ -14881,33 +14881,19 @@ fn collection_versions_survive_reclaim_for_every_surviving_file_combination() {
 /// With the reclaimed WAL and no version baseline at all (no checkpoint, no
 /// versions file, no `journal.lsn`), the store must not open and report every
 /// collection at version zero: the WAL groups that carried the versions are
-/// gone, so a silent open turns versions `[5, 8]` into `[0, 0]`.
+/// gone, so a silent open would turn versions `[5, 8]` into `[0, 0]`.
 ///
 /// Not a state the publication order leaves, but losing the baseline must never
-/// reset versions quietly. Today the open succeeds with zero versions: nothing
-/// on disk records that coverage was ever claimed, so the guard (which keys on
-/// durable coverage) does not fire. Kept as a regression test for that gap and
-/// ignored until recovery fails closed here; the expectation is the strict one.
+/// reset versions quietly. Nothing in the pool's files then says coverage was
+/// ever claimed, so the evidence is the shared WAL's header: each reclaim
+/// records, per pool, the newest LSN of history it removed, and a writable open
+/// of the pool refuses unless its baseline covers that LSN.
 ///
-/// What a fix can and cannot rely on. Refusing on "no baseline and no recovered
-/// group for this pool" is too broad: an imported or quiet pool meets it, and a
-/// few surviving groups do not prove earlier history was kept. The pool's pack
-/// frames carry the LSN of the group that last wrote them, which can show that
-/// some reclaimed history existed, but not every case: a collection deletion
-/// advances a version without leaving a surviving record, and versions must not
-/// be rebuilt from those LSNs. So a pack-LSN check is a conservative safeguard,
-/// not a complete one. Complete detection needs durable per-pool evidence of
-/// reclaimed coverage, written when the history is dropped.
-///
-/// Limitation, for the follow-up refusal: a pack's `last_write_lsn` can show
-/// that some history was reclaimed (a tagged LSN below the WAL base), but it
-/// cannot show that all history survived. A collection delete advances the
-/// logical version without leaving a surviving record whose LSN could be
-/// compared, so the frame check is a conservative safeguard, not a complete
-/// detector. Complete detection needs durable per-pool evidence that coverage
-/// was reclaimed, independent of the three baseline files.
+/// What a pack-LSN check could not do: it cannot see every case (a collection
+/// deletion advances a version without leaving a surviving record), and
+/// versions must not be rebuilt from frame LSNs. The header marks are written
+/// when the history is dropped, so they do not depend on what survives.
 #[test]
-#[ignore = "known gap: a store with every version baseline lost opens with zero versions"]
 fn losing_every_version_baseline_beside_a_reclaimed_wal_fails_closed() {
     let fixture = reclaimed_versions_fixture();
     let outcome = reopen_with_surviving_files(&fixture, 0);
@@ -14917,4 +14903,252 @@ fn losing_every_version_baseline_beside_a_reclaimed_wal_fails_closed() {
         message.contains("no readable version baseline"),
         "refused for another reason: {message}"
     );
+}
+
+/// A shared-WAL store for the reclaimed-history tests.
+struct SharedWalStore {
+    store_dir: PathBuf,
+    wal: PathBuf,
+    coordinator: Arc<crate::journal::JournalCoordinator>,
+    store: PackfileStorage,
+}
+
+fn open_shared_wal_store(label: &str) -> SharedWalStore {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal = test_dir(&format!("{label}_wal")).join("shared.wal");
+    let store_dir = test_dir(&format!("{label}_store"));
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    SharedWalStore {
+        store_dir,
+        wal,
+        coordinator,
+        store,
+    }
+}
+
+impl SharedWalStore {
+    fn put(&self, collection: &[u8; 16], ids: std::ops::Range<u8>) {
+        for i in ids {
+            self.store
+                .put(
+                    collection,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(version_test_value(collection, i))),
+                )
+                .unwrap();
+        }
+    }
+
+    /// Commit to the WAL, then sync the store: its checkpoint reclaims.
+    fn sync_and_reclaim(&self) {
+        self.coordinator.sync().unwrap();
+        self.store.sync_all().unwrap();
+    }
+}
+
+/// Reopen the State pool in `store` beside the WAL image `wal`.
+fn reopen_state_pool(store: &Path, wal: &[u8]) -> Result<PackfileStorage, String> {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_path = test_dir("reclaimed_history_reopen_wal").join("shared.wal");
+    fs::write(&wal_path, wal).unwrap();
+    let (journal, scan) = Journal::open_shared(&wal_path).map_err(|error| error.to_string())?;
+    let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+    let reopened = PackfileStorage::open(store.to_path_buf()).map_err(|error| error.to_string())?;
+    reopened
+        .enable_shared_journal(coordinator, ShardType::State)
+        .map_err(|error| error.to_string())?;
+    Ok(reopened)
+}
+
+fn remove_baseline_files(store: &Path) {
+    for file in VERSION_FILES {
+        let _ = fs::remove_file(store.join(file));
+    }
+}
+
+fn assert_refuses_without_a_baseline(outcome: &Result<PackfileStorage, String>, what: &str) {
+    match outcome {
+        Ok(_) => panic!("{what}: the store opened without a version baseline"),
+        Err(message) => assert!(
+            message.contains("no readable version baseline"),
+            "{what}: refused for another reason: {message}"
+        ),
+    }
+}
+
+/// A readable but stale baseline loses versions too: after a second reclaim the
+/// WAL has dropped history newer than the first checkpoint and versions file
+/// cover, so putting those older files back must refuse, while the current ones
+/// open.
+#[test]
+fn a_stale_version_baseline_beside_a_newer_reclaim_fails_closed() {
+    use crate::journal::Journal;
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store("stale_baseline");
+    // Every sync must reclaim, or the second one only appends a delta and the
+    // first baseline is not stale.
+    shared.coordinator.set_reclaim_trigger_len(1);
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    let first_files = copy_store(&shared.store_dir, "stale_baseline_first");
+    let first_mark = shared
+        .coordinator
+        .reclaimed_history_through(ShardType::State)
+        .unwrap();
+    shared.put(&TEST_COLLECTION, 3..6);
+    shared.sync_and_reclaim();
+    assert!(
+        Journal::scan_read_only(&shared.wal)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "the second sync reclaimed"
+    );
+    assert!(
+        shared
+            .coordinator
+            .reclaimed_history_through(ShardType::State)
+            .unwrap()
+            > first_mark,
+        "the second reclaim removed newer history than the first baseline covers"
+    );
+    let wal = fs::read(&shared.wal).unwrap();
+    let current = copy_store(&shared.store_dir, "stale_baseline_current");
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    assert!(
+        reopen_state_pool(&current, &wal).is_ok(),
+        "the current baseline must open"
+    );
+    for file in VERSION_FILES {
+        fs::copy(first_files.join(file), current.join(file)).unwrap();
+    }
+    let stale = reopen_state_pool(&current, &wal);
+    assert_refuses_without_a_baseline(&stale, "the first sync's baseline");
+}
+
+/// The evidence is the history the WAL dropped, not what survives in the packs:
+/// a deleted collection leaves no record to find, and losing the baseline must
+/// still refuse.
+#[test]
+fn losing_the_baseline_of_a_deleted_collection_fails_closed() {
+    let shared = open_shared_wal_store("deleted_collection");
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.coordinator.sync().unwrap();
+    shared.store.delete_collection(&TEST_COLLECTION).unwrap();
+    shared.sync_and_reclaim();
+    let wal = fs::read(&shared.wal).unwrap();
+    let published = copy_store(&shared.store_dir, "deleted_collection_published");
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    let intact = reopen_state_pool(&published, &wal).expect("the intact store opens");
+    assert_eq!(
+        intact.collection_len(&TEST_COLLECTION).unwrap(),
+        None,
+        "the collection stays deleted"
+    );
+    drop(intact);
+    remove_baseline_files(&published);
+    assert_refuses_without_a_baseline(&reopen_state_pool(&published, &wal), "deleted collection");
+}
+
+/// Groups newer than the reclaim that survive in the WAL do not show that older
+/// history was kept: with the baseline lost they must not let the store open.
+#[test]
+fn surviving_newer_wal_groups_do_not_hide_a_lost_baseline() {
+    let shared = open_shared_wal_store("newer_groups");
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    // Newer groups reach the WAL but are not reclaimed.
+    shared.put(&TEST_COLLECTION, 3..5);
+    shared.coordinator.sync().unwrap();
+    let wal = fs::read(&shared.wal).unwrap();
+    let files = copy_store(&shared.store_dir, "newer_groups_files");
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    let intact = reopen_state_pool(&files, &wal).expect("the intact store opens");
+    drop(intact);
+    remove_baseline_files(&files);
+    assert_refuses_without_a_baseline(&reopen_state_pool(&files, &wal), "newer groups survive");
+}
+
+/// A pool that took no part in the reclaimed history is not refused: one with
+/// imported data that never reached the shared WAL, and one that is new and
+/// quiet, both have nothing recorded and no baseline to lose.
+#[test]
+fn imported_and_quiet_pools_open_beside_a_reclaimed_wal() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store("quiet_pools");
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    let wal = fs::read(&shared.wal).unwrap();
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    // Imported: data written and synced with no journal at all.
+    let imported_dir = test_dir("quiet_pools_imported");
+    {
+        let imported = PackfileStorage::open(imported_dir.clone()).unwrap();
+        for i in 0..3 {
+            imported
+                .put(
+                    &SECOND_COLLECTION,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![i; 8])),
+                )
+                .unwrap();
+        }
+        imported.sync_all().unwrap();
+    }
+    remove_baseline_files(&imported_dir);
+    let quiet_dir = test_dir("quiet_pools_new");
+
+    let wal_path = test_dir("quiet_pools_reopen_wal").join("shared.wal");
+    fs::write(&wal_path, &wal).unwrap();
+    let (journal, scan) = Journal::open_shared(&wal_path).unwrap();
+    let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+    assert!(
+        coordinator
+            .reclaimed_history_through(ShardType::State)
+            .is_some_and(|mark| mark > 0),
+        "the State pool's history was reclaimed"
+    );
+    assert_eq!(
+        coordinator.reclaimed_history_through(ShardType::EventDag),
+        Some(0)
+    );
+    for dir in [imported_dir, quiet_dir] {
+        let pool = PackfileStorage::open(dir).unwrap();
+        pool.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .expect("a pool with nothing reclaimed opens without a baseline");
+    }
 }

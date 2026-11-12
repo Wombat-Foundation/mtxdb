@@ -12697,14 +12697,45 @@ impl PackfileStorage {
         // merging this pool-local table with `max` preserves whichever side is
         // newer. The checkpoint is also read for compatibility with a store
         // written before the file existed (a writable paged open migrates it).
-        if let Some(snapshot) =
-            crate::index::versions::read_versions(&Self::index_versions_path(&self.base_dir))
-        {
+        let snapshot =
+            crate::index::versions::read_versions(&Self::index_versions_path(&self.base_dir));
+        let checkpoint =
+            crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(&self.base_dir));
+        // The shared WAL records, per pool, the newest LSN of history a reclaim
+        // removed. The groups that carried this pool's collection versions
+        // through that LSN are gone, so the baseline files must cover it: a
+        // missing baseline, or a stale one, would restore older versions, or
+        // none, without any record that it did. Fail closed rather than open.
+        // A read-only handle only reads, and a journal that cannot say what it
+        // reclaimed (an older header) proves nothing either way.
+        if self.shards.is_writable() {
+            let baseline_covered = snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.covered_lsn)
+                .max(
+                    checkpoint
+                        .as_ref()
+                        .map_or(0, |checkpoint| checkpoint.covered_lsn),
+                );
+            if let Some(reclaimed) = journal
+                .reclaimed_history_through(pool)
+                .filter(|reclaimed| *reclaimed > 0)
+            {
+                if baseline_covered < reclaimed {
+                    return Err(StorageError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "no readable version baseline covering the history the shared WAL reclaimed for this pool through LSN {reclaimed}: {} and the checkpoint cover through {baseline_covered}; refusing to open a writable store that cannot restore its collection versions",
+                            Self::index_versions_path(&self.base_dir).display()
+                        ),
+                    )));
+                }
+            }
+        }
+        if let Some(snapshot) = snapshot {
             journal.restore_collection_versions(pool, &snapshot.versions);
         }
-        if let Some(checkpoint) =
-            crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(&self.base_dir))
-        {
+        if let Some(checkpoint) = checkpoint {
             journal.restore_collection_versions(pool, &checkpoint.logical_versions);
         }
         self.journal_pool.store(pool_tag(pool), Ordering::Release);
