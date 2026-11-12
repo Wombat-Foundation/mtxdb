@@ -8131,7 +8131,8 @@ fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
         let (journal, scan) = Journal::open_shared(&wal).unwrap();
         JournalCoordinator::new(journal, &scan)
     });
-    let a = PackfileStorage::open(test_dir("shared_reclaim_replay_a")).unwrap();
+    let a_dir = test_dir("shared_reclaim_replay_a");
+    let a = PackfileStorage::open(a_dir.clone()).unwrap();
     let b = PackfileStorage::open(test_dir("shared_reclaim_replay_b")).unwrap();
     a.enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
         .unwrap();
@@ -8158,9 +8159,10 @@ fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
     assert_eq!(coordinator.committed_lsn(), 3);
 
     // State checkpoints through its own frame; EventDag has not. Only the
-    // covered single-pool group may be reclaimed.
-    coordinator.report_pool_coverage(ShardType::State, 1);
-    assert!(coordinator.reclaim_shared().unwrap().is_some());
+    // covered single-pool group may be reclaimed. The checkpoint is real, so
+    // State's baseline covers the history the reclaim removes; coverage reported
+    // with no baseline behind it is what a reopen now refuses.
+    a.sync_all().unwrap();
     drop(a);
     drop(b);
     drop(coordinator);
@@ -8173,7 +8175,7 @@ fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
 
     // The reclaimed state frame is gone from the journal by design: its
     // pool's checkpoint owns it, so a state store has nothing to replay.
-    let fresh_a = PackfileStorage::open(test_dir("shared_reclaim_replay_fresh_a")).unwrap();
+    let fresh_a = PackfileStorage::open(a_dir).unwrap();
     fresh_a
         .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
         .unwrap();
