@@ -9197,6 +9197,33 @@ fn rejected_state_event_does_not_change_later_state() {
         .map(|entry| entry.stream_ordering)
         .collect();
     assert_eq!(streams, vec![1, 2, 3, 4]);
+
+    // Neither $rules_bad nor $bob carries an exporter `rejected` flag: both
+    // rejections are derived by the import. The persisted state groups must
+    // therefore reflect the derived rejection set, not the annotation
+    // fallback, or the rejected state event would replace $rules_ok.
+    let aux =
+        mtxdb::auxiliary::AuxiliaryIndex::open(db.event_dag().as_ref(), STATE_GROUP_NAMESPACE);
+    let loaded = load_state_groups(
+        &aux,
+        &[
+            "$leave:test".to_owned(),
+            "$rules_bad:test".to_owned(),
+            "$bob:test".to_owned(),
+        ],
+    )
+    .unwrap();
+    let StateGroupLoad::Complete(groups) = loaded else {
+        panic!("state groups should be cached");
+    };
+    assert_eq!(
+        groups["$rules_bad:test"], groups["$leave:test"],
+        "a derived rejection must keep the unannotated state event out of the state"
+    );
+    assert_eq!(
+        groups["$bob:test"], groups["$rules_bad:test"],
+        "an event citing only rejected auth contributes no state either"
+    );
 }
 
 #[test]
