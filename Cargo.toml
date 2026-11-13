@@ -15,10 +15,11 @@ license = "MIT OR Apache-2.0"
 authors = ["Shane Jaroch <chown_tee@proton.me>"]
 keywords = ["database", "matrix", "packfile", "content-addressed", "hamt"]
 categories = ["database-implementations", "filesystem"]
-# Test code is not part of the published surface. Extracted unit-test modules
-# live beside their sources as `src/**/test_*.rs`, and integration tests under
-# `tests/`; exclude both from the packaged archive. Local `cargo test` still
-# compiles them through the out-of-line `mod tests;` declarations.
+# Integration tests under `tests/` are not part of the published surface, so
+# exclude them from the packaged archive. The library's out-of-line unit-test
+# modules (`src/**/test_*.rs`) stay in the package: they are declared with
+# `#[cfg(test)]` beside their sources, and a packaged crate that drops them
+# cannot compile `cargo test --lib`.
 #
 # The examples are internal measurement harnesses (fixture-driven, several
 # rewrite store metadata), not usage documentation, so they are excluded too.
@@ -28,8 +29,6 @@ exclude = [
     "tests/",
     "examples/",
     "benches/",
-    "src/test_*.rs",
-    "src/**/test_*.rs",
     "scripts/",
     "pyproject.toml",
     "rust-toolchain.toml",
