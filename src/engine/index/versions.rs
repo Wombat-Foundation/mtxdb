@@ -223,11 +223,9 @@ mod tests {
         let snapshot = read_versions(&path).unwrap();
         assert_eq!(snapshot.covered_lsn, 1234);
         assert_eq!(read_coverage(&path), Some(1234));
-        let mut read = snapshot.versions;
-        read.sort_unstable();
         let mut expected = versions.clone();
-        expected.sort_unstable();
-        assert_eq!(read, expected);
+        expected.sort_unstable_by_key(|(collection_id, _)| *collection_id);
+        assert_eq!(snapshot.versions, expected, "decoded in sorted file order");
         let _ = fs::remove_file(path);
     }
 

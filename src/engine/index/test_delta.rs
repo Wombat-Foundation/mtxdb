@@ -122,6 +122,16 @@ fn compaction_keeps_the_newest_redo_and_the_final_coverage() {
     assert_eq!(compacted.len(), 4);
     assert_eq!(compacted[2], versions);
     assert_eq!(compacted[3], coverage);
+    match &compacted[0] {
+        DeltaOperation::Redo(record) => {
+            assert_eq!(record.delta_seq, 2, "the untouched hash keeps its set");
+            let RedoOp::Set { full_hash, .. } = record.op else {
+                panic!("expected a set");
+            };
+            assert_eq!(full_hash, [2; 16]);
+        }
+        other => panic!("expected redo, got {other:?}"),
+    }
     match &compacted[1] {
         DeltaOperation::Redo(record) => {
             assert_eq!(

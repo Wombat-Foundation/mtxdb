@@ -2405,15 +2405,26 @@ pub(crate) fn write_room_with_resolved_findings(
         // facts kept from the source. An exported outlier keeps a record with
         // the annotation cleared, so a rebuild can see it was checked without
         // migrating the source's outlier claim.
+        let verdict_collection = event_verdict_collection_id(&record);
         if !verdict.is_empty()
             || (event.metadata.outlier && exported_rejection(&event.metadata) != Some(true))
         {
             tx.put(
                 EVENT_POOL,
-                event_verdict_collection_id(&record),
+                verdict_collection,
                 record,
                 &node(encode_verdict(event_id, &verdict)?),
             )?;
+        } else if tx
+            .get(EVENT_POOL, &verdict_collection, &[record])?
+            .into_iter()
+            .next()
+            .flatten()
+            .is_some()
+        {
+            // A re-import that now derives no verdict must not leave the
+            // previous run's verdict for flag rebuilds to read.
+            tx.remove(EVENT_POOL, verdict_collection, record)?;
         }
 
         let rejected = findings.forced.get(position).copied().flatten().is_some();
