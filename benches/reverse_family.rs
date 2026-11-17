@@ -16,6 +16,8 @@
 //! live tail, default 4), `MTXDB_REV_LOOKUPS` (default 1000), `MTXDB_BENCH_ROOT`.
 //! Each event gets a prev edge to its predecessor and, for every fourth event,
 //! a second edge to an earlier event, so some parents have several children.
+//! A second family has an empty row for every owner, to isolate the cost of
+//! reading a family whose rows carry no edges.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -79,6 +81,7 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
     let scope = ScopeId([7; 16]);
     let writer = store.writer(&db).expect("writer");
     assert!(u32::try_from(events).is_ok(), "event ids must fit u32");
+    let empty_family = EdgeFamily::plain(1);
     let segment_count = segments.checked_add(1).expect("segment count overflow");
     let per_segment = events
         .checked_div(segment_count.max(1))
@@ -87,13 +90,19 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
     let mut sealed = 0usize;
     while next < events {
         let end = next.saturating_add(BATCH).min(events);
-        let batch: Vec<RowRecord> = (next..end)
-            .map(|owner| RowRecord {
+        let mut batch = Vec::with_capacity(end.saturating_sub(next).saturating_mul(2));
+        for owner in next..end {
+            batch.push(RowRecord {
                 family,
                 owner: u(owner),
                 edges: edges_of(owner),
-            })
-            .collect();
+            });
+            batch.push(RowRecord {
+                family: empty_family,
+                owner: u(owner),
+                edges: Vec::new(),
+            });
+        }
         writer.append_rows(scope, &batch).expect("append");
         next = end;
         let next_boundary = sealed
@@ -105,7 +114,16 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
         }
     }
 
-    // First read, then a repeat: shows whether anything is cached.
+    // An empty family still has a scope directory in each segment. This
+    // isolates directory lookup/checksum work from selected-family row reads.
+    let (empty_rows, empty_first) =
+        timed(|| store.read_family(scope, empty_family).expect("empty read_family"));
+    assert_eq!(empty_rows.len(), events, "empty family row count");
+    assert!(empty_rows.iter().all(|(_, edges)| edges.is_empty()));
+    let (_, empty_repeat) =
+        timed(|| store.read_family(scope, empty_family).expect("empty read_family"));
+
+    // First populated-family read, then a repeat.
     let (rows, first_read) = timed(|| store.read_family(scope, family).expect("read_family"));
     let (_, second_read) = timed(|| store.read_family(scope, family).expect("read_family"));
     let edge_count: usize = rows.iter().map(|(_, e)| e.len()).sum();
@@ -135,7 +153,7 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
         .unwrap_or(Duration::ZERO);
     let full = first_read.saturating_add(build);
     println!(
-        "events {events:>8} edges {edge_count:>8} sealed {sealed}+tail | read_family first {first_read:>10.2?} repeat {second_read:>10.2?} | build {build:>10.2?} | full derive {full:>10.2?}"
+        "events {events:>8} edges {edge_count:>8} sealed {sealed}+tail | empty-edge family first {empty_first:>10.2?} repeat {empty_repeat:>10.2?} | populated read first {first_read:>10.2?} repeat {second_read:>10.2?} | build {build:>10.2?} | full derive {full:>10.2?}"
     );
     println!(
         "{:>60} {lookups} lookups: {per_lookup:?}/lookup ({hits} children); derive amortised over K={lookups}: {:?}/lookup; over K=10: {:?}/lookup",
