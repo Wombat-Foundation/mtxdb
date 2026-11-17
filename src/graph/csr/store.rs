@@ -967,11 +967,6 @@ fn le_u32(data: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
-fn le_u16(data: &[u8], at: usize) -> Option<u16> {
-    let bytes: [u8; 2] = data.get(at..at.checked_add(2)?)?.try_into().ok()?;
-    Some(u16::from_le_bytes(bytes))
-}
-
 fn decode_frames(data: &[u8]) -> (Vec<Frame>, usize) {
     let mut frames = Vec::new();
     let mut at = 0usize;
