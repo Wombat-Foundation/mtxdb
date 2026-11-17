@@ -2,11 +2,15 @@
 //!
 //! Splits `ensure_reverse` (the whole-room `PREV` + `AUTH` transpose a late
 //! arrival forces) into its phases, then times `dirty_closure` on the cached
-//! maps. Test-only and ignored; it changes no production code.
+//! maps. Runs two fixtures: a `PREV` chain and an AUTH-only star with no
+//! `prev_events`, because the two give different dirty-closure shapes.
+//!
+//! Test-only and ignored; it changes no production code.
 //!
 //! Run: `cargo +1.90.0 test --release -p mtxdb-cli direct_reverse_timing -- --ignored --nocapture`
 
 use super::*;
+use rezzy::json::Value as OwnedValue;
 use std::time::{Duration, Instant};
 
 const ROOM: &str = "!direct-timing:example.org";
@@ -15,32 +19,48 @@ const BATCH: usize = 256;
 
 #[allow(clippy::arithmetic_side_effects)]
 fn count_segments(dir: &std::path::Path) -> usize {
-    let mut n = 0;
+    let mut count = 0_usize;
     let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().is_some_and(|e| e == "csr") {
-                n += 1;
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "csr") {
+                count = count.saturating_add(1);
             }
         }
     }
-    n
+    count
 }
 
-/// `reverse_edges_by_event_id`, replicated phase by phase.
+fn render_ids(ids: &[&str]) -> String {
+    ids.iter()
+        .map(|event_id| format!("\"{event_id}\""))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn event_value(id: &str, prev: &[&str], auth: &[&str]) -> OwnedValue {
+    let json = format!(
+        r#"{{"event_id":"{id}","room_id":"{ROOM}","prev_events":[{}],"auth_events":[{}]}}"#,
+        render_ids(prev),
+        render_ids(auth)
+    );
+    OwnedValue::parse_bytes(json.as_bytes()).expect("benchmark event is valid JSON")
+}
+
+/// Replicate `reverse_edges_by_event_id` with a timer around each phase.
 fn phases(
     db: &Database,
     adjacency: &CsrAdjacency,
     family: mtxdb::csr::EdgeFamily,
-) -> (Duration, Duration, Duration, usize) {
-    let t = Instant::now();
+) -> (Duration, Duration, Duration, Duration, usize) {
+    let started = Instant::now();
     let reverse = adjacency.reverse_family(db, family).unwrap();
-    let derive = t.elapsed();
+    let derive = started.elapsed();
 
-    let t = Instant::now();
+    let started = Instant::now();
     let parents = reverse.parents().to_vec();
     let mut short_ids = parents.clone();
     for parent in &parents {
@@ -50,10 +70,13 @@ fn phases(
     }
     short_ids.sort_unstable();
     short_ids.dedup();
-    let resolved = adjacency.resolve_event_ids(db, &short_ids).unwrap();
-    let resolve = t.elapsed();
+    let collect_ids = started.elapsed();
 
-    let t = Instant::now();
+    let started = Instant::now();
+    let resolved = adjacency.resolve_event_ids(db, &short_ids).unwrap();
+    let resolve_ids = started.elapsed();
+
+    let started = Instant::now();
     let names: HashMap<u32, String> = short_ids
         .iter()
         .copied()
@@ -75,128 +98,112 @@ fn phases(
         children.dedup();
         edges.insert(parent_name.clone(), children);
     }
-    let build = t.elapsed();
-    (derive, resolve, build, edges.len())
+    let build_maps = started.elapsed();
+    (derive, collect_ids, resolve_ids, build_maps, edges.len())
 }
 
 #[test]
 #[ignore = "timing measurement, not a correctness test"]
 #[allow(clippy::too_many_lines, clippy::arithmetic_side_effects)]
 fn direct_reverse_timing() {
-    for events in [10_000_usize, 100_000] {
-        let root = std::env::temp_dir().join(format!(
-            "mtxdb-direct-reverse-timing-{}-{events}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let db = Database::open(root.clone()).unwrap();
-        let adj = CsrAdjacency::new(ROOM);
-        let name = |n: usize| format!("${:016x}", (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        // 0 = create, 1 = power levels, 2..2+MEMBERS = members, then messages in
-        // a prev chain; every message cites create, power levels and one member.
-        let first = 2 + MEMBERS;
-        let total = first + events;
-        let names: Vec<String> = (0..total).map(name).collect();
-        let mut written = 0;
-        while written < total {
-            let end = (written + BATCH).min(total);
-            let prevs: Vec<Vec<&str>> = (written..end)
-                .map(|n| {
-                    if n == 0 {
-                        vec![]
-                    } else {
-                        vec![names[n - 1].as_str()]
-                    }
-                })
-                .collect();
-            let auths: Vec<Vec<&str>> = (written..end)
-                .map(|n| {
-                    if n == 0 {
-                        vec![]
-                    } else if n < first {
-                        vec![names[0].as_str()]
-                    } else {
-                        vec![
-                            names[0].as_str(),
-                            names[1].as_str(),
-                            names[2 + n % MEMBERS].as_str(),
-                        ]
-                    }
-                })
-                .collect();
-            let records: Vec<EventRecord<'_>> = (written..end)
-                .map(|n| EventRecord {
-                    event_id: names[n].as_str(),
-                    prev: &prevs[n - written],
-                    auth: &auths[n - written],
-                    relation: None,
-                })
-                .collect();
-            adj.record_events(&db, &records).unwrap();
-            written = end;
-        }
-        println!(
-            "direct import transpose, {events} events, {} sealed segments:",
-            count_segments(&root)
-        );
+    for (fixture, prev_chain) in [("prev chain", true), ("no prev", false)] {
+        for messages in [10_000_usize, 100_000] {
+            let root = std::env::temp_dir().join(format!(
+                "mtxdb-direct-reverse-timing-{}-{}-{messages}",
+                std::process::id(),
+                if prev_chain { "chain" } else { "star" }
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let db = Database::open(root.clone()).unwrap();
+            let adjacency = CsrAdjacency::new(ROOM);
+            let template = default_matrix_import_template();
+            let name = |number: usize| format!("${:016x}", number as u64);
 
-        for (label, family) in [("PREV", PREV), ("AUTH", AUTH)] {
-            let (derive, resolve, build, parents) = phases(&db, &adj, family);
-            println!(
-                "  {label}: derive {derive:?} | resolve ids {resolve:?} | build maps {build:?} | {parents} parents"
-            );
-        }
-
-        let collection_id = [7_u8; 16];
-        let mut cache = ImportRunCache::default();
-        let t = Instant::now();
-        let reverse = cache.ensure_reverse(&db, &collection_id, ROOM).unwrap();
-        let cold = t.elapsed();
-        let (prev_parents, auth_parents) = (reverse.prev.len(), reverse.auth.len());
-        let t = Instant::now();
-        let _ = cache.ensure_reverse(&db, &collection_id, ROOM).unwrap();
-        let warm = t.elapsed();
-        println!(
-            "  ensure_reverse cold {cold:?} ({prev_parents} prev / {auth_parents} auth parents) | cached {warm:?}"
-        );
-
-        let hit = |ids: &[&str], prev: bool| {
-            let set: HashSet<String> = ids.iter().map(|s| (*s).to_owned()).collect();
-            if prev {
-                WaitingHits {
-                    prev: set,
-                    auth: HashSet::new(),
-                }
-            } else {
-                WaitingHits {
-                    prev: HashSet::new(),
-                    auth: set,
-                }
+            // Match auth_star_timing: create, power levels, 100 members, then
+            // messages citing create, power levels and one member. `prev` is a
+            // chain for the first fixture and empty for the second.
+            let first_message = 2 + MEMBERS;
+            let total = first_message + messages;
+            let names: Vec<String> = (0..total).map(name).collect();
+            let mut written = 0_usize;
+            while written < total {
+                let end = (written + BATCH).min(total);
+                let events: Vec<OwnedValue> = (written..end)
+                    .map(|number| {
+                        let auth: Vec<&str> = if number == 0 {
+                            Vec::new()
+                        } else if number < first_message {
+                            vec![names[0].as_str()]
+                        } else {
+                            vec![
+                                names[0].as_str(),
+                                names[1].as_str(),
+                                names[2 + number % MEMBERS].as_str(),
+                            ]
+                        };
+                        let prev: Vec<&str> = if prev_chain && number > 0 {
+                            vec![names[number - 1].as_str()]
+                        } else {
+                            Vec::new()
+                        };
+                        event_value(&names[number], &prev, &auth)
+                    })
+                    .collect();
+                record_csr_adjacency(&db, &template, &events).unwrap();
+                written = end;
             }
-        };
-        let cases = [
-            (
-                "prev hit 10 from the tip",
-                hit(&[names[total - 11].as_str()], true),
-            ),
-            (
-                "auth hit on a member event",
-                hit(&[names[2].as_str()], false),
-            ),
-            ("auth hit on create", hit(&[names[0].as_str()], false)),
-        ];
-        for (label, hits) in &cases {
-            let t = Instant::now();
-            let dirty = cache
-                .dirty_closure(&db, &collection_id, ROOM, hits)
-                .unwrap();
-            let elapsed = t.elapsed();
-            let over_half = dirty.len().saturating_mul(2) > total;
+
             println!(
-                "  dirty_closure ({label}): {} events in {elapsed:?}, exceeds half the room: {over_half}",
-                dirty.len()
+                "direct import reverse, {fixture}, {messages} messages / {total} total events, {} sealed segments (one run):",
+                count_segments(&root)
             );
+            let collection_id = [7_u8; 16];
+            let mut cache = ImportRunCache::default();
+            let started = Instant::now();
+            let reverse = cache.ensure_reverse(&db, &collection_id, ROOM).unwrap();
+            let cache_miss = started.elapsed();
+            let (prev_parents, auth_parents) = (reverse.prev.len(), reverse.auth.len());
+            let started = Instant::now();
+            cache.ensure_reverse(&db, &collection_id, ROOM).unwrap();
+            let warm = started.elapsed();
+            println!(
+                "  ensure_reverse: cache miss {cache_miss:?} ({prev_parents} PREV / {auth_parents} AUTH parents), cached {warm:?}"
+            );
+
+            for (label, family) in [("PREV", PREV), ("AUTH", AUTH)] {
+                let (derive, collect, resolve, build, parent_count) =
+                    phases(&db, &adjacency, family);
+                println!(
+                    "  {label}: derive {derive:?} | collect ids {collect:?} | resolve ids {resolve:?} | build string maps {build:?} | {parent_count} parents"
+                );
+            }
+
+            let hits = |prev: &[&str], auth: &[&str]| WaitingHits {
+                prev: prev.iter().map(|id| (*id).to_owned()).collect(),
+                auth: auth.iter().map(|id| (*id).to_owned()).collect(),
+            };
+            let cases = [
+                (
+                    "prev hit 10 from the tip",
+                    hits(&[names[total - 11].as_str()], &[]),
+                ),
+                ("auth hit on a member", hits(&[], &[names[2].as_str()])),
+                ("auth hit on create", hits(&[], &[names[0].as_str()])),
+            ];
+            for (label, hits) in &cases {
+                let started = Instant::now();
+                let dirty = cache
+                    .dirty_closure(&db, &collection_id, ROOM, hits)
+                    .unwrap();
+                let elapsed = started.elapsed();
+                let over_half = dirty.len().saturating_mul(2) > total;
+                println!(
+                    "  cached dirty_closure ({label}): {} events in {elapsed:?}; exceeds half-room fallback: {over_half}",
+                    dirty.len()
+                );
+            }
+            drop(db);
+            let _ = std::fs::remove_dir_all(root);
         }
-        let _ = std::fs::remove_dir_all(root);
     }
 }
