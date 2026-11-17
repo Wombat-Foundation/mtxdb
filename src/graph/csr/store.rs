@@ -63,6 +63,13 @@ const SEGMENT_VERSION: u8 = 1;
 const MAX_READ_ATTEMPTS: usize = 16;
 const SEGMENT_PREFIX: &str = "seg-";
 const SEGMENT_SUFFIX: &str = ".csr";
+/// Upper bound on one buffered read of a family's contiguous row span. A row
+/// larger than this is still read whole, so the buffer is at most one row over.
+#[cfg(not(test))]
+const FAMILY_READ_CHUNK: usize = 4 * 1024 * 1024;
+/// Tests use a tiny cap so a handful of rows exercises several chunks.
+#[cfg(test)]
+const FAMILY_READ_CHUNK: usize = 512;
 const TAIL_FILE: &str = "tail.log";
 
 /// Seal once the tail reaches this many bytes.
@@ -1456,42 +1463,49 @@ fn read_family_directory(
         return Ok(());
     }
 
-    let end_offset = expected_offset;
-    if end_offset > data_len {
+    if expected_offset > data_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "csr row out of range",
         ));
     }
-    let span_len = end_offset
-        .checked_sub(first_offset)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
-    let mut batch = vec![0_u8; span_len];
-    let absolute_start = data_start
-        .checked_add(first_offset)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
-    file.seek(SeekFrom::Start(absolute_start as u64))?;
-    file.read_exact(&mut batch)?;
-
-    for item in selected {
-        let (offset, len, crc) = fields(item)?;
-        let relative_start = offset
-            .checked_sub(first_offset)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
-        let relative_end = relative_start
-            .checked_add(len)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
-        let row = batch
-            .get(relative_start..relative_end)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
-        if crc32fast::hash(row) != crc {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "csr row checksum mismatch",
-            ));
+    // The rows are contiguous, so read them in bounded chunks on row
+    // boundaries (a row larger than the chunk is read alone) rather than one
+    // allocation for the whole family. Every row is still checksummed.
+    let out_of_range = || io::Error::new(io::ErrorKind::InvalidData, "csr row out of range");
+    let mut next = 0;
+    while next < selected.len() {
+        let (chunk_start, first_len, _) = fields(&selected[next])?;
+        let mut chunk_end = next.saturating_add(1);
+        let mut span = first_len;
+        while chunk_end < selected.len() && span < FAMILY_READ_CHUNK {
+            let (_, len, _) = fields(&selected[chunk_end])?;
+            span = span.checked_add(len).ok_or_else(out_of_range)?;
+            chunk_end = chunk_end.saturating_add(1);
         }
-        apply_payload(row, rows)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed csr row"))?;
+        let mut batch = vec![0_u8; span];
+        let absolute_start = data_start
+            .checked_add(chunk_start)
+            .ok_or_else(out_of_range)?;
+        file.seek(SeekFrom::Start(absolute_start as u64))?;
+        file.read_exact(&mut batch)?;
+        for item in &selected[next..chunk_end] {
+            let (offset, len, crc) = fields(item)?;
+            let relative_start = offset.checked_sub(chunk_start).ok_or_else(out_of_range)?;
+            let relative_end = relative_start.checked_add(len).ok_or_else(out_of_range)?;
+            let row = batch
+                .get(relative_start..relative_end)
+                .ok_or_else(out_of_range)?;
+            if crc32fast::hash(row) != crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "csr row checksum mismatch",
+                ));
+            }
+            apply_payload(row, rows)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed csr row"))?;
+        }
+        next = chunk_end;
     }
     Ok(())
 }
@@ -1775,6 +1789,148 @@ mod tests {
         }
         reopened.seal().unwrap();
         assert_eq!(resolved(&reopened), before);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    /// Rows for three families in one scope: a typed family with edges, a plain
+    /// family with edges for some owners, and a plain family of empty rows.
+    fn mixed_family_rows() -> Vec<RowRecord> {
+        let mut rows = Vec::new();
+        for owner in 1..=200_u32 {
+            rows.push(RowRecord {
+                family: EdgeFamily::typed(3),
+                owner,
+                edges: vec![
+                    Edge {
+                        target: owner.saturating_add(1),
+                        kind: 1,
+                    },
+                    Edge {
+                        target: owner.saturating_add(2),
+                        kind: 2,
+                    },
+                ],
+            });
+            if owner % 2 == 0 {
+                rows.push(RowRecord {
+                    family: EdgeFamily::plain(1),
+                    owner,
+                    edges: vec![Edge {
+                        target: owner / 2,
+                        kind: 0,
+                    }],
+                });
+            }
+            rows.push(RowRecord {
+                family: EdgeFamily::plain(2),
+                owner,
+                edges: Vec::new(),
+            });
+        }
+        rows
+    }
+
+    fn sorted_family(
+        store: &CsrStore,
+        scope: ScopeId,
+        family: EdgeFamily,
+    ) -> Vec<(u32, Vec<(u32, u16)>)> {
+        let mut rows: Vec<(u32, Vec<(u32, u16)>)> = store
+            .read_family(scope, family)
+            .unwrap()
+            .into_iter()
+            .map(|(owner, edges)| {
+                (
+                    owner,
+                    edges.into_iter().map(|e| (e.target, e.kind)).collect(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn family_read_matches_point_reads_across_families() {
+        let layout = layout("family-batched");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([9; 16]);
+        let rows = mixed_family_rows();
+        for chunk in rows.chunks(37) {
+            store.append_rows(scope, chunk).unwrap();
+        }
+        // Once from the tail, then again from a sealed segment.
+        for sealed in [false, true] {
+            if sealed {
+                store.seal().unwrap();
+            }
+            for family in [
+                EdgeFamily::typed(3),
+                EdgeFamily::plain(1),
+                EdgeFamily::plain(2),
+            ] {
+                let expected: Vec<(u32, Vec<(u32, u16)>)> = {
+                    let mut e: Vec<_> = rows
+                        .iter()
+                        .filter(|r| r.family.id == family.id)
+                        .map(|r| {
+                            (
+                                r.owner,
+                                r.edges.iter().map(|e| (e.target, e.kind)).collect(),
+                            )
+                        })
+                        .collect();
+                    e.sort();
+                    e
+                };
+                let got = sorted_family(&store, scope, family);
+                assert_eq!(got, expected, "family {} sealed={sealed}", family.id);
+                // A point read of every owner agrees with the family read.
+                let keys: Vec<(EdgeFamily, u32)> =
+                    expected.iter().map(|(owner, _)| (family, *owner)).collect();
+                let points = store.read_rows(scope, &keys).unwrap();
+                for ((owner, edges), point) in expected.iter().zip(points) {
+                    let point: Vec<(u32, u16)> = point
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|e| (e.target, e.kind))
+                        .collect();
+                    assert_eq!(&point, edges, "owner {owner} family {}", family.id);
+                }
+            }
+            // A family with no rows reads as empty, not as an error.
+            assert_eq!(
+                store.read_family(scope, EdgeFamily::plain(9)).unwrap(),
+                Vec::new()
+            );
+        }
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn family_read_rejects_a_corrupted_sealed_row() {
+        let layout = layout("family-batched-corrupt");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([10; 16]);
+        let rows: Vec<RowRecord> = mixed_family_rows()
+            .into_iter()
+            .filter(|r| r.family.id == EdgeFamily::typed(3).id)
+            .collect();
+        store.append_rows(scope, &rows).unwrap();
+        store.seal().unwrap();
+        assert_eq!(
+            sorted_family(&store, scope, EdgeFamily::typed(3)).len(),
+            200
+        );
+        let segment = store.segments().unwrap().pop().unwrap().1;
+        let mut bytes = fs::read(&segment).unwrap();
+        let at = bytes.len() * 2 / 3;
+        bytes[at] ^= 0xFF;
+        fs::write(&segment, &bytes).unwrap();
+        let error = store
+            .read_family(scope, EdgeFamily::typed(3))
+            .expect_err("a flipped byte in a sealed row must not read back");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
         let _ = fs::remove_dir_all(layout.root());
     }
 
