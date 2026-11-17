@@ -10913,9 +10913,18 @@ impl ImportRunCache {
             .get(collection_id)
             .is_none_or(|entry| entry.room_id != room_id);
         if stale {
+            let started = Instant::now();
             let adjacency = CsrAdjacency::new(room_id);
             let prev = reverse_edges_by_event_id(db, &adjacency, PREV)?;
             let auth = reverse_edges_by_event_id(db, &adjacency, AUTH)?;
+            if direct_debug_enabled() {
+                eprintln!(
+                    "direct: reverse transpose (cold) in {:?} ({} PREV / {} AUTH parents)",
+                    started.elapsed(),
+                    prev.len(),
+                    auth.len()
+                );
+            }
             self.reverse.insert(
                 *collection_id,
                 RoomReverse {
@@ -11946,6 +11955,14 @@ fn direct_import_enabled() -> bool {
     std::env::var_os("MTXDB_DIRECT_IMPORT").is_some()
 }
 
+/// Opt-in stderr diagnostics for the direct path, enabled with
+/// `MTXDB_DIRECT_DEBUG`. Off by default so a normal import stays quiet; pair it
+/// with `MTXDB_DIRECT_IMPORT` when collecting the dirty-closure shape of a real
+/// run.
+fn direct_debug_enabled() -> bool {
+    std::env::var_os("MTXDB_DIRECT_DEBUG").is_some()
+}
+
 /// Import PDU events through the normal event-DAG path.
 #[allow(
     clippy::too_many_arguments,
@@ -12209,6 +12226,7 @@ fn import_pdu_events_with_raw_state_hamts(
     // this file can change. Computing it before the writes keeps the closure
     // to the edges that existed before this file arrived.
     let mut dirty_closure_bailed = false;
+    let mut bail_reason = "";
     let closure_started = Instant::now();
     let dirty_ids = if direct
         && direct_identity
@@ -12223,12 +12241,7 @@ fn import_pdu_events_with_raw_state_hamts(
                 // Re-judging most of the room costs more than the whole-room
                 // path it would replace. Bail before loading bodies or
                 // walking; the transpose has already been paid once.
-                if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
-                    eprintln!(
-                        "direct: fallback, |D|={} exceeds half of {stored_events_hint} stored event(s)",
-                        ids.len()
-                    );
-                }
+                bail_reason = "over_half";
                 dirty_closure_bailed = true;
                 HashSet::new()
             }
@@ -12237,6 +12250,7 @@ fn import_pdu_events_with_raw_state_hamts(
                 eprintln!(
                     "  warning: raw import reverse-edge lookup failed; using the whole-room path: {error:#}"
                 );
+                bail_reason = "error";
                 dirty_closure_bailed = true;
                 HashSet::new()
             }
@@ -12244,11 +12258,28 @@ fn import_pdu_events_with_raw_state_hamts(
     } else {
         HashSet::new()
     };
-    if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
+    // Opt-in shape data for deciding whether a short-id reverse that resolves
+    // only the dirty set would pay: the closure size against the room and
+    // whether the direct path bailed back to the whole-room one.
+    if direct_debug_enabled() && (!waiting_hits.prev.is_empty() || !waiting_hits.auth.is_empty()) {
+        // The stored-event count is a hint built with the waiting set; it can
+        // be zero when the rebuild found no timeline bodies to count.
+        let room_share = match dirty_ids
+            .len()
+            .saturating_mul(100)
+            .checked_div(stored_events_hint)
+        {
+            Some(percent) => format!("{percent}%"),
+            None => "unknown".to_owned(),
+        };
         eprintln!(
-            "direct: closure took {:?} for {} id(s)",
-            closure_started.elapsed(),
-            dirty_ids.len()
+            "direct: late arrival room={} room_events={stored_events_hint} hits={}p/{}a dirty={} (room_share={room_share}) bail={} closure={:?}",
+            resolved.canonical_id,
+            waiting_hits.prev.len(),
+            waiting_hits.auth.len(),
+            dirty_ids.len(),
+            if bail_reason.is_empty() { "no" } else { bail_reason },
+            closure_started.elapsed()
         );
     }
     record_csr_adjacency_with_raw(db, template, events, raw_adjacency)?;
@@ -12308,7 +12339,7 @@ fn import_pdu_events_with_raw_state_hamts(
             )?;
             let written_at = Instant::now();
             cache.observe_adjacency(&collection_id, &resolved.canonical_id, events.iter());
-            if std::env::var_os("MTXDB_DIRECT_DEBUG").is_some() {
+            if direct_debug_enabled() {
                 eprintln!(
                     "direct: observe waiting {:?}, adjacency {:?}",
                     written_at.duration_since(observe_started),
