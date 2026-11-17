@@ -1413,10 +1413,18 @@ fn read_family_directory(
     family_id: u16,
     rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
 ) -> io::Result<()> {
-    for item in entries.as_chunks::<DIR_ENTRY>().0 {
-        if le_u16(item, 0) != Some(family_id) {
-            continue;
-        }
+    let directory = entries.as_chunks::<DIR_ENTRY>().0;
+    // Entries are encoded in `(family, owner)` order. Find this family's
+    // contiguous range so an empty family doesn't scan unrelated rows.
+    let start =
+        directory.partition_point(|item| u16::from_le_bytes([item[0], item[1]]) < family_id);
+    let end = directory.partition_point(|item| u16::from_le_bytes([item[0], item[1]]) <= family_id);
+    let selected = &directory[start..end];
+    let Some(first) = selected.first() else {
+        return Ok(());
+    };
+
+    let fields = |item: &[u8; DIR_ENTRY]| -> io::Result<(usize, usize, u32)> {
         let (Some(offset), Some(len), Some(crc)) =
             (le_u32(item, 6), le_u32(item, 10), le_u32(item, 14))
         else {
@@ -1425,15 +1433,70 @@ fn read_family_directory(
                 "csr family directory entry is truncated",
             ));
         };
-        read_row_at(
-            file,
-            data_start,
-            data_len,
-            offset as usize,
-            len as usize,
-            crc,
-            rows,
-        )?;
+        Ok((offset as usize, len as usize, crc))
+    };
+
+    let (first_offset, first_len, _) = fields(first)?;
+    let mut expected_offset = first_offset
+        .checked_add(first_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
+    let mut contiguous = true;
+    for item in selected.iter().skip(1) {
+        let (offset, len, _) = fields(item)?;
+        if offset != expected_offset {
+            contiguous = false;
+        }
+        expected_offset = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
+    }
+
+    if !contiguous {
+        // Preserve the general reader's behavior for any valid future layout
+        // whose selected rows are not stored contiguously.
+        for item in selected {
+            let (offset, len, crc) = fields(item)?;
+            read_row_at(file, data_start, data_len, offset, len, crc, rows)?;
+        }
+        return Ok(());
+    }
+
+    let end_offset = expected_offset;
+    if end_offset > data_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "csr row out of range",
+        ));
+    }
+    let span_len = end_offset
+        .checked_sub(first_offset)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
+    let mut batch = vec![0_u8; span_len];
+    let absolute_start = data_start
+        .checked_add(first_offset)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
+    file.seek(SeekFrom::Start(absolute_start as u64))?;
+    file.read_exact(&mut batch)?;
+
+    for item in selected {
+        let (offset, len, crc) = fields(item)?;
+        let relative_start = offset
+            .checked_sub(first_offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
+        let relative_end = relative_start
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
+        let row = batch
+            .get(relative_start..relative_end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "csr row out of range"))?;
+        if crc32fast::hash(row) != crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "csr row checksum mismatch",
+            ));
+        }
+        apply_payload(row, rows)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed csr row"))?;
     }
     Ok(())
 }
