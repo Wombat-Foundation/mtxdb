@@ -684,3 +684,57 @@ fn legacy_scope_timing() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+/// Times the `AUTH` reverse view and a rejection cascade over it.
+///
+/// Run: `cargo test --release --lib auth_cascade_timing -- --ignored --nocapture`
+#[test]
+#[ignore = "timing measurement, not a correctness test"]
+fn auth_cascade_timing() {
+    for events in [10_000_usize, 100_000] {
+        let root = test_root("auth-cascade-timing");
+        let db = Database::open(root.clone()).unwrap();
+        let adj = adjacency();
+        let names: Vec<String> = (0..=events)
+            .map(|n| format!("${:016x}", (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+            .collect();
+        // Event n cites the create event (0) and event n-1: a worst-case chain.
+        let auths: Vec<[&str; 2]> = (1..=events)
+            .map(|n| [names[0].as_str(), names[n - 1].as_str()])
+            .collect();
+        let records: Vec<EventRecord<'_>> = (1..=events)
+            .map(|n| EventRecord {
+                event_id: names[n].as_str(),
+                prev: &[],
+                auth: &auths[n - 1],
+                relation: None,
+            })
+            .collect();
+        for chunk in records.chunks(256) {
+            adj.record_events(&db, chunk).unwrap();
+        }
+        let t = std::time::Instant::now();
+        let reverse = adj.reverse_family(&db, AUTH).unwrap();
+        let derive = t.elapsed();
+        let cascade = |start: usize| {
+            let t = std::time::Instant::now();
+            let first = adj.short_id(&db, &names[start]).unwrap().unwrap();
+            let mut seen = std::collections::HashSet::from([first]);
+            let mut stack = vec![first];
+            while let Some(parent) = stack.pop() {
+                for edge in reverse.children_of(parent).unwrap_or(&[]) {
+                    if seen.insert(edge.target) {
+                        stack.push(edge.target);
+                    }
+                }
+            }
+            (seen.len() - 1, t.elapsed())
+        };
+        let (deep, deep_time) = cascade(events / 10);
+        let (leaf, leaf_time) = cascade(events - 1);
+        println!(
+            "auth {events:>7} events: derive {derive:?} | cascade from 10%: {deep} events in {deep_time:?} | cascade from tip: {leaf} events in {leaf_time:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
