@@ -12240,6 +12240,7 @@ fn import_pdu_events_with_raw_state_hamts(
     // to the edges that existed before this file arrived.
     let mut dirty_closure_bailed = false;
     let mut bail_reason = "";
+    let mut dirty_count = 0_usize;
     let closure_started = Instant::now();
     let dirty_ids = if direct
         && direct_identity
@@ -12248,15 +12249,19 @@ fn import_pdu_events_with_raw_state_hamts(
     {
         let cache = &mut *room_cache;
         match cache.dirty_closure(db, &collection_id, &resolved.canonical_id, &waiting_hits) {
-            Ok(ids) if dirty_closure_exceeds_half(ids.len(), stored_events_hint) => {
-                // Re-judging most of the room costs more than the whole-room
-                // path it would replace. Bail before loading bodies or
-                // walking; the transpose has already been paid once.
-                bail_reason = "over_half";
-                dirty_closure_bailed = true;
-                HashSet::new()
+            Ok(ids) => {
+                dirty_count = ids.len();
+                if dirty_closure_exceeds_half(dirty_count, stored_events_hint) {
+                    // Re-judging most of the room costs more than the whole-room
+                    // path it would replace. Bail before loading bodies or
+                    // walking; the transpose has already been paid once.
+                    bail_reason = "over_half";
+                    dirty_closure_bailed = true;
+                    HashSet::new()
+                } else {
+                    ids
+                }
             }
-            Ok(ids) => ids,
             Err(error) => {
                 eprintln!(
                     "  warning: raw import reverse-edge lookup failed; using the whole-room path: {error:#}"
@@ -12275,8 +12280,7 @@ fn import_pdu_events_with_raw_state_hamts(
     if direct_debug_enabled() && (!waiting_hits.prev.is_empty() || !waiting_hits.auth.is_empty()) {
         // The stored-event count is a hint built with the waiting set; it can
         // be zero when the rebuild found no timeline bodies to count.
-        let room_share = match dirty_ids
-            .len()
+        let room_share = match dirty_count
             .saturating_mul(100)
             .checked_div(stored_events_hint)
         {
@@ -12284,11 +12288,10 @@ fn import_pdu_events_with_raw_state_hamts(
             None => "unknown".to_owned(),
         };
         eprintln!(
-            "direct: late arrival room={} room_events={stored_events_hint} hits={}p/{}a dirty={} (room_share={room_share}) bail={} closure={:?}",
+            "direct: late arrival room={} room_events={stored_events_hint} hits={}p/{}a dirty={dirty_count} (room_share={room_share}) bail={} closure={:?}",
             resolved.canonical_id,
             waiting_hits.prev.len(),
             waiting_hits.auth.len(),
-            dirty_ids.len(),
             if bail_reason.is_empty() { "no" } else { bail_reason },
             closure_started.elapsed()
         );
