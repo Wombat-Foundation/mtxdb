@@ -16667,6 +16667,10 @@ fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {
 #[path = "test_cmd.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "test_direct_reverse_timing.rs"]
+mod direct_reverse_timing;
+
 /// Test-only experiment: fill-only seeding of a missing-prev gap root's base
 /// state from the `(type, state_key)` keys its cited `auth_events` name. It
 /// fills only keys the inherited base lacks, skips conflicting, unresolvable,
