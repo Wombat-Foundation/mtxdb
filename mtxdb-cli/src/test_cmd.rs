@@ -3997,8 +3997,13 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
         .filter(|(_, direct, _, _)| *direct)
         .map(|(_, _, files, _)| files)
         .sum();
+    // One late file in the small fixture now exceeds half the room's stored
+    // events (4 of 6, 6 of 8) and correctly takes the whole-room path instead
+    // of the direct one, so the count is 7 rather than the 8 it was while the
+    // room-size hint stayed at 0. The convergence check above still covers
+    // every plan, bailing or not.
     assert!(
-        direct_files >= 8,
+        direct_files >= 7,
         "the multi-file plans should exercise the direct path, got {direct_files} direct files"
     );
     for (plan_index, direct, files, _) in &snapshots {
