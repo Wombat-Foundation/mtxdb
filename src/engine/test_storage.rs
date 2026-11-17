@@ -623,7 +623,7 @@ fn established_collection_lifecycle_and_validation() {
 
     // 13. Unknown member namespace rejected on establishment
     let meta_unknown = CollectionMetadata {
-        member_namespace: Some(*b"EDGE"),
+        member_namespace: Some(*b"SINF"),
         ..valid_meta.clone()
     };
     let err_unknown = sim_store
@@ -814,6 +814,84 @@ fn create_or_upsert_established_validated_contract() {
         )
         .unwrap_err();
     assert!(matches!(err, StorageError::Internal(_)));
+}
+
+#[test]
+fn validated_upsert_rejects_malformed_metadata_and_a_differing_genesis() {
+    use crate::template::{
+        derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
+        MEMBER_NAMESPACE_INTL,
+    };
+
+    let canonical_id = b"sys:validated-mismatch";
+    let col_id = derive_collection_id(Some(MEMBER_NAMESPACE_INTL), canonical_id);
+    let metadata = CollectionMetadata {
+        member_namespace: Some(MEMBER_NAMESPACE_INTL),
+        collection_canonical_id: canonical_id.to_vec(),
+        record_id_rule: RecordIdentityRule {
+            policy: FrameIdPolicy::Key,
+            digest_algorithm: DigestAlgorithm::Blake3,
+        },
+        payload: PayloadPolicy::Source,
+        extension: None,
+        role: Some("system_auxiliary".to_owned()),
+        schema: None,
+    };
+    let node_id = [0x22; 16];
+    let data = NodeData::new(bytes::Bytes::from_static(b"value"));
+
+    // A genesis record that cannot be decoded is corruption, not "absent".
+    let store = InMemoryStorage::new();
+    store.collections.write().entry(col_id).or_default().insert(
+        COLLECTION_METADATA_RECORD_ID,
+        NodeData::new(bytes::Bytes::from_static(b"not-metadata")),
+    );
+    let error = store
+        .create_or_upsert_established_validated(
+            &col_id,
+            &metadata,
+            &node_id,
+            &data,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+    assert!(matches!(error, StorageError::Corrupt(_)));
+
+    // A stored genesis with the same identity but a different non-identity
+    // field is a mismatch (Internal), not a truncation collision.
+    let store = InMemoryStorage::new();
+    store.collections.write().entry(col_id).or_default().insert(
+        COLLECTION_METADATA_RECORD_ID,
+        NodeData::new(metadata.encode().into()),
+    );
+    let mut differing = metadata.clone();
+    differing.role = Some("a-different-role".to_owned());
+    let error = store
+        .create_or_upsert_established_validated(&col_id, &differing, &node_id, &data, &mut |_| {
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StorageError::Internal(ref message) if message.contains("existing genesis record differs")
+    ));
+
+    // A record written before genesis blocks the later metadata write.
+    let store = InMemoryStorage::new();
+    store.put(&col_id, &node_id, &data).unwrap();
+    let error = store
+        .create_or_upsert_established_validated(
+            &col_id,
+            &metadata,
+            &node_id,
+            &data,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StorageError::Internal(ref message) if message.contains("genesis metadata must be written")
+    ));
 }
 
 #[test]

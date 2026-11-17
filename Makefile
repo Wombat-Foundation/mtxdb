@@ -59,11 +59,9 @@ fix: ##H Apply auto-fixes with clippy across workspace crates
 .PHONY: doc
 doc: ##H Build docs
 	$(CARGO) test --workspace --doc
-	# Document the library only — the mtxdb-cli binary shares the name
-	# "mtxdb" with the root library, hitting cargo #6313.  Skip it;
-	# CLI usage is covered by `mtxdb --help`.
-	$(CARGO) doc -p mtxdb --no-deps
-	echo '<meta http-equiv="refresh" content="0;url=mtxdb/index.html">' > target/doc/index.html
+	$(CARGO) doc --workspace --no-deps
+	$(CARGO) rustdoc -p mtxdb-cli --lib -- --document-private-items
+	echo '<!doctype html><title>mtxdb documentation</title><h1>mtxdb documentation</h1><ul><li><a href="mtxdb/index.html">mtxdb library</a></li><li><a href="mtxdb_cli/index.html">mtxdb-cli</a></li></ul>' > target/doc/index.html
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -77,9 +75,17 @@ ifneq ($(strip $(MTXDB_TEST_PROFILE)),)
 MTXDB_TEST_PROFILE_FLAG := --profile $(MTXDB_TEST_PROFILE)
 endif
 
+# Extra arguments for the test binaries (passed after `--`). For per-test
+# durations, set `-Z unstable-options --report-time` in `.env`; each result line
+# then ends with `<seconds>`. libtest gates that flag behind RUSTC_BOOTSTRAP, so
+# it is set for this recipe only, and only when a `-Z` argument is present.
+MTXDB_TEST_ARGS ?=
+MTXDB_TEST_ARGS_FLAG := $(if $(strip $(MTXDB_TEST_ARGS)),-- $(MTXDB_TEST_ARGS))
+MTXDB_TEST_ENV := $(if $(findstring -Z,$(MTXDB_TEST_ARGS)),RUSTC_BOOTSTRAP=1)
+
 .PHONY: test
 test: ##H Run library and workspace tests
-	$(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings
+	$(MTXDB_TEST_ENV) $(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings $(MTXDB_TEST_ARGS_FLAG)
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false
@@ -101,9 +107,17 @@ cov: ##H Run code coverage and generate HTML report
 	$(CARGO) llvm-cov report $(MTXDB_TEST_PROFILE_FLAG) -p mtxdb \
 		--ignore-filename-regex 'src/bin/.*|scripts/.*' \
 		--codecov --output-path .coverage/codecov.json
+	# JSON summary for the coverage gate (`make cov-check`)
+	$(CARGO) llvm-cov report $(MTXDB_TEST_PROFILE_FLAG) -p mtxdb \
+		--ignore-filename-regex 'src/bin/.*|scripts/.*' \
+		--json --output-path .coverage/summary.json
 	@echo DONE. You may open it with:
 	@echo firefox .coverage/html/index.html
 
+
+.PHONY: cov-check
+cov-check: ##H Fail if production coverage drops below the floors in scripts/check_coverage.py (run `make cov` first)
+	python3 scripts/check_coverage.py .coverage/summary.json
 
 .PHONY: bench
 bench: ##H Run benchmarks and append results to the CSV history in benches/csv/

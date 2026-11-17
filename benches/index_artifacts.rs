@@ -12,6 +12,10 @@
 //! 4. `trusted`: reopen that stats the pack, compares its length with a
 //!    manifest, and loads the `.idx`, never reading the pack. `digest` shows what
 //!    verifying the pack's bytes at reopen would cost instead.
+//! 5. `sidecar`: the real [`mtxdb::index::packidx`] v1 index built from the same
+//!    scan, with its exact size, lower-bound size projections for truncated-id
+//!    and sparse variants, frame order in this synthetic arrival-order pack,
+//!    and mapped RSS after a small random-access probe using `MADV_RANDOM`.
 //!
 //! The `.idx` here is a prototype of the layout, one collection only (ids are the
 //! frame hashes); it is not crash-ordering-safe, it measures cost. The question it
@@ -33,12 +37,24 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mtxdb::packfile::scan_and_recover_packfile;
+use mtxdb::index::packidx::{
+    PackIndex, PackIndexIdentity, PackIndexInput, PACK_INDEX_COLLECTION_ENTRY_LEN,
+    PACK_INDEX_FANOUT_LEN, PACK_INDEX_FLAG_ENTRY_LEN, PACK_INDEX_HEADER_LEN,
+    PACK_INDEX_SECTION_ENTRY_LEN,
+};
+use mtxdb::index::{IndexConfig, InsertError, LossyIndex};
+use mtxdb::packfile::{read_header, scan_and_recover_packfile};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::PackfileStorage;
 
 const COLLECTION: [u8; 16] = [0xE7; 16];
 const MAGIC: &[u8; 8] = b"MTXIDX01";
+/// A truncated id keeps 8 suffix bytes, the offset, and its removal flag.
+const TRUNCATED_ENTRY_BYTES: u64 = 8 + 4 + 1;
+/// Sample one entry in ten in the sparse lower-bound projection.
+const SPARSE_STRIDE: u64 = 10;
+/// Keep the RSS probe small relative to the number of pages in the sidecar.
+const RSS_PROBES: u64 = 64;
 
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -77,7 +93,9 @@ fn usize_f64(value: usize) -> f64 {
 }
 
 fn mib_f64(bytes: u64) -> f64 {
-    to_f64(bytes) / to_f64(1_u64 << 20)
+    let high = u32::try_from(bytes >> 32).unwrap_or(u32::MAX);
+    let low = u32::try_from(bytes & 0xFFFF_FFFF).unwrap_or(u32::MAX);
+    (f64::from(high) * 4_294_967_296.0 + f64::from(low)) / 1_048_576.0
 }
 
 fn sample_index(seed: u64, count: u64) -> u64 {
@@ -147,6 +165,312 @@ fn checkpoint_bytes(dir: &Path) -> u64 {
     std::fs::metadata(dir.join("index.checkpoint")).map_or(0, |m| m.len())
 }
 
+/// Resident bytes for one file mapping from Linux `/proc/self/smaps`.
+/// This is this process's mapped RSS, not total system page-cache residency.
+fn mapped_rss_bytes(path: &Path) -> Option<u64> {
+    fn is_mapping_header(line: &str) -> bool {
+        let Some(address) = line.split_ascii_whitespace().next() else {
+            return false;
+        };
+        let Some((start, end)) = address.split_once('-') else {
+            return false;
+        };
+        u64::from_str_radix(start, 16).is_ok() && u64::from_str_radix(end, 16).is_ok()
+    }
+
+    let path = path.canonicalize().ok()?;
+    let path = path.to_string_lossy();
+    let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+    let mut in_mapping = false;
+    let mut found = false;
+    let mut rss_kib = 0_u64;
+    for line in smaps.lines() {
+        if is_mapping_header(line) {
+            in_mapping = line.ends_with(path.as_ref());
+            found |= in_mapping;
+        } else if in_mapping {
+            if let Some(value) = line.strip_prefix("Rss:") {
+                rss_kib =
+                    rss_kib.saturating_add(value.split_ascii_whitespace().next()?.parse().ok()?);
+            }
+        }
+    }
+    found.then(|| rss_kib.saturating_mul(1024))
+}
+
+/// `(RssAnon, RssFile)` in bytes from `/proc/self/status` (Linux only).
+/// Anonymous pages are private heap; file pages include checkpoint mappings.
+fn process_rss_split() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let field = |name: &str| -> Option<u64> {
+        let line = status.lines().find(|l| l.starts_with(name))?;
+        let kib: u64 = line.split_ascii_whitespace().nth(1)?.parse().ok()?;
+        Some(kib.saturating_mul(1024))
+    };
+    Some((field("RssAnon:")?, field("RssFile:")?))
+}
+
+fn pack_index_identity(pack: &Path, pack_len: u64) -> PackIndexIdentity {
+    let mut file = std::fs::File::open(pack).expect("open pack header");
+    let header = read_header(&mut file)
+        .expect("read pack header")
+        .expect("pack header exists");
+    PackIndexIdentity {
+        pack_id: header.pack_id,
+        creation_seq: u64::from(header.creation_seq),
+        pack_file_len: pack_len,
+    }
+}
+
+fn build_pack_index(
+    dir: &Path,
+    pack: &Path,
+    pack_len: u64,
+    entries: &[([u8; 16], [u8; 16], u64)],
+) -> (PathBuf, PackIndexIdentity, u64, Duration, Duration) {
+    // Derive each frame's physical extent from the next frame's offset; the
+    // last frame runs to the end of the pack.
+    let mut frames: Vec<(u64, u64)> = entries.iter().map(|entry| (entry.2, 0)).collect();
+    frames.sort_unstable_by_key(|frame| frame.0);
+    for position in 0..frames.len() {
+        let offset = frames[position].0;
+        let next = frames
+            .get(position.saturating_add(1))
+            .map_or(pack_len, |frame| frame.0);
+        frames[position].1 = next.saturating_sub(offset).max(1);
+    }
+    let expected_disk_bytes = frames
+        .iter()
+        .map(|frame| frame.1)
+        .fold(0_u64, u64::saturating_add);
+    let inputs = entries
+        .iter()
+        .map(|(collection_id, logical_id, offset)| {
+            let frame = frames
+                .binary_search_by_key(offset, |frame| frame.0)
+                .expect("entry has a frame extent");
+            PackIndexInput {
+                collection_id: *collection_id,
+                logical_id: *logical_id,
+                offset: *offset,
+                removed: false,
+                disk_bytes: frames[frame].1,
+            }
+        })
+        .collect();
+    let identity = pack_index_identity(pack, pack_len);
+    let (index, build_t) = timed(|| PackIndex::build(identity, inputs).expect("build PackIndex"));
+    assert_eq!(
+        index.collection_disk_bytes(&COLLECTION),
+        Some(expected_disk_bytes),
+        "PackIndex records nonzero physical frame bytes"
+    );
+    let bytes = u64::try_from(index.as_bytes().len()).expect("PackIndex length fits u64");
+    let path = dir.join("pack.mtxidx");
+    let ((), write_t) = timed(|| {
+        index.write_atomic(&path).expect("write PackIndex");
+    });
+    (path, identity, bytes, build_t, write_t)
+}
+
+fn report_pack_index(
+    path: &Path,
+    identity: PackIndexIdentity,
+    entries: &[([u8; 16], [u8; 16], u64)],
+    bytes: u64,
+    build: Duration,
+    write: Duration,
+) {
+    let count = u64::try_from(entries.len()).expect("entry count fits u64");
+    assert!(count > 0, "sidecar report needs at least one record");
+    let mut collection_ids: Vec<[u8; 16]> = entries.iter().map(|entry| entry.0).collect();
+    collection_ids.sort_unstable();
+    collection_ids.dedup();
+    let collections = collection_ids.len();
+    let overhead = u64::try_from(add_usize(
+        add_usize(
+            PACK_INDEX_HEADER_LEN,
+            mul_usize(PACK_INDEX_COLLECTION_ENTRY_LEN, collections),
+        ),
+        mul_usize(PACK_INDEX_FANOUT_LEN, collections),
+    ))
+    .expect("PackIndex overhead fits u64");
+    let truncated = overhead.saturating_add(count.saturating_mul(TRUNCATED_ENTRY_BYTES));
+    let sparse_count = count.saturating_add(SPARSE_STRIDE - 1) / SPARSE_STRIDE;
+    let sparse = overhead.saturating_add(sparse_count.saturating_mul(TRUNCATED_ENTRY_BYTES));
+    let dense_projection = overhead.saturating_add(
+        count.saturating_mul((PACK_INDEX_SECTION_ENTRY_LEN + PACK_INDEX_FLAG_ENTRY_LEN) as u64),
+    );
+    assert_eq!(
+        bytes, dense_projection,
+        "v1 layout projection matches encoding"
+    );
+    assert!(
+        truncated < bytes,
+        "truncated-id projection should be smaller"
+    );
+    assert!(sparse < truncated, "sparse projection should be smaller");
+    println!(
+        "  PackIndex sidecar {:.2} MiB ({:.2} B/record over {count} records, {collections} collection(s)); \
+         build {:.0} ms, write+fsync {:.0} ms",
+        mib_f64(bytes),
+        to_f64(bytes) / to_f64(count),
+        ms(build),
+        ms(write),
+    );
+    println!(
+        "    layout: {PACK_INDEX_HEADER_LEN} B header + {PACK_INDEX_COLLECTION_ENTRY_LEN} B/collection \
+         directory + {PACK_INDEX_FANOUT_LEN} B/collection fanout + {PACK_INDEX_SECTION_ENTRY_LEN} B/record \
+         locator + {PACK_INDEX_FLAG_ENTRY_LEN} B/record flags (CRC is in the header)"
+    );
+    println!(
+        "    truncated id (8 B): {:.2} MiB ({:.2} B/record, {:.0}% of dense)",
+        mib_f64(truncated),
+        to_f64(truncated) / to_f64(count),
+        100.0 * to_f64(truncated) / to_f64(bytes),
+    );
+    println!(
+        "    sparse + truncated (1 in {SPARSE_STRIDE}, lower bound; omits scan-bound metadata): \
+         {:.2} MiB ({:.2} B/record, {:.0}% of dense)",
+        mib_f64(sparse),
+        to_f64(sparse) / to_f64(count),
+        100.0 * to_f64(sparse) / to_f64(bytes),
+    );
+
+    // A sparse index is only valid if frames sit in id order in the pack. Sort
+    // by (collection, id) and check the offsets increase along that order.
+    let mut ordered = entries.to_vec();
+    ordered.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut backwards = 0usize;
+    let mut worst_jump = 0u64;
+    for pair in ordered.windows(2) {
+        if pair[1].2 <= pair[0].2 {
+            backwards = add_usize(backwards, 1);
+            worst_jump = worst_jump.max(pair[0].2.saturating_sub(pair[1].2));
+        }
+    }
+    let pairs = ordered.len().saturating_sub(1);
+    println!(
+        "  synthetic arrival-order pack frames in logical-id order: {} ({backwards} of {pairs} \
+         adjacent pairs go backwards, worst back-jump {worst_jump} B)",
+        if backwards == 0 { "yes" } else { "no" },
+    );
+
+    // `open_mmap` validates metadata and the directory without reading the
+    // complete body. Random advice limits sequential readahead, though RSS can
+    // still include kernel fault-around and shared page-cache pages.
+    let mapped = PackIndex::open_mmap(path, identity).expect("mmap PackIndex");
+    #[cfg(unix)]
+    mapped.advise_random().expect("advise random mmap access");
+    let before = mapped_rss_bytes(path);
+    let probes = RSS_PROBES.min(count);
+    for i in 0..probes {
+        let seq = sample_index(i ^ 0x5041_434b, count);
+        assert!(
+            mapped.get(&entries[0].0, &node_id(seq)).is_some(),
+            "PackIndex lookup hits"
+        );
+    }
+    let after = mapped_rss_bytes(path);
+    let show = |value: Option<u64>| {
+        value.map_or_else(
+            || "unavailable".to_owned(),
+            |n| format!("{:.2} MiB", mib_f64(n)),
+        )
+    };
+    println!(
+        "  PackIndex mmap: mapped RSS before {probes} random lookups {}, after {} \
+         (Linux smaps; shared/reclaimable pages; probe result, not a memory-cost estimate)",
+        show(before),
+        show(after),
+    );
+}
+
+fn report_lossy_index(
+    label: &str,
+    entries: usize,
+    capacity: u32,
+    heap_bytes: usize,
+    mapped_bytes: usize,
+) {
+    let load = 100.0 * usize_f64(entries) / to_f64(u64::from(capacity));
+    let per_entry = |bytes: usize| usize_f64(bytes) / usize_f64(entries);
+    println!(
+        "  LossyIndex {label}: {entries} records / {capacity} slots ({load:.1}% load); \
+         private heap {:.2} MiB ({:.1} B/record), mapped slots {:.2} MiB ({:.1} B/record)",
+        mib_f64(u64::try_from(heap_bytes).expect("heap bytes fit u64")),
+        per_entry(heap_bytes),
+        mib_f64(u64::try_from(mapped_bytes).expect("mapped bytes fit u64")),
+        per_entry(mapped_bytes),
+    );
+}
+
+fn insert_or_grow(index: &mut LossyIndex, key: &[u8; 16], offset: u64) {
+    match index.insert(key, 0, offset) {
+        Ok(()) => {}
+        Err(InsertError::TableFull) => {
+            *index = index.grow().expect("complete owned index grows");
+            index.insert(key, 0, offset).expect("grown index has room");
+        }
+        Err(error) => panic!("unexpected index insert failure: {error}"),
+    }
+}
+
+/// Build an owned index with the same 64-slot floor and 75% growth threshold
+/// as `PackfileStorage`'s default collection index.
+fn build_lossy_index(entries: &[([u8; 16], [u8; 16], u64)]) -> LossyIndex {
+    let mut index = LossyIndex::with_config(64, IndexConfig::default());
+    for (_, id, offset) in entries {
+        insert_or_grow(&mut index, id, *offset);
+    }
+    index
+}
+
+/// Exercise the first insertion past a full table's load threshold so the
+/// resulting owned index is measured immediately after its doubling.
+fn build_post_grow_lossy_index(
+    entries: &[([u8; 16], [u8; 16], u64)],
+    final_capacity: u32,
+) -> LossyIndex {
+    let old_capacity = final_capacity / 2;
+    let threshold = usize::try_from(old_capacity)
+        .expect("capacity fits usize")
+        .checked_mul(75)
+        .and_then(|value| value.checked_div(100))
+        .expect("load threshold fits usize");
+    assert!(
+        threshold < entries.len(),
+        "workload has an entry to trigger growth"
+    );
+    let mut index = LossyIndex::with_config(
+        usize::try_from(old_capacity).expect("capacity fits usize"),
+        IndexConfig::default(),
+    );
+    for (_, id, offset) in &entries[..threshold] {
+        index
+            .insert(id, 0, *offset)
+            .expect("pre-growth index has room");
+    }
+    let (_, id, offset) = entries[threshold];
+    assert!(
+        matches!(index.insert(&id, 0, offset), Err(InsertError::TableFull)),
+        "the next insert crosses the old table's load threshold"
+    );
+    index = index.grow().expect("complete index grows at threshold");
+    index.insert(&id, 0, offset).expect("grown index has room");
+    assert_eq!(
+        index.len(),
+        threshold.checked_add(1).expect("entry count fits usize"),
+        "the triggering insert is included after growth"
+    );
+    assert_eq!(
+        index.capacity(),
+        final_capacity,
+        "growth doubles the old capacity"
+    );
+    index
+}
+
 fn sync_and_evict(dir: &Path) -> bool {
     let _ = std::process::Command::new("sync").status();
     bench_evict::evict_dir(dir)
@@ -166,7 +490,7 @@ fn build(dir: &Path, target: u64, mixed: bool) -> u64 {
     while written < target {
         let len = if mixed {
             add_usize(
-                usize::try_from(mix(seq ^ 77) % (64_u64 << 10)).expect("len"),
+                usize::try_from(mix(seq ^ 0x4d) % (64_u64 << 10)).expect("len"),
                 1,
             )
         } else {
@@ -556,18 +880,17 @@ fn measure_warm_lookups(
 }
 
 fn measure_end_to_end(pack: &Path, idx: &Idx, keys: &[[u8; 16]], lookups: usize) {
-    use std::os::unix::fs::FileExt;
     let file = std::fs::File::open(pack).expect("open pack");
     let mut buf = vec![0u8; 72 << 10];
     let (found, t) = timed(|| {
         let mut ok = 0;
         for key in keys {
             let off = idx.get(key).expect("hit");
-            let n = file.read_at(&mut buf[..4096], off).expect("pread");
+            let n = read_at(&file, &mut buf[..4096], off).expect("pread");
             let rec = if let Ok(rec) = mtxdb::packfile::read_record(&mut &buf[..n]) {
                 rec
             } else {
-                let n = file.read_at(&mut buf, off).expect("pread");
+                let n = read_at(&file, &mut buf, off).expect("pread");
                 mtxdb::packfile::read_record(&mut &buf[..n]).expect("read frame")
             };
             black_box(&rec);
@@ -579,6 +902,118 @@ fn measure_end_to_end(pack: &Path, idx: &Idx, keys: &[[u8; 16]], lookups: usize)
     println!(
         "  end-to-end via .idx (locate + pread + read_record; naive read path, not tuned): {:.0} ns each",
         t.as_secs_f64() * 1e9 / usize_f64(lookups)
+    );
+}
+
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+fn report_lossy_index_cases(dir: &Path, entries: &[([u8; 16], [u8; 16], u64)]) {
+    let (fresh_index, fresh_build) = timed(|| build_lossy_index(entries));
+    println!(
+        "  LossyIndex owned build for memory report: {:.0} ms",
+        ms(fresh_build)
+    );
+    report_lossy_index(
+        "owned after build",
+        fresh_index.len(),
+        fresh_index.capacity(),
+        fresh_index.resident_bytes(),
+        fresh_index.mapped_bytes(),
+    );
+    let fresh_capacity = fresh_index.capacity();
+    drop(fresh_index);
+    let (post_grow_index, post_grow_build) =
+        timed(|| build_post_grow_lossy_index(entries, fresh_capacity));
+    println!(
+        "  LossyIndex post-grow setup: {:.0} ms",
+        ms(post_grow_build)
+    );
+    report_lossy_index(
+        "owned immediately after doubling",
+        post_grow_index.len(),
+        post_grow_index.capacity(),
+        post_grow_index.resident_bytes(),
+        post_grow_index.mapped_bytes(),
+    );
+    drop(post_grow_index);
+
+    let checkpoint_store = PackfileStorage::open(PathBuf::from(dir))
+        .expect("open store before writing a clean checkpoint");
+    checkpoint_store
+        .force_index_checkpoint()
+        .expect("write clean index checkpoint");
+    drop(checkpoint_store);
+
+    let reopened = PackfileStorage::open(PathBuf::from(dir)).expect("reopen checkpoint for memory");
+    let (reopened_records, heap_bytes, mapped_bytes, capacity) = reopened
+        .collection_index_residency(&COLLECTION)
+        .expect("reopened collection index");
+    println!(
+        "  checkpoint reopen path: {:?}",
+        reopened.open_timings().map(|timings| timings.path)
+    );
+    report_lossy_index(
+        "after store reopen",
+        reopened_records,
+        capacity,
+        heap_bytes,
+        mapped_bytes,
+    );
+
+    // The first mutation materializes mmap-backed slots and initializes the
+    // identity tables. Updating an existing id keeps the pack's record count
+    // unchanged while measuring that representation transition.
+    let first_id = entries.first().expect("benchmark pack has records").1;
+    let rss_before_write = process_rss_split();
+    let first_write = [(first_id, NodeData::from_slice(&[0xA5; 16]))];
+    let ((), write_time) = timed(|| {
+        reopened
+            .put_many(&COLLECTION, &first_write)
+            .expect("first write after checkpoint reopen");
+    });
+    let (written_records, heap_bytes, mapped_bytes, capacity) = reopened
+        .collection_index_residency(&COLLECTION)
+        .expect("written collection index");
+    let rss_after_write = process_rss_split();
+    println!("  first write after reopen: {:.1} ms", ms(write_time));
+    // Allocated heap above counts zeroed identity tables in full. Anonymous
+    // RSS shows how much of it, plus the materialized slot clone, became
+    // resident; file RSS shows the released checkpoint mapping.
+    match (rss_before_write, rss_after_write) {
+        (Some((anon_before, file_before)), Some((anon_after, file_after))) => {
+            let delta = |after: u64, before: u64| {
+                if after >= before {
+                    mib_f64(sub_u64(after, before))
+                } else {
+                    -mib_f64(sub_u64(before, after))
+                }
+            };
+            println!(
+                "    RSS across the first write: anonymous {:+.2} MiB, file-backed {:+.2} MiB \
+                 (allocated private heap {:.2} MiB)",
+                delta(anon_after, anon_before),
+                delta(file_after, file_before),
+                mib_f64(u64::try_from(heap_bytes).expect("heap fits u64")),
+            );
+        }
+        _ => println!("    process RSS unavailable"),
+    }
+    report_lossy_index(
+        "after reopen + one overwrite",
+        written_records,
+        capacity,
+        heap_bytes,
+        mapped_bytes,
     );
 }
 
@@ -616,6 +1051,21 @@ fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
 
     let entries = scan_and_recover_packfile(&pack).expect("scan");
     assert_eq!(entries.len() as u64, records, "scan saw every record");
+    let (
+        pack_index_path,
+        pack_index_identity,
+        pack_index_bytes,
+        pack_index_build,
+        pack_index_write,
+    ) = build_pack_index(&dir, &pack, pack_len, &entries);
+    report_pack_index(
+        &pack_index_path,
+        pack_index_identity,
+        &entries,
+        pack_index_bytes,
+        pack_index_build,
+        pack_index_write,
+    );
     let idx_path = dir.join("pack.idx");
     let (idx_bytes, idx_build) = timed(|| {
         let bytes = build_idx(&entries);
@@ -642,7 +1092,6 @@ fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
     );
     drop(idx_bytes);
     let manifest_len = pack_len;
-    drop(entries);
     let idx = load_idx(&idx_path);
 
     for cold in [false, true] {
@@ -653,6 +1102,7 @@ fn run(base: &Path, mib: u64, mixed: bool, lookups: usize) {
             measure_warm_lookups(&dir, &pack, &idx_path, &idx, records, lookups);
         }
     }
+    report_lossy_index_cases(&dir, &entries);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

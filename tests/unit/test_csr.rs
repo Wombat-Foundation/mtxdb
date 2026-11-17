@@ -109,6 +109,74 @@ fn test_empty_graph() {
 }
 
 #[test]
+fn reverse_csr_uses_sparse_parent_rows_and_stored_counts() {
+    let family = EdgeFamily::plain(1);
+    let forward = vec![
+        (
+            2,
+            vec![Edge { target: 9, kind: 0 }, Edge { target: 4, kind: 0 }],
+        ),
+        (3, vec![Edge { target: 9, kind: 0 }]),
+        (8, vec![Edge { target: 4, kind: 0 }]),
+    ];
+
+    let reverse = ReverseCsr::from_forward_rows(family, &forward).unwrap();
+
+    assert_eq!(reverse.family(), family);
+    assert_eq!(reverse.parents(), &[4, 9]);
+    assert_eq!(reverse.child_count(4), Some(2));
+    assert_eq!(reverse.child_count(9), Some(2));
+    assert_eq!(reverse.child_count(7), None);
+    assert_eq!(
+        reverse.children_of(4),
+        Some(&[Edge { target: 2, kind: 0 }, Edge { target: 8, kind: 0 },][..])
+    );
+    assert_eq!(
+        reverse.children_of(9),
+        Some(&[Edge { target: 2, kind: 0 }, Edge { target: 3, kind: 0 },][..])
+    );
+}
+
+#[test]
+fn reverse_csr_preserves_relation_kinds_and_deduplicates_edges() {
+    let family = EdgeFamily::typed(3);
+    let forward = vec![
+        (
+            12,
+            vec![
+                Edge { target: 5, kind: 2 },
+                Edge { target: 5, kind: 1 },
+                Edge { target: 5, kind: 2 },
+            ],
+        ),
+        (14, vec![Edge { target: 5, kind: 1 }]),
+    ];
+
+    let reverse = ReverseCsr::from_forward_rows(family, &forward).unwrap();
+
+    assert_eq!(
+        reverse.children_of(5),
+        Some(
+            &[
+                Edge {
+                    target: 12,
+                    kind: 1
+                },
+                Edge {
+                    target: 12,
+                    kind: 2
+                },
+                Edge {
+                    target: 14,
+                    kind: 1
+                },
+            ][..]
+        )
+    );
+    assert_eq!(reverse.child_count(5), Some(3));
+}
+
+#[test]
 fn test_topo_order_ready_queue_is_deterministic() {
     // Initial ready nodes are queued by local ID, then newly ready nodes
     // follow the FIFO queue in CSR adjacency order.

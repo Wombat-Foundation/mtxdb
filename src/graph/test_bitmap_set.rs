@@ -200,18 +200,42 @@ fn derived_domain_tags_are_stable_and_distinct() {
         "different labels must derive different tags"
     );
     assert_ne!(
-        DomainTag::for_scope(ShardType::Edges, &[0; 16]),
+        DomainTag::for_scope(ShardType::ServerInfo, &[0; 16]),
         DomainTag::for_scope(ShardType::State, &[0; 16]),
         "the same collection id in different pools must not share a domain"
     );
     assert_ne!(
-        DomainTag::for_scope(ShardType::Edges, &[0; 16]),
-        DomainTag::for_scope(ShardType::Edges, &[1; 16]),
+        DomainTag::for_scope(ShardType::ServerInfo, &[0; 16]),
+        DomainTag::for_scope(ShardType::ServerInfo, &[1; 16]),
         "different collections must not share a domain"
     );
     assert_eq!(
-        DomainTag::for_scope(ShardType::Edges, &[7; 16]),
-        DomainTag::for_scope(ShardType::Edges, &[7; 16]),
+        DomainTag::for_scope(ShardType::ServerInfo, &[7; 16]),
+        DomainTag::for_scope(ShardType::ServerInfo, &[7; 16]),
         "a scope must derive a stable tag"
     );
+}
+
+#[test]
+fn encoded_membership_checks_domain_and_payload() {
+    let set = BitmapSet::from_values(A, [0, 255, 256, 65_535, 65_536, u32::MAX]);
+    let bytes = set.encode().unwrap();
+    for value in [0, 1, 255, 256, 65_535, 65_536, u32::MAX] {
+        assert_eq!(
+            BitmapSet::contains_encoded(&bytes, A, value).unwrap(),
+            set.contains(value)
+        );
+    }
+    assert!(matches!(
+        BitmapSet::contains_encoded(&bytes, B, 0),
+        Err(StorageError::Collision(_))
+    ));
+    assert!(matches!(
+        BitmapSet::contains_encoded(&bytes[..20], A, 0),
+        Err(StorageError::Corrupt(_))
+    ));
+    assert!(matches!(
+        BitmapSet::contains_encoded(&bytes[..bytes.len() - 1], A, 0),
+        Err(StorageError::Corrupt(_))
+    ));
 }

@@ -20,12 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config::RuntimeConfig;
 use crate::journal::{
     CommitReceipt, Journal, JournalCoordinator, SharedWalLock, StagedLookup, TxnStage,
     TxnStageState,
 };
 use crate::layout::{DatabaseLayout, ShardType};
-use crate::packfile::storage::PackfileStorage;
+use crate::packfile::storage::{OpenPath, PackfileStorage};
 use crate::storage::{NodeId, StorageEngine, StorageError};
 
 /// Write and verification policy for a single storage pool.
@@ -35,6 +36,29 @@ pub struct PoolPolicy {
     pub compress: bool,
     /// How much CRC32 checksum verification this pool applies.
     pub checksum_policy: crate::packfile::ChecksumPolicy,
+    /// Whether sealed packs keep their locators in the resident index or are
+    /// served from their sidecars.
+    pub index_residency: crate::index::IndexResidency,
+    /// Physical layout repack gives this pool's records. A topological
+    /// policy writes each record after the records it depends on (events
+    /// after their `prev_events`, state groups after their parents and HAMT
+    /// root, HAMT nodes after their children); any other policy keeps id
+    /// order. Logical ordering only: it never changes what is stored.
+    pub ordering: crate::record_class::OrderingPolicy,
+    /// When appended frames reach the pack file.
+    ///
+    /// The default [`crate::shard::AppendPolicy::Eager`] writes each frame as
+    /// part of the mutation that produced it. [`crate::shard::AppendPolicy::Buffered`]
+    /// accumulates frames per shard and writes them with one positioned write
+    /// per flush, which is substantially faster for bulk load.
+    ///
+    /// Buffered changes the crash boundary: frames since the last flush live
+    /// only in process memory. The shared WAL still makes a synced transaction
+    /// recoverable, because `sync`/`sync_all` flush every shard before the WAL
+    /// fsync, but an unsynced commit can be lost if this process exits. Opt in
+    /// only for workloads whose own durability schedule already ends in a
+    /// sync, such as a bulk import.
+    pub append_policy: crate::shard::AppendPolicy,
 }
 
 impl Default for PoolPolicy {
@@ -42,11 +66,15 @@ impl Default for PoolPolicy {
         Self {
             compress: true,
             checksum_policy: crate::packfile::ChecksumPolicy::Full,
+            index_residency: crate::index::IndexResidency::Resident,
+            ordering: crate::record_class::OrderingPolicy::None,
+            append_policy: crate::shard::AppendPolicy::Eager,
         }
     }
 }
 
 const POOL_COUNT: usize = ShardType::ALL.len();
+type VersionedStagedRecords = (Vec<Option<crate::storage::NodeData>>, Vec<u64>, Vec<bool>);
 
 /// Policies for every named pool in a database.
 ///
@@ -551,21 +579,40 @@ impl DatabaseTransaction<'_> {
         collection_id: &[u8; 16],
         node_ids: &[NodeId],
     ) -> Result<(Vec<Option<crate::storage::NodeData>>, Vec<u64>), StorageError> {
+        let (records, versions, _) =
+            self.get_with_record_versions_and_staged(pool, collection_id, node_ids)?;
+        Ok((records, versions))
+    }
+
+    /// As [`Self::get_with_record_versions`], also reporting which values came
+    /// from this transaction's staged mutations rather than the live store.
+    pub(crate) fn get_with_record_versions_and_staged(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_ids: &[NodeId],
+    ) -> Result<VersionedStagedRecords, StorageError> {
         let _lifecycle = self.lifecycle.lock();
         let staged = self.stage.lookup_many(pool, collection_id, node_ids);
         let mut results = Vec::with_capacity(node_ids.len());
         let mut versions = vec![0u64; node_ids.len()];
+        let mut is_staged = Vec::with_capacity(node_ids.len());
         let mut live_slots = Vec::new();
         let mut live_ids = Vec::new();
         for (slot, (node_id, lookup)) in node_ids.iter().zip(staged).enumerate() {
             match lookup {
                 StagedLookup::Put(payload) => {
+                    is_staged.push(true);
                     results.push(Some(crate::storage::NodeData::new(bytes::Bytes::from(
                         payload,
                     ))));
                 }
-                StagedLookup::Deleted => results.push(None),
+                StagedLookup::Deleted => {
+                    is_staged.push(true);
+                    results.push(None);
+                }
                 StagedLookup::Absent => {
+                    is_staged.push(false);
                     results.push(None);
                     live_slots.push(slot);
                     live_ids.push(*node_id);
@@ -582,7 +629,7 @@ impl DatabaseTransaction<'_> {
                 versions[slot] = version;
             }
         }
-        Ok((results, versions))
+        Ok((results, versions, is_staged))
     }
 
     /// Read node payloads and the collection version without copying the
@@ -611,12 +658,13 @@ impl DatabaseTransaction<'_> {
             })
     }
 
-    /// Commit the staged mutations. Pack/index application is performed once;
-    /// journal publication can be retried if the post-commit callback fails.
+    /// Commit the transaction.
     ///
     /// # Errors
-    /// Returns an error if storage application or shared-WAL publication
-    /// fails. After storage application succeeds, retrying this method is safe.
+    /// Returns an error if validation or journal publication fails. If
+    /// publication succeeds but materialization fails,
+    /// returns [`StorageError::Internal`] with recovery guidance; the published
+    /// transaction cannot be rolled back and recovery will retry it.
     pub fn commit(&self) -> Result<(), StorageError> {
         let _lifecycle = self.lifecycle.lock();
         if self.stage.state() == TxnStageState::Active {
@@ -710,7 +758,13 @@ impl DatabaseTransaction<'_> {
                 .commit_phases
                 .materialize
                 .add(started.elapsed());
-            materialized?;
+            materialized.map_err(|error| {
+                self.database.note_materialization_failure(&error);
+                StorageError::Internal(format!(
+                    "transaction is published but not yet materialized; do not \
+                     rewrite it, recover_pending_transactions will finish it: {error}"
+                ))
+            })?;
             self.stage.mark_published().map_err(StorageError::Io)?;
             self.database.finish_recovery_stage(&self.stage)?;
         }
@@ -753,7 +807,20 @@ impl Database {
     /// Returns an error if the root lock is held, the shared segment cannot be
     /// opened, or any pool cannot be opened or attached.
     pub fn open(root: PathBuf) -> Result<Self, StorageError> {
-        Self::open_with_policies(root, PoolPolicies::default())
+        Self::open_with_config(root, RuntimeConfig::default())
+    }
+
+    /// Open `root` with explicit runtime settings.
+    ///
+    /// Callers that want environment defaults pass [`RuntimeConfig::from_env`]
+    /// here. The config is validated before the root lock or WAL is touched, so
+    /// an unsupported residency cannot modify on-disk state before failing.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid config, if the root lock is held, or if
+    /// any pool cannot be opened or attached.
+    pub fn open_with_config(root: PathBuf, config: RuntimeConfig) -> Result<Self, StorageError> {
+        Self::open_with_policies_and_config(root, PoolPolicies::default(), config)
     }
 
     /// Open `root` for writing through one shared WAL with explicit per-pool policies.
@@ -762,15 +829,45 @@ impl Database {
     /// exist. This blocks with `WouldBlock` if another live process holds the
     /// root writer lock.
     ///
+    /// Explicit policies are used as-is; environment defaults are not
+    /// consulted. Use [`Self::open_with_config`] for environment-driven
+    /// defaults.
+    ///
     /// # Errors
     /// Returns an error if the root lock is held, the shared segment cannot be
     /// opened, or any pool cannot be opened or attached.
     pub fn open_with_policies(root: PathBuf, policies: PoolPolicies) -> Result<Self, StorageError> {
-        Self::open_with_policies_and_stage_limit(
-            root,
-            policies,
-            crate::journal::MAX_TXN_STAGE_BYTES,
-        )
+        Self::open_with_policies_and_config(root, policies, RuntimeConfig::default())
+    }
+
+    /// Open with explicit policies and runtime settings.
+    ///
+    /// A `Some` index residency in `config` overrides every pool's policy.
+    /// Paged residency is rejected before any I/O because shared-WAL
+    /// journaling cannot advance durable coverage from a paged sync.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid config, unsupported residency, if the
+    /// root lock is held, or if any pool cannot be opened or attached.
+    pub fn open_with_policies_and_config(
+        root: PathBuf,
+        mut policies: PoolPolicies,
+        config: RuntimeConfig,
+    ) -> Result<Self, StorageError> {
+        config.validate_for_database()?;
+        if let Some(residency) = config.index_residency {
+            for shard in ShardType::ALL {
+                policies.for_shard_mut(shard).index_residency = residency;
+            }
+        }
+        for shard in ShardType::ALL {
+            if policies.for_shard(shard).index_residency == crate::index::IndexResidency::Paged {
+                return Err(StorageError::Unsupported(format!(
+                    "{shard:?} uses Paged index residency, which cannot use shared WAL journaling; use Resident residency"
+                )));
+            }
+        }
+        Self::open_with_policies_and_config_unchecked(root, policies, config)
     }
 
     #[cfg(test)]
@@ -778,13 +875,17 @@ impl Database {
         root: PathBuf,
         limit_bytes: usize,
     ) -> Result<Self, StorageError> {
-        Self::open_with_policies_and_stage_limit(root, PoolPolicies::default(), limit_bytes)
+        let config = RuntimeConfig {
+            txn_stage_limit_bytes: limit_bytes,
+            ..RuntimeConfig::default()
+        };
+        Self::open_with_config(root, config)
     }
 
-    fn open_with_policies_and_stage_limit(
+    fn open_with_policies_and_config_unchecked(
         root: PathBuf,
         policies: PoolPolicies,
-        txn_stage_limit_bytes: usize,
+        config: RuntimeConfig,
     ) -> Result<Self, StorageError> {
         let layout = DatabaseLayout::open(root)?;
         let wal_path = layout.shared_wal_path();
@@ -792,13 +893,24 @@ impl Database {
         let seed_lsn = shared_wal_seed_lsn(&layout);
         let (journal, scan) = Journal::open_shared_with_base(&wal_path, seed_lsn)?;
         let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+        if let Some(bytes) = config.reclaim_trigger_bytes {
+            coordinator.configure_reclaim_trigger_len(bytes)?;
+        }
+        coordinator.configure_replay_lease_cap(config.replay_lease_max_retained_bytes);
 
         let mut pools = Vec::with_capacity(ShardType::ALL.len());
         for shard in ShardType::ALL {
             let dir = layout.pool_path(shard);
             let policy = policies.for_shard(shard);
-            let store =
-                PackfileStorage::open_shared_member(dir, policy.compress, policy.checksum_policy)?;
+            let store = PackfileStorage::open_shared_member(
+                dir,
+                config.cache_capacity,
+                policy.compress,
+                policy.checksum_policy,
+                policy.index_residency,
+            )?
+            .with_append_policy(policy.append_policy);
+            store.set_stats_enabled(config.stats_enabled);
             // This process holds the exclusive WAL lock, so its in-memory
             // index is authoritative and a negative lookup is a true miss.
             // Left on, every miss after a sync (which moves the durable
@@ -808,6 +920,22 @@ impl Database {
             store.set_refresh_on_miss(false);
             store.enable_shared_journal(Arc::clone(&coordinator), shard)?;
             store.replay_journal()?;
+            // A rescan leaves no checkpoint describing the pack set, so every
+            // later open would pay the same rescan until something happened to
+            // sync. Persist one now, through the normal sync path so the packs
+            // are durable first. Best effort: the packs stay authoritative.
+            // Empty pools are skipped; they are created on first write.
+            if store
+                .open_timings()
+                .is_some_and(|t| t.path == OpenPath::FullScan)
+                && !store.collection_summaries().is_empty()
+            {
+                if let Err(error) = store.sync_all() {
+                    eprintln!(
+                        "warning: checkpointing {shard:?} after a full-scan open failed: {error}"
+                    );
+                }
+            }
             pools.push(Arc::new(store));
         }
         let pools: [Arc<PackfileStorage>; POOL_COUNT] = pools.try_into().map_err(|_| {
@@ -837,7 +965,7 @@ impl Database {
             layout,
             coordinator,
             pools,
-            txn_stage_limit_bytes,
+            txn_stage_limit_bytes: config.txn_stage_limit_bytes,
             recovery_queue: parking_lot::Mutex::new(Vec::new()),
             recovery_lifecycle: parking_lot::Mutex::new(()),
             commit_phases: CommitPhases::default(),
@@ -849,6 +977,12 @@ impl Database {
     #[must_use]
     pub fn layout(&self) -> &DatabaseLayout {
         &self.layout
+    }
+
+    /// Maximum charged payload one transaction may stage on this database.
+    #[must_use]
+    pub fn txn_stage_limit_bytes(&self) -> usize {
+        self.txn_stage_limit_bytes
     }
 
     /// The one coordinator every pool publishes through.
@@ -873,12 +1007,6 @@ impl Database {
     #[must_use]
     pub fn event_dag(&self) -> &Arc<PackfileStorage> {
         self.pool(ShardType::EventDag)
-    }
-
-    /// The Edges store (`ShardType::Edges`), hosting PREV and AUTH edge collections.
-    #[must_use]
-    pub fn edges(&self) -> &Arc<PackfileStorage> {
-        self.pool(ShardType::Edges)
     }
 
     /// The server-info store (`ShardType::ServerInfo`).
@@ -1024,6 +1152,17 @@ impl Database {
         }
     }
 
+    /// Record a materialization failure that a retry cannot fix. A transient
+    /// `WouldBlock` leaves the group queued for the existing retry path; any
+    /// other error means this process's live index no longer matches the WAL,
+    /// so later publications and versioned reads must fail until a reopen.
+    fn note_materialization_failure(&self, error: &StorageError) {
+        if !error.is_would_block() {
+            self.coordinator
+                .fail_apply(format!("transaction materialization failed: {error}"));
+        }
+    }
+
     fn materialize_transaction(&self, stage: &TxnStage) -> Result<(), StorageError> {
         // The published group's last LSN is stamped into each record it writes,
         // so a record's optimistic token survives reclaim of the group's WAL.
@@ -1073,7 +1212,10 @@ impl Database {
             if stage.state() != TxnStageState::Materializing {
                 continue;
             }
-            self.materialize_transaction(&stage)?;
+            if let Err(error) = self.materialize_transaction(&stage) {
+                self.note_materialization_failure(&error);
+                return Err(error);
+            }
             stage.mark_published().map_err(StorageError::Io)?;
             self.finish_recovery_stage(&stage)?;
         }

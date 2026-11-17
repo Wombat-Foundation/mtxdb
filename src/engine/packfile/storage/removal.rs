@@ -17,7 +17,9 @@
 //! [`PackfileStorage::remove_record`] is the pool-level counterpart of
 //! `DatabaseTransaction::remove` for tooling that works on one pool directory.
 
-use super::*;
+use super::{
+    packfile, HashMap, JournalMutation, NodeId, PackfileStorage, StorageEngine, StorageError,
+};
 
 /// What a collection's packs hold, split into live data and removals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -129,9 +131,10 @@ impl PackfileStorage {
             collection_id: *collection_id,
             node_id: *node_id,
         };
-        let published_lsn = self.publish_mutation(|| mutation.clone())?;
-        self.apply_remove_record_locked(collection_id, node_id, published_lsn.unwrap_or(0))?;
-        self.note_published_materialized(published_lsn);
+        let published = self.publish_mutation(|| mutation)?;
+        let published_lsn = published.as_ref().map_or(0, |published| published.last_lsn);
+        self.apply_remove_record_locked(collection_id, node_id, published_lsn)?;
+        self.note_published_materialized(published);
         Ok(true)
     }
 
@@ -176,8 +179,12 @@ impl PackfileStorage {
         let mut stats = RemovalStats::default();
         let mut newest: HashMap<NodeId, Newest> = HashMap::new();
         for (_, shard) in self.shards.all_shards() {
-            let file_len = std::fs::metadata(&shard.path)?.len();
-            let mut entries = packfile::scan_packfile(&shard.path)?;
+            // The active pack may still be staged; scan its physical file so an
+            // in-process repack plan sees everything already flushed, while
+            // path/pub consumers keep using the canonical name.
+            let path = shard.data_path();
+            let file_len = std::fs::metadata(&path)?.len();
+            let mut entries = packfile::scan_packfile(&path)?;
             entries.sort_unstable_by_key(|(_, _, offset)| *offset);
             for (index, (rid, hash, offset)) in entries.iter().enumerate() {
                 if rid != collection_id {

@@ -2,23 +2,40 @@
 //!
 //! Packs remain authoritative. The sidecar stores
 //! `(collection_id, logical_id) -> byte_offset` and can be rebuilt by scanning
-//! its pack. This module defines the format and I/O primitives; pack sealing
-//! and store-open integration are separate work.
+//! its pack. Sealing publishes a sidecar through [`build_and_write`], and
+//! store open loads it through [`open_for_pack`]. A Paged store serves sealed
+//! lookups from sidecars; a Resident store uses them when its checksum policy
+//! does not verify reads, and otherwise scans frames.
+//!
+//! The `index_artifacts` benchmark writes frames in arrival order; it does not
+//! measure repacked packs. Repacking rewrites a collection's live frames in
+//! topological order ([`crate::packfile::storage::PackfileStorage::repack_collection_reachable`]
+//! copies in `topo_order()`). Neither order sorts by logical id, so sparse
+//! sampling cannot scan between sampled ids in these layouts. Supporting that
+//! would require an id-ordered write path and would trade away the locality
+//! repack creates. Truncated ids (drop the trailing bytes, then verify the full
+//! id from the frame header and probe adjacent equal prefixes) project to about
+//! 40% less sidecar data, before accounting for any additional lookup metadata.
+//! [`PackIndex::open_mmap`] is the production loader (via [`open_for_pack`]),
+//! and the `index_artifacts` bench also calls it directly.
 //!
 //! Version 1 is little-endian:
 //!
 //! ```text
 //! [64-byte header]
-//! [collection directory: 20 bytes per collection]
+//! [collection directory: 28 bytes per collection]
 //! [collection sections in collection-id order]
 //! ```
 //!
 //! The `MTXIDX01` magic identifies the version. The header CRC field is zeroed
 //! while calculating CRC32 over the complete file. Each directory entry is a
-//! 16-byte collection id followed by a `u32` entry count. Its section starts
+//! 16-byte collection id followed by a `u32` entry count and a `u64` physical
+//! frame-byte total. Its section starts
 //! immediately after the previous section and contains cumulative
-//! `fanout[256]`, sorted 16-byte logical ids, then parallel `u32` offsets.
-//! Duplicate `(collection_id, logical_id)` inputs keep the greatest offset.
+//! `fanout[256]`, sorted 16-byte logical ids, parallel `u32` offsets, then one
+//! flags byte per entry. Bit 0 marks a removal version; the offset still points
+//! at the removal frame, so append order decides which version wins. Duplicate
+//! `(collection_id, logical_id)` inputs keep the greatest offset.
 //!
 //! [`PackIndex::build`] sorts one flat input vector and is intended for
 //! in-memory construction. It does not implement external sorting; a bounded
@@ -37,10 +54,16 @@ use crate::packfile::{PackId, HEADER_LEN};
 pub const PACK_INDEX_MAGIC: [u8; 8] = *b"MTXIDX01";
 /// Fixed header length in bytes.
 pub const PACK_INDEX_HEADER_LEN: usize = 64;
-/// One collection directory entry in bytes.
-pub const PACK_INDEX_COLLECTION_ENTRY_LEN: usize = 20;
+/// One collection directory entry in bytes: id, entry count, disk bytes.
+pub const PACK_INDEX_COLLECTION_ENTRY_LEN: usize = 28;
 /// Cumulative first-byte fanout table length in bytes.
 pub const PACK_INDEX_FANOUT_LEN: usize = 256 * 4;
+/// Bytes per locator in a collection section: a 16-byte id and a `u32` offset.
+pub const PACK_INDEX_SECTION_ENTRY_LEN: usize = 20;
+/// Bytes of per-entry flags in a collection section.
+pub const PACK_INDEX_FLAG_ENTRY_LEN: usize = 1;
+/// Flag bit marking a removal version.
+pub const PACK_INDEX_FLAG_REMOVED: u8 = 1;
 const CRC_RANGE: std::ops::Range<usize> = 60..64;
 const MAX_FILE_LEN: u64 = 0xFFFF_FFFF;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +77,91 @@ pub struct PackIndexInput {
     pub logical_id: [u8; 16],
     /// Byte offset of the frame in the pack.
     pub offset: u64,
+    /// Whether the frame at `offset` is a removal version.
+    pub removed: bool,
+    /// Bytes this frame occupies on disk, used to preserve the physical byte
+    /// accounting when an open is served from the sidecar. The checked extent
+    /// `offset..offset + disk_bytes` must fit inside the pack.
+    pub disk_bytes: u64,
+}
+
+/// What a locator names: a live frame or a removal version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackIndexLocator {
+    /// A live frame at this byte offset.
+    Frame(u32),
+    /// A removal version at this byte offset. The frame is present, but the key
+    /// is absent from the collection.
+    Removed(u32),
+}
+
+/// On-disk sidecar path for a pack file.
+#[must_use]
+pub fn pack_index_path(pack_path: &Path) -> PathBuf {
+    pack_path.with_extension("idx")
+}
+
+/// Identity of a pack read from its header and current extent.
+fn pack_identity(pack_path: &Path) -> io::Result<PackIndexIdentity> {
+    let mut file = File::open(pack_path)?;
+    let header = crate::packfile::read_header(&mut file)?
+        .ok_or_else(|| io::Error::other("pack has no header"))?;
+    let pack_file_len = file.metadata()?.len();
+    Ok(PackIndexIdentity {
+        pack_id: header.pack_id,
+        creation_seq: u64::from(header.creation_seq),
+        pack_file_len,
+    })
+}
+
+/// Build an index for a sealed pack by scanning its frames.
+///
+/// The caller is responsible for ensuring the pack is not being appended to
+/// while this runs (seal-time generation holds the shard's append lock).
+///
+/// # Errors
+/// Returns an I/O error if the pack cannot be read or scanned, or if its
+/// records cannot be represented by the v1 sidecar format.
+pub fn build_for_pack(pack_path: &Path, verify_checksum: bool) -> io::Result<PackIndex> {
+    let identity = pack_identity(pack_path)?;
+    let mut inputs = Vec::new();
+    crate::packfile::scan_packfile_from_with_removal_visit(
+        pack_path,
+        0,
+        verify_checksum,
+        |entry| {
+            inputs.push(PackIndexInput {
+                collection_id: entry.collection_id,
+                logical_id: entry.hash,
+                offset: entry.offset,
+                removed: entry.removed,
+                disk_bytes: entry.disk_bytes,
+            });
+        },
+    )?;
+    PackIndex::build(identity, inputs).map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// Build and atomically publish a pack's sidecar index.
+///
+/// # Errors
+/// Returns an I/O error if scanning the pack, encoding the index, or writing
+/// the sidecar fails.
+pub fn build_and_write(pack_path: &Path, verify_checksum: bool) -> io::Result<()> {
+    let index = build_for_pack(pack_path, verify_checksum)?;
+    index.write_atomic(&pack_index_path(pack_path))
+}
+
+/// Open a pack's sidecar when it matches the pack's current header and extent.
+///
+/// Returns `None` for a missing, stale, or corrupt sidecar; callers fall back
+/// to scanning the pack.
+#[must_use]
+pub fn open_for_pack(pack_path: &Path) -> Option<MappedPackIndex> {
+    let identity = pack_identity(pack_path).ok()?;
+    let index = PackIndex::open_mmap(&pack_index_path(pack_path), identity).ok()?;
+    index.verify().ok()?;
+    Some(index)
 }
 
 /// Expected identity and extent when opening an index for a pack.
@@ -103,6 +211,8 @@ struct CollectionView {
     fan_at: usize,
     ids_at: usize,
     offsets_at: usize,
+    flags_at: usize,
+    disk_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -110,6 +220,7 @@ struct CollectionRange {
     id: [u8; 16],
     start: usize,
     end: usize,
+    disk_bytes: u64,
 }
 
 /// Errors found while constructing or fully validating a pack index.
@@ -131,6 +242,15 @@ pub enum PackIndexError {
         /// The pack extent used during construction.
         pack_len: u64,
     },
+    /// A frame's byte extent overflows or extends past the pack end.
+    FrameExtentOutsidePack {
+        /// The frame's start offset.
+        offset: u64,
+        /// The frame's byte length.
+        disk_bytes: u64,
+        /// The pack extent used during construction.
+        pack_len: u64,
+    },
 }
 
 impl std::fmt::Display for PackIndexError {
@@ -144,6 +264,14 @@ impl std::fmt::Display for PackIndexError {
             Self::OffsetOutsidePack { offset, pack_len } => {
                 write!(f, "pack offset {offset} is outside pack length {pack_len}")
             }
+            Self::FrameExtentOutsidePack {
+                offset,
+                disk_bytes,
+                pack_len,
+            } => write!(
+                f,
+                "frame extent at {offset} with length {disk_bytes} exceeds pack length {pack_len}"
+            ),
         }
     }
 }
@@ -185,7 +313,8 @@ impl PackIndex {
     ///
     /// # Errors
     /// Returns an error if a pack id is zero, an offset is outside frame data
-    /// or the pack extent, or v1 cannot represent the output.
+    /// or the pack extent, a frame's checked `offset + disk_bytes` extent
+    /// exceeds the pack length, or v1 cannot represent the output.
     pub fn build(
         identity: PackIndexIdentity,
         mut inputs: Vec<PackIndexInput>,
@@ -206,6 +335,17 @@ impl PackIndex {
                     pack_len: identity.pack_file_len,
                 });
             }
+            if input
+                .offset
+                .checked_add(input.disk_bytes)
+                .is_none_or(|end| end > identity.pack_file_len)
+            {
+                return Err(PackIndexError::FrameExtentOutsidePack {
+                    offset: input.offset,
+                    disk_bytes: input.disk_bytes,
+                    pack_len: identity.pack_file_len,
+                });
+            }
             u32::try_from(input.offset).map_err(|_| PackIndexError::TooLarge)?;
         }
         inputs.sort_unstable_by(|left, right| {
@@ -214,10 +354,22 @@ impl PackIndex {
                 .then_with(|| left.logical_id.cmp(&right.logical_id))
                 .then_with(|| right.offset.cmp(&left.offset))
         });
-        inputs.dedup_by(|later, earlier| {
-            later.collection_id == earlier.collection_id && later.logical_id == earlier.logical_id
-        });
-        Self::encode_sorted(identity, &inputs)
+        let mut deduplicated: Vec<PackIndexInput> = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if let Some(previous) = deduplicated.last_mut() {
+                if previous.collection_id == input.collection_id
+                    && previous.logical_id == input.logical_id
+                {
+                    previous.disk_bytes = previous
+                        .disk_bytes
+                        .checked_add(input.disk_bytes)
+                        .ok_or(PackIndexError::TooLarge)?;
+                    continue;
+                }
+            }
+            deduplicated.push(input);
+        }
+        Self::encode_sorted(identity, &deduplicated)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -317,16 +469,76 @@ impl PackIndex {
         self.entry_count
     }
 
+    /// Bytes of the owned encoded index image.
+    #[must_use]
+    pub fn mapped_file_bytes(&self) -> u64 {
+        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Unique locators recorded for one collection.
+    #[must_use]
+    pub fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
+        collection_count(&self.collections, collection_id)
+    }
+
     /// Encoded bytes, including the header and CRC-protected body.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// Resolve a key to its frame offset in this pack.
+    /// Resolve a key to a live frame offset in this pack.
+    ///
+    /// Returns `None` for a missing key and for a key whose newest version is a
+    /// removal. Use [`Self::get_locator`] when the difference matters.
     #[must_use]
     pub fn get(&self, collection_id: &[u8; 16], logical_id: &[u8; 16]) -> Option<u32> {
+        match lookup(&self.bytes, &self.collections, collection_id, logical_id)? {
+            PackIndexLocator::Frame(offset) => Some(offset),
+            PackIndexLocator::Removed(_) => None,
+        }
+    }
+
+    /// Resolve a key to the newest version recorded in this pack, including a
+    /// removal version.
+    #[must_use]
+    pub fn get_locator(
+        &self,
+        collection_id: &[u8; 16],
+        logical_id: &[u8; 16],
+    ) -> Option<PackIndexLocator> {
         lookup(&self.bytes, &self.collections, collection_id, logical_id)
+    }
+
+    /// Visit every `(collection_id, logical_id, locator)` in the index.
+    ///
+    /// The callback is invoked in collection order, then logical-id order.
+    pub fn for_each_entry(&self, mut visit: impl FnMut([u8; 16], [u8; 16], PackIndexLocator)) {
+        for_each_entry_in(&self.bytes, &self.collections, &mut visit);
+    }
+
+    /// Visit each collection and the bytes its frames occupy in this pack.
+    pub fn for_each_collection(&self, mut visit: impl FnMut([u8; 16], u64)) {
+        for_each_collection(&self.collections, &mut visit);
+    }
+
+    /// Bytes the collection's frames occupy in this pack, if present.
+    #[must_use]
+    pub fn collection_disk_bytes(&self, collection_id: &[u8; 16]) -> Option<u64> {
+        self.collections
+            .binary_search_by_key(collection_id, |view| view.id)
+            .ok()
+            .and_then(|index| self.collections.get(index))
+            .map(|view| view.disk_bytes)
+    }
+
+    /// Visit one collection's `(logical_id, locator)` entries.
+    pub fn for_each_entry_in_collection(
+        &self,
+        collection_id: &[u8; 16],
+        mut visit: impl FnMut([u8; 16], PackIndexLocator),
+    ) {
+        for_each_entry_in_collection(&self.bytes, &self.collections, collection_id, &mut visit);
     }
 
     /// Atomically publish this index, syncing the file and parent directory where supported.
@@ -340,6 +552,8 @@ impl PackIndex {
     /// renaming it fails. On Unix, a parent-directory sync error may be
     /// returned after the new file is visible.
     pub fn write_atomic(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("sidecar.publish", path);
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -377,10 +591,15 @@ fn group_collections(inputs: &[PackIndexInput]) -> Result<Vec<CollectionRange>, 
         while cursor < inputs.len() && inputs[cursor].collection_id == id {
             cursor = cursor.checked_add(1).ok_or(PackIndexError::TooLarge)?;
         }
+        let disk_bytes = inputs[start..cursor]
+            .iter()
+            .try_fold(0_u64, |total, input| total.checked_add(input.disk_bytes))
+            .ok_or(PackIndexError::TooLarge)?;
         groups.push(CollectionRange {
             id,
             start,
             end: cursor,
+            disk_bytes,
         });
     }
     Ok(groups)
@@ -395,7 +614,9 @@ fn encoded_file_len(groups: &[CollectionRange]) -> Result<usize, PackIndexError>
         .iter()
         .try_fold(0_usize, |total, group| {
             let count = group.end.checked_sub(group.start)?;
-            let section_len = PACK_INDEX_FANOUT_LEN.checked_add(count.checked_mul(20)?)?;
+            let section_len = PACK_INDEX_FANOUT_LEN
+                .checked_add(count.checked_mul(PACK_INDEX_SECTION_ENTRY_LEN)?)?
+                .checked_add(count.checked_mul(PACK_INDEX_FLAG_ENTRY_LEN)?)?;
             total.checked_add(section_len)
         })
         .ok_or(PackIndexError::TooLarge)?;
@@ -448,6 +669,7 @@ fn encode_directory(bytes: &mut Vec<u8>, groups: &[CollectionRange]) -> Result<(
                 .map_err(|_| PackIndexError::TooLarge)?
                 .to_le_bytes(),
         );
+        bytes.extend_from_slice(&group.disk_bytes.to_le_bytes());
     }
     Ok(())
 }
@@ -492,6 +714,14 @@ fn encode_collection(
                 .to_le_bytes(),
         );
     }
+    let flags_at = bytes.len();
+    for input in &inputs[group.start..group.end] {
+        bytes.push(if input.removed {
+            PACK_INDEX_FLAG_REMOVED
+        } else {
+            0
+        });
+    }
     debug_assert_eq!(
         ids_at, expected_ids_at,
         "logical-id section must immediately follow the fanout table"
@@ -502,6 +732,8 @@ fn encode_collection(
         fan_at,
         ids_at,
         offsets_at,
+        flags_at,
+        disk_bytes: group.disk_bytes,
     })
 }
 
@@ -518,10 +750,95 @@ impl MappedPackIndex {
         self.entry_count
     }
 
-    /// Resolve a key to its frame offset in this pack.
+    /// Bytes of the mapped sidecar file.
+    #[must_use]
+    pub fn mapped_file_bytes(&self) -> u64 {
+        u64::try_from(self.map.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Unique locators recorded for one collection.
+    #[must_use]
+    pub fn collection_entry_count(&self, collection_id: &[u8; 16]) -> Option<u64> {
+        collection_count(&self.collections, collection_id)
+    }
+
+    /// Resolve a key to a live frame offset in this pack.
+    ///
+    /// Returns `None` for a missing key and for a key whose newest version is a
+    /// removal. Use [`Self::get_locator`] when the difference matters.
     #[must_use]
     pub fn get(&self, collection_id: &[u8; 16], logical_id: &[u8; 16]) -> Option<u32> {
+        match lookup(&self.map, &self.collections, collection_id, logical_id)? {
+            PackIndexLocator::Frame(offset) => Some(offset),
+            PackIndexLocator::Removed(_) => None,
+        }
+    }
+
+    /// Resolve a key to the newest version recorded in this pack, including a
+    /// removal version.
+    #[must_use]
+    pub fn get_locator(
+        &self,
+        collection_id: &[u8; 16],
+        logical_id: &[u8; 16],
+    ) -> Option<PackIndexLocator> {
         lookup(&self.map, &self.collections, collection_id, logical_id)
+    }
+
+    /// Visit every `(collection_id, logical_id, locator)` in the index.
+    ///
+    /// The callback is invoked in collection order, then logical-id order.
+    pub fn for_each_entry(&self, mut visit: impl FnMut([u8; 16], [u8; 16], PackIndexLocator)) {
+        for_each_entry_in(&self.map, &self.collections, &mut visit);
+    }
+
+    /// Visit each collection and the bytes its frames occupy in this pack.
+    pub fn for_each_collection(&self, mut visit: impl FnMut([u8; 16], u64)) {
+        for_each_collection(&self.collections, &mut visit);
+    }
+
+    /// Bytes the collection's frames occupy in this pack, if present.
+    #[must_use]
+    pub fn collection_disk_bytes(&self, collection_id: &[u8; 16]) -> Option<u64> {
+        self.collections
+            .binary_search_by_key(collection_id, |view| view.id)
+            .ok()
+            .and_then(|index| self.collections.get(index))
+            .map(|view| view.disk_bytes)
+    }
+
+    /// Every `(collection_id, logical_id, locator)` in collection order, then
+    /// logical-id order, as a pull iterator for streaming merges. Unlike the
+    /// callback visitors it can be advanced in step with other sources.
+    pub fn entries(&self) -> impl Iterator<Item = ([u8; 16], [u8; 16], PackIndexLocator)> + '_ {
+        self.collections.iter().flat_map(move |collection| {
+            let count = usize::try_from(collection.count).unwrap_or(0);
+            (0..count).filter_map(move |index| {
+                entry_at(&self.map, collection, index)
+                    .map(|(id, locator)| (collection.id, id, locator))
+            })
+        })
+    }
+
+    /// Visit one collection's `(logical_id, locator)` entries.
+    pub fn for_each_entry_in_collection(
+        &self,
+        collection_id: &[u8; 16],
+        mut visit: impl FnMut([u8; 16], PackIndexLocator),
+    ) {
+        for_each_entry_in_collection(&self.map, &self.collections, collection_id, &mut visit);
+    }
+
+    /// Tell the operating system that lookups will access the mapping randomly.
+    ///
+    /// This can reduce sequential readahead for scattered lookups. It is only
+    /// a hint; the mapping remains correct if the operating system ignores it.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the operating system cannot apply the advice.
+    #[cfg(unix)]
+    pub fn advise_random(&self) -> io::Result<()> {
+        self.map.advise(memmap2::Advice::Random)
     }
 
     /// Verify CRC, sorted ids, exact fanout values, and every frame offset.
@@ -537,12 +854,79 @@ impl MappedPackIndex {
     }
 }
 
+fn for_each_entry_in(
+    bytes: &[u8],
+    collections: &[CollectionView],
+    visit: &mut impl FnMut([u8; 16], [u8; 16], PackIndexLocator),
+) {
+    for collection in collections {
+        for_each_in_collection(bytes, collection, |id, locator| {
+            visit(collection.id, id, locator);
+        });
+    }
+}
+
+fn for_each_collection(collections: &[CollectionView], visit: &mut impl FnMut([u8; 16], u64)) {
+    for collection in collections {
+        visit(collection.id, collection.disk_bytes);
+    }
+}
+
+fn for_each_entry_in_collection(
+    bytes: &[u8],
+    collections: &[CollectionView],
+    collection_id: &[u8; 16],
+    visit: &mut impl FnMut([u8; 16], PackIndexLocator),
+) {
+    let Ok(index) = collections.binary_search_by_key(collection_id, |view| view.id) else {
+        return;
+    };
+    if let Some(collection) = collections.get(index) {
+        for_each_in_collection(bytes, collection, visit);
+    }
+}
+
+fn for_each_in_collection(
+    bytes: &[u8],
+    collection: &CollectionView,
+    mut visit: impl FnMut([u8; 16], PackIndexLocator),
+) {
+    let count = usize::try_from(collection.count).unwrap_or(0);
+    for index in 0..count {
+        if let Some((id, locator)) = entry_at(bytes, collection, index) {
+            visit(id, locator);
+        }
+    }
+}
+
+/// The `index`th entry of a collection section, or `None` if it lies outside
+/// the mapping.
+fn entry_at(
+    bytes: &[u8],
+    collection: &CollectionView,
+    index: usize,
+) -> Option<([u8; 16], PackIndexLocator)> {
+    let id_at = collection.ids_at.checked_add(index.checked_mul(16)?)?;
+    let id = <[u8; 16]>::try_from(bytes.get(id_at..id_at.checked_add(16)?)?).ok()?;
+    let offset = read_u32(
+        bytes,
+        collection.offsets_at.checked_add(index.checked_mul(4)?)?,
+    )?;
+    let flags = *bytes.get(collection.flags_at.checked_add(index)?)?;
+    let locator = if flags & PACK_INDEX_FLAG_REMOVED != 0 {
+        PackIndexLocator::Removed(offset)
+    } else {
+        PackIndexLocator::Frame(offset)
+    };
+    Some((id, locator))
+}
+
 fn lookup(
     bytes: &[u8],
     collections: &[CollectionView],
     collection_id: &[u8; 16],
     logical_id: &[u8; 16],
-) -> Option<u32> {
+) -> Option<PackIndexLocator> {
     let collection = collections
         .binary_search_by_key(collection_id, |view| view.id)
         .ok()
@@ -569,7 +953,14 @@ fn lookup(
             std::cmp::Ordering::Greater => right = middle,
             std::cmp::Ordering::Equal => {
                 let offset_at = collection.offsets_at.checked_add(middle.checked_mul(4)?)?;
-                return read_u32(bytes, offset_at);
+                let offset = read_u32(bytes, offset_at)?;
+                let flags_at = collection.flags_at.checked_add(middle)?;
+                let flags = *bytes.get(flags_at)?;
+                return Some(if flags & PACK_INDEX_FLAG_REMOVED != 0 {
+                    PackIndexLocator::Removed(offset)
+                } else {
+                    PackIndexLocator::Frame(offset)
+                });
             }
         }
     }
@@ -621,6 +1012,7 @@ fn parse_layout(bytes: &[u8], verify_body: bool) -> Option<ParsedLayout> {
         }
         previous_id = Some(id);
         let count = read_u32(bytes, dir_at.checked_add(16)?)?;
+        let disk_bytes = read_u64(bytes, dir_at.checked_add(20)?)?;
         if count == 0 {
             return None;
         }
@@ -628,7 +1020,9 @@ fn parse_layout(bytes: &[u8], verify_body: bool) -> Option<ParsedLayout> {
         let fan_at = section_at;
         let ids_at = fan_at.checked_add(PACK_INDEX_FANOUT_LEN)?;
         let offsets_at = ids_at.checked_add(count_usize.checked_mul(16)?)?;
-        let section_end = offsets_at.checked_add(count_usize.checked_mul(4)?)?;
+        let flags_at = offsets_at.checked_add(count_usize.checked_mul(4)?)?;
+        let section_end =
+            flags_at.checked_add(count_usize.checked_mul(PACK_INDEX_FLAG_ENTRY_LEN)?)?;
         if section_end > bytes.len() {
             return None;
         }
@@ -639,6 +1033,8 @@ fn parse_layout(bytes: &[u8], verify_body: bool) -> Option<ParsedLayout> {
             fan_at,
             ids_at,
             offsets_at,
+            flags_at,
+            disk_bytes,
         });
         section_at = section_end;
     }
@@ -690,6 +1086,10 @@ fn validate_body(bytes: &[u8], parsed: &ParsedLayout) -> Option<()> {
             *frequency = frequency.checked_add(1)?;
             let offset_at = collection.offsets_at.checked_add(i.checked_mul(4)?)?;
             let offset = u64::from(read_u32(bytes, offset_at)?);
+            let flags = *bytes.get(collection.flags_at.checked_add(i)?)?;
+            if flags & !PACK_INDEX_FLAG_REMOVED != 0 {
+                return None;
+            }
             if offset < min_offset || offset >= parsed.identity.pack_file_len {
                 return None;
             }
@@ -718,6 +1118,14 @@ fn crc_with_zeroed_field(bytes: &[u8]) -> Option<u32> {
     hasher.update(&[0; 4]);
     hasher.update(bytes.get(CRC_RANGE.end..)?);
     Some(hasher.finalize())
+}
+
+fn collection_count(collections: &[CollectionView], collection_id: &[u8; 16]) -> Option<u64> {
+    collections
+        .binary_search_by_key(collection_id, |view| view.id)
+        .ok()
+        .and_then(|index| collections.get(index))
+        .map(|view| u64::from(view.count))
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {

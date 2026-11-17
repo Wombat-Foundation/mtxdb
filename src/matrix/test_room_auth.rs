@@ -3,16 +3,16 @@
 //! The room auth façade: ingest, lazy and persisted auth chains, pinned
 //! snapshots, rebuild/retire/verify/purge, and the error contract.
 
+use crate::csr_adjacency::{AlwaysVisible, RelationRef};
 use crate::database::Database;
 use crate::layout::ShardType;
-use crate::matrix_adjacency::{AlwaysVisible, RelationRef};
 use crate::room_auth::tests::take_edge_reads;
 use crate::room_auth::{NewEvent, RoomAuth, RoomAuthError};
 use crate::short_id::SHORT_ID_MAX;
 use crate::storage::StorageError;
 use std::path::PathBuf;
 
-const POOL: ShardType = ShardType::Edges;
+const POOL: ShardType = ShardType::State;
 const ROOM: &str = "!facade:example.org";
 
 fn root(name: &str) -> PathBuf {
@@ -47,7 +47,7 @@ fn record_diamond(room: &RoomAuth, db: &Database) {
 fn a_chain_is_ancestors_only_before_any_generation_exists() {
     let dir = root("lazy");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     record_diamond(&room, &db);
 
     assert_eq!(room.snapshot(&db).unwrap().generation(), None);
@@ -77,7 +77,7 @@ fn a_chain_is_ancestors_only_before_any_generation_exists() {
 fn persisted_and_lazy_chains_agree() {
     let dir = root("agree");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     record_diamond(&room, &db);
     let lazy: Vec<_> = ["$create", "$member", "$power", "$msg"]
         .iter()
@@ -100,7 +100,7 @@ fn persisted_and_lazy_chains_agree() {
 fn a_query_for_a_new_event_never_walks_the_covered_history() {
     let dir = root("bounded");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     // A long covered chain: e0 <- e1 <- ... <- e49.
     let ids: Vec<String> = (0..50).map(|i| format!("$e{i}")).collect();
     for (index, id) in ids.iter().enumerate() {
@@ -133,7 +133,7 @@ fn a_query_for_a_new_event_never_walks_the_covered_history() {
 fn absent_events_are_told_apart() {
     let dir = root("absent");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     // `$leaf` is recorded with an empty auth list; `$ghost` is only referenced.
     room.record_event(&db, &event("$leaf", &[])).unwrap();
     room.record_event(&db, &event("$child", &["$ghost"]))
@@ -168,7 +168,7 @@ fn absent_events_are_told_apart() {
 fn an_auth_cycle_is_corruption() {
     let dir = root("cycle");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     room.record_event(&db, &event("$a", &["$b"])).unwrap();
     room.record_event(&db, &event("$b", &["$a"])).unwrap();
     let error = room.auth_chain(&db, "$a").unwrap_err();
@@ -184,7 +184,7 @@ fn an_auth_cycle_is_corruption() {
 fn visibility_filters_relations_but_never_the_auth_chain() {
     let dir = root("visibility");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     record_diamond(&room, &db);
     room.record_event(
         &db,
@@ -226,7 +226,7 @@ fn visibility_filters_relations_but_never_the_auth_chain() {
 fn a_pinned_snapshot_goes_stale_when_its_generation_is_retired() {
     let dir = root("stale");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     record_diamond(&room, &db);
     let first = room.rebuild(&db).unwrap();
     let pinned = room.snapshot(&db).unwrap();
@@ -256,8 +256,8 @@ fn a_pinned_snapshot_goes_stale_when_its_generation_is_retired() {
 fn purge_removes_the_room_and_expires_held_snapshots() {
     let dir = root("purge");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
-    let other = RoomAuth::new(POOL, "!other:example.org");
+    let room = RoomAuth::new(ROOM);
+    let other = RoomAuth::new("!other:example.org");
     record_diamond(&room, &db);
     record_diamond(&other, &db);
     let generation = room.rebuild(&db).unwrap().generation;
@@ -289,7 +289,7 @@ fn purge_removes_the_room_and_expires_held_snapshots() {
 fn an_exhausted_id_space_is_typed() {
     let dir = root("exhausted");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     room.record_event(&db, &event("$first", &[])).unwrap();
     room.closure_for_test()
         .adjacency()
@@ -322,7 +322,7 @@ fn a_lost_publish_race_is_a_rebuild_conflict() {
 fn a_lost_publish_race_leaves_the_winner_readable_and_the_loser_reclaimable() {
     let dir = root("rebuild-race");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     room.record_event(&db, &event("$root", &[])).unwrap();
 
     let store = room.closure_for_test().store();
@@ -393,7 +393,7 @@ fn a_lost_publish_race_leaves_the_winner_readable_and_the_loser_reclaimable() {
 fn a_batch_is_one_transaction_and_a_failed_one_records_nothing() {
     let dir = root("batch");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     room.record_event(&db, &event("$x", &["$p1"])).unwrap();
 
     // Events in one batch may reference each other.
@@ -438,7 +438,7 @@ fn a_batch_is_one_transaction_and_a_failed_one_records_nothing() {
 fn an_oversized_batch_is_refused_whole() {
     let dir = root("batch-limit");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     let ids: Vec<String> = (0..=crate::room_auth::MAX_BATCH_EVENTS)
         .map(|index| format!("$e{index}"))
         .collect();
@@ -460,7 +460,7 @@ fn an_oversized_batch_is_refused_whole() {
 fn verify_reports_state_and_gaps_without_calling_them_corruption() {
     let dir = root("verify");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     record_diamond(&room, &db);
     room.record_event(&db, &event("$orphan", &["$ghost"]))
         .unwrap();
@@ -500,7 +500,7 @@ fn verify_reports_state_and_gaps_without_calling_them_corruption() {
 fn a_held_snapshot_reports_no_current_generation_after_the_closures_are_purged() {
     let dir = root("stale-none");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     record_diamond(&room, &db);
     let generation = room.rebuild(&db).unwrap().generation;
     let pinned = room.snapshot(&db).unwrap();
@@ -543,7 +543,7 @@ fn a_power_cut_never_leaves_a_half_published_room() {
     let dir = root("power-cut");
     let image = root("power-cut-image");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
 
     let id = |index: usize| format!("$p{index}");
     // The last global event index (+1) known durable, and its generation.
@@ -596,7 +596,7 @@ fn a_power_cut_never_leaves_a_half_published_room() {
                 cut_segment_image_to_durable_mark(&image.join("wal.bin")).unwrap();
             }
             let recovered = Database::open(image.clone()).unwrap();
-            let after = RoomAuth::new(POOL, ROOM);
+            let after = RoomAuth::new(ROOM);
             let label = format!("batch {batch}, wal cut: {cut_wal}");
 
             // Nothing stored may disagree with the adjacency.
@@ -660,7 +660,7 @@ fn ingesting_and_rebuilding_many_events_keeps_index_probe_chains_short() {
     const BATCH: usize = 500;
     let dir = root("probe-chains");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
 
     let ids: Vec<String> = (0..EVENTS).map(|index| format!("$e{index:0>40}")).collect();
     let auth: Vec<Vec<&str>> = (0..EVENTS)
@@ -710,7 +710,7 @@ fn ingesting_and_rebuilding_many_events_keeps_index_probe_chains_short() {
 fn a_full_batch_of_realistic_events_fits_one_transaction() {
     let dir = root("full-batch");
     let db = Database::open(dir.clone()).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     let count = crate::room_auth::MAX_BATCH_EVENTS;
 
     let ids: Vec<String> = (0..count).map(|index| format!("${index:0>43}")).collect();
@@ -744,9 +744,15 @@ fn a_full_batch_of_realistic_events_fits_one_transaction() {
 
     let recorded = room.record_events(&db, &events).unwrap();
     assert_eq!(recorded.len(), count, "the whole batch is one commit");
-    let last = &ids[count - 1];
-    assert_eq!(room.auth_edges(&db, last).unwrap().len(), 10);
-    assert!(room.verify(&db).unwrap().is_consistent());
+    // Full-room consistency is covered by the dedicated verify tests. Keep
+    // this capacity test focused on the batch write and representative reads.
+    for index in [0, count / 2, count - 1] {
+        assert_eq!(
+            room.auth_edges(&db, &ids[index]).unwrap().len(),
+            index.min(10),
+            "auth edges for event {index}"
+        );
+    }
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -759,7 +765,7 @@ fn a_batch_over_the_transaction_stage_limit_is_a_typed_error_and_records_nothing
     const TEST_TXN_STAGE_LIMIT_BYTES: usize = 2 << 20;
     let dir = root("stage-limit");
     let db = Database::open_with_txn_stage_limit(dir.clone(), TEST_TXN_STAGE_LIMIT_BYTES).unwrap();
-    let room = RoomAuth::new(POOL, ROOM);
+    let room = RoomAuth::new(ROOM);
     // Staged size scales with key length, and every new key is stored twice (its
     // forward and reverse records), so long ids cross the test ceiling while a
     // single event still fits beneath it.
@@ -806,4 +812,101 @@ fn a_batch_over_the_transaction_stage_limit_is_a_typed_error_and_records_nothing
     assert_eq!(room.auth_edges(&db, &ids[0]).unwrap().len(), 1000);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_helpers_and_short_ids_agree_with_single_event_recording() {
+    use crate::csr_adjacency::AppendDurability;
+    let dir = root("batch-helpers");
+    let db = Database::open(dir.clone()).unwrap();
+    let room = RoomAuth::new(ROOM);
+
+    let recorded = room
+        .record_events_with(
+            &db,
+            &[event("$a", &[]), event("$b", &["$a"])],
+            AppendDurability::Durable,
+        )
+        .unwrap();
+    assert_eq!(recorded.len(), 2);
+    room.sync_adjacency(&db).unwrap();
+
+    let ids = room.short_ids(&db, &["$a", "$b", "$fresh"]).unwrap();
+    assert_eq!(ids.len(), 3);
+    assert_eq!(room.short_id(&db, "$a").unwrap(), Some(ids[0]));
+    assert_eq!(
+        room.short_ids(&db, &["$fresh"]).unwrap(),
+        vec![ids[2]],
+        "asking again returns the allocated id"
+    );
+
+    let (prev, auth) = room.referenced_event_ids_by_family(&db).unwrap();
+    assert!(prev.is_empty());
+    assert_eq!(auth.into_iter().collect::<Vec<_>>(), vec!["$a".to_owned()]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_error_variant_renders_and_only_storage_has_a_source() {
+    use std::error::Error;
+    let cases = [
+        (RoomAuthError::BatchTooLarge { limit: 3 }, "at most 3"),
+        (
+            RoomAuthError::BatchExceedsTransactionLimit {
+                staged_bytes: 9,
+                limit_bytes: 4,
+            },
+            "9 bytes",
+        ),
+        (RoomAuthError::OrdinalExhausted, "exhausted"),
+        (
+            RoomAuthError::UnknownEvent {
+                event_id: "$x".into(),
+            },
+            "unknown event $x",
+        ),
+        (
+            RoomAuthError::EventNotRecorded {
+                event_id: "$x".into(),
+            },
+            "never recorded",
+        ),
+        (
+            RoomAuthError::MissingParent {
+                event_id: "$x".into(),
+            },
+            "unrecorded event $x",
+        ),
+        (
+            RoomAuthError::StaleGeneration {
+                pinned: 1,
+                current: Some(2),
+            },
+            "current generation is 2",
+        ),
+        (
+            RoomAuthError::StaleGeneration {
+                pinned: 1,
+                current: None,
+            },
+            "no generation is published",
+        ),
+        (RoomAuthError::RebuildConflict, "another rebuild"),
+        (RoomAuthError::WrongDomain, "different domain"),
+        (RoomAuthError::Corruption("bad".into()), "corrupt: bad"),
+        (
+            RoomAuthError::IncompleteClosure {
+                missing: vec!["$m".into()],
+            },
+            "missing",
+        ),
+    ];
+    for (error, needle) in cases {
+        assert!(error.to_string().contains(needle), "{error}");
+        assert!(error.source().is_none());
+    }
+    let storage = RoomAuthError::Storage(StorageError::Corrupt("c".into()));
+    assert!(storage.source().is_some());
+    assert_ne!(storage.to_string(), "");
 }

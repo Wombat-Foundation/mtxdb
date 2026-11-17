@@ -170,6 +170,8 @@ pub const MEMBER_NAMESPACE_STAT: [u8; 4] = *b"STAT";
 pub const MEMBER_NAMESPACE_STGP: [u8; 4] = *b"STGP";
 /// Member namespace for generation-scoped forward-edge collections (`b"FWD "`).
 pub const MEMBER_NAMESPACE_FWD: [u8; 4] = *b"FWD ";
+/// Member namespace for room flag bitmap collections (`b"FLAG"`).
+pub const MEMBER_NAMESPACE_FLAG: [u8; 4] = *b"FLAG";
 /// Member namespace for internal system collections (`b"INTL"`).
 pub const MEMBER_NAMESPACE_INTL: [u8; 4] = *b"INTL";
 
@@ -221,6 +223,14 @@ pub const NAMESPACE_BIAS_FWD: [u8; 32] = [
     0x78, 0xc0, 0xe6, 0xbe, 0xb2, 0x3a, 0x7d, 0x9d, 0xc9, 0x1b, 0x6f, 0xf5, 0x60, 0x1c, 0xad, 0x8f,
 ];
 
+/// Fixed 32-byte namespace bias constant for `b"FLAG"`.
+///
+/// Computed as `BLAKE3-256("mtxdb/namespace/v1/FLAG")`.
+pub const NAMESPACE_BIAS_FLAG: [u8; 32] = [
+    0x2d, 0xde, 0x0a, 0x8e, 0x3d, 0xa1, 0x57, 0x3d, 0x0e, 0xf4, 0x9d, 0x0e, 0xda, 0x33, 0x29, 0xb2,
+    0xcc, 0xfa, 0x6a, 0x4c, 0x84, 0xcf, 0x53, 0xb9, 0x8b, 0x5b, 0xd6, 0x7d, 0x5c, 0xb3, 0xaf, 0x8b,
+];
+
 /// Fixed 32-byte namespace bias constant for `b"INTL"`.
 ///
 /// Computed as `BLAKE3-256("mtxdb/namespace/v1/INTL")`.
@@ -231,7 +241,7 @@ pub const NAMESPACE_BIAS_INTL: [u8; 32] = [
 
 /// Map a 4-byte member namespace to its fixed 32-byte bias constant.
 ///
-/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`).
+/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`, `FLAG`).
 /// Returns `None` for unrecognized namespaces (such as physical pool tags like `b"EDGE"`).
 #[must_use]
 pub const fn namespace_bias(namespace: [u8; 4]) -> Option<[u8; 32]> {
@@ -274,6 +284,12 @@ pub const fn namespace_bias(namespace: [u8; 4]) -> Option<[u8; 32]> {
         && namespace[3] == b' '
     {
         Some(NAMESPACE_BIAS_FWD)
+    } else if namespace[0] == b'F'
+        && namespace[1] == b'L'
+        && namespace[2] == b'A'
+        && namespace[3] == b'G'
+    {
+        Some(NAMESPACE_BIAS_FLAG)
     } else {
         None
     }

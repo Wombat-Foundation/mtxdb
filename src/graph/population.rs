@@ -2,12 +2,12 @@
 //! compacted runs.
 //!
 //! The owner log holds one entry per event the room's holder owns, each with
-//! the 32-byte payload from [`encode_owner_payload`]. Compaction folds the
+//! the 32-byte payload from [`encode_owner_payload`](crate::population::encode_owner_payload). Compaction folds the
 //! log into immutable sorted *runs* and publishes them under a *manifest*; the
 //! counter record carries `(log_epoch, log_epoch_start_seq, manifest_version)`
 //! together, so one read yields a manifest and the log tail it pairs with.
 //!
-//! A [`PopulationSnapshot`] is a cached, shared base (the runs merged into a
+//! A [`PopulationSnapshot`](crate::population::PopulationSnapshot) is a cached, shared base (the runs merged into a
 //! sorted population) plus a small tail (the log entries since the last
 //! compaction), pinned at an `owner_seq_ceiling`. It is materialized in
 //! memory, so an exchange keeps answering from one population while writers
@@ -16,14 +16,15 @@
 //! Layout, all in the scope's pool:
 //! - manifest `v`: a record in the scope's collection, immutable once
 //!   written, holding the kernel at the folded watermark and the run list;
-//! - one collection per run, holding sorted [`RUN_CHUNK_ENTRIES`]-entry chunk
+//! - one collection per run, holding sorted [`RUN_CHUNK_ENTRIES`](crate::population::RUN_CHUNK_ENTRIES)-entry chunk
 //!   records, so a retired run is dropped with one `delete_collection`;
 //! - a mutable garbage list of collections awaiting deletion after a grace
-//!   period, which [`ShortIdIndex::collect_garbage`] works through.
+//!   period, which [`ShortIdIndex::collect_garbage`](crate::short_id::ShortIdIndex::collect_garbage) works through.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -57,6 +58,8 @@ const READ_CHUNK: u32 = 4096;
 const CHUNKS_PER_TXN: usize = 500;
 /// Chunk records read per call.
 const CHUNKS_PER_READ: u32 = 50;
+/// Stripe same-scope compactions without retaining one lock per collection.
+const COMPACTION_LOCK_STRIPES: usize = 256;
 
 const MANIFEST_MAGIC: [u8; 4] = *b"SIDM";
 const RUN_CHUNK_MAGIC: [u8; 4] = *b"SIDK";
@@ -68,6 +71,17 @@ const RUN_SCOPE: &[u8] = b"short-id-run";
 
 /// One element as the runs store it, ordered `(h64, q3, h128)`.
 type Entry = (u64, u64, u128);
+
+static COMPACTION_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| {
+    (0..COMPACTION_LOCK_STRIPES)
+        .map(|_| Mutex::new(()))
+        .collect()
+});
+
+fn compaction_lock(scope: &[u8; 16]) -> &'static Mutex<()> {
+    let stripe = usize::from(scope[0] ^ scope[7] ^ scope[15]);
+    &COMPACTION_LOCKS[stripe]
+}
 
 /// Encode the owner-log payload for `hash` as 32 bytes: `h64`, `q3`, then
 /// `h128`, all big-endian.
@@ -439,6 +453,11 @@ thread_local! {
     /// before it queues its run for deletion.
     pub(crate) static BEFORE_QUEUE: std::cell::RefCell<Option<PublishHook>> =
         const { std::cell::RefCell::new(None) };
+    /// Runs once, between writing the run and publishing it. It must sit
+    /// there to simulate a GC pass in that window, so it runs while this
+    /// scope's compaction lock is held: it must not call `compact` on the
+    /// same scope (the lock is not reentrant). `collect_garbage` is fine.
+    /// Hooks that need to compact use `BEFORE_QUEUE`, which runs before the lock.
     pub(crate) static BEFORE_PUBLISH: std::cell::RefCell<Option<PublishHook>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -505,6 +524,16 @@ struct PublishPlan {
     retired: Vec<[u8; 16]>,
     now_ms: u64,
     grace_ms: u64,
+}
+
+/// The immutable inputs a compactor prepared before serializing its writes.
+struct PreparedCompaction {
+    counters: ScopeCounters,
+    counter_token: u64,
+    run: RunMeta,
+    carry: Vec<Entry>,
+    manifest: Manifest,
+    retired: Vec<[u8; 16]>,
 }
 
 /// How one publish transaction ended.
@@ -623,9 +652,15 @@ impl ShortIdIndex {
             chunk = end;
         }
         if out.len() != run.entries as usize {
-            return Err(StorageError::Corrupt(
-                "short-id run entry count disagrees with its manifest".to_owned(),
-            ));
+            return Err(StorageError::Corrupt(format!(
+                "short-id run entry count disagrees with its manifest: run v{} token {} \
+                 read {} entries, manifest says {} entries in {} chunks",
+                run.version,
+                run.token,
+                out.len(),
+                run.entries,
+                run.chunks,
+            )));
         }
         Ok(out)
     }
@@ -862,12 +897,34 @@ impl ShortIdIndex {
         if tail_len == 0 || (!force && tail_len < COMPACT_TRIGGER) {
             return Ok(None);
         }
-        let manifest = self.read_manifest(&txn, counters.manifest_version)?;
+        let prepared = self.prepare_compaction(db, &txn, &counters, counter_token)?;
+        let version = prepared.run.version;
+        let run_entries = prepared.run.entries;
+        drop(txn);
+        let retired_collections = self.write_publish_compaction(db, prepared, now_ms, grace_ms)?;
+        Ok(Some(CompactionReport {
+            manifest_version: version,
+            folded_entries: tail_len,
+            run_entries,
+            retired_collections,
+        }))
+    }
+
+    /// Build the run and manifest a compaction would publish: fold the current
+    /// log tail into the kernel, absorb older runs by size, and check that the
+    /// result covers every folded owner. Nothing is written here.
+    fn prepare_compaction(
+        &self,
+        db: &Database,
+        txn: &DatabaseTransaction<'_>,
+        counters: &ScopeCounters,
+        counter_token: u64,
+    ) -> Result<PreparedCompaction, StorageError> {
+        let manifest = self.read_manifest(txn, counters.manifest_version)?;
         let version = counters
             .manifest_version
             .checked_add(1)
             .ok_or_else(|| StorageError::Exhausted("short-id manifest versions".to_owned()))?;
-
         let mut carry = self.read_tail(
             db,
             counters.log_epoch,
@@ -878,22 +935,9 @@ impl ShortIdIndex {
         for &entry in &carry {
             kernel.insert(element(entry)).map_err(algebraic)?;
         }
-
-        // Size tiering: absorb the newest kept run while it is under twice
-        // the carry, so runs shrink at least by half toward the newest.
         let mut kept = manifest.runs.clone();
-        let mut retired: Vec<[u8; 16]> = vec![self.owner_log_collection(counters.log_epoch)];
-        while let Some(previous) = kept.last().copied() {
-            let carried = u64::try_from(carry.len()).unwrap_or(u64::MAX);
-            if carried.saturating_mul(2) < u64::from(previous.entries) {
-                break;
-            }
-            let older = self.load_run(&txn, &previous)?;
-            carry = merge_sorted(&[&older, &carry]);
-            retired.push(self.run_collection(&previous));
-            kept.pop();
-        }
-
+        let mut retired = vec![self.owner_log_collection(counters.log_epoch)];
+        self.absorb_runs(txn, &mut kept, &mut carry, &mut retired)?;
         let run = RunMeta {
             version,
             token: counter_token,
@@ -902,21 +946,6 @@ impl ShortIdIndex {
             chunks: u32::try_from(carry.len().div_ceil(RUN_CHUNK_ENTRIES))
                 .map_err(|_| StorageError::Exhausted("short-id run chunks".to_owned()))?,
         };
-        // Queue the run for deletion before it exists: an attempt that is
-        // abandoned (another compactor won, or a crash) leaves a queued
-        // collection that garbage collection removes. The publish takes the
-        // entry off the list.
-        let run_collection = self.run_collection(&run);
-        #[cfg(test)]
-        BEFORE_QUEUE.with(|hook| {
-            // Take it out first: the hook may compact, and so re-enter here.
-            let taken = hook.borrow_mut().take();
-            if let Some(mut hook) = taken {
-                hook();
-            }
-        });
-        self.queue_garbage(db, &[(run_collection, now_ms.saturating_add(grace_ms))])?;
-        self.write_run(db, &run, &carry)?;
         kept.push(run);
         let new_manifest = Manifest {
             version,
@@ -929,31 +958,98 @@ impl ShortIdIndex {
                 "short-id runs do not cover the folded owner sequence".to_owned(),
             ));
         }
+        Ok(PreparedCompaction {
+            counters: *counters,
+            counter_token,
+            run,
+            carry,
+            manifest: new_manifest,
+            retired,
+        })
+    }
+
+    /// Size tiering: absorb the newest kept run while it is under twice the
+    /// carry, so runs shrink at least by half toward the newest.
+    fn absorb_runs(
+        &self,
+        txn: &DatabaseTransaction<'_>,
+        kept: &mut Vec<RunMeta>,
+        carry: &mut Vec<Entry>,
+        retired: &mut Vec<[u8; 16]>,
+    ) -> Result<(), StorageError> {
+        while let Some(previous) = kept.last().copied() {
+            let carried = u64::try_from(carry.len()).unwrap_or(u64::MAX);
+            if carried.saturating_mul(2) < u64::from(previous.entries) {
+                break;
+            }
+            let older = self.load_run(txn, &previous)?;
+            let merged = merge_sorted(&[&older, carry.as_slice()]);
+            *carry = merged;
+            retired.push(self.run_collection(&previous));
+            kept.pop();
+        }
+        Ok(())
+    }
+
+    fn write_publish_compaction(
+        &self,
+        db: &Database,
+        prepared: PreparedCompaction,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<usize, StorageError> {
+        let run_collection = self.run_collection(&prepared.run);
+        #[cfg(test)]
+        BEFORE_QUEUE.with(|hook| {
+            // The hook may publish a newer manifest before this attempt queues
+            // or writes its deterministic run collection.
+            let taken = hook.borrow_mut().take();
+            if let Some(mut hook) = taken {
+                hook();
+            }
+        });
+
+        // Only one compactor for a scope may write its deterministic run
+        // collection at a time. Writers may continue appending; publish
+        // carries any owner-log entries added beyond this plan's watermark.
+        let _compaction_guard = compaction_lock(&self.collection_id).lock();
+        let live_txn = db.begin_transaction();
+        let (live, live_token) = self.read_counters(&live_txn)?;
+        if live.log_epoch != prepared.counters.log_epoch
+            || live.log_epoch_start_seq != prepared.counters.log_epoch_start_seq
+            || live.manifest_version != prepared.counters.manifest_version
+        {
+            return Err(StorageError::StaleRead {
+                pool: self.pool,
+                collection_id: self.collection_id,
+                expected: prepared.counter_token,
+                actual: live_token,
+            });
+        }
+
+        // Queue before writing so an abandoned attempt is collectable.
+        self.queue_garbage(db, &[(run_collection, now_ms.saturating_add(grace_ms))])?;
+        self.write_run(db, &prepared.run, &prepared.carry)?;
         #[cfg(test)]
         BEFORE_PUBLISH.with(|hook| {
             if let Some(mut hook) = hook.borrow_mut().take() {
                 hook();
             }
         });
-        let retired_collections = self.publish_compaction(
+
+        self.publish_compaction(
             db,
             &PublishPlan {
-                counters,
-                counter_token,
-                version,
+                counters: prepared.counters,
+                counter_token: prepared.counter_token,
+                version: prepared.run.version,
                 run_collection,
-                manifest: new_manifest.encode()?,
-                retired,
+                manifest: prepared.manifest.encode()?,
+                retired: prepared.retired,
                 now_ms,
                 grace_ms,
             },
-        )?;
-        Ok(Some(CompactionReport {
-            manifest_version: version,
-            folded_entries: tail_len,
-            run_entries: run.entries,
-            retired_collections,
-        }))
+        )
     }
 
     /// Append `items` to the garbage list.

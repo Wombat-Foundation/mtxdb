@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn state_batch_budget_respects_the_configured_stage_limit() {
+    let dir =
+        std::env::temp_dir().join(format!("mtxdb-interop-stage-limit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = crate::RuntimeConfig {
+        txn_stage_limit_bytes: 512,
+        ..crate::RuntimeConfig::default()
+    };
+    let db = crate::Database::open_with_config(dir.clone(), config).unwrap();
+    let room = b"!room:example.com";
+    let stat = room_state_collection_id(room);
+    let payload = [0x11_u8; 100];
+    let node = state_hamt_node_id(&[0x22_u8; 32]);
+
+    let error = commit_state_batches(&db, [(stat, node, payload.as_slice())], [], 1024)
+        .expect_err("the requested batch exceeds the configured stage limit");
+    assert!(
+        error.to_string().contains("1..=512"),
+        "unexpected error: {error}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn derive_id_separates_domains_and_is_stable() {
     assert_eq!(derive_id(b"event", b"x"), derive_id(b"event", b"x"));
     assert_ne!(derive_id(b"event", b"x"), derive_id(b"root", b"x"));
@@ -9,6 +34,22 @@ fn derive_id_separates_domains_and_is_stable() {
     assert_eq!(
         &event_record_id(b"$event:example.com")[..],
         &event_digest[..16]
+    );
+}
+
+#[test]
+fn room_version_record_round_trips_and_rejects_malformed_values() {
+    let encoded = encode_room_version_record("!room:example.com", "12").unwrap();
+    assert_eq!(
+        decode_room_version_record(&encoded).unwrap(),
+        ("!room:example.com", "12")
+    );
+    assert!(decode_room_version_record(&encoded[..7]).is_err());
+    assert!(decode_room_version_record(&encoded[..13]).is_err());
+    assert!(decode_room_version_record(b"bad!").is_err());
+    assert_ne!(
+        room_version_collection_id(b"!a:example.com"),
+        room_version_collection_id(b"!b:example.com")
     );
 }
 
@@ -64,6 +105,7 @@ fn verdicts_round_trip_and_reject_truncation() {
         soft_fail: Some(7),
         redacted_by: Some(b"$redact:example.com".to_vec()),
         outlier: true,
+        arrival_ordering: Some(42),
     };
     let bytes = encode_verdict(b"$event:example.com", &verdict).unwrap();
     let (event_id, decoded) = decode_verdict(&bytes).unwrap();
@@ -75,6 +117,24 @@ fn verdicts_round_trip_and_reject_truncation() {
     }
     assert!(decode_verdict(&[]).is_err());
     assert!(decode_verdict(&[9, 0, 0, 0, 0]).is_err());
+}
+
+#[test]
+fn arrival_ordering_follows_redaction_in_the_wire_format() {
+    let arrival = 0x1122_3344_5566_7788_u64;
+    let verdict = Verdict {
+        redacted_by: Some(b"$r:x".to_vec()),
+        arrival_ordering: Some(arrival),
+        ..Verdict::default()
+    };
+    let bytes = encode_verdict(b"$e:x", &verdict).unwrap();
+    // version, flags, u32 event-id length, event id, redactor length, redactor,
+    // then the arrival ordering. An older decoder stops after `redacted_by`.
+    let redactor = 6 + b"$e:x".len();
+    assert_eq!(&bytes[redactor..redactor + 4], &4_u32.to_le_bytes());
+    assert_eq!(&bytes[redactor + 4..redactor + 8], b"$r:x");
+    assert_eq!(&bytes[redactor + 8..], &arrival.to_le_bytes());
+    assert_eq!(decode_verdict(&bytes).unwrap().1, verdict);
 }
 
 #[test]
@@ -126,24 +186,19 @@ fn server_keys_round_trip_and_reject_truncation() {
 }
 
 #[test]
-fn server_key_record_ids_are_distinct_per_kind_and_origin() {
-    let historical = server_key_record_id(KeyRecordKind::Historical, b"a.example");
-    let provisional = server_key_record_id(KeyRecordKind::Provisional, b"a.example");
-    let other = server_key_record_id(KeyRecordKind::Historical, b"b.example");
-    assert_ne!(historical, provisional);
-    assert_ne!(historical, other);
+fn notary_record_ids_are_distinct_per_origin() {
+    let one = notary_record_id(b"a.example");
+    assert_ne!(one, notary_record_id(b"b.example"));
+    assert_eq!(one, notary_record_id(b"a.example"));
+    // Pin the derivation so changing the domain or hash silently rewrites
+    // every existing Notary slot id is caught here.
     assert_eq!(
-        historical,
-        server_key_record_id(KeyRecordKind::Historical, b"a.example")
+        one,
+        [
+            0xE2, 0x68, 0xE8, 0x1F, 0xF2, 0x0A, 0xFA, 0x72, 0xE0, 0x04, 0x45, 0xB0, 0x00, 0xCE,
+            0x60, 0xA0,
+        ]
     );
-}
-
-#[test]
-fn key_record_kinds_parse_their_tags() {
-    for kind in KeyRecordKind::ALL {
-        assert_eq!(KeyRecordKind::parse(kind.as_str()), Some(kind));
-    }
-    assert_eq!(KeyRecordKind::parse("wat"), None);
 }
 
 #[test]
@@ -196,14 +251,6 @@ fn event_collection_ids_are_pinned() {
         "9507be45c492c4382edb18fc074477cc"
     );
     assert_eq!(
-        hex(&room_prev_collection_id(room)),
-        "fea9a58f0ab869317d696093fd7c6173"
-    );
-    assert_eq!(
-        hex(&room_auth_collection_id(room)),
-        "4842a2eff3cf511f9e48406350253c77"
-    );
-    assert_eq!(
         hex(&event_locator_collection_id(&node)),
         "8630e25f0c7e1a94558485e7176a1bda"
     );
@@ -231,24 +278,6 @@ fn locator_encoding_is_pinned_and_round_trips() {
 }
 
 #[test]
-fn edge_encoding_is_pinned_and_round_trips() {
-    let bytes = encode_edges(&[b"$a", b"$bc"]).unwrap();
-    assert_eq!(
-        bytes,
-        [&[2, 0, 0, 0][..], b"$a", &[3, 0, 0, 0], b"$bc"].concat()
-    );
-    assert_eq!(
-        decode_edges(&bytes).unwrap(),
-        vec![b"$a".to_vec(), b"$bc".to_vec()]
-    );
-    assert_eq!(encode_edges(&[]).unwrap(), Vec::<u8>::new());
-    assert_eq!(decode_edges(&[]).unwrap(), Vec::<Vec<u8>>::new());
-    for cut in [1, 3, 5, 8] {
-        assert!(decode_edges(&bytes[..cut]).is_err(), "cut at {cut}");
-    }
-}
-
-#[test]
 fn outlier_flag_is_part_of_the_verdict_record() {
     let outlier = Verdict {
         outlier: true,
@@ -267,45 +296,6 @@ fn outlier_flag_is_part_of_the_verdict_record() {
             .1
             .outlier
     );
-}
-
-#[test]
-fn auth_chain_records_are_pinned_and_round_trip() {
-    assert_eq!(
-        hex(&auth_counter_record_id()),
-        "82f29a189df9d4f1ce570f12c1d2c503"
-    );
-    assert_eq!(
-        hex(&auth_forward_record_id(b"$e:x")),
-        "a4bcb32a1124a90417ed80a8e041c52e"
-    );
-    assert_eq!(
-        hex(&auth_reverse_record_id(7)),
-        "1c1be185af0d4bceb68f842fb6203b27"
-    );
-    assert_eq!(
-        hex(&auth_closure_record_id(7)),
-        "9f23b01a4899ca947d360350824645da"
-    );
-    assert_ne!(auth_reverse_record_id(7), auth_closure_record_id(7));
-    assert_ne!(auth_reverse_record_id(7), auth_reverse_record_id(8));
-
-    let forward = encode_auth_forward(0x0102_0304, b"$e:x");
-    assert_eq!(forward, [&[1, 2, 3, 4][..], b"$e:x"].concat());
-    assert_eq!(
-        decode_auth_forward(&forward).unwrap(),
-        (0x0102_0304, &b"$e:x"[..])
-    );
-    for cut in 0..4 {
-        assert!(
-            decode_auth_forward(&forward[..cut]).is_err(),
-            "cut at {cut}"
-        );
-    }
-    assert_eq!(decode_auth_counter(&9_u32.to_be_bytes()).unwrap(), 9);
-    assert_eq!(decode_auth_counter(&encode_auth_counter(9)).unwrap(), 9);
-    assert!(decode_auth_counter(&[0, 0, 9]).is_err());
-    assert!(decode_auth_counter(&[0, 0, 0, 0, 9]).is_err());
 }
 
 #[test]

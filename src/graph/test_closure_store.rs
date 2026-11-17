@@ -1,6 +1,6 @@
 use super::closure_store;
 use super::closure_store::*;
-use super::short_id::{EdgeFamily, ShortIdIndex};
+use super::short_id::ShortIdIndex;
 use crate::database::Database;
 use crate::layout::ShardType;
 use crate::storage::{NodeData, StorageError};
@@ -8,7 +8,7 @@ use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const POOL: ShardType = ShardType::Edges;
+const POOL: ShardType = ShardType::ServerInfo;
 const SCOPE: [u8; 16] = [0xC1; 16];
 
 fn test_root(name: &str) -> PathBuf {
@@ -717,8 +717,7 @@ fn scope_purge_is_atomic_with_the_short_id_scope() {
     let root = test_root("purge");
     let db = open_db(&root);
     let ids = ShortIdIndex::new(POOL, SCOPE);
-    ids.record_edges(&db, b"$a", EdgeFamily::plain(1), &[b"$b"])
-        .unwrap();
+    ids.get_or_create(&db, &[b"$a", b"$b"]).unwrap();
     build(&db, 1, 1..3);
     build(&db, 2, 1..3);
 
@@ -820,7 +819,7 @@ fn open_db(root: &Path) -> Database {
 /// with `CRASH_EXIT_CODE` (the injected crash), as opposed to a panic or a clean
 /// exit.
 fn run_child(root: &PathBuf, scenario: &str, crash_at: &str) -> bool {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let output = std::process::Command::new(crate::io::test_binary_path())
         .args([
             "--exact",
             "test_closure_store::crash_child",

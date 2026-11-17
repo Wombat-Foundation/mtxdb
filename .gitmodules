@@ -1,4 +1,4 @@
 [submodule "docs"]
 	path = docs
-	url = gcrypt::https://gitlab.com/wombat-foundation/mtxdb-res.git
+	url = https://git.nutra.tk/wombat-foundation/mtxdb-docs.git
 	update = none

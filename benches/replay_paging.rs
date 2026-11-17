@@ -1,6 +1,6 @@
 //! Shared-WAL replay paging and multi-collection snapshots under load.
 //!
-//! The first run measures incremental resume pages while four pool writers
+//! The first run measures incremental resume pages while three pool writers
 //! publish and parallel readers catch up. The second repeats with shared WAL
 //! reclaim enabled, exercising lease advancement and stale-offset fallback.
 //! During each run the main thread times 1/2/4/8-collection snapshots against
@@ -34,12 +34,7 @@ use mtxdb::layout::ShardType;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine, StorageError};
 use mtxdb::PackfileStorage;
 
-const POOLS: [ShardType; 4] = [
-    ShardType::Edges,
-    ShardType::EventDag,
-    ShardType::State,
-    ShardType::ServerInfo,
-];
+const POOLS: [ShardType; 3] = [ShardType::EventDag, ShardType::State, ShardType::ServerInfo];
 const SNAPSHOT_COLLECTIONS: usize = 8;
 
 struct ScratchDir(PathBuf);
@@ -298,7 +293,9 @@ fn run_case(label: &str, with_reclaim: bool) -> Result<(), Box<dyn Error>> {
                             .sum::<u64>(),
                         Ordering::Relaxed,
                     );
-                    _lease.advance(page.through_lsn);
+                    _lease
+                        .advance(page.through_lsn)
+                        .expect("benchmarks run without a replay-lease cap");
                     cursor = page.next_cursor;
                 } else if done_before_read == worker_count {
                     break;
@@ -440,7 +437,11 @@ fn run_reclaim_fallback_arm() -> Result<(), Box<dyn Error>> {
     // ServerInfo is seeded last, so its pool watermark reaches the shared WAL
     // tail. Using EventDag here would leave later pools' seed groups after the
     // cursor and make the fallback page contain more than the test group.
-    let (scans, cursor, lease) = db.stores[3]
+    let server_info = POOLS
+        .iter()
+        .position(|pool| *pool == ShardType::ServerInfo)
+        .ok_or("ServerInfo pool missing from POOLS")?;
+    let (scans, cursor, lease) = db.stores[server_info]
         .scan_collections_at_snapshot(&db.collections)
         .expect("take fallback-arm snapshot");
     drop(scans);

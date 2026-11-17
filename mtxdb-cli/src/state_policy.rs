@@ -13,6 +13,8 @@
 //!   by another, and an unverified import can never masquerade as a verified
 //!   one.
 
+use std::collections::HashSet;
+
 use mtxdb::state_group::{StateGroupDerivation, StateGroupResolver, StateGroupTrust};
 use rezzy::json::Value as OwnedValue;
 use rezzy::StateResVersion;
@@ -100,6 +102,22 @@ impl StateView {
             EventDisposition::SoftFailed => self == Self::Client,
             EventDisposition::Accepted => false,
         }
+    }
+
+    /// Whether this view drops an event, using the import's own rejection
+    /// verdicts instead of the exporter's annotation. Soft-failed events stay
+    /// in the federated view.
+    #[must_use]
+    pub(crate) fn excludes_import(
+        self,
+        event: &OwnedValue,
+        event_id: &str,
+        rejected: &HashSet<String>,
+    ) -> bool {
+        if rejected.contains(event_id) {
+            return true;
+        }
+        self == Self::Client && has_event_flag(event, "soft_failed")
     }
 }
 
@@ -217,6 +235,28 @@ mod tests {
         }
         assert!(!federated.excludes(&soft_failed));
         assert!(client.excludes(&soft_failed));
+    }
+
+    #[test]
+    fn import_view_uses_derived_rejections_and_soft_fail_disposition() {
+        let rejected = value(r#"{"rejected":true,"type":"m.room.name"}"#);
+        let exporter_only = value(r#"{"rejected":true,"type":"m.room.name"}"#);
+        let soft_failed = value(r#"{"soft_failed":true,"type":"m.room.name"}"#);
+        let both = value(r#"{"rejected":true,"soft_failed":true,"type":"m.room.name"}"#);
+        let rejected_ids = HashSet::from(["$derived".to_owned()]);
+        let none = HashSet::new();
+
+        for view in [StateView::Federated, StateView::Client] {
+            assert!(view.excludes_import(&rejected, "$derived", &rejected_ids));
+            assert!(!view.excludes_import(&exporter_only, "$exporter-only", &none));
+        }
+        assert!(!StateView::Federated.excludes_import(&soft_failed, "$soft", &none));
+        assert!(StateView::Client.excludes_import(&soft_failed, "$soft", &none));
+        // The exporter's own rejection annotation is not used for import
+        // filtering, but a soft-fail still drops the event from the client
+        // view even when a rejection annotation accompanies it.
+        assert!(!StateView::Federated.excludes_import(&both, "$both", &none));
+        assert!(StateView::Client.excludes_import(&both, "$both", &none));
     }
 
     #[test]

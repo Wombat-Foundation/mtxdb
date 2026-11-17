@@ -1,4 +1,6 @@
-use super::{Database, DatabaseTransaction, TransactionOverlayGuard};
+use super::{Database, DatabaseTransaction, PoolPolicies, PoolPolicy, TransactionOverlayGuard};
+use crate::config::RuntimeConfig;
+use crate::index::IndexResidency;
 use crate::journal::Journal;
 use crate::layout::ShardType;
 use crate::packfile::storage::PackfileStorage;
@@ -10,6 +12,102 @@ fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("mtxdb-shared-db-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
+}
+
+#[test]
+fn paged_residency_is_rejected_before_the_root_is_created() {
+    let root = test_root("config-paged-before-io");
+    let config = RuntimeConfig {
+        index_residency: Some(IndexResidency::Paged),
+        ..RuntimeConfig::default()
+    };
+    let Err(error) = Database::open_with_config(root.clone(), config) else {
+        panic!("paged residency must be rejected");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be used with Database/shared WAL"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !root.exists(),
+        "validation must run before the layout creates the root"
+    );
+}
+
+#[test]
+fn a_paged_pool_policy_is_rejected_before_the_root_is_created() {
+    let root = test_root("policy-paged-before-io");
+    let policy = PoolPolicy {
+        index_residency: IndexResidency::Paged,
+        ..PoolPolicy::default()
+    };
+    let Err(error) = Database::open_with_policies(root.clone(), PoolPolicies::uniform(policy))
+    else {
+        panic!("paged residency must be rejected");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("cannot use shared WAL journaling"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !root.exists(),
+        "validation must run before the layout creates the root"
+    );
+}
+
+#[test]
+fn writable_paged_open_inside_a_database_root_is_rejected_and_keeps_the_checkpoint() {
+    let root = test_root("writable-paged-inside-root");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0x42_u8; 16];
+    db.event_dag()
+        .put(
+            &collection,
+            &node(1),
+            &NodeData::new(bytes::Bytes::from_static(b"checkpoint me")),
+        )
+        .unwrap();
+    db.event_dag().sync_all().unwrap();
+    let pool = db.layout().pool_path(ShardType::EventDag);
+    drop(db);
+
+    let checkpoint = pool.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE);
+    assert!(
+        checkpoint.exists(),
+        "the fixture did not write a checkpoint"
+    );
+
+    let config = RuntimeConfig {
+        index_residency: Some(IndexResidency::Paged),
+        ..RuntimeConfig::default()
+    };
+    let Err(error) = PackfileStorage::open_with_config(pool.clone(), &config) else {
+        panic!("a writable paged pool inside a database root must be rejected")
+    };
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("paged"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        checkpoint.exists(),
+        "rejecting the open must not retire the root's checkpoint"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn configured_transaction_stage_limit_is_visible_on_the_database() {
+    let root = test_root("config-stage-limit");
+    let config = RuntimeConfig {
+        txn_stage_limit_bytes: 1 << 20,
+        ..RuntimeConfig::default()
+    };
+    let db = Database::open_with_config(root, config).unwrap();
+    assert_eq!(db.txn_stage_limit_bytes(), 1 << 20);
 }
 
 fn prepare_partial_materialization(
@@ -320,7 +418,7 @@ fn a_transaction_still_reads_its_writes_while_its_commit_is_part_way() {
 
 /// A large batch of reads against a large stage preserves request order
 /// and resolves every id. This is a correctness test for the batch
-/// layering; the single-pass complexity is implemented by `lookup_many`.
+/// layering; the indexed lookup is implemented by `lookup_many`.
 #[test]
 fn a_large_batch_read_preserves_order_and_values() {
     const RECORDS: u16 = 4000;
@@ -497,10 +595,7 @@ fn server_info_is_a_shared_wal_transaction_pool() {
     transaction
         .put(ShardType::State, collection, node(5), &data(b"state"))
         .unwrap();
-    assert_eq!(
-        transaction.stage.touched_pools(),
-        [true, false, false, true]
-    );
+    assert_eq!(transaction.stage.touched_pools(), [true, false, true]);
 
     transaction.commit().unwrap();
     let scan = Journal::scan_read_only(root.join("wal.bin")).unwrap();
@@ -1271,7 +1366,7 @@ fn repeated_syncs_keep_the_shared_wal_bounded_with_only_event_dag_active() {
 
 #[test]
 fn repeated_syncs_keep_the_shared_wal_bounded_with_only_edges_active() {
-    assert_wal_bounded("wal_bounded_edges", &[ShardType::Edges]);
+    assert_wal_bounded("wal_bounded_edges", &[ShardType::ServerInfo]);
 }
 
 /// With two contributing pools the segment is only reclaimable once both
@@ -1299,11 +1394,11 @@ fn overlay_is_activated_only_on_the_pools_a_transaction_stages() {
     let txn = db.begin_transaction();
     txn.put(ShardType::EventDag, collection, node(1), &data(b"staged"))
         .unwrap();
-    assert_eq!(txn.stage.touched_pools(), [false, true, false, false]);
+    assert_eq!(txn.stage.touched_pools(), [false, true, false]);
     let overlay = activate_for(&db, &txn.stage);
     assert!(db.pool(ShardType::EventDag).read_journal_installed());
     assert!(!db.pool(ShardType::State).read_journal_installed());
-    assert!(!db.pool(ShardType::Edges).read_journal_installed());
+    assert!(!db.pool(ShardType::ServerInfo).read_journal_installed());
     drop(overlay);
     assert!(!db.pool(ShardType::EventDag).read_journal_installed());
     // A transaction that stages for two pools touches exactly those two.
@@ -1312,9 +1407,9 @@ fn overlay_is_activated_only_on_the_pools_a_transaction_stages() {
         .put(ShardType::State, collection, node(2), &data(b"state"))
         .unwrap();
     mixed
-        .put(ShardType::Edges, collection, node(3), &data(b"edge"))
+        .put(ShardType::ServerInfo, collection, node(3), &data(b"info"))
         .unwrap();
-    assert_eq!(mixed.stage.touched_pools(), [true, false, true, false]);
+    assert_eq!(mixed.stage.touched_pools(), [true, false, true]);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1354,28 +1449,48 @@ fn small_segment_database(name: &str) -> (Database, PathBuf) {
     (db, root)
 }
 
-/// `State` and `EventDag` both have committed frames, but only `EventDag` is ever
-/// synced. With nothing to remediate the lag, reclaim stalls: it must be
-/// reported with the pool named, `EventDag` must stop repeating a checkpoint
-/// that cannot help, and a commit that finally hits the hard limit must say
-/// which pool it is waiting on instead of failing silently.
+/// The real-stack counterpart of
+/// `a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing` in
+/// the journal tests, which runs the same policy at full scale without fsyncs.
+/// Here a real `EventDag` sync must stop repeating a checkpoint that cannot
+/// help while `State` stays silent, and the commit that finally hits the hard
+/// limit must name the pool it waits on. A small cap reaches both the
+/// back-off zone and the limit in a handful of real commits and syncs; the
+/// proportions are unchanged.
 #[test]
 fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
     let (db, root) = small_segment_database("lagging_no_remediation");
+    db.coordinator().set_segment_cap(1 << 18);
     db.coordinator().set_blocker_remediation(|_| {});
     let pools = [ShardType::State, ShardType::EventDag];
     let coordinator = db.coordinator();
     let emergency = coordinator.segment_cap() - coordinator.segment_cap() / 4;
     let trigger = coordinator.reclaim_trigger_len();
     let mut next = 0u64;
+    let collection = [0x7d; 16];
+    // Each round must grow the segment by less than the retry growth (an
+    // eighth of the trigger), or every sync is legitimately allowed to retry
+    // and the back-off never has a chance to apply.
+    let commit_small = |next: &mut u64| {
+        let txn = db.begin_transaction();
+        for _ in 0..8 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&next.to_le_bytes());
+            *next = next.saturating_add(1);
+            for pool in pools {
+                txn.put(pool, collection, id, &NodeData::from_slice(&[0x5a; 256]))
+                    .unwrap();
+            }
+        }
+        txn.commit()
+    };
     // Syncs and checkpoints taken while the segment is stalled but short of
     // the emergency line, where the back-off applies.
     let mut backed_off_syncs = 0usize;
     let mut backed_off_checkpoints = 0usize;
     let mut rounds = 0usize;
     let failure = loop {
-        // About 10 KiB per round: well under the retry growth (32 KiB).
-        if let Err(error) = commit_batch(&db, &pools, &mut next, 1) {
+        if let Err(error) = commit_small(&mut next) {
             break error;
         }
         let in_back_off_zone =
@@ -1394,7 +1509,7 @@ fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
             }
         }
         rounds += 1;
-        assert!(rounds < 400, "the segment never filled");
+        assert!(rounds < 100, "the segment never filled");
     };
     let message = failure.to_string();
     assert!(message.contains("segment is full"), "{message}");
@@ -1421,18 +1536,22 @@ fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Pools sync one after another, so the first to cross the trigger cannot
-/// yet reclaim what the others have not reported. That is normal: it must
-/// neither be counted nor logged as a stall, and the later pool's coverage
-/// clears the pending state.
+/// The real-stack counterpart of `a_healthy_sequential_pool_sync_is_not_a_stall`
+/// in the journal tests, which runs 150 rounds at full scale without fsyncs.
+/// Pools sync one after another, so the first to cross the trigger cannot yet
+/// reclaim what the others have not reported. That is normal: it must neither be
+/// counted nor logged as a stall, and the later pool's coverage clears the
+/// pending state. A small trigger makes the crossing a few real commits and
+/// syncs; the proportions are the same.
 #[test]
 fn a_healthy_sequential_sync_is_not_reported_as_a_stall() {
     let (db, root) = small_segment_database("healthy_sequential");
+    db.coordinator().set_reclaim_trigger_len(16 << 10);
     let pools = [ShardType::State, ShardType::EventDag];
     let coordinator = db.coordinator();
     let mut next = 0u64;
     let mut saw_pending = false;
-    for round in 0..150 {
+    for round in 0..6 {
         commit_batch(&db, &pools, &mut next, 1)
             .unwrap_or_else(|error| panic!("round {round}: {error}"));
         db.pool(ShardType::EventDag).sync_all().unwrap();
@@ -1457,19 +1576,27 @@ fn a_healthy_sequential_sync_is_not_reported_as_a_stall() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A pool that stays silent is reported, but only after the segment has
-/// grown by an eighth of the trigger past the first failed reclaim.
+/// The real-stack counterpart of `a_silent_pool_is_reported_only_after_the_grace_period`
+/// in the journal tests, which proves the grace arithmetic at full scale without
+/// fsyncs. This one proves a real `sync_all` reports the coverage that policy
+/// consumes: a pool that stays silent is reported, but only after the segment
+/// has grown by an eighth of the trigger past the first failed reclaim, and
+/// once. The trigger is small so that grace (an eighth of it) is reached in a
+/// few real commits and syncs instead of a hundred; the proportions are the
+/// same.
 #[test]
 fn a_silent_contributor_is_reported_after_the_grace_period() {
     let (db, root) = small_segment_database("stall_grace");
     db.coordinator().set_blocker_remediation(|_| {});
+    db.coordinator().set_reclaim_trigger_len(16 << 10);
     let pools = [ShardType::State, ShardType::EventDag];
     let coordinator = db.coordinator();
     let grace = coordinator.reclaim_trigger_len() / 8;
     let mut next = 0u64;
     let mut first_len = None;
     let mut reported_at = None;
-    for _ in 0..200 {
+    let mut rounds_after_report = 0;
+    for _ in 0..60 {
         if commit_batch(&db, &pools, &mut next, 1).is_err() {
             break;
         }
@@ -1480,6 +1607,13 @@ fn a_silent_contributor_is_reported_after_the_grace_period() {
         }
         if reported_at.is_none() && coordinator.reclaim_stalls() > 0 {
             reported_at = Some(coordinator.segment_len());
+        }
+        if reported_at.is_some() {
+            // Keep going a little: a stall that repeats would show here.
+            rounds_after_report += 1;
+            if rounds_after_report >= 6 {
+                break;
+            }
         }
     }
     let first_len = first_len.expect("the pending stall was never seen");
@@ -1668,29 +1802,51 @@ fn a_power_cut_image_never_loses_a_record_a_claim_covered() {
 
 /// The same lag, but the database can make the silent pool checkpoint. Once
 /// the segment reaches the emergency zone it does, reclaim succeeds, and no
-/// commit ever fails.
+/// commit ever fails. The full-scale policy loop lives in
+/// `a_lagging_pool_is_checkpointed_before_the_segment_fills` in the journal
+/// tests; this keeps the production remediation wiring and a real checkpoint
+/// in the loop, with a small cap so it reaches the emergency zone quickly.
 #[test]
 fn a_lagging_pool_is_checkpointed_for_the_caller_before_the_segment_fills() {
     use crate::PackfileStorage;
     let (db, root) = small_segment_database("lagging_remediated");
+    db.coordinator().set_segment_cap(1 << 18);
     let pools = [ShardType::State, ShardType::EventDag];
     let state_lsn =
         || PackfileStorage::read_journal_lsn(&db.layout().pool_dir(ShardType::State).unwrap());
     let mut next = 0u64;
-    for round in 0..120 {
-        commit_batch(&db, &pools, &mut next, 2)
-            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+    let mut rounds = 0;
+    // Keep going past the first stall: remediation runs once reclaim reaches
+    // the emergency zone, and the detached checkpoint writes its LSN file a
+    // little later.
+    while state_lsn() == 0 {
+        assert!(rounds < 60, "State was never made to checkpoint");
+        commit_batch(&db, &pools, &mut next, 1)
+            .unwrap_or_else(|error| panic!("round {rounds}: {error}"));
         db.pool(ShardType::EventDag).sync_all().unwrap();
         assert!(
             db.coordinator().segment_len() < db.coordinator().segment_cap(),
-            "round {round}: the segment reached its cap"
+            "round {rounds}: the segment reached its cap"
         );
+        rounds += 1;
     }
     assert!(
         db.coordinator().reclaim_stalls() >= 1,
         "a stall must have been seen"
     );
-    assert!(state_lsn() > 0, "State was never made to checkpoint");
+    // The delta coverage path carries the version table, so reclaiming the
+    // shared segment no longer requires an EventDag checkpoint per sync.
+    let stats = db.pool(ShardType::EventDag).stats();
+    eprintln!(
+        "lagging-pool measurement: eventdag_checkpoints={} delta_appends={}",
+        stats.checkpoint_writes, stats.delta_appends
+    );
+    assert!(
+        stats.checkpoint_writes <= 2,
+        "reclaim must not force a full checkpoint on every sync ({} seen)",
+        stats.checkpoint_writes
+    );
+    assert!(stats.delta_appends > 0, "the delta coverage path must run");
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1733,6 +1889,54 @@ fn a_commit_burst_that_fills_the_segment_is_refused_then_recovers_after_a_sync()
         .get_read_committed(&collection, &[first])
         .unwrap()[0]
         .is_some());
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A transaction refused because the segment is full stays retryable: after a
+/// sync reclaims space, committing the same transaction succeeds and its data
+/// is readable.
+#[test]
+fn a_refused_transaction_retries_after_a_sync() {
+    let (db, root) = small_segment_database("refused_txn_retry");
+    let collection = [0x7e; 16];
+    let mut next = 0u64;
+    let (txn, error) = loop {
+        let txn = db.begin_transaction();
+        for _ in 0..20 {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&next.to_le_bytes());
+            next = next.saturating_add(1);
+            txn.put(
+                ShardType::EventDag,
+                collection,
+                id,
+                &NodeData::from_slice(&[0x5a; 256]),
+            )
+            .unwrap();
+        }
+        match txn.commit() {
+            Ok(()) => {}
+            Err(error) => break (txn, error),
+        }
+        assert!(next < 20_000, "the segment never filled");
+    };
+    assert!(
+        error.is_would_block(),
+        "expected a retryable refusal, got {error}"
+    );
+
+    db.pool(ShardType::EventDag).sync_all().unwrap();
+    txn.commit().unwrap();
+
+    let mut last = [0u8; 16];
+    last[..8].copy_from_slice(&(next - 1).to_le_bytes());
+    assert!(db
+        .pool(ShardType::EventDag)
+        .get_read_committed(&collection, &[last])
+        .unwrap()[0]
+        .is_some());
+    drop(txn);
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1782,6 +1986,18 @@ fn a_checkpoint_does_not_claim_an_unmaterialized_transaction() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Read this pool's current delta log. The test checks the version table the
+/// coverage batch carries.
+fn pool_delta_log(db: &Database, pool: ShardType) -> crate::index::delta::DeltaLog {
+    let dir = db.layout().pool_dir(pool).unwrap();
+    let name = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| name.starts_with("index.delta."))
+        .expect("a delta coverage batch writes a log");
+    crate::index::delta::read_delta_log(&dir.join(name)).expect("the delta log reads")
+}
+
 /// Shared-WAL coverage advances only after each pool writes the checkpoint
 /// version table. The shared segment is reclaimed only once both have
 /// reported: after the first pool's step the second still holds it, and after
@@ -1805,8 +2021,14 @@ fn shared_reclaim_waits_for_every_pools_version_checkpoint() {
     db.pool(ShardType::EventDag).sync_all().unwrap();
     let timings = db.pool(ShardType::EventDag).sync_timings().unwrap();
     assert!(
-        !timings.checkpoint.is_zero(),
-        "EventDag coverage must anchor its logical-version table"
+        !timings.delta_log.is_zero(),
+        "EventDag coverage travels in a delta batch"
+    );
+    assert!(
+        pool_delta_log(&db, ShardType::EventDag)
+            .version_table
+            .is_some(),
+        "the delta coverage batch carries EventDag's logical-version table"
     );
     assert_eq!(
         coordinator.segment_len(),
@@ -1818,8 +2040,14 @@ fn shared_reclaim_waits_for_every_pools_version_checkpoint() {
     db.pool(ShardType::State).sync_all().unwrap();
     let timings = db.pool(ShardType::State).sync_timings().unwrap();
     assert!(
-        !timings.checkpoint.is_zero(),
-        "State coverage must anchor its logical-version table"
+        !timings.delta_log.is_zero(),
+        "State coverage travels in a delta batch"
+    );
+    assert!(
+        pool_delta_log(&db, ShardType::State)
+            .version_table
+            .is_some(),
+        "the delta coverage batch carries State's logical-version table"
     );
     assert!(
         coordinator.segment_len() < before,
@@ -1898,7 +2126,7 @@ fn transaction_commit_applies_and_publishes_once() {
 fn versioned_transaction_read_rejects_stale_commit_and_retries() {
     let root = test_root("versioned_transaction_read");
     let db = Database::open(root.clone()).unwrap();
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x73; 16];
     let key = node(1);
     let other_key = node(2);
@@ -1995,7 +2223,7 @@ fn versioned_transaction_read_rejects_stale_commit_and_retries() {
 fn versioned_transaction_byte_read_preserves_payload_without_reencoding() {
     let root = test_root("versioned_transaction_bytes");
     let db = Database::open(root.clone()).unwrap();
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x74; 16];
     let key = node(1);
 
@@ -2020,7 +2248,7 @@ fn versioned_transaction_byte_read_preserves_payload_without_reencoding() {
 fn versioned_read_retries_when_publication_is_not_materialized() {
     let root = test_root("versioned_read_unmaterialized");
     let db = Database::open(root.clone()).unwrap();
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x75; 16];
     let key = node(1);
 
@@ -2050,7 +2278,7 @@ fn versioned_read_retries_when_publication_is_not_materialized() {
 fn versioned_read_after_a_journaled_removal_is_not_left_pending() {
     let root = test_root("versioned_read_after_removal");
     let db = Database::open(root.clone()).unwrap();
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x76; 16];
     let key = node(1);
 
@@ -2079,7 +2307,7 @@ fn versioned_point_reads_match_their_token_during_concurrent_publication() {
 
     let root = test_root("versioned_point_read_concurrent");
     let db = Arc::new(Database::open(root.clone()).unwrap());
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x74; 16];
     let key = node(3);
 
@@ -2375,6 +2603,246 @@ fn unmaterialized_floor_pins_until_group_is_materialized() {
         u64::MAX,
         "materialization must release the floor"
     );
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `finish_recovery_stage` uses `swap_remove`, so finishing the first of three
+/// queued groups moves the last one into its slot. The read floor must still
+/// be pinned by the earliest unmaterialized group, whatever the queue order.
+#[test]
+fn recovery_queue_reorder_does_not_let_later_group_pass_earlier() {
+    let root = test_root("recovery_queue_reorder");
+    let database = Database::open(root.clone()).unwrap();
+    let collection = [0x5bu8; 16];
+    let pool = ShardType::State;
+
+    let mut staged = Vec::new();
+    for id in 1..=3u8 {
+        let txn = database.begin_transaction();
+        txn.put(
+            pool,
+            collection,
+            node(id),
+            &NodeData::new(bytes::Bytes::from_static(b"pending")),
+        )
+        .unwrap();
+        let mut overlay = Some(activate_for(&database, &txn.stage));
+        database.publish_transaction(&txn.stage).unwrap();
+        let receipt = txn.stage.published_receipt().unwrap();
+        txn.stage.begin_materialization().unwrap();
+        database
+            .register_new_recovery_stage(Arc::clone(&txn.stage), receipt, &mut overlay)
+            .unwrap();
+        staged.push((Arc::clone(&txn.stage), receipt));
+        drop(txn);
+    }
+    let finish = |index: usize| {
+        let (stage, _) = &staged[index];
+        database.materialize_transaction(stage).unwrap();
+        stage.mark_published().unwrap();
+        database.finish_recovery_stage(stage).unwrap();
+    };
+    let second_first_lsn = staged[1].1.first_lsn;
+
+    // Finish the first group; swap_remove moves the third into slot 0.
+    finish(0);
+    assert_eq!(
+        database.coordinator().unmaterialized_floor(),
+        second_first_lsn - 1,
+        "the second group must still pin the floor"
+    );
+    // The third group materializes ahead of the second.
+    finish(2);
+    assert_eq!(
+        database.coordinator().unmaterialized_floor(),
+        second_first_lsn - 1,
+        "a later group must not lift the floor past an earlier pending one"
+    );
+
+    database.recover_pending_transactions().unwrap();
+    assert_eq!(database.coordinator().unmaterialized_floor(), u64::MAX);
+
+    drop(staged);
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A cross-pool transaction is one journal group whose `last_lsn` is the last
+/// pool's last entry. Versions are seeded from the group's `last_lsn`, so after
+/// a restart each pool's read boundary must reach that LSN once its own entries
+/// are replayed, even when the group's trailing entries belong to another pool.
+/// The live path already does this (`finish_recovery_stage` notes the group's
+/// `last_lsn` for every touched pool).
+#[test]
+fn replayed_cross_pool_group_lifts_every_touched_pools_boundary() {
+    let root = test_root("replayed_cross_pool_boundary");
+    let event_collection = [0x70u8; 16];
+    let edge_collection = [0x71u8; 16];
+    {
+        let database = Database::open(root.clone()).unwrap();
+        let transaction = database.begin_transaction();
+        transaction
+            .put(
+                ShardType::EventDag,
+                event_collection,
+                node(1),
+                &NodeData::new(bytes::Bytes::from_static(b"event")),
+            )
+            .unwrap();
+        for id in 1..=2u8 {
+            transaction
+                .put(
+                    ShardType::ServerInfo,
+                    edge_collection,
+                    node(id),
+                    &NodeData::new(bytes::Bytes::from_static(b"edge")),
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(transaction);
+        drop(database);
+    }
+
+    let database = Database::open(root.clone()).unwrap();
+    for (pool, collection, id) in [
+        (ShardType::EventDag, event_collection, node(1)),
+        (ShardType::ServerInfo, edge_collection, node(2)),
+    ] {
+        let (records, _) = database
+            .pool(pool)
+            .get_with_collection_version(&collection, &[id])
+            .expect("a replayed group must not leave the pool's boundary behind its version");
+        assert!(records[0].is_some());
+    }
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A published autocommit write whose apply never completes means the live
+/// index no longer matches the journal. The database must fail fast with the
+/// cause (no version left ahead of the data, nothing blocking forever), and a
+/// reopen must replay the write from the WAL.
+#[test]
+fn failed_autocommit_apply_fails_fast_and_reopen_replays_it() {
+    let root = test_root("autocommit_apply_failure");
+    let collection = [0x5du8; 16];
+    let pool = ShardType::State;
+    {
+        let database = Database::open(root.clone()).unwrap();
+        let store = database.pool(pool);
+        let published = store
+            .publish_mutation(|| crate::journal::Mutation::Put {
+                collection_id: collection,
+                node_id: node(9),
+                payload: b"published".to_vec(),
+            })
+            .unwrap();
+        assert!(published.is_some());
+        // The apply "fails": the guard is dropped without completing.
+        drop(published);
+
+        let error = store
+            .get_with_collection_version(&collection, &[node(9)])
+            .expect_err("a read must fail fast, not wait for a group that cannot apply");
+        assert!(
+            error.to_string().contains("failed to apply"),
+            "unexpected error: {error}"
+        );
+        let error = store
+            .put(
+                &collection,
+                &node(10),
+                &NodeData::new(bytes::Bytes::from_static(b"later")),
+            )
+            .expect_err("new writes must be rejected until a reopen");
+        assert!(error.to_string().contains("failed to apply"), "{error}");
+    }
+
+    let database = Database::open(root.clone()).unwrap();
+    let store = database.pool(pool);
+    let (records, _) = store
+        .get_with_collection_version(&collection, &[node(9)])
+        .unwrap();
+    assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), b"published");
+    store
+        .put(
+            &collection,
+            &node(10),
+            &NodeData::new(bytes::Bytes::from_static(b"later")),
+        )
+        .unwrap();
+
+    drop(database);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Writers race while one publishes and fails to apply. Everything after the
+/// failure must error promptly (no hang), and after a reopen every write that
+/// did publish must be readable.
+#[test]
+fn concurrent_writers_see_a_failed_apply_promptly_and_reopen_keeps_published() {
+    let root = test_root("concurrent_apply_failure");
+    let collection = [0x5fu8; 16];
+    let pool = ShardType::State;
+    let published_ids = std::sync::Mutex::new(Vec::<u8>::new());
+    {
+        let database = Arc::new(Database::open(root.clone()).unwrap());
+        std::thread::scope(|scope| {
+            for writer in 0..4u8 {
+                let database = Arc::clone(&database);
+                let published_ids = &published_ids;
+                scope.spawn(move || {
+                    let store = database.pool(pool);
+                    for index in 0..40u8 {
+                        let id = writer * 40 + index;
+                        let mutation = crate::journal::Mutation::Put {
+                            collection_id: collection,
+                            node_id: node(id),
+                            payload: vec![id],
+                        };
+                        let published = match store.publish_mutation(|| mutation.clone()) {
+                            Ok(published) => published,
+                            Err(error) => {
+                                assert!(
+                                    error
+                                        .to_string()
+                                        .contains("published group failed to apply"),
+                                    "unexpected publication failure after apply error: {error}"
+                                );
+                                continue;
+                            }
+                        };
+                        published_ids.lock().unwrap().push(id);
+                        if writer == 0 && index == 10 {
+                            drop(published); // the apply fails
+                        } else {
+                            let lsn = published
+                                .as_ref()
+                                .map(|published| published.last_lsn)
+                                .unwrap();
+                            store.apply_transaction_mutation(&mutation, lsn).unwrap();
+                            store.note_published_materialized(published);
+                        }
+                        let _ = store.get_with_collection_version(&collection, &[node(id)]);
+                    }
+                });
+            }
+        });
+        assert!(database.coordinator().apply_failure().is_some());
+    }
+
+    let database = Database::open(root.clone()).unwrap();
+    let store = database.pool(pool);
+    for id in published_ids.into_inner().unwrap() {
+        let (records, _) = store
+            .get_with_collection_version(&collection, &[node(id)])
+            .unwrap();
+        assert_eq!(records[0].as_ref().unwrap().bytes.as_ref(), &[id]);
+    }
 
     drop(database);
     let _ = std::fs::remove_dir_all(&root);
@@ -2678,7 +3146,7 @@ fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
         );
     }
 
-    let before = PackfileStorage::read_journal_lsn(&root.join("pools/mtpl-state"));
+    let before = PackfileStorage::read_journal_lsn(&root.join("mtpl-state"));
     assert!(
         before > 0,
         "state's durable checkpoint coverage must survive the reclaim"
@@ -2690,7 +3158,7 @@ fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
     let db = Database::open(root.clone()).unwrap();
     db.pool(ShardType::State).force_index_checkpoint().unwrap();
     assert_eq!(
-        PackfileStorage::read_journal_lsn(&root.join("pools/mtpl-state")),
+        PackfileStorage::read_journal_lsn(&root.join("mtpl-state")),
         before,
         "a checkpoint must never regress its covered LSN to zero"
     );
@@ -2706,12 +3174,8 @@ fn checkpoint_coverage_does_not_regress_to_zero_after_reclaim() {
 fn a_missing_wal_is_seeded_above_the_pools_recorded_coverage() {
     let root = test_root("seed_missing_wal");
     drop(crate::layout::DatabaseLayout::open(root.clone()).unwrap());
-    std::fs::create_dir_all(root.join("pools/mtpl-state")).unwrap();
-    std::fs::write(
-        root.join("pools/mtpl-state/journal.lsn"),
-        7u64.to_le_bytes(),
-    )
-    .unwrap();
+    std::fs::create_dir_all(root.join("mtpl-state")).unwrap();
+    std::fs::write(root.join("mtpl-state/journal.lsn"), 7u64.to_le_bytes()).unwrap();
     assert!(!root.join("wal.bin").exists());
 
     let db = Database::open(root.clone()).unwrap();
@@ -2753,7 +3217,7 @@ fn a_per_pool_journal_is_refused_inside_a_shared_root() {
     let db = Database::open(root.clone()).unwrap();
     let err = db
         .pool(ShardType::State)
-        .enable_journal(root.join("pools/mtpl-state/wal.bin"))
+        .enable_journal(root.join("mtpl-state/wal.bin"))
         .unwrap_err();
     assert!(
         err.to_string().contains("inside database root"),
@@ -2786,22 +3250,85 @@ fn open_with_policies_applies_per_pool_settings() {
     let root = test_root("explicit_policies");
     let mut policies = super::PoolPolicies::default();
     policies.for_shard_mut(ShardType::State).compress = false;
-    policies.for_shard_mut(ShardType::Edges).checksum_policy =
-        crate::packfile::ChecksumPolicy::WriteOnly;
+    policies
+        .for_shard_mut(ShardType::ServerInfo)
+        .checksum_policy = crate::packfile::ChecksumPolicy::WriteOnly;
 
     let db = Database::open_with_policies(root.clone(), policies).unwrap();
     assert!(!db.state().is_compression_enabled());
     assert!(db.event_dag().is_compression_enabled());
-    assert!(db.edges().is_compression_enabled());
+    assert!(db.server_info().is_compression_enabled());
     assert_eq!(
-        db.edges().checksum_policy(),
+        db.server_info().checksum_policy(),
         crate::packfile::ChecksumPolicy::WriteOnly
     );
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Every concurrent versioned read-modify-write must survive. The version
+/// Append policy is per pool like every other policy field, and the default
+/// stays the historical eager behavior.
+#[test]
+fn open_with_policies_applies_append_policy_per_pool() {
+    let root = test_root("append_policy_policy");
+    let mut policies = PoolPolicies::default();
+    policies.for_shard_mut(ShardType::State).append_policy = crate::shard::AppendPolicy::buffered();
+
+    let db = Database::open_with_policies(root.clone(), policies).unwrap();
+    assert_eq!(
+        db.pool(ShardType::State).append_policy(),
+        crate::shard::AppendPolicy::buffered()
+    );
+    for shard in ShardType::ALL {
+        if shard != ShardType::State {
+            assert_eq!(
+                db.pool(shard).append_policy(),
+                crate::shard::AppendPolicy::Eager,
+                "{shard:?} must keep the eager default"
+            );
+        }
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A buffered pool must still lose nothing at a sync boundary: the sync
+/// flushes buffered frames before it makes the WAL group durable, so a reopen
+/// sees the committed transaction.
+#[test]
+fn buffered_append_policy_survives_sync_and_reopen() {
+    let root = test_root("append_policy_reopen");
+    let policies = PoolPolicies::uniform(PoolPolicy {
+        append_policy: crate::shard::AppendPolicy::buffered(),
+        ..PoolPolicy::default()
+    });
+    let collection = [0x5Au8; 16];
+    {
+        let db = Database::open_with_policies(root.clone(), policies).unwrap();
+        let transaction = db.begin_transaction();
+        transaction
+            .put(
+                ShardType::State,
+                collection,
+                node(1),
+                &data(b"buffered-commit"),
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        for shard in ShardType::ALL {
+            db.pool(shard).sync_all().unwrap();
+        }
+    }
+
+    let reopened = Database::open_with_policies(root.clone(), policies).unwrap();
+    assert_eq!(
+        live_get(&reopened, ShardType::State, collection, node(1)),
+        Some(b"buffered-commit".to_vec()),
+        "a synced buffered write must be visible after reopen"
+    );
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&root);
+}
 /// token has to cover the data it is paired with: if a reader can observe a
 /// just-published version alongside pre-publication data, its conditional
 /// commit validates against that version and overwrites another writer's
@@ -2814,7 +3341,7 @@ fn concurrent_versioned_rmw_keeps_every_update() {
 
     let root = test_root("concurrent_versioned_rmw");
     let db = Arc::new(Database::open(root.clone()).unwrap());
-    let pool = ShardType::Edges;
+    let pool = ShardType::ServerInfo;
     let collection = [0x7au8; 16];
     let key = node(1);
 
@@ -3181,13 +3708,27 @@ fn disjoint_record_writes_do_not_conflict() {
             let key = *key;
             std::thread::spawn(move || {
                 barrier.wait();
-                let txn = db.begin_transaction();
-                let (records, versions) = txn
-                    .get_with_record_versions(pool, &collection, &[key])
-                    .unwrap();
-                assert!(records[0].is_none());
-                txn.expect_record_version(pool, collection, key, versions[0])
-                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let txn = loop {
+                    let txn = db.begin_transaction();
+                    match txn.get_with_record_versions(pool, &collection, &[key]) {
+                        Ok((records, versions)) => {
+                            assert!(records[0].is_none());
+                            txn.expect_record_version(pool, collection, key, versions[0])
+                                .unwrap();
+                            break txn;
+                        }
+                        // A concurrent commit may publish a group whose
+                        // materialization has not reached this reader yet.
+                        Err(error) if error.is_would_block() => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "versioned read kept blocking: {error}"
+                            );
+                        }
+                        Err(error) => panic!("versioned read failed: {error}"),
+                    }
+                };
                 txn.put(
                     pool,
                     collection,
@@ -3308,6 +3849,28 @@ fn a_fresh_shared_database_creates_only_the_files_it_needs() {
         .pool(ShardType::State)
         .put(&[1; 16], &node(1), &data(b"x"))
         .unwrap();
+    // A new pack is physically created by the write but stays under its
+    // non-discoverable staging name until its first durability barrier.
+    let mut staged = Vec::new();
+    files_under(&root, &mut staged);
+    assert!(
+        staged
+            .iter()
+            .any(|name| { name.starts_with("pack_") && name.contains(".tmp.") }),
+        "the written pool's new pack must be staged before sync: {staged:?}"
+    );
+    assert_eq!(
+        staged
+            .iter()
+            .filter(|name| std::path::Path::new(name)
+                .extension()
+                .is_some_and(|e| e == "pack"))
+            .count(),
+        0,
+        "a staged pack must not be canonically discoverable: {staged:?}"
+    );
+
+    database.pool(ShardType::State).sync_all().unwrap();
     let mut after = Vec::new();
     files_under(&root, &mut after);
     assert_eq!(
@@ -3318,7 +3881,13 @@ fn a_fresh_shared_database_creates_only_the_files_it_needs() {
                 .is_some_and(|e| e == "pack"))
             .count(),
         1,
-        "only the written pool gets a pack: {after:?}"
+        "the first barrier publishes only the written pool's pack: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|name| { name.starts_with("pack_") && name.contains(".tmp.") }),
+        "publication must consume the staging name: {after:?}"
     );
 }
 
@@ -3343,6 +3912,11 @@ fn pools_written_through_a_shared_database_read_back_read_only() {
                 .unwrap();
         }
         database.coordinator().sync().unwrap();
+        // The durable read-only path observes published packs only; publish
+        // each pool's first pack before reopening it.
+        for shard in ShardType::ALL {
+            database.pool(shard).sync_all().unwrap();
+        }
     }
     let mut names = Vec::new();
     files_under(&root, &mut names);
@@ -3365,10 +3939,14 @@ fn pools_written_through_a_shared_database_read_back_read_only() {
 }
 
 fn pool_dirs(root: &std::path::Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(root.join("pools"))
+    let mut names: Vec<String> = std::fs::read_dir(root)
         .map(|entries| {
             entries
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    (entry.file_type().ok()?.is_dir() && name.starts_with("mtpl-")).then_some(name)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -3397,22 +3975,22 @@ fn pools_are_created_by_their_first_write() {
     );
 
     database
-        .pool(ShardType::Edges)
-        .put(&[9; 16], &node(1), &data(b"edge"))
+        .pool(ShardType::ServerInfo)
+        .put(&[9; 16], &node(1), &data(b"info"))
         .unwrap();
-    assert_eq!(pool_dirs(&root), vec!["mtpl-edges".to_owned()]);
+    assert_eq!(pool_dirs(&root), vec!["mtpl-srvinfo".to_owned()]);
     database.coordinator().sync().unwrap();
     drop(database);
 
     let reopened = Database::open(root.clone()).unwrap();
-    assert_eq!(pool_dirs(&root), vec!["mtpl-edges".to_owned()]);
+    assert_eq!(pool_dirs(&root), vec!["mtpl-srvinfo".to_owned()]);
     assert_eq!(
         reopened
-            .pool(ShardType::Edges)
+            .pool(ShardType::ServerInfo)
             .get(&[9; 16], &node(1))
             .unwrap()
             .map(|d| d.bytes.to_vec()),
-        Some(b"edge".to_vec())
+        Some(b"info".to_vec())
     );
 }
 
@@ -3594,18 +4172,20 @@ fn a_committed_delete_collection_hides_synced_records() {
     let db = Database::open(root.clone()).unwrap();
     let doomed = [0x71_u8; 16];
     let put = db.begin_transaction();
-    put.put(ShardType::Edges, doomed, node(1), &data(b"doomed"))
+    put.put(ShardType::ServerInfo, doomed, node(1), &data(b"doomed"))
         .unwrap();
     put.commit().unwrap();
-    db.pool(ShardType::Edges).sync_all().unwrap();
+    db.pool(ShardType::ServerInfo).sync_all().unwrap();
 
     let delete = db.begin_transaction();
-    delete.delete_collection(ShardType::Edges, doomed).unwrap();
+    delete
+        .delete_collection(ShardType::ServerInfo, doomed)
+        .unwrap();
     delete.commit().unwrap();
 
     let read = db.begin_transaction();
     let (records, _) = read
-        .get_with_record_versions(ShardType::Edges, &doomed, &[node(1)])
+        .get_with_record_versions(ShardType::ServerInfo, &doomed, &[node(1)])
         .unwrap();
     assert!(records[0].is_none(), "the deleted record is still readable");
     drop(read);
@@ -3620,21 +4200,23 @@ fn repacking_a_deleted_collection_does_not_resurrect_it() {
     let db = Database::open(root.clone()).unwrap();
     let doomed = [0x71_u8; 16];
     let put = db.begin_transaction();
-    put.put(ShardType::Edges, doomed, node(1), &data(b"doomed"))
+    put.put(ShardType::ServerInfo, doomed, node(1), &data(b"doomed"))
         .unwrap();
     put.commit().unwrap();
     let delete = db.begin_transaction();
-    delete.delete_collection(ShardType::Edges, doomed).unwrap();
+    delete
+        .delete_collection(ShardType::ServerInfo, doomed)
+        .unwrap();
     delete.commit().unwrap();
     let read = |db: &Database| {
         db.begin_transaction()
-            .get_with_record_versions(ShardType::Edges, &doomed, &[node(1)])
+            .get_with_record_versions(ShardType::ServerInfo, &doomed, &[node(1)])
             .unwrap()
             .0[0]
             .is_some()
     };
     assert!(!read(&db), "the delete itself must take effect");
-    db.pool(ShardType::Edges)
+    db.pool(ShardType::ServerInfo)
         .repack_collection_reachable(&doomed, |_, _| Vec::new())
         .unwrap();
     assert!(!read(&db), "the repack brought the deleted record back");
@@ -3652,23 +4234,23 @@ fn a_deleted_collection_can_be_recreated_and_read() {
     let collection = [0x71_u8; 16];
     let write = |id: u8, payload: &'static [u8]| {
         let txn = db.begin_transaction();
-        txn.put(ShardType::Edges, collection, node(id), &data(payload))
+        txn.put(ShardType::ServerInfo, collection, node(id), &data(payload))
             .unwrap();
         txn.commit().unwrap();
     };
     let read = |id: u8| {
         db.begin_transaction()
-            .get_with_record_versions(ShardType::Edges, &collection, &[node(id)])
+            .get_with_record_versions(ShardType::ServerInfo, &collection, &[node(id)])
             .unwrap()
             .0[0]
             .as_ref()
             .map(|record| record.bytes.to_vec())
     };
     write(1, b"old");
-    db.pool(ShardType::Edges).sync_all().unwrap();
+    db.pool(ShardType::ServerInfo).sync_all().unwrap();
     let delete = db.begin_transaction();
     delete
-        .delete_collection(ShardType::Edges, collection)
+        .delete_collection(ShardType::ServerInfo, collection)
         .unwrap();
     delete.commit().unwrap();
     assert_eq!(read(1), None);
@@ -3679,12 +4261,12 @@ fn a_deleted_collection_can_be_recreated_and_read() {
         None,
         "the deleted record came back with the new one"
     );
-    db.pool(ShardType::Edges).sync_all().unwrap();
+    db.pool(ShardType::ServerInfo).sync_all().unwrap();
     drop(db);
     let db = Database::open(root.clone()).unwrap();
     let after = db
         .begin_transaction()
-        .get_with_record_versions(ShardType::Edges, &collection, &[node(1), node(2)])
+        .get_with_record_versions(ShardType::ServerInfo, &collection, &[node(1), node(2)])
         .unwrap()
         .0;
     assert!(after[0].is_none() && after[1].is_some());
@@ -3701,18 +4283,18 @@ fn a_miss_after_a_sync_does_not_refresh_the_collection() {
     let collection = [0x74_u8; 16];
     for round in 0..3_u8 {
         let txn = db.begin_transaction();
-        txn.put(ShardType::Edges, collection, node(round), &data(b"x"))
+        txn.put(ShardType::ServerInfo, collection, node(round), &data(b"x"))
             .unwrap();
         txn.commit().unwrap();
-        db.pool(ShardType::Edges).sync_all().unwrap();
+        db.pool(ShardType::ServerInfo).sync_all().unwrap();
         // A first-time key: absent, as every new event's forward record is.
         let missing = db
-            .pool(ShardType::Edges)
+            .pool(ShardType::ServerInfo)
             .get_many_with_refresh(&collection, &[node(100 + round)])
             .unwrap();
         assert!(missing[0].is_none());
     }
-    let stats = db.pool(ShardType::Edges).stats();
+    let stats = db.pool(ShardType::ServerInfo).stats();
     assert_eq!(stats.miss_refreshes, 0, "a miss rescanned the collection");
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
@@ -3820,4 +4402,68 @@ fn rejected_remove_many_leaves_the_transaction_unchanged() {
     writer.commit().unwrap();
     txn.commit().expect("no leftover record precondition");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_full_scan_open_leaves_a_checkpoint_for_the_next_open() {
+    use crate::packfile::storage::OpenPath;
+
+    let root = test_root("full-scan-write-back");
+    let collection = [0x55u8; 16];
+    {
+        let db = Database::open(root.clone()).unwrap();
+        db.pool(ShardType::State)
+            .put(&collection, &node(1), &NodeData::from_slice(b"state-1"))
+            .unwrap();
+        db.pool(ShardType::State).sync_all().unwrap();
+    }
+    // Simulate a store whose checkpoint went stale or was never written.
+    let checkpoint = root
+        .join("mtpl-state")
+        .join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE);
+    std::fs::remove_file(&checkpoint).unwrap();
+
+    {
+        let db = Database::open(root.clone()).unwrap();
+        assert_eq!(
+            db.pool(ShardType::State).open_timings().unwrap().path,
+            OpenPath::FullScan,
+            "without a checkpoint the open must rescan"
+        );
+    }
+    assert!(
+        checkpoint.exists(),
+        "the rescanning open must persist a checkpoint"
+    );
+
+    let db = Database::open(root.clone()).unwrap();
+    assert_eq!(
+        db.pool(ShardType::State).open_timings().unwrap().path,
+        OpenPath::Checkpoint,
+        "the next open must load the checkpoint instead of rescanning"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reclaim_trigger_config_reaches_the_journal_coordinator() {
+    let root = test_root("config-reclaim-trigger");
+    let default_db = Database::open(root.clone()).unwrap();
+    let default_len = default_db.coordinator().reclaim_trigger_len();
+    drop(default_db);
+
+    let config = RuntimeConfig {
+        reclaim_trigger_bytes: Some(default_len / 2),
+        ..RuntimeConfig::default()
+    };
+    let db = Database::open_with_config(root.clone(), config).unwrap();
+    assert_eq!(db.coordinator().reclaim_trigger_len(), default_len / 2);
+    drop(db);
+
+    let bad = RuntimeConfig {
+        reclaim_trigger_bytes: Some(0),
+        ..RuntimeConfig::default()
+    };
+    assert!(Database::open_with_config(root, bad).is_err());
 }

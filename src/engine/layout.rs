@@ -42,7 +42,7 @@ impl Drop for TempFileGuard {
 /// [`PackfileStorage`](crate::PackfileStorage) remains available as a
 /// lower-level single-pool API.
 const DB_META_MAGIC: &[u8; 4] = b"MTXD";
-const DB_META_VERSION: u8 = 1;
+const DB_META_VERSION: u8 = 2;
 const DB_META_SEED_LEN: usize = 8;
 /// The pool list a descriptor must carry, built from the pool directory names
 /// so it can never drift from them. A root whose descriptor lists other names
@@ -134,9 +134,8 @@ fn read_db_meta(path: &Path) -> io::Result<DbMeta> {
     })
 }
 
-/// The index seed of the pool at `pool_dir` when it lives at
-/// `<root>/pools/<pool>` inside a database root; `None` for a standalone pool
-/// directory, which keeps its own `pool.meta`.
+/// The index seed of a pool directory inside a database root; `None` for a
+/// standalone pool directory, which keeps its own `pool.meta`.
 ///
 /// # Errors
 /// Returns `InvalidData` if the enclosing `db.meta` is unrecognized.
@@ -144,16 +143,13 @@ pub fn enclosing_pool_seed(pool_dir: &Path) -> io::Result<Option<u64>> {
     let Some(name) = pool_dir.file_name().and_then(|name| name.to_str()) else {
         return Ok(None);
     };
-    let Some(shard_type) = ShardType::ALL.into_iter().find(|t| t.as_str() == name) else {
-        return Ok(None);
-    };
-    let Some(pools) = pool_dir
-        .parent()
-        .filter(|p| p.file_name().is_some_and(|n| n == "pools"))
+    let Some(shard_type) = ShardType::ALL
+        .into_iter()
+        .find(|shard| shard.as_str() == name)
     else {
         return Ok(None);
     };
-    let Some(root) = pools.parent() else {
+    let Some(root) = pool_dir.parent() else {
         return Ok(None);
     };
     let meta_path = root.join(DB_META_FILENAME);
@@ -177,7 +173,7 @@ pub fn enclosing_pool_seed(pool_dir: &Path) -> io::Result<Option<u64>> {
 /// The `mtxdb` version that created the database root enclosing `pool_dir`.
 #[must_use]
 pub fn enclosing_created_by(pool_dir: &Path) -> Option<String> {
-    let root = pool_dir.parent()?.parent()?;
+    let root = enclosing_root(pool_dir).ok()??;
     read_db_meta(&root.join(DB_META_FILENAME))
         .ok()
         .map(|meta| meta.created_by)
@@ -225,7 +221,7 @@ pub fn is_database_root(root: &Path) -> io::Result<bool> {
 /// Nearest enclosing database root for `dir`, if any.
 ///
 /// Walks `dir` and its ancestors looking for a `db.meta` descriptor. This is
-/// how a store opened on `root/pools/<pool>` discovers that it lives inside a
+/// how a store opened on `root/<pool>` discovers that it lives inside a
 /// database root (see the per-pool journal gate in
 /// [`PackfileStorage::enable_journal`](crate::PackfileStorage::enable_journal)).
 ///
@@ -256,19 +252,18 @@ pub fn enclosing_root(dir: &Path) -> io::Result<Option<PathBuf>> {
 /// A named independent packfile pool in an mtxdb database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShardType {
-    /// HAMT nodes, roots, and state-group sidecars.
+    /// HAMT nodes, roots, state-group sidecars, and the derived graph sidecars
+    /// (event-id maps, CSR adjacency segments and auth-closure generations).
     State,
-    /// Event JSON plus collection-DAG-oriented event data.
+    /// Plain event records: event JSON plus collection-DAG-oriented event data.
     EventDag,
-    /// Edges pool: houses previous-event edges (`PREV`) and auth-chain edges (`AUTH`).
-    Edges,
     /// Server metadata, including federation signing keys and raw key responses.
     ServerInfo,
 }
 
 impl ShardType {
     /// Every shard type defined by the current database layout.
-    pub const ALL: [Self; 4] = [Self::State, Self::EventDag, Self::Edges, Self::ServerInfo];
+    pub const ALL: [Self; 3] = [Self::State, Self::EventDag, Self::ServerInfo];
 
     /// This pool's position in [`Self::ALL`], the canonical pool order. Use it to
     /// index per-pool arrays so they cannot drift from `ALL` when a pool is added.
@@ -291,15 +286,22 @@ impl ShardType {
         match self {
             Self::State => "mtpl-state",
             Self::EventDag => "mtpl-event",
-            Self::Edges => "mtpl-edges",
-            Self::ServerInfo => "mtpl-server-info",
+            Self::ServerInfo => "mtpl-srvinfo",
+        }
+    }
+
+    const fn graph_as_str(self) -> &'static str {
+        match self {
+            Self::State => "mtgr-state",
+            Self::EventDag => "mtgr-event",
+            Self::ServerInfo => "mtgr-srvinfo",
         }
     }
 
     /// Stable 4-byte physical pool tag used in physical layout and diagnostic labeling.
     ///
     /// # Note
-    /// This is a physical storage pool tag (e.g. `EDGE`), **not** a logical
+    /// This is a physical storage pool tag (e.g. `EVNT`), **not** a logical
     /// member namespace (`PREV` / `AUTH`). Collection derivation MUST use logical
     /// member namespaces, never this physical pool tag.
     #[must_use]
@@ -307,7 +309,6 @@ impl ShardType {
         match self {
             Self::State => *b"STAT",
             Self::EventDag => *b"EVNT",
-            Self::Edges => *b"EDGE",
             Self::ServerInfo => *b"SINF",
         }
     }
@@ -331,9 +332,12 @@ impl DatabaseLayout {
         Self::reject_flat_store(&root)?;
         let meta_path = root.join(DB_META_FILENAME);
         if !meta_path.exists() {
+            Self::reject_legacy_parents(&root)?;
             Self::write_descriptor(&meta_path)?;
         }
-        let seed = read_db_meta(&meta_path)?.seed;
+        let meta = read_db_meta(&meta_path)?;
+        Self::validate_current_layout(&root)?;
+        let seed = meta.seed;
         Ok(Self { root, seed })
     }
 
@@ -351,7 +355,7 @@ impl DatabaseLayout {
     /// # Errors
     /// Returns an error if the pool parent cannot be created.
     pub fn pool_dir(&self, shard_type: ShardType) -> io::Result<PathBuf> {
-        let path = self.root.join("pools").join(shard_type.as_str());
+        let path = self.pool_path(shard_type);
         fs::create_dir_all(&path)?;
         Ok(path)
     }
@@ -361,7 +365,19 @@ impl DatabaseLayout {
     /// pack.
     #[must_use]
     pub fn pool_path(&self, shard_type: ShardType) -> PathBuf {
-        self.root.join("pools").join(shard_type.as_str())
+        self.root.join(shard_type.as_str())
+    }
+
+    /// The shared sidecar store for `shard_type`, `<root>/mtgr-<pool>/`.
+    ///
+    /// Graph sidecars are derived data and live outside every pack. There is
+    /// one store per pool, shared by every collection in it; rows are addressed
+    /// by `(collection id, family, owner)`. No directory is named after a
+    /// domain object, so the file count does not grow with the number of
+    /// collections.
+    #[must_use]
+    pub fn graph_path(&self, shard_type: ShardType) -> PathBuf {
+        self.root.join(shard_type.graph_as_str())
     }
 
     /// Return a named pool's directory without creating it or any parent.
@@ -369,7 +385,7 @@ impl DatabaseLayout {
     /// # Errors
     /// Returns an error if the pool directory does not exist.
     pub fn pool_dir_read_only(&self, shard_type: ShardType) -> io::Result<PathBuf> {
-        let path = self.root.join("pools").join(shard_type.as_str());
+        let path = self.pool_path(shard_type);
         if !path.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -402,7 +418,9 @@ impl DatabaseLayout {
                 format!("missing database descriptor: {}", meta_path.display()),
             ));
         }
-        let seed = read_db_meta(&meta_path)?.seed;
+        let meta = read_db_meta(&meta_path)?;
+        Self::validate_current_layout(&root)?;
+        let seed = meta.seed;
         Self::reject_flat_store(&root)?;
         Ok(Self { root, seed })
     }
@@ -420,6 +438,46 @@ impl DatabaseLayout {
     #[must_use]
     pub fn shared_wal_path(&self) -> PathBuf {
         self.root.join("wal.bin")
+    }
+
+    fn reject_legacy_parents(root: &Path) -> io::Result<()> {
+        if root.join("pools").exists() || root.join("graph").exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "nested mtxdb layouts are unsupported; initialize a fresh database root at {}",
+                    root.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_current_layout(root: &Path) -> io::Result<()> {
+        Self::reject_legacy_parents(root)?;
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !(name.starts_with("mtpl-") || name.starts_with("mtgr-")) {
+                continue;
+            }
+            if !ShardType::ALL
+                .into_iter()
+                .any(|shard| name == shard.as_str() || name == shard.graph_as_str())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unexpected pool or graph directory `{name}` in {}",
+                        root.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn reject_flat_store(root: &Path) -> io::Result<()> {

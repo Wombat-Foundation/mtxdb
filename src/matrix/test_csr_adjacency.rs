@@ -1,6 +1,5 @@
-use super::matrix_adjacency::*;
+use super::csr_adjacency::*;
 use crate::database::Database;
-use crate::layout::ShardType;
 use crate::storage::StorageError;
 use std::path::PathBuf;
 
@@ -12,8 +11,8 @@ fn test_root(name: &str) -> PathBuf {
     path
 }
 
-fn adjacency() -> MatrixAdjacency {
-    MatrixAdjacency::new(ShardType::Edges, ROOM)
+fn adjacency() -> CsrAdjacency {
+    CsrAdjacency::new(ROOM)
 }
 
 #[test]
@@ -59,6 +58,77 @@ fn records_and_reads_prev_auth_and_relation() {
     );
     assert_eq!(adj.relation_of(&db, "$msg", &AlwaysVisible).unwrap(), None);
     assert!(adj.verify(&db).unwrap().is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_event_ids_round_trips_short_ids_and_reports_absent_ones() {
+    let root = test_root("resolve_ids");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    adj.record_event(&db, "$msg", &["$create"], &["$create"], None)
+        .unwrap();
+    let create = adj.short_id(&db, "$create").unwrap().unwrap();
+    let msg = adj.short_id(&db, "$msg").unwrap().unwrap();
+    let absent = u32::MAX;
+
+    assert_eq!(
+        adj.resolve_event_ids(&db, &[msg, absent, create]).unwrap(),
+        vec![Some("$msg".to_owned()), None, Some("$create".to_owned()),],
+        "order is preserved and an unassigned id resolves to None"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reverse_family_transposes_persisted_rows() {
+    let root = test_root("reverse-family");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    adj.record_event(&db, "$msg", &["$create"], &["$create"], None)
+        .unwrap();
+    adj.record_event(
+        &db,
+        "$react",
+        &["$msg"],
+        &["$create"],
+        Some(RelationRef {
+            target: "$msg",
+            rel_type: "m.annotation",
+        }),
+    )
+    .unwrap();
+
+    let create = adj.short_id(&db, "$create").unwrap().unwrap();
+    let msg = adj.short_id(&db, "$msg").unwrap().unwrap();
+    let react = adj.short_id(&db, "$react").unwrap().unwrap();
+    let prev = adj.reverse_family(&db, PREV).unwrap();
+    let auth = adj.reverse_family(&db, AUTH).unwrap();
+    let relations = adj.reverse_family(&db, RELATIONS).unwrap();
+
+    assert_eq!(prev.child_count(create), Some(1));
+    assert_eq!(prev.children_of(create).unwrap()[0].target, msg);
+    assert_eq!(prev.children_of(msg).unwrap()[0].target, react);
+    assert_eq!(auth.child_count(create), Some(2));
+    assert_eq!(
+        auth.children_of(create)
+            .unwrap()
+            .iter()
+            .map(|edge| edge.target)
+            .collect::<Vec<_>>(),
+        vec![msg, react]
+    );
+    assert_eq!(relations.child_count(msg), Some(1));
+    assert_eq!(relations.children_of(msg).unwrap()[0].target, react);
+    assert_eq!(
+        relations.children_of(msg).unwrap()[0].kind,
+        adj.kind_id(&db, "m.annotation").unwrap()
+    );
+
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -283,7 +353,7 @@ fn purge_removes_events_and_the_kind_dictionary_together() {
         }),
     )
     .unwrap();
-    let other_room = MatrixAdjacency::new(ShardType::Edges, "!other:example.org");
+    let other_room = CsrAdjacency::new("!other:example.org");
     other_room.record_event(&db, "$x", &[], &[], None).unwrap();
 
     adj.purge(&db).unwrap();
@@ -477,4 +547,140 @@ fn a_relation_can_be_added_later_but_never_changed_or_removed() {
     assert!(adj.verify(&db).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn concurrent_recordings_of_one_event_cannot_both_succeed() {
+    let root = test_root("concurrent-same-owner");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    let (first, second) = std::thread::scope(|scope| {
+        let one = scope.spawn(|| adj.record_event(&db, "$e", &["$a"], &[], None));
+        let two = scope.spawn(|| adj.record_event(&db, "$e", &["$b"], &[], None));
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    assert_eq!(
+        usize::from(first.is_ok()) + usize::from(second.is_ok()),
+        1,
+        "two different prev sets for one event must not both win"
+    );
+    let error = first
+        .err()
+        .or_else(|| second.err())
+        .expect("exactly one recording failed");
+    assert!(matches!(error, StorageError::Collision(_)), "{error}");
+    let stored = adj.prev_of(&db, "$e").unwrap().unwrap();
+    assert!(
+        stored == ["$a".to_owned()] || stored == ["$b".to_owned()],
+        "the winner's edges must survive intact: {stored:?}"
+    );
+    assert!(adj.verify(&db).unwrap().is_consistent());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn children_of_matches_the_derived_reverse_family() {
+    let root = test_root("children-of");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    adj.record_event(&db, "$a", &[], &[], None).unwrap();
+    // Fan-out in separate batches and a merge event with two parents.
+    adj.record_event(&db, "$b", &["$a"], &[], None).unwrap();
+    adj.record_event(&db, "$c", &["$a"], &[], None).unwrap();
+    adj.record_events(
+        &db,
+        &[
+            EventRecord {
+                event_id: "$d",
+                prev: &["$b", "$c"],
+                auth: &[],
+                relation: None,
+            },
+            EventRecord {
+                event_id: "$e",
+                prev: &["$a"],
+                auth: &[],
+                relation: None,
+            },
+        ],
+    )
+    .unwrap();
+    // Re-recording identical data must not change the reverse rows.
+    adj.record_event(&db, "$b", &["$a"], &[], None).unwrap();
+
+    let derived = adj.reverse_family(&db, PREV).unwrap();
+    for id in ["$a", "$b", "$c", "$d", "$e"] {
+        let short = adj.short_id(&db, id).unwrap().unwrap();
+        let expected: Option<Vec<u32>> = derived
+            .children_of(short)
+            .map(|edges| edges.iter().map(|edge| edge.target).collect());
+        assert_eq!(adj.children_of(&db, short).unwrap(), expected, "{id}");
+    }
+    // The reverse rows must not break the forward snapshot or verification.
+    assert_eq!(adj.verify(&db).unwrap().problems, Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn children_of_falls_back_then_backfills_a_legacy_scope() {
+    let root = test_root("children-of-legacy");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    // Rows as a build without the reverse family wrote them.
+    adj.record_legacy_prev(&db, &[("$b", "$a"), ("$c", "$a")])
+        .unwrap();
+    let a = adj.short_id(&db, "$a").unwrap().unwrap();
+    let b = adj.short_id(&db, "$b").unwrap().unwrap();
+    let c = adj.short_id(&db, "$c").unwrap().unwrap();
+    // Unmarked: the derive fallback must still answer correctly.
+    assert_eq!(adj.children_of(&db, a).unwrap(), Some(vec![b, c]));
+    assert_eq!(adj.children_of(&db, b).unwrap(), None);
+    // The next write backfills the old rows and marks the scope.
+    adj.record_event(&db, "$d", &["$b"], &[], None).unwrap();
+    let d = adj.short_id(&db, "$d").unwrap().unwrap();
+    assert_eq!(adj.children_of(&db, a).unwrap(), Some(vec![b, c]));
+    assert_eq!(adj.children_of(&db, b).unwrap(), Some(vec![d]));
+    assert_eq!(adj.children_of(&db, d).unwrap(), None);
+    assert_eq!(adj.verify(&db).unwrap().problems, Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Timing only: `cargo test --release --lib legacy_scope_timing -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing run"]
+fn legacy_scope_timing() {
+    for events in [10_000_usize, 100_000] {
+        let root = test_root("children-of-legacy-timing");
+        let db = Database::open(root.clone()).unwrap();
+        let adj = adjacency();
+        // Spread ids (constant-prefix ids cluster the hash index) in a chain.
+        let names: Vec<String> = (0..=events)
+            .map(|n| format!("${:016x}", (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+            .collect();
+        for chunk in names.windows(2).collect::<Vec<_>>().chunks(256) {
+            let pairs: Vec<(&str, &str)> = chunk
+                .iter()
+                .map(|w| (w[1].as_str(), w[0].as_str()))
+                .collect();
+            adj.record_legacy_prev(&db, &pairs).unwrap();
+        }
+        let mid = adj.short_id(&db, &names[events / 2]).unwrap().unwrap();
+        let t = std::time::Instant::now();
+        let fallback = adj.children_of(&db, mid).unwrap();
+        let fallback_time = t.elapsed();
+        assert!(fallback.is_some());
+        let t = std::time::Instant::now();
+        adj.record_event(&db, "$new", &[names[events].as_str()], &[], None)
+            .unwrap();
+        let backfill_time = t.elapsed();
+        let t = std::time::Instant::now();
+        let fast = adj.children_of(&db, mid).unwrap();
+        let fast_time = t.elapsed();
+        assert_eq!(fast, fallback);
+        println!(
+            "legacy {events:>7} events: fallback children_of {fallback_time:?} | first write (backfill) {backfill_time:?} | children_of after {fast_time:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

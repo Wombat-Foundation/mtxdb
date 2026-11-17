@@ -6,13 +6,22 @@ mod tests {
 
     use rezzy::json::Value;
 
+    /// A per-test temp root. Test thread names contain `::`, which is not
+    /// valid in a Windows path, so colons become underscores.
+    fn test_root(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("test")
+                .replace(':', "_")
+        ))
+    }
+
     #[test]
     fn meta_json_smoke_output_is_valid() {
-        let root = std::env::temp_dir().join(format!(
-            "mtxdb-meta-cli-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root = test_root("mtxdb-meta-cli");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
@@ -30,12 +39,8 @@ mod tests {
 
     #[test]
     fn meta_json_reports_checkpoint_diagnostic() {
-        let root = std::env::temp_dir().join(format!(
-            "mtxdb-meta-cli-checkpoint-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let state = root.join("pools/mtpl-state");
+        let root = test_root("mtxdb-meta-cli-checkpoint");
+        let state = root.join("mtpl-state");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join("index.checkpoint"), b"corrupt checkpoint").unwrap();

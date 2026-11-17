@@ -1,68 +1,33 @@
 [package]
 name = "mtxdb-cli"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.3"
 edition = "2021"
-rust-version = "1.88"
-publish = false
+rust-version = "1.89"
 
 repository = "https://github.com/Wombat-Foundation/mtxdb"
 description = "mtxdb: CLI and core library components; fast Matrix binary DB."
 license = "MIT OR Apache-2.0"
 authors = ["Shane Jaroch <chown_tee@proton.me>"]
 keywords = ["database", "matrix", "cli"]
-categories = ["database", "cli"]
+categories = ["database", "command-line-utilities"]
 readme = "../README.md"
 # Test code is not part of the published surface. The extracted unit-test
 # module lives beside its source as `src/test_*.rs`, and integration tests
 # under `tests/`; exclude both from the packaged archive. Local `cargo test`
 # still compiles them through the out-of-line `mod tests;` declaration.
-exclude = [
-    "tests/",
-    "src/test_*.rs",
-    "src/**/test_*.rs",
-]
+exclude = ["docs/", "tests/", "src/test_*.rs", "src/**/test_*.rs"]
 
-# Standalone workspace root, like benches/: the parent `[workspace]`
-# must not include this crate, or its edition-2024 deps would raise the
-# whole repo's Cargo floor to 1.85 (see the root Cargo.toml comment).
-[workspace]
-resolver = "2"
-
-# Custom build profiles. Cargo resolves `--profile` against the workspace root
-# manifest, and this crate *is* its own root, so the parent manifest's
-# `[profile.*]` tables never reach it. Mirror the repo root's custom profiles
-# here or `cargo install --profile dev-quick --path mtxdb-cli` (i.e.
-# `make install MTXDB_INSTALL_PROFILE=dev-quick`) fails with
-# "profile `dev-quick` is not defined". Keep these in sync with the root
-# Cargo.toml.
-[profile.dev-quick]
-inherits = "dev"
-codegen-units = 256
-debug = "line-tables-only"
-incremental = true
-lto = "off"
-opt-level = 0
-strip = "symbols"
-
-[profile.release-quick]
-inherits = "release"
-debug = "full"
-debug-assertions = false
-incremental = true
-lto = "off"
-opt-level = 1
-strip = "none"
-
-[profile.release-max-perf]
-inherits = "release"
-strip = "symbols"
-lto = "fat"
-codegen-units = 1
-panic = "abort"
+[lib]
+name = "mtxdb_cli"
+path = "src/cli.rs"
 
 [[bin]]
 name = "mtxdb"
 path = "src/main.rs"
+# The binary shares the root library's crate name (`mtxdb`). Documenting it
+# would write into the same target/doc/mtxdb directory and hit cargo #6313;
+# the mtxdb_cli library target carries the CLI documentation instead.
+doc = false
 
 [features]
 default = ["completions"]
@@ -77,8 +42,16 @@ bytes = "1.5"
 clap = { version = "=4.6.7", default-features = false, features = ["std", "env", "help", "usage", "error-context", "color"] }
 clap_complete = { version = "=4.6.11", optional = true }
 hex = "0.4"
-mtxdb = { path = ".." }
-rezzy = { git = "https://gitlab.com/Wombat-Foundation/rezzy.git", branch = "dev" }
+mimalloc = { version = "0.1.52", default-features = false }
+mtxdb = { path = "..", version = "0.1.0-beta.2" }
+rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", features = ["signing-consensus"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
+
+# Custom build profiles live in the workspace root manifest. Cargo resolves
+# `--profile` against that manifest, so a `[profile.*]` table here would be
+# ignored with a warning.
 
 # INTEGRATION TESTS. Ungated files are folded into one `tests/unit/main.rs`
 # target so `cargo test` links a single binary for them (see that file's

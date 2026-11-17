@@ -51,6 +51,72 @@ fn empty_put_many_establishes_metadata_for_a_fresh_index() {
 }
 
 #[test]
+fn put_many_writes_and_replaces_envelopes() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "put_many");
+    assert_eq!(
+        index.put_many(&[(b"a", b"one"), (b"b", b"two")]).unwrap(),
+        2
+    );
+    assert_eq!(
+        index.get_many(&[b"a", b"b"]).unwrap(),
+        vec![Some(b"one".to_vec()), Some(b"two".to_vec())]
+    );
+
+    // Replacing an existing record decodes its stored envelope first, so a
+    // stale/corrupt value cannot be silently overwritten either.
+    assert_eq!(index.put_many(&[(b"a", b"three")]).unwrap(), 1);
+    assert_eq!(index.get(b"a").unwrap(), Some(b"three".to_vec()));
+}
+
+#[test]
+fn put_many_rejects_a_corrupt_existing_envelope_without_partial_writes() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "put_many_corrupt");
+    // Establish the collection before planting the raw record: `put_many`
+    // ensures metadata itself, and a record written before the collection
+    // exists is not part of its generation.
+    index.ensure_metadata().unwrap();
+    let digest = auxiliary_key_digest(b"bad");
+    engine
+        .put(
+            &index.collection_id(),
+            &physical_id(&digest),
+            &NodeData::new(VALUE_MAGIC.to_vec().into()),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        index.put_many(&[(b"good", b"value"), (b"bad", b"value")]),
+        Err(StorageError::Corrupt(_))
+    ));
+    assert_eq!(
+        index.get(b"good").unwrap(),
+        None,
+        "a rejected batch must not apply its valid entries"
+    );
+}
+
+#[test]
+fn put_rejects_a_corrupt_existing_envelope() {
+    let engine = InMemoryStorage::new();
+    let index = AuxiliaryIndex::open(&engine, "put_corrupt");
+    let digest = auxiliary_key_digest(b"bad");
+    engine
+        .put(
+            &index.collection_id(),
+            &physical_id(&digest),
+            &NodeData::new(VALUE_MAGIC.to_vec().into()),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        index.put(b"bad", b"value"),
+        Err(StorageError::Corrupt(_))
+    ));
+}
+
+#[test]
 fn get_many_rejects_a_corrupt_envelope() {
     let engine = InMemoryStorage::new();
     let index = AuxiliaryIndex::open(&engine, "corrupt");

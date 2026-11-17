@@ -4,13 +4,16 @@
 //! reads it. Both sides must spell every record tag and field the same way and
 //! agree on what each verdict code number means, so those live here once. The
 //! module is pure: names, numbers and tag conversions, no JSON library and no
-//! I/O. The `kind` of a `server_keys` record is
-//! [`crate::interop::KeyRecordKind::as_str`].
+//! I/O. A `server_keys` record is one signing key of an origin, tagged by
+//! [`key_kind::PROVISIONAL`] or [`key_kind::PERMANENT`], or the origin's
+//! verbatim self-signed payload, tagged [`key_kind::NOTARY`].
 //!
 //! Each line is one JSON object tagged by [`field::T`]:
 //!
-//! 1. [`tag::HEADER`]: [`field::FORMAT`], [`field::SERVER`], [`field::ROOM_ID`].
-//! 2. [`tag::EVENT`]: the event's identity, edges, flags, verdict codes and PDU.
+//! 1. [`tag::HEADER`]: [`field::FORMAT`], [`field::SERVER`], [`field::ROOM_ID`],
+//!    and optionally [`field::TIMELINE`].
+//! 2. [`tag::EVENT`]: the event's identity, edges, ordering, flags, verdict
+//!    codes and PDU.
 //! 3. [`tag::END`]: [`field::EVENTS`], the number of event records. A file
 //!    without it was truncated.
 //!
@@ -32,6 +35,16 @@ pub mod tag {
     pub const SERVER_KEYS: &str = "server_keys";
 }
 
+/// The `kind` of a `server_keys` record.
+pub mod key_kind {
+    /// A key seen only through a notary so far.
+    pub const PROVISIONAL: &str = "provisional";
+    /// A key observed by a direct fetch from its origin.
+    pub const PERMANENT: &str = "permanent";
+    /// The origin's self-signed payload, kept verbatim.
+    pub const NOTARY: &str = "notary";
+}
+
 /// Field names, by record.
 pub mod field {
     /// The record tag, on every record.
@@ -43,9 +56,21 @@ pub mod field {
     pub const SERVER: &str = "server";
     /// `header`: the room every event record belongs to.
     pub const ROOM_ID: &str = "room_id";
+    /// `header`, optional: whether the export guarantees timeline stream
+    /// orderings. Absent is false, for legacy exports.
+    pub const TIMELINE: &str = "timeline";
 
     /// `event`: the event's id.
     pub const EVENT_ID: &str = "event_id";
+    /// `event`, optional: the event's timeline position. Present only for
+    /// events the source put on its timeline, with negative positions for backfill.
+    pub const STREAM_ORDERING: &str = "stream_ordering";
+    /// `event`, optional: the source's global ordering for an outlier kept off
+    /// the timeline, including a soft-failed event. Uses the source's counter, so it is
+    /// comparable with `stream_ordering`.
+    pub const ARRIVAL_ORDERING: &str = "arrival_ordering";
+    /// `event`, optional: the event's depth.
+    pub const DEPTH: &str = "depth";
     /// `event`: ids of the event's `prev_events`.
     pub const PREV_EVENTS: &str = "prev_events";
     /// `event`: ids of the event's `auth_events`.
@@ -70,10 +95,40 @@ pub mod field {
 
     /// `server_keys`: the server the keys belong to.
     pub const ORIGIN: &str = "origin";
-    /// `server_keys`: the record kind, a `KeyRecordKind` tag.
+    /// `server_keys`: the record kind, a [`super::key_kind`] tag.
     pub const KIND: &str = "kind";
-    /// `server_keys`: base64 of the record's payload bytes.
+    /// `server_keys` notary: base64 of the self-signed payload's exact bytes.
     pub const PAYLOAD: &str = "payload";
+    /// `server_keys` key: the key's id, for example `ed25519:abc`.
+    pub const KEY_ID: &str = "key_id";
+    /// `server_keys` key: base64 of the public key bytes.
+    pub const KEY: &str = "key";
+    /// `server_keys` key: millisecond timestamp the key is valid until.
+    pub const VALID_UNTIL_TS: &str = "valid_until_ts";
+    /// `server_keys` key: who first supplied the key.
+    pub const SOURCE: &str = "source";
+    /// `provisional` or `permanent`, optional: base64 SHA-256 of the key body.
+    /// A key whose bytes were evicted carries this and no `key`.
+    pub const DIGEST: &str = "digest";
+    /// `provisional` or `permanent`, optional: when the receiver first bound
+    /// the key id; absent is `ts_added_ms`.
+    pub const FIRST_SEEN_MS: &str = "first_seen_ms";
+    /// `provisional` or `permanent`, optional: when the key was last seen
+    /// active; absent is `ts_added_ms`.
+    pub const LAST_ACTIVE_MS: &str = "last_active_ms";
+    /// `provisional` or `permanent`, optional: whether the receiver observed
+    /// the key active; absent is false.
+    pub const CORROBORATED: &str = "corroborated";
+    /// `provisional` or `permanent`, optional: whether the key vanished from
+    /// the origin's responses without an `expired_ts`; absent is false.
+    pub const INFERRED_RETIRED: &str = "inferred_retired";
+    /// `provisional`, optional: the last millisecond a direct fetch may still
+    /// override the key; absent is `0`.
+    pub const PROMOTE_BY_MS: &str = "promote_by_ms";
+    /// `provisional` or `permanent`, optional: when the key was retired.
+    pub const EXPIRED_TS: &str = "expired_ts";
+    /// `provisional` or `permanent`: millisecond timestamp the key was last seen.
+    pub const TS_ADDED_MS: &str = "ts_added_ms";
 }
 
 /// Why an event was rejected: the server refused it outright.

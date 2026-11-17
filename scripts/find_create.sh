@@ -18,9 +18,9 @@ set -eu
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ "$#" -eq 0 ]; then
-  set -- *.jsonl
+	set -- *.jsonl
 fi
 
-rg -n --no-heading --no-messages '"type":"m\.room\.create"' "$@" \
-  | rg -v '"state_key":"[^"]' \
-  | python3 "$here/find_create.py" --candidates "$@"
+rg -n --no-heading --no-messages '"type":"m\.room\.create"' "$@" |
+	rg -v '"state_key":"[^"]' |
+	python3 "$here/find_create.py" --candidates "$@"

@@ -271,3 +271,118 @@ fn dir_expansion_drops_stray_files_from_a_glob() {
     assert_eq!(dirs, vec!["pid-1", "pid-2"]);
     assert_eq!(m.subcommand_name(), Some("collections"));
 }
+
+#[test]
+fn test_shard_type_flag_accepts_server_info() {
+    for val in ["server-info", "server_info"] {
+        let m = build_cli()
+            .try_get_matches_from(["mtxdb", "-t", val, "collections"])
+            .unwrap();
+        assert_eq!(
+            m.get_one::<String>("shard_type").map(String::as_str),
+            Some(val)
+        );
+        assert_eq!(shard_type_from_arg(val), Some(ShardType::ServerInfo));
+    }
+}
+
+#[test]
+fn search_requires_a_term_and_defaults_its_limit() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "search", "0x01"])
+        .is_err());
+    let matches = build_cli()
+        .try_get_matches_from([
+            "mtxdb",
+            "search",
+            "0x01",
+            "--term",
+            "hi",
+            "--template",
+            "t.json",
+        ])
+        .unwrap();
+    let sub = matches.subcommand_matches("search").unwrap();
+    assert_eq!(
+        sub.get_one::<String>("term").map(String::as_str),
+        Some("hi")
+    );
+    assert_eq!(
+        sub.get_one::<String>("template").map(String::as_str),
+        Some("t.json")
+    );
+    assert_eq!(sub.get_one::<i64>("limit"), Some(&50));
+}
+
+#[test]
+fn gaps_anchor_requires_an_explicit_boundary() {
+    let base = [
+        "mtxdb",
+        "gaps",
+        "anchor",
+        "--room",
+        "!r:t",
+        "--gap",
+        "$g",
+        "--event",
+        "$e",
+        "--source",
+        "state_ids",
+    ];
+    // `/state_ids` is the state before an event, so a missing boundary must be
+    // an error rather than a guessed default.
+    assert!(build_cli().try_get_matches_from(base).is_err());
+    for boundary in ["before", "after"] {
+        let mut args = base.to_vec();
+        args.extend(["--boundary", boundary]);
+        assert!(build_cli().try_get_matches_from(args).is_ok(), "{boundary}");
+    }
+    let mut bad = base.to_vec();
+    bad.extend(["--boundary", "during"]);
+    assert!(build_cli().try_get_matches_from(bad).is_err());
+}
+
+#[test]
+fn gaps_list_status_filter_rejects_unknown_names() {
+    let ok = build_cli().try_get_matches_from([
+        "mtxdb",
+        "gaps",
+        "list",
+        "--room",
+        "!r:t",
+        "--status",
+        "absent",
+        "--history",
+    ]);
+    assert!(ok.is_ok());
+    let bad = build_cli().try_get_matches_from([
+        "mtxdb", "gaps", "list", "--room", "!r:t", "--status", "closed",
+    ]);
+    assert!(
+        bad.is_err(),
+        "there is no closed status: a gap closes only by import"
+    );
+}
+
+#[test]
+fn gaps_waive_needs_who_and_why() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "gaps", "waive", "--room", "!r:t", "--gap", "$g"])
+        .is_err());
+}
+
+#[test]
+fn allow_waived_gaps_needs_the_strict_flag() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "import", "--allow-waived-gaps", "x.jsonl"])
+        .is_err());
+    assert!(build_cli()
+        .try_get_matches_from([
+            "mtxdb",
+            "import",
+            "--require-complete-prevs",
+            "--allow-waived-gaps",
+            "x.jsonl"
+        ])
+        .is_ok());
+}

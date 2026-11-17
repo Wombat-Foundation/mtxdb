@@ -18,7 +18,7 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 fn index() -> ShortIdIndex {
-    ShortIdIndex::new(ShardType::Edges, SCOPE)
+    ShortIdIndex::new(ShardType::ServerInfo, SCOPE)
 }
 
 /// A spread-out hash for element `i`: distinct digests, varied top bits.
@@ -56,7 +56,6 @@ fn record(db: &Database, range: std::ops::Range<u32>) {
             db,
             &[BatchEvent {
                 owner: &key,
-                families: &[],
                 owner_payload: Some(&payload),
             }],
         );
@@ -140,7 +139,6 @@ fn a_malformed_payload_is_corruption() {
             &db,
             &[BatchEvent {
                 owner: b"$a",
-                families: &[],
                 owner_payload: Some(b"too short"),
             }],
         )
@@ -211,7 +209,7 @@ fn compaction_folds_the_log_without_changing_the_population() {
     // New owners land in the new generation and join as the tail.
     record(&db, 50..60);
     assert_serves(&index().population_snapshot(&db).unwrap(), 0..60);
-    assert!(index().verify(&db, &[]).unwrap().is_consistent());
+    assert!(index().verify(&db).unwrap().is_consistent());
     // A tail below the trigger is left alone unless forced.
     assert_eq!(index().compact(&db, 0, GRACE_MS, false).unwrap(), None);
     drop(db);
@@ -231,7 +229,7 @@ fn comparable_runs_merge_and_a_small_run_stands_alone() {
     let small = index().compact(&db, 0, GRACE_MS, true).unwrap().unwrap();
     assert_eq!((small.folded_entries, small.run_entries), (10, 10));
     assert_serves(&index().population_snapshot(&db).unwrap(), 0..70);
-    assert!(index().verify(&db, &[]).unwrap().is_consistent());
+    assert!(index().verify(&db).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -318,7 +316,7 @@ fn writers_racing_compaction_lose_nothing() {
     writer.join().unwrap();
     index().compact(&db, 0, GRACE_MS, true).unwrap();
     assert!(compactions >= 1, "compaction never ran against the writer");
-    let report = index().verify(&db, &[]).unwrap();
+    let report = index().verify(&db).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
     assert_eq!(report.owners_checked, 400);
     assert_serves(&index().population_snapshot(&db).unwrap(), 0..400);
@@ -367,7 +365,11 @@ fn purge_after_compaction_drops_every_run_and_queued_generation() {
     let txn = db.begin_transaction();
     for (collection, _) in &before {
         let (records, _) = txn
-            .get_with_record_versions(ShardType::Edges, collection, &[run_chunk_id_for_test(0)])
+            .get_with_record_versions(
+                ShardType::ServerInfo,
+                collection,
+                &[run_chunk_id_for_test(0)],
+            )
             .unwrap();
         // Only runs have chunk records; a queued generation reads empty here.
         assert!(records[0].is_none());
@@ -375,7 +377,7 @@ fn purge_after_compaction_drops_every_run_and_queued_generation() {
     for epoch in 0..3 {
         let (records, _) = txn
             .get_with_record_versions(
-                ShardType::Edges,
+                ShardType::ServerInfo,
                 &index().owner_log_collection(epoch),
                 &[crate::short_id::owner_log_record_id_for_test(1)],
             )
@@ -398,12 +400,12 @@ fn verify_flags_runs_that_disagree_with_the_log() {
     let db = Database::open(root.clone()).unwrap();
     record(&db, 0..10);
     index().compact(&db, 0, GRACE_MS, true).unwrap();
-    assert!(index().verify(&db, &[]).unwrap().is_consistent());
+    assert!(index().verify(&db).unwrap().is_consistent());
     // Make the counter claim one more folded owner than the runs hold.
     let counters = index().counters(&db).unwrap();
     let txn = db.begin_transaction();
     txn.put(
-        ShardType::Edges,
+        ShardType::ServerInfo,
         SCOPE,
         super::short_id::COUNTER_ID,
         &crate::storage::NodeData::new(bytes::Bytes::from(super::short_id::encode_counter(
@@ -416,7 +418,7 @@ fn verify_flags_runs_that_disagree_with_the_log() {
     )
     .unwrap();
     txn.commit().unwrap();
-    let report = index().verify(&db, &[]).unwrap();
+    let report = index().verify(&db).unwrap();
     assert!(!report.is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
@@ -427,7 +429,7 @@ fn verify_flags_runs_that_disagree_with_the_log() {
 /// and a writer on one scope.
 #[test]
 fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
-    let scope = ShortIdIndex::new(ShardType::Edges, [0x6f; 16]);
+    let scope = ShortIdIndex::new(ShardType::ServerInfo, [0x6f; 16]);
     let root = test_root("leak");
     let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
     let writer = {
@@ -441,7 +443,6 @@ fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
                     &db,
                     &[BatchEvent {
                         owner: &key,
-                        families: &[],
                         owner_payload: Some(&payload),
                     }],
                 );
@@ -487,7 +488,7 @@ fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
             "a written run is neither live nor queued"
         );
     }
-    let report = scope.verify(&db, &[]).unwrap();
+    let report = scope.verify(&db).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
@@ -498,7 +499,7 @@ fn abandoned_compaction_attempts_leave_no_unqueued_runs() {
 /// attempt, not publish a manifest naming a deleted run.
 #[test]
 fn a_run_collected_before_the_publish_is_never_published() {
-    let scope = ShortIdIndex::new(ShardType::Edges, [0x70; 16]);
+    let scope = ShortIdIndex::new(ShardType::ServerInfo, [0x70; 16]);
     let root = test_root("collected-run");
     let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
     for i in 0..20_u32 {
@@ -509,7 +510,6 @@ fn a_run_collected_before_the_publish_is_never_published() {
             &db,
             &[BatchEvent {
                 owner: &key,
-                families: &[],
                 owner_payload: Some(&payload),
             }],
         );
@@ -538,18 +538,18 @@ fn a_run_collected_before_the_publish_is_never_published() {
     let db = Database::open(root.clone()).unwrap();
     let snapshot = scope.population_snapshot(&db).unwrap();
     assert_eq!(snapshot.len(), 20);
-    assert!(scope.verify(&db, &[]).unwrap().is_consistent());
+    assert!(scope.verify(&db).unwrap().is_consistent());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The scope's records stay in one pool while the owner log and the runs live
-/// in another: counter, manifests and garbage list in `Edges`; generations and
+/// in another: counter, manifests and garbage list in one pool; generations and
 /// runs in `ServerInfo`.
 #[test]
 fn the_log_and_runs_can_live_in_their_own_pool() {
     let scope =
-        ShortIdIndex::new(ShardType::Edges, [0x75; 16]).with_log_pool(ShardType::ServerInfo);
+        ShortIdIndex::new(ShardType::State, [0x75; 16]).with_log_pool(ShardType::ServerInfo);
     let root = test_root("log-pool");
     let db = Database::open(root.clone()).unwrap();
     let put = |range: std::ops::Range<u32>| {
@@ -561,7 +561,6 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
                 &db,
                 &[BatchEvent {
                     owner: &key,
-                    families: &[],
                     owner_payload: Some(&payload),
                 }],
             );
@@ -578,7 +577,7 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
     let generation0 = scope.owner_log_collection(0);
     let entry1 = crate::short_id::owner_log_record_id_for_test(1);
     assert!(has(ShardType::ServerInfo, generation0, entry1));
-    assert!(!has(ShardType::Edges, generation0, entry1));
+    assert!(!has(ShardType::State, generation0, entry1));
 
     scope.compact(&db, 0, 0, true).unwrap().unwrap();
     put(30..40);
@@ -586,14 +585,14 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
     assert!(runs.iter().any(|(_, present)| *present));
     for (collection, _) in &runs {
         assert!(!has(
-            ShardType::Edges,
+            ShardType::State,
             *collection,
             run_chunk_id_for_test(0)
         ));
     }
     let snapshot = scope.population_snapshot(&db).unwrap();
     assert_eq!(snapshot.len(), 40);
-    assert!(scope.verify(&db, &[]).unwrap().is_consistent());
+    assert!(scope.verify(&db).unwrap().is_consistent());
 
     assert_eq!(scope.collect_garbage(&db, u64::MAX).unwrap().dropped, 1);
     assert!(!has(ShardType::ServerInfo, generation0, entry1));
@@ -603,7 +602,7 @@ fn the_log_and_runs_can_live_in_their_own_pool() {
     scope.purge(&db).unwrap();
     for (collection, _) in &runs {
         assert!(!has(
-            ShardType::ServerInfo,
+            ShardType::State,
             *collection,
             run_chunk_id_for_test(0)
         ));
@@ -635,7 +634,7 @@ fn a_back_to_back_writer_cannot_starve_compaction() {
     writer.join().unwrap();
     index().compact(&db, 0, GRACE_MS, true).unwrap();
     assert!(landed >= 1, "compaction never ran against the writer");
-    let report = index().verify(&db, &[]).unwrap();
+    let report = index().verify(&db).unwrap();
     assert!(report.is_consistent(), "{:?}", report.problems);
     assert_eq!(report.owners_checked, 2000);
     assert_serves(&index().population_snapshot(&db).unwrap(), 0..2000);
@@ -649,7 +648,7 @@ fn a_back_to_back_writer_cannot_starve_compaction() {
 #[test]
 fn a_stale_queue_entry_does_not_shorten_a_retired_runs_grace() {
     const GRACE_MS: u64 = 1_000;
-    let scope = ShortIdIndex::new(ShardType::Edges, [0x72; 16]);
+    let scope = ShortIdIndex::new(ShardType::ServerInfo, [0x72; 16]);
     let root = test_root("stale-queue-grace");
     let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
     let put = |range: std::ops::Range<u32>| {
@@ -661,7 +660,6 @@ fn a_stale_queue_entry_does_not_shorten_a_retired_runs_grace() {
                 &db,
                 &[BatchEvent {
                     owner: &key,
-                    families: &[],
                     owner_payload: Some(&payload),
                 }],
             );
@@ -695,7 +693,11 @@ fn a_stale_queue_entry_does_not_shorten_a_retired_runs_grace() {
     let db = Database::open(root.clone()).unwrap();
     let present = db
         .begin_transaction()
-        .get_with_record_versions(ShardType::Edges, &first_run, &[run_chunk_id_for_test(0)])
+        .get_with_record_versions(
+            ShardType::ServerInfo,
+            &first_run,
+            &[run_chunk_id_for_test(0)],
+        )
         .unwrap()
         .0[0]
         .is_some();
@@ -703,6 +705,60 @@ fn a_stale_queue_entry_does_not_shorten_a_retired_runs_grace() {
         present,
         "the retired run was deleted inside its grace period"
     );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A compactor overtaken before it queues its run must detect the newer
+/// manifest before writing or queueing the same deterministic run collection.
+#[test]
+fn a_stale_compactor_does_not_requeue_the_winners_run() {
+    const GRACE_MS: u64 = 1_000;
+    let scope = ShortIdIndex::new(ShardType::ServerInfo, [0x73; 16]);
+    let root = test_root("stale-queue-live");
+    let db = std::sync::Arc::new(Database::open(root.clone()).unwrap());
+    for i in 0..20_u32 {
+        let key = format!("$e{i}").into_bytes();
+        let payload = encode_owner_payload(hash(i));
+        record_retrying(
+            &scope,
+            &db,
+            &[BatchEvent {
+                owner: &key,
+                owner_payload: Some(&payload),
+            }],
+        );
+    }
+    let hook_db = db.clone();
+    BEFORE_QUEUE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            scope.compact(&hook_db, 0, GRACE_MS, true).unwrap().unwrap();
+        }));
+    });
+    scope.compact(&db, 0, GRACE_MS, true).unwrap();
+
+    let run = WRITTEN_RUNS
+        .lock()
+        .iter()
+        .find(|(owner, _)| *owner == [0x73; 16])
+        .map(|(_, run)| *run)
+        .expect("the winning compactor wrote a run");
+    let collections = scope.run_collections_for_test(&db).unwrap();
+    assert_eq!(
+        collections
+            .iter()
+            .filter(|(collection, _)| *collection == run)
+            .count(),
+        1,
+        "the stale attempt must not enqueue or rewrite the winner's run"
+    );
+
+    // Long past the grace deadline, with the run still live.
+    scope.collect_garbage(&db, 1_000_000).unwrap();
+    drop(db);
+    let db = Database::open(root.clone()).unwrap();
+    let snapshot = scope.population_snapshot(&db).unwrap();
+    assert_serves(&snapshot, 0..20);
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

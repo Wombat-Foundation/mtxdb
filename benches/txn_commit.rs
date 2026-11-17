@@ -57,7 +57,7 @@
 //!   (default: `B/4, B, 4B` clamped to the dataset)
 //! - `MTXDB_TXN_PASSES` (default 3) — median of the reported times
 //! - `MTXDB_TXN_RUNS` — substring filter; only matching run names execute
-//! - `MTXDB_TXN_COMPRESS=0` disables per-record zstd (default on)
+//! - `MTXDB_BENCH_COMPRESS=0` disables per-record zstd (default on)
 //! - `MTXDB_TXN_STAGE_PROBE=1` stages past the 64 MiB budget to show the
 //!   failure is a clean error, not a crash or a silent drop
 //! - `MTXDB_BENCH_ROOT` redirects scratch data off tmpfs
@@ -201,11 +201,12 @@ fn fmt_bytes(bytes: u64) -> String {
 }
 
 /// Open one fresh shared-WAL database root, with per-pool compression chosen
-/// by `MTXDB_TXN_COMPRESS`.
+/// by `MTXDB_BENCH_COMPRESS`.
 fn open_db(dir: PathBuf, compress: bool) -> Database {
     let policy = PoolPolicy {
         compress,
         checksum_policy: ChecksumPolicy::Full,
+        ..PoolPolicy::default()
     };
     let policies = PoolPolicies::uniform(policy);
     Database::open_with_policies(dir, policies).expect("open shared database")

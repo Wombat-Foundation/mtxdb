@@ -40,6 +40,15 @@ pub const STATE_GROUP_RECORD_VERSION: u8 = 0x01;
 /// resolver.
 pub const STATE_GROUP_DOMAIN_PREFIX: &[u8] = b"mtxdb/state-group/v1";
 
+/// Number of state groups between materialized state-lattice keyframes.
+///
+/// Intermediate groups store a small delta list against the last keyframe
+/// instead of a full 2 KiB `LtHash`, so this is the upper bound on replay work
+/// for a cold lattice read. 500 is the shared default across mtxdb and the
+/// homeserver integration; Synapse's `MAX_STATE_DELTA_HOPS` of 100 applies to
+/// full state rows and is not the right bound for compact lattice deltas.
+pub const STATE_LATTICE_KEYFRAME_HOPS: u32 = 500;
+
 /// A 128-bit state-group instance id (also a record/node id).
 pub type StateGroupId = [u8; 16];
 

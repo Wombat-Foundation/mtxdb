@@ -1,0 +1,15 @@
+[package]
+name = "gen-export"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Deterministic generator of valid, signed mtxdb-export/v1 rooms for import scaling runs"
+
+# Its own workspace root, like benches/ and mtxdb-cli: it must not join the
+# root workspace.
+[workspace]
+
+[dependencies]
+base64 = "0.23.1"
+ed25519-zebra = "5"
+rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", features = ["signing-consensus"] }

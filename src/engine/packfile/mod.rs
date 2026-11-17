@@ -416,7 +416,32 @@ pub(crate) struct ScanEntryWithRemoval {
     pub hash: [u8; 16],
     pub offset: u64,
     pub removed: bool,
+    pub disk_bytes: u64,
 }
+
+/// Relative forward skip that buffered readers can satisfy without
+/// discarding their buffer.
+pub trait SkipForward {
+    /// Advance by `bytes` from the current position.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the underlying seek fails.
+    fn skip_forward(&mut self, bytes: i64) -> io::Result<()>;
+}
+
+impl<R: Read + Seek> SkipForward for BufReader<R> {
+    fn skip_forward(&mut self, bytes: i64) -> io::Result<()> {
+        self.seek_relative(bytes)
+    }
+}
+
+impl<T: AsRef<[u8]>> SkipForward for io::Cursor<T> {
+    fn skip_forward(&mut self, bytes: i64) -> io::Result<()> {
+        self.seek(io::SeekFrom::Current(bytes)).map(|_| ())
+    }
+}
+
+const SCAN_BUF_BYTES: usize = 16 * 1024;
 
 /// Streaming packfile metadata scanner.
 pub struct PackfileScanner {
@@ -424,6 +449,9 @@ pub struct PackfileScanner {
     file_end: u64,
     verify_payload: bool,
     done: bool,
+    /// Offset of the next frame. Tracked here because asking a
+    /// `BufReader<File>` for its position is an `lseek` per call.
+    pos: u64,
 }
 
 /// Open a streaming scanner for a packfile.
@@ -437,7 +465,7 @@ pub struct PackfileScanner {
 /// be read or validated, or its length cannot be obtained. A file that
 /// [`read_header`] identifies as a non-packfile yields an empty scanner.
 pub fn scan_packfile_iter(path: &Path, verify_payload: bool) -> io::Result<PackfileScanner> {
-    let file = File::open(path)?;
+    let file = crate::io::open_read_sequential(path)?;
     scan_packfile_iter_from_file(file, verify_payload)
 }
 
@@ -454,13 +482,15 @@ pub(crate) fn scan_packfile_iter_from_file(
     verify_payload: bool,
 ) -> io::Result<PackfileScanner> {
     let file_end = file.metadata()?.len();
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(HEADER_LEN, file);
     let done = read_header(&mut reader)?.is_none();
+    let pos = reader.stream_position()?;
     Ok(PackfileScanner {
         reader,
         file_end,
         verify_payload,
         done,
+        pos,
     })
 }
 
@@ -468,23 +498,43 @@ impl Iterator for PackfileScanner {
     type Item = io::Result<ScanEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_with_removal()
+            .map(|entry| entry.map(|entry| (entry.collection_id, entry.hash, entry.offset)))
+    }
+}
+
+impl PackfileScanner {
+    /// Read the next frame's identity and removal marker without retaining a
+    /// scan-sized vector. The ordinary iterator intentionally keeps its
+    /// historical `(collection_id, hash, offset)` item shape.
+    pub(crate) fn next_with_removal(&mut self) -> Option<io::Result<ScanEntryWithRemoval>> {
         if self.done {
             return None;
         }
-        let offset = match self.reader.stream_position() {
-            Ok(offset) => offset,
-            Err(error) => {
-                self.done = true;
-                return Some(Err(error));
-            }
-        };
+        let offset = self.pos;
         let result = if self.verify_payload {
-            read_record_metadata(&mut self.reader)
+            read_record_metadata_with_len(&mut self.reader)
         } else {
-            read_record_metadata_skip_payload_with_end(&mut self.reader, self.file_end)
+            read_record_metadata_skip_payload_with_end_and_len(
+                &mut self.reader,
+                offset,
+                self.file_end,
+            )
         };
         match result {
-            Ok(Some(metadata)) => Some(Ok((metadata.collection_id, metadata.hash, offset))),
+            Ok(Some((metadata, disk_bytes))) => {
+                self.pos = offset.saturating_add(disk_bytes);
+                Some(Ok(ScanEntryWithRemoval {
+                    collection_id: metadata.collection_id,
+                    hash: metadata.hash,
+                    offset,
+                    removed: metadata
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|frame| frame.removed),
+                    disk_bytes,
+                }))
+            }
             Ok(None) => {
                 self.done = true;
                 None
@@ -1357,9 +1407,24 @@ fn read_record_metadata_scratch(
     reader: &mut impl Read,
     discard: &mut [u8; SCAN_DISCARD_BUF_LEN],
 ) -> io::Result<Option<RecordMetadata>> {
+    read_record_metadata_scratch_with_len(reader, discard)
+        .map(|result| result.map(|(metadata, _)| metadata))
+}
+
+fn read_record_metadata_with_len(
+    reader: &mut impl Read,
+) -> io::Result<Option<(RecordMetadata, u64)>> {
+    read_record_metadata_scratch_with_len(reader, &mut [0u8; SCAN_DISCARD_BUF_LEN])
+}
+
+fn read_record_metadata_scratch_with_len(
+    reader: &mut impl Read,
+    discard: &mut [u8; SCAN_DISCARD_BUF_LEN],
+) -> io::Result<Option<(RecordMetadata, u64)>> {
     let Some(header) = read_frame_header(reader)? else {
         return Ok(None);
     };
+    let disk_bytes = u64::from(header.frame_len).saturating_add(8);
 
     let mut crc = if header.flags & FLAG_CRC_DISABLED == 0 {
         let mut crc = crc32fast::Hasher::new();
@@ -1407,11 +1472,14 @@ fn read_record_metadata_scratch(
         }
     }
 
-    Ok(Some(RecordMetadata {
-        collection_id: header.collection_id,
-        hash: header.hash,
-        metadata: header.metadata,
-    }))
+    Ok(Some((
+        RecordMetadata {
+            collection_id: header.collection_id,
+            hash: header.hash,
+            metadata: header.metadata,
+        },
+        disk_bytes,
+    )))
 }
 
 /// Read one frame's metadata and seek over its payload and CRC without
@@ -1428,21 +1496,34 @@ fn read_record_metadata_scratch(
 /// conversions and the frame-length subtraction provably valid after the
 /// preceding bounds checks.
 pub fn read_record_metadata_skip_payload(
-    reader: &mut (impl Read + Seek),
+    reader: &mut (impl Read + Seek + SkipForward),
 ) -> io::Result<Option<RecordMetadata>> {
-    let payload_start = reader.stream_position()?;
+    let record_start = reader.stream_position()?;
     let file_end = reader.seek(io::SeekFrom::End(0))?;
-    reader.seek(io::SeekFrom::Start(payload_start))?;
-    read_record_metadata_skip_payload_with_end(reader, file_end)
+    reader.seek(io::SeekFrom::Start(record_start))?;
+    read_record_metadata_skip_payload_with_end(reader, record_start, file_end)
 }
 
-fn read_record_metadata_skip_payload_with_end(
-    reader: &mut (impl Read + Seek),
+fn read_record_metadata_skip_payload_with_end<R: Read + Seek + SkipForward>(
+    reader: &mut R,
+    record_start: u64,
     file_end: u64,
 ) -> io::Result<Option<RecordMetadata>> {
+    read_record_metadata_skip_payload_with_end_and_len(reader, record_start, file_end)
+        .map(|result| result.map(|(metadata, _)| metadata))
+}
+
+/// `record_start` is the offset of the frame's length prefix. Callers know it
+/// already, and deriving the payload offset from it saves an `lseek` per frame.
+fn read_record_metadata_skip_payload_with_end_and_len<R: Read + Seek + SkipForward>(
+    reader: &mut R,
+    record_start: u64,
+    file_end: u64,
+) -> io::Result<Option<(RecordMetadata, u64)>> {
     let Some(header) = read_frame_header(reader)? else {
         return Ok(None);
     };
+    let disk_bytes = u64::from(header.frame_len).saturating_add(8);
 
     // The frame length excludes the four-byte CRC, while the fixed portion
     // includes the metadata and flags but not the node bytes or the
@@ -1456,7 +1537,12 @@ fn read_record_metadata_skip_payload_with_end(
     )
     .checked_add(4)
     .expect("frame payload length fits u64");
-    let payload_start = reader.stream_position()?;
+    // Length prefix, fixed fields and metadata block are already consumed.
+    let payload_start = record_start
+        .checked_add(4)
+        .and_then(|at| at.checked_add(u64::from(FRAME_FIXED_LEN)))
+        .and_then(|at| at.checked_add(header.metadata_block.len() as u64))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record start overflows u64"))?;
     let frame_end = payload_start
         .checked_add(skip)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record end overflows u64"))?;
@@ -1466,12 +1552,19 @@ fn read_record_metadata_skip_payload_with_end(
             "record payload or CRC is truncated",
         ));
     }
-    reader.seek(io::SeekFrom::Start(frame_end))?;
-    Ok(Some(RecordMetadata {
-        collection_id: header.collection_id,
-        hash: header.hash,
-        metadata: header.metadata,
-    }))
+    // `seek_relative` keeps the buffered window when the target is inside
+    // it, so scans over small frames avoid an lseek and refill per frame.
+    let skip = i64::try_from(skip)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record skip overflows i64"))?;
+    reader.skip_forward(skip)?;
+    Ok(Some((
+        RecordMetadata {
+            collection_id: header.collection_id,
+            hash: header.hash,
+            metadata: header.metadata,
+        },
+        disk_bytes,
+    )))
 }
 
 /// Write a new pack file's [`HEADER_LEN`]-byte reserved header: magic,
@@ -1733,15 +1826,10 @@ pub fn read_header(reader: &mut impl Read) -> io::Result<Option<ShardHeader>> {
 pub fn open_packfile(path: &Path, writable: bool, pack_id: &PackId) -> io::Result<File> {
     let file = if writable {
         let mut options = OpenOptions::new();
-        options.read(true);
-        // See `open_packfile_with_creation_seq` for the per-platform handle.
-        #[cfg(unix)]
-        options.append(true);
-        #[cfg(not(unix))]
-        options.write(true);
+        options.read(true).write(true);
         options.open(path)?
     } else {
-        File::open(path)?
+        crate::io::open_read_sequential(path)?
     };
     validate_header_identity(&file, path, pack_id)?;
     Ok(file)
@@ -1749,7 +1837,7 @@ pub fn open_packfile(path: &Path, writable: bool, pack_id: &PackId) -> io::Resul
 
 /// Check that `file`'s header parses and names `pack_id`.
 fn validate_header_identity(file: &File, path: &Path, pack_id: &PackId) -> io::Result<()> {
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(HEADER_LEN, file);
     let Some(header) = read_header(&mut reader)? else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1783,21 +1871,42 @@ pub fn open_packfile_with_creation_seq(
     pack_id: &PackId,
     creation_seq: u32,
 ) -> io::Result<File> {
+    open_packfile_with_creation_seq_inner(path, pack_id, creation_seq, true)
+}
+
+/// Like [`open_packfile_with_creation_seq`], but a newly written header is not
+/// synced. The caller owns publication: it must sync the file at the pack's
+/// first durability barrier, before the file is renamed to its canonical name.
+pub(crate) fn open_staged_packfile_with_creation_seq(
+    path: &Path,
+    pack_id: &PackId,
+    creation_seq: u32,
+) -> io::Result<File> {
+    open_packfile_with_creation_seq_inner(path, pack_id, creation_seq, false)
+}
+
+fn open_packfile_with_creation_seq_inner(
+    path: &Path,
+    pack_id: &PackId,
+    creation_seq: u32,
+    durable_header: bool,
+) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.read(true).create(true);
-    // Unix flushes use positioned writes through the append-capable
-    // handle. Windows' append access masks FILE_WRITE_DATA, which is
-    // required by set_len during torn-tail rollback; its write path
-    // therefore opens an ordinary writable handle instead.
-    #[cfg(unix)]
-    options.append(true);
-    #[cfg(not(unix))]
-    options.write(true);
+    // Positioned writes do not need `O_APPEND`, and on Linux `pwrite` on an
+    // append-mode descriptor ignores its offset and appends at EOF. Opening a
+    // plain writable handle makes the offset authoritative on every platform.
+    // It also keeps `FILE_WRITE_DATA`, which `set_len` needs during torn-tail
+    // rollback on Windows.
+    options.read(true).write(true).create(true);
     let mut file = options.open(path)?;
 
     if file.metadata()?.len() == 0 {
         write_header_with_creation_seq(&mut file, pack_id, creation_seq)?;
-        file.sync_all()?;
+        if durable_header {
+            #[cfg(test)]
+            let _trace = crate::test_trace::span("pack.header_fsync", path);
+            file.sync_all()?;
+        }
     } else {
         validate_header_identity(&file, path, pack_id)?;
     }
@@ -1818,8 +1927,8 @@ pub fn open_packfile_with_creation_seq(
 /// Returns `io::Error` on I/O failure during open or header read, or on
 /// any read-loop error other than `UnexpectedEof`.
 pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let file = crate::io::open_read_sequential(path)?;
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     let mut entries = Vec::new();
 
     if read_header(&mut reader)?.is_none() {
@@ -1853,8 +1962,8 @@ pub fn scan_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
 /// Returns an I/O error on failure to open, read, seek, or validate the
 /// packfile.
 pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let file = crate::io::open_read_sequential(path)?;
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     let mut entries = Vec::new();
 
     if read_header(&mut reader)?.is_none() {
@@ -1863,7 +1972,7 @@ pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
     let file_end = reader.get_ref().metadata()?.len();
     loop {
         let offset = reader.stream_position()?;
-        match read_record_metadata_skip_payload_with_end(&mut reader, file_end) {
+        match read_record_metadata_skip_payload_with_end(&mut reader, offset, file_end) {
             Ok(Some(meta)) => entries.push((meta.collection_id, meta.hash, offset)),
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -1890,8 +1999,8 @@ pub fn scan_packfile_skip_payload(path: &Path) -> io::Result<Vec<ScanEntry>> {
 /// # Errors
 /// Returns `io::Error` on I/O failure other than `UnexpectedEof`.
 pub fn scan_packfile_from(path: &Path, start_offset: u64) -> io::Result<Vec<ScanEntry>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let file = crate::io::open_read_sequential(path)?;
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
 
     // Seek past the reserved header (HEADER_LEN bytes) to the first
     // record. If start_offset is already past the header, seek directly
@@ -1948,11 +2057,27 @@ pub(crate) fn scan_packfile_from_with_removal(
     start_offset: u64,
     verify_checksum: bool,
 ) -> io::Result<Vec<ScanEntryWithRemoval>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    scan_packfile_from_with_removal_visit(path, start_offset, verify_checksum, |entry| {
+        entries.push(entry);
+    })?;
+    Ok(entries)
+}
+
+/// Streaming counterpart to [`scan_packfile_from_with_removal`]. The visitor
+/// is called once per complete frame, so callers can build indexes without
+/// retaining a vector proportional to a shard's record count.
+pub(crate) fn scan_packfile_from_with_removal_visit(
+    path: &Path,
+    start_offset: u64,
+    verify_checksum: bool,
+    mut visit: impl FnMut(ScanEntryWithRemoval),
+) -> io::Result<()> {
+    let file = crate::io::open_read_sequential(path)?;
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     if start_offset == 0 {
         if read_header(&mut reader)?.is_none() {
-            return Ok(Vec::new());
+            return Ok(());
         }
     } else {
         use std::io::Seek;
@@ -1967,30 +2092,32 @@ pub(crate) fn scan_packfile_from_with_removal(
     }
 
     let file_end = reader.get_ref().metadata()?.len();
-    let mut entries = Vec::new();
     loop {
         let offset = reader.stream_position()?;
         let metadata = if verify_checksum {
-            read_record_metadata(&mut reader)
+            read_record_metadata_with_len(&mut reader)
         } else {
-            read_record_metadata_skip_payload_with_end(&mut reader, file_end)
+            read_record_metadata_skip_payload_with_end_and_len(&mut reader, offset, file_end)
         };
         match metadata {
-            Ok(Some(metadata)) => entries.push(ScanEntryWithRemoval {
-                collection_id: metadata.collection_id,
-                hash: metadata.hash,
-                offset,
-                removed: metadata
-                    .metadata
-                    .as_ref()
-                    .is_some_and(|frame| frame.removed),
-            }),
+            Ok(Some((metadata, disk_bytes))) => {
+                visit(ScanEntryWithRemoval {
+                    collection_id: metadata.collection_id,
+                    hash: metadata.hash,
+                    offset,
+                    removed: metadata
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|frame| frame.removed),
+                    disk_bytes,
+                });
+            }
             Ok(None) => break,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(error) => return Err(error),
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
 /// Streaming reader yielding each frame's full [`Record`] — payload, identity,
@@ -2024,8 +2151,8 @@ impl RecordScanner {
 /// be read, and [`io::ErrorKind::InvalidData`] if the file does not start with
 /// an mtxdb packfile header (rather than silently yielding an empty stream).
 pub fn scan_records_iter(path: &Path) -> io::Result<RecordScanner> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let file = crate::io::open_read_sequential(path)?;
+    let mut reader = BufReader::with_capacity(SCAN_BUF_BYTES, file);
     match read_header(&mut reader)? {
         Some(_) => Ok(RecordScanner {
             reader,
@@ -2174,7 +2301,7 @@ pub fn extract_packfile_collection(
     target_collection: &[u8; 16],
     dest_pack_id: &PackId,
 ) -> io::Result<PackExtractStats> {
-    let src_file = File::open(source_path)?;
+    let src_file = crate::io::open_read_sequential(source_path)?;
     let mut reader = BufReader::with_capacity(RECOVERY_BUFFER_BYTES, src_file);
 
     let Some(source_header) = read_header(&mut reader)? else {
@@ -2288,15 +2415,6 @@ pub fn scan_and_recover_packfile(path: &Path) -> io::Result<Vec<ScanEntry>> {
     Ok(entries)
 }
 
-/// Recovery scan variant that also returns each frame's explicit removal bit.
-pub(crate) fn scan_and_recover_packfile_with_removal(
-    path: &Path,
-) -> io::Result<Vec<ScanEntryWithRemoval>> {
-    let mut entries = Vec::new();
-    recover_packfile_with(path, |entry| entries.push(entry))?;
-    Ok(entries)
-}
-
 /// What [`recover_packfile`] found in one pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackRecovery {
@@ -2345,18 +2463,69 @@ fn recover_packfile_with(
     path: &Path,
     mut on_record: impl FnMut(ScanEntryWithRemoval),
 ) -> io::Result<PackRecovery> {
-    let file = File::open(path)?;
+    try_recover_packfile_with(path, |entry| {
+        on_record(entry);
+        Ok(())
+    })
+}
+
+/// Fallible-visitor variant of [`recover_packfile_with`].
+///
+/// A caller that is building engine state directly from the scan (for example
+/// an index insert) must be able to abort on a semantic error without first
+/// materializing the whole pack. Returning `Err` stops the walk; a torn tail
+/// found before that point is not truncated, because the open fails anyway.
+pub(crate) fn try_recover_packfile_with<E, F>(path: &Path, on_record: F) -> Result<PackRecovery, E>
+where
+    E: From<io::Error>,
+    F: FnMut(ScanEntryWithRemoval) -> Result<(), E>,
+{
+    let file = crate::io::open_read_sequential(path).map_err(E::from)?;
     let mut reader = CountingReader {
         inner: BufReader::with_capacity(RECOVERY_BUFFER_BYTES, file),
         position: 0,
     };
+    let recovery = {
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("recovery.scan", path);
+        walk_packfile(&mut reader, on_record)?
+    };
+
+    // Only truncate if we actually hit a torn tail — not on clean EOF
+    // or mid-file corruption (which was propagated as an error above).
+    if recovery.truncated {
+        drop(reader);
+        let file = OpenOptions::new().write(true).open(path).map_err(E::from)?;
+        #[cfg(test)]
+        let _trace = crate::test_trace::span("recovery.truncate_sync", path);
+        file.set_len(recovery.valid_len).map_err(E::from)?;
+        file.sync_all().map_err(E::from)?;
+    }
+
+    Ok(recovery)
+}
+
+/// The recovery walk over an already-open reader: validates the header and
+/// every frame, calls `on_record` for each valid record, and reports where the
+/// valid data ends. It never touches the file, so the caller decides what to do
+/// with `truncated`; an in-memory reader exercises exactly the production
+/// parsing.
+fn walk_packfile<R, E, F>(
+    reader: &mut CountingReader<R>,
+    mut on_record: F,
+) -> Result<PackRecovery, E>
+where
+    R: Read,
+    E: From<io::Error>,
+    F: FnMut(ScanEntryWithRemoval) -> Result<(), E>,
+{
     let mut recovery = PackRecovery {
         records: 0,
         valid_len: 0,
         truncated: false,
     };
 
-    if read_header(&mut reader)?.is_none() {
+    if read_header(&mut *reader).map_err(E::from)?.is_none() {
         return Ok(recovery);
     }
 
@@ -2364,22 +2533,23 @@ fn recover_packfile_with(
     let mut scratch = [0u8; SCAN_DISCARD_BUF_LEN];
     loop {
         let offset = reader.position;
-        match read_record_metadata_scratch(&mut reader, &mut scratch) {
-            Ok(Some(meta)) => {
+        match read_record_metadata_scratch_with_len(&mut *reader, &mut scratch) {
+            Ok(Some((meta, disk_bytes))) => {
                 on_record(ScanEntryWithRemoval {
                     collection_id: meta.collection_id,
                     hash: meta.hash,
                     offset,
                     removed: meta.metadata.as_ref().is_some_and(|frame| frame.removed),
-                });
+                    disk_bytes,
+                })?;
                 recovery.records = recovery.records.saturating_add(1);
                 recovery.valid_len = reader.position;
             }
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                // Torn tail: a write crashed mid-frame. Truncate to the
-                // last valid record boundary so future appends don't land
-                // after a corrupt frame.
+                // Torn tail: a write crashed mid-frame. The caller truncates
+                // to the last valid record boundary so future appends don't
+                // land after a corrupt frame.
                 recovery.truncated = true;
                 break;
             }
@@ -2387,20 +2557,10 @@ fn recover_packfile_with(
                 // Real corruption (CRC mismatch, invalid length) — propagate
                 // without truncating. Later valid records may exist past the
                 // corrupt frame; truncating would lose them.
-                return Err(e);
+                return Err(E::from(e));
             }
         }
     }
-
-    // Only truncate if we actually hit a torn tail — not on clean EOF
-    // or mid-file corruption (which was propagated as an error above).
-    if recovery.truncated {
-        drop(reader);
-        let file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(recovery.valid_len)?;
-        file.sync_all()?;
-    }
-
     Ok(recovery)
 }
 

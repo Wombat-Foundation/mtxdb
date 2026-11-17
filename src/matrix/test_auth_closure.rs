@@ -5,13 +5,11 @@
 
 use super::auth_closure::{AuthClosure, ClosureOutcome};
 use super::closure_store::{self, ClosureCoverage};
+use super::csr_adjacency::CsrAdjacency;
 use super::database::Database;
-use super::layout::ShardType;
-use super::matrix_adjacency::MatrixAdjacency;
 use super::storage::StorageError;
 use std::path::PathBuf;
 
-const POOL: ShardType = ShardType::Edges;
 const ROOM: &str = "!closure-room:example.org";
 
 fn test_root(name: &str) -> PathBuf {
@@ -24,8 +22,8 @@ fn test_root(name: &str) -> PathBuf {
 /// A room whose events form a chain off `$create`. `$orphan` references a parent
 /// that was never recorded, so its walk is incomplete and cascades nowhere else
 /// because it is the only event depending on it.
-fn record_room(db: &Database) -> MatrixAdjacency {
-    let adjacency = MatrixAdjacency::new(POOL, ROOM);
+fn record_room(db: &Database) -> CsrAdjacency {
+    let adjacency = CsrAdjacency::new(ROOM);
     adjacency
         .record_event(db, "$create", &[], &[], None)
         .unwrap();
@@ -39,6 +37,133 @@ fn record_room(db: &Database) -> MatrixAdjacency {
         .record_event(db, "$m2", &[], &["$create"], None)
         .unwrap();
     adjacency
+}
+
+/// A gap-free chain: `$create` is the only root, and both messages auth it.
+fn record_clean_room(db: &Database) -> CsrAdjacency {
+    let adjacency = CsrAdjacency::new(ROOM);
+    adjacency
+        .record_event(db, "$create", &[], &[], None)
+        .unwrap();
+    adjacency
+        .record_event(db, "$m1", &[], &["$create"], None)
+        .unwrap();
+    adjacency
+        .record_event(db, "$m2", &[], &["$create"], None)
+        .unwrap();
+    adjacency
+}
+
+/// Publish a hand-built generation for `source_next` ids, with `entries`
+/// overriding the blob written for a short id. Ids in `skipped` are declared
+/// skipped instead of stored.
+fn publish_hand_built(
+    closure: &AuthClosure,
+    db: &Database,
+    source_next: u32,
+    entries: &[(u32, Vec<u8>)],
+    skipped: &[u32],
+) {
+    let store = closure.store_for_test();
+    let mut builder = store.begin(db).unwrap();
+    let refs: Vec<(u32, &[u8])> = entries
+        .iter()
+        .map(|(id, blob)| (*id, blob.as_slice()))
+        .collect();
+    builder.add(db, &refs).unwrap();
+    builder.publish(db, source_next, skipped).unwrap();
+}
+
+#[test]
+fn verify_reports_a_closure_record_that_disagrees_with_the_edges() {
+    let root = test_root("verify-disagree");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_clean_room(&db));
+    let graph = closure.graph(&db).unwrap();
+    let mut entries = Vec::new();
+    for id in 1..4 {
+        let ClosureOutcome::Complete(mut set) = graph.compute_at(id).unwrap() else {
+            panic!("the clean room has no gaps");
+        };
+        if id == 2 {
+            let _ = set.insert(999);
+        }
+        entries.push((id, set.encode().unwrap()));
+    }
+    publish_hand_built(&closure, &db, 4, &entries, &[]);
+
+    let report = closure.verify(&db).unwrap();
+    assert!(!report.is_consistent());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("disagrees with its direct auth edges")),
+        "{:?}",
+        report.problems
+    );
+}
+
+#[test]
+fn verify_reports_an_undecodable_closure_record() {
+    let root = test_root("verify-undecodable");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_clean_room(&db));
+    let graph = closure.graph(&db).unwrap();
+    let mut entries = Vec::new();
+    for id in 1..4 {
+        let ClosureOutcome::Complete(set) = graph.compute_at(id).unwrap() else {
+            panic!("the clean room has no gaps");
+        };
+        entries.push((
+            id,
+            if id == 2 {
+                b"not-a-bitmap".to_vec()
+            } else {
+                set.encode().unwrap()
+            },
+        ));
+    }
+    publish_hand_built(&closure, &db, 4, &entries, &[]);
+
+    let report = closure.verify(&db).unwrap();
+    assert!(!report.is_consistent());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("undecodable closure")),
+        "{:?}",
+        report.problems
+    );
+}
+
+#[test]
+fn verify_reports_a_complete_walk_marked_skipped() {
+    let root = test_root("verify-skipped-complete");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_clean_room(&db));
+    let graph = closure.graph(&db).unwrap();
+    let mut entries = Vec::new();
+    for id in [1, 3] {
+        let ClosureOutcome::Complete(set) = graph.compute_at(id).unwrap() else {
+            panic!("the clean room has no gaps");
+        };
+        entries.push((id, set.encode().unwrap()));
+    }
+    // Claim id 2 was skipped even though its walk is complete.
+    publish_hand_built(&closure, &db, 4, &entries, &[2]);
+
+    let report = closure.verify(&db).unwrap();
+    assert!(!report.is_consistent());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("marks it skipped but its walk is complete")),
+        "{:?}",
+        report.problems
+    );
 }
 
 #[test]
@@ -243,7 +368,7 @@ fn no_generation_yet_is_not_a_failure() {
 fn an_auth_cycle_is_corruption_not_a_gap() {
     let root = test_root("cycle");
     let db = Database::open(root.clone()).unwrap();
-    let adjacency = MatrixAdjacency::new(POOL, ROOM);
+    let adjacency = CsrAdjacency::new(ROOM);
     adjacency
         .record_event(&db, "$a", &[], &["$b"], None)
         .unwrap();
@@ -276,7 +401,7 @@ fn a_cycle_abandons_its_generation_instead_of_leaving_an_orphan() {
     let published = good.rebuild(&db).unwrap();
     let retained_generation = published.generation;
 
-    let cyclic = MatrixAdjacency::new(POOL, ROOM);
+    let cyclic = CsrAdjacency::new(ROOM);
     cyclic.record_event(&db, "$x", &[], &["$y"], None).unwrap();
     cyclic.record_event(&db, "$y", &[], &["$x"], None).unwrap();
     let closure = AuthClosure::from_adjacency(cyclic);
@@ -322,7 +447,7 @@ fn a_cycle_abandons_its_generation_instead_of_leaving_an_orphan() {
 fn verify_reports_an_auth_cycle_as_a_finding_not_an_error() {
     let root = test_root("verify-cycle");
     let db = Database::open(root.clone()).unwrap();
-    let adjacency = MatrixAdjacency::new(POOL, ROOM);
+    let adjacency = CsrAdjacency::new(ROOM);
     adjacency
         .record_event(&db, "$a", &[], &["$b"], None)
         .unwrap();
@@ -347,6 +472,70 @@ fn verify_reports_an_auth_cycle_as_a_finding_not_an_error() {
         "{:?}",
         report.problems
     );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn union_covers_known_events_and_names_everything_missing() {
+    let root = test_root("union");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_room(&db));
+    let create = closure
+        .adjacency()
+        .short_id(&db, "$create")
+        .unwrap()
+        .unwrap();
+    let m1 = closure.adjacency().short_id(&db, "$m1").unwrap().unwrap();
+    let m2 = closure.adjacency().short_id(&db, "$m2").unwrap().unwrap();
+
+    let ClosureOutcome::Complete(plain) = closure.union_of(&db, &["$m1", "$m2"], false).unwrap()
+    else {
+        panic!("both walks are complete");
+    };
+    assert_eq!(plain.iter().collect::<Vec<_>>(), vec![create]);
+
+    let ClosureOutcome::Complete(given) = closure.union_of(&db, &["$m1", "$m2"], true).unwrap()
+    else {
+        panic!("both walks are complete");
+    };
+    let mut want = vec![create, m1, m2];
+    want.sort_unstable();
+    assert_eq!(given.iter().collect::<Vec<_>>(), want);
+
+    // An unknown id and an event with a gap each make the union incomplete,
+    // and both are reported.
+    let ClosureOutcome::Incomplete { missing } = closure
+        .union_of(&db, &["$m1", "$orphan", "$never-seen"], false)
+        .unwrap()
+    else {
+        panic!("a union with a gap must be incomplete");
+    };
+    assert!(missing.contains(&"$never-seen".to_owned()), "{missing:?}");
+    assert!(
+        missing.contains(&"$never-recorded".to_owned()),
+        "{missing:?}"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn persisted_closure_is_absent_until_a_generation_covers_the_event() {
+    let root = test_root("get-at");
+    let db = Database::open(root.clone()).unwrap();
+    let closure = AuthClosure::from_adjacency(record_room(&db));
+    let m1 = closure.adjacency().short_id(&db, "$m1").unwrap().unwrap();
+
+    assert!(closure.get_at(&db, m1).unwrap().is_none());
+    assert!(closure.get(&db, "$never-seen").unwrap().is_none());
+    closure.rebuild(&db).unwrap();
+    let set = closure
+        .get_at(&db, m1)
+        .unwrap()
+        .expect("covered after rebuild");
+    assert_eq!(set.len(), 1);
+    assert!(closure.get_at(&db, 9999).unwrap().is_none());
     drop(db);
     let _ = std::fs::remove_dir_all(&root);
 }

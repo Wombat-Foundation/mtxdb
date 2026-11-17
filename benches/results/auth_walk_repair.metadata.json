@@ -1,0 +1,11 @@
+{
+  "sithnapse_source_sha256": "25590a25e66d46d08ab47749d0c5a7f224a2a2f7dd83bfc735a41564d7ee8393",
+  "sizes": [1000, 10000],
+  "conflicts": [2, 8],
+  "outside_factor": 1,
+  "seed_patterns": ["spanning", "tips"],
+  "incomplete_percent": 10,
+  "python": "3.14.7 (main, Aug 10 2026, 07:46:56) [GCC 16.1.1 20260728]",
+  "sqlite": "3.53.4",
+  "scope": "Python helper/algorithm comparison with synthetic SQLite adapter; no homeserver DB, mtxdb or Rust timing, no physical IO measurement"
+}

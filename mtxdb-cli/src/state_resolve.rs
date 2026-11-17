@@ -3,7 +3,7 @@
 //! mtxdb walks the room's event DAG itself and keeps one state set per
 //! frontier event. When a node has more than one resident parent those sets
 //! have to be merged, and this module owns that merge: it converts mtxdb's
-//! state sets into rezzy's persistent [`SharedState`] maps, feeds rezzy the
+//! state sets into rezzy's persistent `SharedState` maps, feeds rezzy the
 //! events its auth rules read, and converts the resolved map back.
 //!
 //! Two properties are load-bearing.
@@ -36,10 +36,13 @@ use crate::state_policy::{event_disposition, EventDisposition, ResolutionPolicy}
 
 /// mtxdb's state set, keyed by `(type, state_key)` and valued by event id.
 ///
-/// This is the shape [`crate::cmd::StateSet::entries`] stores; it is spelled
+/// This is the shape `crate::cmd::StateSet::entries` stores; it is spelled
 /// out here so the adapter can be written and tested against mtxdb's own type
 /// without widening that module's API.
-pub(crate) type StateEntries = HashMap<(String, String), String>;
+///
+/// A persistent map: cloning is O(1) and a write copies only its root-to-leaf
+/// path, so a state event costs O(log n) instead of a copy of the whole state.
+pub(crate) type StateEntries = rezzy::PersistentOrdMap<(String, String), String>;
 
 /// A merge that could not be resolved because the import batch does not carry
 /// everything the resolver reads.
@@ -69,6 +72,18 @@ pub(crate) struct LeanEventContext<'a> {
     /// Ids that resolve to nothing in this batch. Monotone, so reporting the
     /// whole set on every call stays correct.
     missing: BTreeSet<String>,
+    /// The room-wide reachability index and the resolver's memoization,
+    /// built on the first real merge and reused by every later one. Rebuilding
+    /// them per merge made each merge cost O(room).
+    resolve_state: Option<(
+        rezzy::resolve::reachability::RangePrefilterReachability<String>,
+        rezzy::ForkResolveCaches<String, rezzy::JsonValue>,
+    )>,
+    /// Per-event auth-chain bitmaps over every event in the batch, built with
+    /// the reachability index. Present only when the batch's auth graph is
+    /// complete: the difference it yields is exact only then, so a gapped
+    /// batch falls back to the resolver's own walk.
+    auth_graph: Option<rezzy::auth::roaring::AuthGraph<String>>,
 }
 
 impl<'a> LeanEventContext<'a> {
@@ -85,14 +100,69 @@ impl<'a> LeanEventContext<'a> {
             events: HashMap::new(),
             verified: HashSet::new(),
             missing: BTreeSet::new(),
+            resolve_state: None,
+            auth_graph: None,
+        }
+    }
+
+    /// Resolve `maps` with rezzy, sharing one reachability index and one set
+    /// of caches across every merge in the walk.
+    ///
+    /// The first call materializes every batch event so the index covers the
+    /// whole room; later [`Self::ensure`] calls then find them already built.
+    /// Dangling `auth_events` references are skipped by the index, so a batch
+    /// with absent ancestors cannot make it panic.
+    pub(crate) fn resolve(
+        &mut self,
+        maps: &[RezzyState],
+        version: rezzy::StateResVersion,
+    ) -> RezzyState {
+        if self.resolve_state.is_none() {
+            let ids: Vec<&'a str> = self.values.keys().copied().collect();
+            for id in ids {
+                if !self.events.contains_key(id) {
+                    if let Some(event) = self.values.get(id).and_then(|v| lean_event(v, id)) {
+                        self.events.insert(id.to_owned(), event);
+                    }
+                }
+            }
+            let index = rezzy::resolve::reachability::RangePrefilterReachability::<String>::build(
+                &self.events,
+            );
+            self.resolve_state = Some((index, rezzy::ForkResolveCaches::new(version)));
+            self.auth_graph = rezzy::auth::roaring::AuthGraph::try_build(&self.events)
+                .ok()
+                .filter(rezzy::auth::roaring::AuthGraph::is_complete);
+        }
+        // The merge's auth difference from the bitmaps, when every state event
+        // is in a complete graph; otherwise the resolver walks the auth lists.
+        let auth_diff = self
+            .auth_graph
+            .as_ref()
+            .and_then(|graph| graph.try_state_auth_difference(maps).ok());
+        match self.resolve_state.as_mut() {
+            Some((index, caches)) => match auth_diff {
+                Some(diff) => rezzy::resolve_state_maps_cached_with_auth_diff(
+                    maps,
+                    &self.events,
+                    version,
+                    index,
+                    caches,
+                    &diff,
+                ),
+                None => {
+                    rezzy::resolve_state_maps_cached(maps, &self.events, version, index, caches)
+                }
+            },
+            None => rezzy::resolve_state_maps(maps, &self.events, version),
         }
     }
 
     /// Materialize `roots` and their transitive `auth_events` closure.
     ///
     /// Returns every id this context knows to be absent from the batch, sorted.
-    /// An empty result means [`Self::map`] is complete enough to hand to
-    /// `rezzy::resolve_state_maps`.
+    /// An empty result means the materialized event map is complete enough
+    /// to hand to `rezzy::resolve_state_maps`.
     pub(crate) fn ensure(&mut self, roots: &[String]) -> Vec<String> {
         let mut queue: VecDeque<String> = roots
             .iter()
@@ -133,6 +203,7 @@ impl<'a> LeanEventContext<'a> {
     }
 
     /// The materialized events, ready to pass as `event_context`.
+    #[cfg(test)]
     pub(crate) fn map(&self) -> &HashMap<String, LeanEvent<String>> {
         &self.events
     }
@@ -164,6 +235,20 @@ pub(crate) fn from_rezzy_state(state: &RezzyState) -> StateEntries {
         .collect()
 }
 
+/// Time spent inside each part of one merge, so an import can report where a
+/// slow gapped room actually spends its state-walk seconds.
+#[derive(Debug, Default)]
+pub(crate) struct MergePhaseTimes {
+    /// Converting mtxdb's state maps into rezzy's key type.
+    pub(crate) convert: std::time::Duration,
+    /// Materializing the auth closure the resolver reads.
+    pub(crate) ensure: std::time::Duration,
+    /// `rezzy::resolve_state_maps`.
+    pub(crate) resolve: std::time::Duration,
+    /// Converting the resolved map back into mtxdb's type.
+    pub(crate) back: std::time::Duration,
+}
+
 /// Resolve one multi-parent merge with rezzy.
 ///
 /// # Errors
@@ -174,20 +259,30 @@ pub(crate) fn resolve_parents(
     context: &mut LeanEventContext<'_>,
     parent_entries: &[&StateEntries],
     policy: ResolutionPolicy,
+    phases: &mut MergePhaseTimes,
 ) -> Result<StateEntries, IncompleteResolution> {
     let Some(version) = policy.rezzy_version else {
         // No recognized room version means no auth rules; the derivation
         // already records `FirstParent`, so the caller uses the first-parent merge.
         return Err(IncompleteResolution::default());
     };
+    let convert_started = std::time::Instant::now();
     let maps: Vec<RezzyState> = parent_entries.iter().map(|e| to_rezzy_state(e)).collect();
     let roots = referenced_ids(&maps);
+    phases.convert = phases.convert.saturating_add(convert_started.elapsed());
+    let ensure_started = std::time::Instant::now();
     let missing = context.ensure(&roots);
+    phases.ensure = phases.ensure.saturating_add(ensure_started.elapsed());
     if !missing.is_empty() {
         return Err(IncompleteResolution { missing });
     }
-    let resolved = rezzy::resolve_state_maps(&maps, context.map(), version);
-    Ok(from_rezzy_state(&resolved))
+    let resolve_started = std::time::Instant::now();
+    let resolved = context.resolve(&maps, version);
+    phases.resolve = phases.resolve.saturating_add(resolve_started.elapsed());
+    let back_started = std::time::Instant::now();
+    let entries = from_rezzy_state(&resolved);
+    phases.back = phases.back.saturating_add(back_started.elapsed());
+    Ok(entries)
 }
 
 /// Every event id any parent state map points at, deduplicated in first-seen
@@ -211,7 +306,7 @@ fn referenced_ids(maps: &[RezzyState]) -> Vec<String> {
 /// Returns `None` when the value is not a usable event — no `type`, or not an
 /// object at all. The caller records that as a missing id rather than handing
 /// rezzy something it would unwrap.
-fn lean_event(value: &OwnedValue, event_id: &str) -> Option<LeanEvent<String>> {
+pub(crate) fn lean_event(value: &OwnedValue, event_id: &str) -> Option<LeanEvent<String>> {
     let event_type = event_string_field(value, "type")?;
     let disposition = event_disposition(value);
     Some(LeanEvent {
@@ -253,7 +348,7 @@ fn u64_field(value: &OwnedValue, field: &str) -> u64 {
 /// Read an array of event references. Matrix rooms v1/v2 encode references as
 /// `[event_id, hashes]` pairs while later room versions use plain strings;
 /// both forms name the id in the same place.
-fn reference_list(value: &OwnedValue, field: &str) -> Vec<String> {
+pub(crate) fn reference_list(value: &OwnedValue, field: &str) -> Vec<String> {
     let Some(OwnedValue::Array(items)) = value.get(field) else {
         return Vec::new();
     };
@@ -298,7 +393,7 @@ mod tests {
             event("$unrelated", &[]),
         ];
         let mut context = LeanEventContext::new(events.iter());
-        assert!(context.ensure(&["$child".to_owned()]).is_empty());
+        assert_eq!(context.ensure(&["$child".to_owned()]), Vec::<String>::new());
         assert!(context.map().contains_key("$child"));
         assert!(context.map().contains_key("$root"));
         assert!(!context.map().contains_key("$unrelated"));
@@ -318,6 +413,200 @@ mod tests {
             context.ensure(&["$present".to_owned()]),
             vec!["$absent".to_owned()]
         );
+    }
+
+    fn room_event(
+        id: &str,
+        kind: &str,
+        state_key: &str,
+        sender: &str,
+        depth: u32,
+        content: &str,
+        auth: &[&str],
+    ) -> OwnedValue {
+        let auth = auth
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        value(&format!(
+            r#"{{"event_id":"{id}","type":"{kind}","state_key":"{state_key}","sender":"{sender}",
+                 "depth":{depth},"origin_server_ts":{depth},"content":{content},
+                 "auth_events":[{auth}],"prev_events":[]}}"#
+        ))
+    }
+
+    fn state(rows: &[(&str, &str, &str)]) -> RezzyState {
+        let mut entries = StateEntries::new();
+        for (kind, key, id) in rows {
+            entries.insert(((*kind).to_owned(), (*key).to_owned()), (*id).to_owned());
+        }
+        to_rezzy_state(&entries)
+    }
+
+    /// A merge resolved with the room's auth bitmaps must equal the same merge
+    /// resolved by the resolver's own auth-list walk.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture lists each event of the two forks"
+    )]
+    fn a_merge_resolved_from_the_bitmaps_equals_the_walked_one() {
+        let events = [
+            room_event(
+                "$create",
+                "m.room.create",
+                "",
+                "@a:x",
+                1,
+                r#"{"creator":"@a:x"}"#,
+                &[],
+            ),
+            room_event(
+                "$alice",
+                "m.room.member",
+                "@a:x",
+                "@a:x",
+                2,
+                r#"{"membership":"join"}"#,
+                &["$create"],
+            ),
+            room_event(
+                "$pl",
+                "m.room.power_levels",
+                "",
+                "@a:x",
+                3,
+                r#"{"users":{"@a:x":100}}"#,
+                &["$create", "$alice"],
+            ),
+            room_event(
+                "$jr",
+                "m.room.join_rules",
+                "",
+                "@a:x",
+                4,
+                r#"{"join_rule":"public"}"#,
+                &["$create", "$alice", "$pl"],
+            ),
+            room_event(
+                "$topic_a",
+                "m.room.topic",
+                "",
+                "@a:x",
+                5,
+                r#"{"topic":"a"}"#,
+                &["$create", "$alice", "$pl"],
+            ),
+            room_event(
+                "$bob_a",
+                "m.room.member",
+                "@b:x",
+                "@b:x",
+                5,
+                r#"{"membership":"join"}"#,
+                &["$create", "$jr", "$pl"],
+            ),
+            room_event(
+                "$topic_b",
+                "m.room.topic",
+                "",
+                "@a:x",
+                6,
+                r#"{"topic":"b"}"#,
+                &["$create", "$alice", "$pl"],
+            ),
+            room_event(
+                "$carol_b",
+                "m.room.member",
+                "@c:x",
+                "@c:x",
+                6,
+                r#"{"membership":"join"}"#,
+                &["$create", "$jr", "$pl"],
+            ),
+        ];
+        let shared = [
+            ("m.room.create", "", "$create"),
+            ("m.room.member", "@a:x", "$alice"),
+            ("m.room.power_levels", "", "$pl"),
+            ("m.room.join_rules", "", "$jr"),
+        ];
+        let mut fork_a = shared.to_vec();
+        fork_a.extend([
+            ("m.room.topic", "", "$topic_a"),
+            ("m.room.member", "@b:x", "$bob_a"),
+        ]);
+        let mut fork_b = shared.to_vec();
+        fork_b.extend([
+            ("m.room.topic", "", "$topic_b"),
+            ("m.room.member", "@c:x", "$carol_b"),
+        ]);
+        let maps = [state(&fork_a), state(&fork_b)];
+
+        for version in [rezzy::StateResVersion::V2, rezzy::StateResVersion::V2_1] {
+            let mut context = LeanEventContext::new(events.iter());
+            let resolved = context.resolve(&maps, version);
+            assert!(
+                context.auth_graph.is_some(),
+                "a complete batch must build the bitmap graph"
+            );
+            let walked = rezzy::resolve_state_maps(&maps, context.map(), version);
+            assert_eq!(resolved, walked, "{version:?}");
+        }
+    }
+
+    /// A batch with a dangling auth reference has no bitmap graph, so the
+    /// merge falls back to the walk instead of using an inexact difference.
+    /// The gap sits on an event outside both forks, as `ensure` has already
+    /// refused any merge whose own auth closure is gapped.
+    #[test]
+    fn a_gapped_batch_builds_no_bitmap_graph_and_still_resolves() {
+        let events = [
+            room_event("$create", "m.room.create", "", "@a:x", 1, "{}", &[]),
+            room_event(
+                "$t1",
+                "m.room.topic",
+                "",
+                "@a:x",
+                2,
+                r#"{"topic":"1"}"#,
+                &["$create"],
+            ),
+            room_event(
+                "$t2",
+                "m.room.topic",
+                "",
+                "@a:x",
+                2,
+                r#"{"topic":"2"}"#,
+                &["$create"],
+            ),
+            room_event(
+                "$orphan",
+                "m.room.name",
+                "",
+                "@a:x",
+                2,
+                r#"{"name":"n"}"#,
+                &["$missing"],
+            ),
+        ];
+        let maps = [
+            state(&[
+                ("m.room.create", "", "$create"),
+                ("m.room.topic", "", "$t1"),
+            ]),
+            state(&[
+                ("m.room.create", "", "$create"),
+                ("m.room.topic", "", "$t2"),
+            ]),
+        ];
+        let mut context = LeanEventContext::new(events.iter());
+        let resolved = context.resolve(&maps, rezzy::StateResVersion::V2);
+        assert!(context.auth_graph.is_none());
+        let walked = rezzy::resolve_state_maps(&maps, context.map(), rezzy::StateResVersion::V2);
+        assert_eq!(resolved, walked);
     }
 
     #[test]

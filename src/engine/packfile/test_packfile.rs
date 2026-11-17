@@ -922,22 +922,95 @@ fn test_scan_and_recover_clean_file() {
     assert_eq!(std::fs::metadata(&path).unwrap().len(), expected_len as u64);
 }
 
-/// The counting recovery does what the collecting one does: at every
-/// truncation point of a multi-record pack it finds the same records, keeps
-/// the same length and reports the truncation the same way; a corrupt frame
-/// is the same error and leaves the file alone.
-#[test]
-fn test_recover_packfile_matches_scan_and_recover_at_every_cut() {
-    let dir = test_dir("recover_matches");
-    std::fs::create_dir_all(&dir).unwrap();
+/// Run the production recovery walk over in-memory bytes, with no file and no
+/// truncation: the result says what recovery would keep.
+fn walk_bytes(bytes: &[u8]) -> io::Result<(PackRecovery, Vec<ScanEntry>)> {
+    let mut reader = CountingReader {
+        inner: std::io::Cursor::new(bytes),
+        position: 0,
+    };
+    let mut entries = Vec::new();
+    let recovery = walk_packfile(&mut reader, |entry| {
+        entries.push((entry.collection_id, entry.hash, entry.offset));
+        Ok::<(), io::Error>(())
+    })?;
+    Ok((recovery, entries))
+}
+
+/// A header plus four records of increasing size, and the offset at which each
+/// frame ends (the header's end first).
+fn multi_record_pack() -> (Vec<u8>, Vec<usize>) {
     let mut buf = Vec::new();
     write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
-    let header_len = buf.len();
+    let mut boundaries = vec![buf.len()];
     for (index, byte) in [0xa1u8, 0xa2, 0xa3, 0xa4].into_iter().enumerate() {
-        let payload = vec![byte; 7 + index * 40];
+        let payload = vec![byte; 7usize.saturating_add(index.saturating_mul(40))];
         write_record(&mut buf, &test_record_raw([byte; 16], &payload)).unwrap();
+        boundaries.push(buf.len());
     }
+    (buf, boundaries)
+}
+
+/// At every truncation point of a multi-record pack, recovery keeps exactly the
+/// records that are complete: the same count, valid length and visited offsets,
+/// and it reports a torn tail unless the cut is a frame boundary. This runs the
+/// production walk over in-memory bytes, so every cut is covered without a
+/// file; `recover_packfile_truncates_real_files_at_representative_cuts` covers
+/// what recovery does to a file.
+#[test]
+fn test_recover_walk_is_exact_at_every_cut() {
+    let (buf, boundaries) = multi_record_pack();
+    let header_len = boundaries[0];
     for cut in 0..=buf.len() {
+        let result = walk_bytes(&buf[..cut]);
+        if cut < header_len {
+            // An incomplete header holds no records and is never "truncated":
+            // there is no valid prefix to cut back to.
+            if let Ok((recovery, entries)) = result {
+                assert_eq!(recovery.records, 0, "cut {cut}");
+                assert_eq!(recovery.valid_len, 0, "cut {cut}");
+                assert!(!recovery.truncated, "cut {cut}");
+                assert!(entries.is_empty(), "cut {cut}");
+            }
+            continue;
+        }
+        let (recovery, entries) = result.unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+        let kept = boundaries.iter().rposition(|&end| end <= cut).unwrap();
+        assert_eq!(recovery.records, kept as u64, "cut {cut}");
+        assert_eq!(recovery.valid_len, boundaries[kept] as u64, "cut {cut}");
+        assert_eq!(recovery.truncated, cut != boundaries[kept], "cut {cut}");
+        assert_eq!(entries.len(), kept, "cut {cut}");
+        for (entry, start) in entries.iter().zip(&boundaries) {
+            assert_eq!(entry.2, *start as u64, "cut {cut}: record offset");
+        }
+    }
+}
+
+/// A flipped payload byte is corruption: an error, never a truncation.
+#[test]
+fn test_recover_walk_rejects_a_corrupt_frame() {
+    let (buf, boundaries) = multi_record_pack();
+    let mut corrupt = buf.clone();
+    corrupt[boundaries[0] + 60] ^= 0x40;
+    assert!(walk_bytes(&corrupt).is_err());
+}
+
+/// What recovery does to a real file at representative cuts: an incomplete
+/// header and a clean boundary leave the file alone; a torn tail is cut back to
+/// the last frame boundary with the valid prefix byte-for-byte intact; and the
+/// collecting and counting entry points agree.
+#[test]
+fn recover_packfile_truncates_real_files_at_representative_cuts() {
+    let dir = test_dir("recover_matches");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (buf, boundaries) = multi_record_pack();
+    let header_len = boundaries[0];
+    let mut cuts = vec![0, 1, header_len - 1, header_len, header_len + 3];
+    for pair in boundaries.windows(2) {
+        // Just into the frame, in the middle of it, and one byte short.
+        cuts.extend([pair[0] + 1, pair[0].midpoint(pair[1]), pair[1] - 1, pair[1]]);
+    }
+    for cut in cuts {
         let collecting = dir.join("collecting.pack");
         let counting = dir.join("counting.pack");
         std::fs::write(&collecting, &buf[..cut]).unwrap();
@@ -946,28 +1019,30 @@ fn test_recover_packfile_matches_scan_and_recover_at_every_cut() {
         let recovery = recover_packfile(&counting);
         match (&entries, &recovery) {
             (Ok(records), Ok(found)) => {
+                let kept = boundaries.iter().rposition(|&end| end <= cut);
+                let expected_len = kept.map_or(cut, |i| boundaries[i]);
                 assert_eq!(u64::try_from(*records).unwrap(), found.records, "cut {cut}");
-                assert_eq!(
-                    std::fs::metadata(&collecting).unwrap().len(),
-                    std::fs::metadata(&counting).unwrap().len(),
-                    "cut {cut}: the two left different lengths"
-                );
+                for path in [&collecting, &counting] {
+                    let on_disk = std::fs::read(path).unwrap();
+                    assert_eq!(on_disk.len(), expected_len, "cut {cut}: file length");
+                    assert_eq!(on_disk, buf[..expected_len], "cut {cut}: valid prefix kept");
+                }
                 if cut >= header_len {
-                    assert_eq!(
-                        found.valid_len,
-                        std::fs::metadata(&counting).unwrap().len(),
-                        "cut {cut}"
-                    );
+                    assert_eq!(found.valid_len, expected_len as u64, "cut {cut}");
                 }
             }
-            (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind(), "cut {cut}"),
+            (Err(a), Err(b)) => {
+                assert_eq!(a.kind(), b.kind(), "cut {cut}");
+                // A failed recovery leaves the file as it found it.
+                assert_eq!(std::fs::read(&collecting).unwrap(), buf[..cut], "cut {cut}");
+            }
             _ => panic!("cut {cut}: {entries:?} vs {recovery:?}"),
         }
     }
-    // A flipped payload byte is corruption: the same error, and no truncation.
+    // Corruption through a real file: the same error from both entry points,
+    // and the file is not truncated.
     let mut corrupt = buf.clone();
-    let flip = header_len + 60;
-    corrupt[flip] ^= 0x40;
+    corrupt[header_len + 60] ^= 0x40;
     let collecting = dir.join("collecting.pack");
     let counting = dir.join("counting.pack");
     std::fs::write(&collecting, &corrupt).unwrap();
@@ -975,10 +1050,7 @@ fn test_recover_packfile_matches_scan_and_recover_at_every_cut() {
     let a = scan_and_recover_packfile(&collecting).unwrap_err();
     let b = recover_packfile(&counting).unwrap_err();
     assert_eq!(a.kind(), b.kind());
-    assert_eq!(
-        std::fs::metadata(&counting).unwrap().len(),
-        corrupt.len() as u64
-    );
+    assert_eq!(std::fs::read(&counting).unwrap(), corrupt);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1048,6 +1120,49 @@ fn test_scan_packfile_skip_payload_matches_scan_packfile() {
     let skipped = scan_packfile_skip_payload(&path).unwrap();
     assert_eq!(full, skipped);
     assert_eq!(skipped.len(), 2);
+}
+
+/// The streaming scanner tracks its own offset instead of asking the file for
+/// it before every frame. Both modes must still report the offsets the
+/// seek-based scan does, across payloads smaller and larger than the read
+/// buffer, and the offsets must tile the file exactly.
+#[test]
+fn test_scanner_tracked_offsets_match_seek_based_scan() {
+    let dir = test_dir("scanner_tracked_offsets");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shard_00.pack");
+    let mut buf = Vec::new();
+    write_header_with_creation_seq(&mut buf, &test_pack_id(0), 1).unwrap();
+    for (i, size) in [0usize, 17, 4096, 70_000, 3, 200_000, 1]
+        .into_iter()
+        .enumerate()
+    {
+        let tag = u8::try_from(i).unwrap();
+        write_record(
+            &mut buf,
+            &test_record([tag; 16], [tag.wrapping_add(0x40); 16], &vec![tag; size]),
+        )
+        .unwrap();
+    }
+    std::fs::write(&path, &buf).unwrap();
+
+    let expected = scan_packfile(&path).unwrap();
+    assert_eq!(expected.len(), 7);
+    for verify_payload in [false, true] {
+        let scanned: Vec<_> = scan_packfile_iter(&path, verify_payload)
+            .unwrap()
+            .collect::<io::Result<_>>()
+            .unwrap();
+        assert_eq!(scanned, expected, "verify_payload = {verify_payload}");
+        let mut frames = scan_packfile_iter(&path, verify_payload).unwrap();
+        let mut end = expected[0].2;
+        while let Some(entry) = frames.next_with_removal() {
+            let entry = entry.unwrap();
+            assert_eq!(entry.offset, end, "frames tile the file with no gap");
+            end = entry.offset + entry.disk_bytes;
+        }
+        assert_eq!(end, u64::try_from(buf.len()).unwrap());
+    }
 }
 
 #[test]

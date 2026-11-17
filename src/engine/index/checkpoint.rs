@@ -16,11 +16,7 @@
 //!   [CheckpointHeader 104B]
 //!   [CollectionDirEntry * count, 56B each]
 //!   [collection 0 slots: capacity * 8B]
-//!   [collection 0 homes: capacity * 8B]
-//!   [collection 0 tails: capacity * 8B]
 //!   [collection 1 slots: capacity * 8B]
-//!   [collection 1 homes: capacity * 8B]
-//!   [collection 1 tails: capacity * 8B]
 //!   [PackTableEntry * pack_table_count, 20B each]
 //!   [CollectionVersionEntry * logical_version_count, 24B each]
 //!   ...
@@ -123,7 +119,7 @@ pub struct LoadedCheckpoint {
     pub logical_versions: Vec<([u8; 16], u64)>,
 }
 
-/// One collection's raw slots, homes, and tails in the checkpoint mapping.
+/// One collection's raw slots in the checkpoint mapping.
 #[derive(Debug)]
 pub struct LoadedCollection {
     /// The collection whose slots these are.
@@ -133,18 +129,10 @@ pub struct LoadedCollection {
     pub generation: u64,
     /// Absolute byte offset of the raw `capacity * 8` slot array.
     pub slots_offset: usize,
-    /// Absolute byte offset of the homes array (`capacity * 8` bytes).
-    /// 0 when homes were not persisted.
-    pub homes_offset: usize,
-    /// Absolute byte offset of the tails array (`capacity * 8` bytes).
-    /// 0 when tails were not persisted.
-    pub tails_offset: usize,
     /// Allocated index capacity.
     pub capacity: u32,
     /// Number of non-empty slots, recorded at checkpoint write time.
     pub slot_count: u32,
-    /// Whether homes/tails are present in this checkpoint.
-    pub has_homes_tails: bool,
 }
 
 /// Deterministic FNV-1a hash of the `(pack_id, file_len)` set a checkpoint
@@ -173,7 +161,7 @@ fn blob_capacity(blob: &[u8]) -> Option<u64> {
 }
 
 /// Number of occupied (non-`0u64`) slots in a `LossyIndex::serialize` blob's
-/// slot section. The blob format is `[capacity_u64][slots × cap][homes × cap][tails × cap]`.
+/// slot section. The blob format is `[capacity_u64][slots × cap]`.
 fn blob_slot_count(blob: &[u8]) -> u32 {
     let Some(capacity) = blob_capacity(blob) else {
         return 0;
@@ -214,7 +202,7 @@ fn blob_slot_count(blob: &[u8]) -> u32 {
 /// left intact in that case.
 #[allow(
     clippy::too_many_lines,
-    reason = "the three phases (directory, slots/homes/tails offsets, body write) are one atomic construction; splitting them would scatter overflow-checked arithmetic that must stay in lockstep"
+    reason = "the checkpoint phases are one atomic construction; splitting them would scatter overflow-checked arithmetic that must stay in lockstep"
 )]
 pub fn write_checkpoint(
     path: &Path,
@@ -257,11 +245,8 @@ pub fn write_checkpoint(
         .and_then(|n| n.checked_mul(COLLECTION_DIR_ENTRY_LEN as u64))
         .ok_or_else(|| std::io::Error::other("checkpoint directory size overflow"))?;
 
-    // Compute per-section byte lengths from the serialize blobs.
-    // Blob format: [capacity_u64][slots × cap][homes × cap][tails × cap]
+    // Compute the slots section length from the serialize blobs.
     let mut slots_bytes: u64 = 0;
-    let mut homes_bytes: u64 = 0;
-    let mut tails_bytes: u64 = 0;
     for (_, _, blob) in collections {
         let capacity = blob_capacity(blob)
             .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
@@ -271,26 +256,20 @@ pub fn write_checkpoint(
         slots_bytes = slots_bytes
             .checked_add(cap8)
             .ok_or_else(|| std::io::Error::other("checkpoint slots size overflow"))?;
-        // homes and tails are each capacity × 8 bytes when present in the blob
-        let blob_body = blob.len().saturating_sub(8);
-        let cap_usize = usize::try_from(capacity).unwrap_or(usize::MAX);
-        if blob_body >= cap_usize.saturating_mul(24) {
-            homes_bytes = homes_bytes
-                .checked_add(cap8)
-                .ok_or_else(|| std::io::Error::other("checkpoint homes size overflow"))?;
-            tails_bytes = tails_bytes
-                .checked_add(cap8)
-                .ok_or_else(|| std::io::Error::other("checkpoint tails size overflow"))?;
+        let expected_len = usize::try_from(cap8)
+            .ok()
+            .and_then(|len| len.checked_add(8))
+            .ok_or_else(|| std::io::Error::other("checkpoint slot blob size overflow"))?;
+        if blob.len() != expected_len {
+            return Err(std::io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint collection blob must use the slots-only v1 format",
+            ));
         }
     }
-
-    let body_bytes = slots_bytes
-        .checked_add(homes_bytes)
-        .and_then(|v| v.checked_add(tails_bytes))
-        .ok_or_else(|| std::io::Error::other("checkpoint body size overflow"))?;
     let total_len = CHECKPOINT_HEADER_LEN
         .saturating_add(usize::try_from(directory_bytes).unwrap_or(usize::MAX))
-        .saturating_add(usize::try_from(body_bytes).unwrap_or(usize::MAX))
+        .saturating_add(usize::try_from(slots_bytes).unwrap_or(usize::MAX))
         .saturating_add(usize::try_from(pack_table_bytes).unwrap_or(usize::MAX))
         .saturating_add(usize::try_from(logical_version_bytes).unwrap_or(usize::MAX));
     // Reserve the header first, then build the body directly into the final
@@ -301,12 +280,7 @@ pub fn write_checkpoint(
 
     // Phase 1: build directory entries, tracking per-collection offsets.
     //
-    // Offsets must mirror Phase 3's actual write order exactly: each
-    // collection's slots/homes/tails are written back-to-back as one block
-    // (not as three separate all-slots/all-homes/all-tails sections), so a
-    // single running `body_offset` — not three independent per-kind
-    // counters — is what keeps a later collection's offsets from landing
-    // inside an earlier collection's bytes.
+    // Each collection's slots follow the previous collection's slots.
     let mut body_offset: u64 = 0;
     let mut dir_entries = Vec::with_capacity(collections.len());
     for (collection_id, generation, blob) in collections {
@@ -317,39 +291,18 @@ pub fn write_checkpoint(
         let cap8 = capacity
             .checked_mul(8)
             .ok_or_else(|| std::io::Error::other("collection capacity × 8 overflow"))?;
-        let blob_body = blob.len().saturating_sub(8);
-        let cap_usize = usize::try_from(capacity).unwrap_or(usize::MAX);
-        let has_homes_tails = blob_body >= cap_usize.saturating_mul(24);
-
         let slots_offset = body_offset;
-        let (homes_offset, tails_offset) = if has_homes_tails {
-            let homes_offset = body_offset
-                .checked_add(cap8)
-                .ok_or_else(|| std::io::Error::other("checkpoint homes offset overflow"))?;
-            let tails_offset = homes_offset
-                .checked_add(cap8)
-                .ok_or_else(|| std::io::Error::other("checkpoint tails offset overflow"))?;
-            (homes_offset, tails_offset)
-        } else {
-            (0, 0)
-        };
         dir_entries.push(CollectionDirEntry {
             collection_id: *collection_id,
             generation: *generation,
             slots_offset,
-            homes_offset,
-            tails_offset,
+            homes_offset: 0,
+            tails_offset: 0,
             capacity: capacity32,
             slot_count: blob_slot_count(blob),
         });
-        let block_bytes = if has_homes_tails {
-            cap8.checked_mul(3)
-                .ok_or_else(|| std::io::Error::other("collection capacity × 24 overflow"))?
-        } else {
-            cap8
-        };
         body_offset = body_offset
-            .checked_add(block_bytes)
+            .checked_add(cap8)
             .ok_or_else(|| std::io::Error::other("checkpoint body offset overflow"))?;
     }
 
@@ -358,31 +311,19 @@ pub fn write_checkpoint(
         buf.extend_from_slice(&entry.encode());
     }
 
-    // Phase 3: write slots, homes, tails as separate contiguous sections.
+    // Phase 3: write each collection's slots.
     for (_, _, blob) in collections {
         let capacity = blob_capacity(blob)
             .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
         let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
         let slots_end = 8_usize.saturating_add(cap.saturating_mul(8));
-        let homes_end = slots_end.saturating_add(cap.saturating_mul(8));
-        let tails_end = homes_end.saturating_add(cap.saturating_mul(8));
-        // Slots
         if let Some(slots) = blob.get(8..slots_end) {
             buf.extend_from_slice(slots);
-        }
-        // Homes
-        if let Some(homes) = blob.get(slots_end..homes_end) {
-            buf.extend_from_slice(homes);
-        }
-        // Tails
-        if let Some(tails) = blob.get(homes_end..tails_end) {
-            buf.extend_from_slice(tails);
         }
     }
 
     // Phase 4: write the pack table (slot -> pack_id bindings), one fixed-
-    // width entry per currently-live pack. Appended after the slots/homes/
-    // tails body so existing offset math above is untouched.
+    // width entry per currently-live pack. Appended after the slots body.
     for &(slot, pack_id) in pack_table {
         buf.extend_from_slice(&PackTableEntry { slot, pack_id }.encode());
     }
@@ -408,8 +349,8 @@ pub fn write_checkpoint(
         slots_bytes,
         pack_fingerprint: fingerprint,
         content_crc32,
-        homes_bytes,
-        tails_bytes,
+        homes_bytes: 0,
+        tails_bytes: 0,
         covered_lsn,
         pack_table_count,
         pack_table_bytes,
@@ -490,10 +431,13 @@ pub fn read_checkpoint_with_policy(
     }
     let slot_base =
         CHECKPOINT_HEADER_LEN.checked_add(usize::try_from(header.directory_bytes).ok()?)?;
-    let body_bytes = header
-        .slots_bytes
-        .checked_add(header.homes_bytes)
-        .and_then(|v| v.checked_add(header.tails_bytes))?;
+    // v1 checkpoints written before identity side tables were removed must not
+    // be loaded at all: the reader does not consume those tables, and their
+    // presence would only make the section offsets ambiguous.
+    if header.homes_bytes != 0 || header.tails_bytes != 0 {
+        return None;
+    }
+    let body_bytes = header.slots_bytes;
     // Slots are unique u16 values, so a valid pack table cannot exceed 65,536
     // entries; reject before `pack_table` and its dedupe sets reserve capacity
     // from `pack_table_count`.
@@ -535,6 +479,7 @@ pub fn read_checkpoint_with_policy(
     }
 
     let mut collections = Vec::with_capacity(count);
+    let mut body_offset = 0_usize;
     for i in 0..count {
         let entry_offset =
             CHECKPOINT_HEADER_LEN.checked_add(i.checked_mul(COLLECTION_DIR_ENTRY_LEN)?)?;
@@ -543,6 +488,9 @@ pub fn read_checkpoint_with_policy(
             .try_into()
             .ok()?;
         let entry = CollectionDirEntry::decode(&entry_bytes)?;
+        if entry.homes_offset != 0 || entry.tails_offset != 0 {
+            return None;
+        }
         if entry.capacity < 16 || !entry.capacity.is_power_of_two() {
             return None;
         }
@@ -559,10 +507,16 @@ pub fn read_checkpoint_with_policy(
             return None;
         }
         let slots_len = (entry.capacity as usize).checked_mul(8)?;
-        let region = slot_base.checked_add(usize::try_from(entry.slots_offset).ok()?)?;
-        if region.checked_add(slots_len)? > buf.len() {
+        if usize::try_from(entry.slots_offset).ok()? != body_offset {
             return None;
         }
+        let region = slot_base.checked_add(body_offset)?;
+        let slots_end = region.checked_add(slots_len)?;
+        if slots_end > pack_table_base {
+            return None;
+        }
+        body_offset = body_offset.checked_add(slots_len)?;
+        let mut occupied = 0_u32;
         for slot_bytes in buf
             .get(region..region.checked_add(slots_len)?)?
             .as_chunks::<8>()
@@ -572,36 +526,27 @@ pub fn read_checkpoint_with_policy(
             if !super::IndexEntry::valid_raw_slot(raw) {
                 return None;
             }
+            if !super::IndexEntry(raw).is_empty() {
+                occupied = occupied.checked_add(1)?;
+            }
         }
-        let has_homes_tails = header.homes_bytes > 0 && header.tails_bytes > 0;
-        let homes_region = if has_homes_tails {
-            let r = slot_base.checked_add(usize::try_from(entry.homes_offset).ok()?)?;
-            if r.checked_add(slots_len)? > buf.len() {
-                return None;
-            }
-            r
-        } else {
-            0
-        };
-        let tails_region = if has_homes_tails {
-            let r = slot_base.checked_add(usize::try_from(entry.tails_offset).ok()?)?;
-            if r.checked_add(slots_len)? > buf.len() {
-                return None;
-            }
-            r
-        } else {
-            0
-        };
+        // The body CRC check above normally catches a `slot_count` that
+        // disagrees with the actual slots, but `WriteOnly` skips it. Count the
+        // slots we just walked so an understated value cannot become the
+        // index's `len` and let inserts pass the load-factor threshold.
+        if occupied != entry.slot_count {
+            return None;
+        }
         collections.push(LoadedCollection {
             collection_id: entry.collection_id,
             generation: entry.generation,
             slots_offset: region,
-            homes_offset: homes_region,
-            tails_offset: tails_region,
             capacity: entry.capacity,
             slot_count: entry.slot_count,
-            has_homes_tails,
         });
+    }
+    if body_offset != usize::try_from(body_bytes).ok()? {
+        return None;
     }
 
     let mut pack_table = Vec::with_capacity(header.pack_table_count as usize);
@@ -764,5 +709,186 @@ pub fn read_durable_fingerprint(
             torn_tail: false,
         })),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{IndexConfig, LossyIndex};
+
+    fn temp_checkpoint(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "mtxdb-checkpoint-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    fn rewrite_crc(bytes: &mut [u8]) {
+        let mut header_bytes: [u8; CHECKPOINT_HEADER_LEN] =
+            bytes[..CHECKPOINT_HEADER_LEN].try_into().unwrap();
+        let mut header = CheckpointHeader::decode(&header_bytes).unwrap();
+        header.content_crc32 = crc32fast::hash(&bytes[CHECKPOINT_HEADER_LEN..]);
+        header_bytes.copy_from_slice(&header.encode());
+        bytes[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header_bytes);
+    }
+
+    fn write_slots_only_checkpoint(path: &Path, pack_table: &[(u16, PackId)]) {
+        let index = LossyIndex::with_config(16, IndexConfig::default());
+        let blob = index.serialize();
+        write_checkpoint(
+            path,
+            0x1234,
+            10,
+            0,
+            &[([0xA1; 16], 0, &blob)],
+            pack_table,
+            &[([0xA1; 16], 7)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_slot_range_cannot_extend_into_pack_table() {
+        let path = temp_checkpoint("slot-bounds");
+        write_slots_only_checkpoint(&path, &[(0, PackId([0xB2; 16]))]);
+        let mut bytes = fs::read(&path).unwrap();
+        let header =
+            CheckpointHeader::decode(bytes[..CHECKPOINT_HEADER_LEN].try_into().unwrap()).unwrap();
+        let directory_at = CHECKPOINT_HEADER_LEN;
+        let directory_end = directory_at + COLLECTION_DIR_ENTRY_LEN;
+        let mut directory =
+            CollectionDirEntry::decode(&bytes[directory_at..directory_end]).unwrap();
+        directory.slots_offset = header.slots_bytes;
+        bytes[directory_at..directory_end].copy_from_slice(&directory.encode());
+        rewrite_crc(&mut bytes);
+        fs::write(&path, bytes).unwrap();
+
+        assert!(read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_only_rejects_a_slot_count_that_understates_the_slots() {
+        let path = temp_checkpoint("understated-slot-count");
+        let index = LossyIndex::with_config(16, IndexConfig::default());
+        index.insert(&[0xA5; 16], 0, 128).unwrap();
+        let blob = index.serialize();
+        write_checkpoint(&path, 0x1234, 10, 0, &[([0xA1; 16], 0, &blob)], &[], &[]).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        let directory_at = CHECKPOINT_HEADER_LEN;
+        let directory_end = directory_at + COLLECTION_DIR_ENTRY_LEN;
+        let mut directory =
+            CollectionDirEntry::decode(&bytes[directory_at..directory_end]).unwrap();
+        assert_eq!(directory.slot_count, 1);
+        directory.slot_count = 0;
+        bytes[directory_at..directory_end].copy_from_slice(&directory.encode());
+        // Leave the body CRC stale: WriteOnly deliberately skips it, which is
+        // exactly the policy this understated count used to slip through.
+        fs::write(&path, bytes).unwrap();
+
+        assert!(
+            read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::WriteOnly).is_none(),
+            "an understated slot_count must not become the loaded index length"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn checkpoint_rejects_duplicate_pack_slots_and_addresses() {
+        let path = temp_checkpoint("duplicate-pack-table");
+        for packs in [
+            [(1, PackId([0xB1; 16])), (1, PackId([0xB2; 16]))],
+            [(1, PackId([0xB1; 16])), (2, PackId([0xB1; 16]))],
+        ] {
+            write_slots_only_checkpoint(&path, &packs);
+            assert!(
+                read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_none(),
+                "duplicate pack identity must be rejected even with a valid checksum: {packs:?}"
+            );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn checkpoint_rejects_unordered_or_uncovered_collection_versions() {
+        let path = temp_checkpoint("invalid-version-table");
+        let index = LossyIndex::with_config(16, IndexConfig::default());
+        let blob = index.serialize();
+        for versions in [
+            [([0xA1; 16], 7), ([0xA1; 16], 8)],
+            [([0xA2; 16], 7), ([0xA1; 16], 8)],
+            [([0xA1; 16], 7), ([0xA2; 16], 11)],
+        ] {
+            let error = write_checkpoint(
+                &path,
+                0x1234,
+                10,
+                0,
+                &[([0xA1; 16], 0, &blob)],
+                &[],
+                &versions,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            // Start with a readable, checksummed table, then model malformed
+            // metadata independently of checksum corruption.
+            write_checkpoint(
+                &path,
+                0x1234,
+                10,
+                0,
+                &[([0xA1; 16], 0, &blob)],
+                &[],
+                &[([0xA1; 16], 7), ([0xA2; 16], 8)],
+            )
+            .unwrap();
+            assert!(read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_some());
+            let mut bytes = fs::read(&path).unwrap();
+            let table_start = bytes.len() - 2 * COLLECTION_VERSION_ENTRY_LEN;
+            for (i, (collection_id, last_write_lsn)) in versions.into_iter().enumerate() {
+                let offset = table_start + i * COLLECTION_VERSION_ENTRY_LEN;
+                bytes[offset..offset + COLLECTION_VERSION_ENTRY_LEN].copy_from_slice(
+                    &CollectionVersionEntry {
+                        collection_id,
+                        last_write_lsn,
+                    }
+                    .encode(),
+                );
+            }
+            rewrite_crc(&mut bytes);
+            fs::write(&path, bytes).unwrap();
+            assert!(read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_none());
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_insert_on_checkpoint_mapping_does_not_allocate_identity_tables() {
+        let path = temp_checkpoint("mapped-insert");
+        write_slots_only_checkpoint(&path, &[]);
+        let loaded = read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).unwrap();
+        let collection = &loaded.collections[0];
+        let index = LossyIndex::from_mmap_slots_with_config(
+            Arc::clone(&loaded.mmap),
+            collection.slots_offset,
+            collection.capacity,
+            collection.slot_count,
+            IndexConfig::default(),
+        );
+        let before = index.resident_bytes();
+
+        assert!(matches!(
+            index.insert_undoable(&[0xA5; 16], 0, 128),
+            Err(super::super::InsertError::TableFull)
+        ));
+        assert_eq!(index.resident_bytes(), before);
+        assert!(index.is_mmap_backed());
+        let _ = fs::remove_file(path);
     }
 }

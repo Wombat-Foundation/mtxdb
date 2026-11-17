@@ -239,6 +239,32 @@ impl BitmapSet {
         Ok(out)
     }
 
+    /// Test encoded membership after validating the bitmap payload.
+    /// Validates the entire payload; the current format has no offset directory.
+    ///
+    /// # Errors
+    /// Returns corruption for invalid encodings or collision for a wrong domain.
+    pub fn contains_encoded(
+        bytes: &[u8],
+        expected: DomainTag,
+        value: u32,
+    ) -> Result<bool, StorageError> {
+        if bytes.len() < HEADER_LEN
+            || bytes[..4] != BITMAP_SET_MAGIC
+            || bytes[4] != BITMAP_SET_FORMAT_VERSION
+        {
+            return Err(StorageError::Corrupt("bitmap-set header".to_owned()));
+        }
+        let found = RezzyBitmap::contains_encoded(&bytes[HEADER_LEN..], value)
+            .map_err(|error| StorageError::Corrupt(format!("bitmap-set payload: {error}")))?;
+        if bytes[5..HEADER_LEN] != expected.as_bytes()[..] {
+            return Err(StorageError::Collision(
+                "bitmap-set domain mismatch on decode".to_owned(),
+            ));
+        }
+        Ok(found)
+    }
+
     /// Parse a set produced by [`BitmapSet::encode`], keeping its domain tag.
     ///
     /// # Errors

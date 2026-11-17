@@ -3,7 +3,8 @@
 //! mtxdb is the only store for events, verdicts, signing keys and state. A
 //! server writes those records through its adapters; an `mtxdb import`
 //! batch writes the same records from an export file. Both must agree on
-//! every byte, or a room that imported cleanly reads as empty after a
+//! every byte, including immutable room-version records, or a room that
+//! imported cleanly reads as empty after a
 //! restart. This module owns that agreement: the encodings, the collection
 //! and node derivations, and the data-format version the import marker
 //! vouches for.
@@ -21,8 +22,7 @@
 
 use crate::{
     derive_group_full_id, derive_member_collection_id_from_group, storage::StorageError, ShardType,
-    MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT, MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT,
-    MEMBER_NAMESPACE_STGP,
+    MEMBER_NAMESPACE_EVNT, MEMBER_NAMESPACE_FLAG, MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP,
 };
 
 /// Serialized `rezzy::hamt::RootHandle` length used by the server's state
@@ -138,6 +138,73 @@ pub fn event_state_root_node_id(event_id: &[u8]) -> [u8; 16] {
 /// is refused instead of misread.
 pub const DATA_FORMAT: u8 = 2;
 
+/// Stable domain tags for the importer's immutable room-version record.
+pub const ROOM_VERSION_DOMAIN: &[u8] = b"matrix-room-version-v1";
+/// Stable node-id domain for immutable room-version records. Its historical
+/// bytes match neither the collection domain nor the node value; changing them
+/// would change the stored node id, so preserve this tag as part of the format.
+pub const ROOM_VERSION_COLLECTION_DOMAIN: &[u8] = b"matrix-room-version-record-v1";
+/// Stable node identifier for immutable room-version records.
+pub const ROOM_VERSION_NODE: &[u8] = b"room-version";
+const ROOM_VERSION_MAGIC: &[u8; 4] = b"MRV1";
+
+/// Derive the collection holding a room's immutable version record.
+#[must_use]
+pub fn room_version_collection_id(room_id: &[u8]) -> [u8; 16] {
+    derive_id(ROOM_VERSION_DOMAIN, room_id)
+}
+
+/// Node id holding the room's immutable version record.
+#[must_use]
+pub fn room_version_node_id() -> [u8; 16] {
+    derive_id(ROOM_VERSION_COLLECTION_DOMAIN, ROOM_VERSION_NODE)
+}
+
+/// Encode the immutable room-version value as `MRV1`, a big-endian room-id
+/// byte length, the UTF-8 room id, then the UTF-8 room version.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] if the room id exceeds the format's
+/// `u32` length field.
+pub fn encode_room_version_record(room_id: &str, version: &str) -> Result<Vec<u8>, StorageError> {
+    let room_len = u32::try_from(room_id.len()).map_err(|_| {
+        StorageError::Corrupt("room id exceeds room-version record limit".to_owned())
+    })?;
+    let mut record = Vec::with_capacity(
+        8usize
+            .saturating_add(room_id.len())
+            .saturating_add(version.len()),
+    );
+    record.extend_from_slice(ROOM_VERSION_MAGIC);
+    record.extend_from_slice(&room_len.to_be_bytes());
+    record.extend_from_slice(room_id.as_bytes());
+    record.extend_from_slice(version.as_bytes());
+    Ok(record)
+}
+
+/// Decode a room-version value, returning borrowed room id and version text.
+///
+/// # Errors
+/// Returns [`StorageError::Corrupt`] for a bad magic, truncated room id, or
+/// invalid UTF-8.
+pub fn decode_room_version_record(bytes: &[u8]) -> Result<(&str, &str), StorageError> {
+    let malformed = || StorageError::Corrupt("malformed room-version record".to_owned());
+    let (magic, rest) = bytes.split_at_checked(4).ok_or_else(malformed)?;
+    if magic != ROOM_VERSION_MAGIC {
+        return Err(malformed());
+    }
+    let (length, rest) = rest.split_at_checked(4).ok_or_else(malformed)?;
+    let room_len = usize::try_from(u32::from_be_bytes(
+        length.try_into().map_err(|_| malformed())?,
+    ))
+    .map_err(|_| malformed())?;
+    let (room, version) = rest.split_at_checked(room_len).ok_or_else(malformed)?;
+    Ok((
+        std::str::from_utf8(room).map_err(|_| malformed())?,
+        std::str::from_utf8(version).map_err(|_| malformed())?,
+    ))
+}
+
 /// Derive a 128-bit BLAKE3 identifier from a domain and logical identifier.
 ///
 /// Hashes `domain`, a NUL separator, then `identifier`, taking the first
@@ -168,6 +235,7 @@ const HAS_REJECTION: u8 = 1;
 const HAS_SOFT_FAIL: u8 = 1 << 1;
 const HAS_REDACTION: u8 = 1 << 2;
 const IS_OUTLIER: u8 = 1 << 3;
+const HAS_ARRIVAL: u8 = 1 << 4;
 
 /// Everything recorded about an event beyond its body and edges.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -181,6 +249,11 @@ pub struct Verdict {
     /// Whether the event is stored as an outlier. This is independent of its
     /// rejection and soft-fail verdicts.
     pub outlier: bool,
+    /// The source's global counter value when it finished soft-failing the
+    /// event, for outliers kept out of its timeline. Soft-failed events and
+    /// non-soft-failed outliers can carry this. Comparable with the signed
+    /// `stream_ordering` of timeline events.
+    pub arrival_ordering: Option<u64>,
 }
 
 impl Verdict {
@@ -191,7 +264,20 @@ impl Verdict {
             && self.soft_fail.is_none()
             && self.redacted_by.is_none()
             && !self.outlier
+            && self.arrival_ordering.is_none()
     }
+}
+
+/// Derive the collection holding a room's gap manifest.
+#[must_use]
+pub fn gap_manifest_collection_id(room_id: &[u8]) -> [u8; 16] {
+    derive_id(b"gap-manifest", room_id)
+}
+
+/// Node id holding a room's gap manifest.
+#[must_use]
+pub fn gap_manifest_node_id() -> [u8; 16] {
+    derive_id(b"manifest", b"gaps")
 }
 
 /// Derive an event record id as the first 16 bytes of the BLAKE3 hash of the
@@ -235,6 +321,9 @@ pub fn encode_verdict(event_id: &[u8], verdict: &Verdict) -> Result<Vec<u8>, Sto
     if verdict.redacted_by.is_some() {
         flags |= HAS_REDACTION;
     }
+    if verdict.arrival_ordering.is_some() {
+        flags |= HAS_ARRIVAL;
+    }
 
     let mut out = vec![VERDICT_VERSION, flags];
     out.extend_from_slice(
@@ -245,6 +334,9 @@ pub fn encode_verdict(event_id: &[u8], verdict: &Verdict) -> Result<Vec<u8>, Sto
     out.extend_from_slice(event_id);
     out.extend(verdict.rejection);
     out.extend(verdict.soft_fail);
+    // Redaction comes before arrival ordering so an older decoder that knows
+    // HAS_REDACTION but not HAS_ARRIVAL still reads `redacted_by` correctly and
+    // ignores the trailing arrival bytes.
     if let Some(redactor) = &verdict.redacted_by {
         out.extend_from_slice(
             &u32::try_from(redactor.len())
@@ -252,6 +344,9 @@ pub fn encode_verdict(event_id: &[u8], verdict: &Verdict) -> Result<Vec<u8>, Sto
                 .to_le_bytes(),
         );
         out.extend_from_slice(redactor);
+    }
+    if let Some(arrival) = verdict.arrival_ordering {
+        out.extend_from_slice(&arrival.to_le_bytes());
     }
     Ok(out)
 }
@@ -302,7 +397,13 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(&[u8], Verdict), StorageError> {
     if flags & HAS_REDACTION != 0 {
         let (length, header) = take_len(rest)?;
         let tail = rest.get(header..).ok_or_else(malformed)?;
-        verdict.redacted_by = Some(tail.get(..length).ok_or_else(malformed)?.to_vec());
+        let (redactor, tail) = tail.split_at_checked(length).ok_or_else(malformed)?;
+        verdict.redacted_by = Some(redactor.to_vec());
+        rest = tail;
+    }
+    if flags & HAS_ARRIVAL != 0 {
+        let (bytes, _) = rest.split_first_chunk::<8>().ok_or_else(malformed)?;
+        verdict.arrival_ordering = Some(u64::from_le_bytes(*bytes));
     }
     Ok((event_id, verdict))
 }
@@ -310,78 +411,21 @@ pub fn decode_verdict(bytes: &[u8]) -> Result<(&[u8], Verdict), StorageError> {
 /// Version byte of the signing-key record value encoding.
 pub const KEY_RECORD_VERSION: u8 = 1;
 
-/// Which of an origin's signing-key records.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KeyRecordKind {
-    /// Cumulative `verify_keys` and `old_verify_keys` ever seen.
-    Historical,
-    /// Key ids bound only through a notary so far.
-    Provisional,
-    /// Key ids observed as currently active by a direct fetch.
-    Corroborated,
-    /// The last verbatim self-signed payload, re-served by the notary.
-    Notary,
-}
-
-impl KeyRecordKind {
-    /// Every kind, for scan and summary paths.
-    pub const ALL: [Self; 4] = [
-        Self::Historical,
-        Self::Provisional,
-        Self::Corroborated,
-        Self::Notary,
-    ];
-
-    /// The kind tag written into the record-id pre-image.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Historical => "historical",
-            Self::Provisional => "provisional",
-            Self::Corroborated => "corroborated",
-            Self::Notary => "notary",
-        }
-    }
-
-    /// Parse a kind tag, or `None` for an unknown tag.
-    #[must_use]
-    pub fn parse(tag: &str) -> Option<Self> {
-        match tag {
-            "historical" => Some(Self::Historical),
-            "provisional" => Some(Self::Provisional),
-            "corroborated" => Some(Self::Corroborated),
-            "notary" => Some(Self::Notary),
-            _ => None,
-        }
-    }
-
-    fn as_bytes(self) -> &'static [u8] {
-        self.as_str().as_bytes()
-    }
-}
-
 /// Derive the collection holding every origin's signing-key records.
 #[must_use]
 pub fn server_keys_collection_id() -> [u8; 16] {
     derive_id(b"sys", b"server-keys")
 }
 
-/// Derive the record id of one signing-key record of `origin`.
+/// Derive the record id of `origin`'s Notary record, the verbatim self-signed
+/// payload the notary endpoint re-serves. Its keys live in per-origin
+/// collections; see [`crate::server_keys`].
 #[must_use]
-pub fn server_key_record_id(kind: KeyRecordKind, origin: &[u8]) -> [u8; 16] {
-    let mut identifier = Vec::with_capacity(
-        kind.as_bytes()
-            .len()
-            .saturating_add(origin.len())
-            .saturating_add(1),
-    );
-    identifier.extend_from_slice(kind.as_bytes());
-    identifier.push(0);
-    identifier.extend_from_slice(origin);
-    derive_id(b"server-key", &identifier)
+pub fn notary_record_id(origin: &[u8]) -> [u8; 16] {
+    derive_id(b"server-key-notary", origin)
 }
 
-/// Encode one signing-key record for storage.
+/// Encode a Notary record for storage: the origin, then the payload verbatim.
 ///
 /// # Errors
 /// Returns [`StorageError::Corrupt`] if the origin does not fit its length
@@ -401,7 +445,7 @@ pub fn encode_server_key(origin: &[u8], payload: &[u8]) -> Result<Vec<u8>, Stora
     Ok(out)
 }
 
-/// Decode a stored signing-key record into its origin and payload.
+/// Decode a stored Notary record into its origin and payload.
 ///
 /// # Errors
 /// Returns [`StorageError::Corrupt`] for a truncated record or an unknown
@@ -424,9 +468,6 @@ pub fn decode_server_key(bytes: &[u8]) -> Result<(&[u8], &[u8]), StorageError> {
 
 /// Pool holding event bodies, event locators and verdicts.
 pub const EVENT_POOL: ShardType = ShardType::EventDag;
-
-/// Pool holding the prev and auth edge records.
-pub const EDGE_POOL: ShardType = ShardType::Edges;
 
 /// Pool holding signing keys and the import marker.
 pub const SERVER_INFO_POOL: ShardType = ShardType::ServerInfo;
@@ -453,16 +494,10 @@ pub fn room_event_collection_id(room_id: &[u8]) -> [u8; 16] {
     room_member_collection(MEMBER_NAMESPACE_EVNT, room_id)
 }
 
-/// Derive the collection holding a room's prev-event edge lists.
+/// Derive the collection holding a room's flag bitmaps.
 #[must_use]
-pub fn room_prev_collection_id(room_id: &[u8]) -> [u8; 16] {
-    room_member_collection(MEMBER_NAMESPACE_PREV, room_id)
-}
-
-/// Derive the collection holding a room's auth-event edge lists.
-#[must_use]
-pub fn room_auth_collection_id(room_id: &[u8]) -> [u8; 16] {
-    room_member_collection(MEMBER_NAMESPACE_AUTH, room_id)
+pub fn room_flag_collection_id(room_id: &[u8]) -> [u8; 16] {
+    room_member_collection(MEMBER_NAMESPACE_FLAG, room_id)
 }
 
 /// Derive the event-locator collection holding `node`.
@@ -517,100 +552,6 @@ pub fn decode_event_locator(bytes: &[u8]) -> Result<(&[u8], &[u8]), StorageError
         return Err(malformed());
     }
     Ok(rest.split_at(length))
-}
-
-/// Encode an edge list (prev or auth) as repeated `[u32 LE length][event id]`.
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] if an id does not fit its length prefix.
-pub fn encode_edges(edges: &[&[u8]]) -> Result<Vec<u8>, StorageError> {
-    let too_large = || StorageError::Corrupt("event edge is too large".to_owned());
-    let mut out = Vec::new();
-    for edge in edges {
-        let length = u32::try_from(edge.len()).map_err(|_| too_large())?;
-        out.extend_from_slice(&length.to_le_bytes());
-        out.extend_from_slice(edge);
-    }
-    Ok(out)
-}
-
-/// Record id of the per-room auth short-id counter (big-endian `u32`).
-#[must_use]
-pub fn auth_counter_record_id() -> [u8; 16] {
-    derive_id(b"authchain:counter", b"")
-}
-
-/// Record id of an event's forward short-id record in the room auth collection.
-#[must_use]
-pub fn auth_forward_record_id(event_id: &[u8]) -> [u8; 16] {
-    derive_id(b"authchain:fwd", event_id)
-}
-
-/// Record id of a short id's reverse record (the event id).
-#[must_use]
-pub fn auth_reverse_record_id(short: u32) -> [u8; 16] {
-    derive_id(b"authchain:rev", &short.to_be_bytes())
-}
-
-/// Record id of a short id's closure bitmap.
-#[must_use]
-pub fn auth_closure_record_id(short: u32) -> [u8; 16] {
-    derive_id(b"authchain:closure", &short.to_be_bytes())
-}
-
-/// Forward short-id record: `[u32 BE short][event id]`. The event id lets a
-/// reader reject a record that merely shares the 128-bit key.
-#[must_use]
-pub fn encode_auth_forward(short: u32, event_id: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(event_id.len().saturating_add(4));
-    out.extend_from_slice(&short.to_be_bytes());
-    out.extend_from_slice(event_id);
-    out
-}
-
-/// Decode a forward short-id record.
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] for a record shorter than its prefix.
-pub fn decode_auth_forward(bytes: &[u8]) -> Result<(u32, &[u8]), StorageError> {
-    let (short, event) = bytes
-        .split_first_chunk::<4>()
-        .ok_or_else(|| StorageError::Corrupt("malformed auth short-id record".to_owned()))?;
-    Ok((u32::from_be_bytes(*short), event))
-}
-
-/// Decode the per-room short-id counter.
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] unless the record is exactly four bytes.
-pub fn decode_auth_counter(bytes: &[u8]) -> Result<u32, StorageError> {
-    <[u8; 4]>::try_from(bytes)
-        .map(u32::from_be_bytes)
-        .map_err(|_| StorageError::Corrupt("malformed auth counter".to_owned()))
-}
-
-/// Encode the per-room short-id counter as big-endian `u32`.
-#[must_use]
-pub const fn encode_auth_counter(value: u32) -> [u8; 4] {
-    value.to_be_bytes()
-}
-
-/// Decode an edge list written by [`encode_edges`].
-///
-/// # Errors
-/// Returns [`StorageError::Corrupt`] for a truncated record.
-pub fn decode_edges(bytes: &[u8]) -> Result<Vec<Vec<u8>>, StorageError> {
-    let malformed = || StorageError::Corrupt("malformed event edge record".to_owned());
-    let mut edges = Vec::new();
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        let (length, tail) = rest.split_first_chunk::<4>().ok_or_else(malformed)?;
-        let length = usize::try_from(u32::from_le_bytes(*length)).map_err(|_| malformed())?;
-        let (edge, tail) = tail.split_at_checked(length).ok_or_else(malformed)?;
-        edges.push(edge.to_vec());
-        rest = tail;
-    }
-    Ok(edges)
 }
 
 /// Version byte of the import-marker value encoding.
@@ -758,13 +699,11 @@ pub fn commit_state_batches<'a>(
         }
         Ok(())
     }
-    if batch_bytes == 0 || batch_bytes > crate::journal::MAX_TXN_STAGE_BYTES {
+    let stage_limit = db.txn_stage_limit_bytes();
+    if batch_bytes == 0 || batch_bytes > stage_limit {
         return Err(StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!(
-                "state batch budget must be in 1..={} bytes",
-                crate::journal::MAX_TXN_STAGE_BYTES
-            ),
+            format!("state batch budget must be in 1..={stage_limit} bytes"),
         )));
     }
     let mut committed = 0_usize;

@@ -260,12 +260,12 @@ fn fixed_derivation_vectors() {
     );
 
     // Unknown namespaces (such as physical pool tags like EDGE) MUST be rejected
-    assert_eq!(namespace_bias(*b"EDGE"), None);
+    assert_eq!(namespace_bias(*b"SINF"), None);
     assert_eq!(namespace_bias(*b"XYZW"), None);
     assert_eq!(namespace_bias(*b"    "), None);
-    assert_eq!(derive_group_member_full_id(*b"EDGE", room), None);
-    assert_eq!(derive_group_member_collection_id(*b"EDGE", room), None);
-    assert_eq!(try_derive_collection_id(Some(*b"EDGE"), room), None);
+    assert_eq!(derive_group_member_full_id(*b"SINF", room), None);
+    assert_eq!(derive_group_member_collection_id(*b"SINF", room), None);
+    assert_eq!(try_derive_collection_id(Some(*b"SINF"), room), None);
 
     // All member collection IDs are strictly separated
     let all_ids = [
@@ -752,14 +752,14 @@ fn validate_identity_collision_and_namespace_rejection() {
 
     // 5. Unregistered namespace (e.g. physical pool tag EDGE)
     let mut meta_edge = meta1.clone();
-    meta_edge.member_namespace = Some(*b"EDGE");
+    meta_edge.member_namespace = Some(*b"SINF");
     assert!(!meta_edge.verify_collection_id(&col1_id));
     assert_eq!(
-        try_derive_collection_full_id(Some(*b"EDGE"), b"!room:example.com"),
+        try_derive_collection_full_id(Some(*b"SINF"), b"!room:example.com"),
         None
     );
     assert_eq!(
-        try_derive_collection_id(Some(*b"EDGE"), b"!room:example.com"),
+        try_derive_collection_id(Some(*b"SINF"), b"!room:example.com"),
         None
     );
     assert!(CollectionMetadata::decode(&meta_edge.encode()).is_none());
@@ -768,7 +768,7 @@ fn validate_identity_collision_and_namespace_rejection() {
 #[test]
 #[should_panic(expected = "member_namespace must be a valid registered namespace")]
 fn derive_collection_id_panics_on_unknown_namespace() {
-    let _ = derive_collection_id(Some(*b"EDGE"), b"!room:example.com");
+    let _ = derive_collection_id(Some(*b"SINF"), b"!room:example.com");
 }
 
 #[test]
@@ -781,6 +781,7 @@ fn namespace_bias_constants_match_blake3() {
         (b"STGP", NAMESPACE_BIAS_STGP),
         (b"FWD ", NAMESPACE_BIAS_FWD),
         (b"INTL", NAMESPACE_BIAS_INTL),
+        (b"FLAG", NAMESPACE_BIAS_FLAG),
     ] {
         let mut input = Vec::from(&b"mtxdb/namespace/v1/"[..]);
         input.extend_from_slice(namespace);

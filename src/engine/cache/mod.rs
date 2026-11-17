@@ -277,17 +277,26 @@ impl NodeCache {
     }
 
     /// Hit rate as a fraction [0.0, 1.0].
+    ///
+    /// The relaxed atomic loads form an approximate snapshot while accesses
+    /// are concurrent. Large counters are scaled down, so the result can
+    /// remain approximate even after the counters stop changing.
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let h = self.hits.load(Ordering::Relaxed);
         let m = self.misses.load(Ordering::Relaxed);
-        let total = h.saturating_add(m);
-        h.checked_mul(10_000)
-            .and_then(|v| v.checked_div(total))
-            .map_or(0.0, |scaled| {
-                let clamped = u32::try_from(scaled).unwrap_or(u32::MAX);
-                f64::from(clamped) / 10_000.0
-            })
+        // Scale both counters down together until they fit in 32 bits so the
+        // ratio needs no lossy casts. Below 2^32 lookups the counters are
+        // converted exactly; above it, truncation can round a tiny hit count
+        // down to zero (1 hit in 2^32 misses reports 0.0).
+        let excess = u32::BITS.saturating_sub(h.max(m).leading_zeros());
+        let narrow = |count: u64| f64::from(u32::try_from(count >> excess).unwrap_or(u32::MAX));
+        let (h, m) = (narrow(h), narrow(m));
+        if h + m == 0.0 {
+            0.0
+        } else {
+            h / (h + m)
+        }
     }
 
     /// Clear all entries.
@@ -360,5 +369,30 @@ impl PinnedNodes {
 impl Default for PinnedNodes {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hit_rate_scaling_boundary() {
+        let cache = NodeCache::new(1);
+        cache.hits.store(1, Ordering::Relaxed);
+        cache
+            .misses
+            .store(u64::from(u32::MAX) - 1, Ordering::Relaxed);
+        let exact = 1.0 / f64::from(u32::MAX);
+        assert!((cache.hit_rate() - exact).abs() < exact * 1.0e-12);
+
+        // Past 2^32 the counters are scaled; a lone hit is rounded away.
+        cache.misses.store(1 << 32, Ordering::Relaxed);
+        assert!(cache.hit_rate().abs() < f64::EPSILON);
+
+        // Large balanced counters keep their ratio.
+        cache.hits.store(1 << 40, Ordering::Relaxed);
+        cache.misses.store(3 << 40, Ordering::Relaxed);
+        assert!((cache.hit_rate() - 0.25).abs() < 1.0e-9);
     }
 }

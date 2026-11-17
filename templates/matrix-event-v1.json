@@ -3,6 +3,7 @@
   "name": "matrix-event-v1",
   "version": 1,
   "description": "Lossless archive mapping for Matrix event JSON.",
+  "search": { "fields": ["/type", "/sender"] },
   "input": { "decoder": "json", "framing": ["jsonl", "federation-response"] },
   "record": {
     "identity": {

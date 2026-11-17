@@ -1,4 +1,6 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const TEST_COLLECTION: [u8; 16] = [0x01; 16];
@@ -21,11 +23,32 @@ const OTHER_COLLECTION: [u8; 16] = [0x02; 16];
 fn test_dir(name: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("mdb_test_pfs_{name}_{}_{id}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    loop {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = crate::test_scratch::root().join(format!(
+            "mdb_test_pfs_{name}_{}_{}_{}",
+            std::process::id(),
+            id,
+            nonce
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create test directory {}: {error}", dir.display()),
+        }
+    }
+}
+
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -627,6 +650,227 @@ fn read_committed_overlay_reloads_after_reclaim_advances_coverage() {
     );
 }
 
+/// Seeds a committed value, opens a read-only streaming reader and a writer,
+/// drops the seed checkpoint so the writer's next sync takes the full
+/// checkpoint path, and makes every sync reclaim.
+struct ReclaimFixture {
+    writer: PackfileStorage,
+    reader: std::sync::Arc<PackfileStorage>,
+    wal: PathBuf,
+    collection: [u8; 16],
+    seed_key: [u8; 16],
+}
+
+fn open_reclaim_fixture(label: &str) -> ReclaimFixture {
+    let dir = test_dir(label);
+    let wal = dir.join("wal.bin");
+    let collection = [0x4Du8; 16];
+    let seed_key = [0x01u8; 16];
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &collection,
+        &seed_key,
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+    let (journal, _) = Journal::open(&wal).unwrap();
+    drop(journal);
+
+    let reader = std::sync::Arc::new(PackfileStorage::open_read_only(dir.clone()).unwrap());
+    reader.enable_read_journal(&wal).unwrap();
+
+    // Drop the seed checkpoint so the writer's sync writes a full checkpoint
+    // (which reclaims), instead of appending a delta that does not.
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    // Make every sync checkpoint and reclaim so each round is deterministic.
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+
+    ReclaimFixture {
+        writer,
+        reader,
+        wal,
+        collection,
+        seed_key,
+    }
+}
+
+/// Run 40 write/sync rounds and return how many times the journal base moved.
+/// `after_sync` runs once per round after the checkpoint lands; the streaming
+/// test uses it to publish the new value and demand reader progress.
+fn run_reclaim_rounds(
+    writer: &PackfileStorage,
+    wal: &std::path::Path,
+    collection: &[u8; 16],
+    mut after_sync: impl FnMut(u8),
+) -> usize {
+    let mut last_base = Journal::scan_read_only(wal).unwrap().base_lsn;
+    let mut advances: usize = 0;
+    for i in 0u8..40 {
+        let key = [0x80u8.wrapping_add(i); 16];
+        writer
+            .put(
+                collection,
+                &key,
+                &NodeData::new(bytes::Bytes::from(vec![i; 8])),
+            )
+            .unwrap();
+        writer.sync().unwrap();
+        after_sync(i);
+        let base = Journal::scan_read_only(wal).unwrap().base_lsn;
+        if base > last_base {
+            advances = advances.saturating_add(1);
+            last_base = base;
+        }
+    }
+    advances
+}
+
+/// A reader streaming `get_read_committed` must not stop the writer's sync from
+/// advancing the checkpoint and reclaiming the journal. Transient `WouldBlock`
+/// is allowed for the reader; a gap or wrong value is not. The reader starts
+/// before the first reclaim and must acknowledge each round's newly committed
+/// value before the writer continues. This coordinates interleaving between
+/// rounds; it does not force a read to run inside a reclaim.
+#[test]
+fn streaming_read_committed_does_not_hold_back_reclaim() {
+    use std::sync::atomic::{AtomicBool, AtomicU8};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    let ReclaimFixture {
+        writer,
+        reader,
+        wal,
+        collection,
+        seed_key,
+    } = open_reclaim_fixture("read_committed_stream_vs_reclaim");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // A writer panic must still wake the reader before unwinding.
+    let _stop_on_drop = StopOnDrop(stop.as_ref());
+    let published = Arc::new(AtomicU8::new(0));
+    let acknowledged = Arc::new(AtomicU8::new(0));
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let handle = {
+        let reader = Arc::clone(&reader);
+        let stop = Arc::clone(&stop);
+        let published = Arc::clone(&published);
+        let acknowledged = Arc::clone(&acknowledged);
+        std::thread::spawn(move || {
+            let mut announced = false;
+            while !stop.load(Ordering::Acquire) {
+                let newest = published.load(Ordering::Acquire);
+                let mut keys = vec![seed_key];
+                if newest > 0 {
+                    keys.push([0x80u8.wrapping_add(newest - 1); 16]);
+                }
+                match reader.get_read_committed(&collection, &keys) {
+                    Ok(values) => {
+                        assert_eq!(
+                            values[0].as_ref().map(|data| data.bytes.as_ref()),
+                            Some(&b"seed"[..]),
+                            "a streamed read must never observe a hole"
+                        );
+                        if newest > 0 {
+                            let expected = [newest - 1; 8];
+                            assert_eq!(
+                                values[1].as_ref().map(|data| data.bytes.as_ref()),
+                                Some(&expected[..]),
+                                "a streamed reader must see the newly committed value"
+                            );
+                            // Acknowledge the exact round whose key was
+                            // validated, so the writer cannot mistake an older
+                            // in-flight read for progress on this round. The
+                            // update is monotonic because rounds only advance.
+                            acknowledged.fetch_max(newest, Ordering::Release);
+                        }
+                        if !announced {
+                            let _ = started_tx.send(());
+                            announced = true;
+                        }
+                    }
+                    // Bounded-retry classification under a racing reclaim.
+                    Err(StorageError::WouldBlock(_)) => {}
+                    Err(err) => panic!("unexpected read error: {err}"),
+                }
+            }
+        })
+    };
+
+    // The reader must be live before the first reclaim, not merely at some
+    // point before the loop stops.
+    started_rx
+        .recv()
+        .expect("reader must complete a read before the writer starts");
+
+    let advances = run_reclaim_rounds(&writer, &wal, &collection, |i| {
+        let target = i.wrapping_add(1);
+        published.store(target, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while acknowledged.load(Ordering::Acquire) < target {
+            assert!(
+                Instant::now() < deadline,
+                "reader did not acknowledge the newly committed value in round {i}"
+            );
+            std::thread::yield_now();
+        }
+    });
+
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap();
+
+    assert_eq!(
+        advances, 40,
+        "reclaim must advance the journal base on every round while reads stream"
+    );
+}
+
+/// The paired no-reader control for the streaming test: the same writer and
+/// reclaim setup advances the base repeatedly without any reader attached.
+#[test]
+fn reclaim_advances_without_a_streaming_reader() {
+    let dir = test_dir("read_committed_reclaim_without_reader");
+    let wal = dir.join("wal.bin");
+    let collection = [0x4Du8; 16];
+    let seed_key = [0x01u8; 16];
+
+    let seed = PackfileStorage::open(dir.clone()).unwrap();
+    seed.put(
+        &collection,
+        &seed_key,
+        &NodeData::new(bytes::Bytes::from_static(b"seed")),
+    )
+    .unwrap();
+    seed.sync().unwrap();
+    drop(seed);
+    let (journal, _) = Journal::open(&wal).unwrap();
+    drop(journal);
+
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+
+    let advances = run_reclaim_rounds(&writer, &wal, &collection, |_| {});
+    assert_eq!(
+        advances, 40,
+        "reclaim must advance the journal base on every round without a reader"
+    );
+}
+
 #[test]
 fn read_committed_reload_skips_the_exact_pack_gate() {
     let dir = test_dir("read_committed_reload_skip_gate");
@@ -900,7 +1144,6 @@ fn post_repack_delta_epoch_replays_for_a_cold_reader() {
 
     let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
     reader.enable_read_journal(&wal).unwrap();
-
     let timings = reader
         .stats()
         .last_open_timings
@@ -1805,6 +2048,59 @@ fn test_walk_ancestors_stops_at_boundary() {
 }
 
 #[test]
+fn test_walk_ancestors_of_an_unknown_collection_is_empty() {
+    let dir = test_dir("walk_unknown_collection");
+    let store = PackfileStorage::open(dir).unwrap();
+
+    let mut walk = store
+        .walk_ancestors(
+            &[0x77; 16],
+            &[distinct_id(1)],
+            &[],
+            |_, _| Vec::new(),
+            WalkLimits::default(),
+        )
+        .unwrap();
+    assert!(
+        walk.next().is_none(),
+        "a collection the store has never seen walks to nothing, not an error"
+    );
+}
+
+#[test]
+fn test_walk_ancestors_rejects_a_cyclic_graph() {
+    let dir = test_dir("walk_cycle");
+    let store = PackfileStorage::open(dir).unwrap();
+    let a = distinct_id(1);
+    let b = distinct_id(2);
+    for id in [a, b] {
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from_static(b"cycle")),
+            )
+            .unwrap();
+    }
+
+    // Two nodes that name each other: an event graph must be acyclic, and a
+    // corrupt edge set must fail closed instead of looping or ordering nodes
+    // that have no valid replay order.
+    let extract = |hash: &[u8; 16], _data: &[u8]| {
+        if *hash == a {
+            vec![b]
+        } else {
+            vec![a]
+        }
+    };
+    let result = store.walk_ancestors(&TEST_COLLECTION, &[a], &[], extract, WalkLimits::default());
+    let Err(error) = result else {
+        panic!("a cyclic adjacency must be reported as corruption");
+    };
+    assert!(matches!(error, StorageError::Corrupt(_)));
+}
+
+#[test]
 fn test_walk_ancestors_branching_dag() {
     let dir = test_dir("walk_branch");
     let store = PackfileStorage::open(dir).unwrap();
@@ -2271,6 +2567,159 @@ fn previous_version_shard_collections_sidecar_is_rejected_and_rebuilt() {
     let rebuilt = std::fs::read(&sidecar_path).unwrap();
     assert_eq!(&rebuilt[0..4], SHARD_ROOMS_MAGIC);
     assert_eq!(rebuilt[4], SHARD_ROOMS_VERSION);
+}
+
+/// Build a syntactically valid header-only v2 sidecar. A header-only file can
+/// legitimately mean zero records; only a populated file truncated to this
+/// length is damaged.
+fn header_only_shard_collections() -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(SHARD_ROOMS_MAGIC);
+    buf.push(SHARD_ROOMS_VERSION);
+    buf.extend_from_slice(&0x1234_u64.to_le_bytes());
+    buf.extend_from_slice(&1_u64.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 4]);
+    let crc = crc32fast::hash(&buf);
+    buf[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+#[test]
+fn shard_collections_checksum_rejects_damage_and_rebuilds_accounting() {
+    let dir = test_dir("shard_collections_checksum");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    for i in 0..3u8 {
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(i),
+                &NodeData::new(bytes::Bytes::from(vec![i])),
+            )
+            .unwrap();
+    }
+    for i in 0..2u8 {
+        store
+            .put(
+                &OTHER_COLLECTION,
+                &distinct_id(100 + i),
+                &NodeData::new(bytes::Bytes::from(vec![i])),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    store.persist_shard_collections().unwrap();
+    drop(store);
+
+    let sidecar = PackfileStorage::shard_collections_path(&dir);
+    let good = std::fs::read(&sidecar).unwrap();
+    assert_eq!(good[4], SHARD_ROOMS_VERSION);
+
+    // Damage each part of the complete contents independently: body, magic,
+    // fingerprint, timestamp, CRC field, and truncations.
+    let mut variants = Vec::new();
+    let mut body = good.clone();
+    let last = body.len() - 1;
+    body[last] ^= 0xff;
+    variants.push(("body", body));
+    let mut magic = good.clone();
+    magic[0] ^= 0xff;
+    variants.push(("magic", magic));
+    let mut fingerprint = good.clone();
+    fingerprint[5] ^= 0xff;
+    variants.push(("fingerprint", fingerprint));
+    let mut timestamp = good.clone();
+    timestamp[13] ^= 0xff;
+    variants.push(("timestamp", timestamp));
+    let mut crc = good.clone();
+    crc[SHARD_ROOMS_CRC_OFFSET] ^= 0xff;
+    variants.push(("crc", crc));
+    variants.push((
+        "truncated-header-1",
+        good[..SHARD_ROOMS_HEADER_LEN - 1].to_vec(),
+    ));
+    variants.push(("truncated-header", good[..SHARD_ROOMS_HEADER_LEN].to_vec()));
+    variants.push(("truncated-record", good[..good.len() - 1].to_vec()));
+
+    for (name, bytes) in &variants {
+        std::fs::write(&sidecar, bytes).unwrap();
+        assert!(
+            read_persisted_shard_collections(&dir).is_none(),
+            "{name}: damaged sidecar must be rejected"
+        );
+        assert!(
+            PackfileStorage::collection_directory_from_disk(&dir).is_empty(),
+            "{name}: a rejected sidecar yields no directory"
+        );
+        assert!(
+            PackfileStorage::collection_disk_bytes_from_disk(&dir).is_none(),
+            "{name}: a rejected sidecar yields no byte totals"
+        );
+    }
+
+    // Leave the body-corrupt file in place and recover through a reopen.
+    std::fs::write(&sidecar, &variants[0].1).unwrap();
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let mut summaries: Vec<([u8; 16], u64)> = reopened
+        .collection_summaries()
+        .into_iter()
+        .map(|(id, count, _mem, _cap)| (id, count as u64))
+        .collect();
+    summaries.sort_unstable_by_key(|(id, _)| *id);
+    assert!(summaries.contains(&(TEST_COLLECTION, 3)));
+    assert!(summaries.contains(&(OTHER_COLLECTION, 2)));
+    assert!(
+        read_persisted_shard_collections(&dir).is_none(),
+        "the reopen must not accept the damaged sidecar"
+    );
+
+    reopened.persist_shard_collections().unwrap();
+    drop(reopened);
+
+    let rebuilt = read_persisted_shard_collections(&dir).expect("rewritten v2 sidecar");
+    assert_eq!(
+        rebuilt.records.len(),
+        (good.len() - SHARD_ROOMS_HEADER_LEN) / SHARD_ROOMS_RECORD_LEN
+    );
+    let mut from_disk = PackfileStorage::collection_directory_from_disk(&dir);
+    from_disk.sort_unstable_by_key(|(id, _)| *id);
+    assert_eq!(
+        from_disk, summaries,
+        "rebuilt counts match the reopened store"
+    );
+    let bytes = PackfileStorage::collection_disk_bytes_from_disk(&dir).expect("byte totals");
+    assert!(bytes.get(&TEST_COLLECTION).copied().unwrap_or(0) > 0);
+    assert!(bytes.get(&OTHER_COLLECTION).copied().unwrap_or(0) > 0);
+}
+
+#[test]
+fn header_only_shard_collections_is_valid_but_truncating_a_populated_one_is_not() {
+    let dir = test_dir("shard_collections_header_only");
+    let _store = PackfileStorage::open(dir.clone()).unwrap();
+    let sidecar = PackfileStorage::shard_collections_path(&dir);
+
+    // A header-only v2 file with a correct CRC is a valid empty directory.
+    std::fs::write(&sidecar, header_only_shard_collections()).unwrap();
+    assert!(
+        read_persisted_shard_collections(&dir).is_some(),
+        "a header-only zero-record sidecar is valid"
+    );
+    assert_eq!(
+        PackfileStorage::collection_directory_from_disk(&dir),
+        Vec::new(),
+        "a header-only zero-record sidecar yields no directory entries"
+    );
+
+    // A populated file cut to the same header is damaged: its original CRC
+    // covered the records that are now gone.
+    let mut populated = header_only_shard_collections();
+    populated.extend_from_slice(&[0xAB; SHARD_ROOMS_RECORD_LEN]);
+    let crc = crc32fast::hash(&populated);
+    populated[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&sidecar, &populated[..SHARD_ROOMS_HEADER_LEN]).unwrap();
+    assert!(
+        read_persisted_shard_collections(&dir).is_none(),
+        "truncating a populated sidecar must fail its CRC"
+    );
 }
 
 #[test]
@@ -3052,12 +3501,12 @@ fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
         .put(&collection, &batch_node(1), &NodeData::from_slice(b"one"))
         .unwrap();
     store.sync_all().unwrap();
-    store.delta_log_cap_override.store(1024, Ordering::Relaxed);
+    store.delta_log_cap_override.store(512, Ordering::Relaxed);
     store.invalidate_delta_log(&collection);
 
     let state = store.delta_state.lock().clone();
     let Err(error) = store.build_v1_pending_batch(&state, false) else {
-        panic!("the snapshot must not fit under a 1 KiB cap");
+        panic!("the snapshot must not fit under a 512-byte cap");
     };
     let detail = PackfileStorage::delta_batch_too_large(&error).expect("a too-large batch");
     let blob_len = store
@@ -3067,7 +3516,7 @@ fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
         .unwrap();
     let expected = delta::v1_empty_batch_len() + delta::v1_snapshot_frame_len(blob_len).unwrap();
     assert_eq!(detail.batch_bytes, expected);
-    assert_eq!(detail.cap, 1024);
+    assert_eq!(detail.cap, 512);
 
     // With the real cap the same pending snapshot builds.
     store.delta_log_cap_override.store(0, Ordering::Relaxed);
@@ -4055,6 +4504,257 @@ fn test_rebuild_index_triggers_on_full_table() {
 
     let got = store.get(&TEST_COLLECTION, &extra).unwrap().unwrap();
     assert_eq!(got.bytes, bytes::Bytes::from_static(b"y"));
+}
+
+#[test]
+fn full_scan_rebuild_keeps_latest_cross_shard_tombstone() {
+    let dir = test_dir("streaming_rebuild_latest_tombstone");
+    let collection = [0xA7; 16];
+    let victim = distinct_id(251);
+    {
+        let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 48 * 1024).unwrap();
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"old"))
+            .unwrap();
+        fill_incompressible(&store, &collection, 10_000, 120);
+        store
+            .put(&collection, &victim, &NodeData::from_slice(b"new"))
+            .unwrap();
+        fill_incompressible(&store, &collection, 20_000, 120);
+        assert!(store.remove(&collection, &victim).unwrap());
+        store.sync_all().unwrap();
+
+        let versions: Vec<_> = store
+            .scan_collection_records(&collection)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, id, _, _, _)| *id == victim)
+            .collect();
+        assert_eq!(versions.len(), 3, "old, overwrite, and tombstone frames");
+        assert_eq!(
+            versions
+                .iter()
+                .map(|record| record.0)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "each version should land in a different shard"
+        );
+    }
+
+    // Removing both derived index files forces the next open to rebuild from
+    // pack frames rather than trusting a checkpoint or shard-count sidecar.
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    fs::remove_file(PackfileStorage::shard_collections_path(&dir)).unwrap();
+    let rebuilt = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(rebuilt.open_timings().unwrap().path, OpenPath::FullScan);
+    assert!(
+        rebuilt.get(&collection, &victim).unwrap().is_none(),
+        "the newest tombstone must win over both older values"
+    );
+    assert!(
+        !rebuilt.remove(&collection, &victim).unwrap(),
+        "lookup_removed must report the key as already removed"
+    );
+    drop(rebuilt);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn slots_only_reopen_resolves_removed_state_from_the_frame() {
+    let dir = test_dir("slots_only_lookup_removed");
+    let collection = [0xA8; 16];
+    let id = distinct_id(252);
+    {
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(&collection, &id, &NodeData::from_slice(b"value"))
+            .unwrap();
+        assert!(store.remove(&collection, &id).unwrap());
+        store.sync_all().unwrap();
+    }
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let generation = reopened.generation(&collection).unwrap();
+    assert_eq!(
+        generation.index.lookup_removed(&id),
+        None,
+        "the slots-only index cannot prove identity before hydration"
+    );
+    assert_eq!(
+        reopened.durable_removed(&collection, &id).unwrap(),
+        Some(true),
+        "the storage fallback verifies the full key and removal bit in the frame header"
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).ok();
+}
+
+/// `durable_removed` resolves candidates from one generation, then pins the
+/// shards those candidates point at. If a refresh or repack swaps the
+/// generation in between, the pinned shards may be retired; the lookup must
+/// retry against the new generation instead of reporting a stale answer.
+#[test]
+fn durable_removed_retries_when_generation_swaps_before_pin() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let dir = test_dir("durable_removed_generation_retry");
+    let collection = [0xAA; 16];
+    let removed = distinct_id(0x71);
+    let live = distinct_id(0x72);
+    let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+    store
+        .put(&collection, &removed, &NodeData::from_slice(b"old"))
+        .unwrap();
+    assert!(store.remove(&collection, &removed).unwrap());
+    store
+        .put(&collection, &live, &NodeData::from_slice(b"live"))
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let swapped = Arc::new(AtomicBool::new(false));
+    let weak = Arc::downgrade(&store);
+    let hook = PackfileStorage::install_test_before_pin(Box::new({
+        let calls = Arc::clone(&calls);
+        let swapped = Arc::clone(&swapped);
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if !swapped.swap(true, Ordering::SeqCst) {
+                if let Some(store) = weak.upgrade() {
+                    store.refresh_collection(&collection).unwrap();
+                }
+            }
+        }
+    }));
+
+    assert_eq!(
+        store.durable_removed(&collection, &removed).unwrap(),
+        Some(true)
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "the lookup must retry after the generation swap"
+    );
+    assert_eq!(
+        store.durable_removed(&collection, &live).unwrap(),
+        Some(false)
+    );
+    drop(hook);
+    drop(store);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn collection_len_overlay_handles_slots_only_tombstone_put_and_remove() {
+    let dir = test_dir("collection_len_slots_only_overlay_tombstone");
+    let wal = dir.join("wal.bin");
+    let collection = [0xA9; 16];
+    let tombstoned = distinct_id(250);
+    let live = distinct_id(251);
+    {
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(&collection, &tombstoned, &NodeData::from_slice(b"old"))
+            .unwrap();
+        assert!(store.remove(&collection, &tombstoned).unwrap());
+        store
+            .put(&collection, &live, &NodeData::from_slice(b"live"))
+            .unwrap();
+        store.sync_all().unwrap();
+    }
+
+    let (mut journal, _) = Journal::open(&wal).unwrap();
+    journal
+        .append_group(&[JournalMutation::Put {
+            collection_id: collection,
+            node_id: tombstoned,
+            payload: b"resurrected".to_vec(),
+        }])
+        .unwrap();
+    let reader = PackfileStorage::open_read_only(dir.clone()).unwrap();
+    reader.enable_read_journal(&wal).unwrap();
+    assert_eq!(
+        reader.durable_removed(&collection, &tombstoned).unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        reader.generation(&collection).unwrap().index.live_count(),
+        1
+    );
+    assert_eq!(
+        reader
+            .get_read_committed(&collection, &[tombstoned])
+            .unwrap()[0]
+            .as_ref()
+            .map(|data| data.bytes.as_ref()),
+        Some(&b"resurrected"[..])
+    );
+    assert_eq!(reader.collection_len(&collection).unwrap(), Some(2));
+
+    journal
+        .append_group(&[JournalMutation::RemoveRecord {
+            collection_id: collection,
+            node_id: tombstoned,
+        }])
+        .unwrap();
+    assert_eq!(
+        reader.collection_len(&collection).unwrap(),
+        Some(1),
+        "overlay removal of an already-tombstoned durable key must not subtract twice"
+    );
+
+    drop(reader);
+    drop(journal);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn put_many_publishes_one_journal_group_for_the_whole_batch() {
+    // A batch is one atomic publication, not one journal group per record.
+    // This is the same visibility model DatabaseTransaction uses, and it keeps
+    // the WAL framing and version bookkeeping proportional to batches rather
+    // than records.
+    let dir = test_dir("put_many_one_wal_group");
+    let wal = dir.join("wal.bin");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.enable_journal(&wal).unwrap();
+
+    let entries: Vec<_> = (0..64u8)
+        .map(|byte| {
+            (
+                distinct_id(byte),
+                NodeData::new(bytes::Bytes::from(format!("entry-{byte}"))),
+            )
+        })
+        .collect();
+    store.put_many(&TEST_COLLECTION, &entries).unwrap();
+    store.flush_durable().unwrap();
+
+    let scan = crate::journal::Journal::scan_read_only(&wal).unwrap();
+    assert_eq!(
+        scan.groups.len(),
+        1,
+        "put_many must publish one journal group, got {}",
+        scan.groups.len()
+    );
+    assert_eq!(
+        scan.groups[0]
+            .last_lsn
+            .saturating_sub(scan.groups[0].first_lsn)
+            .saturating_add(1),
+        entries.len() as u64
+    );
+
+    for (id, data) in &entries {
+        assert_eq!(
+            store.get(&TEST_COLLECTION, id).unwrap().unwrap().bytes,
+            data.bytes
+        );
+    }
+
+    drop(store);
+    fs::remove_dir_all(dir).ok();
 }
 
 #[test]
@@ -6648,6 +7348,78 @@ fn test_collection_disk_bytes_track_overwrite_reopen_and_repack() {
 }
 
 #[test]
+fn physical_only_collection_bytes_survive_reopen_without_live_shard_membership() {
+    let dir = test_dir("physical_only_collection_bytes");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let target = distinct_id(0x41);
+    let neighbor = distinct_id(0x42);
+    store
+        .put(&TEST_COLLECTION, &target, &NodeData::from_slice(b"target"))
+        .unwrap();
+    store
+        .put(
+            &SECOND_COLLECTION,
+            &neighbor,
+            &NodeData::from_slice(b"neighbor"),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let source_pack = *store
+        .index_tables
+        .read()
+        .collection_shards
+        .get(&TEST_COLLECTION)
+        .and_then(|packs| packs.iter().next())
+        .expect("target collection has a source pack");
+    assert!(
+        store
+            .index_tables
+            .read()
+            .collection_shards
+            .get(&SECOND_COLLECTION)
+            .is_some_and(|packs| packs.contains(&source_pack)),
+        "neighbor shares the target's source pack"
+    );
+
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let persisted = read_persisted_shard_collections(&dir).unwrap();
+    assert!(persisted.records.iter().any(|record| {
+        record.pack_id == source_pack
+            && record.collection_id == TEST_COLLECTION
+            && record.count == 0
+            && record.disk_bytes > 0
+    }));
+
+    let physical_bytes = crate::packfile::layout::physical_layout(&dir)
+        .unwrap()
+        .collections[&TEST_COLLECTION]
+        .disk_bytes;
+    drop(store);
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .unwrap()
+            .get(&TEST_COLLECTION),
+        Some(&physical_bytes),
+        "physical totals include old frames retained in the shared source pack"
+    );
+    assert!(!reopened
+        .index_tables
+        .read()
+        .shard_collections
+        .get(&source_pack)
+        .is_some_and(|collections| collections.contains_key(&TEST_COLLECTION)));
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_collection_summaries_from_disk_capacity_matches_new_collection_floor() {
     // A one-node collection's live index starts at
     // `NEW_COLLECTION_INDEX_FLOOR` (64), never `LossyIndex::new`'s own
@@ -7366,6 +8138,48 @@ fn checkpoint_growth_recovers_metadata_bearing_frames() {
 /// commits both pools' published mutations in one durability barrier, and
 /// a later reopen replays only each pool's own tagged frames.
 #[test]
+fn paged_residency_rejects_wal_journaling_until_coverage_can_advance() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("paged_rejects_wal");
+    let store = PackfileStorage::open_with_residency(
+        dir.clone(),
+        packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    let per_pool = store.enable_journal(dir.join("per-pool.wal")).unwrap_err();
+    assert!(matches!(
+        per_pool,
+        StorageError::Unsupported(message) if message.contains("journal coverage")
+    ));
+
+    let sequence = Arc::new(AtomicU64::new(1));
+    let sequenced = store
+        .enable_journal_with_sequence(dir.join("sequenced.wal"), sequence)
+        .unwrap_err();
+    assert!(matches!(
+        sequenced,
+        StorageError::Unsupported(message) if message.contains("journal coverage")
+    ));
+
+    let shared_root = test_dir("paged_rejects_shared_wal");
+    let (journal, scan) = Journal::open_shared(shared_root.join("wal.bin")).unwrap();
+    let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+    let shared = store
+        .enable_shared_journal(coordinator, ShardType::EventDag)
+        .unwrap_err();
+    assert!(matches!(
+        shared,
+        StorageError::Unsupported(message) if message.contains("journal coverage")
+    ));
+    drop(store);
+    fs::remove_dir_all(dir).ok();
+    fs::remove_dir_all(shared_root).ok();
+}
+
+#[test]
 fn shared_journal_fences_all_pools_and_routes_replay_by_pool() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -7470,7 +8284,8 @@ fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
         let (journal, scan) = Journal::open_shared(&wal).unwrap();
         JournalCoordinator::new(journal, &scan)
     });
-    let a = PackfileStorage::open(test_dir("shared_reclaim_replay_a")).unwrap();
+    let a_dir = test_dir("shared_reclaim_replay_a");
+    let a = PackfileStorage::open(a_dir.clone()).unwrap();
     let b = PackfileStorage::open(test_dir("shared_reclaim_replay_b")).unwrap();
     a.enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
         .unwrap();
@@ -7497,9 +8312,10 @@ fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
     assert_eq!(coordinator.committed_lsn(), 3);
 
     // State checkpoints through its own frame; EventDag has not. Only the
-    // covered single-pool group may be reclaimed.
-    coordinator.report_pool_coverage(ShardType::State, 1);
-    assert!(coordinator.reclaim_shared().unwrap().is_some());
+    // covered single-pool group may be reclaimed. The checkpoint is real, so
+    // State's baseline covers the history the reclaim removes; coverage reported
+    // with no baseline behind it is what a reopen now refuses.
+    a.sync_all().unwrap();
     drop(a);
     drop(b);
     drop(coordinator);
@@ -7512,7 +8328,7 @@ fn shared_reclaim_of_a_single_pool_group_then_reopen_replays_the_rest() {
 
     // The reclaimed state frame is gone from the journal by design: its
     // pool's checkpoint owns it, so a state store has nothing to replay.
-    let fresh_a = PackfileStorage::open(test_dir("shared_reclaim_replay_fresh_a")).unwrap();
+    let fresh_a = PackfileStorage::open(a_dir).unwrap();
     fresh_a
         .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
         .unwrap();
@@ -7604,6 +8420,122 @@ fn shared_checkpoint_preserves_collection_versions_after_reclaim() {
         "the checkpoint restores an idle collection's logical version"
     );
     drop(reopened);
+}
+
+/// A delta coverage batch is enough to reclaim a shared segment: the stores
+/// keep a full checkpoint as their base, record later coverage and the complete
+/// version table in the log, and a reopen restores the exact clocks from it.
+/// The clocks include a deleted collection's delete LSN.
+#[test]
+fn delta_coverage_reclaim_restores_exact_collection_versions() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store("delta_versions_reclaim");
+    shared.coordinator.set_reclaim_trigger_len(1);
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    let checkpoints_after_first = shared.store.stats().checkpoint_writes;
+
+    // The second sync can continue the delta epoch, so it reclaims with a
+    // coverage batch instead of rewriting the checkpoint.
+    shared.put(&TEST_COLLECTION, 3..6);
+    shared.sync_and_reclaim();
+    assert!(
+        Journal::scan_read_only(&shared.wal)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "the delta coverage batch reclaimed the WAL group"
+    );
+    assert_eq!(
+        shared.store.stats().checkpoint_writes,
+        checkpoints_after_first,
+        "reclaim must not force another full checkpoint"
+    );
+    assert!(
+        shared.store.stats().delta_appends >= 1,
+        "the sync appended a coverage batch"
+    );
+    let live_version = shared
+        .coordinator
+        .collection_version(ShardType::State, &TEST_COLLECTION);
+    assert!(live_version > 0);
+
+    // A deletion advances the collection's clock without leaving a record in
+    // any pack, and the next coverage batch must carry it too.
+    shared.store.delete_collection(&TEST_COLLECTION).unwrap();
+    shared.sync_and_reclaim();
+    let deleted_version = shared
+        .coordinator
+        .collection_version(ShardType::State, &TEST_COLLECTION);
+    assert!(
+        deleted_version > live_version,
+        "the deletion must advance the clock"
+    );
+    let coverage = shared.store.durable_coverage();
+    let wal = fs::read(&shared.wal).unwrap();
+    let delta_dir = copy_store(&shared.store_dir, "delta_versions_reclaim_copy");
+    // A later full checkpoint must anchor the delta-carried clocks and retire
+    // the epoch; recovery then depends on the checkpoint alone.
+    shared.store.force_index_checkpoint().unwrap();
+    let checkpoints = crate::index::versions::read_versions(&PackfileStorage::index_versions_path(
+        &shared.store_dir,
+    ))
+    .expect("the handoff writes the versions file");
+    assert_eq!(checkpoints.covered_lsn, coverage);
+    assert_eq!(
+        checkpoints
+            .versions
+            .iter()
+            .find(|(id, _)| id == &TEST_COLLECTION)
+            .map(|(_, version)| *version),
+        Some(deleted_version),
+        "the checkpoint anchors the deleted collection's clock"
+    );
+    let checkpoint_dir = copy_store(&shared.store_dir, "delta_versions_reclaim_handoff");
+    assert!(
+        !fs::read_dir(&checkpoint_dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("index.delta.")),
+        "the full checkpoint retires the delta epoch"
+    );
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    for (dir, what) in [
+        (delta_dir, "the delta-carried table"),
+        (checkpoint_dir, "the checkpoint handoff"),
+    ] {
+        let wal_path = test_dir("delta_versions_reclaim_wal").join("shared.wal");
+        fs::write(&wal_path, &wal).unwrap();
+        let (journal, scan) = Journal::open_shared(&wal_path).unwrap();
+        let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+        let reopened = PackfileStorage::open(dir).unwrap();
+        reopened
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+            .unwrap();
+        assert_eq!(
+            recovered.collection_version(ShardType::State, &TEST_COLLECTION),
+            deleted_version,
+            "{what} restores the deleted collection's clock"
+        );
+        assert_eq!(
+            reopened.durable_coverage(),
+            coverage,
+            "{what} covers exactly the claimed LSN"
+        );
+        assert_eq!(
+            recovered.reclaimed_history_through(ShardType::State),
+            coverage,
+            "{what}: the mark matches the reclaimed coverage"
+        );
+    }
 }
 
 /// A shared segment may only be reclaimed up to the minimum durable
@@ -8012,6 +8944,56 @@ fn shared_wal_lock_is_exclusive() {
     );
 }
 
+/// Child-process half of `shared_wal_lock_is_exclusive_across_processes`.
+#[test]
+fn shared_wal_lock_child_cannot_acquire_held_lock() {
+    let Ok(root) = std::env::var("MTXDB_SHARED_WAL_LOCK_CHILD_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let result = crate::journal::SharedWalLock::acquire(&root);
+    match result {
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "child must fail with WouldBlock while the parent owns the root lock"
+        ),
+        Ok(_lock) => panic!("child acquired the root lock while the parent owns it"),
+    }
+    std::fs::write(root.join("child-checked-lock"), b"blocked").unwrap();
+}
+
+/// The OS-level root lock excludes a second writer process, not just another
+/// lock attempt in the same process.
+#[test]
+fn shared_wal_lock_is_exclusive_across_processes() {
+    let root = test_dir("shared_wal_lock_process_exclusive");
+    let _cleanup = RemoveDirOnDrop(root.clone());
+    let _layout = crate::layout::DatabaseLayout::open(root.clone()).unwrap();
+    let lock = crate::journal::SharedWalLock::acquire(&root).unwrap();
+    let output = std::process::Command::new(crate::io::test_binary_path())
+        .args([
+            "--exact",
+            "packfile::storage::tests::shared_wal_lock_child_cannot_acquire_held_lock",
+            "--test-threads=1",
+        ])
+        .env("MTXDB_SHARED_WAL_LOCK_CHILD_ROOT", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child lock assertion failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(root.join("child-checked-lock")).unwrap(),
+        b"blocked",
+        "the re-executed test must actually perform the lock assertion"
+    );
+    drop(lock);
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn packfile_storage_create_or_upsert_established_validated_contract() {
@@ -8132,7 +9114,9 @@ fn packfile_storage_create_or_upsert_established_validated_contract() {
         b"val2_updated"[..]
     );
 
-    // 6. Persistence across reopen
+    // 6. Persistence across reopen. A reopen observes only published packs, so
+    // the records must cross a durability barrier first.
+    store.sync_all().unwrap();
     drop(store);
     let reopened = PackfileStorage::open(dir).unwrap();
     assert_eq!(
@@ -8826,9 +9810,15 @@ fn the_one_pass_durable_state_matches_for_a_foreign_or_torn_log() {
         &log_path,
         true,
         checkpoint.fingerprint ^ 1,
-        &[delta::DeltaOperation::Coverage {
-            covered_lsn: u64::MAX,
-        }],
+        &[
+            delta::DeltaOperation::Versions {
+                covered_lsn: u64::MAX,
+                entries: Vec::new(),
+            },
+            delta::DeltaOperation::Coverage {
+                covered_lsn: u64::MAX,
+            },
+        ],
         0x99,
         false,
     )
@@ -8890,7 +9880,12 @@ fn logical_redo_replays_in_order_and_the_counter_resumes_above_the_log() {
     drop(store);
 
     let reopened = PackfileStorage::open(dir.clone()).unwrap();
-    assert_eq!(reopened.open_timings().unwrap().path, OpenPath::Checkpoint);
+    assert_eq!(
+        reopened.open_timings().unwrap().path,
+        OpenPath::Checkpoint,
+        "open timings: {:?}",
+        reopened.open_timings()
+    );
     assert_eq!(
         reopened
             .get(&collection, &batch_node(1))
@@ -9007,6 +10002,70 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
             6
         )
     );
+}
+
+/// A delta log holding an incremental frame stamped with a generation the
+/// collection does not have is stale: it is rejected by name and the open
+/// rescans without losing a record. Frames for a collection that was deleted
+/// in the same log are skipped rather than rejected.
+#[test]
+fn a_stale_incremental_frame_is_rejected_and_the_open_rescans() {
+    let dir = test_dir("stale_incremental_frame");
+    let collection = [0xDA; 16];
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(&collection, &batch_node(0), &NodeData::from_slice(b"base"))
+        .unwrap();
+    store.sync_all().unwrap();
+    for id in 1..=3 {
+        store
+            .put(&collection, &batch_node(id), &NodeData::from_slice(b"redo"))
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    let base = store.delta_state.lock().base_fingerprint.unwrap();
+    drop(store);
+
+    let path = PackfileStorage::delta_path(&dir, base);
+    let log = delta::read_delta_log(&path).unwrap();
+    let mut operations = log.operations;
+    operations.push(DeltaOperation::Incremental(
+        crate::index::format::DeltaFrame {
+            collection_id: collection,
+            bucket: 0,
+            generation: u64::MAX,
+            slot: 1,
+        },
+    ));
+    fs::remove_file(&path).unwrap();
+    delta::append_batch_with_durability(
+        &path,
+        true,
+        log.base_fingerprint,
+        &operations,
+        log.tail_fingerprint,
+        false,
+    )
+    .unwrap();
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    let timings = reopened.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert_eq!(
+        timings.checkpoint_reject,
+        Some(CheckpointReject::DeltaGenerationMismatch)
+    );
+    for id in 0..=3 {
+        assert!(
+            reopened
+                .get(&collection, &batch_node(id))
+                .unwrap()
+                .is_some(),
+            "record {id} survives the rescan"
+        );
+    }
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
 }
 
 /// A checkpoint whose bridging delta log has vanished — the state a store is
@@ -9238,12 +10297,25 @@ fn applying_redo_sets_is_idempotent_and_order_convergent() {
         });
     }
     let fresh = || LossyIndex::with_config(16, config);
-    let once = PackfileStorage::apply_redo_sets(fresh(), &records, &pack_lookup).unwrap();
-    let twice = PackfileStorage::apply_redo_sets(once.clone(), &records, &pack_lookup).unwrap();
+    let once =
+        PackfileStorage::apply_redo_sets(&[1; 16], fresh(), &records, &pack_lookup, |_, _| None)
+            .unwrap();
+    let twice =
+        PackfileStorage::apply_redo_sets(&[1; 16], once.clone(), &records, &pack_lookup, |_, _| {
+            None
+        })
+        .unwrap();
     let over_prefix = {
-        let prefix =
-            PackfileStorage::apply_redo_sets(fresh(), &records[..350], &pack_lookup).unwrap();
-        PackfileStorage::apply_redo_sets(prefix, &records, &pack_lookup).unwrap()
+        let prefix = PackfileStorage::apply_redo_sets(
+            &[1; 16],
+            fresh(),
+            &records[..350],
+            &pack_lookup,
+            |_, _| None,
+        )
+        .unwrap();
+        PackfileStorage::apply_redo_sets(&[1; 16], prefix, &records, &pack_lookup, |_, _| None)
+            .unwrap()
     };
     assert_eq!(once.len(), 300, "300 distinct identities");
     for candidate in [&twice, &over_prefix] {
@@ -9769,13 +10841,14 @@ fn changes_since_includes_removals_and_pages_across_groups() {
         collection_id: collection,
         node_id: victim,
     };
-    let removal_lsn = store
+    let published = store
         .publish_mutation(|| removal.clone())
         .unwrap()
         .expect("journal is enabled");
     store
-        .apply_transaction_mutation(&removal, removal_lsn)
+        .apply_transaction_mutation(&removal, published.last_lsn)
         .unwrap();
+    store.note_published_materialized(Some(published));
     store
         .put(
             &collection,
@@ -10880,87 +11953,6 @@ fn build_index_fails_closed_when_the_table_rejects_an_insert() {
     assert_eq!(index.len(), offsets.len());
 }
 
-#[test]
-fn init_collection_from_scan_fails_closed_when_the_table_rejects_an_insert() {
-    // `open` hardcodes the default index config, so the FullScan rebuild path
-    // can only be starved by calling `init_collection_from_scan` directly. Its
-    // table is sized at 2× the record count (floored at 64), so a 1% load
-    // factor makes the first insert fail; the rebuild must surface that as
-    // `Corrupt`, not publish an index silently missing the record — the exact
-    // gap that let the original large-index rescan truncate.
-    let dir = test_dir("init_scan_fails_closed");
-    let store = PackfileStorage::open(dir.clone()).unwrap();
-    store
-        .put(
-            &TEST_COLLECTION,
-            &distinct_id(1),
-            &NodeData::new(bytes::Bytes::from_static(b"scan-record")),
-        )
-        .unwrap();
-    store.sync().unwrap();
-
-    // Collect the real on-disk (slot, hash, offset) for the seeded record so
-    // the control path's disk-length pass has a true offset to read.
-    let mut records: Vec<ShardRecord> = Vec::new();
-    for entry in fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_none_or(|extension| extension != "pack") {
-            continue;
-        }
-        for (collection, hash, offset) in ShardPool::scan_shard(&path).unwrap() {
-            if collection == TEST_COLLECTION {
-                records.push((
-                    0,
-                    hash,
-                    offset,
-                    PackId([0u8; crate::packfile::PACK_ID_LEN]),
-                    false,
-                ));
-            }
-        }
-    }
-    assert_eq!(records.len(), 1, "the seeded record must be on disk");
-
-    let starved = crate::index::IndexConfig {
-        load_factor_percent: 1,
-        ..crate::index::IndexConfig::default()
-    };
-    let mut out = RoomScanOutput::default();
-    let error = PackfileStorage::init_collection_from_scan(
-        &TEST_COLLECTION,
-        &records,
-        &store.shards,
-        0,
-        starved,
-        &mut out,
-    )
-    .unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("index rebuild dropped") && message.contains("too full"),
-        "unexpected error: {message}"
-    );
-
-    // Control: the same records rebuild completely at the default load factor,
-    // and the scan output counts their on-disk bytes.
-    let mut out = RoomScanOutput::default();
-    PackfileStorage::init_collection_from_scan(
-        &TEST_COLLECTION,
-        &records,
-        &store.shards,
-        0,
-        crate::index::IndexConfig::default(),
-        &mut out,
-    )
-    .unwrap();
-    let bytes =
-        out.collection_disk_bytes[&PackId([0u8; crate::packfile::PACK_ID_LEN])][&TEST_COLLECTION];
-    assert!(
-        bytes > 0,
-        "the rebuild must account for the record's disk bytes"
-    );
-}
-
 // ---- Removal markers when runtime slot order disagrees with write order ----
 //
 // A live pool recycles shard slots, so after the allocator wraps a newer pack
@@ -11063,33 +12055,23 @@ fn marker_in_lower_slot(
 /// frame in the highest slot.
 #[test]
 fn open_time_rebuild_picks_the_marker_when_it_sits_in_a_lower_slot() {
-    let (dir, store, collection, victim, marker_slot, value_slot) =
+    let (dir, store, collection, victim, _marker_slot, _value_slot) =
         marker_in_lower_slot("lower_slot_rebuild", false);
-    let mut records: Vec<ShardRecord> = Vec::new();
-    records.extend(store.scan_collection_records(&collection).unwrap());
-    // The scan visits the lower slot (the marker) before the higher (the value).
-    let marker_pos = records
-        .iter()
-        .position(|(slot, hash, _, _, _)| *hash == victim && *slot == marker_slot)
-        .unwrap();
-    let value_pos = records
-        .iter()
-        .position(|(slot, hash, _, _, _)| *hash == victim && *slot == value_slot)
-        .unwrap();
-    assert!(marker_pos < value_pos, "the layout must be misordered");
-
-    let latest = PackfileStorage::latest_records_for_collection(&records, &store.shards).unwrap();
-    let chosen: Vec<_> = latest
-        .iter()
-        .filter(|(_, hash, _, _, _)| *hash == victim)
-        .collect();
-    assert_eq!(chosen.len(), 1, "one frame per key");
-    let (slot, _, offset, _, _) = *chosen[0];
-    assert!(
-        frame_is_removed(&store, slot, offset),
-        "the newest frame is the removal marker, whatever the slot order"
-    );
     drop(store);
+
+    // Remove persisted index state so open exercises the production streaming scan.
+    for entry in fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(crate::index::checkpoint::INDEX_CHECKPOINT_FILE)
+            || name.starts_with(INDEX_DELTA_FILE)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert!(reopened.get(&collection, &victim).unwrap().is_none());
+    drop(reopened);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -11136,6 +12118,7 @@ fn repack_scan_keeps_a_re_added_key_live_in_a_misordered_layout() {
 /// with the raw on-disk flags byte for every frame in a pack that mixes
 /// plain, compressed, metadata-bearing and removal-marker frames, under both
 /// checksum modes.
+#[cfg(feature = "zstd")]
 #[test]
 fn repack_scan_removal_flag_matches_a_direct_frame_read() {
     use std::io::{Read, Seek, SeekFrom};
@@ -11389,7 +12372,15 @@ fn copy_store(from: &std::path::Path, label: &str) -> PathBuf {
 }
 
 /// The file classes whose directory entry or contents move at a sync.
-const CRASH_CLASSES: [&str; 4] = ["wal.bin", "journal.lsn", "index.checkpoint", "index.delta."];
+/// `index.versions` is published with `index.checkpoint` under one directory
+/// barrier, so a crash can keep either, both or neither of the two renames.
+const CRASH_CLASSES: [&str; 5] = [
+    "wal.bin",
+    "journal.lsn",
+    "index.checkpoint",
+    "index.versions",
+    "index.delta.",
+];
 
 fn in_class(name: &str, class: &str) -> bool {
     if class.ends_with(['.', '_']) {
@@ -11399,13 +12390,32 @@ fn in_class(name: &str, class: &str) -> bool {
     }
 }
 
+/// The files in one crash class, name and bytes, for deciding whether reverting
+/// that class between two images can change anything.
+fn class_snapshot(dir: &std::path::Path, class: &str) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| in_class(name, class))
+        .map(|name| {
+            let bytes = fs::read(dir.join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 /// Power loss that keeps every fsynced byte but may lose any rename or file
 /// creation not yet made durable by a directory sync: after each acknowledged
-/// sync, every subset of {WAL, LSN sidecar, index checkpoint, delta log} is put
-/// back to the version from one sync earlier (or removed, if it did not exist),
+/// sync, every subset of {WAL, LSN sidecar, index checkpoint, versions file,
+/// delta log} is put back to the version from one sync earlier (or removed, if it did not exist),
 /// and the store must reopen and serve every acknowledged record. Combinations
 /// that need the WAL to be newer than the checkpoint side are listed apart:
-/// they are exactly what the checkpoint-before-WAL ordering rules out.
+/// they are exactly what the checkpoint-before-WAL ordering rules out. A class
+/// that is byte-identical in the two images is dropped from the subset, since
+/// reverting it cannot change the candidate; every distinct image is still
+/// tested.
 #[test]
 fn power_loss_images_lose_no_acknowledged_record() {
     let dir = test_dir("power_loss_live");
@@ -11430,7 +12440,23 @@ fn power_loss_images_lose_no_acknowledged_record() {
 
     let mut failures = Vec::new();
     for step in 1..images.len() {
-        for mask in 0_u8..16 {
+        // Reverting a class whose files are byte-identical in the two images
+        // cannot change the candidate, so only the classes that differ need a
+        // bit. This keeps the same exhaustive mask space while skipping the
+        // copies and reopens that would test identical bytes again.
+        let relevant: Vec<usize> = (0..CRASH_CLASSES.len())
+            .filter(|&bit| {
+                let class = CRASH_CLASSES[bit];
+                class_snapshot(&images[step], class) != class_snapshot(&images[step - 1], class)
+            })
+            .collect();
+        for subset in 0_u8..(1 << relevant.len()) {
+            let mut mask = 0_u8;
+            for (position, bit) in relevant.iter().enumerate() {
+                if subset & (1 << position) != 0 {
+                    mask |= 1 << bit;
+                }
+            }
             let candidate = copy_store(&images[step], "power_loss_try");
             for (bit, class) in CRASH_CLASSES.iter().enumerate() {
                 if mask & (1 << bit) == 0 {
@@ -11449,19 +12475,43 @@ fn power_loss_images_lose_no_acknowledged_record() {
                     }
                 }
             }
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let reopened = PackfileStorage::open(candidate.clone()).unwrap();
-                reopened.enable_journal(candidate.join("wal.bin")).unwrap();
-                reopened.replay_journal().unwrap();
-                (1..=u8::try_from(step).unwrap()).all(|index| {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<bool, String> {
+                    let reopened = PackfileStorage::open(candidate.clone())
+                        .map_err(|error| error.to_string())?;
                     reopened
-                        .get(&[0x4Du8; 16], &[index; 16])
-                        .unwrap()
-                        .map(|data| data.bytes.to_vec())
-                        == Some(vec![index; 16])
-                })
-            }));
-            if !matches!(outcome, Ok(true)) {
+                        .enable_journal(candidate.join("wal.bin"))
+                        .map_err(|error| error.to_string())?;
+                    reopened
+                        .replay_journal()
+                        .map_err(|error| error.to_string())?;
+                    Ok((1..=u8::try_from(step).unwrap()).all(|index| {
+                        reopened
+                            .get(&[0x4Du8; 16], &[index; 16])
+                            .unwrap()
+                            .map(|data| data.bytes.to_vec())
+                            == Some(vec![index; 16])
+                    }))
+                },
+            ));
+            // One state may refuse to open instead of serving the records: the
+            // checkpoint and the versions file both gone while `journal.lsn`
+            // still claims coverage, which only exists at the first checkpoint,
+            // where there is no earlier version of either to revert to. The
+            // publication order (checkpoint and versions made durable by one
+            // directory barrier, only then `journal.lsn`) never leaves it, and a
+            // store that cannot restore its collection versions must not open
+            // with an empty baseline. So the refusal must be that explicit
+            // guard, and only when neither baseline file is left; any other
+            // error, panic or lost record is a failure.
+            let refused_without_a_baseline = matches!(
+                &outcome,
+                Ok(Err(message))
+                    if message.contains("no readable version baseline")
+                        && !candidate.join("index.versions").exists()
+                        && !candidate.join("index.checkpoint").exists()
+            );
+            if !matches!(outcome, Ok(Ok(true))) && !refused_without_a_baseline {
                 let lost: Vec<&str> = CRASH_CLASSES
                     .iter()
                     .enumerate()
@@ -11484,6 +12534,40 @@ fn power_loss_images_lose_no_acknowledged_record() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// Parse every byte cut of the unacknowledged WAL tail in memory, as a file the
+/// scan can read: the tail's group may only appear whole, never half-applied.
+/// This is the part that needs every cut; real store reopens can then sample
+/// the interesting ones, because each pays a full copy and replay.
+fn assert_every_torn_wal_cut_parses(image: &std::path::Path, synced_wal: u64, full_wal: u64) {
+    let intact = Journal::scan_read_only(image.join("wal.bin")).unwrap();
+    assert_eq!(
+        intact.groups.len(),
+        1,
+        "reclaim left only the unacknowledged group"
+    );
+    let tail_lsn = intact.groups[0].last_lsn;
+    let wal_bytes = fs::read(image.join("wal.bin")).unwrap();
+    let scan_dir = test_dir("torn_tail_scan");
+    let scan_path = scan_dir.join("wal.bin");
+    for cut in synced_wal..=full_wal {
+        let mut torn = wal_bytes[..usize::try_from(cut).unwrap().min(wal_bytes.len())].to_vec();
+        torn.extend_from_slice(&[0xA5; 37]);
+        fs::write(&scan_path, &torn).unwrap();
+        let scan = Journal::scan_read_only(&scan_path).unwrap();
+        assert!(
+            scan.groups.len() <= 1,
+            "wal cut at {cut}: a torn tail surfaced as a group"
+        );
+        if let Some(group) = scan.groups.first() {
+            assert_eq!(
+                group.last_lsn, tail_lsn,
+                "wal cut at {cut}: a partial group surfaced"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&scan_dir);
 }
 
 /// Power loss in the middle of an unacknowledged write: the WAL and the delta
@@ -11538,7 +12622,22 @@ fn a_torn_unacknowledged_tail_never_costs_an_acknowledged_record() {
         }
     };
 
-    for cut in synced_wal..=full_wal {
+    // Exhaustively parse every byte cut; the real store reopens below sample
+    // the interesting ones, because each pays a full copy and replay.
+    assert_every_torn_wal_cut_parses(&image, synced_wal, full_wal);
+
+    let torn_span = full_wal.saturating_sub(synced_wal);
+    let offsets: std::collections::BTreeSet<u64> = [
+        synced_wal,
+        synced_wal.saturating_add(1),
+        synced_wal.saturating_add(torn_span / 2),
+        full_wal.saturating_sub(1),
+        full_wal,
+    ]
+    .into_iter()
+    .filter(|cut| (synced_wal..=full_wal).contains(cut))
+    .collect();
+    for cut in offsets {
         let candidate = copy_store(&image, "torn_tail_try");
         let bytes = fs::read(image.join("wal.bin")).unwrap();
         let mut torn = bytes[..usize::try_from(cut).unwrap().min(bytes.len())].to_vec();
@@ -11589,7 +12688,7 @@ fn one_pools_undurable_checkpoint_keeps_the_shared_wal_for_the_other_directory()
         .unwrap();
     let store_b = PackfileStorage::open(dir_b.clone()).unwrap();
     store_b
-        .enable_shared_journal(Arc::clone(&coordinator), ShardType::Edges)
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::ServerInfo)
         .unwrap();
     for (store, tag) in [(&store_a, 1_u8), (&store_b, 2_u8)] {
         store
@@ -11629,7 +12728,7 @@ fn one_pools_undurable_checkpoint_keeps_the_shared_wal_for_the_other_directory()
     });
     let reopened = PackfileStorage::open(image_b).unwrap();
     reopened
-        .enable_shared_journal(Arc::clone(&coordinator), ShardType::Edges)
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::ServerInfo)
         .unwrap();
     reopened.replay_journal().unwrap();
     assert_eq!(
@@ -11682,4 +12781,2979 @@ fn a_coverage_batch_syncs_the_directory_of_a_log_an_earlier_batch_created() {
         "claimed coverage without a durable log entry"
     );
     crate::shard::clear_directory_sync_failure(&dir);
+}
+
+/// Once a durable batch has synced the delta log's directory entry, later
+/// coverage batches append to the same name and must not pay for another
+/// parent sync. Injecting a directory-sync failure proves the skip: the claim
+/// still advances, which it could not do if a sync were still attempted.
+#[test]
+fn a_coverage_batch_skips_the_directory_sync_once_the_log_entry_is_durable() {
+    let store_dir = test_dir("delta_dirsync_once_store");
+    // Keep the WAL outside the store directory: a reclaim rewrites the WAL and
+    // syncs its own parent, which must not be confused with the log's entry.
+    let wal = test_dir("delta_dirsync_once_wal").join("wal.bin");
+    let writer = PackfileStorage::open(store_dir.clone()).unwrap();
+    writer.enable_journal(&wal).unwrap();
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+    let put = |i: u8| {
+        writer
+            .put(
+                &[0x4Eu8; 16],
+                &[i; 16],
+                &NodeData::new(bytes::Bytes::from(vec![i; 16])),
+            )
+            .unwrap();
+    };
+    // The first sync has no checkpoint base, so it rewrites one and rotates
+    // onto a fresh delta epoch; the second writes the epoch's first durable
+    // coverage batch and therefore syncs its directory entry.
+    put(1);
+    writer.sync().unwrap();
+    put(2);
+    writer.sync().unwrap();
+    let before = writer.durable_coverage();
+    let appends = writer.stats().delta_appends;
+    assert!(before > 0, "the first durable coverage batch reported");
+
+    crate::shard::fail_directory_sync_after(&store_dir, 0);
+    put(3);
+    writer
+        .sync()
+        .expect("the durable directory entry needs no second sync");
+    assert!(
+        writer.durable_coverage() > before,
+        "the coverage batch advanced without a directory sync"
+    );
+    assert!(
+        writer.stats().delta_appends > appends,
+        "the advancing claim came from a delta coverage batch, not a checkpoint"
+    );
+    crate::shard::clear_directory_sync_failure(&store_dir);
+}
+
+#[test]
+fn slots_only_reopen_counts_identity_reads_for_a_tag_collision() {
+    let dir = test_dir("slots_only_identity_reads");
+    let collection = [0x7Au8; 16];
+
+    // Equal bucket bytes (0..8) and equal tag bytes (8..12): the lossy index
+    // cannot tell these two apart without reading the frame header. Only the
+    // bytes it does not inspect (12..16, plus the tail it does) differ.
+    let mut first = [0u8; 16];
+    first[..8].copy_from_slice(&[0x11; 8]);
+    first[8..12].copy_from_slice(&[0x22; 4]);
+    first[12..].copy_from_slice(&[0x33; 4]);
+    let mut second = first;
+    second[12..].copy_from_slice(&[0x44; 4]);
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.force_index_checkpoint().unwrap();
+    drop(store);
+
+    // A checkpoint contains the collection's persisted index slots.
+    let checkpoint =
+        crate::index::checkpoint::read_checkpoint(&PackfileStorage::index_checkpoint_path(&dir))
+            .expect("forced checkpoint is readable");
+    assert!(
+        checkpoint
+            .collections
+            .iter()
+            .any(|loaded| loaded.collection_id == collection),
+        "the forced checkpoint must contain this collection"
+    );
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        store.stats().index_identity_reads,
+        0,
+        "opening does not read identities"
+    );
+
+    store
+        .put(
+            &collection,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.stats().index_identity_reads,
+        1,
+        "a same-tag probe against a slots-only index must hydrate from the frame"
+    );
+    assert_eq!(
+        store
+            .get(&collection, &first)
+            .unwrap()
+            .map(|node| node.bytes),
+        Some(bytes::Bytes::from_static(b"first")),
+        "the colliding predecessor must still resolve"
+    );
+    assert_eq!(
+        store
+            .get(&collection, &second)
+            .unwrap()
+            .map(|node| node.bytes),
+        Some(bytes::Bytes::from_static(b"second"))
+    );
+    drop(store);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn slots_only_delta_snapshot_is_short_and_replays() {
+    let dir = test_dir("slots_only_delta_snapshot");
+    let collection = [0x6Du8; 16];
+    let ids: Vec<[u8; 16]> = (0..200u8).map(distinct_id).collect();
+    let entries: Vec<([u8; 16], NodeData)> = ids
+        .iter()
+        .map(|id| (*id, NodeData::from_slice(b"payload")))
+        .collect();
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store.put_many(&collection, &entries).unwrap();
+    // Baseline slots-only checkpoint gives the delta log a continuable base.
+    store.sync_all().unwrap();
+
+    // Promote the collection to a whole-index snapshot in the delta log.
+    store.invalidate_delta_log(&collection);
+    // A write marks the checkpoint dirty so the next sync takes the delta
+    // path; the snapshot serialized at sync time includes this record.
+    let extra = distinct_id(0xFE);
+    store
+        .put(
+            &collection,
+            &extra,
+            &NodeData::new(bytes::Bytes::from_static(b"extra")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    let (len, _memory, capacity) = store
+        .collection_index_info(&collection)
+        .expect("collection");
+    assert_eq!(len, ids.len() + 1);
+    let capacity_bytes = u64::from(capacity);
+    let short_blob = 8 + capacity_bytes * 8;
+    let full_blob = 8 + capacity_bytes * 24;
+    let delta_bytes: u64 = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(crate::index::delta::INDEX_DELTA_FILE)
+        })
+        .map(|entry| entry.metadata().map_or(0, |m| m.len()))
+        .sum();
+    assert!(
+        delta_bytes > short_blob,
+        "the batch must carry the snapshot: {delta_bytes} bytes"
+    );
+    assert!(
+        delta_bytes < full_blob,
+        "the snapshot must use the short form: {delta_bytes} bytes, full form is {full_blob}"
+    );
+    drop(store);
+
+    // Replay must accept the short snapshot and keep every record.
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    for id in ids.iter().chain(std::iter::once(&extra)) {
+        assert!(
+            store.get(&collection, id).unwrap().is_some(),
+            "replayed snapshot lost a record"
+        );
+    }
+    assert_eq!(
+        store.stats().index_identity_reads,
+        0,
+        "opening must not read identities"
+    );
+
+    // The replayed collection is slots-only, so an overwrite hydrates from the
+    // frame exactly as a short checkpoint does.
+    let before = store.stats().index_identity_reads;
+    store
+        .put(
+            &collection,
+            &ids[0],
+            &NodeData::new(bytes::Bytes::from_static(b"again")),
+        )
+        .unwrap();
+    assert_eq!(
+        store.stats().index_identity_reads,
+        before + 1,
+        "a replayed slots-only snapshot must hydrate on the first overwrite"
+    );
+    drop(store);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sealing_a_pack_writes_a_sidecar_and_open_skips_recovery() {
+    let dir = test_dir("packidx_seal");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAA;
+        let payload_byte = u8::try_from(index).expect("index is less than 200");
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[payload_byte; 32]),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    let (sidecars, packs) = fs::read_dir(&dir).unwrap().filter_map(Result::ok).fold(
+        (0_usize, 0_usize),
+        |(sidecars, packs), entry| {
+            let path = entry.path();
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("idx") => (sidecars + 1, packs),
+                Some("pack") => (sidecars, packs + 1),
+                _ => (sidecars, packs),
+            }
+        },
+    );
+    assert!(sidecars > 0, "rotation seals at least one pack index");
+    assert!(packs > sidecars, "the active pack is not sealed yet");
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        reopened.open_timings().unwrap().packfile_recovery_calls,
+        u64::try_from(packs - sidecars).unwrap(),
+        "only the active pack pays the recovery scan"
+    );
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAA;
+        assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+    let expected_disk_bytes = crate::packfile::layout::physical_layout(&dir)
+        .unwrap()
+        .collections
+        .get(&TEST_COLLECTION)
+        .expect("test collection is present in physical layout")
+        .disk_bytes;
+    assert_eq!(
+        PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .unwrap()
+            .get(&TEST_COLLECTION)
+            .copied(),
+        Some(expected_disk_bytes),
+        "reopened sidecar accounting matches physical pack bytes"
+    );
+    let rebuilt = reopened.rebuild_index(&TEST_COLLECTION).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAA;
+        assert!(rebuilt.lookup(&id).is_some());
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resident_checkpoint_open_releases_unconsumed_sealed_sidecars() {
+    let dir = test_dir("resident_checkpoint_releases_sidecars");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAB;
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[u8::try_from(index).unwrap(); 32]),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    let reopened = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    assert_eq!(reopened.open_timings().unwrap().path, OpenPath::Checkpoint);
+    let sealed: Vec<_> = reopened
+        .shards
+        .all_shards()
+        .into_iter()
+        .filter(|(_, shard)| shard.sealed.load(Ordering::Acquire))
+        .collect();
+    assert!(!sealed.is_empty(), "fixture must contain sealed packs");
+    assert!(
+        sealed
+            .iter()
+            .all(|(_, shard)| shard.sealed_index.lock().is_none()),
+        "checkpoint opens must release sidecar images not consumed by a scan"
+    );
+    drop(reopened);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn full_scan_registers_sealed_locators_for_collection() {
+    let dir = test_dir("packidx_sealed_locators");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    let mut ids = Vec::new();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAC;
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[u8::try_from(index % 256).unwrap(); 32]),
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    let _ = fs::remove_file(dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE));
+    let reopened = PackfileStorage::open_with_policies(
+        dir.clone(),
+        true,
+        crate::packfile::ChecksumPolicy::Disabled,
+    )
+    .unwrap();
+    assert!(reopened.open_timings().unwrap().pack_index_sidecars > 0);
+
+    let generation = reopened.generation(&TEST_COLLECTION).expect("generation");
+    assert!(
+        !generation.sealed.is_empty(),
+        "sealed sidecars must be registered per collection"
+    );
+    assert!(generation.sealed.mapped_bytes() > 0);
+    let sealed = ids
+        .iter()
+        .filter(|id| {
+            generation
+                .sealed
+                .lookup(&TEST_COLLECTION, id)
+                .unwrap()
+                .is_some()
+        })
+        .count();
+    assert!(
+        sealed > 0,
+        "records from packs sealed before this open must have sealed locators"
+    );
+    assert!(
+        sealed < ids.len(),
+        "the current unsealed pack's records must stay resident"
+    );
+    // This slice keeps the resident index complete; the sealed set is a
+    // verified fallback, not yet the only locator source.
+    for id in &ids {
+        assert_ne!(
+            generation.candidates(&TEST_COLLECTION, id).unwrap(),
+            Vec::<(u16, u64)>::new(),
+            "every record should have a resident or sealed locator"
+        );
+    }
+    drop(generation);
+
+    for id in &ids {
+        assert!(reopened.get(&TEST_COLLECTION, id).unwrap().is_some());
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn full_scan_uses_sealed_sidecars_instead_of_raw_frames() {
+    let dir = test_dir("packidx_full_scan");
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAB;
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::from_slice(&[u8::try_from(index % 256).unwrap(); 32]),
+            )
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    // Remove the checkpoint so the next open takes the full-scan path. The
+    // sealed sidecars must still serve the indexes.
+    let _ = fs::remove_file(dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE));
+    let reopened = PackfileStorage::open_with_policies(
+        dir.clone(),
+        true,
+        crate::packfile::ChecksumPolicy::Disabled,
+    )
+    .unwrap();
+    let timings = reopened.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert!(
+        timings.pack_index_sidecars > 0,
+        "the full scan ingested at least one sealed sidecar"
+    );
+    for index in 0..200u32 {
+        let mut id = [0_u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[15] = 0xAB;
+        assert!(reopened.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+    let expected_disk_bytes = crate::packfile::layout::physical_layout(&dir)
+        .unwrap()
+        .collections
+        .get(&TEST_COLLECTION)
+        .map(|collection| collection.disk_bytes);
+    assert_eq!(
+        PackfileStorage::collection_disk_bytes_from_disk(&dir)
+            .unwrap()
+            .get(&TEST_COLLECTION)
+            .copied(),
+        expected_disk_bytes,
+        "full-scan sidecar accounting matches physical pack bytes"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Write enough small records to rotate several sealed packs under a default
+/// (Full-checksum) writer, then leave the store closed.
+fn paged_fixture(dir: &std::path::Path) -> Vec<[u8; 16]> {
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), 8192).unwrap();
+    let mut ids = Vec::new();
+    for index in 0..200u8 {
+        let id = distinct_id(index);
+        store
+            .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&[index; 32]))
+            .unwrap();
+        ids.push(id);
+    }
+    store.sync_all().unwrap();
+    ids
+}
+
+fn paged_open(dir: &std::path::Path) -> PackfileStorage {
+    PackfileStorage::open_with_max_shard_bytes_and_residency(
+        dir.to_path_buf(),
+        8192,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap()
+}
+
+/// A collection version is durable in the checkpoint (or the WAL groups the
+/// checkpoint has not reclaimed), not in the sealed packs' frames. A paged
+/// open deletes the checkpoint, so a version that only lived there must not
+/// come back as zero after the WAL has been reclaimed.
+#[test]
+#[ignore = "Paged + shared WAL is refused until a Paged sync can advance coverage"]
+fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("paged_version_wal");
+    let store_dir = test_dir("paged_version_store");
+    let wal = wal_dir.join("shared.wal");
+    let probe = distinct_id(255);
+
+    let (version_before, coverage_before) = {
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let store =
+            PackfileStorage::open_with_max_shard_bytes(store_dir.clone(), 48 * 1024).unwrap();
+        store
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        fill_incompressible(&store, &TEST_COLLECTION, 10_000, 120);
+        coordinator.sync().unwrap();
+        store.sync_all().unwrap();
+        // A full checkpoint is what advances coverage and lets the journal
+        // drop the groups; a delta append would leave them for replay.
+        store.force_index_checkpoint().unwrap();
+        assert_eq!(
+            Journal::scan_read_only(&wal).unwrap().groups.len(),
+            0,
+            "the checkpoint must cover and reclaim every WAL group"
+        );
+        let (_, version) = store
+            .get_with_collection_version(&TEST_COLLECTION, &[probe])
+            .unwrap();
+        assert!(version > 0, "the writer must observe its own version");
+        let coverage = store.durable_coverage();
+        assert!(
+            coverage >= version,
+            "coverage {coverage} must include the version {version} it claims"
+        );
+        (version, coverage)
+    };
+
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        store_dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    let (_, version_after) = reopened
+        .get_with_collection_version(&TEST_COLLECTION, &[probe])
+        .unwrap();
+    assert!(
+        version_after >= version_before,
+        "a paged reopen lowered the collection version: before={version_before}, after={version_after}"
+    );
+    assert_eq!(
+        reopened.durable_coverage(),
+        coverage_before,
+        "the versions file must report the coverage it restored"
+    );
+    drop(reopened);
+    drop(coordinator);
+    fs::remove_dir_all(&wal_dir).ok();
+    fs::remove_dir_all(&store_dir).ok();
+}
+
+/// The coverage cap applies whenever a valid versions file exists, in either
+/// mode. A Resident checkpoint therefore has to refresh that file every time
+/// it writes `journal.lsn`, or a store carrying a stale versions file (from an
+/// older build or a Paged session) would keep a stale cap and retain WAL it no
+/// longer needs.
+#[test]
+fn resident_checkpoint_refreshes_a_stale_versions_file() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("versions_resident_refresh_wal");
+    let store_dir = test_dir("versions_resident_refresh_store");
+    let wal = wal_dir.join("shared.wal");
+
+    // Seed the stale versions file directly: Paged journaling is refused, but
+    // a versions file left by an older build (or a Paged store that never
+    // checkpointed) must still not cap a later Resident checkpoint.
+    fs::create_dir_all(&store_dir).unwrap();
+    crate::index::versions::write_versions(
+        &PackfileStorage::index_versions_path(&store_dir),
+        &[],
+        0,
+    )
+    .unwrap();
+    let stale =
+        crate::index::versions::read_coverage(&PackfileStorage::index_versions_path(&store_dir))
+            .expect("the seeded versions file must be readable");
+    assert_eq!(stale, 0, "the seeded coverage is stale");
+
+    let expected = {
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let store =
+            PackfileStorage::open_with_max_shard_bytes(store_dir.clone(), 48 * 1024).unwrap();
+        store
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &distinct_id(2),
+                &NodeData::from_slice(b"resident"),
+            )
+            .unwrap();
+        coordinator.sync().unwrap();
+        store.sync_all().unwrap();
+        store.force_index_checkpoint().unwrap();
+        let expected = store.durable_coverage();
+        assert!(expected > stale, "the checkpoint must advance coverage");
+        let published = crate::index::versions::read_coverage(
+            &PackfileStorage::index_versions_path(&store_dir),
+        )
+        .expect("the Resident checkpoint must refresh index.versions");
+        assert_eq!(
+            published, expected,
+            "index.versions must carry the coverage journal.lsn was written with"
+        );
+        expected
+    };
+
+    let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        store_dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.durable_coverage(),
+        expected,
+        "a stale versions file capped coverage below the Resident checkpoint"
+    );
+    drop(reopened);
+    fs::remove_dir_all(&wal_dir).ok();
+    fs::remove_dir_all(&store_dir).ok();
+}
+
+/// A `journal.lsn` ahead of the versions file is a leftover, not a coverage
+/// claim: the versions file is synced first, so a larger value must not let a
+/// paged reopen (or a later reclaim) move past the versions it can restore.
+#[test]
+fn paged_coverage_is_capped_by_the_versions_file() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("versions_cap_wal");
+    let store_dir = test_dir("versions_cap_store");
+    let wal = wal_dir.join("shared.wal");
+    let probe = distinct_id(255);
+
+    let (version, versions_coverage) = {
+        let coordinator = Arc::new({
+            let (journal, scan) = Journal::open_shared(&wal).unwrap();
+            JournalCoordinator::new(journal, &scan)
+        });
+        let store =
+            PackfileStorage::open_with_max_shard_bytes(store_dir.clone(), 48 * 1024).unwrap();
+        store
+            .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+            .unwrap();
+        fill_incompressible(&store, &TEST_COLLECTION, 10_000, 120);
+        coordinator.sync().unwrap();
+        store.sync_all().unwrap();
+        store.force_index_checkpoint().unwrap();
+        assert_eq!(
+            Journal::scan_read_only(&wal).unwrap().groups.len(),
+            0,
+            "the checkpoint must reclaim the WAL before the cap matters"
+        );
+        let coverage = crate::index::versions::read_coverage(
+            &PackfileStorage::index_versions_path(&store_dir),
+        )
+        .expect("the checkpoint tail must publish index.versions");
+        let (_, version) = store
+            .get_with_collection_version(&TEST_COLLECTION, &[probe])
+            .unwrap();
+        assert!(coverage >= version);
+        (version, coverage)
+    };
+
+    fs::write(
+        PackfileStorage::journal_lsn_path(&store_dir),
+        (versions_coverage + 1_000_000).to_le_bytes(),
+    )
+    .unwrap();
+
+    // Paged journaling is refused, so read the cap from the open state
+    // instead of attaching a coordinator.
+    let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        store_dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    let coverage = reopened.durable_coverage();
+    assert!(
+        coverage <= versions_coverage,
+        "journal.lsn overclaimed coverage: versions={versions_coverage}, reported={coverage}"
+    );
+    assert!(coverage >= version);
+    drop(reopened);
+    fs::remove_dir_all(&wal_dir).ok();
+    fs::remove_dir_all(&store_dir).ok();
+}
+
+#[cfg(feature = "multi-reader")]
+/// Child half of [`a_second_process_reads_a_committed_record_before_its_pack_is_published`].
+///
+/// Opens the writer's store read-only and reads through the shared-WAL
+/// read-committed overlay. It must observe the committed record even though the
+/// writer's pack is still staged and no canonical pack exists yet.
+#[test]
+fn second_process_wal_reader_child() {
+    use crate::layout::ShardType;
+
+    let Ok(root) = std::env::var("MTXDB_STAGED_READER_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let reader = PackfileStorage::open_read_committed_shared(
+        root.join("state"),
+        root.join("shared.wal"),
+        ShardType::State,
+    )
+    .unwrap();
+    let got = reader
+        .get_read_committed(&TEST_COLLECTION, &[distinct_id(42)])
+        .unwrap();
+    let got = got[0]
+        .as_ref()
+        .expect("a committed record must be visible through the WAL overlay");
+    assert_eq!(got.bytes.as_ref(), b"staged-visible");
+    std::fs::write(root.join("child-read"), b"visible").unwrap();
+}
+
+#[cfg(feature = "multi-reader")]
+/// A real second process sees a committed record through the shared-WAL overlay
+/// while the writer's pack is still staged, then the record and its collection
+/// version survive publication and WAL reclaim.
+#[test]
+fn a_second_process_reads_a_committed_record_before_its_pack_is_published() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let root = test_dir("staged_second_process_reader");
+    let wal = root.join("shared.wal");
+    let store_dir = root.join("state");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(42),
+            &NodeData::new(bytes::Bytes::from_static(b"staged-visible")),
+        )
+        .unwrap();
+    // Only the WAL group is durable; the first pack has no canonical name.
+    coordinator.sync().unwrap();
+    let canonical_packs = fs::read_dir(&store_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .count();
+    assert_eq!(canonical_packs, 0, "the pack must still be staged");
+    let expected_version = coordinator.collection_version(ShardType::State, &TEST_COLLECTION);
+
+    let output = std::process::Command::new(crate::io::test_binary_path())
+        .args([
+            "--exact",
+            "packfile::storage::tests::second_process_wal_reader_child",
+            "--test-threads=1",
+        ])
+        .env("MTXDB_STAGED_READER_ROOT", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "second-process reader failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(root.join("child-read")).unwrap(),
+        b"visible",
+        "the child must actually perform the overlay read"
+    );
+
+    // Publish the pack, then checkpoint so coverage reclaims the WAL group.
+    store.sync_all().unwrap();
+    drop(store);
+    drop(coordinator);
+    let (journal, scan) = Journal::open_shared(&wal).unwrap();
+    assert!(
+        scan.groups.is_empty(),
+        "the checkpoint must reclaim the WAL group"
+    );
+    let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+    let reopened = PackfileStorage::open(store_dir.clone()).unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+        .unwrap();
+    let got = reopened
+        .get(&TEST_COLLECTION, &distinct_id(42))
+        .unwrap()
+        .expect("the published pack serves the record without the WAL");
+    assert_eq!(got.bytes.as_ref(), b"staged-visible");
+    assert_eq!(
+        recovered.collection_version(ShardType::State, &TEST_COLLECTION),
+        expected_version,
+        "the exact collection version survives reclaim"
+    );
+}
+
+#[test]
+fn a_failed_publication_does_not_advance_coverage_until_retry() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let root = test_dir("failed_publication_coverage");
+    let wal = root.join("shared.wal");
+    let store_dir = root.join("state");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(7),
+            &NodeData::new(bytes::Bytes::from_static(b"owed-publication")),
+        )
+        .unwrap();
+    // The WAL group is acknowledged, but the pack is still staged.
+    coordinator.sync().unwrap();
+    assert_eq!(store.durable_coverage(), 0);
+
+    // Fail the directory barrier that completes publication. The checkpoint
+    // may report the failure best-effort, but no coverage may be claimed from
+    // the unpublished name.
+    crate::shard::fail_directory_sync_after(&store_dir, 0);
+    store
+        .sync_all()
+        .expect("checkpoint persistence is best-effort; the WAL still holds the group");
+    assert_eq!(
+        store.durable_coverage(),
+        0,
+        "no coverage may advance while publication is incomplete"
+    );
+
+    crate::shard::clear_directory_sync_failure(&store_dir);
+    store.sync_all().unwrap();
+    assert!(
+        store.durable_coverage() > 0,
+        "the retry publishes the pack and records its coverage"
+    );
+    drop(store);
+    drop(coordinator);
+
+    let (_, scan) = Journal::open_shared(&wal).unwrap();
+    assert!(
+        scan.groups.is_empty(),
+        "withheld coverage must keep the group; the retry then reclaims it"
+    );
+}
+
+/// Child half of [`versions_fsync_precedes_wal_reclaim_crash_safe`]: write,
+/// commit the WAL, then force a checkpoint and die after the versions fsync but
+/// before `journal.lsn` and reclaim.
+#[test]
+fn versions_crash_child() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let Ok(root) = std::env::var("MTXDB_VERSIONS_CRASH_DIR") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let wal = root.join("shared.wal");
+    let store_dir = root.join("store");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open_with_max_shard_bytes(store_dir, 48 * 1024).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    fill_incompressible(&store, &TEST_COLLECTION, 10_000, 120);
+    coordinator.sync().unwrap();
+    let (_, version) = store
+        .get_with_collection_version(&TEST_COLLECTION, &[distinct_id(255)])
+        .unwrap();
+    let coverage = coordinator.committed_lsn_for_pool(ShardType::State);
+    std::fs::write(root.join("expected.txt"), format!("{version} {coverage}")).unwrap();
+    // The crash point fires inside the checkpoint tail.
+    store.force_index_checkpoint().unwrap();
+    unreachable!("the child must exit at the versions crash point");
+}
+
+/// A crash between the versions fsync and the coverage claim leaves the
+/// checkpoint unreclaimed and `journal.lsn` unwritten. A paged reopen retires
+/// the checkpoint, so only `index.versions` can restore the version and
+/// coverage.
+#[test]
+#[ignore = "Paged + shared WAL is refused until a Paged sync can advance coverage"]
+fn versions_fsync_precedes_wal_reclaim_crash_safe() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+    use std::process::Command;
+
+    let root = test_dir("versions_crash");
+    fs::create_dir_all(&root).unwrap();
+    let output = Command::new(crate::io::test_binary_path())
+        .args([
+            "--exact",
+            "packfile::storage::tests::versions_crash_child",
+            "--test-threads=1",
+        ])
+        .env("MTXDB_VERSIONS_CRASH_DIR", &root)
+        .env("MTXDB_CRASH_AT", "after-versions-fsync")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(super::VERSIONS_CRASH_EXIT_CODE),
+        "child did not stop at the crash point\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let expected = fs::read_to_string(root.join("expected.txt")).unwrap();
+    let mut fields = expected.split_whitespace();
+    let version_before: u64 = fields.next().unwrap().parse().unwrap();
+    let coverage_before: u64 = fields.next().unwrap().parse().unwrap();
+    assert!(coverage_before >= version_before);
+
+    let wal = root.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        root.join("store"),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    let (_, version_after) = reopened
+        .get_with_collection_version(&TEST_COLLECTION, &[distinct_id(255)])
+        .unwrap();
+    assert!(
+        version_after >= version_before,
+        "version went backwards after the crash: before={version_before}, after={version_after}"
+    );
+    assert_eq!(
+        reopened.durable_coverage(),
+        coverage_before,
+        "coverage must come from index.versions when journal.lsn was never written"
+    );
+    drop(reopened);
+    drop(coordinator);
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn paged_full_scan_uses_sidecars_under_full_checksums() {
+    let dir = test_dir("paged_full_scan_full_checksums");
+    let ids = paged_fixture(&dir);
+    // Force the scan path: the writer's checkpoint is complete and a paged
+    // open deliberately rebuilds rather than materialize it.
+    let _ = fs::remove_file(dir.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE));
+
+    let store = paged_open(&dir);
+    let timings = store.open_timings().unwrap();
+    assert_eq!(timings.path, OpenPath::FullScan);
+    assert!(
+        timings.pack_index_sidecars > 0,
+        "paged mode must read sidecars even under Full checksums"
+    );
+    {
+        let generation = store.generation(&TEST_COLLECTION).expect("generation");
+        assert!(!generation.sealed.is_empty());
+        let sealed = usize::try_from(
+            generation
+                .sealed
+                .entry_count_in_collection(&TEST_COLLECTION),
+        )
+        .unwrap();
+        assert!(sealed > 0, "sealed records must be sidecar-served");
+        assert_eq!(
+            generation.index.len() + sealed,
+            ids.len(),
+            "the resident tail plus sealed sidecars must account for every record once"
+        );
+        assert!(
+            generation.index.len() < ids.len(),
+            "paged resident table must not hold sealed locators"
+        );
+    }
+    let summary = store
+        .collection_summaries()
+        .into_iter()
+        .find(|(id, _, _, _)| *id == TEST_COLLECTION)
+        .expect("collection summary");
+    assert_eq!(summary.1, ids.len());
+    let (entries, _, _, _) = store
+        .collection_index_residency(&TEST_COLLECTION)
+        .expect("residency");
+    assert_eq!(entries, ids.len());
+    assert_eq!(
+        store.collection_len(&TEST_COLLECTION).unwrap(),
+        Some(ids.len()),
+        "a paged length must include sealed live records"
+    );
+
+    for id in &ids {
+        assert!(
+            store.get(&TEST_COLLECTION, id).unwrap().is_some(),
+            "sealed record must resolve from its sidecar"
+        );
+    }
+    assert!(store.remove(&TEST_COLLECTION, &ids[0]).unwrap());
+    assert_eq!(
+        store.collection_len(&TEST_COLLECTION).unwrap(),
+        Some(ids.len() - 1),
+        "a resident removal must shadow the sealed live version"
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resident_to_paged_writes_then_resident_sees_every_record() {
+    let dir = test_dir("paged_cross_mode");
+    let checkpoint = PackfileStorage::index_checkpoint_path(&dir);
+    let resident = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    let mut ids = Vec::new();
+    for index in 0..100u8 {
+        let id = distinct_id(index);
+        resident
+            .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&[index; 32]))
+            .unwrap();
+        ids.push(id);
+    }
+    resident.sync_all().unwrap();
+    drop(resident);
+    assert!(checkpoint.exists(), "resident sync writes a checkpoint");
+
+    // A paged writer removes the resident checkpoint before its first write,
+    // and publishes neither a checkpoint nor a delta of its own.
+    let paged = paged_open(&dir);
+    assert!(
+        !checkpoint.exists(),
+        "paged open must invalidate a leftover resident checkpoint"
+    );
+    for index in 100..150u8 {
+        let id = distinct_id(index);
+        paged
+            .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&[index; 32]))
+            .unwrap();
+        ids.push(id);
+    }
+    paged.sync_all().unwrap();
+    assert!(
+        !checkpoint.exists(),
+        "paged sync must not publish a checkpoint"
+    );
+    let delta_prefix = format!("{}.", crate::index::delta::INDEX_DELTA_FILE);
+    for entry in fs::read_dir(&dir).unwrap().filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            name != crate::index::delta::INDEX_DELTA_FILE && !name.starts_with(&delta_prefix),
+            "paged sync must not publish a delta log: {name}"
+        );
+    }
+    drop(paged);
+
+    // With no checkpoint left, a resident reopen must scan and still see the
+    // records written while the store was paged.
+    let reopened = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+    assert_eq!(reopened.open_timings().unwrap().path, OpenPath::FullScan);
+    for id in &ids {
+        assert!(
+            reopened.get(&TEST_COLLECTION, id).unwrap().is_some(),
+            "resident reopen lost a record written during the paged session"
+        );
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_missing_sidecar_falls_back_to_frames() {
+    let dir = test_dir("paged_missing_sidecar");
+    let ids = paged_fixture(&dir);
+    let store = paged_open(&dir);
+    store.sync_all().unwrap();
+    drop(store);
+    assert!(
+        !PackfileStorage::index_checkpoint_path(&dir).exists(),
+        "paged sync must not leave a checkpoint"
+    );
+
+    let sidecar = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "idx"))
+        .expect("a sealed sidecar");
+    fs::remove_file(&sidecar).unwrap();
+
+    let reopened = paged_open(&dir);
+    assert_eq!(reopened.open_timings().unwrap().path, OpenPath::FullScan);
+    for id in &ids {
+        assert!(
+            reopened.get(&TEST_COLLECTION, id).unwrap().is_some(),
+            "a missing sidecar must fall back to the frame, never look absent"
+        );
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_repack_after_open_preserves_every_record() {
+    let dir = test_dir("paged_repack");
+    let ids = paged_fixture(&dir);
+    let store = paged_open(&dir);
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    for id in &ids {
+        assert!(
+            store.get(&TEST_COLLECTION, id).unwrap().is_some(),
+            "repack must see records counted from sealed sidecars"
+        );
+    }
+    store.sync_all().unwrap();
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    for id in &ids {
+        assert!(reopened.get(&TEST_COLLECTION, id).unwrap().is_some());
+    }
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_sealed_shards_are_not_retired_as_unreferenced() {
+    let dir = test_dir("paged_retire_sealed");
+    let ids = paged_fixture(&dir);
+    let store = paged_open(&dir);
+    let sealed_before = store.generation(&TEST_COLLECTION).unwrap().sealed.len();
+    assert!(sealed_before > 0);
+    // The resident table does not reference these shards; retirement must
+    // consult SealedLocators as well.
+    store.retire_empty_shards_after_batch();
+    let sealed_after = store.generation(&TEST_COLLECTION).unwrap().sealed.len();
+    assert_eq!(
+        sealed_after, sealed_before,
+        "sealed shards are still referenced by their sidecars"
+    );
+    for id in &ids {
+        assert!(
+            store.get(&TEST_COLLECTION, id).unwrap().is_some(),
+            "retirement must not unlink a shard still serving sealed records"
+        );
+    }
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_refresh_rebuilds_only_the_unsealed_tail() {
+    let dir = test_dir("paged_refresh_tail");
+    let ids = paged_fixture(&dir);
+    let store = paged_open(&dir);
+    let sealed_before = store.generation(&TEST_COLLECTION).unwrap().sealed.len();
+    assert!(sealed_before > 0);
+
+    store.refresh_collection(&TEST_COLLECTION).unwrap();
+
+    let generation = store.generation(&TEST_COLLECTION).expect("generation");
+    assert!(
+        generation.index.len() < ids.len(),
+        "a paged refresh must not pull sealed packs back into the resident table"
+    );
+    assert_eq!(
+        generation.sealed.len(),
+        sealed_before,
+        "the refresh must keep the sealed locator set"
+    );
+    drop(generation);
+    for id in &ids {
+        assert!(store.get(&TEST_COLLECTION, id).unwrap().is_some());
+    }
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_lookups_remain_available_while_sealed_pack_is_evicted() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = test_dir("paged_seal_evict_concurrent");
+    let store = Arc::new(
+        PackfileStorage::open_with_max_shard_bytes_and_residency(
+            dir.clone(),
+            8192,
+            crate::packfile::ChecksumPolicy::Full,
+            crate::index::IndexResidency::Paged,
+        )
+        .unwrap(),
+    );
+    let ids = Arc::new(parking_lot::Mutex::new(Vec::<[u8; 16]>::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let eviction_seen = Arc::new(AtomicBool::new(false));
+
+    let reader_store = Arc::clone(&store);
+    let reader_ids = Arc::clone(&ids);
+    let reader_done = Arc::clone(&done);
+    let reader_eviction_seen = Arc::clone(&eviction_seen);
+    let reader = std::thread::spawn(move || {
+        while !reader_done.load(Ordering::Acquire) {
+            let snapshot = reader_ids.lock().clone();
+            for id in snapshot {
+                assert!(
+                    reader_store.get(&TEST_COLLECTION, &id).unwrap().is_some(),
+                    "a concurrent lookup missed {id:02x?} during sidecar publication/eviction"
+                );
+            }
+            if let Some(generation) = reader_store.generation(&TEST_COLLECTION) {
+                if !generation.sealed.is_empty()
+                    && generation
+                        .sealed
+                        .packs()
+                        .iter()
+                        .all(|pack| !generation.index.references_slot(pack.slot))
+                {
+                    reader_eviction_seen.store(true, Ordering::Release);
+                }
+            }
+            std::thread::yield_now();
+        }
+    });
+
+    for index in 0..200u8 {
+        let id = distinct_id(index);
+        store
+            .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&[index; 64]))
+            .unwrap();
+        ids.lock().push(id);
+    }
+    store.shards.wait_for_seals();
+    store.evict_newly_sealed(true);
+    for _ in 0..10_000 {
+        if eviction_seen.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    done.store(true, Ordering::Release);
+    reader.join().unwrap();
+    assert!(
+        eviction_seen.load(Ordering::Acquire),
+        "reader must observe the atomically published sidecar generation"
+    );
+
+    let generation = store.generation(&TEST_COLLECTION).expect("generation");
+    assert!(
+        !generation.sealed.is_empty(),
+        "the fixture must seal a pack"
+    );
+    for pack in generation.sealed.packs() {
+        assert!(
+            !generation.index.references_slot(pack.slot),
+            "sealed pack {} remained resident after its sidecar was published",
+            pack.pack_id
+        );
+    }
+    for id in ids.lock().iter() {
+        assert!(store.get(&TEST_COLLECTION, id).unwrap().is_some());
+    }
+    drop(generation);
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `(collection, id, expected value)`; `None` means removed.
+type ExpectedRecord = ([u8; 16], [u8; 16], Option<Vec<u8>>);
+
+/// `(collection, id)`.
+type RecordKey = ([u8; 16], [u8; 16]);
+
+/// Two collections across several sealed packs, with overwrites and removals
+/// in later packs, so newer versions shadow older ones across pack ranges.
+/// Returns the expected value of every key ever written (`None` = removed).
+fn paged_run_fixture(dir: &std::path::Path) -> Vec<ExpectedRecord> {
+    let store = PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), 8192).unwrap();
+    let mut model: HashMap<RecordKey, Option<Vec<u8>>> = HashMap::new();
+    let mut put = |collection: [u8; 16], id: [u8; 16], value: Vec<u8>| {
+        store
+            .put(&collection, &id, &NodeData::from_slice(&value))
+            .unwrap();
+        model.insert((collection, id), Some(value));
+    };
+    for index in 0..200u8 {
+        put(TEST_COLLECTION, distinct_id(index), vec![index; 32]);
+        if index < 120 {
+            let mut id = distinct_id(index);
+            id[15] = 0x5A;
+            put(OTHER_COLLECTION, id, vec![index ^ 0xFF; 24]);
+        }
+    }
+    for index in 0..40u8 {
+        put(
+            TEST_COLLECTION,
+            distinct_id(index),
+            vec![index.wrapping_add(100); 40],
+        );
+    }
+    for index in 40..60u8 {
+        let id = distinct_id(index);
+        assert!(store.remove(&TEST_COLLECTION, &id).unwrap());
+        model.insert((TEST_COLLECTION, id), None);
+    }
+    for index in 0..20u8 {
+        let mut id = distinct_id(index);
+        id[15] = 0x5A;
+        assert!(store.remove(&OTHER_COLLECTION, &id).unwrap());
+        model.insert((OTHER_COLLECTION, id), None);
+    }
+    store.sync_all().unwrap();
+    drop(store);
+    // A writable Paged open seals every non-active pack and publishes its
+    // sidecar, so the runs below can cover all but the newest pack.
+    drop(paged_open(dir));
+    let mut expected: Vec<_> = model
+        .into_iter()
+        .map(|((collection, id), value)| (collection, id, value))
+        .collect();
+    expected.sort();
+    expected
+}
+
+/// Every pack in `dir`, oldest first, with its identity.
+fn pool_pack_identities(
+    dir: &std::path::Path,
+) -> Vec<(crate::index::packidx::PackIndexIdentity, PathBuf)> {
+    let mut packs: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .map(|path| {
+            let mut file = fs::File::open(&path).unwrap();
+            let header = crate::packfile::read_header(&mut file).unwrap().unwrap();
+            let identity = crate::index::packidx::PackIndexIdentity {
+                pack_id: header.pack_id,
+                creation_seq: u64::from(header.creation_seq),
+                pack_file_len: file.metadata().unwrap().len(),
+            };
+            (identity, path)
+        })
+        .collect();
+    packs.sort_by_key(|(identity, _)| (identity.creation_seq, identity.pack_id.0));
+    packs
+}
+
+/// Merge the sidecars of the packs at `positions` (oldest-first pool order)
+/// into one run in `dir`. Returns the run path.
+fn write_pool_run(dir: &std::path::Path, positions: &[usize]) -> PathBuf {
+    let packs = pool_pack_identities(dir);
+    let sidecars: Vec<_> = positions
+        .iter()
+        .map(|&position| {
+            crate::index::packidx::open_for_pack(&packs[position].1).expect("sealed sidecar")
+        })
+        .collect();
+    let sources: Vec<_> = sidecars
+        .iter()
+        .map(crate::index::run::MergeSource::Sidecar)
+        .collect();
+    let first = packs[*positions.first().unwrap()].0;
+    let last = packs[*positions.last().unwrap()].0;
+    let path = dir.join(crate::index::run::run_file_name(&first, &last));
+    crate::index::run::merge_to_path(
+        &sources,
+        &crate::index::run::MergeOptions {
+            drop_removals: positions.first() == Some(&0),
+            block_entries: 8,
+            ..crate::index::run::MergeOptions::default()
+        },
+        &path,
+    )
+    .unwrap()
+    .expect("a non-empty run");
+    path
+}
+
+/// Sealed packs in pool order, counted from the oldest until the first pack
+/// without a valid sidecar.
+fn leading_sealed_packs(dir: &std::path::Path) -> usize {
+    pool_pack_identities(dir)
+        .iter()
+        .take_while(|(_, path)| crate::index::packidx::open_for_pack(path).is_some())
+        .count()
+}
+
+fn assert_store_matches(store: &PackfileStorage, expected: &[ExpectedRecord], context: &str) {
+    for (collection, id, value) in expected {
+        let got = store
+            .get(collection, id)
+            .unwrap()
+            .map(|data| data.bytes.to_vec());
+        assert_eq!(&got, value, "{context}: key {id:?} in {collection:?}");
+    }
+}
+
+type ShardAccounting = (
+    HashMap<PackId, HashMap<[u8; 16], u64>>,
+    HashMap<[u8; 16], HashSet<PackId>>,
+    HashMap<PackId, HashMap<[u8; 16], u64>>,
+);
+
+fn shard_accounting(store: &PackfileStorage) -> ShardAccounting {
+    let tables = store.index_tables.read();
+    (
+        tables.shard_collections.clone(),
+        tables.collection_shards.clone(),
+        tables.collection_disk_bytes.clone(),
+    )
+}
+
+#[test]
+fn paged_run_replaces_covered_sidecars_with_identical_answers() {
+    let dir = test_dir("paged_run_open");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 3, "fixture must seal several packs, got {sealed}");
+
+    let baseline = paged_open(&dir);
+    let baseline_sidecars = baseline.open_timings().unwrap().pack_index_sidecars;
+    let baseline_accounting = shard_accounting(&baseline);
+    let baseline_summaries = baseline.collection_summaries();
+    assert_store_matches(&baseline, &expected, "sidecars only");
+    drop(baseline);
+
+    // Cover every sealed pack but the newest, so one sidecar stays unmerged
+    // and lookups must order it before the run.
+    let covered: Vec<usize> = (0..sealed - 1).collect();
+    write_pool_run(&dir, &covered);
+
+    let store = paged_open(&dir);
+    let timings = store.open_timings().unwrap();
+    assert_eq!(
+        timings.pack_index_sidecars,
+        baseline_sidecars - u64::try_from(covered.len()).unwrap(),
+        "covered packs must not be read through their sidecars at open"
+    );
+    // Pool open decides sealed status by verifying sidecars; a run's identity
+    // check replaces that for every pack it covers.
+    let pool_verified = |store: &PackfileStorage| {
+        store
+            .shards
+            .open_timings()
+            .expect("pool open timings")
+            .sidecar_verify_calls
+    };
+    let packs = u64::try_from(pool_pack_identities(&dir).len()).unwrap();
+    assert_eq!(
+        pool_verified(&store),
+        packs - u64::try_from(covered.len()).unwrap(),
+        "pool open must not verify a covered sidecar"
+    );
+    {
+        let generation = store.generation(&TEST_COLLECTION).unwrap();
+        assert_eq!(generation.sealed.runs().len(), 1);
+        assert_eq!(
+            generation.sealed.runs()[0].packs().len(),
+            covered.len(),
+            "the run serves every covered pack"
+        );
+    }
+    assert_eq!(
+        shard_accounting(&store),
+        baseline_accounting,
+        "run pack stats must reproduce sidecar accounting"
+    );
+    assert_eq!(store.collection_summaries(), baseline_summaries);
+    assert_store_matches(&store, &expected, "run plus sidecars");
+
+    // A refresh rebuilds the sealed set from this session's runs, not by
+    // reopening every covered sidecar.
+    store.refresh_collection(&TEST_COLLECTION).unwrap();
+    assert_eq!(
+        store
+            .generation(&TEST_COLLECTION)
+            .unwrap()
+            .sealed
+            .runs()
+            .len(),
+        1
+    );
+    assert_eq!(shard_accounting(&store), baseline_accounting);
+    assert_store_matches(&store, &expected, "after refresh");
+
+    // Retirement must still see run-covered packs as referenced.
+    store.retire_empty_shards_after_batch();
+    assert_store_matches(&store, &expected, "after retirement pass");
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_writable_store_publishes_runs_after_sealing() {
+    let dir = test_dir("paged_run_publish");
+    let store = paged_open(&dir);
+    let mut expected = Vec::new();
+    let mut sequence = 0_u64;
+    let sealed_count = || {
+        store
+            .shards
+            .all_shards()
+            .iter()
+            .filter(|(_, shard)| shard.sealed.load(Ordering::Acquire))
+            .count()
+    };
+    while sealed_count() <= 16 {
+        for _ in 0..256 {
+            let mut id = [0_u8; 16];
+            id[..8].copy_from_slice(&sequence.to_le_bytes());
+            id[8..].copy_from_slice(&sequence.rotate_left(17).to_le_bytes());
+            let value = sequence.to_le_bytes().to_vec();
+            store
+                .put(&TEST_COLLECTION, &id, &NodeData::from_slice(&value))
+                .unwrap();
+            expected.push((TEST_COLLECTION, id, Some(value)));
+            sequence = sequence.saturating_add(1);
+        }
+    }
+    store.sync_all().unwrap();
+    store.settle_run_merges();
+    let runs = store.shards.sealed_runs();
+    assert!(
+        !runs.is_empty(),
+        "sealing more than T packs publishes a run"
+    );
+    assert!(
+        runs.iter().any(|run| run.packs().len() > 16),
+        "the run covers the sealed sidecars selected by the T=16 policy"
+    );
+    assert_store_matches(&store, &expected, "published run");
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        !reopened.shards.sealed_runs().is_empty(),
+        "a published run is discovered and installed on the next open"
+    );
+    assert_store_matches(&reopened, &expected, "reopened published run");
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_corrupt_run_block_falls_back_to_sidecars() {
+    let dir = test_dir("paged_run_corrupt_block");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    let run_path = write_pool_run(&dir, &(0..sealed).collect::<Vec<_>>());
+
+    // Damage the first entry block. The metadata CRC does not cover blocks,
+    // so the run still opens and fails only on first read.
+    let mut bytes = fs::read(&run_path).unwrap();
+    bytes[crate::index::run::RUN_HEADER_LEN] ^= 0xFF;
+    fs::write(&run_path, &bytes).unwrap();
+
+    let store = paged_open(&dir);
+    assert_eq!(
+        store
+            .generation(&TEST_COLLECTION)
+            .unwrap()
+            .sealed
+            .runs()
+            .len(),
+        1,
+        "a block fault is not visible at open"
+    );
+    assert_store_matches(&store, &expected, "damaged run");
+    assert!(
+        store.generation(&TEST_COLLECTION).unwrap().sealed.runs()[0]
+            .run()
+            .is_invalid(),
+        "the lookup walk must have hit the damaged block"
+    );
+    let live = store
+        .collection_live_locations(&TEST_COLLECTION)
+        .unwrap()
+        .unwrap();
+    let live_expected = expected
+        .iter()
+        .filter(|(collection, _, value)| *collection == TEST_COLLECTION && value.is_some())
+        .count();
+    assert!(
+        live.len() >= live_expected,
+        "scans fall back to sidecars as well"
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_open_discards_gapped_damaged_and_temporary_runs() {
+    let dir = test_dir("paged_run_rejects");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 3);
+    // Packs 0 and 2 without 1: an uncovered pack inside the range.
+    let gapped = write_pool_run(&dir, &[0, 2]);
+    // A run whose metadata no longer matches its CRC.
+    let damaged = dir.join("00000000000000000098-00000000000000000099.run");
+    let mut bytes = fs::read(&gapped).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    fs::write(&damaged, &bytes).unwrap();
+    let temporary = dir.join("00000000000000000001-00000000000000000002.run.tmp");
+    fs::write(&temporary, b"partial").unwrap();
+
+    let store = paged_open(&dir);
+    assert!(
+        store
+            .generation(&TEST_COLLECTION)
+            .unwrap()
+            .sealed
+            .runs()
+            .is_empty(),
+        "no rejected run may serve lookups"
+    );
+    assert_store_matches(&store, &expected, "rejected runs");
+    for path in [&gapped, &damaged, &temporary] {
+        assert!(!path.exists(), "a writable open deletes {}", path.display());
+    }
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resident_open_reads_run_covered_packs_correctly() {
+    let dir = test_dir("resident_run_covered");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    let run_path = write_pool_run(&dir, &(0..sealed).collect::<Vec<_>>());
+    for policy in [
+        crate::packfile::ChecksumPolicy::Full,
+        crate::packfile::ChecksumPolicy::Disabled,
+    ] {
+        // Force the full scan: Resident mode ignores runs, but pool open has
+        // marked the covered packs sealed without loading their sidecars.
+        let _ = fs::remove_file(PackfileStorage::index_checkpoint_path(&dir));
+        let store = PackfileStorage::open_with_max_shard_bytes_and_residency(
+            dir.clone(),
+            8192,
+            policy,
+            crate::index::IndexResidency::Resident,
+        )
+        .unwrap();
+        assert_eq!(store.open_timings().unwrap().path, OpenPath::FullScan);
+        assert!(
+            store
+                .generation(&TEST_COLLECTION)
+                .unwrap()
+                .sealed
+                .runs()
+                .is_empty(),
+            "Resident mode does not serve lookups from runs"
+        );
+        assert_store_matches(&store, &expected, &format!("resident {policy:?}"));
+        drop(store);
+        assert!(run_path.exists(), "a valid run survives a Resident open");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_repack_invalidates_a_run_over_retired_packs() {
+    let dir = test_dir("paged_run_repack");
+    // TEST_COLLECTION alone fills the oldest packs, OTHER_COLLECTION the
+    // newer ones, so repacking TEST_COLLECTION leaves its old packs unread.
+    let mut expected: Vec<ExpectedRecord> = Vec::new();
+    {
+        let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+        for (collection, tag) in [(TEST_COLLECTION, 0xA1), (OTHER_COLLECTION, 0xB2)] {
+            for index in 0..150u8 {
+                let mut id = distinct_id(index);
+                id[15] = tag;
+                let value = vec![index ^ tag; 32];
+                store
+                    .put(&collection, &id, &NodeData::from_slice(&value))
+                    .unwrap();
+                expected.push((collection, id, Some(value)));
+            }
+        }
+        store.sync_all().unwrap();
+    }
+    drop(paged_open(&dir));
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 4, "fixture must seal several packs, got {sealed}");
+    let run_path = write_pool_run(&dir, &(0..sealed).collect::<Vec<_>>());
+
+    let store = paged_open(&dir);
+    assert_eq!(
+        store
+            .generation(&OTHER_COLLECTION)
+            .unwrap()
+            .sealed
+            .runs()
+            .len(),
+        1
+    );
+    let retired_before = store.shards.retired_count();
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    assert!(
+        store.shards.retired_count() > retired_before,
+        "packs only TEST_COLLECTION read must retire despite the run"
+    );
+    let other = store.generation(&OTHER_COLLECTION).unwrap();
+    assert!(
+        other.sealed.runs().is_empty(),
+        "a run over a retired pack must leave every generation"
+    );
+    assert!(
+        !other.sealed.packs().is_empty(),
+        "the surviving covered packs answer through their sidecars"
+    );
+    drop(other);
+    assert!(store.shards.sealed_runs().is_empty());
+    assert_store_matches(&store, &expected, "after repack");
+    store.sync_all().unwrap();
+    drop(store);
+
+    // The run names a retired pack, so the next writable open discards it.
+    let reopened = paged_open(&dir);
+    assert!(!run_path.exists(), "a stale run is deleted at open");
+    assert_store_matches(&reopened, &expected, "after reopen");
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Every published run file in `dir`, sorted.
+fn run_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut runs: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "run"))
+        .collect();
+    runs.sort();
+    runs
+}
+
+/// Sidecars the pool verified at its last open.
+fn pool_sidecar_verifies(store: &PackfileStorage) -> u64 {
+    store
+        .shards
+        .open_timings()
+        .expect("pool open timings")
+        .sidecar_verify_calls
+}
+
+/// Build the merge the policy would start next, without installing it: the
+/// state a crash leaves after the run file is published.
+fn publish_planned_run(store: &PackfileStorage) -> PathBuf {
+    let plan = store.plan_run_merge().expect("a planned merge");
+    build_planned_run(
+        store.shards.base_dir(),
+        &plan,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap()
+    .expect("a non-empty run")
+    .path
+}
+
+#[test]
+fn paged_store_publishes_a_run_with_identical_answers() {
+    let dir = test_dir("paged_run_publish");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 3, "fixture must seal several packs, got {sealed}");
+    let packs = u64::try_from(pool_pack_identities(&dir).len()).unwrap();
+
+    let store = paged_open(&dir);
+    let baseline_accounting = shard_accounting(&store);
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    store.settle_run_merges();
+    assert_eq!(store.run_merges_installed.load(Ordering::Relaxed), 1);
+    let runs = store.shards.sealed_runs();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].packs().len(),
+        sealed,
+        "the run covers every sealed pack"
+    );
+    for collection in [TEST_COLLECTION, OTHER_COLLECTION] {
+        let generation = store.generation(&collection).unwrap();
+        assert!(
+            generation.sealed.packs().is_empty(),
+            "covered sidecars leave the generation"
+        );
+        assert!(generation.sealed.contains_run(&runs[0]));
+    }
+    drop(runs);
+    assert_eq!(shard_accounting(&store), baseline_accounting);
+    assert_store_matches(&store, &expected, "after publication");
+    assert_eq!(run_files(&dir).len(), 1);
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert_eq!(
+        pool_sidecar_verifies(&reopened),
+        packs - u64::try_from(sealed).unwrap(),
+        "a published run replaces its packs' sidecars at open"
+    );
+    assert_store_matches(&reopened, &expected, "after reopen");
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_run_carry_replaces_its_input_runs() {
+    let dir = test_dir("paged_run_carry");
+    let mut expected = paged_run_fixture(&dir);
+    let store = paged_open(&dir);
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    store.settle_run_merges();
+    let first = run_files(&dir);
+    assert_eq!(first.len(), 1);
+
+    // Seal more packs, then fold their run into the first one.
+    store.run_merge_unmerged_packs.store(0, Ordering::Relaxed);
+    store.run_merge_fan_in.store(u64::MAX, Ordering::Relaxed);
+    // Both collections move on, so their old home packs seal.
+    for index in 0..200u8 {
+        for collection in [TEST_COLLECTION, OTHER_COLLECTION] {
+            let mut id = distinct_id(index);
+            id[14] = 0xC4;
+            let value = vec![index; 48];
+            store
+                .put(&collection, &id, &NodeData::from_slice(&value))
+                .unwrap();
+            expected.push((collection, id, Some(value)));
+        }
+    }
+    store.sync_all().unwrap();
+    store.settle_run_merges();
+    assert!(store.run_merges_installed.load(Ordering::Relaxed) >= 3);
+    let runs = store.shards.sealed_runs();
+    assert_eq!(
+        runs.len(),
+        1,
+        "every carry folds into one run: {:?} installed {} files {:?}",
+        runs.iter()
+            .map(|run| (run.packs()[0].creation_seq, run.packs().len()))
+            .collect::<Vec<_>>(),
+        store.run_merges_installed.load(Ordering::Relaxed),
+        run_files(&dir)
+    );
+    let covered = runs[0].packs().len();
+    drop(runs);
+    let files = run_files(&dir);
+    assert_eq!(files.len(), 1, "input runs are deleted after the carry");
+    assert!(!files.contains(&first[0]));
+    assert_store_matches(&store, &expected, "after the carry");
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert_eq!(reopened.shards.sealed_runs()[0].packs().len(), covered);
+    assert_store_matches(&reopened, &expected, "after reopen");
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_run_crash_points_reopen_with_identical_answers() {
+    let dir = test_dir("paged_run_crash");
+    let expected = paged_run_fixture(&dir);
+    let sealed = leading_sealed_packs(&dir);
+    assert!(sealed >= 3);
+    let packs = u64::try_from(pool_pack_identities(&dir).len()).unwrap();
+
+    // Before the rename: only the temp file exists.
+    let identities = pool_pack_identities(&dir);
+    let temporary = dir.join(format!(
+        "{}.tmp",
+        crate::index::run::run_file_name(&identities[0].0, &identities[sealed - 1].0)
+    ));
+    fs::write(&temporary, b"partial run").unwrap();
+    let store = paged_open(&dir);
+    assert!(!temporary.exists(), "a writable open deletes a temp run");
+    assert!(store.shards.sealed_runs().is_empty());
+    assert_store_matches(&store, &expected, "after a crash before rename");
+
+    // After the rename (with or without the directory fsync), before the
+    // generation swap: an orphan run that open validates and accepts.
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    let orphan = publish_planned_run(&store);
+    assert_store_matches(&store, &expected, "while the run is uninstalled");
+    drop(store);
+    let store = paged_open(&dir);
+    assert!(orphan.exists());
+    assert_eq!(
+        pool_sidecar_verifies(&store),
+        packs - u64::try_from(sealed).unwrap()
+    );
+    assert_store_matches(&store, &expected, "after a crash before install");
+    drop(store);
+
+    // A carry published, its input run not yet deleted: the containing run
+    // wins at open and the contained one is removed.
+    fs::remove_file(&orphan).unwrap();
+    let older = write_pool_run(&dir, &(0..sealed - 1).collect::<Vec<_>>());
+    let newer = write_pool_run(&dir, &[sealed - 1]);
+    let store = paged_open(&dir);
+    assert_eq!(store.shards.sealed_runs().len(), 2);
+    store.run_merge_fan_in.store(u64::MAX, Ordering::Relaxed);
+    let carried = publish_planned_run(&store);
+    drop(store);
+    let store = paged_open(&dir);
+    assert_eq!(run_files(&dir), vec![carried.clone()]);
+    assert!(!older.exists() && !newer.exists());
+    assert_eq!(store.shards.sealed_runs()[0].packs().len(), sealed);
+    assert_store_matches(&store, &expected, "after a crash before deleting inputs");
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_run_install_is_discarded_after_its_packs_retire() {
+    let dir = test_dir("paged_run_install_retired");
+    let mut expected: Vec<ExpectedRecord> = Vec::new();
+    {
+        let store = PackfileStorage::open_with_max_shard_bytes(dir.clone(), 8192).unwrap();
+        for (collection, tag) in [(TEST_COLLECTION, 0xA1), (OTHER_COLLECTION, 0xB2)] {
+            for index in 0..150u8 {
+                let mut id = distinct_id(index);
+                id[15] = tag;
+                let value = vec![index ^ tag; 32];
+                store
+                    .put(&collection, &id, &NodeData::from_slice(&value))
+                    .unwrap();
+                expected.push((collection, id, Some(value)));
+            }
+        }
+        store.sync_all().unwrap();
+    }
+    let store = paged_open(&dir);
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    let plan = store.plan_run_merge().expect("a planned merge");
+    let built = build_planned_run(
+        store.shards.base_dir(),
+        &plan,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap()
+    .expect("a non-empty run");
+    let path = built.path.clone();
+    // A repack retires packs the run covers before it is installed.
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    store.install_run(built);
+    assert!(!path.exists(), "a run over a retired pack is discarded");
+    assert!(store.shards.sealed_runs().is_empty());
+    assert_eq!(store.run_merges_installed.load(Ordering::Relaxed), 0);
+    for collection in [TEST_COLLECTION, OTHER_COLLECTION] {
+        assert!(store
+            .generation(&collection)
+            .unwrap()
+            .sealed
+            .runs()
+            .is_empty());
+    }
+    assert_store_matches(&store, &expected, "after a discarded install");
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_lookups_see_no_gap_while_a_run_installs() {
+    let dir = test_dir("paged_run_concurrent");
+    let expected = Arc::new(paged_run_fixture(&dir));
+    let store = Arc::new(paged_open(&dir));
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let expected = Arc::clone(&expected);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut rounds = 0u64;
+                while !stop.load(Ordering::Acquire) || rounds == 0 {
+                    assert_store_matches(&store, &expected, "during install");
+                    rounds = rounds.saturating_add(1);
+                }
+                rounds
+            })
+        })
+        .collect();
+    store.settle_run_merges();
+    assert_eq!(store.run_merges_installed.load(Ordering::Relaxed), 1);
+    stop.store(true, Ordering::Release);
+    for reader in readers {
+        assert!(reader.join().unwrap() > 0);
+    }
+    assert_store_matches(&store, &expected, "after install");
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_run_install_rechecks_pack_identity_under_the_locks() {
+    let dir = test_dir("paged_run_install_identity");
+    let _ = paged_run_fixture(&dir);
+    let store = paged_open(&dir);
+    store.run_merge_unmerged_packs.store(1, Ordering::Relaxed);
+    let plan = store.plan_run_merge().expect("a planned merge");
+    let built = build_planned_run(
+        store.shards.base_dir(),
+        &plan,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap()
+    .expect("a non-empty run");
+    let path = built.path.clone();
+    let by_pack: HashMap<PackId, (u16, PathBuf)> = store
+        .shards
+        .all_shards()
+        .into_iter()
+        .map(|(slot, shard)| (shard.pack_id, (slot, shard.path.clone())))
+        .collect();
+    // Wrapping succeeds: every pack was current when the run was opened.
+    let run = sealed_run_for(built, &by_pack).expect("a wrapped run");
+    assert!(store.prepare_run_install(&run).is_ok());
+    let rejection = |store: &PackfileStorage| match store.prepare_run_install(&run) {
+        Ok(_) => panic!("a run over a changed pack must not install"),
+        Err(reason) => reason,
+    };
+
+    // The pack changed after the run was built (as a replacement would):
+    // same slot and id, different length.
+    let changed = store.shards.get_shard(run.packs()[1].slot).unwrap();
+    changed.file_len.fetch_add(1, Ordering::AcqRel);
+    assert!(rejection(&store).contains("retired or replaced"));
+    changed.file_len.fetch_sub(1, Ordering::AcqRel);
+    assert!(store.prepare_run_install(&run).is_ok());
+
+    // Model slot reuse after the earlier pack-id lookup: keep the run's
+    // identity table intact, but make one ordinal resolve through another
+    // current pack's slot. Pool coverage still matches, so only the final
+    // slot-to-identity recheck should reject it.
+    let mut stale_packs = run.packs().to_vec();
+    stale_packs[0].slot = stale_packs[1].slot;
+    let stale = Arc::new(
+        crate::index::sealed::SealedRun::new(
+            Arc::new(crate::index::run::RunIndex::open(&path).unwrap()),
+            stale_packs,
+            Box::new(|| Ok(Vec::new())),
+        )
+        .unwrap(),
+    );
+    assert!(store.run_covers_contiguous_sealed_pool(stale.run().packs()));
+    let mut collection_ids: Vec<_> = store.collections_read().keys().copied().collect();
+    collection_ids.extend(stale.run().pack_stats().map(|row| row.collection_id));
+    collection_ids.sort_unstable();
+    collection_ids.dedup();
+    let mutexes: Vec<_> = collection_ids
+        .iter()
+        .map(|id| store.put_mutex(id))
+        .collect();
+    let guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
+    assert!(matches!(
+        store.prepare_run_install(&stale),
+        Err(reason) if reason == "a covered pack was retired or replaced"
+    ));
+    drop(guards);
+    drop(stale);
+
+    // The pack retired after the run was built.
+    store.shards.retire_slot(run.packs()[1].slot);
+    assert!(rejection(&store).contains("retired or replaced"));
+    drop(changed);
+    drop(run);
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn rewrite_test_key(i: u8) -> [u8; 16] {
+    [0x80u8.wrapping_add(i); 16]
+}
+
+fn rewrite_test_value(i: u8) -> Vec<u8> {
+    vec![i; 8]
+}
+
+/// Read every committed key and record each successful read's nanosecond
+/// interval, returning them for the rewrite-overlap check.
+fn rewrite_test_reader(
+    reader: &PackfileStorage,
+    phase: &crate::journal::RewritePhase,
+    committed: &AtomicU64,
+    stop: &AtomicBool,
+    verified: &AtomicUsize,
+    collection: [u8; 16],
+) -> Vec<(u64, u64)> {
+    let mut intervals = Vec::new();
+    while !stop.load(Ordering::Acquire) {
+        let done = committed.load(Ordering::Acquire);
+        if done == 0 {
+            std::thread::yield_now();
+            continue;
+        }
+        // Keys 0..done are committed and synced; read them all.
+        let count = u8::try_from(done).unwrap();
+        let keys: Vec<_> = (0..count).map(rewrite_test_key).collect();
+        loop {
+            let start = phase.now_ns();
+            let got = reader.get_read_committed(&collection, &keys);
+            let end = phase.now_ns();
+            match got {
+                Ok(values) => {
+                    for (i, value) in values.iter().enumerate() {
+                        let i = u8::try_from(i).unwrap();
+                        assert_eq!(
+                            value.as_ref().map(|d| d.bytes.to_vec()),
+                            Some(rewrite_test_value(i)),
+                            "key {i} must stay readable across a rewrite"
+                        );
+                    }
+                    verified.fetch_add(1, Ordering::Relaxed);
+                    intervals.push((start, end));
+                    break;
+                }
+                Err(StorageError::WouldBlock(_)) => std::thread::yield_now(),
+                Err(err) => panic!("unexpected read error: {err}"),
+            }
+        }
+    }
+    intervals
+}
+
+/// Readers verify every committed key while the writer reclaims repeatedly, so
+/// each reclaim rewrites and renames the WAL segment under them. The reclaim is
+/// driven deterministically rather than by the fixture's reclaim trigger: the
+/// journal group is made durable, then a forced checkpoint makes the packs
+/// durable and reclaims through the group. A test-only recorder timestamps each
+/// rewrite window, and the test requires that at least one read's own time
+/// interval intersects one of those windows, so the coverage is not vacuous. A
+/// transient `WouldBlock` is retried.
+#[test]
+fn committed_reads_stay_correct_across_repeated_segment_rewrites() {
+    const ROUNDS: u8 = 120;
+    // A checkpoint and its reclaim cost a real fsync; batch a few rounds so
+    // the test spends its time under readers instead of in barriers. Every
+    // batch still commits and reclaims, so the segment is rewritten throughout.
+    const ROUNDS_PER_BARRIER: u8 = 3;
+    let ReclaimFixture {
+        writer,
+        reader,
+        wal,
+        collection,
+        ..
+    } = open_reclaim_fixture("reads_across_rewrites");
+    let phase = writer.journal().unwrap().rewrite_phase();
+    let committed = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let verified = AtomicUsize::new(0);
+
+    let mut last_base = Journal::scan_read_only(&wal).unwrap().base_lsn;
+    let mut base_moves = 0usize;
+    let read_intervals: Vec<(u64, u64)> = std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..3 {
+            let reader = Arc::clone(&reader);
+            let phase = Arc::clone(&phase);
+            let committed = &committed;
+            let stop = &stop;
+            let verified = &verified;
+            workers.push(scope.spawn(move || {
+                rewrite_test_reader(&reader, &phase, committed, stop, verified, collection)
+            }));
+        }
+        for i in 0..ROUNDS {
+            writer
+                .put(
+                    &collection,
+                    &rewrite_test_key(i),
+                    &NodeData::new(bytes::Bytes::from(rewrite_test_value(i))),
+                )
+                .unwrap();
+            let round = i + 1;
+            if round % ROUNDS_PER_BARRIER == 0 || round == ROUNDS {
+                // The WAL group is durable now; the forced checkpoint makes the
+                // packs durable and reclaims through it, rewriting the segment.
+                writer.journal().unwrap().sync().unwrap();
+                writer.force_index_checkpoint().unwrap();
+                committed.store(u64::from(round), Ordering::Release);
+                let base = Journal::scan_read_only(&wal).unwrap().base_lsn;
+                if base != last_base {
+                    base_moves += 1;
+                    last_base = base;
+                }
+            }
+        }
+        stop.store(true, Ordering::Release);
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect()
+    });
+    let windows = phase.windows();
+    assert!(
+        !windows.is_empty(),
+        "the run must record at least one rewrite window"
+    );
+    let overlapped = read_intervals
+        .iter()
+        .filter(|(read_start, read_end)| {
+            windows
+                .iter()
+                .any(|(start, end)| read_start <= end && start <= read_end)
+        })
+        .count();
+    assert!(
+        base_moves >= usize::from(ROUNDS) / 4,
+        "the segment must be rewritten repeatedly, saw {base_moves} base moves"
+    );
+    assert!(
+        verified.load(Ordering::Relaxed) > 0,
+        "readers must verify reads"
+    );
+    assert!(
+        overlapped > 0,
+        "no read interval intersected a rewrite window ({} reads, {} windows)",
+        read_intervals.len(),
+        windows.len()
+    );
+}
+
+/// A held `ReadSnapshot` delays writers on the same handle: `put` takes the
+/// snapshot gate, so it completes only after the snapshot drops. This pins the
+/// cost the type's doc warns about, so a change that removes the delay (or
+/// makes it unbounded) shows up here. Reads on the pinned handle are not part
+/// of this: they share the overlay and are covered by the reclaim tests. It
+/// pins the blocking behavior, not its typical cost; `read_snapshot_pin_latency`
+/// measures how long snapshots are actually held.
+#[test]
+fn a_held_read_snapshot_delays_a_put_until_it_drops() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = test_dir("snapshot_write_delay");
+    let store = Arc::new(PackfileStorage::open(dir.clone()).unwrap());
+    let collection = [0x4Du8; 16];
+    store
+        .put(
+            &collection,
+            &[1u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"seed")),
+        )
+        .unwrap();
+
+    let snapshot = store.read_snapshot().unwrap();
+    let put_finished = Arc::new(AtomicBool::new(false));
+    let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+    let writer = {
+        let store = Arc::clone(&store);
+        let put_finished = Arc::clone(&put_finished);
+        std::thread::spawn(move || {
+            attempting_tx.send(()).unwrap();
+            store
+                .put(
+                    &collection,
+                    &[2u8; 16],
+                    &NodeData::new(bytes::Bytes::from_static(b"next")),
+                )
+                .unwrap();
+            put_finished.store(true, Ordering::Release);
+        })
+    };
+
+    // The writer is about to call `put`; the hold below then gives it time to
+    // reach the gate. This cannot prove arrival without a hook after the lock,
+    // but it rules out the thread not having started before the snapshot drops.
+    attempting_rx.recv().unwrap();
+    let hold = Duration::from_millis(150);
+    std::thread::sleep(hold);
+    assert!(
+        !put_finished.load(Ordering::Acquire),
+        "a put must wait while a snapshot holds the gate"
+    );
+    drop(snapshot);
+    writer.join().unwrap();
+    assert!(
+        put_finished.load(Ordering::Acquire),
+        "the put completes once the snapshot drops"
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A read completes while a reclaim is paused inside its critical section
+/// (sync and journal locks held, segment not yet rewritten), so ordinary
+/// committed reads are not blocked by a reclaim in progress.
+#[test]
+fn read_committed_completes_inside_a_paused_reclaim() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    let ReclaimFixture {
+        writer,
+        reader,
+        collection,
+        seed_key,
+        ..
+    } = open_reclaim_fixture("read_committed_inside_reclaim");
+    let journal = writer.journal().unwrap();
+
+    let entered = Arc::new(AtomicUsize::new(0));
+    let reads_inside = Arc::new(AtomicUsize::new(0));
+    let hook = {
+        let reader = Arc::clone(&reader);
+        let entered = Arc::clone(&entered);
+        let reads_inside = Arc::clone(&reads_inside);
+        Arc::new(move || {
+            entered.fetch_add(1, Ordering::SeqCst);
+            // The reclaim thread holds the journal locks here. Run the reads
+            // on another thread and require them to finish, not just start.
+            let reader = Arc::clone(&reader);
+            let done = std::thread::spawn(move || {
+                let mut ok = 0;
+                for _ in 0..50 {
+                    match reader.get_read_committed(&collection, &[seed_key]) {
+                        Ok(values) => {
+                            assert_eq!(
+                                values[0].as_ref().map(|d| d.bytes.as_ref()),
+                                Some(&b"seed"[..])
+                            );
+                            ok += 1;
+                        }
+                        Err(StorageError::WouldBlock(_)) => {}
+                        Err(err) => panic!("unexpected read error: {err}"),
+                    }
+                }
+                ok
+            });
+            reads_inside.fetch_add(done.join().unwrap(), Ordering::SeqCst);
+        })
+    };
+    journal.set_reclaim_hook(Some(hook));
+
+    writer
+        .put(
+            &collection,
+            &[0x80u8; 16],
+            &NodeData::new(bytes::Bytes::from_static(&[0u8; 8])),
+        )
+        .unwrap();
+    writer.sync().unwrap();
+
+    assert!(
+        entered.load(Ordering::SeqCst) >= 1,
+        "the reclaim hook must run"
+    );
+    assert!(
+        reads_inside.load(Ordering::SeqCst) > 0,
+        "reads must complete while a reclaim holds its locks"
+    );
+}
+
+/// Every combination of absent, previous and new for the three files a
+/// checkpoint replaces (`index.checkpoint`, `index.versions`, `journal.lsn`):
+/// the states a crash can leave when their directory entries are made durable
+/// by fewer barriers than renames. Recovery must read coverage that is never
+/// above what the surviving files back, and a valid `index.versions` must
+/// decide it however `journal.lsn` looks: that is what lets the checkpoint and
+/// versions renames share one directory sync and `journal.lsn` follow it.
+#[test]
+fn recovery_coverage_is_safe_for_every_combination_of_the_checkpoint_files() {
+    const PREVIOUS: u64 = 100;
+    const NEW: u64 = 200;
+    // 0 = absent, 1 = the previous checkpoint's file, 2 = the new one's.
+    let lsn_of = |state: usize| match state {
+        1 => Some(PREVIOUS),
+        2 => Some(NEW),
+        _ => None,
+    };
+    for checkpoint in 0..3_usize {
+        for versions in 0..3_usize {
+            for journal_lsn in 0..3_usize {
+                let dir = test_dir(&format!(
+                    "coverage_matrix_{checkpoint}{versions}{journal_lsn}"
+                ));
+                if let Some(lsn) = lsn_of(checkpoint) {
+                    crate::index::checkpoint::write_checkpoint(
+                        &PackfileStorage::index_checkpoint_path(&dir),
+                        0xfeed,
+                        lsn,
+                        0,
+                        &[],
+                        &[],
+                        &[],
+                    )
+                    .unwrap();
+                }
+                if let Some(lsn) = lsn_of(versions) {
+                    crate::index::versions::write_versions(
+                        &PackfileStorage::index_versions_path(&dir),
+                        &[],
+                        lsn,
+                    )
+                    .unwrap();
+                }
+                if let Some(lsn) = lsn_of(journal_lsn) {
+                    std::fs::write(PackfileStorage::journal_lsn_path(&dir), lsn.to_le_bytes())
+                        .unwrap();
+                }
+                let got = PackfileStorage::read_journal_lsn(&dir);
+                let checkpoint_coverage = lsn_of(checkpoint).unwrap_or(0);
+                let journal_coverage = lsn_of(journal_lsn).unwrap_or(0);
+                let expected = match lsn_of(versions) {
+                    // A valid versions file decides; `journal.lsn` cannot raise it.
+                    Some(versions_coverage) => versions_coverage.max(checkpoint_coverage),
+                    // Without one, `journal.lsn` is trusted. A checkpoint writer
+                    // makes the versions file durable before `journal.lsn`, so
+                    // this row (a new `journal.lsn` with no versions and an older
+                    // checkpoint) cannot be left by a crash while the versions
+                    // and checkpoint renames are durable before it.
+                    None => journal_coverage.max(checkpoint_coverage),
+                };
+                assert_eq!(
+                    got, expected,
+                    "checkpoint={checkpoint} versions={versions} journal.lsn={journal_lsn}"
+                );
+                // However the files are combined, nothing reads above the newest
+                // coverage any of them was written with.
+                assert!(got <= NEW);
+                // A new `journal.lsn` beside a valid versions file never raises
+                // the coverage past what the versions and checkpoint carry.
+                if journal_lsn == 2 && versions != 0 {
+                    assert_eq!(got, lsn_of(versions).unwrap().max(checkpoint_coverage));
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+}
+
+/// Retiring the previous delta epoch must never unlink the epoch now in use. A
+/// checkpoint taken with the packs unchanged has the same fingerprint as its
+/// predecessor, so the previous epoch's file is the live one; a different
+/// fingerprint is retired as before, and no previous epoch is a no-op.
+#[test]
+fn retiring_a_delta_epoch_never_unlinks_the_live_log() {
+    let dir = test_dir("retire_live_epoch");
+    let previous = PackfileStorage::delta_path(&dir, 1);
+    let live = PackfileStorage::delta_path(&dir, 2);
+    std::fs::write(&previous, b"previous epoch").unwrap();
+    std::fs::write(&live, b"live epoch").unwrap();
+
+    // Same fingerprint: the "old" epoch is the live one.
+    super::retire_delta_epoch_file(&dir, Some(2), 2);
+    assert!(live.exists(), "the live epoch's log was unlinked");
+    assert!(previous.exists());
+
+    // No previous epoch (opened by a rescan): nothing to retire.
+    super::retire_delta_epoch_file(&dir, None, 2);
+    assert!(live.exists() && previous.exists());
+
+    // A different fingerprint is the superseded epoch and goes.
+    super::retire_delta_epoch_file(&dir, Some(1), 2);
+    assert!(!previous.exists(), "the superseded epoch was not retired");
+    assert!(live.exists(), "the live epoch's log was unlinked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a shared-WAL store leaves after its first sync reclaimed the WAL groups
+/// that carried its collection versions: the published store directory, the
+/// reclaimed WAL, and each collection's record count and logical version.
+struct ReclaimedVersions {
+    store: PathBuf,
+    wal: Vec<u8>,
+    expected: [([u8; 16], u64, u64); 2],
+}
+
+const VERSIONS_SECOND_COLLECTION: [u8; 16] = [0x77; 16];
+const VERSION_FILES: [&str; 3] = ["index.checkpoint", "index.versions", "journal.lsn"];
+
+fn version_test_value(collection: &[u8; 16], i: u8) -> Vec<u8> {
+    vec![i ^ collection[0]; 8]
+}
+
+/// Commit mutations to two collections, record their logical versions, sync,
+/// and capture the published files and the reclaimed WAL.
+fn reclaimed_versions_fixture() -> ReclaimedVersions {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_dir = test_dir("versions_reclaim_wal");
+    let store_dir = test_dir("versions_reclaim_store");
+    let wal = wal_dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    for (collection, count) in [(TEST_COLLECTION, 5_u8), (VERSIONS_SECOND_COLLECTION, 3_u8)] {
+        for i in 0..count {
+            store
+                .put(
+                    &collection,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(version_test_value(&collection, i))),
+                )
+                .unwrap();
+        }
+    }
+    coordinator.sync().unwrap();
+    let expected = [
+        (
+            TEST_COLLECTION,
+            5_u64,
+            coordinator.collection_version(ShardType::State, &TEST_COLLECTION),
+        ),
+        (
+            VERSIONS_SECOND_COLLECTION,
+            3_u64,
+            coordinator.collection_version(ShardType::State, &VERSIONS_SECOND_COLLECTION),
+        ),
+    ];
+    assert!(
+        expected.iter().all(|(_, _, version)| *version > 0),
+        "the mutations must have produced versions: {expected:?}"
+    );
+    assert!(
+        !Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
+        "before the sync the WAL still holds the groups"
+    );
+    store.sync_all().unwrap();
+    assert!(
+        Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
+        "the sync reclaimed the covered groups"
+    );
+    let reclaimed = fs::read(&wal).unwrap();
+    let published = copy_store(&store_dir, "versions_reclaim_after");
+    for file in VERSION_FILES {
+        assert!(published.join(file).exists(), "{file} was not published");
+    }
+    drop(store);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&store_dir);
+    let _ = fs::remove_dir_all(&wal_dir);
+    ReclaimedVersions {
+        store: published,
+        wal: reclaimed,
+        expected,
+    }
+}
+
+/// Reopen the published store with only the files in `surviving` (bit 0 the
+/// checkpoint, bit 1 the versions file, bit 2 `journal.lsn`) beside the
+/// reclaimed WAL; every record and each collection's version, or the open's
+/// error.
+fn reopen_with_surviving_files(
+    fixture: &ReclaimedVersions,
+    surviving: u8,
+) -> Result<Vec<u64>, String> {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let store = copy_store(&fixture.store, "versions_reclaim_try");
+    for (bit, file) in VERSION_FILES.iter().enumerate() {
+        if surviving & (1 << bit) == 0 {
+            fs::remove_file(store.join(file)).unwrap();
+        }
+    }
+    let wal_dir = test_dir("versions_reclaim_try_wal");
+    let wal = wal_dir.join("shared.wal");
+    fs::write(&wal, &fixture.wal).unwrap();
+    let outcome = (|| -> Result<Vec<u64>, String> {
+        let (journal, scan) = Journal::open_shared(&wal).map_err(|error| error.to_string())?;
+        let recovered = Arc::new(JournalCoordinator::new(journal, &scan));
+        let reopened = PackfileStorage::open(store.clone()).map_err(|error| error.to_string())?;
+        reopened
+            .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+            .map_err(|error| error.to_string())?;
+        for (collection, count, _) in &fixture.expected {
+            for i in 0..u8::try_from(*count).unwrap() {
+                let got = reopened
+                    .get(collection, &distinct_id(i))
+                    .map_err(|error| error.to_string())?;
+                if got.map(|data| data.bytes.to_vec()) != Some(version_test_value(collection, i)) {
+                    return Err(format!("record {i} of {:02x} lost", collection[0]));
+                }
+            }
+        }
+        Ok(fixture
+            .expected
+            .iter()
+            .map(|(collection, _, _)| recovered.collection_version(ShardType::State, collection))
+            .collect())
+    })();
+    let _ = fs::remove_dir_all(&store);
+    let _ = fs::remove_dir_all(&wal_dir);
+    outcome
+}
+
+/// Collection versions survive a reclaim: the WAL groups that carried them are
+/// dropped once `index.checkpoint`, `index.versions` and `journal.lsn` are
+/// published, so what is left on disk must restore every version exactly.
+///
+/// Every candidate keeps the reclaimed WAL, so the WAL cannot supply a version
+/// the files lost, and every combination of which of the three files survive
+/// is reopened (the empty combination has its own test below).
+///
+/// Which states a crash can leave follows from the publication order: the
+/// checkpoint and the versions file are renamed and made durable by one
+/// directory barrier, then `journal.lsn` is renamed and made durable, and only
+/// after that does the WAL rewrite that drops the groups begin. A durable
+/// reclaimed WAL therefore implies all three files are durable, so exactly one
+/// state is reachable beside it: it must reopen with every record and the exact
+/// versions. The others are not states the order leaves. Those that keep a
+/// readable baseline (the checkpoint or the versions file) still restore the
+/// exact versions; with no baseline left, a surviving `journal.lsn` makes the
+/// open refuse with the explicit guard instead of starting from an empty
+/// version baseline.
+#[test]
+fn collection_versions_survive_reclaim_for_every_surviving_file_combination() {
+    let fixture = reclaimed_versions_fixture();
+    let exact: Vec<u64> = fixture
+        .expected
+        .iter()
+        .map(|(_, _, version)| *version)
+        .collect();
+    for mask in 1_u8..8 {
+        let label = format!("surviving files mask={mask:03b} (checkpoint, versions, lsn)");
+        let outcome = reopen_with_surviving_files(&fixture, mask);
+        if mask & 0b011 != 0 {
+            // The reachable state (all three) and every other combination that
+            // keeps a readable baseline restore the exact versions.
+            assert_eq!(outcome, Ok(exact.clone()), "{label}");
+        } else {
+            // Only `journal.lsn` left: coverage claimed, versions unrecoverable.
+            let message = outcome.expect_err(&label);
+            assert!(
+                message.contains("no readable version baseline"),
+                "{label}: refused for another reason: {message}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&fixture.store);
+}
+
+/// With the reclaimed WAL and no version baseline at all (no checkpoint, no
+/// versions file, no `journal.lsn`), the store must not open and report every
+/// collection at version zero: the WAL groups that carried the versions are
+/// gone, so a silent open would turn versions `[5, 8]` into `[0, 0]`.
+///
+/// Not a state the publication order leaves, but losing the baseline must never
+/// reset versions quietly. Nothing in the pool's files then says coverage was
+/// ever claimed, so the evidence is the shared WAL's header: each reclaim
+/// records, per pool, the newest LSN of history it removed, and a writable open
+/// of the pool refuses unless its baseline covers that LSN.
+///
+/// What a pack-LSN check could not do: it cannot see every case (a collection
+/// deletion advances a version without leaving a surviving record), and
+/// versions must not be rebuilt from frame LSNs. The header marks are written
+/// when the history is dropped, so they do not depend on what survives.
+#[test]
+fn losing_every_version_baseline_beside_a_reclaimed_wal_fails_closed() {
+    let fixture = reclaimed_versions_fixture();
+    let outcome = reopen_with_surviving_files(&fixture, 0);
+    let _ = fs::remove_dir_all(&fixture.store);
+    let message = outcome.expect_err("the open reported versions it could not restore");
+    assert!(
+        message.contains("no readable version baseline"),
+        "refused for another reason: {message}"
+    );
+}
+
+/// A shared-WAL store for the reclaimed-history tests.
+struct SharedWalStore {
+    store_dir: PathBuf,
+    wal: PathBuf,
+    coordinator: Arc<crate::journal::JournalCoordinator>,
+    store: PackfileStorage,
+}
+
+fn open_shared_wal_store(label: &str) -> SharedWalStore {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal = test_dir(&format!("{label}_wal")).join("shared.wal");
+    let store_dir = test_dir(&format!("{label}_store"));
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let store = PackfileStorage::open(store_dir.clone()).unwrap();
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    SharedWalStore {
+        store_dir,
+        wal,
+        coordinator,
+        store,
+    }
+}
+
+impl SharedWalStore {
+    fn put(&self, collection: &[u8; 16], ids: std::ops::Range<u8>) {
+        for i in ids {
+            self.store
+                .put(
+                    collection,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(version_test_value(collection, i))),
+                )
+                .unwrap();
+        }
+    }
+
+    /// Commit to the WAL, then sync the store: its checkpoint reclaims.
+    fn sync_and_reclaim(&self) {
+        self.coordinator.sync().unwrap();
+        self.store.sync_all().unwrap();
+    }
+}
+
+/// Reopen the State pool in `store` beside the WAL image `wal`.
+fn reopen_state_pool(store: &Path, wal: &[u8]) -> Result<PackfileStorage, String> {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let wal_path = test_dir("reclaimed_history_reopen_wal").join("shared.wal");
+    fs::write(&wal_path, wal).unwrap();
+    let (journal, scan) = Journal::open_shared(&wal_path).map_err(|error| error.to_string())?;
+    let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+    let reopened = PackfileStorage::open(store.to_path_buf()).map_err(|error| error.to_string())?;
+    reopened
+        .enable_shared_journal(coordinator, ShardType::State)
+        .map_err(|error| error.to_string())?;
+    Ok(reopened)
+}
+
+fn remove_baseline_files(store: &Path) {
+    for file in VERSION_FILES {
+        let _ = fs::remove_file(store.join(file));
+    }
+}
+
+/// Remove every delta log, the third place collection versions can survive a
+/// reclaim now that coverage batches carry a version table.
+fn remove_delta_logs(store: &Path) {
+    for entry in fs::read_dir(store).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if name.starts_with("index.delta.") {
+            let _ = fs::remove_file(store.join(&name));
+        }
+    }
+}
+
+fn assert_refuses_without_a_baseline(outcome: &Result<PackfileStorage, String>, what: &str) {
+    match outcome {
+        Ok(_) => panic!("{what}: the store opened without a version baseline"),
+        Err(message) => assert!(
+            message.contains("no readable version baseline"),
+            "{what}: refused for another reason: {message}"
+        ),
+    }
+}
+
+/// A readable but stale baseline loses versions too: after a second reclaim the
+/// WAL has dropped history newer than the first checkpoint and versions file
+/// cover, so putting those older files back must refuse, while the current ones
+/// open.
+#[test]
+fn a_stale_version_baseline_beside_a_newer_reclaim_fails_closed() {
+    use crate::journal::Journal;
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store("stale_baseline");
+    // Every sync must reclaim, or the second one only appends a delta and the
+    // first baseline is not stale.
+    shared.coordinator.set_reclaim_trigger_len(1);
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    let first_files = copy_store(&shared.store_dir, "stale_baseline_first");
+    let first_mark = shared
+        .coordinator
+        .reclaimed_history_through(ShardType::State);
+    shared.put(&TEST_COLLECTION, 3..6);
+    shared.sync_and_reclaim();
+    assert!(
+        Journal::scan_read_only(&shared.wal)
+            .unwrap()
+            .groups
+            .is_empty(),
+        "the second sync reclaimed"
+    );
+    assert!(
+        shared
+            .coordinator
+            .reclaimed_history_through(ShardType::State)
+            > first_mark,
+        "the second reclaim removed newer history than the first baseline covers"
+    );
+    let wal = fs::read(&shared.wal).unwrap();
+    let current = copy_store(&shared.store_dir, "stale_baseline_current");
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    assert!(
+        reopen_state_pool(&current, &wal).is_ok(),
+        "the current baseline must open"
+    );
+    for file in VERSION_FILES {
+        fs::copy(first_files.join(file), current.join(file)).unwrap();
+    }
+    // The delta log is version evidence now; drop it so the stale files are
+    // all that is left to restore the newer reclaim.
+    remove_delta_logs(&current);
+    let stale = reopen_state_pool(&current, &wal);
+    assert_refuses_without_a_baseline(&stale, "the first sync's baseline");
+}
+
+/// The evidence is the history the WAL dropped, not what survives in the packs:
+/// a deleted collection leaves no record to find, and losing the baseline must
+/// still refuse.
+#[test]
+fn losing_the_baseline_of_a_deleted_collection_fails_closed() {
+    let shared = open_shared_wal_store("deleted_collection");
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.coordinator.sync().unwrap();
+    shared.store.delete_collection(&TEST_COLLECTION).unwrap();
+    shared.sync_and_reclaim();
+    let wal = fs::read(&shared.wal).unwrap();
+    let published = copy_store(&shared.store_dir, "deleted_collection_published");
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    let intact = reopen_state_pool(&published, &wal).expect("the intact store opens");
+    assert_eq!(
+        intact.collection_len(&TEST_COLLECTION).unwrap(),
+        None,
+        "the collection stays deleted"
+    );
+    drop(intact);
+    remove_baseline_files(&published);
+    assert_refuses_without_a_baseline(&reopen_state_pool(&published, &wal), "deleted collection");
+}
+
+/// Groups newer than the reclaim that survive in the WAL do not show that older
+/// history was kept: with the baseline lost they must not let the store open.
+#[test]
+fn surviving_newer_wal_groups_do_not_hide_a_lost_baseline() {
+    let shared = open_shared_wal_store("newer_groups");
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    // Newer groups reach the WAL but are not reclaimed.
+    shared.put(&TEST_COLLECTION, 3..5);
+    shared.coordinator.sync().unwrap();
+    let wal = fs::read(&shared.wal).unwrap();
+    let files = copy_store(&shared.store_dir, "newer_groups_files");
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    let intact = reopen_state_pool(&files, &wal).expect("the intact store opens");
+    drop(intact);
+    remove_baseline_files(&files);
+    assert_refuses_without_a_baseline(&reopen_state_pool(&files, &wal), "newer groups survive");
+}
+
+/// A pool that took no part in the reclaimed history is not refused: one with
+/// imported data that never reached the shared WAL, and one that is new and
+/// quiet, both have nothing recorded and no baseline to lose.
+#[test]
+fn imported_and_quiet_pools_open_beside_a_reclaimed_wal() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store("quiet_pools");
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    let wal = fs::read(&shared.wal).unwrap();
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    // Imported: data written and synced with no journal at all.
+    let imported_dir = test_dir("quiet_pools_imported");
+    {
+        let imported = PackfileStorage::open(imported_dir.clone()).unwrap();
+        for i in 0..3 {
+            imported
+                .put(
+                    &SECOND_COLLECTION,
+                    &distinct_id(i),
+                    &NodeData::new(bytes::Bytes::from(vec![i; 8])),
+                )
+                .unwrap();
+        }
+        imported.sync_all().unwrap();
+    }
+    remove_baseline_files(&imported_dir);
+    let quiet_dir = test_dir("quiet_pools_new");
+
+    let wal_path = test_dir("quiet_pools_reopen_wal").join("shared.wal");
+    fs::write(&wal_path, &wal).unwrap();
+    let (journal, scan) = Journal::open_shared(&wal_path).unwrap();
+    let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+    assert!(
+        coordinator.reclaimed_history_through(ShardType::State) > 0,
+        "the State pool's history was reclaimed"
+    );
+    assert_eq!(
+        coordinator.reclaimed_history_through(ShardType::EventDag),
+        0
+    );
+    for dir in [imported_dir, quiet_dir] {
+        let pool = PackfileStorage::open(dir).unwrap();
+        pool.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+            .expect("a pool with nothing reclaimed opens without a baseline");
+    }
 }

@@ -54,7 +54,7 @@ fn env_u32(key: &str, default: u32) -> u32 {
 }
 
 fn index() -> ShortIdIndex {
-    let scope = ShortIdIndex::new(ShardType::Edges, SCOPE);
+    let scope = ShortIdIndex::new(ShardType::State, SCOPE);
     if env_u32("MTXDB_PB_LOG_POOL", 0) != 0 {
         scope.with_log_pool(ShardType::ServerInfo)
     } else {
@@ -66,7 +66,7 @@ fn index() -> ShortIdIndex {
 fn digest(i: u32) -> [u8; 32] {
     let mut out = [0_u8; 32];
     let mut x = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    for chunk in out.chunks_exact_mut(8) {
+    for chunk in out.as_chunks_mut::<8>().0 {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -142,7 +142,6 @@ fn build_store(dir: &Path, owners: u32) -> Database {
             .zip(&payloads)
             .map(|(key, payload)| BatchEvent {
                 owner: key,
-                families: &[],
                 owner_payload: with_payload.then_some(payload.as_slice()),
             })
             .collect();
@@ -151,13 +150,13 @@ fn build_store(dir: &Path, owners: u32) -> Database {
         // Syncing lets the journal reclaim; without it a large build fills
         // the segment and commits fail.
         if sync_every != 0 && (next / BATCH).checked_rem(sync_every) == Some(0) {
-            db.edges().sync_all().expect("sync");
+            db.pool(ShardType::State).sync_all().expect("sync");
         }
     }
-    db.edges().sync_all().expect("sync");
+    db.pool(ShardType::State).sync_all().expect("sync");
     if env_u32("MTXDB_PB_RUNS", 1) != 0 {
         write_runs(&db, owners);
-        db.edges().sync_all().expect("sync");
+        db.pool(ShardType::State).sync_all().expect("sync");
     }
     let secs = started.elapsed().as_secs_f64();
     println!(
@@ -218,7 +217,7 @@ fn write_runs(db: &Database, owners: u32) {
             let mut id = [0_u8; 16];
             id[..4].copy_from_slice(&seq.to_be_bytes());
             txn.put(
-                ShardType::Edges,
+                ShardType::State,
                 RUN_COLLECTION,
                 id,
                 &NodeData::new(bytes::Bytes::from(bytes)),
@@ -228,7 +227,7 @@ fn write_runs(db: &Database, owners: u32) {
             next = end;
         }
         txn.commit().expect("commit runs");
-        db.edges().sync_all().expect("sync");
+        db.pool(ShardType::State).sync_all().expect("sync");
     }
 }
 
@@ -247,10 +246,10 @@ fn read_runs(db: &Database, owners: u32) -> usize {
             .collect();
         let txn = db.begin_transaction();
         let (found, _) = txn
-            .get_with_record_versions(ShardType::Edges, &RUN_COLLECTION, &ids)
+            .get_with_record_versions(ShardType::State, &RUN_COLLECTION, &ids)
             .expect("read runs");
         for record in found.into_iter().flatten() {
-            for chunk in record.bytes.chunks_exact(32) {
+            for chunk in record.bytes.as_chunks::<32>().0 {
                 let (h64, rest) = chunk.split_at(8);
                 let (q3, h128) = rest.split_at(8);
                 hashes.push(ElementHash {
@@ -282,7 +281,6 @@ fn sync_scaling(db: &Database, dir: &Path, owners: u32) {
             .zip(&payloads)
             .map(|(key, payload)| BatchEvent {
                 owner: key,
-                families: &[],
                 owner_payload: Some(payload),
             })
             .collect();
@@ -290,7 +288,7 @@ fn sync_scaling(db: &Database, dir: &Path, owners: u32) {
         index().record_events(db, &events).expect("record");
         write_ms.push(began.elapsed().as_secs_f64() * 1e3);
         let began = Instant::now();
-        db.edges().sync_all().expect("sync");
+        db.pool(ShardType::State).sync_all().expect("sync");
         sync_ms.push(began.elapsed().as_secs_f64() * 1e3);
         println!("    round {round}: {}", state_line(dir));
     }
@@ -313,7 +311,7 @@ fn reclaim(db: &Database, dir: &Path) {
     let pool = db.pool(if env_u32("MTXDB_PB_LOG_POOL", 0) != 0 {
         ShardType::ServerInfo
     } else {
-        ShardType::Edges
+        ShardType::State
     });
     println!(
         "  before: {}, shards retired {}",
@@ -326,7 +324,7 @@ fn reclaim(db: &Database, dir: &Path) {
         "  compact: {:.1}s {report:?}",
         started.elapsed().as_secs_f64()
     );
-    db.edges().sync_all().expect("sync");
+    db.pool(ShardType::State).sync_all().expect("sync");
     println!(
         "  after compact: {}, shards retired {}",
         state_line(dir),
@@ -343,7 +341,7 @@ fn reclaim(db: &Database, dir: &Path) {
             repack.elapsed().as_secs_f64()
         );
     }
-    db.edges().sync_all().expect("sync");
+    db.pool(ShardType::State).sync_all().expect("sync");
     pool.sync_all().expect("sync");
     println!(
         "  gc: {:.1}s {gc:?}\n  after gc: {}, shards retired {}",

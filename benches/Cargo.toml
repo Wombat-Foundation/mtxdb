@@ -29,7 +29,8 @@ memmap2 = "0.9"
 fjall = "2.11.2"
 libmdbx = "0.6"
 base64 = "0.22"
-mtxdb = { path = "..", features = ["reconcile"] }
+mtxdb = { path = "..", features = ["reconcile", "test-util"] }
+
 rusqlite = "0.32"
 
 [target.'cfg(windows)'.dependencies]
@@ -157,6 +158,24 @@ name = "reopen_cost"
 path = "reopen_cost.rs"
 harness = false
 
+# Prototype: immutable sorted segments + manifest vs the resident LossyIndex image.
+[[bench]]
+name = "index_segments"
+path = "index_segments.rs"
+harness = false
+
+# Does a rotation wait for a pack-index build when builders fall behind?
+[[bench]]
+name = "seal_rotation"
+path = "seal_rotation.rs"
+harness = false
+
+# Append-path A/B: eager vs buffered pack writes, per-record vs batched WAL.
+[[bench]]
+name = "io_append"
+path = "io_append.rs"
+harness = false
+
 # Where the time of a pack recovery scan goes.
 [[bench]]
 name = "pack_scan_profile"
@@ -180,32 +199,39 @@ harness = false
 name = "big_reopen_repro"
 path = "big_reopen_repro.rs"
 harness = false
+test = false
 
-# What the short-id edge store costs on disk for a real room.
 [[bench]]
-name = "edge_layout_measure"
-path = "edge_layout_measure.rs"
+name = "edge_codec_bench"
+path = "edge_codec_bench.rs"
 harness = false
 
-# Read and write cost of the chunked edge-layout prototype against the current store.
+# Reclaim-trigger sweep with and without a held replay lease (synthetic, host-specific).
 [[bench]]
-name = "edge_layout_lookup"
-path = "edge_layout_lookup.rs"
+name = "reclaim_trigger_sweep"
+path = "reclaim_trigger_sweep.rs"
 harness = false
 
-# Write cost of the chunked prototype when events arrive in small batches.
+# CSR point reads vs first/warm whole-scope reads and post-seal reads.
 [[bench]]
-name = "edge_layout_batches"
-path = "edge_layout_batches.rs"
+name = "csr_read_cache"
+path = "csr_read_cache.rs"
 harness = false
 
-# Which layer of the prototype's id -> key read costs the time: decode, fetch, compression, CRC.
+# Request-scoped parent->children derivation (reverse_family) cost vs room size.
 [[bench]]
-name = "edge_layout_read_split"
-path = "edge_layout_read_split.rs"
+name = "reverse_family"
+path = "reverse_family.rs"
+harness = false
+
+# Write cost of maintaining PREV_CHILDREN and children_of read latency vs the
+# whole-room reverse_family derive.
+[[bench]]
+name = "prev_children"
+path = "prev_children.rs"
 harness = false
 
 [[bench]]
-name = "edge_layout_sithnapse"
-path = "edge_layout_sithnapse.rs"
+name = "bitmap_membership"
+path = "bitmap_membership.rs"
 harness = false

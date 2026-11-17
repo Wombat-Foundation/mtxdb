@@ -30,9 +30,7 @@ fn test_dir(name: &str) -> std::path::PathBuf {
     path
 }
 
-/// A root written before the pool directories were renamed lists the old
-/// names. It must be rejected loudly, not opened with its data orphaned in
-/// `pools/state` etc. beside freshly created, empty `pools/mtpl-*`.
+/// A descriptor listing old pool names is rejected instead of misparsed.
 #[test]
 fn a_descriptor_listing_the_old_pool_names_is_rejected() {
     let root = test_dir("old_pool_names");
@@ -110,7 +108,7 @@ fn a_zero_seed_or_old_version_descriptor_is_rejected() {
     assert!(DatabaseLayout::open(root.clone()).is_err());
 
     let mut old = good;
-    old[4] = 2;
+    old[4] = 1;
     fs::write(&meta_path, old).unwrap();
     assert!(DatabaseLayout::open_read_only(root.clone()).is_err());
     let _ = fs::remove_dir_all(root);
@@ -123,26 +121,26 @@ fn initializes_named_pool_layout() {
     assert!(root.join(DB_META_FILENAME).is_file());
     for shard_type in ShardType::ALL {
         assert!(
-            !root.join("pools").join(shard_type.as_str()).exists(),
+            !root.join(shard_type.as_str()).exists(),
             "init creates only the root; pools appear on first write"
         );
-        assert_eq!(
-            layout.pool_path(shard_type),
-            root.join("pools").join(shard_type.as_str())
-        );
+        assert_eq!(layout.pool_path(shard_type), root.join(shard_type.as_str()));
     }
+    assert!(!root.join("pools").exists());
+    assert!(!root.join("graph").exists());
     assert_eq!(
         layout.pool_dir(ShardType::State).unwrap(),
-        root.join("pools/mtpl-state")
+        root.join("mtpl-state")
     );
     assert_eq!(
         layout.pool_dir(ShardType::EventDag).unwrap(),
-        root.join("pools/mtpl-event")
+        root.join("mtpl-event")
     );
     assert_eq!(
-        layout.pool_dir(ShardType::Edges).unwrap(),
-        root.join("pools/mtpl-edges")
+        layout.pool_dir(ShardType::ServerInfo).unwrap(),
+        root.join("mtpl-srvinfo")
     );
+    assert_eq!(layout.graph_path(ShardType::State), root.join("mtgr-state"));
 }
 
 #[test]

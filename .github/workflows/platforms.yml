@@ -1,5 +1,5 @@
 ---
-name: Native platforms
+name: Platform coverage
 
 on:
   push:
@@ -22,11 +22,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-latest, ubuntu-24.04-arm]
     env:
       # Workflow declares `stable`, but the committed rust-toolchain.toml pin
-      # (nightly-2026-08-20) outranks the installed default; RUSTUP_TOOLCHAIN
-      # wins over the file so these runners actually use stable.
+      # (1.89.0) outranks the installed default; RUSTUP_TOOLCHAIN wins over the
+      # file so these runners actually use stable.
       RUSTUP_TOOLCHAIN: stable
       # `.cargo/config.toml` enables the host-native `rustc-wrapper` on every
       # platform, but Windows cannot execute its `.sh` (`%1 is not a valid
@@ -39,10 +39,39 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install zstd development files (Linux ARM)
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: sudo apt-get update && sudo apt-get install --yes libzstd-dev pkg-config
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Record and assert architecture and page size (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          arch=$(uname -m)
+          pagesize=$(getconf PAGESIZE)
+          echo "arch: $arch"
+          echo "pagesize: $pagesize"
+
+          if [ "$RUNNER_OS" = macOS ]; then
+            case "$arch" in
+              arm64) expected=16384 ;;
+              x86_64) expected=4096 ;;
+              *)
+                echo "::error::unexpected macOS architecture: $arch"
+                exit 1
+                ;;
+            esac
+            if [ "$pagesize" != "$expected" ]; then
+              echo "::error::expected $expected-byte pages on macOS $arch, got $pagesize"
+              exit 1
+            fi
+          fi
+
+          rustc -vV
 
       - name: Toolchain versions
         run: |
@@ -62,6 +91,169 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install vmtouch
 
+      - name: Install vmtouch (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The runner's resolver occasionally fails for a few minutes; retry
+          # the index fetch and the download instead of failing the job.
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get -o Acquire::Retries=5 update \
+              && sudo apt-get -o Acquire::Retries=5 install --yes vmtouch; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying" >&2
+            sleep 15
+          done
+          exit 1
+
       - name: Run benchmarks
         if: github.event_name == 'push'
-        run: cargo bench --locked --manifest-path benches/Cargo.toml --benches --all-targets
+        env:
+          # read_plan requires disk-backed scratch storage for cold reads.
+          MTXDB_BENCH_ROOT: ${{ runner.temp }}/mtxdb-bench
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo bench --locked --manifest-path benches/Cargo.toml --benches --all-targets 2>&1 | tee bench-output.txt
+
+      - name: Upload platform benchmarks
+        if: ${{ !cancelled() && github.event_name == 'push' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-${{ matrix.os }}
+          path: bench-output.txt
+
+  emulated:
+    name: Linux ${{ matrix.arch }} (QEMU userspace)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: ppc64le
+            page_size: 4096
+          - arch: armv7
+            page_size: 4096
+          - arch: riscv64
+            page_size: 4096
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # User emulation exercises cross-architecture ABI and page alignment.
+      # The index format currently rejects big-endian targets at compile time.
+      # These containers still use the host kernel; native 64 KiB testing is separate.
+      - uses: uraimo/run-on-arch-action@v3
+        with:
+          arch: ${{ matrix.arch }}
+          distro: ubuntu24.04
+          # armv7 runs a 32-bit userspace on the host's 64-bit kernel. The
+          # workspace filesystem hands out inode numbers that don't fit in
+          # 32-bit `ino_t`, so readdir() fails with EOVERFLOW; libgit2 then
+          # walks away thinking the pinned rezzy commit does not exist
+          # ("revspec ... not found"). A tmpfs has small inode numbers, so
+          # keep Cargo's git/registry caches there instead of on the mount.
+          dockerRunArgs: --tmpfs /opt/cargo:size=2g
+          env: |
+            RUSTUP_TOOLCHAIN: stable
+            RUSTC_WRAPPER: ""
+            CARGO_HOME: /opt/cargo
+            QEMU_PAGESIZE: ${{ matrix.page_size }}
+            CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          install: |
+            set -eu
+            # This step runs inside `docker build`, which resolves package
+            # hosts through the runner's resolver. That resolver occasionally
+            # fails to resolve ports.ubuntu.com for a few seconds and turns a
+            # transient network hiccup into a failed job, so retry the index
+            # fetch and the downloads instead of failing on the first error.
+            # `apt-get update` exits 0 when every index fails to download, so
+            # the later install then reports "Unable to locate package". Make
+            # fetch failures fatal and retry update and install as one unit so
+            # a resolver outage re-fetches the indexes too.
+            apt_setup() {
+              apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update &&
+                apt-get -o Acquire::Retries=5 install -y build-essential curl ca-certificates git pkg-config libzstd-dev
+            }
+            attempt=1
+            while ! apt_setup; do
+              if [ "$attempt" -ge 6 ]; then
+                exit 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 20
+            done
+            attempt=1
+            while ! curl --retry 5 --retry-delay 5 --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; do
+              if [ "$attempt" -ge 3 ]; then
+                exit 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 10
+            done
+          run: |
+            set -eu
+            export PATH="/opt/cargo/bin:$HOME/.cargo/bin:$PATH"
+            uname -m
+            getconf PAGESIZE
+            test "$(getconf PAGESIZE)" = "${{ matrix.page_size }}"
+            rustc -vV
+            cargo test --locked --all-features --lib --tests
+            cargo test --locked --no-default-features --features multi-reader,zstd --lib --tests
+
+  linux-abi:
+    name: Linux ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: i686-unknown-linux-gnu
+            packages: gcc-multilib libc6-dev-i386
+          - target: x86_64-unknown-linux-musl
+            packages: musl-tools
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install target compiler and libc
+        run: sudo apt-get update && sudo apt-get install --yes ${{ matrix.packages }}
+      - name: Test target
+        run: |
+          rustc -vV
+          cargo test --locked --target ${{ matrix.target }} --all-features --features zstd-sys/vendored --lib --tests
+          cargo test --locked --target ${{ matrix.target }} --no-default-features --features multi-reader,zstd,zstd-sys/vendored --lib --tests
+
+  arm64-64k:
+    name: Linux ARM64 real 64 KiB kernel (full-system VM)
+    # Disabled for PR/push: GitHub-hosted ARM runners have no /dev/kvm, so the
+    # full-system 64 KiB guest runs under TCG and is too slow to run routinely.
+    # Run it manually via workflow_dispatch, or move it to a self-hosted 64K
+    # ARM runner before enabling it again.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install VM tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-arm qemu-utils qemu-efi-aarch64 cloud-image-utils
+      - name: Test under a real 64 KiB kernel
+        run: bash .github/scripts/arm64-64k.sh
+      - name: Upload guest console
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-64k-console
+          path: arm64-64k-serial.log

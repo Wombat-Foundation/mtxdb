@@ -1,12 +1,15 @@
-//! Logical redo records: the proposed replacement for the physical
-//! [`DeltaFrame`](super::format::DeltaFrame) (design: `docs/2026-09-27-index-checkpoint-design.md`,
-//! "Proposed logical-redo contract"). **Scaffold only**: nothing writes or reads
-//! these records in the delta log yet.
+//! Logical redo records for the index delta log.
 //!
 //! A record names a change by content identity, not by table position, so it
 //! replays into a table of any capacity and a resize cannot invalidate it. It is
 //! a fixed 80-byte little-endian payload; the outer delta operation supplies the
 //! frame type, length and CRC.
+//!
+//! These records are live. `PackfileStorage` writes them as
+//! `DeltaOperation::Redo` when appending a delta batch and replays them when the
+//! log continues the loaded checkpoint. They are not the physical `DeltaFrame`.
+//! Design: `docs/2026-09-27-index-checkpoint-design.md` ("Proposed
+//! logical-redo contract").
 //!
 //! ```text
 //!   0..16    collection_id

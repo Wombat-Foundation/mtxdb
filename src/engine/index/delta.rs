@@ -33,13 +33,14 @@
 //! collection ID that happens to spell a magic value can never misdirect the
 //! parser. A torn suffix is ignored and only complete batches are trusted.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
 use super::format::{DeltaFrame, DELTA_FRAME_LEN};
-use super::redo::{RedoRecord, REDO_RECORD_LEN};
+use super::redo::{RedoOp, RedoRecord, REDO_RECORD_LEN};
 
 /// File name of the incremental index delta log inside a store's base dir.
 pub const INDEX_DELTA_FILE: &str = "index.delta";
@@ -98,7 +99,10 @@ pub const DELTA_LOG_TRAILER_LEN: usize = 16;
 const MAX_DELTA_LOG_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 const DELTA_LOG_MAGIC: &[u8; 4] = b"MTXL";
-/// Current v1 delta-log version, with variable-length collection operations.
+/// The sole delta-log format version, with variable-length collection
+/// operations. A new frame kind carries the logical-version table; an older
+/// reader rejects the unknown frame and therefore the whole log, so it cannot
+/// accept a coverage claim while ignoring that table.
 const DELTA_LOG_VERSION: u8 = 1;
 const DELTA_BATCH_MAGIC: &[u8; 4] = b"MTXB";
 const DELTA_LOG_TRAILER_MAGIC: &[u8; 4] = b"MTXT";
@@ -115,11 +119,21 @@ const V1_COLLECTION_SNAPSHOT: u8 = 0x02;
 const V1_COLLECTION_TOMBSTONE: u8 = 0x03;
 const V1_COVERAGE: u8 = 0x04;
 const V1_REDO: u8 = 0x05;
+const V1_VERSIONS: u8 = 0x06;
 const V1_FRAME_HEADER_LEN: usize = 1 + 4;
 const V1_FRAME_TRAILER_LEN: usize = 4;
 const V1_SNAPSHOT_FIXED_LEN: usize = 16 + 8 + 8 + 4;
 const V1_TOMBSTONE_LEN: usize = 16 + 8;
 const V1_COVERAGE_LEN: usize = 8;
+/// Revision of the version-table payload: `revision:u8 | covered_lsn:u64 |
+/// entry_count:u32 | entries`, each entry `collection_id:[u8;16] | version:u64`.
+const V1_VERSIONS_REVISION: u8 = 1;
+const V1_VERSIONS_FIXED_LEN: usize = 1 + 8 + 4;
+const V1_VERSION_ENTRY_LEN: usize = 16 + 8;
+/// Most entries one version table may carry. A table is a complete snapshot of a
+/// pool's collection versions, so this bounds a pool's collection count for
+/// delta coverage; a pool above it takes the full checkpoint path instead.
+pub const MAX_VERSION_TABLE_ENTRIES: usize = 1 << 20;
 
 /// One v1 operation in a count-framed delta batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,8 +154,9 @@ pub enum DeltaOperation {
         generation: u64,
         /// Stable position in `collection_order`.
         order_key: u64,
-        /// `LossyIndex::serialize()` bytes; semantic validation occurs during
-        /// replay, where the configured index policy is available.
+        /// `LossyIndex::serialize()` bytes in the slots-only v1 format. The
+        /// payload is self-describing by length; semantic validation occurs
+        /// during replay, where the configured index policy is available.
         index_blob: Vec<u8>,
     },
     /// Remove a collection from the replayed checkpoint state.
@@ -162,6 +177,22 @@ pub enum DeltaOperation {
     Coverage {
         /// Highest journal LSN of this pool the packs durably cover.
         covered_lsn: u64,
+    },
+    /// A complete snapshot of the pool's collection logical versions through
+    /// `covered_lsn`, sorted by collection id with no duplicates. Once the WAL
+    /// groups that carried a version are reclaimed, this is where it survives, so
+    /// a coverage claim that lets the journal drop them must travel with it.
+    ///
+    /// Every coverage claim carries one, and only a claim does: the table is
+    /// the operation immediately before the batch's [`Self::Coverage`], with the
+    /// same `covered_lsn`. A table with no matching claim, a claim with no table,
+    /// or a claim that disagrees with its table damages the batch and it claims
+    /// nothing.
+    Versions {
+        /// The journal LSN these versions are complete through.
+        covered_lsn: u64,
+        /// `(collection_id, logical_version)`, strictly ascending by id.
+        entries: Vec<([u8; 16], u64)>,
     },
 }
 
@@ -209,6 +240,33 @@ pub fn encode_frame(operation: &DeltaOperation) -> io::Result<Vec<u8>> {
         }
         DeltaOperation::Coverage { covered_lsn } => {
             (V1_COVERAGE, covered_lsn.to_le_bytes().to_vec())
+        }
+        DeltaOperation::Versions {
+            covered_lsn,
+            entries,
+        } => {
+            if entries.len() > MAX_VERSION_TABLE_ENTRIES
+                || entries.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "version table is too large, unsorted or has a duplicate id",
+                ));
+            }
+            let count = u32::try_from(entries.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "version count"))?;
+            let mut payload = Vec::with_capacity(
+                V1_VERSIONS_FIXED_LEN
+                    .saturating_add(entries.len().saturating_mul(V1_VERSION_ENTRY_LEN)),
+            );
+            payload.push(V1_VERSIONS_REVISION);
+            payload.extend_from_slice(&covered_lsn.to_le_bytes());
+            payload.extend_from_slice(&count.to_le_bytes());
+            for (collection_id, version) in entries {
+                payload.extend_from_slice(collection_id);
+                payload.extend_from_slice(&version.to_le_bytes());
+            }
+            (V1_VERSIONS, payload)
         }
     };
     let payload_len = u32::try_from(payload.len())
@@ -284,9 +342,48 @@ pub fn decode_frame(bytes: &[u8]) -> Option<(DeltaOperation, usize)> {
                 covered_lsn: u64::from_le_bytes(payload.try_into().ok()?),
             }
         }
+        V1_VERSIONS => {
+            let (covered_lsn, entries) = parse_versions_payload(payload)?;
+            DeltaOperation::Versions {
+                covered_lsn,
+                entries,
+            }
+        }
         _ => return None,
     };
     Some((operation, frame_end))
+}
+
+/// Validate and decode a version-table payload: the revision, an exact length
+/// for the stated count, a bounded count, and strictly ascending ids.
+fn parse_versions_payload(payload: &[u8]) -> Option<(u64, VersionEntries)> {
+    if *payload.first()? != V1_VERSIONS_REVISION {
+        return None;
+    }
+    let covered_lsn = u64::from_le_bytes(payload.get(1..9)?.try_into().ok()?);
+    let count = usize::try_from(u32::from_le_bytes(payload.get(9..13)?.try_into().ok()?)).ok()?;
+    if count > MAX_VERSION_TABLE_ENTRIES {
+        return None;
+    }
+    let expected = V1_VERSIONS_FIXED_LEN.checked_add(count.checked_mul(V1_VERSION_ENTRY_LEN)?)?;
+    if payload.len() != expected {
+        return None;
+    }
+    let mut entries: Vec<([u8; 16], u64)> = Vec::with_capacity(count);
+    let body = payload.get(V1_VERSIONS_FIXED_LEN..)?;
+    let (chunks, remainder) = body.as_chunks::<V1_VERSION_ENTRY_LEN>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    for chunk in chunks {
+        let id: [u8; 16] = chunk.get(..16)?.try_into().ok()?;
+        let version = u64::from_le_bytes(chunk.get(16..24)?.try_into().ok()?);
+        if entries.last().is_some_and(|(previous, _)| *previous >= id) {
+            return None;
+        }
+        entries.push((id, version));
+    }
+    Some((covered_lsn, entries))
 }
 
 /// Encode the fixed-width log header for `base_fingerprint`.
@@ -540,36 +637,58 @@ fn scan_v1_frames(
     operation_count: u32,
 ) -> Result<Option<(u64, crc32fast::Hasher, Option<u64>)>, DeltaFingerprintError> {
     let mut batch_crc = crc32fast::Hasher::new();
-    let mut coverage: Option<u64> = None;
     let mut claims = 0usize;
-    let mut last_was_claim = false;
+    let mut tables = 0usize;
+    let mut last = FrameFact::Other;
+    let mut before_last = FrameFact::Other;
     for _ in 0..operation_count {
-        let Some((next, frame_coverage)) =
-            scan_v1_frame(file, path, file_len, cursor, &mut batch_crc)?
+        let Some((next, fact)) = scan_v1_frame(file, path, file_len, cursor, &mut batch_crc)?
         else {
             return Ok(None);
         };
         cursor = next;
-        last_was_claim = frame_coverage.is_some();
-        if let Some(claimed) = frame_coverage {
-            claims = claims.saturating_add(1);
-            coverage = Some(claimed);
+        match fact {
+            FrameFact::Coverage(_) => claims = claims.saturating_add(1),
+            FrameFact::Versions(_) => tables = tables.saturating_add(1),
+            FrameFact::Other => {}
         }
+        before_last = last;
+        last = fact;
     }
-    // The same shape rule `read_delta_log` applies: one claim, and last.
-    if claims > 1 || (claims == 1 && !last_was_claim) {
-        return Ok(None);
-    }
+    // The same shape rule `read_delta_log` applies: a claim is last and directly
+    // follows the one table that names the same LSN, and a table has a claim.
+    let coverage = match (claims, tables) {
+        (0, 0) => None,
+        (1, 1) => match (before_last, last) {
+            (FrameFact::Versions(table), FrameFact::Coverage(claimed)) if table == claimed => {
+                Some(claimed)
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
     Ok(Some((cursor, batch_crc, coverage)))
 }
 
+/// What a frame contributes to the batch shape check.
+#[derive(Clone, Copy)]
+enum FrameFact {
+    Other,
+    Coverage(u64),
+    Versions(u64),
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "streams one frame's fixed header, payload and checksum in order"
+)]
 fn scan_v1_frame(
     file: &mut TrackedReader,
     path: &Path,
     file_len: u64,
     cursor: u64,
     batch_crc: &mut crc32fast::Hasher,
-) -> Result<Option<(u64, Option<u64>)>, DeltaFingerprintError> {
+) -> Result<Option<(u64, FrameFact)>, DeltaFingerprintError> {
     let header_len = u64::try_from(V1_FRAME_HEADER_LEN)
         .map_err(|_| invalid(path, "v1 frame header length overflows u64"))?;
     let Some(header_end) = cursor
@@ -611,9 +730,17 @@ fn scan_v1_frame(
             0
         }
         V1_COVERAGE if payload_len == u64::try_from(V1_COVERAGE_LEN).unwrap_or(u64::MAX) => 0,
+        V1_VERSIONS
+            if payload_len >= u64::try_from(V1_VERSIONS_FIXED_LEN).unwrap_or(u64::MAX)
+                && payload_len <= max_versions_payload_len() =>
+        {
+            0
+        }
         _ => return Ok(None),
     };
     let is_coverage = header[0] == V1_COVERAGE;
+    let is_versions = header[0] == V1_VERSIONS;
+    let mut versions_payload: Vec<u8> = Vec::new();
     let mut coverage_bytes = [0u8; V1_COVERAGE_LEN];
     let mut frame_crc = crc32fast::Hasher::new();
     frame_crc.update(&header);
@@ -648,6 +775,10 @@ fn scan_v1_frame(
             // A coverage payload is exactly eight bytes, read in one chunk.
             coverage_bytes.copy_from_slice(&chunk[..V1_COVERAGE_LEN]);
         }
+        if is_versions {
+            // A version table is validated whole, so keep its payload.
+            versions_payload.extend_from_slice(&chunk[..chunk_size]);
+        }
         frame_crc.update(&chunk[..chunk_size]);
         batch_crc.update(&chunk[..chunk_size]);
         remaining = remaining.saturating_sub(u64::try_from(chunk_size).unwrap_or(u64::MAX));
@@ -659,8 +790,25 @@ fn scan_v1_frame(
         return Ok(None);
     }
     batch_crc.update(&stored_crc);
-    let coverage = is_coverage.then(|| u64::from_le_bytes(coverage_bytes));
-    Ok(Some((checksum_end, coverage)))
+    let fact = if is_coverage {
+        FrameFact::Coverage(u64::from_le_bytes(coverage_bytes))
+    } else if is_versions {
+        let Some((covered_lsn, _)) = parse_versions_payload(&versions_payload) else {
+            return Ok(None);
+        };
+        FrameFact::Versions(covered_lsn)
+    } else {
+        FrameFact::Other
+    };
+    Ok(Some((checksum_end, fact)))
+}
+
+/// Largest valid version-table payload.
+fn max_versions_payload_len() -> u64 {
+    u64::try_from(
+        V1_VERSIONS_FIXED_LEN.saturating_add(MAX_VERSION_TABLE_ENTRIES * V1_VERSION_ENTRY_LEN),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Lightweight forward scan of the delta log's last committed
@@ -893,6 +1041,12 @@ pub const fn v1_coverage_frame_len() -> usize {
     V1_FRAME_HEADER_LEN + V1_COVERAGE_LEN + V1_FRAME_TRAILER_LEN
 }
 
+/// Length of one framed version table with `entry_count` entries.
+#[must_use]
+pub fn v1_versions_frame_len(entry_count: usize) -> Option<usize> {
+    v1_frame_len(V1_VERSIONS_FIXED_LEN.checked_add(entry_count.checked_mul(V1_VERSION_ENTRY_LEN)?)?)
+}
+
 /// Length of one framed collection snapshot whose index blob is `blob_len`
 /// bytes, known without building the blob.
 #[must_use]
@@ -914,6 +1068,7 @@ pub fn v1_batch_len(operations: &[DeltaOperation]) -> Option<usize> {
             }
             DeltaOperation::CollectionTombstone { .. } => v1_tombstone_frame_len(),
             DeltaOperation::Coverage { .. } => v1_coverage_frame_len(),
+            DeltaOperation::Versions { entries, .. } => v1_versions_frame_len(entries.len())?,
         };
         total = total.checked_add(frame_len)?;
     }
@@ -939,16 +1094,55 @@ pub struct DeltaLog {
     /// operation: the prefix whose index changes are exactly what that coverage
     /// describes. Zero when no batch carries coverage.
     pub coverage_prefix_ops: usize,
+    /// The collection version table of the newest coverage claim (the one with
+    /// the highest covered LSN; a later batch wins a tie). Each table is a
+    /// complete snapshot, so this one supersedes the earlier ones.
+    pub version_table: Option<VersionTable>,
 }
 
-/// The writer appends its one coverage claim as the last operation of a batch.
+/// `(collection_id, logical_version)`, strictly ascending by id.
+pub type VersionEntries = Vec<([u8; 16], u64)>;
+
+/// A complete snapshot of a pool's collection logical versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionTable {
+    /// The journal LSN the versions are complete through.
+    pub covered_lsn: u64,
+    /// The versions, strictly ascending by collection id.
+    pub entries: VersionEntries,
+}
+
+/// The writer appends its one coverage claim as the last operation of a batch,
+/// directly after the version table that claim carries, which names the same
+/// LSN. A batch with neither is an index-only batch.
 fn coverage_claim_is_well_placed(operations: &[DeltaOperation]) -> bool {
     let claims = operations
         .iter()
         .filter(|operation| matches!(operation, DeltaOperation::Coverage { .. }))
         .count();
-    claims == 0
-        || (claims == 1 && matches!(operations.last(), Some(DeltaOperation::Coverage { .. })))
+    let tables = operations
+        .iter()
+        .filter(|operation| matches!(operation, DeltaOperation::Versions { .. }))
+        .count();
+    match (claims, tables) {
+        (0, 0) => true,
+        (1, 1) => {
+            let Some((
+                DeltaOperation::Coverage {
+                    covered_lsn: claimed,
+                },
+                before,
+            )) = operations.split_last()
+            else {
+                return false;
+            };
+            matches!(
+                before.last(),
+                Some(DeltaOperation::Versions { covered_lsn, .. }) if covered_lsn == claimed
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Read and structurally validate a v1 delta log.
@@ -962,6 +1156,10 @@ fn coverage_claim_is_well_placed(operations: &[DeltaOperation]) -> bool {
 /// that has lost a later batch. Returns `None` for a missing file, a bad
 /// header, the wrong version, or a log with no complete committed batch.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "decodes the batch framing, shape rules and coverage in one pass"
+)]
 pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
     use std::io::Read;
     let mut file = fs::File::open(path).ok()?;
@@ -983,6 +1181,7 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
     let mut tail_fingerprint: Option<u64> = None;
     let mut coverage: Option<u64> = None;
     let mut coverage_prefix_ops = 0usize;
+    let mut version_table: Option<VersionTable> = None;
     let mut offset = DELTA_LOG_HEADER_LEN;
     while offset < buf.len() {
         let Some(header_end) = offset.checked_add(DELTA_BATCH_HEADER_LEN) else {
@@ -1050,6 +1249,24 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
             // Coverage only moves forward; a lower claim in a later batch
             // (it should not happen) cannot lower what was proven earlier.
             coverage = Some(coverage.map_or(*covered_lsn, |old: u64| old.max(*covered_lsn)));
+            if let Some(DeltaOperation::Versions {
+                covered_lsn: table_lsn,
+                entries,
+            }) = batch_operations
+                .len()
+                .checked_sub(2)
+                .and_then(|index| batch_operations.get(index))
+            {
+                if version_table
+                    .as_ref()
+                    .is_none_or(|current| *table_lsn >= current.covered_lsn)
+                {
+                    version_table = Some(VersionTable {
+                        covered_lsn: *table_lsn,
+                        entries: entries.clone(),
+                    });
+                }
+            }
         }
         operations.append(&mut batch_operations);
         if matches!(operations.last(), Some(DeltaOperation::Coverage { .. })) {
@@ -1067,7 +1284,187 @@ pub fn read_delta_log(path: &Path) -> Option<DeltaLog> {
         operations,
         coverage,
         coverage_prefix_ops,
+        version_table,
     })
+}
+
+/// Identity used to discard superseded operations during delta compaction.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum CompactKey {
+    /// One logical redo set, identified by its content hash.
+    RedoSet([u8; 16], [u8; 16]),
+    /// One physical slot overwrite, identified by its target bucket.
+    Incremental([u8; 16], u32),
+}
+
+/// Drop operations that a later operation in the same covered prefix supersedes.
+///
+/// The returned sequence preserves relative order and keeps the last coverage
+/// claim last. A collection snapshot or tombstone is a hard cut: everything
+/// earlier for that collection is dropped, and only the newest cut survives.
+/// The caller must only pass a prefix ending at a coverage claim; compacting
+/// past one would change what the claim proves.
+#[must_use]
+pub fn compact_operations(operations: &[DeltaOperation]) -> Vec<DeltaOperation> {
+    let mut last_cut: HashMap<[u8; 16], usize> = HashMap::new();
+    let mut last_dedup: HashMap<CompactKey, usize> = HashMap::new();
+    let mut last_coverage = None;
+    let mut last_versions = None;
+
+    for (index, operation) in operations.iter().enumerate() {
+        match operation {
+            DeltaOperation::Redo(record) => match record.op {
+                RedoOp::Set { full_hash, .. } => {
+                    last_dedup.insert(CompactKey::RedoSet(record.collection_id, full_hash), index);
+                }
+                RedoOp::CollectionTombstone => {
+                    last_cut.insert(record.collection_id, index);
+                }
+            },
+            DeltaOperation::Incremental(frame) => {
+                last_dedup.insert(
+                    CompactKey::Incremental(frame.collection_id, frame.bucket),
+                    index,
+                );
+            }
+            DeltaOperation::CollectionSnapshot { collection_id, .. }
+            | DeltaOperation::CollectionTombstone { collection_id, .. } => {
+                last_cut.insert(*collection_id, index);
+            }
+            DeltaOperation::Coverage { .. } => last_coverage = Some(index),
+            DeltaOperation::Versions { .. } => last_versions = Some(index),
+        }
+    }
+
+    operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| match operation {
+            DeltaOperation::Coverage { .. } => {
+                (last_coverage == Some(index)).then(|| operation.clone())
+            }
+            // Each table is a complete snapshot, so only the newest survives,
+            // directly before the claim it belongs to.
+            DeltaOperation::Versions { .. } => {
+                (last_versions == Some(index)).then(|| operation.clone())
+            }
+            DeltaOperation::Redo(record) => {
+                if last_cut
+                    .get(&record.collection_id)
+                    .is_some_and(|cut| index < *cut)
+                {
+                    return None;
+                }
+                let keep = match record.op {
+                    RedoOp::Set { full_hash, .. } => {
+                        last_dedup.get(&CompactKey::RedoSet(record.collection_id, full_hash))
+                            == Some(&index)
+                    }
+                    RedoOp::CollectionTombstone => {
+                        last_cut.get(&record.collection_id) == Some(&index)
+                    }
+                };
+                keep.then(|| operation.clone())
+            }
+            DeltaOperation::Incremental(frame) => {
+                if last_cut
+                    .get(&frame.collection_id)
+                    .is_some_and(|cut| index < *cut)
+                {
+                    return None;
+                }
+                (last_dedup.get(&CompactKey::Incremental(frame.collection_id, frame.bucket))
+                    == Some(&index))
+                .then(|| operation.clone())
+            }
+            DeltaOperation::CollectionSnapshot { collection_id, .. }
+            | DeltaOperation::CollectionTombstone { collection_id, .. } => {
+                (last_cut.get(collection_id) == Some(&index)).then(|| operation.clone())
+            }
+        })
+        .collect()
+}
+
+/// Minimum share of the log a compaction must release before it is worth the
+/// rewrite. Below this, the ordinary checkpoint path is cheaper than repeatedly
+/// compacting a working set that is genuinely growing.
+pub const MIN_COMPACTION_SAVINGS_PERCENT: u64 = 25;
+
+/// Rewrite a v1 delta log without the operations superseded inside its covered
+/// prefix. Returns the new on-disk length when a compaction was written.
+///
+/// This is an *in-place rewrite of the same epoch*: it keeps the log name, the
+/// base fingerprint, the tail fingerprint, and the final coverage claim, so all
+/// existing trust gates are unchanged. The rewrite goes to a sibling temp file,
+/// is fsynced, read back and compared, and only then renamed over the live log.
+/// A crash before the rename leaves the old log untouched; a crash after it
+/// leaves the new log, which is semantically identical for replay.
+///
+/// # Errors
+/// Returns an I/O error if the log cannot be read or the replacement cannot be
+/// written. A malformed or compacting-useless log returns `Ok(None)` and is
+/// left alone.
+pub fn compact_delta_log(path: &Path) -> io::Result<Option<u64>> {
+    let Some(log) = read_delta_log(path) else {
+        return Ok(None);
+    };
+    // Compaction is only safe over the prefix a coverage claim already proves.
+    // Requiring the claim to be the final operation keeps the rewritten batch's
+    // "coverage is last" rule intact.
+    if log.coverage_prefix_ops == 0 || log.coverage_prefix_ops != log.operations.len() {
+        return Ok(None);
+    }
+    let compacted = compact_operations(&log.operations);
+    if compacted.len() == log.operations.len() {
+        return Ok(None);
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("delta log path has no file name"))?;
+    // Compaction is serialized by the caller's persist lock, so one fixed
+    // temporary name is enough. Removing it first also reaps a file left by a
+    // crash between the write and the rename.
+    let temp = path.with_file_name(format!(".{name}.compact"));
+    let _ = fs::remove_file(&temp);
+
+    let result = (|| {
+        append_batch_with_durability(
+            &temp,
+            true,
+            log.base_fingerprint,
+            &compacted,
+            log.tail_fingerprint,
+            true,
+        )?;
+        let check = read_delta_log(&temp)
+            .ok_or_else(|| io::Error::other("compacted delta log does not read back"))?;
+        if check.coverage != log.coverage || check.operations.len() != compacted.len() {
+            return Err(io::Error::other(
+                "compacted delta log failed its read-back check",
+            ));
+        }
+        let len = fs::metadata(&temp)?.len();
+        let original_len = fs::metadata(path)?.len();
+        // Avoid a compaction treadmill: a log that is mostly live keys gains
+        // little from a rewrite and would be back at the threshold after a few
+        // batches. Only publish when the freed fraction justifies it.
+        let required_max = original_len.saturating_mul(100 - MIN_COMPACTION_SAVINGS_PERCENT);
+        if len.saturating_mul(100) > required_max {
+            return Ok(None);
+        }
+        fs::rename(&temp, path)?;
+        if let Some(parent) = path.parent() {
+            crate::shard::sync_directory(parent)?;
+        }
+        Ok(Some(len))
+    })();
+
+    if !matches!(result.as_ref(), Ok(Some(_))) {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 /// Append one batch (optional header, then a count-framed batch) to the delta
@@ -1130,6 +1527,39 @@ pub fn append_batch_with_durability(
     tail_fingerprint: u64,
     durable: bool,
 ) -> std::io::Result<usize> {
+    append_batch_with_durability_and_directory(
+        path,
+        write_header,
+        base_fingerprint,
+        operations,
+        tail_fingerprint,
+        durable,
+        false,
+    )
+}
+
+/// [`append_batch_with_durability`] with caller-held knowledge that the log's
+/// current directory entry is already durable.
+///
+/// `directory_entry_durable` is the caller's assertion that a previous durable
+/// batch already synced the parent directory for this exact path. A caller that
+/// is not certain must pass `false`: the file name is then synced on every
+/// durable append, as [`append_batch_with_durability`] always does. Passing
+/// `true` only skips the parent-directory sync; the batch's own bytes are still
+/// synced.
+///
+/// # Errors
+/// Returns an error if the operation count exceeds `u32`, a frame fails to
+/// encode, or a write, data sync, or required directory sync fails.
+pub fn append_batch_with_durability_and_directory(
+    path: &Path,
+    write_header: bool,
+    base_fingerprint: u64,
+    operations: &[DeltaOperation],
+    tail_fingerprint: u64,
+    durable: bool,
+    directory_entry_durable: bool,
+) -> std::io::Result<usize> {
     let operation_count = u32::try_from(operations.len())
         .map_err(|_| std::io::Error::other("delta batch exceeds u32 operation count"))?;
     let mut appended = 0usize;
@@ -1158,10 +1588,14 @@ pub fn append_batch_with_durability(
     appended = appended.saturating_add(DELTA_LOG_TRAILER_LEN);
     if durable {
         file.sync_data()?;
-        // Always, not only with the header: an earlier non-durable batch may
-        // have created the file, and this batch's claim rests on it existing.
-        if let Some(parent) = path.parent() {
-            crate::shard::sync_directory(parent)?;
+        // An earlier non-durable batch may have created the file without
+        // making its name durable, and this batch's claim rests on it
+        // existing after a power loss. Skip the parent sync only when the
+        // caller knows a previous durable batch synced this exact name.
+        if !directory_entry_durable {
+            if let Some(parent) = path.parent() {
+                crate::shard::sync_directory(parent)?;
+            }
         }
     }
     Ok(appended)

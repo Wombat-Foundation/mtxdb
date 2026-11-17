@@ -5,8 +5,8 @@ fn test_dir(name: &str) -> PathBuf {
     use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("mdb_test_shard_{name}_{}_{id}", std::process::id()));
+    let dir = crate::test_scratch::root()
+        .join(format!("mdb_test_shard_{name}_{}_{id}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -40,6 +40,65 @@ fn test_shard_pool_create_and_write() {
     assert_eq!(read.collection_id[0], 0x01);
     assert_eq!(read.hash[0], 0xAA);
     assert_eq!(read.data.as_ref(), b"hello shard");
+}
+
+#[test]
+fn stale_remap_snapshot_never_moves_the_append_frontier_backwards() {
+    let dir = test_dir("remap_stale_frontier");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let first = test_record(0x31, 0x01, b"first");
+    let (_, first_offset) = pool.put_record(&first).unwrap();
+    let shard = pool.get_shard(0).unwrap();
+    let old_frontier = shard.file_len();
+
+    let pause = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    let thread_name = "mtxdb-remap-frontier-test";
+    *TEST_REMAP_PAUSE.get_or_init(|| Mutex::new(None)).lock() =
+        Some((thread_name.to_owned(), Arc::clone(&pause)));
+    let remapping_shard = Arc::clone(&shard);
+    let remap_worker = std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(move || ShardPool::remap_shard(&remapping_shard))
+        .unwrap();
+
+    // remap_shard has captured the old filesystem length but has not yet
+    // published it. A concurrent local append advances the real frontier.
+    pause.0.wait();
+    let second = test_record(0x31, 0x02, b"second");
+    let second_result = pool.put_record(&second);
+    let second_frontier = shard.file_len();
+    pause.1.wait();
+    let remap_result = remap_worker.join().unwrap();
+    *TEST_REMAP_PAUSE.get_or_init(|| Mutex::new(None)).lock() = None;
+
+    let (_, second_offset) = second_result.unwrap();
+    remap_result.unwrap();
+    assert_eq!(second_offset, old_frontier);
+    assert!(second_frontier > old_frontier);
+    assert_eq!(
+        shard.file_len(),
+        second_frontier,
+        "a stale remap snapshot must not regress the append frontier"
+    );
+
+    let third = test_record(0x31, 0x03, b"third");
+    let (_, third_offset) = pool.put_record(&third).unwrap();
+    assert_eq!(third_offset, second_frontier);
+    assert_eq!(
+        pool.read_at(&shard, first_offset, false).unwrap().hash,
+        first.hash
+    );
+    assert_eq!(
+        pool.read_at(&shard, second_offset, false).unwrap().hash,
+        second.hash
+    );
+    assert_eq!(
+        pool.read_at(&shard, third_offset, false).unwrap().hash,
+        third.hash
+    );
+
+    drop(pool);
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -114,12 +173,135 @@ fn record_disk_len_rejects_truncated_frame_body() {
     pool.flush_all().unwrap();
 
     let len = shard.file.metadata().unwrap().len();
-    shard.file.set_len(len - 1).unwrap();
+    // Windows refuses to truncate a file while any view of it is mapped.
     *shard.mmap.write() = None;
+    shard.file.set_len(len - 1).unwrap();
 
     assert!(matches!(
         ShardPool::record_disk_len_at(&shard, offset),
         Err(crate::storage::StorageError::Corrupt(_))
+    ));
+}
+
+/// Overwrite bytes in a committed pack behind the mmap, so the next read sees
+/// them. Clearing the mapping first keeps the old snapshot from answering.
+fn corrupt_committed_bytes(shard: &Shard, offset: u64, bytes: &[u8]) {
+    *shard.mmap.write() = None;
+    crate::io::write_all_at(&shard.file, bytes, offset).unwrap();
+}
+
+fn frame_len_at(shard: &Shard, offset: u64) -> u32 {
+    let guard = shard.mmap().unwrap();
+    let mapping = guard.as_ref().expect("committed frame must be mapped");
+    let start = usize::try_from(offset).unwrap();
+    let prefix = mapping
+        .get(start..)
+        .and_then(|tail| tail.get(..4))
+        .expect("committed frame must have a length prefix");
+    u32::from_le_bytes(prefix.try_into().unwrap())
+}
+
+#[test]
+fn record_disk_len_rejects_an_impossible_length_prefix() {
+    let dir = test_dir("disk_len_bad_prefix");
+    let pool = ShardPool::open(dir).unwrap();
+    let (slot, offset) = pool
+        .put_record(&test_record(0x01, 0xAA, b"bad prefix"))
+        .unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    pool.flush_all().unwrap();
+
+    // A zero length can never hold the fixed frame header.
+    corrupt_committed_bytes(&shard, offset, &0_u32.to_le_bytes());
+    let error = ShardPool::record_disk_len_at(&shard, offset)
+        .expect_err("an impossible length prefix must be corrupt");
+    assert!(matches!(error, crate::storage::StorageError::Corrupt(_)));
+
+    // An offset at or past the committed frontier has no prefix at all.
+    let past_end = shard.file_len();
+    let error = ShardPool::record_disk_len_at(&shard, past_end)
+        .expect_err("a prefix past the frontier must be corrupt");
+    assert!(matches!(error, crate::storage::StorageError::Corrupt(_)));
+}
+
+#[test]
+fn read_at_committed_rejects_bad_prefixes_flags_and_truncation() {
+    let dir = test_dir("committed_read_corruption");
+    let pool = ShardPool::open(dir).unwrap();
+    let (slot, offset) = pool
+        .put_record(&test_record(0x01, 0xAA, b"corrupt me"))
+        .unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    pool.flush_all().unwrap();
+    let good_len = frame_len_at(&shard, offset);
+
+    corrupt_committed_bytes(&shard, offset, &0_u32.to_le_bytes());
+    let error = ShardPool::read_at_committed(&shard, offset, false)
+        .expect_err("a zero length prefix must be corrupt");
+    assert!(matches!(error, crate::storage::StorageError::Corrupt(_)));
+
+    corrupt_committed_bytes(&shard, offset, &u32::MAX.to_le_bytes());
+    let error = ShardPool::read_at_committed(&shard, offset, false)
+        .expect_err("an oversized length prefix must be corrupt");
+    assert!(matches!(error, crate::storage::StorageError::Corrupt(_)));
+
+    // Restore a valid length, then poison the frame's flags byte.
+    corrupt_committed_bytes(&shard, offset, &good_len.to_le_bytes());
+    corrupt_committed_bytes(&shard, offset + 4, &[0xFF]);
+    let error = ShardPool::read_at_committed(&shard, offset, false)
+        .expect_err("unknown flag bits must be corrupt");
+    assert!(matches!(
+        error,
+        crate::storage::StorageError::Corrupt(ref message)
+            if message.contains("unsupported record flags")
+    ));
+
+    // A frame that runs past the committed frontier is truncated.
+    let past_end = shard.file_len();
+    let error = ShardPool::read_at_committed(&shard, past_end, false)
+        .expect_err("a read past the frontier must be corrupt");
+    assert!(matches!(
+        error,
+        crate::storage::StorageError::Corrupt(ref message)
+            if message.contains("truncated length prefix")
+    ));
+
+    let len = shard.file.metadata().unwrap().len();
+    // Windows refuses to truncate a file while any view of it is mapped.
+    *shard.mmap.write() = None;
+    shard.file.set_len(len - 1).unwrap();
+    let error = ShardPool::read_at_committed(&shard, offset, false)
+        .expect_err("a frame whose tail is gone must be corrupt");
+    assert!(matches!(
+        error,
+        crate::storage::StorageError::Corrupt(ref message) if message.contains("truncated frame")
+    ));
+}
+
+#[test]
+fn record_identity_at_rejects_a_damaged_removal_crc() {
+    let dir = test_dir("identity_removal_crc");
+    let pool = ShardPool::open(dir).unwrap();
+    let mut record = test_record(0x02, 0xBB, b"");
+    record.metadata = Some(crate::packfile::FrameMetadata {
+        removed: true,
+        ..crate::packfile::FrameMetadata::default()
+    });
+    let (slot, offset) = pool.put_record(&record).unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    pool.flush_all().unwrap();
+
+    // The removal answer alone is CRC-checked, so a damaged removal flag must
+    // fail closed rather than report a live record as removed (or vice versa).
+    let frame_len = frame_len_at(&shard, offset);
+    let crc_pos = offset + 4 + u64::from(frame_len);
+    corrupt_committed_bytes(&shard, crc_pos, &[0xFF]);
+    let error = pool
+        .record_identity_at(&shard, offset)
+        .expect_err("a damaged removal CRC must be corrupt");
+    assert!(matches!(
+        error,
+        crate::storage::StorageError::Corrupt(ref message) if message.contains("CRC mismatch")
     ));
 }
 
@@ -381,18 +563,23 @@ fn test_sync_dirty_clears_only_written_shards() {
     pool.sync_dirty().unwrap();
 }
 
-/// Compatibility contract for the default eager policy: an unsynced put
-/// is committed to the page cache immediately, so a fresh open of the
-/// same directory sees the record even though `flush_all`/`sync` were
-/// never called. This is the historical behavior buffering must not
-/// silently change — callers that don't opt into buffering keep it.
+/// Compatibility contract for the default eager policy: once a pack has been
+/// published by a durability barrier, an unsynced put is committed to the page
+/// cache immediately, so a fresh open of the same directory sees the record even
+/// though `flush_all`/`sync` were never called again. A brand-new pack itself is
+/// published by its first barrier; this test covers the append case after that.
 #[test]
-fn eager_put_is_visible_to_fresh_open_without_flush_or_sync() {
+fn eager_put_is_visible_to_fresh_open_after_its_first_barrier() {
     let dir = test_dir("eager_put_fresh_open");
+    let first = test_record(0x01, 0xA9, b"published baseline");
     let record = test_record(0x01, 0xAA, b"eager visibility");
 
     let (offset, slot) = {
         let pool = ShardPool::open(dir.clone()).unwrap();
+        pool.put_record(&first).unwrap();
+        // The first barrier publishes the pack; every later append inherits
+        // the historical eager visibility boundary.
+        pool.sync_all().unwrap();
         let (slot, offset) = pool.put_record(&record).unwrap();
         assert!(
             pool.dirty.lock().contains(&slot),
@@ -409,21 +596,24 @@ fn eager_put_is_visible_to_fresh_open_without_flush_or_sync() {
     assert_eq!(read.data.as_ref(), b"eager visibility");
 }
 
-/// The buffered policy's known visibility boundary: an unflushed put
-/// occupies only a virtual offset past the committed file length, so a
-/// fresh open — which only sees committed bytes — must not be able to
-/// read it back. This is opt-in behavior; eager callers never hit it.
+/// The buffered policy's known visibility boundary: an unflushed put occupies
+/// only a virtual offset past the committed file length, so a fresh open — which
+/// only sees committed bytes — must not be able to read it back. The pack is
+/// published first; buffering controls flushed bytes, not publication.
 #[test]
 fn buffered_put_is_hidden_from_fresh_open_until_flush() {
+    let baseline = test_record(0x01, 0xBA, b"published baseline");
     let record = test_record(0x01, 0xBB, b"buffered invisibility");
 
-    // No flush before drop: the byte is only in the writer's memory, so
+    // No flush before drop: the second byte is only in the writer's memory, so
     // a fresh open must not be able to read it back.
     let dir = test_dir("buffered_put_fresh_open");
     let (offset, slot) = {
         let pool = ShardPool::open(dir.clone())
             .unwrap()
             .with_append_policy(AppendPolicy::buffered());
+        pool.put_record(&baseline).unwrap();
+        pool.sync_all().unwrap();
         let (slot, offset) = pool.put_record(&record).unwrap();
         assert!(
             pool.dirty.lock().is_empty(),
@@ -449,6 +639,8 @@ fn buffered_put_is_hidden_from_fresh_open_until_flush() {
         let pool = ShardPool::open(dir.clone())
             .unwrap()
             .with_append_policy(AppendPolicy::buffered());
+        pool.put_record(&baseline).unwrap();
+        pool.sync_all().unwrap();
         let (slot, offset) = pool.put_record(&record).unwrap();
         pool.flush_all().unwrap();
         (slot, offset)
@@ -473,6 +665,9 @@ fn test_sync_survives_persist_stats_failure() {
 
     let record = test_record(0x01, 0xDD, b"data that must stay durable");
     pool.put_record(&record).unwrap();
+    // Publish the first pack while the directory still exists; publication is
+    // part of the durability barrier and legitimately fails without it.
+    pool.sync_all().unwrap();
 
     // Remove the base directory itself, so persist_stats' File::create
     // for its temp file fails with ENOENT -- while the shard's already-
@@ -498,6 +693,50 @@ fn test_shard_pool_rotation() {
     let record = test_record(0x01, 0xBB, b"trigger rotation");
     let (slot, _offset) = pool.put_record(&record).unwrap();
     assert_eq!(slot, 1);
+}
+
+#[test]
+fn sealed_pack_index_skips_recovery_and_corruption_falls_back() {
+    let dir = test_dir("sealed_pack_index_recovery");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let record = test_record(1, 2, b"sealed record");
+    let (slot, offset) = pool.put_record(&record).unwrap();
+    let old = pool.get_shard(slot).unwrap();
+    pool.rotate().unwrap();
+    // Publish the rotated-to pack as well, so both packs exist canonically
+    // across the reopen below.
+    pool.sync_all().unwrap();
+    assert!(!old.sealed.load(Ordering::Acquire));
+    pool.rotate_collection_full_home(&record.collection_id, slot)
+        .unwrap();
+    assert!(old.sealed.load(Ordering::Acquire));
+    pool.wait_for_seals();
+    let sidecar_path = packidx::pack_index_path(&old.path);
+    assert!(sidecar_path.exists());
+    drop(old);
+    drop(pool);
+
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 1);
+    let old = pool.get_shard(slot).unwrap();
+    assert!(old.sealed.load(Ordering::Acquire));
+    assert_eq!(pool.read_at(&old, offset, true).unwrap().data, record.data);
+    drop(old);
+    drop(pool);
+
+    let mut sidecar = fs::read(&sidecar_path).unwrap();
+    let last = sidecar.len() - 1;
+    sidecar[last] ^= 0xff;
+    fs::write(&sidecar_path, sidecar).unwrap();
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 2);
+    assert!(pool.get_shard(slot).unwrap().sealed.load(Ordering::Acquire));
+    drop(pool);
+
+    // The invalid sidecar was rebuilt while opening the non-active pack.
+    // Later opens should recover-scan only the active append pack.
+    let pool = ShardPool::open(dir).unwrap();
+    assert_eq!(pool.open_timings().unwrap().packfile_recovery_calls, 1);
 }
 
 /// Core fix: a collection's writes must stay on its own home shard even
@@ -807,10 +1046,12 @@ fn test_shard_pool_scan() {
     pool.put_record(&r1).unwrap();
     pool.put_record(&r2).unwrap();
     pool.put_record(&r3).unwrap();
-    // The file scan only sees committed bytes, so flush before scanning.
+    // The file scan only sees committed bytes, so flush before scanning. The
+    // pack may still be staged (no durability barrier yet), so scan its
+    // physical path rather than the not-yet-published canonical name.
     pool.flush_all().unwrap();
 
-    let entries = ShardPool::scan_shard(&pool.get_shard(0).unwrap().path).unwrap();
+    let entries = ShardPool::scan_shard(&pool.get_shard(0).unwrap().data_path()).unwrap();
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].0[0], 0x01);
     assert_eq!(entries[0].1[0], 0x10);
@@ -960,6 +1201,9 @@ fn test_drop_deletes_retired_shard_only_after_last_reference() {
 
     let record = test_record(0x01, 0xAA, b"payload");
     let (slot, _offset) = pool.put_record(&record).unwrap();
+    // The first barrier publishes the pack under its canonical name; retirement
+    // removes that name.
+    pool.sync_all().unwrap();
 
     let pinned = pool.get_shard(slot).unwrap();
     let path = pinned.path.clone();
@@ -999,6 +1243,7 @@ fn test_scan_discovers_valid_shards_in_pack_id_order() {
     // its own filename.
     let record = test_record(0x01, 0xAA, b"live data");
     pool.put_record(&record).unwrap();
+    pool.sync_all().unwrap();
     let old_path = pool.get_shard(0).unwrap().path.clone();
     drop(pool);
     std::fs::remove_file(&old_path).unwrap();
@@ -1234,10 +1479,12 @@ fn test_pack_creation_sequence_survives_reopen() {
     let pool = ShardPool::open(dir.clone()).unwrap();
     pool.try_active_shard().unwrap();
     pool.rotate().unwrap();
+    pool.sync_all().unwrap();
     drop(pool);
 
     let pool = ShardPool::open(dir.clone()).unwrap();
     pool.rotate().unwrap();
+    pool.sync_all().unwrap();
 
     let mut sequences = pool
         .all_shards()
@@ -1288,7 +1535,7 @@ fn two_rooted_pools_open_in_one_process_without_self_blocking() {
     let state = ShardPool::open(layout.pool_path(crate::layout::ShardType::State));
     // The first standalone writer owns the root lock; a second one must fail
     // fast rather than block forever on the same file.
-    let second = ShardPool::open(layout.pool_path(crate::layout::ShardType::Edges));
+    let second = ShardPool::open(layout.pool_path(crate::layout::ShardType::ServerInfo));
     assert!(state.is_ok());
     assert_eq!(
         second.err().map(|e| e.kind()),
@@ -1423,9 +1670,14 @@ fn a_new_pool_creates_no_pack_until_the_first_write() {
 
     let record = test_record(1, 1, b"first");
     let (slot, offset, _) = pool.put_record_with_len(&record).unwrap();
-    assert_eq!(pack_count(&dir), 1, "the first write creates the pack");
+    assert_eq!(
+        pack_count(&dir),
+        0,
+        "the first write stages a pack; only a durability barrier publishes it"
+    );
     assert_eq!(pool.shard_count(), 1);
     pool.sync_all().unwrap();
+    assert_eq!(pack_count(&dir), 1, "the first barrier publishes the pack");
     drop(pool);
 
     let reopened = ShardPool::open_read_only(dir.clone()).unwrap();
@@ -1488,6 +1740,7 @@ fn test_reopen_picks_most_recent_pack_not_highest_address() {
         for _ in 0..6 {
             pool.rotate().unwrap();
         }
+        pool.sync_all().unwrap();
         pool.active_shard().path.clone()
     };
     // Age every other pack so the last-created one is unambiguously newest,
@@ -1506,4 +1759,433 @@ fn test_reopen_picks_most_recent_pack_not_highest_address() {
     }
     let pool = ShardPool::open(dir).unwrap();
     assert_eq!(pool.active_shard().path, newest_path);
+}
+
+#[test]
+fn a_staged_pack_before_its_first_barrier_is_swept_not_recovered() {
+    let dir = test_dir("staged_before_barrier");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let old = test_record(0x01, 0x01, b"acknowledged");
+    let (_old_slot, old_offset) = pool.put_record(&old).unwrap();
+    // Publish the first pack, so it is an acknowledged canonical pack.
+    pool.sync_all().unwrap();
+    let old_path = pool.get_shard(0).unwrap().path.clone();
+    assert_eq!(pack_count(&dir), 1);
+
+    // Force a rotation and write one record to the new pack without a barrier.
+    pool.active_shard()
+        .file_len
+        .store(MAX_SHARD_BYTES - 10, Ordering::Release);
+    let fresh = test_record(0x01, 0x02, b"never acknowledged");
+    let (slot, _offset) = pool.put_record(&fresh).unwrap();
+    assert_eq!(slot, 1);
+    assert_eq!(
+        pack_count(&dir),
+        1,
+        "the unbarriered pack must not be canonically visible"
+    );
+    let mut staged: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pack_") && name.contains(".tmp."))
+        })
+        .collect();
+    assert_eq!(staged.len(), 1, "expected one staging file: {staged:?}");
+    let staged_path = staged.pop().unwrap();
+    drop(pool);
+
+    // A crash before the first barrier can persist a full-sized invalid
+    // staging image. It must not block recovery, and the older acknowledged
+    // pack must stay usable.
+    std::fs::write(&staged_path, vec![0u8; packfile::HEADER_LEN]).unwrap();
+    let reopened = ShardPool::open(dir.clone()).expect("staging remnant must not block open");
+    assert_eq!(reopened.shard_count(), 1);
+    assert!(old_path.exists(), "the acknowledged pack must stay");
+    assert!(
+        !staged_path.exists(),
+        "a writable open sweeps the staging file"
+    );
+    let shard = reopened.get_shard(0).unwrap();
+    assert_eq!(
+        reopened.read_at(&shard, old_offset, true).unwrap().data,
+        old.data
+    );
+}
+
+#[test]
+fn a_failed_publication_step_is_retried_and_never_exposed_as_canonical() {
+    // File-sync failure: nothing is renamed, so no canonical name appears.
+    {
+        let dir = test_dir("publish_fsync_fail");
+        let pool = ShardPool::open(dir).unwrap();
+        let record = test_record(0x01, 0x01, b"retry payload");
+        let (_slot, offset) = pool.put_record(&record).unwrap();
+        let shard = pool.get_shard(0).unwrap();
+        fail_pack_fsync_after(&shard.path, 0);
+        assert!(
+            pool.sync_all().is_err(),
+            "the file-sync failure must surface"
+        );
+        assert!(!shard.path.exists(), "a failed file sync must not rename");
+        clear_pack_fsync_failure(&shard.path);
+        pool.sync_all().unwrap();
+        assert!(shard.path.exists(), "the retry publishes the pack");
+        assert_eq!(
+            pool.read_at(&shard, offset, true).unwrap().data,
+            record.data
+        );
+    }
+
+    // Rename failure: the bytes are durable but the canonical name is absent.
+    {
+        let dir = test_dir("publish_rename_fail");
+        let pool = ShardPool::open(dir).unwrap();
+        let record = test_record(0x01, 0x02, b"retry payload");
+        let (_slot, offset) = pool.put_record(&record).unwrap();
+        let shard = pool.get_shard(0).unwrap();
+        fail_pack_rename_after(&shard.path, 0);
+        assert!(pool.sync_all().is_err(), "the rename failure must surface");
+        assert!(
+            !shard.path.exists(),
+            "a failed rename leaves a staging name"
+        );
+        clear_pack_rename_failure(&shard.path);
+        pool.sync_all().unwrap();
+        assert!(shard.path.exists());
+        assert_eq!(
+            pool.read_at(&shard, offset, true).unwrap().data,
+            record.data
+        );
+    }
+
+    // Directory-sync failure after the rename: the pack is visible but owes a
+    // directory barrier, and a later barrier must finish it even with no new
+    // bytes appended.
+    {
+        let dir = test_dir("publish_dir_fail");
+        let pool = ShardPool::open(dir.clone()).unwrap();
+        let record = test_record(0x01, 0x03, b"retry payload");
+        let (_slot, offset) = pool.put_record(&record).unwrap();
+        let shard = pool.get_shard(0).unwrap();
+        fail_directory_sync_after(&dir, 0);
+        assert!(
+            pool.sync_all().is_err(),
+            "the directory-sync failure must surface"
+        );
+        assert!(
+            shard.path.exists(),
+            "the rename happened before the directory barrier"
+        );
+        clear_directory_sync_failure(&dir);
+        // Prove the retry performs the directory barrier rather than skipping
+        // it because the file was already synced and renamed.
+        fail_directory_sync_after(&dir, 0);
+        assert!(
+            pool.sync_all().is_err(),
+            "the retry must still owe the directory barrier"
+        );
+        clear_directory_sync_failure(&dir);
+        pool.sync_all().unwrap();
+        assert_eq!(
+            pool.read_at(&shard, offset, true).unwrap().data,
+            record.data
+        );
+    }
+}
+
+#[test]
+fn staging_cleanup_requires_the_writer_lock_and_never_touches_a_live_writer() {
+    let dir = test_dir("staging_cleanup_owner");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    pool.put_record(&test_record(0x01, 0x01, b"staged"))
+        .unwrap();
+    let staged: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pack_") && name.contains(".tmp."))
+        })
+        .collect();
+    assert_eq!(staged.len(), 1, "expected one staging file: {staged:?}");
+    let staged_path = staged[0].clone();
+
+    // A second writer cannot open the pool, so it cannot sweep the live
+    // writer's staging file.
+    let error = ShardPool::open(dir.clone())
+        .err()
+        .expect("a second writer must be refused by the writer lock");
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(
+        staged_path.exists(),
+        "a refused writer must not delete a live writer's staging file"
+    );
+
+    // A read-only observer never deletes anything either.
+    let observer = ShardPool::open_read_only(dir.clone()).unwrap();
+    assert_eq!(observer.shard_count(), 0);
+    drop(observer);
+    assert!(
+        staged_path.exists(),
+        "a read-only open must leave the staging file alone"
+    );
+
+    drop(pool);
+    let reopened = ShardPool::open(dir.clone()).unwrap();
+    assert!(
+        !staged_path.exists(),
+        "a writable open holding the lock sweeps the orphan"
+    );
+    assert_eq!(pack_count(&dir), 0, "the swept pack never became canonical");
+    assert_eq!(reopened.shard_count(), 0);
+}
+
+#[test]
+fn test_run_merge_worker_stops_when_signalled() {
+    let dir = test_dir("run_merge_stop");
+    let pool = ShardPool::open(dir).unwrap();
+    let started = Arc::new(AtomicBool::new(false));
+    let started_clone = Arc::clone(&started);
+    let worker_stopped = Arc::new(AtomicBool::new(false));
+    let worker_stopped_clone = Arc::clone(&worker_stopped);
+
+    let started_ok = pool
+        .start_run_merge_worker(move |stop| {
+            started_clone.store(true, Ordering::Release);
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worker_stopped_clone.store(true, Ordering::Release);
+            Ok(None)
+        })
+        .unwrap();
+    assert!(started_ok);
+    while !started.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    assert!(pool.run_merge_active());
+    pool.stop_run_merge();
+    assert!(pool.wait_for_run_merge());
+    assert!(!pool.run_merge_active());
+    assert!(worker_stopped.load(Ordering::Acquire));
+}
+
+#[test]
+fn open_with_max_shard_bytes_rejects_unusable_thresholds() {
+    for bad in [0, 1, MAX_SHARD_BYTES + 1] {
+        let dir = test_dir("bad_shard_size");
+        let Err(error) = ShardPool::open_with_max_shard_bytes(dir, bad) else {
+            panic!("threshold {bad} must be rejected");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{bad}");
+    }
+}
+
+#[test]
+fn discover_rejects_malformed_pack_names_but_ignores_foreign_packs() {
+    let dir = test_dir("discover_names");
+    fs::write(dir.join("foreign.pack"), b"not ours").unwrap();
+    // A foreign `.pack` file is skipped, not an error.
+    assert_eq!(ShardPool::discover_pack_files(&dir).unwrap().len(), 0);
+    fs::write(dir.join("pack_ZZZ.pack"), b"bad").unwrap();
+    let error =
+        ShardPool::discover_pack_files(&dir).expect_err("malformed pack_ name must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("invalid pack filename"));
+}
+
+#[test]
+fn read_only_open_of_a_directory_with_no_pool_fails_as_not_found() {
+    let dir = test_dir("read_only_empty");
+    let Err(error) = ShardPool::open_read_only(dir) else {
+        panic!("an empty directory has nothing to read");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn damaged_pool_meta_is_reported_instead_of_ignored() {
+    let dir = test_dir("pool_meta_damage");
+    {
+        let pool = ShardPool::open(dir.clone()).unwrap();
+        pool.put_record(&test_record(1, 1, b"x")).unwrap();
+        pool.sync_all().unwrap();
+    }
+    let meta = dir.join(POOL_META_FILENAME);
+    let good = fs::read(&meta).expect("pool.meta is written for a used pool");
+    assert!(good.len() >= POOL_META_FIXED_LEN);
+
+    let truncated = good[..POOL_META_FIXED_LEN - 1].to_vec();
+    let mut bad_magic = good.clone();
+    bad_magic[0] ^= 0xff;
+    let mut bad_version = good.clone();
+    bad_version[4] = POOL_META_VERSION.wrapping_add(1);
+    for (bytes, kind) in [
+        (truncated, io::ErrorKind::InvalidData),
+        (bad_magic, io::ErrorKind::InvalidData),
+        (bad_version, io::ErrorKind::Unsupported),
+    ] {
+        fs::write(&meta, bytes).unwrap();
+        let error =
+            ShardPool::restore_pool_meta(&dir).expect_err("damaged pool.meta must be an error");
+        assert_eq!(error.kind(), kind);
+    }
+    fs::remove_file(&meta).unwrap();
+    assert!(ShardPool::restore_pool_meta(&dir).unwrap().is_none());
+}
+
+#[test]
+fn lock_holder_info_parses_markers_and_rejects_garbage() {
+    let dir = test_dir("lock_info");
+    let path = dir.join("marker.lock");
+    assert!(ShardPool::lock_holder_info(&path).is_none());
+    fs::write(&path, "not-a-pid").unwrap();
+    assert!(ShardPool::lock_holder_info(&path).is_none());
+    fs::write(&path, format!("{}", std::process::id())).unwrap();
+    let info = ShardPool::lock_holder_info(&path).unwrap();
+    assert_eq!(info.pid, std::process::id());
+    assert!(!info.has_starttime);
+    fs::write(&path, format!("{} 12345", std::process::id())).unwrap();
+    assert!(ShardPool::lock_holder_info(&path).unwrap().has_starttime);
+}
+
+/// Rotate `n` times and return the packs left behind, each with a record so
+/// there is something to index.
+fn rotate_out_packs(pool: &ShardPool, n: u8) -> Vec<Arc<Shard>> {
+    (0..n)
+        .map(|i| {
+            let (slot, _) = pool
+                .put_record(&test_record(i.saturating_add(1), i, b"sealed by rotation"))
+                .unwrap();
+            let shard = pool.get_shard(slot).unwrap();
+            pool.rotate().unwrap();
+            shard
+        })
+        .collect()
+}
+
+fn hold_seal_workers(pool: &ShardPool, held: bool) {
+    pool.seal_queue.state.lock().held = held;
+    pool.seal_queue.work.notify_all();
+}
+
+/// With every worker blocked, sealing more packs than there are workers must
+/// return without waiting for any build, and every pack is announced once the
+/// workers are released. The sealing runs on its own thread under a watchdog so
+/// a regression (the old join-the-oldest-builder behaviour) fails the test
+/// instead of hanging it.
+#[test]
+fn seal_queue_does_not_block_the_writer_and_drains_later() {
+    let pool = Arc::new(ShardPool::open(test_dir("seal_queue_blocked")).unwrap());
+    hold_seal_workers(&pool, true);
+    let count = u8::try_from(MAX_SEAL_WORKERS).unwrap().saturating_add(3);
+    let packs = rotate_out_packs(&pool, count);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let sealer = {
+        let (pool, packs) = (Arc::clone(&pool), packs.clone());
+        std::thread::spawn(move || {
+            for shard in &packs {
+                pool.seal_pack(shard).unwrap();
+                // Sealing twice is still one job.
+                pool.seal_pack(shard).unwrap();
+            }
+            done_tx.send(()).unwrap();
+        })
+    };
+    let returned = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+    // Always release the workers, so a failure cannot leave threads parked.
+    let backlog = pool.seal_backlog();
+    let ready_while_held = pool.take_sealed_ready();
+    hold_seal_workers(&pool, false);
+    assert!(
+        returned,
+        "sealing more packs than workers waited for a held build"
+    );
+    sealer.join().unwrap();
+    // Nothing started while held: every pack was queued, none running.
+    assert_eq!(backlog.queued, packs.len());
+    assert_eq!(backlog.running, 0);
+    assert_eq!(
+        ready_while_held.len(),
+        0,
+        "nothing is ready while the build is held"
+    );
+
+    pool.wait_for_seals();
+    let ready = pool.take_sealed_ready();
+    assert_eq!(ready.len(), packs.len());
+    for shard in &packs {
+        assert!(ready.contains(&(shard.slot, shard.pack_id)));
+        assert!(packidx::pack_index_path(&shard.path).exists());
+    }
+    let after = pool.seal_backlog();
+    assert_eq!((after.queued, after.running), (0, 0));
+    assert!(after.workers <= MAX_SEAL_WORKERS);
+}
+
+/// A pack retired while its job is queued is skipped and never announced; the
+/// other queued packs are still built.
+#[test]
+fn seal_queue_skips_a_pack_retired_while_queued() {
+    let pool = ShardPool::open(test_dir("seal_queue_retired")).unwrap();
+    hold_seal_workers(&pool, true);
+    let packs = rotate_out_packs(&pool, 2);
+    for shard in &packs {
+        pool.seal_pack(shard).unwrap();
+    }
+    packs[0].is_current.store(false, Ordering::Release);
+    hold_seal_workers(&pool, false);
+    pool.wait_for_seals();
+    let ready = pool.take_sealed_ready();
+    assert_eq!(ready, vec![(packs[1].slot, packs[1].pack_id)]);
+    assert!(pool.seal_queue.state.lock().pending.is_empty());
+    assert!(pool.seal_queue.state.lock().outstanding.is_empty());
+}
+
+/// Dropping the pool drains submitted work and joins the workers.
+#[test]
+fn seal_queue_shutdown_drains_and_joins() {
+    let dir = test_dir("seal_queue_shutdown");
+    let pool = ShardPool::open(dir).unwrap();
+    hold_seal_workers(&pool, true);
+    let packs = rotate_out_packs(&pool, 3);
+    for shard in &packs {
+        pool.seal_pack(shard).unwrap();
+    }
+    let paths: Vec<_> = packs.iter().map(|s| s.path.clone()).collect();
+    drop(packs);
+    drop(pool);
+    for path in paths {
+        assert!(packidx::pack_index_path(&path).exists());
+    }
+}
+
+/// Killed with sidecars never built, reopen recovers through the frame
+/// scanner and the data is intact.
+#[test]
+fn seal_queue_unbuilt_sidecar_recovers_by_scan() {
+    let dir = test_dir("seal_queue_crash");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let record = test_record(1, 7, b"survives a missing sidecar");
+    let (slot, offset) = pool.put_record(&record).unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    pool.rotate().unwrap();
+    pool.sync_all().unwrap();
+    let path = shard.path.clone();
+    // Rotation alone does not seal, so no sidecar was ever built.
+    drop(shard);
+    drop(pool);
+    assert!(!packidx::pack_index_path(&path).exists());
+
+    let pool = ShardPool::open(dir).unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+    assert_eq!(
+        pool.read_at(&shard, offset, true).unwrap().data,
+        record.data
+    );
 }

@@ -48,6 +48,8 @@
 //! paging returns keys strictly greater than the cursor, reverse strictly less,
 //! so resuming is exact and idempotent in both directions.
 
+use std::borrow::Cow;
+
 use bytes::Bytes;
 
 use crate::database::{Database, DatabaseTransaction};
@@ -57,6 +59,18 @@ use crate::template::{
     derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
     MEMBER_NAMESPACE_INTL,
 };
+
+/// Derive a 16-byte scope for [`TimelineEntry`] with domain-separated BLAKE3 over the room ID.
+#[must_use]
+pub fn room_scope_id(room_id: &[u8]) -> [u8; 16] {
+    crate::interop::derive_id(b"timeline-room-scope", room_id)
+}
+
+/// Hash full event ID into a 32-byte reference for [`TimelineEntry`].
+#[must_use]
+pub fn event_id_ref(event_id: &[u8]) -> EventRef {
+    *blake3::hash(event_id).as_bytes()
+}
 
 /// Version byte of every timeline record and the cursor encoding.
 pub const TIMELINE_FORMAT_VERSION: u8 = 0x01;
@@ -255,6 +269,54 @@ fn content_id(payload: &[u8]) -> NodeId {
     id
 }
 
+fn merge_and_stage_leaves(
+    existing: &[TimelineEntry],
+    incoming: &[TimelineEntry],
+    manifest: &mut Vec<(TimelineEntry, NodeId)>,
+    inserted: &mut u64,
+    mut stage_record: impl FnMut(NodeId, Vec<u8>) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let mut merged = Vec::with_capacity(existing.len().saturating_add(incoming.len()));
+    let (mut left, mut right) = (0, 0);
+    while left < existing.len() || right < incoming.len() {
+        let take_existing =
+            right == incoming.len() || (left < existing.len() && existing[left] <= incoming[right]);
+        let entry = if take_existing {
+            let entry = existing[left];
+            left = left.checked_add(1).ok_or_else(|| {
+                StorageError::Internal("timeline merge offset overflow".to_owned())
+            })?;
+            if right < incoming.len() && incoming[right] == entry {
+                right = right.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("timeline merge offset overflow".to_owned())
+                })?;
+            }
+            entry
+        } else {
+            let entry = incoming[right];
+            right = right.checked_add(1).ok_or_else(|| {
+                StorageError::Internal("timeline merge offset overflow".to_owned())
+            })?;
+            *inserted = inserted.checked_add(1).ok_or_else(|| {
+                StorageError::Internal("timeline entry count overflow".to_owned())
+            })?;
+            entry
+        };
+        merged.push(entry);
+    }
+
+    for chunk in merged.chunks(TIMELINE_LEAF_CAP) {
+        let payload = encode_leaf(chunk)?;
+        let id = content_id(&payload);
+        let first = *chunk
+            .first()
+            .ok_or_else(|| StorageError::Internal("empty timeline leaf".to_owned()))?;
+        stage_record(id, payload)?;
+        manifest.push((first, id));
+    }
+    Ok(())
+}
+
 fn room_start(room_id: &[u8; 16]) -> TimelineEntry {
     TimelineEntry::new(*room_id, i64::MIN, i64::MIN, [0u8; 16], [0u8; 32])
 }
@@ -266,18 +328,30 @@ fn room_end(room_id: &[u8; 16]) -> TimelineEntry {
 /// A persisted timeline index over an existing storage engine.
 pub struct TimelineIndex<'a, S: StorageEngine + ?Sized> {
     engine: &'a S,
-    name: String,
+    name: Cow<'a, str>,
     collection_id: [u8; 16],
 }
 
 impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// Open (or create) the named timeline index.
     #[must_use]
-    pub fn open(engine: &'a S, name: &str) -> Self {
+    pub fn open(engine: &'a S, name: impl Into<Cow<'a, str>>) -> Self {
+        let name = name.into();
+        let collection_id = timeline_collection_id(name.as_ref());
+        Self::with_collection_id(engine, name, collection_id)
+    }
+
+    /// Open with a pre-computed collection ID and pre-owned or borrowed name.
+    #[must_use]
+    pub fn with_collection_id(
+        engine: &'a S,
+        name: impl Into<Cow<'a, str>>,
+        collection_id: [u8; 16],
+    ) -> Self {
         Self {
             engine,
-            name: name.to_owned(),
-            collection_id: timeline_collection_id(name),
+            name: name.into(),
+            collection_id,
         }
     }
 
@@ -631,45 +705,9 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         manifest: &mut Vec<(TimelineEntry, NodeId)>,
         inserted: &mut u64,
     ) -> Result<(), StorageError> {
-        let mut merged = Vec::with_capacity(existing.len().saturating_add(incoming.len()));
-        let (mut left, mut right) = (0, 0);
-        while left < existing.len() || right < incoming.len() {
-            let take_existing = right == incoming.len()
-                || (left < existing.len() && existing[left] <= incoming[right]);
-            let entry = if take_existing {
-                let entry = existing[left];
-                left = left.checked_add(1).ok_or_else(|| {
-                    StorageError::Internal("timeline merge offset overflow".to_owned())
-                })?;
-                if right < incoming.len() && incoming[right] == entry {
-                    right = right.checked_add(1).ok_or_else(|| {
-                        StorageError::Internal("timeline merge offset overflow".to_owned())
-                    })?;
-                }
-                entry
-            } else {
-                let entry = incoming[right];
-                right = right.checked_add(1).ok_or_else(|| {
-                    StorageError::Internal("timeline merge offset overflow".to_owned())
-                })?;
-                *inserted = inserted.checked_add(1).ok_or_else(|| {
-                    StorageError::Internal("timeline entry count overflow".to_owned())
-                })?;
-                entry
-            };
-            merged.push(entry);
-        }
-
-        for chunk in merged.chunks(TIMELINE_LEAF_CAP) {
-            let payload = encode_leaf(chunk)?;
-            let id = content_id(&payload);
-            self.write_record(&id, payload)?;
-            let first = *chunk
-                .first()
-                .ok_or_else(|| StorageError::Internal("empty timeline leaf".to_owned()))?;
-            manifest.push((first, id));
-        }
-        Ok(())
+        merge_and_stage_leaves(existing, incoming, manifest, inserted, |id, payload| {
+            self.write_record(&id, payload)
+        })
     }
 
     /// Merge sorted, unique inputs into encoded leaves in `pending_records`
@@ -686,45 +724,10 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         inserted: &mut u64,
         pending_records: &mut Vec<(NodeId, Vec<u8>)>,
     ) -> Result<(), StorageError> {
-        let mut merged = Vec::with_capacity(existing.len().saturating_add(incoming.len()));
-        let (mut left, mut right) = (0, 0);
-        while left < existing.len() || right < incoming.len() {
-            let take_existing = right == incoming.len()
-                || (left < existing.len() && existing[left] <= incoming[right]);
-            let entry = if take_existing {
-                let entry = existing[left];
-                left = left.checked_add(1).ok_or_else(|| {
-                    StorageError::Internal("timeline merge offset overflow".to_owned())
-                })?;
-                if right < incoming.len() && incoming[right] == entry {
-                    right = right.checked_add(1).ok_or_else(|| {
-                        StorageError::Internal("timeline merge offset overflow".to_owned())
-                    })?;
-                }
-                entry
-            } else {
-                let entry = incoming[right];
-                right = right.checked_add(1).ok_or_else(|| {
-                    StorageError::Internal("timeline merge offset overflow".to_owned())
-                })?;
-                *inserted = inserted.checked_add(1).ok_or_else(|| {
-                    StorageError::Internal("timeline entry count overflow".to_owned())
-                })?;
-                entry
-            };
-            merged.push(entry);
-        }
-
-        for chunk in merged.chunks(TIMELINE_LEAF_CAP) {
-            let payload = encode_leaf(chunk)?;
-            let id = content_id(&payload);
-            let first = *chunk
-                .first()
-                .ok_or_else(|| StorageError::Internal("empty timeline leaf".to_owned()))?;
-            manifest.push((first, id));
+        merge_and_stage_leaves(existing, incoming, manifest, inserted, |id, payload| {
             pending_records.push((id, payload));
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Stage a record in this index's collection for publication on commit.

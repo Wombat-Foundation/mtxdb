@@ -1,7 +1,7 @@
 use super::{
     changes_since_full_scans, set_changes_since_before_read_hook,
     set_changes_since_force_untrusted, BackgroundFailure, BackgroundState, GroupCommitConfig,
-    Journal, JournalCoordinator, Mutation,
+    Journal, JournalCoordinator, Mutation, MAX_RECLAIM_TRIGGER_LEN,
 };
 use super::{TxnStage, TxnStageState};
 use std::fs;
@@ -102,7 +102,7 @@ fn shared_segment_round_trips_pool_tags() {
     let tagged = [
         (ShardType::State, put(1, 1, b"state")),
         (ShardType::EventDag, put(2, 2, b"event")),
-        (ShardType::Edges, put(3, 3, b"edges")),
+        (ShardType::ServerInfo, put(3, 3, b"edges")),
     ];
     journal
         .append_group_tagged_with_sequence(&tagged, None)
@@ -118,7 +118,7 @@ fn shared_segment_round_trips_pool_tags() {
         .collect();
     assert_eq!(
         pools,
-        vec![ShardType::State, ShardType::EventDag, ShardType::Edges,]
+        vec![ShardType::State, ShardType::EventDag, ShardType::ServerInfo,]
     );
 
     // Recovery must preserve the tags so each frame can be routed.
@@ -153,10 +153,10 @@ fn shared_committed_watermark_is_per_pool() {
     let coordinator = JournalCoordinator::new(journal, &scan);
 
     // Group one: state only. Only state's watermark may advance past zero.
-    coordinator
+    let state_receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(state_receipt.first_lsn);
     coordinator.sync().unwrap();
     let state_only = coordinator.committed_lsn();
     assert_eq!(
@@ -169,13 +169,13 @@ fn shared_committed_watermark_is_per_pool() {
         0,
         "another pool's group must not advance event-DAG's watermark"
     );
-    assert_eq!(coordinator.committed_lsn_for_pool(ShardType::Edges), 0);
+    assert_eq!(coordinator.committed_lsn_for_pool(ShardType::ServerInfo), 0);
 
     // Group two: event-DAG only. State's watermark must stay put.
-    coordinator
+    let event_receipt = coordinator
         .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(event_receipt.first_lsn);
     coordinator.sync().unwrap();
     assert_eq!(
         coordinator.committed_lsn_for_pool(ShardType::State),
@@ -215,13 +215,14 @@ fn shared_reclaim_waits_for_a_staged_pools_frame() {
 
     // A transaction stages an event-DAG frame without going through
     // `publish`; it must still block reclaim until event-DAG checkpoints.
-    coordinator
+    let receipt = coordinator
         .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
         .unwrap();
-    coordinator
+    coordinator.transaction_materialized(receipt.first_lsn);
+    let receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(receipt.first_lsn);
     coordinator.sync().unwrap();
     let committed = coordinator.committed_lsn();
     assert!(coordinator.committed_lsn_for_pool(ShardType::EventDag) > 0);
@@ -249,20 +250,20 @@ fn shared_reclaim_does_not_wait_for_an_idle_pool() {
     let coordinator = JournalCoordinator::new(journal, &scan);
 
     // State contributes only the first group, then goes idle.
-    coordinator
+    let state_receipt = coordinator
         .publish_group_tagged(ShardType::State, &[put(1, 1, b"state")])
-        .map(|receipt| receipt.last_lsn)
         .unwrap();
+    coordinator.transaction_materialized(state_receipt.first_lsn);
     coordinator.sync().unwrap();
     let state_lsn = coordinator.committed_lsn_for_pool(ShardType::State);
 
     // Event-DAG writes several later groups that never carry a state frame.
     let mut event_lsn = 0;
     for id in 0..4u8 {
-        coordinator
+        let receipt = coordinator
             .publish_group_tagged(ShardType::EventDag, &[put(2, id, b"event")])
-            .map(|receipt| receipt.last_lsn)
             .unwrap();
+        coordinator.transaction_materialized(receipt.first_lsn);
         coordinator.sync().unwrap();
         event_lsn = coordinator.committed_lsn_for_pool(ShardType::EventDag);
     }
@@ -330,7 +331,7 @@ fn coordinator_publishes_tagged_frames() {
     coordinator
         .publish_tagged_groups(&[
             (ShardType::State, &[put(1, 1, b"a")]),
-            (ShardType::Edges, &[put(3, 3, b"c")]),
+            (ShardType::ServerInfo, &[put(3, 3, b"c")]),
         ])
         .unwrap();
     coordinator.sync().unwrap();
@@ -341,7 +342,7 @@ fn coordinator_publishes_tagged_frames() {
         .iter()
         .map(|entry| entry.pool)
         .collect();
-    assert_eq!(pools, vec![ShardType::State, ShardType::Edges]);
+    assert_eq!(pools, vec![ShardType::State, ShardType::ServerInfo]);
     fs::remove_file(path).unwrap();
 }
 
@@ -401,7 +402,7 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
         .stage_put(ShardType::EventDag, [2; 16], [2; 16], b"event".to_vec())
         .unwrap();
     stage
-        .stage_put(ShardType::Edges, [3; 16], [3; 16], b"edge".to_vec())
+        .stage_put(ShardType::ServerInfo, [3; 16], [3; 16], b"edge".to_vec())
         .unwrap();
 
     stage
@@ -420,7 +421,7 @@ fn transaction_stage_publishes_all_pools_as_one_shared_group() {
             .iter()
             .map(|entry| entry.pool)
             .collect::<Vec<_>>(),
-        vec![ShardType::Edges, ShardType::EventDag, ShardType::State]
+        vec![ShardType::EventDag, ShardType::State, ShardType::ServerInfo]
     );
     assert_eq!(stage.state(), TxnStageState::JournalPublished);
     fs::remove_file(path).unwrap();
@@ -546,6 +547,8 @@ fn published_groups_are_visible_not_durable_until_one_fsync_covers_them() {
 
     // One sync makes both groups durable and promotes each pool.
     coordinator.sync_through(2).unwrap();
+    coordinator.transaction_materialized(first.first_lsn);
+    coordinator.transaction_materialized(second.first_lsn);
     assert_eq!(coordinator.committed_lsn(), 2);
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::State), 1);
     assert_eq!(coordinator.committed_lsn_for_pool(ShardType::EventDag), 2);
@@ -1116,6 +1119,43 @@ fn open_shared_arc(label: &str) -> Arc<JournalCoordinator> {
     Arc::new(JournalCoordinator::new(journal, &scan))
 }
 
+#[test]
+fn configured_reclaim_trigger_stays_below_the_live_emergency_boundary() {
+    let coordinator = open_shared_arc("configured_reclaim_trigger_boundary");
+
+    coordinator
+        .configure_reclaim_trigger_len(MAX_RECLAIM_TRIGGER_LEN)
+        .unwrap();
+    assert_eq!(coordinator.reclaim_trigger_len(), MAX_RECLAIM_TRIGGER_LEN);
+
+    let over = MAX_RECLAIM_TRIGGER_LEN.saturating_add(1);
+    let error = coordinator.configure_reclaim_trigger_len(over).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        coordinator.reclaim_trigger_len(),
+        MAX_RECLAIM_TRIGGER_LEN,
+        "a rejected value must not change the trigger"
+    );
+
+    // A shrunk cap lowers the boundary even for a value below the
+    // compile-time ceiling.
+    coordinator.set_segment_cap(1024);
+    let shrunk_max = super::max_reclaim_trigger_for_cap(1024);
+    coordinator
+        .configure_reclaim_trigger_len(shrunk_max)
+        .unwrap();
+    assert_eq!(coordinator.reclaim_trigger_len(), shrunk_max);
+    assert!(coordinator
+        .configure_reclaim_trigger_len(shrunk_max.saturating_add(1))
+        .is_err());
+    assert!(
+        coordinator
+            .configure_reclaim_trigger_len(MAX_RECLAIM_TRIGGER_LEN)
+            .is_err(),
+        "the compile-time ceiling must not override a shrunk live cap"
+    );
+}
+
 fn publish(coordinator: &JournalCoordinator, node: u8, payload: &[u8]) -> super::CommitReceipt {
     coordinator
         .publish_group_tagged(crate::layout::ShardType::State, &[put(1, node, payload)])
@@ -1259,7 +1299,7 @@ fn mark_slots(path: &Path) -> [Option<(u64, u64)>; 2] {
 #[test]
 fn groups_start_after_a_reserved_sector_aligned_mark_region() {
     assert_eq!(super::FILE_HEADER_LEN % super::MARK_SECTOR_LEN, 0);
-    const { assert!(super::FH_BASE_CRC.end <= super::MARK_SECTOR_LEN) };
+    const { assert!(super::FH_SLOTS.end <= super::MARK_SECTOR_LEN) };
     for offset in super::MARK_SLOT_OFFSETS {
         assert_eq!(offset % super::MARK_SECTOR_LEN, 0, "slot starts a sector");
         assert!(offset >= super::MARK_SECTOR_LEN, "not in the header sector");
@@ -1829,6 +1869,60 @@ fn reclaim_below_base_is_a_noop() {
     fs::remove_file(path).unwrap();
 }
 
+/// A reclaim boundary past the last committed LSN would drop data no
+/// checkpoint covers; it is rejected and the segment is left untouched.
+#[test]
+fn reclaim_refuses_an_lsn_past_the_committed_frontier() {
+    let path = temp_path("reclaim_uncommitted");
+    let _ = fs::remove_file(&path);
+    let (mut journal, _) = Journal::open(&path).unwrap();
+    let only = journal.commit_group(&[put(1, 1, b"only")]).unwrap();
+    let before = fs::metadata(&path).unwrap().len();
+
+    let error = journal
+        .reclaim_through(only.last_lsn.saturating_add(1))
+        .expect_err("an uncommitted LSN cannot be reclaimed");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(fs::metadata(&path).unwrap().len(), before);
+
+    drop(journal);
+    let (_journal, scan) = Journal::open(&path).unwrap();
+    assert_eq!(scan.groups.len(), 1);
+    fs::remove_file(path).unwrap();
+}
+
+/// Dropping a sliver while copying a large suffix is skipped, and the cut that
+/// later covers the rest drops the whole segment with no copy.
+#[test]
+fn reclaim_skips_a_sliver_that_would_copy_a_large_suffix() {
+    let path = temp_path("reclaim_unprofitable");
+    let _ = fs::remove_file(&path);
+    let (mut journal, _) = Journal::open(&path).unwrap();
+    let first = journal.commit_group(&[put(1, 1, b"small")]).unwrap();
+    let big = vec![7u8; 2 << 20];
+    let second = journal.commit_group(&[put(1, 2, &big)]).unwrap();
+    let before = fs::metadata(&path).unwrap().len();
+
+    let skipped = journal.reclaim_through(first.last_lsn).unwrap();
+    assert_eq!(skipped.reclaimed_bytes, 0);
+    assert_eq!(skipped.retained_groups, 2);
+    assert_eq!(
+        fs::metadata(&path).unwrap().len(),
+        before,
+        "the file is unchanged"
+    );
+
+    let dropped = journal.reclaim_through(second.last_lsn).unwrap();
+    assert_eq!(dropped.retained_groups, 0);
+    assert!(dropped.reclaimed_bytes > 0);
+    assert!(
+        fs::metadata(&path).unwrap().len() < 64 * 1024,
+        "only the header and marks remain"
+    );
+    drop(journal);
+    fs::remove_file(path).unwrap();
+}
+
 /// The coordinator exposes reclamation without disturbing its LSN counters:
 /// a publish after reclaim still continues the sequence.
 #[test]
@@ -2220,7 +2314,7 @@ fn replay_lease_advance_lets_reclaim_pass_consumed_pages() {
     assert_eq!(page.groups[0].last_lsn, second.last_lsn);
 
     // Once the page is applied, advancing the floor releases the snapshot.
-    lease.advance(page.through_lsn);
+    lease.advance(page.through_lsn).unwrap();
     coordinator.reclaim_through(second.last_lsn).unwrap();
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -2239,8 +2333,8 @@ fn replay_lease_advance_is_monotonic() {
     let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
     let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
 
-    lease.advance(second.last_lsn);
-    lease.advance(first.last_lsn);
+    lease.advance(second.last_lsn).unwrap();
+    lease.advance(first.last_lsn).unwrap();
 
     // The floor stays at `second`, so reclaim may drop the snapshot and expire
     // the cursor. A lowered floor would clamp the cut to `first` and keep the
@@ -2248,6 +2342,184 @@ fn replay_lease_advance_is_monotonic() {
     coordinator.reclaim_through(second.last_lsn).unwrap();
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// The retention cap is opt-in: with no cap configured, a lease pins its
+/// original cursor however far the segment grows.
+#[test]
+fn replay_lease_cap_is_off_by_default() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_off");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(None);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(!lease.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 0);
+    lease.advance(second.last_lsn).unwrap();
+    let page = coordinator.changes_since(&cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+}
+
+/// A lease pinning more history than the cap allows is revoked by the next
+/// reclaim, which then passes it; reads fall through to the cursor-expired
+/// error and `advance` reports the revocation.
+#[test]
+fn replay_lease_cap_revokes_a_lease_that_retains_too_much() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_breach");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(Some(1));
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    assert_eq!(coordinator.replay_lease_count(), 1);
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(lease.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 1);
+    assert_eq!(coordinator.replay_lease_count(), 0);
+    assert_eq!(
+        lease.advance(second.last_lsn),
+        Err(crate::journal::ReplayLeaseRevoked)
+    );
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// The cap is per lease: at the next reclaim, an older lease over the limit is
+/// revoked while a newer lease retaining exactly the cap is kept.
+#[test]
+fn replay_lease_cap_revokes_only_leases_over_the_limit() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_selective");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let newer_cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let newer = coordinator.pin_replay_cursor(&newer_cursor).unwrap();
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    let retained_by_newer = coordinator.replay_lease_lag_bytes().unwrap();
+    assert!(
+        retained_by_newer > 0,
+        "the newer lease retains the new group"
+    );
+
+    // Exactly at the cap: kept. The older lease retains more than that.
+    coordinator.configure_replay_lease_cap(Some(retained_by_newer));
+    let older_cursor = coordinator.replay_cursor(0).unwrap();
+    let older = coordinator.pin_replay_cursor(&older_cursor).unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(older.is_revoked());
+    assert!(!newer.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 1);
+    assert_eq!(coordinator.replay_lease_count(), 1);
+    let error = coordinator.changes_since(&older_cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    // The surviving lease still reads the retained group and can advance.
+    let page = coordinator.changes_since(&newer_cursor, 8).unwrap();
+    assert_eq!(page.groups.len(), 1);
+    assert_eq!(page.groups[0].last_lsn, second.last_lsn);
+    newer.advance(second.last_lsn).unwrap();
+}
+
+/// Dropping a lease releases its pin without revoking it; the revoked counter
+/// only tracks cap-driven invalidations.
+#[test]
+fn dropping_a_replay_lease_is_not_a_revocation() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_drop");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(Some(1));
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    drop(lease);
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+    assert_eq!(coordinator.replay_leases_revoked(), 0);
+    assert_eq!(coordinator.replay_lease_count(), 0);
+}
+
+/// A lease that fits under the cap is left active, and its lag is reported so
+/// a stuck lease is visible before it matters.
+#[test]
+fn replay_lease_lag_reports_retained_bytes_within_the_cap() {
+    let dir = ReplayTestDir::new("changes_since_lease_lag");
+    let coordinator = open_replay_arc(&dir);
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    coordinator.configure_replay_lease_cap(Some(u64::MAX / 2));
+
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+    let lag = coordinator.replay_lease_lag_bytes().unwrap();
+    assert!(lag > 0, "the second group is retained by the lease");
+    assert!(coordinator.oldest_replay_lease_age().is_some());
+    coordinator.reclaim_through(second.last_lsn).unwrap();
+
+    assert!(!lease.is_revoked());
+    lease.advance(second.last_lsn).unwrap();
+}
+
+/// Concurrent `advance` and cap revocation share the pin registry: after the
+/// reclaim revokes the lease, every later `advance` reports it.
+#[test]
+fn replay_lease_advance_observes_concurrent_revocation() {
+    let dir = ReplayTestDir::new("changes_since_lease_cap_race");
+    let coordinator = open_replay_arc(&dir);
+    coordinator.configure_replay_lease_cap(Some(1));
+    let first = coordinator
+        .publish_group(&[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+    let second = coordinator.publish_group(&[put(1, 2, b"replay")]).unwrap();
+    coordinator.sync().unwrap();
+
+    let revoked = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| loop {
+            if lease.is_revoked() {
+                return lease.advance(first.last_lsn).err();
+            }
+            if let Err(error) = lease.advance(first.last_lsn) {
+                return Some(error);
+            }
+            std::thread::yield_now();
+        });
+        coordinator.reclaim_through(second.last_lsn).unwrap();
+        worker.join().unwrap()
+    });
+
+    assert_eq!(revoked, Some(crate::journal::ReplayLeaseRevoked));
+    assert!(lease.is_revoked());
 }
 
 #[test]
@@ -2281,6 +2553,37 @@ fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
 
     drop(lease);
     coordinator.reclaim_shared().unwrap();
+    let error = coordinator.changes_since(&cursor, 8).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn shared_reclaim_revokes_a_lease_over_the_cap() {
+    use crate::layout::ShardType;
+
+    let dir = ReplayTestDir::new("shared_replay_lease_cap");
+    let path = dir.journal_path();
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+    coordinator.configure_replay_lease_cap(Some(1));
+
+    let first = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let cursor = coordinator.replay_cursor(first.last_lsn).unwrap();
+    let lease = coordinator.pin_replay_cursor(&cursor).unwrap();
+
+    let second = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 2, b"replay")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    coordinator.report_pool_coverage(ShardType::State, second.last_lsn);
+    coordinator.reclaim_shared().unwrap();
+
+    assert!(lease.is_revoked());
+    assert_eq!(coordinator.replay_leases_revoked(), 1);
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
@@ -3198,7 +3501,7 @@ fn directory_boundary_equals_the_scan_boundary() {
                 for (pool, level) in [
                     (ShardType::State, state),
                     (ShardType::EventDag, event_dag),
-                    (ShardType::Edges, edges),
+                    (ShardType::ServerInfo, edges),
                 ] {
                     if let Some(lsn) = level {
                         covered.insert(pool, lsn);
@@ -3347,7 +3650,7 @@ fn collection_version_is_recovered_from_the_segment() {
     let coordinator = JournalCoordinator::new(journal, &scan);
     coordinator.enable_publish_signal().unwrap();
     let receipt = coordinator
-        .publish_group_tagged(ShardType::Edges, &[put(9, 1, b"edge")])
+        .publish_group_tagged(ShardType::ServerInfo, &[put(9, 1, b"edge")])
         .unwrap();
     coordinator.sync().unwrap();
     drop(coordinator);
@@ -3355,7 +3658,7 @@ fn collection_version_is_recovered_from_the_segment() {
     let (journal, scan) = Journal::open_shared(&path).unwrap();
     let recovered = JournalCoordinator::new(journal, &scan);
     assert_eq!(
-        recovered.collection_version(ShardType::Edges, &[9; 16]),
+        recovered.collection_version(ShardType::ServerInfo, &[9; 16]),
         receipt.last_lsn,
         "a retained group's collection version survives a reopen"
     );
@@ -3387,6 +3690,30 @@ fn expectations_are_staged_and_discarded_with_the_transaction() {
         stage.expectations().is_empty(),
         "discard drops staged expectations"
     );
+}
+
+#[test]
+fn conflicting_collection_expectations_are_rejected_but_synthetic_zero_is_ignored() {
+    use crate::layout::ShardType;
+
+    let stage = TxnStage::new();
+    stage
+        .stage_expectation(ShardType::State, [4; 16], 42)
+        .unwrap();
+    // A later staged-view read can report a synthetic zero; it must not
+    // replace the original precondition.
+    stage
+        .stage_expectation(ShardType::State, [4; 16], 0)
+        .unwrap();
+    assert_eq!(stage.expectations().len(), 1);
+    assert_eq!(stage.expectations()[0].expected, 42);
+
+    // A second real token is a conflict, not something to silently drop.
+    let error = stage
+        .stage_expectation(ShardType::State, [4; 16], 43)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(stage.expectations()[0].expected, 42);
 }
 
 #[test]
@@ -3530,6 +3857,9 @@ fn a_failed_directory_sync_after_the_rewrite_poisons_the_journal() {
     journal
         .commit_group(&[put(1, 3, b"third")])
         .expect_err("a poisoned handle acknowledges nothing");
+    journal
+        .reclaim_through(first.last_lsn)
+        .expect_err("a poisoned handle must not rewrite the segment either");
     assert!(!path.with_extension("rotate").exists(), "no temp file left");
     drop(journal);
 
@@ -3603,4 +3933,697 @@ fn either_segment_a_rewrite_crash_leaves_opens_and_numbers_consistently() {
         "numbering continues identically"
     );
     assert_eq!(next_lsns[0], second.last_lsn.saturating_add(1));
+}
+
+/// The original lookup: one pass over every staged mutation. Kept as the
+/// reference the incremental index must agree with.
+fn scan_lookup(
+    mutations: &[Mutation],
+    collection_id: &[u8; 16],
+    node_ids: &[[u8; 16]],
+) -> Vec<super::StagedLookup> {
+    use super::StagedLookup;
+    use std::collections::{HashMap, HashSet};
+
+    let wanted: HashSet<[u8; 16]> = node_ids.iter().copied().collect();
+    let mut newest: HashMap<[u8; 16], (usize, Option<&Vec<u8>>)> = HashMap::new();
+    let mut last_delete: Option<usize> = None;
+    for (position, mutation) in mutations.iter().enumerate() {
+        match mutation {
+            Mutation::Put {
+                collection_id: staged,
+                node_id,
+                payload,
+            } if staged == collection_id && wanted.contains(node_id) => {
+                newest.insert(*node_id, (position, Some(payload)));
+            }
+            Mutation::RemoveRecord {
+                collection_id: staged,
+                node_id,
+            } if staged == collection_id && wanted.contains(node_id) => {
+                newest.insert(*node_id, (position, None));
+            }
+            Mutation::DeleteCollection {
+                collection_id: staged,
+            } if staged == collection_id => last_delete = Some(position),
+            _ => {}
+        }
+    }
+    node_ids
+        .iter()
+        .map(|node_id| match (newest.get(node_id), last_delete) {
+            (Some((position, _)), Some(delete)) if *position < delete => StagedLookup::Deleted,
+            (Some((_, Some(payload))), _) => StagedLookup::Put((*payload).clone()),
+            (Some((_, None)), _) | (None, Some(_)) => StagedLookup::Deleted,
+            (None, None) => StagedLookup::Absent,
+        })
+        .collect()
+}
+
+#[test]
+fn staged_lookup_index_matches_a_full_scan() {
+    use crate::layout::ShardType;
+    use std::collections::HashSet;
+
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        usize::try_from(seed % u64::try_from(bound).unwrap()).unwrap()
+    };
+    let pool = ShardType::EventDag;
+    let pool_position = pool.index();
+    let ids: Vec<[u8; 16]> = (0..12_u8).map(|n| [n; 16]).collect();
+    let collections = [[0xa0_u8; 16], [0xb0_u8; 16]];
+    let stage = TxnStage::new();
+
+    for step in 0..600_u32 {
+        let collection = collections[next(2)];
+        let id = ids[next(12)];
+        match next(8) {
+            0..=2 => stage
+                .stage_put(pool, collection, id, step.to_le_bytes().to_vec())
+                .unwrap(),
+            3 => stage.stage_remove_record(pool, collection, id).unwrap(),
+            4 => stage.stage_delete_collection(pool, collection).unwrap(),
+            5 => stage
+                .stage_puts(pool, collection, &[(id, vec![1]), (ids[next(12)], vec![2])])
+                .unwrap(),
+            // These two rewrite the staged vector and must invalidate the index.
+            6 => stage
+                .forget_staged_records(pool, collection, &HashSet::from([id]))
+                .unwrap(),
+            _ => stage
+                .stage_removals_normalized(pool, collection, &[(id, 0)], &[id])
+                .unwrap(),
+        }
+        let mutations = stage.snapshot_mutations()[pool_position].clone();
+        for collection in &collections {
+            assert_eq!(
+                stage.lookup_many(pool, collection, &ids),
+                scan_lookup(&mutations, collection, &ids),
+                "step {step}"
+            );
+        }
+    }
+
+    stage.discard();
+    assert_eq!(stage.state(), TxnStageState::Discarded);
+}
+
+#[test]
+fn inactive_stage_rejects_every_staging_call_without_changing_state() {
+    use crate::layout::ShardType;
+
+    let stage = TxnStage::new();
+    stage
+        .stage_put(ShardType::State, [1; 16], [1; 16], b"v".to_vec())
+        .unwrap();
+    stage.discard();
+    assert_eq!(stage.state(), TxnStageState::Discarded);
+
+    assert!(stage.ensure_capacity(1).is_err());
+    assert!(stage
+        .stage_remove_record(ShardType::State, [1; 16], [1; 16])
+        .is_err());
+    assert!(stage
+        .stage_remove_records(ShardType::State, [1; 16], &[[1; 16]])
+        .is_err());
+    assert!(stage
+        .forget_staged_record(ShardType::State, [1; 16], [1; 16])
+        .is_err());
+    // An empty removal batch is a no-op even on an inactive stage.
+    stage
+        .stage_remove_records(ShardType::State, [1; 16], &[])
+        .unwrap();
+    assert!(stage.is_empty());
+}
+
+#[test]
+fn stage_budget_is_enforced_and_released_by_forgetting() {
+    use crate::layout::ShardType;
+
+    // Each removal marker is charged 64 bytes.
+    let stage = TxnStage::with_limit(64 * 3);
+    stage
+        .stage_remove_records(ShardType::State, [1; 16], &[[1; 16], [2; 16], [3; 16]])
+        .unwrap();
+    // The stage is exactly full: more of either shape is refused and nothing
+    // is staged on failure.
+    assert!(stage
+        .stage_remove_records(ShardType::State, [1; 16], &[[4; 16]])
+        .is_err());
+    assert!(stage
+        .stage_remove_record(ShardType::State, [1; 16], [4; 16])
+        .is_err());
+    assert!(stage.ensure_capacity(1).is_err());
+    assert_eq!(
+        stage.snapshot_mutations()[0..]
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        3
+    );
+
+    // Forgetting one staged key releases its budget for reuse.
+    stage
+        .forget_staged_record(ShardType::State, [1; 16], [2; 16])
+        .unwrap();
+    stage.ensure_capacity(64).unwrap();
+    stage
+        .stage_remove_record(ShardType::State, [1; 16], [4; 16])
+        .unwrap();
+    assert_eq!(
+        stage
+            .snapshot_mutations()
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        3
+    );
+}
+
+#[test]
+fn publish_refuses_cross_pool_stage_without_a_shared_coordinator() {
+    use crate::layout::ShardType;
+
+    let first_path = temp_path("txn_stage_split_a");
+    let second_path = temp_path("txn_stage_split_b");
+    let _ = fs::remove_file(&first_path);
+    let _ = fs::remove_file(&second_path);
+    let (first_journal, first_scan) = Journal::open_shared(&first_path).unwrap();
+    let (second_journal, second_scan) = Journal::open_shared(&second_path).unwrap();
+    let first = JournalCoordinator::new(first_journal, &first_scan);
+    let second = JournalCoordinator::new(second_journal, &second_scan);
+
+    let stage = TxnStage::new();
+    stage
+        .stage_put(ShardType::EventDag, [1; 16], [1; 16], b"e".to_vec())
+        .unwrap();
+    stage
+        .stage_put(ShardType::State, [2; 16], [2; 16], b"s".to_vec())
+        .unwrap();
+    let mut coordinators: [Option<&JournalCoordinator>; ShardType::ALL.len()] =
+        ShardType::ALL.map(|_| None);
+    coordinators[ShardType::EventDag as usize] = Some(&first);
+    coordinators[ShardType::State as usize] = Some(&second);
+    let error = stage.publish(coordinators).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(stage.state(), TxnStageState::Active);
+
+    let _ = fs::remove_file(first_path);
+    let _ = fs::remove_file(second_path);
+}
+
+#[test]
+fn publish_reports_a_staged_pool_with_no_journal() {
+    use crate::layout::ShardType;
+
+    let path = temp_path("txn_stage_unconnected");
+    let _ = fs::remove_file(&path);
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+
+    let stage = TxnStage::new();
+    stage
+        .stage_put(ShardType::State, [1; 16], [1; 16], b"s".to_vec())
+        .unwrap();
+    // Some other pool is journaled, but the touched pool is not.
+    let mut coordinators: [Option<&JournalCoordinator>; ShardType::ALL.len()] =
+        ShardType::ALL.map(|_| None);
+    coordinators[ShardType::EventDag as usize] = Some(&coordinator);
+    let error = stage.publish(coordinators).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+
+    // With journaling disabled everywhere the stage is simply published.
+    let no_journal = TxnStage::new();
+    no_journal
+        .stage_put(ShardType::State, [1; 16], [1; 16], b"s".to_vec())
+        .unwrap();
+    no_journal.publish(ShardType::ALL.map(|_| None)).unwrap();
+    assert_eq!(no_journal.state(), TxnStageState::Published);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn shared_wal_lock_refuses_a_directory_that_is_not_a_database_root() {
+    let dir = ReplayTestDir::new("wal_lock_not_root");
+    let Err(error) = super::SharedWalLock::acquire(&dir.0) else {
+        panic!("a plain directory must not be lockable as a database root");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("not an mtxdb database root"));
+}
+
+/// Publish one tagged group and return its last LSN, with its frame
+/// materialized so reclaim can consider it.
+fn publish_for(coordinator: &JournalCoordinator, pool: crate::layout::ShardType, byte: u8) -> u64 {
+    let receipt = coordinator
+        .publish_group_tagged(pool, &[put(byte, byte, b"x")])
+        .unwrap();
+    coordinator.transaction_materialized(receipt.first_lsn);
+    receipt.last_lsn
+}
+
+fn reclaimed_marks(coordinator: &JournalCoordinator) -> [u64; 3] {
+    use crate::layout::ShardType;
+    ShardType::ALL.map(|pool| coordinator.reclaimed_history_through(pool))
+}
+
+/// The version table a coverage claim carries is snapshotted through exactly
+/// the claimed LSN, so a group published after that boundary is never claimed
+/// as durable in the delta batch.
+#[test]
+fn collection_versions_through_stops_at_the_covered_boundary() {
+    use crate::layout::ShardType::{EventDag, State};
+    let path = temp_path("versions_boundary");
+    let _ = fs::remove_file(&path);
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    let first = publish_for(&coordinator, State, 1);
+    let second = publish_for(&coordinator, State, 1);
+    let later = publish_for(&coordinator, EventDag, 2);
+    coordinator.sync().unwrap();
+    assert!(first < second && second < later);
+
+    assert_eq!(
+        coordinator.collection_versions_through(State, first),
+        Vec::new(),
+        "the only known state version is the later write, above the boundary"
+    );
+    assert_eq!(
+        coordinator.collection_versions_through(State, second),
+        vec![([1; 16], second)]
+    );
+    assert_eq!(
+        coordinator.collection_versions_through(EventDag, second),
+        Vec::new(),
+        "another pool's group is never claimed through this pool's boundary"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+/// A reclaim records, per pool, only the history it removed, never the coverage a
+/// pool reported, and the marks only grow: a later rewrite that drops nothing of
+/// a pool's still carries that pool's mark forward. They live in the header, so
+/// they survive a reopen.
+#[test]
+fn reclaimed_history_marks_record_only_removed_history_and_only_grow() {
+    use crate::layout::ShardType::{EventDag, ServerInfo, State};
+    let path = temp_path("reclaimed_history_marks");
+    let _ = fs::remove_file(&path);
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    assert_eq!(
+        reclaimed_marks(&coordinator),
+        [0; 3],
+        "a fresh journal has reclaimed nothing"
+    );
+
+    let first = [
+        publish_for(&coordinator, State, 1),
+        publish_for(&coordinator, EventDag, 2),
+        publish_for(&coordinator, State, 3),
+        publish_for(&coordinator, EventDag, 4),
+    ];
+    coordinator.sync().unwrap();
+    // State reports far more than will be removed; EventDag only its first group.
+    coordinator.report_pool_coverage(State, first[3]);
+    coordinator.report_pool_coverage(EventDag, first[1]);
+    assert!(coordinator.reclaim_shared().unwrap().is_some());
+    // The cut falls before EventDag's second group: the first three go.
+    assert_eq!(
+        reclaimed_marks(&coordinator),
+        [first[2], first[1], 0],
+        "State's mark is its newest removed group, not its reported coverage"
+    );
+
+    // Only EventDag writes next. The rewrite removes EventDag groups and none of
+    // State's, so State's mark must be carried, not lowered or reset.
+    let second = [
+        publish_for(&coordinator, EventDag, 5),
+        publish_for(&coordinator, EventDag, 6),
+    ];
+    coordinator.sync().unwrap();
+    coordinator.report_pool_coverage(EventDag, second[0]);
+    assert!(coordinator.reclaim_shared().unwrap().is_some());
+    let expected = [first[2], second[0], 0];
+    assert_eq!(reclaimed_marks(&coordinator), expected);
+    // Nothing more to remove: the marks do not move.
+    coordinator.report_pool_coverage(EventDag, second[0]);
+    let _ = coordinator.reclaim_shared().unwrap();
+    assert_eq!(reclaimed_marks(&coordinator), expected);
+    drop(coordinator);
+
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let reopened = JournalCoordinator::new(journal, &scan);
+    assert_eq!(
+        reclaimed_marks(&reopened),
+        expected,
+        "marks survive a reopen"
+    );
+    assert_eq!(reopened.reclaimed_history_through(ServerInfo), 0);
+    fs::remove_file(path).unwrap();
+}
+
+/// The marks are covered by the header checksum: damage to a mark, to the slot
+/// count or to the checksum itself fails the open instead of yielding other
+/// marks.
+#[test]
+fn a_damaged_reclaimed_history_header_fails_to_open() {
+    use crate::layout::ShardType::State;
+    let path = temp_path("reclaimed_history_damage");
+    let _ = fs::remove_file(&path);
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    let last = publish_for(&coordinator, State, 1);
+    publish_for(&coordinator, State, 2);
+    coordinator.sync().unwrap();
+    coordinator.report_pool_coverage(State, last);
+    assert!(coordinator.reclaim_shared().unwrap().is_some());
+    drop(coordinator);
+    let good = fs::read(&path).unwrap();
+
+    let slots_at = super::FH_SLOTS.start;
+    let crc_at = super::FH_MARKS_AT + 3 * 8;
+    for (what, at) in [
+        ("a mark", super::FH_MARKS_AT),
+        ("the slot count", slots_at),
+        ("the checksum", crc_at),
+    ] {
+        let mut bytes = good.clone();
+        bytes[at] ^= 0x01;
+        fs::write(&path, &bytes).unwrap();
+        let error = Journal::open_shared(&path).map(|_| ()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{what}");
+        assert!(
+            Journal::scan_read_only(&path).is_err(),
+            "{what}: a read-only scan accepted the damaged header"
+        );
+    }
+    fs::write(&path, &good).unwrap();
+    assert!(Journal::open_shared(&path).is_ok());
+    fs::remove_file(path).unwrap();
+}
+
+/// Policy harness: the coordinator driven the way a pool's forced checkpoint
+/// drives it. A forced checkpoint reports the pool's coverage and reclaims the
+/// shared segment; everything else a commit does is an append, so groups are
+/// published with no fsync at all, and the real `should_force_reclaim_checkpoint`
+/// decides when a pool "syncs". What this cannot show is that a real sync reports
+/// the coverage injected here; the real-stack tests in `test_database.rs` keep
+/// that short and scaled down.
+struct PolicyHarness {
+    coordinator: Arc<JournalCoordinator>,
+    path: PathBuf,
+    /// Each pool's newest published LSN and the coverage it last reported.
+    published: [u64; 3],
+    reported: [u64; 3],
+    /// Pools a remediation asked to checkpoint, in order.
+    remediated: Arc<std::sync::Mutex<Vec<crate::layout::ShardType>>>,
+}
+
+impl PolicyHarness {
+    fn new(label: &str, segment_cap: u64) -> Self {
+        let path = temp_path(label);
+        let _ = fs::remove_file(&path);
+        let (journal, scan) = Journal::open_shared(&path).unwrap();
+        let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
+        coordinator.set_segment_cap(segment_cap);
+        Self {
+            coordinator,
+            path,
+            published: [0; 3],
+            reported: [0; 3],
+            remediated: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// A pool's checkpoint reports its coverage and reclaims, which is what a
+    /// real checkpoint does for the pool that owns it. This is the only way
+    /// coverage advances here, so a pool that never "syncs" stays silent.
+    fn checkpoint(&mut self, pool: crate::layout::ShardType) {
+        let index = pool.index();
+        self.reported[index] = self.published[index];
+        self.coordinator
+            .report_pool_coverage(pool, self.published[index]);
+        self.coordinator.reclaim_shared().unwrap();
+    }
+
+    /// Make a lagging pool checkpoint when reclaim reaches the emergency zone,
+    /// the same role the database's remediation closure has for real pools.
+    /// The ask is recorded so a test can assert it happened.
+    fn remediate_laggards(&self) {
+        let coordinator = Arc::clone(&self.coordinator);
+        let remediated = Arc::clone(&self.remediated);
+        self.coordinator.set_blocker_remediation(move |pool| {
+            remediated.lock().unwrap().push(pool);
+            coordinator.report_pool_coverage(pool, coordinator.published_lsn());
+            let _ = coordinator.reclaim_shared();
+        });
+    }
+
+    fn remediated(&self) -> Vec<crate::layout::ShardType> {
+        self.remediated.lock().unwrap().clone()
+    }
+
+    /// One commit's worth for `pool`: twenty 256-byte puts in one group, about
+    /// what a real batch writes per pool. `Err` once the segment cannot take it.
+    fn commit(&mut self, pool: crate::layout::ShardType) -> std::io::Result<()> {
+        let mutations: Vec<Mutation> = (0..20_u8)
+            .map(|node| put(0x7c, node, &[0x5a; 256]))
+            .collect();
+        let receipt = self.coordinator.publish_group_tagged(pool, &mutations)?;
+        self.coordinator.transaction_materialized(receipt.first_lsn);
+        self.published[pool.index()] = receipt.last_lsn;
+        Ok(())
+    }
+
+    /// `pool` syncs: when the policy would force a checkpoint for it (the
+    /// segment is over the trigger, the stall gate permits it, and it has
+    /// something uncovered) it checkpoints. Then, like a real sync, it gives
+    /// the coordinator a chance to remediate pools holding reclaim back.
+    /// Returns whether the checkpoint was forced.
+    fn sync(&mut self, pool: crate::layout::ShardType) -> bool {
+        let index = pool.index();
+        let forced = self.coordinator.should_force_reclaim_checkpoint(Some(pool))
+            && self.published[index] > self.reported[index];
+        if forced {
+            self.checkpoint(pool);
+        }
+        self.coordinator.remediate_blockers(Some(pool));
+        forced
+    }
+}
+
+impl Drop for PolicyHarness {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A pool that stays silent is reported, but only after the segment has grown by
+/// an eighth of the trigger past the first failed reclaim, and only once. The
+/// full-scale arithmetic (1 MiB segment, 256 KiB trigger), with no fsyncs.
+#[test]
+fn a_silent_pool_is_reported_only_after_the_grace_period() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_stall_grace", 1 << 20);
+    harness.coordinator.set_blocker_remediation(|_| {});
+    let grace = harness.coordinator.reclaim_trigger_len() / 8;
+    let mut first_len = None;
+    let mut reported_at = None;
+    for _ in 0..200 {
+        // State commits and never syncs; EventDag commits and syncs.
+        if harness.commit(State).is_err() || harness.commit(EventDag).is_err() {
+            break;
+        }
+        harness.sync(EventDag);
+        if first_len.is_none() && harness.coordinator.is_reclaim_stalled() {
+            first_len = Some(harness.coordinator.segment_len());
+            assert_eq!(
+                harness.coordinator.reclaim_stalls(),
+                0,
+                "reported with no grace"
+            );
+        }
+        if reported_at.is_none() && harness.coordinator.reclaim_stalls() > 0 {
+            reported_at = Some(harness.coordinator.segment_len());
+        }
+    }
+    let first_len = first_len.expect("the pending stall was never seen");
+    let reported_at = reported_at.expect("a silent pool was never reported");
+    assert!(
+        reported_at >= first_len + grace,
+        "reported at {reported_at}, only {} past the first failure",
+        reported_at - first_len
+    );
+    assert_eq!(
+        harness.coordinator.reclaim_stalls(),
+        1,
+        "one stall, reported once"
+    );
+    assert_eq!(
+        harness.coordinator.reclaim_blockers(),
+        vec![crate::layout::ShardType::State],
+        "the silent pool is the one named"
+    );
+}
+
+/// `State` and `EventDag` both commit, but only `EventDag` ever syncs and
+/// nothing remediates the lag. Reclaim stalls, is reported once with the pool
+/// named, and `EventDag` stops repeating a checkpoint that cannot help. The
+/// commit that finally hits the hard limit says which pool it waits on.
+#[test]
+fn a_pool_that_never_reports_stalls_reclaim_visibly_and_without_thrashing() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_lagging_no_remediation", 1 << 20);
+    let coordinator = Arc::clone(&harness.coordinator);
+    let emergency = coordinator.segment_cap() - coordinator.segment_cap() / 4;
+    let trigger = coordinator.reclaim_trigger_len();
+    let mut backed_off_syncs = 0usize;
+    let mut backed_off_checkpoints = 0usize;
+    let mut rounds = 0usize;
+    let failure = loop {
+        let failure = harness
+            .commit(State)
+            .and_then(|()| harness.commit(EventDag));
+        if let Err(error) = failure {
+            break error;
+        }
+        let in_back_off_zone =
+            coordinator.is_reclaim_stalled() && coordinator.segment_len() < emergency;
+        let forced = harness.sync(EventDag);
+        if in_back_off_zone {
+            backed_off_syncs += 1;
+            if forced {
+                backed_off_checkpoints += 1;
+            }
+        }
+        rounds += 1;
+        assert!(rounds < 400, "the segment never filled");
+    };
+    let message = failure.to_string();
+    assert!(message.contains("segment is full"), "{message}");
+    assert!(
+        message.contains("waiting on pools") && message.contains("State"),
+        "the error must name the lagging pool: {message}"
+    );
+    assert!(coordinator.is_reclaim_stalled());
+    assert_eq!(coordinator.reclaim_stalls(), 1, "one stall, reported once");
+    assert_eq!(coordinator.reclaim_blockers(), vec![State]);
+    // The segment may only retry after growing by an eighth of the trigger,
+    // so the zone allows at most (emergency - trigger) / (trigger / 8)
+    // retries however many syncs happen in it.
+    let bound = usize::try_from((emergency - trigger) / (trigger / 8)).unwrap() + 2;
+    assert!(
+        backed_off_checkpoints <= bound,
+        "{backed_off_checkpoints} forced checkpoints in the back-off zone; at most {bound}"
+    );
+    assert!(
+        backed_off_checkpoints * 2 < backed_off_syncs,
+        "EventDag checkpointed {backed_off_checkpoints} times in {backed_off_syncs} syncs"
+    );
+}
+
+/// Pools sync one after another, so the first to cross the trigger cannot yet
+/// reclaim what the others have not reported. That is normal: it must neither
+/// be counted nor logged as a stall, and the later pool's coverage clears the
+/// pending state.
+#[test]
+fn a_healthy_sequential_sync_is_not_reported_as_a_stall() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_healthy_sequential", 1 << 20);
+    let coordinator = Arc::clone(&harness.coordinator);
+    let mut saw_pending = false;
+    for round in 0..150 {
+        harness
+            .commit(State)
+            .and_then(|()| harness.commit(EventDag))
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        harness.sync(EventDag);
+        saw_pending |= coordinator.is_reclaim_stalled();
+        harness.sync(State);
+        assert_eq!(
+            coordinator.reclaim_stalls(),
+            0,
+            "round {round}: a healthy crossing was reported as a stall"
+        );
+    }
+    assert!(
+        saw_pending,
+        "the first pool to cross must have seen a pending stall, or this proves nothing"
+    );
+    assert!(
+        !coordinator.is_reclaim_stalled(),
+        "the second pool's coverage must clear it"
+    );
+    assert!(coordinator.reclaim_trigger_len() > 0);
+}
+
+/// With a pool that stays silent, reclaim reaches the emergency zone, asks
+/// that pool to checkpoint, and succeeds. The segment never fills and no
+/// commit is refused, however many rounds run.
+#[test]
+fn a_lagging_pool_is_checkpointed_before_the_segment_fills() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_lagging_remediated", 1 << 20);
+    let coordinator = Arc::clone(&harness.coordinator);
+    harness.remediate_laggards();
+    for round in 0..120 {
+        harness
+            .commit(State)
+            .and_then(|()| harness.commit(EventDag))
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        harness.sync(EventDag);
+        assert!(
+            coordinator.segment_len() < coordinator.segment_cap(),
+            "round {round}: the segment reached its cap"
+        );
+    }
+    assert!(
+        coordinator.reclaim_stalls() >= 1,
+        "a stall must have been seen"
+    );
+    assert!(
+        harness.remediated().contains(&State),
+        "State was never asked to checkpoint"
+    );
+}
+
+/// Pools sync one after another, so the first to cross the trigger cannot yet
+/// reclaim what the others have not reported. That is normal: it must neither be
+/// counted nor logged as a stall, and the later pool's coverage clears the
+/// pending state. Full scale, no fsyncs.
+#[test]
+fn a_healthy_sequential_pool_sync_is_not_a_stall() {
+    use crate::layout::ShardType::{EventDag, State};
+    let mut harness = PolicyHarness::new("policy_healthy_sequential", 1 << 20);
+    let mut saw_pending = false;
+    for round in 0..150 {
+        harness
+            .commit(State)
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        harness
+            .commit(EventDag)
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        harness.sync(EventDag);
+        saw_pending |= harness.coordinator.is_reclaim_stalled();
+        harness.sync(State);
+        assert_eq!(
+            harness.coordinator.reclaim_stalls(),
+            0,
+            "round {round}: a healthy crossing was reported as a stall"
+        );
+    }
+    assert!(
+        saw_pending,
+        "the first pool to cross must have seen a pending stall, or this proves nothing"
+    );
+    assert!(
+        !harness.coordinator.is_reclaim_stalled(),
+        "the second pool's coverage must clear it"
+    );
+    assert!(harness.coordinator.reclaim_trigger_len() > 0);
 }

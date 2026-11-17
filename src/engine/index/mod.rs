@@ -8,9 +8,28 @@ pub mod delta;
 pub mod format;
 pub mod packidx;
 pub mod redo;
+pub mod run;
+pub mod sealed;
+pub mod versions;
 
 use crate::index::delta::DeltaReplayError;
 use crate::index::format::DeltaFrame;
+
+/// Where sealed packs' locators are served from.
+///
+/// `Resident` is the historical behaviour: every pack, sealed or not, has a
+/// copy in the resident [`LossyIndex`]. `Paged` keeps only unsealed packs in
+/// the resident table and resolves sealed packs through their mmap'd sidecars.
+/// It is an opt-in memory/CPU trade: a sealed miss becomes a sidecar lookup
+/// instead of a hash-table probe, and a missing sidecar falls back to a scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexResidency {
+    /// Every pack is indexed in the resident hash table.
+    #[default]
+    Resident,
+    /// Only the unsealed tail is resident; sealed packs use sidecars.
+    Paged,
+}
 
 /// Per-database-instance tuning for [`LossyIndex`] construction.
 ///
@@ -218,11 +237,15 @@ impl IndexEntry {
 /// A per-collection lossy fanout index for content-addressed records.
 ///
 /// Uses open addressing with linear probing on a power-of-two sized table.
-/// The index is mmap-able (flat `u64` array) and small enough to stay
-/// resident in RAM for active collections.
+/// The entry slots can be mmap-backed on checkpoint load; identity tables
+/// remain in private heap when present.
 ///
 /// Design decisions (from docs):
-/// - Partition by collection: ~8KB per 1000-node collection, 100 active collections < 1MB.
+/// - Partition by collection: an owned table uses 24 bytes per capacity slot
+///   (8 packed entry plus the 16-byte `homes`/`tails` side tables), about 32
+///   bytes per record at the 75% load ceiling and about 64 just after a
+///   doubling. A hydrated checkpoint-loaded table keeps 16 bytes per slot in
+///   private identity tables and maps 8 bytes per slot for entries.
 /// - Empty entry terminates probe. Removed versions remain occupied entries,
 ///   so removal never breaks a probe chain.
 /// - Tag collisions coexist in the probe chain; a tag is only a candidate
@@ -431,7 +454,7 @@ impl LossyIndex {
 
     /// This index's entry-table capacity (always a power of two).
     #[must_use]
-    pub(crate) fn capacity(&self) -> u32 {
+    pub const fn capacity(&self) -> u32 {
         self.capacity
     }
 
@@ -598,6 +621,29 @@ impl LossyIndex {
         offset: u64,
         removed: bool,
     ) -> Result<(u32, u64, EntryUndo), InsertError> {
+        // A checkpoint-backed index is read-only until its caller clones it
+        // into owned storage. Do not resize the identity tables on a write
+        // that must fail: the mapped index has no slot storage to update.
+        if !matches!(&self.slots, EntryStorage::Owned(_)) {
+            self.bump_max_probe_len(0);
+            return Err(InsertError::TableFull);
+        }
+        // A checkpoint-mapped index has no in-memory identity tables. Once a
+        // caller materializes it for writing, allocate zeroed tables so new
+        // entries can be recorded while existing candidates still request
+        // identity verification from storage.
+        {
+            let mut homes = self.homes.lock();
+            if homes.len() != self.capacity as usize {
+                homes.resize(self.capacity as usize, 0);
+            }
+        }
+        {
+            let mut tails = self.tails.lock();
+            if tails.len() != self.capacity as usize {
+                tails.resize(self.capacity as usize, 0);
+            }
+        }
         let tag = self.tag(hash);
         let raw_home = u64::from_be_bytes(hash[..8].try_into().unwrap());
         let home = self.mix_home(raw_home);
@@ -995,7 +1041,58 @@ impl LossyIndex {
         self.len.load(Ordering::Acquire) == 0
     }
 
-    /// Estimated memory usage in bytes.
+    /// Iterate the live records' `(shard slot, frame offset)` locations.
+    ///
+    /// Removed versions and empty slots are skipped. The order is the hash
+    /// table's bucket order, not append order; callers that need a stable
+    /// physical order sort by `(pack id, offset)`.
+    pub fn live_entries(&self) -> impl Iterator<Item = (u16, u64)> + '_ {
+        (0..self.capacity as usize).filter_map(move |slot| {
+            let entry = IndexEntry(self.slots.get(slot));
+            if entry.is_empty() || entry.is_removed() || entry.has_invalid_slot_bits() {
+                None
+            } else {
+                Some((entry.slot(), entry.offset()))
+            }
+        })
+    }
+
+    /// Bytes of private heap currently occupied by this table: its struct,
+    /// initialized owned entry slots, and initialized `homes`/`tails` entries.
+    /// Uses vector lengths rather than capacities. The entry array is absent
+    /// when slots are mapped from a checkpoint; identity tables are empty when
+    /// that checkpoint lacks them.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        let word = std::mem::size_of::<u64>();
+        let slots = match &self.slots {
+            EntryStorage::Owned(slots) => slots.len().saturating_mul(word),
+            EntryStorage::Mmap { .. } => 0,
+        };
+        let homes_len = self.homes.lock().len();
+        let tails_len = self.tails.lock().len();
+        let identities = homes_len.saturating_add(tails_len).saturating_mul(word);
+        std::mem::size_of::<Self>()
+            .saturating_add(slots)
+            .saturating_add(identities)
+    }
+
+    /// Extent in bytes of the entry array borrowed from a checkpoint mapping.
+    /// This is reclaimable file-backed address space, not RSS; zero once the
+    /// table has been written to and cloned into owned slots.
+    #[must_use]
+    pub fn mapped_bytes(&self) -> usize {
+        match &self.slots {
+            EntryStorage::Owned(_) => 0,
+            EntryStorage::Mmap { .. } => {
+                (self.capacity as usize).saturating_mul(std::mem::size_of::<u64>())
+            }
+        }
+    }
+
+    /// Historical capacity-based estimate of memory usage. This charges every
+    /// slot as owned, including checkpoint-mapped slots; use
+    /// [`Self::resident_bytes`] and [`Self::mapped_bytes`] for the actual split.
     #[must_use]
     pub fn memory_usage(&self) -> usize {
         (self.capacity as usize)
@@ -1062,12 +1159,41 @@ impl LossyIndex {
     /// of the packfile itself.
     #[must_use]
     pub fn slot_counts(&self) -> std::collections::HashMap<u16, u64> {
+        self.slot_counts_excluding(|_| false)
+    }
+
+    /// As [`Self::slot_counts`], excluding slots a caller will account for
+    /// from another source. A paged collection uses this to count only its
+    /// unsealed tail while sealed sidecars supply the rest, so a pack sealed
+    /// during the session is never counted twice.
+    #[must_use]
+    pub fn slot_counts_excluding(
+        &self,
+        mut excluded: impl FnMut(u16) -> bool,
+    ) -> std::collections::HashMap<u16, u64> {
         let mut counts = std::collections::HashMap::new();
         for index in 0..self.capacity as usize {
             let entry = IndexEntry(self.entry_at(index));
-            if !entry.is_empty() {
+            if !entry.is_empty() && !excluded(entry.slot()) {
                 let entry = counts.entry(entry.slot()).or_insert(0u64);
                 *entry = entry.saturating_add(1);
+            }
+        }
+        counts
+    }
+
+    /// Count entries by slot, excluding a precomputed set of slot ids.
+    #[must_use]
+    pub fn slot_counts_excluding_set(
+        &self,
+        excluded: &std::collections::HashSet<u16>,
+    ) -> std::collections::HashMap<u16, u64> {
+        let mut counts = std::collections::HashMap::new();
+        for index in 0..self.capacity as usize {
+            let entry = IndexEntry(self.entry_at(index));
+            if !entry.is_empty() && !excluded.contains(&entry.slot()) {
+                let count = counts.entry(entry.slot()).or_insert(0_u64);
+                *count = count.saturating_add(1);
             }
         }
         counts
@@ -1162,13 +1288,11 @@ impl LossyIndex {
         true
     }
 
-    /// Length of [`Self::serialize`]'s output, `8 + capacity * 24` bytes, known
+    /// Length of [`Self::serialize`]'s output, `8 + capacity * 8` bytes, known
     /// without building it.
     #[must_use]
     pub fn serialized_len(&self) -> usize {
-        (self.capacity as usize)
-            .saturating_mul(24)
-            .saturating_add(8)
+        (self.capacity as usize).saturating_mul(8).saturating_add(8)
     }
 
     /// Serialize the index to bytes for persistence.
@@ -1177,27 +1301,18 @@ impl LossyIndex {
     /// ```text
     ///   [capacity: u64]
     ///   [slot_0: u64] ... [slot_{cap-1}: u64]     ← capacity × 8 B
-    ///   [home_0: u64] ... [home_{cap-1}: u64]     ← capacity × 8 B (0 if unhydrated)
-    ///   [tail_0: u64] ... [tail_{cap-1}: u64]     ← capacity × 8 B (0 if unhydrated)
     /// ```
-    /// Total: `8 + capacity * 24` bytes.
+    /// Total: `8 + capacity * 8` bytes. Identity tables are rebuilt in memory
+    /// as records are written or read.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         let cap = self.capacity as usize;
-        let byte_len = 8_usize.wrapping_add(cap.wrapping_mul(24));
+        let byte_len = 8_usize.wrapping_add(cap.wrapping_mul(8));
         let mut buf = Vec::with_capacity(byte_len);
         buf.extend_from_slice(&u64::from(self.capacity).to_le_bytes());
         for index in 0..cap {
             let entry = IndexEntry(self.entry_at(index));
             buf.extend_from_slice(&entry.0.to_le_bytes());
-        }
-        let homes = self.homes.lock();
-        let tails = self.tails.lock();
-        for index in 0..cap {
-            buf.extend_from_slice(&homes[index].to_le_bytes());
-        }
-        for index in 0..cap {
-            buf.extend_from_slice(&tails[index].to_le_bytes());
         }
         buf
     }
@@ -1217,9 +1332,8 @@ impl LossyIndex {
 
     /// Deserialize an index from bytes with a given config (providing seed).
     ///
-    /// Accepts both the slots-only format (`8 + cap*8` bytes) and the
-    /// slots+homes+tails format (`8 + cap*24` bytes). Homes and tails are
-    /// populated from the blob when present; zeroed otherwise.
+    /// Accepts the v1 slots-only format (`8 + cap*8` bytes). Homes and tails
+    /// are rebuilt in memory as the index is used.
     ///
     /// # Errors
     /// Returns `DeserializationError::TooShort` if the data is too short,
@@ -1245,11 +1359,9 @@ impl LossyIndex {
         }
 
         let slots_len = 8_usize.wrapping_add(capacity_usize.wrapping_mul(8));
-        let full_len = 8_usize.wrapping_add(capacity_usize.wrapping_mul(24));
-        if data.len() < slots_len {
+        if data.len() != slots_len {
             return Err(DeserializationError::TooShort);
         }
-        let has_homes_tails = data.len() >= full_len;
 
         let mut slots = Vec::with_capacity(capacity_usize);
         let mut len: u32 = 0;
@@ -1268,33 +1380,8 @@ impl LossyIndex {
 
         let shift = 64_u32.wrapping_sub(capacity.trailing_zeros());
 
-        let homes = if has_homes_tails {
-            let base = slots_len;
-            let mut h = Vec::with_capacity(capacity_usize);
-            for i in 0..capacity_usize {
-                let offset = base.wrapping_add(i.wrapping_mul(8));
-                h.push(u64::from_le_bytes(
-                    data[offset..offset.wrapping_add(8)].try_into().unwrap(),
-                ));
-            }
-            h
-        } else {
-            vec![0; capacity_usize]
-        };
-
-        let tails = if has_homes_tails {
-            let base = slots_len.wrapping_add(capacity_usize.wrapping_mul(8));
-            let mut t = Vec::with_capacity(capacity_usize);
-            for i in 0..capacity_usize {
-                let offset = base.wrapping_add(i.wrapping_mul(8));
-                t.push(u64::from_le_bytes(
-                    data[offset..offset.wrapping_add(8)].try_into().unwrap(),
-                ));
-            }
-            t
-        } else {
-            vec![0; capacity_usize]
-        };
+        let homes = vec![0; capacity_usize];
+        let tails = vec![0; capacity_usize];
 
         let slots = EntryStorage::Owned(slots);
         let can_grow = Self::identity_tables_complete(capacity, shift, &slots, &homes, &tails);
@@ -1340,68 +1427,6 @@ impl LossyIndex {
             homes: Mutex::new(Vec::new()),
             tails: Mutex::new(Vec::new()),
             can_grow: false,
-            len: AtomicU32::new(len),
-            max_probe_len: AtomicU32::new(0),
-        }
-    }
-
-    /// Build a read-only index directly over a validated checkpoint's raw
-    /// slots with a given config, loading pre-hydrated homes and tails from
-    /// the checkpoint mmap. This eliminates cold-start packfile reads for
-    /// tag-collision verification when the checkpoint carries identity data.
-    ///
-    /// The slots remain mmap-backed; homes and tails are copied into owned
-    /// `Vec<u64>` so they can be updated by `hydrate_slot_identity` if needed.
-    ///
-    /// # Panics
-    /// Panics if `[homes_offset, homes_offset + capacity*8)` or
-    /// `[tails_offset, tails_offset + capacity*8)` fall outside `mmap` —
-    /// callers must only pass offsets validated against a checkpoint's own
-    /// declared body length (see `checkpoint::read_checkpoint`).
-    #[must_use]
-    pub fn from_mmap_slots_with_homes_tails(
-        mmap: Arc<Mmap>,
-        slots_offset: usize,
-        homes_offset: usize,
-        tails_offset: usize,
-        capacity: u32,
-        len: u32,
-        config: IndexConfig,
-    ) -> Self {
-        let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
-        let mut homes = Vec::with_capacity(cap);
-        let mut tails = Vec::with_capacity(cap);
-        let buf: &[u8] = &mmap;
-        for i in 0..cap {
-            let h_off = homes_offset.wrapping_add(i.wrapping_mul(8));
-            let t_off = tails_offset.wrapping_add(i.wrapping_mul(8));
-            homes.push(u64::from_le_bytes(
-                buf[h_off..h_off.wrapping_add(8)].try_into().unwrap(),
-            ));
-            tails.push(u64::from_le_bytes(
-                buf[t_off..t_off.wrapping_add(8)].try_into().unwrap(),
-            ));
-        }
-        let slots = EntryStorage::Mmap {
-            mmap,
-            offset: slots_offset,
-        };
-        let can_grow = Self::identity_tables_complete(
-            capacity,
-            64_u32.wrapping_sub(capacity.trailing_zeros()),
-            &slots,
-            &homes,
-            &tails,
-        );
-        Self {
-            mask: capacity.wrapping_sub(1),
-            capacity,
-            shift: 64_u32.wrapping_sub(capacity.trailing_zeros()),
-            config,
-            slots,
-            homes: Mutex::new(homes),
-            tails: Mutex::new(tails),
-            can_grow,
             len: AtomicU32::new(len),
             max_probe_len: AtomicU32::new(0),
         }
