@@ -5,23 +5,24 @@ use super::{
     cmd_shards, cmd_stats, cmd_sync, cmd_tombstones, collection_canonical_id,
     compile_import_template, compute_state_groups_partial, decode_event_json_record,
     decode_hamt_node, decode_hamt_root, default_matrix_import_template, derive_template_key,
-    direct_import_enabled, display_collection_role, event_id, event_room_id, event_short_id,
-    export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
-    format_canonical_display, format_id, glob_pack_files, import_data, import_pdu_events,
-    import_pdu_events_with_raw, interleaving_worth_noting, is_server_keys_export, json_string,
-    keys_first, listing_shard_types, load_collection_events, load_state_groups,
-    matrix_batch_has_create, matrix_room_collection_id, matrix_room_extension_from_store,
-    meta_checkpoints, meta_lock_line, meta_pools, meta_raw, overlay_auth_projection, pack_identity,
-    parse_federation_input, parse_pack_id_selector, parse_pack_selectors, partial_topo_sort_dag,
-    prepare_state_collection, pretty_print_payload, raw_auth_projection,
-    raw_auth_projection_collection_id, record_csr_adjacency, redacted_event_bytes,
-    resolve_import_collection, run, scan_payload_suffix, search_record_matches, search_template,
-    split_canonical_display, template_collection_id, template_event_id_node_id, template_node_id,
-    topological_event_order, valid_json_pointer, valid_state_group_id, verify_auth_chain_edges,
-    write_raw_auth_projections, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    ImportRunCache, JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting,
-    ScanOptions, SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
-    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    direct_import_enabled, dirty_closure_exceeds_half, display_collection_role, event_id,
+    event_room_id, event_short_id, export_envelope_line, extract_pointer_string, finish_import,
+    fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id, glob_pack_files,
+    import_data, import_pdu_events, import_pdu_events_with_raw, interleaving_worth_noting,
+    is_server_keys_export, json_string, keys_first, listing_shard_types, load_collection_events,
+    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
+    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
+    overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
+    parse_pack_selectors, partial_topo_sort_dag, prepare_state_collection, pretty_print_payload,
+    raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
+    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+    search_record_matches, search_template, split_canonical_display, template_collection_id,
+    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
+    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
+    CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache, JsonValueExt,
+    MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions, SharedState,
+    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -2680,6 +2681,21 @@ fn waiting_set_families_clear_on_the_right_kind_of_arrival() {
     assert!(waiting.auth.is_empty());
 }
 
+/// A room that starts empty must still report its growing size, or the direct
+/// path's half-room bail (`stored_events > 0`) can never fire.
+#[test]
+fn waiting_set_room_size_hint_grows_with_written_files() {
+    let none = HashSet::new();
+    let mut waiting = RoomWaiting::from_scratch("!room", [], [], &none, &none);
+    assert_eq!(waiting.stored_events, 0);
+    let arrived: HashSet<String> = ["$a".to_owned(), "$b".to_owned()].into();
+    waiting.observe_written(&arrived, &arrived, [], &none, &none);
+    assert_eq!(waiting.stored_events, 2);
+    let more: HashSet<String> = ["$c".to_owned()].into();
+    waiting.observe_written(&more, &more, [], &none, &none);
+    assert_eq!(waiting.stored_events, 3);
+}
+
 /// Adding references uses the canonical presence predicate per family: an id
 /// with only an auth body is present for `auth` but still absent for `prev`.
 #[test]
@@ -3572,11 +3588,40 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
             &mut established,
             &mut cache,
         );
+        if direct {
+            let hint = cache
+                .waiting
+                .get(&collection_id)
+                .map_or(0, |waiting| waiting.stored_events);
+            assert_eq!(
+                hint, 3,
+                "the stored-event hint must track the bodies this run wrote"
+            );
+            assert!(
+                !dirty_closure_exceeds_half(1, hint),
+                "one dirty event of three is below the half-room threshold"
+            );
+        }
         import_file(
             &write("second.jsonl", &[&early, &later, &child, &grandchild]),
             &mut established,
             &mut cache,
         );
+        if direct {
+            let hint = cache
+                .waiting
+                .get(&collection_id)
+                .map_or(0, |waiting| waiting.stored_events);
+            assert_eq!(hint, 7, "the hint keeps up with every written body");
+            assert!(
+                dirty_closure_exceeds_half(4, hint),
+                "four of seven is over half; the bail must be armed once the room has filled"
+            );
+            assert!(
+                !dirty_closure_exceeds_half(3, hint),
+                "three of seven is not over half"
+            );
+        }
 
         let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
         let mapped = |id: &str| {

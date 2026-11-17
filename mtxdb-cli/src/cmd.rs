@@ -10611,8 +10611,9 @@ struct RoomWaiting {
     room_id: String,
     prev: HashSet<String>,
     auth: HashSet<String>,
-    /// Timeline bodies the rebuild saw referenced. A cheap lower bound on the
-    /// room's stored events, used only to bound the direct path's dirty set.
+    /// Timeline bodies stored when the set was built, plus each written file's
+    /// arrivals since. A cheap estimate of the room's size, used only to bound
+    /// the direct path's dirty set.
     stored_events: usize,
 }
 
@@ -10686,6 +10687,9 @@ impl RoomWaiting {
         timeline_present: &HashSet<String>,
         anywhere_present: &HashSet<String>,
     ) {
+        // Keep the room-size hint current: a room that began empty would
+        // otherwise report 0 for the whole run and disable the half-room bail.
+        self.stored_events = self.stored_events.saturating_add(timeline_arrived.len());
         // A timeline body is also an auth body, so it clears both families.
         for id in timeline_arrived {
             self.prev.remove(id);
@@ -11116,6 +11120,21 @@ impl ImportRunCache {
             &anywhere_present,
         );
         Ok(())
+    }
+
+    /// Keep the room's stored-event hint current as files land.
+    ///
+    /// The waiting set is built once per room, so `RoomWaiting::from_scratch`
+    /// captures `stored_events` at that moment — often zero, because a run's
+    /// first file for a room arrives while the room is still empty. Without
+    /// this the hint stays at its build-time count for the whole room, and the
+    /// direct path's half-room bail (which requires a nonzero hint) can never
+    /// fire. Every newly stored timeline body is one more event the bail may
+    /// count, so the hint stays a lower bound.
+    fn note_stored_events(&mut self, collection_id: &[u8; 16], added: usize) {
+        if let Some(waiting) = self.waiting.get_mut(collection_id) {
+            waiting.stored_events = waiting.stored_events.saturating_add(added);
+        }
     }
 }
 
@@ -11963,6 +11982,15 @@ fn direct_debug_enabled() -> bool {
     std::env::var_os("MTXDB_DIRECT_DEBUG").is_some()
 }
 
+/// Whether re-judging a dirty closure of `closure` events would cost more than
+/// the whole-room path it replaces, judged against the room's stored-event hint.
+///
+/// The hint is a lower bound, so a zero hint disables the bail rather than
+/// bailing on no evidence.
+fn dirty_closure_exceeds_half(closure: usize, stored_events_hint: usize) -> bool {
+    stored_events_hint > 0 && closure.saturating_mul(2) > stored_events_hint
+}
+
 /// Import PDU events through the normal event-DAG path.
 #[allow(
     clippy::too_many_arguments,
@@ -12235,9 +12263,7 @@ fn import_pdu_events_with_raw_state_hamts(
     {
         let cache = &mut *room_cache;
         match cache.dirty_closure(db, &collection_id, &resolved.canonical_id, &waiting_hits) {
-            Ok(ids)
-                if stored_events_hint > 0 && ids.len().saturating_mul(2) > stored_events_hint =>
-            {
+            Ok(ids) if dirty_closure_exceeds_half(ids.len(), stored_events_hint) => {
                 // Re-judging most of the room costs more than the whole-room
                 // path it would replace. Bail before loading bodies or
                 // walking; the transpose has already been paid once.
@@ -12339,6 +12365,7 @@ fn import_pdu_events_with_raw_state_hamts(
             )?;
             let written_at = Instant::now();
             cache.observe_adjacency(&collection_id, &resolved.canonical_id, events.iter());
+            cache.note_stored_events(&collection_id, to_write.len());
             if direct_debug_enabled() {
                 eprintln!(
                     "direct: observe waiting {:?}, adjacency {:?}",
