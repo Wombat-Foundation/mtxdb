@@ -3555,6 +3555,21 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
             r#"["$child"]"#,
             r#"["$create","$join"]"#,
         );
+        // Filler keeps the room larger than twice the late file's closure, so
+        // the half-room bail stays out of the way and this test still exercises
+        // the direct dirty-closure path rather than the whole-room fallback.
+        let filler = |number: u32| {
+            event(
+                &format!("$filler{number}"),
+                "m.room.message",
+                "",
+                r#"{"body":"filler"}"#,
+                r#"["$base"]"#,
+                r#"["$create","$join"]"#,
+            )
+        };
+        let (filler1, filler2) = (filler(1), filler(2));
+        let (filler3, filler4) = (filler(3), filler(4));
 
         let write = |name: &str, events: &[&OwnedValue]| {
             let path = dir.join(name);
@@ -3603,7 +3618,19 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
             );
         }
         import_file(
-            &write("second.jsonl", &[&early, &later, &child, &grandchild]),
+            &write(
+                "second.jsonl",
+                &[
+                    &early,
+                    &later,
+                    &child,
+                    &grandchild,
+                    &filler1,
+                    &filler2,
+                    &filler3,
+                    &filler4,
+                ],
+            ),
             &mut established,
             &mut cache,
         );
@@ -3612,14 +3639,14 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
                 .waiting
                 .get(&collection_id)
                 .map_or(0, |waiting| waiting.stored_events);
-            assert_eq!(hint, 7, "the hint keeps up with every written body");
+            assert_eq!(hint, 11, "the hint keeps up with every written body");
             assert!(
-                dirty_closure_exceeds_half(4, hint),
-                "four of seven is over half; the bail must be armed once the room has filled"
+                dirty_closure_exceeds_half(6, hint),
+                "six of eleven is over half; the bail must be armed once the room has filled"
             );
             assert!(
-                !dirty_closure_exceeds_half(3, hint),
-                "three of seven is not over half"
+                !dirty_closure_exceeds_half(5, hint),
+                "five of eleven is not over half"
             );
         }
 
