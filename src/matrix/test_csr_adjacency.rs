@@ -679,7 +679,8 @@ fn legacy_scope_timing() {
         let fast_time = t.elapsed();
         assert_eq!(fast, fallback);
         println!(
-            "legacy {events:>7} events: fallback children_of {fallback_time:?} | first write (backfill) {backfill_time:?} | children_of after {fast_time:?}"
+            "legacy {events:>7} events: fallback children_of {fallback_time:?} | first write (backfill) {backfill_time:?} | children_of after {fast_time:?} | sealed segments {}",
+            count_segments(&root)
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -733,8 +734,225 @@ fn auth_cascade_timing() {
         let (deep, deep_time) = cascade(events / 10);
         let (leaf, leaf_time) = cascade(events - 1);
         println!(
-            "auth {events:>7} events: derive {derive:?} | cascade from 10%: {deep} events in {deep_time:?} | cascade from tip: {leaf} events in {leaf_time:?}"
+            "auth {events:>7} events: derive {derive:?} | cascade from 10%: {deep} events in {deep_time:?} | cascade from tip: {leaf} events in {leaf_time:?} | sealed segments {}",
+            count_segments(&root)
         );
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+/// Throwaway benchmark: a maintained reverse `AUTH` family against deriving it,
+/// on a star-shaped auth graph (every event cites create, power levels and one
+/// of 100 member events). The rejection check is deliberately not measured.
+///
+/// Run: `cargo test --release --lib auth_star_timing -- --ignored --nocapture`
+#[test]
+#[ignore = "timing measurement, not a correctness test"]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::arithmetic_side_effects
+)] // throwaway benchmark: readability over lint-cleanliness
+fn auth_star_timing() {
+    use std::time::{Duration, Instant};
+    const MEMBERS: usize = 100;
+    const BATCH: usize = 256;
+    // AUTH_STAR_BASELINE=1 skips the prototype to measure the store's size without it.
+    let baseline = std::env::var_os("AUTH_STAR_BASELINE").is_some();
+    let avg = |total: Duration, n: usize| total / u32::try_from(n.max(1)).unwrap();
+    for events in [10_000_usize, 100_000] {
+        let root = test_root("auth-star-timing");
+        let db = Database::open(root.clone()).unwrap();
+        let adj = CsrAdjacency::new("!star:example.org");
+        let name = |n: usize| format!("${:016x}", (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        // 0 = create, 1 = power levels, 2..2+MEMBERS = members, rest = messages.
+        let first = 2 + MEMBERS;
+        let names: Vec<String> = (0..first + events).map(name).collect();
+        let auth_of = |n: usize| -> Vec<&str> {
+            if n == 0 {
+                vec![]
+            } else if n < first {
+                vec![names[0].as_str()]
+            } else {
+                vec![
+                    names[0].as_str(),
+                    names[1].as_str(),
+                    names[2 + n % MEMBERS].as_str(),
+                ]
+            }
+        };
+        let mut write_core = Duration::ZERO;
+        let mut write_proto = Duration::ZERO;
+        let mut window = (0_usize, Duration::ZERO, Duration::ZERO);
+        let mut short: Vec<u32> = Vec::new();
+        let mut written = 0;
+        println!("auth star, {events} events (per-event write cost as the create row grows):");
+        while written < first + events {
+            let end = (written + BATCH).min(first + events);
+            let auths: Vec<Vec<&str>> = (written..end).map(auth_of).collect();
+            let records: Vec<EventRecord<'_>> = (written..end)
+                .map(|n| EventRecord {
+                    event_id: names[n].as_str(),
+                    prev: &[],
+                    auth: &auths[n - written],
+                    relation: None,
+                })
+                .collect();
+            let t = Instant::now();
+            let ids = adj.record_events(&db, &records).unwrap();
+            let core = t.elapsed();
+            short.extend(&ids);
+            let batch: Vec<(u32, Vec<u32>)> = (written..end)
+                .map(|n| {
+                    let parents = auths[n - written]
+                        .iter()
+                        .map(|a| short[names.iter().position(|x| x == a).unwrap_or(0)])
+                        .collect();
+                    (short[n], parents)
+                })
+                .collect();
+            let t = Instant::now();
+            if !baseline {
+                adj.proto_maintain_auth_children(&db, &batch).unwrap();
+            }
+            let proto = t.elapsed();
+            write_core += core;
+            write_proto += proto;
+            window.0 += end - written;
+            window.1 += core;
+            window.2 += proto;
+            written = end;
+            if written % (events / 4 / BATCH * BATCH).max(BATCH) < BATCH && window.0 >= events / 4 {
+                println!(
+                    "  at {written:>7} events: record {:?}/event | maintain AUTH reverse {:?}/event",
+                    avg(window.1, window.0),
+                    avg(window.2, window.0)
+                );
+                window = (0, Duration::ZERO, Duration::ZERO);
+            }
+        }
+        println!(
+            "  whole build: record {:?}/event | maintain {:?}/event",
+            avg(write_core, events),
+            avg(write_proto, events)
+        );
+        println!(
+            "  store after build: {} segments, {:.1} MiB on disk",
+            count_segments(&root),
+            dir_bytes(&root) as f64 / (1024.0 * 1024.0)
+        );
+        if baseline {
+            let _ = std::fs::remove_dir_all(root);
+            continue;
+        }
+        // Single-event writes against the fully grown create row.
+        let (mut single_core, mut single_proto) = (Duration::ZERO, Duration::ZERO);
+        for k in 0..100 {
+            let n = first + events + k;
+            let id = name(n);
+            let auth = [names[0].as_str(), names[1].as_str(), names[2].as_str()];
+            let t = Instant::now();
+            let ids = adj
+                .record_events(
+                    &db,
+                    &[EventRecord {
+                        event_id: &id,
+                        prev: &[],
+                        auth: &auth,
+                        relation: None,
+                    }],
+                )
+                .unwrap();
+            single_core += t.elapsed();
+            let t = Instant::now();
+            adj.proto_maintain_auth_children(&db, &[(ids[0], vec![short[0], short[1], short[2]])])
+                .unwrap();
+            single_proto += t.elapsed();
+        }
+        println!(
+            "  single-event writes on a {events}-child create row: record {:?} | maintain {:?}",
+            avg(single_core, 100),
+            avg(single_proto, 100)
+        );
+
+        let reads = |label: &str| {
+            let t = Instant::now();
+            let view = adj.reverse_family(&db, AUTH).unwrap();
+            let derive = t.elapsed();
+            let probes = [
+                ("create", short[0]),
+                ("member", short[2]),
+                ("message", short[first + events / 2]),
+            ];
+            for (what, id) in probes {
+                let derived: Option<Vec<u32>> = view
+                    .children_of(id)
+                    .map(|e| e.iter().map(|edge| edge.target).collect());
+                let t = Instant::now();
+                let mut got = None;
+                for _ in 0..20 {
+                    got = adj.proto_auth_children_of(&db, id).unwrap();
+                }
+                let point = avg(t.elapsed(), 20);
+                let mut a = derived.clone().unwrap_or_default();
+                let mut b = got.clone().unwrap_or_default();
+                a.sort_unstable();
+                b.sort_unstable();
+                // The 100 single-event writes after the build are not in `view`
+                // only if it was derived earlier; both are read after them.
+                assert_eq!(a, b, "{what} children differ");
+                println!(
+                    "  {label}: {what:<7} ({} children) maintained point read {point:?}",
+                    a.len()
+                );
+            }
+            println!("  {label}: derive reverse_family(AUTH) {derive:?}");
+        };
+        reads("tail only");
+        let before = count_segments(&root);
+        adj.proto_seal(&db).unwrap();
+        println!(
+            "  sealed segments: {before} before seal, {} after",
+            count_segments(&root)
+        );
+        reads("sealed   ");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// Number of sealed `.csr` segments under `dir` (the store seals its tail at
+/// 4 MiB on its own, so "tail only" holds only for small runs).
+#[allow(clippy::arithmetic_side_effects)] // benchmark helper
+fn count_segments(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "csr") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Total bytes of all files under `dir`.
+#[allow(clippy::arithmetic_side_effects)] // benchmark helper
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(meta) = p.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
 }

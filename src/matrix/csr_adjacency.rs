@@ -79,6 +79,10 @@ pub fn sync_all_tails(db: &Database) -> Result<(), StorageError> {
 
 /// Family of an event's `prev_events`.
 pub const PREV: EdgeFamily = EdgeFamily::plain(1);
+/// Throwaway prototype family for the maintained reverse `AUTH` benchmark.
+#[cfg(test)]
+pub(crate) const PROTO_AUTH_CHILDREN: EdgeFamily = EdgeFamily::plain(5);
+
 /// Family of an event's `auth_events`.
 pub const AUTH: EdgeFamily = EdgeFamily::plain(2);
 /// Family of an event's single relation (`m.relates_to`), typed by relation kind.
@@ -545,6 +549,72 @@ impl CsrAdjacency {
             .reverse_family(db, PREV)?
             .children_of(short_id)
             .map(|edges| edges.iter().map(|edge| edge.target).collect()))
+    }
+
+    /// Throwaway prototype: maintain a reverse `AUTH` family (id 5) for a batch
+    /// of `(owner, auth targets)` pairs, in its own transaction after the
+    /// event write. Test-only; the production write path never calls it.
+    #[cfg(test)]
+    pub(crate) fn proto_maintain_auth_children(
+        &self,
+        db: &Database,
+        batch: &[(u32, Vec<u32>)],
+    ) -> Result<(), StorageError> {
+        let store = self.store(db);
+        store.with_write_lock(|| {
+            let mut added: std::collections::BTreeMap<u32, BTreeSet<Edge>> =
+                std::collections::BTreeMap::new();
+            for (owner, parents) in batch {
+                for &parent in parents {
+                    added.entry(parent).or_default().insert(Edge {
+                        target: *owner,
+                        kind: 0,
+                    });
+                }
+            }
+            let keys: Vec<(EdgeFamily, u32)> =
+                added.keys().map(|&p| (PROTO_AUTH_CHILDREN, p)).collect();
+            let existing = store
+                .read_rows_locked(self.scope(), &keys)
+                .map_err(StorageError::Io)?;
+            let mut changed = Vec::new();
+            for ((_, parent), old) in keys.iter().zip(existing) {
+                let mut children: BTreeSet<Edge> = old.unwrap_or_default().into_iter().collect();
+                children.extend(added.remove(parent).unwrap_or_default());
+                changed.push(RowRecord {
+                    family: PROTO_AUTH_CHILDREN,
+                    owner: *parent,
+                    edges: children.into_iter().collect(),
+                });
+            }
+            store
+                .writer(db)
+                .and_then(|writer| writer.append_rows_locked(self.scope(), &changed))
+                .map_err(StorageError::Io)
+        })
+    }
+
+    /// Throwaway prototype: one point read of the prototype reverse `AUTH` row.
+    #[cfg(test)]
+    pub(crate) fn proto_auth_children_of(
+        &self,
+        db: &Database,
+        short_id: u32,
+    ) -> Result<Option<Vec<u32>>, StorageError> {
+        let mut rows = self
+            .store(db)
+            .read_rows(self.scope(), &[(PROTO_AUTH_CHILDREN, short_id)])
+            .map_err(StorageError::Io)?;
+        Ok(rows
+            .pop()
+            .flatten()
+            .map(|edges| edges.into_iter().map(|edge| edge.target).collect()))
+    }
+
+    /// Seal the scope's tail into an immutable segment (benchmark helper).
+    #[cfg(test)]
+    pub(crate) fn proto_seal(&self, db: &Database) -> Result<(), StorageError> {
+        self.store(db).seal().map_err(StorageError::Io)
     }
 
     /// Write forward `PREV` rows the way a pre-reverse-family build did: no
