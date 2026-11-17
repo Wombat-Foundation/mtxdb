@@ -9,8 +9,13 @@
 //! - **relation kinds**: relation type string (`m.annotation`, ...) -> `u16`
 //!   kind id.
 //! - **CSR**: one versioned snapshot holding the `prev`, `auth` and typed
-//!   `relations` families as compressed sparse rows keyed by short id. The
-//!   reverse (child-of) view is the transpose of each forward row set.
+//!   `relations` families as compressed sparse rows keyed by short id, plus
+//!   the maintained [`PREV_CHILDREN`](crate::csr_adjacency::PREV_CHILDREN)
+//!   family, which stores each parent's child list so
+//!   [`CsrAdjacency::children_of`](crate::csr_adjacency::CsrAdjacency::children_of)
+//!   is a point read. Transposing a forward family on demand
+//!   ([`CsrAdjacency::reverse_family`](crate::csr_adjacency::CsrAdjacency::reverse_family))
+//!   is still available for whole-family batch queries.
 //!
 //! Kind ids are persisted in the dictionary and never regenerated: once a type
 //! has an id it keeps it for the life of the room's data, so stored relation
@@ -334,6 +339,11 @@ impl CsrAdjacency {
     /// therefore means "no relation known", not "no relation", so redaction
     /// never has to be stored.
     ///
+    /// Recording also updates each parent's [`PREV_CHILDREN`] row in the same
+    /// append, which is what makes [`Self::children_of`] a point read. A scope
+    /// written before that family existed is backfilled from its stored `PREV`
+    /// rows once, on its first write.
+    ///
     /// # Errors
     /// Storage errors, a collision as described, or an error if the relation
     /// kind dictionary is out of `u16` ids.
@@ -362,6 +372,9 @@ impl CsrAdjacency {
     ///
     /// Either every event is recorded or none is. Events may reference each
     /// other, and the same event twice with the same data is a no-op.
+    ///
+    /// Like [`Self::record_event`], this maintains the [`PREV_CHILDREN`] rows
+    /// for every parent in the batch.
     ///
     /// # Errors
     /// As [`Self::record_event`], applied to the whole batch.
@@ -884,10 +897,17 @@ impl CsrAdjacency {
     /// Build a sparse parent-to-children CSR view for one forward family.
     ///
     /// This reads the family's stored rows once (no event-visibility filter:
-    /// for `RELATIONS` the caller must check each child's visibility) and is intended for a batch
-    /// of reverse lookups; callers should reuse the returned view rather than
-    /// rebuilding it per parent. Reverse rows are derived from the canonical
-    /// forward rows, so purges and relation unions are reflected automatically.
+    /// for `RELATIONS` the caller must check each child's visibility) and is
+    /// intended for a batch of reverse lookups; callers should reuse the
+    /// returned view rather than rebuilding it per parent. Reverse rows are
+    /// derived from the canonical forward rows, so purges and relation unions
+    /// are reflected automatically.
+    ///
+    /// For one parent's children, prefer [`Self::children_of`]: it reads the
+    /// maintained [`PREV_CHILDREN`] family in one point read. Build this view
+    /// when a request has enough `PREV` parents that the single derive beats
+    /// one point read each, or when another family such as `RELATIONS` is
+    /// needed.
     ///
     /// # Errors
     /// Returns an error on a read failure, corrupt segment, or an index too
