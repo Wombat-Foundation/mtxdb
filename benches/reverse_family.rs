@@ -16,8 +16,9 @@
 //! live tail, default 4), `MTXDB_REV_LOOKUPS` (default 1000), `MTXDB_BENCH_ROOT`.
 //! Each event gets a prev edge to its predecessor and, for every fourth event,
 //! a second edge to an earlier event, so some parents have several children.
-//! A second family has an empty row for every owner, to isolate the cost of
-//! reading a family whose rows carry no edges.
+//! A second family has an empty row for every owner, to measure per-row work
+//! without edge payloads. A typed sparse family models relation rows among a
+//! much denser family.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ use mtxdb::csr::{Edge, EdgeFamily, ReverseCsr};
 use mtxdb::{Database, ShardType};
 
 const BATCH: usize = 4096;
+const SPARSE_STRIDE: usize = 1000;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -82,6 +84,7 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
     let writer = store.writer(&db).expect("writer");
     assert!(u32::try_from(events).is_ok(), "event ids must fit u32");
     let empty_family = EdgeFamily::plain(1);
+    let sparse_family = EdgeFamily::typed(2);
     let segment_count = segments.checked_add(1).expect("segment count overflow");
     let per_segment = events
         .checked_div(segment_count.max(1))
@@ -90,7 +93,7 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
     let mut sealed = 0usize;
     while next < events {
         let end = next.saturating_add(BATCH).min(events);
-        let mut batch = Vec::with_capacity(end.saturating_sub(next).saturating_mul(2));
+        let mut batch = Vec::with_capacity(end.saturating_sub(next).saturating_mul(3));
         for owner in next..end {
             batch.push(RowRecord {
                 family,
@@ -102,6 +105,16 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
                 owner: u(owner),
                 edges: Vec::new(),
             });
+            if owner > 0 && owner.is_multiple_of(SPARSE_STRIDE) {
+                batch.push(RowRecord {
+                    family: sparse_family,
+                    owner: u(owner),
+                    edges: vec![Edge {
+                        target: u(owner.saturating_sub(1)),
+                        kind: 1,
+                    }],
+                });
+            }
         }
         writer.append_rows(scope, &batch).expect("append");
         next = end;
@@ -114,14 +127,31 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
         }
     }
 
-    // An empty family still has a scope directory in each segment. This
-    // isolates directory lookup/checksum work from selected-family row reads.
+    // Every owner has a row in this family, but the rows contain no edges.
     let (empty_rows, empty_first) =
         timed(|| store.read_family(scope, empty_family).expect("empty read_family"));
     assert_eq!(empty_rows.len(), events, "empty family row count");
     assert!(empty_rows.iter().all(|(_, edges)| edges.is_empty()));
     let (_, empty_repeat) =
         timed(|| store.read_family(scope, empty_family).expect("empty read_family"));
+
+    // A few typed rows amid the dense PREV and empty-edge families exercise
+    // the family's directory-range lookup and bounded payload read.
+    let (sparse_rows, sparse_first) = timed(|| {
+        store
+            .read_family(scope, sparse_family)
+            .expect("sparse read_family")
+    });
+    let expected_sparse_rows = events.saturating_sub(1) / SPARSE_STRIDE;
+    assert_eq!(sparse_rows.len(), expected_sparse_rows, "sparse family row count");
+    assert!(sparse_rows
+        .iter()
+        .all(|(_, edges)| edges.len() == 1 && edges[0].kind == 1));
+    let (_, sparse_repeat) = timed(|| {
+        store
+            .read_family(scope, sparse_family)
+            .expect("sparse read_family")
+    });
 
     // First populated-family read, then a repeat.
     let (rows, first_read) = timed(|| store.read_family(scope, family).expect("read_family"));
@@ -153,7 +183,8 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
         .unwrap_or(Duration::ZERO);
     let full = first_read.saturating_add(build);
     println!(
-        "events {events:>8} edges {edge_count:>8} sealed {sealed}+tail | empty-edge family first {empty_first:>10.2?} repeat {empty_repeat:>10.2?} | populated read first {first_read:>10.2?} repeat {second_read:>10.2?} | build {build:>10.2?} | full derive {full:>10.2?}"
+        "events {events:>8} edges {edge_count:>8} sealed {sealed}+tail | empty-edge {empty_first:>10.2?}/{empty_repeat:>10.2?} | sparse {}/{sparse_first:>10.2?}/{sparse_repeat:>10.2?} | populated {first_read:>10.2?}/{second_read:>10.2?} | build {build:>10.2?} | full derive {full:>10.2?}",
+        sparse_rows.len()
     );
     println!(
         "{:>60} {lookups} lookups: {per_lookup:?}/lookup ({hits} children); derive amortised over K={lookups}: {:?}/lookup; over K=10: {:?}/lookup",
