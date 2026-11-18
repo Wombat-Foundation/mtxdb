@@ -19,10 +19,11 @@ jobs:
   native:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-24.04-arm]
+        os: [windows-latest, ubuntu-24.04-arm]
     env:
       # Workflow declares `stable`, but the committed rust-toolchain.toml pin
       # (1.89.0) outranks the installed default; RUSTUP_TOOLCHAIN wins over the
@@ -87,10 +88,6 @@ jobs:
       - name: Test workspace
         run: cargo test --locked --workspace --all-features --lib --tests
 
-      - name: Install vmtouch (macOS)
-        if: runner.os == 'macOS'
-        run: brew install vmtouch
-
       - name: Install vmtouch (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -122,6 +119,71 @@ jobs:
         with:
           name: benchmarks-${{ matrix.os }}
           path: bench-output.txt
+
+  macos:
+    name: macOS (non-blocking)
+    # Avoid long pull request queues when GitHub-hosted macOS capacity is
+    # unavailable. Keep coverage on pushes and manual runs, without blocking CI.
+    #
+    # `macos-latest` resolves to macos-26-arm64, whose hosted pool repeatedly
+    # queues these jobs with no runner assigned and cancels them after ~15
+    # minutes, before any step runs. Pin macos-15 (also arm64 with 16 KiB
+    # pages) until that pool is healthy again. Note: in that failure mode the
+    # job is cancelled rather than failed, so `continue-on-error` below cannot
+    # absorb it; it only keeps genuine build failures from failing the run.
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 60
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      RUSTC_WRAPPER: .cargo/cargo-wrapper.sh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Record and assert architecture and page size
+        run: |
+          arch=$(uname -m)
+          pagesize=$(getconf PAGESIZE)
+          echo "arch: $arch"
+          echo "pagesize: $pagesize"
+          case "$arch" in
+            arm64) expected=16384 ;;
+            x86_64) expected=4096 ;;
+            *)
+              echo "::error::unexpected macOS architecture: $arch"
+              exit 1
+              ;;
+          esac
+          if [ "$pagesize" != "$expected" ]; then
+            echo "::error::expected $expected-byte pages on macOS $arch, got $pagesize"
+            exit 1
+          fi
+          rustc -vV
+
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check workspace
+        run: cargo check --locked --workspace --all-targets --all-features
+
+      - name: Lint workspace
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --locked --workspace --all-features --lib --tests
+
+      - name: Install vmtouch
+        run: brew install vmtouch
 
   emulated:
     name: Linux ${{ matrix.arch }} (QEMU userspace)

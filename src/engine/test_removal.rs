@@ -1372,6 +1372,43 @@ fn removal_stats_count_live_and_removed_keys_and_reclaimable_bytes() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Trailing bytes that do not form a complete frame belong to no frame, so
+/// they must not be charged to the last complete frame's byte totals.
+#[test]
+fn removal_stats_ignore_a_torn_trailing_frame() {
+    use std::io::Write as _;
+
+    let (dir, store) = fresh_store("stats_torn_tail");
+    let collection = [0xb5; 16];
+    for id in 1..=2u8 {
+        store
+            .put(&collection, &node(id), &NodeData::from_slice(b"value"))
+            .unwrap();
+    }
+    store.sync_all().unwrap();
+    let before = store.removal_stats(&collection).unwrap();
+
+    let packs: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .collect();
+    assert!(!packs.is_empty(), "at least one pack file");
+    for pack in packs {
+        let mut file = std::fs::OpenOptions::new().append(true).open(pack).unwrap();
+        file.write_all(&[0xff; 3]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let after = store.removal_stats(&collection).unwrap();
+    assert_eq!(after.frames, before.frames);
+    assert_eq!(after.total_bytes, before.total_bytes);
+    assert_eq!(after.reclaimable_bytes, before.reclaimable_bytes);
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn a_re_added_key_is_live_again_and_its_old_versions_are_superseded() {
     let (dir, store) = fresh_store("stats_readd");
@@ -1538,7 +1575,9 @@ fn a_batch_removal_loses_to_a_concurrent_re_put_of_identical_content() {
 // frame of each key.
 
 fn assert_index_matches_packs(store: &PackfileStorage, collection: &[u8; 16], stage: &str) {
-    let stats = store.removal_stats(collection).unwrap();
+    let stats = store
+        .removal_stats(collection)
+        .unwrap_or_else(|e| panic!("{stage}: removal_stats failed: {e:?}"));
     let (len, _, _) = store
         .collection_index_info(collection)
         .unwrap_or_else(|| panic!("{stage}: collection is not loaded"));

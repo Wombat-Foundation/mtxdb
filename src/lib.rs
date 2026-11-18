@@ -220,7 +220,7 @@ pub use auxiliary::{
 };
 #[cfg(feature = "bitmaps")]
 pub use bitmap_set::{BitmapSet, DomainTag, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
-pub use cache::NodeCache;
+pub use cache::{LruCache, NodeCache};
 pub use config::{ConfigError, RuntimeConfig};
 pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
