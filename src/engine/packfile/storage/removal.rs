@@ -181,19 +181,25 @@ impl PackfileStorage {
         for (_, shard) in self.shards.all_shards() {
             // The active pack may still be staged; scan its physical file so an
             // in-process repack plan sees everything already flushed, while
-            // path/pub consumers keep using the canonical name.
-            let path = shard.data_path();
-            let file_len = std::fs::metadata(&path)?.len();
-            let mut entries = packfile::scan_packfile(&path)?;
-            entries.sort_unstable_by_key(|(_, _, offset)| *offset);
-            for (index, (rid, hash, offset)) in entries.iter().enumerate() {
+            // path/pub consumers keep using the canonical name. Open under the
+            // publication lock: a concurrent first barrier renames a staged
+            // file, and resolving a path first would let that rename land
+            // between the lookup and the open.
+            let file = shard.open_data_file()?;
+            let mut scanner = packfile::scan_packfile_iter_from_file(file, false)?;
+            // Each frame's size is its own on-disk length, so a trailing
+            // partial frame (a flush still writing past the scanner's length
+            // snapshot) is never charged to the last complete frame.
+            let mut entries = Vec::new();
+            while let Some(entry) = scanner.next_with_removal() {
+                entries.push(entry?);
+            }
+            for entry in &entries {
+                let (rid, hash, offset) = (&entry.collection_id, &entry.hash, &entry.offset);
                 if rid != collection_id {
                     continue;
                 }
-                let end = entries
-                    .get(index.saturating_add(1))
-                    .map_or(file_len, |(_, _, next)| *next);
-                let len = end.saturating_sub(*offset);
+                let len = entry.disk_bytes;
                 let removed = self
                     .read_at(&shard, *offset, verify)?
                     .metadata

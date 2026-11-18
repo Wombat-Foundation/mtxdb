@@ -692,6 +692,26 @@ impl Shard {
         }
     }
 
+    /// Open the file currently backing this shard for a live in-process scan.
+    ///
+    /// The publication lock is held across the open, so a concurrent
+    /// staged-to-canonical rename cannot invalidate the chosen name between
+    /// selecting it and opening it. The returned handle stays valid across a
+    /// later rename or retirement.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the file cannot be opened.
+    pub(crate) fn open_data_file(&self) -> io::Result<File> {
+        let publication = self.publication.lock();
+        let path = match &*publication {
+            PackPublication::Staged(path) => path.as_path(),
+            PackPublication::Renamed | PackPublication::Published => self.path.as_path(),
+        };
+        let file = File::open(path)?;
+        crate::io::advise_sequential(&file);
+        Ok(file)
+    }
+
     /// Mark a newly created shard as staged under `staging_path`. Only the
     /// creation paths call this, before the shard is shared with any scanner.
     fn mark_staged(&self, staging_path: PathBuf) {
