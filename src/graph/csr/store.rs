@@ -1198,6 +1198,9 @@ fn apply_segment(
     if wanted.is_some() {
         return dir_cache::apply_point(path, scope, wanted, rows);
     }
+    if let Some(family) = family {
+        return dir_cache::apply_family(path, scope, family, rows);
+    }
     let (mut file, index_bytes, payload_start, payload_len) = open_segment(path)?;
     if let Some(dir) = read_scope_dir(
         path,
@@ -1264,13 +1267,10 @@ mod dir_cache {
 
     static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::default()));
 
-    pub(super) fn apply_point(
-        path: &Path,
-        scope: ScopeId,
-        wanted: Option<&HashSet<(u16, u32)>>,
-        rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
-    ) -> io::Result<()> {
-        let mut file = File::open(path)?;
+    /// Open `path` and return its cached verified directory, if the segment
+    /// still has the identity the cached entry was built from.
+    fn cached_dir(path: &Path, scope: ScopeId) -> io::Result<(File, Option<Arc<ScopeDir>>)> {
+        let file = File::open(path)?;
         let stamp = stamp_of(&file)?;
         let key = (path.to_path_buf(), scope.0);
         let hit = CACHE
@@ -1307,8 +1307,34 @@ mod dir_cache {
             cache.bytes = cache.bytes.saturating_add(size);
             dir
         };
+        Ok((file, dir))
+    }
+
+    pub(super) fn apply_point(
+        path: &Path,
+        scope: ScopeId,
+        wanted: Option<&HashSet<(u16, u32)>>,
+        rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+    ) -> io::Result<()> {
+        let (mut file, dir) = cached_dir(path, scope)?;
         if let Some(dir) = dir {
             apply_scope_dir(&mut file, &dir, scope, wanted, None, rows)?;
+        }
+        Ok(())
+    }
+
+    /// Family reads reuse the verified immutable scope directory. Without
+    /// this cache every sparse family read rereads and checksums entries for
+    /// all the other families in the scope.
+    pub(super) fn apply_family(
+        path: &Path,
+        scope: ScopeId,
+        family: super::EdgeFamily,
+        rows: &mut HashMap<RowKey, (bool, Vec<Edge>)>,
+    ) -> io::Result<()> {
+        let (mut file, dir) = cached_dir(path, scope)?;
+        if let Some(dir) = dir {
+            apply_scope_dir(&mut file, &dir, scope, None, Some(family), rows)?;
         }
         Ok(())
     }

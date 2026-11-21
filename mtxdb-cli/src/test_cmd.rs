@@ -2656,6 +2656,7 @@ fn waiting_set_families_clear_on_the_right_kind_of_arrival() {
     let auth_arrived: HashSet<String> = ["$both".to_owned(), "$auth-only".to_owned()].into();
     waiting.observe_written(
         &HashSet::new(),
+        &HashSet::new(),
         &auth_arrived,
         [],
         &no_timeline,
@@ -2671,6 +2672,7 @@ fn waiting_set_families_clear_on_the_right_kind_of_arrival() {
     // A timeline body clears both.
     let timeline_arrived: HashSet<String> = ["$both".to_owned()].into();
     waiting.observe_written(
+        &timeline_arrived,
         &timeline_arrived,
         &HashSet::new(),
         [],
@@ -2689,10 +2691,13 @@ fn waiting_set_room_size_hint_grows_with_written_files() {
     let mut waiting = RoomWaiting::from_scratch("!room", [], [], &none, &none);
     assert_eq!(waiting.stored_events, 0);
     let arrived: HashSet<String> = ["$a".to_owned(), "$b".to_owned()].into();
-    waiting.observe_written(&arrived, &arrived, [], &none, &none);
+    waiting.observe_written(&arrived, &arrived, &arrived, [], &none, &none);
     assert_eq!(waiting.stored_events, 2);
     let more: HashSet<String> = ["$c".to_owned()].into();
-    waiting.observe_written(&more, &more, [], &none, &none);
+    waiting.observe_written(&more, &more, &more, [], &none, &none);
+    assert_eq!(waiting.stored_events, 3);
+    // Repeating an already stored body is not a new arrival.
+    waiting.observe_written(&more, &HashSet::new(), &more, [], &none, &none);
     assert_eq!(waiting.stored_events, 3);
 }
 
@@ -2709,6 +2714,7 @@ fn waiting_set_adds_references_against_the_canonical_presence() {
     let mut waiting = RoomWaiting::default();
     let auth_arrived: HashSet<String> = ["$auth-body".to_owned()].into();
     waiting.observe_written(
+        &HashSet::new(),
         &HashSet::new(),
         &auth_arrived,
         [
@@ -2884,6 +2890,7 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
                     &template,
                     &collection_id,
                     FIXTURE_ROOM,
+                    &arrived,
                     &arrived,
                     &auth_arrived,
                     events.iter().chain(auth_chain.iter()),
@@ -3649,6 +3656,35 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
                 "five of eleven is not over half"
             );
         }
+        // An overlapping file repeats stored events and adds one new body; only
+        // the new body may grow the room-size hint.
+        let filler5 = filler(5);
+        import_file(
+            &write("overlap.jsonl", &[&base, &filler4, &filler5]),
+            &mut established,
+            &mut cache,
+        );
+        if direct {
+            let hint = cache
+                .waiting
+                .get(&collection_id)
+                .map_or(0, |waiting| waiting.stored_events);
+            assert_eq!(hint, 12, "repeated bodies must not inflate the hint");
+        }
+        // A duplicate-only replay has nothing new to store, so the hint and the
+        // room-size estimate must not move.
+        import_file(
+            &write("repeat.jsonl", &[&base, &filler4, &filler5]),
+            &mut established,
+            &mut cache,
+        );
+        if direct {
+            let hint = cache
+                .waiting
+                .get(&collection_id)
+                .map_or(0, |waiting| waiting.stored_events);
+            assert_eq!(hint, 12, "a duplicate-only replay must not grow the hint");
+        }
 
         let aux = mtxdb::auxiliary::AuxiliaryIndex::open(state_store, STATE_GROUP_NAMESPACE);
         let mapped = |id: &str| {
@@ -3688,8 +3724,8 @@ fn direct_dirty_closure_matches_the_whole_room_for_late_bodies() {
     let (on_files, on_rows) = &snapshots[1];
     assert_eq!(*off_files, 0, "the whole-room run never uses the gate");
     assert_eq!(
-        *on_files, 2,
-        "the late-body file must re-judge its dirty closure directly"
+        *on_files, 3,
+        "the overlap file and the late-body file must each take the direct path"
     );
     assert_eq!(
         off_rows, on_rows,
@@ -3738,6 +3774,14 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
         outlier_flag: bool,
         soft_failed: bool,
     }
+
+    type Snapshot = (
+        usize,
+        bool,
+        usize,
+        usize,
+        std::collections::BTreeMap<String, Row>,
+    );
 
     let room = "!permutations:test";
     let template = default_matrix_import_template();
@@ -3900,8 +3944,7 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
         ])],
     ];
 
-    let mut snapshots: Vec<(usize, bool, usize, std::collections::BTreeMap<String, Row>)> =
-        Vec::new();
+    let mut snapshots: Vec<Snapshot> = Vec::new();
     for (plan_index, plan) in plans.iter().enumerate() {
         for direct in [false, true] {
             let dir = unique_temp_dir().join(format!("permutation_{plan_index}_{direct}"));
@@ -3981,12 +4024,18 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
                     },
                 );
             }
-            snapshots.push((plan_index, direct, cache.direct_files, rows));
+            snapshots.push((
+                plan_index,
+                direct,
+                cache.direct_files,
+                cache.half_room_bails,
+                rows,
+            ));
         }
     }
 
-    let (base_plan, base_direct, _, baseline) = &snapshots[0];
-    for (plan_index, direct, _, rows) in &snapshots {
+    let (base_plan, base_direct, _, _, baseline) = &snapshots[0];
+    for (plan_index, direct, _, _, rows) in &snapshots {
         assert_eq!(
             rows, baseline,
             "plan {plan_index} direct={direct} diverged from plan {base_plan} direct={base_direct}"
@@ -3994,19 +4043,28 @@ fn raw_import_chunk_permutations_converge_and_match_the_whole_room() {
     }
     let direct_files: usize = snapshots
         .iter()
-        .filter(|(_, direct, _, _)| *direct)
-        .map(|(_, _, files, _)| files)
+        .filter(|(_, direct, _, _, _)| *direct)
+        .map(|(_, _, files, _, _)| files)
         .sum();
-    // One late file in the small fixture now exceeds half the room's stored
-    // events (4 of 6, 6 of 8) and correctly takes the whole-room path instead
-    // of the direct one, so the count is 7 rather than the 8 it was while the
+    let half_room_bails: usize = snapshots
+        .iter()
+        .filter(|(_, direct, _, _, _)| *direct)
+        .map(|(_, _, _, bails, _)| bails)
+        .sum();
+    // Two late files in the small fixture exceed half the room's stored events
+    // (4 of 6, 6 of 8) and correctly take the whole-room path instead of the
+    // direct one, so the count is 7 rather than the 9 it would be while the
     // room-size hint stayed at 0. The convergence check above still covers
     // every plan, bailing or not.
-    assert!(
-        direct_files >= 7,
-        "the multi-file plans should exercise the direct path, got {direct_files} direct files"
+    assert_eq!(
+        direct_files, 7,
+        "over-half late closures must take the whole-room path; got {direct_files} direct files"
     );
-    for (plan_index, direct, files, _) in &snapshots {
+    assert_eq!(
+        half_room_bails, 2,
+        "the production import path must actually arm the whole-room bail for each over-half file"
+    );
+    for (plan_index, direct, files, _, _) in &snapshots {
         if !*direct {
             assert_eq!(*files, 0, "the whole-room run never uses the gate");
         } else if *plan_index == plans.len() - 1 {

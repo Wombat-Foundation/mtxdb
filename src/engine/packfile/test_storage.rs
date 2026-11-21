@@ -15293,6 +15293,47 @@ fn retiring_a_delta_epoch_never_unlinks_the_live_log() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn checkpoint_tail_sweeps_rejected_epochs_but_keeps_the_live_epoch() {
+    let dir = test_dir("checkpoint_tail_delta_sweep");
+    let _cleanup = RemoveDirOnDrop(dir.clone());
+    let live_fingerprint = 0x22;
+    let rejected_fingerprint = 0x11;
+    let live_path = PackfileStorage::delta_path(&dir, live_fingerprint);
+    let rejected_path = PackfileStorage::delta_path(&dir, rejected_fingerprint);
+    fs::write(&rejected_path, b"rejected epoch").unwrap();
+
+    let (release_tail, wait_for_tail) = std::sync::mpsc::channel();
+    let tail = CheckpointTail {
+        base_dir: dir.clone(),
+        fingerprint: live_fingerprint,
+        covered_lsn: None,
+        base_delta_seq: 0,
+        logical_versions: Vec::new(),
+        blobs: Vec::new(),
+        pack_table: Vec::new(),
+        journal: None,
+        pool_tag: 0,
+        durable_coverage: Arc::new(AtomicU64::new(0)),
+        hook: Some(TailHook {
+            gate: wait_for_tail,
+            fail: false,
+        }),
+    };
+    let worker = std::thread::spawn(move || tail.run());
+
+    // A batch can be appended to the new epoch while the checkpoint tail is
+    // waiting. Cleanup must preserve this live path even with no old base
+    // fingerprint available to identify a predecessor.
+    fs::write(&live_path, b"batch appended during tail").unwrap();
+    release_tail.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+
+    assert!(!rejected_path.exists());
+    assert_eq!(fs::read(&live_path).unwrap(), b"batch appended during tail");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// What a shared-WAL store leaves after its first sync reclaimed the WAL groups
 /// that carried its collection versions: the published store directory, the
 /// reclaimed WAL, and each collection's record count and logical version.

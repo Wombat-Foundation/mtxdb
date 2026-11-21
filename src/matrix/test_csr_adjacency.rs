@@ -63,6 +63,38 @@ fn records_and_reads_prev_auth_and_relation() {
 }
 
 #[test]
+fn referenced_event_ids_union_and_split_by_family() {
+    let root = test_root("referenced-ids");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    adj.record_event(&db, "$msg", &["$create"], &["$create"], None)
+        .unwrap();
+    adj.record_event(
+        &db,
+        "$react",
+        &["$msg"],
+        &["$create", "$missing-auth"],
+        None,
+    )
+    .unwrap();
+
+    let set = |ids: &[&str]| -> std::collections::BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    };
+    assert_eq!(
+        adj.referenced_event_ids(&db).unwrap(),
+        set(&["$create", "$msg", "$missing-auth"]),
+        "the union names every cited id, whether or not its body exists"
+    );
+    let (prev, auth) = adj.referenced_event_ids_by_family(&db).unwrap();
+    assert_eq!(prev, set(&["$create", "$msg"]));
+    assert_eq!(auth, set(&["$create", "$missing-auth"]));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn resolve_event_ids_round_trips_short_ids_and_reports_absent_ones() {
     let root = test_root("resolve_ids");
     let db = Database::open(root.clone()).unwrap();
@@ -623,6 +655,65 @@ fn children_of_matches_the_derived_reverse_family() {
 }
 
 #[test]
+fn proto_auth_children_merge_dedupe_and_survive_a_seal() {
+    let root = test_root("proto-auth-children");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    let ids = adj
+        .record_events(
+            &db,
+            &[
+                EventRecord {
+                    event_id: "$p",
+                    prev: &[],
+                    auth: &[],
+                    relation: None,
+                },
+                EventRecord {
+                    event_id: "$a",
+                    prev: &[],
+                    auth: &["$p"],
+                    relation: None,
+                },
+                EventRecord {
+                    event_id: "$b",
+                    prev: &[],
+                    auth: &["$p"],
+                    relation: None,
+                },
+            ],
+        )
+        .unwrap();
+    let (p, a, b) = (ids[0], ids[1], ids[2]);
+    let sorted = |v: Option<Vec<u32>>| {
+        let mut v = v.unwrap_or_default();
+        v.sort_unstable();
+        v
+    };
+    // A parent with no recorded child reads as absent.
+    assert_eq!(adj.proto_auth_children_of(&db, p).unwrap(), None);
+    adj.proto_maintain_auth_children(&db, &[(a, vec![p])])
+        .unwrap();
+    // A second batch merges with the stored child and repeats `a`.
+    adj.proto_maintain_auth_children(&db, &[(a, vec![p]), (b, vec![p])])
+        .unwrap();
+    let mut expected = vec![a, b];
+    expected.sort_unstable();
+    assert_eq!(
+        sorted(adj.proto_auth_children_of(&db, p).unwrap()),
+        expected
+    );
+    assert_eq!(adj.proto_auth_children_of(&db, a).unwrap(), None);
+    adj.proto_seal(&db).unwrap();
+    assert_eq!(
+        sorted(adj.proto_auth_children_of(&db, p).unwrap()),
+        expected
+    );
+    assert_eq!(adj.proto_auth_children_of(&db, a).unwrap(), None);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn children_of_falls_back_then_backfills_a_legacy_scope() {
     let root = test_root("children-of-legacy");
     let db = Database::open(root.clone()).unwrap();
@@ -804,10 +895,13 @@ fn auth_star_timing() {
             short.extend(&ids);
             let batch: Vec<(u32, Vec<u32>)> = (written..end)
                 .map(|n| {
-                    let parents = auths[n - written]
-                        .iter()
-                        .map(|a| short[names.iter().position(|x| x == a).unwrap_or(0)])
-                        .collect();
+                    let parents = if n == 0 {
+                        Vec::new()
+                    } else if n < first {
+                        vec![short[0]]
+                    } else {
+                        vec![short[0], short[1], short[2 + n % MEMBERS]]
+                    };
                     (short[n], parents)
                 })
                 .collect();

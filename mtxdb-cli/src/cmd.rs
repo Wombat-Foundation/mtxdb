@@ -10570,6 +10570,9 @@ struct ImportRunCache {
     reverse: HashMap<[u8; 16], RoomReverse>,
     direct: bool,
     direct_files: usize,
+    /// Files whose dirty closure exceeded half the room and therefore took the
+    /// whole-room path instead of the direct one.
+    half_room_bails: usize,
     /// Stored signing keys by server for this run. Each lookup scans the whole
     /// server-info pool, so rooms share one read per server. Cleared when a
     /// keys file is imported.
@@ -10587,6 +10590,7 @@ impl Default for ImportRunCache {
             reverse: HashMap::new(),
             direct: direct_import_enabled(),
             direct_files: 0,
+            half_room_bails: 0,
             server_keys: HashMap::new(),
             gap_rooms: std::collections::BTreeSet::new(),
         }
@@ -10682,6 +10686,7 @@ impl RoomWaiting {
     fn observe_written(
         &mut self,
         timeline_arrived: &HashSet<String>,
+        newly_stored: &HashSet<String>,
         auth_arrived: &HashSet<String>,
         references: impl IntoIterator<Item = (String, bool)>,
         timeline_present: &HashSet<String>,
@@ -10689,7 +10694,9 @@ impl RoomWaiting {
     ) {
         // Keep the room-size hint current: a room that began empty would
         // otherwise report 0 for the whole run and disable the half-room bail.
-        self.stored_events = self.stored_events.saturating_add(timeline_arrived.len());
+        // Only bodies new to the room grow it; repeats from overlapping files
+        // or reimports must not inflate the estimate.
+        self.stored_events = self.stored_events.saturating_add(newly_stored.len());
         // A timeline body is also an auth body, so it clears both families.
         for id in timeline_arrived {
             self.prev.remove(id);
@@ -11065,6 +11072,7 @@ impl ImportRunCache {
         collection_id: &[u8; 16],
         room_id: &str,
         timeline_arrived: &HashSet<String>,
+        newly_stored: &HashSet<String>,
         auth_arrived: &HashSet<String>,
         written_events: impl IntoIterator<Item = &'a OwnedValue>,
     ) -> anyhow::Result<()> {
@@ -11114,6 +11122,7 @@ impl ImportRunCache {
             .expect("waiting set was ensured above");
         entry.observe_written(
             timeline_arrived,
+            newly_stored,
             auth_arrived,
             references,
             &timeline_present,
@@ -11421,6 +11430,7 @@ impl ImportContext<'_> {
                     self.template,
                     &timeline_collection,
                     &room_id,
+                    &HashSet::new(),
                     &HashSet::new(),
                     &auth_arrived,
                     events_by_room.get(&room_id).into_iter().flatten().copied(),
@@ -12257,6 +12267,7 @@ fn import_pdu_events_with_raw_state_hamts(
                     // walking; the transpose has already been paid once.
                     bail_reason = "over_half";
                     dirty_closure_bailed = true;
+                    cache.half_room_bails = cache.half_room_bails.saturating_add(1);
                     HashSet::new()
                 } else {
                     ids
@@ -12288,7 +12299,7 @@ fn import_pdu_events_with_raw_state_hamts(
             None => "unknown".to_owned(),
         };
         eprintln!(
-            "direct: late arrival room={} room_events={stored_events_hint} hits={}p/{}a dirty={dirty_count} (room_share={room_share}) bail={} closure={:?}",
+            "direct: late arrival room={:?} room_events={stored_events_hint} hits={}p/{}a dirty={dirty_count} (room_share={room_share}) bail={} closure={:?}",
             resolved.canonical_id,
             waiting_hits.prev.len(),
             waiting_hits.auth.len(),
@@ -12339,6 +12350,13 @@ fn import_pdu_events_with_raw_state_hamts(
                 .filter_map(event_id)
                 .map(str::to_owned)
                 .collect();
+            // Only bodies new to the room grow it; repeats from overlapping
+            // files or reimports must not inflate the room-size hint.
+            let newly_stored: HashSet<String> = body_ids
+                .iter()
+                .filter(|id| !existed_before.contains(*id))
+                .cloned()
+                .collect();
             let observe_started = Instant::now();
             cache.observe_written(
                 db,
@@ -12348,6 +12366,7 @@ fn import_pdu_events_with_raw_state_hamts(
                 &collection_id,
                 &resolved.canonical_id,
                 &body_ids,
+                &newly_stored,
                 &auth_arrived,
                 events.iter().chain(auth_chain.iter()),
             )?;

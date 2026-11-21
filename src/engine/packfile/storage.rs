@@ -3859,6 +3859,12 @@ impl PackfileStorage {
             .as_ref()
             .is_some_and(|snapshot| snapshot.covered_lsn >= table.covered_lsn)
         {
+            // A previous attempt may have renamed the file and then failed its
+            // directory sync; make that rename durable before the caller
+            // reclaims the log.
+            if let Some(dir) = versions_path.parent() {
+                crate::shard::sync_directory(dir)?;
+            }
             return Ok(());
         }
         let mut merged: std::collections::BTreeMap<[u8; 16], u64> = existing
@@ -6665,11 +6671,11 @@ impl PackfileStorage {
         let snapshots = self.checkpoint_snapshots();
         let serialize_started = std::time::Instant::now();
 
-        // Rotate the delta epoch while still locked: `old_base_fingerprint`
-        // (D0's name, if any) is retired below only after `fingerprint`'s
-        // checkpoint (C1) is durable; every collection's writers already
-        // target the new epoch (D1) by the time the locks drop next.
-        let old_base_fingerprint = self.rotate_delta_epoch(fingerprint, &snapshots);
+        // Rotate the delta epoch while still locked. Every collection's
+        // writers target the new fingerprint by the time the locks drop; the
+        // tail preserves that epoch and retires all others after the checkpoint
+        // is durable, including rejected epochs from a full rescan.
+        self.rotate_delta_epoch(fingerprint, &snapshots);
         // Every put mutex is held, so no redo record is in flight: the sequence
         // reached so far is exactly what this checkpoint incorporates.
         let base_delta_seq = self.delta_state.lock().delta_seq_high;
@@ -6720,7 +6726,6 @@ impl PackfileStorage {
             logical_versions,
             blobs,
             pack_table,
-            old_base_fingerprint,
             journal: self.journal(),
             pool_tag: self.journal_pool.load(Ordering::Acquire),
             durable_coverage: Arc::clone(&self.durable_coverage),
@@ -14551,6 +14556,10 @@ fn write_journal_lsn_file(
 /// Remove the superseded delta-log epoch once the checkpoint that makes it safe
 /// to discard is durably renamed. Best-effort: a leftover file names a
 /// fingerprint no future checkpoint carries, so it is inert.
+///
+/// The production checkpoint tail now sweeps every non-live epoch, so this
+/// narrower helper is retained only for the test mirror that predates it.
+#[cfg(test)]
 fn retire_delta_epoch_file(
     base_dir: &Path,
     old_base_fingerprint: Option<u64>,
@@ -14623,7 +14632,6 @@ struct CheckpointTail {
     logical_versions: Vec<([u8; 16], u64)>,
     blobs: Vec<([u8; 16], u64, Vec<u8>)>,
     pack_table: Vec<(u16, PackId)>,
-    old_base_fingerprint: Option<u64>,
     journal: Option<Arc<JournalCoordinator>>,
     pool_tag: u8,
     durable_coverage: Arc<AtomicU64>,
@@ -14717,7 +14725,12 @@ impl CheckpointTail {
             done.reclaim = reclaim_started.elapsed();
         }
         let retire_started = std::time::Instant::now();
-        retire_delta_epoch_file(&self.base_dir, self.old_base_fingerprint, self.fingerprint);
+        // The replacement checkpoint is durable. Keep its live epoch, which
+        // may have received batches while this tail ran, and retire every
+        // other (now rejected) delta epoch, even when the prior in-memory
+        // state had no base fingerprint.
+        let live_epoch = PackfileStorage::delta_path(&self.base_dir, self.fingerprint);
+        PackfileStorage::sweep_orphan_delta_logs(&self.base_dir, Some(&live_epoch));
         done.retire = retire_started.elapsed();
         done.total = tail_started.elapsed();
         Ok(done)
