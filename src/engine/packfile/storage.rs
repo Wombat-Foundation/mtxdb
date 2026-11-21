@@ -3295,6 +3295,13 @@ impl PackfileStorage {
         // resident session *before* this session's first write, so a later
         // resident open cannot load an image that predates those writes (and
         // cannot replay a delta this session never wrote).
+        // Every writable open that can delete a delta log (this paged branch,
+        // the pack-set and fingerprint gates, and the rescan below) must first
+        // make the log's version table durable elsewhere. Do it once, up front,
+        // so no deletion site can run ahead of it.
+        if writable {
+            Self::promote_delta_versions(&base_dir)?;
+        }
         let mut versions_valid = true;
         if residency == crate::index::IndexResidency::Paged && writable {
             // The checkpoint is not the primary index in paged mode, but it
@@ -3410,13 +3417,16 @@ impl PackfileStorage {
             return Ok(store);
         }
         timings.path = OpenPath::FullScan;
-        // The checkpoint/log gates rejected the persisted index state; never
-        // carry forward a stale log into the rescanned session — a writable
-        // open can delete it outright (read-only opens leave the file alone
-        // but will re-rescan, since the damaged bases can never trust it).
-        if writable {
-            Self::sweep_orphan_delta_logs(&base_dir, None);
-        }
+        // The checkpoint/log gates rejected the persisted index state, but do
+        // not sweep the delta epochs here: this open returns to the caller,
+        // and a shared-WAL caller runs `enable_shared_journal` only afterwards.
+        // That check reads a matching delta epoch as the pool's durable
+        // collection-version baseline for history the WAL has already
+        // reclaimed. Deleting it first would destroy the only bridge between
+        // an old checkpoint and the reclaimed LSN and turn a recoverable open
+        // into a permanent refusal, even though the epoch was valid. The
+        // epoch is inert for the rescanned index; the first successful
+        // checkpoint rotates a fresh one and sweeps the old epochs.
 
         let scan_started = std::time::Instant::now();
         let mut scan_state = StreamingOpenScan::new(collection_order, residency);
@@ -3811,6 +3821,55 @@ impl PackfileStorage {
             checkpoint.covered_lsn,
         )
         .is_ok()
+    }
+
+    /// Persist the collection-version table a delta log carries into
+    /// `index.versions` before a writable open can delete that log.
+    ///
+    /// A coverage batch lets the journal be reclaimed past the checkpoint's
+    /// own coverage, and the version table it carries is then the only durable
+    /// copy of the versions for the reclaimed groups. The open path deletes
+    /// delta logs in several places (a log that no longer matches the pack set,
+    /// a checkpoint rejected into a rescan, a paged conversion), and every one
+    /// of them runs before [`Self::enable_shared_journal`] checks that the
+    /// baseline covers the reclaimed history. Deleting the log first leaves
+    /// nothing for that check to find, and every retry fails the same way.
+    /// Moving the table into its own file first makes the baseline independent
+    /// of what happens to the log.
+    ///
+    /// Only a table the reader already trusts is moved (see
+    /// [`Self::delta_version_table`]), and it is merged with `max` into any
+    /// existing file so neither a newer coverage nor a collection that only the
+    /// file knows is lost. A no-op when there is no such table or the file
+    /// already covers it.
+    ///
+    /// # Errors
+    /// Returns the write error. The caller must refuse the open rather than
+    /// continue: the log may be the only copy of those versions.
+    fn promote_delta_versions(base_dir: &std::path::Path) -> std::io::Result<()> {
+        let Some(table) = Self::delta_version_table(base_dir) else {
+            return Ok(());
+        };
+        if table.covered_lsn == 0 {
+            return Ok(());
+        }
+        let versions_path = Self::index_versions_path(base_dir);
+        let existing = crate::index::versions::read_versions(&versions_path);
+        if existing
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.covered_lsn >= table.covered_lsn)
+        {
+            return Ok(());
+        }
+        let mut merged: std::collections::BTreeMap<[u8; 16], u64> = existing
+            .map(|snapshot| snapshot.versions.into_iter().collect())
+            .unwrap_or_default();
+        for (collection, version) in table.entries {
+            let entry = merged.entry(collection).or_insert(0);
+            *entry = (*entry).max(version);
+        }
+        let merged: Vec<([u8; 16], u64)> = merged.into_iter().collect();
+        crate::index::versions::write_versions(&versions_path, &merged, table.covered_lsn)
     }
 
     /// Path of one *epoch* of this store's incremental index delta log.
@@ -4216,6 +4275,17 @@ impl PackfileStorage {
             .collect();
 
         let delta_path = Self::delta_path(base_dir, checkpoint.fingerprint);
+        // A delta epoch rejected below is deliberately left on disk. A
+        // shared-WAL caller runs `enable_shared_journal` only after this open
+        // returns, and that check reads a matching epoch's version table as the
+        // pool's durable baseline for history the WAL has already reclaimed.
+        // Deleting a rejected epoch here would destroy that baseline before the
+        // check can use it and turn a recoverable open into a permanent
+        // refusal. A rejected epoch cannot be appended to later (a rescan
+        // starts a fresh epoch), and the next successful checkpoint sweeps it.
+        // Only the `!replay_needed` case below removes it eagerly: there the
+        // packs still match the checkpoint, so there is no reclaimed history to
+        // bridge, and the next append would reuse this exact path.
         // Only the epoch named for this exact checkpoint can ever be trusted
         // (see `delta_path`); anything else on disk — a stale predecessor
         // epoch left by a crash between checkpoint rename and retirement, or
@@ -4269,9 +4339,6 @@ impl PackfileStorage {
                     || log.tail_fingerprint != local_fingerprint
                 {
                     timings.delta_replay = delta_started.elapsed();
-                    if writable {
-                        let _ = std::fs::remove_file(&delta_path);
-                    }
                     timings.checkpoint_reject = Some(CheckpointReject::DeltaFingerprintMismatch);
                     return None;
                 }
@@ -4280,9 +4347,6 @@ impl PackfileStorage {
                 replay_operations = log.operations;
             } else {
                 timings.delta_replay = delta_started.elapsed();
-                if writable {
-                    let _ = std::fs::remove_file(&delta_path);
-                }
                 timings.checkpoint_reject = Some(CheckpointReject::DeltaLogMissing);
                 return None;
             }
@@ -4355,17 +4419,11 @@ impl PackfileStorage {
             .collect();
         let mut redo_by_collection: HashMap<[u8; 16], Vec<RedoRecord>> = HashMap::new();
         let mut last_delta_seq = checkpoint.base_delta_seq;
-        let reject_log = || {
-            if writable {
-                let _ = std::fs::remove_file(&delta_path);
-            }
-        };
         for operation in replay_operations {
             match operation {
                 DeltaOperation::Redo(record) => {
                     // Strictly increasing above the checkpoint's base sequence.
                     if record.delta_seq <= last_delta_seq {
-                        reject_log();
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaOperationInvalid);
                         return None;
                     }
@@ -4380,7 +4438,6 @@ impl PackfileStorage {
                         ..
                     } = record.op
                     else {
-                        reject_log();
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaOperationInvalid);
                         return None;
                     };
@@ -4392,7 +4449,6 @@ impl PackfileStorage {
                     if live_generations.get(&record.collection_id) != Some(&record.base_generation)
                         || !extent_ok
                     {
-                        reject_log();
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
@@ -4406,17 +4462,11 @@ impl PackfileStorage {
                         continue;
                     }
                     if live_generations.get(&frame.collection_id) != Some(&frame.generation) {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
                     if let Some((_, index)) = snapshot_indexes.get(&frame.collection_id) {
                         if index.replay_frames(std::slice::from_ref(&frame)).is_err() {
-                            if writable {
-                                let _ = std::fs::remove_file(&delta_path);
-                            }
                             timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                             return None;
                         }
@@ -4437,9 +4487,6 @@ impl PackfileStorage {
                         continue;
                     }
                     let Some(capacity_bytes) = index_blob.get(..8) else {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     };
@@ -4452,17 +4499,11 @@ impl PackfileStorage {
                         .checked_mul(8)
                         .and_then(|bytes| bytes.checked_add(8));
                     if Some(index_blob.len()) != slots_len {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     }
                     let Ok(index) = LossyIndex::deserialize_with_config(&index_blob, index_config)
                     else {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     };
@@ -4481,9 +4522,6 @@ impl PackfileStorage {
                         continue;
                     }
                     if live_generations.get(&collection_id) != Some(&generation) {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
@@ -4507,7 +4545,6 @@ impl PackfileStorage {
         // names a freshly appended record, so this is a sequential pass over
         // pages the pack recovery has just read.
         if !Self::redo_locators_verified(shards, &redo_by_collection, &pack_lookup) {
-            reject_log();
             timings.checkpoint_reject = Some(CheckpointReject::RedoLocatorUnverified);
             return None;
         }
@@ -4586,9 +4623,6 @@ impl PackfileStorage {
                 let index = if let Some(frames) = frames_by_collection.get(&loaded.collection_id) {
                     let owned = mmap_index.clone();
                     if owned.replay_frames(frames).is_err() {
-                        if writable {
-                            let _ = std::fs::remove_file(&delta_path);
-                        }
                         timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
                         return None;
                     }
@@ -14535,9 +14569,9 @@ fn retire_delta_epoch_file(
     let path = PackfileStorage::delta_path(base_dir, old_base_fingerprint);
     // No directory sync after the unlink: if a crash restores the file it is
     // inert. Its name and header carry a fingerprint no future checkpoint will
-    // match, and `sweep_orphan_delta_logs` removes it at the next open. The
-    // checkpoint rename's durability is already covered by the directory sync
-    // in `CheckpointTail::run`, before this runs.
+    // match, and `sweep_orphan_delta_logs` removes it at the next successful
+    // checkpoint. The checkpoint rename's durability is already covered by the
+    // directory sync in `CheckpointTail::run`, before this runs.
     let _ = fs::remove_file(&path);
 }
 

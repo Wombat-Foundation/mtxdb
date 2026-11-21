@@ -15650,6 +15650,392 @@ fn a_stale_version_baseline_beside_a_newer_reclaim_fails_closed() {
     assert_refuses_without_a_baseline(&stale, "the first sync's baseline");
 }
 
+/// A writable open that has to rescan must keep a delta epoch that still
+/// covers history the shared WAL has reclaimed.
+///
+/// `PackfileStorage::open` runs first and `enable_shared_journal` runs after
+/// it, so at the moment the open chooses the `FullScan` path the delta epoch is
+/// the only durable bridge between the checkpoint and the reclaimed LSN. If
+/// the rescan sweeps it first, the baseline check has nothing left to accept
+/// and the pool is permanently unopenable even though the epoch was valid.
+#[test]
+fn a_full_scan_open_keeps_the_reclaimed_version_baseline() {
+    use crate::journal::Journal;
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store("full_scan_keeps_baseline");
+    // Force the second sync to write a coverage delta and reclaim the WAL.
+    shared.coordinator.set_reclaim_trigger_len(1);
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    shared.put(&TEST_COLLECTION, 3..6);
+    shared.sync_and_reclaim();
+    assert_eq!(
+        Journal::scan_read_only(&shared.wal).unwrap().groups.len(),
+        0,
+        "the fixture needs a reclaimed WAL"
+    );
+    let reclaimed = shared
+        .coordinator
+        .reclaimed_history_through(ShardType::State);
+    assert!(reclaimed > 0, "the WAL must have reclaimed state history");
+    let has_delta = |dir: &std::path::Path| {
+        fs::read_dir(dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("index.delta.")
+        })
+    };
+    assert!(
+        has_delta(&shared.store_dir),
+        "the fixture needs a delta epoch carrying the reclaimed versions"
+    );
+
+    // An unsynced write moves the packs past the checkpoint, so the next
+    // writable open rejects the persisted pack table and takes FullScan. The
+    // delta epoch still matches the checkpoint.
+    shared.put(&TEST_COLLECTION, 6..7);
+    let wal = fs::read(&shared.wal).unwrap();
+    let current = copy_store(&shared.store_dir, "full_scan_keeps_baseline_current");
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+
+    let wal_path = test_dir("full_scan_keeps_baseline_reopen_wal").join("shared.wal");
+    fs::write(&wal_path, &wal).unwrap();
+    let (journal, scan) = Journal::open_shared(&wal_path).unwrap();
+    let recovered = Arc::new(crate::journal::JournalCoordinator::new(journal, &scan));
+    let reopened = match PackfileStorage::open(current.clone()) {
+        Ok(store) => store,
+        Err(error) => panic!("the pool must open: {error}"),
+    };
+    assert!(
+        has_delta(&current),
+        "the rescan deleted the delta epoch before the shared-WAL baseline check"
+    );
+    reopened
+        .enable_shared_journal(Arc::clone(&recovered), ShardType::State)
+        .expect("the surviving delta must cover the reclaimed history");
+    for i in 0..7_u8 {
+        assert!(
+            reopened
+                .get(&TEST_COLLECTION, &distinct_id(i))
+                .unwrap()
+                .is_some(),
+            "record {i} lost across the rescanned open"
+        );
+    }
+    let version = recovered.collection_version(ShardType::State, &TEST_COLLECTION);
+    assert!(
+        version >= reclaimed,
+        "the restored version {version} stops before the reclaimed LSN {reclaimed}"
+    );
+}
+
+/// A pool stopped the way a killed or restarted writer leaves it: the WAL was
+/// reclaimed past the checkpoint on the strength of a delta coverage batch, and
+/// the pack then grew beyond that batch's tail before the process went away, so
+/// the next writable open rejects the delta log into a rescan.
+struct DeltaOnlyBaseline {
+    /// The pool directory as the stopped writer left it.
+    files: PathBuf,
+    /// The shared WAL image beside it.
+    wal: Vec<u8>,
+    /// The collection's logical version the stopped writer held.
+    version: u64,
+    /// Records the pool held, which the reopen must still serve.
+    records: u8,
+}
+
+fn delta_only_baseline(label: &str) -> DeltaOnlyBaseline {
+    use crate::layout::ShardType;
+
+    let shared = open_shared_wal_store(label);
+    shared.coordinator.set_reclaim_trigger_len(1);
+    shared.put(&TEST_COLLECTION, 0..3);
+    shared.sync_and_reclaim();
+    // The second sync appends a coverage batch to the delta log and reclaims
+    // the WAL past the checkpoint's own coverage.
+    shared.put(&TEST_COLLECTION, 3..6);
+    shared.sync_and_reclaim();
+
+    let checkpoint_covered = crate::index::checkpoint::read_checkpoint(
+        &PackfileStorage::index_checkpoint_path(&shared.store_dir),
+    )
+    .expect("a checkpoint")
+    .covered_lsn;
+    let versions_covered = crate::index::versions::read_coverage(
+        &PackfileStorage::index_versions_path(&shared.store_dir),
+    )
+    .unwrap_or(0);
+    let reclaimed = shared
+        .coordinator
+        .reclaimed_history_through(ShardType::State);
+    let delta_table = PackfileStorage::delta_version_table(&shared.store_dir)
+        .expect("the delta log carries a version table");
+    assert!(
+        checkpoint_covered.max(versions_covered) < reclaimed,
+        "the reclaim must have gone past the checkpoint and versions file \
+         ({checkpoint_covered}/{versions_covered} vs {reclaimed}) or the delta is not the baseline"
+    );
+    assert!(
+        delta_table.covered_lsn >= reclaimed,
+        "the delta's table must cover the reclaimed history"
+    );
+
+    // The pack grows past the delta's tail: committed to the WAL and written
+    // to the pack, but no delta batch or checkpoint follows.
+    shared.put(&TEST_COLLECTION, 6..8);
+    shared.coordinator.sync().unwrap();
+    let version = shared
+        .coordinator
+        .collection_version(ShardType::State, &TEST_COLLECTION);
+    let wal = fs::read(&shared.wal).unwrap();
+    let files = copy_store(&shared.store_dir, &format!("{label}_stopped"));
+    let SharedWalStore {
+        store, coordinator, ..
+    } = shared;
+    drop(store);
+    drop(coordinator);
+    DeltaOnlyBaseline {
+        files,
+        wal,
+        version,
+        records: 8,
+    }
+}
+
+fn delta_logs(store: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(store)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("index.delta."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The incident this guards: the delta log was the only durable baseline for
+/// the reclaimed WAL groups, and the writable open that follows a stop with the
+/// pack ahead of the log deleted it (the rescan path) before the baseline check
+/// that would have accepted it. Every retry then refused with "no readable
+/// version baseline". The open must keep the baseline and serve every record at
+/// the exact version.
+#[test]
+fn a_rescan_open_keeps_the_delta_baseline_beside_a_reclaimed_wal() {
+    use crate::layout::ShardType;
+
+    let fixture = delta_only_baseline("rescan_keeps_delta");
+    assert!(
+        !delta_logs(&fixture.files).is_empty(),
+        "the fixture keeps a delta log"
+    );
+
+    let reopened = reopen_state_pool(&fixture.files, &fixture.wal)
+        .expect("the delta's version table is a readable baseline");
+    assert_eq!(
+        reopened.open_timings().unwrap().path,
+        OpenPath::FullScan,
+        "the fixture must exercise the rescan path"
+    );
+    for i in 0..fixture.records {
+        let got = reopened.get(&TEST_COLLECTION, &distinct_id(i)).unwrap();
+        assert_eq!(
+            got.map(|data| data.bytes.to_vec()),
+            Some(version_test_value(&TEST_COLLECTION, i)),
+            "record {i} lost"
+        );
+    }
+    drop(reopened);
+
+    // The baseline is durable beyond the delta log now: the file alone covers
+    // the reclaimed history, so a later open does not depend on the log.
+    let coordinator = {
+        let wal = fixture.files.join("again.wal");
+        fs::write(&wal, &fixture.wal).unwrap();
+        let (journal, scan) = crate::journal::Journal::open_shared(&wal).unwrap();
+        Arc::new(crate::journal::JournalCoordinator::new(journal, &scan))
+    };
+    let covered = crate::index::versions::read_coverage(&PackfileStorage::index_versions_path(
+        &fixture.files,
+    ))
+    .expect("the open persisted index.versions");
+    assert!(
+        covered >= coordinator.reclaimed_history_through(ShardType::State),
+        "index.versions ({covered}) must cover the reclaimed history"
+    );
+    remove_delta_logs(&fixture.files);
+    let without_delta = reopen_state_pool(&fixture.files, &fixture.wal)
+        .expect("index.versions alone is now a sufficient baseline");
+    assert!(
+        without_delta
+            .get(&TEST_COLLECTION, &distinct_id(0))
+            .unwrap()
+            .is_some(),
+        "records survive the second open"
+    );
+    let _ = fixture.version;
+    drop(without_delta);
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
+fn read_if_present(path: &Path) -> Option<Vec<u8>> {
+    fs::read(path).ok()
+}
+
+/// Promotion moves the trusted delta table into `index.versions` and keeps the
+/// newer coverage and every collection either side knows: a file that already
+/// covers more is left alone, an older one is merged with `max`.
+#[test]
+fn promoting_a_delta_table_merges_and_never_lowers_coverage() {
+    let fixture = delta_only_baseline("promote_merge");
+    let versions_path = PackfileStorage::index_versions_path(&fixture.files);
+    let table = PackfileStorage::delta_version_table(&fixture.files)
+        .expect("the fixture's delta carries a table");
+    let extra = [0xEE_u8; 16];
+
+    // An older file that knows a collection the table does not, and a higher
+    // version of the table's own collection.
+    let table_version = table
+        .entries
+        .iter()
+        .find(|(collection, _)| *collection == TEST_COLLECTION)
+        .map(|(_, version)| *version)
+        .expect("the table names the test collection");
+    crate::index::versions::write_versions(
+        &versions_path,
+        &[(extra, 7), (TEST_COLLECTION, table_version + 100)],
+        1,
+    )
+    .unwrap();
+    PackfileStorage::promote_delta_versions(&fixture.files).unwrap();
+    let merged = crate::index::versions::read_versions(&versions_path).unwrap();
+    assert_eq!(merged.covered_lsn, table.covered_lsn, "coverage advances");
+    let get = |collection: &[u8; 16]| {
+        merged
+            .versions
+            .iter()
+            .find(|(id, _)| id == collection)
+            .map(|(_, version)| *version)
+    };
+    assert_eq!(
+        get(&extra),
+        Some(7),
+        "a collection only the file knew stays"
+    );
+    assert_eq!(
+        get(&TEST_COLLECTION),
+        Some(table_version + 100),
+        "the larger version wins"
+    );
+
+    // A file that already covers more than the table is left byte for byte.
+    crate::index::versions::write_versions(&versions_path, &[(extra, 9)], table.covered_lsn + 10)
+        .unwrap();
+    let before = fs::read(&versions_path).unwrap();
+    PackfileStorage::promote_delta_versions(&fixture.files).unwrap();
+    assert_eq!(
+        fs::read(&versions_path).unwrap(),
+        before,
+        "a newer file is never rewritten with an older table"
+    );
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
+/// Only a table the reader trusts is promoted: a delta log that does not name
+/// the current checkpoint restores nothing, so it must not reach the file.
+#[test]
+fn promotion_ignores_a_delta_that_does_not_name_the_checkpoint() {
+    let fixture = delta_only_baseline("promote_foreign");
+    let versions_path = PackfileStorage::index_versions_path(&fixture.files);
+    let delta = delta_logs(&fixture.files).pop().expect("a delta log");
+    fs::rename(
+        fixture.files.join(&delta),
+        fixture.files.join("index.delta.00000000deadbeef"),
+    )
+    .unwrap();
+    crate::index::versions::write_versions(&versions_path, &[([0xAA; 16], 1)], 1).unwrap();
+    let before = fs::read(&versions_path).unwrap();
+    PackfileStorage::promote_delta_versions(&fixture.files).unwrap();
+    assert_eq!(fs::read(&versions_path).unwrap(), before);
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
+/// A store with no journal, and so no table, is left exactly as it was.
+#[test]
+fn promotion_is_a_noop_without_a_version_table() {
+    let dir = test_dir("promote_noop");
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &distinct_id(0),
+            &NodeData::from_slice(b"x"),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+    let versions_path = PackfileStorage::index_versions_path(&dir);
+    let before = read_if_present(&versions_path);
+    PackfileStorage::promote_delta_versions(&dir).unwrap();
+    assert_eq!(read_if_present(&versions_path), before);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A read-only open writes nothing: it must not promote, and must leave the
+/// delta log in place for the writer.
+#[test]
+fn a_read_only_open_leaves_the_baseline_files_alone() {
+    let fixture = delta_only_baseline("promote_read_only");
+    let files = ["index.checkpoint", "index.versions", "journal.lsn"];
+    let before: Vec<Option<Vec<u8>>> = files
+        .iter()
+        .map(|file| read_if_present(&fixture.files.join(file)))
+        .collect();
+    let logs_before = delta_logs(&fixture.files);
+    let reader = PackfileStorage::open_read_only(fixture.files.clone()).unwrap();
+    drop(reader);
+    for (file, expected) in files.iter().zip(&before) {
+        assert_eq!(
+            &read_if_present(&fixture.files.join(file)),
+            expected,
+            "a read-only open rewrote {file}"
+        );
+    }
+    assert_eq!(delta_logs(&fixture.files), logs_before);
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
+/// When there really is no baseline (the delta log is gone), the open refuses,
+/// and the refusal destroys nothing further: the same files are on disk after,
+/// so a repair or a retry starts from what the operator had.
+#[test]
+fn a_refused_open_leaves_every_baseline_file_untouched() {
+    let fixture = delta_only_baseline("refused_destroys_nothing");
+    remove_delta_logs(&fixture.files);
+    let files = ["index.checkpoint", "index.versions", "journal.lsn"];
+    let before: Vec<Option<Vec<u8>>> = files
+        .iter()
+        .map(|file| read_if_present(&fixture.files.join(file)))
+        .collect();
+    let outcome = reopen_state_pool(&fixture.files, &fixture.wal);
+    assert_refuses_without_a_baseline(&outcome, "no delta, stale files");
+    drop(outcome);
+    for (file, expected) in files.iter().zip(&before) {
+        assert_eq!(
+            &read_if_present(&fixture.files.join(file)),
+            expected,
+            "the refused open rewrote {file}"
+        );
+    }
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
 /// The evidence is the history the WAL dropped, not what survives in the packs:
 /// a deleted collection leaves no record to find, and losing the baseline must
 /// still refuse.
