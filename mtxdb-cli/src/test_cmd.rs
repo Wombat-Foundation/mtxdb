@@ -689,6 +689,54 @@ fn collections_rebuilds_after_a_corrupt_shard_collections_sidecar() {
 }
 
 #[test]
+fn info_falls_back_when_sidecar_predates_a_collection() {
+    let dir = unique_temp_dir();
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let pool_dir = layout.pool_dir(ShardType::State).unwrap();
+    let old_collection = [0x11; 16];
+    let new_collection = [0x22; 16];
+    {
+        let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+        store
+            .put(
+                &old_collection,
+                &[0x01; 16],
+                &NodeData::new(Bytes::from_static(b"old")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        store.persist_shard_collections().unwrap();
+        let stale_sidecar = std::fs::read(pool_dir.join("shard_collections.bin")).unwrap();
+
+        store
+            .put(
+                &new_collection,
+                &[0x02; 16],
+                &NodeData::new(Bytes::from_static(b"new")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        drop(store);
+
+        // Simulate a live writer whose collection directory has not been
+        // republished since `new_collection` was first written, while the pack
+        // and index already contain it.
+        std::fs::write(pool_dir.join("shard_collections.bin"), stale_sidecar).unwrap();
+    }
+
+    assert!(
+        super::collection_exists_in_dir(&pool_dir, &new_collection),
+        "a sidecar miss must fall back to the store index"
+    );
+    assert!(
+        super::inspect_collection_in_dir(&pool_dir, &new_collection, false, None),
+        "info must not report a collection absent just because the sidecar is stale"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn shards_dash_t_all_iterates_every_pool_without_the_all_flag() {
     let dir = unique_temp_dir();
     DatabaseLayout::open(dir.clone()).unwrap();

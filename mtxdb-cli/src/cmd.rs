@@ -4839,6 +4839,26 @@ fn pack_locations_in_selected_pools(cli: &Cli) -> Vec<PackLocation> {
     locations
 }
 
+/// Whether the live index in `dir` contains `collection_id`.
+///
+/// `collection_summaries_from_disk` is only a fast snapshot of the last
+/// persisted collection directory: a collection created or written since the
+/// last index checkpoint does not appear there until the writer republishes
+/// the sidecar. A miss is therefore a hint, not proof. Fall back to opening the
+/// pool, which gates the sidecar on the current pack fingerprint and rebuilds
+/// from a scan when it is stale.
+fn collection_exists_in_dir(dir: &Path, collection_id: &[u8; 16]) -> bool {
+    if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(dir) {
+        if summaries.iter().any(|(id, _, _, _)| id == collection_id) {
+            return true;
+        }
+    }
+    open_pool_read_only(dir.to_path_buf())
+        .ok()
+        .and_then(|store| store.collection_index_info(collection_id))
+        .is_some()
+}
+
 /// Whether a live collection with this id exists in any selected pool.
 ///
 /// Same cost caveat as [`pack_locations_in_selected_pools`]: a single `info`
@@ -4862,15 +4882,7 @@ fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
             let Ok(dir) = pool_dir(&layout, shard_type) else {
                 continue;
             };
-            let has = if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir)
-            {
-                summaries.iter().any(|(id, _, _, _)| id == target_id)
-            } else if let Ok(store) = open_pool_read_only(dir) {
-                store.collection_index_info(target_id).is_some()
-            } else {
-                false
-            };
-            if has {
+            if collection_exists_in_dir(&dir, target_id) {
                 return true;
             }
         }
@@ -5062,16 +5074,7 @@ fn cmd_info_coalesced(
                     let Ok(dir) = pool_dir(&layout, shard_type) else {
                         continue;
                     };
-                    let has_collection = if let Some(summaries) =
-                        PackfileStorage::collection_summaries_from_disk(&dir)
-                    {
-                        summaries.iter().any(|(id, _, _, _)| id == &collection_id)
-                    } else if let Ok(store) = open_pool_read_only(dir.clone()) {
-                        store.collection_index_info(&collection_id).is_some()
-                    } else {
-                        false
-                    };
-                    if has_collection {
+                    if collection_exists_in_dir(&dir, &collection_id) {
                         matches.push((db_dir.clone(), shard_type, dir));
                     }
                 }
@@ -5090,7 +5093,7 @@ fn cmd_info_coalesced(
                 let (db_dir, shard_type, dir) = &matches[0];
                 println!("database: {}", db_dir.display());
                 println!("pool:     {}", shard_type.as_str());
-                inspect_collection_in_dir(dir, &collection_id, deep);
+                inspect_collection_in_dir(dir, &collection_id, deep, None);
             } else {
                 for (i, (db_dir, shard_type, dir)) in matches.iter().enumerate() {
                     if i > 0 {
@@ -5101,7 +5104,7 @@ fn cmd_info_coalesced(
                         db_dir.display(),
                         shard_type.as_str()
                     );
-                    inspect_collection_in_dir(dir, &collection_id, deep);
+                    inspect_collection_in_dir(dir, &collection_id, deep, None);
                 }
                 println!();
                 println!(
@@ -6436,7 +6439,26 @@ fn print_collection_info(
     print_collection_details(dir, collection_id, deep);
 }
 
-fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16], deep: bool) -> bool {
+/// Print one collection's details if `dir`'s live index contains it.
+///
+/// `section` optionally names the pool to announce first, and whether the
+/// caller already emitted a section (so this match needs the blank separator).
+fn inspect_collection_in_dir(
+    dir: &Path,
+    collection_id: &[u8; 16],
+    deep: bool,
+    section: Option<(ShardType, bool)>,
+) -> bool {
+    let print_section = || {
+        if let Some((shard_type, needs_spacing)) = section {
+            if needs_spacing {
+                println!();
+                println!();
+            }
+            print_section_header(shard_type);
+        }
+    };
+
     if let (Some(summaries), Some(collection_shards)) = (
         PackfileStorage::collection_summaries_from_disk(dir),
         PackfileStorage::collection_shards_from_disk(dir),
@@ -6449,16 +6471,20 @@ fn inspect_collection_in_dir(dir: &Path, collection_id: &[u8; 16], deep: bool) -
                 .get(collection_id)
                 .cloned()
                 .unwrap_or_default();
+            print_section();
             print_collection_info(dir, collection_id, len, mem, capacity, &shards, deep);
             return true;
         }
-        return false;
+        // A missing entry is not authoritative: the sidecar can predate the
+        // collection (see `collection_exists_in_dir`). Fall through to the
+        // pooled index instead of reporting a stale snapshot's miss.
     }
 
     let Ok(store) = open_pool_read_only(dir.to_path_buf()) else {
         return false;
     };
     if let Some((len, mem, capacity)) = store.collection_index_info(collection_id) {
+        print_section();
         let hex = format_id(collection_id);
         println!(
             "collection {hex}: {len} nodes, {} index ({})",
@@ -6484,21 +6510,12 @@ fn cmd_info_collection(cli: &Cli, collection: &str, deep: bool) -> anyhow::Resul
         for shard_type in cli.shard_types() {
             let dir = pool_dir(&db_layout, shard_type)?;
             let collection_id = parse_collection_selector(collection)?;
-            let has_collection =
-                if let Some(summaries) = PackfileStorage::collection_summaries_from_disk(&dir) {
-                    summaries.iter().any(|(id, _, _, _)| id == &collection_id)
-                } else if let Ok(store) = open_pool_read_only(dir.clone()) {
-                    store.collection_index_info(&collection_id).is_some()
-                } else {
-                    false
-                };
-            if has_collection {
-                if matched_any {
-                    println!();
-                    println!();
-                }
-                print_section_header(shard_type);
-                inspect_collection_in_dir(&dir, &collection_id, deep);
+            if inspect_collection_in_dir(
+                &dir,
+                &collection_id,
+                deep,
+                Some((shard_type, matched_any)),
+            ) {
                 matched_any = true;
             }
         }
@@ -6515,7 +6532,7 @@ fn cmd_info_collection(cli: &Cli, collection: &str, deep: bool) -> anyhow::Resul
     let hex = format_id(&collection_id);
     let dir = selected_pool_dir(cli)?;
 
-    if inspect_collection_in_dir(&dir, &collection_id, deep) {
+    if inspect_collection_in_dir(&dir, &collection_id, deep, None) {
         return Ok(());
     }
 
@@ -7630,16 +7647,7 @@ fn cmd_scan_coalesced(
                     let Ok(dir) = pool_dir(&layout, shard_type) else {
                         continue;
                     };
-                    let has = if let Some(summaries) =
-                        PackfileStorage::collection_summaries_from_disk(&dir)
-                    {
-                        summaries.iter().any(|(id, _, _, _)| id == &collection_id)
-                    } else if let Ok(store) = open_pool_read_only(dir) {
-                        store.collection_index_info(&collection_id).is_some()
-                    } else {
-                        false
-                    };
-                    if has {
+                    if collection_exists_in_dir(&dir, &collection_id) {
                         found_in_db = true;
                         break;
                     }
