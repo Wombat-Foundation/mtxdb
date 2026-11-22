@@ -271,6 +271,92 @@ impl DatabaseTransaction<'_> {
             .stage_put(pool, collection_id, node_id, data.bytes.to_vec())
     }
 
+    /// Atomically increment signed 64-bit big-endian counters in this transaction.
+    /// Missing or removed records are zero. Duplicate keys are applied in input
+    /// order and the returned values correspond to each input delta.
+    ///
+    /// Each distinct key is read once. A record-version precondition is reused
+    /// when already staged; otherwise the live record version is captured,
+    /// including when the transaction has a blind staged put for the key.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] for malformed counters or arithmetic
+    /// overflow, and propagates storage or transaction-staging errors.
+    pub fn increment_counters(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        deltas: &[(NodeId, i64)],
+    ) -> Result<Vec<i64>, StorageError> {
+        let _lifecycle = self.lifecycle.lock();
+        if deltas.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut positions = std::collections::HashMap::with_capacity(deltas.len());
+        let mut ids = Vec::new();
+        for (id, _) in deltas {
+            if !positions.contains_key(id) {
+                positions.insert(*id, ids.len());
+                ids.push(*id);
+            }
+        }
+
+        // Read live values and versions even for staged keys: a blind put
+        // still needs a live-version precondition before the counter write.
+        let (live, versions) = self
+            .database
+            .pool(pool)
+            .get_with_record_versions(&collection_id, &ids)?;
+        let staged = self.stage.lookup_many(pool, &collection_id, &ids);
+
+        let mut values = Vec::with_capacity(ids.len());
+        let mut new_expectations = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let value = match &staged[i] {
+                StagedLookup::Put(bytes) => Some(bytes.as_slice()),
+                StagedLookup::Deleted => None,
+                StagedLookup::Absent => live[i].as_ref().map(|v| v.bytes.as_ref()),
+            };
+            let value = match value {
+                None | Some([]) => 0,
+                Some(bytes) if bytes.len() == 8 => {
+                    let mut encoded = [0u8; 8];
+                    encoded.copy_from_slice(bytes);
+                    i64::from_be_bytes(encoded)
+                }
+                Some(_) => {
+                    return Err(StorageError::Corrupt(format!(
+                        "counter {id:?} is not 8 bytes"
+                    )))
+                }
+            };
+            values.push(value);
+            if !self.stage.has_record_expectation(pool, &collection_id, id) {
+                new_expectations.push((*id, versions[i]));
+            }
+        }
+
+        let mut results = Vec::with_capacity(deltas.len());
+        for (id, delta) in deltas {
+            let value = &mut values[positions[id]];
+            *value = value
+                .checked_add(*delta)
+                .ok_or_else(|| StorageError::Corrupt("counter overflow".to_owned()))?;
+            results.push(*value);
+        }
+
+        let writes: Vec<_> = ids
+            .iter()
+            .zip(&values)
+            .map(|(id, value)| (*id, value.to_be_bytes().to_vec()))
+            .collect();
+        self.stage
+            .stage_puts_with_record_expectations(pool, collection_id, &new_expectations, &writes)
+            .map_err(StorageError::Io)?;
+        Ok(results)
+    }
+
     /// Stage removal of a collection.
     ///
     /// # Errors

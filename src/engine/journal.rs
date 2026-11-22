@@ -327,6 +327,10 @@ struct TxnStageData {
     expectations: Vec<CollectionExpectation>,
     /// Per-record version preconditions validated at publication.
     record_expectations: Vec<RecordExpectation>,
+    /// Keys that already have a [`RecordExpectation`] above. A staged write is
+    /// not enough: a blind put never validated the live value it replaced, so
+    /// callers that need a read-modify-write precondition must still add one.
+    record_expectation_keys: HashSet<(usize, [u8; 16], [u8; 16])>,
     bytes: usize,
     /// Successful pool appends. Retrying a callback after a partial error
     /// resumes at the failed pool instead of duplicating earlier groups.
@@ -462,6 +466,7 @@ impl TxnStage {
                 applied: std::array::from_fn(|_| Vec::new()),
                 expectations: Vec::new(),
                 record_expectations: Vec::new(),
+                record_expectation_keys: HashSet::new(),
                 bytes: 0,
                 appended: [false; ShardType::ALL.len()],
                 receipt: None,
@@ -573,6 +578,7 @@ impl TxnStage {
             data.applied.iter_mut().for_each(Vec::clear);
             data.expectations.clear();
             data.record_expectations.clear();
+            data.record_expectation_keys.clear();
             data.bytes = 0;
             self.state.store(Self::DISCARDED, Ordering::Release);
         }
@@ -892,6 +898,8 @@ impl TxnStage {
         data.applied[index] = vec![false; data.pools[index].len()];
         data.bytes = total;
         for (node_id, expected) in pending {
+            data.record_expectation_keys
+                .insert((index, collection_id, *node_id));
             data.record_expectations.push(RecordExpectation {
                 pool,
                 collection_id,
@@ -1007,6 +1015,64 @@ impl TxnStage {
         Ok(())
     }
 
+    /// Atomically add record-version preconditions and puts. Used by
+    /// transaction primitives that must not leave partial staged state when
+    /// the staging budget or an expectation check fails.
+    pub(crate) fn stage_puts_with_record_expectations(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        expectations: &[([u8; 16], u64)],
+        entries: &[([u8; 16], Vec<u8>)],
+    ) -> io::Result<()> {
+        let charge = entries
+            .iter()
+            .try_fold(0usize, |total, (_, payload)| {
+                total.checked_add(payload.len().saturating_add(64))
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transaction stage size overflow",
+                )
+            })?;
+        let mut data = self.data.lock();
+        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        let total = data.bytes.checked_add(charge).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction stage size overflow",
+            )
+        })?;
+        if total > self.limit_bytes {
+            return Err(stage_too_large_with_limit(total, self.limit_bytes));
+        }
+        let index = pool_index(pool);
+        for (node_id, expected) in expectations {
+            if data
+                .record_expectation_keys
+                .insert((index, collection_id, *node_id))
+            {
+                data.record_expectations.push(RecordExpectation {
+                    pool,
+                    collection_id,
+                    node_id: *node_id,
+                    expected: *expected,
+                });
+            }
+        }
+        data.pools[index].extend(entries.iter().map(|(node_id, payload)| Mutation::Put {
+            collection_id,
+            node_id: *node_id,
+            payload: payload.clone(),
+        }));
+        data.applied[index].extend(vec![false; entries.len()]);
+        data.bytes = total;
+        Ok(())
+    }
+
     /// Add a collection delete to this attempt. Callers must not eagerly
     /// mutate the live index for a delete that can still roll back.
     ///
@@ -1106,6 +1172,8 @@ impl TxnStage {
         if self.state.load(Ordering::Acquire) != Self::ACTIVE {
             return Err(io::Error::other("transaction stage is not active"));
         }
+        data.record_expectation_keys
+            .insert((pool_index(pool), collection_id, node_id));
         data.record_expectations.push(RecordExpectation {
             pool,
             collection_id,
@@ -1113,6 +1181,22 @@ impl TxnStage {
             expected,
         });
         Ok(())
+    }
+
+    /// Whether a per-record version precondition is already staged for this
+    /// key, regardless of whether the key also has a staged write.
+    #[must_use]
+    pub fn has_record_expectation(
+        &self,
+        pool: ShardType,
+        collection_id: &[u8; 16],
+        node_id: &[u8; 16],
+    ) -> bool {
+        self.data.lock().record_expectation_keys.contains(&(
+            pool_index(pool),
+            *collection_id,
+            *node_id,
+        ))
     }
 
     /// Snapshot the staged per-record version preconditions.
