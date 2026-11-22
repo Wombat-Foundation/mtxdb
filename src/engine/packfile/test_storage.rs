@@ -1403,6 +1403,7 @@ fn reset_has_coverage_gap_is_a_pure_base_jump() {
         valid_len: 0,
         truncated_tail: false,
         base_lsn: 3,
+        base_sequence: 1,
         consumed_tail: Vec::new(),
         group_ends: Vec::new(),
     };

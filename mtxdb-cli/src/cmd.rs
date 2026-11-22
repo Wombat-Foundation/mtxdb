@@ -16662,29 +16662,150 @@ fn cmd_sync(cli: &Cli, all: bool) -> anyhow::Result<()> {
 /// Force a full checkpoint in every pool through the shared `Database`, so
 /// each pool reports coverage to the same journal coordinator and the WAL can
 /// reclaim through the oldest covered group.
+///
+/// A shared segment can only be reclaimed past a group once every pool that
+/// contributed a frame to it has reported coverage, so this always checkpoints
+/// all pools regardless of `-t`. The output reports the reclaim's effect on the
+/// segment's numbering, each pool's coverage, and where the checkpoint time
+/// went; nothing here is written to a log file.
 fn cmd_reclaim_wal(cli: &Cli) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
+    // Read the segment before opening it: a writer open replays and reclaims
+    // during recovery, so a snapshot taken afterwards would not show what this
+    // command started from.
+    let wal_path = layout.shared_wal_path();
+    let position_before = wal_position_on_disk(&wal_path);
+    let bytes_before = fs::metadata(&wal_path).ok().map(|metadata| metadata.len());
+
     let db = open_database(layout.root().to_path_buf())
         .context("opening the shared database to reclaim its WAL")?;
-    let before = db.coordinator().segment_len();
+    let coordinator = db.coordinator();
+    let before = bytes_before.unwrap_or_else(|| coordinator.segment_len());
 
+    let mut checkpoints = Vec::with_capacity(ShardType::ALL.len());
     for shard in ShardType::ALL {
+        let started = Instant::now();
         db.pool(shard)
             .force_index_checkpoint()
             .with_context(|| format!("checkpointing the {shard:?} pool to reclaim the WAL"))?;
+        checkpoints.push((shard, started.elapsed()));
     }
     for shard in ShardType::ALL {
         db.pool(shard).wait_for_checkpoint();
     }
 
-    let coordinator = db.coordinator();
     let after = coordinator.segment_len();
-    println!("shared WAL: {before} -> {after} bytes");
+    let position_after = coordinator.segment_position();
+
+    println!(
+        "shared WAL: {before} -> {after} bytes ({} reclaimed)",
+        before.saturating_sub(after)
+    );
+    if let Some(position_before) = position_before {
+        println!(
+            "  groups: {} -> {} ({} dropped)",
+            position_before.groups,
+            position_after.groups,
+            position_before.groups.saturating_sub(position_after.groups)
+        );
+        println!(
+            "  retained LSNs: {} -> {}",
+            retained_lsns(position_before),
+            retained_lsns(position_after)
+        );
+        println!(
+            "  retained sequences: {} -> {}",
+            retained_sequences(position_before),
+            retained_sequences(position_after)
+        );
+    } else {
+        println!("  groups: {}", position_after.groups);
+        println!("  retained LSNs: {}", retained_lsns(position_after));
+        println!(
+            "  retained sequences: {}",
+            retained_sequences(position_after)
+        );
+    }
+    println!(
+        "  next append: LSN {}, sequence {} (committed through LSN {})",
+        position_after.next_lsn,
+        position_after.next_sequence,
+        coordinator.committed_lsn()
+    );
+    println!(
+        "  segment: {after} of {} bytes; reclaim trigger {}",
+        coordinator.segment_cap(),
+        coordinator.reclaim_trigger_len()
+    );
+    if coordinator.is_reclaim_stalled() {
+        println!(
+            "  reclaim is stalled ({} stall(s) recorded)",
+            coordinator.reclaim_stalls()
+        );
+    }
     let blockers = coordinator.reclaim_blockers();
     if !blockers.is_empty() {
-        println!("reclaim still blocked by pools: {blockers:?}");
+        println!("  reclaim still blocked by pools: {blockers:?}");
     }
+    if coordinator.replay_lease_count() > 0 {
+        println!(
+            "  replay leases: {} active, oldest LSN {}, lag {} bytes",
+            coordinator.replay_lease_count(),
+            coordinator
+                .oldest_replay_lease_lsn()
+                .map_or_else(|| "none".to_owned(), |lsn| lsn.to_string()),
+            coordinator
+                .replay_lease_lag_bytes()
+                .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string())
+        );
+    }
+
+    let coverage: Vec<String> = ShardType::ALL
+        .iter()
+        .map(|shard| format!("{}={}", shard.as_str(), db.pool(*shard).durable_coverage()))
+        .collect();
+    println!("  pool coverage: {}", coverage.join(" "));
+    let timings: Vec<String> = checkpoints
+        .iter()
+        .map(|(shard, elapsed)| format!("{}={elapsed:.1?}", shard.as_str()))
+        .collect();
+    println!("  checkpoint calls: {}", timings.join(" "));
     Ok(())
+}
+
+/// A read-only snapshot of a WAL segment's numbering as found on disk.
+///
+/// Uses the file header for the base and the last live group for the next
+/// numbers; a header-only segment records the next numbers as its base.
+fn wal_position_on_disk(path: &Path) -> Option<mtxdb::journal::SegmentPosition> {
+    let scan = mtxdb::journal::Journal::scan_read_only(path).ok()?;
+    let last = scan.groups.last();
+    Some(mtxdb::journal::SegmentPosition {
+        base_sequence: scan.base_sequence,
+        next_sequence: last.map_or(scan.base_sequence, |group| group.sequence.saturating_add(1)),
+        base_lsn: scan.base_lsn,
+        next_lsn: last.map_or(scan.base_lsn, |group| group.last_lsn.saturating_add(1)),
+        groups: u64::try_from(scan.groups.len()).unwrap_or(u64::MAX),
+    })
+}
+
+/// The live LSN range of a segment, or its base when it holds no groups.
+fn retained_lsns(position: mtxdb::journal::SegmentPosition) -> String {
+    if position.groups == 0 {
+        return format!("empty (base {})", position.base_lsn);
+    }
+    let end = position.next_lsn.saturating_sub(1);
+    format!("{}..={end}", position.base_lsn)
+}
+
+/// The live sequence range of a segment, or the next sequence when it holds no
+/// groups.
+fn retained_sequences(position: mtxdb::journal::SegmentPosition) -> String {
+    if position.groups == 0 {
+        return format!("empty (next {})", position.next_sequence);
+    }
+    let end = position.next_sequence.saturating_sub(1);
+    format!("{}..={end}", position.base_sequence)
 }
 
 fn cmd_sync_single(cli: &Cli, all: bool) -> anyhow::Result<()> {

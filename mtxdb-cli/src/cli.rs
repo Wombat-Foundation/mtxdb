@@ -761,6 +761,14 @@ fn sub_sync() -> Command {
 fn sub_reclaim_wal() -> Command {
     Command::new("reclaim-wal")
         .about("Checkpoint every pool and reclaim the shared write-ahead log")
+        .long_about(
+            "Checkpoint every pool and reclaim the shared write-ahead log.\n\n".to_owned()
+                + "`-t` is ignored: a group in the shared segment can only be dropped once \
+                   every pool that contributed a frame to it has reported coverage, so all \
+                   pools are checkpointed. The report covers bytes, retained groups, the LSN \
+                   and sequence windows, each pool's coverage, and checkpoint timings. It is \
+                   printed to stdout/stderr only; mtxdb writes no log file for it.",
+        )
 }
 
 fn sub_completions() -> Command {

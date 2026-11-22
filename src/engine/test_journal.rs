@@ -1,7 +1,7 @@
 use super::{
     changes_since_full_scans, set_changes_since_before_read_hook,
     set_changes_since_force_untrusted, BackgroundFailure, BackgroundState, GroupCommitConfig,
-    Journal, JournalCoordinator, Mutation, MAX_RECLAIM_TRIGGER_LEN,
+    Journal, JournalCoordinator, Mutation, SegmentPosition, MAX_RECLAIM_TRIGGER_LEN,
 };
 use super::{TxnStage, TxnStageState};
 use std::fs;
@@ -2555,6 +2555,59 @@ fn shared_reclaim_honors_replay_lease_across_pool_coverage() {
     coordinator.reclaim_shared().unwrap();
     let error = coordinator.changes_since(&cursor, 8).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn segment_position_moves_the_base_but_not_the_next_number_on_reclaim() {
+    use crate::layout::ShardType;
+
+    let dir = ReplayTestDir::new("segment_position");
+    let path = dir.journal_path();
+    let (journal, scan) = Journal::open_shared(&path).unwrap();
+    let coordinator = JournalCoordinator::new(journal, &scan);
+    coordinator.enable_publish_signal().unwrap();
+
+    let initial = coordinator.segment_position();
+    assert_eq!(
+        initial,
+        SegmentPosition {
+            base_sequence: 1,
+            next_sequence: 1,
+            base_lsn: 1,
+            next_lsn: 1,
+            groups: 0,
+        }
+    );
+
+    let first = coordinator
+        .publish_group_tagged(ShardType::State, &[put(1, 1, b"snapshot")])
+        .unwrap();
+    coordinator.sync().unwrap();
+    let second = coordinator
+        .publish_group_tagged(ShardType::EventDag, &[put(2, 2, b"event")])
+        .unwrap();
+    coordinator.sync().unwrap();
+
+    let before = coordinator.segment_position();
+    assert_eq!(before.groups, 2);
+    assert_eq!(before.base_sequence, first.sequence);
+    assert_eq!(before.base_lsn, first.first_lsn);
+    assert_eq!(before.next_sequence, second.sequence.saturating_add(1));
+    assert_eq!(before.next_lsn, second.last_lsn.saturating_add(1));
+
+    coordinator.report_pool_coverage(ShardType::State, second.last_lsn);
+    coordinator.report_pool_coverage(ShardType::EventDag, second.last_lsn);
+    let reclaimed = coordinator.reclaim_shared().unwrap().unwrap();
+    assert!(reclaimed.reclaimed_bytes > 0);
+
+    // Reclaim drops assigned groups: the retained window's base becomes the
+    // next number, while nothing new is assigned.
+    let after = coordinator.segment_position();
+    assert_eq!(after.groups, 0);
+    assert_eq!(after.base_sequence, before.next_sequence);
+    assert_eq!(after.base_lsn, before.next_lsn);
+    assert_eq!(after.next_sequence, before.next_sequence);
+    assert_eq!(after.next_lsn, before.next_lsn);
 }
 
 #[test]

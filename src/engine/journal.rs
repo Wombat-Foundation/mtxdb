@@ -1545,6 +1545,25 @@ pub struct GroupDirectoryStats {
     pub allocated_bytes: u64,
 }
 
+/// The live numbering of a journal segment: what reclaim has left, and what the
+/// next append will take. Read from the in-memory header and group directory,
+/// so this never scans the segment file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentPosition {
+    /// Sequence of the oldest live group, or the sequence the next group would
+    /// take when the segment holds none.
+    pub base_sequence: u64,
+    /// Sequence the next appended group will take.
+    pub next_sequence: u64,
+    /// LSN of the first mutation of the oldest live group, or the LSN the next
+    /// group would take when the segment holds none.
+    pub base_lsn: u64,
+    /// LSN the next appended mutation will take.
+    pub next_lsn: u64,
+    /// Complete committed groups currently in the segment.
+    pub groups: u64,
+}
+
 /// The smallest group the format allows: a header, one mutation frame and a
 /// trailer.
 const MIN_GROUP_LEN: u64 = (GROUP_HEADER_LEN + MIN_FRAME_LEN + GROUP_TRAILER_LEN) as u64;
@@ -1633,6 +1652,10 @@ pub struct Scan {
     /// there are no groups to compare but the base still moved past what the
     /// reader's index incorporated.
     pub base_lsn: u64,
+    /// Sequence the segment's first group would carry — the file header's base
+    /// sequence. Like [`Self::base_lsn`], this survives a reclaim that removed
+    /// every group.
+    pub base_sequence: u64,
     /// The last bytes (up to [`CONSUMED_TAIL_LEN`]) of the complete groups this
     /// scan consumed, never reaching into the file header. A read-only overlay
     /// remembers them, appended to what it already remembered, so it later
@@ -1667,6 +1690,7 @@ impl Scan {
             valid_len: 0,
             truncated_tail: false,
             base_lsn: 0,
+            base_sequence: 0,
             consumed_tail: Vec::new(),
             group_ends: Vec::new(),
         }
@@ -4191,6 +4215,24 @@ impl JournalCoordinator {
         self.journal.lock().file_len
     }
 
+    /// The segment's live LSN and sequence numbering without scanning it.
+    ///
+    /// A reclaim moves the base forward but never changes `next_lsn` or
+    /// `next_sequence`: reclaim drops already-assigned groups, it does not
+    /// assign new numbers. Compare two snapshots to see how far reclaim advanced
+    /// the retained window.
+    #[must_use]
+    pub fn segment_position(&self) -> SegmentPosition {
+        let journal = self.journal.lock();
+        SegmentPosition {
+            base_sequence: journal.base_sequence,
+            next_sequence: journal.next_sequence,
+            base_lsn: journal.base_lsn,
+            next_lsn: journal.next_lsn,
+            groups: journal.directory_stats().groups,
+        }
+    }
+
     /// Largest the segment may grow before commits are refused.
     #[must_use]
     pub fn segment_cap(&self) -> u64 {
@@ -4877,7 +4919,7 @@ impl Journal {
         file.seek(SeekFrom::Start(0))?;
         let mut header = vec![0; FILE_HEADER_LEN];
         file.read_exact(&mut header)?;
-        let (_base_sequence, base_lsn) = validate_file_header(&header)?;
+        let (base_sequence, base_lsn) = validate_file_header(&header)?;
         let scan_end = end.min(len);
         if start >= scan_end {
             return Ok(Scan {
@@ -4885,6 +4927,7 @@ impl Journal {
                 valid_len: start.min(scan_end),
                 truncated_tail: false,
                 base_lsn,
+                base_sequence,
                 consumed_tail: Vec::new(),
                 group_ends: Vec::new(),
             });
@@ -4893,9 +4936,15 @@ impl Journal {
         let mut tail = Vec::new();
         file.take(scan_end.saturating_sub(start))
             .read_to_end(&mut tail)?;
-        scan_groups_from(&tail, start, 0, expected_lsn, base_lsn, || {
-            read_durable_len_from_header(&header, len)
-        })
+        scan_groups_from(
+            &tail,
+            start,
+            0,
+            expected_lsn,
+            base_lsn,
+            base_sequence,
+            || read_durable_len_from_header(&header, len),
+        )
     }
 
     /// Read up to `max_len` bytes of the segment ending at `end_offset` from an
@@ -5596,6 +5645,7 @@ impl Journal {
                 first.sequence,
                 first.first_lsn,
                 new_base_lsn,
+                first.sequence,
                 || u64::MAX,
             ) else {
                 return self.reclaim_through_scan(covered_lsn);
@@ -6179,6 +6229,7 @@ fn scan_bytes(
         base_sequence,
         base_lsn,
         base_lsn,
+        base_sequence,
         durable_len,
     )
 }
@@ -6289,6 +6340,7 @@ fn scan_groups_from(
     mut expected_sequence: u64,
     mut expected_lsn: u64,
     segment_base_lsn: u64,
+    segment_base_sequence: u64,
     durable_len: impl Fn() -> u64,
 ) -> io::Result<Scan> {
     let mut cursor = 0usize;
@@ -6348,6 +6400,7 @@ fn scan_groups_from(
         valid_len,
         truncated_tail,
         base_lsn: segment_base_lsn,
+        base_sequence: segment_base_sequence,
         consumed_tail,
         group_ends,
     })
