@@ -12,13 +12,15 @@ use anyhow::{anyhow, bail, Context};
 use mtxdb::auxiliary::AuxiliaryIndex;
 use mtxdb::csr_adjacency::{CsrAdjacency, EventRecord, AUTH, PREV};
 use mtxdb::export_schema::{RejectionCode, SoftFailCode};
-use mtxdb::packfile::layout::{avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout};
+use mtxdb::packfile::layout::{
+    avoidable_spread_bytes, physical_layout, CollectionPhysicalLayout, PhysicalLayout,
+};
 use mtxdb::packfile::storage::{CollectionSummary, OpenPath, RuntimeStats};
 use mtxdb::packfile::PackId;
 use mtxdb::room_auth::{RoomAuth, MAX_BATCH_EVENTS};
 use mtxdb::room_flag::{Flag, FlagChange, FlagQuery, RoomFlagIndex};
 use mtxdb::server_keys::KeyTier;
-use mtxdb::shard::ShardPool;
+use mtxdb::shard::{ShardPool, MAX_SHARD_BYTES};
 use mtxdb::state_group::{StateGroupDerivation, StateGroupTrust};
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{
@@ -16167,6 +16169,93 @@ fn resolve_repack_slots(
     ))
 }
 
+/// Print the physical islands a repack would combine, before and after.
+///
+/// Current counts match `mtxdb shards --layout`: a run is one maximal
+/// contiguous stretch of a single collection, "excess" is runs beyond one per
+/// collection per pack, and superseded frames are included because that is
+/// what the physical scan sees. Repack writes each collection as one
+/// contiguous stretch, so the projected count is one island per collection plus
+/// at most one split per output-pack boundary. The output size is an upper
+/// bound (input minus pruned bytes), which deliberately over-counts superseded
+/// frames the repack will not copy.
+fn print_repack_layout_preview(
+    physical: &PhysicalLayout,
+    pack_ids: &[PackId],
+    collections: &[[u8; 16]],
+    total_input_bytes: u64,
+    total_dropped_bytes: u64,
+) {
+    let current_runs: u64 = pack_ids
+        .iter()
+        .filter_map(|pack_id| physical.packs.get(pack_id))
+        .map(|stats| stats.segments)
+        .sum();
+    if current_runs == 0 {
+        return;
+    }
+    let current_excess: u64 = pack_ids
+        .iter()
+        .filter_map(|pack_id| physical.packs.get(pack_id))
+        .map(|stats| {
+            stats
+                .segments
+                .saturating_sub(stats.collections.len() as u64)
+        })
+        .sum();
+    let collection_count = u64::try_from(collections.len()).unwrap_or(u64::MAX);
+    let output_upper_bound = total_input_bytes.saturating_sub(total_dropped_bytes);
+    let projected_packs = if collections.is_empty() {
+        0
+    } else {
+        output_upper_bound.div_ceil(MAX_SHARD_BYTES).max(1)
+    };
+    let projected_runs = if collections.is_empty() {
+        0
+    } else {
+        collection_count.saturating_add(projected_packs.saturating_sub(1))
+    };
+    let projected_excess = projected_runs.saturating_sub(collection_count);
+    let combined = current_runs.saturating_sub(projected_runs);
+    println!(
+        "layout before: {current_runs} contiguous runs across {} pack{} ({current_excess} excess from interleaving)",
+        pack_ids.len(),
+        if pack_ids.len() == 1 { "" } else { "s" },
+    );
+    println!(
+        "layout after:  <= {projected_runs} contiguous runs across <= {projected_packs} pack{} ({projected_excess} boundary split{}); each collection becomes one contiguous island",
+        if projected_packs == 1 { "" } else { "s" },
+        if projected_excess == 1 { "" } else { "s" },
+    );
+    println!(
+        "               {combined} island{} combined",
+        if combined == 1 { "" } else { "s" },
+    );
+
+    let mut fragmented: Vec<(u64, [u8; 16])> = collections
+        .iter()
+        .filter_map(|collection_id| {
+            physical
+                .collections
+                .get(collection_id)
+                .map(|stats| (stats.segments, *collection_id))
+        })
+        .filter(|(segments, _)| *segments > 1)
+        .collect();
+    fragmented
+        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    if !fragmented.is_empty() {
+        println!("most fragmented collections:");
+        for (segments, collection_id) in fragmented.into_iter().take(5) {
+            println!("  {}: {segments} islands -> 1", format_id(&collection_id));
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "preflight prints one coherent plan; splitting it would hide the sequence"
+)]
 fn repack_preview(
     cli: &Cli,
     target: &RepackTarget,
@@ -16230,6 +16319,9 @@ fn repack_preview(
         .map(PackId::filename_stem)
         .collect::<Vec<_>>()
         .join(", ");
+    let physical = selected_pool_dir(cli)
+        .ok()
+        .and_then(|dir| physical_layout(&dir).ok());
 
     println!(
         "this will repack {} collection{} across {} pack{} ({pack_labels})",
@@ -16260,6 +16352,15 @@ fn repack_preview(
         "                 {total_dropped} nodes / {} pruned",
         fmt_bytes(total_dropped_bytes),
     );
+    if let Some(physical) = &physical {
+        print_repack_layout_preview(
+            physical,
+            &pack_ids,
+            &collections,
+            total_input_bytes,
+            total_dropped_bytes,
+        );
+    }
     // preview_store (and its non-exclusive read-only handle) drops
     // here, before the confirmation prompt — nothing about a
     // read-only open blocks a real writer anyway, but there's no
