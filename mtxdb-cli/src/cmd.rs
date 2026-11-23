@@ -698,12 +698,11 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         }
         Commands::AuthCheck {
             room,
-            namespace,
             state_members,
             limit,
         } => {
             cli.require_single_dir("auth-check")?;
-            cmd_auth_check(cli, room, namespace, *state_members, *limit)
+            cmd_auth_check(cli, room, *state_members, *limit)
         }
         Commands::Members { room, json } => {
             cli.require_single_dir("members")?;
@@ -16812,11 +16811,10 @@ fn cmd_members(cli: &Cli, room: &str, json: bool) -> anyhow::Result<()> {
 fn cmd_auth_check(
     cli: &Cli,
     room: &str,
-    namespace: &str,
     check_state_members: bool,
     limit: usize,
 ) -> anyhow::Result<()> {
-    use crate::auth_check::{event_node_id, event_record_json, EventAuth};
+    use crate::auth_check::{event_record_json, EventAuth};
 
     if !room.starts_with('!') {
         bail!("auth-check takes a Matrix room ID (starting with `!`), got `{room}`");
@@ -16831,6 +16829,81 @@ fn cmd_auth_check(
         .context("failed to open the event pool")?;
     event_store.set_read_plan_policy(cli.read_plan);
 
+    // Event ids are derived from each record's own JSON (reference hash under
+    // the room's version), so no key salt is needed to find a record. Records
+    // whose id cannot be derived (room versions 1-2, unparsable JSON) are
+    // reported as unreadable.
+    struct Scanned {
+        node_id: [u8; 16],
+        is_state: bool,
+        auth: EventAuth,
+    }
+    let mut raw: Vec<([u8; 16], Result<OwnedValue, String>)> = Vec::new();
+    for entry in event_store.scan_collection(&event_collection)? {
+        let (node_id, data) = entry?;
+        if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID || data.bytes.is_empty() {
+            continue;
+        }
+        let parsed = event_record_json(&data.bytes).and_then(|json| {
+            OwnedValue::parse_bytes(json).map_err(|error| format!("not valid JSON: {error}"))
+        });
+        raw.push((node_id, parsed));
+    }
+    let room_version = raw.iter().find_map(|(_, parsed)| {
+        let value = parsed.as_ref().ok()?;
+        (value.get("type").and_then(OwnedValue::as_str) == Some("m.room.create"))
+            .then(|| {
+                value
+                    .get("content")
+                    .and_then(|c| c.get("room_version"))
+                    .and_then(OwnedValue::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten()
+    });
+    let mut scanned: HashMap<String, Scanned> = HashMap::new();
+    for (node_id, parsed) in raw {
+        let (event_id, entry) = match (parsed, room_version.as_deref()) {
+            (Ok(value), Some(version)) => match rezzy::reference_hash(&value, version) {
+                Ok(hash) => (
+                    format!("${hash}"),
+                    Scanned {
+                        node_id,
+                        is_state: value.get("state_key").is_some(),
+                        auth: EventAuth::Ids(crate::auth_check::authoritative_auth_ids(&value)),
+                    },
+                ),
+                Err(reason) => (
+                    format!("<node {}>", hex::encode(node_id)),
+                    Scanned {
+                        node_id,
+                        is_state: false,
+                        auth: EventAuth::Unreadable(format!("event id not derivable: {reason}")),
+                    },
+                ),
+            },
+            (Ok(_), None) => (
+                format!("<node {}>", hex::encode(node_id)),
+                Scanned {
+                    node_id,
+                    is_state: false,
+                    auth: EventAuth::Unreadable(
+                        "room has no m.room.create room_version".to_owned(),
+                    ),
+                },
+            ),
+            (Err(reason), _) => (
+                format!("<node {}>", hex::encode(node_id)),
+                Scanned {
+                    node_id,
+                    is_state: false,
+                    auth: EventAuth::Unreadable(reason),
+                },
+            ),
+        };
+        scanned.insert(event_id, entry);
+    }
+
     let report = crate::auth_check::check(
         |id| {
             store
@@ -16838,41 +16911,25 @@ fn cmd_auth_check(
                 .map(|data| data.map(|d| d.bytes.to_vec()))
         },
         |event_id| {
-            let node = event_node_id(namespace, event_id);
-            let Some(data) = event_store.get(&event_collection, &node)? else {
-                return Ok(EventAuth::Absent);
-            };
-            let parsed = event_record_json(&data.bytes).and_then(|json| {
-                OwnedValue::parse_bytes(json).map_err(|error| format!("not valid JSON: {error}"))
-            });
-            Ok(match parsed {
-                Ok(value) => EventAuth::Ids(crate::auth_check::authoritative_auth_ids(&value)),
-                Err(reason) => EventAuth::Unreadable(reason),
+            Ok(match scanned.get(event_id) {
+                None => EventAuth::Absent,
+                Some(entry) => match &entry.auth {
+                    EventAuth::Ids(ids) => EventAuth::Ids(ids.clone()),
+                    EventAuth::Unreadable(reason) => EventAuth::Unreadable(reason.clone()),
+                    EventAuth::Absent => EventAuth::Absent,
+                },
             })
         },
     )?;
 
     // Persisted state events no short id names: closures are built only for
     // state events, so a message event with no short id is expected.
-    let known: HashSet<[u8; 16]> = report
-        .names
-        .values()
-        .map(|event_id| event_node_id(namespace, event_id))
+    let named: HashSet<&String> = report.names.values().collect();
+    let unembedded: Vec<[u8; 16]> = scanned
+        .iter()
+        .filter(|(event_id, entry)| entry.is_state && !named.contains(event_id))
+        .map(|(_, entry)| entry.node_id)
         .collect();
-    let mut unembedded: Vec<[u8; 16]> = Vec::new();
-    for entry in event_store.scan_collection(&event_collection)? {
-        let (node_id, data) = entry?;
-        if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID || known.contains(&node_id) {
-            continue;
-        }
-        let is_state = event_record_json(&data.bytes)
-            .ok()
-            .and_then(|json| OwnedValue::parse_bytes(json).ok())
-            .is_some_and(|value| value.get("state_key").is_some());
-        if is_state {
-            unembedded.push(node_id);
-        }
-    }
 
     let missing_state_members = if check_state_members {
         collect_missing_state_members(&store, room, &collection_id)?

@@ -24,7 +24,7 @@
 //! The record layout belongs to the homeserver, not to this crate: the key
 //! derivations and encoding below mirror sithnapse's
 //! `rust/src/database/mtxdb_syn.rs` (`short_id_*_node_id`,
-//! `encode_auth_edges`, `event_node_id`, `_encode_event_json_record`). If that layout changes, this check must change with
+//! `encode_auth_edges`, `_encode_event_json_record`). If that layout changes, this check must change with
 //! it; a version mismatch is reported rather than guessed at.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,17 +56,6 @@ pub(crate) fn edge_node_id(short_id: u32) -> NodeId {
 
 pub(crate) fn reverse_node_id(short_id: u32) -> NodeId {
     node_id(&[b"authchain:rev:", &short_id.to_be_bytes()])
-}
-
-/// The node id sithnapse stores an event's JSON record under in the room's
-/// `EventDag` collection.
-pub(crate) fn event_node_id(namespace: &str, event_id: &str) -> NodeId {
-    node_id(&[
-        b"event_json:event:",
-        namespace.as_bytes(),
-        b"\0",
-        event_id.as_bytes(),
-    ])
 }
 
 /// The node id sithnapse stores an event's auth short id under in the room's
@@ -499,12 +488,6 @@ mod tests {
         let mut bad = record.clone();
         bad[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(event_record_json(&bad).is_err());
-    }
-
-    #[test]
-    fn event_node_id_is_namespaced_and_stable() {
-        assert_eq!(event_node_id("ns", "$e"), event_node_id("ns", "$e"));
-        assert_ne!(event_node_id("ns", "$e"), event_node_id("other", "$e"));
     }
 
     #[test]

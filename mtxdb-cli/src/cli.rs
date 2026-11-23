@@ -288,7 +288,6 @@ pub(crate) enum Commands {
     },
     AuthCheck {
         room: String,
-        namespace: String,
         state_members: bool,
         limit: usize,
     },
@@ -1365,14 +1364,6 @@ fn sub_auth_check() -> Command {
                 .help("Matrix room ID, e.g. !room:server"),
         )
         .arg(
-            Arg::new("namespace")
-                .long("namespace")
-                .short('n')
-                .required(true)
-                .value_name("NAMESPACE")
-                .help("The homeserver's embedded_db namespace (event records are keyed by it)"),
-        )
-        .arg(
             Arg::new("state-members")
                 .long("state-members")
                 .action(ArgAction::SetTrue)
@@ -1865,7 +1856,6 @@ fn parse_cli() -> Cli {
         },
         Some(("auth-check", m)) => Commands::AuthCheck {
             room: m.get_one::<String>("room").unwrap().clone(),
-            namespace: m.get_one::<String>("namespace").unwrap().clone(),
             state_members: m.get_flag("state-members"),
             limit: *m.get_one::<usize>("limit").unwrap(),
         },
