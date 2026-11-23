@@ -16806,40 +16806,26 @@ fn cmd_members(cli: &Cli, room: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `auth-check`: re-derive a room's auth graph from its event records and
-/// compare it with the embedded edge table.
-fn cmd_auth_check(
-    cli: &Cli,
-    room: &str,
-    check_state_members: bool,
-    limit: usize,
-) -> anyhow::Result<()> {
-    use crate::auth_check::{event_record_json, EventAuth};
+/// One event record found by scanning a room's event collection.
+struct ScannedEvent {
+    node_id: [u8; 16],
+    is_state: bool,
+    auth: crate::auth_check::EventAuth,
+}
 
-    if !room.starts_with('!') {
-        bail!("auth-check takes a Matrix room ID (starting with `!`), got `{room}`");
-    }
-    let collection_id = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room.as_bytes());
-    let event_collection = matrix_room_collection_id(room);
-    let layout = open_layout(cli)?;
-    let store = open_pool_read_only(pool_dir(&layout, ShardType::State)?)
-        .context("failed to open the state pool")?;
-    store.set_read_plan_policy(cli.read_plan);
-    let event_store = open_pool_read_only(pool_dir(&layout, ShardType::EventDag)?)
-        .context("failed to open the event pool")?;
-    event_store.set_read_plan_policy(cli.read_plan);
+/// Scan a room's event collection and key each record by its derived event id.
+fn scan_room_events(
+    event_store: &PackfileStorage,
+    event_collection: &[u8; 16],
+) -> anyhow::Result<HashMap<String, ScannedEvent>> {
+    use crate::auth_check::{event_record_json, EventAuth};
 
     // Event ids are derived from each record's own JSON (reference hash under
     // the room's version), so no key salt is needed to find a record. Records
     // whose id cannot be derived (room versions 1-2, unparsable JSON) are
     // reported as unreadable.
-    struct Scanned {
-        node_id: [u8; 16],
-        is_state: bool,
-        auth: EventAuth,
-    }
     let mut raw: Vec<([u8; 16], Result<OwnedValue, String>)> = Vec::new();
-    for entry in event_store.scan_collection(&event_collection)? {
+    for entry in event_store.scan_collection(event_collection)? {
         let (node_id, data) = entry?;
         if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID || data.bytes.is_empty() {
             continue;
@@ -16861,13 +16847,13 @@ fn cmd_auth_check(
             })
             .flatten()
     });
-    let mut scanned: HashMap<String, Scanned> = HashMap::new();
+    let mut scanned: HashMap<String, ScannedEvent> = HashMap::new();
     for (node_id, parsed) in raw {
         let (event_id, entry) = match (parsed, room_version.as_deref()) {
             (Ok(value), Some(version)) => match rezzy::reference_hash(&value, version) {
                 Ok(hash) => (
                     format!("${hash}"),
-                    Scanned {
+                    ScannedEvent {
                         node_id,
                         is_state: value.get("state_key").is_some(),
                         auth: EventAuth::Ids(crate::auth_check::authoritative_auth_ids(&value)),
@@ -16875,7 +16861,7 @@ fn cmd_auth_check(
                 ),
                 Err(reason) => (
                     format!("<node {}>", hex::encode(node_id)),
-                    Scanned {
+                    ScannedEvent {
                         node_id,
                         is_state: false,
                         auth: EventAuth::Unreadable(format!("event id not derivable: {reason}")),
@@ -16884,7 +16870,7 @@ fn cmd_auth_check(
             },
             (Ok(_), None) => (
                 format!("<node {}>", hex::encode(node_id)),
-                Scanned {
+                ScannedEvent {
                     node_id,
                     is_state: false,
                     auth: EventAuth::Unreadable(
@@ -16894,7 +16880,7 @@ fn cmd_auth_check(
             ),
             (Err(reason), _) => (
                 format!("<node {}>", hex::encode(node_id)),
-                Scanned {
+                ScannedEvent {
                     node_id,
                     is_state: false,
                     auth: EventAuth::Unreadable(reason),
@@ -16903,6 +16889,33 @@ fn cmd_auth_check(
         };
         scanned.insert(event_id, entry);
     }
+    Ok(scanned)
+}
+
+/// `auth-check`: re-derive a room's auth graph from its event records and
+/// compare it with the embedded edge table.
+fn cmd_auth_check(
+    cli: &Cli,
+    room: &str,
+    check_state_members: bool,
+    limit: usize,
+) -> anyhow::Result<()> {
+    use crate::auth_check::EventAuth;
+
+    if !room.starts_with('!') {
+        bail!("auth-check takes a Matrix room ID (starting with `!`), got `{room}`");
+    }
+    let collection_id = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room.as_bytes());
+    let event_collection = matrix_room_collection_id(room);
+    let layout = open_layout(cli)?;
+    let store = open_pool_read_only(pool_dir(&layout, ShardType::State)?)
+        .context("failed to open the state pool")?;
+    store.set_read_plan_policy(cli.read_plan);
+    let event_store = open_pool_read_only(pool_dir(&layout, ShardType::EventDag)?)
+        .context("failed to open the event pool")?;
+    event_store.set_read_plan_policy(cli.read_plan);
+
+    let scanned = scan_room_events(&event_store, &event_collection)?;
 
     let report = crate::auth_check::check(
         |id| {
