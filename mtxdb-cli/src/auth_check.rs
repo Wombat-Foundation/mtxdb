@@ -69,6 +69,12 @@ pub(crate) fn event_node_id(namespace: &str, event_id: &str) -> NodeId {
     ])
 }
 
+/// The node id sithnapse stores an event's auth short id under in the room's
+/// `AUTH` collection.
+pub(crate) fn forward_node_id(event_id: &str) -> NodeId {
+    node_id(&[b"authchain:fwd:", event_id.as_bytes()])
+}
+
 /// The JSON bytes of an event record:
 /// `[i32 format_version][u32 metadata_len][internal_metadata][json]`, big-endian.
 pub(crate) fn event_record_json(bytes: &[u8]) -> Result<&[u8], String> {
@@ -138,6 +144,73 @@ pub(crate) struct Mismatch {
     pub(crate) missing: Vec<String>,
     /// In the embedded edges but absent from `auth_events`.
     pub(crate) extra: Vec<String>,
+}
+
+/// A state-HAMT member whose event has no auth short id.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MissingStateMember {
+    pub(crate) event_id: String,
+    /// State groups that hold this member, sorted.
+    pub(crate) groups: Vec<[u8; 16]>,
+}
+
+/// Compare state-HAMT membership with the AUTH forward map.
+///
+/// `groups` is `(state group id, member event ids)`. An event that appears in
+/// several groups is reported once, with every group that names it. Each event
+/// is looked up once, so repeated memberships cost only the group bookkeeping.
+pub(crate) fn missing_state_members<E>(
+    groups: impl IntoIterator<Item = ([u8; 16], Vec<String>)>,
+    mut forward_present: impl FnMut(&str) -> Result<bool, E>,
+) -> Result<Vec<MissingStateMember>, E> {
+    let mut absent: BTreeMap<String, BTreeSet<[u8; 16]>> = BTreeMap::new();
+    let mut checked: BTreeMap<String, bool> = BTreeMap::new();
+    for (group_id, event_ids) in groups {
+        for event_id in event_ids {
+            let present = if let Some(present) = checked.get(&event_id).copied() {
+                present
+            } else {
+                let present = forward_present(&event_id)?;
+                checked.insert(event_id.clone(), present);
+                present
+            };
+            if !present {
+                absent.entry(event_id).or_default().insert(group_id);
+            }
+        }
+    }
+    Ok(absent
+        .into_iter()
+        .map(|(event_id, groups)| MissingStateMember {
+            event_id,
+            groups: groups.into_iter().collect(),
+        })
+        .collect())
+}
+
+/// The auth event ids a stored event record implies.
+///
+/// Room v4+ stores the room ID in the event and deliberately omits the create
+/// event from `auth_events`: the create event ID is implicit, derived from the
+/// room ID by replacing the leading `!` with `$`. The homeserver's own
+/// `Event::auth_event_ids` appends it, and the embedded edges are built from
+/// that, so the comparison must append it too. Older formats have no `room_id`
+/// field and list every auth event explicitly.
+pub(crate) fn authoritative_auth_ids(value: &rezzy::json::Value) -> Vec<String> {
+    let mut ids = crate::state_resolve::reference_list(value, "auth_events");
+    let is_create = value.get("type").and_then(rezzy::json::Value::as_str) == Some("m.room.create")
+        && value.get("state_key").and_then(rezzy::json::Value::as_str) == Some("");
+    if !is_create {
+        if let Some(room_id) = value.get("room_id").and_then(rezzy::json::Value::as_str) {
+            if let Some(local) = room_id.strip_prefix('!') {
+                let create_event_id = format!("${local}");
+                if !ids.contains(&create_event_id) {
+                    ids.push(create_event_id);
+                }
+            }
+        }
+    }
+    ids
 }
 
 /// What an event record says about an event's auth events.
@@ -432,5 +505,100 @@ mod tests {
     fn event_node_id_is_namespaced_and_stable() {
         assert_eq!(event_node_id("ns", "$e"), event_node_id("ns", "$e"));
         assert_ne!(event_node_id("ns", "$e"), event_node_id("other", "$e"));
+    }
+
+    #[test]
+    fn authoritative_auth_ids_adds_the_implicit_create_event_for_v4_rooms() {
+        let value = rezzy::json::Value::parse_bytes(
+            br#"{"type":"m.room.member","state_key":"@a:x","room_id":"!room:x",
+                 "auth_events":["$a","$b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            authoritative_auth_ids(&value),
+            vec!["$a".to_owned(), "$b".to_owned(), "$room:x".to_owned()]
+        );
+    }
+
+    #[test]
+    fn authoritative_auth_ids_leaves_the_create_event_alone() {
+        let value = rezzy::json::Value::parse_bytes(
+            br#"{"type":"m.room.create","state_key":"","room_id":"!room:x",
+                 "auth_events":[]}"#,
+        )
+        .unwrap();
+        assert!(authoritative_auth_ids(&value).is_empty());
+    }
+
+    #[test]
+    fn authoritative_auth_ids_keeps_v1_events_as_stored() {
+        let value = rezzy::json::Value::parse_bytes(
+            br#"{"type":"m.room.member","state_key":"@a:x",
+                 "auth_events":[["$create",{}],["$member",{}]]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            authoritative_auth_ids(&value),
+            vec!["$create".to_owned(), "$member".to_owned()]
+        );
+    }
+
+    #[test]
+    fn authoritative_auth_ids_does_not_duplicate_an_explicit_create_event() {
+        let value = rezzy::json::Value::parse_bytes(
+            br#"{"type":"m.room.member","state_key":"@a:x","room_id":"!room:x",
+                 "auth_events":["$room:x"]}"#,
+        )
+        .unwrap();
+        assert_eq!(authoritative_auth_ids(&value), vec!["$room:x".to_owned()]);
+    }
+
+    #[test]
+    fn state_members_without_a_forward_id_are_grouped_and_deduplicated() {
+        let groups = vec![
+            ([1u8; 16], vec!["$a".to_owned(), "$b".to_owned()]),
+            ([2u8; 16], vec!["$b".to_owned()]),
+        ];
+        let report =
+            missing_state_members(groups, |event_id| Ok::<_, Infallible>(event_id == "$a"))
+                .unwrap();
+        assert_eq!(
+            report,
+            vec![MissingStateMember {
+                event_id: "$b".to_owned(),
+                groups: vec![[1u8; 16], [2u8; 16]],
+            }]
+        );
+    }
+
+    #[test]
+    fn state_members_with_forward_ids_are_clean() {
+        let groups = vec![([1u8; 16], vec!["$a".to_owned()])];
+        assert!(missing_state_members(groups, |_| Ok::<_, Infallible>(true))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn state_members_are_looked_up_once() {
+        let groups = vec![
+            ([1u8; 16], vec!["$a".to_owned()]),
+            ([2u8; 16], vec!["$a".to_owned()]),
+        ];
+        let lookups = std::cell::Cell::new(0u32);
+        let report = missing_state_members(groups, |_| {
+            lookups.set(lookups.get() + 1);
+            Ok::<_, Infallible>(false)
+        })
+        .unwrap();
+        assert_eq!(lookups.get(), 1);
+        assert_eq!(report[0].groups, vec![[1u8; 16], [2u8; 16]]);
+    }
+
+    #[test]
+    fn forwarding_errors_propagate() {
+        let groups = vec![([1u8; 16], vec!["$a".to_owned()])];
+        let result: Result<_, &str> = missing_state_members(groups, |_| Err("boom"));
+        assert_eq!(result.unwrap_err(), "boom");
     }
 }

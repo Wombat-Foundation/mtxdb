@@ -443,6 +443,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Delete { .. } => "delete",
         Commands::Tombstones { .. } => "tombstones",
         Commands::AuthCheck { .. } => "auth-check",
+        Commands::Members { .. } => "members",
         Commands::Remove { .. } => "remove",
         Commands::Shards { .. } => "shards",
         Commands::Collections { .. } => "collections",
@@ -698,10 +699,15 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::AuthCheck {
             room,
             namespace,
+            state_members,
             limit,
         } => {
             cli.require_single_dir("auth-check")?;
-            cmd_auth_check(cli, room, namespace, *limit)
+            cmd_auth_check(cli, room, namespace, *state_members, *limit)
+        }
+        Commands::Members { room, json } => {
+            cli.require_single_dir("members")?;
+            cmd_members(cli, room, *json)
         }
         Commands::Tombstones {
             collection,
@@ -7104,7 +7110,15 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
         stats.min_size = Some(stats.min_size.map_or(size, |m| m.min(size)));
         stats.max_size = stats.max_size.max(size);
         let bytes = record.data.to_vec();
-        let parsed = OwnedValue::parse_bytes(&bytes).ok();
+        // The homeserver stores `[format_version][metadata_len][metadata][json]`;
+        // an imported collection stores the event JSON directly. Try the
+        // header first, but only accept a decoded payload that is an object,
+        // and fall back to the raw payload otherwise.
+        let json_bytes = crate::auth_check::event_record_json(&bytes)
+            .ok()
+            .filter(|json| json.first() == Some(&b'{'))
+            .unwrap_or(&bytes);
+        let parsed = OwnedValue::parse_bytes(json_bytes).ok();
         let Some(event @ OwnedValue::Object(_)) = parsed else {
             let kind = classify_record_payload(&record.data);
             let count = stats.kinds.entry(kind.to_owned()).or_default();
@@ -16750,9 +16764,58 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
     Ok(())
 }
 
+/// `members`: count a room's latest membership per user, from its event
+/// records. This is the same one-pass scan `info --stats` uses, without
+/// requiring Matrix room metadata that this server does not write.
+fn cmd_members(cli: &Cli, room: &str, json: bool) -> anyhow::Result<()> {
+    if !room.starts_with('!') {
+        bail!("members takes a Matrix room ID (starting with `!`), got `{room}`");
+    }
+    let layout = open_layout(cli)?;
+    let dir = pool_dir(&layout, ShardType::EventDag)?;
+    let collection_id = matrix_room_collection_id(room);
+    let stats = scan_room_event_stats(&dir, &collection_id)?;
+
+    let mut by_membership: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, membership) in stats.members.values() {
+        let count = by_membership.entry(membership.clone()).or_default();
+        *count = count.saturating_add(1);
+    }
+    let joined = by_membership.get("join").copied().unwrap_or(0);
+
+    if json {
+        let memberships = by_membership
+            .iter()
+            .map(|(membership, count)| format!("\"{membership}\":{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{{\"room\":\"{room}\",\"collection\":\"0x{}\",\"users\":{},\"join\":{joined},\
+             \"by_membership\":{{{memberships}}}}}",
+            hex::encode(collection_id),
+            stats.members.len(),
+        );
+    } else {
+        println!("room:                {room}");
+        println!("event collection:    0x{}", hex::encode(collection_id));
+        println!("distinct users:      {}", stats.members.len());
+        println!("joined (latest):     {joined}");
+        for (membership, count) in &by_membership {
+            println!("  {membership:<10} {count}");
+        }
+    }
+    Ok(())
+}
+
 /// `auth-check`: re-derive a room's auth graph from its event records and
 /// compare it with the embedded edge table.
-fn cmd_auth_check(cli: &Cli, room: &str, namespace: &str, limit: usize) -> anyhow::Result<()> {
+fn cmd_auth_check(
+    cli: &Cli,
+    room: &str,
+    namespace: &str,
+    check_state_members: bool,
+    limit: usize,
+) -> anyhow::Result<()> {
     use crate::auth_check::{event_node_id, event_record_json, EventAuth};
 
     if !room.starts_with('!') {
@@ -16783,9 +16846,7 @@ fn cmd_auth_check(cli: &Cli, room: &str, namespace: &str, limit: usize) -> anyho
                 OwnedValue::parse_bytes(json).map_err(|error| format!("not valid JSON: {error}"))
             });
             Ok(match parsed {
-                Ok(value) => {
-                    EventAuth::Ids(crate::state_resolve::reference_list(&value, "auth_events"))
-                }
+                Ok(value) => EventAuth::Ids(crate::auth_check::authoritative_auth_ids(&value)),
                 Err(reason) => EventAuth::Unreadable(reason),
             })
         },
@@ -16813,9 +16874,17 @@ fn cmd_auth_check(cli: &Cli, room: &str, namespace: &str, limit: usize) -> anyho
         }
     }
 
+    let missing_state_members = if check_state_members {
+        collect_missing_state_members(&store, room, &collection_id)?
+    } else {
+        Vec::new()
+    };
+
     print_auth_check_report(
         &report,
         &unembedded,
+        &missing_state_members,
+        check_state_members,
         &AuthCheckHeader {
             room,
             auth_collection: collection_id,
@@ -16824,6 +16893,48 @@ fn cmd_auth_check(cli: &Cli, room: &str, namespace: &str, limit: usize) -> anyho
         limit,
     );
     Ok(())
+}
+
+/// Compare authoritative persisted state-group members with the AUTH forward map.
+/// Multiple groups containing one event are reported on a single row.
+fn collect_missing_state_members(
+    store: &PackfileStorage,
+    room: &str,
+    auth_collection: &[u8; 16],
+) -> anyhow::Result<Vec<crate::auth_check::MissingStateMember>> {
+    let Some(groups_collection) = mtxdb::state_group_collection_id(room) else {
+        return Ok(Vec::new());
+    };
+    let mut groups = Vec::new();
+    let mut seen_xxp = false;
+    for item in store.scan_collection(&groups_collection)? {
+        let (group_id, _) = item?;
+        if group_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+            continue;
+        }
+        let Some(entries) = crate::state_hamt::load_state_group_entries(store, room, &group_id)?
+        else {
+            continue;
+        };
+        let event_ids = entries
+            .into_iter()
+            .map(|(_, _, event_id)| {
+                seen_xxp |= event_id.contains("xxpSMID");
+                event_id
+            })
+            .collect::<Vec<_>>();
+        groups.push((group_id, event_ids));
+    }
+    eprintln!(
+        "state-members diagnostic: groups={} xxp_present={seen_xxp}",
+        groups.len()
+    );
+    crate::auth_check::missing_state_members(groups, |event_id| {
+        let forward_id = crate::auth_check::forward_node_id(event_id);
+        Ok(store
+            .get(auth_collection, &forward_id)?
+            .is_none_or(|data| data.bytes.len() != 4))
+    })
 }
 
 /// Where an `auth-check` report was read from.
@@ -16836,6 +16947,8 @@ struct AuthCheckHeader<'a> {
 fn print_auth_check_report(
     report: &crate::auth_check::Report,
     unembedded: &[[u8; 16]],
+    missing_state_members: &[crate::auth_check::MissingStateMember],
+    state_members_checked: bool,
     header: &AuthCheckHeader<'_>,
     limit: usize,
 ) {
@@ -16848,7 +16961,12 @@ fn print_auth_check_report(
         "event collection:    {}",
         format_id(&header.event_collection)
     );
-    if report.allocated == 0 && report.corrupt.is_empty() && unembedded.is_empty() {
+    if report.allocated == 0
+        && report.corrupt.is_empty()
+        && unembedded.is_empty()
+        && missing_state_members.is_empty()
+        && !state_members_checked
+    {
         println!("no auth-chain short ids recorded for this room");
         return;
     }
@@ -16861,6 +16979,12 @@ fn print_auth_check_report(
     println!("unnamed short ids:   {}", report.unnamed.len());
     println!("bad event records:   {}", report.bad_records.len());
     println!("state events with no short id: {}", unembedded.len());
+    if state_members_checked {
+        println!(
+            "state members with no short id: {}",
+            missing_state_members.len()
+        );
+    }
     let name = |short_id: u32| {
         report
             .names
@@ -16911,6 +17035,15 @@ fn print_auth_check_report(
     }
     for node_id in unembedded.iter().take(shown) {
         println!("NO_SHORT_ID node={}", hex::encode(node_id));
+    }
+    for member in missing_state_members.iter().take(shown) {
+        let group_ids = member
+            .groups
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("NO_SHORT_ID group={group_ids} event={}", member.event_id);
     }
     for (short_id, reason) in report.corrupt.iter().take(shown) {
         println!("UNREADABLE short_id={short_id}: {reason}");

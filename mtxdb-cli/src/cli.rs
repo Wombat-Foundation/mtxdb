@@ -289,7 +289,12 @@ pub(crate) enum Commands {
     AuthCheck {
         room: String,
         namespace: String,
+        state_members: bool,
         limit: usize,
+    },
+    Members {
+        room: String,
+        json: bool,
     },
     Remove {
         collection: String,
@@ -419,6 +424,7 @@ fn build_cli() -> Command {
         .subcommand(sub_delete())
         .subcommand(sub_tombstones())
         .subcommand(sub_auth_check())
+        .subcommand(sub_members())
         .subcommand(sub_remove())
         .subcommand(sub_put())
         .subcommand(sub_get())
@@ -1345,7 +1351,9 @@ fn sub_auth_check() -> Command {
              short ids with no outbound edge record (a closure walk reports an incomplete \
              graph), events whose embedded edges differ from their `auth_events` (a \
              truncated or extra edge list), edge records with no event record, and \
-             persisted state events that have no short id at all. The record layouts are \
+             persisted state events that have no short id at all. With --state-members, \
+             also compare state-HAMT members against auth short ids (O(groups × entries)). \
+             The record layouts are \
              the homeserver's (sithnapse), not this crate's; an unknown record version is \
              reported, not guessed at. Reads the state and event pools. Read-only; \
              coexists with a running writer.",
@@ -1365,6 +1373,12 @@ fn sub_auth_check() -> Command {
                 .help("The homeserver's embedded_db namespace (event records are keyed by it)"),
         )
         .arg(
+            Arg::new("state-members")
+                .long("state-members")
+                .action(ArgAction::SetTrue)
+                .help("Also compare persisted state HAMT members with auth short ids (O(groups × entries))"),
+        )
+        .arg(
             Arg::new("limit")
                 .long("limit")
                 .short('l')
@@ -1372,6 +1386,31 @@ fn sub_auth_check() -> Command {
                 .value_parser(clap::value_parser!(usize))
                 .default_value("50")
                 .help("Maximum rows to print per category (0 for no cap)"),
+        )
+}
+
+fn sub_members() -> Command {
+    Command::new("members")
+        .about("Count a room's latest membership per user, read from its event records")
+        .long_about(
+            "Scan the room's EventDag collection once and report each user's latest \
+             membership by origin_server_ts, grouped by membership value. This counts \
+             distinct state keys, not events: a user who joined and later left counts \
+             once, as `leave`. Read-only; coexists with a running writer. It does not \
+             read the current state HAMT, so an unapplied or unverifiable membership \
+             event still contributes its latest value.",
+        )
+        .arg(
+            Arg::new("room")
+                .required(true)
+                .value_name("ROOM")
+                .help("Matrix room ID (starting with `!`)"),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Print a single JSON object instead of text"),
         )
 }
 
@@ -1827,7 +1866,12 @@ fn parse_cli() -> Cli {
         Some(("auth-check", m)) => Commands::AuthCheck {
             room: m.get_one::<String>("room").unwrap().clone(),
             namespace: m.get_one::<String>("namespace").unwrap().clone(),
+            state_members: m.get_flag("state-members"),
             limit: *m.get_one::<usize>("limit").unwrap(),
+        },
+        Some(("members", m)) => Commands::Members {
+            room: m.get_one::<String>("room").unwrap().clone(),
+            json: m.get_flag("json"),
         },
         Some(("tombstones", m)) => Commands::Tombstones {
             collection: m.get_one::<String>("collection").unwrap().clone(),
