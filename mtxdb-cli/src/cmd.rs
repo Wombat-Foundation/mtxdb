@@ -442,6 +442,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Search { .. } => "search",
         Commands::Delete { .. } => "delete",
         Commands::Tombstones { .. } => "tombstones",
+        Commands::AuthCheck { .. } => "auth-check",
         Commands::Remove { .. } => "remove",
         Commands::Shards { .. } => "shards",
         Commands::Collections { .. } => "collections",
@@ -693,6 +694,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Delete { collections, yes } => {
             cli.require_single_dir("delete")?;
             cmd_delete(cli, collections, *yes)
+        }
+        Commands::AuthCheck { room, limit } => {
+            cli.require_single_dir("auth-check")?;
+            cmd_auth_check(cli, room, *limit)
         }
         Commands::Tombstones {
             collection,
@@ -16737,6 +16742,69 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
             "deleted {count} nodes for collection {}",
             format_id(&collection_id)
         );
+    }
+    Ok(())
+}
+
+/// `auth-check`: list a room's auth targets that have no outbound edge record.
+fn cmd_auth_check(cli: &Cli, room: &str, limit: usize) -> anyhow::Result<()> {
+    if !room.starts_with('!') {
+        bail!("auth-check takes a Matrix room ID (starting with `!`), got `{room}`");
+    }
+    let collection_id = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room.as_bytes());
+    let layout = open_layout(cli)?;
+    let store = open_pool_read_only(pool_dir(&layout, ShardType::State)?)
+        .context("failed to open the state pool")?;
+    store.set_read_plan_policy(cli.read_plan);
+
+    let report = crate::auth_check::check(|id| {
+        store
+            .get(&collection_id, id)
+            .map(|data| data.map(|d| d.bytes.to_vec()))
+    })?;
+
+    println!("room:                {room}");
+    println!("auth collection:     {}", format_id(&collection_id));
+    if report.allocated == 0 && report.corrupt.is_empty() {
+        println!("no auth-chain short ids recorded for this room");
+        return Ok(());
+    }
+    println!("short ids allocated: {}", report.allocated);
+    println!("with edge records:   {}", report.with_edges);
+    println!("dangling targets:    {}", report.dangling.len());
+    println!("unreadable records:  {}", report.corrupt.len());
+    let name = |short_id: u32| {
+        report
+            .names
+            .get(&short_id)
+            .cloned()
+            .unwrap_or_else(|| format!("<short id {short_id}, no event id>"))
+    };
+    let shown = if limit == 0 { usize::MAX } else { limit };
+    for dangling in report.dangling.iter().take(shown) {
+        println!(
+            "DANGLING short_id={} event_id={}",
+            dangling.short_id,
+            dangling.event_id.as_deref().unwrap_or("<unmapped>")
+        );
+        for citer in dangling.cited_by.iter().take(5) {
+            println!("    cited by {}", name(*citer));
+        }
+        if dangling.cited_by.len() > 5 {
+            println!(
+                "    ... and {} more",
+                dangling.cited_by.len().saturating_sub(5)
+            );
+        }
+    }
+    if report.dangling.len() > shown {
+        println!(
+            "... {} more not shown (use --limit 0)",
+            report.dangling.len().saturating_sub(shown)
+        );
+    }
+    for (short_id, reason) in report.corrupt.iter().take(shown) {
+        println!("UNREADABLE short_id={short_id}: {reason}");
     }
     Ok(())
 }

@@ -449,6 +449,7 @@ dependencies = [
  "mtxdb",
  "rezzy",
  "rustix",
+ "sha2",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 //! CLI for the mtxdb content-addressed storage engine.
 
+mod auth_check;
 mod cmd;
 mod export_import;
 mod gap_manifest;
@@ -285,6 +286,10 @@ pub(crate) enum Commands {
         keys: bool,
         detail: bool,
     },
+    AuthCheck {
+        room: String,
+        limit: usize,
+    },
     Remove {
         collection: String,
         ids: Vec<String>,
@@ -412,6 +417,7 @@ fn build_cli() -> Command {
         .subcommand(sub_info())
         .subcommand(sub_delete())
         .subcommand(sub_tombstones())
+        .subcommand(sub_auth_check())
         .subcommand(sub_remove())
         .subcommand(sub_put())
         .subcommand(sub_get())
@@ -1328,6 +1334,34 @@ fn sub_delete() -> Command {
         )
 }
 
+fn sub_auth_check() -> Command {
+    Command::new("auth-check")
+        .about("List a room's auth targets that have no outbound edge record (read-only)")
+        .long_about(
+            "Read a room's auth-edge records from the state pool and list every short id \
+             that has no outbound edge record, with the event it names and the events \
+             that cite it. Such a target makes a closure walk report an incomplete graph. \
+             The record layout is the homeserver's (sithnapse), not this crate's; an \
+             unknown record version is reported, not guessed at. Always reads the state \
+             pool. Read-only; coexists with a running writer.",
+        )
+        .arg(
+            Arg::new("room")
+                .required(true)
+                .value_name("ROOM_ID")
+                .help("Matrix room ID, e.g. !room:server"),
+        )
+        .arg(
+            Arg::new("limit")
+                .long("limit")
+                .short('l')
+                .value_name("N")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("50")
+                .help("Maximum dangling targets to print (0 for no cap)"),
+        )
+}
+
 fn sub_tombstones() -> Command {
     Command::new("tombstones")
         .about("Report removed keys and reclaimable space for a collection")
@@ -1776,6 +1810,10 @@ fn parse_cli() -> Cli {
                 .cloned()
                 .collect(),
             yes: m.get_flag("yes"),
+        },
+        Some(("auth-check", m)) => Commands::AuthCheck {
+            room: m.get_one::<String>("room").unwrap().clone(),
+            limit: *m.get_one::<usize>("limit").unwrap(),
         },
         Some(("tombstones", m)) => Commands::Tombstones {
             collection: m.get_one::<String>("collection").unwrap().clone(),
