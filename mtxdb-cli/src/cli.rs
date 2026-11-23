@@ -288,6 +288,7 @@ pub(crate) enum Commands {
     },
     AuthCheck {
         room: String,
+        namespace: String,
         limit: usize,
     },
     Remove {
@@ -1336,14 +1337,18 @@ fn sub_delete() -> Command {
 
 fn sub_auth_check() -> Command {
     Command::new("auth-check")
-        .about("List a room's auth targets that have no outbound edge record (read-only)")
+        .about("Check a room's embedded auth graph against its events' own auth_events (read-only)")
         .long_about(
-            "Read a room's auth-edge records from the state pool and list every short id \
-             that has no outbound edge record, with the event it names and the events \
-             that cite it. Such a target makes a closure walk report an incomplete graph. \
-             The record layout is the homeserver's (sithnapse), not this crate's; an \
-             unknown record version is reported, not guessed at. Always reads the state \
-             pool. Read-only; coexists with a running writer.",
+            "Re-derive a room's auth graph from its event records and compare it with the \
+             embedded edge table. The edge table is derived data; the authoritative graph \
+             is each event's own `auth_events` in the room's event collection. Reports: \
+             short ids with no outbound edge record (a closure walk reports an incomplete \
+             graph), events whose embedded edges differ from their `auth_events` (a \
+             truncated or extra edge list), edge records with no event record, and \
+             persisted state events that have no short id at all. The record layouts are \
+             the homeserver's (sithnapse), not this crate's; an unknown record version is \
+             reported, not guessed at. Reads the state and event pools. Read-only; \
+             coexists with a running writer.",
         )
         .arg(
             Arg::new("room")
@@ -1352,13 +1357,21 @@ fn sub_auth_check() -> Command {
                 .help("Matrix room ID, e.g. !room:server"),
         )
         .arg(
+            Arg::new("namespace")
+                .long("namespace")
+                .short('n')
+                .required(true)
+                .value_name("NAMESPACE")
+                .help("The homeserver's embedded_db namespace (event records are keyed by it)"),
+        )
+        .arg(
             Arg::new("limit")
                 .long("limit")
                 .short('l')
                 .value_name("N")
                 .value_parser(clap::value_parser!(usize))
                 .default_value("50")
-                .help("Maximum dangling targets to print (0 for no cap)"),
+                .help("Maximum rows to print per category (0 for no cap)"),
         )
 }
 
@@ -1813,6 +1826,7 @@ fn parse_cli() -> Cli {
         },
         Some(("auth-check", m)) => Commands::AuthCheck {
             room: m.get_one::<String>("room").unwrap().clone(),
+            namespace: m.get_one::<String>("namespace").unwrap().clone(),
             limit: *m.get_one::<usize>("limit").unwrap(),
         },
         Some(("tombstones", m)) => Commands::Tombstones {

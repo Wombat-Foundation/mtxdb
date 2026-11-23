@@ -695,9 +695,13 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             cli.require_single_dir("delete")?;
             cmd_delete(cli, collections, *yes)
         }
-        Commands::AuthCheck { room, limit } => {
+        Commands::AuthCheck {
+            room,
+            namespace,
+            limit,
+        } => {
             cli.require_single_dir("auth-check")?;
-            cmd_auth_check(cli, room, *limit)
+            cmd_auth_check(cli, room, namespace, *limit)
         }
         Commands::Tombstones {
             collection,
@@ -16746,33 +16750,117 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
     Ok(())
 }
 
-/// `auth-check`: list a room's auth targets that have no outbound edge record.
-fn cmd_auth_check(cli: &Cli, room: &str, limit: usize) -> anyhow::Result<()> {
+/// `auth-check`: re-derive a room's auth graph from its event records and
+/// compare it with the embedded edge table.
+fn cmd_auth_check(cli: &Cli, room: &str, namespace: &str, limit: usize) -> anyhow::Result<()> {
+    use crate::auth_check::{event_node_id, event_record_json, EventAuth};
+
     if !room.starts_with('!') {
         bail!("auth-check takes a Matrix room ID (starting with `!`), got `{room}`");
     }
     let collection_id = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room.as_bytes());
+    let event_collection = matrix_room_collection_id(room);
     let layout = open_layout(cli)?;
     let store = open_pool_read_only(pool_dir(&layout, ShardType::State)?)
         .context("failed to open the state pool")?;
     store.set_read_plan_policy(cli.read_plan);
+    let event_store = open_pool_read_only(pool_dir(&layout, ShardType::EventDag)?)
+        .context("failed to open the event pool")?;
+    event_store.set_read_plan_policy(cli.read_plan);
 
-    let report = crate::auth_check::check(|id| {
-        store
-            .get(&collection_id, id)
-            .map(|data| data.map(|d| d.bytes.to_vec()))
-    })?;
+    let report = crate::auth_check::check(
+        |id| {
+            store
+                .get(&collection_id, id)
+                .map(|data| data.map(|d| d.bytes.to_vec()))
+        },
+        |event_id| {
+            let node = event_node_id(namespace, event_id);
+            let Some(data) = event_store.get(&event_collection, &node)? else {
+                return Ok(EventAuth::Absent);
+            };
+            let parsed = event_record_json(&data.bytes).and_then(|json| {
+                OwnedValue::parse_bytes(json).map_err(|error| format!("not valid JSON: {error}"))
+            });
+            Ok(match parsed {
+                Ok(value) => {
+                    EventAuth::Ids(crate::state_resolve::reference_list(&value, "auth_events"))
+                }
+                Err(reason) => EventAuth::Unreadable(reason),
+            })
+        },
+    )?;
 
-    println!("room:                {room}");
-    println!("auth collection:     {}", format_id(&collection_id));
-    if report.allocated == 0 && report.corrupt.is_empty() {
+    // Persisted state events no short id names: closures are built only for
+    // state events, so a message event with no short id is expected.
+    let known: HashSet<[u8; 16]> = report
+        .names
+        .values()
+        .map(|event_id| event_node_id(namespace, event_id))
+        .collect();
+    let mut unembedded: Vec<[u8; 16]> = Vec::new();
+    for entry in event_store.scan_collection(&event_collection)? {
+        let (node_id, data) = entry?;
+        if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID || known.contains(&node_id) {
+            continue;
+        }
+        let is_state = event_record_json(&data.bytes)
+            .ok()
+            .and_then(|json| OwnedValue::parse_bytes(json).ok())
+            .is_some_and(|value| value.get("state_key").is_some());
+        if is_state {
+            unembedded.push(node_id);
+        }
+    }
+
+    print_auth_check_report(
+        &report,
+        &unembedded,
+        &AuthCheckHeader {
+            room,
+            auth_collection: collection_id,
+            event_collection,
+        },
+        limit,
+    );
+    Ok(())
+}
+
+/// Where an `auth-check` report was read from.
+struct AuthCheckHeader<'a> {
+    room: &'a str,
+    auth_collection: [u8; 16],
+    event_collection: [u8; 16],
+}
+
+fn print_auth_check_report(
+    report: &crate::auth_check::Report,
+    unembedded: &[[u8; 16]],
+    header: &AuthCheckHeader<'_>,
+    limit: usize,
+) {
+    println!("room:                {}", header.room);
+    println!(
+        "auth collection:     {}",
+        format_id(&header.auth_collection)
+    );
+    println!(
+        "event collection:    {}",
+        format_id(&header.event_collection)
+    );
+    if report.allocated == 0 && report.corrupt.is_empty() && unembedded.is_empty() {
         println!("no auth-chain short ids recorded for this room");
-        return Ok(());
+        return;
     }
     println!("short ids allocated: {}", report.allocated);
     println!("with edge records:   {}", report.with_edges);
     println!("dangling targets:    {}", report.dangling.len());
     println!("unreadable records:  {}", report.corrupt.len());
+    println!("edge mismatches:     {}", report.mismatched.len());
+    println!("no event record:     {}", report.no_record.len());
+    println!("unnamed short ids:   {}", report.unnamed.len());
+    println!("bad event records:   {}", report.bad_records.len());
+    println!("state events with no short id: {}", unembedded.len());
     let name = |short_id: u32| {
         report
             .names
@@ -16803,10 +16891,30 @@ fn cmd_auth_check(cli: &Cli, room: &str, limit: usize) -> anyhow::Result<()> {
             report.dangling.len().saturating_sub(shown)
         );
     }
+    for mismatch in report.mismatched.iter().take(shown) {
+        println!("MISMATCH {}", mismatch.event_id);
+        for id in mismatch.missing.iter().take(5) {
+            println!("    in auth_events, not in embedded edges: {id}");
+        }
+        for id in mismatch.extra.iter().take(5) {
+            println!("    in embedded edges, not in auth_events: {id}");
+        }
+    }
+    for event_id in report.no_record.iter().take(shown) {
+        println!("NO_EVENT_RECORD {event_id}");
+    }
+    for short_id in report.unnamed.iter().take(shown) {
+        println!("UNNAMED short_id={short_id}");
+    }
+    for (event_id, reason) in report.bad_records.iter().take(shown) {
+        println!("BAD_EVENT_RECORD {event_id}: {reason}");
+    }
+    for node_id in unembedded.iter().take(shown) {
+        println!("NO_SHORT_ID node={}", hex::encode(node_id));
+    }
     for (short_id, reason) in report.corrupt.iter().take(shown) {
         println!("UNREADABLE short_id={short_id}: {reason}");
     }
-    Ok(())
 }
 
 fn cmd_tombstones(cli: &Cli, collection: &str, keys: bool, detail: bool) -> anyhow::Result<()> {
