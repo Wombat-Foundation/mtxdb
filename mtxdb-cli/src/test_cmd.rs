@@ -12035,3 +12035,26 @@ fn the_strict_check_covers_every_room_the_run_touched() {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+#[test]
+fn room_selector_expands_per_pool() {
+    let room = "!roomid:example.org";
+    let event = super::parse_collection_selectors_for_pool(room, ShardType::EventDag).unwrap();
+    assert_eq!(event, vec![super::matrix_room_collection_id(room)]);
+    let state = super::parse_collection_selectors_for_pool(room, ShardType::State).unwrap();
+    assert_eq!(
+        state,
+        vec![
+            mtxdb::room_state_collection_id(room.as_bytes()),
+            mtxdb::room_roots_collection_id(room.as_bytes()),
+            derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room.as_bytes()),
+        ]
+    );
+    assert!(!state.contains(&event[0]));
+    let hex = super::parse_collection_selectors_for_pool(
+        "0xA3C8003F0854283F22C5C115DB3F0BD6",
+        ShardType::State,
+    )
+    .unwrap();
+    assert_eq!(hex.len(), 1);
+}

@@ -879,6 +879,42 @@ fn parse_collection_selector(selector: &str) -> anyhow::Result<[u8; 16]> {
     }
 }
 
+/// Resolve a Matrix room selector in the namespace used by the selected pool.
+/// Event collections use EVNT, while the room's materialized state HAMT lives
+/// in STAT. Explicit `0x` collection IDs remain pool-independent.
+fn parse_scan_collection_selector(cli: &Cli, selector: &str) -> anyhow::Result<[u8; 16]> {
+    if selector.starts_with('!') && cli.shard_type == Some(ShardType::State) {
+        return crate::state_hamt::state_hamt_collection_id(selector)
+            .context("invalid Matrix room ID for state collection");
+    }
+    parse_collection_selector(selector)
+}
+
+/// Resolve a collection selector to the collection IDs it names *in one pool*.
+///
+/// A `0x` logical ID names exactly itself. A canonical room ID (`!room:server`)
+/// is a *group* ID whose member collections live in different pools: the event
+/// bodies (`EVNT`) in the event pool, the HAMT nodes (`STAT`), the room and
+/// event root handles (`STGP`) and the auth closures (`AUTH`) in the state pool. The same canonical ID
+/// therefore expands per pool, so `-t state '!room'` shows that room's state.
+fn parse_collection_selectors_for_pool(
+    selector: &str,
+    shard_type: ShardType,
+) -> anyhow::Result<Vec<[u8; 16]>> {
+    if !selector.starts_with('!') {
+        return Ok(vec![parse_collection_id(selector)?]);
+    }
+    let room = selector.as_bytes();
+    Ok(match shard_type {
+        ShardType::State => vec![
+            mtxdb::room_state_collection_id(room),
+            mtxdb::room_roots_collection_id(room),
+            derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room),
+        ],
+        ShardType::EventDag | ShardType::ServerInfo => vec![matrix_room_collection_id(selector)],
+    })
+}
+
 /// Parse the `MTXDB_COMPRESS` override for writable opens.
 ///
 /// `Ok(None)` means the variable is unset and the pool policies decide.
@@ -6509,14 +6545,15 @@ fn cmd_info_collection(cli: &Cli, collection: &str, deep: bool) -> anyhow::Resul
         let mut matched_any = false;
         for shard_type in cli.shard_types() {
             let dir = pool_dir(&db_layout, shard_type)?;
-            let collection_id = parse_collection_selector(collection)?;
-            if inspect_collection_in_dir(
-                &dir,
-                &collection_id,
-                deep,
-                Some((shard_type, matched_any)),
-            ) {
-                matched_any = true;
+            for collection_id in parse_collection_selectors_for_pool(collection, shard_type)? {
+                if inspect_collection_in_dir(
+                    &dir,
+                    &collection_id,
+                    deep,
+                    Some((shard_type, matched_any)),
+                ) {
+                    matched_any = true;
+                }
             }
         }
         if !matched_any {
@@ -6528,18 +6565,20 @@ fn cmd_info_collection(cli: &Cli, collection: &str, deep: bool) -> anyhow::Resul
         return Ok(());
     }
 
-    let collection_id = parse_collection_selector(collection)?;
-    let hex = format_id(&collection_id);
+    let shard_type = cli.require_shard_type()?;
     let dir = selected_pool_dir(cli)?;
-
-    if inspect_collection_in_dir(&dir, &collection_id, deep, None) {
-        return Ok(());
+    let mut found = false;
+    for collection_id in parse_collection_selectors_for_pool(collection, shard_type)? {
+        found |= inspect_collection_in_dir(&dir, &collection_id, deep, None);
     }
-
-    eprintln!(
-        "collection {hex}: not found{}",
-        other_shard_type_hint(cli, &collection_id)
-    );
+    if !found {
+        let collection_id = parse_collection_selector(collection)?;
+        eprintln!(
+            "collection {}: not found{}",
+            format_id(&collection_id),
+            other_shard_type_hint(cli, &collection_id)
+        );
+    }
     Ok(())
 }
 
@@ -8372,7 +8411,7 @@ fn cmd_scan_collection_live_rows(
         "`scan --live` requires a specific shard type (-t state, -t events, or -t edges); \
          `-t all` cannot select a single live collection index"
     );
-    let collection_id = parse_collection_selector(selector)?;
+    let collection_id = parse_scan_collection_selector(cli, selector)?;
     let store = open_store_read_only(cli)?;
     let Some(locations) = store.collection_live_locations(&collection_id)? else {
         bail!(
@@ -8569,7 +8608,6 @@ fn render_live_scan_rows(
 /// diagnostic scan, so superseded copies are deliberately retained in the
 /// output; use `export` to enumerate only the collection's live records.
 fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow::Result<()> {
-    let collection_id = parse_collection_selector(selector)?;
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
@@ -8577,16 +8615,18 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
             let Some(pool_dir) = existing_pool_dir(&db_layout, shard_type)? else {
                 continue;
             };
-            let frames = cmd_scan_collection_in_pool(
-                &pool_dir,
-                collection_id,
-                opts,
-                shard_type,
-                true,
-                matched_any,
-            )?;
-            if frames > 0 {
-                matched_any = true;
+            for collection_id in parse_collection_selectors_for_pool(selector, shard_type)? {
+                let frames = cmd_scan_collection_in_pool(
+                    &pool_dir,
+                    collection_id,
+                    opts,
+                    shard_type,
+                    true,
+                    matched_any,
+                )?;
+                if frames > 0 {
+                    matched_any = true;
+                }
             }
         }
         if !matched_any {
@@ -8596,12 +8636,22 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
     }
     let shard_type = cli.require_shard_type()?;
     let pool_dir = selected_pool_dir(cli)?;
-    let frames =
-        cmd_scan_collection_in_pool(&pool_dir, collection_id, opts, shard_type, false, false)?;
+    let mut frames = 0_usize;
+    let ids = parse_collection_selectors_for_pool(selector, shard_type)?;
+    for (index, collection_id) in ids.iter().enumerate() {
+        frames = frames.saturating_add(cmd_scan_collection_in_pool(
+            &pool_dir,
+            *collection_id,
+            opts,
+            shard_type,
+            ids.len() > 1,
+            index > 0 && frames > 0,
+        )?);
+    }
     if frames == 0 {
         bail!(
             "no matching physical record found in collection {selector}{}",
-            other_shard_type_hint(cli, &collection_id)
+            other_shard_type_hint(cli, &parse_collection_selector(selector)?)
         );
     }
     Ok(())
