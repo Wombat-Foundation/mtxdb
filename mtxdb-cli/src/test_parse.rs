@@ -450,3 +450,29 @@ fn allow_waived_gaps_needs_the_strict_flag() {
         ])
         .is_ok());
 }
+
+/// Every path in a scope table must name a real command that ends up with the
+/// flag; a stale name would otherwise only surface as a clap panic at startup.
+#[test]
+fn scope_tables_name_real_commands_that_carry_their_flag() {
+    let root = build_cli();
+    for (flag, table) in [
+        ("coalesce", COALESCE_COMMANDS),
+        ("read_plan", READ_PLAN_COMMANDS),
+        ("shard_type", SHARD_TYPE_COMMANDS),
+    ] {
+        for path in table {
+            let mut command = &root;
+            for name in *path {
+                command = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("`{}` is not a command", path.join(" ")));
+            }
+            assert!(
+                command.get_arguments().any(|arg| arg.get_id() == flag),
+                "`{}` is in the {flag} table but does not carry it",
+                path.join(" ")
+            );
+        }
+    }
+}
