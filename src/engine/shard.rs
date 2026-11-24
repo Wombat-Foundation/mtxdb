@@ -692,6 +692,30 @@ impl Shard {
         }
     }
 
+    /// Run a path-based scan against the file currently backing this shard.
+    ///
+    /// `data_path` is only a snapshot: a background fsync or seal can publish
+    /// the pack (staging name to canonical name) between the snapshot and the
+    /// scan's `open`, which then reports `NotFound`. Publication is one-way,
+    /// so a single retry with a fresh snapshot always sees the final name.
+    ///
+    /// # Errors
+    /// Returns whatever `scan` returns for the final attempt.
+    pub(crate) fn scan_data_path<T>(&self, scan: impl Fn(&Path) -> io::Result<T>) -> io::Result<T> {
+        let first = self.data_path();
+        match scan(&first) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let second = self.data_path();
+                if second == first {
+                    Err(error)
+                } else {
+                    scan(&second)
+                }
+            }
+            result => result,
+        }
+    }
+
     /// Open the file currently backing this shard for a live in-process scan.
     ///
     /// The publication lock is held across the open, so a concurrent

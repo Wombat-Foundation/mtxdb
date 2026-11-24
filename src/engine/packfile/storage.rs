@@ -5635,7 +5635,7 @@ impl PackfileStorage {
             .map(|(_, shard)| {
                 // Scan the physical file: a newly created pack may still be
                 // staged until its first durability barrier publishes it.
-                let file = std::fs::File::open(shard.data_path())?;
+                let file = shard.open_data_file()?;
                 let end = shard.file_len();
                 let scanner = packfile::scan_packfile_iter_from_file(file, false)?;
                 Ok((end, scanner))
@@ -5714,10 +5714,12 @@ impl PackfileStorage {
     ) -> Result<Vec<TestScannedRecord>, StorageError> {
         let mut scanned = Vec::new();
         for (slot, shard) in self.shards.all_shards() {
-            for entry in packfile::scan_packfile_with_removal(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )? {
+            for entry in shard.scan_data_path(|path| {
+                packfile::scan_packfile_with_removal(
+                    path,
+                    self.shards.checksum_policy().verifies_reads(),
+                )
+            })? {
                 if entry.collection_id == *collection_id {
                     scanned.push((slot, entry.hash, entry.offset, shard.pack_id, entry.removed));
                 }
@@ -5732,14 +5734,17 @@ impl PackfileStorage {
     ) -> Result<Vec<ScannedRepackShard>, StorageError> {
         let mut scanned = Vec::new();
         for (slot, shard) in self.shards.all_shards() {
-            let entries = packfile::scan_packfile_with_removal(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )?
-            .into_iter()
-            .filter(|entry| entry.collection_id == *collection_id)
-            .map(|entry| (entry.hash, entry.offset, entry.removed))
-            .collect::<Vec<_>>();
+            let entries = shard
+                .scan_data_path(|path| {
+                    packfile::scan_packfile_with_removal(
+                        path,
+                        self.shards.checksum_policy().verifies_reads(),
+                    )
+                })?
+                .into_iter()
+                .filter(|entry| entry.collection_id == *collection_id)
+                .map(|entry| (entry.hash, entry.offset, entry.removed))
+                .collect::<Vec<_>>();
             if !entries.is_empty() {
                 scanned.push((slot, entries));
             }
@@ -5762,10 +5767,12 @@ impl PackfileStorage {
             .map(|collection_id| (collection_id, (HashMap::new(), HashMap::new())))
             .collect();
         for (slot, shard) in self.shards.all_shards() {
-            for entry in packfile::scan_packfile_with_removal(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )? {
+            for entry in shard.scan_data_path(|path| {
+                packfile::scan_packfile_with_removal(
+                    path,
+                    self.shards.checksum_policy().verifies_reads(),
+                )
+            })? {
                 if wanted.contains(&entry.collection_id) {
                     let (live, removed) = maps.entry(entry.collection_id).or_default();
                     self.update_repack_record_map(
@@ -8072,10 +8079,9 @@ impl PackfileStorage {
                     continue;
                 }
             }
-            let mut scanner = packfile::scan_packfile_iter(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )?;
+            let mut scanner = shard.scan_data_path(|path| {
+                packfile::scan_packfile_iter(path, self.shards.checksum_policy().verifies_reads())
+            })?;
             while let Some(record) = scanner.next_with_removal() {
                 let record = record?;
                 if record.collection_id != *collection_id {
@@ -8190,10 +8196,9 @@ impl PackfileStorage {
                 }
             }
 
-            let mut scanner = packfile::scan_packfile_iter(
-                &shard.data_path(),
-                self.shards.checksum_policy().verifies_reads(),
-            )?;
+            let mut scanner = shard.scan_data_path(|path| {
+                packfile::scan_packfile_iter(path, self.shards.checksum_policy().verifies_reads())
+            })?;
             while let Some(record) = scanner.next_with_removal() {
                 let record = record?;
                 if record.collection_id != *collection_id {
@@ -8749,12 +8754,15 @@ impl PackfileStorage {
                     .get(&slot)
                     .filter(|(pack_id, _)| *pack_id == shard.pack_id)
                     .map_or(0, |(_, offset)| *offset);
-                let entries = packfile::scan_packfile_from_with_removal(
-                    &shard.data_path(),
-                    start,
-                    self.shards.checksum_policy().verifies_reads(),
-                )
-                .map_err(StorageError::Io)?;
+                let entries = shard
+                    .scan_data_path(|path| {
+                        packfile::scan_packfile_from_with_removal(
+                            path,
+                            start,
+                            self.shards.checksum_policy().verifies_reads(),
+                        )
+                    })
+                    .map_err(StorageError::Io)?;
                 for entry in entries {
                     if entry.collection_id == *collection_id {
                         self.update_repack_record_map(
