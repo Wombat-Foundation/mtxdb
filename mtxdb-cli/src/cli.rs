@@ -216,14 +216,13 @@ pub(crate) enum Commands {
         decode: Option<String>,
     },
     Info {
-        /// Positional selector; its namespace is inferred (pack for a 1-16 hex
-        /// prefix, pack or collection for 32 hex by existence).
+        /// Positional collection selector; a room ID is also accepted.
         selector: Option<String>,
-        /// Explicit `--pack` selector; bypasses inference.
-        pack: Option<String>,
-        /// Explicit `--collection` selector; bypasses inference.
-        collection: Option<String>,
         stats: bool,
+        tombstones: bool,
+        keys: bool,
+        detail: bool,
+        json: bool,
     },
     Scan {
         selector: String,
@@ -275,14 +274,13 @@ pub(crate) enum Commands {
         collections: Vec<String>,
         yes: bool,
     },
-    Tombstones {
-        collection: String,
-        keys: bool,
-        detail: bool,
-    },
-    AuthCheck {
+    RoomCheck {
         room: String,
+        auth: bool,
+        prevs: bool,
         state_members: bool,
+        status: Option<String>,
+        history: bool,
         limit: usize,
     },
     Members {
@@ -315,6 +313,19 @@ pub(crate) enum PacksAction {
     },
     /// Show one pack's header, collection composition, and node counts.
     Inspect { pack: String },
+    /// Scan a pack's physical frames.
+    Scan {
+        selector: String,
+        verbose: bool,
+        header: bool,
+        decode: Option<String>,
+        limit: i64,
+        id: Option<String>,
+        collection: Option<String>,
+        raw: bool,
+        sort: Option<String>,
+        reverse: bool,
+    },
     /// Dump every frame in one pack as decoded JSONL.
     Dump {
         pack: String,
@@ -336,11 +347,6 @@ pub(crate) enum GapAction {
         room: String,
         run: String,
         report: PathBuf,
-    },
-    List {
-        room: String,
-        status: Option<String>,
-        history: bool,
     },
     Waive {
         room: String,
@@ -389,7 +395,6 @@ fn build_cli() -> Command {
         .subcommand(sub_scan())
         .subcommand(sub_info())
         .subcommand(sub_drop())
-        .subcommand(sub_tombstones())
         .subcommand(sub_remove())
         .subcommand(sub_put())
         .subcommand(sub_get())
@@ -403,10 +408,10 @@ const COALESCE_COMMANDS: &[&[&str]] = &[
     &["collections"],
     &["stats"],
     &["get"],
-    &["sync"],
     &["scan"],
     &["info"],
-    &["packs"],
+    &["packs", "list"],
+    &["packs", "scan"],
     &["repack"],
 ];
 
@@ -415,9 +420,8 @@ const READ_PLAN_COMMANDS: &[&[&str]] = &[
     &["get"],
     &["scan"],
     &["export"],
-    &["tombstones"],
     &["import"],
-    &["room", "auth-check"],
+    &["room", "check"],
     &["repack"],
 ];
 
@@ -438,7 +442,6 @@ const SHARD_TYPE_COMMANDS: &[&[&str]] = &[
     &["sync"],
     &["repack"],
     &["export"],
-    &["tombstones"],
     &["packs"],
 ];
 
@@ -574,7 +577,8 @@ fn sub_timeline() -> Command {
                 .long("limit")
                 .short('l')
                 .help("Maximum number of events to show")
-                .default_value("20")
+                .value_name("N")
+                .default_value("50")
                 .value_parser(clap::value_parser!(i64)),
         )
         .arg(
@@ -619,6 +623,7 @@ fn sub_flags() -> Command {
             Arg::new("limit")
                 .long("limit")
                 .short('l')
+                .value_name("N")
                 .help("Maximum number of events to select")
                 .default_value("50")
                 .value_parser(clap::value_parser!(usize)),
@@ -680,13 +685,7 @@ fn sub_meta() -> Command {
 fn sub_collections() -> Command {
     Command::new("collections")
         .about("List logical collections in the selected shard pool")
-        .arg(
-            Arg::new("all")
-                .short('a')
-                .long("all")
-                .action(ArgAction::SetTrue)
-                .help("List collections in every independent pool"),
-        )
+        .arg(all_arg("List collections in every independent pool"))
         .arg(layout_arg())
         .arg(
             Arg::new("canonical")
@@ -731,6 +730,7 @@ fn limit_arg() -> Arg {
     Arg::new("limit")
         .short('l')
         .long("limit")
+        .value_name("N")
         .default_value("50")
         .allow_hyphen_values(true)
         .value_parser(clap::value_parser!(i64))
@@ -753,13 +753,9 @@ fn sub_init() -> Command {
 fn sub_sync() -> Command {
     Command::new("sync")
         .about("Bootstrap or refresh persisted shard stats")
-        .arg(
-            Arg::new("all")
-                .short('a')
-                .long("all")
-                .action(ArgAction::SetTrue)
-                .help("Sync every independent pool, not just the selected `-t` one"),
-        )
+        .arg(all_arg(
+            "Sync every independent pool, not just the selected `-t` one",
+        ))
 }
 
 fn sub_reclaim_wal() -> Command {
@@ -790,21 +786,31 @@ fn sub_completions() -> Command {
 }
 
 fn sub_scan() -> Command {
+    scan_command(false)
+}
+
+fn sub_pack_scan() -> Command {
+    scan_command(true)
+}
+
+fn scan_command(pack_only: bool) -> Command {
+    let selector = Arg::new("selector")
+        .required(true)
+        .value_name(if pack_only { "PACK_ID" } else { "COLLECTION" })
+        .help(if pack_only {
+            "Pack identity (full 0x-prefixed id or unique 1-16 hex filename prefix)"
+        } else {
+            "Collection ID (0x-prefixed 32 hex digits) or canonical room ID"
+        });
     Command::new("scan")
-        .about("Scan a packfile or collection and print physical records")
-        .arg(
-            Arg::new("selector")
-                .required(true)
-                .value_name("PACK_ID|COLLECTION")
-                .help(
-                    "A `0x`-prefixed collection ID (32 hex digits after `0x`), or a pack ID \
-                     from `mtxdb shards` (also `0x`-prefixed, 1-16 hex digits) — e.g. `mtxdb \
-                     scan 0x0102030405060708090a0b0c0d0e0f10` or `mtxdb scan 0x1`",
-                ),
-        )
+        .about(if pack_only {
+            "Scan a pack's physical records"
+        } else {
+            "Scan a collection's physical records"
+        })
+        .arg(selector)
         .arg(
             Arg::new("verbose")
-                .short('v')
                 .long("verbose")
                 .action(ArgAction::SetTrue)
                 .help("Print each frame's payload when available"),
@@ -831,28 +837,11 @@ fn sub_scan() -> Command {
                 .value_name("NODE_ID")
                 .help("Restrict the physical scan to one node ID"),
         )
-        .arg(
-            Arg::new("collection")
-                .long("collection")
-                .value_name("COLLECTION")
-                .help("With a pack selector, restrict the scan to this collection"),
-        )
         .arg(Arg::new("raw").long("raw").action(ArgAction::SetTrue).help(
             "Write matching frames' payload bytes verbatim, concatenated, to stdout (all \
                      matches, or up to --limit; use -l 0 for no cap). With --verbose, a per-frame \
                      context line goes to stderr so stdout stays a clean byte stream",
         ))
-        .arg(
-            Arg::new("live")
-                .long("live")
-                .alias("indexed")
-                .action(ArgAction::SetTrue)
-                .help(
-                    "Read the live collection index instead of scanning physical frames. \
-                     Superseded frames and tombstones are omitted; valid only for a collection \
-                     selector. Use plain `scan` for the physical view.",
-                ),
-        )
         .arg(sort_arg("payload, offset"))
         .arg(
             Arg::new("reverse")
@@ -862,6 +851,26 @@ fn sub_scan() -> Command {
                 .help("Reverse the sort order (descending) when used with -s"),
         )
         .arg(limit_arg())
+        .args(if pack_only {
+            vec![Arg::new("collection")
+                .long("collection")
+                .value_name("COLLECTION")
+                .help("Restrict the scan to this collection")]
+        } else {
+            Vec::new()
+        })
+        .args(if pack_only {
+            Vec::new()
+        } else {
+            vec![Arg::new("live")
+                .long("live")
+                .alias("indexed")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Read the live collection index instead of scanning physical frames; \
+                         superseded frames and tombstones are omitted",
+                )]
+        })
 }
 
 fn sub_search() -> Command {
@@ -908,42 +917,13 @@ fn sub_search() -> Command {
 
 fn sub_info() -> Command {
     Command::new("info")
-        .about("Show storage info for a collection or a pack")
+        .about("Show database or collection storage info")
         .arg(
             Arg::new("selector")
                 .required(false)
-                .conflicts_with_all(["pack", "collection"])
-                .value_name("PACK_ID|COLLECTION")
-                .help(
-                    "A `0x`-prefixed pack filename prefix (1-16 hex digits, as shown by `mtxdb \
-                     shards`), a `0x`-prefixed 32-hex id naming a pack or a collection, or a \
-                     canonical collection sigil such as !room:server. A 32-hex selector is inferred: it \
-                     resolves to a pack if only a pack matches, to a collection if only a \
-                     collection matches, and is an error if both match (specify --pack or \
-                     --collection to disambiguate). Mutually exclusive with --pack/--collection. \
-                     Omit to show database and pool metadata.",
-                ),
-        )
-        .arg(
-            Arg::new("pack")
-                .long("pack")
-                .conflicts_with("collection")
-                .value_name("PACK_ID")
-                .help(
-                    "Interpret the selector as a pack (0x-prefixed full 32-hex id, or a unique \
-                     1-16 hex filename prefix). Bypasses inference; errors if no such pack \
-                     exists.",
-                ),
-        )
-        .arg(
-            Arg::new("collection")
-                .long("collection")
-                .conflicts_with("pack")
                 .value_name("COLLECTION")
                 .help(
-                    "Interpret the selector as a collection (0x-prefixed 32-hex id, or a \
-                     canonical sigil such as !room:server). Bypasses inference; errors if no \
-                     such collection exists.",
+                    "Collection ID (0x-prefixed) or canonical Matrix room ID; omit for database and pool metadata",
                 ),
         )
         .arg(
@@ -954,6 +934,34 @@ fn sub_info() -> Command {
                     "For a collection, also scan every record for event statistics (room \
                      state, members, DAG health, activity, senders). Slower on large rooms.",
                 ),
+        )
+        .arg(
+            Arg::new("tombstones")
+                .long("tombstones")
+                .action(ArgAction::SetTrue)
+                .requires("selector")
+                .help("Also report live and removed key counts"),
+        )
+        .arg(
+            Arg::new("detail")
+                .long("detail")
+                .action(ArgAction::SetTrue)
+                .requires("tombstones")
+                .help("With --tombstones, include frame counts and byte totals"),
+        )
+        .arg(
+            Arg::new("keys")
+                .long("keys")
+                .action(ArgAction::SetTrue)
+                .requires("tombstones")
+                .help("With --tombstones, list removed keys"),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .requires("tombstones")
+                .help("With --tombstones, emit JSON instead of text"),
         )
 }
 
@@ -1045,23 +1053,6 @@ fn sub_gaps() -> Command {
                         .required(true)
                         .value_name("REPORT.json")
                         .help("JSON report emitted by `rezzy federation gap-fill`"),
-                ),
-        )
-        .subcommand(
-            Command::new("list")
-                .about("List a room's gaps with their derived status")
-                .arg(
-                    Arg::new("status")
-                        .long("status")
-                        .value_name("STATUS")
-                        .value_parser(["open", "absent", "waived", "anchored"])
-                        .help("Show only gaps with this derived status"),
-                )
-                .arg(
-                    Arg::new("history")
-                        .long("history")
-                        .action(ArgAction::SetTrue)
-                        .help("Also print every recorded server answer, oldest assessment first"),
                 ),
         )
         .subcommand(
@@ -1187,6 +1178,7 @@ fn sub_packs() -> Command {
                         .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
                 ),
         )
+        .subcommand(sub_pack_scan())
         .subcommand(sub_packs_dump())
         .subcommand(sub_packs_extract())
 }
@@ -1309,12 +1301,13 @@ fn sub_drop() -> Command {
 }
 
 fn sub_auth_check() -> Command {
-    Command::new("auth-check")
-        .about("Check a room's embedded auth graph against its events' own auth_events (read-only)")
+    Command::new("check")
+        .about("Check a room's prev_events gaps and auth_events graph")
         .long_about(
-            "Re-derive a room's auth graph from its event records and compare it with the \
-             embedded edge table. The edge table is derived data; the authoritative graph \
-             is each event's own `auth_events` in the room's event collection. Reports: \
+            "Check room completeness across the `prev_events` gap manifest and the \
+             embedded `auth_events` graph. By default both checks run; pass --prevs or \
+             --auth to run only one. The auth graph is re-derived from event records and \
+             compared with the embedded edge table. Reports: \
              short ids with no outbound edge record (a closure walk reports an incomplete \
              graph), events whose embedded edges differ from their `auth_events` (a \
              truncated or extra edge list), edge records with no event record, and \
@@ -1331,11 +1324,14 @@ fn sub_auth_check() -> Command {
                 .value_name("ROOM_ID")
                 .help("Matrix room ID, e.g. !room:server"),
         )
+        .arg(Arg::new("auth").long("auth").action(ArgAction::SetTrue).help("Check auth_events graph integrity"))
+        .arg(Arg::new("prevs").long("prevs").action(ArgAction::SetTrue).help("List unresolved prev_events gaps"))
+        .arg(Arg::new("history").long("history").action(ArgAction::SetTrue).help("With prevs, print recorded server answers"))
         .arg(
             Arg::new("state-members")
                 .long("state-members")
                 .action(ArgAction::SetTrue)
-                .help("Also compare persisted state HAMT members with auth short ids (O(groups × entries))"),
+                .help("With auth, compare state HAMT members with auth short ids (O(groups × entries))"),
         )
         .arg(
             Arg::new("limit")
@@ -1385,36 +1381,6 @@ fn sub_room() -> Command {
         .subcommand(sub_members())
         .subcommand(sub_auth_check())
         .subcommand(sub_gaps())
-}
-
-fn sub_tombstones() -> Command {
-    Command::new("tombstones")
-        .about("Report removed keys and reclaimable space for a collection")
-        .long_about(
-            "Count live keys and keys whose newest version is a removal marker, from \
-             the index alone. With --detail or --keys it also reads every frame, to \
-             report frame and byte totals or list the removed ids. Read-only; coexists \
-             with a running writer. Journal entries not yet materialized into a pack \
-             are not counted.",
-        )
-        .arg(
-            Arg::new("collection")
-                .required(true)
-                .value_name("COLLECTION")
-                .help("Namespace ID to inspect"),
-        )
-        .arg(
-            Arg::new("detail")
-                .long("detail")
-                .action(ArgAction::SetTrue)
-                .help("Also report frame counts, superseded versions and reclaimable bytes (reads every frame)"),
-        )
-        .arg(
-            Arg::new("keys")
-                .long("keys")
-                .action(ArgAction::SetTrue)
-                .help("List the removed keys (reads every frame)"),
-        )
 }
 
 fn sub_remove() -> Command {
@@ -1619,9 +1585,12 @@ fn parse_room_command(m: &clap::ArgMatches) -> Commands {
             room: sub.get_one::<String>("room").unwrap().clone(),
             json: sub.get_flag("json"),
         },
-        "auth-check" => Commands::AuthCheck {
+        "check" => Commands::RoomCheck {
             room: sub.get_one::<String>("room").unwrap().clone(),
+            auth: sub.get_flag("auth"),
+            prevs: sub.get_flag("prevs"),
             state_members: sub.get_flag("state-members"),
+            history: sub.get_flag("history"),
             limit: *sub.get_one::<usize>("limit").unwrap(),
         },
         "gaps" => {
@@ -1631,11 +1600,6 @@ fn parse_room_command(m: &clap::ArgMatches) -> Commands {
                     room,
                     run: action.get_one::<String>("run").unwrap().clone(),
                     report: PathBuf::from(action.get_one::<String>("report").unwrap()),
-                },
-                Some(("list", action)) => GapAction::List {
-                    room,
-                    status: action.get_one::<String>("status").cloned(),
-                    history: action.get_flag("history"),
                 },
                 Some(("waive", action)) => GapAction::Waive {
                     room,
@@ -1766,9 +1730,11 @@ fn parse_cli() -> Cli {
         },
         Some(("info", m)) => Commands::Info {
             selector: m.get_one::<String>("selector").cloned(),
-            pack: m.get_one::<String>("pack").cloned(),
-            collection: m.get_one::<String>("collection").cloned(),
             stats: m.get_flag("stats"),
+            tombstones: m.get_flag("tombstones"),
+            keys: m.get_flag("keys"),
+            detail: m.get_flag("detail"),
+            json: m.get_flag("json"),
         },
         Some(("scan", m)) => Commands::Scan {
             selector: m.get_one::<String>("selector").unwrap().clone(),
@@ -1776,7 +1742,7 @@ fn parse_cli() -> Cli {
             header: m.get_flag("header"),
             decode: m.get_one::<String>("decode").cloned(),
             id: m.get_one::<String>("id").cloned(),
-            collection: m.get_one::<String>("collection").cloned(),
+            collection: None,
             raw: m.get_flag("raw"),
             sort: m.get_one::<String>("sort").cloned(),
             reverse: m.get_flag("reverse"),
@@ -1827,6 +1793,18 @@ fn parse_cli() -> Cli {
                 Some(("inspect", sub)) => PacksAction::Inspect {
                     pack: sub.get_one::<String>("pack").unwrap().clone(),
                 },
+                Some(("scan", sub)) => PacksAction::Scan {
+                    selector: sub.get_one::<String>("selector").unwrap().clone(),
+                    verbose: sub.get_flag("verbose"),
+                    header: sub.get_flag("header"),
+                    decode: sub.get_one::<String>("decode").cloned(),
+                    limit: *sub.get_one::<i64>("limit").unwrap(),
+                    id: sub.get_one::<String>("id").cloned(),
+                    collection: sub.get_one::<String>("collection").cloned(),
+                    raw: sub.get_flag("raw"),
+                    sort: sub.get_one::<String>("sort").cloned(),
+                    reverse: sub.get_flag("reverse"),
+                },
                 Some(("dump", sub)) => PacksAction::Dump {
                     pack: sub.get_one::<String>("pack").unwrap().clone(),
                     collection: sub.get_one::<String>("collection").cloned(),
@@ -1861,11 +1839,6 @@ fn parse_cli() -> Cli {
             yes: m.get_flag("yes"),
         },
         Some(("room", m)) => parse_room_command(m),
-        Some(("tombstones", m)) => Commands::Tombstones {
-            collection: m.get_one::<String>("collection").unwrap().clone(),
-            keys: m.get_flag("keys"),
-            detail: m.get_flag("detail"),
-        },
         Some(("remove", m)) => Commands::Remove {
             collection: m.get_one::<String>("collection").unwrap().clone(),
             ids: m.get_many::<String>("id").unwrap().cloned().collect(),

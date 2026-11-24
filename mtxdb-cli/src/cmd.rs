@@ -512,19 +512,27 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
         } => cmd_meta(cli, target, *json, *limit, *offset, decode.as_deref()),
         Commands::Info {
             selector,
-            pack,
-            collection,
             stats,
+            tombstones,
+            keys,
+            detail,
+            json,
         } => {
-            if let Some(pack) = pack {
-                cmd_info(cli, pack, Some(InfoTarget::Pack), *stats)
-            } else if let Some(collection) = collection {
-                cmd_info(cli, collection, Some(InfoTarget::Collection), *stats)
+            let result = if *json && *tombstones {
+                Ok(())
             } else if let Some(selector) = selector {
-                cmd_info(cli, selector, None, *stats)
+                cmd_info(cli, selector, Some(InfoTarget::Collection), *stats)
             } else {
                 cmd_info_default(cli, *stats)
+            };
+            result?;
+            if *tombstones {
+                let selector = selector
+                    .as_deref()
+                    .expect("clap requires a selector with --tombstones");
+                cmd_tombstones(cli, selector, *keys, *detail, *json)?;
             }
+            Ok(())
         }
         Commands::Scan {
             selector,
@@ -540,7 +548,10 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             live,
         } => cmd_scan(
             cli,
-            selector,
+            {
+                parse_collection_selector(selector)?;
+                selector
+            },
             *verbose,
             *header,
             decode.as_deref(),
@@ -584,14 +595,6 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             GapAction::Ingest { room, run, report } => {
                 cli.require_single_dir("gaps ingest")?;
                 cmd_gap_ingest(cli, room, run, report)
-            }
-            GapAction::List {
-                room,
-                status,
-                history,
-            } => {
-                cli.require_single_dir("gaps list")?;
-                cmd_gap_list(cli, room, status.as_deref(), *history)
             }
             GapAction::Waive {
                 room,
@@ -650,25 +653,20 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             cli.require_single_dir("drop")?;
             cmd_drop(cli, collections, *yes)
         }
-        Commands::AuthCheck {
+        Commands::RoomCheck {
             room,
+            auth,
+            prevs,
             state_members,
+            history,
             limit,
         } => {
-            cli.require_single_dir("auth-check")?;
-            cmd_auth_check(cli, room, *state_members, *limit)
+            cli.require_single_dir("room check")?;
+            cmd_room_check(cli, room, *auth, *prevs, *state_members, *history, *limit)
         }
         Commands::Members { room, json } => {
             cli.require_single_dir("members")?;
             cmd_members(cli, room, *json)
-        }
-        Commands::Tombstones {
-            collection,
-            keys,
-            detail,
-        } => {
-            cli.require_single_dir("tombstones")?;
-            cmd_tombstones(cli, collection, *keys, *detail)
         }
         Commands::Remove {
             collection,
@@ -10250,6 +10248,34 @@ fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
     match action {
         PacksAction::List { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         PacksAction::Inspect { pack } => cmd_info_pack(cli, pack, None),
+        PacksAction::Scan {
+            selector,
+            verbose,
+            header,
+            decode,
+            limit,
+            id,
+            collection,
+            raw,
+            sort,
+            reverse,
+        } => {
+            parse_pack_id_selector(selector)?;
+            cmd_scan(
+                cli,
+                selector,
+                *verbose,
+                *header,
+                decode.as_deref(),
+                *limit,
+                id.as_deref(),
+                collection.as_deref(),
+                *raw,
+                sort.as_deref(),
+                *reverse,
+                false,
+            )
+        }
         PacksAction::Dump {
             pack,
             collection,
@@ -16780,7 +16806,33 @@ fn scan_room_events(
     Ok(scanned)
 }
 
-/// `auth-check`: re-derive a room's auth graph from its event records and
+/// `room check`: run the selected prev and auth completeness checks.
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "the booleans are independent command-line switches, not a mode"
+)]
+fn cmd_room_check(
+    cli: &Cli,
+    room: &str,
+    auth: bool,
+    prevs: bool,
+    state_members: bool,
+    history: bool,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let defaults = !auth && !prevs;
+    if auth || state_members || defaults {
+        println!("== auth_events ==");
+        cmd_auth_check(cli, room, state_members, limit)?;
+    }
+    if prevs || defaults {
+        println!("== prev_events gaps ==");
+        cmd_gap_list(cli, room, None, history)?;
+    }
+    Ok(())
+}
+
+/// Re-derive a room's auth graph from its event records and
 /// compare it with the embedded edge table.
 fn cmd_auth_check(
     cli: &Cli,
@@ -17008,17 +17060,57 @@ fn print_auth_check_report(
     }
 }
 
-fn cmd_tombstones(cli: &Cli, collection: &str, keys: bool, detail: bool) -> anyhow::Result<()> {
-    let collection_id = parse_collection_id(collection)?;
+fn cmd_tombstones(
+    cli: &Cli,
+    collection: &str,
+    keys: bool,
+    detail: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let collection_id = parse_collection_selector(collection)?;
     let store = open_store_read_only(cli)?;
     let counts = store
         .removal_counts(&collection_id)
         .ok_or_else(|| anyhow::anyhow!("no such collection: {}", format_id(&collection_id)))?;
+    let stats = detail
+        .then(|| store.removal_stats(&collection_id))
+        .transpose()?;
+    let removed = if keys {
+        store.removed_keys(&collection_id)?
+    } else {
+        Vec::new()
+    };
+    if json {
+        let mut fields = vec![
+            ("collection", json_string(&format_id(&collection_id))),
+            ("live_keys", counts.live_keys.to_string()),
+            ("removed_keys", counts.removed_keys.to_string()),
+        ];
+        if let Some(stats) = stats {
+            fields.extend([
+                ("frames", stats.frames.to_string()),
+                ("removal_markers", stats.marker_frames.to_string()),
+                ("superseded_frames", stats.superseded_frames.to_string()),
+                ("total_bytes", stats.total_bytes.to_string()),
+                ("reclaimable_bytes", stats.reclaimable_bytes.to_string()),
+            ]);
+        }
+        if keys {
+            let values = removed
+                .iter()
+                .map(|key| json_string(&format_id(key)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            fields.push(("removed", format!("[{values}]")));
+        }
+        println!("{}", json_object(&fields, ""));
+        return Ok(());
+    }
+
     println!("collection:        {}", format_id(&collection_id));
     println!("live keys:         {}", counts.live_keys);
     println!("removed keys:      {}", counts.removed_keys);
-    if detail {
-        let stats = store.removal_stats(&collection_id)?;
+    if let Some(stats) = stats {
         println!("frames:            {}", stats.frames);
         println!("  removal markers: {}", stats.marker_frames);
         println!("  superseded:      {}", stats.superseded_frames);
@@ -17026,7 +17118,7 @@ fn cmd_tombstones(cli: &Cli, collection: &str, keys: bool, detail: bool) -> anyh
         println!("reclaimable bytes: {}", stats.reclaimable_bytes);
     }
     if keys {
-        for key in store.removed_keys(&collection_id)? {
+        for key in removed {
             println!("removed {}", format_id(&key));
         }
     }

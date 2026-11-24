@@ -54,7 +54,12 @@ fn test_dir_parsing() {
     let m = build_cli()
         .try_get_matches_from(["mtxdb", "packs", "list", "-d", "dir1", "-d", "dir2", "-c"])
         .unwrap();
-    assert!(m.subcommand_matches("packs").unwrap().get_flag("coalesce"));
+    assert!(m
+        .subcommand_matches("packs")
+        .unwrap()
+        .subcommand_matches("list")
+        .unwrap()
+        .get_flag("coalesce"));
 
     // `--coalesce` belongs to the commands that aggregate; a leading flag or a
     // command that does not aggregate rejects it.
@@ -86,27 +91,29 @@ fn test_dir_parsing() {
 }
 
 #[test]
-fn test_info_selector_modes_and_mutual_exclusion() {
-    // Positional, --pack, and --collection are each accepted alone.
+fn info_is_collection_scoped_and_tombstones_need_a_selector() {
     assert!(build_cli()
         .try_get_matches_from(["mtxdb", "info", "0x1f"])
         .is_ok());
     assert!(build_cli()
-        .try_get_matches_from(["mtxdb", "info", "--pack", "0x1f"])
-        .is_ok());
-    assert!(build_cli()
-        .try_get_matches_from(["mtxdb", "info", "--collection", "!room:server"])
+        .try_get_matches_from([
+            "mtxdb",
+            "info",
+            "!room:server",
+            "--tombstones",
+            "--keys",
+            "--json"
+        ])
         .is_ok());
     assert!(build_cli().try_get_matches_from(["mtxdb", "info"]).is_ok());
-
     assert!(build_cli()
-        .try_get_matches_from(["mtxdb", "info", "--pack", "0x1f", "--collection", "0x2f"])
+        .try_get_matches_from(["mtxdb", "info", "--tombstones"])
         .is_err());
     assert!(build_cli()
-        .try_get_matches_from(["mtxdb", "info", "0x1f", "--pack", "0x2f"])
+        .try_get_matches_from(["mtxdb", "info", "!room:server", "--keys"])
         .is_err());
     assert!(build_cli()
-        .try_get_matches_from(["mtxdb", "info", "0x1f", "--collection", "0x2f"])
+        .try_get_matches_from(["mtxdb", "info", "--pack", "0x1f"])
         .is_err());
 }
 
@@ -385,25 +392,33 @@ fn gaps_anchor_requires_an_explicit_boundary() {
 }
 
 #[test]
-fn gaps_list_status_filter_rejects_unknown_names() {
-    let ok = build_cli().try_get_matches_from([
-        "mtxdb",
-        "room",
-        "gaps",
-        "!r:t",
-        "list",
-        "--status",
-        "absent",
-        "--history",
-    ]);
-    assert!(ok.is_ok());
-    let bad = build_cli().try_get_matches_from([
-        "mtxdb", "room", "gaps", "!r:t", "list", "--status", "closed",
-    ]);
-    assert!(
-        bad.is_err(),
-        "there is no closed status: a gap closes only by import"
-    );
+fn room_check_defaults_to_both_audits_and_can_select_one() {
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "room", "check", "!r:t"])
+        .is_ok());
+    assert!(build_cli()
+        .try_get_matches_from([
+            "mtxdb",
+            "room",
+            "check",
+            "!r:t",
+            "--auth",
+            "--state-members"
+        ])
+        .is_ok());
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "room", "check", "!r:t", "--prevs", "--history"])
+        .is_ok());
+    assert!(build_cli()
+        .try_get_matches_from([
+            "mtxdb",
+            "room",
+            "check",
+            "!r:t",
+            "--state-members",
+            "--prevs"
+        ])
+        .is_ok());
 }
 
 #[test]

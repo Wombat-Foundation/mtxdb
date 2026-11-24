@@ -841,9 +841,11 @@ fn info_explains_a_malformed_hex_selector() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: Some(String::new()),
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
     let doubled = cmd_info(&cli, "0x0x144ACE34F53560B728FA9E33DD3FEF63", None, false).unwrap_err();
@@ -861,9 +863,11 @@ fn info_selector_boundary_between_pack_and_collection() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: None,
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
     let digits = |n: usize| format!("0x{}", "a".repeat(n));
@@ -918,9 +922,11 @@ fn info_selector_32_hex_disambiguation() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: None,
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
 
@@ -1053,9 +1059,11 @@ fn info_pack_flag_reports_same_id_in_multiple_pools() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: None,
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
 
@@ -1079,9 +1087,11 @@ fn only_the_canonical_lowercase_prefix_is_accepted() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: None,
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
     // A short 0x-prefixed prefix is a filename-prefix selector.
@@ -1758,9 +1768,11 @@ fn info_dash_t_all_finds_collection_across_pools() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: Some(col_hex.clone()),
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
 
@@ -7902,9 +7914,11 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Info {
             selector: Some(format_id(&col1)),
-            pack: None,
-            collection: None,
             stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
     };
     cmd_info(&cli_info, &format_id(&col1), None, false).unwrap();
@@ -8452,18 +8466,21 @@ fn remove_hides_records_and_tombstones_reports_them() {
 
     let report = state_cli(
         &dir,
-        Commands::Tombstones {
-            collection: collection_hex.clone(),
+        Commands::Info {
+            selector: Some(collection_hex.clone()),
+            stats: false,
+            tombstones: true,
             keys: true,
             detail: true,
+            json: false,
         },
     );
     // Counts only (index), counts plus frame totals, and the key listing.
-    cmd_tombstones(&report, &collection_hex, false, false).unwrap();
-    cmd_tombstones(&report, &collection_hex, false, true).unwrap();
-    cmd_tombstones(&report, &collection_hex, true, true).unwrap();
+    cmd_tombstones(&report, &collection_hex, false, false, false).unwrap();
+    cmd_tombstones(&report, &collection_hex, false, true, false).unwrap();
+    cmd_tombstones(&report, &collection_hex, true, true, false).unwrap();
     // An unknown collection is an error, not an empty report.
-    assert!(cmd_tombstones(&report, &format_id(&[0x77u8; 16]), false, false).is_err());
+    assert!(cmd_tombstones(&report, &format_id(&[0x77u8; 16]), false, false, false).is_err());
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
