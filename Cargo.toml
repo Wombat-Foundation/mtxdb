@@ -147,7 +147,7 @@ memmap2 = "0.9.11"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 # The content-addressed HAMT (`mtxdb::hamt`) and the Matrix state layer on top
 # of it (`mtxdb::state_hamt`).
-rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1" }
+rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev" }
 rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", optional = true }
 sha2 = "0.11"
 zstd = { version = "0.14", default-features = false, optional = true }
