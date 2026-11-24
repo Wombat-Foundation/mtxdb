@@ -187,7 +187,10 @@ impl CsrWriter<'_> {
         self.store.append_rows(scope, rows)
     }
 
-    /// Append while the caller holds [`CsrStore::with_write_lock`].
+    /// Append and sync while the caller holds [`CsrStore::with_write_lock`].
+    /// Only tests need the sync-inside-the-lock form; production appends use
+    /// [`Self::append_rows_deferred_locked`] and sync after releasing the lock.
+    #[cfg(test)]
     pub(crate) fn append_rows_locked(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
         self.store.append_rows_locked(scope, rows, true)
     }
@@ -230,8 +233,29 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Whether this thread's last tail sync ran while the store's write lock
+    /// was held (by any thread). Tests assert a durable append releases the
+    /// lock before it syncs, so overlapping readers never wait on the flush.
+    static LAST_SYNC_HELD_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
 fn count_tail_sync() {
     TAIL_SYNCS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+/// Tail syncs issued by the current thread (test builds only).
+#[cfg(test)]
+pub(crate) fn test_tail_syncs() -> usize {
+    TAIL_SYNCS.with(std::cell::Cell::get)
+}
+
+/// Whether the current thread's most recent tail sync ran under the store's
+/// write lock (test builds only).
+#[cfg(test)]
+pub(crate) fn test_last_sync_held_lock() -> bool {
+    LAST_SYNC_HELD_LOCK.with(std::cell::Cell::get)
 }
 
 impl CsrStore {
@@ -306,14 +330,25 @@ impl CsrStore {
 
     /// Append changed rows and sync the tail.
     ///
+    /// The rows are written under the store's write lock and the tail is
+    /// synced after releasing it: holding the lock across `fsync` would stall
+    /// every overlapping reader for the length of the flush. This returns only
+    /// after the rows are durable.
+    ///
     /// Empty input does nothing and does not create the store directory.
     ///
     /// # Errors
     /// I/O errors, or a row with more than `u32::MAX` edges.
     pub(crate) fn append_rows(&self, scope: ScopeId, rows: &[RowRecord]) -> io::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let lock = self.store_lock();
-        let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
-        self.append_rows_locked(scope, rows, true)
+        {
+            let _guard = lock.write().unwrap_or_else(PoisonError::into_inner);
+            self.append_rows_locked(scope, rows, false)?;
+        }
+        self.sync_tail()
     }
 
     /// Make the tail's contents durable. Its directory entry was made durable
@@ -334,6 +369,8 @@ impl CsrStore {
             Ok(file) => {
                 #[cfg(test)]
                 let _trace = crate::test_trace::span("csr.tail_sync", &self.dir);
+                #[cfg(test)]
+                LAST_SYNC_HELD_LOCK.with(|held| held.set(self.store_lock().try_write().is_err()));
                 file.sync_data()?;
                 #[cfg(test)]
                 count_tail_sync();
@@ -1724,6 +1761,22 @@ mod tests {
             store.append_rows(scope, &[row_for(owner, 9)]).unwrap();
         }
         assert_eq!(tail_syncs() - before, 3);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn durable_append_syncs_after_releasing_the_write_lock() {
+        let layout = layout("sync-outside-lock");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([5; 16]);
+        store.append_rows(scope, &[row_for(1, 9)]).unwrap();
+        assert!(
+            !test_last_sync_held_lock(),
+            "a durable append must release the write lock before it fsyncs"
+        );
+        // The probe really does see the lock: a sync issued under it reports so.
+        store.with_write_lock(|| store.sync_tail()).unwrap();
+        assert!(test_last_sync_held_lock());
         let _ = fs::remove_dir_all(layout.root());
     }
 

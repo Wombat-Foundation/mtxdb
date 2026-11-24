@@ -1128,3 +1128,22 @@ fn read_only_graph_reads_what_the_writer_committed() {
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn durable_record_events_syncs_once_outside_the_write_lock() {
+    let root = test_root("sync-outside-lock");
+    let db = Database::open(root.clone()).unwrap();
+    let adj = adjacency();
+    let before = crate::csr::store::test_tail_syncs();
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    assert_eq!(
+        crate::csr::store::test_tail_syncs() - before,
+        1,
+        "one durable recording is one tail sync"
+    );
+    assert!(
+        !crate::csr::store::test_last_sync_held_lock(),
+        "the sync must run after the store write lock is released"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}

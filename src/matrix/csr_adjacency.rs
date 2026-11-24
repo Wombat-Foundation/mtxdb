@@ -450,7 +450,16 @@ impl CsrAdjacency {
             .saturating_add(1);
         crate::csr::store::CSR_MAX_IN_FLIGHT
             .fetch_max(in_flight, std::sync::atomic::Ordering::Relaxed);
-        let timed = store.with_write_lock(|| {
+        let timed: Result<
+            (
+                Vec<u32>,
+                bool,
+                usize,
+                std::time::Duration,
+                std::time::Duration,
+            ),
+            StorageError,
+        > = store.with_write_lock(|| {
             // TEMP diagnostic (not for commit): split the durable append.
             let lock_wait = lock_started.elapsed();
             let prepare_started = std::time::Instant::now();
@@ -470,39 +479,52 @@ impl CsrAdjacency {
             let prepare = prepare_started.elapsed();
             let appended = !changed_rows.is_empty();
             if appended {
+                // Append under the lock, but never fsync under it. The sync is
+                // the expensive part of a durable append, and holding the store
+                // write lock across it stalls every overlapping reader for the
+                // duration of the flush. The rows are readable as soon as they
+                // are written; `sync_tail` below makes them durable after the
+                // lock is released, and this call does not return before then.
                 store
                     .writer(db)
-                    .and_then(|writer| match durability {
-                        AppendDurability::Durable => {
-                            writer.append_rows_locked(self.scope(), &changed_rows)
-                        }
-                        AppendDurability::Deferred => {
-                            writer.append_rows_deferred_locked(self.scope(), &changed_rows)
-                        }
+                    .and_then(|writer| {
+                        writer.append_rows_deferred_locked(self.scope(), &changed_rows)
                     })
                     .map_err(StorageError::Io)?;
             }
-            if appended && crate::csr::store::csr_timing_enabled() {
-                let (write_ns, sync_ns, seal_ns) =
-                    crate::csr::store::last_append_timing_ns();
-                eprintln!(
-                    "MTXDB-CSR-TIMING rows={} durable={} inflight={} max_inflight={} lock_wait_us={} prepare_us={} write_us={} sync_us={} seal_us={}",
-                    changed_rows.len(),
-                    matches!(durability, AppendDurability::Durable),
-                    in_flight,
-                    crate::csr::store::CSR_MAX_IN_FLIGHT
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    lock_wait.as_micros(),
-                    prepare.as_micros(),
-                    write_ns / 1000,
-                    sync_ns / 1000,
-                    seal_ns / 1000,
-                );
-            }
-            Ok(owners)
+            Ok((owners, appended, changed_rows.len(), lock_wait, prepare))
         });
         crate::csr::store::CSR_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        timed
+        let (owners, appended, appended_rows, lock_wait, prepare) = timed?;
+
+        // Durability barrier: outside the write lock, so readers can proceed
+        // while the tail is flushed. A concurrent seal may have folded these
+        // rows into a segment (and synced it) and truncated the tail; syncing
+        // an empty or unrelated tail is harmless, and the rows are durable
+        // either way.
+        let sync_started = std::time::Instant::now();
+        if appended && durability == AppendDurability::Durable {
+            store.sync_tail().map_err(StorageError::Io)?;
+        }
+        let sync_ns = u64::try_from(sync_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        if appended && crate::csr::store::csr_timing_enabled() {
+            let (write_ns, _, seal_ns) = crate::csr::store::last_append_timing_ns();
+            eprintln!(
+                "MTXDB-CSR-TIMING rows={} durable={} inflight={} max_inflight={} lock_wait_us={} prepare_us={} write_us={} sync_us={} seal_us={}",
+                appended_rows,
+                durability == AppendDurability::Durable,
+                in_flight,
+                crate::csr::store::CSR_MAX_IN_FLIGHT
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                lock_wait.as_micros(),
+                prepare.as_micros(),
+                write_ns / 1000,
+                sync_ns / 1000,
+                seal_ns / 1000,
+            );
+        }
+        Ok(owners)
     }
 
     /// Add the reverse rows for the `PREV` rows in `changed`: for each parent,
