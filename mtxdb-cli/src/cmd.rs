@@ -1010,7 +1010,7 @@ fn database_labels(paths: &[PathBuf]) -> HashMap<PathBuf, String> {
 /// Run a command over all targeted database roots.
 ///
 /// When a single directory (or default `.`) is targeted, runs `f` directly.
-/// When multiple directories are targeted (e.g. `mtxdb shards -d *`), iterates over each,
+/// When multiple directories are targeted (e.g. `mtxdb packs list -d *`), iterates over each,
 /// printing a section header for each database root and skipping non-databases with a note.
 fn run_multi_dir<F>(cli: &Cli, mut f: F) -> anyhow::Result<()>
 where
@@ -3032,7 +3032,7 @@ fn interleaving_worth_noting(collections: u64, excess_runs: u64) -> bool {
     excess_runs >= collections.max(1)
 }
 
-/// Physical-layout block of `mtxdb shards --layout`: per-pack contiguous
+/// Physical-layout block of `mtxdb packs list --layout`: per-pack contiguous
 /// runs, interleaving excess, and — when fragmentation is worth acting on —
 /// the note that repack is never automatic.
 fn print_pack_physical_layout(
@@ -3040,7 +3040,7 @@ fn print_pack_physical_layout(
     physical: &mtxdb::packfile::layout::PhysicalLayout,
 ) {
     // Aggregate only over the packs listed in `shard_entries`: the caller
-    // passes every pack for `mtxdb shards --layout` (pool-wide totals) but a
+    // passes every pack for `mtxdb packs list --layout` (pool-wide totals) but a
     // single pack for `mtxdb info 0x…`, where reporting pool-wide runs while
     // displaying only the selected pack would mislead.
     let listed_packs = shard_entries
@@ -4705,7 +4705,7 @@ fn fmt_duration(secs: u64) -> String {
 
 /// `info` accepts a collection selector (a canonical sigil, a bare `0x`-less
 /// sigil, or a `0x`-prefixed 32-hex logical ID) or a pack selector
-/// (`0x`-prefixed, 1–16 hex digits, as printed by `mtxdb shards`).
+/// (`0x`-prefixed, 1–16 hex digits, as printed by `mtxdb packs list`).
 ///
 /// A `0x`-prefixed 32-hex selector is genuinely ambiguous now that a pack's
 /// full address is 32 hex digits: it can name either a collection or a pack,
@@ -6102,7 +6102,7 @@ fn cmd_info_single(
 
 /// Print a pack's age (header `created_at`) and how long it stayed the
 /// active append target (span to its file's last-modified time), from the
-/// same header `mtxdb shards` already validates when discovering packs.
+/// same header `mtxdb packs list` already validates when discovering packs.
 fn print_pack_lifetime(path: &Path) {
     let created_at = fs::File::open(path).ok().and_then(|file| {
         mtxdb::packfile::read_header(&mut BufReader::new(file))
@@ -6140,7 +6140,7 @@ fn print_pack_lifetime(path: &Path) {
     }
 }
 
-/// Print the same per-pack summary row `mtxdb shards` would, for one pack ID.
+/// Print the same per-pack summary row `mtxdb packs list` would, for one pack ID.
 #[allow(
     clippy::too_many_lines,
     reason = "prints one pack's stats, physical layout, and per-collection breakdown in sequence"
@@ -7435,7 +7435,7 @@ fn print_collection_shards(shards: &[PackId]) {
 
 /// An operator-facing pack identifier. Slots are deliberately not accepted
 /// here: they are recycled implementation details, while a pack address is the
-/// permanent identity printed by `mtxdb shards`. A selector is either the full
+/// permanent identity printed by `mtxdb packs list`. A selector is either the full
 /// 32-hex address or a 1–16 hex filename prefix; the prefix is resolved against
 /// a pool's discovered packs, where it must be unique.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7455,7 +7455,7 @@ impl PackSelector {
         let Some(hex) = selector.strip_prefix("0x") else {
             bail!(
                 "invalid pack ID `{selector}`; use the lowercase 0x-prefixed ID shown by \
-                 `mtxdb shards`"
+                 `mtxdb packs list`"
             );
         };
         if hex.is_empty()
@@ -8896,7 +8896,7 @@ fn scan_payload_suffix(data: &[u8]) -> Option<String> {
         return None;
     }
     Some(match data.len() {
-        0 => "0 bytes [empty payload: a removal marker or an empty value; see `mtxdb tombstones`]"
+        0 => "0 bytes [empty payload: a removal marker or an empty value; see `mtxdb info <collection> --tombstones`]"
             .to_owned(),
         _ => match data.get(0..4) {
             Some(magic) => format!(
@@ -10262,7 +10262,6 @@ const PACK_DUMP_SCHEMA: &str = "mtxdb.pack.dump/v1";
 fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
     match action {
         PacksAction::List { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
-        PacksAction::Inspect { pack } => cmd_info_pack(cli, pack, None),
         PacksAction::Scan {
             selector,
             verbose,
@@ -16122,7 +16121,7 @@ fn resolve_repack_slots(
 
 /// Print the physical islands a repack would combine, before and after.
 ///
-/// Current counts match `mtxdb shards --layout`: a run is one maximal
+/// Current counts match `mtxdb packs list --layout`: a run is one maximal
 /// contiguous stretch of a single collection, "excess" is runs beyond one per
 /// collection per pack, and superseded frames are included because that is
 /// what the physical scan sees. Repack writes each collection as one

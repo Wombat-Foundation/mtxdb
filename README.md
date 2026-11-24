@@ -41,3 +41,31 @@ where possible.
 The process-safety policy for read-only tools and the `multi-reader` feature is
 documented in
 [`docs/docs/2026-09-30-process-safety-and-reader-builds.md`](docs/docs/2026-09-30-process-safety-and-reader-builds.md).
+
+## CLI layout
+
+The CLI groups Matrix room operations under `room` and pack operations under
+`packs`. `info` accepts a collection, room, or pack selector; use it for the
+summary view of any one of those objects.
+
+```text
+mtxdb packs list [--layout]
+mtxdb packs scan <PACK_ID> [--collection <COLLECTION>]
+mtxdb packs dump --pack <PACK_ID> [--collection <COLLECTION>] [--out <FILE>]
+mtxdb packs extract --pack <PACK_ID> --collection <COLLECTION> --out <FILE>
+mtxdb scan <COLLECTION>
+mtxdb info [<SELECTOR>] [--stats] [--tombstones [--detail] [--keys]]
+mtxdb room timeline <ROOM_ID>
+mtxdb room flags <ROOM_ID>
+mtxdb room members <ROOM_ID>
+mtxdb room check <ROOM_ID> [--auth] [--prevs] [--status <STATUS>]
+mtxdb room gaps <ROOM_ID> {ingest|waive|anchor}
+mtxdb get [--collection <COLLECTION>] <ID>
+mtxdb remove <COLLECTION> <ID>...
+mtxdb drop <COLLECTION>...
+```
+
+`<SELECTOR>` for `info` is a collection ID, a canonical room ID, or a pack ID.
+With neither `--auth` nor `--prevs`, `room check` runs both audits; `--status`
+filters the prev-event gaps section, which also runs by default. `get` takes its
+record ID positionally; the former `-i/--id` spelling is not supported.

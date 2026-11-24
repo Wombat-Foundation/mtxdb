@@ -216,7 +216,7 @@ pub(crate) enum Commands {
         decode: Option<String>,
     },
     Info {
-        /// Positional collection selector; a room ID is also accepted.
+        /// Positional collection, room, or pack selector.
         selector: Option<String>,
         stats: bool,
         tombstones: bool,
@@ -311,8 +311,6 @@ pub(crate) enum PacksAction {
         layout: bool,
         sort: Option<String>,
     },
-    /// Show one pack's header, collection composition, and node counts.
-    Inspect { pack: String },
     /// Scan a pack's physical frames.
     Scan {
         selector: String,
@@ -918,14 +916,14 @@ fn sub_search() -> Command {
 
 fn sub_info() -> Command {
     Command::new("info")
-        .about("Show database or collection storage info")
+        .about("Show database, collection, or pack storage info")
         .arg(
             Arg::new("selector")
                 .required(false)
-                .value_name("COLLECTION")
+                .value_name("SELECTOR")
                 .help(
-                    "Collection ID (0x-prefixed) or canonical Matrix room ID; omit for database and pool metadata",
-                ),
+                "Collection ID, canonical room ID, or pack ID; omit for database and pool metadata",
+            ),
         )
         .arg(
             Arg::new("stats")
@@ -1155,7 +1153,7 @@ fn sub_export() -> Command {
 
 fn sub_packs() -> Command {
     Command::new("packs")
-        .about("Inspect and dump pack frames (read-only)")
+        .about("List, scan, dump, or extract pack data")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(
@@ -1166,18 +1164,6 @@ fn sub_packs() -> Command {
                 .arg(sort_arg(
                     "pack, bytes, nodes, collections, syncs, segments, interleaving",
                 )),
-        )
-        .subcommand(
-            Command::new("inspect")
-                .about("Show one pack's header, collections, and node counts")
-                .arg(
-                    Arg::new("pack")
-                        .short('p')
-                        .long("pack")
-                        .required(true)
-                        .value_name("PACK_ID")
-                        .help("Pack identity (0x-prefixed full 32-hex id, or a unique 1-16 hex filename prefix)"),
-                ),
         )
         .subcommand(sub_pack_scan())
         .subcommand(sub_packs_dump())
@@ -1435,14 +1421,7 @@ fn sub_get() -> Command {
         .arg(
             Arg::new("id")
                 .index(1)
-                .required_unless_present("id_option")
-                .help("Node ID (0x-prefixed, 32 hex digits) or Matrix event ID"),
-        )
-        .arg(
-            Arg::new("id_option")
-                .short('i')
-                .long("id")
-                .conflicts_with("id")
+                .required(true)
                 .help("Node ID (0x-prefixed, 32 hex digits) or Matrix event ID"),
         )
         .arg(
@@ -1700,11 +1679,7 @@ fn parse_cli() -> Cli {
         },
         Some(("get", m)) => Commands::Get {
             collection: m.get_one::<String>("collection").cloned(),
-            id: m
-                .get_one::<String>("id")
-                .or_else(|| m.get_one::<String>("id_option"))
-                .expect("clap requires either positional ID or --id")
-                .clone(),
+            id: m.get_one::<String>("id").unwrap().clone(),
             raw: m.get_flag("raw"),
             verbose: m.get_flag("verbose"),
             header: m.get_flag("header"),
@@ -1798,9 +1773,6 @@ fn parse_cli() -> Cli {
                     all: sub.get_flag("all"),
                     layout: sub.get_flag("layout"),
                     sort: sub.get_one::<String>("sort").cloned(),
-                },
-                Some(("inspect", sub)) => PacksAction::Inspect {
-                    pack: sub.get_one::<String>("pack").unwrap().clone(),
                 },
                 Some(("scan", sub)) => PacksAction::Scan {
                     selector: sub.get_one::<String>("selector").unwrap().clone(),
