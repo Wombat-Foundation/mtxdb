@@ -273,7 +273,11 @@ pub(crate) fn check<E>(
     // Every allocated id: the authoritative comparison below names each event.
     for short_id in 1..=allocated {
         if let Some(bytes) = read_present(&reverse_node_id(short_id))? {
-            if let Ok(event_id) = String::from_utf8(bytes) {
+            if bytes.is_empty() {
+                report
+                    .corrupt
+                    .push((short_id, "reverse map record is empty".to_owned()));
+            } else if let Ok(event_id) = String::from_utf8(bytes) {
                 report.names.insert(short_id, event_id);
             }
         }
@@ -419,6 +423,19 @@ mod tests {
         assert_eq!(report.with_edges, 0);
         assert_eq!(report.corrupt.len(), 1);
         assert_eq!(report.corrupt[0].0, 1);
+    }
+
+    #[test]
+    fn present_empty_reverse_record_is_corrupt_not_a_name() {
+        // A live zero-byte payload is an ordinary value, not a removal.
+        let map = room(1, &[(1, edges(&[]))], &[(1, "")]);
+        let report = run(&map);
+        assert_eq!(report.names.get(&1), None);
+        assert_eq!(
+            report.corrupt,
+            vec![(1, "reverse map record is empty".to_owned())]
+        );
+        assert_eq!(report.unnamed, vec![1]);
     }
 
     #[test]

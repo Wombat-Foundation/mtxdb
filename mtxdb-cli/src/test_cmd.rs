@@ -12279,7 +12279,7 @@ fn auth_check_reports_empty_event_payloads_as_unreadable() {
         .unwrap();
 
     let scanned = super::scan_room_events(&store, &collection).unwrap();
-    let entry = scanned.get(&format!("<node {}>", hex::encode(node_id))).unwrap();
+    let entry = &scanned[&format!("<node {}>", hex::encode(node_id))];
     assert!(matches!(
         entry.auth,
         crate::auth_check::EventAuth::Unreadable(_)
