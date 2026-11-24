@@ -367,7 +367,7 @@ mod tests {
         let report = run(&map);
         assert_eq!(report.allocated, 2);
         assert_eq!(report.with_edges, 2);
-        assert!(report.dangling.is_empty());
+        assert_eq!(report.dangling, Vec::<Dangling>::new());
     }
 
     #[test]
@@ -410,7 +410,7 @@ mod tests {
         bad[0] = 9;
         let map = room(1, &[(1, bad)], &[]);
         let report = run(&map);
-        assert!(report.dangling.is_empty());
+        assert_eq!(report.dangling, Vec::<Dangling>::new());
         assert_eq!(report.corrupt.len(), 1);
     }
 
@@ -423,9 +423,9 @@ mod tests {
         );
         let own = HashMap::from([("$create", vec![]), ("$child", vec!["$create"])]);
         let report = run_with(&map, &own);
-        assert!(report.mismatched.is_empty());
-        assert!(report.no_record.is_empty());
-        assert!(report.unnamed.is_empty());
+        assert_eq!(report.mismatched, Vec::<Mismatch>::new());
+        assert_eq!(report.no_record, Vec::<String>::new());
+        assert_eq!(report.unnamed, Vec::<u32>::new());
     }
 
     #[test]
@@ -508,7 +508,7 @@ mod tests {
                  "auth_events":[]}"#,
         )
         .unwrap();
-        assert!(authoritative_auth_ids(&value).is_empty());
+        assert_eq!(authoritative_auth_ids(&value), Vec::<String>::new());
     }
 
     #[test]
@@ -555,9 +555,10 @@ mod tests {
     #[test]
     fn state_members_with_forward_ids_are_clean() {
         let groups = vec![([1u8; 16], vec!["$a".to_owned()])];
-        assert!(missing_state_members(groups, |_| Ok::<_, Infallible>(true))
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            missing_state_members(groups, |_| Ok::<_, Infallible>(true)).unwrap(),
+            Vec::<MissingStateMember>::new()
+        );
     }
 
     #[test]
