@@ -1545,9 +1545,13 @@ fn read_family_directory(
         let (chunk_start, first_len, _) = fields(&selected[next])?;
         let mut chunk_end = next.saturating_add(1);
         let mut span = first_len;
-        while chunk_end < selected.len() && span < FAMILY_READ_CHUNK {
+        while chunk_end < selected.len() {
             let (_, len, _) = fields(&selected[chunk_end])?;
-            span = span.checked_add(len).ok_or_else(out_of_range)?;
+            let prospective = span.checked_add(len).ok_or_else(out_of_range)?;
+            if prospective > FAMILY_READ_CHUNK {
+                break;
+            }
+            span = prospective;
             chunk_end = chunk_end.saturating_add(1);
         }
         let mut batch = vec![0_u8; span];

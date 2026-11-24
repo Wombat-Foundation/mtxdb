@@ -445,8 +445,9 @@ impl CsrAdjacency {
         // validate against the old state, and the later append would silently
         // replace the earlier one.
         let lock_started = std::time::Instant::now();
-        let in_flight =
-            crate::csr::store::CSR_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let in_flight = crate::csr::store::CSR_IN_FLIGHT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
         crate::csr::store::CSR_MAX_IN_FLIGHT
             .fetch_max(in_flight, std::sync::atomic::Ordering::Relaxed);
         let timed = store.with_write_lock(|| {
