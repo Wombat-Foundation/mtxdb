@@ -38,6 +38,11 @@ const EDGE_ENCODING_VERSION: u8 = 1;
 /// 5 MSC4242), plus -1 for a record stored with no format version.
 const EVENT_RECORD_FORMAT_VERSIONS: [i32; 6] = [-1, 1, 2, 3, 4, 5];
 
+/// The MSC4242 event format tag (sithnapse's `ROOM_VMSC4242`). MSC4242 removes
+/// `auth_events` from the PDU, so the record's own auth list is only in its
+/// internal metadata.
+pub(crate) const MSC4242_FORMAT_VERSION: i32 = 5;
+
 type NodeId = [u8; 16];
 
 fn node_id(parts: &[&[u8]]) -> NodeId {
@@ -72,6 +77,11 @@ pub(crate) fn forward_node_id(event_id: &str) -> NodeId {
 /// The JSON bytes of an event record:
 /// `[i32 format_version][u32 metadata_len][internal_metadata][json]`, big-endian.
 pub(crate) fn event_record_json(bytes: &[u8]) -> Result<&[u8], String> {
+    Ok(event_record_parts(bytes)?.2)
+}
+
+/// Split an event record into its format tag, internal metadata, and JSON body.
+pub(crate) fn event_record_parts(bytes: &[u8]) -> Result<(i32, &[u8], &[u8]), String> {
     let Some(header) = bytes.get(..8) else {
         return Err("event record too short".to_owned());
     };
@@ -80,10 +90,40 @@ pub(crate) fn event_record_json(bytes: &[u8]) -> Result<&[u8], String> {
         return Err(format!("unsupported event format version {format_version}"));
     }
     let metadata_len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    8usize
-        .checked_add(metadata_len)
-        .and_then(|start| bytes.get(start..))
-        .ok_or_else(|| "event record metadata length exceeds the record".to_owned())
+    let Some(metadata_end) = 8usize.checked_add(metadata_len) else {
+        return Err("event record metadata length exceeds the record".to_owned());
+    };
+    let Some(metadata) = bytes.get(8..metadata_end) else {
+        return Err("event record metadata length exceeds the record".to_owned());
+    };
+    Ok((format_version, metadata, &bytes[metadata_end..]))
+}
+
+/// The auth event ids a format-5 record's internal metadata records.
+///
+/// MSC4242 stores the ids selected for the event under
+/// `calculated_auth_event_ids` in the metadata, beside the PDU. That copy is
+/// written with the event and is independent of the derived AUTH edge table,
+/// so it is the authoritative side of the audit. Missing or malformed metadata
+/// is an error: the record is then uncomparable, not empty.
+pub(crate) fn metadata_auth_ids(metadata: &[u8]) -> Result<Vec<String>, String> {
+    let value = rezzy::json::Value::parse_bytes(metadata)
+        .map_err(|error| format!("internal metadata is not valid JSON: {error}"))?;
+    let Some(ids) = value.get("calculated_auth_event_ids") else {
+        return Err(
+            "MSC4242 record has no calculated_auth_event_ids in internal metadata".to_owned(),
+        );
+    };
+    let rezzy::json::Value::Array(ids) = ids else {
+        return Err("MSC4242 calculated_auth_event_ids is not an array".to_owned());
+    };
+    ids.iter()
+        .map(|id| {
+            id.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "MSC4242 calculated_auth_event_ids contains a non-string".to_owned())
+        })
+        .collect()
 }
 
 /// Decode an edge record, or say why it cannot be trusted.
@@ -213,6 +253,7 @@ pub(crate) fn authoritative_auth_ids(
 }
 
 /// What an event record says about an event's auth events.
+#[derive(Debug)]
 pub(crate) enum EventAuth {
     /// No record for this event.
     Absent,
@@ -546,6 +587,39 @@ mod tests {
         assert!(event_record_json(&unsupported)
             .unwrap_err()
             .contains("unsupported event format version 99"));
+    }
+
+    #[test]
+    fn metadata_auth_ids_reads_the_recorded_list() {
+        assert_eq!(
+            metadata_auth_ids(br#"{"calculated_auth_event_ids":["$a","$b"],"device_id":"DEV"}"#)
+                .unwrap(),
+            vec!["$a".to_owned(), "$b".to_owned()]
+        );
+        assert_eq!(
+            metadata_auth_ids(br#"{"calculated_auth_event_ids":[]}"#).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn metadata_auth_ids_rejects_missing_or_malformed_lists() {
+        let cases: [(&[u8], &str); 4] = [
+            (b"{}", "has no calculated_auth_event_ids"),
+            (br#"{"calculated_auth_event_ids":"$a"}"#, "is not an array"),
+            (
+                br#"{"calculated_auth_event_ids":["$a",1]}"#,
+                "contains a non-string",
+            ),
+            (b"not json", "not valid JSON"),
+        ];
+        for (metadata, expected) in cases {
+            let error = metadata_auth_ids(metadata).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "{error} does not contain {expected}"
+            );
+        }
     }
 
     #[test]

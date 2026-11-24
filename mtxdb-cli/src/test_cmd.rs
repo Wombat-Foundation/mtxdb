@@ -12288,7 +12288,7 @@ fn auth_check_reports_empty_event_payloads_as_unreadable() {
 }
 
 #[test]
-fn auth_check_marks_msc4242_auth_metadata_as_unreadable() {
+fn auth_check_marks_msc4242_without_metadata_auth_ids_as_unreadable() {
     let dir = unique_temp_dir();
     let room = "!msc4242:test";
     let collection = matrix_room_collection_id(room);
@@ -12317,5 +12317,232 @@ fn auth_check_marks_msc4242_auth_metadata_as_unreadable() {
         crate::auth_check::EventAuth::Unreadable(reason)
             if reason.contains("MSC4242") && reason.contains("internal metadata")
     )));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_compares_msc4242_metadata_auth_ids() {
+    let dir = unique_temp_dir();
+    let room = "!msc4242-ok:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"org.matrix.msc4242.12"},"prev_events":[]}"#;
+    let message = r#"{"type":"m.room.message","room_id":"!msc4242-ok:test","content":{"body":"hello"},"prev_state_events":[]}"#;
+    store
+        .put(
+            &collection,
+            &[0xC3; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                5,
+                r#"{"calculated_auth_event_ids":[]}"#,
+                create,
+            )),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xC4; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                5,
+                r#"{"calculated_auth_event_ids":["$evt"]}"#,
+                message,
+            )),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    assert_eq!(scanned.len(), 2);
+    // The metadata ids are compared only after the event id is derived.
+    assert!(scanned.keys().all(|event_id| event_id.starts_with('$')));
+
+    let create_entry = scanned
+        .values()
+        .find(|entry| entry.node_id == [0xC3; 16])
+        .unwrap();
+    assert!(matches!(
+        &create_entry.auth,
+        crate::auth_check::EventAuth::Ids(ids) if ids.is_empty()
+    ));
+    let message_entry = scanned
+        .values()
+        .find(|entry| entry.node_id == [0xC4; 16])
+        .unwrap();
+    match &message_entry.auth {
+        crate::auth_check::EventAuth::Ids(ids) => {
+            assert_eq!(ids, &vec!["$evt".to_owned()]);
+        }
+        other => panic!("MSC4242 metadata auth ids were not compared: {other:?}"),
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_compares_msc4242_metadata_ids_with_auth_edges() {
+    let create_id = msc4242_event_id(MSC4242_CREATE);
+    let report = check_msc4242_metadata_against_auth_edges(&[&create_id]);
+    assert_eq!(report.allocated, 2);
+    assert_eq!(report.with_edges, 2);
+    assert_eq!(
+        report.mismatched,
+        Vec::new(),
+        "metadata ids should match the edges"
+    );
+    assert_eq!(report.bad_records, Vec::new());
+}
+
+#[test]
+fn auth_check_reports_msc4242_metadata_ids_that_disagree_with_auth_edges() {
+    let create_id = msc4242_event_id(MSC4242_CREATE);
+    let report = check_msc4242_metadata_against_auth_edges(&["$unrelated"]);
+    assert_eq!(report.mismatched.len(), 1, "{:?}", report.mismatched);
+    let mismatch = &report.mismatched[0];
+    assert_eq!(mismatch.event_id, msc4242_event_id(MSC4242_MESSAGE));
+    assert_eq!(mismatch.missing, vec!["$unrelated".to_owned()]);
+    assert_eq!(mismatch.extra, vec![create_id]);
+}
+
+const MSC4242_CREATE: &str = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"org.matrix.msc4242.12"},"prev_events":[]}"#;
+const MSC4242_MESSAGE: &str = r#"{"type":"m.room.message","room_id":"!msc4242-edges:test","content":{"body":"hello"},"prev_state_events":[]}"#;
+
+fn msc4242_event_id(json: &str) -> String {
+    let hash = rezzy::reference_hash(&owned_value(json), "org.matrix.msc4242.12")
+        .expect("MSC4242 event ids are reference hashes");
+    format!("${hash}")
+}
+
+fn auth_edge_record(targets: &[u32]) -> Vec<u8> {
+    let mut buf = vec![1u8];
+    buf.extend_from_slice(
+        &u32::try_from(targets.len())
+            .expect("test edge list fits in u32")
+            .to_be_bytes(),
+    );
+    for target in targets {
+        buf.extend_from_slice(&target.to_be_bytes());
+    }
+    buf
+}
+
+/// Scan a format-5 room whose message event records `metadata_ids` as its auth
+/// list, then run the whole check against an AUTH edge table where short id 1
+/// is the create event (no auth) and 2 is the message (auth: create).
+fn check_msc4242_metadata_against_auth_edges(metadata_ids: &[&str]) -> crate::auth_check::Report {
+    let dir = unique_temp_dir();
+    let room = "!msc4242-edges:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create_id = msc4242_event_id(MSC4242_CREATE);
+    let message_id = msc4242_event_id(MSC4242_MESSAGE);
+    let metadata = format!(
+        r#"{{"calculated_auth_event_ids":[{}]}}"#,
+        metadata_ids
+            .iter()
+            .map(|id| format!("{id:?}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    store
+        .put(
+            &collection,
+            &[0xE1; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                5,
+                r#"{"calculated_auth_event_ids":[]}"#,
+                MSC4242_CREATE,
+            )),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xE2; 16],
+            &NodeData::from_slice(&encode_event_json_record(5, &metadata, MSC4242_MESSAGE)),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    let mut auth = HashMap::new();
+    auth.insert(
+        crate::auth_check::counter_node_id(),
+        2u64.to_be_bytes().to_vec(),
+    );
+    auth.insert(crate::auth_check::edge_node_id(1), auth_edge_record(&[]));
+    auth.insert(crate::auth_check::edge_node_id(2), auth_edge_record(&[1]));
+    auth.insert(
+        crate::auth_check::reverse_node_id(1),
+        create_id.as_bytes().to_vec(),
+    );
+    auth.insert(
+        crate::auth_check::reverse_node_id(2),
+        message_id.as_bytes().to_vec(),
+    );
+
+    let report = crate::auth_check::check(
+        |id| Ok::<_, std::convert::Infallible>(auth.get(id).cloned()),
+        |event_id| {
+            Ok(match scanned.get(event_id) {
+                Some(entry) => match &entry.auth {
+                    crate::auth_check::EventAuth::Ids(ids) => {
+                        crate::auth_check::EventAuth::Ids(ids.clone())
+                    }
+                    crate::auth_check::EventAuth::Unreadable(reason) => {
+                        crate::auth_check::EventAuth::Unreadable(reason.clone())
+                    }
+                    crate::auth_check::EventAuth::Absent => crate::auth_check::EventAuth::Absent,
+                },
+                None => crate::auth_check::EventAuth::Absent,
+            })
+        },
+    )
+    .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    report
+}
+
+#[test]
+fn auth_check_keeps_using_the_body_for_non_msc4242_records() {
+    let dir = unique_temp_dir();
+    let room = "!v11-body:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"11"},"prev_events":[]}"#;
+    let message = r#"{"type":"m.room.member","state_key":"@a:test","room_id":"!v11-body:test","content":{"membership":"join"},"auth_events":["$body"],"prev_events":[]}"#;
+    // A metadata copy must not override the body for formats that carry
+    // `auth_events` themselves.
+    store
+        .put(
+            &collection,
+            &[0xD1; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                3,
+                r#"{"calculated_auth_event_ids":["$meta"]}"#,
+                create,
+            )),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xD2; 16],
+            &NodeData::from_slice(&encode_event_json_record(
+                3,
+                r#"{"calculated_auth_event_ids":["$meta"]}"#,
+                message,
+            )),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    let entry = scanned
+        .values()
+        .find(|entry| entry.node_id == [0xD2; 16])
+        .unwrap();
+    match &entry.auth {
+        crate::auth_check::EventAuth::Ids(ids) => {
+            assert_eq!(ids, &vec!["$body".to_owned()]);
+        }
+        other => panic!("v11 record did not use its body auth list: {other:?}"),
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }

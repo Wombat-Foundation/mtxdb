@@ -16792,24 +16792,42 @@ fn scan_room_events(
     event_store: &PackfileStorage,
     event_collection: &[u8; 16],
 ) -> anyhow::Result<HashMap<String, ScannedEvent>> {
-    use crate::auth_check::{event_record_json, EventAuth};
+    use crate::auth_check::{
+        event_record_parts, metadata_auth_ids, EventAuth, MSC4242_FORMAT_VERSION,
+    };
 
     // Event ids are derived from each record's own JSON (reference hash under
     // the room's version), so no key salt is needed to find a record. Records
     // whose id cannot be derived (room versions 1-2, unparsable JSON) are
     // reported as unreadable.
-    let mut raw: Vec<([u8; 16], Result<OwnedValue, String>)> = Vec::new();
+    //
+    // The third element is the auth list recorded in internal metadata:
+    // `Ok(None)` when the record's format keeps it in the body instead.
+    type ParsedRecord = (
+        [u8; 16],
+        Result<OwnedValue, String>,
+        Result<Option<Vec<String>>, String>,
+    );
+    let mut raw: Vec<ParsedRecord> = Vec::new();
     for entry in event_store.scan_collection(event_collection)? {
         let (node_id, data) = entry?;
         if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
             continue;
         }
-        let parsed = event_record_json(&data.bytes).and_then(|json| {
-            OwnedValue::parse_bytes(json).map_err(|error| format!("not valid JSON: {error}"))
-        });
-        raw.push((node_id, parsed));
+        let (parsed, metadata_auth) = match event_record_parts(&data.bytes) {
+            Ok((format_version, metadata, json)) => (
+                OwnedValue::parse_bytes(json).map_err(|error| format!("not valid JSON: {error}")),
+                if format_version == MSC4242_FORMAT_VERSION {
+                    metadata_auth_ids(metadata).map(Some)
+                } else {
+                    Ok(None)
+                },
+            ),
+            Err(reason) => (Err(reason), Ok(None)),
+        };
+        raw.push((node_id, parsed, metadata_auth));
     }
-    let room_version = raw.iter().find_map(|(_, parsed)| {
+    let room_version = raw.iter().find_map(|(_, parsed, _)| {
         let value = parsed.as_ref().ok()?;
         (value.get("type").and_then(OwnedValue::as_str) == Some("m.room.create"))
             .then(|| {
@@ -16822,7 +16840,7 @@ fn scan_room_events(
             .flatten()
     });
     let mut scanned: HashMap<String, ScannedEvent> = HashMap::new();
-    for (node_id, parsed) in raw {
+    for (node_id, parsed, metadata_auth) in raw {
         let (event_id, entry) = match (parsed, room_version.as_deref()) {
             (Ok(value), Some(version)) => match rezzy::reference_hash(&value, version) {
                 Ok(hash) => (
@@ -16830,15 +16848,17 @@ fn scan_room_events(
                     ScannedEvent {
                         node_id,
                         is_state: value.get("state_key").is_some(),
-                        auth: if version == "org.matrix.msc4242.12" {
-                            EventAuth::Unreadable(
-                                "MSC4242 stores calculated auth event IDs in internal metadata, which this check does not decode"
-                                    .to_owned(),
-                            )
-                        } else {
-                            EventAuth::Ids(crate::auth_check::authoritative_auth_ids(
+                        auth: match metadata_auth {
+                            // No implicit-create append here: sithnapse records
+                            // the list computed from `auth_types_for_event`
+                            // (which includes `m.room.create`) in metadata, then
+                            // strips create from the v12 PDU body. The metadata
+                            // copy keeps it, and that same list becomes the edges.
+                            Ok(Some(ids)) => EventAuth::Ids(ids),
+                            Ok(None) => EventAuth::Ids(crate::auth_check::authoritative_auth_ids(
                                 &value, version,
-                            ))
+                            )),
+                            Err(reason) => EventAuth::Unreadable(reason),
                         },
                     },
                 ),
