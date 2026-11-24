@@ -17012,7 +17012,9 @@ fn cmd_auth_check(
         .try_into()
         .map_err(|_| anyhow!("failed to open every pool for adjacency reads"))?;
     let graph = mtxdb::short_id::ReadOnlyGraph::new(graph_layout, graph_pools);
-    let adjacency = CsrAdjacency::new(room);
+    // The homeserver records each event's edges in the room's event
+    // collection scope (`CsrAdjacency::for_collection`).
+    let adjacency = CsrAdjacency::for_collection(&event_collection);
     let graph_records = auth_check_records_from_csr(&adjacency, &graph, &scanned)?;
     let use_csr = graph_records.contains_key(&crate::auth_check::counter_node_id());
     let unreadable_by_node: HashMap<[u8; 16], String> = scanned
@@ -17102,8 +17104,8 @@ fn cmd_auth_check(
 }
 
 /// Adapt the maintained CSR adjacency to the auth-check report's compact
-/// edge-record interface. `RoomAuth::record_events` writes these rows to the
-/// graph store, not to the legacy AUTH pack collection.
+/// edge-record interface. The homeserver writes these rows to the graph store
+/// under `CsrAdjacency::for_collection`, not to the legacy AUTH pack collection.
 fn auth_check_records_from_csr(
     adjacency: &CsrAdjacency,
     graph: &impl mtxdb::short_id::GraphReader,
@@ -17174,7 +17176,7 @@ fn collect_missing_state_members(
         store,
         room,
         auth_collection,
-        &CsrAdjacency::new(room),
+        &CsrAdjacency::for_collection(&matrix_room_collection_id(room)),
         None,
         false,
     )

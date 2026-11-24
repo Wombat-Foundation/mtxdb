@@ -12336,11 +12336,19 @@ fn auth_check_reads_plain_json_event_records() {
 }
 
 #[test]
-fn auth_check_reads_the_adjacency_written_by_room_auth() {
+fn auth_check_reads_adjacency_in_the_homeserver_event_collection_scope() {
     let dir = unique_temp_dir();
-    let room = "!room-auth-csr:test";
+    let room = "!homeserver-csr:test";
     let db = Database::open(dir.clone()).unwrap();
-    RoomAuth::new(room)
+    // The homeserver derives the room's EVNT member collection from the
+    // group id and records edges under `for_collection` of that id.
+    let homeserver_collection = mtxdb::derive_member_collection_id_from_group(
+        mtxdb::MEMBER_NAMESPACE_EVNT,
+        mtxdb::derive_group_full_id(room.as_bytes()),
+    )
+    .unwrap();
+    assert_eq!(homeserver_collection, matrix_room_collection_id(room));
+    mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection)
         .record_events(
             &db,
             &[
@@ -12359,11 +12367,6 @@ fn auth_check_reads_the_adjacency_written_by_room_auth() {
             ],
         )
         .unwrap();
-    assert_eq!(
-        RoomAuth::new(room).auth_edges(&db, "$child").unwrap(),
-        vec!["$root"]
-    );
-
     let layout = DatabaseLayout::open(dir.clone()).unwrap();
     let pools: Vec<_> = ShardType::ALL
         .into_iter()
@@ -12381,7 +12384,7 @@ fn auth_check_reads_the_adjacency_written_by_room_auth() {
     let pools: [std::sync::Arc<PackfileStorage>; ShardType::ALL.len()] =
         pools.try_into().ok().expect("three shard pools");
     let graph = mtxdb::short_id::ReadOnlyGraph::new(layout, pools);
-    let test_adjacency = mtxdb::csr_adjacency::CsrAdjacency::new(room);
+    let test_adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection);
     assert_eq!(
         test_adjacency.auth_of(&graph, "$child").unwrap(),
         Some(vec!["$root".to_owned()])
@@ -12409,7 +12412,7 @@ fn auth_check_reads_the_adjacency_written_by_room_auth() {
             },
         ),
     ]);
-    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::new(room);
+    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection);
     let records = super::auth_check_records_from_csr(&adjacency, &graph, &scanned).unwrap();
     let report = crate::auth_check::check(
         |id| Ok::<_, std::convert::Infallible>(records.get(id).cloned()),
