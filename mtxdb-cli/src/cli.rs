@@ -1303,7 +1303,8 @@ fn sub_auth_check() -> Command {
              The record layouts are \
              the homeserver's (sithnapse), not this crate's; an unknown record version is \
              reported, not guessed at. Reads the state and event pools. Read-only; \
-             coexists with a running writer.",
+             coexists with a running writer. The auth graph reader attaches to the root's \
+             shared WAL, so `--auth` requires a database with a usable shared WAL.",
         )
         .arg(
             Arg::new("room")

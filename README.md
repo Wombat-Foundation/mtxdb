@@ -69,3 +69,5 @@ mtxdb drop <COLLECTION>...
 With neither `--auth` nor `--prevs`, `room check` runs both audits; `--status`
 filters the prev-event gaps section, which also runs by default. `get` takes its
 record ID positionally; the former `-i/--id` spelling is not supported.
+The `room check --auth` audit reads the auth graph through the database's shared
+WAL, so it requires a usable shared WAL at the database root.

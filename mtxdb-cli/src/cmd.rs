@@ -17004,7 +17004,11 @@ fn cmd_auth_check(
             graph_layout.shared_wal_path(),
             shard_type,
         )
-        .with_context(|| format!("opening the {shard_type:?} pool for adjacency reads"))?;
+        .with_context(|| {
+            format!(
+                "auth-check requires a readable shared WAL (multi-reader read-committed path); opening the {shard_type:?} pool for adjacency reads"
+            )
+        })?;
         pool.set_read_plan_policy(cli.read_plan);
         graph_pools.push(Arc::new(pool));
     }
