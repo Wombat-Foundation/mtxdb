@@ -189,16 +189,10 @@ pub(crate) enum Commands {
         sort: Option<String>,
         limit: i64,
     },
-    Shards {
-        all: bool,
-        layout: bool,
-        sort: Option<String>,
-    },
     Stats {
         json: bool,
     },
     Memory {
-        evict: bool,
         evict_pages: bool,
     },
     Timeline {
@@ -277,7 +271,7 @@ pub(crate) enum Commands {
         out: Option<PathBuf>,
         yes: bool,
     },
-    Delete {
+    Drop {
         collections: Vec<String>,
         yes: bool,
     },
@@ -308,33 +302,17 @@ pub(crate) enum Commands {
     },
     ReclaimWal,
     Init,
-    /// Internal: write a test record and sync (for subprocess tests).
-    SubprocessWriter {
-        path: String,
-    },
-    /// Internal: write a test record without sync (for subprocess tests).
-    SubprocessWriterUnsynced {
-        path: String,
-    },
-    /// Internal: seed test data and sync (for subprocess tests).
-    SubprocessWriterSeed {
-        path: String,
-    },
-    /// Internal: append and sync test data (for subprocess tests).
-    SubprocessWriterAppend {
-        path: String,
-    },
-    /// Internal: read with refresh (for subprocess tests).
-    SubprocessReader {
-        path: String,
-    },
 }
 
 /// Sub-operations for the read-only `packs` inspection group.
 #[derive(Clone)]
 pub(crate) enum PacksAction {
     /// List open packs with size and IO/sync stats.
-    List { all: bool },
+    List {
+        all: bool,
+        layout: bool,
+        sort: Option<String>,
+    },
     /// Show one pack's header, collection composition, and node counts.
     Inspect { pack: String },
     /// Dump every frame in one pack as decoded JSONL.
@@ -395,106 +373,98 @@ fn build_cli() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Print version"),
         )
-        .arg(
-            Arg::new("version_upper")
-                .short('V')
-                .action(ArgAction::SetTrue)
-                .hide(true),
-        )
         .about("CLI for the mtxdb content-addressed storage engine")
-        .subcommand(sub_shards())
         .subcommand(sub_collections())
         .subcommand(sub_stats())
         .subcommand(sub_memory())
-        .subcommand(sub_timeline())
-        .subcommand(sub_flags())
         .subcommand(sub_meta())
         .subcommand(sub_sync())
         .subcommand(sub_reclaim_wal())
         .subcommand(sub_completions())
         .subcommand(sub_import())
-        .subcommand(sub_gaps())
         .subcommand(sub_export())
         .subcommand(sub_packs())
         .subcommand(sub_repack())
         .subcommand(sub_search())
         .subcommand(sub_scan())
         .subcommand(sub_info())
-        .subcommand(sub_delete())
+        .subcommand(sub_drop())
         .subcommand(sub_tombstones())
-        .subcommand(sub_auth_check())
-        .subcommand(sub_members())
         .subcommand(sub_remove())
         .subcommand(sub_put())
         .subcommand(sub_get())
         .subcommand(sub_init())
-        .subcommand(sub_subprocess_writer())
-        .subcommand(sub_subprocess_writer_unsynced())
-        .subcommand(sub_subprocess_writer_seed())
-        .subcommand(sub_subprocess_writer_append())
-        .subcommand(sub_subprocess_reader());
+        .subcommand(sub_room());
     scope_flags(cmd)
 }
 
 /// Commands that aggregate across several database roots (`--coalesce`).
-const COALESCE_COMMANDS: &[&str] = &[
-    "shards",
-    "collections",
-    "stats",
-    "get",
-    "sync",
-    "scan",
-    "info",
-    "packs",
-    "repack",
+const COALESCE_COMMANDS: &[&[&str]] = &[
+    &["collections"],
+    &["stats"],
+    &["get"],
+    &["sync"],
+    &["scan"],
+    &["info"],
+    &["packs"],
+    &["repack"],
 ];
 
 /// Commands that run batch reads, where `--read-plan` changes how they are issued.
-const READ_PLAN_COMMANDS: &[&str] = &[
-    "get",
-    "scan",
-    "export",
-    "tombstones",
-    "import",
-    "auth-check",
-    "repack",
+const READ_PLAN_COMMANDS: &[&[&str]] = &[
+    &["get"],
+    &["scan"],
+    &["export"],
+    &["tombstones"],
+    &["import"],
+    &["room", "auth-check"],
+    &["repack"],
 ];
 
 /// Commands that choose an independent pool with `-t`. The rest (room
-/// commands, `search`, `gaps`, `meta`, `reclaim-wal`, `init`) work on fixed
-/// pools or on the whole database, so the flag would be ignored there.
-const SHARD_TYPE_COMMANDS: &[&str] = &[
-    "shards",
-    "collections",
-    "stats",
-    "memory",
-    "get",
-    "put",
-    "remove",
-    "delete",
-    "scan",
-    "info",
-    "import",
-    "sync",
-    "repack",
-    "export",
-    "tombstones",
-    "packs",
+/// commands, `search`, `meta`, `reclaim-wal`, `init`) work on fixed pools or
+/// on the whole database, so the flag would be ignored there.
+const SHARD_TYPE_COMMANDS: &[&[&str]] = &[
+    &["collections"],
+    &["stats"],
+    &["memory"],
+    &["get"],
+    &["put"],
+    &["remove"],
+    &["drop"],
+    &["scan"],
+    &["info"],
+    &["import"],
+    &["sync"],
+    &["repack"],
+    &["export"],
+    &["tombstones"],
+    &["packs"],
 ];
 
 /// Attach `--coalesce`, `--read-plan` and `--shard-type` only to the commands
-/// that honor them, so every other command's help stays free of them.
-fn scope_flags(cmd: Command) -> Command {
-    let cmd = add_to(cmd, COALESCE_COMMANDS, coalesce_arg);
-    let cmd = add_to(cmd, READ_PLAN_COMMANDS, read_plan_arg);
-    add_to(cmd, SHARD_TYPE_COMMANDS, shard_type_arg)
-}
-
-fn add_to(mut cmd: Command, names: &[&str], arg: fn() -> Arg) -> Command {
-    for name in names {
-        cmd = cmd.mut_subcommand(*name, |sub| sub.arg(arg()));
+/// that honor them, so every other command's help stays free of them. A path
+/// names a nested subcommand, e.g. `["room", "auth-check"]`.
+fn scope_flags(mut cmd: Command) -> Command {
+    type Scope = (&'static [&'static [&'static str]], fn() -> Arg);
+    let scopes: [Scope; 3] = [
+        (COALESCE_COMMANDS, coalesce_arg),
+        (READ_PLAN_COMMANDS, read_plan_arg),
+        (SHARD_TYPE_COMMANDS, shard_type_arg),
+    ];
+    for (paths, arg) in scopes {
+        for path in paths {
+            cmd = attach_to_path(cmd, path, arg());
+        }
     }
     cmd
+}
+
+fn attach_to_path(cmd: Command, path: &[&str], arg: Arg) -> Command {
+    let Some((name, rest)) = path.split_first() else {
+        return cmd.arg(arg);
+    };
+    cmd.mut_subcommand(*name, |sub| attach_to_path(sub, rest, arg))
 }
 
 /// The flag shared by every subcommand (`--dir`), plus `--debug`.
@@ -559,22 +529,6 @@ fn read_plan_arg() -> Arg {
         .help("Merged read prefetch for batch reads: 'plain' (default, independent reads) or 'prefetch' to meld nearby candidates into sequential extents")
 }
 
-fn sub_shards() -> Command {
-    Command::new("shards")
-        .about("List open packs with size and IO/sync stats")
-        .arg(
-            Arg::new("all")
-                .short('a')
-                .long("all")
-                .action(ArgAction::SetTrue)
-                .help("List packs in every independent pool"),
-        )
-        .arg(layout_arg())
-        .arg(sort_arg(
-            "pack, bytes, nodes, collections, syncs, segments, interleaving",
-        ))
-}
-
 fn sub_stats() -> Command {
     Command::new("stats")
         .about("Runtime, open, and persisted pool statistics")
@@ -588,28 +542,20 @@ fn sub_stats() -> Command {
 
 fn sub_memory() -> Command {
     Command::new("memory")
-        .about("Inspect or evict in-process caches and filesystem pages")
+        .about("Report in-process cache state or request filesystem page eviction")
         .long_about(
-            "Inspect or evict mtxdb's in-process decoded-node caches, or request eviction of the selected database's filesystem pages.\n\n".to_owned()
-                + "This reports heap objects decoded by the current mtxdb process only. "
-                + "It does not include durable records, indexes, memory-mapped files, or "
+            "Report heap objects decoded by the current mtxdb process, or request eviction of the selected database's filesystem pages.\n\n".to_owned()
+                + "The report does not include durable records, indexes, memory-mapped files, or "
                 + "the operating system's filesystem page cache. A one-shot CLI process "
-                + "starts with an empty decoded-node cache; this is primarily useful to "
-                + "long-lived embedders. --evict-pages is a Linux-only, best-effort request "
+                + "starts with an empty decoded-node cache, so this report is primarily useful "
+                + "with --evict-pages. That flag is a Linux-only, best-effort request "
                 + "to discard clean page-cache pages for files under the database directory; "
                 + "the kernel may retain dirty or actively mapped pages.",
-        )
-        .arg(
-            Arg::new("evict")
-                .long("evict")
-                .action(ArgAction::SetTrue)
-                .help("Evict decoded nodes held by this process; does not flush the OS page cache"),
         )
         .arg(
             Arg::new("evict-pages")
                 .long("evict-pages")
                 .action(ArgAction::SetTrue)
-                .conflicts_with("evict")
                 .help("Request eviction of clean filesystem pages for database files (Linux; best effort)"),
         )
 }
@@ -758,6 +704,22 @@ fn sub_collections() -> Command {
         .arg(sort_arg("collection, nodes, idx-load (alias: load), shards, index, disk, packs, avoidable, segments, fragmentation"))
 }
 
+fn all_arg(help: &'static str) -> Arg {
+    Arg::new("all")
+        .short('a')
+        .long("all")
+        .action(ArgAction::SetTrue)
+        .help(help)
+}
+
+fn yes_arg(help: &'static str) -> Arg {
+    Arg::new("yes")
+        .short('y')
+        .long("yes")
+        .action(ArgAction::SetTrue)
+        .help(help)
+}
+
 fn layout_arg() -> Arg {
     Arg::new("layout")
         .long("layout")
@@ -786,41 +748,6 @@ fn sort_arg(help: &'static str) -> Arg {
 fn sub_init() -> Command {
     Command::new("init")
         .about("Create a new mtxdb database root (db.meta); pools are created on first write.")
-}
-
-fn sub_subprocess_writer() -> Command {
-    Command::new("subprocess-writer")
-        .about("Internal: write a test record and sync")
-        .hide(true)
-        .arg(Arg::new("path").required(true).index(1))
-}
-
-fn sub_subprocess_writer_unsynced() -> Command {
-    Command::new("subprocess-writer-unsynced")
-        .about("Internal: write a test record without sync")
-        .hide(true)
-        .arg(Arg::new("path").required(true).index(1))
-}
-
-fn sub_subprocess_writer_seed() -> Command {
-    Command::new("subprocess-writer-seed")
-        .about("Internal: seed test data and sync")
-        .hide(true)
-        .arg(Arg::new("path").required(true).index(1))
-}
-
-fn sub_subprocess_writer_append() -> Command {
-    Command::new("subprocess-writer-append")
-        .about("Internal: append and sync test data")
-        .hide(true)
-        .arg(Arg::new("path").required(true).index(1))
-}
-
-fn sub_subprocess_reader() -> Command {
-    Command::new("subprocess-reader")
-        .about("Internal: read with refresh")
-        .hide(true)
-        .arg(Arg::new("path").required(true).index(1))
 }
 
 fn sub_sync() -> Command {
@@ -1099,19 +1026,13 @@ fn sub_import() -> Command {
 
 fn sub_gaps() -> Command {
     Command::new("gaps")
-        .about("Inspect and record unresolved Matrix prev_events gaps")
+        .about("Inspect and record unresolved Matrix prev_events gaps for a room")
+        .arg(room_arg())
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(
             Command::new("ingest")
                 .about("Record per-server outcomes from a rezzy federation gap-fill report")
-                .arg(
-                    Arg::new("room")
-                        .long("room")
-                        .required(true)
-                        .value_name("ROOM_ID")
-                        .help("Room whose gap manifest receives this report"),
-                )
                 .arg(
                     Arg::new("run")
                         .long("run")
@@ -1129,7 +1050,6 @@ fn sub_gaps() -> Command {
         .subcommand(
             Command::new("list")
                 .about("List a room's gaps with their derived status")
-                .arg(gap_room_arg("Room whose gap manifest to list"))
                 .arg(
                     Arg::new("status")
                         .long("status")
@@ -1147,7 +1067,6 @@ fn sub_gaps() -> Command {
         .subcommand(
             Command::new("waive")
                 .about("Record a decision not to chase a gap (policy only; the gap stays a gap)")
-                .arg(gap_room_arg("Room whose gap manifest to change"))
                 .arg(gap_id_arg())
                 .arg(
                     Arg::new("by")
@@ -1167,7 +1086,6 @@ fn sub_gaps() -> Command {
         .subcommand(
             Command::new("anchor")
                 .about("Record a trusted state reference for a gap")
-                .arg(gap_room_arg("Room whose gap manifest to change"))
                 .arg(gap_id_arg())
                 .arg(
                     Arg::new("event")
@@ -1194,12 +1112,13 @@ fn sub_gaps() -> Command {
         )
 }
 
-fn gap_room_arg(help: &'static str) -> Arg {
+/// One room selector, shared by every room-scoped command.
+fn room_arg() -> Arg {
     Arg::new("room")
-        .long("room")
         .required(true)
         .value_name("ROOM_ID")
-        .help(help)
+        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+        .help("Matrix room ID, e.g. !room:server")
 }
 
 fn gap_id_arg() -> Arg {
@@ -1250,13 +1169,11 @@ fn sub_packs() -> Command {
         .subcommand(
             Command::new("list")
                 .about("List open packs with size and IO/sync stats")
-                .arg(
-                    Arg::new("all")
-                        .short('a')
-                        .long("all")
-                        .action(ArgAction::SetTrue)
-                        .help("List packs in every independent pool"),
-                ),
+                .arg(all_arg("List packs in every independent pool"))
+                .arg(layout_arg())
+                .arg(sort_arg(
+                    "pack, bytes, nodes, collections, syncs, segments, interleaving",
+                )),
         )
         .subcommand(
             Command::new("inspect")
@@ -1366,11 +1283,8 @@ fn sub_repack() -> Command {
                 .help("Repack collections referencing packs (repeat -p for multiple pack IDs)"),
         )
         .arg(
-            Arg::new("all")
-                .long("all")
-                .conflicts_with_all(["collection", "pack"])
-                .action(ArgAction::SetTrue)
-                .help("Repack every collection in every active pack"),
+            all_arg("Repack every collection in every active pack")
+                .conflicts_with_all(["collection", "pack"]),
         )
         .arg(
             Arg::new("out")
@@ -1378,31 +1292,20 @@ fn sub_repack() -> Command {
                 .value_name("DIR")
                 .help("Destination directory for coalescing repack into a new canonical database"),
         )
-        .arg(
-            Arg::new("yes")
-                .short('y')
-                .long("yes")
-                .action(ArgAction::SetTrue)
-                .help("Skip interactive confirmation"),
-        )
+        .arg(yes_arg("Skip interactive confirmation"))
 }
 
-fn sub_delete() -> Command {
-    Command::new("delete")
-        .about("Delete all data for one or more collections")
+fn sub_drop() -> Command {
+    Command::new("drop")
+        .about("Drop one or more collections and all their data")
         .arg(
             Arg::new("collection")
                 .required(true)
                 .num_args(1..)
                 .value_name("COLLECTION")
-                .help("Namespace IDs to delete"),
+                .help("Collection IDs to drop"),
         )
-        .arg(
-            Arg::new("yes")
-                .long("yes")
-                .action(ArgAction::SetTrue)
-                .help("Skip confirmation prompt"),
-        )
+        .arg(yes_arg("Skip confirmation prompt"))
 }
 
 fn sub_auth_check() -> Command {
@@ -1470,6 +1373,20 @@ fn sub_members() -> Command {
         )
 }
 
+/// Room-scoped inspection and gap management. Every child selects its own
+/// room, and none of them takes a shard pool or coalescing flag.
+fn sub_room() -> Command {
+    Command::new("room")
+        .about("Inspect or manage one Matrix room")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(sub_timeline())
+        .subcommand(sub_flags())
+        .subcommand(sub_members())
+        .subcommand(sub_auth_check())
+        .subcommand(sub_gaps())
+}
+
 fn sub_tombstones() -> Command {
     Command::new("tombstones")
         .about("Report removed keys and reclaimable space for a collection")
@@ -1521,12 +1438,7 @@ fn sub_remove() -> Command {
                 .value_name("ID")
                 .help("Record IDs to remove"),
         )
-        .arg(
-            Arg::new("yes")
-                .long("yes")
-                .action(ArgAction::SetTrue)
-                .help("Skip confirmation prompt"),
-        )
+        .arg(yes_arg("Skip confirmation prompt"))
 }
 
 fn sub_put() -> Command {
@@ -1680,6 +1592,72 @@ fn expand_dir_args(
     out
 }
 
+/// Map `mtxdb room <subcommand>` to its flat `Commands` value.
+fn parse_room_command(m: &clap::ArgMatches) -> Commands {
+    let Some((name, sub)) = m.subcommand() else {
+        unreachable!("clap requires a room subcommand");
+    };
+    match name {
+        "timeline" => Commands::Timeline {
+            room: sub.get_one::<String>("room").unwrap().clone(),
+            limit: *sub
+                .get_one::<i64>("limit")
+                .expect("clap supplies a default limit"),
+            reverse: sub.get_flag("reverse"),
+        },
+        "flags" => Commands::Flags {
+            room: sub.get_one::<String>("room").unwrap().clone(),
+            flag: sub.get_one::<String>("flag").cloned(),
+            not: sub.get_flag("not"),
+            count: sub.get_flag("count"),
+            limit: *sub
+                .get_one::<usize>("limit")
+                .expect("clap supplies a default limit"),
+            rebuild: sub.get_flag("rebuild"),
+        },
+        "members" => Commands::Members {
+            room: sub.get_one::<String>("room").unwrap().clone(),
+            json: sub.get_flag("json"),
+        },
+        "auth-check" => Commands::AuthCheck {
+            room: sub.get_one::<String>("room").unwrap().clone(),
+            state_members: sub.get_flag("state-members"),
+            limit: *sub.get_one::<usize>("limit").unwrap(),
+        },
+        "gaps" => {
+            let room = sub.get_one::<String>("room").unwrap().clone();
+            let action = match sub.subcommand() {
+                Some(("ingest", action)) => GapAction::Ingest {
+                    room,
+                    run: action.get_one::<String>("run").unwrap().clone(),
+                    report: PathBuf::from(action.get_one::<String>("report").unwrap()),
+                },
+                Some(("list", action)) => GapAction::List {
+                    room,
+                    status: action.get_one::<String>("status").cloned(),
+                    history: action.get_flag("history"),
+                },
+                Some(("waive", action)) => GapAction::Waive {
+                    room,
+                    gap: action.get_one::<String>("gap").unwrap().clone(),
+                    by: action.get_one::<String>("by").unwrap().clone(),
+                    reason: action.get_one::<String>("reason").unwrap().clone(),
+                },
+                Some(("anchor", action)) => GapAction::Anchor {
+                    room,
+                    gap: action.get_one::<String>("gap").unwrap().clone(),
+                    event: action.get_one::<String>("event").unwrap().clone(),
+                    after: action.get_one::<String>("boundary").unwrap() == "after",
+                    source: action.get_one::<String>("source").unwrap().clone(),
+                },
+                _ => unreachable!("clap requires a gaps action"),
+            };
+            Commands::Gaps { action }
+        }
+        _ => unreachable!("clap validates the room subcommand"),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the exhaustive clap-to-command mapping is clearest in one match"
@@ -1693,7 +1671,7 @@ fn parse_cli() -> Cli {
         |name| command.find_subcommand(name).is_some(),
     ));
 
-    if matches.get_flag("version") || matches.get_flag("version_upper") {
+    if matches.get_flag("version") {
         println!("mtxdb {}", build_cli().get_version().unwrap());
         std::process::exit(0);
     }
@@ -1769,34 +1747,11 @@ fn parse_cli() -> Cli {
                 .get_one::<i64>("limit")
                 .expect("clap supplies a default limit"),
         },
-        Some(("shards", m)) => Commands::Shards {
-            all: m.get_flag("all"),
-            layout: m.get_flag("layout"),
-            sort: m.get_one::<String>("sort").cloned(),
-        },
         Some(("stats", m)) => Commands::Stats {
             json: m.get_flag("json"),
         },
         Some(("memory", m)) => Commands::Memory {
-            evict: m.get_flag("evict"),
             evict_pages: m.get_flag("evict-pages"),
-        },
-        Some(("timeline", m)) => Commands::Timeline {
-            room: m.get_one::<String>("room").unwrap().clone(),
-            limit: *m
-                .get_one::<i64>("limit")
-                .expect("clap supplies a default limit"),
-            reverse: m.get_flag("reverse"),
-        },
-        Some(("flags", m)) => Commands::Flags {
-            room: m.get_one::<String>("room").unwrap().clone(),
-            flag: m.get_one::<String>("flag").cloned(),
-            not: m.get_flag("not"),
-            count: m.get_flag("count"),
-            limit: *m
-                .get_one::<usize>("limit")
-                .expect("clap supplies a default limit"),
-            rebuild: m.get_flag("rebuild"),
         },
         Some(("meta", m)) => Commands::Meta {
             target: m.get_one::<String>("target").unwrap().clone(),
@@ -1854,34 +1809,6 @@ fn parse_cli() -> Cli {
             require_complete_prevs: m.get_flag("require-complete-prevs"),
             allow_waived_gaps: m.get_flag("allow-waived-gaps"),
         },
-        Some(("gaps", m)) => Commands::Gaps {
-            action: match m.subcommand() {
-                Some(("ingest", sub)) => GapAction::Ingest {
-                    room: sub.get_one::<String>("room").unwrap().clone(),
-                    run: sub.get_one::<String>("run").unwrap().clone(),
-                    report: PathBuf::from(sub.get_one::<String>("report").unwrap()),
-                },
-                Some(("list", sub)) => GapAction::List {
-                    room: sub.get_one::<String>("room").unwrap().clone(),
-                    status: sub.get_one::<String>("status").cloned(),
-                    history: sub.get_flag("history"),
-                },
-                Some(("waive", sub)) => GapAction::Waive {
-                    room: sub.get_one::<String>("room").unwrap().clone(),
-                    gap: sub.get_one::<String>("gap").unwrap().clone(),
-                    by: sub.get_one::<String>("by").unwrap().clone(),
-                    reason: sub.get_one::<String>("reason").unwrap().clone(),
-                },
-                Some(("anchor", sub)) => GapAction::Anchor {
-                    room: sub.get_one::<String>("room").unwrap().clone(),
-                    gap: sub.get_one::<String>("gap").unwrap().clone(),
-                    event: sub.get_one::<String>("event").unwrap().clone(),
-                    after: sub.get_one::<String>("boundary").unwrap() == "after",
-                    source: sub.get_one::<String>("source").unwrap().clone(),
-                },
-                _ => unreachable!("subcommand_required enforces a gaps action"),
-            },
-        },
         Some(("export", m)) => Commands::Export {
             collection: m.get_one::<String>("collection").unwrap().clone(),
             format: m
@@ -1894,6 +1821,8 @@ fn parse_cli() -> Cli {
             action: match m.subcommand() {
                 Some(("list", sub)) => PacksAction::List {
                     all: sub.get_flag("all"),
+                    layout: sub.get_flag("layout"),
+                    sort: sub.get_one::<String>("sort").cloned(),
                 },
                 Some(("inspect", sub)) => PacksAction::Inspect {
                     pack: sub.get_one::<String>("pack").unwrap().clone(),
@@ -1923,7 +1852,7 @@ fn parse_cli() -> Cli {
             out: m.get_one::<String>("out").map(PathBuf::from),
             yes: m.get_flag("yes"),
         },
-        Some(("delete", m)) => Commands::Delete {
+        Some(("drop", m)) => Commands::Drop {
             collections: m
                 .get_many::<String>("collection")
                 .unwrap()
@@ -1931,15 +1860,7 @@ fn parse_cli() -> Cli {
                 .collect(),
             yes: m.get_flag("yes"),
         },
-        Some(("auth-check", m)) => Commands::AuthCheck {
-            room: m.get_one::<String>("room").unwrap().clone(),
-            state_members: m.get_flag("state-members"),
-            limit: *m.get_one::<usize>("limit").unwrap(),
-        },
-        Some(("members", m)) => Commands::Members {
-            room: m.get_one::<String>("room").unwrap().clone(),
-            json: m.get_flag("json"),
-        },
+        Some(("room", m)) => parse_room_command(m),
         Some(("tombstones", m)) => Commands::Tombstones {
             collection: m.get_one::<String>("collection").unwrap().clone(),
             keys: m.get_flag("keys"),
@@ -1958,21 +1879,6 @@ fn parse_cli() -> Cli {
         },
         Some(("reclaim-wal", _)) => Commands::ReclaimWal,
         Some(("init", _)) => Commands::Init,
-        Some(("subprocess-writer", m)) => Commands::SubprocessWriter {
-            path: m.get_one::<String>("path").unwrap().clone(),
-        },
-        Some(("subprocess-writer-unsynced", m)) => Commands::SubprocessWriterUnsynced {
-            path: m.get_one::<String>("path").unwrap().clone(),
-        },
-        Some(("subprocess-writer-seed", m)) => Commands::SubprocessWriterSeed {
-            path: m.get_one::<String>("path").unwrap().clone(),
-        },
-        Some(("subprocess-writer-append", m)) => Commands::SubprocessWriterAppend {
-            path: m.get_one::<String>("path").unwrap().clone(),
-        },
-        Some(("subprocess-reader", m)) => Commands::SubprocessReader {
-            path: m.get_one::<String>("path").unwrap().clone(),
-        },
         _ => {
             build_cli().print_help().unwrap();
             std::process::exit(0);

@@ -745,10 +745,12 @@ fn shards_dash_t_all_iterates_every_pool_without_the_all_flag() {
         shard_type: None,
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
-        command: Commands::Shards {
-            all: false,
-            layout: false,
-            sort: None,
+        command: Commands::Packs {
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
 
@@ -1234,7 +1236,11 @@ fn packs_dump_writes_decoded_jsonl_for_a_pack() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: false },
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
     let out_file = dir.join("dump.jsonl");
@@ -1293,7 +1299,11 @@ fn packs_dump_rejects_a_pack_selector_present_in_multiple_pools() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: true },
+            action: super::PacksAction::List {
+                all: true,
+                layout: false,
+                sort: None,
+            },
         },
     };
     let error = super::cmd_packs_dump(&cli, "0xab", None, None).unwrap_err();
@@ -1311,7 +1321,11 @@ fn packs_dump_errors_when_the_pack_is_absent() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: false },
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
     let error = super::cmd_packs_dump(&cli, "0x0", None, None).unwrap_err();
@@ -1372,7 +1386,11 @@ fn packs_extract_slices_target_collection_into_valid_pack() {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: false },
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
 
@@ -1432,7 +1450,11 @@ fn one_record_pack_fixture() -> (PathBuf, Cli, PackId) {
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
         command: Commands::Packs {
-            action: super::PacksAction::List { all: false },
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
     (dir, cli, pack_id)
@@ -7471,10 +7493,12 @@ fn multi_dir_shards_iterates_all_databases() {
         shard_type: None,
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
-        command: Commands::Shards {
-            all: false,
-            layout: false,
-            sort: None,
+        command: Commands::Packs {
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
 
@@ -7511,6 +7535,7 @@ fn mutating_command_rejects_multi_dir() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn coalesced_shards_and_collections_and_stats() {
     let dir1 = unique_temp_dir();
     let dir2 = unique_temp_dir();
@@ -7535,10 +7560,12 @@ fn coalesced_shards_and_collections_and_stats() {
         shard_type: None,
         coalesce: true,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
-        command: Commands::Shards {
-            all: false,
-            layout: false,
-            sort: Some("bytes".to_owned()),
+        command: Commands::Packs {
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: Some("bytes".to_owned()),
+            },
         },
     };
     cmd_shards(&cli_shards, false, false, Some("bytes")).unwrap();
@@ -7678,7 +7705,7 @@ fn coalesce_safeguards_reject_unsupported_commands() {
             id: "$event:example.org".to_owned(),
             data: "{}".to_owned(),
         },
-        Commands::Delete {
+        Commands::Drop {
             collections: vec!["0x00000000000000000000000000000000".to_owned()],
             yes: true,
         },
@@ -7996,10 +8023,12 @@ fn import_into_a_freshly_initialized_root_creates_pools_on_first_write() {
         shard_type: None,
         coalesce: false,
         read_plan: mtxdb::ReadPlanPolicy::disabled(),
-        command: Commands::Shards {
-            all: false,
-            layout: false,
-            sort: None,
+        command: Commands::Packs {
+            action: super::PacksAction::List {
+                all: false,
+                layout: false,
+                sort: None,
+            },
         },
     };
     cmd_shards(&inspect, false, false, None).unwrap();

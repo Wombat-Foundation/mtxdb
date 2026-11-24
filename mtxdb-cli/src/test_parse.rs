@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn test_dir_parsing() {
     let m = build_cli()
-        .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2"])
+        .try_get_matches_from(["mtxdb", "packs", "list", "-d", "dir1", "-d", "dir2"])
         .unwrap();
     let dirs: Vec<_> = m
         .get_many::<String>("dir")
@@ -13,7 +13,7 @@ fn test_dir_parsing() {
     assert_eq!(dirs, vec!["dir1", "dir2"]);
 
     let m = build_cli()
-        .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2"])
+        .try_get_matches_from(["mtxdb", "packs", "list", "-d", "dir1", "-d", "dir2"])
         .unwrap();
     let dirs: Vec<_> = m
         .get_many::<String>("dir")
@@ -23,7 +23,7 @@ fn test_dir_parsing() {
     assert_eq!(dirs, vec!["dir1", "dir2"]);
 
     let m = build_cli()
-        .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2", "-a"])
+        .try_get_matches_from(["mtxdb", "packs", "list", "-d", "dir1", "-d", "dir2", "-a"])
         .unwrap();
     let dirs: Vec<_> = m
         .get_many::<String>("dir")
@@ -52,16 +52,16 @@ fn test_dir_parsing() {
     assert_eq!(m.subcommand_name(), Some("scan"));
 
     let m = build_cli()
-        .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2", "-c"])
+        .try_get_matches_from(["mtxdb", "packs", "list", "-d", "dir1", "-d", "dir2", "-c"])
         .unwrap();
-    assert!(m.subcommand_matches("shards").unwrap().get_flag("coalesce"));
+    assert!(m.subcommand_matches("packs").unwrap().get_flag("coalesce"));
 
     // `--coalesce` belongs to the commands that aggregate; a leading flag or a
     // command that does not aggregate rejects it.
     for argv in [
-        vec!["mtxdb", "--coalesce", "shards"],
-        vec!["mtxdb", "timeline", "!r:x", "--coalesce"],
-        vec!["mtxdb", "members", "!r:x", "-c"],
+        vec!["mtxdb", "--coalesce", "packs", "list"],
+        vec!["mtxdb", "room", "timeline", "!r:x", "--coalesce"],
+        vec!["mtxdb", "room", "members", "!r:x", "-c"],
         vec!["mtxdb", "put", "-c"],
     ] {
         assert!(build_cli().try_get_matches_from(argv).is_err());
@@ -172,9 +172,9 @@ fn test_read_plan_flag_parsing() {
         .is_err());
     // Commands that do not batch-read do not take it, nor does the root.
     for argv in [
-        ["mtxdb", "shards", "--read-plan", "prefetch"],
-        ["mtxdb", "--read-plan", "prefetch", "export"],
-        ["mtxdb", "init", "--read-plan", "prefetch"],
+        vec!["mtxdb", "packs", "list", "--read-plan", "prefetch"],
+        vec!["mtxdb", "--read-plan", "prefetch", "export"],
+        vec!["mtxdb", "init", "--read-plan", "prefetch"],
     ] {
         assert!(build_cli().try_get_matches_from(argv).is_err());
     }
@@ -360,10 +360,10 @@ fn search_requires_a_term_and_defaults_its_limit() {
 fn gaps_anchor_requires_an_explicit_boundary() {
     let base = [
         "mtxdb",
+        "room",
         "gaps",
-        "anchor",
-        "--room",
         "!r:t",
+        "anchor",
         "--gap",
         "$g",
         "--event",
@@ -388,17 +388,17 @@ fn gaps_anchor_requires_an_explicit_boundary() {
 fn gaps_list_status_filter_rejects_unknown_names() {
     let ok = build_cli().try_get_matches_from([
         "mtxdb",
+        "room",
         "gaps",
-        "list",
-        "--room",
         "!r:t",
+        "list",
         "--status",
         "absent",
         "--history",
     ]);
     assert!(ok.is_ok());
     let bad = build_cli().try_get_matches_from([
-        "mtxdb", "gaps", "list", "--room", "!r:t", "--status", "closed",
+        "mtxdb", "room", "gaps", "!r:t", "list", "--status", "closed",
     ]);
     assert!(
         bad.is_err(),
@@ -409,7 +409,7 @@ fn gaps_list_status_filter_rejects_unknown_names() {
 #[test]
 fn gaps_waive_needs_who_and_why() {
     assert!(build_cli()
-        .try_get_matches_from(["mtxdb", "gaps", "waive", "--room", "!r:t", "--gap", "$g"])
+        .try_get_matches_from(["mtxdb", "room", "gaps", "!r:t", "waive", "--gap", "$g"])
         .is_err());
 }
 

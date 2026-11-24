@@ -555,11 +555,9 @@ mod tests {
     #[test]
     fn state_members_with_forward_ids_are_clean() {
         let groups = vec![([1u8; 16], vec!["$a".to_owned()])];
-        assert!(
-            missing_state_members(groups, |_| Ok::<_, Infallible>(true))
-                .unwrap()
-                .is_empty()
-            );
+        assert!(missing_state_members(groups, |_| Ok::<_, Infallible>(true))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

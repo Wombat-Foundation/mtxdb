@@ -488,9 +488,8 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
                 limit: *limit,
             },
         ),
-        Commands::Shards { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         Commands::Stats { json } => cmd_stats(cli, *json),
-        Commands::Memory { evict, evict_pages } => cmd_memory(cli, *evict, *evict_pages),
+        Commands::Memory { evict_pages } => cmd_memory(cli, *evict_pages),
         Commands::Timeline {
             room,
             limit,
@@ -647,9 +646,9 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
                 cmd_repack(cli, collection.as_deref(), packs, *all, topo, *yes)
             }
         }
-        Commands::Delete { collections, yes } => {
-            cli.require_single_dir("delete")?;
-            cmd_delete(cli, collections, *yes)
+        Commands::Drop { collections, yes } => {
+            cli.require_single_dir("drop")?;
+            cmd_drop(cli, collections, *yes)
         }
         Commands::AuthCheck {
             room,
@@ -690,52 +689,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             cli.require_single_dir("init")?;
             cmd_init(cli)
         }
-        Commands::SubprocessWriter { path } | Commands::SubprocessWriterAppend { path } => {
-            cmd_subprocess_writer(path, true, false)
-        }
-        Commands::SubprocessWriterUnsynced { path } => cmd_subprocess_writer(path, false, false),
-        Commands::SubprocessWriterSeed { path } => cmd_subprocess_writer(path, true, true),
-        Commands::SubprocessReader { path } => cmd_subprocess_reader(path),
     }
-}
-
-const SUBPROCESS_COLLECTION: [u8; 16] = [0x01; 16];
-const SUBPROCESS_RECORD: [u8; 16] = [0xD0; 16];
-const SUBPROCESS_SEED: [u8; 16] = [0xC0; 16];
-
-fn cmd_subprocess_writer(path: &str, sync: bool, seed: bool) -> anyhow::Result<()> {
-    let store = open_pool(PathBuf::from(path)).context("failed to open test store")?;
-    let id = if seed {
-        SUBPROCESS_SEED
-    } else {
-        SUBPROCESS_RECORD
-    };
-    let payload: &[u8] = if seed { b"seed" } else { b"synced" };
-    let data = NodeData::new(bytes::Bytes::from_static(payload));
-    store
-        .put(&SUBPROCESS_COLLECTION, &id, &data)
-        .context("failed to write test record")?;
-    if sync {
-        store.sync().context("failed to sync test record")?;
-    }
-    Ok(())
-}
-
-fn cmd_subprocess_reader(path: &str) -> anyhow::Result<()> {
-    let store =
-        open_pool_read_only(PathBuf::from(path)).context("failed to open test store read-only")?;
-    store.reset_stats();
-    let result = store
-        .get_many_with_refresh(&SUBPROCESS_COLLECTION, &[SUBPROCESS_RECORD])
-        .context("failed to read test record")?;
-    let stats = store.stats();
-    if result.first().and_then(Option::as_ref).is_some() {
-        println!("RECOVERED");
-    } else {
-        println!("NOT_FOUND");
-    }
-    println!("miss_refreshes={}", stats.miss_refreshes);
-    Ok(())
 }
 
 /// Create a new mtxdb database root: `db.meta` plus an empty directory for
@@ -3427,13 +3381,11 @@ fn cmd_stats(cli: &Cli, json: bool) -> anyhow::Result<()> {
     run_multi_dir(cli, |sub_cli| cmd_stats_single(sub_cli, json))
 }
 
-fn cmd_memory(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Result<()> {
-    run_multi_dir(cli, |sub_cli| {
-        cmd_memory_single(sub_cli, evict, evict_pages)
-    })
+fn cmd_memory(cli: &Cli, evict_pages: bool) -> anyhow::Result<()> {
+    run_multi_dir(cli, |sub_cli| cmd_memory_single(sub_cli, evict_pages))
 }
 
-fn cmd_memory_single(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Result<()> {
+fn cmd_memory_single(cli: &Cli, evict_pages: bool) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
     if evict_pages {
         let (files, bytes) = evict_database_pages(layout.root())?;
@@ -3459,35 +3411,16 @@ fn cmd_memory_single(cli: &Cli, evict: bool, evict_pages: bool) -> anyhow::Resul
             continue;
         };
         let store = open_pool_read_only(pool.clone()).context("failed to open store")?;
-        let before = store.resident_cache_stats();
-        let evicted = if evict {
-            store.evict_resident_caches()
-        } else {
-            0
-        };
-        let after = store.resident_cache_stats();
-        if evict {
-            println!(
-                "{} ({}) — evicted {} decoded nodes; {} remain across {} collection caches (hits={}, misses={})",
-                pool.display(),
-                shard_type.as_str(),
-                evicted,
-                after.entries,
-                after.collections,
-                after.hits,
-                after.misses,
-            );
-        } else {
-            println!(
-                "{} ({}) — {} decoded nodes resident across {} collection caches (hits={}, misses={})",
-                pool.display(),
-                shard_type.as_str(),
-                before.entries,
-                before.collections,
-                before.hits,
-                before.misses,
-            );
-        }
+        let stats = store.resident_cache_stats();
+        println!(
+            "{} ({}) — {} decoded nodes resident across {} collection caches (hits={}, misses={})",
+            pool.display(),
+            shard_type.as_str(),
+            stats.entries,
+            stats.collections,
+            stats.hits,
+            stats.misses,
+        );
         reported = true;
     }
 
@@ -10315,7 +10248,7 @@ const PACK_DUMP_SCHEMA: &str = "mtxdb.pack.dump/v1";
 /// Read-only `packs` group: list packs or dump one pack's frames as JSONL.
 fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
     match action {
-        PacksAction::List { all } => cmd_shards(cli, *all, false, None),
+        PacksAction::List { all, layout, sort } => cmd_shards(cli, *all, *layout, sort.as_deref()),
         PacksAction::Inspect { pack } => cmd_info_pack(cli, pack, None),
         PacksAction::Dump {
             pack,
@@ -16682,7 +16615,7 @@ fn record_csr_adjacency_with_raw(
     Ok(shorts)
 }
 
-fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {
+fn cmd_drop(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()> {
     let mut collection_ids: Vec<[u8; 16]> = collections
         .iter()
         .map(|collection| parse_collection_id(collection))
@@ -16692,13 +16625,13 @@ fn cmd_delete(cli: &Cli, collections: &[String], yes: bool) -> anyhow::Result<()
 
     if !yes {
         println!(
-            "This will permanently delete all data for {} collection(s):",
+            "This will permanently drop {} collection(s) and all their data:",
             collection_ids.len()
         );
         for collection_id in &collection_ids {
             println!("  {}", format_id(collection_id));
         }
-        if !confirm("Delete these collections?")? {
+        if !confirm("Drop these collections?")? {
             println!("aborted");
             return Ok(());
         }
