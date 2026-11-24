@@ -74,13 +74,14 @@ const FAMILY_READ_CHUNK: usize = 4 * 1024 * 1024;
 const FAMILY_READ_CHUNK: usize = 512;
 const TAIL_FILE: &str = "tail.log";
 
-/// TEMP diagnostic (not for commit): per-append CSR timing, toggled by
-/// `PackfileStorage::set_stats_enabled` (i.e. `SYNAPSE_MTXDB_STATS`).
+/// Per-append CSR timing, toggled by `PackfileStorage::set_stats_enabled`.
+/// Sithnapse enables that when `SYNAPSE_MTXDB_STATS` is set; this crate reads
+/// no environment variable of its own.
 static CSR_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    /// TEMP diagnostic: `(write_ns, sync_ns, seal_ns)` for this thread's last
-    /// tail append, recorded by `append_rows_locked`.
+    /// `(write_ns, sync_ns, seal_ns)` for this thread's last tail append,
+    /// recorded by `append_rows_locked`.
     static CSR_LAST_APPEND_NS: std::cell::Cell<(u64, u64, u64)> =
         const { std::cell::Cell::new((0, 0, 0)) };
 }
@@ -97,9 +98,8 @@ pub(crate) fn last_append_timing_ns() -> (u64, u64, u64) {
     CSR_LAST_APPEND_NS.with(std::cell::Cell::get)
 }
 
-/// TEMP diagnostic: appends currently inside `record_events_with`, and the
-/// peak seen. Greater than one means durable appends overlap and a coalesced
-/// fsync could pay off.
+/// Appends currently inside `record_events_with`, and the peak seen. Greater
+/// than one means durable appends overlap and a coalesced fsync could pay off.
 pub(crate) static CSR_IN_FLIGHT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub(crate) static CSR_MAX_IN_FLIGHT: std::sync::atomic::AtomicUsize =

@@ -460,7 +460,7 @@ impl CsrAdjacency {
             ),
             StorageError,
         > = store.with_write_lock(|| {
-            // Opt-in timing (MTXDB-CSR-TIMING): split the durable append.
+            // Opt-in timing: split the durable append so each phase is timed.
             let lock_wait = lock_started.elapsed();
             let prepare_started = std::time::Instant::now();
             let prepared = self.prepare_events(db, events)?;

@@ -14013,9 +14013,9 @@ impl PackfileStorage {
     /// `put`, and `put_many` in [`Self::stats`].
     pub fn set_stats_enabled(&self, enabled: bool) {
         self.stats_enabled.store(enabled, Ordering::Relaxed);
-        // TEMP diagnostic (not for commit): the CSR tail has no access to this
-        // store's flag, so mirror it into the module-level switch that gates
-        // the per-append lock/prepare/write/sync timing lines.
+        // The CSR tail has no access to this store's flag, so mirror it into
+        // the module-level switch that gates the per-append lock/prepare/write/
+        // sync timing lines.
         crate::csr::store::set_csr_timing_enabled(enabled);
     }
 
