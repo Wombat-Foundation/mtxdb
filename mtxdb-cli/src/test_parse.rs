@@ -54,20 +54,30 @@ fn test_dir_parsing() {
     let m = build_cli()
         .try_get_matches_from(["mtxdb", "shards", "-d", "dir1", "-d", "dir2", "-c"])
         .unwrap();
-    assert!(m.get_flag("coalesce"));
+    assert!(m.subcommand_matches("shards").unwrap().get_flag("coalesce"));
 
-    let m = build_cli()
-        .try_get_matches_from(["mtxdb", "--coalesce", "shards", "-d", "dir1", "-d", "dir2"])
-        .unwrap();
-    assert!(m.get_flag("coalesce"));
+    // `--coalesce` belongs to the commands that aggregate; a leading flag or a
+    // command that does not aggregate rejects it.
+    for argv in [
+        vec!["mtxdb", "--coalesce", "shards"],
+        vec!["mtxdb", "timeline", "!r:x", "--coalesce"],
+        vec!["mtxdb", "members", "!r:x", "-c"],
+        vec!["mtxdb", "put", "-c"],
+    ] {
+        assert!(build_cli().try_get_matches_from(argv).is_err());
+    }
+    // Nested `packs` subcommands inherit it from `packs`.
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "packs", "list", "-c"])
+        .is_ok());
 
     let m = build_cli()
         .try_get_matches_from([
             "mtxdb", "repack", "-d", "dir1", "-d", "dir2", "-c", "--out", "target", "-y",
         ])
         .unwrap();
-    assert!(m.get_flag("coalesce"));
     let sub = m.subcommand_matches("repack").unwrap();
+    assert!(sub.get_flag("coalesce"));
     assert_eq!(
         sub.get_one::<String>("out").map(String::as_str),
         Some("target")
@@ -137,31 +147,60 @@ fn optional_decode_formats_require_equals_and_default_to_auto() {
 
 #[test]
 fn test_read_plan_flag_parsing() {
+    let read_plan = |argv: &[&str]| {
+        let m = build_cli().try_get_matches_from(argv).unwrap();
+        let mut leaf = &m;
+        while let Some((_, sub)) = leaf.subcommand() {
+            leaf = sub;
+        }
+        leaf.get_one::<String>("read_plan").cloned()
+    };
+
     // Default is plain.
-    let default = build_cli()
-        .try_get_matches_from(["mtxdb", "shards"])
-        .unwrap();
     assert_eq!(
-        default.get_one::<String>("read_plan").map(String::as_str),
+        read_plan(&["mtxdb", "export", "0x01"]).as_deref(),
         Some("plain")
     );
-
-    // Explicit prefetch is accepted (before and after the subcommand).
-    for argv in [
-        ["mtxdb", "--read-plan", "prefetch", "shards"],
-        ["mtxdb", "shards", "--read-plan", "prefetch"],
-    ] {
-        let m = build_cli().try_get_matches_from(argv).unwrap();
-        assert_eq!(
-            m.get_one::<String>("read_plan").map(String::as_str),
-            Some("prefetch")
-        );
-    }
-
+    // Explicit prefetch is accepted.
+    assert_eq!(
+        read_plan(&["mtxdb", "export", "0x01", "--read-plan", "prefetch"]).as_deref(),
+        Some("prefetch")
+    );
     // An unknown mode is rejected by clap's value parser.
     assert!(build_cli()
-        .try_get_matches_from(["mtxdb", "--read-plan", "ssd", "shards"])
+        .try_get_matches_from(["mtxdb", "export", "0x01", "--read-plan", "ssd"])
         .is_err());
+    // Commands that do not batch-read do not take it, nor does the root.
+    for argv in [
+        ["mtxdb", "shards", "--read-plan", "prefetch"],
+        ["mtxdb", "--read-plan", "prefetch", "export"],
+        ["mtxdb", "init", "--read-plan", "prefetch"],
+    ] {
+        assert!(build_cli().try_get_matches_from(argv).is_err());
+    }
+}
+
+#[test]
+fn shard_type_is_scoped_to_pool_selecting_commands() {
+    for argv in [
+        ["mtxdb", "collections", "-t", "state"],
+        ["mtxdb", "scan", "-t", "state"],
+    ] {
+        // `scan` needs a selector, so only the flag's acceptance matters.
+        let result = build_cli().try_get_matches_from(argv);
+        assert!(!matches!(
+            result.as_ref().err().map(clap::Error::kind),
+            Some(clap::error::ErrorKind::UnknownArgument)
+        ));
+    }
+    for argv in [
+        ["mtxdb", "init", "-t", "state"],
+        ["mtxdb", "reclaim-wal", "-t", "state"],
+        ["mtxdb", "meta", "-t", "state"],
+        ["mtxdb", "-t", "state", "collections"],
+    ] {
+        assert!(build_cli().try_get_matches_from(argv).is_err());
+    }
 }
 
 #[test]
@@ -214,11 +253,11 @@ fn dir_flag_takes_a_shell_glob_of_directories() {
     let is_dir = |p: &Path| p.to_string_lossy().starts_with("pid-");
     let args = [
         "mtxdb",
-        "-c",
         "-d",
         "pid-1",
         "pid-2",
         "collections",
+        "-c",
         "-t",
         "all",
     ];
@@ -249,12 +288,12 @@ fn dir_expansion_leaves_non_directory_tokens_alone() {
 fn dir_expansion_drops_stray_files_from_a_glob() {
     let args = [
         "mtxdb",
-        "-c",
         "-d",
         "pid-1",
         "pid-2",
         "pids.tar",
         "collections",
+        "-c",
     ];
     let expanded = expand_dir_args(
         args.map(Into::into),
@@ -276,10 +315,13 @@ fn dir_expansion_drops_stray_files_from_a_glob() {
 fn test_shard_type_flag_accepts_server_info() {
     for val in ["server-info", "server_info"] {
         let m = build_cli()
-            .try_get_matches_from(["mtxdb", "-t", val, "collections"])
+            .try_get_matches_from(["mtxdb", "collections", "-t", val])
             .unwrap();
         assert_eq!(
-            m.get_one::<String>("shard_type").map(String::as_str),
+            m.subcommand_matches("collections")
+                .unwrap()
+                .get_one::<String>("shard_type")
+                .map(String::as_str),
             Some(val)
         );
         assert_eq!(shard_type_from_arg(val), Some(ShardType::ServerInfo));

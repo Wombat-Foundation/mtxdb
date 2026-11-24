@@ -433,58 +433,13 @@ fn confirm(prompt: &str) -> anyhow::Result<bool> {
     Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
-fn command_name(cmd: &Commands) -> &'static str {
-    match cmd {
-        Commands::Init => "init",
-        Commands::Put { .. } => "put",
-        Commands::Get { .. } => "get",
-        Commands::Scan { .. } => "scan",
-        Commands::Search { .. } => "search",
-        Commands::Delete { .. } => "delete",
-        Commands::Tombstones { .. } => "tombstones",
-        Commands::AuthCheck { .. } => "auth-check",
-        Commands::Members { .. } => "members",
-        Commands::Remove { .. } => "remove",
-        Commands::Shards { .. } => "shards",
-        Commands::Collections { .. } => "collections",
-        Commands::Info { .. } => "info",
-        Commands::Sync { .. } => "sync",
-        Commands::ReclaimWal => "reclaim-wal",
-        Commands::Stats { .. } => "stats",
-        Commands::Memory { .. } => "memory",
-        Commands::Timeline { .. } => "timeline",
-        Commands::Flags { .. } => "flags",
-        Commands::Meta { .. } => "meta",
-        Commands::Import { .. } => "import",
-        Commands::Gaps { .. } => "gaps",
-        Commands::Export { .. } => "export",
-        Commands::Packs { .. } => "packs",
-        Commands::Repack { .. } => "repack",
-        Commands::Completions { .. } => "completions",
-        _ => "internal",
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
     if cli.coalesce {
-        match &cli.command {
-            Commands::Shards { .. }
-            | Commands::Collections { .. }
-            | Commands::Stats { .. }
-            | Commands::Get { .. }
-            | Commands::Sync { .. }
-            | Commands::Scan { .. }
-            | Commands::Info { .. }
-            | Commands::Packs { .. }
-            | Commands::Repack { out: Some(_), .. } => {}
-            Commands::Repack { out: None, .. } => {
-                bail!("--coalesce is not supported for in-place repack; coalescing repack requires --out <DIR>");
-            }
-            _ => {
-                let name = command_name(&cli.command);
-                bail!("--coalesce is not supported by `mtxdb {name}`");
-            }
+        // clap only accepts `--coalesce` on commands that aggregate; in-place
+        // repack is the one that still needs `--out`.
+        if matches!(&cli.command, Commands::Repack { out: None, .. }) {
+            bail!("--coalesce is not supported for in-place repack; coalescing repack requires --out <DIR>");
         }
         if cli.dirs_or_default().len() == 1
             && !matches!(&cli.command, Commands::Repack { out: Some(_), .. })

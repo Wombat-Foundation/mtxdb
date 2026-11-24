@@ -484,15 +484,15 @@ const SHARD_TYPE_COMMANDS: &[&str] = &[
 
 /// Attach `--coalesce`, `--read-plan` and `--shard-type` only to the commands
 /// that honor them, so every other command's help stays free of them.
-fn scope_flags(mut cmd: Command) -> Command {
-    for (names, arg) in [
-        (COALESCE_COMMANDS, coalesce_arg as fn() -> Arg),
-        (READ_PLAN_COMMANDS, read_plan_arg),
-        (SHARD_TYPE_COMMANDS, shard_type_arg),
-    ] {
-        for name in names {
-            cmd = cmd.mut_subcommand(*name, |sub| sub.arg(arg()));
-        }
+fn scope_flags(cmd: Command) -> Command {
+    let cmd = add_to(cmd, COALESCE_COMMANDS, coalesce_arg);
+    let cmd = add_to(cmd, READ_PLAN_COMMANDS, read_plan_arg);
+    add_to(cmd, SHARD_TYPE_COMMANDS, shard_type_arg)
+}
+
+fn add_to(mut cmd: Command, names: &[&str], arg: fn() -> Arg) -> Command {
+    for name in names {
+        cmd = cmd.mut_subcommand(*name, |sub| sub.arg(arg()));
     }
     cmd
 }

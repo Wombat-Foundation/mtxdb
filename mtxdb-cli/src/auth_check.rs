@@ -367,7 +367,7 @@ mod tests {
         let report = run(&map);
         assert_eq!(report.allocated, 2);
         assert_eq!(report.with_edges, 2);
-        assert_eq!(report.dangling, []);
+        assert!(report.dangling.is_empty());
     }
 
     #[test]
@@ -410,7 +410,7 @@ mod tests {
         bad[0] = 9;
         let map = room(1, &[(1, bad)], &[]);
         let report = run(&map);
-        assert_eq!(report.dangling, []);
+        assert!(report.dangling.is_empty());
         assert_eq!(report.corrupt.len(), 1);
     }
 
@@ -423,9 +423,9 @@ mod tests {
         );
         let own = HashMap::from([("$create", vec![]), ("$child", vec!["$create"])]);
         let report = run_with(&map, &own);
-        assert_eq!(report.mismatched, []);
-        assert_eq!(report.no_record, []);
-        assert_eq!(report.unnamed, []);
+        assert!(report.mismatched.is_empty());
+        assert!(report.no_record.is_empty());
+        assert!(report.unnamed.is_empty());
     }
 
     #[test]
@@ -508,7 +508,7 @@ mod tests {
                  "auth_events":[]}"#,
         )
         .unwrap();
-        assert_eq!(authoritative_auth_ids(&value), []);
+        assert!(authoritative_auth_ids(&value).is_empty());
     }
 
     #[test]
@@ -555,10 +555,11 @@ mod tests {
     #[test]
     fn state_members_with_forward_ids_are_clean() {
         let groups = vec![([1u8; 16], vec!["$a".to_owned()])];
-        assert_eq!(
-            missing_state_members(groups, |_| Ok::<_, Infallible>(true)).unwrap(),
-            []
-        );
+        assert!(
+            missing_state_members(groups, |_| Ok::<_, Infallible>(true))
+                .unwrap()
+                .is_empty()
+            );
     }
 
     #[test]
