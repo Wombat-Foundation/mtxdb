@@ -1081,3 +1081,50 @@ fn for_collection_scopes_by_collection_id_and_serves_children_of() {
     drop(db);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[cfg(feature = "multi-reader")]
+#[test]
+fn read_only_graph_reads_what_the_writer_committed() {
+    use crate::layout::{DatabaseLayout, ShardType};
+    use crate::packfile::storage::PackfileStorage;
+    use crate::short_id::ReadOnlyGraph;
+    use std::sync::Arc;
+
+    let root = test_root("read-only-graph");
+    let db = Database::open(root.clone()).unwrap();
+    let collection = [0xc3; 16];
+    let adj = CsrAdjacency::for_collection(&collection);
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    adj.record_event(&db, "$msg", &["$create"], &["$create"], None)
+        .unwrap();
+
+    let layout = DatabaseLayout::open(root.clone()).unwrap();
+    let pools: Vec<Arc<PackfileStorage>> = ShardType::ALL
+        .iter()
+        .map(|&pool| {
+            Arc::new(
+                PackfileStorage::open_read_committed_shared(
+                    layout.pool_dir(pool).unwrap(),
+                    layout.shared_wal_path(),
+                    pool,
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+    let reader = ReadOnlyGraph::new(layout, pools.try_into().ok().unwrap());
+
+    assert_eq!(
+        adj.prev_of(&reader, "$msg").unwrap(),
+        Some(vec!["$create".to_owned()])
+    );
+    let create = adj.short_id(&reader, "$create").unwrap().unwrap();
+    let children = adj.children_of(&reader, create).unwrap().unwrap();
+    assert_eq!(
+        adj.resolve_event_ids(&reader, &children).unwrap(),
+        vec![Some("$msg".to_owned())]
+    );
+    drop(reader);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}

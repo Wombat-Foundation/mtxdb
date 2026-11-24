@@ -45,7 +45,7 @@ use crate::csr::store::{CsrStore, RowRecord, ScopeId};
 use crate::csr::{Edge, EdgeFamily, EdgeKey, ReverseCsr};
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
-use crate::short_id::ShortIdIndex;
+use crate::short_id::{GraphReader, ShortIdIndex};
 use crate::storage::StorageError;
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
 
@@ -292,7 +292,7 @@ impl CsrAdjacency {
         ScopeId(self.csr_collection())
     }
 
-    fn store(&self, db: &Database) -> CsrStore {
+    fn store<R: GraphReader + ?Sized>(&self, db: &R) -> CsrStore {
         CsrStore::open(db.layout(), self.events.scope().0)
     }
 
@@ -543,9 +543,9 @@ impl CsrAdjacency {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt segment.
-    pub fn children_of(
+    pub fn children_of<R: GraphReader + ?Sized>(
         &self,
-        db: &Database,
+        db: &R,
         short_id: u32,
     ) -> Result<Option<Vec<u32>>, StorageError> {
         let mut rows = self
@@ -834,7 +834,11 @@ impl CsrAdjacency {
     ///
     /// # Errors
     /// Returns an error on a read failure.
-    pub fn short_id(&self, db: &Database, event_id: &str) -> Result<Option<u32>, StorageError> {
+    pub fn short_id<R: GraphReader + ?Sized>(
+        &self,
+        db: &R,
+        event_id: &str,
+    ) -> Result<Option<u32>, StorageError> {
         self.events.lookup(db, event_id.as_bytes())
     }
 
@@ -848,9 +852,9 @@ impl CsrAdjacency {
     /// # Errors
     /// Returns an error on a read failure, a corrupt reverse record, or a
     /// stored key that is not UTF-8.
-    pub fn resolve_event_ids(
+    pub fn resolve_event_ids<R: GraphReader + ?Sized>(
         &self,
-        db: &Database,
+        db: &R,
         short_ids: &[u32],
     ) -> Result<Vec<Option<String>>, StorageError> {
         self.events
@@ -867,9 +871,9 @@ impl CsrAdjacency {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt record.
-    pub fn prev_of(
+    pub fn prev_of<R: GraphReader + ?Sized>(
         &self,
-        db: &Database,
+        db: &R,
         event_id: &str,
     ) -> Result<Option<Vec<String>>, StorageError> {
         self.targets_of(db, event_id, PREV)
@@ -880,9 +884,9 @@ impl CsrAdjacency {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt record.
-    pub fn auth_of(
+    pub fn auth_of<R: GraphReader + ?Sized>(
         &self,
-        db: &Database,
+        db: &R,
         event_id: &str,
     ) -> Result<Option<Vec<String>>, StorageError> {
         self.targets_of(db, event_id, AUTH)
@@ -892,9 +896,9 @@ impl CsrAdjacency {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt snapshot.
-    pub fn family_edges(
+    pub fn family_edges<R: GraphReader + ?Sized>(
         &self,
-        db: &Database,
+        db: &R,
         short_id: u32,
         family: EdgeFamily,
     ) -> Result<Option<Vec<Edge>>, StorageError> {
@@ -1002,9 +1006,9 @@ impl CsrAdjacency {
     /// # Errors
     /// Returns an error on a read failure, corrupt segment, or an index too
     /// large for `u32` offsets.
-    pub fn reverse_family(
+    pub fn reverse_family<R: GraphReader + ?Sized>(
         &self,
-        db: &Database,
+        db: &R,
         family: EdgeFamily,
     ) -> Result<ReverseCsr, StorageError> {
         let rows = self
@@ -1185,9 +1189,9 @@ impl CsrAdjacency {
         Ok(())
     }
 
-    fn targets_of(
+    fn targets_of<R: GraphReader + ?Sized>(
         &self,
-        db: &Database,
+        db: &R,
         event_id: &str,
         family: EdgeFamily,
     ) -> Result<Option<Vec<String>>, StorageError> {

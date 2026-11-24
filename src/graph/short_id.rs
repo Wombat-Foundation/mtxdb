@@ -32,9 +32,12 @@ use std::collections::{HashMap, HashSet};
 use bytes::Bytes;
 
 use crate::database::{Database, DatabaseTransaction};
+use crate::layout::DatabaseLayout;
 use crate::layout::ShardType;
+use crate::packfile::storage::PackfileStorage;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageError};
 use crate::template::{derive_collection_id, MEMBER_NAMESPACE_INTL};
+use std::sync::Arc;
 
 /// Wire version shared by every short-id record. Version 2 intentionally
 /// rejects the pre-CSR format, whose `SIDE` adjacency records are no longer
@@ -303,6 +306,81 @@ impl ShortIdVerifyReport {
     }
 }
 
+/// A source of committed point reads: the part of a database that graph
+/// lookups ([`ShortIdIndex::lookup`], [`ShortIdIndex::resolve`] and the CSR
+/// readers built on them) need.
+///
+/// [`Database`] implements it for the writer. [`ReadOnlyGraph`] implements it
+/// for a process that opened the pools read-only and holds no `Database`.
+pub trait GraphReader {
+    /// The database layout, which locates the graph stores.
+    fn layout(&self) -> &DatabaseLayout;
+
+    /// Committed records `ids` of `collection` in `pool`; `None` for a miss.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure.
+    fn read_nodes(
+        &self,
+        pool: ShardType,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError>;
+}
+
+impl GraphReader for Database {
+    fn layout(&self) -> &DatabaseLayout {
+        Database::layout(self)
+    }
+
+    fn read_nodes(
+        &self,
+        pool: ShardType,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        let txn = self.begin_transaction();
+        txn.get_with_record_versions(pool, collection, ids)
+            .map(|(records, _)| records)
+    }
+}
+
+/// Read-only graph access over pools opened with `open_read_only`.
+///
+/// Reads overlay the writer's committed journal groups
+/// (`PackfileStorage::get_read_committed`), so a reader sees what the writer
+/// has committed without holding the writer lock.
+pub struct ReadOnlyGraph {
+    layout: DatabaseLayout,
+    pools: [Arc<PackfileStorage>; ShardType::ALL.len()],
+}
+
+impl ReadOnlyGraph {
+    /// Wrap a read-only layout and its pools, indexed by [`ShardType::index`].
+    #[must_use]
+    pub fn new(
+        layout: DatabaseLayout,
+        pools: [Arc<PackfileStorage>; ShardType::ALL.len()],
+    ) -> Self {
+        Self { layout, pools }
+    }
+}
+
+impl GraphReader for ReadOnlyGraph {
+    fn layout(&self) -> &DatabaseLayout {
+        &self.layout
+    }
+
+    fn read_nodes(
+        &self,
+        pool: ShardType,
+        collection: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        self.pools[pool.index()].get_read_committed(collection, ids)
+    }
+}
+
 /// One short-id scope (a collection inside one pool).
 #[derive(Debug, Clone, Copy)]
 pub struct ShortIdIndex {
@@ -494,10 +572,12 @@ impl ShortIdIndex {
     /// # Errors
     /// Returns an error on a read failure, a corrupt record, or a hash collision
     /// with a different key.
-    pub fn lookup(&self, db: &Database, key: &[u8]) -> Result<Option<u32>, StorageError> {
-        let txn = db.begin_transaction();
-        let (records, _) =
-            txn.get_with_record_versions(self.pool, &self.collection_id, &[forward_id(key)])?;
+    pub fn lookup<R: GraphReader + ?Sized>(
+        &self,
+        db: &R,
+        key: &[u8],
+    ) -> Result<Option<u32>, StorageError> {
+        let records = db.read_nodes(self.pool, &self.collection_id, &[forward_id(key)])?;
         match records.into_iter().next().flatten() {
             None => Ok(None),
             Some(record) => {
@@ -555,17 +635,16 @@ impl ShortIdIndex {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt record.
-    pub fn resolve(
+    pub fn resolve<R: GraphReader + ?Sized>(
         &self,
-        db: &Database,
+        db: &R,
         short_ids: &[u32],
     ) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
         let ids: Vec<NodeId> = short_ids
             .iter()
             .map(|id| indexed_id(REVERSE_PREFIX, *id))
             .collect();
-        let txn = db.begin_transaction();
-        let (records, _) = txn.get_with_record_versions(self.pool, &self.collection_id, &ids)?;
+        let records = db.read_nodes(self.pool, &self.collection_id, &ids)?;
         records
             .into_iter()
             .map(|record| {
