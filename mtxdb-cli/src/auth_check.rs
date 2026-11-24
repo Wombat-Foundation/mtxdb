@@ -233,7 +233,12 @@ pub(crate) fn check<E>(
             .push((0, "short-id counter is not 8 bytes".to_owned()));
         return Ok(report);
     };
-    let allocated = u32::try_from(u64::from_be_bytes(counter_bytes)).unwrap_or(u32::MAX);
+    let Ok(allocated) = u32::try_from(u64::from_be_bytes(counter_bytes)) else {
+        report
+            .corrupt
+            .push((0, "short-id counter exceeds u32".to_owned()));
+        return Ok(report);
+    };
     report.allocated = allocated;
 
     let mut missing: BTreeSet<u32> = BTreeSet::new();
@@ -294,6 +299,15 @@ pub(crate) fn check<E>(
                     });
                 }
             }
+        }
+    }
+
+    // A cited target outside `1..=allocated` cannot name an allocated short
+    // id. Report it like an allocated target with no edge record, with its
+    // citers, instead of letting the inconsistency vanish.
+    for &target in cited_by.keys() {
+        if target == 0 || target > allocated {
+            missing.insert(target);
         }
     }
 
@@ -582,5 +596,35 @@ mod tests {
         let groups = vec![([1u8; 16], vec!["$a".to_owned()])];
         let result: Result<_, &str> = missing_state_members(groups, |_| Err("boom"));
         assert_eq!(result.unwrap_err(), "boom");
+    }
+
+    #[test]
+    fn counter_above_u32_is_corrupt_not_truncated() {
+        let mut map = HashMap::new();
+        map.insert(
+            counter_node_id(),
+            (u64::from(u32::MAX) + 1).to_be_bytes().to_vec(),
+        );
+        let report = run(&map);
+        assert_eq!(report.allocated, 0);
+        assert_eq!(
+            report.corrupt,
+            vec![(0, "short-id counter exceeds u32".to_owned())]
+        );
+    }
+
+    #[test]
+    fn cited_target_outside_the_counter_is_reported_as_dangling() {
+        // 2 cites 9, but the counter says only 1..=2 were allocated.
+        let map = room(2, &[(1, edges(&[])), (2, edges(&[1, 9]))], &[(2, "$child")]);
+        let report = run(&map);
+        assert_eq!(
+            report.dangling,
+            vec![Dangling {
+                short_id: 9,
+                event_id: None,
+                cited_by: vec![2],
+            }]
+        );
     }
 }

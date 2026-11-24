@@ -797,8 +797,19 @@ type ServerAnswerParts = (AnswerKind, Option<u16>, Option<String>);
 /// # Errors
 /// Propagates storage errors and refuses a malformed record.
 pub(crate) fn read(db: &Database, room_id: &str) -> Result<GapManifest> {
-    let record = db
-        .pool(SERVER_INFO_POOL)
+    read_from_pool(db.pool(SERVER_INFO_POOL).as_ref(), room_id)
+}
+
+/// Read a room's manifest from an already-open server-info pool, which may be
+/// a read-only open that coexists with a live writer.
+///
+/// # Errors
+/// Propagates storage errors and refuses a malformed record.
+pub(crate) fn read_from_pool<S: StorageEngine + ?Sized>(
+    pool: &S,
+    room_id: &str,
+) -> Result<GapManifest> {
+    let record = pool
         .get(
             &gap_manifest_collection_id(room_id.as_bytes()),
             &gap_manifest_node_id(),

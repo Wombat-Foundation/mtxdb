@@ -2,27 +2,27 @@ use super::{
     all_verdicts_present, base_is_incomplete, build_event_dag, canonical_column_width,
     cmd_collections, cmd_flags, cmd_gap_edit, cmd_gap_list, cmd_get, cmd_import, cmd_import_file,
     cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_scan_collection_live_rows,
-    cmd_shards, cmd_stats, cmd_sync, cmd_tombstones, collection_canonical_id,
+    cmd_shards, cmd_stats, cmd_sync, cmd_tombstones, collection_canonical_id, committed_through,
     compile_import_template, compute_state_groups_partial, decode_event_json_record,
     decode_hamt_node, decode_hamt_root, default_matrix_import_template, derive_template_key,
     direct_import_enabled, dirty_closure_exceeds_half, display_collection_role, event_id,
     event_room_id, event_short_id, export_envelope_line, extract_pointer_string, finish_import,
-    fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id, glob_pack_files,
-    import_data, import_pdu_events, import_pdu_events_with_raw, interleaving_worth_noting,
-    is_server_keys_export, json_string, keys_first, listing_shard_types, load_collection_events,
-    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
-    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
-    overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
-    parse_pack_selectors, partial_topo_sort_dag, prepare_state_collection, pretty_print_payload,
-    raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
-    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
-    search_record_matches, search_template, split_canonical_display, template_collection_id,
-    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
-    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
-    CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache, JsonValueExt,
-    MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions, SharedState,
-    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
-    STATE_GROUP_NAMESPACE,
+    fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id,
+    forward_short_id_present, glob_pack_files, import_data, import_pdu_events,
+    import_pdu_events_with_raw, interleaving_worth_noting, is_server_keys_export, json_string,
+    keys_first, listing_shard_types, load_collection_events, load_state_groups,
+    matrix_batch_has_create, matrix_room_collection_id, matrix_room_extension_from_store,
+    meta_checkpoints, meta_lock_line, meta_pools, meta_raw, overlay_auth_projection, pack_identity,
+    parse_federation_input, parse_pack_id_selector, parse_pack_selectors, partial_topo_sort_dag,
+    prepare_state_collection, pretty_print_payload, raw_auth_projection,
+    raw_auth_projection_collection_id, record_csr_adjacency, redacted_event_bytes,
+    resolve_import_collection, run, scan_payload_suffix, search_record_matches, search_template,
+    split_canonical_display, template_collection_id, template_event_id_node_id, template_node_id,
+    topological_event_order, valid_json_pointer, valid_state_group_id, verify_auth_chain_edges,
+    write_raw_auth_projections, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
+    ImportRunCache, JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting,
+    ScanOptions, SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
+    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -11821,7 +11821,7 @@ fn gap_commands_edit_and_list_a_stored_manifest() {
         gap_manifest::read(&db, room).unwrap().gaps["$gap"].status()
     };
 
-    cmd_gap_list(&cli, room, None, true).unwrap();
+    cmd_gap_list(&cli, room, None, true, 0).unwrap();
     assert_eq!(status(), GapStatus::Open);
 
     // An id the manifest does not track is refused, and nothing is created.
@@ -11841,7 +11841,7 @@ fn gap_commands_edit_and_list_a_stored_manifest() {
     })
     .unwrap();
     assert_eq!(status(), GapStatus::Anchored);
-    cmd_gap_list(&cli, room, Some("anchored"), false).unwrap();
+    cmd_gap_list(&cli, room, Some("anchored"), false, 0).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -12103,4 +12103,25 @@ fn room_selector_expands_per_pool() {
     )
     .unwrap();
     assert_eq!(hex.len(), 1);
+}
+
+#[test]
+fn committed_through_reports_reclaimed_history_for_a_reopened_segment() {
+    // A fresh segment starts at base 1; nothing has been committed.
+    assert_eq!(committed_through(0, 1), 0);
+    // A populated segment keeps its live watermark.
+    assert_eq!(committed_through(42, 7), 42);
+    // A header-only reopened segment has no live groups, so its base is the
+    // only evidence of the history already reclaimed before it.
+    assert_eq!(committed_through(0, 7), 6);
+    assert_eq!(committed_through(3, 7), 6);
+}
+
+#[test]
+fn forward_short_id_is_present_only_for_a_four_byte_record() {
+    assert!(!forward_short_id_present(None));
+    assert!(!forward_short_id_present(Some(&[])));
+    assert!(!forward_short_id_present(Some(&[0, 1, 2])));
+    assert!(!forward_short_id_present(Some(&[0, 1, 2, 3, 4])));
+    assert!(forward_short_id_present(Some(&[0, 1, 2, 3])));
 }

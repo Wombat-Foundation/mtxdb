@@ -518,6 +518,9 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             detail,
             json,
         } => {
+            if *tombstones {
+                cli.require_single_dir("info --tombstones")?;
+            }
             let result = if *json && *tombstones {
                 Ok(())
             } else if let Some(selector) = selector {
@@ -4843,6 +4846,35 @@ fn collection_id_exists(cli: &Cli, target_id: &[u8; 16]) -> bool {
     false
 }
 
+/// Whether a selector names a live collection in any selected pool.
+///
+/// A room selector expands to a different collection in each pool, so a
+/// state-only room still matches under `-t state` even though its event
+/// collection lives in another pool.
+fn collection_selector_exists(cli: &Cli, selector: &str) -> anyhow::Result<bool> {
+    let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
+        vec![st]
+    } else {
+        cli.shard_types().collect()
+    };
+    for db_dir in valid_database_dirs(cli)? {
+        let Ok(layout) = DatabaseLayout::open_read_only(db_dir) else {
+            continue;
+        };
+        for &shard_type in &shard_types {
+            let Ok(dir) = pool_dir(&layout, shard_type) else {
+                continue;
+            };
+            for collection_id in parse_collection_selectors_for_pool(selector, shard_type)? {
+                if collection_exists_in_dir(&dir, &collection_id) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Classify an `info`/`scan` selector by inference. See
 /// [`classify_info_selector_explicit`]; this is the no-override form.
 fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarget> {
@@ -4930,8 +4962,7 @@ fn classify_info_selector_with_inventory(
             }
         }
         Some(InfoTarget::Collection) => {
-            let id = parse_collection_selector(selector)?;
-            if !collection_id_exists(cli, &id) {
+            if !collection_selector_exists(cli, selector)? {
                 bail!("collection {selector}: not found");
             }
             return Ok((InfoTarget::Collection, None));
@@ -5017,7 +5048,6 @@ fn cmd_info_coalesced(
 
     match target {
         InfoTarget::Collection => {
-            let collection_id = parse_collection_selector(selector)?;
             let mut matches = Vec::new();
             for db_dir in &valid_dirs {
                 let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
@@ -5027,8 +5057,14 @@ fn cmd_info_coalesced(
                     let Ok(dir) = pool_dir(&layout, shard_type) else {
                         continue;
                     };
-                    if collection_exists_in_dir(&dir, &collection_id) {
-                        matches.push((db_dir.clone(), shard_type, dir));
+                    // A room selector names a different set of collections in
+                    // each pool (event bodies vs state, roots and auth), so
+                    // expand it per pool before probing.
+                    for collection_id in parse_collection_selectors_for_pool(selector, shard_type)?
+                    {
+                        if collection_exists_in_dir(&dir, &collection_id) {
+                            matches.push((db_dir.clone(), shard_type, dir.clone(), collection_id));
+                        }
                     }
                 }
             }
@@ -5036,19 +5072,19 @@ fn cmd_info_coalesced(
             if matches.is_empty() {
                 eprintln!(
                     "collection {}: not found across {} database(s)",
-                    format_id(&collection_id),
+                    format_id(&parse_collection_selector(selector)?),
                     valid_dirs.len()
                 );
                 return Ok(());
             }
 
             if matches.len() == 1 {
-                let (db_dir, shard_type, dir) = &matches[0];
+                let (db_dir, shard_type, dir, collection_id) = &matches[0];
                 println!("database: {}", db_dir.display());
                 println!("pool:     {}", shard_type.as_str());
-                inspect_collection_in_dir(dir, &collection_id, deep, None);
+                inspect_collection_in_dir(dir, collection_id, deep, None);
             } else {
-                for (i, (db_dir, shard_type, dir)) in matches.iter().enumerate() {
+                for (i, (db_dir, shard_type, dir, collection_id)) in matches.iter().enumerate() {
                     if i > 0 {
                         println!();
                     }
@@ -5057,11 +5093,11 @@ fn cmd_info_coalesced(
                         db_dir.display(),
                         shard_type.as_str()
                     );
-                    inspect_collection_in_dir(dir, &collection_id, deep, None);
+                    inspect_collection_in_dir(dir, collection_id, deep, None);
                 }
                 println!();
                 println!(
-                    "note: collection found in {} of {} database(s)",
+                    "note: collection found in {} location(s) across {} database(s)",
                     matches.len(),
                     valid_dirs.len()
                 );
@@ -7601,7 +7637,6 @@ fn cmd_scan_coalesced(
     let mut matching_dirs = Vec::new();
     match target {
         InfoTarget::Collection => {
-            let collection_id = parse_collection_selector(selector)?;
             for db_dir in &valid_dirs {
                 let Ok(layout) = DatabaseLayout::open_read_only(db_dir.clone()) else {
                     continue;
@@ -7611,8 +7646,16 @@ fn cmd_scan_coalesced(
                     let Ok(dir) = pool_dir(&layout, shard_type) else {
                         continue;
                     };
-                    if collection_exists_in_dir(&dir, &collection_id) {
-                        found_in_db = true;
+                    // Expand a room selector in each pool: the room's event
+                    // bodies live in one collection, its state in others.
+                    for collection_id in parse_collection_selectors_for_pool(selector, shard_type)?
+                    {
+                        if collection_exists_in_dir(&dir, &collection_id) {
+                            found_in_db = true;
+                            break;
+                        }
+                    }
+                    if found_in_db {
                         break;
                     }
                 }
@@ -8222,13 +8265,8 @@ fn cmd_scan_collection_in_pool(
     }
     sort_collection_records(&mut context);
     if context.mode.is_raw() {
-        if context.show_section_header && !context.raw_matches.is_empty() {
-            if context.needs_section_spacing {
-                println!();
-                println!();
-            }
-            print_section_header(context.shard_type);
-        }
+        // `--raw` promises a clean byte stream on stdout; a section banner
+        // would corrupt it, so never print one here.
         let stdout = io::stdout();
         let mut out = stdout.lock();
         for (shard, _, offset) in context.raw_matches.iter().take(max_rows) {
@@ -8924,11 +8962,21 @@ fn cmd_gap_edit(
 }
 
 /// Print a room's gaps with their derived status, optionally filtered.
-fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> anyhow::Result<()> {
+///
+/// Reads through a read-only pool so it works while a writer holds the root.
+/// `limit` caps the printed entries; zero is unlimited. The summary counts
+/// always describe the full match set.
+fn cmd_gap_list(
+    cli: &Cli,
+    room: &str,
+    status: Option<&str>,
+    history: bool,
+    limit: usize,
+) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
-    let db =
-        open_database(layout.root().to_path_buf()).context("opening the database to list gaps")?;
-    let manifest = crate::gap_manifest::read(&db, room)?;
+    let pool = open_pool_read_only(pool_dir(&layout, mtxdb::interop::SERVER_INFO_POOL)?)
+        .context("opening the server-info pool to list gaps")?;
+    let manifest = crate::gap_manifest::read_from_pool(&pool, room)?;
     let matching: Vec<_> = manifest
         .gaps
         .iter()
@@ -8947,7 +8995,9 @@ fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> a
         println!("  no gaps match the requested status");
         return Ok(());
     }
-    for (id, record) in matching {
+    let shown = if limit == 0 { matching.len() } else { limit };
+    let hidden = matching.len().saturating_sub(shown);
+    for (id, record) in matching.into_iter().take(shown) {
         let derived = record.status();
         println!("{id}\t{}", derived.describe());
         if let Some(waiver) = &record.waiver {
@@ -8988,6 +9038,9 @@ fn cmd_gap_list(cli: &Cli, room: &str, status: Option<&str>, history: bool) -> a
         } else {
             println!("  no server assessment recorded");
         }
+    }
+    if hidden > 0 {
+        println!("  ... {hidden} more gap(s) not shown (raise -l, or 0 for all)");
     }
     Ok(())
 }
@@ -16713,12 +16766,13 @@ fn cmd_members(cli: &Cli, room: &str, json: bool) -> anyhow::Result<()> {
     if json {
         let memberships = by_membership
             .iter()
-            .map(|(membership, count)| format!("\"{membership}\":{count}"))
+            .map(|(membership, count)| format!("{}:{count}", json_string(membership)))
             .collect::<Vec<_>>()
             .join(",");
         println!(
-            "{{\"room\":\"{room}\",\"collection\":\"0x{}\",\"users\":{},\"join\":{joined},\
+            "{{\"room\":{},\"collection\":\"0x{}\",\"users\":{},\"join\":{joined},\
              \"by_membership\":{{{memberships}}}}}",
+            json_string(room),
             hex::encode(collection_id),
             stats.members.len(),
         );
@@ -16862,7 +16916,7 @@ fn cmd_room_check(cli: &Cli, room: &str, options: &RoomCheckOptions<'_>) -> anyh
     }
     if run_prevs {
         println!("== prev_events gaps ==");
-        if let Err(error) = cmd_gap_list(cli, room, status, history) {
+        if let Err(error) = cmd_gap_list(cli, room, status, history, limit) {
             failures.push(format!("prev_events: {error:#}"));
         }
     }
@@ -16925,6 +16979,16 @@ fn cmd_auth_check(
         .filter(|(event_id, entry)| entry.is_state && !named.contains(event_id))
         .map(|(_, entry)| entry.node_id)
         .collect();
+    // Records that could not be parsed at all. They carry no state flag, so
+    // they never appear in `unembedded`; report them separately rather than
+    // letting them vanish.
+    let unreadable: Vec<([u8; 16], String)> = scanned
+        .values()
+        .filter_map(|entry| match &entry.auth {
+            EventAuth::Unreadable(reason) => Some((entry.node_id, reason.clone())),
+            EventAuth::Ids(_) | EventAuth::Absent => None,
+        })
+        .collect();
 
     let missing_state_members = if check_state_members {
         collect_missing_state_members(&store, room, &collection_id)?
@@ -16935,6 +16999,7 @@ fn cmd_auth_check(
     print_auth_check_report(
         &report,
         &unembedded,
+        &unreadable,
         &missing_state_members,
         check_state_members,
         &AuthCheckHeader {
@@ -16983,10 +17048,19 @@ fn collect_missing_state_members(
     );
     crate::auth_check::missing_state_members(groups, |event_id| {
         let forward_id = crate::auth_check::forward_node_id(event_id);
-        Ok(store
-            .get(auth_collection, &forward_id)?
-            .is_none_or(|data| data.bytes.len() != 4))
+        let data = store.get(auth_collection, &forward_id)?;
+        Ok(forward_short_id_present(
+            data.as_ref().map(|data| data.bytes.as_ref()),
+        ))
     })
+}
+
+/// Whether an AUTH forward record holds a short id.
+///
+/// Only a present four-byte record counts: an absent record and one of any
+/// other length do not map the member to a short id.
+fn forward_short_id_present(bytes: Option<&[u8]>) -> bool {
+    bytes.is_some_and(|bytes| bytes.len() == 4)
 }
 
 /// Where an `auth-check` report was read from.
@@ -16996,9 +17070,14 @@ struct AuthCheckHeader<'a> {
     event_collection: [u8; 16],
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "prints the summary and every report category in a fixed order"
+)]
 fn print_auth_check_report(
     report: &crate::auth_check::Report,
     unembedded: &[[u8; 16]],
+    unreadable: &[([u8; 16], String)],
     missing_state_members: &[crate::auth_check::MissingStateMember],
     state_members_checked: bool,
     header: &AuthCheckHeader<'_>,
@@ -17016,6 +17095,7 @@ fn print_auth_check_report(
     if report.allocated == 0
         && report.corrupt.is_empty()
         && unembedded.is_empty()
+        && unreadable.is_empty()
         && missing_state_members.is_empty()
         && !state_members_checked
     {
@@ -17030,6 +17110,7 @@ fn print_auth_check_report(
     println!("no event record:     {}", report.no_record.len());
     println!("unnamed short ids:   {}", report.unnamed.len());
     println!("bad event records:   {}", report.bad_records.len());
+    println!("unreadable event records: {}", unreadable.len());
     println!("state events with no short id: {}", unembedded.len());
     if state_members_checked {
         println!(
@@ -17088,6 +17169,12 @@ fn print_auth_check_report(
     for node_id in unembedded.iter().take(shown) {
         println!("NO_SHORT_ID node={}", hex::encode(node_id));
     }
+    for (node_id, reason) in unreadable.iter().take(shown) {
+        println!(
+            "UNREADABLE_EVENT_RECORD node={}: {reason}",
+            hex::encode(node_id)
+        );
+    }
     for member in missing_state_members.iter().take(shown) {
         let group_ids = member
             .groups
@@ -17109,60 +17196,74 @@ fn cmd_tombstones(
     detail: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    let collection_id = parse_collection_selector(collection)?;
+    // A room selector names a different collection in each pool (the event
+    // bodies in EVNT, the state, roots and auth collections in STAT), so
+    // expand it per pool and report every collection that exists.
+    let shard_type = cli.require_shard_type()?;
+    let collection_ids = parse_collection_selectors_for_pool(collection, shard_type)?;
     let store = open_store_read_only(cli)?;
-    let counts = store
-        .removal_counts(&collection_id)
-        .ok_or_else(|| anyhow::anyhow!("no such collection: {}", format_id(&collection_id)))?;
-    let stats = detail
-        .then(|| store.removal_stats(&collection_id))
-        .transpose()?;
-    let removed = if keys {
-        store.removed_keys(&collection_id)?
-    } else {
-        Vec::new()
-    };
-    if json {
-        let mut fields = vec![
-            ("collection", json_string(&format_id(&collection_id))),
-            ("live_keys", counts.live_keys.to_string()),
-            ("removed_keys", counts.removed_keys.to_string()),
-        ];
+    let mut reported = 0_usize;
+    for collection_id in collection_ids {
+        let Some(counts) = store.removal_counts(&collection_id) else {
+            continue;
+        };
+        reported = reported.saturating_add(1);
+        let stats = detail
+            .then(|| store.removal_stats(&collection_id))
+            .transpose()?;
+        let removed = if keys {
+            store.removed_keys(&collection_id)?
+        } else {
+            Vec::new()
+        };
+        if json {
+            let mut fields = vec![
+                ("collection", json_string(&format_id(&collection_id))),
+                ("live_keys", counts.live_keys.to_string()),
+                ("removed_keys", counts.removed_keys.to_string()),
+            ];
+            if let Some(stats) = stats {
+                fields.extend([
+                    ("frames", stats.frames.to_string()),
+                    ("removal_markers", stats.marker_frames.to_string()),
+                    ("superseded_frames", stats.superseded_frames.to_string()),
+                    ("total_bytes", stats.total_bytes.to_string()),
+                    ("reclaimable_bytes", stats.reclaimable_bytes.to_string()),
+                ]);
+            }
+            if keys {
+                let values = removed
+                    .iter()
+                    .map(|key| json_string(&format_id(key)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                fields.push(("removed", format!("[{values}]")));
+            }
+            println!("{}", json_object(&fields, ""));
+            continue;
+        }
+
+        println!("collection:        {}", format_id(&collection_id));
+        println!("live keys:         {}", counts.live_keys);
+        println!("removed keys:      {}", counts.removed_keys);
         if let Some(stats) = stats {
-            fields.extend([
-                ("frames", stats.frames.to_string()),
-                ("removal_markers", stats.marker_frames.to_string()),
-                ("superseded_frames", stats.superseded_frames.to_string()),
-                ("total_bytes", stats.total_bytes.to_string()),
-                ("reclaimable_bytes", stats.reclaimable_bytes.to_string()),
-            ]);
+            println!("frames:            {}", stats.frames);
+            println!("  removal markers: {}", stats.marker_frames);
+            println!("  superseded:      {}", stats.superseded_frames);
+            println!("total bytes:       {}", stats.total_bytes);
+            println!("reclaimable bytes: {}", stats.reclaimable_bytes);
         }
         if keys {
-            let values = removed
-                .iter()
-                .map(|key| json_string(&format_id(key)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            fields.push(("removed", format!("[{values}]")));
+            for key in removed {
+                println!("removed {}", format_id(&key));
+            }
         }
-        println!("{}", json_object(&fields, ""));
-        return Ok(());
     }
-
-    println!("collection:        {}", format_id(&collection_id));
-    println!("live keys:         {}", counts.live_keys);
-    println!("removed keys:      {}", counts.removed_keys);
-    if let Some(stats) = stats {
-        println!("frames:            {}", stats.frames);
-        println!("  removal markers: {}", stats.marker_frames);
-        println!("  superseded:      {}", stats.superseded_frames);
-        println!("total bytes:       {}", stats.total_bytes);
-        println!("reclaimable bytes: {}", stats.reclaimable_bytes);
-    }
-    if keys {
-        for key in removed {
-            println!("removed {}", format_id(&key));
-        }
+    if reported == 0 {
+        bail!(
+            "no such collection: {}",
+            format_id(&parse_collection_selector(collection)?)
+        );
     }
     Ok(())
 }
@@ -17286,11 +17387,10 @@ fn cmd_reclaim_wal(cli: &Cli) -> anyhow::Result<()> {
             retained_sequences(position_after)
         );
     }
+    let committed_through = committed_through(coordinator.committed_lsn(), position_after.base_lsn);
     println!(
-        "  next append: LSN {}, sequence {} (committed through LSN {})",
-        position_after.next_lsn,
-        position_after.next_sequence,
-        coordinator.committed_lsn()
+        "  next append: LSN {}, sequence {} (committed through LSN {committed_through})",
+        position_after.next_lsn, position_after.next_sequence,
     );
     println!(
         "  segment: {after} of {} bytes; reclaim trigger {}",
@@ -17331,6 +17431,16 @@ fn cmd_reclaim_wal(cli: &Cli) -> anyhow::Result<()> {
         .collect();
     println!("  checkpoint calls: {}", timings.join(" "));
     Ok(())
+}
+
+/// Committed-through LSN to report for the shared WAL.
+///
+/// A header-only segment reopened after a reclaim has no live groups, so the
+/// in-memory watermark can sit below the history already reclaimed before the
+/// segment's base. The base is authoritative for that case; a fresh segment
+/// (base 1) still reports zero, and a populated segment keeps its watermark.
+fn committed_through(committed_lsn: u64, base_lsn: u64) -> u64 {
+    committed_lsn.max(base_lsn.saturating_sub(1))
 }
 
 /// A read-only snapshot of a WAL segment's numbering as found on disk.
