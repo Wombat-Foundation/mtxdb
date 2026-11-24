@@ -74,6 +74,7 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
     (value, started.elapsed())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
     let root = base.join(format!("mtxdb-reverse-{}-{events}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -128,12 +129,21 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
     }
 
     // Every owner has a row in this family, but the rows contain no edges.
-    let (empty_rows, empty_first) =
-        timed(|| store.read_family(scope, empty_family).expect("empty read_family"));
+    let (empty_rows, empty_first) = timed(|| {
+        store
+            .read_family(scope, empty_family)
+            .expect("empty read_family")
+    });
     assert_eq!(empty_rows.len(), events, "empty family row count");
-    assert!(empty_rows.iter().all(|(_, edges)| edges.is_empty()));
-    let (_, empty_repeat) =
-        timed(|| store.read_family(scope, empty_family).expect("empty read_family"));
+    assert!(
+        empty_rows.iter().all(|(_, edges)| edges.is_empty()),
+        "empty family should contain no edge payloads"
+    );
+    let (_, empty_repeat) = timed(|| {
+        store
+            .read_family(scope, empty_family)
+            .expect("empty read_family")
+    });
 
     // A few typed rows amid the dense PREV and empty-edge families exercise
     // the family's directory-range lookup and bounded payload read.
@@ -143,10 +153,17 @@ fn run(base: &std::path::Path, events: usize, segments: usize, lookups: usize) {
             .expect("sparse read_family")
     });
     let expected_sparse_rows = events.saturating_sub(1) / SPARSE_STRIDE;
-    assert_eq!(sparse_rows.len(), expected_sparse_rows, "sparse family row count");
-    assert!(sparse_rows
-        .iter()
-        .all(|(_, edges)| edges.len() == 1 && edges[0].kind == 1));
+    assert_eq!(
+        sparse_rows.len(),
+        expected_sparse_rows,
+        "sparse family row count"
+    );
+    assert!(
+        sparse_rows
+            .iter()
+            .all(|(_, edges)| edges.len() == 1 && edges[0].kind == 1),
+        "each sparse family row should contain one typed edge"
+    );
     let (_, sparse_repeat) = timed(|| {
         store
             .read_family(scope, sparse_family)
