@@ -181,12 +181,6 @@ pub struct CsrAdjacency {
     kinds: ShortIdIndex,
 }
 
-fn collection(prefix: &str, room_id: &str) -> [u8; 16] {
-    let mut canonical = prefix.as_bytes().to_vec();
-    canonical.extend_from_slice(room_id.as_bytes());
-    derive_collection_id(Some(MEMBER_NAMESPACE_INTL), &canonical)
-}
-
 fn utf8(bytes: Vec<u8>, what: &str) -> Result<String, StorageError> {
     String::from_utf8(bytes).map_err(|_| StorageError::Corrupt(format!("{what} is not UTF-8")))
 }
@@ -253,20 +247,19 @@ impl CsrAdjacency {
     /// `EventDag`.
     #[must_use]
     pub fn new(room_id: &str) -> Self {
-        Self::scoped(
-            collection("matrix-adjacency:", room_id),
-            collection("matrix-relation-kinds:", room_id),
-        )
+        Self::for_collection(&crate::interop::room_event_collection_id(
+            room_id.as_bytes(),
+        ))
     }
 
-    /// Address the adjacency of the room whose 16-byte collection id is
+    /// Address the adjacency of the room whose 16-byte event collection id is
     /// `room_collection`.
     ///
-    /// For callers that resolve an event to its room's collection id (a
-    /// locator read) and never see the room id string. The scope is derived
-    /// from the collection id alone, so every caller using the same id reaches
-    /// the same rows. It is a different scope from [`Self::new`] for the same
-    /// room: pick one addressing scheme per database and keep to it.
+    /// For callers that resolve an event to its room through the locator and
+    /// never see the room id string. The scope is derived from the collection
+    /// id alone, so every caller using the same id reaches the same rows, and
+    /// [`Self::new`] delegates here so the two constructors cannot address
+    /// different scopes for one room.
     #[must_use]
     pub fn for_collection(room_collection: &[u8; 16]) -> Self {
         let derive = |prefix: &[u8]| {
