@@ -1324,14 +1324,21 @@ fn sub_auth_check() -> Command {
                 .value_name("ROOM_ID")
                 .help("Matrix room ID, e.g. !room:server"),
         )
-        .arg(Arg::new("auth").long("auth").action(ArgAction::SetTrue).help("Check auth_events graph integrity"))
-        .arg(Arg::new("prevs").long("prevs").action(ArgAction::SetTrue).help("List unresolved prev_events gaps"))
+        .arg(Arg::new("auth").long("auth").action(ArgAction::SetTrue).help("Check auth_events graph integrity (default when neither --auth nor --prevs is given)"))
+        .arg(Arg::new("prevs").long("prevs").action(ArgAction::SetTrue).help("List unresolved prev_events gaps (default when neither --auth nor --prevs is given)"))
+        .arg(
+            Arg::new("status")
+                .long("status")
+                .value_name("STATUS")
+                .value_parser(["open", "absent", "waived", "anchored"])
+                .help("With prevs, only show gaps with this derived status"),
+        )
         .arg(Arg::new("history").long("history").action(ArgAction::SetTrue).help("With prevs, print recorded server answers"))
         .arg(
             Arg::new("state-members")
                 .long("state-members")
                 .action(ArgAction::SetTrue)
-                .help("With auth, compare state HAMT members with auth short ids (O(groups × entries))"),
+                .help("Implies --auth; compare state HAMT members with auth short ids (O(groups × entries))"),
         )
         .arg(
             Arg::new("limit")
@@ -1590,6 +1597,7 @@ fn parse_room_command(m: &clap::ArgMatches) -> Commands {
             auth: sub.get_flag("auth"),
             prevs: sub.get_flag("prevs"),
             state_members: sub.get_flag("state-members"),
+            status: sub.get_one::<String>("status").cloned(),
             history: sub.get_flag("history"),
             limit: *sub.get_one::<usize>("limit").unwrap(),
         },

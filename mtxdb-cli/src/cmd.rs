@@ -658,11 +658,26 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             auth,
             prevs,
             state_members,
+            status,
             history,
             limit,
         } => {
             cli.require_single_dir("room check")?;
-            cmd_room_check(cli, room, *auth, *prevs, *state_members, *history, *limit)
+            cmd_room_check(
+                cli,
+                room,
+                &RoomCheckOptions {
+                    sections: match (*auth, *prevs) {
+                        (false, false) | (true, true) => CheckSections::Both,
+                        (true, false) => CheckSections::Auth,
+                        (false, true) => CheckSections::Prevs,
+                    },
+                    state_members: *state_members,
+                    status: status.as_deref(),
+                    history: *history,
+                    limit: *limit,
+                },
+            )
         }
         Commands::Members { room, json } => {
             cli.require_single_dir("members")?;
@@ -16806,30 +16821,58 @@ fn scan_room_events(
     Ok(scanned)
 }
 
-/// `room check`: run the selected prev and auth completeness checks.
-#[allow(
-    clippy::fn_params_excessive_bools,
-    reason = "the booleans are independent command-line switches, not a mode"
-)]
-fn cmd_room_check(
-    cli: &Cli,
-    room: &str,
-    auth: bool,
-    prevs: bool,
+#[derive(Clone, Copy)]
+enum CheckSections {
+    Both,
+    Auth,
+    Prevs,
+}
+
+/// Selected `room check` sections and their modifiers.
+struct RoomCheckOptions<'a> {
+    sections: CheckSections,
     state_members: bool,
+    status: Option<&'a str>,
     history: bool,
     limit: usize,
-) -> anyhow::Result<()> {
-    let defaults = !auth && !prevs;
-    if auth || state_members || defaults {
+}
+
+/// `room check`: run the selected prev and auth completeness checks.
+fn cmd_room_check(cli: &Cli, room: &str, options: &RoomCheckOptions<'_>) -> anyhow::Result<()> {
+    let RoomCheckOptions {
+        sections,
+        state_members,
+        status,
+        history,
+        limit,
+    } = *options;
+    let (run_auth, run_prevs) = match sections {
+        CheckSections::Both => (true, true),
+        CheckSections::Auth => (true, false),
+        CheckSections::Prevs => (false, true),
+    };
+    // --state-members is an auth check even when --prevs alone was selected.
+    let run_auth = run_auth || state_members;
+    let mut failures = Vec::new();
+
+    if run_auth {
         println!("== auth_events ==");
-        cmd_auth_check(cli, room, state_members, limit)?;
+        if let Err(error) = cmd_auth_check(cli, room, state_members, limit) {
+            failures.push(format!("auth_events: {error:#}"));
+        }
     }
-    if prevs || defaults {
+    if run_prevs {
         println!("== prev_events gaps ==");
-        cmd_gap_list(cli, room, None, history)?;
+        if let Err(error) = cmd_gap_list(cli, room, status, history) {
+            failures.push(format!("prev_events: {error:#}"));
+        }
     }
-    Ok(())
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("one or more checks failed:\n{}", failures.join("\n"))
+    }
 }
 
 /// Re-derive a room's auth graph from its event records and

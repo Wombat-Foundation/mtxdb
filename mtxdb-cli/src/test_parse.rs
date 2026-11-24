@@ -419,6 +419,13 @@ fn room_check_defaults_to_both_audits_and_can_select_one() {
             "--prevs"
         ])
         .is_ok());
+    // A status filter is accepted with the default (both) selection.
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "room", "check", "!r:t", "--status", "open"])
+        .is_ok());
+    assert!(build_cli()
+        .try_get_matches_from(["mtxdb", "room", "check", "!r:t", "--status", "closed"])
+        .is_err());
 }
 
 #[test]
