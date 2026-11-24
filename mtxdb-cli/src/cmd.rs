@@ -565,6 +565,7 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             sort.as_deref(),
             *reverse,
             *live,
+            Some(InfoTarget::Collection),
         ),
         Commands::Search {
             collection,
@@ -4875,12 +4876,6 @@ fn collection_selector_exists(cli: &Cli, selector: &str) -> anyhow::Result<bool>
     Ok(false)
 }
 
-/// Classify an `info`/`scan` selector by inference. See
-/// [`classify_info_selector_explicit`]; this is the no-override form.
-fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarget> {
-    classify_info_selector_explicit(cli, selector, None)
-}
-
 /// Classify a selector, optionally under an explicit namespace.
 ///
 /// With `explicit` set (from `info --pack` / `info --collection`), the requested
@@ -5029,6 +5024,11 @@ fn classify_info_selector_explicit(
     explicit: Option<InfoTarget>,
 ) -> anyhow::Result<InfoTarget> {
     Ok(classify_info_selector_with_inventory(cli, selector, explicit)?.0)
+}
+
+#[cfg(test)]
+fn classify_info_selector(cli: &Cli, selector: &str) -> anyhow::Result<InfoTarget> {
+    classify_info_selector_explicit(cli, selector, None)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7021,23 +7021,38 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
             latest.insert(record_id, (Arc::clone(&shard), offset));
         }
     }
+    // The physical pass above supplies frame statistics and a fallback for
+    // membership records absent from the live index. For indexed records,
+    // use the generation's winning payload: physical pack ordering is not a
+    // record-version ordering after imports, repacks, or slot reuse.
+    let store = open_pool_read_only(dir.to_path_buf()).context("opening event pool index")?;
+    let mut indexed = HashMap::new();
+    for item in store.scan_collection(collection_id)? {
+        let (record_id, data) = item?;
+        indexed.insert(record_id, data.bytes.to_vec());
+    }
     for (record_id, (shard, offset)) in latest {
         if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
             continue;
         }
-        let record = ShardPool::read_at_committed(&shard, offset, false)?;
+        let bytes = if let Some(bytes) = indexed.remove(&record_id) {
+            bytes
+        } else {
+            ShardPool::read_at_committed(&shard, offset, false)?
+                .data
+                .to_vec()
+        };
         stats.records = stats.records.saturating_add(1);
-        if record.data.is_empty() {
+        if bytes.is_empty() {
             stats.tombstones = stats.tombstones.saturating_add(1);
             continue;
         }
-        let size = record.data.len();
+        let size = bytes.len();
         stats.payload_bytes = stats
             .payload_bytes
             .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
         stats.min_size = Some(stats.min_size.map_or(size, |m| m.min(size)));
         stats.max_size = stats.max_size.max(size);
-        let bytes = record.data.to_vec();
         // The homeserver stores `[format_version][metadata_len][metadata][json]`;
         // an imported collection stores the event JSON directly. Try the
         // header first, but only accept a decoded payload that is an object,
@@ -7048,7 +7063,7 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
             .unwrap_or(&bytes);
         let parsed = OwnedValue::parse_bytes(json_bytes).ok();
         let Some(event @ OwnedValue::Object(_)) = parsed else {
-            let kind = classify_record_payload(&record.data);
+            let kind = classify_record_payload(&bytes);
             let count = stats.kinds.entry(kind.to_owned()).or_default();
             *count = count.saturating_add(1);
             continue;
@@ -7614,11 +7629,12 @@ fn cmd_scan_coalesced(
     sort: Option<&str>,
     reverse: bool,
     live: bool,
+    explicit: Option<InfoTarget>,
 ) -> anyhow::Result<()> {
     if live {
         bail!("--live is not supported with --coalesce");
     }
-    let target = classify_info_selector(cli, selector)?;
+    let target = classify_info_selector_explicit(cli, selector, explicit)?;
     let valid_dirs = valid_database_dirs(cli)?;
     let shard_types: Vec<ShardType> = if let Some(st) = cli.shard_type {
         vec![st]
@@ -7697,7 +7713,7 @@ fn cmd_scan_coalesced(
         println!("database: {}", matching_dirs[0].display());
         cmd_scan_single(
             &sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
-            live,
+            live, explicit,
         )?;
     } else {
         for (i, db_dir) in matching_dirs.iter().enumerate() {
@@ -7708,7 +7724,7 @@ fn cmd_scan_coalesced(
             let sub_cli = cli.with_dir(db_dir.clone());
             if let Err(e) = cmd_scan_single(
                 &sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort,
-                reverse, live,
+                reverse, live, explicit,
             ) {
                 eprintln!("error in `{}`: {e:#}", db_dir.display());
             }
@@ -7909,16 +7925,18 @@ fn cmd_scan(
     sort: Option<&str>,
     reverse: bool,
     live: bool,
+    explicit: Option<InfoTarget>,
 ) -> anyhow::Result<()> {
     if cli.coalesce {
         return cmd_scan_coalesced(
-            cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse, live,
+            cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
+            live, explicit,
         );
     }
     run_multi_dir(cli, |sub_cli| {
         cmd_scan_single(
             sub_cli, selector, verbose, header, decode, limit, id, collection, raw, sort, reverse,
-            live,
+            live, explicit,
         )
     })
 }
@@ -7941,6 +7959,7 @@ fn cmd_scan_single(
     sort: Option<&str>,
     reverse: bool,
     live: bool,
+    explicit: Option<InfoTarget>,
 ) -> anyhow::Result<()> {
     let sort_column = sort.map(SortColumn::from_str).transpose()?;
     if sort_column == Some(SortColumn::Payload) && (!verbose && decode.is_none() || raw) {
@@ -7960,7 +7979,8 @@ fn cmd_scan_single(
     };
     // `info` and `scan` share `classify_info_selector`, so the same selector
     // works for both and a malformed one gets the same explanation.
-    let looks_like_pack_id = classify_info_selector(cli, selector)? == InfoTarget::Pack;
+    let looks_like_pack_id =
+        classify_info_selector_explicit(cli, selector, explicit)? == InfoTarget::Pack;
     if !looks_like_pack_id {
         if collection_filter.is_some() {
             bail!("--collection is only valid when scanning a pack ID; the selector already identifies the collection");
@@ -8209,10 +8229,6 @@ fn cmd_scan_collection_in_pool(
     };
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
-    let collection_packs = PackfileStorage::collection_shards_from_disk(pool_dir)
-        .and_then(|mut collections| collections.remove(&collection_id))
-        .map(|packs| packs.into_iter().collect::<HashSet<_>>());
-
     let mut packs = 0_usize;
     let max_rows = opts.max_rows();
     let bounded = max_rows != usize::MAX;
@@ -8239,11 +8255,6 @@ fn cmd_scan_collection_in_pool(
         decode: opts.decode.clone(),
     };
     for (_, shard) in shards {
-        if let Some(collection_packs) = &collection_packs {
-            if !collection_packs.contains(&shard.pack_id) {
-                continue;
-            }
-        }
         let matched_pack = scan_collection_shard(&shard, &mut context)?;
         packs = packs.saturating_add(usize::from(matched_pack));
         if bounded && !opts.is_sorting() && !opts.reverse && context.frames >= max_rows {
@@ -10333,6 +10344,7 @@ fn cmd_packs(cli: &Cli, action: &PacksAction) -> anyhow::Result<()> {
                 sort.as_deref(),
                 *reverse,
                 false,
+                Some(InfoTarget::Pack),
             )
         }
         PacksAction::Dump {
@@ -16814,16 +16826,23 @@ fn scan_room_events(
         if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
             continue;
         }
-        let (parsed, metadata_auth) = match event_record_parts(&data.bytes) {
-            Ok((format_version, metadata, json)) => (
-                OwnedValue::parse_bytes(json).map_err(|error| format!("not valid JSON: {error}")),
-                if format_version == MSC4242_FORMAT_VERSION {
-                    metadata_auth_ids(metadata).map(Some)
-                } else {
-                    Ok(None)
-                },
-            ),
-            Err(reason) => (Err(reason), Ok(None)),
+        // Imported event collections store the event JSON directly, with no
+        // binary envelope or internal metadata. Recognize that complete shape
+        // before interpreting the first four bytes as a format tag.
+        let (parsed, metadata_auth) = match OwnedValue::parse_bytes(&data.bytes) {
+            Ok(value @ OwnedValue::Object(_)) => (Ok(value), Ok(None)),
+            _ => match event_record_parts(&data.bytes) {
+                Ok((format_version, metadata, json)) => (
+                    OwnedValue::parse_bytes(json)
+                        .map_err(|error| format!("not valid JSON: {error}")),
+                    if format_version == MSC4242_FORMAT_VERSION {
+                        metadata_auth_ids(metadata).map(Some)
+                    } else {
+                        Ok(None)
+                    },
+                ),
+                Err(reason) => (Err(reason), Ok(None)),
+            },
         };
         raw.push((node_id, parsed, metadata_auth));
     }
@@ -16951,6 +16970,10 @@ fn cmd_room_check(cli: &Cli, room: &str, options: &RoomCheckOptions<'_>) -> anyh
 
 /// Re-derive a room's auth graph from its event records and
 /// compare it with the embedded edge table.
+#[allow(
+    clippy::too_many_lines,
+    reason = "coordinates the auth scan and report"
+)]
 fn cmd_auth_check(
     cli: &Cli,
     room: &str,
@@ -16973,6 +16996,25 @@ fn cmd_auth_check(
     event_store.set_read_plan_policy(cli.read_plan);
 
     let scanned = scan_room_events(&event_store, &event_collection)?;
+    let graph_layout = DatabaseLayout::open_read_only(layout.root().to_path_buf())?;
+    let mut graph_pools = Vec::with_capacity(ShardType::ALL.len());
+    for shard_type in ShardType::ALL {
+        let pool = PackfileStorage::open_read_committed_shared(
+            pool_dir(&graph_layout, shard_type)?,
+            graph_layout.shared_wal_path(),
+            shard_type,
+        )
+        .with_context(|| format!("opening the {shard_type:?} pool for adjacency reads"))?;
+        pool.set_read_plan_policy(cli.read_plan);
+        graph_pools.push(Arc::new(pool));
+    }
+    let graph_pools: [Arc<PackfileStorage>; ShardType::ALL.len()] = graph_pools
+        .try_into()
+        .map_err(|_| anyhow!("failed to open every pool for adjacency reads"))?;
+    let graph = mtxdb::short_id::ReadOnlyGraph::new(graph_layout, graph_pools);
+    let adjacency = CsrAdjacency::new(room);
+    let graph_records = auth_check_records_from_csr(&adjacency, &graph, &scanned)?;
+    let use_csr = graph_records.contains_key(&crate::auth_check::counter_node_id());
     let unreadable_by_node: HashMap<[u8; 16], String> = scanned
         .values()
         .filter_map(|entry| match &entry.auth {
@@ -16984,9 +17026,13 @@ fn cmd_auth_check(
 
     let report = crate::auth_check::check(
         |id| -> anyhow::Result<_> {
-            Ok(store
-                .get(&collection_id, id)?
-                .map(|data| data.bytes.to_vec()))
+            if use_csr {
+                Ok(graph_records.get(id).cloned())
+            } else {
+                Ok(store
+                    .get(&collection_id, id)?
+                    .map(|data| data.bytes.to_vec()))
+            }
         },
         |event_id| -> anyhow::Result<_> {
             let auth = if let Some(entry) = scanned.get(event_id) {
@@ -17027,7 +17073,14 @@ fn cmd_auth_check(
         .collect();
 
     let missing_state_members = if check_state_members {
-        collect_missing_state_members(&store, room, &collection_id)?
+        collect_missing_state_members_with_graph(
+            &store,
+            room,
+            &collection_id,
+            &adjacency,
+            Some(&graph),
+            use_csr,
+        )?
     } else {
         Vec::new()
     };
@@ -17048,12 +17101,92 @@ fn cmd_auth_check(
     Ok(())
 }
 
+/// Adapt the maintained CSR adjacency to the auth-check report's compact
+/// edge-record interface. `RoomAuth::record_events` writes these rows to the
+/// graph store, not to the legacy AUTH pack collection.
+fn auth_check_records_from_csr(
+    adjacency: &CsrAdjacency,
+    graph: &impl mtxdb::short_id::GraphReader,
+    scanned: &HashMap<String, ScannedEvent>,
+) -> anyhow::Result<HashMap<NodeId, Vec<u8>>> {
+    let mut event_ids = std::collections::BTreeSet::new();
+    for event_id in scanned.keys() {
+        if event_id.starts_with("<node ") {
+            continue;
+        }
+        event_ids.insert(event_id.clone());
+        if let Some(targets) = adjacency.auth_of(graph, event_id)? {
+            event_ids.extend(targets);
+        }
+    }
+
+    let mut names = BTreeMap::new();
+    for event_id in event_ids {
+        if let Some(short_id) = adjacency
+            .events_index()
+            .lookup(graph, event_id.as_bytes())?
+        {
+            names.insert(short_id, event_id);
+        }
+    }
+    let next_id = adjacency.events_index().counter(graph)?;
+    let allocated = next_id.saturating_sub(1);
+    if allocated == 0 {
+        return Ok(HashMap::new());
+    }
+    let mut records = HashMap::new();
+    records.insert(
+        crate::auth_check::counter_node_id(),
+        u64::from(allocated).to_be_bytes().to_vec(),
+    );
+    for (&short_id, event_id) in &names {
+        records.insert(
+            crate::auth_check::reverse_node_id(short_id),
+            event_id.as_bytes().to_vec(),
+        );
+        if let Some(targets) = adjacency.auth_of(graph, event_id)? {
+            let mut target_ids = Vec::with_capacity(targets.len());
+            for target in targets {
+                let target_id = adjacency
+                    .events_index()
+                    .lookup(graph, target.as_bytes())?
+                    .ok_or_else(|| anyhow!("AUTH edge target {target} has no short id"))?;
+                target_ids.push(target_id);
+            }
+            records.insert(
+                crate::auth_check::edge_node_id(short_id),
+                crate::auth_check::encode_edges(&target_ids),
+            );
+        }
+    }
+    Ok(records)
+}
+
 /// Compare authoritative persisted state-group members with the AUTH forward map.
 /// Multiple groups containing one event are reported on a single row.
+#[cfg(test)]
 fn collect_missing_state_members(
     store: &PackfileStorage,
     room: &str,
     auth_collection: &[u8; 16],
+) -> anyhow::Result<Vec<crate::auth_check::MissingStateMember>> {
+    collect_missing_state_members_with_graph(
+        store,
+        room,
+        auth_collection,
+        &CsrAdjacency::new(room),
+        None,
+        false,
+    )
+}
+
+fn collect_missing_state_members_with_graph(
+    store: &PackfileStorage,
+    room: &str,
+    auth_collection: &[u8; 16],
+    adjacency: &CsrAdjacency,
+    graph: Option<&dyn mtxdb::short_id::GraphReader>,
+    use_csr: bool,
 ) -> anyhow::Result<Vec<crate::auth_check::MissingStateMember>> {
     let Some(groups_collection) = mtxdb::state_group_collection_id(room) else {
         return Ok(Vec::new());
@@ -17083,6 +17216,15 @@ fn collect_missing_state_members(
         groups.len()
     );
     crate::auth_check::missing_state_members(groups, |event_id| {
+        if use_csr {
+            return Ok(adjacency
+                .events_index()
+                .lookup(
+                    graph.expect("CSR mode supplies its reader"),
+                    event_id.as_bytes(),
+                )?
+                .is_some());
+        }
         let forward_id = crate::auth_check::forward_node_id(event_id);
         let data = store.get(auth_collection, &forward_id)?;
         Ok(forward_short_id_present(

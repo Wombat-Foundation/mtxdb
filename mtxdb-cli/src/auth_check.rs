@@ -77,6 +77,16 @@ pub(crate) fn forward_node_id(event_id: &str) -> NodeId {
 /// The JSON bytes of an event record:
 /// `[i32 format_version][u32 metadata_len][internal_metadata][json]`, big-endian.
 pub(crate) fn event_record_json(bytes: &[u8]) -> Result<&[u8], String> {
+    // Imported event collections can store a bare JSON object. Recognize
+    // that complete shape before interpreting the first four bytes as a
+    // binary format tag; malformed JSON still falls through to the envelope
+    // checks, which retain their version and bounds errors.
+    if matches!(
+        rezzy::json::Value::parse_bytes(bytes),
+        Ok(rezzy::json::Value::Object(_))
+    ) {
+        return Ok(bytes);
+    }
     Ok(event_record_parts(bytes)?.2)
 }
 
@@ -140,6 +150,21 @@ pub(crate) fn decode_edges(bytes: &[u8]) -> Result<Vec<u32>, String> {
     }
     let (chunks, _) = bytes[5..].as_chunks::<4>();
     Ok(chunks.iter().map(|c| u32::from_be_bytes(*c)).collect())
+}
+
+/// Encode the edge payload consumed by [`check`].
+pub(crate) fn encode_edges(targets: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(EDGE_ENCODING_VERSION);
+    bytes.extend_from_slice(
+        &u32::try_from(targets.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    for target in targets {
+        bytes.extend_from_slice(&target.to_be_bytes());
+    }
+    bytes
 }
 
 /// One short id with no outbound edge record.
@@ -557,6 +582,9 @@ mod tests {
 
     #[test]
     fn event_record_json_skips_the_metadata_header() {
+        let plain = b"{\"auth_events\":[]}";
+        assert_eq!(event_record_json(plain).unwrap(), plain);
+        assert!(event_record_json(b"{not json}").is_err());
         let mut record = Vec::new();
         record.extend_from_slice(&3i32.to_be_bytes());
         record.extend_from_slice(&3u32.to_be_bytes());

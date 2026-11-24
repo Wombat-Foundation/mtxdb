@@ -1725,6 +1725,7 @@ fn get_and_scan_with_header_and_decode() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 
@@ -1742,6 +1743,7 @@ fn get_and_scan_with_header_and_decode() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 
@@ -1814,7 +1816,7 @@ fn scan_dash_t_all_finds_collection_across_pools() {
     };
 
     cmd_scan(
-        &cli, &col_hex, false, false, None, -1, None, None, false, None, false, false,
+        &cli, &col_hex, false, false, None, -1, None, None, false, None, false, false, None,
     )
     .unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1904,6 +1906,7 @@ fn live_collection_scan_excludes_superseded_versions() {
         None,
         false,
         true,
+        None,
     )
     .unwrap();
 
@@ -7955,12 +7958,13 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 
     let missing = format_id(&[0x99; 16]);
     assert!(cmd_scan(
-        &cli_scan, &missing, false, false, None, 10, None, None, false, None, false, false
+        &cli_scan, &missing, false, false, None, 10, None, None, false, None, false, false, None
     )
     .is_err());
 
@@ -12284,6 +12288,148 @@ fn auth_check_reports_empty_event_payloads_as_unreadable() {
         entry.auth,
         crate::auth_check::EventAuth::Unreadable(_)
     ));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_reads_plain_json_event_records() {
+    let dir = unique_temp_dir();
+    let room = "!plain-json:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"11"},"prev_events":[]}"#;
+    let message = r#"{"type":"m.room.member","state_key":"@a:test","room_id":"!plain-json:test","content":{"membership":"join"},"auth_events":["$body"],"prev_events":[]}"#;
+    store
+        .put(
+            &collection,
+            &[0xD3; 16],
+            &NodeData::from_slice(create.as_bytes()),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xD4; 16],
+            &NodeData::from_slice(message.as_bytes()),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    assert_eq!(scanned.len(), 2);
+    assert!(
+        !scanned
+            .keys()
+            .any(|event_id| event_id.starts_with("<node ")),
+        "plain JSON records must derive their event IDs, not fall back to node labels"
+    );
+    let entry = scanned
+        .values()
+        .find(|entry| entry.node_id == [0xD4; 16])
+        .unwrap();
+    match &entry.auth {
+        crate::auth_check::EventAuth::Ids(ids) => {
+            assert_eq!(ids, &vec!["$body".to_owned()]);
+        }
+        other => panic!("plain JSON record did not use its body auth list: {other:?}"),
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_reads_the_adjacency_written_by_room_auth() {
+    let dir = unique_temp_dir();
+    let room = "!room-auth-csr:test";
+    let db = Database::open(dir.clone()).unwrap();
+    RoomAuth::new(room)
+        .record_events(
+            &db,
+            &[
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: "$root",
+                    prev: &[],
+                    auth: &[],
+                    relation: None,
+                },
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: "$child",
+                    prev: &[],
+                    auth: &["$root"],
+                    relation: None,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        RoomAuth::new(room).auth_edges(&db, "$child").unwrap(),
+        vec!["$root"]
+    );
+
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let pools: Vec<_> = ShardType::ALL
+        .into_iter()
+        .map(|shard_type| {
+            std::sync::Arc::new(
+                PackfileStorage::open_read_committed_shared(
+                    layout.pool_path(shard_type),
+                    layout.shared_wal_path(),
+                    shard_type,
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+    let pools: [std::sync::Arc<PackfileStorage>; ShardType::ALL.len()] =
+        pools.try_into().ok().expect("three shard pools");
+    let graph = mtxdb::short_id::ReadOnlyGraph::new(layout, pools);
+    let test_adjacency = mtxdb::csr_adjacency::CsrAdjacency::new(room);
+    assert_eq!(
+        test_adjacency.auth_of(&graph, "$child").unwrap(),
+        Some(vec!["$root".to_owned()])
+    );
+    assert!(test_adjacency
+        .events_index()
+        .lookup(&graph, b"$child")
+        .unwrap()
+        .is_some());
+    let scanned = HashMap::from([
+        (
+            "$root".to_owned(),
+            super::ScannedEvent {
+                node_id: [1; 16],
+                is_state: true,
+                auth: crate::auth_check::EventAuth::Ids(Vec::new()),
+            },
+        ),
+        (
+            "$child".to_owned(),
+            super::ScannedEvent {
+                node_id: [2; 16],
+                is_state: true,
+                auth: crate::auth_check::EventAuth::Ids(vec!["$root".to_owned()]),
+            },
+        ),
+    ]);
+    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::new(room);
+    let records = super::auth_check_records_from_csr(&adjacency, &graph, &scanned).unwrap();
+    let report = crate::auth_check::check(
+        |id| Ok::<_, std::convert::Infallible>(records.get(id).cloned()),
+        |event_id| {
+            Ok::<_, std::convert::Infallible>(match &scanned[event_id].auth {
+                crate::auth_check::EventAuth::Ids(ids) => {
+                    crate::auth_check::EventAuth::Ids(ids.clone())
+                }
+                crate::auth_check::EventAuth::Unreadable(reason) => {
+                    crate::auth_check::EventAuth::Unreadable(reason.clone())
+                }
+                crate::auth_check::EventAuth::Absent => crate::auth_check::EventAuth::Absent,
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(report.allocated, 2);
+    assert_eq!(report.with_edges, 2);
+    assert!(report.mismatched.is_empty());
+    drop(db);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

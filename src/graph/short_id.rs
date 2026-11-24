@@ -443,8 +443,12 @@ impl ShortIdIndex {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt counter.
-    pub fn counter(&self, db: &Database) -> Result<u32, StorageError> {
-        self.counters(db).map(|counters| counters.next_id)
+    pub fn counter<R: GraphReader + ?Sized>(&self, db: &R) -> Result<u32, StorageError> {
+        let records = db.read_nodes(self.pool, &self.collection_id, &[COUNTER_ID])?;
+        match records.into_iter().next().flatten() {
+            Some(record) => Ok(decode_counter(&record.bytes)?.next_id),
+            None => Ok(ScopeCounters::default().next_id),
+        }
     }
 
     /// All of the scope's counters, read together.
