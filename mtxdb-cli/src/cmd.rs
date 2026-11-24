@@ -16830,9 +16830,16 @@ fn scan_room_events(
                     ScannedEvent {
                         node_id,
                         is_state: value.get("state_key").is_some(),
-                        auth: EventAuth::Ids(crate::auth_check::authoritative_auth_ids(
-                            &value, version,
-                        )),
+                        auth: if version == "org.matrix.msc4242.12" {
+                            EventAuth::Unreadable(
+                                "MSC4242 stores calculated auth event IDs in internal metadata, which this check does not decode"
+                                    .to_owned(),
+                            )
+                        } else {
+                            EventAuth::Ids(crate::auth_check::authoritative_auth_ids(
+                                &value, version,
+                            ))
+                        },
                     },
                 ),
                 Err(reason) => (

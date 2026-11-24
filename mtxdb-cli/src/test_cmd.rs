@@ -12286,3 +12286,36 @@ fn auth_check_reports_empty_event_payloads_as_unreadable() {
     ));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn auth_check_marks_msc4242_auth_metadata_as_unreadable() {
+    let dir = unique_temp_dir();
+    let room = "!msc4242:test";
+    let collection = matrix_room_collection_id(room);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"org.matrix.msc4242.12"},"auth_events":[],"prev_events":[]}"#;
+    let message = r#"{"type":"m.room.message","room_id":"!msc4242:test","content":{"body":"hello"},"prev_state_events":[]}"#;
+    store
+        .put(
+            &collection,
+            &[0xC1; 16],
+            &NodeData::from_slice(&encode_event_json_record(5, "{}", create)),
+        )
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &[0xC2; 16],
+            &NodeData::from_slice(&encode_event_json_record(5, "{}", message)),
+        )
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    assert_eq!(scanned.len(), 2);
+    assert!(scanned.values().all(|event| matches!(
+        &event.auth,
+        crate::auth_check::EventAuth::Unreadable(reason)
+            if reason.contains("MSC4242") && reason.contains("internal metadata")
+    )));
+    std::fs::remove_dir_all(dir).unwrap();
+}
