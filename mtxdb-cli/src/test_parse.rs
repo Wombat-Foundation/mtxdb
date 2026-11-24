@@ -476,3 +476,64 @@ fn scope_tables_name_real_commands_that_carry_their_flag() {
         }
     }
 }
+
+/// Every synopsis in the README's CLI-layout block must parse against the real
+/// builder. Placeholders become syntactically valid values and bracketed groups
+/// are treated as present, so this catches drift such as a flag that became a
+/// positional or a flag that was renamed.
+#[test]
+fn readme_cli_layout_synopses_parse() {
+    const HEX32: &str = "00112233445566778899aabbccddeeff";
+    let readme = include_str!("../../README.md");
+    let mut in_section = false;
+    let mut in_block = false;
+    let mut checked = 0;
+
+    for raw in readme.lines() {
+        let line = raw.trim();
+        if line.starts_with("## ") {
+            in_section = line == "## CLI layout";
+            in_block = false;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if line.starts_with("```") {
+            in_block = !in_block;
+            continue;
+        }
+        if !in_block || !line.starts_with("mtxdb ") {
+            continue;
+        }
+
+        let expanded = line
+            .replace(
+                "{ingest|waive|anchor}",
+                "ingest --run run-1 /tmp/report.json",
+            )
+            .replace("<PACK_ID>", &format!("0x{HEX32}"))
+            .replace("<COLLECTION>", &format!("0x{HEX32}"))
+            .replace("<ROOM_ID>", "!room:example.org")
+            .replace("<SELECTOR>", "!room:example.org")
+            .replace("<STATUS>", "open")
+            .replace("<FILE>", "/tmp/out.pack")
+            .replace("<ID>", &format!("0x{HEX32}"))
+            .replace(['[', ']'], "");
+        let argv: Vec<&str> = expanded.split_whitespace().collect();
+        assert_eq!(argv[0], "mtxdb");
+
+        let result = build_cli().try_get_matches_from(&argv);
+        assert!(
+            result.is_ok(),
+            "README synopsis does not parse: `{line}`\n{}",
+            result.unwrap_err()
+        );
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 10,
+        "README CLI layout block not found or too small"
+    );
+}
