@@ -1,28 +1,29 @@
 use super::{
     all_verdicts_present, base_is_incomplete, build_event_dag, canonical_column_width,
-    cmd_collections, cmd_flags, cmd_gap_edit, cmd_gap_list, cmd_get, cmd_import, cmd_import_file,
-    cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan, cmd_scan_collection_live_rows,
-    cmd_shards, cmd_stats, cmd_sync, cmd_tombstones, collection_canonical_id, committed_through,
-    compile_import_template, compute_state_groups_partial, decode_event_json_record,
-    decode_hamt_node, decode_hamt_root, default_matrix_import_template, derive_template_key,
-    direct_import_enabled, dirty_closure_exceeds_half, display_collection_role, event_id,
-    event_room_id, event_short_id, export_envelope_line, extract_pointer_string, finish_import,
-    fmt_disk_megabytes, fmt_megabytes, format_canonical_display, format_id,
-    forward_short_id_present, glob_pack_files, import_data, import_pdu_events,
-    import_pdu_events_with_raw, interleaving_worth_noting, is_server_keys_export, json_string,
-    keys_first, listing_shard_types, load_collection_events, load_state_groups,
-    matrix_batch_has_create, matrix_room_collection_id, matrix_room_extension_from_store,
-    meta_checkpoints, meta_lock_line, meta_pools, meta_raw, overlay_auth_projection, pack_identity,
-    parse_federation_input, parse_pack_id_selector, parse_pack_selectors, partial_topo_sort_dag,
-    prepare_state_collection, pretty_print_payload, raw_auth_projection,
-    raw_auth_projection_collection_id, record_csr_adjacency, redacted_event_bytes,
-    resolve_import_collection, run, scan_payload_suffix, search_record_matches, search_template,
-    split_canonical_display, template_collection_id, template_event_id_node_id, template_node_id,
-    topological_event_order, valid_json_pointer, valid_state_group_id, verify_auth_chain_edges,
-    write_raw_auth_projections, CollectionFlags, CollectionOptions, CollectionTemplate, ImportRun,
-    ImportRunCache, JsonValueExt, MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting,
-    ScanOptions, SharedState, StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE,
-    STATE_GROUP_ID_LENGTH, STATE_GROUP_NAMESPACE,
+    cmd_auth_check, cmd_collections, cmd_flags, cmd_gap_edit, cmd_gap_list, cmd_get, cmd_import,
+    cmd_import_file, cmd_info, cmd_remove, cmd_repack_coalesced, cmd_scan,
+    cmd_scan_collection_live_rows, cmd_shards, cmd_stats, cmd_sync, cmd_tombstones,
+    collection_canonical_id, committed_through, compile_import_template,
+    compute_state_groups_partial, decode_event_json_record, decode_hamt_node, decode_hamt_root,
+    default_matrix_import_template, derive_template_key, direct_import_enabled,
+    dirty_closure_exceeds_half, display_collection_role, event_id, event_room_id, event_short_id,
+    export_envelope_line, extract_pointer_string, finish_import, fmt_disk_megabytes, fmt_megabytes,
+    format_canonical_display, format_id, forward_short_id_present, glob_pack_files, import_data,
+    import_pdu_events, import_pdu_events_with_raw, interleaving_worth_noting,
+    is_server_keys_export, json_string, keys_first, listing_shard_types, load_collection_events,
+    load_state_groups, matrix_batch_has_create, matrix_room_collection_id,
+    matrix_room_extension_from_store, meta_checkpoints, meta_lock_line, meta_pools, meta_raw,
+    overlay_auth_projection, pack_identity, parse_federation_input, parse_pack_id_selector,
+    parse_pack_selectors, partial_topo_sort_dag, prepare_state_collection, pretty_print_payload,
+    raw_auth_projection, raw_auth_projection_collection_id, record_csr_adjacency,
+    redacted_event_bytes, resolve_import_collection, run, scan_payload_suffix,
+    search_record_matches, search_template, split_canonical_display, template_collection_id,
+    template_event_id_node_id, template_node_id, topological_event_order, valid_json_pointer,
+    valid_state_group_id, verify_auth_chain_edges, write_raw_auth_projections, CollectionFlags,
+    CollectionOptions, CollectionTemplate, ImportRun, ImportRunCache, JsonValueExt,
+    MatrixRoomExtension, MetaReport, PackIdentity, RoomWaiting, ScanOptions, SharedState,
+    StateGroupLoad, StateSet, MATRIX_ROOM_MEMBER_NAMESPACE, STATE_GROUP_ID_LENGTH,
+    STATE_GROUP_NAMESPACE,
 };
 use crate::{export_import, Cli, Commands};
 use bytes::Bytes;
@@ -12339,7 +12340,6 @@ fn auth_check_reads_plain_json_event_records() {
 fn auth_check_reads_adjacency_in_the_homeserver_event_collection_scope() {
     let dir = unique_temp_dir();
     let room = "!homeserver-csr:test";
-    let db = Database::open(dir.clone()).unwrap();
     // The homeserver derives the room's EVNT member collection from the
     // group id and records edges under `for_collection` of that id.
     let homeserver_collection = mtxdb::derive_member_collection_id_from_group(
@@ -12348,92 +12348,116 @@ fn auth_check_reads_adjacency_in_the_homeserver_event_collection_scope() {
     )
     .unwrap();
     assert_eq!(homeserver_collection, matrix_room_collection_id(room));
+    let (create_id, child_id) =
+        write_homeserver_auth_check_events(&dir, room, &homeserver_collection);
+
+    let db = Database::open(dir.clone()).unwrap();
     mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection)
         .record_events(
             &db,
             &[
                 mtxdb::csr_adjacency::EventRecord {
-                    event_id: "$root",
+                    event_id: &create_id,
                     prev: &[],
                     auth: &[],
                     relation: None,
                 },
                 mtxdb::csr_adjacency::EventRecord {
-                    event_id: "$child",
+                    event_id: &child_id,
                     prev: &[],
-                    auth: &["$root"],
+                    auth: &[&create_id],
                     relation: None,
                 },
             ],
         )
         .unwrap();
-    let layout = DatabaseLayout::open(dir.clone()).unwrap();
-    let pools: Vec<_> = ShardType::ALL
+
+    let graph_layout = DatabaseLayout::open_read_only(dir.clone()).unwrap();
+    let graph_pools: Vec<_> = ShardType::ALL
         .into_iter()
         .map(|shard_type| {
             std::sync::Arc::new(
                 PackfileStorage::open_read_committed_shared(
-                    layout.pool_path(shard_type),
-                    layout.shared_wal_path(),
+                    graph_layout.pool_path(shard_type),
+                    graph_layout.shared_wal_path(),
                     shard_type,
                 )
                 .unwrap(),
             )
         })
         .collect();
-    let pools: [std::sync::Arc<PackfileStorage>; ShardType::ALL.len()] =
-        pools.try_into().ok().expect("three shard pools");
-    let graph = mtxdb::short_id::ReadOnlyGraph::new(layout, pools);
-    let test_adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection);
-    assert_eq!(
-        test_adjacency.auth_of(&graph, "$child").unwrap(),
-        Some(vec!["$root".to_owned()])
-    );
-    assert!(test_adjacency
+    let graph_pools: [std::sync::Arc<PackfileStorage>; ShardType::ALL.len()] =
+        graph_pools.try_into().ok().expect("three shard pools");
+    let graph = mtxdb::short_id::ReadOnlyGraph::new(graph_layout.clone(), graph_pools);
+    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection);
+    assert!(adjacency
         .events_index()
-        .lookup(&graph, b"$child")
+        .lookup(&graph, create_id.as_bytes())
         .unwrap()
         .is_some());
-    let scanned = HashMap::from([
-        (
-            "$root".to_owned(),
-            super::ScannedEvent {
-                node_id: [1; 16],
-                is_state: true,
-                auth: crate::auth_check::EventAuth::Ids(Vec::new()),
-            },
-        ),
-        (
-            "$child".to_owned(),
-            super::ScannedEvent {
-                node_id: [2; 16],
-                is_state: true,
-                auth: crate::auth_check::EventAuth::Ids(vec!["$root".to_owned()]),
-            },
-        ),
-    ]);
-    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection);
-    let records = super::auth_check_records_from_csr(&adjacency, &graph, &scanned).unwrap();
-    let report = crate::auth_check::check(
-        |id| Ok::<_, std::convert::Infallible>(records.get(id).cloned()),
-        |event_id| {
-            Ok::<_, std::convert::Infallible>(match &scanned[event_id].auth {
-                crate::auth_check::EventAuth::Ids(ids) => {
-                    crate::auth_check::EventAuth::Ids(ids.clone())
-                }
-                crate::auth_check::EventAuth::Unreadable(reason) => {
-                    crate::auth_check::EventAuth::Unreadable(reason.clone())
-                }
-                crate::auth_check::EventAuth::Absent => crate::auth_check::EventAuth::Absent,
-            })
+    assert_eq!(
+        adjacency.auth_of(&graph, &child_id).unwrap(),
+        Some(vec![create_id.clone()])
+    );
+
+    let cli = state_cli(
+        &dir,
+        Commands::Info {
+            selector: None,
+            stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
         },
-    )
-    .unwrap();
+    );
+    let report = cmd_auth_check(&cli, room, false, 0).unwrap();
     assert_eq!(report.allocated, 2);
     assert_eq!(report.with_edges, 2);
     assert!(report.mismatched.is_empty());
+    assert!(report.no_record.is_empty());
+    assert!(report.bad_records.is_empty());
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn write_homeserver_auth_check_events(
+    dir: &Path,
+    room: &str,
+    collection: &[u8; 16],
+) -> (String, String) {
+    let create = r#"{"type":"m.room.create","state_key":"","content":{"room_version":"org.matrix.msc4242.12"},"prev_events":[]}"#.to_owned();
+    let child = format!(
+        r#"{{"type":"m.room.message","room_id":"{room}","content":{{"body":"hello"}},"prev_state_events":[]}}"#
+    );
+    let create_id = msc4242_event_id(&create);
+    let child_id = msc4242_event_id(&child);
+    let layout = DatabaseLayout::open(dir.to_path_buf()).unwrap();
+    let store = PackfileStorage::open(layout.pool_path(ShardType::EventDag)).unwrap();
+    let events = [
+        (
+            [1; 16],
+            r#"{"calculated_auth_event_ids":[]}"#.to_owned(),
+            create,
+        ),
+        (
+            [2; 16],
+            format!(r#"{{"calculated_auth_event_ids":["{create_id}"]}}"#),
+            child,
+        ),
+    ];
+    for (node_id, metadata, json) in &events {
+        store
+            .put(
+                collection,
+                node_id,
+                &NodeData::from_slice(&encode_event_json_record(5, metadata, json)),
+            )
+            .unwrap();
+    }
+    assert_eq!(store.scan_collection(collection).unwrap().count(), 2);
+    store.sync().unwrap();
+    (create_id, child_id)
 }
 
 #[test]

@@ -16979,7 +16979,7 @@ fn cmd_auth_check(
     room: &str,
     check_state_members: bool,
     limit: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<crate::auth_check::Report> {
     use crate::auth_check::EventAuth;
 
     if !room.starts_with('!') {
@@ -17100,7 +17100,7 @@ fn cmd_auth_check(
         },
         limit,
     );
-    Ok(())
+    Ok(report)
 }
 
 /// Adapt the maintained CSR adjacency to the auth-check report's compact
