@@ -181,6 +181,15 @@ pub struct CsrAdjacency {
     kinds: ShortIdIndex,
 }
 
+/// Preserve the room-id-derived scope used before collection-based scopes
+/// were introduced. Existing databases keep their persisted short-id maps and
+/// CSR rows at these addresses.
+fn legacy_collection(prefix: &str, room_id: &str) -> [u8; 16] {
+    let mut canonical = prefix.as_bytes().to_vec();
+    canonical.extend_from_slice(room_id.as_bytes());
+    derive_collection_id(Some(MEMBER_NAMESPACE_INTL), &canonical)
+}
+
 fn utf8(bytes: Vec<u8>, what: &str) -> Result<String, StorageError> {
     String::from_utf8(bytes).map_err(|_| StorageError::Corrupt(format!("{what} is not UTF-8")))
 }
@@ -244,22 +253,25 @@ impl CsrAdjacency {
     /// The event-id maps and relation-kind dictionary live in the
     /// [`ShardType::State`] pool. CSR rows live in that pool's shared graph
     /// store, `<db_root>/mtgr-state/`, outside the packs. Event bodies stay in
-    /// `EventDag`.
+    /// `EventDag`. This keeps the original room-id-derived storage scopes so
+    /// existing rooms retain their adjacency.
     #[must_use]
     pub fn new(room_id: &str) -> Self {
-        Self::for_collection(&crate::interop::room_event_collection_id(
-            room_id.as_bytes(),
-        ))
+        Self::scoped(
+            legacy_collection("matrix-adjacency:", room_id),
+            legacy_collection("matrix-relation-kinds:", room_id),
+        )
     }
 
-    /// Address the adjacency of the room whose 16-byte event collection id is
-    /// `room_collection`.
+    /// Address a fresh adjacency scope using the room's 16-byte event
+    /// collection id. This scope is different from the legacy room-id-derived
+    /// scope used by [`Self::new`]; existing data must be re-exported before
+    /// switching to it. This explicit migration requirement avoids silently
+    /// treating legacy adjacency as empty.
     ///
     /// For callers that resolve an event to its room through the locator and
     /// never see the room id string. The scope is derived from the collection
-    /// id alone, so every caller using the same id reaches the same rows, and
-    /// [`Self::new`] delegates here so the two constructors cannot address
-    /// different scopes for one room.
+    /// id alone, so every caller using the same id reaches the same rows.
     #[must_use]
     pub fn for_collection(room_collection: &[u8; 16]) -> Self {
         let derive = |prefix: &[u8]| {
@@ -1338,4 +1350,23 @@ fn merge_row(
         edges: list,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod scope_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn room_id_constructor_preserves_legacy_scopes() {
+        let room = "!legacy:example.org";
+        let adjacency = CsrAdjacency::new(room);
+        assert_eq!(
+            adjacency.events.scope().1,
+            legacy_collection("matrix-adjacency:", room)
+        );
+        assert_eq!(
+            adjacency.kinds.scope().1,
+            legacy_collection("matrix-relation-kinds:", room)
+        );
+    }
 }

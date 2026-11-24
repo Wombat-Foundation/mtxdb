@@ -12106,6 +12106,59 @@ fn room_selector_expands_per_pool() {
 }
 
 #[test]
+fn room_stats_scan_packs_missing_from_a_stale_collection_sidecar() {
+    let dir = unique_temp_dir();
+    let source_dir = unique_temp_dir();
+    let room = "!sidecar-room:test";
+    let collection = mtxdb::interop::room_event_collection_id(room.as_bytes());
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let source_layout = DatabaseLayout::open(source_dir.clone()).unwrap();
+    let pool_dir = layout.pool_dir(ShardType::EventDag).unwrap();
+    let source_pool_dir = source_layout.pool_dir(ShardType::EventDag).unwrap();
+
+    let write_event = |path: &Path, node: [u8; 16], body: &str, persist_sidecar: bool| {
+        let store = PackfileStorage::open(path.to_path_buf()).unwrap();
+        store
+            .put(&collection, &node, &NodeData::from_slice(body.as_bytes()))
+            .unwrap();
+        store.sync_all().unwrap();
+        if persist_sidecar {
+            store.persist_shard_collections().unwrap();
+        }
+    };
+    write_event(
+        &pool_dir,
+        [1; 16],
+        r#"{"event_id":"$old","room_id":"!sidecar-room:test","type":"m.room.member","state_key":"@alice:test","origin_server_ts":1000,"content":{"membership":"join"}}"#,
+        true,
+    );
+    write_event(
+        &source_pool_dir,
+        [2; 16],
+        r#"{"event_id":"$new","room_id":"!sidecar-room:test","type":"m.room.member","state_key":"@alice:test","origin_server_ts":2000,"content":{"membership":"leave"}}"#,
+        false,
+    );
+    let new_pack = glob_pack_files(&source_pool_dir).unwrap()[0].0;
+    std::fs::copy(
+        source_pool_dir.join(new_pack.filename()),
+        pool_dir.join(new_pack.filename()),
+    )
+    .unwrap();
+
+    let sidecar = PackfileStorage::collection_shards_from_disk(&pool_dir).unwrap();
+    assert_eq!(sidecar[&collection].len(), 1);
+    assert!(!sidecar[&collection].contains(&new_pack));
+
+    let stats = super::scan_room_event_stats(&pool_dir, &collection).unwrap();
+    assert_eq!(
+        stats.members.get("@alice:test"),
+        Some(&(2000, "leave".to_owned()))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(source_dir).unwrap();
+}
+
+#[test]
 fn committed_through_reports_reclaimed_history_for_a_reopened_segment() {
     // A fresh segment starts at base 1; nothing has been committed.
     assert_eq!(committed_through(0, 1), 0);
@@ -12124,4 +12177,112 @@ fn forward_short_id_is_present_only_for_a_four_byte_record() {
     assert!(!forward_short_id_present(Some(&[0, 1, 2])));
     assert!(!forward_short_id_present(Some(&[0, 1, 2, 3, 4])));
     assert!(forward_short_id_present(Some(&[0, 1, 2, 3])));
+}
+
+#[test]
+fn state_member_lookup_reports_missing_and_malformed_auth_forward_records() {
+    let dir = unique_temp_dir();
+    let room = "!state-members:test";
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    let entries = vec![
+        (
+            "m.room.member".to_owned(),
+            "@mapped:test".to_owned(),
+            "$mapped".to_owned(),
+        ),
+        (
+            "m.room.member".to_owned(),
+            "@unmapped:test".to_owned(),
+            "$unmapped".to_owned(),
+        ),
+        (
+            "m.room.member".to_owned(),
+            "@malformed:test".to_owned(),
+            "$malformed".to_owned(),
+        ),
+    ];
+    let built = crate::state_hamt::build_state_hamt(
+        room,
+        &crate::state_hamt::room_hamt_prefix(room),
+        &entries,
+    )
+    .unwrap();
+    let stat_collection = crate::state_hamt::state_hamt_collection_id(room).unwrap();
+    for (hash, bytes) in &built.nodes {
+        store
+            .put(
+                &stat_collection,
+                &mtxdb::state_hamt_node_id(hash),
+                &NodeData::from_slice(bytes),
+            )
+            .unwrap();
+    }
+    let root_id = crate::state_hamt::state_hamt_root_node_id(room, &built.state_group_id);
+    store
+        .put(
+            &stat_collection,
+            &root_id,
+            &NodeData::from_slice(&built.root_record),
+        )
+        .unwrap();
+    let group_id = [0x51; 16];
+    let group = mtxdb::StateGroupInstance {
+        parents: Vec::new(),
+        lthash: built.state_group_id,
+        root_id,
+        derivation: mtxdb::StateGroupDerivation::new(
+            mtxdb::StateGroupResolver::V2,
+            mtxdb::StateGroupTrust::TrustedImport,
+        ),
+    };
+    store
+        .put(
+            &mtxdb::state_group_collection_id(room).unwrap(),
+            &group_id,
+            &NodeData::from_slice(&mtxdb::encode_state_group_record(&group)),
+        )
+        .unwrap();
+    let auth_collection = derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_AUTH), room.as_bytes());
+    store
+        .put(
+            &auth_collection,
+            &crate::auth_check::forward_node_id("$mapped"),
+            &NodeData::from_slice(&[0, 0, 0, 1]),
+        )
+        .unwrap();
+    store
+        .put(
+            &auth_collection,
+            &crate::auth_check::forward_node_id("$malformed"),
+            &NodeData::from_slice(&[0, 1, 2]),
+        )
+        .unwrap();
+
+    let missing = super::collect_missing_state_members(&store, room, &auth_collection).unwrap();
+    assert_eq!(missing.len(), 2);
+    assert_eq!(missing[0].event_id, "$malformed");
+    assert_eq!(missing[0].groups, vec![group_id]);
+    assert_eq!(missing[1].event_id, "$unmapped");
+    assert_eq!(missing[1].groups, vec![group_id]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_reports_empty_event_payloads_as_unreadable() {
+    let dir = unique_temp_dir();
+    let room = "!empty-event:test";
+    let collection = matrix_room_collection_id(room);
+    let node_id = [0xA5; 16];
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(&collection, &node_id, &NodeData::from_slice(&[]))
+        .unwrap();
+
+    let scanned = super::scan_room_events(&store, &collection).unwrap();
+    let entry = scanned.get(&format!("<node {}>", hex::encode(node_id))).unwrap();
+    assert!(matches!(
+        entry.auth,
+        crate::auth_check::EventAuth::Unreadable(_)
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
 }

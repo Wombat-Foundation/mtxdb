@@ -33,6 +33,11 @@ use sha2::{Digest, Sha256};
 
 const EDGE_ENCODING_VERSION: u8 = 1;
 
+/// The event format tags the homeserver stores ahead of each event record: its
+/// fixed `EventFormatVersions` table (1 room v1/v2, 2 v3, 3 v4+, 4 v11 hydra+,
+/// 5 MSC4242), plus -1 for a record stored with no format version.
+const EVENT_RECORD_FORMAT_VERSIONS: [i32; 6] = [-1, 1, 2, 3, 4, 5];
+
 type NodeId = [u8; 16];
 
 fn node_id(parts: &[&[u8]]) -> NodeId {
@@ -70,6 +75,10 @@ pub(crate) fn event_record_json(bytes: &[u8]) -> Result<&[u8], String> {
     let Some(header) = bytes.get(..8) else {
         return Err("event record too short".to_owned());
     };
+    let format_version = i32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if !EVENT_RECORD_FORMAT_VERSIONS.contains(&format_version) {
+        return Err(format!("unsupported event format version {format_version}"));
+    }
     let metadata_len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
     8usize
         .checked_add(metadata_len)
@@ -177,17 +186,20 @@ pub(crate) fn missing_state_members<E>(
 
 /// The auth event ids a stored event record implies.
 ///
-/// Room v4+ stores the room ID in the event and deliberately omits the create
-/// event from `auth_events`: the create event ID is implicit, derived from the
-/// room ID by replacing the leading `!` with `$`. The homeserver's own
-/// `Event::auth_event_ids` appends it, and the embedded edges are built from
-/// that, so the comparison must append it too. Older formats have no `room_id`
-/// field and list every auth event explicitly.
-pub(crate) fn authoritative_auth_ids(value: &rezzy::json::Value) -> Vec<String> {
+/// Room v12 derives the room ID from the create event ID and omits that event
+/// from ordinary events' `auth_events`. For those rooms, append the implicit
+/// create event ID derived from the room ID. Earlier room versions, including
+/// v11, list their auth events explicitly.
+pub(crate) fn authoritative_auth_ids(
+    value: &rezzy::json::Value,
+    room_version: &str,
+) -> Vec<String> {
     let mut ids = crate::state_resolve::reference_list(value, "auth_events");
     let is_create = value.get("type").and_then(rezzy::json::Value::as_str) == Some("m.room.create")
         && value.get("state_key").and_then(rezzy::json::Value::as_str) == Some("");
-    if !is_create {
+    if !is_create
+        && mtxdb::MatrixRoomVersion::parse(room_version) == Some(mtxdb::MatrixRoomVersion::V12)
+    {
         if let Some(room_id) = value.get("room_id").and_then(rezzy::json::Value::as_str) {
             if let Some(local) = room_id.strip_prefix('!') {
                 let create_event_id = format!("${local}");
@@ -212,16 +224,12 @@ pub(crate) enum EventAuth {
 
 /// Walk short ids `1..=counter`, reading through `read`, which returns the
 /// payload of a node in the room's `AUTH` collection (`None` if absent).
-/// Empty payloads count as absent: the engine treats them as removal markers.
-///
 /// `authoritative` returns what an event's own record says its auth events are.
 pub(crate) fn check<E>(
     mut read: impl FnMut(&NodeId) -> Result<Option<Vec<u8>>, E>,
     mut authoritative: impl FnMut(&str) -> Result<EventAuth, E>,
 ) -> Result<Report, E> {
-    let mut read_present = |id: &NodeId| -> Result<Option<Vec<u8>>, E> {
-        Ok(read(id)?.filter(|bytes| !bytes.is_empty()))
-    };
+    let mut read_present = |id: &NodeId| read(id);
 
     let mut report = Report::default();
     let Some(counter) = read_present(&counter_node_id())? else {
@@ -405,11 +413,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_edge_payload_is_a_removal_marker_not_a_leaf() {
+    fn present_empty_edge_payload_is_corrupt_not_absent() {
         let map = room(1, &[(1, Vec::new())], &[]);
         let report = run(&map);
         assert_eq!(report.with_edges, 0);
-        assert_eq!(report.dangling.len(), 1);
+        assert_eq!(report.corrupt.len(), 1);
+        assert_eq!(report.corrupt[0].0, 1);
     }
 
     #[test]
@@ -491,26 +500,59 @@ mod tests {
     #[test]
     fn event_record_json_skips_the_metadata_header() {
         let mut record = Vec::new();
-        record.extend_from_slice(&(-1i32).to_be_bytes());
+        record.extend_from_slice(&3i32.to_be_bytes());
         record.extend_from_slice(&3u32.to_be_bytes());
         record.extend_from_slice(b"{}x");
         record.extend_from_slice(b"{\"auth_events\":[]}");
         assert_eq!(event_record_json(&record).unwrap(), b"{\"auth_events\":[]}");
         assert!(event_record_json(&record[..6]).is_err());
+        for version in [-1_i32, 1, 2, 3, 4, 5] {
+            let mut supported = record.clone();
+            supported[..4].copy_from_slice(&version.to_be_bytes());
+            assert_eq!(
+                event_record_json(&supported).unwrap(),
+                b"{\"auth_events\":[]}"
+            );
+        }
+        for version in [0_i32, 6, 99] {
+            let mut unsupported = record.clone();
+            unsupported[..4].copy_from_slice(&version.to_be_bytes());
+            assert!(event_record_json(&unsupported)
+                .unwrap_err()
+                .contains(&format!("unsupported event format version {version}")));
+        }
         let mut bad = record.clone();
         bad[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(event_record_json(&bad).is_err());
+        let mut unsupported = record;
+        unsupported[..4].copy_from_slice(&99i32.to_be_bytes());
+        assert!(event_record_json(&unsupported)
+            .unwrap_err()
+            .contains("unsupported event format version 99"));
     }
 
     #[test]
-    fn authoritative_auth_ids_adds_the_implicit_create_event_for_v4_rooms() {
+    fn authoritative_auth_ids_do_not_add_create_for_v11_server_assigned_rooms() {
         let value = rezzy::json::Value::parse_bytes(
             br#"{"type":"m.room.member","state_key":"@a:x","room_id":"!room:x",
                  "auth_events":["$a","$b"]}"#,
         )
         .unwrap();
         assert_eq!(
-            authoritative_auth_ids(&value),
+            authoritative_auth_ids(&value, "11"),
+            vec!["$a".to_owned(), "$b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn authoritative_auth_ids_adds_implicit_create_for_v12_hash_derived_rooms() {
+        let value = rezzy::json::Value::parse_bytes(
+            br#"{"type":"m.room.member","state_key":"@a:x","room_id":"!room:x",
+                 "auth_events":["$a","$b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            authoritative_auth_ids(&value, "12"),
             vec!["$a".to_owned(), "$b".to_owned(), "$room:x".to_owned()]
         );
     }
@@ -522,7 +564,7 @@ mod tests {
                  "auth_events":[]}"#,
         )
         .unwrap();
-        assert_eq!(authoritative_auth_ids(&value), Vec::<String>::new());
+        assert_eq!(authoritative_auth_ids(&value, "12"), Vec::<String>::new());
     }
 
     #[test]
@@ -533,7 +575,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            authoritative_auth_ids(&value),
+            authoritative_auth_ids(&value, "1"),
             vec!["$create".to_owned(), "$member".to_owned()]
         );
     }
@@ -545,7 +587,10 @@ mod tests {
                  "auth_events":["$room:x"]}"#,
         )
         .unwrap();
-        assert_eq!(authoritative_auth_ids(&value), vec!["$room:x".to_owned()]);
+        assert_eq!(
+            authoritative_auth_ids(&value, "12"),
+            vec!["$room:x".to_owned()]
+        );
     }
 
     #[test]

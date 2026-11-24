@@ -7007,19 +7007,11 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
         ShardPool::open_read_only(dir.to_path_buf()).context("failed to open shard store")?;
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
-    let collection_packs = PackfileStorage::collection_shards_from_disk(dir)
-        .and_then(|mut collections| collections.remove(collection_id))
-        .map(|packs| packs.into_iter().collect::<HashSet<_>>());
 
     let mut stats = RoomEventStats::default();
     // Later frames supersede earlier ones for the same record id.
     let mut latest: HashMap<[u8; 16], (Arc<mtxdb::shard::Shard>, u64)> = HashMap::new();
     for (_, shard) in shards {
-        if let Some(packs) = &collection_packs {
-            if !packs.contains(&shard.pack_id) {
-                continue;
-            }
-        }
         for record in mtxdb::packfile::scan_packfile_iter(&shard.path, false)? {
             let (record_collection, record_id, offset) = record?;
             if &record_collection != collection_id {
@@ -16809,7 +16801,7 @@ fn scan_room_events(
     let mut raw: Vec<([u8; 16], Result<OwnedValue, String>)> = Vec::new();
     for entry in event_store.scan_collection(event_collection)? {
         let (node_id, data) = entry?;
-        if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID || data.bytes.is_empty() {
+        if node_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
             continue;
         }
         let parsed = event_record_json(&data.bytes).and_then(|json| {
@@ -16838,7 +16830,9 @@ fn scan_room_events(
                     ScannedEvent {
                         node_id,
                         is_state: value.get("state_key").is_some(),
-                        auth: EventAuth::Ids(crate::auth_check::authoritative_auth_ids(&value)),
+                        auth: EventAuth::Ids(crate::auth_check::authoritative_auth_ids(
+                            &value, version,
+                        )),
                     },
                 ),
                 Err(reason) => (
@@ -16952,22 +16946,37 @@ fn cmd_auth_check(
     event_store.set_read_plan_policy(cli.read_plan);
 
     let scanned = scan_room_events(&event_store, &event_collection)?;
+    let unreadable_by_node: HashMap<[u8; 16], String> = scanned
+        .values()
+        .filter_map(|entry| match &entry.auth {
+            EventAuth::Unreadable(reason) => Some((entry.node_id, reason.clone())),
+            EventAuth::Ids(_) | EventAuth::Absent => None,
+        })
+        .collect();
+    let template = default_matrix_import_template();
 
     let report = crate::auth_check::check(
-        |id| {
-            store
-                .get(&collection_id, id)
-                .map(|data| data.map(|d| d.bytes.to_vec()))
+        |id| -> anyhow::Result<_> {
+            Ok(store
+                .get(&collection_id, id)?
+                .map(|data| data.bytes.to_vec()))
         },
-        |event_id| {
-            Ok(match scanned.get(event_id) {
-                None => EventAuth::Absent,
-                Some(entry) => match &entry.auth {
+        |event_id| -> anyhow::Result<_> {
+            let auth = if let Some(entry) = scanned.get(event_id) {
+                match &entry.auth {
                     EventAuth::Ids(ids) => EventAuth::Ids(ids.clone()),
                     EventAuth::Unreadable(reason) => EventAuth::Unreadable(reason.clone()),
                     EventAuth::Absent => EventAuth::Absent,
-                },
-            })
+                }
+            } else {
+                let node_id = template_event_id_node_id(&template, event_id)?;
+                unreadable_by_node
+                    .get(&node_id)
+                    .map_or(EventAuth::Absent, |reason| {
+                        EventAuth::Unreadable(reason.clone())
+                    })
+            };
+            Ok(auth)
         },
     )?;
 
