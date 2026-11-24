@@ -421,6 +421,7 @@ const READ_PLAN_COMMANDS: &[&[&str]] = &[
     &["scan"],
     &["export"],
     &["import"],
+    &["info"],
     &["room", "check"],
     &["repack"],
 ];
