@@ -47,9 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
-use std::time::Instant;
 
 use super::{Edge, EdgeFamily};
 use crate::database::Database;
@@ -73,37 +71,6 @@ const FAMILY_READ_CHUNK: usize = 4 * 1024 * 1024;
 #[cfg(test)]
 const FAMILY_READ_CHUNK: usize = 512;
 const TAIL_FILE: &str = "tail.log";
-
-/// Per-append CSR timing, toggled by `PackfileStorage::set_stats_enabled`.
-/// Sithnapse enables that when `SYNAPSE_MTXDB_STATS` is set; this crate reads
-/// no environment variable of its own.
-static CSR_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
-
-thread_local! {
-    /// `(write_ns, sync_ns, seal_ns)` for this thread's last tail append,
-    /// recorded by `append_rows_locked`.
-    static CSR_LAST_APPEND_NS: std::cell::Cell<(u64, u64, u64)> =
-        const { std::cell::Cell::new((0, 0, 0)) };
-}
-
-pub(crate) fn set_csr_timing_enabled(enabled: bool) {
-    CSR_TIMING_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-pub(crate) fn csr_timing_enabled() -> bool {
-    CSR_TIMING_ENABLED.load(Ordering::Relaxed)
-}
-
-pub(crate) fn last_append_timing_ns() -> (u64, u64, u64) {
-    CSR_LAST_APPEND_NS.with(std::cell::Cell::get)
-}
-
-/// Appends currently inside `record_events_with`, and the peak seen. Greater
-/// than one means durable appends overlap and a coalesced fsync could pay off.
-pub(crate) static CSR_IN_FLIGHT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-pub(crate) static CSR_MAX_IN_FLIGHT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 /// Seal once the tail reaches this many bytes.
 pub const SEAL_THRESHOLD: u64 = 4 * 1024 * 1024;
@@ -415,28 +382,20 @@ impl CsrStore {
             file.set_len(valid)?;
         }
         file.seek(SeekFrom::End(0))?;
-        let write_started = Instant::now();
         let mut buffer = Vec::new();
         for row in rows {
             let payload = encode_row(scope, row.family, row.owner, &row.edges, false)?;
             write_frame(&mut buffer, &payload);
         }
         file.write_all(&buffer)?;
-        let write_ns = u64::try_from(write_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let mut sync_ns = 0_u64;
         if sync {
             #[cfg(test)]
             let _trace = crate::test_trace::span("csr.tail_sync", &self.dir);
-            let sync_started = Instant::now();
             file.sync_data()?;
-            sync_ns = u64::try_from(sync_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             #[cfg(test)]
             count_tail_sync();
         }
-        let seal_started = Instant::now();
         self.maybe_seal()?;
-        let seal_ns = u64::try_from(seal_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        CSR_LAST_APPEND_NS.with(|cell| cell.set((write_ns, sync_ns, seal_ns)));
         Ok(())
     }
 
