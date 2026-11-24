@@ -1050,3 +1050,34 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
     }
     total
 }
+
+#[test]
+fn for_collection_scopes_by_collection_id_and_serves_children_of() {
+    let root = test_root("for-collection");
+    let db = Database::open(root.clone()).unwrap();
+    let room_a = [0xa1; 16];
+    let room_b = [0xb2; 16];
+    let a = CsrAdjacency::for_collection(&room_a);
+    a.record_event(&db, "$create", &[], &[], None).unwrap();
+    a.record_event(&db, "$msg", &["$create"], &["$create"], None)
+        .unwrap();
+
+    // A second handle on the same collection id reaches the same rows.
+    let again = CsrAdjacency::for_collection(&room_a);
+    assert_eq!(
+        again.prev_of(&db, "$msg").unwrap(),
+        Some(vec!["$create".to_owned()])
+    );
+    let create = again.short_id(&db, "$create").unwrap().unwrap();
+    let children = again.children_of(&db, create).unwrap().unwrap();
+    assert_eq!(
+        again.resolve_event_ids(&db, &children).unwrap(),
+        vec![Some("$msg".to_owned())]
+    );
+
+    // Another collection id does not see them.
+    let other = CsrAdjacency::for_collection(&room_b);
+    assert_eq!(other.prev_of(&db, "$msg").unwrap(), None);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}

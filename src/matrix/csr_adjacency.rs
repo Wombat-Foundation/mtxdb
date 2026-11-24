@@ -253,11 +253,38 @@ impl CsrAdjacency {
     /// `EventDag`.
     #[must_use]
     pub fn new(room_id: &str) -> Self {
+        Self::scoped(
+            collection("matrix-adjacency:", room_id),
+            collection("matrix-relation-kinds:", room_id),
+        )
+    }
+
+    /// Address the adjacency of the room whose 16-byte collection id is
+    /// `room_collection`.
+    ///
+    /// For callers that resolve an event to its room's collection id (a
+    /// locator read) and never see the room id string. The scope is derived
+    /// from the collection id alone, so every caller using the same id reaches
+    /// the same rows. It is a different scope from [`Self::new`] for the same
+    /// room: pick one addressing scheme per database and keep to it.
+    #[must_use]
+    pub fn for_collection(room_collection: &[u8; 16]) -> Self {
+        let derive = |prefix: &[u8]| {
+            let mut canonical = prefix.to_vec();
+            canonical.extend_from_slice(room_collection);
+            derive_collection_id(Some(MEMBER_NAMESPACE_INTL), &canonical)
+        };
+        Self::scoped(
+            derive(b"matrix-adjacency-c:"),
+            derive(b"matrix-relation-kinds-c:"),
+        )
+    }
+
+    fn scoped(events: [u8; 16], kinds: [u8; 16]) -> Self {
         let pool = ShardType::State;
         Self {
-            events: ShortIdIndex::new(pool, collection("matrix-adjacency:", room_id)),
-            kinds: ShortIdIndex::new(pool, collection("matrix-relation-kinds:", room_id))
-                .with_max_id(u32::from(u16::MAX)),
+            events: ShortIdIndex::new(pool, events),
+            kinds: ShortIdIndex::new(pool, kinds).with_max_id(u32::from(u16::MAX)),
         }
     }
 
