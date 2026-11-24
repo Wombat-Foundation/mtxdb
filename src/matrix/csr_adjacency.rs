@@ -444,7 +444,15 @@ impl CsrAdjacency {
         // recordings that both read the same stored row would otherwise each
         // validate against the old state, and the later append would silently
         // replace the earlier one.
-        store.with_write_lock(|| {
+        let lock_started = std::time::Instant::now();
+        let in_flight =
+            crate::csr::store::CSR_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        crate::csr::store::CSR_MAX_IN_FLIGHT
+            .fetch_max(in_flight, std::sync::atomic::Ordering::Relaxed);
+        let timed = store.with_write_lock(|| {
+            // TEMP diagnostic (not for commit): split the durable append.
+            let lock_wait = lock_started.elapsed();
+            let prepare_started = std::time::Instant::now();
             let prepared = self.prepare_events(db, events)?;
 
             // Validate everything that can collide before allocating any id,
@@ -458,7 +466,9 @@ impl CsrAdjacency {
             let ids = self.events.get_or_create(db, &keys)?;
             let (owners, mut changed_rows) = merge_batch(&mut stored, &prepared, &starts, &ids)?;
             self.add_child_rows(db, &mut changed_rows)?;
-            if !changed_rows.is_empty() {
+            let prepare = prepare_started.elapsed();
+            let appended = !changed_rows.is_empty();
+            if appended {
                 store
                     .writer(db)
                     .and_then(|writer| match durability {
@@ -471,8 +481,27 @@ impl CsrAdjacency {
                     })
                     .map_err(StorageError::Io)?;
             }
+            if appended && crate::csr::store::csr_timing_enabled() {
+                let (write_ns, sync_ns, seal_ns) =
+                    crate::csr::store::last_append_timing_ns();
+                eprintln!(
+                    "MTXDB-CSR-TIMING rows={} durable={} inflight={} max_inflight={} lock_wait_us={} prepare_us={} write_us={} sync_us={} seal_us={}",
+                    changed_rows.len(),
+                    matches!(durability, AppendDurability::Durable),
+                    in_flight,
+                    crate::csr::store::CSR_MAX_IN_FLIGHT
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    lock_wait.as_micros(),
+                    prepare.as_micros(),
+                    write_ns / 1000,
+                    sync_ns / 1000,
+                    seal_ns / 1000,
+                );
+            }
             Ok(owners)
-        })
+        });
+        crate::csr::store::CSR_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        timed
     }
 
     /// Add the reverse rows for the `PREV` rows in `changed`: for each parent,
