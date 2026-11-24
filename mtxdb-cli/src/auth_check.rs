@@ -89,10 +89,8 @@ pub(crate) fn decode_edges(bytes: &[u8]) -> Result<Vec<u32>, String> {
     if count.checked_mul(4).and_then(|n| n.checked_add(5)) != Some(bytes.len()) {
         return Err("edge record length mismatch".to_owned());
     }
-    Ok(bytes[5..]
-        .chunks_exact(4)
-        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    let (chunks, _) = bytes[5..].as_chunks::<4>();
+    Ok(chunks.iter().map(|c| u32::from_be_bytes(*c)).collect())
 }
 
 /// One short id with no outbound edge record.
@@ -369,7 +367,7 @@ mod tests {
         let report = run(&map);
         assert_eq!(report.allocated, 2);
         assert_eq!(report.with_edges, 2);
-        assert!(report.dangling.is_empty());
+        assert_eq!(report.dangling, []);
     }
 
     #[test]
@@ -412,7 +410,7 @@ mod tests {
         bad[0] = 9;
         let map = room(1, &[(1, bad)], &[]);
         let report = run(&map);
-        assert!(report.dangling.is_empty());
+        assert_eq!(report.dangling, []);
         assert_eq!(report.corrupt.len(), 1);
     }
 
@@ -425,9 +423,9 @@ mod tests {
         );
         let own = HashMap::from([("$create", vec![]), ("$child", vec!["$create"])]);
         let report = run_with(&map, &own);
-        assert!(report.mismatched.is_empty());
-        assert!(report.no_record.is_empty());
-        assert!(report.unnamed.is_empty());
+        assert_eq!(report.mismatched, []);
+        assert_eq!(report.no_record, []);
+        assert_eq!(report.unnamed, []);
     }
 
     #[test]
@@ -510,7 +508,7 @@ mod tests {
                  "auth_events":[]}"#,
         )
         .unwrap();
-        assert!(authoritative_auth_ids(&value).is_empty());
+        assert_eq!(authoritative_auth_ids(&value), []);
     }
 
     #[test]
@@ -557,9 +555,10 @@ mod tests {
     #[test]
     fn state_members_with_forward_ids_are_clean() {
         let groups = vec![([1u8; 16], vec!["$a".to_owned()])];
-        assert!(missing_state_members(groups, |_| Ok::<_, Infallible>(true))
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            missing_state_members(groups, |_| Ok::<_, Infallible>(true)).unwrap(),
+            []
+        );
     }
 
     #[test]

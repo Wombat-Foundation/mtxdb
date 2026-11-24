@@ -380,7 +380,7 @@ pub(crate) enum GapAction {
 }
 
 fn build_cli() -> Command {
-    global_args(Command::new("mtxdb").subcommand_precedence_over_arg(true))
+    let cmd = global_args(Command::new("mtxdb").subcommand_precedence_over_arg(true))
         .version(concat!(
             env!("CARGO_PKG_VERSION"),
             " (",
@@ -432,10 +432,72 @@ fn build_cli() -> Command {
         .subcommand(sub_subprocess_writer_unsynced())
         .subcommand(sub_subprocess_writer_seed())
         .subcommand(sub_subprocess_writer_append())
-        .subcommand(sub_subprocess_reader())
+        .subcommand(sub_subprocess_reader());
+    scope_flags(cmd)
 }
 
-/// The two flags shared by every subcommand (`--dir`, `--shard-type`).
+/// Commands that aggregate across several database roots (`--coalesce`).
+const COALESCE_COMMANDS: &[&str] = &[
+    "shards",
+    "collections",
+    "stats",
+    "get",
+    "sync",
+    "scan",
+    "info",
+    "packs",
+    "repack",
+];
+
+/// Commands that run batch reads, where `--read-plan` changes how they are issued.
+const READ_PLAN_COMMANDS: &[&str] = &[
+    "get",
+    "scan",
+    "export",
+    "tombstones",
+    "import",
+    "auth-check",
+    "repack",
+];
+
+/// Commands that choose an independent pool with `-t`. The rest (room
+/// commands, `search`, `gaps`, `meta`, `reclaim-wal`, `init`) work on fixed
+/// pools or on the whole database, so the flag would be ignored there.
+const SHARD_TYPE_COMMANDS: &[&str] = &[
+    "shards",
+    "collections",
+    "stats",
+    "memory",
+    "get",
+    "put",
+    "remove",
+    "delete",
+    "scan",
+    "info",
+    "import",
+    "sync",
+    "repack",
+    "export",
+    "tombstones",
+    "packs",
+];
+
+/// Attach `--coalesce`, `--read-plan` and `--shard-type` only to the commands
+/// that honor them, so every other command's help stays free of them.
+fn scope_flags(mut cmd: Command) -> Command {
+    for (names, arg) in [
+        (COALESCE_COMMANDS, coalesce_arg as fn() -> Arg),
+        (READ_PLAN_COMMANDS, read_plan_arg),
+        (SHARD_TYPE_COMMANDS, shard_type_arg),
+    ] {
+        for name in names {
+            cmd = cmd.mut_subcommand(*name, |sub| sub.arg(arg()));
+        }
+    }
+    cmd
+}
+
+/// The flag shared by every subcommand (`--dir`), plus `--debug`.
 fn global_args(cmd: Command) -> Command {
     cmd.arg(
         Arg::new("dir")
@@ -449,49 +511,52 @@ fn global_args(cmd: Command) -> Command {
             .help("Database root directory (or multiple directories)"),
     )
     .arg(
-        Arg::new("coalesce")
-            .short('c')
-            .long("coalesce")
-            .action(ArgAction::SetTrue)
-            .global(true)
-            .help("Aggregate supported read-only reports across multiple database roots (shards, collections, stats, get) or coalescing repack (--out)"),
-    )
-    .arg(
-        Arg::new("shard_type")
-            .short('t')
-            .long("shard-type")
-            .env("MTXDB_SHARD_TYPE")
-            .value_name("TYPE")
-            .default_value("events")
-            .value_parser([
-                "state",
-                "event",
-                "events",
-                "event-dag",
-                "server-info",
-                "server_info",
-                "all",
-            ])
-            .hide_possible_values(true)
-            .global(true)
-            .help("Independent shard pool to operate on (use 'all' to target every pool)"),
-    )
-    .arg(
-        Arg::new("read_plan")
-            .long("read-plan")
-            .value_name("MODE")
-            .default_value("plain")
-            .value_parser(["plain", "prefetch"])
-            .global(true)
-            .help("Merged read prefetch for batch reads: 'plain' (default, independent reads) or 'prefetch' to meld nearby candidates into sequential extents"),
-    )
-    .arg(
         Arg::new("debug")
             .long("debug")
             .action(ArgAction::SetTrue)
             .global(true)
             .help("Enable additional diagnostic output"),
     )
+}
+
+fn coalesce_arg() -> Arg {
+    Arg::new("coalesce")
+        .short('c')
+        .long("coalesce")
+        .action(ArgAction::SetTrue)
+        .global(true)
+        .help("Aggregate results across multiple database roots (repack requires --out)")
+}
+
+fn shard_type_arg() -> Arg {
+    Arg::new("shard_type")
+        .short('t')
+        .long("shard-type")
+        .env("MTXDB_SHARD_TYPE")
+        .value_name("TYPE")
+        .default_value("events")
+        .value_parser([
+            "state",
+            "event",
+            "events",
+            "event-dag",
+            "server-info",
+            "server_info",
+            "all",
+        ])
+        .hide_possible_values(true)
+        .global(true)
+        .help("Independent shard pool to operate on (use 'all' to target every pool)")
+}
+
+fn read_plan_arg() -> Arg {
+    Arg::new("read_plan")
+        .long("read-plan")
+        .value_name("MODE")
+        .default_value("plain")
+        .value_parser(["plain", "prefetch"])
+        .global(true)
+        .help("Merged read prefetch for batch reads: 'plain' (default, independent reads) or 'prefetch' to meld nearby candidates into sequential extents")
 }
 
 fn sub_shards() -> Command {
@@ -1637,7 +1702,19 @@ fn parse_cli() -> Cli {
         .get_many::<String>("dir")
         .map(|vals| vals.map(PathBuf::from).collect())
         .unwrap_or_default();
-    let coalesce = matches.get_flag("coalesce");
+    // `--coalesce`, `--read-plan` and `--shard-type` are scoped to the commands
+    // that honor them, so read them from the selected (innermost) subcommand
+    // and fall back to the defaults where a command does not define them.
+    let mut leaf = &matches;
+    while let Some((_, sub)) = leaf.subcommand() {
+        leaf = sub;
+    }
+    let coalesce = leaf
+        .try_get_one::<bool>("coalesce")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false);
     // Precedence: explicit `-d`, then a database root in the current
     // directory, then `MTXDB_DIR`. The env var is only a fallback default.
     if matches.value_source("dir") == Some(clap::parser::ValueSource::EnvVariable) {
@@ -1652,16 +1729,16 @@ fn parse_cli() -> Cli {
     }
     let _ = DEBUG_ENABLED.set(matches.get_flag("debug"));
     let read_plan = read_plan_from_mode(
-        matches
-            .get_one::<String>("read_plan")
-            .map(String::as_str)
-            .expect("clap supplies the default read-plan mode"),
+        leaf.try_get_one::<String>("read_plan")
+            .ok()
+            .flatten()
+            .map_or("plain", String::as_str),
     );
     let shard_type = shard_type_from_arg(
-        matches
-            .get_one::<String>("shard_type")
-            .map(String::as_str)
-            .expect("clap supplies the default shard type"),
+        leaf.try_get_one::<String>("shard_type")
+            .ok()
+            .flatten()
+            .map_or("events", String::as_str),
     );
 
     let command = match matches.subcommand() {

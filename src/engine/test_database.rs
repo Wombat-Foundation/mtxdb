@@ -3589,13 +3589,13 @@ fn transaction_counter_rejects_corruption_and_overflow_without_partial_staging()
         txn.increment_counters(pool, collection, &[(good, 1), (corrupt, 1)]),
         Err(crate::storage::StorageError::Corrupt(_))
     ));
-    assert!(txn.stage.record_expectations().is_empty());
+    assert_eq!(txn.stage.record_expectations(), []);
     assert!(txn.get(pool, &collection, &[good]).unwrap()[0].is_none());
     assert!(matches!(
         txn.increment_counters(pool, collection, &[(overflow, 1)]),
         Err(crate::storage::StorageError::Corrupt(_))
     ));
-    assert!(txn.stage.record_expectations().is_empty());
+    assert_eq!(txn.stage.record_expectations(), []);
     assert_eq!(
         txn.get(pool, &collection, &[overflow]).unwrap()[0]
             .as_ref()
@@ -4637,10 +4637,7 @@ fn increment_counters_applies_duplicates_in_order_from_zero() {
         .increment_counters(pool, collection, &[(a, 1), (b, 5), (a, 2), (b, -7)])
         .unwrap();
     assert_eq!(out, vec![1, 5, 3, -2]);
-    assert!(txn
-        .increment_counters(pool, collection, &[])
-        .unwrap()
-        .is_empty());
+    assert_eq!(txn.increment_counters(pool, collection, &[]).unwrap(), []);
     txn.commit().unwrap();
 
     assert_eq!(counter_value(&db, pool, collection, a), Some(3));
