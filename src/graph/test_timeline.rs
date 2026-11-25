@@ -313,6 +313,50 @@ fn empty_stage_append_on_a_new_index_publishes_an_empty_root() {
 }
 
 #[test]
+fn height_three_root_pages_through_two_directory_levels() {
+    let room = [12; 16];
+    let entry = full(room, 1, 1, 1);
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "height_three_page");
+    index.ensure_metadata().unwrap();
+
+    let leaf_payload = encode_leaf(&[entry]).unwrap();
+    let leaf_id = content_id(&leaf_payload);
+    index.write_record(&leaf_id, leaf_payload).unwrap();
+    let leaf_span = SpanDescriptor {
+        child_id: leaf_id,
+        ..span(entry, entry, 1)
+    };
+    let level_one_payload = encode_directory(&[leaf_span], 1).unwrap();
+    let level_one_id = content_id(&level_one_payload);
+    index
+        .write_record(&level_one_id, level_one_payload)
+        .unwrap();
+    let level_one_span = SpanDescriptor {
+        child_id: level_one_id,
+        ..leaf_span
+    };
+    let level_two_payload = encode_directory(&[level_one_span], 2).unwrap();
+    let level_two_id = content_id(&level_two_payload);
+    index
+        .write_record(&level_two_id, level_two_payload)
+        .unwrap();
+    let root_span = SpanDescriptor {
+        child_id: level_two_id,
+        ..leaf_span
+    };
+    let root_payload = encode_root(&[root_span], 1, 3).unwrap();
+    let root_id = content_id(&root_payload);
+    index.write_record(&root_id, root_payload).unwrap();
+    index
+        .write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, 1))
+        .unwrap();
+
+    assert_eq!(index.page(&room, None, true, 10).unwrap().entries, [entry]);
+    assert_eq!(index.page(&room, None, false, 10).unwrap().entries, [entry]);
+}
+
+#[test]
 fn transactional_append_uses_head_cas_and_can_be_retried() {
     let db_path = test_root("append_cas");
     let db = Database::open(db_path.clone()).unwrap();
