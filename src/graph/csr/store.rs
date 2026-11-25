@@ -49,7 +49,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use super::{Edge, EdgeFamily};
 use crate::database::Database;
@@ -677,12 +677,56 @@ impl CsrStore {
         })
     }
 
+    /// The sealed segments in order, listing the directory only when it may
+    /// have changed.
+    ///
+    /// A listing is reused while the directory's identity and modification
+    /// time match the cached ones, and only if the directory was already
+    /// quiet for [`SEGMENT_CACHE_QUIET`] when it was listed. The quiet margin
+    /// covers coarse timestamps: a seal landing in the same timestamp tick as
+    /// the listing would otherwise leave a stale list that still matches.
     fn segments(&self) -> io::Result<Vec<(u64, PathBuf)>> {
+        let stamp = dir_stamp(&self.dir);
+        if let Some(stamp) = &stamp {
+            let cache = SEGMENT_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = cache.get(&self.dir) {
+                if entry.stamp == *stamp && entry.quiet {
+                    return Ok(entry.segments.clone());
+                }
+            }
+        }
         let started = Instant::now();
         let listed = self.list_segments();
         SEGMENT_LISTINGS.fetch_add(1, Ordering::Relaxed);
         add_nanos(&SEGMENT_LISTING_NANOS, started);
-        listed
+        #[cfg(test)]
+        {
+            let mut counts = SEGMENT_LISTINGS_BY_DIR
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let count = counts.entry(self.dir.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+        let segments = listed?;
+        // Stamp taken before the listing: a change during the listing makes
+        // the stamp differ on the next read, never the other way round.
+        if let Some(stamp) = stamp {
+            let quiet = SystemTime::now()
+                .duration_since(stamp.modified)
+                .is_ok_and(|age| age >= SEGMENT_CACHE_QUIET);
+            SEGMENT_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    self.dir.clone(),
+                    SegmentCacheEntry {
+                        stamp,
+                        quiet,
+                        segments: segments.clone(),
+                    },
+                );
+        }
+        Ok(segments)
     }
 
     fn list_segments(&self) -> io::Result<Vec<(u64, PathBuf)>> {
@@ -1029,6 +1073,47 @@ pub fn read_stats() -> ReadStats {
         segment_listing_nanos: SEGMENT_LISTING_NANOS.load(Ordering::Relaxed),
     }
 }
+
+/// How long a store directory must have been unchanged before a listing of it
+/// is trusted without listing again.
+const SEGMENT_CACHE_QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Identity and modification time of a store directory. Creating, renaming or
+/// removing an entry in it changes the modification time.
+#[derive(Clone, PartialEq, Eq)]
+struct DirStamp {
+    modified: SystemTime,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+struct SegmentCacheEntry {
+    stamp: DirStamp,
+    /// The directory had been unchanged for [`SEGMENT_CACHE_QUIET`] when it
+    /// was listed, so the stamp is a safe validator.
+    quiet: bool,
+    segments: Vec<(u64, PathBuf)>,
+}
+
+fn dir_stamp(dir: &Path) -> Option<DirStamp> {
+    let meta = fs::metadata(dir).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    Some(DirStamp {
+        modified: meta.modified().ok()?,
+        #[cfg(unix)]
+        inode: std::os::unix::fs::MetadataExt::ino(&meta),
+    })
+}
+
+static SEGMENT_CACHE: LazyLock<Mutex<HashMap<PathBuf, SegmentCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Tests count directory listings per store.
+#[cfg(test)]
+static SEGMENT_LISTINGS_BY_DIR: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Tests count reads that decoded a tail from byte 0.
 #[cfg(test)]
@@ -1867,6 +1952,71 @@ mod tests {
             before,
             "readers must extend one shared decoded tail, not re-decode it"
         );
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    fn listings(dir: &Path) -> usize {
+        SEGMENT_LISTINGS_BY_DIR
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(dir)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Age a directory's modification time so the segment cache trusts it.
+    fn age_dir(dir: &Path) {
+        let old = SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap();
+        File::open(dir).unwrap().set_modified(old).unwrap();
+    }
+
+    #[test]
+    fn a_quiet_store_directory_is_listed_once_and_a_seal_is_still_seen() {
+        let layout = layout("segment-cache");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([8; 16]);
+        store
+            .with_write_lock(|| store.append_rows_locked(scope, &[row_for(1, 9)], false))
+            .unwrap();
+        age_dir(store.dir());
+        let family = row_for(1, 9).family;
+        // The first read lists and caches; the rest must not list again.
+        store.read_rows(scope, &[(family, 1)]).unwrap();
+        let before = listings(store.dir());
+        for _ in 0..50 {
+            assert!(store.read_rows(scope, &[(family, 1)]).unwrap()[0].is_some());
+        }
+        assert_eq!(listings(store.dir()), before, "a quiet directory is cached");
+        // A seal changes the directory, so the cache must notice at once and the
+        // sealed rows must still be read.
+        store.seal().unwrap();
+        assert!(store.read_rows(scope, &[(family, 1)]).unwrap()[0].is_some());
+        assert!(
+            listings(store.dir()) > before,
+            "a seal invalidates the cache"
+        );
+        assert_eq!(store.segments().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn a_recently_changed_directory_is_never_trusted_from_the_cache() {
+        let layout = layout("segment-cache-racy");
+        let store = CsrStore::open(&layout, ShardType::State);
+        let scope = ScopeId([9; 16]);
+        store
+            .with_write_lock(|| store.append_rows_locked(scope, &[row_for(1, 9)], false))
+            .unwrap();
+        store.seal().unwrap();
+        // Just changed, so every read lists again instead of risking a stale
+        // list inside one timestamp tick.
+        let family = row_for(1, 9).family;
+        store.read_rows(scope, &[(family, 1)]).unwrap();
+        let before = listings(store.dir());
+        store.read_rows(scope, &[(family, 1)]).unwrap();
+        assert!(listings(store.dir()) > before);
         let _ = fs::remove_dir_all(layout.root());
     }
 
