@@ -2948,6 +2948,13 @@ impl JournalCoordinator {
         // and coverage last.
         {
             let _sync = self.sync_lock.lock();
+            // Rewriting fsyncs the retained suffix, which can include groups
+            // that were published but are not yet durable. Run the pre-sync
+            // hook first, outside the journal lock (it can wait on derived-store
+            // writers that are themselves waiting to publish), so their derived
+            // rows are durable before the groups can be.
+            let hooked_through = self.published_lsn();
+            let had_hook = self.run_pre_sync_hook()?;
             let mut journal = self.journal.lock();
             self.revoke_over_cap_leases(&journal);
             let boundary = {
@@ -2956,6 +2963,11 @@ impl JournalCoordinator {
             };
             match boundary {
                 SharedBoundary::Through(covered_lsn, blocked_by) => {
+                    if had_hook && journal.next_lsn.saturating_sub(1) > hooked_through {
+                        // A group landed after the hook ran; rewriting would make
+                        // it durable through an unhooked fsync.
+                        return Ok(Some(journal.skipped_reclaim()));
+                    }
                     // Shared reclaim computes its own per-group/per-pool
                     // boundary, so apply the replay floor after that decision
                     // and before the segment rewrite. The lease is global to
