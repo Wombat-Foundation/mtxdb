@@ -12414,9 +12414,9 @@ fn auth_check_reads_adjacency_in_the_homeserver_event_collection_scope() {
     let report = cmd_auth_check(&cli, room, false, 0).unwrap();
     assert_eq!(report.allocated, 2);
     assert_eq!(report.with_edges, 2);
-    assert!(report.mismatched.is_empty());
-    assert!(report.no_record.is_empty());
-    assert!(report.bad_records.is_empty());
+    assert_eq!(report.mismatched.len(), 0);
+    assert_eq!(report.no_record.len(), 0);
+    assert_eq!(report.bad_records.len(), 0);
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
 }
