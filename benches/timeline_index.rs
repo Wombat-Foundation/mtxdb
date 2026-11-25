@@ -247,63 +247,6 @@ fn run(n: usize, batch: usize) {
         );
     }
 
-    // Measure marginal publish cost at the populated tree size. Payload writes
-    // happen first and outside the timer; each timed call publishes only the
-    // corresponding timeline entry, including its leaf/root/head writes.
-    const SINGLE_TAIL_WRITES: usize = 20;
-    const BATCHED_TAIL_WRITES: usize = 20;
-    const TAIL_BATCH_SIZE: usize = 16;
-    let tail_total = SINGLE_TAIL_WRITES + BATCHED_TAIL_WRITES * TAIL_BATCH_SIZE;
-    let tail_records: Vec<_> = (0..tail_total)
-        .map(|offset| {
-            let sequence = n as u64 + offset as u64;
-            (node_id(sequence), NodeData::new(payload(sequence)))
-        })
-        .collect();
-    let tail_seed_start = Instant::now();
-    store
-        .put_many(&EVENT_COLLECTION, &tail_records)
-        .expect("seed tail-append payloads");
-    let tail_payload_seed_us = tail_seed_start.elapsed().as_micros();
-
-    let mut single_samples = Vec::with_capacity(SINGLE_TAIL_WRITES);
-    for offset in 0..SINGLE_TAIL_WRITES {
-        let entry = entry(n as u64 + offset as u64);
-        let start = Instant::now();
-        index
-            .append_untransactional(std::slice::from_ref(&entry))
-            .expect("single-entry tail append");
-        single_samples.push(start.elapsed().as_nanos());
-    }
-    single_samples.sort_unstable();
-
-    let mut batch_samples = Vec::with_capacity(BATCHED_TAIL_WRITES);
-    for batch_index in 0..BATCHED_TAIL_WRITES {
-        let start_sequence =
-            n as u64 + SINGLE_TAIL_WRITES as u64 + (batch_index * TAIL_BATCH_SIZE) as u64;
-        let batch_entries: Vec<_> = (0..TAIL_BATCH_SIZE)
-            .map(|offset| entry(start_sequence + offset as u64))
-            .collect();
-        let start = Instant::now();
-        index
-            .append_untransactional(&batch_entries)
-            .expect("16-entry tail append");
-        batch_samples.push(start.elapsed().as_nanos());
-    }
-    batch_samples.sort_unstable();
-    println!(
-        "timeline_tail_publish n={n} leaves_before~{} payload_seed_records={tail_total} payload_seed_us={tail_payload_seed_us} single_entries={} single_min_ns={} single_median_ns={} batch_entries={} batch_count={} batch_min_ns={} batch_median_ns={}",
-        n.div_ceil(TIMELINE_LEAF_CAP),
-        SINGLE_TAIL_WRITES,
-        single_samples[0],
-        single_samples[single_samples.len() / 2],
-        TAIL_BATCH_SIZE,
-        BATCHED_TAIL_WRITES,
-        batch_samples[0],
-        batch_samples[batch_samples.len() / 2],
-    );
-    store.sync_all().expect("sync tail publishes");
-
     // Reopen the storage handle and repeat the first-page read. This measures
     // a fresh engine handle; the OS page cache is uncontrolled and may be warm.
     drop(index);
@@ -333,29 +276,65 @@ fn run(n: usize, batch: usize) {
         "forward page should contain all records selected for fetch"
     );
 
-    // Bulk setup uses large batches, which hides the per-publish cost of
-    // rewriting the root manifest. Time small tail appends onto the populated
-    // index to expose the marginal publish slope at this leaf count.
-    let mut next = n as u64;
-    for tail_batch in [1_usize, 16] {
-        let samples = 20;
-        let mut nanos = Vec::with_capacity(samples);
-        for _ in 0..samples {
-            let entries: Vec<_> = (next..next + tail_batch as u64).map(entry).collect();
-            next += tail_batch as u64;
-            let start = Instant::now();
-            reopened_index
-                .append_untransactional(&entries)
-                .expect("tail timeline append");
-            nanos.push(start.elapsed().as_nanos());
-        }
-        nanos.sort_unstable();
-        println!(
-            "timeline_tail_append n={n} batch={tail_batch} samples={samples} min_ns={} median_ns={} entries_after={next}",
-            nanos[0],
-            nanos[samples / 2],
-        );
+    // Measure marginal publish cost at the populated tree size, after all
+    // read metrics above have run against exactly n entries. Payload writes
+    // happen first and outside the timer; each timed call publishes only the
+    // corresponding timeline entry, including its leaf/root/head writes.
+    const SINGLE_TAIL_WRITES: usize = 20;
+    const BATCHED_TAIL_WRITES: usize = 20;
+    const TAIL_BATCH_SIZE: usize = 16;
+    let tail_total = SINGLE_TAIL_WRITES + BATCHED_TAIL_WRITES * TAIL_BATCH_SIZE;
+    let tail_records: Vec<_> = (0..tail_total)
+        .map(|offset| {
+            let sequence = n as u64 + offset as u64;
+            (node_id(sequence), NodeData::new(payload(sequence)))
+        })
+        .collect();
+    let tail_seed_start = Instant::now();
+    reopened
+        .put_many(&EVENT_COLLECTION, &tail_records)
+        .expect("seed tail-append payloads");
+    let tail_payload_seed_us = tail_seed_start.elapsed().as_micros();
+
+    let mut single_samples = Vec::with_capacity(SINGLE_TAIL_WRITES);
+    for offset in 0..SINGLE_TAIL_WRITES {
+        let entry = entry(n as u64 + offset as u64);
+        let start = Instant::now();
+        reopened_index
+            .append_untransactional(std::slice::from_ref(&entry))
+            .expect("single-entry tail append");
+        single_samples.push(start.elapsed().as_nanos());
     }
+    single_samples.sort_unstable();
+
+    let mut batch_samples = Vec::with_capacity(BATCHED_TAIL_WRITES);
+    for batch_index in 0..BATCHED_TAIL_WRITES {
+        let start_sequence =
+            n as u64 + SINGLE_TAIL_WRITES as u64 + (batch_index * TAIL_BATCH_SIZE) as u64;
+        let batch_entries: Vec<_> = (0..TAIL_BATCH_SIZE)
+            .map(|offset| entry(start_sequence + offset as u64))
+            .collect();
+        let start = Instant::now();
+        reopened_index
+            .append_untransactional(&batch_entries)
+            .expect("16-entry tail append");
+        batch_samples.push(start.elapsed().as_nanos());
+    }
+    batch_samples.sort_unstable();
+    println!(
+        "timeline_tail_publish n={n} leaves_before~{} payload_seed_records={tail_total} payload_seed_us={tail_payload_seed_us} single_entries={} single_min_ns={} single_median_ns={} batch_entries={} batch_count={} batch_min_ns={} batch_median_ns={}",
+        n.div_ceil(TIMELINE_LEAF_CAP),
+        SINGLE_TAIL_WRITES,
+        single_samples[0],
+        single_samples[single_samples.len() / 2],
+        TAIL_BATCH_SIZE,
+        BATCHED_TAIL_WRITES,
+        batch_samples[0],
+        batch_samples[batch_samples.len() / 2],
+    );
+    reopened.sync_all().expect("sync tail publishes");
+    drop(reopened_index);
+    drop(reopened);
     let _ = std::fs::remove_dir_all(dir);
 }
 
