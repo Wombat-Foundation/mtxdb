@@ -2321,9 +2321,10 @@ pub(crate) fn write_room_with_resolved_findings(
     )?);
 
     let room_scope = mtxdb::room_scope_id(room);
-    let timeline_index =
-        mtxdb::timeline::TimelineIndex::open(db.pool(EVENT_POOL).as_ref(), &export.room_id);
+    let (topo_index, stream_index) =
+        mtxdb::ordered_timeline::open_event_timeline_indexes(db.pool(EVENT_POOL).as_ref());
     let mut batch_timeline_entries = Vec::new();
+    let mut batch_payloads = Vec::new();
 
     for (position, event) in export.events.iter().enumerate() {
         let event_id = event.event_id.as_bytes();
@@ -2370,12 +2371,18 @@ pub(crate) fn write_room_with_resolved_findings(
                     export.room_id
                 );
             }
-            if !batch_timeline_entries.is_empty() {
-                timeline_index
-                    .stage_append(&tx, EVENT_POOL, &batch_timeline_entries)
-                    .context("staging room timeline index")?;
-                batch_timeline_entries.clear();
-            }
+            mtxdb::ordered_timeline::stage_event_timeline_batch(
+                &tx,
+                EVENT_POOL,
+                event_collection,
+                &batch_payloads,
+                &topo_index,
+                &stream_index,
+                &batch_timeline_entries,
+            )
+            .context("staging event payloads and timeline indexes")?;
+            batch_payloads.clear();
+            batch_timeline_entries.clear();
             tx.commit().context("committing an import batch")?;
             reclaim_journal(db)?;
             tx = db.begin_transaction();
@@ -2394,7 +2401,7 @@ pub(crate) fn write_room_with_resolved_findings(
         let locator_collection = event_locator_collection_id(&record);
         check_locator_collision(&tx, record, &event.event_id)?;
 
-        tx.put(EVENT_POOL, event_collection, record, &node(stored.to_vec()))?;
+        batch_payloads.push((record, node(stored.to_vec())));
         tx.put(
             EVENT_POOL,
             locator_collection,
@@ -2432,7 +2439,7 @@ pub(crate) fn write_room_with_resolved_findings(
             timeline_orderings(export, event, rejected)
         {
             let event_ref = mtxdb::event_id_ref(event_id);
-            batch_timeline_entries.push(mtxdb::timeline::TimelineEntry::new(
+            batch_timeline_entries.push(mtxdb::ordered_timeline::EventTimelineEntry::new(
                 room_scope,
                 topological_ordering,
                 stream_ordering,
@@ -2445,11 +2452,16 @@ pub(crate) fn write_room_with_resolved_findings(
         written = written.saturating_add(1);
     }
 
-    if !batch_timeline_entries.is_empty() {
-        timeline_index
-            .stage_append(&tx, EVENT_POOL, &batch_timeline_entries)
-            .context("staging room timeline index")?;
-    }
+    mtxdb::ordered_timeline::stage_event_timeline_batch(
+        &tx,
+        EVENT_POOL,
+        event_collection,
+        &batch_payloads,
+        &topo_index,
+        &stream_index,
+        &batch_timeline_entries,
+    )
+    .context("staging event payloads and timeline indexes")?;
     tx.commit().context("committing an import batch")?;
     reclaim_journal(db)?;
     crate::cmd::report_import_phase(

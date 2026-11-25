@@ -3509,7 +3509,7 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
     let layout = open_layout(cli)?;
     let pool = pool_dir(&layout, ShardType::EventDag)?;
     let store = open_pool_read_only(pool).context("failed to open EventDag store")?;
-    let timeline_index = mtxdb::timeline::TimelineIndex::open(&store, room);
+    let timeline_index = mtxdb::ordered_timeline::EventTopoIndex::open(&store, "event-timeline-v1");
     let room_scope = mtxdb::room_scope_id(room.as_bytes());
     let limit_usize = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
     let page = timeline_index.page(&room_scope, None, !reverse, limit_usize)?;
@@ -3523,10 +3523,10 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
     );
     println!("{}", "-".repeat(90));
     for (idx, entry) in page.entries.iter().enumerate() {
-        let node_hex = hex::encode(entry.id);
-        let locator_col = mtxdb::interop::event_locator_collection_id(&entry.id);
+        let node_hex = hex::encode(entry.event_node_id);
+        let locator_col = mtxdb::interop::event_locator_collection_id(&entry.event_node_id);
         let event_id_str = store
-            .get(&locator_col, &entry.id)?
+            .get(&locator_col, &entry.event_node_id)?
             .and_then(|data| {
                 let (eid, _) = mtxdb::interop::decode_event_locator(&data.bytes).ok()?;
                 std::str::from_utf8(eid).ok().map(ToOwned::to_owned)
@@ -3535,8 +3535,8 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
         println!(
             "{:<6} {:<12} {:<12} {:<34} {}",
             idx.saturating_add(1),
-            entry.primary,
-            entry.secondary,
+            entry.topological_ordering,
+            entry.stream_ordering,
             node_hex,
             event_id_str
         );

@@ -70,7 +70,8 @@ fn collect<S: StorageEngine + ?Sized>(
 #[test]
 fn cursor_encoding_roundtrips() {
     let entry = entry([1u8; 16], 7, 3);
-    let cursor = TimelineCursor::new([0xAB; 16], entry, DomainTag::new([0xCD; 16]));
+    let cursor = TimelineCursor::new([0xAB; 16], entry, DomainTag::new([0xCD; 16]))
+        .expect("valid timeline cursor geometry");
     let bytes = cursor.encode();
     assert_eq!(bytes.len(), CURSOR_LEN);
     assert_eq!(TimelineCursor::decode(&bytes), Some(cursor));
@@ -127,7 +128,6 @@ fn ordered_index_writes_and_pages_through_height_four() {
     assert_eq!(page.entries.last().copied(), Some(TinyKey(1_257)));
 
     drop(index);
-    drop(engine);
     drop(db);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -152,7 +152,7 @@ fn ordered_cursor_rejects_another_key_domain() {
     let first = OrderedIndex::<_, TinyKey>::open(&engine, "tiny_cursor_first");
     let second = OrderedIndex::<_, TinyKey>::open(&engine, "tiny_cursor_second");
     let root_id = first.build(&[TinyKey(4)]).unwrap();
-    let cursor = first.cursor(root_id, TinyKey(4));
+    let cursor = first.cursor(root_id, TinyKey(4)).unwrap();
     let error = second.page(&(), Some(&cursor), true, 1).unwrap_err();
     assert!(matches!(error, StorageError::Corrupt(_)));
 }
@@ -727,7 +727,8 @@ fn wire_encoding_is_byte_comparable_and_roundtrips() {
         [9u8; 16],
         full(room, -3, i64::MIN, 6),
         DomainTag::new([0xD0; 16]),
-    );
+    )
+    .unwrap();
     assert_eq!(TimelineCursor::decode(&cursor.encode()), Some(cursor));
 }
 
@@ -797,7 +798,8 @@ fn tiny_geometry_grows_and_pages_through_multiple_heights() {
     let last = index.page(&(), None, false, 2).unwrap();
     assert_eq!(last.entries, [TinyKey(2_099), TinyKey(2_098)]);
 
-    let wrong_domain = OrderedCursor::new(root_id, TinyKey(1_000), DomainTag::new([0xAB; 16]));
+    let wrong_domain =
+        OrderedCursor::new(root_id, TinyKey(1_000), DomainTag::new([0xAB; 16])).unwrap();
     assert!(
         index.page(&(), Some(&wrong_domain), true, 1).is_err(),
         "a cursor from another domain must be rejected"

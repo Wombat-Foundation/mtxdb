@@ -187,7 +187,9 @@ fn run(n: usize, batch: usize) {
         .expect("read index head")
         .expect("index root")
         .0;
-    let middle_seed = index.cursor(root_id, entry((n / 2).saturating_sub(1) as u64));
+    let middle_seed = index
+        .cursor(root_id, entry((n / 2).saturating_sub(1) as u64))
+        .expect("valid timeline cursor geometry");
     let middle_cursor = index
         .page(&ROOM, Some(&middle_seed), true, 1)
         .expect("get midpoint cursor from a preceding page")
@@ -244,7 +246,9 @@ fn run(n: usize, batch: usize) {
     // the root manifest has been fetched and decoded, so this prices the O(L)
     // manifest step without reading any leaf.
     let below = TimelineEntry::new(ROOM, i64::MIN, i64::MIN, [0u8; 16], [0u8; 32]);
-    let below_cursor = index.cursor(root_id, below);
+    let below_cursor = index
+        .cursor(root_id, below)
+        .expect("valid timeline cursor geometry");
     let (root_min_ns, root_median_ns) = sample_ns(20, || {
         black_box(
             index

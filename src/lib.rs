@@ -132,6 +132,9 @@ pub mod logical_head;
 /// Matrix-specific room-version policy.
 #[path = "matrix/matrix_policy.rs"]
 pub mod matrix_policy;
+/// Matrix event timeline key layouts over the generic ordered sidecar tree.
+#[path = "matrix/ordered_timeline.rs"]
+pub mod ordered_timeline;
 /// On-disk packfile format and the storage engine built on top of it.
 #[path = "engine/packfile/mod.rs"]
 pub mod packfile;
@@ -305,8 +308,9 @@ pub use template::{
     NAMESPACE_BIAS_ORDX, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
 };
 pub use timeline::{
-    timeline_collection_id, EventRef, KeyTag, OrderedKey, ScopedSeqKey, TimelineCursor,
-    TimelineEntry, TimelineIndex, TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
+    ordered_collection_id, timeline_collection_id, EventRef, KeyTag, OrderedCursor, OrderedIndex,
+    OrderedKey, OrderedPage, ScopedSeqKey, TimelineCursor, TimelineEntry, TimelineIndex,
+    TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
 };
 
 #[cfg(test)]

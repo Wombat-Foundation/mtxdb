@@ -50,7 +50,7 @@ use crate::template::{
 };
 
 /// Version byte for timeline records and cursors.
-pub const TIMELINE_FORMAT_VERSION: u8 = 0x02;
+pub const TIMELINE_FORMAT_VERSION: u8 = 0x01;
 /// Maximum entries per leaf record.
 pub const TIMELINE_LEAF_CAP: usize = 128;
 /// Maximum leaf descriptors per directory record.
@@ -610,20 +610,22 @@ pub type TimelineCursor = OrderedCursor<ScopedSeqKey>;
 impl<K: OrderedKey> OrderedCursor<K> {
     /// Build a cursor for `root_id` at `entry`.
     ///
-    /// # Panics
-    /// Panics if `K::LEAF_CAP` or `K::DIR_FANOUT` exceeds `u32::MAX`. Index
-    /// opens and appends validate the tighter `u16` geometry first, so this
-    /// only trips for a caller-defined key used without that validation.
-    #[must_use]
-    pub fn new(root_id: NodeId, entry: K, domain: DomainTag) -> Self {
-        Self {
+    /// # Errors
+    /// Returns an error if the key geometry cannot be represented in the
+    /// cursor's wire header.
+    pub fn new(root_id: NodeId, entry: K, domain: DomainTag) -> Result<Self, StorageError> {
+        let leaf_cap = u32::try_from(K::LEAF_CAP)
+            .map_err(|_| StorageError::Internal("ordered leaf cap exceeds u32".to_owned()))?;
+        let dir_fanout = u32::try_from(K::DIR_FANOUT)
+            .map_err(|_| StorageError::Internal("ordered fanout exceeds u32".to_owned()))?;
+        Ok(Self {
             domain,
             schema_tag: K::SCHEMA_TAG,
-            leaf_cap: u32::try_from(K::LEAF_CAP).unwrap_or(u32::MAX),
-            dir_fanout: u32::try_from(K::DIR_FANOUT).unwrap_or(u32::MAX),
+            leaf_cap,
+            dir_fanout,
             root_id,
             entry,
-        }
+        })
     }
 
     /// The snapshot root this cursor pins.
@@ -851,19 +853,6 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         Self::with_collection_id(engine, name, collection_id)
     }
 
-    /// Open a named ordered index; the domain is derived from the collection id.
-    #[must_use]
-    pub fn open_in_pool(engine: &'a S, name: impl Into<Cow<'a, str>>, _pool: ShardType) -> Self {
-        let name = name.into();
-        let collection_id = ordered_collection_id::<K>(name.as_ref());
-        Self::with_collection_id_and_domain(
-            engine,
-            name,
-            collection_id,
-            ordered_domain::<K>(&collection_id),
-        )
-    }
-
     /// Open with a pre-computed collection ID and pre-owned or borrowed name.
     #[must_use]
     pub fn with_collection_id(
@@ -905,8 +894,11 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
     }
 
     /// Construct a cursor pinned to this index's domain.
-    #[must_use]
-    pub fn cursor(&self, root_id: NodeId, entry: K) -> OrderedCursor<K> {
+    ///
+    /// # Errors
+    /// Returns an error if the key geometry cannot be represented in the
+    /// cursor's wire header.
+    pub fn cursor(&self, root_id: NodeId, entry: K) -> Result<OrderedCursor<K>, StorageError> {
         OrderedCursor::new(root_id, entry, self.domain)
     }
 
@@ -958,6 +950,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
     /// Propagates the backend error, or [`StorageError::Internal`] if a count
     /// exceeds the record layout.
     pub fn build(&self, entries: &[K]) -> Result<NodeId, StorageError> {
+        validate_geometry::<K>()?;
         self.ensure_metadata()?;
         let mut sorted = entries.to_vec();
         sorted.sort_unstable();
@@ -1056,6 +1049,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         pool: ShardType,
         new_entries: &[K],
     ) -> Result<NodeId, StorageError> {
+        validate_geometry::<K>()?;
         let engine_identity = std::ptr::from_ref(self.engine).cast::<()>() as usize;
         if engine_identity != transaction.pool_identity(pool) {
             return Err(StorageError::Internal(
@@ -1182,6 +1176,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
     /// referenced root or touched leaf, and [`StorageError::Internal`] if the
     /// resulting entry count cannot be represented.
     pub fn append_untransactional(&self, new_entries: &[K]) -> Result<NodeId, StorageError> {
+        validate_geometry::<K>()?;
         self.ensure_metadata()?;
         let Some((old_root_id, old_count)) = self.head()? else {
             return self.build(new_entries);
@@ -1292,6 +1287,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         if limit == 0 {
             return Ok(empty);
         }
+        validate_geometry::<K>()?;
 
         let (snapshot_root, key) = match cursor {
             Some(cursor) => {
@@ -1334,7 +1330,9 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
             self.reverse_page(&root.directories, level, prefix, key, limit, &mut out)?;
         }
         let next_cursor = if out.len() == limit {
-            out.last().map(|entry| self.cursor(snapshot_root, *entry))
+            out.last()
+                .map(|entry| self.cursor(snapshot_root, *entry))
+                .transpose()?
         } else {
             None
         };
