@@ -7041,8 +7041,12 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
         }
         accumulate_room_event(&mut stats, &data.bytes);
     }
+    // A key whose newest version is a removal is not live, even though an
+    // older body frame is still in the pack; do not count it as a member.
+    let removed: std::collections::HashSet<[u8; 16]> =
+        store.removed_keys(collection_id)?.into_iter().collect();
     for (record_id, (shard, offset)) in latest {
-        if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
+        if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID || removed.contains(&record_id) {
             continue;
         }
         let record = ShardPool::read_at_committed(&shard, offset, false)?;
@@ -7068,11 +7072,13 @@ fn accumulate_room_event(stats: &mut RoomEventStats, bytes: &[u8]) {
     // an imported collection stores the event JSON directly. Try the header
     // first, but only accept a decoded payload that parses as an object, and
     // fall back to the raw payload otherwise.
-    let json_bytes = crate::auth_check::event_record_json(bytes)
+    let decoded = crate::auth_check::event_record_json(bytes)
         .ok()
-        .filter(|json| matches!(OwnedValue::parse_bytes(json), Ok(OwnedValue::Object(_))))
-        .unwrap_or(bytes);
-    let parsed = OwnedValue::parse_bytes(json_bytes).ok();
+        .and_then(|json| match OwnedValue::parse_bytes(json) {
+            Ok(object @ OwnedValue::Object(_)) => Some(object),
+            _ => None,
+        });
+    let parsed = decoded.or_else(|| OwnedValue::parse_bytes(bytes).ok());
     let Some(event @ OwnedValue::Object(_)) = parsed else {
         let kind = classify_record_payload(bytes);
         let count = stats.kinds.entry(kind.to_owned()).or_default();
@@ -8304,6 +8310,8 @@ fn cmd_scan_collection_in_pool(
         return Ok(frames);
     }
     if context.mode.is_sorting() || context.reverse {
+        let displayed = frames.min(max_rows);
+        let truncated = frames > max_rows;
         if context.show_section_header && !context.header_printed {
             if context.needs_section_spacing {
                 println!();
@@ -8312,20 +8320,20 @@ fn cmd_scan_collection_in_pool(
             print_section_header(context.shard_type);
             context.header_printed = true;
         }
-        if bounded && frames >= max_rows {
+        if truncated {
             println!(
-                "collection {}: showing first {frames} physical records (at least {packs} pack{})",
+                "collection {}: showing first {displayed} of {frames} physical records across {packs} pack{}",
                 format_id(&collection_id),
-                if packs == 1 { "" } else { "s" },
-            );
-        } else {
-            println!(
-                "collection {}: {frames} physical record{} across {packs} pack{}",
-                format_id(&collection_id),
-                if frames == 1 { "" } else { "s" },
                 if packs == 1 { "" } else { "s" },
             );
             print_scan_limit_note(frames, max_rows);
+        } else {
+            println!(
+                "collection {}: {displayed} physical record{} across {packs} pack{}",
+                format_id(&collection_id),
+                if displayed == 1 { "" } else { "s" },
+                if packs == 1 { "" } else { "s" },
+            );
         }
         print_scan_table_header("PACK", scan_payload_label(context.shard_type));
         let sorted_records = context.sorted_records.clone();
@@ -17060,7 +17068,7 @@ fn cmd_auth_check(
     // The homeserver records each event's edges in the room's event
     // collection scope (`CsrAdjacency::for_collection`).
     let adjacency = CsrAdjacency::for_collection(&event_collection);
-    let graph_records = auth_check_records_from_csr(&adjacency, &graph, &scanned)?;
+    let graph_records = auth_check_records_from_csr(&adjacency, &graph)?;
     let use_csr = graph_records.contains_key(&crate::auth_check::counter_node_id());
     let unreadable_by_node: HashMap<[u8; 16], String> = scanned
         .values()
@@ -17155,12 +17163,13 @@ fn cmd_auth_check(
 /// Stored AUTH owners and their numeric targets come from the CSR rows directly,
 /// so an owner whose event body was not scanned still gets its edge record and
 /// a missing reverse mapping becomes an unresolved target in the report rather
-/// than an error. The body scan only supplies names and the authoritative
-/// comparison performed by [`crate::auth_check::check`].
+/// than an error. Names come only from the stored reverse mapping: a missing
+/// one stays absent so the checker reports it, and is never filled in from a
+/// body scan. The authoritative comparison is
+/// [`crate::auth_check::check`]'s.
 fn auth_check_records_from_csr(
     adjacency: &CsrAdjacency,
     graph: &impl mtxdb::short_id::GraphReader,
-    scanned: &HashMap<String, ScannedEvent>,
 ) -> anyhow::Result<HashMap<NodeId, Vec<u8>>> {
     let next_id = adjacency.events_index().counter(graph)?;
     let allocated = next_id.saturating_sub(1);
@@ -17172,23 +17181,14 @@ fn auth_check_records_from_csr(
         crate::auth_check::counter_node_id(),
         u64::from(allocated).to_be_bytes().to_vec(),
     );
-    // Keep the names the body scan already knows, so state events with no AUTH
-    // row still resolve in the report.
-    for event_id in scanned.keys() {
-        if event_id.starts_with("<node ") {
-            continue;
-        }
-        if let Some(short_id) = adjacency
-            .events_index()
-            .lookup(graph, event_id.as_bytes())?
-        {
-            records.insert(
-                crate::auth_check::reverse_node_id(short_id),
-                event_id.as_bytes().to_vec(),
-            );
-        }
-    }
-    let auth_rows = adjacency.auth_target_ids(graph)?;
+    // The counter and the rows are read separately, so an append between the
+    // two reads can leave owners above the reported counter. Compare only the
+    // owners the counter covers.
+    let auth_rows: Vec<_> = adjacency
+        .auth_target_ids(graph)?
+        .into_iter()
+        .filter(|(owner, _)| *owner <= allocated)
+        .collect();
     let mut referenced = std::collections::BTreeSet::new();
     for (owner, targets) in &auth_rows {
         referenced.insert(*owner);

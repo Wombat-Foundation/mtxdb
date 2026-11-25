@@ -12451,11 +12451,8 @@ fn auth_check_reports_a_stored_auth_owner_without_an_event_body() {
         )
         .unwrap();
 
-    let (graph_layout, graph) = open_auth_test_graph(&dir);
-    let event_store =
-        PackfileStorage::open_read_only(graph_layout.pool_path(ShardType::EventDag)).unwrap();
-    let scanned = super::scan_room_events(&event_store, &homeserver_collection).unwrap();
-    let records = super::auth_check_records_from_csr(&adjacency, &graph, &scanned).unwrap();
+    let (_, graph) = open_auth_test_graph(&dir);
+    let records = super::auth_check_records_from_csr(&adjacency, &graph).unwrap();
     let owner_id = adjacency
         .events_index()
         .lookup(&graph, edge_only.as_bytes())
