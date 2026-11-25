@@ -23,9 +23,9 @@ const ENTRY_MAGIC: [u8; 4] = *b"EDLG";
 const ENTRY_VERSION: u8 = 1;
 const COUNTER_ID: NodeId = *b"MTXD-EDGELOG-CNT";
 const PRUNED_ID: NodeId = *b"MTXD-EDGELOG-PRN";
-const ENTRY_PREFIX: [u8; 12] = *b"MTXD-EDGELOG";
+const ENTRY_PREFIX: [u8; 8] = *b"EDGELOG1";
 /// Entries removed per prune transaction, bounding one transaction's staging.
-const PRUNE_BATCH: u32 = 512;
+const PRUNE_BATCH: u64 = 512;
 
 /// One logged event: the scope it was recorded in and its edges.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,10 +55,10 @@ impl Default for EdgeLog {
     }
 }
 
-fn entry_id(seq: u32) -> NodeId {
+fn entry_id(seq: u64) -> NodeId {
     let mut id = [0_u8; 16];
-    id[..12].copy_from_slice(&ENTRY_PREFIX);
-    id[12..].copy_from_slice(&seq.to_be_bytes());
+    id[..8].copy_from_slice(&ENTRY_PREFIX);
+    id[8..].copy_from_slice(&seq.to_be_bytes());
     id
 }
 
@@ -177,7 +177,7 @@ impl EdgeLog {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt counter.
-    pub fn head<R: GraphReader + ?Sized>(&self, db: &R) -> Result<u32, StorageError> {
+    pub fn head<R: GraphReader + ?Sized>(&self, db: &R) -> Result<u64, StorageError> {
         let records = db.read_nodes(self.pool, &self.collection, &[COUNTER_ID])?;
         match records.into_iter().next().flatten() {
             None => Ok(0),
@@ -187,7 +187,7 @@ impl EdgeLog {
                     .as_ref()
                     .try_into()
                     .map_err(|_| StorageError::Corrupt("edge log counter".to_owned()))?;
-                u32::try_from(i64::from_be_bytes(raw))
+                u64::try_from(i64::from_be_bytes(raw))
                     .map_err(|_| StorageError::Corrupt("edge log counter range".to_owned()))
             }
         }
@@ -200,25 +200,25 @@ impl EdgeLog {
     ///
     /// # Errors
     /// Returns an error if the transaction fails or the sequence overflows.
-    pub fn append(&self, db: &Database, events: &[LoggedEvent]) -> Result<u32, StorageError> {
+    pub fn append(&self, db: &Database, events: &[LoggedEvent]) -> Result<u64, StorageError> {
         if events.is_empty() {
             return self.head(db);
         }
         let count = i64::try_from(events.len())
             .map_err(|_| StorageError::Corrupt("edge log batch too large".to_owned()))?;
         let txn = db.begin_transaction();
-        let result = (|| -> Result<u32, StorageError> {
+        let result = (|| -> Result<u64, StorageError> {
             let counters =
                 txn.increment_counters(self.pool, self.collection, &[(COUNTER_ID, count)])?;
-            let last = u32::try_from(counters[0])
+            let last = u64::try_from(counters[0])
                 .map_err(|_| StorageError::Corrupt("edge log sequence overflow".to_owned()))?;
             let first = last
-                .checked_sub(u32::try_from(events.len()).unwrap_or(u32::MAX))
+                .checked_sub(u64::try_from(events.len()).unwrap_or(u64::MAX))
                 .and_then(|before| before.checked_add(1))
                 .ok_or_else(|| StorageError::Corrupt("edge log sequence".to_owned()))?;
             for (offset, event) in events.iter().enumerate() {
                 let seq = first
-                    .checked_add(u32::try_from(offset).unwrap_or(u32::MAX))
+                    .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
                     .ok_or_else(|| StorageError::Corrupt("edge log sequence".to_owned()))?;
                 let data = NodeData::new(bytes::Bytes::from(encode(event)?));
                 txn.put(self.pool, self.collection, entry_id(seq), &data)
@@ -247,9 +247,9 @@ impl EdgeLog {
     pub fn read_range<R: GraphReader + ?Sized>(
         &self,
         db: &R,
-        after: u32,
-        through: u32,
-    ) -> Result<Vec<(u32, LoggedEvent)>, StorageError> {
+        after: u64,
+        through: u64,
+    ) -> Result<Vec<(u64, LoggedEvent)>, StorageError> {
         let mut out = Vec::new();
         let mut next = after.saturating_add(1);
         while next <= through {
@@ -261,7 +261,7 @@ impl EdgeLog {
                     out.push((seq, decode(&record.bytes)?));
                 }
             }
-            if stop == u32::MAX {
+            if stop == u64::MAX {
                 break;
             }
             next = stop.saturating_add(1);
@@ -269,11 +269,20 @@ impl EdgeLog {
         Ok(out)
     }
 
+    /// Remove one entry without touching the counters, as damage would.
+    #[cfg(test)]
+    pub(crate) fn drop_entry_for_test(&self, db: &Database, seq: u64) {
+        let txn = db.begin_transaction();
+        txn.remove_many(self.pool, self.collection, &[entry_id(seq)])
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
     /// The newest sequence number already pruned (0 for none).
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt counter.
-    pub fn pruned<R: GraphReader + ?Sized>(&self, db: &R) -> Result<u32, StorageError> {
+    pub fn pruned<R: GraphReader + ?Sized>(&self, db: &R) -> Result<u64, StorageError> {
         let records = db.read_nodes(self.pool, &self.collection, &[PRUNED_ID])?;
         match records.into_iter().next().flatten() {
             None => Ok(0),
@@ -283,7 +292,7 @@ impl EdgeLog {
                     .as_ref()
                     .try_into()
                     .map_err(|_| StorageError::Corrupt("edge log pruned counter".to_owned()))?;
-                u32::try_from(i64::from_be_bytes(raw))
+                u64::try_from(i64::from_be_bytes(raw))
                     .map_err(|_| StorageError::Corrupt("edge log pruned range".to_owned()))
             }
         }
@@ -296,7 +305,7 @@ impl EdgeLog {
     ///
     /// # Errors
     /// Returns an error if a transaction fails.
-    pub fn prune_through(&self, db: &Database, through: u32) -> Result<(), StorageError> {
+    pub fn prune_through(&self, db: &Database, through: u64) -> Result<(), StorageError> {
         let mut done = self.pruned(db)?;
         while done < through {
             let first = done.saturating_add(1);
@@ -308,7 +317,11 @@ impl EdgeLog {
             txn.increment_counters(
                 self.pool,
                 self.collection,
-                &[(PRUNED_ID, i64::from(stop.saturating_sub(done)))],
+                &[(
+                    PRUNED_ID,
+                    i64::try_from(stop.saturating_sub(done))
+                        .map_err(|_| StorageError::Corrupt("edge log prune range".to_owned()))?,
+                )],
             )?;
             txn.commit()?;
             done = stop;

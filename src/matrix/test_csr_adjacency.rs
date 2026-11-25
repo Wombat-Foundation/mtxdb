@@ -1185,6 +1185,23 @@ mod edge_log_recovery {
     }
 
     #[test]
+    fn a_missing_entry_above_the_prune_point_is_corruption() {
+        let root = test_root("edge-log-gap");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        for (id, prev) in [("$a", &[][..]), ("$b", &["$a"][..]), ("$c", &["$b"][..])] {
+            adj.record_events_logged(&db, &log, &[event(id, prev)], AppendDurability::Deferred)
+                .unwrap();
+        }
+        // Lose entry 2 from the journal, as a damaged log would.
+        log.drop_entry_for_test(&db, 2);
+        let db = crash_keeping_only_the_wal(&root, db);
+        let err = CsrAdjacency::recover_edge_log(&db, &log).unwrap_err();
+        assert!(err.to_string().contains("missing entries"), "{err}");
+    }
+
+    #[test]
     fn rows_lost_with_the_tail_are_rebuilt_from_the_log() {
         let root = test_root("edge-log-recover");
         let db = Database::open(root.clone()).unwrap();

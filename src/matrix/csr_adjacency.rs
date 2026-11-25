@@ -1447,31 +1447,41 @@ const WATERMARK_SCOPE: ScopeId = ScopeId([0xED; 16]);
 const WATERMARK: EdgeFamily = EdgeFamily::plain(40);
 
 /// Append the watermark row for log entry `seq`, under the store's write lock.
-fn write_watermark_locked(store: &CsrStore, db: &Database, seq: u32) -> std::io::Result<()> {
+fn write_watermark_locked(store: &CsrStore, db: &Database, seq: u64) -> std::io::Result<()> {
     store.writer(db).and_then(|writer| {
         writer.append_rows_deferred_locked(
             WATERMARK_SCOPE,
             &[RowRecord {
                 family: WATERMARK,
                 owner: 0,
-                edges: vec![Edge {
-                    target: seq,
-                    kind: 0,
-                }],
+                // A u32 edge target holds half the sequence number; the kind
+                // says which half.
+                edges: vec![
+                    Edge {
+                        target: u32::try_from(seq >> 32).unwrap_or(u32::MAX),
+                        kind: 0,
+                    },
+                    Edge {
+                        target: u32::try_from(seq & u64::from(u32::MAX)).unwrap_or(u32::MAX),
+                        kind: 1,
+                    },
+                ],
             }],
         )
     })
 }
 
 /// The last edge-log sequence number whose rows the CSR has (0 for none).
-fn read_watermark(store: &CsrStore) -> std::io::Result<u32> {
+fn read_watermark(store: &CsrStore) -> std::io::Result<u64> {
     let rows = store.read_rows(WATERMARK_SCOPE, &[(WATERMARK, 0)])?;
-    Ok(rows
-        .into_iter()
-        .next()
-        .flatten()
-        .and_then(|edges| edges.first().map(|edge| edge.target))
-        .unwrap_or(0))
+    let edges = rows.into_iter().next().flatten().unwrap_or_default();
+    let half = |kind: u16| {
+        edges
+            .iter()
+            .find(|edge| edge.kind == kind)
+            .map_or(0, |edge| u64::from(edge.target))
+    };
+    Ok(half(0) << 32 | half(1))
 }
 
 impl CsrAdjacency {
@@ -1494,6 +1504,17 @@ impl CsrAdjacency {
             return Ok(0);
         }
         let entries = log.read_range(db, watermark, head)?;
+        // Entries at or below the prune point are legitimately gone; any other
+        // gap means the log lost an entry and the rows it covered, so advancing
+        // the watermark would hide the loss.
+        let floor = watermark.max(log.pruned(db)?);
+        let expected = head.saturating_sub(floor);
+        let present = entries.iter().filter(|(seq, _)| *seq > floor).count();
+        if u64::try_from(present).ok() != Some(expected) {
+            return Err(StorageError::Corrupt(format!(
+                "edge log is missing entries above {floor}: expected {expected}, found {present}"
+            )));
+        }
         let mut replayed = 0_u32;
         // Replay run by run, one scope at a time, in log order.
         let mut start = 0;
