@@ -6921,7 +6921,9 @@ impl PackfileStorage {
     /// [`Self::persist_index_checkpoint_best_effort`].
     fn persist_index_checkpoint_for_sync(&self) {
         if !self.background_checkpoint.load(Ordering::Relaxed) {
-            self.persist_index_checkpoint_best_effort();
+            // `persist_index_checkpoint_or_delta` already holds
+            // `index_persist_lock` across this call.
+            self.persist_index_checkpoint_best_effort_locked();
             return;
         }
         if let Err(error) = self.start_checkpoint_worker() {
@@ -7524,6 +7526,12 @@ impl PackfileStorage {
         // and inline tail with detached checkpoint starts, so a new worker
         // cannot rotate an epoch while this checkpoint's tail is sweeping.
         let _persist_guard = self.index_persist_lock.lock();
+        self.persist_index_checkpoint_best_effort_locked();
+    }
+
+    /// Same as [`Self::persist_index_checkpoint_best_effort`] for a caller
+    /// that already holds `index_persist_lock`.
+    fn persist_index_checkpoint_best_effort_locked(&self) {
         if let Err(e) = self.persist_index_checkpoint() {
             eprintln!("mtxdb: failed to persist index checkpoint: {e}");
         }

@@ -16075,6 +16075,15 @@ fn promotion_refuses_to_overwrite_a_damaged_versions_file() {
         before,
         "the damaged baseline is preserved for repair"
     );
+    fs::remove_file(&versions_path).unwrap();
+    fs::create_dir(&versions_path).unwrap();
+    let error = PackfileStorage::promote_delta_versions(&fixture.files)
+        .expect_err("a read failure must not be treated as a missing baseline");
+    assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    assert!(
+        versions_path.is_dir(),
+        "the unreadable baseline is preserved"
+    );
     let _ = fs::remove_dir_all(&fixture.files);
 }
 
