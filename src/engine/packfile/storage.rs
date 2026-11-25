@@ -6906,7 +6906,13 @@ impl PackfileStorage {
     }
 
     /// Block until any background checkpoint has finished.
+    ///
+    /// Holds `index_persist_lock` while the tail is joined: the worker slot is
+    /// emptied before the join, so without the lock a sync could see no worker
+    /// and capture a new checkpoint while this one's tail is still sweeping.
+    /// Must not be called with that lock already held.
     pub fn wait_for_checkpoint(&self) {
+        let _persist_guard = self.index_persist_lock.lock();
         self.finish_checkpoint_worker(true);
     }
 
