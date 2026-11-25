@@ -373,16 +373,22 @@ fn remove_and_purge_keep_both_orders_consistent() {
     tx.commit().unwrap();
     assert_eq!(topo_removed.1, 2);
     assert_eq!(stream_removed.1, 2);
-    assert!(topo_index
-        .page(&other, None, true, 10)
-        .unwrap()
-        .entries
-        .is_empty());
-    assert!(stream_index
-        .page(&other, None, true, 10)
-        .unwrap()
-        .entries
-        .is_empty());
+    assert_eq!(
+        topo_index
+            .page(&other, None, true, 10)
+            .unwrap()
+            .entries
+            .len(),
+        0
+    );
+    assert_eq!(
+        stream_index
+            .page(&other, None, true, 10)
+            .unwrap()
+            .entries
+            .len(),
+        0
+    );
     assert_eq!(
         topo_index
             .page(&room, None, true, 10)

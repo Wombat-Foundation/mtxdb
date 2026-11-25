@@ -383,11 +383,10 @@ fn empty_stage_append_on_a_new_index_publishes_an_empty_root() {
     transaction.commit().unwrap();
 
     assert_eq!(index.head().unwrap().unwrap().0, root_id);
-    assert!(index
-        .page(&[1; 16], None, true, 10)
-        .unwrap()
-        .entries
-        .is_empty());
+    assert_eq!(
+        index.page(&[1; 16], None, true, 10).unwrap().entries.len(),
+        0
+    );
 
     drop(db);
     let _ = std::fs::remove_dir_all(db_path);
@@ -842,7 +841,7 @@ fn tiny_tree_removal_demotes_and_prefix_purge_keeps_old_cursors_valid() {
     let count = index.head().unwrap().unwrap().1;
     assert_eq!(count, 0);
     assert_eq!(ordered_height(&index, db.event_dag().as_ref()), 0);
-    assert!(index.page(&(), None, true, 10).unwrap().entries.is_empty());
+    assert_eq!(index.page(&(), None, true, 10).unwrap().entries.len(), 0);
 
     drop(db);
     let _ = std::fs::remove_dir_all(db_path);
@@ -870,7 +869,7 @@ fn removal_collapses_height_and_keeps_a_canonical_empty_root() {
         .unwrap();
     assert_eq!(ordered_height(&index, &engine), 0);
     assert_eq!(index.head().unwrap().unwrap().1, 0);
-    assert!(index.page(&(), None, true, 10).unwrap().entries.is_empty());
+    assert_eq!(index.page(&(), None, true, 10).unwrap().entries.len(), 0);
 }
 
 #[test]
@@ -984,13 +983,13 @@ fn prefix_purge_drops_one_room_without_reading_its_subtrees() {
     index.build(&entries).unwrap();
 
     index.purge_prefix_untransactional(room_a).unwrap();
-    assert!(collect(&index, &room_a, true, 17).is_empty());
+    assert_eq!(collect(&index, &room_a, true, 17).len(), 0);
     assert_eq!(collect(&index, &room_b, true, 17).len(), 100);
     assert_eq!(index.head().unwrap().unwrap().1, 100);
     assert_eq!(ordered_height(&index, &engine), 1);
 
     index.purge_prefix_untransactional(room_b).unwrap();
-    assert!(collect(&index, &room_b, true, 17).is_empty());
+    assert_eq!(collect(&index, &room_b, true, 17).len(), 0);
     assert_eq!(index.head().unwrap().unwrap().1, 0);
     assert_eq!(ordered_height(&index, &engine), 0);
 }

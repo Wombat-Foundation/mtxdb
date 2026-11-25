@@ -16,15 +16,6 @@
 //! fetches (`multi_room_fetch`), and mutations (`multi_room_mutate`). I/O
 //! counters come from `/proc/self/io`, `/proc/self/stat`, and cgroup v2
 //! `memory.stat`; they are process-wide deltas around each measurement.
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::pedantic,
-    clippy::style
-)]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -32,7 +23,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use mtxdb::ordered_timeline::{
     open_event_timeline_indexes, page_stream_up_to, stage_event_timeline_batch,
-    stage_purge_room_timeline, stage_remove_event_timeline_batch, EventTimelineEntry,
+    stage_promote_outlier_to_timeline, stage_purge_room_timeline,
+    stage_remove_event_timeline_batch, EventTimelineEntry,
 };
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{interop, Database, ShardType};
@@ -50,9 +42,10 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn bench_root() -> PathBuf {
-    std::env::var_os("MTXDB_BENCH_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("mtxdb-timeline-multi-room"))
+    std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(
+        || std::env::temp_dir().join("mtxdb-timeline-multi-room"),
+        PathBuf::from,
+    )
 }
 
 fn node_id(sequence: u64) -> NodeId {
@@ -106,26 +99,41 @@ struct SpecEvent {
 }
 
 fn synthetic_rooms(rooms: usize, events: usize) -> (Vec<Room>, Vec<usize>) {
-    let weights: Vec<f64> = (0..rooms)
-        .map(|index| 1.0 / ((index.saturating_add(1)) as f64).powf(1.1))
+    let weights: Vec<u64> = (0..rooms)
+        .map(|index| {
+            1_000_000_u64
+                .checked_div(
+                    u64::try_from(index.saturating_add(1))
+                        .unwrap_or(u64::MAX)
+                        .max(1),
+                )
+                .unwrap_or(0)
+        })
         .collect();
-    let total: f64 = weights.iter().sum();
+    let total: u64 = weights.iter().copied().sum();
+    let events = u64::try_from(events).unwrap_or(u64::MAX);
     let mut counts: Vec<usize> = weights
         .iter()
-        .map(|weight| ((events as f64 * weight / total).round() as usize).max(1))
+        .map(|weight| {
+            let scaled = events
+                .saturating_mul(*weight)
+                .checked_div(total.max(1))
+                .unwrap_or(0);
+            usize::try_from(scaled).unwrap_or(usize::MAX).max(1)
+        })
         .collect();
+    let events = usize::try_from(events).unwrap_or(usize::MAX);
     let assigned: usize = counts.iter().sum();
     if assigned != events {
         let largest = counts
             .iter()
             .enumerate()
             .max_by_key(|(_, count)| **count)
-            .map(|(index, _)| index)
-            .unwrap_or(0);
+            .map_or(0, |(index, _)| index);
         if assigned < events {
-            counts[largest] = counts[largest].saturating_add(events - assigned);
+            counts[largest] = counts[largest].saturating_add(events.abs_diff(assigned));
         } else {
-            counts[largest] = counts[largest].saturating_sub(assigned - events);
+            counts[largest] = counts[largest].saturating_sub(assigned.abs_diff(events));
         }
     }
     let rooms = (0..rooms)
@@ -153,15 +161,27 @@ fn manifest_rooms(path: &Path) -> Result<(Vec<Room>, Vec<SpecEvent>), String> {
                 line_number.saturating_add(1)
             ));
         }
-        let topo = fields[1]
-            .parse::<i64>()
-            .map_err(|error| format!("{}:{}: {error}", path.display(), line_number + 1))?;
-        let stream = fields[2]
-            .parse::<i64>()
-            .map_err(|error| format!("{}:{}: {error}", path.display(), line_number + 1))?;
-        let bytes = fields[3]
-            .parse::<usize>()
-            .map_err(|error| format!("{}:{}: {error}", path.display(), line_number + 1))?;
+        let topo = fields[1].parse::<i64>().map_err(|error| {
+            format!(
+                "{}:{}: {error}",
+                path.display(),
+                line_number.saturating_add(1)
+            )
+        })?;
+        let stream = fields[2].parse::<i64>().map_err(|error| {
+            format!(
+                "{}:{}: {error}",
+                path.display(),
+                line_number.saturating_add(1)
+            )
+        })?;
+        let bytes = fields[3].parse::<usize>().map_err(|error| {
+            format!(
+                "{}:{}: {error}",
+                path.display(),
+                line_number.saturating_add(1)
+            )
+        })?;
         if bytes == 0 {
             return Err(format!(
                 "{}:{}: payload_bytes must be non-zero",
@@ -365,7 +385,9 @@ fn write_synthetic(db: &Database, rooms: &mut [Room], counts: &[usize], batch: u
                     .min(PAYLOAD_MAX);
                 let node = node_id(sequence);
                 let stream = if sequence.is_multiple_of(50) {
-                    -i64::try_from(sequence / 50).unwrap_or(i64::MAX)
+                    i64::try_from(sequence / 50)
+                        .unwrap_or(i64::MAX)
+                        .saturating_neg()
                 } else {
                     let stream = room.next_stream;
                     room.next_stream = room.next_stream.saturating_add(1);
@@ -373,7 +395,7 @@ fn write_synthetic(db: &Database, rooms: &mut [Room], counts: &[usize], batch: u
                 };
                 room.max_stream = room.max_stream.max(stream);
                 let topo = stream
-                    .saturating_add(i64::from(room.scope[0]) * 1_000_000)
+                    .saturating_add(i64::from(room.scope[0]).saturating_mul(1_000_000))
                     .saturating_sub(if sequence.is_multiple_of(20) { 7 } else { 0 });
                 entries.push(EventTimelineEntry::new(
                     room.scope,
@@ -465,77 +487,14 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
     }
 }
 
-fn main() {
-    let root = bench_root();
-    let _ = std::fs::remove_dir_all(&root);
-    let events = env_usize("MTXDB_MULTI_EVENTS", 1_000_000);
-    let room_count = env_usize("MTXDB_MULTI_ROOMS", 1_000);
-    let batch = env_usize("MTXDB_MULTI_BATCH", 64).max(1);
-    let samples = env_usize("MTXDB_TIMELINE_SAMPLES", 3).max(1);
-
-    let manifest = std::env::var_os("MTXDB_TIMELINE_EXPORT").map(PathBuf::from);
-    let (mut rooms, counts, manifest_events) = match manifest.as_deref() {
-        Some(path) => match manifest_rooms(path) {
-            Ok((rooms, manifest_events)) => {
-                let counts =
-                    manifest_events
-                        .iter()
-                        .fold(vec![0usize; rooms.len()], |mut acc, event| {
-                            if let Some(count) = acc.get_mut(event.room) {
-                                *count = count.saturating_add(1);
-                            }
-                            acc
-                        });
-                (rooms, counts, Some(manifest_events))
-            }
-            Err(error) => {
-                eprintln!("timeline_multi_room: {error}");
-                std::process::exit(2);
-            }
-        },
-        None => {
-            let (rooms, counts) = synthetic_rooms(room_count, events);
-            (rooms, counts, None)
-        }
-    };
-    let total_events: usize = counts.iter().sum();
-    let mut db = Database::open(root.clone()).expect("open benchmark database");
-
-    let write_started = Instant::now();
-    if let Some(manifest_events) = manifest_events.as_deref() {
-        write_manifest(&db, &rooms, manifest_events, batch);
-    } else {
-        write_synthetic(&db, &mut rooms, &counts, batch);
-    }
-    db.event_dag().sync_all().expect("sync benchmark database");
-    let write_ms = write_started.elapsed().as_secs_f64() * 1e3;
-    println!(
-        "multi_room_load events={total_events} rooms={} batch={batch} write_ms={write_ms:.1}",
-        rooms.len()
-    );
-
-    let mut ranked: Vec<usize> = rooms
-        .iter()
-        .enumerate()
-        .filter(|(_, room)| room.max_stream > 0)
-        .map(|(index, _)| index)
-        .collect();
-    ranked.sort_unstable_by_key(|index| rooms.get(*index).map_or(0, |room| room.max_stream));
-    let mut tiers: Vec<usize> = Vec::new();
-    if let Some(index) = ranked.last() {
-        tiers.push(*index);
-    }
-    if ranked.len() > 2 {
-        if let Some(index) = ranked.get(ranked.len() / 2) {
-            tiers.push(*index);
-        }
-    }
-    if let Some(index) = ranked.first() {
-        tiers.push(*index);
-    }
-    tiers.dedup();
-
-    for (tier_rank, tier) in tiers.clone().into_iter().enumerate() {
+fn run_page_rows(
+    mut db: Database,
+    root: &Path,
+    rooms: &[Room],
+    tiers: &[usize],
+    samples: usize,
+) -> Database {
+    for (tier_rank, tier) in tiers.iter().copied().enumerate() {
         let Some(selected) = rooms.get(tier) else {
             continue;
         };
@@ -551,32 +510,29 @@ fn main() {
             for _ in 0..samples {
                 db.event_dag().sync_all().expect("sync before eviction");
                 drop(db);
-                evict(&root, EvictScope::All).expect("evict files before cold read");
-                db = Database::open(root.clone()).expect("reopen benchmark database");
+                evict(root, EvictScope::All).expect("evict files before cold read");
+                db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
                 let (topo_index, stream_index) =
                     open_event_timeline_indexes(db.event_dag().as_ref());
                 let before = IoSnapshot::read();
-                let (elapsed, returned) = match order {
-                    "topo" => {
-                        let started = Instant::now();
-                        let page = topo_index
-                            .page(&selected.scope, None, true, limit)
-                            .expect("cold topological page");
-                        (started.elapsed(), page.entries.len())
-                    }
-                    _ => {
-                        let started = Instant::now();
-                        let page = page_stream_up_to(
-                            &stream_index,
-                            &selected.scope,
-                            None,
-                            true,
-                            limit,
-                            selected.max_stream,
-                        )
-                        .expect("cold stream page");
-                        (started.elapsed(), page.entries.len())
-                    }
+                let (elapsed, returned) = if order == "topo" {
+                    let started = Instant::now();
+                    let page = topo_index
+                        .page(&selected.scope, None, true, limit)
+                        .expect("cold topological page");
+                    (started.elapsed(), page.entries.len())
+                } else {
+                    let started = Instant::now();
+                    let page = page_stream_up_to(
+                        &stream_index,
+                        &selected.scope,
+                        None,
+                        true,
+                        limit,
+                        selected.max_stream,
+                    )
+                    .expect("cold stream page");
+                    (started.elapsed(), page.entries.len())
                 };
                 last_io = IoSnapshot::read().delta(before);
                 std::hint::black_box(returned);
@@ -592,8 +548,7 @@ fn main() {
                 last_io.majflt,
                 last_io.pgmajfault.unwrap_or(u64::MAX),
             );
-            let (topo_index, stream_index) =
-                open_event_timeline_indexes(db.event_dag().as_ref());
+            let (topo_index, stream_index) = open_event_timeline_indexes(db.event_dag().as_ref());
             let mut warm_pages = Vec::with_capacity(20);
             for _ in 0..20 {
                 let started = Instant::now();
@@ -629,13 +584,17 @@ fn main() {
         }
     }
 
+    db
+}
+
+fn run_fetch_rows(mut db: Database, root: &Path, rooms: &[Room], tier: Option<usize>) -> Database {
     for scope in [
         EvictScope::All,
         EvictScope::PacksOnly,
         EvictScope::IndexOnly,
     ] {
-        let Some(room_index) = tiers.first().copied() else {
-            continue;
+        let Some(room_index) = tier else {
+            return db;
         };
         let Some(selected) = rooms.get(room_index) else {
             continue;
@@ -651,8 +610,8 @@ fn main() {
             .map(|entry| entry.event_node_id)
             .collect();
         drop(db);
-        evict(&root, scope).expect("evict selected files before fetch");
-        db = Database::open(root.clone()).expect("reopen benchmark database");
+        evict(root, scope).expect("evict selected files before fetch");
+        db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
         let before = IoSnapshot::read();
         let started = Instant::now();
         let payloads = db
@@ -666,13 +625,16 @@ fn main() {
             .flatten()
             .map(|record| record.bytes.len())
             .sum();
-        let amplification = if returned == 0 {
-            0.0
+        let amplification_bp = if returned == 0 {
+            0
         } else {
-            io.read_bytes as f64 / returned as f64
+            io.read_bytes
+                .saturating_mul(10_000)
+                .checked_div(u64::try_from(returned).unwrap_or(u64::MAX).max(1))
+                .unwrap_or(0)
         };
         println!(
-            "multi_room_fetch evict={} count={} median_us={:.1} syscr={} rchar={} disk_read_bytes={} payload_bytes_returned={returned} read_amp_ratio={amplification:.3} majflt={} cgroup_pgmajfault={}",
+            "multi_room_fetch evict={} count={} median_us={:.1} syscr={} rchar={} disk_read_bytes={} payload_bytes_returned={returned} read_amp_bp={amplification_bp} majflt={} cgroup_pgmajfault={}",
             scope.label(),
             ids.len(),
             elapsed.as_secs_f64() * 1e6,
@@ -684,7 +646,11 @@ fn main() {
         );
     }
 
-    let Some(largest) = tiers.first().copied() else {
+    db
+}
+
+fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>) {
+    let Some(largest) = tier else {
         return;
     };
     let Some(largest_room) = rooms.get(largest) else {
@@ -704,11 +670,10 @@ fn main() {
             event_ref(node),
         );
         let transaction = db.begin_transaction();
-        stage_event_timeline_batch(
+        stage_promote_outlier_to_timeline(
             &transaction,
             ShardType::EventDag,
             largest_room.collection,
-            &[(node, NodeData::new(payload(sequence, PAYLOAD_MIN)))],
             &topo_index,
             &stream_index,
             &[entry],
@@ -765,6 +730,80 @@ fn main() {
         "multi_room_mutate single_median_us={single_median_us:.1} batch_remove_count={removed_count} batch_remove_us={remove_us:.1} purge_removed={} purge_us={purge_us:.1}",
         purged.0 .1,
     );
+}
+
+fn main() {
+    let root = bench_root();
+    let _ = std::fs::remove_dir_all(&root);
+    let events = env_usize("MTXDB_MULTI_EVENTS", 1_000_000);
+    let room_count = env_usize("MTXDB_MULTI_ROOMS", 1_000);
+    let batch = env_usize("MTXDB_MULTI_BATCH", 64).max(1);
+    let samples = env_usize("MTXDB_TIMELINE_SAMPLES", 10).max(1);
+
+    let manifest = std::env::var_os("MTXDB_TIMELINE_EXPORT").map(PathBuf::from);
+    let (mut rooms, counts, manifest_events) = if let Some(path) = manifest.as_deref() {
+        match manifest_rooms(path) {
+            Ok((rooms, manifest_events)) => {
+                let counts =
+                    manifest_events
+                        .iter()
+                        .fold(vec![0usize; rooms.len()], |mut acc, event| {
+                            if let Some(count) = acc.get_mut(event.room) {
+                                *count = count.saturating_add(1);
+                            }
+                            acc
+                        });
+                (rooms, counts, Some(manifest_events))
+            }
+            Err(error) => {
+                eprintln!("timeline_multi_room: {error}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        let (rooms, counts) = synthetic_rooms(room_count, events);
+        (rooms, counts, None)
+    };
+    let total_events: usize = counts.iter().sum();
+    let mut db = Database::open(root.clone()).expect("open benchmark database");
+
+    let write_started = Instant::now();
+    if let Some(manifest_events) = manifest_events.as_deref() {
+        write_manifest(&db, &rooms, manifest_events, batch);
+    } else {
+        write_synthetic(&db, &mut rooms, &counts, batch);
+    }
+    db.event_dag().sync_all().expect("sync benchmark database");
+    let write_ms = write_started.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "multi_room_load events={total_events} rooms={} batch={batch} write_ms={write_ms:.1}",
+        rooms.len()
+    );
+
+    let mut ranked: Vec<usize> = rooms
+        .iter()
+        .enumerate()
+        .filter(|(_, room)| room.max_stream > 0)
+        .map(|(index, _)| index)
+        .collect();
+    ranked.sort_unstable_by_key(|index| rooms.get(*index).map_or(0, |room| room.max_stream));
+    let mut tiers: Vec<usize> = Vec::new();
+    if let Some(index) = ranked.last() {
+        tiers.push(*index);
+    }
+    if ranked.len() > 2 {
+        if let Some(index) = ranked.get(ranked.len() / 2) {
+            tiers.push(*index);
+        }
+    }
+    if let Some(index) = ranked.first() {
+        tiers.push(*index);
+    }
+    tiers.dedup();
+
+    db = run_page_rows(db, &root, &rooms, &tiers, samples);
+    db = run_fetch_rows(db, &root, &rooms, tiers.first().copied());
+    run_mutations(&db, &rooms, tiers.first().copied());
 }
 
 fn tier_label(rank: usize) -> &'static str {
