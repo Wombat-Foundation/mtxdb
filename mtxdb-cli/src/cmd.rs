@@ -524,7 +524,12 @@ pub(crate) fn run(cli: &Cli) -> anyhow::Result<()> {
             let result = if *json && *tombstones {
                 Ok(())
             } else if let Some(selector) = selector {
-                cmd_info(cli, selector, Some(InfoTarget::Collection), *stats)
+                cmd_info(
+                    cli,
+                    selector,
+                    (*tombstones).then_some(InfoTarget::Collection),
+                    *stats,
+                )
             } else {
                 cmd_info_default(cli, *stats)
             };
@@ -7024,121 +7029,125 @@ fn scan_room_event_stats(dir: &Path, collection_id: &[u8; 16]) -> anyhow::Result
     // The physical pass above supplies frame statistics and a fallback for
     // membership records absent from the live index. For indexed records,
     // use the generation's winning payload: physical pack ordering is not a
-    // record-version ordering after imports, repacks, or slot reuse.
+    // record-version ordering after imports, repacks, or slot reuse. The index
+    // is consumed one record at a time so its payloads are never retained as a
+    // second full copy of the collection.
     let store = open_pool_read_only(dir.to_path_buf()).context("opening event pool index")?;
-    let mut indexed = HashMap::new();
     for item in store.scan_collection(collection_id)? {
         let (record_id, data) = item?;
-        indexed.insert(record_id, data.bytes.to_vec());
+        if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID || latest.remove(&record_id).is_none()
+        {
+            continue;
+        }
+        accumulate_room_event(&mut stats, &data.bytes);
     }
     for (record_id, (shard, offset)) in latest {
         if record_id == mtxdb::COLLECTION_METADATA_RECORD_ID {
             continue;
         }
-        let bytes = if let Some(bytes) = indexed.remove(&record_id) {
-            bytes
-        } else {
-            ShardPool::read_at_committed(&shard, offset, false)?
-                .data
-                .to_vec()
-        };
-        stats.records = stats.records.saturating_add(1);
-        if bytes.is_empty() {
-            stats.tombstones = stats.tombstones.saturating_add(1);
-            continue;
-        }
-        let size = bytes.len();
-        stats.payload_bytes = stats
-            .payload_bytes
-            .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
-        stats.min_size = Some(stats.min_size.map_or(size, |m| m.min(size)));
-        stats.max_size = stats.max_size.max(size);
-        // The homeserver stores `[format_version][metadata_len][metadata][json]`;
-        // an imported collection stores the event JSON directly. Try the
-        // header first, but only accept a decoded payload that is an object,
-        // and fall back to the raw payload otherwise.
-        let json_bytes = crate::auth_check::event_record_json(&bytes)
-            .ok()
-            .filter(|json| json.first() == Some(&b'{'))
-            .unwrap_or(&bytes);
-        let parsed = OwnedValue::parse_bytes(json_bytes).ok();
-        let Some(event @ OwnedValue::Object(_)) = parsed else {
-            let kind = classify_record_payload(&bytes);
-            let count = stats.kinds.entry(kind.to_owned()).or_default();
-            *count = count.saturating_add(1);
-            continue;
-        };
-        let OwnedValue::Object(fields) = &event else {
-            continue;
-        };
-        stats.json_events = stats.json_events.saturating_add(1);
-        let count = stats.kinds.entry("JSON event".to_owned()).or_default();
-        *count = count.saturating_add(1);
-        let kind = event_string_field(&event, "type").unwrap_or("");
-        let ts = fields.get("origin_server_ts").and_then(OwnedValue::as_i64);
-        let event_id = event_id(&event).unwrap_or("").to_owned();
-        if is_state_event(&event) {
-            stats.state_events = stats.state_events.saturating_add(1);
-            let state_key = event_string_field(&event, "state_key").unwrap_or("");
-            let when = ts.unwrap_or(0);
-            if kind == "m.room.member" {
-                let membership =
-                    nested_event_string_field(&event, "content", "membership").unwrap_or("?");
-                let newer = stats
-                    .members
-                    .get(state_key)
-                    .is_none_or(|(seen, _)| when >= *seen);
-                if newer {
-                    stats
-                        .members
-                        .insert(state_key.to_owned(), (when, membership.to_owned()));
-                }
-            } else if state_key.is_empty() && ROOM_CONFIG_TYPES.contains(&kind) {
-                let newer = stats
-                    .room_state
-                    .get(kind)
-                    .is_none_or(|(seen, _)| when >= *seen);
-                if newer {
-                    if let Some(content) = fields.get("content") {
-                        stats
-                            .room_state
-                            .insert(kind.to_owned(), (when, content.clone()));
-                    }
-                }
-            }
-        }
-        let bump = |map: &mut HashMap<String, usize>, key: &str| {
-            let count = map.entry(key.to_owned()).or_default();
-            *count = count.saturating_add(1);
-        };
-        bump(&mut stats.types, kind);
-        if let Some(sender) = event_string_field(&event, "sender") {
-            bump(&mut stats.senders, sender);
-            if let Some((_, server)) = sender.split_once(':') {
-                bump(&mut stats.servers, server);
-            }
-        }
-        if let Some(ts) = ts {
-            stats.min_ts = Some(stats.min_ts.map_or(ts, |m| m.min(ts)));
-            stats.max_ts = Some(stats.max_ts.map_or(ts, |m| m.max(ts)));
-            bump(&mut stats.months, &format_utc_ms(ts)[..7]);
-        }
-        if let Some(depth) = fields.get("depth").and_then(OwnedValue::as_i64) {
-            stats.min_depth = Some(stats.min_depth.map_or(depth, |m| m.min(depth)));
-            stats.max_depth = Some(stats.max_depth.map_or(depth, |m| m.max(depth)));
-        }
-        stats.prev_refs.extend(string_array(fields, "prev_events"));
-        stats.auth_refs.extend(string_array(fields, "auth_events"));
-        stats
-            .largest
-            .push((size, event_id.clone(), kind.to_owned()));
-        stats
-            .largest
-            .sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        stats.largest.truncate(3);
-        stats.event_ids.insert(event_id);
+        let record = ShardPool::read_at_committed(&shard, offset, false)?;
+        accumulate_room_event(&mut stats, &record.data);
     }
     Ok(stats)
+}
+
+/// Fold one winning event payload into the room statistics.
+fn accumulate_room_event(stats: &mut RoomEventStats, bytes: &[u8]) {
+    stats.records = stats.records.saturating_add(1);
+    if bytes.is_empty() {
+        stats.tombstones = stats.tombstones.saturating_add(1);
+        return;
+    }
+    let size = bytes.len();
+    stats.payload_bytes = stats
+        .payload_bytes
+        .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+    stats.min_size = Some(stats.min_size.map_or(size, |m| m.min(size)));
+    stats.max_size = stats.max_size.max(size);
+    // The homeserver stores `[format_version][metadata_len][metadata][json]`;
+    // an imported collection stores the event JSON directly. Try the header
+    // first, but only accept a decoded payload that parses as an object, and
+    // fall back to the raw payload otherwise.
+    let json_bytes = crate::auth_check::event_record_json(bytes)
+        .ok()
+        .filter(|json| matches!(OwnedValue::parse_bytes(json), Ok(OwnedValue::Object(_))))
+        .unwrap_or(bytes);
+    let parsed = OwnedValue::parse_bytes(json_bytes).ok();
+    let Some(event @ OwnedValue::Object(_)) = parsed else {
+        let kind = classify_record_payload(bytes);
+        let count = stats.kinds.entry(kind.to_owned()).or_default();
+        *count = count.saturating_add(1);
+        return;
+    };
+    let OwnedValue::Object(fields) = &event else {
+        return;
+    };
+    stats.json_events = stats.json_events.saturating_add(1);
+    let count = stats.kinds.entry("JSON event".to_owned()).or_default();
+    *count = count.saturating_add(1);
+    let kind = event_string_field(&event, "type").unwrap_or("");
+    let ts = fields.get("origin_server_ts").and_then(OwnedValue::as_i64);
+    let event_id = event_id(&event).unwrap_or("").to_owned();
+    if is_state_event(&event) {
+        stats.state_events = stats.state_events.saturating_add(1);
+        let state_key = event_string_field(&event, "state_key").unwrap_or("");
+        let when = ts.unwrap_or(0);
+        if kind == "m.room.member" {
+            let membership =
+                nested_event_string_field(&event, "content", "membership").unwrap_or("?");
+            let newer = stats
+                .members
+                .get(state_key)
+                .is_none_or(|(seen, _)| when >= *seen);
+            if newer {
+                stats
+                    .members
+                    .insert(state_key.to_owned(), (when, membership.to_owned()));
+            }
+        } else if state_key.is_empty() && ROOM_CONFIG_TYPES.contains(&kind) {
+            let newer = stats
+                .room_state
+                .get(kind)
+                .is_none_or(|(seen, _)| when >= *seen);
+            if newer {
+                if let Some(content) = fields.get("content") {
+                    stats
+                        .room_state
+                        .insert(kind.to_owned(), (when, content.clone()));
+                }
+            }
+        }
+    }
+    let bump = |map: &mut HashMap<String, usize>, key: &str| {
+        let count = map.entry(key.to_owned()).or_default();
+        *count = count.saturating_add(1);
+    };
+    bump(&mut stats.types, kind);
+    if let Some(sender) = event_string_field(&event, "sender") {
+        bump(&mut stats.senders, sender);
+        if let Some((_, server)) = sender.split_once(':') {
+            bump(&mut stats.servers, server);
+        }
+    }
+    if let Some(ts) = ts {
+        stats.min_ts = Some(stats.min_ts.map_or(ts, |m| m.min(ts)));
+        stats.max_ts = Some(stats.max_ts.map_or(ts, |m| m.max(ts)));
+        bump(&mut stats.months, &format_utc_ms(ts)[..7]);
+    }
+    if let Some(depth) = fields.get("depth").and_then(OwnedValue::as_i64) {
+        stats.min_depth = Some(stats.min_depth.map_or(depth, |m| m.min(depth)));
+        stats.max_depth = Some(stats.max_depth.map_or(depth, |m| m.max(depth)));
+    }
+    stats.prev_refs.extend(string_array(fields, "prev_events"));
+    stats.auth_refs.extend(string_array(fields, "auth_events"));
+    stats
+        .largest
+        .push((size, event_id.clone(), kind.to_owned()));
+    stats
+        .largest
+        .sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    stats.largest.truncate(3);
+    stats.event_ids.insert(event_id);
 }
 
 /// Format a millisecond Unix timestamp as `YYYY-MM-DD HH:MM` UTC.
@@ -8014,11 +8023,13 @@ fn cmd_scan_single(
                 .into_iter()
                 .find(|(_, shard)| shard.pack_id == pack_id)
             {
-                if matched_any {
+                if matched_any && !opts.raw {
                     println!();
                     println!();
                 }
-                print_section_header(shard_type);
+                if !opts.raw {
+                    print_section_header(shard_type);
+                }
                 scan_pack(cli, &shard, pack_id, collection_filter, &opts, shard_type)?;
                 matched_any = true;
             }
@@ -8221,6 +8232,7 @@ fn cmd_scan_collection_in_pool(
     shard_type: ShardType,
     show_section_header: bool,
     needs_section_spacing: bool,
+    row_budget: usize,
 ) -> anyhow::Result<usize> {
     let pool = match ShardPool::open_read_only(pool_dir.to_path_buf()) {
         Ok(pool) => pool,
@@ -8230,7 +8242,7 @@ fn cmd_scan_collection_in_pool(
     let mut shards = pool.all_shards();
     shards.sort_unstable_by_key(|(_, shard)| shard.pack_id);
     let mut packs = 0_usize;
-    let max_rows = opts.max_rows();
+    let max_rows = opts.max_rows().min(row_budget);
     let bounded = max_rows != usize::MAX;
     let mut context = CollectionScanContext {
         collection_id,
@@ -8577,11 +8589,18 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
     if cli.shard_type.is_none() {
         let db_layout = open_layout(cli)?;
         let mut matched_any = false;
+        let mut remaining = opts.max_rows();
         for shard_type in cli.shard_types() {
+            if remaining == 0 {
+                break;
+            }
             let Some(pool_dir) = existing_pool_dir(&db_layout, shard_type)? else {
                 continue;
             };
             for collection_id in parse_collection_selectors_for_pool(selector, shard_type)? {
+                if remaining == 0 {
+                    break;
+                }
                 let frames = cmd_scan_collection_in_pool(
                     &pool_dir,
                     collection_id,
@@ -8589,7 +8608,9 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
                     shard_type,
                     true,
                     matched_any,
+                    remaining,
                 )?;
+                remaining = remaining.saturating_sub(frames.min(remaining));
                 if frames > 0 {
                     matched_any = true;
                 }
@@ -8603,16 +8624,23 @@ fn cmd_scan_collection(cli: &Cli, selector: &str, opts: &ScanOptions) -> anyhow:
     let shard_type = cli.require_shard_type()?;
     let pool_dir = selected_pool_dir(cli)?;
     let mut frames = 0_usize;
+    let mut remaining = opts.max_rows();
     let ids = parse_collection_selectors_for_pool(selector, shard_type)?;
     for (index, collection_id) in ids.iter().enumerate() {
-        frames = frames.saturating_add(cmd_scan_collection_in_pool(
+        if remaining == 0 {
+            break;
+        }
+        let scanned = cmd_scan_collection_in_pool(
             &pool_dir,
             *collection_id,
             opts,
             shard_type,
             ids.len() > 1,
             index > 0 && frames > 0,
-        )?);
+            remaining,
+        )?;
+        frames = frames.saturating_add(scanned);
+        remaining = remaining.saturating_sub(scanned.min(remaining));
     }
     if frames == 0 {
         bail!(
@@ -8977,8 +9005,21 @@ fn cmd_gap_list(
     limit: usize,
 ) -> anyhow::Result<()> {
     let layout = open_layout(cli)?;
-    let pool = open_pool_read_only(pool_dir(&layout, mtxdb::interop::SERVER_INFO_POOL)?)
-        .context("opening the server-info pool to list gaps")?;
+    let server_info_dir = pool_dir(&layout, mtxdb::interop::SERVER_INFO_POOL)?;
+    let wal_path = layout.shared_wal_path();
+    let pool = if wal_path.try_exists()? {
+        // Read committed history through the established shared-WAL path. If an
+        // existing WAL cannot be opened, fail rather than silently showing only
+        // the pack-covered prefix.
+        PackfileStorage::open_read_committed_shared(
+            server_info_dir,
+            wal_path,
+            mtxdb::interop::SERVER_INFO_POOL,
+        )
+        .context("opening the server-info pool through the shared WAL to list gaps")?
+    } else {
+        open_pool_read_only(server_info_dir).context("opening the server-info pool to list gaps")?
+    };
     let manifest = crate::gap_manifest::read_from_pool(&pool, room)?;
     let matching: Vec<_> = manifest
         .gaps
@@ -17110,31 +17151,17 @@ fn cmd_auth_check(
 /// Adapt the maintained CSR adjacency to the auth-check report's compact
 /// edge-record interface. The homeserver writes these rows to the graph store
 /// under `CsrAdjacency::for_collection`, not to the legacy AUTH pack collection.
+///
+/// Stored AUTH owners and their numeric targets come from the CSR rows directly,
+/// so an owner whose event body was not scanned still gets its edge record and
+/// a missing reverse mapping becomes an unresolved target in the report rather
+/// than an error. The body scan only supplies names and the authoritative
+/// comparison performed by [`crate::auth_check::check`].
 fn auth_check_records_from_csr(
     adjacency: &CsrAdjacency,
     graph: &impl mtxdb::short_id::GraphReader,
     scanned: &HashMap<String, ScannedEvent>,
 ) -> anyhow::Result<HashMap<NodeId, Vec<u8>>> {
-    let mut event_ids = std::collections::BTreeSet::new();
-    for event_id in scanned.keys() {
-        if event_id.starts_with("<node ") {
-            continue;
-        }
-        event_ids.insert(event_id.clone());
-        if let Some(targets) = adjacency.auth_of(graph, event_id)? {
-            event_ids.extend(targets);
-        }
-    }
-
-    let mut names = BTreeMap::new();
-    for event_id in event_ids {
-        if let Some(short_id) = adjacency
-            .events_index()
-            .lookup(graph, event_id.as_bytes())?
-        {
-            names.insert(short_id, event_id);
-        }
-    }
     let next_id = adjacency.events_index().counter(graph)?;
     let allocated = next_id.saturating_sub(1);
     if allocated == 0 {
@@ -17145,25 +17172,43 @@ fn auth_check_records_from_csr(
         crate::auth_check::counter_node_id(),
         u64::from(allocated).to_be_bytes().to_vec(),
     );
-    for (&short_id, event_id) in &names {
-        records.insert(
-            crate::auth_check::reverse_node_id(short_id),
-            event_id.as_bytes().to_vec(),
-        );
-        if let Some(targets) = adjacency.auth_of(graph, event_id)? {
-            let mut target_ids = Vec::with_capacity(targets.len());
-            for target in targets {
-                let target_id = adjacency
-                    .events_index()
-                    .lookup(graph, target.as_bytes())?
-                    .ok_or_else(|| anyhow!("AUTH edge target {target} has no short id"))?;
-                target_ids.push(target_id);
-            }
+    // Keep the names the body scan already knows, so state events with no AUTH
+    // row still resolve in the report.
+    for event_id in scanned.keys() {
+        if event_id.starts_with("<node ") {
+            continue;
+        }
+        if let Some(short_id) = adjacency
+            .events_index()
+            .lookup(graph, event_id.as_bytes())?
+        {
             records.insert(
-                crate::auth_check::edge_node_id(short_id),
-                crate::auth_check::encode_edges(&target_ids),
+                crate::auth_check::reverse_node_id(short_id),
+                event_id.as_bytes().to_vec(),
             );
         }
+    }
+    let auth_rows = adjacency.auth_target_ids(graph)?;
+    let mut referenced = std::collections::BTreeSet::new();
+    for (owner, targets) in &auth_rows {
+        referenced.insert(*owner);
+        referenced.extend(targets.iter().copied());
+    }
+    let ids: Vec<u32> = referenced.into_iter().collect();
+    let names = adjacency.resolve_event_ids(graph, &ids)?;
+    for (&short_id, name) in ids.iter().zip(names) {
+        if let Some(name) = name {
+            records.insert(
+                crate::auth_check::reverse_node_id(short_id),
+                name.into_bytes(),
+            );
+        }
+    }
+    for (owner, targets) in auth_rows {
+        records.insert(
+            crate::auth_check::edge_node_id(owner),
+            crate::auth_check::encode_edges(&targets),
+        );
     }
     Ok(records)
 }

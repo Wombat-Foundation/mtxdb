@@ -7946,28 +7946,14 @@ fn coalesced_info_and_scan_filter_to_matching_databases() {
             live: false,
         },
     };
-    cmd_scan(
-        &cli_scan,
-        &format_id(&col1),
-        false,
-        false,
-        None,
-        10,
-        None,
-        None,
-        false,
-        None,
-        false,
-        false,
-        None,
-    )
-    .unwrap();
+    run(&cli_scan).unwrap();
 
-    let missing = format_id(&[0x99; 16]);
-    assert!(cmd_scan(
-        &cli_scan, &missing, false, false, None, 10, None, None, false, None, false, false, None
-    )
-    .is_err());
+    let mut missing_cli = cli_scan.clone();
+    let Commands::Scan { selector, .. } = &mut missing_cli.command else {
+        unreachable!("the constructed command is a scan");
+    };
+    *selector = format_id(&[0x99; 16]);
+    assert!(run(&missing_cli).is_err());
 
     std::fs::remove_dir_all(&dir1).ok();
     std::fs::remove_dir_all(&dir2).ok();
@@ -12417,6 +12403,93 @@ fn auth_check_reads_adjacency_in_the_homeserver_event_collection_scope() {
     assert_eq!(report.mismatched.len(), 0);
     assert_eq!(report.no_record.len(), 0);
     assert_eq!(report.bad_records.len(), 0);
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_reports_a_stored_auth_owner_without_an_event_body() {
+    let dir = unique_temp_dir();
+    let room = "!homeserver-csr-owner:test";
+    let homeserver_collection = matrix_room_collection_id(room);
+    let (create_id, child_id) =
+        write_homeserver_auth_check_events(&dir, room, &homeserver_collection);
+    let edge_only = "$edge-only".to_owned();
+
+    let db = Database::open(dir.clone()).unwrap();
+    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection);
+    adjacency
+        .record_events(
+            &db,
+            &[
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: &create_id,
+                    prev: &[],
+                    auth: &[],
+                    relation: None,
+                },
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: &child_id,
+                    prev: &[],
+                    auth: &[&create_id],
+                    relation: None,
+                },
+                // An AUTH owner whose event body is deliberately absent from
+                // the event collection.
+                mtxdb::csr_adjacency::EventRecord {
+                    event_id: &edge_only,
+                    prev: &[],
+                    auth: &[&create_id],
+                    relation: None,
+                },
+            ],
+        )
+        .unwrap();
+
+    let graph_layout = DatabaseLayout::open_read_only(dir.clone()).unwrap();
+    let graph_pools: Vec<_> = ShardType::ALL
+        .into_iter()
+        .map(|shard_type| {
+            std::sync::Arc::new(
+                PackfileStorage::open_read_committed_shared(
+                    graph_layout.pool_path(shard_type),
+                    graph_layout.shared_wal_path(),
+                    shard_type,
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+    let graph_pools: [std::sync::Arc<PackfileStorage>; ShardType::ALL.len()] =
+        graph_pools.try_into().ok().expect("three shard pools");
+    let graph = mtxdb::short_id::ReadOnlyGraph::new(graph_layout.clone(), graph_pools);
+    let event_store =
+        PackfileStorage::open_read_only(graph_layout.pool_path(ShardType::EventDag)).unwrap();
+    let scanned = super::scan_room_events(&event_store, &homeserver_collection).unwrap();
+    let records = super::auth_check_records_from_csr(&adjacency, &graph, &scanned).unwrap();
+    let owner_id = adjacency
+        .events_index()
+        .lookup(&graph, edge_only.as_bytes())
+        .unwrap();
+    assert!(
+        records.contains_key(&crate::auth_check::edge_node_id(owner_id.unwrap())),
+        "the stored AUTH owner must get an edge record even without a body"
+    );
+
+    let cli = state_cli(
+        &dir,
+        Commands::Info {
+            selector: None,
+            stats: false,
+            tombstones: false,
+            keys: false,
+            detail: false,
+            json: false,
+        },
+    );
+    let report = cmd_auth_check(&cli, room, false, 0).unwrap();
+    assert_eq!(report.with_edges, 3);
+    assert_eq!(report.no_record, vec![edge_only]);
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
 }
