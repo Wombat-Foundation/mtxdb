@@ -2320,7 +2320,7 @@ pub(crate) fn write_room_with_resolved_findings(
         version_node,
     )?);
 
-    let room_scope = mtxdb::timeline::room_scope_id(room);
+    let room_scope = mtxdb::room_scope_id(room);
     let timeline_index =
         mtxdb::timeline::TimelineIndex::open(db.pool(EVENT_POOL).as_ref(), &export.room_id);
     let mut batch_timeline_entries = Vec::new();
@@ -2431,7 +2431,7 @@ pub(crate) fn write_room_with_resolved_findings(
         if let Some((topological_ordering, stream_ordering)) =
             timeline_orderings(export, event, rejected)
         {
-            let event_ref = mtxdb::timeline::event_id_ref(event_id);
+            let event_ref = mtxdb::event_id_ref(event_id);
             batch_timeline_entries.push(mtxdb::timeline::TimelineEntry::new(
                 room_scope,
                 topological_ordering,

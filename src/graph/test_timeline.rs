@@ -31,7 +31,7 @@ fn span(min_entry: TimelineEntry, max_entry: TimelineEntry, entry_count: u64) ->
 fn sorted_reference(entries: &[TimelineEntry], room_id: &[u8; 16]) -> Vec<TimelineEntry> {
     let mut reference: Vec<TimelineEntry> = entries
         .iter()
-        .filter(|entry| entry.room_id == *room_id)
+        .filter(|entry| entry.scope == *room_id)
         .copied()
         .collect();
     reference.sort_unstable();
@@ -66,7 +66,7 @@ fn collect<S: StorageEngine + ?Sized>(
 #[test]
 fn cursor_encoding_roundtrips() {
     let entry = entry([1u8; 16], 7, 3);
-    let cursor = TimelineCursor::new([0xAB; 16], entry);
+    let cursor = TimelineCursor::new([0xAB; 16], entry, DomainTag::new([0xCD; 16]));
     let bytes = cursor.encode();
     assert_eq!(bytes.len(), CURSOR_LEN);
     assert_eq!(TimelineCursor::decode(&bytes), Some(cursor));
@@ -147,7 +147,7 @@ fn cursor_pins_its_snapshot_across_a_rebuild() {
     }
     assert_eq!(rest.len(), 8);
     assert!(
-        rest.iter().all(|entry| entry.topological_ordering < 10),
+        rest.iter().all(|entry| entry.primary < 10),
         "old snapshot only"
     );
 }
@@ -345,11 +345,11 @@ fn height_three_root_pages_through_two_directory_levels() {
         child_id: level_two_id,
         ..leaf_span
     };
-    let root_payload = encode_root(&[root_span], 1, 3).unwrap();
+    let root_payload = encode_root(&[root_span], 1, 3, index.domain()).unwrap();
     let root_id = content_id(&root_payload);
     index.write_record(&root_id, root_payload).unwrap();
     index
-        .write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, 1))
+        .write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, 1, index.domain()))
         .unwrap();
 
     assert_eq!(index.page(&room, None, true, 10).unwrap().entries, [entry]);
@@ -611,7 +611,7 @@ fn order_is_topological_then_stream_then_node() {
 
     let keys: Vec<(i64, i64, u8)> = collect(&index, &room, true, 2)
         .iter()
-        .map(|e| (e.topological_ordering, e.stream_ordering, e.node_id[0]))
+        .map(|e| (e.primary, e.secondary, e.id[0]))
         .collect();
     assert_eq!(
         keys,
@@ -639,6 +639,10 @@ fn wire_encoding_is_byte_comparable_and_roundtrips() {
     for value in values {
         assert_eq!(decode_position(encode_position(value)), value);
     }
-    let cursor = TimelineCursor::new([9u8; 16], full(room, -3, i64::MIN, 6));
+    let cursor = TimelineCursor::new(
+        [9u8; 16],
+        full(room, -3, i64::MIN, 6),
+        DomainTag::new([0xD0; 16]),
+    );
     assert_eq!(TimelineCursor::decode(&cursor.encode()), Some(cursor));
 }

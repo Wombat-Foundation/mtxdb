@@ -14,12 +14,12 @@ use crate::csr_adjacency::CsrAdjacency;
 use crate::database::{Database, DatabaseTransaction};
 use crate::interop::{
     decode_verdict, derive_id, event_record_id, event_verdict_collection_id,
-    room_event_collection_id, room_flag_collection_id,
+    room_event_collection_id, room_flag_collection_id, room_scope_id,
 };
 use crate::layout::ShardType;
 use crate::short_id::ShortIdIndex;
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
-use crate::timeline::{room_scope_id, TimelineIndex};
+use crate::timeline::TimelineIndex;
 
 /// Magic prefix for the flag index metadata record (`b"FLGM"`).
 pub const FLAG_META_MAGIC: [u8; 4] = *b"FLGM";
@@ -1009,7 +1009,7 @@ impl RoomFlagIndex {
                 break;
             }
             for entry in &page.entries {
-                timeline_nodes.push(entry.node_id);
+                timeline_nodes.push(entry.id);
             }
             if page.next_cursor.is_none() {
                 break;

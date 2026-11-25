@@ -232,12 +232,13 @@ pub use index::LossyIndex;
 pub use interop::{
     commit_state_batches, decode_import_marker, decode_server_key, decode_state_root_handle_v1,
     decode_verdict, encode_import_marker, encode_server_key, encode_state_root_handle_v1,
-    encode_verdict, event_record_id, event_state_root_node_id, event_verdict_collection_id,
-    import_marker_collection_id, import_marker_node_id, notary_record_id, room_flag_collection_id,
-    room_roots_collection_id, room_state_collection_id, room_state_root_node_id,
-    server_keys_collection_id, state_hamt_node_id, ImportMarker, StateRootHandleV1, Verdict,
-    DATA_FORMAT, KEY_RECORD_VERSION, MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL,
-    STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS, VERDICT_VERSION,
+    encode_verdict, event_id_ref, event_record_id, event_state_root_node_id,
+    event_verdict_collection_id, import_marker_collection_id, import_marker_node_id,
+    notary_record_id, room_flag_collection_id, room_roots_collection_id, room_scope_id,
+    room_state_collection_id, room_state_root_node_id, server_keys_collection_id,
+    state_hamt_node_id, ImportMarker, StateRootHandleV1, Verdict, DATA_FORMAT, KEY_RECORD_VERSION,
+    MARKER_VERSION, STATE_BATCH_BYTES, STATE_POOL, STATE_ROOT_HANDLE_V1_LEN, VERDICT_BUCKETS,
+    VERDICT_VERSION,
 };
 pub use journal::SharedWalLock;
 pub use journal::{
@@ -298,14 +299,14 @@ pub use template::{
     CollectionMetadata, CollectionTemplate, EstablishmentRule, FrameIdInput, FrameIdPolicy,
     PayloadPolicy, RecordIdentityRule, COLLECTION_METADATA_RECORD_ID,
     COLLECTION_TEMPLATE_FORMAT_V1, MEMBER_NAMESPACE_AUTH, MEMBER_NAMESPACE_EVNT,
-    MEMBER_NAMESPACE_FLAG, MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_PREV,
-    MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP, NAMESPACE_BIAS_AUTH, NAMESPACE_BIAS_EVNT,
-    NAMESPACE_BIAS_FLAG, NAMESPACE_BIAS_FWD, NAMESPACE_BIAS_INTL, NAMESPACE_BIAS_PREV,
-    NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
+    MEMBER_NAMESPACE_FLAG, MEMBER_NAMESPACE_FWD, MEMBER_NAMESPACE_INTL, MEMBER_NAMESPACE_ORDX,
+    MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP, NAMESPACE_BIAS_AUTH,
+    NAMESPACE_BIAS_EVNT, NAMESPACE_BIAS_FLAG, NAMESPACE_BIAS_FWD, NAMESPACE_BIAS_INTL,
+    NAMESPACE_BIAS_ORDX, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
 };
 pub use timeline::{
-    event_id_ref, room_scope_id, timeline_collection_id, EventRef, TimelineCursor, TimelineEntry,
-    TimelineIndex, TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
+    timeline_collection_id, EventRef, KeyTag, OrderedKey, ScopedSeqKey, TimelineCursor,
+    TimelineEntry, TimelineIndex, TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
 };
 
 #[cfg(test)]

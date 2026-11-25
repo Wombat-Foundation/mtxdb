@@ -9145,6 +9145,7 @@ fn a_room_export_without_a_create_event_is_refused() {
 #[test]
 fn a_room_import_populates_timeline_index() {
     use crate::interchange::parse_room;
+    use mtxdb::room_scope_id;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
 
@@ -9319,6 +9320,7 @@ fn forced_rejection_import_sets_flags_and_not_excludes_it() {
 #[test]
 fn stale_auth_events_are_rejected_against_state_before() {
     use mtxdb::room_flag::*;
+    use mtxdb::room_scope_id;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
 
@@ -9366,11 +9368,7 @@ fn stale_auth_events_are_rejected_against_state_before() {
     let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
         .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
         .unwrap();
-    let streams: Vec<i64> = page
-        .entries
-        .iter()
-        .map(|entry| entry.stream_ordering)
-        .collect();
+    let streams: Vec<i64> = page.entries.iter().map(|entry| entry.secondary).collect();
     assert_eq!(
         streams,
         vec![1, 2, 3],
@@ -9382,6 +9380,7 @@ fn stale_auth_events_are_rejected_against_state_before() {
 fn rejected_state_event_does_not_change_later_state() {
     use mtxdb::export_schema::RejectionCode;
     use mtxdb::room_flag::*;
+    use mtxdb::room_scope_id;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
 
@@ -9450,11 +9449,7 @@ fn rejected_state_event_does_not_change_later_state() {
     let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
         .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
         .unwrap();
-    let streams: Vec<i64> = page
-        .entries
-        .iter()
-        .map(|entry| entry.stream_ordering)
-        .collect();
+    let streams: Vec<i64> = page.entries.iter().map(|entry| entry.secondary).collect();
     assert_eq!(streams, vec![1, 2, 3, 4]);
 
     // Neither $rules_bad nor $bob carries an exporter `rejected` flag: both
@@ -9488,6 +9483,7 @@ fn rejected_state_event_does_not_change_later_state() {
 #[test]
 fn partial_base_state_is_left_unchecked() {
     use mtxdb::room_flag::*;
+    use mtxdb::room_scope_id;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
 
@@ -9544,11 +9540,7 @@ fn partial_base_state_is_left_unchecked() {
     let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
         .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
         .unwrap();
-    let streams: Vec<i64> = page
-        .entries
-        .iter()
-        .map(|entry| entry.stream_ordering)
-        .collect();
+    let streams: Vec<i64> = page.entries.iter().map(|entry| entry.secondary).collect();
     assert_eq!(streams, vec![1, 2, 3, 4, 5]);
 }
 
@@ -9718,6 +9710,7 @@ fn exported_rejected_flag_is_not_trusted_for_state() {
 fn flag_index_timeline_count_matches_timeline_index() {
     use crate::interchange::parse_room;
     use mtxdb::room_flag::*;
+    use mtxdb::room_scope_id;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
 
@@ -9763,6 +9756,7 @@ fn flag_index_timeline_count_matches_timeline_index() {
 fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
     use crate::interchange::parse_room;
     use mtxdb::room_flag::*;
+    use mtxdb::room_scope_id;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
 
@@ -9808,7 +9802,7 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
 
     // The two non-outliers make it in; the soft-failed outlier stays out even
     // though its PDU carries a depth and timestamp.
-    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
+    let streams: Vec<i64> = page.entries.iter().map(|e| e.secondary).collect();
     assert_eq!(streams, vec![1000, 1500, 2000]);
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
@@ -9838,6 +9832,7 @@ fn stream_and_arrival_order_survive_import() {
     use crate::interchange::parse_room;
     use mtxdb::interop::*;
     use mtxdb::room_flag::*;
+    use mtxdb::room_scope_id;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
 
@@ -9878,13 +9873,9 @@ fn stream_and_arrival_order_survive_import() {
 
     // Live and backfilled positions are preserved exactly; the soft-failed
     // event has no timeline position and stays out.
-    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
+    let streams: Vec<i64> = page.entries.iter().map(|e| e.secondary).collect();
     assert_eq!(streams, vec![1, 2, 3, -5]);
-    let depths: Vec<i64> = page
-        .entries
-        .iter()
-        .map(|e| e.topological_ordering)
-        .collect();
+    let depths: Vec<i64> = page.entries.iter().map(|e| e.primary).collect();
     assert_eq!(depths, vec![1, 2, 3, 5]);
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
@@ -9929,6 +9920,7 @@ fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
     use crate::interchange::parse_room;
     use mtxdb::interop::*;
     use mtxdb::room_flag::*;
+    use mtxdb::room_scope_id;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
 
@@ -9982,7 +9974,7 @@ fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
     let page = TimelineIndex::open(db.pool(ShardType::EventDag).as_ref(), room_id)
         .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
         .unwrap();
-    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
+    let streams: Vec<i64> = page.entries.iter().map(|e| e.secondary).collect();
     assert_eq!(
         streams,
         vec![1, 2, 3],
@@ -10109,6 +10101,7 @@ fn rebuild_fidelity_reproduces_exact_bitmaps_after_wipe() {
 #[test]
 fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     use crate::interchange::parse_room;
+    use mtxdb::room_scope_id;
     use mtxdb::timeline::*;
     use mtxdb::ShardType;
 
@@ -10154,20 +10147,20 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
 
     // Verify ordering:
     // 1. $backfill (depth: 10, stream: -5)
-    assert_eq!(page.entries[0].topological_ordering, 10);
-    assert_eq!(page.entries[0].stream_ordering, -5);
+    assert_eq!(page.entries[0].primary, 10);
+    assert_eq!(page.entries[0].secondary, -5);
 
     // 2. $join (depth: 10, stream: 0)
-    assert_eq!(page.entries[1].topological_ordering, 10);
-    assert_eq!(page.entries[1].stream_ordering, 0);
+    assert_eq!(page.entries[1].primary, 10);
+    assert_eq!(page.entries[1].secondary, 0);
 
     // 3. $normal (depth: 10, stream: 100)
-    assert_eq!(page.entries[2].topological_ordering, 10);
-    assert_eq!(page.entries[2].stream_ordering, 100);
+    assert_eq!(page.entries[2].primary, 10);
+    assert_eq!(page.entries[2].secondary, 100);
 
     // 4. $later (depth: 11, stream: 101)
-    assert_eq!(page.entries[3].topological_ordering, 11);
-    assert_eq!(page.entries[3].stream_ordering, 101);
+    assert_eq!(page.entries[3].primary, 11);
+    assert_eq!(page.entries[3].secondary, 101);
 
     // Verify re-import idempotence: re-importing the same export does not duplicate entries
     let (written_again, _) =

@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb::timeline::{TimelineCursor, TimelineEntry, TimelineIndex, TIMELINE_LEAF_CAP};
+use mtxdb::timeline::{TimelineEntry, TimelineIndex, TIMELINE_LEAF_CAP};
 use mtxdb::PackfileStorage;
 
 const EVENT_COLLECTION: [u8; 16] = *b"timeline-events!";
@@ -187,7 +187,7 @@ fn run(n: usize, batch: usize) {
         .expect("read index head")
         .expect("index root")
         .0;
-    let middle_seed = TimelineCursor::new(root_id, entry((n / 2).saturating_sub(1) as u64));
+    let middle_seed = index.cursor(root_id, entry((n / 2).saturating_sub(1) as u64));
     let middle_cursor = index
         .page(&ROOM, Some(&middle_seed), true, 1)
         .expect("get midpoint cursor from a preceding page")
@@ -223,7 +223,7 @@ fn run(n: usize, batch: usize) {
                     "timeline_page n={n} start={start_name} direction={label} limit={page_size} min_ns={min_ns} median_ns={median_ns} resume_min_ns={resume_min_ns} resume_median_ns={resume_median_ns}"
                 );
                 if page_size == 128 && start_name == "first" && forward {
-                    let ids: Vec<_> = first.entries.iter().map(|e| e.node_id).collect();
+                    let ids: Vec<_> = first.entries.iter().map(|e| e.id).collect();
                     let (fetch_min_ns, fetch_median_ns) = sample_ns(20, || {
                         black_box(
                             store
@@ -244,7 +244,7 @@ fn run(n: usize, batch: usize) {
     // the root manifest has been fetched and decoded, so this prices the O(L)
     // manifest step without reading any leaf.
     let below = TimelineEntry::new(ROOM, i64::MIN, i64::MIN, [0u8; 16], [0u8; 32]);
-    let below_cursor = TimelineCursor::new(root_id, below);
+    let below_cursor = index.cursor(root_id, below);
     let (root_min_ns, root_median_ns) = sample_ns(20, || {
         black_box(
             index

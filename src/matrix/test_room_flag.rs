@@ -405,7 +405,7 @@ mod tests {
             db.pool(ShardType::EventDag).as_ref(),
             std::str::from_utf8(room_id).unwrap(),
         );
-        let room_scope = crate::timeline::room_scope_id(room_id);
+        let room_scope = crate::interop::room_scope_id(room_id);
         timeline_index
             .append(
                 &db,
@@ -415,7 +415,7 @@ mod tests {
                     1,
                     1,
                     node1,
-                    crate::timeline::event_id_ref(ev1),
+                    crate::interop::event_id_ref(ev1),
                 )],
             )
             .unwrap();

@@ -290,6 +290,18 @@ pub fn event_record_id(event_id: &[u8]) -> [u8; 16] {
     id
 }
 
+/// Derive the ordered-index scope for a Matrix room identifier.
+#[must_use]
+pub fn room_scope_id(room_id: &[u8]) -> [u8; 16] {
+    derive_id(b"timeline-room-scope", room_id)
+}
+
+/// Hash a complete Matrix event identifier for use as an ordered-key tag.
+#[must_use]
+pub fn event_id_ref(event_id: &[u8]) -> [u8; 32] {
+    *blake3::hash(event_id).as_bytes()
+}
+
 /// Derive the per-event verdict collection holding `node`.
 ///
 /// Bucketed so one write's cost stays proportional to its bucket rather

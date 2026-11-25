@@ -172,6 +172,8 @@ pub const MEMBER_NAMESPACE_STGP: [u8; 4] = *b"STGP";
 pub const MEMBER_NAMESPACE_FWD: [u8; 4] = *b"FWD ";
 /// Member namespace for room flag bitmap collections (`b"FLAG"`).
 pub const MEMBER_NAMESPACE_FLAG: [u8; 4] = *b"FLAG";
+/// Member namespace for ordered-index collections (`b"ORDX"`).
+pub const MEMBER_NAMESPACE_ORDX: [u8; 4] = *b"ORDX";
 /// Member namespace for internal system collections (`b"INTL"`).
 pub const MEMBER_NAMESPACE_INTL: [u8; 4] = *b"INTL";
 
@@ -231,6 +233,14 @@ pub const NAMESPACE_BIAS_FLAG: [u8; 32] = [
     0xcc, 0xfa, 0x6a, 0x4c, 0x84, 0xcf, 0x53, 0xb9, 0x8b, 0x5b, 0xd6, 0x7d, 0x5c, 0xb3, 0xaf, 0x8b,
 ];
 
+/// Fixed 32-byte namespace bias constant for `b"ORDX"`.
+///
+/// Computed as `BLAKE3-256("mtxdb/namespace/v1/ORDX")`.
+pub const NAMESPACE_BIAS_ORDX: [u8; 32] = [
+    0x42, 0x09, 0x54, 0xb5, 0xe4, 0xc5, 0x39, 0x1f, 0x23, 0xf9, 0x56, 0x55, 0xc8, 0x63, 0x92, 0x52,
+    0xeb, 0x3b, 0xca, 0x24, 0xcc, 0x15, 0x8b, 0x03, 0x07, 0xad, 0xb1, 0x8f, 0x65, 0xf6, 0x70, 0x4b,
+];
+
 /// Fixed 32-byte namespace bias constant for `b"INTL"`.
 ///
 /// Computed as `BLAKE3-256("mtxdb/namespace/v1/INTL")`.
@@ -241,7 +251,7 @@ pub const NAMESPACE_BIAS_INTL: [u8; 32] = [
 
 /// Map a 4-byte member namespace to its fixed 32-byte bias constant.
 ///
-/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`, `FLAG`).
+/// Returns `Some(bias)` for recognized member namespaces (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`, `FLAG`, `ORDX`).
 /// Returns `None` for unrecognized namespaces (such as physical pool tags like `b"EDGE"`).
 #[must_use]
 pub const fn namespace_bias(namespace: [u8; 4]) -> Option<[u8; 32]> {
@@ -284,6 +294,12 @@ pub const fn namespace_bias(namespace: [u8; 4]) -> Option<[u8; 32]> {
         && namespace[3] == b' '
     {
         Some(NAMESPACE_BIAS_FWD)
+    } else if namespace[0] == b'O'
+        && namespace[1] == b'R'
+        && namespace[2] == b'D'
+        && namespace[3] == b'X'
+    {
+        Some(NAMESPACE_BIAS_ORDX)
     } else if namespace[0] == b'F'
         && namespace[1] == b'L'
         && namespace[2] == b'A'
@@ -411,11 +427,11 @@ pub fn try_derive_collection_id(
 /// and group canonical ID (e.g. `b"!room:server"`).
 ///
 /// Convenience helper intended for static, compile-time registered namespaces
-/// (such as `Some(MEMBER_NAMESPACE_EVNT)` or `None`).
+/// (such as `Some(MEMBER_NAMESPACE_EVNT)`, `Some(MEMBER_NAMESPACE_ORDX)`, or `None`).
 ///
 /// # Panics
 /// Panics if `member_namespace` is `Some(ns)` and `ns` is not a registered member
-/// namespace (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`).
+/// namespace (`EVNT`, `PREV`, `AUTH`, `STAT`, `STGP`, `FWD `, `INTL`, `FLAG`, `ORDX`).
 /// Physical pool tags like `b"EDGE"` must **never** be passed here.
 /// For fallible callers handling untrusted or dynamic input, use [`try_derive_collection_id`].
 #[must_use]
@@ -424,7 +440,7 @@ pub fn derive_collection_id(
     collection_canonical_id: &[u8],
 ) -> [u8; 16] {
     try_derive_collection_id(member_namespace, collection_canonical_id)
-        .expect("member_namespace must be a valid registered namespace (EVNT, PREV, AUTH, STAT, STGP, FWD , INTL) or None")
+        .expect("member_namespace must be a valid registered namespace (EVNT, PREV, AUTH, STAT, STGP, FWD , INTL, FLAG, ORDX) or None")
 }
 
 /// The reserved node id under which a collection's metadata (genesis) record

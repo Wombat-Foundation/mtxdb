@@ -782,6 +782,7 @@ fn namespace_bias_constants_match_blake3() {
         (b"FWD ", NAMESPACE_BIAS_FWD),
         (b"INTL", NAMESPACE_BIAS_INTL),
         (b"FLAG", NAMESPACE_BIAS_FLAG),
+        (b"ORDX", NAMESPACE_BIAS_ORDX),
     ] {
         let mut input = Vec::from(&b"mtxdb/namespace/v1/"[..]);
         input.extend_from_slice(namespace);

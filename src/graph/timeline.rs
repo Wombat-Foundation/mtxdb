@@ -1,7 +1,7 @@
-//! Persisted, ordered timeline index with copy-on-write roots.
+//! Persisted, scoped sequence index with copy-on-write roots.
 //!
 //! The packfile index maps node id -> frame and has no key order, so it cannot
-//! answer a range read over a room's timeline. This module adds a **derived**
+//! answer a range read over an ordered scope. This module adds a **derived**
 //! ordered index built from ordinary records, in the same spirit as
 //! [`crate::auxiliary::AuxiliaryIndex`]: it is rebuildable, packfiles stay
 //! authoritative, and event payloads are never duplicated — a leaf stores only
@@ -10,25 +10,12 @@
 //! The persisted key is the total order
 //!
 //! ```text
-//! (room_id, topological_ordering, stream_ordering, node_id, event_ref)
+//! (scope, primary, secondary, id, tag)
 //! ```
 //!
-//! This mirrors Synapse's `events_order_room (room_id, topological_ordering,
-//! stream_ordering)` history order.
-//!
-//! - `room_id` scopes the index; a timeline read is a room-prefix range.
-//! - `topological_ordering` (Matrix: depth) and `stream_ordering` are
-//!   caller-supplied, signed 64-bit and **persisted**; the index never
-//!   recomputes them. `stream_ordering` is signed because Synapse gives
-//!   backfilled events negative stream positions. The caller must define a
-//!   deterministic fallback for events without a computable position (missing
-//!   parents, cycles) before building, because the in-memory DAG order cannot
-//!   be regenerated reliably after reopening.
-//! - `node_id` is the operational 128-bit id of the stored event and the
-//!   tie-break after the two orderings, so equal positions never tie.
-//! - `event_ref` is a caller-supplied 32-byte event identity (reference hash),
-//!   kept as the final disambiguator so two ids for the same content stay
-//!   distinct and ordered deterministically.
+//! The caller defines the meaning of `scope`, `primary`, `secondary`, and
+//! `tag`. These fixed-width fields form a memcomparable key followed by a
+//! 128-bit record id and a 32-byte final tie-break.
 //!
 //! **Prototype.** This is a copy-on-write leaf index, not the production
 //! ordered-run format (memtable, sorted runs, fences, blooms, compaction); see
@@ -53,25 +40,14 @@ use std::borrow::Cow;
 
 use bytes::Bytes;
 
+use crate::bitmap_set::DomainTag;
 use crate::database::{Database, DatabaseTransaction};
 use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{
     derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
-    MEMBER_NAMESPACE_INTL,
+    MEMBER_NAMESPACE_ORDX,
 };
-
-/// Derive a 16-byte scope for [`TimelineEntry`] with domain-separated BLAKE3 over the room ID.
-#[must_use]
-pub fn room_scope_id(room_id: &[u8]) -> [u8; 16] {
-    crate::interop::derive_id(b"timeline-room-scope", room_id)
-}
-
-/// Hash full event ID into a 32-byte reference for [`TimelineEntry`].
-#[must_use]
-pub fn event_id_ref(event_id: &[u8]) -> EventRef {
-    *blake3::hash(event_id).as_bytes()
-}
 
 /// Version byte for timeline records and cursors.
 pub const TIMELINE_FORMAT_VERSION: u8 = 0x01;
@@ -94,14 +70,16 @@ pub const TIMELINE_CURSOR_MAGIC: [u8; 4] = *b"TMLC";
 /// Reserved node id of the head record (the only mutable id in the index).
 pub const TIMELINE_HEAD_ID: NodeId = *b"MTXD-TML-HEAD-v1";
 
-/// A caller-supplied event identity (reference hash).
-pub type EventRef = [u8; 32];
+/// A fixed-width final tie-break component of an ordered key.
+pub type KeyTag = [u8; 32];
+/// Compatibility alias for timeline callers that used event references.
+pub type EventRef = KeyTag;
 
 const ENTRY_LEN: usize = 16 + 8 + 8 + 16 + 32;
 const LEAF_HEADER_LEN: usize = 7;
 const SPAN_DESCRIPTOR_LEN: usize = ENTRY_LEN * 2 + 8 + 16;
 const DIRECTORY_HEADER_LEN: usize = 8;
-const ROOT_HEADER_LEN: usize = 18;
+const ROOT_HEADER_LEN: usize = 34;
 const ROOT_DIRECTORY_LEN: usize = SPAN_DESCRIPTOR_LEN;
 const DIRECTORY_LEAF_LEN: usize = SPAN_DESCRIPTOR_LEN;
 const LEAF_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
@@ -109,10 +87,10 @@ const ROOT_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const DIRECTORY_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const HEAD_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const CURSOR_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
-const HEAD_LEN: usize = 5 + 16 + 8;
-const CURSOR_LEN: usize = 5 + 16 + ENTRY_LEN;
+const HEAD_LEN: usize = 5 + 16 + 16 + 8;
+const CURSOR_LEN: usize = 5 + 16 + 16 + ENTRY_LEN;
 const MAX_NODE_ID: NodeId = [0xff; 16];
-const MAX_EVENT_REF: EventRef = [0xff; 32];
+const MAX_KEY_TAG: KeyTag = [0xff; 32];
 
 /// Order-preserving big-endian encoding of a signed position: flipping the
 /// sign bit makes byte order equal numeric order, so the wire key is
@@ -128,49 +106,48 @@ fn decode_position(mut bytes: [u8; 8]) -> i64 {
     i64::from_be_bytes(bytes)
 }
 
-/// One ordered entry: the full
-/// `(room, topological_ordering, stream_ordering, node, event_ref)` key.
+/// One fixed-width ordered key: `(scope, primary, secondary, id, tag)`.
 ///
 /// Field order is the sort order (`derive(Ord)` compares in declaration order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TimelineEntry {
-    /// Room scope; the leading key component.
-    pub room_id: [u8; 16],
-    /// Caller-supplied topological ordering (Matrix: depth).
-    pub topological_ordering: i64,
-    /// Caller-supplied stream ordering; negative for backfilled events.
-    pub stream_ordering: i64,
-    /// The event's operational 128-bit node id; tie-break after the orderings.
-    pub node_id: NodeId,
-    /// Caller-supplied 32-byte event identity; final disambiguator.
-    pub event_ref: EventRef,
+pub struct ScopedSeqKey {
+    /// The leading scope component.
+    pub scope: [u8; 16],
+    /// Caller-supplied primary signed order component.
+    pub primary: i64,
+    /// Caller-supplied secondary signed order component.
+    pub secondary: i64,
+    /// The 128-bit record id; tie-break after the order components.
+    pub id: NodeId,
+    /// Caller-supplied 32-byte final disambiguator.
+    pub tag: KeyTag,
 }
 
-impl TimelineEntry {
+impl ScopedSeqKey {
     /// Construct an entry.
     #[must_use]
     pub const fn new(
-        room_id: [u8; 16],
-        topological_ordering: i64,
-        stream_ordering: i64,
-        node_id: NodeId,
-        event_ref: EventRef,
+        scope: [u8; 16],
+        primary: i64,
+        secondary: i64,
+        id: NodeId,
+        tag: KeyTag,
     ) -> Self {
         Self {
-            room_id,
-            topological_ordering,
-            stream_ordering,
-            node_id,
-            event_ref,
+            scope,
+            primary,
+            secondary,
+            id,
+            tag,
         }
     }
 
     fn encode_into(self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.room_id);
-        out.extend_from_slice(&encode_position(self.topological_ordering));
-        out.extend_from_slice(&encode_position(self.stream_ordering));
-        out.extend_from_slice(&self.node_id);
-        out.extend_from_slice(&self.event_ref);
+        out.extend_from_slice(&self.scope);
+        out.extend_from_slice(&encode_position(self.primary));
+        out.extend_from_slice(&encode_position(self.secondary));
+        out.extend_from_slice(&self.id);
+        out.extend_from_slice(&self.tag);
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
@@ -182,40 +159,88 @@ impl TimelineEntry {
                 .map(decode_position)
                 .map_err(|_| StorageError::Corrupt(format!("timeline entry {what}")))
         };
-        let mut room_id = [0u8; 16];
-        room_id.copy_from_slice(&bytes[..16]);
-        let topological_ordering = position(16..24, "topological ordering")?;
-        let stream_ordering = position(24..32, "stream ordering")?;
-        let mut node_id = [0u8; 16];
-        node_id.copy_from_slice(&bytes[32..48]);
-        let mut event_ref = [0u8; 32];
-        event_ref.copy_from_slice(&bytes[48..ENTRY_LEN]);
+        let mut scope = [0u8; 16];
+        scope.copy_from_slice(&bytes[..16]);
+        let primary = position(16..24, "primary ordering")?;
+        let secondary = position(24..32, "secondary ordering")?;
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes[32..48]);
+        let mut tag = [0u8; 32];
+        tag.copy_from_slice(&bytes[48..ENTRY_LEN]);
         Ok(Self {
-            room_id,
-            topological_ordering,
-            stream_ordering,
-            node_id,
-            event_ref,
+            scope,
+            primary,
+            secondary,
+            id,
+            tag,
         })
     }
 }
 
+/// Compatibility alias for the original timeline-specific key name.
+pub type TimelineEntry = ScopedSeqKey;
+
+/// Contract for fixed-width keys whose byte encoding matches their order.
+pub trait OrderedKey: Copy + Ord + Eq {
+    /// Leading prefix used to scope a range scan.
+    type Prefix: Copy + Ord + Eq;
+    /// Exact encoded key length.
+    const WIRE_LEN: usize;
+    /// Four-byte schema discriminator mixed into the index domain.
+    const SCHEMA_TAG: [u8; 4];
+    /// Maximum entries in one leaf record.
+    const LEAF_CAP: usize = TIMELINE_LEAF_CAP;
+    /// Maximum child descriptors in one directory record.
+    const DIR_FANOUT: usize = TIMELINE_DIRECTORY_FANOUT;
+
+    /// Return the leftmost prefix of this key's sort order.
+    fn prefix(&self) -> Self::Prefix;
+    /// Encode this key in memcomparable order.
+    fn encode_into(&self, out: &mut Vec<u8>);
+    /// Decode an encoded key.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] if `bytes` is not exactly
+    /// [`Self::WIRE_LEN`] bytes or does not decode into a valid key.
+    fn decode(bytes: &[u8]) -> Result<Self, StorageError>;
+}
+
+impl OrderedKey for ScopedSeqKey {
+    type Prefix = [u8; 16];
+
+    const WIRE_LEN: usize = ENTRY_LEN;
+    const SCHEMA_TAG: [u8; 4] = *b"SQK1";
+
+    fn prefix(&self) -> Self::Prefix {
+        self.scope
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        (*self).encode_into(out);
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        ScopedSeqKey::decode(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SpanDescriptor {
-    min_entry: TimelineEntry,
-    max_entry: TimelineEntry,
+struct SpanDescriptor<K: OrderedKey> {
+    min_entry: K,
+    max_entry: K,
     entry_count: u64,
     child_id: NodeId,
 }
 
-type LeafDescriptor = SpanDescriptor;
-type DirectoryDescriptor = SpanDescriptor;
+type LeafDescriptor<K> = SpanDescriptor<K>;
+type DirectoryDescriptor<K> = SpanDescriptor<K>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TimelineRoot {
+struct TimelineRoot<K: OrderedKey> {
+    domain: DomainTag,
     height: u8,
     entry_count: u64,
-    directories: Vec<DirectoryDescriptor>,
+    directories: Vec<DirectoryDescriptor<K>>,
 }
 
 #[derive(Default)]
@@ -229,13 +254,13 @@ enum StagedRecord {
     Directory(NodeId, Vec<u8>),
 }
 
-trait TimelineTreeIo {
-    fn load_leaf(&mut self, span: &SpanDescriptor) -> Result<Vec<TimelineEntry>, StorageError>;
+trait TimelineTreeIo<K: OrderedKey> {
+    fn load_leaf(&mut self, span: &SpanDescriptor<K>) -> Result<Vec<K>, StorageError>;
     fn load_directory(
         &mut self,
-        span: &SpanDescriptor,
+        span: &SpanDescriptor<K>,
         level: u8,
-    ) -> Result<Vec<SpanDescriptor>, StorageError>;
+    ) -> Result<Vec<SpanDescriptor<K>>, StorageError>;
     fn write_leaf(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError>;
     fn write_directory(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError>;
 }
@@ -319,7 +344,7 @@ fn split_mode(
     siblings: &[DirectoryDescriptor],
     index: usize,
     span: &DirectoryDescriptor,
-    entries: &[TimelineEntry],
+    entries: &[ScopedSeqKey],
 ) -> SplitMode {
     let all_front = entries.last().is_some_and(|entry| *entry < span.min_entry);
     if index == 0 && all_front {
@@ -327,7 +352,7 @@ fn split_mode(
     }
     let no_same_room_after = siblings
         .get(index.saturating_add(1))
-        .is_none_or(|next| next.min_entry.room_id != span.max_entry.room_id);
+        .is_none_or(|next| next.min_entry.scope != span.max_entry.scope);
     let all_tail = entries.first().is_some_and(|entry| *entry > span.max_entry);
     if no_same_room_after && all_tail {
         return SplitMode::Tail;
@@ -335,7 +360,7 @@ fn split_mode(
     SplitMode::Interior
 }
 
-fn root_split_mode(root: &TimelineRoot, entries: &[TimelineEntry]) -> (u8, SplitMode) {
+fn root_split_mode(root: &TimelineRoot, entries: &[ScopedSeqKey]) -> (u8, SplitMode) {
     if root.height == 0 {
         return (1, SplitMode::Tail);
     }
@@ -383,7 +408,7 @@ fn validate_span_children(
     Ok(())
 }
 
-fn target_span_index(spans: &[SpanDescriptor], level: u8, entry: &TimelineEntry) -> usize {
+fn target_span_index(spans: &[SpanDescriptor], level: u8, entry: &ScopedSeqKey) -> usize {
     let pos = spans.partition_point(|span| span.min_entry <= *entry);
     if pos == 0 || pos == spans.len() {
         return pos.saturating_sub(1);
@@ -394,13 +419,12 @@ fn target_span_index(spans: &[SpanDescriptor], level: u8, entry: &TimelineEntry)
     }
     let left_span = &spans[left];
     let right_span = &spans[pos];
-    if left_span.max_entry.room_id != entry.room_id && right_span.min_entry.room_id == entry.room_id
-    {
+    if left_span.max_entry.scope != entry.scope && right_span.min_entry.scope == entry.scope {
         return pos;
     }
     if level == 0
-        && left_span.max_entry.room_id == entry.room_id
-        && right_span.min_entry.room_id == entry.room_id
+        && left_span.max_entry.scope == entry.scope
+        && right_span.min_entry.scope == entry.scope
         && left_span.entry_count == TIMELINE_LEAF_CAP as u64
         && right_span.entry_count < TIMELINE_LEAF_CAP as u64
     {
@@ -412,7 +436,7 @@ fn target_span_index(spans: &[SpanDescriptor], level: u8, entry: &TimelineEntry)
 fn append_spans(
     spans: &[SpanDescriptor],
     level: u8,
-    entries: &[TimelineEntry],
+    entries: &[ScopedSeqKey],
     io: &mut dyn TimelineTreeIo,
     inserted: &mut u64,
 ) -> Result<Vec<SpanDescriptor>, StorageError> {
@@ -502,7 +526,7 @@ fn append_spans(
 
 fn validate_leaf_span(
     descriptor: &SpanDescriptor,
-    entries: &[TimelineEntry],
+    entries: &[ScopedSeqKey],
 ) -> Result<(), StorageError> {
     let first = entries
         .first()
@@ -549,15 +573,20 @@ fn promote_spans(
 /// It carries the full ordering key, so both directions resume exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelineCursor {
+    domain: DomainTag,
     root_id: NodeId,
-    entry: TimelineEntry,
+    entry: ScopedSeqKey,
 }
 
 impl TimelineCursor {
     /// Build a cursor for `root_id` at `entry`.
     #[must_use]
-    pub const fn new(root_id: NodeId, entry: TimelineEntry) -> Self {
-        Self { root_id, entry }
+    pub const fn new(root_id: NodeId, entry: ScopedSeqKey, domain: DomainTag) -> Self {
+        Self {
+            domain,
+            root_id,
+            entry,
+        }
     }
 
     /// The snapshot root this cursor pins.
@@ -568,8 +597,14 @@ impl TimelineCursor {
 
     /// The entry this cursor names.
     #[must_use]
-    pub const fn entry(&self) -> TimelineEntry {
+    pub const fn entry(&self) -> ScopedSeqKey {
         self.entry
+    }
+
+    /// The storage and key-schema domain this cursor belongs to.
+    #[must_use]
+    pub const fn domain(&self) -> DomainTag {
+        self.domain
     }
 
     /// Encode the cursor as opaque, versioned bytes.
@@ -578,6 +613,7 @@ impl TimelineCursor {
         let mut out = Vec::with_capacity(CURSOR_LEN);
         out.extend_from_slice(&TIMELINE_CURSOR_MAGIC);
         out.push(CURSOR_FORMAT_VERSION);
+        out.extend_from_slice(self.domain.as_bytes());
         out.extend_from_slice(&self.root_id);
         self.entry.encode_into(&mut out);
         out
@@ -594,10 +630,15 @@ impl TimelineCursor {
         {
             return None;
         }
+        let domain = DomainTag::new(bytes[5..21].try_into().ok()?);
         let mut root_id = [0u8; 16];
-        root_id.copy_from_slice(&bytes[5..21]);
-        let entry = TimelineEntry::decode(&bytes[21..CURSOR_LEN]).ok()?;
-        Some(Self { root_id, entry })
+        root_id.copy_from_slice(&bytes[21..37]);
+        let entry = ScopedSeqKey::decode(&bytes[37..CURSOR_LEN]).ok()?;
+        Some(Self {
+            domain,
+            root_id,
+            entry,
+        })
     }
 }
 
@@ -605,7 +646,7 @@ impl TimelineCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelinePage {
     /// The entries in traversal order.
-    pub entries: Vec<TimelineEntry>,
+    pub entries: Vec<ScopedSeqKey>,
     /// Resume token, present when the page filled `limit`.
     pub next_cursor: Option<TimelineCursor>,
 }
@@ -616,7 +657,24 @@ pub fn timeline_collection_id(name: &str) -> [u8; 16] {
     let mut canonical = Vec::with_capacity(name.len().saturating_add(9));
     canonical.extend_from_slice(b"timeline:");
     canonical.extend_from_slice(name.as_bytes());
-    derive_collection_id(Some(MEMBER_NAMESPACE_INTL), &canonical)
+    derive_collection_id(Some(MEMBER_NAMESPACE_ORDX), &canonical)
+}
+
+fn timeline_domain(collection_id: &[u8; 16]) -> DomainTag {
+    let schema = <ScopedSeqKey as OrderedKey>::SCHEMA_TAG;
+    let mut label = Vec::with_capacity(schema.len().saturating_add(16));
+    label.extend_from_slice(&schema);
+    label.extend_from_slice(collection_id);
+    DomainTag::derive(&label)
+}
+
+fn timeline_domain_in_pool(pool: ShardType, collection_id: &[u8; 16]) -> DomainTag {
+    let scoped = DomainTag::for_scope(pool, collection_id);
+    let schema = <ScopedSeqKey as OrderedKey>::SCHEMA_TAG;
+    let mut label = Vec::with_capacity(schema.len().saturating_add(16));
+    label.extend_from_slice(&schema);
+    label.extend_from_slice(scoped.as_bytes());
+    DomainTag::derive(&label)
 }
 
 fn content_id(payload: &[u8]) -> NodeId {
@@ -627,8 +685,8 @@ fn content_id(payload: &[u8]) -> NodeId {
 }
 
 fn merge_and_stage_leaves(
-    existing: &[TimelineEntry],
-    incoming: &[TimelineEntry],
+    existing: &[ScopedSeqKey],
+    incoming: &[ScopedSeqKey],
     manifest: &mut Vec<LeafDescriptor>,
     inserted: &mut u64,
     mut stage_record: impl FnMut(NodeId, Vec<u8>) -> Result<(), StorageError>,
@@ -716,12 +774,12 @@ fn build_directory_blocks(
     Ok(directories)
 }
 
-fn room_start(room_id: &[u8; 16]) -> TimelineEntry {
-    TimelineEntry::new(*room_id, i64::MIN, i64::MIN, [0u8; 16], [0u8; 32])
+fn room_start(scope: &[u8; 16]) -> ScopedSeqKey {
+    ScopedSeqKey::new(*scope, i64::MIN, i64::MIN, [0u8; 16], [0u8; 32])
 }
 
-fn room_end(room_id: &[u8; 16]) -> TimelineEntry {
-    TimelineEntry::new(*room_id, i64::MAX, i64::MAX, MAX_NODE_ID, MAX_EVENT_REF)
+fn room_end(scope: &[u8; 16]) -> ScopedSeqKey {
+    ScopedSeqKey::new(*scope, i64::MAX, i64::MAX, MAX_NODE_ID, MAX_KEY_TAG)
 }
 
 /// A persisted timeline index over an existing storage engine.
@@ -729,6 +787,7 @@ pub struct TimelineIndex<'a, S: StorageEngine + ?Sized> {
     engine: &'a S,
     name: Cow<'a, str>,
     collection_id: [u8; 16],
+    domain: DomainTag,
 }
 
 impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
@@ -740,6 +799,19 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         Self::with_collection_id(engine, name, collection_id)
     }
 
+    /// Open a named ordered index with a storage-pool-scoped domain tag.
+    #[must_use]
+    pub fn open_in_pool(engine: &'a S, name: impl Into<Cow<'a, str>>, pool: ShardType) -> Self {
+        let name = name.into();
+        let collection_id = timeline_collection_id(name.as_ref());
+        Self::with_collection_id_and_domain(
+            engine,
+            name,
+            collection_id,
+            timeline_domain_in_pool(pool, &collection_id),
+        )
+    }
+
     /// Open with a pre-computed collection ID and pre-owned or borrowed name.
     #[must_use]
     pub fn with_collection_id(
@@ -747,10 +819,23 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         name: impl Into<Cow<'a, str>>,
         collection_id: [u8; 16],
     ) -> Self {
+        let domain = timeline_domain(&collection_id);
+        Self::with_collection_id_and_domain(engine, name, collection_id, domain)
+    }
+
+    /// Open with an explicit collection id and domain.
+    #[must_use]
+    pub fn with_collection_id_and_domain(
+        engine: &'a S,
+        name: impl Into<Cow<'a, str>>,
+        collection_id: [u8; 16],
+        domain: DomainTag,
+    ) -> Self {
         Self {
             engine,
             name: name.into(),
             collection_id,
+            domain,
         }
     }
 
@@ -760,11 +845,23 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         self.collection_id
     }
 
+    /// This index's key and storage-pool domain.
+    #[must_use]
+    pub const fn domain(&self) -> DomainTag {
+        self.domain
+    }
+
+    /// Construct a cursor pinned to this index's domain.
+    #[must_use]
+    pub const fn cursor(&self, root_id: NodeId, entry: ScopedSeqKey) -> TimelineCursor {
+        TimelineCursor::new(root_id, entry, self.domain)
+    }
+
     /// The collection metadata describing this index.
     #[must_use]
     pub fn metadata(&self) -> CollectionMetadata {
         CollectionMetadata {
-            member_namespace: Some(MEMBER_NAMESPACE_INTL),
+            member_namespace: Some(MEMBER_NAMESPACE_ORDX),
             collection_canonical_id: format!("timeline:{}", self.name).into_bytes(),
             record_id_rule: RecordIdentityRule {
                 policy: FrameIdPolicy::Key,
@@ -797,7 +894,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// # Errors
     /// Propagates the backend error, or [`StorageError::Internal`] if a count
     /// exceeds the record layout.
-    pub fn build(&self, entries: &[TimelineEntry]) -> Result<NodeId, StorageError> {
+    pub fn build(&self, entries: &[ScopedSeqKey]) -> Result<NodeId, StorageError> {
         self.ensure_metadata()?;
         let mut sorted = entries.to_vec();
         sorted.sort_unstable();
@@ -829,10 +926,10 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             let mut io = DirectTimelineTreeIo { index: self };
             promote_spans(leaves, 1, SplitMode::Tail, &mut io)?
         };
-        let root_payload = encode_root(&directories, count, height)?;
+        let root_payload = encode_root(&directories, count, height, self.domain)?;
         let root_id = content_id(&root_payload);
         self.write_record(&root_id, root_payload)?;
-        self.write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, count))?;
+        self.write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, count, self.domain))?;
         Ok(root_id)
     }
 
@@ -855,7 +952,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         &self,
         database: &Database,
         pool: ShardType,
-        new_entries: &[TimelineEntry],
+        new_entries: &[ScopedSeqKey],
     ) -> Result<NodeId, StorageError> {
         let transaction = database.begin_transaction();
         let root_id = self.stage_append(&transaction, pool, new_entries)?;
@@ -891,7 +988,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         &self,
         transaction: &DatabaseTransaction<'_>,
         pool: ShardType,
-        new_entries: &[TimelineEntry],
+        new_entries: &[ScopedSeqKey],
     ) -> Result<NodeId, StorageError> {
         let engine_identity = std::ptr::from_ref(self.engine).cast::<()>() as usize;
         if engine_identity != transaction.pool_identity(pool) {
@@ -909,13 +1006,13 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             StorageError::Internal("timeline head read returned no slot".to_owned())
         })?;
         let (old_root_id, old_count, root) = if let Some(head) = head_record {
-            let (root_id, count) = decode_head(&head.bytes)?;
+            let (root_id, count) = decode_head(&head.bytes, self.domain)?;
             let root_records = transaction.get(pool, &self.collection_id, &[root_id])?;
             let root_record = root_records
                 .first()
                 .and_then(Option::as_ref)
                 .ok_or(StorageError::NotFound(root_id))?;
-            let root = decode_root(&root_record.bytes)?;
+            let root = decode_root(&root_record.bytes, self.domain)?;
             if root.entry_count != count {
                 return Err(StorageError::Corrupt(
                     "timeline head/root count mismatch".to_owned(),
@@ -927,6 +1024,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
                 None,
                 0,
                 TimelineRoot {
+                    domain: self.domain,
                     height: 0,
                     entry_count: 0,
                     directories: Vec::new(),
@@ -991,14 +1089,14 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         let count = old_count
             .checked_add(staged.inserted)
             .ok_or_else(|| StorageError::Internal("timeline entry count overflow".to_owned()))?;
-        let root_payload = encode_root(&next_directories, count, next_height)?;
+        let root_payload = encode_root(&next_directories, count, next_height, self.domain)?;
         let root_id = content_id(&root_payload);
         self.stage_record(transaction, pool, &root_id, root_payload)?;
         self.stage_record(
             transaction,
             pool,
             &TIMELINE_HEAD_ID,
-            encode_head(&root_id, count),
+            encode_head(&root_id, count, self.domain),
         )?;
         Ok(root_id)
     }
@@ -1019,7 +1117,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// resulting entry count cannot be represented.
     pub fn append_untransactional(
         &self,
-        new_entries: &[TimelineEntry],
+        new_entries: &[ScopedSeqKey],
     ) -> Result<NodeId, StorageError> {
         self.ensure_metadata()?;
         let Some((old_root_id, old_count)) = self.head()? else {
@@ -1033,7 +1131,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             .engine
             .get(&self.collection_id, &old_root_id)?
             .ok_or(StorageError::NotFound(old_root_id))?;
-        let root = decode_root(&root_bytes.bytes)?;
+        let root = decode_root(&root_bytes.bytes, self.domain)?;
         if root.entry_count != old_count {
             return Err(StorageError::Corrupt(
                 "timeline head/root count mismatch".to_owned(),
@@ -1062,10 +1160,10 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         let count = old_count
             .checked_add(inserted)
             .ok_or_else(|| StorageError::Internal("timeline entry count overflow".to_owned()))?;
-        let root_payload = encode_root(&directories, count, height)?;
+        let root_payload = encode_root(&directories, count, height, self.domain)?;
         let root_id = content_id(&root_payload);
         self.write_record(&root_id, root_payload)?;
-        self.write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, count))?;
+        self.write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, count, self.domain))?;
         Ok(root_id)
     }
 
@@ -1098,11 +1196,11 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     pub fn head(&self) -> Result<Option<(NodeId, u64)>, StorageError> {
         match self.engine.get(&self.collection_id, &TIMELINE_HEAD_ID)? {
             None => Ok(None),
-            Some(data) => decode_head(&data.bytes).map(Some),
+            Some(data) => decode_head(&data.bytes, self.domain).map(Some),
         }
     }
 
-    /// Read one page of `room_id` in `forward` (ascending) or reverse order.
+    /// Read one page of `scope` in `forward` (ascending) or reverse order.
     ///
     /// Forward returns keys strictly greater than `cursor`; reverse strictly
     /// less. `None` starts at the room's first (forward) or last (reverse)
@@ -1116,7 +1214,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     /// record is missing.
     pub fn page(
         &self,
-        room_id: &[u8; 16],
+        scope: &[u8; 16],
         cursor: Option<&TimelineCursor>,
         forward: bool,
         limit: usize,
@@ -1131,7 +1229,12 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
 
         let (snapshot_root, key) = match cursor {
             Some(cursor) => {
-                if cursor.entry.room_id != *room_id {
+                if cursor.domain != self.domain {
+                    return Err(StorageError::Corrupt(
+                        "timeline cursor domain mismatch".to_owned(),
+                    ));
+                }
+                if cursor.entry.scope != *scope {
                     return Err(StorageError::Corrupt(
                         "timeline cursor names a different room".to_owned(),
                     ));
@@ -1141,9 +1244,9 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             None => match self.head()? {
                 Some((snapshot_root, _count)) => {
                     let key = if forward {
-                        room_start(room_id)
+                        room_start(scope)
                     } else {
-                        room_end(room_id)
+                        room_end(scope)
                     };
                     (snapshot_root, Some(key))
                 }
@@ -1155,21 +1258,20 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             .engine
             .get(&self.collection_id, &snapshot_root)?
             .ok_or(StorageError::NotFound(snapshot_root))?;
-        let root = decode_root(&root_bytes.bytes)?;
+        let root = decode_root(&root_bytes.bytes, self.domain)?;
         if root.directories.is_empty() {
             return Ok(empty);
         }
 
-        let mut out: Vec<TimelineEntry> = Vec::with_capacity(limit);
+        let mut out: Vec<ScopedSeqKey> = Vec::with_capacity(limit);
         let level = root.height.saturating_sub(1);
         if forward {
-            self.forward_page(&root.directories, level, room_id, key, limit, &mut out)?;
+            self.forward_page(&root.directories, level, scope, key, limit, &mut out)?;
         } else {
-            self.reverse_page(&root.directories, level, room_id, key, limit, &mut out)?;
+            self.reverse_page(&root.directories, level, scope, key, limit, &mut out)?;
         }
         let next_cursor = if out.len() == limit {
-            out.last()
-                .map(|entry| TimelineCursor::new(snapshot_root, *entry))
+            out.last().map(|entry| self.cursor(snapshot_root, *entry))
         } else {
             None
         };
@@ -1184,25 +1286,25 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         spans: &[SpanDescriptor],
         level: u8,
         room_scope: &[u8; 16],
-        key: Option<TimelineEntry>,
+        key: Option<ScopedSeqKey>,
         limit: usize,
-        out: &mut Vec<TimelineEntry>,
+        out: &mut Vec<ScopedSeqKey>,
     ) -> Result<(), StorageError> {
         let start = forward_leaf_start(spans, key);
         for span in spans.iter().skip(start) {
-            if span.min_entry.room_id > *room_scope {
+            if span.min_entry.scope > *room_scope {
                 break;
             }
-            if span.max_entry.room_id < *room_scope {
+            if span.max_entry.scope < *room_scope {
                 continue;
             }
             if level == 0 {
                 let leaf = self.load_leaf(&span.child_id)?;
                 for entry in &leaf {
-                    if entry.room_id < *room_scope {
+                    if entry.scope < *room_scope {
                         continue;
                     }
-                    if entry.room_id > *room_scope {
+                    if entry.scope > *room_scope {
                         return Ok(());
                     }
                     if key.is_some_and(|k| *entry <= k) {
@@ -1236,28 +1338,28 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         spans: &[SpanDescriptor],
         level: u8,
         room_scope: &[u8; 16],
-        key: Option<TimelineEntry>,
+        key: Option<ScopedSeqKey>,
         limit: usize,
-        out: &mut Vec<TimelineEntry>,
+        out: &mut Vec<ScopedSeqKey>,
     ) -> Result<(), StorageError> {
         let Some(start) = reverse_leaf_start(spans, key) else {
             return Ok(());
         };
         for index in (0..=start).rev() {
             let span = &spans[index];
-            if span.min_entry.room_id > *room_scope {
+            if span.min_entry.scope > *room_scope {
                 continue;
             }
-            if span.max_entry.room_id < *room_scope {
+            if span.max_entry.scope < *room_scope {
                 break;
             }
             if level == 0 {
                 let leaf = self.load_leaf(&span.child_id)?;
                 for entry in leaf.iter().rev() {
-                    if entry.room_id > *room_scope {
+                    if entry.scope > *room_scope {
                         continue;
                     }
-                    if entry.room_id < *room_scope {
+                    if entry.scope < *room_scope {
                         return Ok(());
                     }
                     if key.is_some_and(|k| *entry >= k) {
@@ -1298,7 +1400,7 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         )
     }
 
-    fn load_leaf(&self, id: &NodeId) -> Result<Vec<TimelineEntry>, StorageError> {
+    fn load_leaf(&self, id: &NodeId) -> Result<Vec<ScopedSeqKey>, StorageError> {
         let bytes = self
             .engine
             .get(&self.collection_id, id)?
@@ -1324,7 +1426,7 @@ struct DirectTimelineTreeIo<'index, 'engine, S: StorageEngine + ?Sized> {
 }
 
 impl<S: StorageEngine + ?Sized> TimelineTreeIo for DirectTimelineTreeIo<'_, '_, S> {
-    fn load_leaf(&mut self, span: &SpanDescriptor) -> Result<Vec<TimelineEntry>, StorageError> {
+    fn load_leaf(&mut self, span: &SpanDescriptor) -> Result<Vec<ScopedSeqKey>, StorageError> {
         self.index.load_leaf(&span.child_id)
     }
 
@@ -1353,7 +1455,7 @@ struct TransactionTimelineTreeIo<'index, 'engine, 'tx, 'db, S: StorageEngine + ?
 }
 
 impl<S: StorageEngine + ?Sized> TimelineTreeIo for TransactionTimelineTreeIo<'_, '_, '_, '_, S> {
-    fn load_leaf(&mut self, span: &SpanDescriptor) -> Result<Vec<TimelineEntry>, StorageError> {
+    fn load_leaf(&mut self, span: &SpanDescriptor) -> Result<Vec<ScopedSeqKey>, StorageError> {
         let records =
             self.transaction
                 .get(self.pool, &self.index.collection_id, &[span.child_id])?;
@@ -1392,7 +1494,7 @@ impl<S: StorageEngine + ?Sized> TimelineTreeIo for TransactionTimelineTreeIo<'_,
     }
 }
 
-fn forward_leaf_start(leaves: &[LeafDescriptor], key: Option<TimelineEntry>) -> usize {
+fn forward_leaf_start(leaves: &[LeafDescriptor], key: Option<ScopedSeqKey>) -> usize {
     let Some(key) = key else {
         return 0;
     };
@@ -1401,14 +1503,14 @@ fn forward_leaf_start(leaves: &[LeafDescriptor], key: Option<TimelineEntry>) -> 
         .saturating_sub(1)
 }
 
-fn reverse_leaf_start(leaves: &[LeafDescriptor], key: Option<TimelineEntry>) -> Option<usize> {
+fn reverse_leaf_start(leaves: &[LeafDescriptor], key: Option<ScopedSeqKey>) -> Option<usize> {
     let bound = key?;
     leaves
         .partition_point(|leaf| leaf.min_entry < bound)
         .checked_sub(1)
 }
 
-fn encode_leaf(entries: &[TimelineEntry]) -> Result<Vec<u8>, StorageError> {
+fn encode_leaf(entries: &[ScopedSeqKey]) -> Result<Vec<u8>, StorageError> {
     let count = u16::try_from(entries.len())
         .map_err(|_| StorageError::Internal("timeline leaf exceeds u16 entries".to_owned()))?;
     let mut out = Vec::with_capacity(
@@ -1426,7 +1528,7 @@ fn encode_leaf(entries: &[TimelineEntry]) -> Result<Vec<u8>, StorageError> {
     Ok(out)
 }
 
-fn decode_leaf(bytes: &[u8]) -> Result<Vec<TimelineEntry>, StorageError> {
+fn decode_leaf(bytes: &[u8]) -> Result<Vec<ScopedSeqKey>, StorageError> {
     if bytes.len() < LEAF_HEADER_LEN
         || bytes[..4] != TIMELINE_LEAF_MAGIC
         || bytes[4] != LEAF_FORMAT_VERSION
@@ -1450,7 +1552,7 @@ fn decode_leaf(bytes: &[u8]) -> Result<Vec<TimelineEntry>, StorageError> {
         let end = start
             .checked_add(ENTRY_LEN)
             .ok_or_else(|| StorageError::Corrupt("timeline leaf offset".to_owned()))?;
-        entries.push(TimelineEntry::decode(&bytes[start..end])?);
+        entries.push(ScopedSeqKey::decode(&bytes[start..end])?);
     }
     Ok(entries)
 }
@@ -1550,8 +1652,8 @@ fn decode_span(bytes: &[u8]) -> Result<SpanDescriptor, StorageError> {
         .split_at_checked(8)
         .ok_or_else(|| StorageError::Corrupt("timeline span count".to_owned()))?;
     Ok(SpanDescriptor {
-        min_entry: TimelineEntry::decode(min_bytes)?,
-        max_entry: TimelineEntry::decode(max_bytes)?,
+        min_entry: ScopedSeqKey::decode(min_bytes)?,
+        max_entry: ScopedSeqKey::decode(max_bytes)?,
         entry_count: u64::from_be_bytes(
             <[u8; 8]>::try_from(count_bytes)
                 .map_err(|_| StorageError::Corrupt("timeline span count".to_owned()))?,
@@ -1564,6 +1666,7 @@ fn encode_root(
     directories: &[DirectoryDescriptor],
     count: u64,
     height: u8,
+    domain: DomainTag,
 ) -> Result<Vec<u8>, StorageError> {
     let directory_count = u32::try_from(directories.len())
         .map_err(|_| StorageError::Internal("timeline root exceeds u32 directories".to_owned()))?;
@@ -1585,6 +1688,7 @@ fn encode_root(
     out.extend_from_slice(&TIMELINE_ROOT_MAGIC);
     out.push(ROOT_FORMAT_VERSION);
     out.push(height);
+    out.extend_from_slice(domain.as_bytes());
     out.extend_from_slice(&count.to_be_bytes());
     out.extend_from_slice(&directory_count.to_be_bytes());
     for directory in directories {
@@ -1596,7 +1700,7 @@ fn encode_root(
     Ok(out)
 }
 
-fn decode_root(bytes: &[u8]) -> Result<TimelineRoot, StorageError> {
+fn decode_root(bytes: &[u8], expected_domain: DomainTag) -> Result<TimelineRoot, StorageError> {
     if bytes.len() < ROOT_HEADER_LEN
         || bytes[..4] != TIMELINE_ROOT_MAGIC
         || bytes[4] != ROOT_FORMAT_VERSION
@@ -1604,12 +1708,22 @@ fn decode_root(bytes: &[u8]) -> Result<TimelineRoot, StorageError> {
         return Err(StorageError::Corrupt("timeline root header".to_owned()));
     }
     let height = bytes[5];
+    let domain = DomainTag::new(
+        bytes[6..22]
+            .try_into()
+            .map_err(|_| StorageError::Corrupt("timeline root domain".to_owned()))?,
+    );
+    if domain != expected_domain {
+        return Err(StorageError::Corrupt(
+            "timeline root domain mismatch".to_owned(),
+        ));
+    }
     let entry_count = u64::from_be_bytes(
-        bytes[6..14]
+        bytes[22..30]
             .try_into()
             .map_err(|_| StorageError::Corrupt("timeline root count".to_owned()))?,
     );
-    let directory_count = u32::from_be_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]) as usize;
+    let directory_count = u32::from_be_bytes([bytes[30], bytes[31], bytes[32], bytes[33]]) as usize;
     let expected = directory_count
         .checked_mul(ROOT_DIRECTORY_LEN)
         .and_then(|body| body.checked_add(ROOT_HEADER_LEN))
@@ -1639,8 +1753,8 @@ fn decode_root(bytes: &[u8]) -> Result<TimelineRoot, StorageError> {
         let (count_bytes, child_bytes) = rest
             .split_at_checked(8)
             .ok_or_else(|| StorageError::Corrupt("timeline root directory count".to_owned()))?;
-        let min_entry = TimelineEntry::decode(min_bytes)?;
-        let max_entry = TimelineEntry::decode(max_bytes)?;
+        let min_entry = ScopedSeqKey::decode(min_bytes)?;
+        let max_entry = ScopedSeqKey::decode(max_bytes)?;
         let directory_entry_count = u64::from_be_bytes(
             <[u8; 8]>::try_from(count_bytes)
                 .map_err(|_| StorageError::Corrupt("timeline root directory count".to_owned()))?,
@@ -1675,31 +1789,43 @@ fn decode_root(bytes: &[u8]) -> Result<TimelineRoot, StorageError> {
         return Err(StorageError::Corrupt("timeline root height".to_owned()));
     }
     Ok(TimelineRoot {
+        domain,
         height,
         entry_count,
         directories,
     })
 }
-fn encode_head(root_id: &NodeId, count: u64) -> Vec<u8> {
+fn encode_head(root_id: &NodeId, count: u64, domain: DomainTag) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEAD_LEN);
     out.extend_from_slice(&TIMELINE_HEAD_MAGIC);
     out.push(HEAD_FORMAT_VERSION);
+    out.extend_from_slice(domain.as_bytes());
     out.extend_from_slice(root_id);
     out.extend_from_slice(&count.to_be_bytes());
     out
 }
 
-fn decode_head(bytes: &[u8]) -> Result<(NodeId, u64), StorageError> {
+fn decode_head(bytes: &[u8], expected_domain: DomainTag) -> Result<(NodeId, u64), StorageError> {
     if bytes.len() != HEAD_LEN
         || bytes[..4] != TIMELINE_HEAD_MAGIC
         || bytes[4] != HEAD_FORMAT_VERSION
     {
         return Err(StorageError::Corrupt("timeline head".to_owned()));
     }
+    let domain = DomainTag::new(
+        bytes[5..21]
+            .try_into()
+            .map_err(|_| StorageError::Corrupt("timeline head domain".to_owned()))?,
+    );
+    if domain != expected_domain {
+        return Err(StorageError::Corrupt(
+            "timeline head domain mismatch".to_owned(),
+        ));
+    }
     let mut root_id = [0u8; 16];
-    root_id.copy_from_slice(&bytes[5..21]);
+    root_id.copy_from_slice(&bytes[21..37]);
     let count = u64::from_be_bytes(
-        bytes[21..HEAD_LEN]
+        bytes[37..HEAD_LEN]
             .try_into()
             .map_err(|_| StorageError::Corrupt("timeline head count".to_owned()))?,
     );
