@@ -109,8 +109,6 @@ const ROOT_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const DIRECTORY_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const HEAD_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const CURSOR_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
-const DIRECTORY_LEVEL: u8 = 1;
-const ROOT_HEIGHT: u8 = 2;
 const HEAD_LEN: usize = 5 + 16 + 8;
 const CURSOR_LEN: usize = 5 + 16 + ENTRY_LEN;
 const MAX_NODE_ID: NodeId = [0xff; 16];
@@ -222,9 +220,24 @@ struct TimelineRoot {
 
 #[derive(Default)]
 struct StagedTree {
-    leaf_records: Vec<(NodeId, Vec<u8>)>,
-    directory_records: Vec<(NodeId, Vec<u8>)>,
+    records: Vec<StagedRecord>,
     inserted: u64,
+}
+
+enum StagedRecord {
+    Leaf(NodeId, Vec<u8>),
+    Directory(NodeId, Vec<u8>),
+}
+
+trait TimelineTreeIo {
+    fn load_leaf(&mut self, span: &SpanDescriptor) -> Result<Vec<TimelineEntry>, StorageError>;
+    fn load_directory(
+        &mut self,
+        span: &SpanDescriptor,
+        level: u8,
+    ) -> Result<Vec<SpanDescriptor>, StorageError>;
+    fn write_leaf(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError>;
+    fn write_directory(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError>;
 }
 
 #[derive(Clone, Copy)]
@@ -278,7 +291,7 @@ fn directory_chunk_ranges(
                 .checked_rem(cap)
                 .ok_or_else(|| StorageError::Internal("directory fanout is zero".to_owned()))?;
             let first_size = match mode {
-                SplitMode::Tail => cap,
+                SplitMode::Tail => cap.min(len),
                 SplitMode::Front if remainder == 0 => cap,
                 SplitMode::Front => remainder,
                 SplitMode::Interior => unreachable!(),
@@ -308,18 +321,227 @@ fn split_mode(
     span: &DirectoryDescriptor,
     entries: &[TimelineEntry],
 ) -> SplitMode {
-    let all_front = entries.iter().all(|entry| *entry < span.min_entry);
+    let all_front = entries.last().is_some_and(|entry| *entry < span.min_entry);
     if index == 0 && all_front {
         return SplitMode::Front;
     }
     let no_same_room_after = siblings
         .get(index.saturating_add(1))
         .is_none_or(|next| next.min_entry.room_id != span.max_entry.room_id);
-    let all_tail = entries.iter().all(|entry| *entry > span.max_entry);
+    let all_tail = entries.first().is_some_and(|entry| *entry > span.max_entry);
     if no_same_room_after && all_tail {
         return SplitMode::Tail;
     }
     SplitMode::Interior
+}
+
+fn root_split_mode(root: &TimelineRoot, entries: &[TimelineEntry]) -> (u8, SplitMode) {
+    if root.height == 0 {
+        return (1, SplitMode::Tail);
+    }
+    let mode = if root
+        .directories
+        .first()
+        .is_some_and(|span| entries.last().is_some_and(|entry| *entry < span.min_entry))
+    {
+        SplitMode::Front
+    } else if root
+        .directories
+        .last()
+        .is_some_and(|span| entries.first().is_some_and(|entry| *entry > span.max_entry))
+    {
+        SplitMode::Tail
+    } else {
+        SplitMode::Interior
+    };
+    (root.height, mode)
+}
+
+fn validate_span_children(
+    parent: &SpanDescriptor,
+    children: &[SpanDescriptor],
+) -> Result<(), StorageError> {
+    let first = children
+        .first()
+        .ok_or_else(|| StorageError::Corrupt("empty timeline directory".to_owned()))?;
+    let last = children
+        .last()
+        .ok_or_else(|| StorageError::Corrupt("empty timeline directory".to_owned()))?;
+    let entry_count = children.iter().try_fold(0_u64, |count, child| {
+        count
+            .checked_add(child.entry_count)
+            .ok_or_else(|| StorageError::Corrupt("timeline span count overflow".to_owned()))
+    })?;
+    if first.min_entry != parent.min_entry
+        || last.max_entry != parent.max_entry
+        || entry_count != parent.entry_count
+    {
+        return Err(StorageError::Corrupt(
+            "timeline directory span mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn target_span_index(spans: &[SpanDescriptor], level: u8, entry: &TimelineEntry) -> usize {
+    let pos = spans.partition_point(|span| span.min_entry <= *entry);
+    if pos == 0 || pos == spans.len() {
+        return pos.saturating_sub(1);
+    }
+    let left = pos.saturating_sub(1);
+    if *entry <= spans[left].max_entry {
+        return left;
+    }
+    let left_span = &spans[left];
+    let right_span = &spans[pos];
+    if left_span.max_entry.room_id != entry.room_id && right_span.min_entry.room_id == entry.room_id
+    {
+        return pos;
+    }
+    if level == 0
+        && left_span.max_entry.room_id == entry.room_id
+        && right_span.min_entry.room_id == entry.room_id
+        && left_span.entry_count == TIMELINE_LEAF_CAP as u64
+        && right_span.entry_count < TIMELINE_LEAF_CAP as u64
+    {
+        return pos;
+    }
+    left
+}
+
+fn append_spans(
+    spans: &[SpanDescriptor],
+    level: u8,
+    entries: &[TimelineEntry],
+    io: &mut dyn TimelineTreeIo,
+    inserted: &mut u64,
+) -> Result<Vec<SpanDescriptor>, StorageError> {
+    if spans.is_empty() {
+        if level != 0 {
+            return Err(StorageError::Corrupt(
+                "empty non-leaf timeline directory".to_owned(),
+            ));
+        }
+        let mut leaves = Vec::new();
+        merge_and_stage_leaves(&[], entries, &mut leaves, inserted, |id, payload| {
+            io.write_leaf(id, payload)
+        })?;
+        return Ok(leaves);
+    }
+
+    let mut assigned = vec![Vec::new(); spans.len()];
+    for entry in entries {
+        let index = target_span_index(spans, level, entry);
+        let slot = assigned
+            .get_mut(index)
+            .ok_or_else(|| StorageError::Internal("timeline span route".to_owned()))?;
+        slot.push(*entry);
+    }
+
+    let mut output = Vec::with_capacity(spans.len());
+    for (index, span) in spans.iter().enumerate() {
+        let incoming = &assigned[index];
+        if incoming.is_empty() {
+            output.push(*span);
+            continue;
+        }
+        let before = *inserted;
+        if level == 0 {
+            let all_before = incoming.last().is_some_and(|entry| *entry < span.min_entry);
+            let all_after = incoming
+                .first()
+                .is_some_and(|entry| *entry > span.max_entry);
+            if span.entry_count == TIMELINE_LEAF_CAP as u64 && (all_before || all_after) {
+                let mut added = Vec::new();
+                merge_and_stage_leaves(&[], incoming, &mut added, inserted, |id, payload| {
+                    io.write_leaf(id, payload)
+                })?;
+                if all_before {
+                    output.extend(added);
+                    output.push(*span);
+                } else {
+                    output.push(*span);
+                    output.extend(added);
+                }
+                continue;
+            }
+            let existing = io.load_leaf(span)?;
+            validate_leaf_span(span, &existing)?;
+            if incoming
+                .iter()
+                .all(|entry| existing.binary_search(entry).is_ok())
+            {
+                output.push(*span);
+                continue;
+            }
+            merge_and_stage_leaves(&existing, incoming, &mut output, inserted, |id, payload| {
+                io.write_leaf(id, payload)
+            })?;
+        } else {
+            let children = io.load_directory(span, level)?;
+            validate_span_children(span, &children)?;
+            let child_level = level.checked_sub(1).ok_or_else(|| {
+                StorageError::Corrupt("timeline directory level underflow".to_owned())
+            })?;
+            let changed = append_spans(&children, child_level, incoming, io, inserted)?;
+            if *inserted == before {
+                output.push(*span);
+                continue;
+            }
+            let mode = split_mode(spans, index, span, incoming);
+            output.extend(build_directory_blocks(
+                &changed,
+                level,
+                mode,
+                |id, payload| io.write_directory(id, payload),
+            )?);
+        }
+    }
+    Ok(output)
+}
+
+fn validate_leaf_span(
+    descriptor: &SpanDescriptor,
+    entries: &[TimelineEntry],
+) -> Result<(), StorageError> {
+    let first = entries
+        .first()
+        .ok_or_else(|| StorageError::Corrupt("empty timeline leaf".to_owned()))?;
+    let last = entries
+        .last()
+        .ok_or_else(|| StorageError::Corrupt("empty timeline leaf".to_owned()))?;
+    let count = u64::try_from(entries.len())
+        .map_err(|_| StorageError::Corrupt("timeline leaf count overflow".to_owned()))?;
+    if *first != descriptor.min_entry
+        || *last != descriptor.max_entry
+        || count != descriptor.entry_count
+    {
+        return Err(StorageError::Corrupt(
+            "timeline leaf span mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn promote_spans(
+    mut spans: Vec<SpanDescriptor>,
+    mut height: u8,
+    mode: SplitMode,
+    io: &mut dyn TimelineTreeIo,
+) -> Result<(u8, Vec<SpanDescriptor>), StorageError> {
+    if spans.is_empty() {
+        return Ok((0, spans));
+    }
+    while spans.len() > TIMELINE_DIRECTORY_FANOUT {
+        let next_height = height
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Internal("timeline height overflow".to_owned()))?;
+        spans = build_directory_blocks(&spans, height, mode, |id, payload| {
+            io.write_directory(id, payload)
+        })?;
+        height = next_height;
+    }
+    Ok((height, spans))
 }
 
 /// An opaque, stable cursor naming the snapshot root plus the last entry read.
@@ -601,19 +823,11 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             });
         }
 
-        let count = u64::try_from(sorted.len()).unwrap_or(u64::MAX);
-        let (height, directories) = if leaves.len() <= TIMELINE_DIRECTORY_FANOUT {
-            (1, leaves)
-        } else {
-            (
-                ROOT_HEIGHT,
-                build_directory_blocks(
-                    &leaves,
-                    DIRECTORY_LEVEL,
-                    SplitMode::Tail,
-                    |id, payload| self.write_record(&id, payload),
-                )?,
-            )
+        let count = u64::try_from(sorted.len())
+            .map_err(|_| StorageError::Internal("timeline entry count exceeds u64".to_owned()))?;
+        let (height, directories) = {
+            let mut io = DirectTimelineTreeIo { index: self };
+            promote_spans(leaves, 1, SplitMode::Tail, &mut io)?
         };
         let root_payload = encode_root(&directories, count, height)?;
         let root_id = content_id(&root_payload);
@@ -728,9 +942,26 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         let mut pending = new_entries.to_vec();
         pending.sort_unstable();
         pending.dedup();
+        let mut inserted = 0_u64;
         let mut staged = StagedTree::default();
-        let next_directories =
-            self.stage_directory_tree(transaction, pool, &root, &pending, &mut staged)?;
+        let (start_height, split_mode) = root_split_mode(&root, &pending);
+        let (next_height, next_directories) = {
+            let mut io = TransactionTimelineTreeIo {
+                index: self,
+                transaction,
+                pool,
+                staged: &mut staged,
+            };
+            let next_spans = append_spans(
+                &root.directories,
+                root.height.saturating_sub(1),
+                &pending,
+                &mut io,
+                &mut inserted,
+            )?;
+            promote_spans(next_spans, start_height, split_mode, &mut io)?
+        };
+        staged.inserted = inserted;
         if staged.inserted == 0 {
             if let Some(root_id) = old_root_id {
                 return Ok(root_id);
@@ -749,17 +980,18 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             .expect_collection_version(pool, self.collection_id, collection_version)
             .map_err(StorageError::Io)?;
 
-        for (leaf_id, payload) in staged.leaf_records {
-            self.stage_record(transaction, pool, &leaf_id, payload)?;
-        }
-        for (directory_id, payload) in staged.directory_records {
-            self.stage_record(transaction, pool, &directory_id, payload)?;
+        for record in staged.records {
+            match record {
+                StagedRecord::Leaf(id, payload) | StagedRecord::Directory(id, payload) => {
+                    self.stage_record(transaction, pool, &id, payload)?;
+                }
+            }
         }
 
         let count = old_count
             .checked_add(staged.inserted)
             .ok_or_else(|| StorageError::Internal("timeline entry count overflow".to_owned()))?;
-        let root_payload = encode_root(&next_directories, count, root_height(&next_directories))?;
+        let root_payload = encode_root(&next_directories, count, next_height)?;
         let root_id = content_id(&root_payload);
         self.stage_record(transaction, pool, &root_id, root_payload)?;
         self.stage_record(
@@ -769,143 +1001,6 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             encode_head(&root_id, count),
         )?;
         Ok(root_id)
-    }
-
-    fn stage_directory_tree(
-        &self,
-        transaction: &DatabaseTransaction<'_>,
-        pool: ShardType,
-        root: &TimelineRoot,
-        pending: &[TimelineEntry],
-        staged: &mut StagedTree,
-    ) -> Result<Vec<DirectoryDescriptor>, StorageError> {
-        if root.directories.is_empty() {
-            let mut initial_leaves = Vec::new();
-            Self::stage_merged_leaves(
-                &[],
-                pending,
-                &mut initial_leaves,
-                &mut staged.inserted,
-                &mut staged.leaf_records,
-            )?;
-            return build_directory_blocks(
-                &initial_leaves,
-                DIRECTORY_LEVEL,
-                SplitMode::Tail,
-                |id, payload| {
-                    staged.directory_records.push((id, payload));
-                    Ok(())
-                },
-            );
-        }
-
-        let mut assigned = vec![Vec::new(); root.directories.len()];
-        for entry in pending {
-            let index = root
-                .directories
-                .partition_point(|directory| directory.min_entry <= *entry)
-                .saturating_sub(1);
-            assigned[index].push(*entry);
-        }
-
-        let mut next_directories = Vec::with_capacity(root.directories.len());
-        for (directory_index, descriptor) in root.directories.iter().enumerate() {
-            if assigned[directory_index].is_empty() {
-                next_directories.push(*descriptor);
-                continue;
-            }
-            let changed = self.stage_directory(
-                transaction,
-                pool,
-                descriptor,
-                split_mode(
-                    &root.directories,
-                    directory_index,
-                    descriptor,
-                    &assigned[directory_index],
-                ),
-                &assigned[directory_index],
-                staged,
-            )?;
-            next_directories.extend(changed);
-        }
-        Ok(next_directories)
-    }
-
-    fn stage_directory(
-        &self,
-        transaction: &DatabaseTransaction<'_>,
-        pool: ShardType,
-        descriptor: &DirectoryDescriptor,
-        mode: SplitMode,
-        entries: &[TimelineEntry],
-        staged: &mut StagedTree,
-    ) -> Result<Vec<DirectoryDescriptor>, StorageError> {
-        let directory_records =
-            transaction.get(pool, &self.collection_id, &[descriptor.child_id])?;
-        let directory_record = directory_records
-            .first()
-            .and_then(Option::as_ref)
-            .ok_or(StorageError::NotFound(descriptor.child_id))?;
-        let old_leaves = decode_directory(&directory_record.bytes, DIRECTORY_LEVEL)?;
-        let mut assigned_leaves = vec![Vec::new(); old_leaves.len()];
-        for entry in entries {
-            let leaf_index = old_leaves
-                .partition_point(|leaf| leaf.min_entry <= *entry)
-                .saturating_sub(1);
-            assigned_leaves[leaf_index].push(*entry);
-        }
-        let mut next_leaves = Vec::new();
-        for (leaf_index, leaf_descriptor) in old_leaves.iter().enumerate() {
-            let incoming = &assigned_leaves[leaf_index];
-            if incoming.is_empty() {
-                next_leaves.push(*leaf_descriptor);
-                continue;
-            }
-            let all_before = incoming
-                .iter()
-                .all(|entry| *entry < leaf_descriptor.min_entry);
-            let all_after = incoming
-                .iter()
-                .all(|entry| *entry > leaf_descriptor.max_entry);
-            if leaf_descriptor.entry_count == TIMELINE_LEAF_CAP as u64 && (all_before || all_after)
-            {
-                let mut inserted_leaves = Vec::new();
-                Self::stage_merged_leaves(
-                    &[],
-                    incoming,
-                    &mut inserted_leaves,
-                    &mut staged.inserted,
-                    &mut staged.leaf_records,
-                )?;
-                if all_before {
-                    next_leaves.extend(inserted_leaves);
-                    next_leaves.push(*leaf_descriptor);
-                } else {
-                    next_leaves.push(*leaf_descriptor);
-                    next_leaves.extend(inserted_leaves);
-                }
-                continue;
-            }
-            let leaf_records =
-                transaction.get(pool, &self.collection_id, &[leaf_descriptor.child_id])?;
-            let leaf_record = leaf_records
-                .first()
-                .and_then(Option::as_ref)
-                .ok_or(StorageError::NotFound(leaf_descriptor.child_id))?;
-            let old_leaf = decode_leaf(&leaf_record.bytes)?;
-            Self::stage_merged_leaves(
-                &old_leaf,
-                incoming,
-                &mut next_leaves,
-                &mut staged.inserted,
-                &mut staged.leaf_records,
-            )?;
-        }
-        build_directory_blocks(&next_leaves, DIRECTORY_LEVEL, mode, |id, payload| {
-            staged.directory_records.push((id, payload));
-            Ok(())
-        })
     }
 
     /// Unconditionally append through the raw storage engine. This utility is
@@ -947,142 +1042,31 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
         let mut pending = new_entries.to_vec();
         pending.sort_unstable();
         pending.dedup();
-
-        let mut inserted = 0u64;
-        let mut next_directories = Vec::new();
-        if root.directories.is_empty() {
-            let mut leaves = Vec::new();
-            self.write_merged_leaves(&[], &pending, &mut leaves, &mut inserted)?;
-            next_directories = if leaves.len() <= TIMELINE_DIRECTORY_FANOUT {
-                leaves
-            } else {
-                build_directory_blocks(&leaves, DIRECTORY_LEVEL, SplitMode::Tail, |id, payload| {
-                    self.write_record(&id, payload)
-                })?
-            };
-        } else {
-            let mut assigned = vec![Vec::new(); root.directories.len()];
-            for entry in pending {
-                let index = root
-                    .directories
-                    .partition_point(|directory| directory.min_entry <= entry)
-                    .saturating_sub(1);
-                assigned[index].push(entry);
-            }
-
-            for (directory_index, descriptor) in root.directories.iter().enumerate() {
-                if assigned[directory_index].is_empty() {
-                    next_directories.push(*descriptor);
-                    continue;
-                }
-                let mode = split_mode(
-                    &root.directories,
-                    directory_index,
-                    descriptor,
-                    &assigned[directory_index],
-                );
-                let old_leaves = self.load_directory(descriptor.child_id, DIRECTORY_LEVEL)?;
-                let mut assigned_leaves = vec![Vec::new(); old_leaves.len()];
-                for entry in &assigned[directory_index] {
-                    let leaf_index = old_leaves
-                        .partition_point(|leaf| leaf.min_entry <= *entry)
-                        .saturating_sub(1);
-                    assigned_leaves[leaf_index].push(*entry);
-                }
-                let mut next_leaves = Vec::new();
-                for (leaf_index, leaf_descriptor) in old_leaves.iter().enumerate() {
-                    let incoming = &assigned_leaves[leaf_index];
-                    if incoming.is_empty() {
-                        next_leaves.push(*leaf_descriptor);
-                        continue;
-                    }
-                    let all_before = incoming
-                        .iter()
-                        .all(|entry| *entry < leaf_descriptor.min_entry);
-                    let all_after = incoming
-                        .iter()
-                        .all(|entry| *entry > leaf_descriptor.max_entry);
-                    if leaf_descriptor.entry_count == TIMELINE_LEAF_CAP as u64
-                        && (all_before || all_after)
-                    {
-                        let mut inserted_leaves = Vec::new();
-                        self.write_merged_leaves(
-                            &[],
-                            incoming,
-                            &mut inserted_leaves,
-                            &mut inserted,
-                        )?;
-                        if all_before {
-                            next_leaves.extend(inserted_leaves);
-                            next_leaves.push(*leaf_descriptor);
-                        } else {
-                            next_leaves.push(*leaf_descriptor);
-                            next_leaves.extend(inserted_leaves);
-                        }
-                        continue;
-                    }
-                    let old_leaf = self.load_leaf(&leaf_descriptor.child_id)?;
-                    self.write_merged_leaves(&old_leaf, incoming, &mut next_leaves, &mut inserted)?;
-                }
-                let mut changed_directories =
-                    build_directory_blocks(&next_leaves, DIRECTORY_LEVEL, mode, |id, payload| {
-                        self.write_record(&id, payload)
-                    })?;
-                if inserted == 0 {
-                    next_directories.push(*descriptor);
-                } else {
-                    next_directories.append(&mut changed_directories);
-                }
-            }
+        let (start_height, mode) = root_split_mode(&root, &pending);
+        let mut inserted = 0_u64;
+        let next_spans = {
+            let mut io = DirectTimelineTreeIo { index: self };
+            append_spans(
+                &root.directories,
+                root.height.saturating_sub(1),
+                &pending,
+                &mut io,
+                &mut inserted,
+            )?
+        };
+        if inserted == 0 {
+            return Ok(old_root_id);
         }
-
+        let mut io = DirectTimelineTreeIo { index: self };
+        let (height, directories) = promote_spans(next_spans, start_height, mode, &mut io)?;
         let count = old_count
             .checked_add(inserted)
             .ok_or_else(|| StorageError::Internal("timeline entry count overflow".to_owned()))?;
-        let root_payload = encode_root(&next_directories, count, root_height(&next_directories))?;
+        let root_payload = encode_root(&directories, count, height)?;
         let root_id = content_id(&root_payload);
         self.write_record(&root_id, root_payload)?;
         self.write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, count))?;
         Ok(root_id)
-    }
-
-    /// Merge sorted, unique inputs, write the resulting leaves immediately,
-    /// and append their first keys and IDs to `manifest`. Adds the number of
-    /// entries absent from `existing` to `inserted`.
-    ///
-    /// # Errors
-    /// Propagates write errors or returns [`StorageError::Internal`] on count
-    /// or offset overflow. Earlier writes and output updates remain on error.
-    fn write_merged_leaves(
-        &self,
-        existing: &[TimelineEntry],
-        incoming: &[TimelineEntry],
-        manifest: &mut Vec<LeafDescriptor>,
-        inserted: &mut u64,
-    ) -> Result<(), StorageError> {
-        merge_and_stage_leaves(existing, incoming, manifest, inserted, |id, payload| {
-            self.write_record(&id, payload)
-        })
-    }
-
-    /// Merge sorted, unique inputs into encoded leaves in `pending_records`
-    /// and append their first keys and IDs to `manifest`, without writing to
-    /// storage. Adds entries absent from `existing` to the `inserted` count.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Internal`] on count or offset overflow;
-    /// earlier output updates remain on error.
-    fn stage_merged_leaves(
-        existing: &[TimelineEntry],
-        incoming: &[TimelineEntry],
-        manifest: &mut Vec<LeafDescriptor>,
-        inserted: &mut u64,
-        pending_records: &mut Vec<(NodeId, Vec<u8>)>,
-    ) -> Result<(), StorageError> {
-        merge_and_stage_leaves(existing, incoming, manifest, inserted, |id, payload| {
-            pending_records.push((id, payload));
-            Ok(())
-        })
     }
 
     /// Stage a record in this index's collection for publication on commit.
@@ -1176,135 +1160,130 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
             return Ok(empty);
         }
 
+        let mut out: Vec<TimelineEntry> = Vec::with_capacity(limit);
+        let level = root.height.saturating_sub(1);
         if forward {
-            self.forward_page(snapshot_root, &root.directories, room_id, key, limit)
+            self.forward_page(&root.directories, level, room_id, key, limit, &mut out)?;
         } else {
-            self.reverse_page(snapshot_root, &root.directories, room_id, key, limit)
+            self.reverse_page(&root.directories, level, room_id, key, limit, &mut out)?;
         }
+        let next_cursor = if out.len() == limit {
+            out.last()
+                .map(|entry| TimelineCursor::new(snapshot_root, *entry))
+        } else {
+            None
+        };
+        Ok(TimelinePage {
+            entries: out,
+            next_cursor,
+        })
     }
 
     fn forward_page(
         &self,
-        snapshot_root: NodeId,
-        directories: &[DirectoryDescriptor],
+        spans: &[SpanDescriptor],
+        level: u8,
         room_scope: &[u8; 16],
         key: Option<TimelineEntry>,
         limit: usize,
-    ) -> Result<TimelinePage, StorageError> {
-        let mut out: Vec<TimelineEntry> = Vec::with_capacity(limit);
-        let start = forward_directory_start(directories, key);
-        for directory in directories.iter().skip(start) {
-            if directory.min_entry.room_id > *room_scope {
+        out: &mut Vec<TimelineEntry>,
+    ) -> Result<(), StorageError> {
+        let start = forward_leaf_start(spans, key);
+        for span in spans.iter().skip(start) {
+            if span.min_entry.room_id > *room_scope {
                 break;
             }
-            if directory.max_entry.room_id < *room_scope {
+            if span.max_entry.room_id < *room_scope {
                 continue;
             }
-            let leaves = self.load_directory(directory.child_id, DIRECTORY_LEVEL)?;
-            let leaf_start = forward_leaf_start(&leaves, key);
-            for leaf_descriptor in leaves.iter().skip(leaf_start) {
-                if leaf_descriptor.min_entry.room_id > *room_scope {
-                    return Ok(TimelinePage {
-                        entries: out,
-                        next_cursor: None,
-                    });
-                }
-                if leaf_descriptor.max_entry.room_id < *room_scope {
-                    continue;
-                }
-                let leaf = self.load_leaf(&leaf_descriptor.child_id)?;
+            if level == 0 {
+                let leaf = self.load_leaf(&span.child_id)?;
                 for entry in &leaf {
                     if entry.room_id < *room_scope {
                         continue;
                     }
                     if entry.room_id > *room_scope {
-                        return Ok(TimelinePage {
-                            entries: out,
-                            next_cursor: None,
-                        });
+                        return Ok(());
                     }
                     if key.is_some_and(|k| *entry <= k) {
                         continue;
                     }
                     out.push(*entry);
                     if out.len() == limit {
-                        return Ok(TimelinePage {
-                            next_cursor: Some(TimelineCursor::new(snapshot_root, *entry)),
-                            entries: out,
-                        });
+                        return Ok(());
                     }
+                }
+            } else {
+                let children = self.load_directory(span.child_id, level)?;
+                self.forward_page(
+                    &children,
+                    level.saturating_sub(1),
+                    room_scope,
+                    key,
+                    limit,
+                    out,
+                )?;
+                if out.len() == limit {
+                    return Ok(());
                 }
             }
         }
-        Ok(TimelinePage {
-            entries: out,
-            next_cursor: None,
-        })
+        Ok(())
     }
 
     fn reverse_page(
         &self,
-        snapshot_root: NodeId,
-        directories: &[DirectoryDescriptor],
+        spans: &[SpanDescriptor],
+        level: u8,
         room_scope: &[u8; 16],
         key: Option<TimelineEntry>,
         limit: usize,
-    ) -> Result<TimelinePage, StorageError> {
-        let Some(start) = reverse_directory_start(directories, key) else {
-            return Ok(TimelinePage {
-                entries: Vec::new(),
-                next_cursor: None,
-            });
+        out: &mut Vec<TimelineEntry>,
+    ) -> Result<(), StorageError> {
+        let Some(start) = reverse_leaf_start(spans, key) else {
+            return Ok(());
         };
-        let mut out: Vec<TimelineEntry> = Vec::with_capacity(limit);
         for index in (0..=start).rev() {
-            let directory = &directories[index];
-            if directory.min_entry.room_id > *room_scope {
+            let span = &spans[index];
+            if span.min_entry.room_id > *room_scope {
                 continue;
             }
-            if directory.max_entry.room_id < *room_scope {
+            if span.max_entry.room_id < *room_scope {
                 break;
             }
-            let leaves = self.load_directory(directory.child_id, DIRECTORY_LEVEL)?;
-            let Some(leaf_start) = reverse_leaf_start(&leaves, key) else {
-                continue;
-            };
-            for leaf_index in (0..=leaf_start).rev() {
-                let leaf_descriptor = &leaves[leaf_index];
-                if leaf_descriptor.min_entry.room_id > *room_scope {
-                    continue;
-                }
-                if leaf_descriptor.max_entry.room_id < *room_scope {
-                    break;
-                }
-                let leaf = self.load_leaf(&leaf_descriptor.child_id)?;
+            if level == 0 {
+                let leaf = self.load_leaf(&span.child_id)?;
                 for entry in leaf.iter().rev() {
                     if entry.room_id > *room_scope {
                         continue;
                     }
                     if entry.room_id < *room_scope {
-                        return Ok(TimelinePage {
-                            entries: out,
-                            next_cursor: None,
-                        });
+                        return Ok(());
                     }
                     if key.is_some_and(|k| *entry >= k) {
                         continue;
                     }
                     out.push(*entry);
                     if out.len() == limit {
-                        return Ok(TimelinePage {
-                            next_cursor: Some(TimelineCursor::new(snapshot_root, *entry)),
-                            entries: out,
-                        });
+                        return Ok(());
                     }
+                }
+            } else {
+                let children = self.load_directory(span.child_id, level)?;
+                self.reverse_page(
+                    &children,
+                    level.saturating_sub(1),
+                    room_scope,
+                    key,
+                    limit,
+                    out,
+                )?;
+                if out.len() == limit {
+                    return Ok(());
                 }
             }
         }
-        Ok(TimelinePage {
-            entries: out,
-            next_cursor: None,
-        })
+        Ok(())
     }
 
     fn write_record(&self, id: &NodeId, payload: Vec<u8>) -> Result<(), StorageError> {
@@ -1340,26 +1319,77 @@ impl<'a, S: StorageEngine + ?Sized> TimelineIndex<'a, S> {
     }
 }
 
-fn forward_directory_start(
-    directories: &[DirectoryDescriptor],
-    key: Option<TimelineEntry>,
-) -> usize {
-    let Some(key) = key else {
-        return 0;
-    };
-    directories
-        .partition_point(|directory| directory.min_entry <= key)
-        .saturating_sub(1)
+struct DirectTimelineTreeIo<'index, 'engine, S: StorageEngine + ?Sized> {
+    index: &'index TimelineIndex<'engine, S>,
 }
 
-fn reverse_directory_start(
-    directories: &[DirectoryDescriptor],
-    key: Option<TimelineEntry>,
-) -> Option<usize> {
-    let bound = key?;
-    directories
-        .partition_point(|directory| directory.min_entry < bound)
-        .checked_sub(1)
+impl<S: StorageEngine + ?Sized> TimelineTreeIo for DirectTimelineTreeIo<'_, '_, S> {
+    fn load_leaf(&mut self, span: &SpanDescriptor) -> Result<Vec<TimelineEntry>, StorageError> {
+        self.index.load_leaf(&span.child_id)
+    }
+
+    fn load_directory(
+        &mut self,
+        span: &SpanDescriptor,
+        level: u8,
+    ) -> Result<Vec<SpanDescriptor>, StorageError> {
+        self.index.load_directory(span.child_id, level)
+    }
+
+    fn write_leaf(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError> {
+        self.index.write_record(&id, payload)
+    }
+
+    fn write_directory(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError> {
+        self.index.write_record(&id, payload)
+    }
+}
+
+struct TransactionTimelineTreeIo<'index, 'engine, 'tx, 'db, S: StorageEngine + ?Sized> {
+    index: &'index TimelineIndex<'engine, S>,
+    transaction: &'tx DatabaseTransaction<'db>,
+    pool: ShardType,
+    staged: &'tx mut StagedTree,
+}
+
+impl<S: StorageEngine + ?Sized> TimelineTreeIo for TransactionTimelineTreeIo<'_, '_, '_, '_, S> {
+    fn load_leaf(&mut self, span: &SpanDescriptor) -> Result<Vec<TimelineEntry>, StorageError> {
+        let records =
+            self.transaction
+                .get(self.pool, &self.index.collection_id, &[span.child_id])?;
+        let record = records
+            .first()
+            .and_then(Option::as_ref)
+            .ok_or(StorageError::NotFound(span.child_id))?;
+        decode_leaf(&record.bytes)
+    }
+
+    fn load_directory(
+        &mut self,
+        span: &SpanDescriptor,
+        level: u8,
+    ) -> Result<Vec<SpanDescriptor>, StorageError> {
+        let records =
+            self.transaction
+                .get(self.pool, &self.index.collection_id, &[span.child_id])?;
+        let record = records
+            .first()
+            .and_then(Option::as_ref)
+            .ok_or(StorageError::NotFound(span.child_id))?;
+        decode_directory(&record.bytes, level)
+    }
+
+    fn write_leaf(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError> {
+        self.staged.records.push(StagedRecord::Leaf(id, payload));
+        Ok(())
+    }
+
+    fn write_directory(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError> {
+        self.staged
+            .records
+            .push(StagedRecord::Directory(id, payload));
+        Ok(())
+    }
 }
 
 fn forward_leaf_start(leaves: &[LeafDescriptor], key: Option<TimelineEntry>) -> usize {
@@ -1530,14 +1560,6 @@ fn decode_span(bytes: &[u8]) -> Result<SpanDescriptor, StorageError> {
             .map_err(|_| StorageError::Corrupt("timeline span child".to_owned()))?,
     })
 }
-fn root_height(directories: &[DirectoryDescriptor]) -> u8 {
-    if directories.is_empty() {
-        0
-    } else {
-        ROOT_HEIGHT
-    }
-}
-
 fn encode_root(
     directories: &[DirectoryDescriptor],
     count: u64,
@@ -1649,12 +1671,7 @@ fn decode_root(bytes: &[u8]) -> Result<TimelineRoot, StorageError> {
             "timeline root count mismatch".to_owned(),
         ));
     }
-    let expected_height = if directories.is_empty() {
-        0
-    } else {
-        ROOT_HEIGHT
-    };
-    if height != expected_height {
+    if (height == 0) != directories.is_empty() {
         return Err(StorageError::Corrupt("timeline root height".to_owned()));
     }
     Ok(TimelineRoot {
