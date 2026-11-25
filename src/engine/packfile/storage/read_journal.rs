@@ -845,6 +845,18 @@ impl PackfileStorage {
     /// On success the held overlay guard is returned so the caller can read the
     /// applied overlay without releasing and reacquiring the mutex, which could
     /// otherwise expose an empty or partially rebuilt overlay to another reader.
+    /// Sleep for a refresh backoff and account for it, so a slow read can be
+    /// attributed to retry sleeps rather than decoding or lock waits.
+    fn note_refresh_sleep(&self, delay_ms: u64) {
+        let started = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        self.read_refresh_sleeps.fetch_add(1, Ordering::Relaxed);
+        self.read_refresh_sleep_micros.fetch_add(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     pub(super) fn refresh_read_journal(
         &self,
     ) -> Result<parking_lot::ArcMutexGuard<parking_lot::RawMutex, Option<ReadJournal>>, StorageError>
@@ -891,7 +903,7 @@ impl PackfileStorage {
                     .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
                     .unwrap_or(MAX_BACKOFF_MS)
                     .min(MAX_BACKOFF_MS);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                self.note_refresh_sleep(delay_ms);
                 continue;
             }
             overlay.covered = self.read_covered_lsn.load(Ordering::Acquire);
@@ -927,7 +939,7 @@ impl PackfileStorage {
                     .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
                     .unwrap_or(MAX_BACKOFF_MS)
                     .min(MAX_BACKOFF_MS);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                self.note_refresh_sleep(delay_ms);
             }
         }
         let advanced = self.read_covered_lsn.load(Ordering::Acquire) > coverage_before_attempts;

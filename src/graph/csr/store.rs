@@ -47,7 +47,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
+use std::time::Instant;
 
 use super::{Edge, EdgeFamily};
 use crate::database::Database;
@@ -258,7 +260,10 @@ impl CsrStore {
     /// Readers may overlap each other.
     fn with_read_lock<R>(&self, operation: impl FnOnce() -> R) -> R {
         let lock = self.store_lock();
+        let waited = Instant::now();
         let _guard = lock.read().unwrap_or_else(PoisonError::into_inner);
+        READ_LOCK_WAITS.fetch_add(1, Ordering::Relaxed);
+        add_nanos(&READ_LOCK_WAIT_NANOS, waited);
         operation()
     }
 
@@ -673,6 +678,14 @@ impl CsrStore {
     }
 
     fn segments(&self) -> io::Result<Vec<(u64, PathBuf)>> {
+        let started = Instant::now();
+        let listed = self.list_segments();
+        SEGMENT_LISTINGS.fetch_add(1, Ordering::Relaxed);
+        add_nanos(&SEGMENT_LISTING_NANOS, started);
+        listed
+    }
+
+    fn list_segments(&self) -> io::Result<Vec<(u64, PathBuf)>> {
         if !self.dir.is_dir() {
             return Ok(Vec::new());
         }
@@ -729,7 +742,13 @@ impl CsrStore {
             *state = TailState::default();
         }
         state.generation = generation;
+        TAIL_READS.fetch_add(1, Ordering::Relaxed);
         if state.valid < len {
+            let decoding = Instant::now();
+            let from_start = state.valid == 0;
+            if from_start {
+                TAIL_FULL_DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
             #[cfg(test)]
             if state.valid == 0 {
                 let mut counts = TAIL_FULL_DECODES
@@ -743,6 +762,8 @@ impl CsrStore {
                 state.apply(&frame.payload)?;
             }
             state.valid = state.valid.saturating_add(valid as u64);
+            TAIL_DECODED_BYTES.fetch_add(valid as u64, Ordering::Relaxed);
+            add_nanos(&TAIL_DECODE_NANOS, decoding);
         }
         // A seal publishes a segment before truncating the tail. If its
         // sequence changed while we loaded the tail, this view is stale.
@@ -952,6 +973,60 @@ impl TailState {
                 .insert((scope.0, family.id, owner), (family.typed, edges));
         }
         Ok(())
+    }
+}
+
+/// Process-wide read-path counters for the CSR stores, so a slow forward read
+/// can be attributed to lock wait, tail decoding or directory listings.
+static READ_LOCK_WAITS: AtomicU64 = AtomicU64::new(0);
+static READ_LOCK_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+static TAIL_READS: AtomicU64 = AtomicU64::new(0);
+static TAIL_FULL_DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
+static TAIL_DECODED_BYTES: AtomicU64 = AtomicU64::new(0);
+static TAIL_DECODE_NANOS: AtomicU64 = AtomicU64::new(0);
+static SEGMENT_LISTINGS: AtomicU64 = AtomicU64::new(0);
+static SEGMENT_LISTING_NANOS: AtomicU64 = AtomicU64::new(0);
+
+fn add_nanos(counter: &AtomicU64, started: Instant) {
+    counter.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+/// A snapshot of the CSR read-path counters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadStats {
+    /// Store read-lock acquisitions.
+    pub read_lock_waits: u64,
+    /// Total nanoseconds spent acquiring the store read lock.
+    pub read_lock_wait_nanos: u64,
+    /// Tail reads (`with_tail` calls that reached the cache).
+    pub tail_reads: u64,
+    /// Tail reads that had to decode from byte 0.
+    pub tail_full_decodes: u64,
+    /// Bytes decoded from the tail, extensions included.
+    pub tail_decoded_bytes: u64,
+    /// Total nanoseconds spent decoding the tail.
+    pub tail_decode_nanos: u64,
+    /// `read_dir` listings of a store directory.
+    pub segment_listings: u64,
+    /// Total nanoseconds spent listing store directories.
+    pub segment_listing_nanos: u64,
+}
+
+/// Snapshot the CSR read-path counters (cumulative since process start).
+#[must_use]
+pub fn read_stats() -> ReadStats {
+    ReadStats {
+        read_lock_waits: READ_LOCK_WAITS.load(Ordering::Relaxed),
+        read_lock_wait_nanos: READ_LOCK_WAIT_NANOS.load(Ordering::Relaxed),
+        tail_reads: TAIL_READS.load(Ordering::Relaxed),
+        tail_full_decodes: TAIL_FULL_DECODE_COUNT.load(Ordering::Relaxed),
+        tail_decoded_bytes: TAIL_DECODED_BYTES.load(Ordering::Relaxed),
+        tail_decode_nanos: TAIL_DECODE_NANOS.load(Ordering::Relaxed),
+        segment_listings: SEGMENT_LISTINGS.load(Ordering::Relaxed),
+        segment_listing_nanos: SEGMENT_LISTING_NANOS.load(Ordering::Relaxed),
     }
 }
 

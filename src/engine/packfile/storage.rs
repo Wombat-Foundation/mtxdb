@@ -2622,6 +2622,10 @@ pub struct PackfileStorage {
     read_refreshes: AtomicU64,
     /// Journal bytes scanned by read-only worker refreshes.
     read_refresh_bytes: AtomicU64,
+    /// Backoff sleeps taken by journal refresh retries.
+    read_refresh_sleeps: AtomicU64,
+    /// Total microseconds slept in those backoffs.
+    read_refresh_sleep_micros: AtomicU64,
 }
 
 /// Per-collection state for incremental repack.
@@ -3717,6 +3721,8 @@ impl PackfileStorage {
             read_reload_failures: AtomicU64::new(0),
             read_refreshes: AtomicU64::new(0),
             read_refresh_bytes: AtomicU64::new(0),
+            read_refresh_sleeps: AtomicU64::new(0),
+            read_refresh_sleep_micros: AtomicU64::new(0),
             last_open_timings: parking_lot::Mutex::new(None),
             last_sync_timings: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -14089,6 +14095,8 @@ impl PackfileStorage {
             read_reload_failures: self.read_reload_failures.load(Ordering::Relaxed),
             read_refreshes: self.read_refreshes.load(Ordering::Relaxed),
             read_refresh_bytes: self.read_refresh_bytes.load(Ordering::Relaxed),
+            read_refresh_sleeps: self.read_refresh_sleeps.load(Ordering::Relaxed),
+            read_refresh_sleep_micros: self.read_refresh_sleep_micros.load(Ordering::Relaxed),
             sidecar_writes: self.sidecar_writes.load(Ordering::Relaxed),
             sync_calls: self.sync_calls.load(Ordering::Relaxed),
             replay_pages_resumed: self
@@ -14240,6 +14248,8 @@ impl PackfileStorage {
             &self.read_reload_failures,
             &self.read_refreshes,
             &self.read_refresh_bytes,
+            &self.read_refresh_sleeps,
+            &self.read_refresh_sleep_micros,
             &self.sidecar_writes,
             &self.sync_calls,
         ] {
@@ -14429,6 +14439,10 @@ pub struct RuntimeStats {
     pub read_refreshes: u64,
     /// Journal bytes scanned by read-only worker refreshes.
     pub read_refresh_bytes: u64,
+    /// Backoff sleeps taken by journal refresh retries.
+    pub read_refresh_sleeps: u64,
+    /// Total microseconds slept in those backoffs.
+    pub read_refresh_sleep_micros: u64,
     /// Writes of the shard→collection inspection sidecar (every one counts,
     /// whichever caller triggered it).
     pub sidecar_writes: u64,
@@ -14814,6 +14828,8 @@ impl Default for RuntimeStats {
             read_reload_failures: 0,
             read_refreshes: 0,
             read_refresh_bytes: 0,
+            read_refresh_sleeps: 0,
+            read_refresh_sleep_micros: 0,
             sidecar_writes: 0,
             sync_calls: 0,
             replay_pages_resumed: 0,
