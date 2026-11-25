@@ -35,6 +35,7 @@ use rustix::fs::{fadvise, Advice};
 const PAYLOAD_MIN: usize = 256;
 const PAYLOAD_STEP: usize = 240;
 const PAYLOAD_MAX: usize = 4096;
+const EMPTY_SHARED_WAL_LEN: u64 = 12_288;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -351,7 +352,10 @@ fn file_kind(path: &Path) -> &'static str {
         "pack"
     } else if name == "wal.bin" {
         "wal"
-    } else if name.starts_with("index.") || name.starts_with("shard_") || extension == Some("run") {
+    } else if name.starts_with("index.")
+        || name.starts_with("shard_")
+        || matches!(extension, Some("idx" | "run"))
+    {
         "index"
     } else {
         "other"
@@ -399,7 +403,14 @@ fn extension_bytes(root: &Path) -> Vec<(String, u64)> {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("");
-        let kind = if name == "wal.bin" {
+        let extension = path.extension().and_then(|value| value.to_str());
+        let kind = if extension == Some("idx") {
+            "idx".to_owned()
+        } else if extension == Some("run") {
+            "run".to_owned()
+        } else if extension == Some("pack") {
+            "pack".to_owned()
+        } else if name == "wal.bin" {
             "wal".to_owned()
         } else if name.starts_with("index.delta.") {
             "index.delta".to_owned()
@@ -494,6 +505,27 @@ fn print_memory_diagnostics(db: &Database, root: &Path, rooms: &[Room]) {
         proc_status_kib("VmRSS:").unwrap_or(0),
         proc_status_kib("VmHWM:").unwrap_or(0),
     );
+}
+
+fn recover_benchmark_database(root: &Path, db: Database) -> Database {
+    let recovery_before = IoSnapshot::read();
+    drop(db);
+    let db = Database::open(root.to_path_buf()).expect("recover benchmark database");
+    let recovery_io = IoSnapshot::read().delta(recovery_before);
+    db.event_dag()
+        .sync_all()
+        .expect("sync recovered benchmark database");
+    let reclaim = db.coordinator().reclaim_shared();
+    println!(
+        "multi_room_prepare recovery_read_bytes={} recovery_majflt={} recovery_cgroup_pgmajfault={} wal_bytes={} reclaim_call_ok={}",
+        recovery_io.read_bytes,
+        recovery_io.majflt,
+        recovery_io.pgmajfault.unwrap_or(u64::MAX),
+        directory_bytes(root).3,
+        reclaim.is_ok(),
+    );
+    print_extension_breakdown(root, "prepared");
+    db
 }
 
 fn write_synthetic(db: &Database, rooms: &mut [Room], counts: &[usize], batch: usize) {
@@ -631,8 +663,6 @@ fn run_page_rows(
     tiers: &[usize],
     samples: usize,
 ) -> Database {
-    db.event_dag().sync_all().expect("sync before cold pages");
-    let _ = db.coordinator().reclaim_shared();
     for (tier_rank, tier) in tiers.iter().copied().enumerate() {
         let Some(selected) = rooms.get(tier) else {
             continue;
@@ -736,7 +766,20 @@ fn run_page_rows(
 /// shared-WAL `Database`, this read-only pool can keep sealed-pack locators
 /// paged, so locator faults happen in the measured read rather than at open.
 fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: usize) {
-    let (_, idx_bytes, run_bytes, _, _) = directory_bytes(root);
+    let extension_sizes = extension_bytes(root);
+    let idx_bytes = extension_sizes
+        .iter()
+        .find_map(|(extension, bytes)| (extension == "idx").then_some(*bytes))
+        .unwrap_or(0);
+    let run_bytes = extension_sizes
+        .iter()
+        .find_map(|(extension, bytes)| (extension == "run").then_some(*bytes))
+        .unwrap_or(0);
+    let wal_bytes = directory_bytes(root).3;
+    if wal_bytes > EMPTY_SHARED_WAL_LEN {
+        println!("multi_room_page_paged_skipped reason=shared_wal_pending wal_bytes={wal_bytes}");
+        return;
+    }
     if idx_bytes.saturating_add(run_bytes) == 0 {
         println!(
             "multi_room_page_paged_skipped reason=no_sealed_index_sidecars idx_bytes={idx_bytes} run_bytes={run_bytes}"
@@ -825,8 +868,6 @@ fn run_fetch_rows(
     tier: Option<usize>,
     samples: usize,
 ) -> Database {
-    db.event_dag().sync_all().expect("sync before cold fetches");
-    let _ = db.coordinator().reclaim_shared();
     for scope in [
         EvictScope::All,
         EvictScope::PacksOnly,
@@ -1082,6 +1123,8 @@ fn main() {
         }
     }
 
+    let db = recover_benchmark_database(&root, db);
+    print_memory_diagnostics(&db, &root, &rooms);
     drop(db);
     run_paged_page_rows(&root, &rooms, &tiers, samples);
     let mut db = Database::open(root.clone()).expect("reopen benchmark database");
