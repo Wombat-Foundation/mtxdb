@@ -327,6 +327,42 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn proc_status_kib(field: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        if parts.next()? == field {
+            parts.next()?.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn directory_bytes(root: &Path) -> (u64, u64, u64, u64, u64) {
+    let mut files = Vec::new();
+    walk_files(root, &mut files);
+    let mut pack = 0u64;
+    let mut idx = 0u64;
+    let mut run = 0u64;
+    let mut wal = 0u64;
+    let mut other = 0u64;
+    for path in files {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let len = metadata.len();
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("pack") => pack = pack.saturating_add(len),
+            Some("idx") => idx = idx.saturating_add(len),
+            Some("run") => run = run.saturating_add(len),
+            Some("wal") => wal = wal.saturating_add(len),
+            _ => other = other.saturating_add(len),
+        }
+    }
+    (pack, idx, run, wal, other)
+}
+
 fn evict(dir: &Path, scope: EvictScope) -> std::io::Result<()> {
     let mut files = Vec::new();
     walk_files(dir, &mut files);
@@ -526,6 +562,7 @@ fn run_page_rows(
             let mut last_open_io = IoSnapshot::default();
             for _ in 0..samples {
                 db.event_dag().sync_all().expect("sync before eviction");
+                let _ = db.coordinator().reclaim_shared();
                 drop(db);
                 evict(root, EvictScope::All).expect("evict files before cold read");
                 let open_before = IoSnapshot::read();
@@ -643,6 +680,7 @@ fn run_fetch_rows(
         let mut returned = 0usize;
         for _ in 0..samples {
             db.event_dag().sync_all().expect("sync before fetch");
+            let _ = db.coordinator().reclaim_shared();
             drop(db);
             evict(root, scope).expect("evict selected files before fetch");
             let open_before = IoSnapshot::read();
@@ -842,6 +880,25 @@ fn main() {
         "multi_room_load events={total_events} rooms={} batch={batch} write_ms={write_ms:.1}",
         rooms.len()
     );
+    let (topo_index, stream_index) = open_event_timeline_indexes(db.event_dag().as_ref());
+    let topo_records = db
+        .event_dag()
+        .collection_len(&topo_index.collection_id())
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let stream_records = db
+        .event_dag()
+        .collection_len(&stream_index.collection_id())
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let (pack_bytes, idx_bytes, run_bytes, wal_bytes, other_bytes) = directory_bytes(&root);
+    println!(
+        "multi_room_memory rss_kib={} hwm_kib={} pack_bytes={pack_bytes} idx_bytes={idx_bytes} run_bytes={run_bytes} wal_bytes={wal_bytes} other_bytes={other_bytes} topo_records={topo_records} stream_records={stream_records}",
+        proc_status_kib("VmRSS:").unwrap_or(0),
+        proc_status_kib("VmHWM:").unwrap_or(0),
+    );
 
     let mut ranked: Vec<usize> = rooms
         .iter()
@@ -856,13 +913,16 @@ fn main() {
     }
     if ranked.len() > 2 {
         if let Some(index) = ranked.get(ranked.len() / 2) {
-            tiers.push(*index);
+            if !tiers.contains(index) {
+                tiers.push(*index);
+            }
         }
     }
     if let Some(index) = ranked.first() {
-        tiers.push(*index);
+        if !tiers.contains(index) {
+            tiers.push(*index);
+        }
     }
-    tiers.dedup();
 
     db = run_page_rows(db, &root, &rooms, &tiers, samples);
     db = run_fetch_rows(db, &root, &rooms, tiers.first().copied(), samples);
