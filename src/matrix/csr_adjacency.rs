@@ -44,6 +44,7 @@ type ClaimedEdges = BTreeSet<(Vec<u8>, u16)>;
 use crate::csr::store::{CsrStore, RowRecord, ScopeId};
 use crate::csr::{Edge, EdgeFamily, EdgeKey, ReverseCsr};
 use crate::database::{Database, DatabaseTransaction};
+use crate::edge_log::{EdgeLog, LoggedEvent};
 use crate::layout::ShardType;
 use crate::short_id::{GraphReader, ShortIdIndex};
 use crate::storage::StorageError;
@@ -179,6 +180,10 @@ impl AdjacencyVerifyReport {
 pub struct CsrAdjacency {
     events: ShortIdIndex,
     kinds: ShortIdIndex,
+    /// The room's event collection id, when this scope was addressed by it
+    /// (see [`Self::for_collection`]); the edge log needs it to find the scope
+    /// again after a crash.
+    room_collection: Option<[u8; 16]>,
 }
 
 /// Preserve the room-id-derived scope used before collection-based scopes
@@ -279,10 +284,12 @@ impl CsrAdjacency {
             canonical.extend_from_slice(room_collection);
             derive_collection_id(Some(MEMBER_NAMESPACE_INTL), &canonical)
         };
-        Self::scoped(
+        let mut adjacency = Self::scoped(
             derive(b"matrix-adjacency-c:"),
             derive(b"matrix-relation-kinds-c:"),
-        )
+        );
+        adjacency.room_collection = Some(*room_collection);
+        adjacency
     }
 
     fn scoped(events: [u8; 16], kinds: [u8; 16]) -> Self {
@@ -290,6 +297,7 @@ impl CsrAdjacency {
         Self {
             events: ShortIdIndex::new(pool, events),
             kinds: ShortIdIndex::new(pool, kinds).with_max_id(u32::from(u16::MAX)),
+            room_collection: None,
         }
     }
 
@@ -436,9 +444,50 @@ impl CsrAdjacency {
         events: &[EventRecord<'_>],
         durability: AppendDurability,
     ) -> Result<Vec<u32>, StorageError> {
+        self.record_events_inner(db, events, durability, None)
+    }
+
+    /// [`Self::record_events_with`], also writing the events' edges to the
+    /// journaled `log` before the rows reach the CSR tail.
+    ///
+    /// The log entry is durable with the next WAL group commit, so the tail does
+    /// not have to be: after a crash [`Self::recover_edge_log`] rebuilds any
+    /// rows the tail lost. The rows are followed, in the same append, by a
+    /// watermark row naming the last log entry they cover, which is what makes
+    /// recovery replay only what is missing.
+    ///
+    /// # Errors
+    /// As [`Self::record_event`], plus an error if this adjacency was not
+    /// addressed by a room collection (see [`Self::for_collection`]), since the
+    /// log must be able to find the scope again.
+    pub fn record_events_logged(
+        &self,
+        db: &Database,
+        log: &EdgeLog,
+        events: &[EventRecord<'_>],
+        durability: AppendDurability,
+    ) -> Result<Vec<u32>, StorageError> {
+        self.record_events_inner(db, events, durability, Some(log))
+    }
+
+    fn record_events_inner(
+        &self,
+        db: &Database,
+        events: &[EventRecord<'_>],
+        durability: AppendDurability,
+        log: Option<&EdgeLog>,
+    ) -> Result<Vec<u32>, StorageError> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        let logged_scope = match log {
+            None => None,
+            Some(_) => Some(self.room_collection.ok_or_else(|| {
+                StorageError::Corrupt(
+                    "edge logging needs an adjacency addressed by its room collection".to_owned(),
+                )
+            })?),
+        };
         let store = self.store(db);
         // The read, merge and append must be one critical section: two
         // recordings that both read the same stored row would otherwise each
@@ -459,6 +508,28 @@ impl CsrAdjacency {
             let (owners, mut changed_rows) = merge_batch(&mut stored, &prepared, &starts, &ids)?;
             self.add_child_rows(db, &mut changed_rows)?;
             let appended = !changed_rows.is_empty();
+            // Log the edges first, in a journaled transaction: if it fails
+            // nothing has reached the tail, and if the rows are later lost the
+            // log still has them. The log's sequence order is the order rows are
+            // applied in, because this whole section holds the store's write lock.
+            let log_seq = match (log, logged_scope) {
+                (Some(log), Some(scope)) if appended => {
+                    let logged: Vec<LoggedEvent> = events
+                        .iter()
+                        .map(|event| LoggedEvent {
+                            scope,
+                            event_id: event.event_id.to_owned(),
+                            prev: event.prev.iter().map(|p| (*p).to_owned()).collect(),
+                            auth: event.auth.iter().map(|a| (*a).to_owned()).collect(),
+                            relation: event
+                                .relation
+                                .map(|r| (r.target.to_owned(), r.rel_type.to_owned())),
+                        })
+                        .collect();
+                    Some(log.append(db, &logged)?)
+                }
+                _ => None,
+            };
             if appended {
                 // Append under the lock, but never fsync under it. The sync is
                 // the expensive part of a durable append, and holding the store
@@ -472,6 +543,11 @@ impl CsrAdjacency {
                         writer.append_rows_deferred_locked(self.scope(), &changed_rows)
                     })
                     .map_err(StorageError::Io)?;
+                if let Some(seq) = log_seq {
+                    // The watermark follows the rows in the same tail, so a
+                    // valid watermark means the rows before it are valid too.
+                    write_watermark_locked(&store, db, seq).map_err(StorageError::Io)?;
+                }
             }
             Ok((owners, appended))
         })?;
@@ -1362,6 +1438,128 @@ fn merge_row(
         edges: list,
     });
     Ok(())
+}
+
+/// The reserved scope of the edge-log watermark row, outside any room's scope.
+const WATERMARK_SCOPE: ScopeId = ScopeId([0xED; 16]);
+/// Family of the watermark row: one row, owner 0, whose single edge target is
+/// the last edge-log sequence number the CSR has applied.
+const WATERMARK: EdgeFamily = EdgeFamily::plain(40);
+
+/// Append the watermark row for log entry `seq`, under the store's write lock.
+fn write_watermark_locked(store: &CsrStore, db: &Database, seq: u32) -> std::io::Result<()> {
+    store.writer(db).and_then(|writer| {
+        writer.append_rows_deferred_locked(
+            WATERMARK_SCOPE,
+            &[RowRecord {
+                family: WATERMARK,
+                owner: 0,
+                edges: vec![Edge {
+                    target: seq,
+                    kind: 0,
+                }],
+            }],
+        )
+    })
+}
+
+/// The last edge-log sequence number whose rows the CSR has (0 for none).
+fn read_watermark(store: &CsrStore) -> std::io::Result<u32> {
+    let rows = store.read_rows(WATERMARK_SCOPE, &[(WATERMARK, 0)])?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(|edges| edges.first().map(|edge| edge.target))
+        .unwrap_or(0))
+}
+
+impl CsrAdjacency {
+    /// Rebuild the rows the CSR lost, from the edge log.
+    ///
+    /// Reads the watermark (the last log entry whose rows are in the CSR),
+    /// replays every later entry into its scope, advances the watermark and
+    /// makes the result durable. Replay is idempotent: recording an event whose
+    /// rows survived changes nothing. Run it once after opening a writable
+    /// store and before serving. Returns how many entries were replayed.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure, a corrupt log entry, or a failed
+    /// recording or sync.
+    pub fn recover_edge_log(db: &Database, log: &EdgeLog) -> Result<u32, StorageError> {
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        let watermark = read_watermark(&store).map_err(StorageError::Io)?;
+        let head = log.head(db)?;
+        if head <= watermark {
+            return Ok(0);
+        }
+        let entries = log.read_range(db, watermark, head)?;
+        let mut replayed = 0_u32;
+        // Replay run by run, one scope at a time, in log order.
+        let mut start = 0;
+        while start < entries.len() {
+            let scope = entries[start].1.scope;
+            let mut end = start;
+            while end < entries.len() && entries[end].1.scope == scope {
+                end = end.saturating_add(1);
+            }
+            let run = &entries[start..end];
+            let prevs: Vec<Vec<&str>> = run
+                .iter()
+                .map(|(_, e)| e.prev.iter().map(String::as_str).collect())
+                .collect();
+            let auths: Vec<Vec<&str>> = run
+                .iter()
+                .map(|(_, e)| e.auth.iter().map(String::as_str).collect())
+                .collect();
+            let records: Vec<EventRecord<'_>> = run
+                .iter()
+                .zip(&prevs)
+                .zip(&auths)
+                .map(|(((_, event), prev), auth)| EventRecord {
+                    event_id: &event.event_id,
+                    prev,
+                    auth,
+                    relation: event
+                        .relation
+                        .as_ref()
+                        .map(|(target, rel_type)| RelationRef { target, rel_type }),
+                })
+                .collect();
+            Self::for_collection(&scope).record_events_inner(
+                db,
+                &records,
+                AppendDurability::Deferred,
+                None,
+            )?;
+            replayed = replayed.saturating_add(u32::try_from(run.len()).unwrap_or(u32::MAX));
+            start = end;
+        }
+        store
+            .with_write_lock(|| write_watermark_locked(&store, db, head))
+            .map_err(StorageError::Io)?;
+        store.sync_tail().map_err(StorageError::Io)?;
+        // The rows and the watermark are durable, so the log no longer needs
+        // these entries.
+        log.prune_through(db, head)?;
+        Ok(replayed)
+    }
+
+    /// Make the applied rows durable and drop the log entries they cover.
+    ///
+    /// Reads the watermark first, then syncs the tail, so everything up to that
+    /// watermark is durable when the log is pruned through it. Cheap when there
+    /// is nothing new. This is the maintenance step that keeps the log short and
+    /// recovery fast; it has no ordering relationship with WAL commits.
+    ///
+    /// # Errors
+    /// Returns an error if the sync or the prune fails.
+    pub fn checkpoint_edge_log(db: &Database, log: &EdgeLog) -> Result<(), StorageError> {
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        let watermark = read_watermark(&store).map_err(StorageError::Io)?;
+        store.sync_tail().map_err(StorageError::Io)?;
+        log.prune_through(db, watermark)
+    }
 }
 
 #[cfg(test)]

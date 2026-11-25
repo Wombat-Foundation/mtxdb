@@ -87,6 +87,9 @@ pub mod dag;
 /// Root-level handle that opens every pool behind one shared WAL fence.
 #[path = "engine/database.rs"]
 pub mod database;
+/// Journaled write-ahead log of event edges, replayed into the CSR after a crash.
+#[path = "matrix/edge_log.rs"]
+pub mod edge_log;
 #[path = "matrix/export_schema.rs"]
 pub mod export_schema;
 /// Frontier tracking for nodes awaiting their dependencies before being writable.

@@ -1147,3 +1147,198 @@ fn durable_record_events_syncs_once_outside_the_write_lock() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ---- edge log: journaled edges, rebuilt into the CSR after a crash ----
+
+mod edge_log_recovery {
+    use super::*;
+    use crate::edge_log::EdgeLog;
+    use crate::layout::ShardType;
+
+    const ROOM_A: [u8; 16] = [0xA1; 16];
+    const ROOM_B: [u8; 16] = [0xB2; 16];
+
+    fn event<'a>(id: &'a str, prev: &'a [&'a str]) -> EventRecord<'a> {
+        EventRecord {
+            event_id: id,
+            prev,
+            auth: &["$create"],
+            relation: None,
+        }
+    }
+
+    /// Make the WAL durable (the log with it) but lose the unsynced CSR tail,
+    /// then reopen: the state a crash leaves behind.
+    fn crash_keeping_only_the_wal(root: &std::path::Path, db: Database) -> Database {
+        db.coordinator().sync().unwrap();
+        let tail = db.layout().graph_path(ShardType::State).join("tail.log");
+        drop(db);
+        let _ = std::fs::remove_file(tail);
+        Database::open(root.to_path_buf()).unwrap()
+    }
+
+    /// A restart after the tail was already synced: nothing is lost.
+    fn restart_keeping_everything(root: &std::path::Path, db: Database) -> Database {
+        db.coordinator().sync().unwrap();
+        drop(db);
+        Database::open(root.to_path_buf()).unwrap()
+    }
+
+    #[test]
+    fn rows_lost_with_the_tail_are_rebuilt_from_the_log() {
+        let root = test_root("edge-log-recover");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_events_logged(
+            &db,
+            &log,
+            &[event("$create", &[]), event("$msg", &["$create"])],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+        adj.record_events_logged(
+            &db,
+            &log,
+            &[event("$next", &["$msg"])],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+        assert_eq!(
+            adj.prev_of(&db, "$next").unwrap(),
+            Some(vec!["$msg".to_owned()])
+        );
+
+        let db = crash_keeping_only_the_wal(&root, db);
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        assert_eq!(
+            adj.prev_of(&db, "$next").unwrap(),
+            None,
+            "the unsynced rows are gone"
+        );
+
+        let replayed = CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+
+        assert_eq!(replayed, 3, "every logged event is replayed");
+        assert_eq!(
+            adj.prev_of(&db, "$next").unwrap(),
+            Some(vec!["$msg".to_owned()])
+        );
+        assert_eq!(
+            adj.prev_of(&db, "$msg").unwrap(),
+            Some(vec!["$create".to_owned()])
+        );
+        assert_eq!(
+            adj.auth_of(&db, "$msg").unwrap(),
+            Some(vec!["$create".to_owned()])
+        );
+        let create = adj.short_id(&db, "$create").unwrap().unwrap();
+        let children = adj.children_of(&db, create).unwrap().unwrap();
+        assert_eq!(
+            adj.resolve_event_ids(&db, &children).unwrap(),
+            vec![Some("$msg".to_owned())],
+            "the reverse rows are rebuilt too"
+        );
+        assert!(adj.verify(&db).unwrap().is_consistent());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_rebuilds_every_room_in_log_order() {
+        let root = test_root("edge-log-rooms");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let a = CsrAdjacency::for_collection(&ROOM_A);
+        let b = CsrAdjacency::for_collection(&ROOM_B);
+        a.record_events_logged(&db, &log, &[event("$a1", &[])], AppendDurability::Deferred)
+            .unwrap();
+        b.record_events_logged(&db, &log, &[event("$b1", &[])], AppendDurability::Deferred)
+            .unwrap();
+        a.record_events_logged(
+            &db,
+            &log,
+            &[event("$a2", &["$a1"])],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+
+        let db = crash_keeping_only_the_wal(&root, db);
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+
+        let a = CsrAdjacency::for_collection(&ROOM_A);
+        let b = CsrAdjacency::for_collection(&ROOM_B);
+        assert_eq!(a.prev_of(&db, "$a2").unwrap(), Some(vec!["$a1".to_owned()]));
+        assert_eq!(b.prev_of(&db, "$b1").unwrap(), Some(vec![]));
+        assert_eq!(b.prev_of(&db, "$a2").unwrap(), None, "rooms do not leak");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_replays_nothing_when_the_rows_survived() {
+        let root = test_root("edge-log-idempotent");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_events_logged(
+            &db,
+            &log,
+            &[event("$create", &[])],
+            AppendDurability::Durable,
+        )
+        .unwrap();
+
+        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
+        assert_eq!(adj.prev_of(&db, "$create").unwrap(), Some(vec![]));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_checkpoint_prunes_the_log_and_leaves_nothing_to_replay() {
+        let root = test_root("edge-log-checkpoint");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_events_logged(
+            &db,
+            &log,
+            &[event("$create", &[]), event("$msg", &["$create"])],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+        assert_eq!(log.pruned(&db).unwrap(), 0);
+
+        CsrAdjacency::checkpoint_edge_log(&db, &log).unwrap();
+
+        assert_eq!(log.pruned(&db).unwrap(), log.head(&db).unwrap());
+        assert!(log
+            .read_range(&db, 0, log.head(&db).unwrap())
+            .unwrap()
+            .is_empty());
+        // The rows are durable now, so a restart replays nothing.
+        let db = restart_keeping_everything(&root, db);
+        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        assert_eq!(
+            adj.prev_of(&db, "$msg").unwrap(),
+            Some(vec!["$create".to_owned()])
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn logging_needs_an_adjacency_addressed_by_its_room_collection() {
+        let root = test_root("edge-log-needs-collection");
+        let db = Database::open(root.clone()).unwrap();
+        let by_room_id = CsrAdjacency::new(ROOM);
+
+        let result = by_room_id.record_events_logged(
+            &db,
+            &EdgeLog::new(),
+            &[event("$create", &[])],
+            AppendDurability::Deferred,
+        );
+
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
