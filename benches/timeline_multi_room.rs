@@ -110,7 +110,7 @@ fn synthetic_rooms(rooms: usize, events: usize) -> (Vec<Room>, Vec<usize>) {
                 .unwrap_or(0)
         })
         .collect();
-    let total: u64 = weights.iter().copied().sum();
+    let total = weights.iter().copied().fold(0u64, u64::saturating_add);
     let events = u64::try_from(events).unwrap_or(u64::MAX);
     let mut counts: Vec<usize> = weights
         .iter()
@@ -123,7 +123,7 @@ fn synthetic_rooms(rooms: usize, events: usize) -> (Vec<Room>, Vec<usize>) {
         })
         .collect();
     let events = usize::try_from(events).unwrap_or(usize::MAX);
-    let assigned: usize = counts.iter().sum();
+    let assigned = counts.iter().copied().fold(0usize, usize::saturating_add);
     if assigned != events {
         let largest = counts
             .iter()
@@ -587,7 +587,13 @@ fn run_page_rows(
     db
 }
 
-fn run_fetch_rows(mut db: Database, root: &Path, rooms: &[Room], tier: Option<usize>) -> Database {
+fn run_fetch_rows(
+    mut db: Database,
+    root: &Path,
+    rooms: &[Room],
+    tier: Option<usize>,
+    samples: usize,
+) -> Database {
     for scope in [
         EvictScope::All,
         EvictScope::PacksOnly,
@@ -599,7 +605,6 @@ fn run_fetch_rows(mut db: Database, root: &Path, rooms: &[Room], tier: Option<us
         let Some(selected) = rooms.get(room_index) else {
             continue;
         };
-        db.event_dag().sync_all().expect("sync before fetch");
         let (topo_index, _stream_index) = open_event_timeline_indexes(db.event_dag().as_ref());
         let page = topo_index
             .page(&selected.scope, None, true, 128)
@@ -609,40 +614,49 @@ fn run_fetch_rows(mut db: Database, root: &Path, rooms: &[Room], tier: Option<us
             .iter()
             .map(|entry| entry.event_node_id)
             .collect();
-        drop(db);
-        evict(root, scope).expect("evict selected files before fetch");
-        db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
-        let before = IoSnapshot::read();
-        let started = Instant::now();
-        let payloads = db
-            .pool(ShardType::EventDag)
-            .get_many(&selected.collection, &ids)
-            .expect("cold payload fetch");
-        let elapsed = started.elapsed();
-        let io = IoSnapshot::read().delta(before);
-        let returned: usize = payloads
-            .iter()
-            .flatten()
-            .map(|record| record.bytes.len())
-            .sum();
+        let mut elapsed_samples = Vec::with_capacity(samples);
+        let mut last_io = IoSnapshot::default();
+        let mut returned = 0usize;
+        for _ in 0..samples {
+            db.event_dag().sync_all().expect("sync before fetch");
+            drop(db);
+            evict(root, scope).expect("evict selected files before fetch");
+            db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
+            let before = IoSnapshot::read();
+            let started = Instant::now();
+            let payloads = db
+                .pool(ShardType::EventDag)
+                .get_many(&selected.collection, &ids)
+                .expect("cold payload fetch");
+            elapsed_samples.push(started.elapsed());
+            last_io = IoSnapshot::read().delta(before);
+            returned = payloads
+                .iter()
+                .flatten()
+                .map(|record| record.bytes.len())
+                .fold(0usize, usize::saturating_add);
+        }
+        let min_us = min(&elapsed_samples).as_secs_f64() * 1e6;
+        let median_us = median(&mut elapsed_samples).as_secs_f64() * 1e6;
         let amplification_bp = if returned == 0 {
             0
         } else {
-            io.read_bytes
+            last_io
+                .read_bytes
                 .saturating_mul(10_000)
                 .checked_div(u64::try_from(returned).unwrap_or(u64::MAX).max(1))
                 .unwrap_or(0)
         };
         println!(
-            "multi_room_fetch evict={} count={} median_us={:.1} syscr={} rchar={} disk_read_bytes={} payload_bytes_returned={returned} read_amp_bp={amplification_bp} majflt={} cgroup_pgmajfault={}",
+            "multi_room_fetch evict={} count={} samples={} min_us={min_us:.1} median_us={median_us:.1} syscr={} rchar={} disk_read_bytes={} payload_bytes_returned={returned} read_amp_bp={amplification_bp} majflt={} cgroup_pgmajfault={}",
             scope.label(),
             ids.len(),
-            elapsed.as_secs_f64() * 1e6,
-            io.syscr,
-            io.rchar,
-            io.read_bytes,
-            io.majflt,
-            io.pgmajfault.unwrap_or(u64::MAX),
+            samples,
+            last_io.syscr,
+            last_io.rchar,
+            last_io.read_bytes,
+            last_io.majflt,
+            last_io.pgmajfault.unwrap_or(u64::MAX),
         );
     }
 
@@ -802,7 +816,7 @@ fn main() {
     tiers.dedup();
 
     db = run_page_rows(db, &root, &rooms, &tiers, samples);
-    db = run_fetch_rows(db, &root, &rooms, tiers.first().copied());
+    db = run_fetch_rows(db, &root, &rooms, tiers.first().copied(), samples);
     run_mutations(&db, &rooms, tiers.first().copied());
 }
 
