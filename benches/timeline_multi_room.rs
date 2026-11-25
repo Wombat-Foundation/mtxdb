@@ -7,16 +7,16 @@
 //! (`MTXDB_MULTI_EVENTS=1000000`, `MTXDB_MULTI_ROOMS=1000`). Set
 //! `MTXDB_TIMELINE_EXPORT` to a CSV length manifest with
 //! `room,topo,stream,payload_bytes` rows to drive size-shaped synthetic reads.
-//! Every cold sample syncs and closes the database, advises the kernel to
-//! evict selected files, then reopens before timing. The manifest mode does
-//! not read payloads from an existing database.
+//! The load is synced and reclaimed once before read phases. Each resident
+//! cold sample closes the database, evicts selected files, then reopens before
+//! timing; the manifest mode does not read payloads from an existing database.
 //! `MTXDB_TIMELINE_SAMPLES` controls cold repetitions; warm pages use 20.
 //!
 //! Output rows separate index traversal (`multi_room_page`), locator plus body
 //! fetches (`multi_room_fetch`), and mutations (`multi_room_mutate`). I/O
 //! counters come from `/proc/self/io`, `/proc/self/stat`, and cgroup v2
 //! `memory.stat`; they are process-wide deltas around each measurement.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -341,11 +341,28 @@ fn proc_status_kib(field: &str) -> Option<u64> {
     })
 }
 
+fn file_kind(path: &Path) -> &'static str {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let extension = path.extension().and_then(|value| value.to_str());
+    if extension == Some("pack") {
+        "pack"
+    } else if name == "wal.bin" {
+        "wal"
+    } else if name.starts_with("index.") || name.starts_with("shard_") || extension == Some("run") {
+        "index"
+    } else {
+        "other"
+    }
+}
+
 fn directory_bytes(root: &Path) -> (u64, u64, u64, u64, u64) {
     let mut files = Vec::new();
     walk_files(root, &mut files);
     let mut pack = 0u64;
-    let mut idx = 0u64;
+    let mut index = 0u64;
     let mut run = 0u64;
     let mut wal = 0u64;
     let mut other = 0u64;
@@ -354,15 +371,53 @@ fn directory_bytes(root: &Path) -> (u64, u64, u64, u64, u64) {
             continue;
         };
         let len = metadata.len();
-        match path.extension().and_then(|value| value.to_str()) {
-            Some("pack") => pack = pack.saturating_add(len),
-            Some("idx") => idx = idx.saturating_add(len),
-            Some("run") => run = run.saturating_add(len),
-            Some("wal") => wal = wal.saturating_add(len),
+        match file_kind(&path) {
+            "pack" => pack = pack.saturating_add(len),
+            "index" => {
+                if path.extension().and_then(|value| value.to_str()) == Some("run") {
+                    run = run.saturating_add(len);
+                } else {
+                    index = index.saturating_add(len);
+                }
+            }
+            "wal" => wal = wal.saturating_add(len),
             _ => other = other.saturating_add(len),
         }
     }
-    (pack, idx, run, wal, other)
+    (pack, index, run, wal, other)
+}
+
+fn extension_bytes(root: &Path) -> Vec<(String, u64)> {
+    let mut files = Vec::new();
+    walk_files(root, &mut files);
+    let mut totals = BTreeMap::new();
+    for path in files {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let kind = if name == "wal.bin" {
+            "wal".to_owned()
+        } else if name.starts_with("index.delta.") {
+            "index.delta".to_owned()
+        } else if name.starts_with("index.checkpoint") {
+            "index.checkpoint".to_owned()
+        } else if name.starts_with("index.versions") {
+            "index.versions".to_owned()
+        } else if name.starts_with("shard_") {
+            "shard_metadata".to_owned()
+        } else {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map_or_else(|| "(no extension)".to_owned(), str::to_owned)
+        };
+        let total = totals.entry(kind).or_insert(0u64);
+        *total = total.saturating_add(metadata.len());
+    }
+    totals.into_iter().collect()
 }
 
 fn evict(dir: &Path, scope: EvictScope) -> std::io::Result<()> {
@@ -370,13 +425,10 @@ fn evict(dir: &Path, scope: EvictScope) -> std::io::Result<()> {
     walk_files(dir, &mut files);
     let paths: Vec<PathBuf> = files
         .into_iter()
-        .filter(|path| {
-            let extension = path.extension().and_then(|value| value.to_str());
-            match scope {
-                EvictScope::All => true,
-                EvictScope::PacksOnly => extension == Some("pack"),
-                EvictScope::IndexOnly => matches!(extension, Some("run" | "idx")),
-            }
+        .filter(|path| match scope {
+            EvictScope::All => true,
+            EvictScope::PacksOnly => file_kind(path) == "pack",
+            EvictScope::IndexOnly => file_kind(path) == "index",
         })
         .collect();
     evict_paths(&paths)
@@ -411,6 +463,14 @@ fn maintain_journal(db: &Database) {
         let _ = db.event_dag().sync_all();
         let _ = coordinator.reclaim_shared();
     }
+}
+
+fn print_extension_breakdown(root: &Path, phase: &str) {
+    let rendered: Vec<String> = extension_bytes(root)
+        .into_iter()
+        .map(|(kind, bytes)| format!("{kind}={bytes}"))
+        .collect();
+    println!("multi_room_files phase={phase} {}", rendered.join(" "));
 }
 
 fn print_memory_diagnostics(db: &Database, root: &Path, rooms: &[Room]) {
@@ -571,6 +631,8 @@ fn run_page_rows(
     tiers: &[usize],
     samples: usize,
 ) -> Database {
+    db.event_dag().sync_all().expect("sync before cold pages");
+    let _ = db.coordinator().reclaim_shared();
     for (tier_rank, tier) in tiers.iter().copied().enumerate() {
         let Some(selected) = rooms.get(tier) else {
             continue;
@@ -586,8 +648,6 @@ fn run_page_rows(
             let mut last_io = IoSnapshot::default();
             let mut last_open_io = IoSnapshot::default();
             for _ in 0..samples {
-                db.event_dag().sync_all().expect("sync before eviction");
-                let _ = db.coordinator().reclaim_shared();
                 drop(db);
                 evict(root, EvictScope::All).expect("evict files before cold read");
                 let open_before = IoSnapshot::read();
@@ -765,6 +825,8 @@ fn run_fetch_rows(
     tier: Option<usize>,
     samples: usize,
 ) -> Database {
+    db.event_dag().sync_all().expect("sync before cold fetches");
+    let _ = db.coordinator().reclaim_shared();
     for scope in [
         EvictScope::All,
         EvictScope::PacksOnly,
@@ -790,8 +852,6 @@ fn run_fetch_rows(
         let mut last_open_io = IoSnapshot::default();
         let mut returned = 0usize;
         for _ in 0..samples {
-            db.event_dag().sync_all().expect("sync before fetch");
-            let _ = db.coordinator().reclaim_shared();
             drop(db);
             evict(root, scope).expect("evict selected files before fetch");
             let open_before = IoSnapshot::read();
@@ -986,12 +1046,17 @@ fn main() {
     }
     db.event_dag().sync_all().expect("sync benchmark database");
     let _ = db.coordinator().reclaim_shared();
+    db.event_dag()
+        .sync_all()
+        .expect("sync index sidecars before measurements");
+    let _ = db.coordinator().reclaim_shared();
     let write_ms = write_started.elapsed().as_secs_f64() * 1e3;
     println!(
         "multi_room_load events={total_events} rooms={} batch={batch} write_ms={write_ms:.1}",
         rooms.len()
     );
     print_memory_diagnostics(&db, &root, &rooms);
+    print_extension_breakdown(&root, "load");
 
     let mut ranked: Vec<usize> = rooms
         .iter()
@@ -1017,14 +1082,15 @@ fn main() {
         }
     }
 
-    db.event_dag().sync_all().expect("sync before paged reads");
-    let _ = db.coordinator().reclaim_shared();
     drop(db);
     run_paged_page_rows(&root, &rooms, &tiers, samples);
     let mut db = Database::open(root.clone()).expect("reopen benchmark database");
     db = run_page_rows(db, &root, &rooms, &tiers, samples);
     db = run_fetch_rows(db, &root, &rooms, tiers.first().copied(), samples);
+    print_memory_diagnostics(&db, &root, &rooms);
+    print_extension_breakdown(&root, "after_reads");
     run_mutations(&db, &rooms, tiers.first().copied());
+    print_extension_breakdown(&root, "after_mutations");
 }
 
 fn tier_label(rank: usize) -> &'static str {
