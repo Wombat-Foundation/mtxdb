@@ -1608,10 +1608,12 @@ impl CsrAdjacency {
             // only in the page cache; do not report recovery done before they
             // are durable.
             store.sync_tail().map_err(StorageError::Io)?;
-            repair_rows_after_rollback(db, &store, head)?;
+            repair_rows_after_rollback(db, &store, watermark)?;
             return Ok(0);
         }
-        repair_rows_after_rollback(db, &store, head)?;
+        // Repair stale ids without advancing the watermark. If recovery crashes
+        // before replay completes, the same entries must remain visible next time.
+        repair_rows_after_rollback(db, &store, watermark)?;
         let entries = log.read_range(db, watermark, head)?;
         // Entries at or below the prune point are legitimately gone; any other
         // gap means the log lost an entry and the rows it covered, so advancing
@@ -1703,7 +1705,7 @@ fn csr_scope_for(events: &[u8; 16]) -> [u8; 16] {
 }
 
 /// Drop CSR rows that name short ids the recovered short-id counters no longer
-/// allocate, then reset the watermark to `head`.
+/// allocate, then persist the supplied watermark.
 ///
 /// The pre-sync hook syncs adjacency tails before the WAL group covering them,
 /// so a crash can leave rows for events whose allocations rolled back. The
@@ -1714,7 +1716,7 @@ fn csr_scope_for(events: &[u8; 16]) -> [u8; 16] {
 fn repair_rows_after_rollback(
     db: &Database,
     store: &CsrStore,
-    head: u64,
+    watermark: u64,
 ) -> Result<(), StorageError> {
     let scopes = store.all_scopes().map_err(StorageError::Io)?;
     // A CSR scope is derived from its event collection, so enumerate the State
@@ -1749,7 +1751,12 @@ fn repair_rows_after_rollback(
         if scope == WATERMARK_SCOPE {
             continue;
         }
-        let next = counters.get(&scope.0).copied().unwrap_or(1);
+        // Without the matching recovered event index, there is no evidence
+        // that these IDs rolled back. Keep the scope intact rather than
+        // treating an unknown counter as an empty index and deleting its rows.
+        let Some(next) = counters.get(&scope.0).copied() else {
+            continue;
+        };
         let kind_limit = kind_counters.get(&scope.0).copied();
         let data = store.read_scope(scope).map_err(StorageError::Io)?;
         let mut changed = false;
@@ -1798,7 +1805,7 @@ fn repair_rows_after_rollback(
                 .rewrite_scope_locked(*scope, rows)
                 .map_err(StorageError::Io)?;
         }
-        write_watermark_locked(store, db, head).map_err(StorageError::Io)
+        write_watermark_locked(store, db, watermark).map_err(StorageError::Io)
     })?;
     store.sync_tail().map_err(StorageError::Io)
 }

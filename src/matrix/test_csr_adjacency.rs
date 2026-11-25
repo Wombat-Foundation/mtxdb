@@ -1167,6 +1167,7 @@ fn durable_record_events_syncs_once_outside_the_write_lock() {
 
 mod edge_log_recovery {
     use super::*;
+    use crate::csr::store::{CsrStore, RowRecord, ScopeId};
     use crate::edge_log::{EdgeLog, LoggedEvent};
     use crate::layout::ShardType;
 
@@ -1197,6 +1198,31 @@ mod edge_log_recovery {
         db.coordinator().sync().unwrap();
         drop(db);
         Database::open(root.to_path_buf()).unwrap()
+    }
+
+    #[test]
+    fn rollback_repair_preserves_scopes_without_a_recovered_counter() {
+        let root = test_root("edge-log-unknown-scope");
+        let db = Database::open(root.clone()).unwrap();
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        let scope = ScopeId([0xD4; 16]);
+        let row = RowRecord {
+            family: PREV,
+            owner: 1,
+            edges: vec![crate::csr::Edge { target: 2, kind: 0 }],
+        };
+        store
+            .writer(&db)
+            .unwrap()
+            .append_rows(scope, std::slice::from_ref(&row))
+            .unwrap();
+
+        CsrAdjacency::recover_edge_log(&db, &EdgeLog::new()).unwrap();
+
+        assert_eq!(store.read_scope(scope).unwrap().rows.len(), 1);
+        assert_eq!(store.read_scope(scope).unwrap().rows[0].edges, row.edges);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
