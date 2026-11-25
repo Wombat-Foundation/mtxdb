@@ -19,6 +19,15 @@ fn entry(room_id: [u8; 16], order: i64, seed: u8) -> TimelineEntry {
     TimelineEntry::new(room_id, order, i64::from(seed), node_id, event_ref)
 }
 
+fn span(min_entry: TimelineEntry, max_entry: TimelineEntry, entry_count: u64) -> SpanDescriptor {
+    SpanDescriptor {
+        min_entry,
+        max_entry,
+        entry_count,
+        child_id: [0; 16],
+    }
+}
+
 fn sorted_reference(entries: &[TimelineEntry], room_id: &[u8; 16]) -> Vec<TimelineEntry> {
     let mut reference: Vec<TimelineEntry> = entries
         .iter()
@@ -217,6 +226,90 @@ fn append_to_empty_index_and_empty_append_are_well_defined() {
     assert_eq!(collect(&index, &room, true, 10), expected);
     let root_id = index.head().unwrap().unwrap().0;
     assert_eq!(index.append_untransactional(&[]).unwrap(), root_id);
+}
+
+#[test]
+fn append_routes_gap_entries_to_the_room_or_nonfull_leaf() {
+    let room_a = [1; 16];
+    let room_b = [2; 16];
+    let room_a_max = full(room_a, i64::MAX, i64::MAX, 1);
+    let room_b_min = full(room_b, 0, 0, 2);
+    let room_b_backfill = full(room_b, -1, -1, 3);
+    let cross_room = [
+        span(full(room_a, i64::MIN, i64::MIN, 4), room_a_max, 128),
+        span(room_b_min, full(room_b, 10, 10, 5), 4),
+    ];
+    assert_eq!(target_span_index(&cross_room, 1, &room_b_backfill), 1);
+
+    let room = [3; 16];
+    let left_max = full(room, 20, 20, 6);
+    let right_min = full(room, 40, 40, 7);
+    let same_room_gap = [
+        span(full(room, 0, 0, 8), left_max, TIMELINE_LEAF_CAP as u64),
+        span(right_min, full(room, 60, 60, 9), 1),
+    ];
+    let gap_entry = full(room, 30, 30, 10);
+    assert_eq!(target_span_index(&same_room_gap, 0, &gap_entry), 1);
+}
+
+#[test]
+fn backfill_into_next_room_routes_across_a_directory_gap() {
+    let room_a = [10; 16];
+    let room_b = [11; 16];
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "append_room_gap");
+    let event_count = TIMELINE_LEAF_CAP
+        .checked_mul(TIMELINE_DIRECTORY_FANOUT)
+        .expect("test event count fits usize");
+    let mut entries: Vec<_> = (0..event_count)
+        .map(|position| {
+            let position = i64::try_from(position).expect("test position fits i64");
+            full(room_a, position, position, 1)
+        })
+        .collect();
+    let room_b_entry = full(room_b, 0, 0, 1);
+    entries.push(room_b_entry);
+    index.build(&entries).unwrap();
+
+    let backfills = [
+        full(room_b, -1, -1, 2),
+        full(room_b, -2, -2, 3),
+        full(room_b, -3, -3, 4),
+    ];
+    for backfill in backfills {
+        index.append_untransactional(&[backfill]).unwrap();
+    }
+
+    let mut expected = vec![room_b_entry];
+    expected.extend(backfills);
+    expected.sort_unstable();
+    assert_eq!(collect(&index, &room_b, true, 10), expected);
+    assert_eq!(
+        index.page(&room_a, None, true, 100).unwrap().entries,
+        entries[..100]
+    );
+}
+
+#[test]
+fn empty_stage_append_on_a_new_index_publishes_an_empty_root() {
+    let db_path = test_root("stage_empty_new_index");
+    let db = Database::open(db_path.clone()).unwrap();
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "stage_empty_new_index");
+    let transaction = db.begin_transaction();
+    let root_id = index
+        .stage_append(&transaction, ShardType::EventDag, &[])
+        .unwrap();
+    transaction.commit().unwrap();
+
+    assert_eq!(index.head().unwrap().unwrap().0, root_id);
+    assert!(index
+        .page(&[1; 16], None, true, 10)
+        .unwrap()
+        .entries
+        .is_empty());
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(db_path);
 }
 
 #[test]
