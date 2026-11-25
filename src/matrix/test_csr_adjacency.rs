@@ -1145,6 +1145,21 @@ fn durable_record_events_syncs_once_outside_the_write_lock() {
         !crate::csr::store::test_last_sync_held_lock(),
         "the sync must run after the store write lock is released"
     );
+    let before_noop = crate::csr::store::test_tail_syncs();
+    adj.record_event(&db, "$create", &[], &[], None).unwrap();
+    assert_eq!(
+        crate::csr::store::test_tail_syncs() - before_noop,
+        1,
+        "a durable no-op still establishes the durability barrier"
+    );
+    let before_empty = crate::csr::store::test_tail_syncs();
+    adj.record_events_with(&db, &[], AppendDurability::Durable)
+        .unwrap();
+    assert_eq!(
+        crate::csr::store::test_tail_syncs() - before_empty,
+        1,
+        "an empty durable batch still establishes the durability barrier"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

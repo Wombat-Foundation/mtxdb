@@ -6923,7 +6923,7 @@ impl PackfileStorage {
         if !self.background_checkpoint.load(Ordering::Relaxed) {
             // `persist_index_checkpoint_or_delta` already holds
             // `index_persist_lock` across this call.
-            self.persist_index_checkpoint_best_effort_locked();
+            self.persist_index_checkpoint_best_effort();
             return;
         }
         if let Err(error) = self.start_checkpoint_worker() {
@@ -7521,17 +7521,11 @@ impl PackfileStorage {
     /// and swallows a failure rather than turning it into a hard error. The
     /// checkpoint is an acceleration structure; packfiles remain
     /// authoritative, so a failed persist only costs the next open a rescan.
+    ///
+    /// The caller must hold `index_persist_lock`. Repack takes it before marking
+    /// the index dirty; the sync path already holds it around the whole
+    /// checkpoint/delta decision.
     fn persist_index_checkpoint_best_effort(&self) {
-        // Repack calls this outside the sync path. Serialize the join, capture,
-        // and inline tail with detached checkpoint starts, so a new worker
-        // cannot rotate an epoch while this checkpoint's tail is sweeping.
-        let _persist_guard = self.index_persist_lock.lock();
-        self.persist_index_checkpoint_best_effort_locked();
-    }
-
-    /// Same as [`Self::persist_index_checkpoint_best_effort`] for a caller
-    /// that already holds `index_persist_lock`.
-    fn persist_index_checkpoint_best_effort_locked(&self) {
         if let Err(e) = self.persist_index_checkpoint() {
             eprintln!("mtxdb: failed to persist index checkpoint: {e}");
         }
@@ -9591,6 +9585,7 @@ impl PackfileStorage {
         // here shouldn't be reported as a repack failure — the packfiles
         // stay authoritative and the dirty flag (left set on failure, see
         // `persist_index_checkpoint`) means the next sync retries it.
+        let _persist_guard = self.index_persist_lock.lock();
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.persist_index_checkpoint_best_effort();
         self.persist_shard_collections_best_effort();
@@ -9902,6 +9897,7 @@ impl PackfileStorage {
         // Best-effort for the same reason: the batch's shard writes are
         // already durable, so a checkpoint-write failure here costs the
         // next sync a retry, not correctness.
+        let _persist_guard = self.index_persist_lock.lock();
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.persist_index_checkpoint_best_effort();
         self.persist_shard_collections_best_effort();

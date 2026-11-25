@@ -482,7 +482,11 @@ impl CsrAdjacency {
         durability: AppendDurability,
         log: Option<&EdgeLog>,
     ) -> Result<Vec<u32>, StorageError> {
+        let store = self.store(db);
         if events.is_empty() {
+            if durability == AppendDurability::Durable {
+                store.sync_tail().map_err(StorageError::Io)?;
+            }
             return Ok(Vec::new());
         }
         let logged_scope = match log {
@@ -493,12 +497,11 @@ impl CsrAdjacency {
                 )
             })?),
         };
-        let store = self.store(db);
         // The read, merge and append must be one critical section: two
         // recordings that both read the same stored row would otherwise each
         // validate against the old state, and the later append would silently
         // replace the earlier one.
-        let (owners, appended) = store.with_write_lock(|| -> Result<_, StorageError> {
+        let owners = store.with_write_lock(|| -> Result<_, StorageError> {
             let prepared = self.prepare_events(db, events)?;
 
             // Validate everything that can collide before allocating any id,
@@ -554,15 +557,18 @@ impl CsrAdjacency {
                     write_watermark_locked(&store, db, seq).map_err(StorageError::Io)?;
                 }
             }
-            Ok((owners, appended))
+            Ok(owners)
         })?;
 
         // Durability barrier: outside the write lock, so readers can proceed
         // while the tail is flushed. A concurrent seal may have folded these
         // rows into a segment (and synced it) and truncated the tail; syncing
         // an empty or unrelated tail is harmless, and the rows are durable
-        // either way.
-        if appended && durability == AppendDurability::Durable {
+        // either way. A durable call syncs even when it appended nothing: its
+        // rows may already be present from an earlier deferred call, and the
+        // caller is told they are durable on return. The sync is cheap when
+        // nothing is pending.
+        if durability == AppendDurability::Durable {
             store.sync_tail().map_err(StorageError::Io)?;
         }
         Ok(owners)
@@ -1012,6 +1018,28 @@ impl CsrAdjacency {
             .read_rows(self.scope(), &[(family, short_id)])
             .map_err(StorageError::Io)?;
         Ok(rows.pop().flatten())
+    }
+
+    /// Every recorded `AUTH` row as `(owner short id, target short ids)`.
+    ///
+    /// Includes owners whose row is present but empty. Neither side is resolved
+    /// to an event id, so a missing reverse mapping is reported by the caller
+    /// instead of aborting the read.
+    ///
+    /// # Errors
+    /// Returns an error on a read failure or a corrupt segment.
+    pub fn auth_target_ids<R: GraphReader + ?Sized>(
+        &self,
+        db: &R,
+    ) -> Result<Vec<(u32, Vec<u32>)>, StorageError> {
+        let rows = self
+            .store(db)
+            .read_family(self.scope(), AUTH)
+            .map_err(StorageError::Io)?;
+        Ok(rows
+            .into_iter()
+            .map(|(owner, edges)| (owner, edges.into_iter().map(|edge| edge.target).collect()))
+            .collect())
     }
 
     /// Every recorded row of one family for this scope, in one store read.

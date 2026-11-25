@@ -1477,6 +1477,16 @@ mod dir_cache {
 
     static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::default()));
 
+    /// What one cache entry costs. A present directory keeps its entry count;
+    /// an absent one still holds its key and an `Option`, so it is never free
+    /// (otherwise a scan over many absent scopes would grow the map unbounded).
+    fn dir_charge(key: &CacheKey, dir: Option<&Arc<ScopeDir>>) -> usize {
+        dir.map_or_else(
+            || key.0.as_os_str().len().saturating_add(64),
+            |dir| dir.entries.len().max(1),
+        )
+    }
+
     /// Open `path` and return its cached verified directory, if the segment
     /// still has the identity the cached entry was built from.
     fn cached_dir(path: &Path, scope: ScopeId) -> io::Result<(File, Option<Arc<ScopeDir>>)> {
@@ -1503,16 +1513,14 @@ mod dir_cache {
                 scope,
             )?
             .map(Arc::new);
-            let size = dir.as_ref().map_or(0, |dir| dir.entries.len());
+            let size = dir_charge(&key, dir.as_ref());
             let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
             if cache.bytes.saturating_add(size) > CAP_BYTES {
                 cache.map.clear();
                 cache.bytes = 0;
             }
-            if let Some((_, old)) = cache.map.insert(key, (stamp, dir.clone())) {
-                cache.bytes = cache
-                    .bytes
-                    .saturating_sub(old.as_ref().map_or(0, |dir| dir.entries.len()));
+            if let Some((_, old)) = cache.map.insert(key.clone(), (stamp, dir.clone())) {
+                cache.bytes = cache.bytes.saturating_sub(dir_charge(&key, old.as_ref()));
             }
             cache.bytes = cache.bytes.saturating_add(size);
             dir
