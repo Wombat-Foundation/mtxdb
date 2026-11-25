@@ -27,6 +27,8 @@ const ENTRY_VERSION: u8 = 1;
 const COUNTER_ID: NodeId = *b"MTXD-EDGELOG-CNT";
 const PRUNED_ID: NodeId = *b"MTXD-EDGELOG-PRN";
 const ENTRY_PREFIX: [u8; 8] = *b"EDGELOG1";
+/// Reserved event id for a scope-purge boundary in the edge log.
+const PURGE_EVENT_ID: &str = "mtxdb-edge-log-purge-v1";
 /// Serialises [`EdgeLog::prune_through`] within the process.
 static PRUNE_LOCK: Mutex<()> = Mutex::new(());
 /// Entries removed per prune transaction, bounding one transaction's staging.
@@ -206,8 +208,46 @@ impl EdgeLog {
     /// # Errors
     /// Returns an error if the transaction fails or the sequence overflows.
     pub fn append(&self, db: &Database, events: &[LoggedEvent]) -> Result<u64, StorageError> {
+        self.append_inner(db, events, false)
+    }
+
+    /// Append a durable-in-the-WAL boundary that tells recovery to discard
+    /// earlier entries for this scope before replaying later ones.
+    pub(crate) fn append_scope_purge(
+        &self,
+        db: &Database,
+        scope: [u8; 16],
+    ) -> Result<(), StorageError> {
+        let marker = LoggedEvent {
+            scope,
+            event_id: PURGE_EVENT_ID.to_owned(),
+            prev: Vec::new(),
+            auth: Vec::new(),
+            relation: None,
+        };
+        self.append_inner(db, &[marker], true).map(|_| ())
+    }
+
+    pub(crate) fn is_scope_purge(event: &LoggedEvent) -> bool {
+        event.event_id == PURGE_EVENT_ID
+            && event.prev.is_empty()
+            && event.auth.is_empty()
+            && event.relation.is_none()
+    }
+
+    fn append_inner(
+        &self,
+        db: &Database,
+        events: &[LoggedEvent],
+        allow_purge_marker: bool,
+    ) -> Result<u64, StorageError> {
         if events.is_empty() {
             return self.head(db);
+        }
+        if !allow_purge_marker && events.iter().any(Self::is_scope_purge) {
+            return Err(StorageError::Corrupt(
+                "edge-log scope-purge event id is reserved".to_owned(),
+            ));
         }
         let count = i64::try_from(events.len())
             .map_err(|_| StorageError::Corrupt("edge log batch too large".to_owned()))?;
@@ -316,10 +356,33 @@ impl EdgeLog {
         let _serial = PRUNE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let mut done = self.pruned(db)?;
         while done < through {
-            let first = done.saturating_add(1);
+            let txn = db.begin_transaction();
+            // Re-read the marker inside this transaction and keep its version
+            // as a commit precondition. The process mutex handles local
+            // callers; the record-version check also prevents two processes
+            // from applying deltas computed from stale marker values.
+            let (records, versions) =
+                txn.get_with_record_versions(self.pool, &self.collection, &[PRUNED_ID])?;
+            let current = match records.into_iter().next().flatten() {
+                None => 0,
+                Some(record) => {
+                    let raw: [u8; 8] =
+                        record.bytes.as_ref().try_into().map_err(|_| {
+                            StorageError::Corrupt("edge log pruned counter".to_owned())
+                        })?;
+                    u64::try_from(i64::from_be_bytes(raw))
+                        .map_err(|_| StorageError::Corrupt("edge log pruned range".to_owned()))?
+                }
+            };
+            if current >= through {
+                txn.abort()?;
+                return Ok(());
+            }
+            let first = current.saturating_add(1);
             let stop = through.min(first.saturating_add(PRUNE_BATCH - 1));
             let ids: Vec<NodeId> = (first..=stop).map(entry_id).collect();
-            let txn = db.begin_transaction();
+            txn.expect_record_version(self.pool, self.collection, PRUNED_ID, versions[0])
+                .map_err(StorageError::Io)?;
             txn.remove_many(self.pool, self.collection, &ids)
                 .map_err(StorageError::Io)?;
             txn.increment_counters(
@@ -327,7 +390,7 @@ impl EdgeLog {
                 self.collection,
                 &[(
                     PRUNED_ID,
-                    i64::try_from(stop.saturating_sub(done))
+                    i64::try_from(stop.saturating_sub(current))
                         .map_err(|_| StorageError::Corrupt("edge log prune range".to_owned()))?,
                 )],
             )?;

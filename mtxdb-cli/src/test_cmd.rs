@@ -12322,6 +12322,27 @@ fn auth_check_reads_plain_json_event_records() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+fn open_auth_test_graph(dir: &Path) -> (DatabaseLayout, mtxdb::short_id::ReadOnlyGraph) {
+    let layout = DatabaseLayout::open_read_only(dir.to_path_buf()).unwrap();
+    let pools: Vec<_> = ShardType::ALL
+        .into_iter()
+        .map(|shard_type| {
+            std::sync::Arc::new(
+                PackfileStorage::open_read_committed_shared(
+                    layout.pool_path(shard_type),
+                    layout.shared_wal_path(),
+                    shard_type,
+                )
+                .unwrap(),
+            )
+        })
+        .collect();
+    let pools: [std::sync::Arc<PackfileStorage>; ShardType::ALL.len()] =
+        pools.try_into().ok().expect("three shard pools");
+    let graph = mtxdb::short_id::ReadOnlyGraph::new(layout.clone(), pools);
+    (layout, graph)
+}
+
 #[test]
 fn auth_check_reads_adjacency_in_the_homeserver_event_collection_scope() {
     let dir = unique_temp_dir();
@@ -12358,23 +12379,7 @@ fn auth_check_reads_adjacency_in_the_homeserver_event_collection_scope() {
         )
         .unwrap();
 
-    let graph_layout = DatabaseLayout::open_read_only(dir.clone()).unwrap();
-    let graph_pools: Vec<_> = ShardType::ALL
-        .into_iter()
-        .map(|shard_type| {
-            std::sync::Arc::new(
-                PackfileStorage::open_read_committed_shared(
-                    graph_layout.pool_path(shard_type),
-                    graph_layout.shared_wal_path(),
-                    shard_type,
-                )
-                .unwrap(),
-            )
-        })
-        .collect();
-    let graph_pools: [std::sync::Arc<PackfileStorage>; ShardType::ALL.len()] =
-        graph_pools.try_into().ok().expect("three shard pools");
-    let graph = mtxdb::short_id::ReadOnlyGraph::new(graph_layout.clone(), graph_pools);
+    let (_, graph) = open_auth_test_graph(&dir);
     let adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&homeserver_collection);
     assert!(adjacency
         .events_index()
@@ -12446,23 +12451,7 @@ fn auth_check_reports_a_stored_auth_owner_without_an_event_body() {
         )
         .unwrap();
 
-    let graph_layout = DatabaseLayout::open_read_only(dir.clone()).unwrap();
-    let graph_pools: Vec<_> = ShardType::ALL
-        .into_iter()
-        .map(|shard_type| {
-            std::sync::Arc::new(
-                PackfileStorage::open_read_committed_shared(
-                    graph_layout.pool_path(shard_type),
-                    graph_layout.shared_wal_path(),
-                    shard_type,
-                )
-                .unwrap(),
-            )
-        })
-        .collect();
-    let graph_pools: [std::sync::Arc<PackfileStorage>; ShardType::ALL.len()] =
-        graph_pools.try_into().ok().expect("three shard pools");
-    let graph = mtxdb::short_id::ReadOnlyGraph::new(graph_layout.clone(), graph_pools);
+    let (graph_layout, graph) = open_auth_test_graph(&dir);
     let event_store =
         PackfileStorage::open_read_only(graph_layout.pool_path(ShardType::EventDag)).unwrap();
     let scanned = super::scan_room_events(&event_store, &homeserver_collection).unwrap();

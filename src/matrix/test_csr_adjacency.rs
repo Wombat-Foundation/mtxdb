@@ -1229,6 +1229,9 @@ mod edge_log_recovery {
         adj.sync_tail(&db).unwrap();
         CsrAdjacency::checkpoint_edge_log(&db, &log).unwrap();
         assert_eq!(log.pruned(&db).unwrap(), 2);
+        // Keep the covered prefix in an immutable segment; the crash helper
+        // removes only the tail, where the watermark and later suffix live.
+        adj.proto_seal(&db).unwrap();
 
         for (id, prev) in [("$c", &["$b"][..]), ("$d", &["$c"][..])] {
             adj.record_events_logged(&db, &log, &[event(id, prev)], AppendDurability::Deferred)
@@ -1246,6 +1249,7 @@ mod edge_log_recovery {
             2,
             "only the entries above the prune point are replayed"
         );
+        assert_eq!(adj.prev_of(&db, "$b").unwrap(), Some(vec!["$a".to_owned()]));
         assert_eq!(adj.prev_of(&db, "$d").unwrap(), Some(vec!["$c".to_owned()]));
         drop(db);
         let _ = std::fs::remove_dir_all(root);
@@ -1286,7 +1290,50 @@ mod edge_log_recovery {
     }
 
     #[test]
-    fn watermark_ahead_of_the_log_head_is_clamped() {
+    fn recovery_does_not_resurrect_rows_from_before_a_scope_purge() {
+        let root = test_root("edge-log-purge-boundary");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        for (id, prev) in [("$a", &[][..]), ("$b", &["$a"][..])] {
+            adj.record_events_logged(&db, &log, &[event(id, prev)], AppendDurability::Deferred)
+                .unwrap();
+        }
+
+        adj.purge(&db).unwrap();
+        adj.record_events_logged(
+            &db,
+            &log,
+            &[event("$after-purge", &[])],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+        let entries = log.read_range(&db, 0, log.head(&db).unwrap()).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(_, event)| EdgeLog::is_scope_purge(event))
+                .count(),
+            1,
+            "purge is represented in the edge log"
+        );
+
+        let db = crash_keeping_only_the_wal(&root, db);
+        assert_eq!(
+            CsrAdjacency::recover_edge_log(&db, &log).unwrap(),
+            1,
+            "only the event recorded after the purge is replayed"
+        );
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        assert_eq!(adj.short_id(&db, "$a").unwrap(), None);
+        assert_eq!(adj.short_id(&db, "$b").unwrap(), None);
+        assert_eq!(adj.prev_of(&db, "$after-purge").unwrap(), Some(Vec::new()));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watermark_ahead_of_the_log_head_purges_scopes_and_resets() {
         use crate::database::tests::crash_image;
         use crate::journal::cut_segment_image_to_durable_mark;
 
@@ -1308,33 +1355,28 @@ mod edge_log_recovery {
 
         let db = Database::open(image.clone()).unwrap();
         assert_eq!(log.head(&db).unwrap(), 0, "the WAL lost every entry");
-        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
-
-        // Appends now reuse sequence 1. If the stale watermark stayed at 3,
-        // the next crash would treat these new entries as already applied.
-        let logged = LoggedEvent {
-            scope: ROOM_B,
-            event_id: "$after".to_owned(),
-            prev: Vec::new(),
-            auth: Vec::new(),
-            relation: None,
-        };
-        assert_eq!(log.append(&db, &[logged]).unwrap(), 1);
-        db.coordinator().sync().unwrap();
-        drop(db);
-
-        let db = Database::open(image.clone()).unwrap();
         assert_eq!(
             CsrAdjacency::recover_edge_log(&db, &log).unwrap(),
-            1,
-            "the reused sequence number must not be hidden by the old watermark"
+            0,
+            "the repair tombstones the stale scopes and resets the watermark"
         );
+
+        // The repaired store still accepts and recovers new logged appends.
+        let adj = CsrAdjacency::for_collection(&ROOM_B);
+        adj.record_events_logged(
+            &db,
+            &log,
+            &[event("$after", &[])],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+        let db = crash_keeping_only_the_wal(&image, db);
+        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 1);
         assert_eq!(
             CsrAdjacency::for_collection(&ROOM_B)
                 .prev_of(&db, "$after")
                 .unwrap(),
-            Some(Vec::new()),
-            "the entry's rows were replayed"
+            Some(Vec::new())
         );
         drop(db);
         let _ = std::fs::remove_dir_all(root);

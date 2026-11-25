@@ -1323,10 +1323,20 @@ impl CsrAdjacency {
     /// Returns an error if the tombstone cannot be appended.
     pub fn purge_graph(&self, db: &Database) -> Result<(), StorageError> {
         let store = self.store(db);
-        store
-            .writer(db)
-            .and_then(|writer| writer.purge_scope(self.scope()))
-            .map_err(StorageError::Io)
+        let scope = self.scope();
+        let log = EdgeLog::new();
+        store.with_write_lock(|| -> Result<(), StorageError> {
+            // The marker and tombstone share the store write lock with logged
+            // appends, so later events receive larger log sequences and remain
+            // eligible for recovery after this purge.
+            if let Some(room_collection) = self.room_collection {
+                log.append_scope_purge(db, room_collection)?;
+            }
+            store
+                .writer(db)
+                .and_then(|writer| writer.purge_scope_locked(scope))
+                .map_err(StorageError::Io)
+        })
     }
 
     /// Stage removal of the room's State-pool records into `txn`.
@@ -1565,13 +1575,24 @@ impl CsrAdjacency {
         let watermark = read_watermark(&store).map_err(StorageError::Io)?;
         let head = log.head(db)?;
         if watermark > head {
-            // The tail outlived the WAL. Its watermark names entries the log
-            // never kept, and new appends reuse those sequence numbers, so the
-            // stale watermark would make a later crash skip them. Lower it to
-            // the log head and make that durable before returning.
-            store
-                .with_write_lock(|| write_watermark_locked(&store, db, head))
-                .map_err(StorageError::Io)?;
+            // The tail outlived the WAL, which can also roll back short-ID
+            // allocations. Existing rows may now name different events if
+            // recording resumes. The CSR is a derived index over event bodies,
+            // so tombstone every scope in this store and lower the watermark to
+            // the recovered head. A scope can then be rebuilt from its events
+            // without ever serving rows that reference reassigned short ids.
+            let scopes: Vec<ScopeId> = store
+                .all_scopes()
+                .map_err(StorageError::Io)?
+                .into_iter()
+                .map(ScopeId)
+                .collect();
+            store.with_write_lock(|| -> Result<(), StorageError> {
+                store
+                    .purge_scopes_locked(&scopes)
+                    .map_err(StorageError::Io)?;
+                write_watermark_locked(&store, db, head).map_err(StorageError::Io)
+            })?;
             store.sync_tail().map_err(StorageError::Io)?;
             return Ok(0);
         }
@@ -1594,46 +1615,46 @@ impl CsrAdjacency {
                 "edge log is missing entries above {floor}: expected {expected}, found {present}"
             )));
         }
+        let latest_purge: HashMap<[u8; 16], u64> = entries
+            .iter()
+            .filter(|(_, event)| EdgeLog::is_scope_purge(event))
+            .map(|(seq, event)| (event.scope, *seq))
+            .collect();
         let mut replayed = 0_u32;
-        // Replay run by run, one scope at a time, in log order.
-        let mut start = 0;
-        while start < entries.len() {
-            let scope = entries[start].1.scope;
-            let mut end = start;
-            while end < entries.len() && entries[end].1.scope == scope {
-                end = end.saturating_add(1);
+        let mut pending_scope = None;
+        let mut pending = Vec::new();
+        for (seq, event) in &entries {
+            if EdgeLog::is_scope_purge(event) {
+                if let Some(scope) = pending_scope.take() {
+                    replayed = replayed.saturating_add(replay_edge_log_run(db, scope, &pending)?);
+                    pending.clear();
+                }
+                let purge_store = CsrStore::open(db.layout(), ShardType::State);
+                purge_store
+                    .writer(db)
+                    .and_then(|writer| {
+                        writer.purge_scope(CsrAdjacency::for_collection(&event.scope).scope())
+                    })
+                    .map_err(StorageError::Io)?;
+                continue;
             }
-            let run = &entries[start..end];
-            let prevs: Vec<Vec<&str>> = run
-                .iter()
-                .map(|(_, e)| e.prev.iter().map(String::as_str).collect())
-                .collect();
-            let auths: Vec<Vec<&str>> = run
-                .iter()
-                .map(|(_, e)| e.auth.iter().map(String::as_str).collect())
-                .collect();
-            let records: Vec<EventRecord<'_>> = run
-                .iter()
-                .zip(&prevs)
-                .zip(&auths)
-                .map(|(((_, event), prev), auth)| EventRecord {
-                    event_id: &event.event_id,
-                    prev,
-                    auth,
-                    relation: event
-                        .relation
-                        .as_ref()
-                        .map(|(target, rel_type)| RelationRef { target, rel_type }),
-                })
-                .collect();
-            Self::for_collection(&scope).record_events_inner(
-                db,
-                &records,
-                AppendDurability::Deferred,
-                None,
-            )?;
-            replayed = replayed.saturating_add(u32::try_from(run.len()).unwrap_or(u32::MAX));
-            start = end;
+            if latest_purge
+                .get(&event.scope)
+                .is_some_and(|purged_at| seq <= purged_at)
+            {
+                continue;
+            }
+            if let Some(scope) = pending_scope {
+                if scope != event.scope {
+                    replayed = replayed.saturating_add(replay_edge_log_run(db, scope, &pending)?);
+                    pending.clear();
+                }
+            }
+            pending_scope = Some(event.scope);
+            pending.push(event);
+        }
+        if let Some(scope) = pending_scope {
+            replayed = replayed.saturating_add(replay_edge_log_run(db, scope, &pending)?);
         }
         store
             .with_write_lock(|| write_watermark_locked(&store, db, head))
@@ -1663,6 +1684,45 @@ impl CsrAdjacency {
         store.sync_tail().map_err(StorageError::Io)?;
         log.prune_through(db, watermark)
     }
+}
+
+fn replay_edge_log_run(
+    db: &Database,
+    scope: [u8; 16],
+    run: &[&LoggedEvent],
+) -> Result<u32, StorageError> {
+    if run.is_empty() {
+        return Ok(0);
+    }
+    let prevs: Vec<Vec<&str>> = run
+        .iter()
+        .map(|event| event.prev.iter().map(String::as_str).collect())
+        .collect();
+    let auths: Vec<Vec<&str>> = run
+        .iter()
+        .map(|event| event.auth.iter().map(String::as_str).collect())
+        .collect();
+    let records: Vec<EventRecord<'_>> = run
+        .iter()
+        .zip(&prevs)
+        .zip(&auths)
+        .map(|((event, prev), auth)| EventRecord {
+            event_id: &event.event_id,
+            prev,
+            auth,
+            relation: event
+                .relation
+                .as_ref()
+                .map(|(target, rel_type)| RelationRef { target, rel_type }),
+        })
+        .collect();
+    CsrAdjacency::for_collection(&scope).record_events_inner(
+        db,
+        &records,
+        AppendDurability::Deferred,
+        None,
+    )?;
+    Ok(u32::try_from(run.len()).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]

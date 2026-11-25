@@ -184,6 +184,11 @@ impl CsrWriter<'_> {
         self.store.purge_scope(scope)
     }
 
+    /// Append a purge while the caller already holds the store's write lock.
+    pub(crate) fn purge_scope_locked(&self, scope: ScopeId) -> io::Result<()> {
+        self.store.purge_scope_locked(scope)
+    }
+
     /// Fold the tail into a new immutable segment.
     ///
     /// # Errors
@@ -415,7 +420,16 @@ impl CsrStore {
     }
 
     /// Append a purge while the caller holds this directory's write lock.
-    fn purge_scope_locked(&self, scope: ScopeId) -> io::Result<()> {
+    pub(crate) fn purge_scope_locked(&self, scope: ScopeId) -> io::Result<()> {
+        self.purge_scopes_locked(&[scope])
+    }
+
+    /// Append tombstones for several scopes and sync the tail once, while the
+    /// caller holds this directory's write lock.
+    pub(crate) fn purge_scopes_locked(&self, scopes: &[ScopeId]) -> io::Result<()> {
+        if scopes.is_empty() {
+            return Ok(());
+        }
         fs::create_dir_all(&self.dir)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -429,15 +443,38 @@ impl CsrStore {
             file.set_len(valid)?;
         }
         file.seek(SeekFrom::End(0))?;
-        let payload = encode_row(scope, EdgeFamily::plain(0), 0, &[], true)?;
         let mut buffer = Vec::new();
-        write_frame(&mut buffer, &payload);
+        for scope in scopes {
+            let payload = encode_row(*scope, EdgeFamily::plain(0), 0, &[], true)?;
+            write_frame(&mut buffer, &payload);
+        }
         file.write_all(&buffer)?;
         file.sync_data()?;
         // Tombstones grow the tail like rows do, so a purge-only workload must
         // seal at the same threshold or the tail and its cache grow unbounded.
         self.maybe_seal()?;
         Ok(())
+    }
+
+    /// Every scope with rows in sealed segments or the verified tail.
+    pub(crate) fn all_scopes(&self) -> io::Result<std::collections::BTreeSet<[u8; 16]>> {
+        self.with_read_lock(|| {
+            let mut scopes = std::collections::BTreeSet::new();
+            for (_, path) in self.segments()? {
+                let (_, index_bytes, _, _) = open_segment(&path)?;
+                for entry in index_bytes.as_chunks::<SCOPE_ENTRY>().0 {
+                    let mut scope = [0_u8; 16];
+                    scope.copy_from_slice(&entry[..16]);
+                    scopes.insert(scope);
+                }
+            }
+            let (frames, _) = self.read_tail()?;
+            for frame in &frames {
+                let (scope, _, _, _, _) = decode_row(&frame.payload)?;
+                scopes.insert(scope.0);
+            }
+            Ok(scopes)
+        })
     }
 
     /// Apply the tail as a new immutable segment, then truncate the tail.
