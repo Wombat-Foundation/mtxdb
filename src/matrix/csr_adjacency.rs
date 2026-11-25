@@ -326,7 +326,7 @@ impl CsrAdjacency {
         // a successful allocation.
         let mut snapshot = Snapshot::empty(0);
         for row in data.rows {
-            if row.family.id == PREV_CHILDREN.id {
+            if row.family.id == PREV_CHILDREN.id || row.family.id == PURGE_APPLIED.id {
                 continue;
             }
             let Some(index) = FAMILIES
@@ -1253,6 +1253,17 @@ impl CsrAdjacency {
         self.kinds.lookup(db, rel_type.as_bytes()).unwrap()
     }
 
+    /// Record that the purge `(seq, token)` is applied to this scope, as a
+    /// crash can leave it.
+    #[cfg(test)]
+    pub(crate) fn mark_purge_applied_for_test(&self, db: &Database, seq: u64, token: u64) {
+        let store = self.store(db);
+        store
+            .with_write_lock(|| write_purge_applied_locked(&store, db, self.scope(), seq, token))
+            .unwrap();
+        store.sync_tail().unwrap();
+    }
+
     /// The next relation-kind id this scope will allocate.
     #[cfg(test)]
     pub(crate) fn kind_counter_for_test(&self, db: &Database) -> Result<u32, StorageError> {
@@ -1342,17 +1353,24 @@ impl CsrAdjacency {
                 .writer(db)
                 .and_then(|writer| writer.purge_scope_locked(scope))
                 .map_err(StorageError::Io)?;
-            // The tombstone is applied, so the marker is no longer a gap. Move
-            // the watermark over it only when it was contiguous; otherwise an
-            // earlier unapplied entry must stay visible to recovery.
-            if let Some(seq) = marker {
+            if let Some((seq, token)) = marker {
+                // Record that this purge is applied to the scope, in the same
+                // tail right after the tombstone. Recovery then never replays
+                // the tombstone over writes that came after it, whether or not
+                // those writes were logged.
+                write_purge_applied_locked(&store, db, scope, seq, token)
+                    .map_err(StorageError::Io)?;
+                // The tombstone is applied, so the marker is no longer a gap.
+                // Move the watermark over it only when it was contiguous;
+                // otherwise an earlier unapplied entry must stay visible.
                 if read_watermark_locked(&store).map_err(StorageError::Io)? == seq.saturating_sub(1)
                 {
                     write_watermark_locked(&store, db, seq).map_err(StorageError::Io)?;
                 }
             }
             Ok(())
-        })
+        })?;
+        store.sync_tail().map_err(StorageError::Io)
     }
 
     /// Stage removal of the room's State-pool records into `txn`.
@@ -1563,6 +1581,73 @@ fn read_watermark_locked(store: &CsrStore) -> std::io::Result<u64> {
     ))
 }
 
+/// Family of a scope's applied-purge row: owner 0, four edges holding the log
+/// sequence number and the token of the last purge applied to the scope. Readers
+/// of the scope's snapshot ignore it, like the owner-0 slot.
+const PURGE_APPLIED: EdgeFamily = EdgeFamily::plain(41);
+
+/// Split `values` into edges: value `n` is the pair of halves with kinds `2n`
+/// (high) and `2n + 1` (low).
+fn u64_edges(values: &[u64]) -> Vec<Edge> {
+    let mut edges = Vec::with_capacity(values.len().saturating_mul(2));
+    for (index, value) in values.iter().enumerate() {
+        let kind = u16::try_from(index.saturating_mul(2)).unwrap_or(u16::MAX);
+        edges.push(Edge {
+            target: u32::try_from(value >> 32).unwrap_or(u32::MAX),
+            kind,
+        });
+        edges.push(Edge {
+            target: u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX),
+            kind: kind.saturating_add(1),
+        });
+    }
+    edges
+}
+
+/// The value `index` encoded by [`u64_edges`].
+fn u64_at(edges: &[Edge], index: usize) -> u64 {
+    let half = |kind: usize| {
+        edges
+            .iter()
+            .find(|edge| usize::from(edge.kind) == kind)
+            .map_or(0, |edge| u64::from(edge.target))
+    };
+    let kind = index.saturating_mul(2);
+    (half(kind) << 32) | half(kind.saturating_add(1))
+}
+
+/// Record, under the store's write lock, that the purge `(seq, token)` is
+/// applied to `scope`.
+fn write_purge_applied_locked(
+    store: &CsrStore,
+    db: &Database,
+    scope: ScopeId,
+    seq: u64,
+    token: u64,
+) -> std::io::Result<()> {
+    store.writer(db).and_then(|writer| {
+        writer.append_rows_deferred_locked(
+            scope,
+            &[RowRecord {
+                family: PURGE_APPLIED,
+                owner: 0,
+                edges: u64_edges(&[seq, token]),
+            }],
+        )
+    })
+}
+
+/// The `(seq, token)` of the last purge applied to `scope`, if one is recorded.
+fn read_purge_applied(store: &CsrStore, scope: ScopeId) -> std::io::Result<Option<(u64, u64)>> {
+    Ok(store
+        .read_rows(scope, &[(PURGE_APPLIED, 0)])?
+        .into_iter()
+        .next()
+        .flatten()
+        .filter(|edges| !edges.is_empty())
+        .map(|edges| (u64_at(&edges, 0), u64_at(&edges, 1))))
+}
+
 fn watermark_from(rows: Vec<Option<Vec<Edge>>>) -> u64 {
     let edges = rows.into_iter().next().flatten().unwrap_or_default();
     let half = |kind: u16| {
@@ -1598,7 +1683,7 @@ impl CsrAdjacency {
             // unrelated event. Keep every row whose owner and targets are
             // still allocated, drop only the references to rolled-back ids,
             // and lower the watermark to the recovered log head.
-            repair_rows_after_rollback(db, &store, head)?;
+            repair_rows_after_rollback(db, &store, head, head)?;
             // The repaired rows and the reset watermark are durable, so the
             // entries they cover are no longer needed.
             log.prune_through(db, head)?;
@@ -1609,12 +1694,12 @@ impl CsrAdjacency {
             // only in the page cache; do not report recovery done before they
             // are durable.
             store.sync_tail().map_err(StorageError::Io)?;
-            repair_rows_after_rollback(db, &store, watermark)?;
+            repair_rows_after_rollback(db, &store, watermark, head)?;
             return Ok(0);
         }
         // Repair stale ids without advancing the watermark. If recovery crashes
         // before replay completes, the same entries must remain visible next time.
-        repair_rows_after_rollback(db, &store, watermark)?;
+        repair_rows_after_rollback(db, &store, watermark, head)?;
         let entries = log.read_range(db, watermark, head)?;
         // Entries at or below the prune point are legitimately gone; any other
         // gap means the log lost an entry and the rows it covered, so advancing
@@ -1632,6 +1717,19 @@ impl CsrAdjacency {
             .filter(|(_, event)| EdgeLog::is_scope_purge(event))
             .map(|(seq, event)| (event.scope, *seq))
             .collect();
+        // The last purge each scope has applied. A scope applied through a purge
+        // whose log marker was since lost must not replay the entries before it,
+        // and a purge already applied must not be replayed over later writes.
+        let mut applied: HashMap<[u8; 16], (u64, u64)> = HashMap::new();
+        for (_, event) in &entries {
+            if applied.contains_key(&event.scope) {
+                continue;
+            }
+            let csr = CsrAdjacency::for_collection(&event.scope).scope();
+            if let Some(done) = read_purge_applied(&store, csr).map_err(StorageError::Io)? {
+                applied.insert(event.scope, done);
+            }
+        }
         let mut replayed = 0_u32;
         let mut pending_scope = None;
         let mut pending = Vec::new();
@@ -1641,19 +1739,34 @@ impl CsrAdjacency {
                     replayed = replayed.saturating_add(replay_edge_log_run(db, scope, &pending)?);
                     pending.clear();
                 }
-                let purge_store = CsrStore::open(db.layout(), ShardType::State);
-                purge_store
-                    .writer(db)
-                    .and_then(|writer| {
-                        writer.purge_scope(CsrAdjacency::for_collection(&event.scope).scope())
+                // Sequence numbers are reused after a crash rolls the log back,
+                // so identity is the (sequence, token) pair. A boundary written
+                // before tokens counts as token 0.
+                let token = EdgeLog::purge_token(event).unwrap_or(0);
+                let already_applied =
+                    applied
+                        .get(&event.scope)
+                        .is_some_and(|(done_seq, done_token)| {
+                            *done_seq > *seq || (*done_seq == *seq && *done_token == token)
+                        });
+                if already_applied {
+                    continue;
+                }
+                let csr = CsrAdjacency::for_collection(&event.scope).scope();
+                store
+                    .with_write_lock(|| -> std::io::Result<()> {
+                        store.writer(db)?.purge_scope_locked(csr)?;
+                        write_purge_applied_locked(&store, db, csr, *seq, token)
                     })
                     .map_err(StorageError::Io)?;
+                applied.insert(event.scope, (*seq, token));
                 continue;
             }
-            if latest_purge
+            let skip_through = latest_purge
                 .get(&event.scope)
-                .is_some_and(|purged_at| seq <= purged_at)
-            {
+                .copied()
+                .max(applied.get(&event.scope).map(|(done_seq, _)| *done_seq));
+            if skip_through.is_some_and(|through| *seq <= through) {
                 continue;
             }
             if let Some(scope) = pending_scope {
@@ -1718,6 +1831,7 @@ fn repair_rows_after_rollback(
     db: &Database,
     store: &CsrStore,
     watermark: u64,
+    head: u64,
 ) -> Result<(), StorageError> {
     let scopes = store.all_scopes().map_err(StorageError::Io)?;
     // A CSR scope is derived from its event collection, so enumerate the State
@@ -1763,6 +1877,23 @@ fn repair_rows_after_rollback(
         let mut changed = false;
         let mut rows = Vec::with_capacity(data.rows.len());
         for row in data.rows {
+            if row.family.id == PURGE_APPLIED.id {
+                // Its edges are log numbers, not short ids, so the filters
+                // below do not apply. Keep the row, so a rewrite does not lose
+                // the applied-purge state, unless it names a purge whose log
+                // entry rolled back: sequence numbers are reused, and a stale
+                // one could later be taken for a different purge.
+                if u64_at(&row.edges, 0) > head {
+                    changed = true;
+                } else {
+                    rows.push(RowRecord {
+                        family: row.family,
+                        owner: row.owner,
+                        edges: row.edges,
+                    });
+                }
+                continue;
+            }
             if row.owner >= next {
                 changed = true;
                 continue;

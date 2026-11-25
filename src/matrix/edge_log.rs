@@ -27,8 +27,12 @@ const ENTRY_VERSION: u8 = 1;
 const COUNTER_ID: NodeId = *b"MTXD-EDGELOG-CNT";
 const PRUNED_ID: NodeId = *b"MTXD-EDGELOG-PRN";
 const ENTRY_PREFIX: [u8; 8] = *b"EDGELOG1";
-/// Reserved event id for a scope-purge boundary in the edge log.
+/// Reserved event id of a scope-purge boundary written before purges carried a
+/// token. Recovery still honours it.
 const PURGE_EVENT_ID: &str = "mtxdb-edge-log-purge-v1";
+/// Prefix of a scope-purge boundary's reserved event id; the purge's token
+/// follows as 16 hex digits.
+const PURGE_EVENT_PREFIX: &str = "mtxdb-edge-log-purge-v2:";
 /// Serialises [`EdgeLog::prune_through`] within the process.
 static PRUNE_LOCK: Mutex<()> = Mutex::new(());
 /// Entries removed per prune transaction, bounding one transaction's staging.
@@ -60,6 +64,22 @@ impl Default for EdgeLog {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A process-seeded random value that tells one purge from another.
+fn fresh_token() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+    );
+    hasher.finish()
 }
 
 fn entry_id(seq: u64) -> NodeId {
@@ -211,28 +231,42 @@ impl EdgeLog {
         self.append_inner(db, events, false)
     }
 
-    /// Append a durable-in-the-WAL boundary that tells recovery to discard
-    /// earlier entries for this scope before replaying later ones.
+    /// Append a boundary that tells recovery to discard earlier entries for
+    /// this scope before replaying later ones. Returns its sequence number and
+    /// its token. Sequence numbers can be reused after a crash rolls the log
+    /// back, so the token is what identifies one purge from another.
     pub(crate) fn append_scope_purge(
         &self,
         db: &Database,
         scope: [u8; 16],
-    ) -> Result<u64, StorageError> {
+    ) -> Result<(u64, u64), StorageError> {
+        let token = fresh_token();
         let marker = LoggedEvent {
             scope,
-            event_id: PURGE_EVENT_ID.to_owned(),
+            event_id: format!("{PURGE_EVENT_PREFIX}{token:016x}"),
             prev: Vec::new(),
             auth: Vec::new(),
             relation: None,
         };
-        self.append_inner(db, &[marker], true)
+        let seq = self.append_inner(db, &[marker], true)?;
+        Ok((seq, token))
     }
 
     pub(crate) fn is_scope_purge(event: &LoggedEvent) -> bool {
-        event.event_id == PURGE_EVENT_ID
+        (event.event_id == PURGE_EVENT_ID || Self::purge_token(event).is_some())
             && event.prev.is_empty()
             && event.auth.is_empty()
             && event.relation.is_none()
+    }
+
+    /// The token of a scope-purge boundary, or `None` for an ordinary event or
+    /// a boundary written before tokens existed.
+    pub(crate) fn purge_token(event: &LoggedEvent) -> Option<u64> {
+        let digits = event.event_id.strip_prefix(PURGE_EVENT_PREFIX)?;
+        if digits.len() != 16 {
+            return None;
+        }
+        u64::from_str_radix(digits, 16).ok()
     }
 
     fn append_inner(

@@ -1615,6 +1615,118 @@ mod edge_log_recovery {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// An entry whose rows never reached the tail, so the watermark cannot move
+    /// past it.
+    fn leave_a_gap(db: &Database, log: &EdgeLog) {
+        let lost = LoggedEvent {
+            scope: ROOM_B,
+            event_id: "$gap".to_owned(),
+            prev: Vec::new(),
+            auth: Vec::new(),
+            relation: None,
+        };
+        log.append(db, &[lost]).unwrap();
+    }
+
+    #[test]
+    fn recovery_keeps_writes_made_after_an_applied_purge() {
+        let root = test_root("edge-log-purge-applied");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        leave_a_gap(&db, &log);
+        for (id, prev) in [("$a", &[][..]), ("$b", &["$a"][..])] {
+            adj.record_events_logged(&db, &log, &[event(id, prev)], AppendDurability::Deferred)
+                .unwrap();
+        }
+        adj.purge(&db).unwrap();
+        // The gap keeps the watermark behind the purge marker, and this write
+        // does not go through the log at all.
+        adj.record_event(&db, "$post", &[], &[], None).unwrap();
+        adj.sync_tail(&db).unwrap();
+
+        let db = restart_keeping_everything(&root, db);
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+
+        assert_eq!(adj.prev_of(&db, "$post").unwrap(), Some(Vec::new()));
+        assert_eq!(adj.prev_of(&db, "$a").unwrap(), None);
+        assert_eq!(adj.prev_of(&db, "$b").unwrap(), None);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_applies_a_logged_purge_whose_tombstone_never_landed() {
+        let root = test_root("edge-log-purge-unapplied");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_events_logged(&db, &log, &[event("$a", &[])], AppendDurability::Deferred)
+            .unwrap();
+        // Crash between the marker and the tombstone.
+        log.append_scope_purge(&db, ROOM_A).unwrap();
+        adj.sync_tail(&db).unwrap();
+        assert_eq!(adj.prev_of(&db, "$a").unwrap(), Some(Vec::new()));
+
+        let db = restart_keeping_everything(&root, db);
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+
+        assert_eq!(adj.prev_of(&db, "$a").unwrap(), None);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_older_purge_is_not_replayed_over_the_latest_one() {
+        let root = test_root("edge-log-purge-twice");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        leave_a_gap(&db, &log);
+        adj.record_events_logged(&db, &log, &[event("$a", &[])], AppendDurability::Deferred)
+            .unwrap();
+        adj.purge(&db).unwrap();
+        adj.record_events_logged(&db, &log, &[event("$b", &[])], AppendDurability::Deferred)
+            .unwrap();
+        adj.purge(&db).unwrap();
+        adj.record_event(&db, "$post", &[], &[], None).unwrap();
+        adj.sync_tail(&db).unwrap();
+
+        let db = restart_keeping_everything(&root, db);
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+
+        assert_eq!(adj.prev_of(&db, "$post").unwrap(), Some(Vec::new()));
+        assert_eq!(adj.prev_of(&db, "$a").unwrap(), None);
+        assert_eq!(adj.prev_of(&db, "$b").unwrap(), None);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_reused_sequence_with_another_token_is_a_different_purge() {
+        let root = test_root("edge-log-purge-token");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_events_logged(&db, &log, &[event("$a", &[])], AppendDurability::Deferred)
+            .unwrap();
+        let (seq, token) = log.append_scope_purge(&db, ROOM_A).unwrap();
+        // The tail names this sequence number as applied, but for a purge whose
+        // log entry rolled back and whose number was then reused.
+        adj.mark_purge_applied_for_test(&db, seq, token.wrapping_add(1));
+
+        let db = restart_keeping_everything(&root, db);
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+
+        assert_eq!(
+            adj.prev_of(&db, "$a").unwrap(),
+            None,
+            "the unapplied purge must not be skipped on a matching number alone"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn an_unchanged_logged_event_does_not_pin_the_watermark() {
         let root = test_root("edge-log-unchanged-watermark");
