@@ -13766,6 +13766,74 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// The supported Resident counterpart of
+/// [`versions_fsync_precedes_wal_reclaim_crash_safe`]: the same crash between
+/// the versions fsync and the coverage claim, recovered through a Resident
+/// reopen with the shared WAL.
+#[test]
+fn versions_fsync_precedes_wal_reclaim_crash_safe_resident() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+    use std::process::Command;
+
+    let root = test_dir("versions_crash_resident");
+    fs::create_dir_all(&root).unwrap();
+    let output = Command::new(crate::io::test_binary_path())
+        .args([
+            "--exact",
+            "packfile::storage::tests::versions_crash_child",
+            "--test-threads=1",
+        ])
+        .env("MTXDB_VERSIONS_CRASH_DIR", &root)
+        .env("MTXDB_CRASH_AT", "after-versions-fsync")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(super::VERSIONS_CRASH_EXIT_CODE),
+        "child did not stop at the crash point\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let expected = fs::read_to_string(root.join("expected.txt")).unwrap();
+    let mut fields = expected.split_whitespace();
+    let version_before: u64 = fields.next().unwrap().parse().unwrap();
+    let coverage_before: u64 = fields.next().unwrap().parse().unwrap();
+    assert!(coverage_before >= version_before);
+
+    let wal = root.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        root.join("store"),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Resident,
+    )
+    .unwrap();
+    reopened
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    let (_, version_after) = reopened
+        .get_with_collection_version(&TEST_COLLECTION, &[distinct_id(255)])
+        .unwrap();
+    assert!(
+        version_after >= version_before,
+        "version went backwards after the crash: before={version_before}, after={version_after}"
+    );
+    assert_eq!(
+        reopened.durable_coverage(),
+        coverage_before,
+        "coverage must survive a crash before journal.lsn was written"
+    );
+    drop(reopened);
+    drop(coordinator);
+    fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn paged_full_scan_uses_sidecars_under_full_checksums() {
     let dir = test_dir("paged_full_scan_full_checksums");
