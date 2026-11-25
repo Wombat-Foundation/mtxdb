@@ -217,7 +217,7 @@ impl EdgeLog {
         &self,
         db: &Database,
         scope: [u8; 16],
-    ) -> Result<(), StorageError> {
+    ) -> Result<u64, StorageError> {
         let marker = LoggedEvent {
             scope,
             event_id: PURGE_EVENT_ID.to_owned(),
@@ -225,7 +225,7 @@ impl EdgeLog {
             auth: Vec::new(),
             relation: None,
         };
-        self.append_inner(db, &[marker], true).map(|_| ())
+        self.append_inner(db, &[marker], true)
     }
 
     pub(crate) fn is_scope_purge(event: &LoggedEvent) -> bool {
@@ -346,7 +346,8 @@ impl EdgeLog {
     /// Remove every entry with `seq <= through`, once the rows they describe
     /// are durable in the CSR. A persisted marker remembers how far pruning
     /// got, so a later call removes only what is new instead of re-checking the
-    /// whole history. The sequence counter is untouched.
+    /// whole history. The sequence counter is untouched. A `through` above the
+    /// current head is lowered to it.
     ///
     /// # Errors
     /// Returns an error if a transaction fails.
@@ -354,6 +355,10 @@ impl EdgeLog {
         // The marker is advanced by a delta computed from what was read, so two
         // overlapping prunes could both add the same range. One at a time.
         let _serial = PRUNE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        // Never advance the marker past the head: entries above it do not exist
+        // yet, and a marker beyond them would hide the entries that later take
+        // those numbers.
+        let through = through.min(self.head(db)?);
         let mut done = self.pruned(db)?;
         while done < through {
             let txn = db.begin_transaction();

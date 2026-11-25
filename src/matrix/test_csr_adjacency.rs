@@ -1409,58 +1409,70 @@ mod edge_log_recovery {
     fn watermark_repair_drops_relation_edges_with_rolled_back_kinds() {
         use crate::database::tests::crash_image;
         use crate::journal::cut_segment_image_to_durable_mark;
+        use crate::storage::NodeData;
 
         let root = test_root("edge-log-clamp-relation-kind");
         let image = test_root("edge-log-clamp-relation-kind-image");
         let db = Database::open(root.clone()).unwrap();
         let log = EdgeLog::new();
         let adj = CsrAdjacency::for_collection(&ROOM_A);
+        let plain = |id| EventRecord {
+            event_id: id,
+            prev: &[],
+            auth: &[],
+            relation: None,
+        };
+        let related = |id, rel_type| EventRecord {
+            event_id: id,
+            prev: &[],
+            auth: &[],
+            relation: Some(RelationRef {
+                target: "$a",
+                rel_type,
+            }),
+        };
+        // Repair finds a scope's kind counter through its room collection in
+        // the event pool, so the room must exist before the durable boundary.
+        let txn = db.begin_transaction();
+        txn.put(
+            ShardType::EventDag,
+            ROOM_A,
+            [1; 16],
+            &NodeData::new(bytes::Bytes::from_static(b"{}")),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        // One relation and its kind dictionary are durable.
         adj.record_events_logged(
             &db,
             &log,
             &[
-                EventRecord {
-                    event_id: "$a",
-                    prev: &[],
-                    auth: &[],
-                    relation: None,
-                },
-                EventRecord {
-                    event_id: "$b",
-                    prev: &[],
-                    auth: &[],
-                    relation: None,
-                },
+                plain("$a"),
+                plain("$b"),
+                plain("$c"),
+                related("$b", "m.annotation"),
             ],
             AppendDurability::Deferred,
         )
         .unwrap();
-        // Keep the event IDs and their log entries durable, but let a later
-        // relation-kind allocation and row reach the tail before its WAL group.
         db.coordinator().sync().unwrap();
+        let durable_kinds = adj.kind_counter_for_test(&db).unwrap();
+        // A later custom kind allocation and its row reach the tail before
+        // their WAL group does.
         adj.record_events_logged(
             &db,
             &log,
-            &[EventRecord {
-                event_id: "$b",
-                prev: &[],
-                auth: &[],
-                relation: Some(RelationRef {
-                    target: "$a",
-                    rel_type: "org.example.rolled-back-kind",
-                }),
-            }],
+            &[related("$c", "org.example.rolled-back-kind")],
             AppendDurability::Deferred,
         )
         .unwrap();
-        assert_eq!(
-            adj.relation_of(&db, "$b", &AlwaysVisible).unwrap(),
-            Some(Relation {
-                target: "$a".to_owned(),
-                rel_type: "org.example.rolled-back-kind".to_owned(),
-            }),
+        assert!(
+            adj.relation_of(&db, "$c", &AlwaysVisible)
+                .unwrap()
+                .is_some(),
             "the relation row exists before the simulated crash"
         );
+        assert!(adj.kind_counter_for_test(&db).unwrap() > durable_kinds);
         adj.sync_tail(&db).unwrap();
 
         crash_image(&db, &root, &image);
@@ -1468,11 +1480,18 @@ mod edge_log_recovery {
         drop(db);
 
         let db = Database::open(image.clone()).unwrap();
-        assert_eq!(log.head(&db).unwrap(), 2);
         CsrAdjacency::recover_edge_log(&db, &log).unwrap();
-        assert_eq!(adj.kind_counter_for_test(&db).unwrap(), 1);
+        assert_eq!(adj.kind_counter_for_test(&db).unwrap(), durable_kinds);
         assert_eq!(
             adj.relation_of(&db, "$b", &AlwaysVisible).unwrap(),
+            Some(Relation {
+                target: "$a".to_owned(),
+                rel_type: "m.annotation".to_owned(),
+            }),
+            "a relation whose kind is durable survives the repair"
+        );
+        assert_eq!(
+            adj.relation_of(&db, "$c", &AlwaysVisible).unwrap(),
             None,
             "the relation row must not retain a kind whose allocation rolled back"
         );

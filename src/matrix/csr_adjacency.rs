@@ -530,7 +530,7 @@ impl CsrAdjacency {
             // log still has them. The log's sequence order is the order rows are
             // applied in, because this whole section holds the store's write lock.
             let log_seq = match (log, logged_scope) {
-                (Some(log), Some(scope)) if appended => {
+                (Some(log), Some(scope)) => {
                     let logged: Vec<LoggedEvent> = events
                         .iter()
                         .map(|event| LoggedEvent {
@@ -1333,13 +1333,24 @@ impl CsrAdjacency {
             // The marker and tombstone share the store write lock with logged
             // appends, so later events receive larger log sequences and remain
             // eligible for recovery after this purge.
-            if let Some(room_collection) = self.room_collection {
-                log.append_scope_purge(db, room_collection)?;
-            }
+            let marker = match self.room_collection {
+                Some(room_collection) => Some(log.append_scope_purge(db, room_collection)?),
+                None => None,
+            };
             store
                 .writer(db)
                 .and_then(|writer| writer.purge_scope_locked(scope))
-                .map_err(StorageError::Io)
+                .map_err(StorageError::Io)?;
+            // The tombstone is applied, so the marker is no longer a gap. Move
+            // the watermark over it only when it was contiguous; otherwise an
+            // earlier unapplied entry must stay visible to recovery.
+            if let Some(seq) = marker {
+                if read_watermark_locked(&store).map_err(StorageError::Io)? == seq.saturating_sub(1)
+                {
+                    write_watermark_locked(&store, db, seq).map_err(StorageError::Io)?;
+                }
+            }
+            Ok(())
         })
     }
 
@@ -1597,8 +1608,10 @@ impl CsrAdjacency {
             // only in the page cache; do not report recovery done before they
             // are durable.
             store.sync_tail().map_err(StorageError::Io)?;
+            repair_rows_after_rollback(db, &store, head)?;
             return Ok(0);
         }
+        repair_rows_after_rollback(db, &store, head)?;
         let entries = log.read_range(db, watermark, head)?;
         // Entries at or below the prune point are legitimately gone; any other
         // gap means the log lost an entry and the rows it covered, so advancing
@@ -1721,7 +1734,7 @@ fn repair_rows_after_rollback(
     // Relation kinds are allocated in a separate dictionary derived from the
     // room collection, not from the event index. EventDag's collections are
     // those room collections, so use them to find each scope's kind counter.
-    // Scopes with no match (legacy or synthetic) lose relation edges below.
+    // Scopes with no match (legacy or synthetic) keep their relation edges.
     let mut kind_counters: HashMap<[u8; 16], u32> = HashMap::new();
     for room_collection in db.pool(ShardType::EventDag).collection_ids() {
         let adjacency = CsrAdjacency::for_collection(&room_collection);
@@ -1751,14 +1764,24 @@ fn repair_rows_after_rollback(
                 .edges
                 .into_iter()
                 .filter(|edge| {
-                    // Without a kind dictionary mapping, a reused kind id could
-                    // name a different relation type, so drop the typed row.
+                    // A scope whose kind dictionary cannot be found is not
+                    // proof that its kinds rolled back, so only a known counter
+                    // invalidates a typed edge.
                     let kind_valid = !row.family.typed
-                        || kind_limit.is_some_and(|limit| u32::from(edge.kind) < limit);
+                        || kind_limit.is_none_or(|limit| u32::from(edge.kind) < limit);
                     edge.target < next && kind_valid
                 })
                 .collect();
-            changed |= edges.len() != before;
+            if edges.len() != before {
+                changed = true;
+                // A forward row is written with its owner and targets
+                // together, so a lost target means the claim is gone: an empty
+                // `prev` or `auth` row would read as a known leaf. Reverse rows
+                // just keep the children that survive.
+                if row.family == PREV || row.family == AUTH || row.family == RELATIONS {
+                    continue;
+                }
+            }
             rows.push(RowRecord {
                 family: row.family,
                 owner: row.owner,
