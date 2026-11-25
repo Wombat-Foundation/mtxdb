@@ -1601,6 +1601,11 @@ mod edge_log_recovery {
         // The watermark moved with the floor, so the new entry can be pruned.
         CsrAdjacency::checkpoint_edge_log(&db, &log).unwrap();
         assert_eq!(log.pruned(&db).unwrap(), 4);
+        // A normal restart after the checkpoint keeps the pruned entry's rows.
+        let db = restart_keeping_everything(&image, db);
+        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
+        assert_eq!(adj.prev_of(&db, "$new").unwrap(), Some(Vec::new()));
+        assert_eq!(adj.prev_of(&db, "$a").unwrap(), None);
         drop(db);
         let db = Database::open(later.clone()).unwrap();
         let db = crash_keeping_only_the_wal(&later, db);
