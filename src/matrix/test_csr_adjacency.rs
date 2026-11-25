@@ -1449,6 +1449,7 @@ mod edge_log_recovery {
         let db = Database::open(image.clone()).unwrap();
         assert_eq!(log.head(&db).unwrap(), 2);
         CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        assert_eq!(adj.kind_counter_for_test(&db).unwrap(), 1);
         assert_eq!(
             adj.relation_of(&db, "$b", &AlwaysVisible).unwrap(),
             None,

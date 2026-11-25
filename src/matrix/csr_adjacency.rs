@@ -1252,6 +1252,12 @@ impl CsrAdjacency {
         self.kinds.lookup(db, rel_type.as_bytes()).unwrap()
     }
 
+    /// The next relation-kind id this scope will allocate.
+    #[cfg(test)]
+    pub(crate) fn kind_counter_for_test(&self, db: &Database) -> Result<u32, StorageError> {
+        self.kinds.counter(db)
+    }
+
     /// Check the event and kind scopes and that every stored relation kind
     /// resolves.
     ///
@@ -1701,14 +1707,27 @@ fn repair_rows_after_rollback(
     // A CSR scope is derived from its event collection, so enumerate the State
     // pool's collections to recover each scope's committed short-id counter.
     // A CSR scope with no matching collection lost every event it indexed.
-    let mut counters: HashMap<[u8; 16], (u32, u32)> = HashMap::new();
+    let mut counters: HashMap<[u8; 16], u32> = HashMap::new();
     for collection in db.pool(ShardType::State).collection_ids() {
-        let adjacency = CsrAdjacency::for_collection(&collection);
+        // `collection` is the event index scope itself, so hash it directly.
+        // `for_collection` would treat it as the room collection and derive a
+        // different scope.
+        let csr = csr_scope_for(&collection);
+        if scopes.contains(&csr) {
+            let next = ShortIdIndex::new(ShardType::State, collection).counter(db)?;
+            counters.insert(csr, next);
+        }
+    }
+    // Relation kinds are allocated in a separate dictionary derived from the
+    // room collection, not from the event index. EventDag's collections are
+    // those room collections, so use them to find each scope's kind counter.
+    // Scopes with no match (legacy or synthetic) lose relation edges below.
+    let mut kind_counters: HashMap<[u8; 16], u32> = HashMap::new();
+    for room_collection in db.pool(ShardType::EventDag).collection_ids() {
+        let adjacency = CsrAdjacency::for_collection(&room_collection);
         let csr = adjacency.csr_collection();
         if scopes.contains(&csr) {
-            let next_event = adjacency.events.counter(db)?;
-            let next_kind = adjacency.kinds.counter(db)?;
-            counters.insert(csr, (next_event, next_kind));
+            kind_counters.insert(csr, adjacency.kinds.counter(db)?);
         }
     }
     let mut repaired: Vec<(ScopeId, Vec<RowRecord>)> = Vec::new();
@@ -1717,12 +1736,13 @@ fn repair_rows_after_rollback(
         if scope == WATERMARK_SCOPE {
             continue;
         }
-        let (next_event, next_kind) = counters.get(&scope.0).copied().unwrap_or((1, 1));
+        let next = counters.get(&scope.0).copied().unwrap_or(1);
+        let kind_limit = kind_counters.get(&scope.0).copied();
         let data = store.read_scope(scope).map_err(StorageError::Io)?;
         let mut changed = false;
         let mut rows = Vec::with_capacity(data.rows.len());
         for row in data.rows {
-            if row.owner >= next_event {
+            if row.owner >= next {
                 changed = true;
                 continue;
             }
@@ -1731,9 +1751,11 @@ fn repair_rows_after_rollback(
                 .edges
                 .into_iter()
                 .filter(|edge| {
-                    edge.target < next_event
-                        && (!row.family.typed
-                            || (edge.kind != 0 && u32::from(edge.kind) < next_kind))
+                    // Without a kind dictionary mapping, a reused kind id could
+                    // name a different relation type, so drop the typed row.
+                    let kind_valid = !row.family.typed
+                        || kind_limit.is_some_and(|limit| u32::from(edge.kind) < limit);
+                    edge.target < next && kind_valid
                 })
                 .collect();
             changed |= edges.len() != before;
