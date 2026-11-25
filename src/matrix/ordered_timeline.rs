@@ -14,6 +14,7 @@ use crate::timeline::{OrderedCursor, OrderedIndex, OrderedKey, OrderedPage, Scop
 pub const EVENT_TIMELINE_INDEX_NAME: &str = "event-timeline-v1";
 const EVENT_KEY_WIRE_LEN: usize = 16 + 8 + 8 + 16 + 32;
 type DecodedEventKey = ([u8; 16], i64, i64, NodeId, [u8; 32]);
+type TimelineMutationRoots = ((NodeId, u64), (NodeId, u64));
 const EVENT_TOPO_SCHEMA: [u8; 4] = *b"ETOP";
 const EVENT_STREAM_SCHEMA: [u8; 4] = *b"ESTR";
 const MAX_NODE_ID: NodeId = [0xff; 16];
@@ -328,6 +329,124 @@ pub fn rebind_stream_cursor_to_head<S: StorageEngine + ?Sized>(
         .head()?
         .map(|(root_id, _count)| index.cursor(root_id, cursor.entry()))
         .transpose()
+}
+
+/// Stage removal of event keys from both ordering indexes.
+///
+/// Missing keys are ignored. Payload and locator removal, if desired, stays in
+/// the same caller transaction.
+///
+/// # Errors
+/// Propagates ordered-index removal and validation errors.
+pub fn stage_remove_event_timeline_batch<S: StorageEngine + ?Sized>(
+    transaction: &DatabaseTransaction<'_>,
+    pool: ShardType,
+    topo_index: &EventTopoIndex<'_, S>,
+    stream_index: &EventStreamIndex<'_, S>,
+    entries: &[EventTimelineEntry],
+) -> Result<Option<TimelineMutationRoots>, StorageError> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let topo_entries: Vec<_> = entries
+        .iter()
+        .copied()
+        .map(EventTimelineEntry::topo_key)
+        .collect();
+    let stream_entries: Vec<_> = entries
+        .iter()
+        .copied()
+        .map(EventTimelineEntry::stream_key)
+        .collect();
+    let topo = topo_index.stage_remove(transaction, pool, &topo_entries)?;
+    let stream = stream_index.stage_remove(transaction, pool, &stream_entries)?;
+    Ok(Some((topo, stream)))
+}
+
+/// Purge every event key in a room from both ordering indexes.
+///
+/// Covered subtrees are dropped from their span descriptors without reading
+/// their records.
+///
+/// # Errors
+/// Propagates ordered-index purge and validation errors.
+pub fn stage_purge_room_timeline<S: StorageEngine + ?Sized>(
+    transaction: &DatabaseTransaction<'_>,
+    pool: ShardType,
+    topo_index: &EventTopoIndex<'_, S>,
+    stream_index: &EventStreamIndex<'_, S>,
+    room_scope: &[u8; 16],
+) -> Result<TimelineMutationRoots, StorageError> {
+    let topo = topo_index.stage_purge_prefix(transaction, pool, *room_scope)?;
+    let stream = stream_index.stage_purge_prefix(transaction, pool, *room_scope)?;
+    Ok((topo, stream))
+}
+
+/// Stage the index half of an outlier-to-timeline promotion.
+///
+/// The caller must also update the room flags and any payload metadata in the
+/// same transaction.
+///
+/// # Errors
+/// Propagates ordered-index append and validation errors.
+pub fn stage_promote_outlier_to_timeline<S: StorageEngine + ?Sized>(
+    transaction: &DatabaseTransaction<'_>,
+    pool: ShardType,
+    payload_collection: [u8; 16],
+    topo_index: &EventTopoIndex<'_, S>,
+    stream_index: &EventStreamIndex<'_, S>,
+    entries: &[EventTimelineEntry],
+) -> Result<Option<(NodeId, NodeId)>, StorageError> {
+    stage_event_timeline_batch(
+        transaction,
+        pool,
+        payload_collection,
+        &[],
+        topo_index,
+        stream_index,
+        entries,
+    )
+}
+
+/// Page a cursored read, re-anchoring an expired snapshot onto the head once.
+///
+/// Active cursors keep strict snapshot isolation. If the pinned root has been
+/// reclaimed and the cursor's full key is still available, the read retries
+/// from the current head at that key, degrading to keyset pagination instead
+/// of surfacing a missing-root error.
+///
+/// # Errors
+/// Propagates ordered-index read errors other than an expired cursor root, and
+/// returns the retry error if re-anchored paging still fails.
+pub fn page_with_rebind_fallback<S: StorageEngine + ?Sized, K: OrderedKey>(
+    index: &OrderedIndex<'_, S, K>,
+    prefix: &K::Prefix,
+    cursor: Option<&OrderedCursor<K>>,
+    forward: bool,
+    limit: usize,
+) -> Result<OrderedPage<K>, StorageError> {
+    match index.page(prefix, cursor, forward, limit) {
+        Ok(page) => Ok(page),
+        Err(StorageError::NotFound(missing))
+            if cursor.is_some_and(|cursor| cursor.root_id() == missing) =>
+        {
+            let Some(pinned) = cursor else {
+                return Ok(OrderedPage {
+                    entries: Vec::new(),
+                    next_cursor: None,
+                });
+            };
+            let Some((root_id, _count)) = index.head()? else {
+                return Ok(OrderedPage {
+                    entries: Vec::new(),
+                    next_cursor: None,
+                });
+            };
+            let rebased = index.cursor(root_id, pinned.entry())?;
+            index.page(prefix, Some(&rebased), forward, limit)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn max_stream_key(room_scope: [u8; 16], persisted_up_to: i64) -> EventStreamKey {

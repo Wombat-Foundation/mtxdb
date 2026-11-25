@@ -313,3 +313,189 @@ fn a_stale_dual_index_commit_does_not_publish_its_payload() {
     drop(db);
     std::fs::remove_dir_all(test_path).unwrap();
 }
+
+#[test]
+fn remove_and_purge_keep_both_orders_consistent() {
+    let test_path = test_dir("remove_purge");
+    let db = Database::open(test_path.clone()).unwrap();
+    let pool = db.pool(ShardType::EventDag);
+    let (topo_index, stream_index) = open_event_timeline_indexes(pool.as_ref());
+    let room = [0x61; 16];
+    let other = [0x62; 16];
+    let payload_collection = [0xD8; 16];
+    let entries = [
+        event(room, 1, 1, 1),
+        event(room, 2, 2, 2),
+        event(room, 3, 3, 3),
+        event(other, 1, 1, 4),
+        event(other, 2, 2, 5),
+    ];
+
+    let tx = db.begin_transaction();
+    stage_event_timeline_batch(
+        &tx,
+        ShardType::EventDag,
+        payload_collection,
+        &[],
+        &topo_index,
+        &stream_index,
+        &entries,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let tx = db.begin_transaction();
+    let removed = stage_remove_event_timeline_batch(
+        &tx,
+        ShardType::EventDag,
+        &topo_index,
+        &stream_index,
+        &[entries[1]],
+    )
+    .unwrap()
+    .expect("a non-empty removal stages both indexes");
+    tx.commit().unwrap();
+    assert_eq!(removed, ((removed.0 .0, 1), (removed.1 .0, 1)));
+    let topo_page = topo_index.page(&room, None, true, 10).unwrap();
+    assert_eq!(
+        topo_page
+            .entries
+            .iter()
+            .map(|entry| entry.stream_ordering)
+            .collect::<Vec<_>>(),
+        [1, 3]
+    );
+
+    let tx = db.begin_transaction();
+    let (topo_removed, stream_removed) =
+        stage_purge_room_timeline(&tx, ShardType::EventDag, &topo_index, &stream_index, &other)
+            .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(topo_removed.1, 2);
+    assert_eq!(stream_removed.1, 2);
+    assert!(topo_index
+        .page(&other, None, true, 10)
+        .unwrap()
+        .entries
+        .is_empty());
+    assert!(stream_index
+        .page(&other, None, true, 10)
+        .unwrap()
+        .entries
+        .is_empty());
+    assert_eq!(
+        topo_index
+            .page(&room, None, true, 10)
+            .unwrap()
+            .entries
+            .len(),
+        2
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(test_path).unwrap();
+}
+
+#[test]
+fn promoting_an_outlier_stages_both_orders_without_payloads() {
+    let test_path = test_dir("promote_outlier");
+    let db = Database::open(test_path.clone()).unwrap();
+    let pool = db.pool(ShardType::EventDag);
+    let (topo_index, stream_index) = open_event_timeline_indexes(pool.as_ref());
+    let room = [0x71; 16];
+    let entry = event(room, 4, 4, 1);
+
+    let tx = db.begin_transaction();
+    let roots = stage_promote_outlier_to_timeline(
+        &tx,
+        ShardType::EventDag,
+        [0xE9; 16],
+        &topo_index,
+        &stream_index,
+        &[entry],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(roots.is_some());
+    assert_eq!(
+        topo_index.page(&room, None, true, 10).unwrap().entries,
+        [entry.topo_key()]
+    );
+    assert_eq!(
+        stream_index.page(&room, None, true, 10).unwrap().entries,
+        [entry.stream_key()]
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(test_path).unwrap();
+}
+
+#[test]
+fn an_expired_cursor_falls_back_to_keyset_pagination() {
+    let test_path = test_dir("expired_cursor_fallback");
+    let db = Database::open(test_path.clone()).unwrap();
+    let pool = db.pool(ShardType::EventDag);
+    let (topo_index, stream_index) = open_event_timeline_indexes(pool.as_ref());
+    let room = [0x81; 16];
+    let entries = [
+        event(room, 1, 1, 1),
+        event(room, 2, 2, 2),
+        event(room, 3, 3, 3),
+    ];
+
+    let tx = db.begin_transaction();
+    stage_event_timeline_batch(
+        &tx,
+        ShardType::EventDag,
+        [0xFA; 16],
+        &[],
+        &topo_index,
+        &stream_index,
+        &entries,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let first = topo_index.page(&room, None, true, 1).unwrap();
+    let cursor = first.next_cursor.expect("full page has a cursor");
+
+    // Move the head to a newer snapshot before the old root is reclaimed.
+    let next_tx = db.begin_transaction();
+    stage_event_timeline_batch(
+        &next_tx,
+        ShardType::EventDag,
+        [0xFA; 16],
+        &[],
+        &topo_index,
+        &stream_index,
+        &[event(room, 4, 4, 4)],
+    )
+    .unwrap();
+    next_tx.commit().unwrap();
+
+    let evict = db.begin_transaction();
+    evict
+        .remove(
+            ShardType::EventDag,
+            topo_index.collection_id(),
+            cursor.root_id(),
+        )
+        .unwrap();
+    evict.commit().unwrap();
+
+    let page = page_with_rebind_fallback(&topo_index, &room, Some(&cursor), true, 10).unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| entry.event_node_id)
+            .collect::<Vec<_>>(),
+        [
+            entries[1].event_node_id,
+            entries[2].event_node_id,
+            event(room, 4, 4, 4).event_node_id,
+        ]
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(test_path).unwrap();
+}
