@@ -16057,6 +16057,27 @@ fn promoting_a_delta_table_merges_and_never_lowers_coverage() {
     let _ = fs::remove_dir_all(&fixture.files);
 }
 
+/// A damaged `index.versions` is not an empty baseline: promotion must fail
+/// without rewriting it, leaving the existing bytes for an operator or a later
+/// repair instead of replacing them with the older delta table.
+#[test]
+fn promotion_refuses_to_overwrite_a_damaged_versions_file() {
+    let fixture = delta_only_baseline("promote_damaged");
+    let versions_path = PackfileStorage::index_versions_path(&fixture.files);
+    fs::write(&versions_path, b"not a versions snapshot").unwrap();
+    let before = fs::read(&versions_path).unwrap();
+
+    let error = PackfileStorage::promote_delta_versions(&fixture.files)
+        .expect_err("a damaged baseline must not be promoted over");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+    assert_eq!(
+        fs::read(&versions_path).unwrap(),
+        before,
+        "the damaged baseline is preserved for repair"
+    );
+    let _ = fs::remove_dir_all(&fixture.files);
+}
+
 /// Only a table the reader trusts is promoted: a delta log that does not name
 /// the current checkpoint restores nothing, so it must not reach the file.
 #[test]

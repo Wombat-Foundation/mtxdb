@@ -29,12 +29,15 @@
 //! with coverage 0, so a store written between the two commits does not lose
 //! its versions.
 //!
-//! A missing, truncated, or corrupt file is treated as absent. Because the
-//! file is a whole-file atomic snapshot (temp + fsync + rename + directory
-//! sync), there is no partial record to replay: a torn write is never
-//! published, and a damaged published file is rejected whole. Callers merge it
-//! with the checkpoint and the retained WAL using `max`, so a stale file
-//! cannot lower a version and a damaged one cannot raise it.
+//! A missing, truncated, or corrupt file is treated as absent by
+//! [`read_versions`]. Because the file is a whole-file atomic snapshot (temp +
+//! fsync + rename + directory sync), there is no partial record to replay: a
+//! torn write is never published, and a damaged published file is rejected
+//! whole. Callers about to replace the file use [`read_versions_strict`], which
+//! reports damage instead of treating it as absence, so an unreadable baseline
+//! is preserved rather than overwritten. Callers merge a valid file with the
+//! checkpoint and the retained WAL using `max`, so a stale file cannot lower a
+//! version and a damaged one cannot raise it.
 
 use std::fs;
 use std::io::Write;
@@ -154,6 +157,27 @@ pub fn read_versions(path: &Path) -> Option<VersionsSnapshot> {
     decode_versions(&bytes)
 }
 
+/// Read and validate `versions`, distinguishing a missing file from a failure.
+///
+/// `Ok(None)` means only that `path` does not exist. A file that exists but
+/// cannot be read or decoded returns an error, so a caller about to replace it
+/// does not mistake damage for "no baseline yet".
+///
+/// # Errors
+/// Returns the read error, or `InvalidData` when the file is malformed.
+pub fn read_versions_strict(path: &Path) -> std::io::Result<Option<VersionsSnapshot>> {
+    match fs::read(path) {
+        Ok(bytes) => decode_versions(&bytes).map(Some).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not a valid versions file", path.display()),
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Read only the coverage field, without decoding the entries.
 ///
 /// `None` for a missing or malformed file.
@@ -245,6 +269,20 @@ mod tests {
         let snapshot = read_versions(&path).unwrap();
         assert_eq!(snapshot.covered_lsn, 0);
         assert_eq!(snapshot.versions, versions.to_vec());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn strict_read_reports_damage_but_treats_only_a_missing_file_as_absent() {
+        let path = temp_path("strict");
+        assert_eq!(
+            read_versions_strict(&path).unwrap(),
+            None,
+            "a missing file is the only absence"
+        );
+        fs::write(&path, b"not a versions snapshot").unwrap();
+        let error = read_versions_strict(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
         let _ = fs::remove_file(path);
     }
 

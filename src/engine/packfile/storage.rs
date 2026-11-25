@@ -3860,7 +3860,10 @@ impl PackfileStorage {
             return Ok(());
         }
         let versions_path = Self::index_versions_path(base_dir);
-        let existing = crate::index::versions::read_versions(&versions_path);
+        // A missing file means this is the first promotion. A file that exists
+        // but cannot be read or decoded is not an empty baseline: writing the
+        // older delta table over it would destroy whatever versions it held.
+        let existing = crate::index::versions::read_versions_strict(&versions_path)?;
         if existing
             .as_ref()
             .is_some_and(|snapshot| snapshot.covered_lsn >= table.covered_lsn)
@@ -7517,6 +7520,10 @@ impl PackfileStorage {
     /// checkpoint is an acceleration structure; packfiles remain
     /// authoritative, so a failed persist only costs the next open a rescan.
     fn persist_index_checkpoint_best_effort(&self) {
+        // Repack calls this outside the sync path. Serialize the join, capture,
+        // and inline tail with detached checkpoint starts, so a new worker
+        // cannot rotate an epoch while this checkpoint's tail is sweeping.
+        let _persist_guard = self.index_persist_lock.lock();
         if let Err(e) = self.persist_index_checkpoint() {
             eprintln!("mtxdb: failed to persist index checkpoint: {e}");
         }
