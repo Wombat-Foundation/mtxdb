@@ -8302,7 +8302,8 @@ fn cmd_scan_collection_in_pool(
             }
         }
         out.flush()?;
-        if let Some(note) = raw_scan_note(frames, max_rows, bounded) {
+        let stopped_at_limit = bounded && !opts.is_sorting() && !opts.reverse && frames >= max_rows;
+        if let Some(note) = raw_scan_note(frames, max_rows, stopped_at_limit) {
             eprintln!("{note}");
         }
         return Ok(frames);
@@ -8360,8 +8361,8 @@ fn cmd_scan_collection_in_pool(
 /// The note after a `--raw` scan. A bounded, unsorted scan stops as soon as it
 /// has `max_rows` matches, so reaching the limit does not show that more exist:
 /// say it stopped, not that rows were left out.
-fn raw_scan_note(frames: usize, max_rows: usize, bounded: bool) -> Option<String> {
-    if bounded && frames >= max_rows {
+fn raw_scan_note(frames: usize, max_rows: usize, stopped_at_limit: bool) -> Option<String> {
+    if stopped_at_limit {
         Some(format!(
             "note: stopped after {max_rows} matching records; use -l 0 to scan all"
         ))

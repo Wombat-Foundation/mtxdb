@@ -12194,8 +12194,14 @@ fn raw_scan_note_does_not_claim_truncation_at_the_limit() {
     let at_limit = super::raw_scan_note(5, 5, true).unwrap();
     assert!(at_limit.contains("stopped after 5"), "{at_limit}");
     assert!(!at_limit.contains("showing first"), "{at_limit}");
-    assert_eq!(super::raw_scan_note(3, 5, true), None);
-    assert_eq!(super::raw_scan_note(3, usize::MAX, false), None);
+    // A streaming scan that stopped at the limit may not know the full count.
+    assert!(super::raw_scan_note(6, 5, true)
+        .unwrap()
+        .contains("stopped after 5"));
+    assert_eq!(super::raw_scan_note(5, 5, false), None);
+    assert!(super::raw_scan_note(6, 5, false)
+        .unwrap()
+        .contains("only showing top 5"));
 }
 
 #[test]
