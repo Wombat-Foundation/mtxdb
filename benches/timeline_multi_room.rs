@@ -21,13 +21,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use mtxdb::index::IndexResidency;
 use mtxdb::ordered_timeline::{
     open_event_timeline_indexes, page_stream_up_to, stage_event_timeline_batch,
     stage_promote_outlier_to_timeline, stage_purge_room_timeline,
     stage_remove_event_timeline_batch, EventTimelineEntry,
 };
+use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb::{interop, Database, ShardType};
+use mtxdb::{interop, Database, DatabaseLayout, RuntimeConfig, ShardType};
 use rustix::fs::{fadvise, Advice};
 
 const PAYLOAD_MIN: usize = 256;
@@ -411,6 +413,29 @@ fn maintain_journal(db: &Database) {
     }
 }
 
+fn print_memory_diagnostics(db: &Database, root: &Path, rooms: &[Room]) {
+    let (topo_index, stream_index) = open_event_timeline_indexes(db.event_dag().as_ref());
+    let count_records = |collection_id: &[u8; 16]| {
+        db.event_dag()
+            .collection_len(collection_id)
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    };
+    let payload_records = rooms.iter().fold(0u64, |total, room| {
+        let count = u64::try_from(count_records(&room.collection)).unwrap_or(u64::MAX);
+        total.saturating_add(count)
+    });
+    let topo_records = count_records(&topo_index.collection_id());
+    let stream_records = count_records(&stream_index.collection_id());
+    let (pack_bytes, idx_bytes, run_bytes, wal_bytes, other_bytes) = directory_bytes(root);
+    println!(
+        "multi_room_memory rss_kib={} hwm_kib={} pack_bytes={pack_bytes} idx_bytes={idx_bytes} run_bytes={run_bytes} wal_bytes={wal_bytes} other_bytes={other_bytes} payload_records={payload_records} topo_records={topo_records} stream_records={stream_records}",
+        proc_status_kib("VmRSS:").unwrap_or(0),
+        proc_status_kib("VmHWM:").unwrap_or(0),
+    );
+}
+
 fn write_synthetic(db: &Database, rooms: &mut [Room], counts: &[usize], batch: usize) {
     let mut sequence = 0u64;
     let mut completed = vec![0usize; rooms.len()];
@@ -647,6 +672,92 @@ fn run_page_rows(
     db
 }
 
+/// Measure cold reads through the standalone paged-index reader. Unlike the
+/// shared-WAL `Database`, this read-only pool can keep sealed-pack locators
+/// paged, so locator faults happen in the measured read rather than at open.
+fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: usize) {
+    let (_, idx_bytes, run_bytes, _, _) = directory_bytes(root);
+    if idx_bytes.saturating_add(run_bytes) == 0 {
+        println!(
+            "multi_room_page_paged_skipped reason=no_sealed_index_sidecars idx_bytes={idx_bytes} run_bytes={run_bytes}"
+        );
+        return;
+    }
+    let layout = DatabaseLayout::open_read_only(root.to_path_buf())
+        .expect("open benchmark layout read-only");
+    let pool_path = layout
+        .pool_dir_read_only(ShardType::EventDag)
+        .expect("find event DAG pool");
+    let config = RuntimeConfig {
+        index_residency: Some(IndexResidency::Paged),
+        ..RuntimeConfig::default()
+    };
+
+    for (tier_rank, tier) in tiers.iter().copied().enumerate() {
+        let Some(selected) = rooms.get(tier) else {
+            continue;
+        };
+        let room_id = String::from_utf8_lossy(&selected.id).into_owned();
+        for (order, limit) in [
+            ("topo", 50usize),
+            ("topo", 128),
+            ("stream_up_to", 50),
+            ("stream_up_to", 128),
+        ] {
+            let mut elapsed_samples = Vec::with_capacity(samples);
+            let mut last_io = IoSnapshot::default();
+            let mut last_open_io = IoSnapshot::default();
+            for _ in 0..samples {
+                evict(root, EvictScope::All).expect("evict before paged open");
+                let open_before = IoSnapshot::read();
+                let store = PackfileStorage::open_read_only_with_config(pool_path.clone(), &config)
+                    .expect("open paged event DAG pool");
+                last_open_io = IoSnapshot::read().delta(open_before);
+                {
+                    let (topo_index, stream_index) = open_event_timeline_indexes(&store);
+                    let before = IoSnapshot::read();
+                    let started = Instant::now();
+                    let returned = if order == "topo" {
+                        topo_index
+                            .page(&selected.scope, None, true, limit)
+                            .expect("paged topological page")
+                            .entries
+                            .len()
+                    } else {
+                        page_stream_up_to(
+                            &stream_index,
+                            &selected.scope,
+                            None,
+                            true,
+                            limit,
+                            selected.max_stream,
+                        )
+                        .expect("paged stream page")
+                        .entries
+                        .len()
+                    };
+                    elapsed_samples.push(started.elapsed());
+                    last_io = IoSnapshot::read().delta(before);
+                    std::hint::black_box(returned);
+                }
+            }
+            let min_us = min(&elapsed_samples).as_secs_f64() * 1e6;
+            let median_us = median(&mut elapsed_samples).as_secs_f64() * 1e6;
+            println!(
+                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} samples={} min_us={min_us:.1} median_us={median_us:.1} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
+                tier_label(tier_rank),
+                elapsed_samples.len(),
+                last_open_io.read_bytes,
+                last_io.read_bytes,
+                last_open_io.majflt,
+                last_io.majflt,
+                last_open_io.pgmajfault.unwrap_or(u64::MAX),
+                last_io.pgmajfault.unwrap_or(u64::MAX),
+            );
+        }
+    }
+}
+
 fn run_fetch_rows(
     mut db: Database,
     root: &Path,
@@ -865,7 +976,7 @@ fn main() {
         (rooms, counts, None)
     };
     let total_events: usize = counts.iter().sum();
-    let mut db = Database::open(root.clone()).expect("open benchmark database");
+    let db = Database::open(root.clone()).expect("open benchmark database");
 
     let write_started = Instant::now();
     if let Some(manifest_events) = manifest_events.as_deref() {
@@ -880,25 +991,7 @@ fn main() {
         "multi_room_load events={total_events} rooms={} batch={batch} write_ms={write_ms:.1}",
         rooms.len()
     );
-    let (topo_index, stream_index) = open_event_timeline_indexes(db.event_dag().as_ref());
-    let topo_records = db
-        .event_dag()
-        .collection_len(&topo_index.collection_id())
-        .ok()
-        .flatten()
-        .unwrap_or(0);
-    let stream_records = db
-        .event_dag()
-        .collection_len(&stream_index.collection_id())
-        .ok()
-        .flatten()
-        .unwrap_or(0);
-    let (pack_bytes, idx_bytes, run_bytes, wal_bytes, other_bytes) = directory_bytes(&root);
-    println!(
-        "multi_room_memory rss_kib={} hwm_kib={} pack_bytes={pack_bytes} idx_bytes={idx_bytes} run_bytes={run_bytes} wal_bytes={wal_bytes} other_bytes={other_bytes} topo_records={topo_records} stream_records={stream_records}",
-        proc_status_kib("VmRSS:").unwrap_or(0),
-        proc_status_kib("VmHWM:").unwrap_or(0),
-    );
+    print_memory_diagnostics(&db, &root, &rooms);
 
     let mut ranked: Vec<usize> = rooms
         .iter()
@@ -924,6 +1017,11 @@ fn main() {
         }
     }
 
+    db.event_dag().sync_all().expect("sync before paged reads");
+    let _ = db.coordinator().reclaim_shared();
+    drop(db);
+    run_paged_page_rows(&root, &rooms, &tiers, samples);
+    let mut db = Database::open(root.clone()).expect("reopen benchmark database");
     db = run_page_rows(db, &root, &rooms, &tiers, samples);
     db = run_fetch_rows(db, &root, &rooms, tiers.first().copied(), samples);
     run_mutations(&db, &rooms, tiers.first().copied());
