@@ -169,6 +169,89 @@ fn empty_timeline_batch_does_not_stage_index_heads() {
 }
 
 #[test]
+fn a_rising_watermark_requires_rebinding_a_pinned_stream_cursor() {
+    let test_path = test_dir("stream_watermark_rebind");
+    let db = Database::open(test_path.clone()).unwrap();
+    let pool = db.pool(ShardType::EventDag);
+    let (topo_index, stream_index) = open_event_timeline_indexes(pool.as_ref());
+    let room = [0x51; 16];
+    let payload_collection = [0xC7; 16];
+
+    // R1 publishes streams 2 and 4 while stream 3 is still in flight, so only
+    // stream 2 is contiguous.
+    let first_tx = db.begin_transaction();
+    stage_event_timeline_batch(
+        &first_tx,
+        ShardType::EventDag,
+        payload_collection,
+        &[],
+        &topo_index,
+        &stream_index,
+        &[event(room, 2, 2, 1), event(room, 4, 4, 2)],
+    )
+    .unwrap();
+    first_tx.commit().unwrap();
+
+    let first = page_stream_up_to(&stream_index, &room, None, true, 1, 2).unwrap();
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| entry.stream_ordering)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+    let pinned = first.next_cursor.expect("truncated page has a cursor");
+
+    // R2 fills stream 3, so the watermark advances to 4.
+    let second_tx = db.begin_transaction();
+    stage_event_timeline_batch(
+        &second_tx,
+        ShardType::EventDag,
+        payload_collection,
+        &[],
+        &topo_index,
+        &stream_index,
+        &[event(room, 3, 3, 3)],
+    )
+    .unwrap();
+    second_tx.commit().unwrap();
+
+    // A cursor pinned to R1 cannot see stream 3 even though the watermark now
+    // covers it; this is the hazard that rebinding removes.
+    let stale = page_stream_up_to(&stream_index, &room, Some(&pinned), true, 10, 4).unwrap();
+    assert_eq!(
+        stale
+            .entries
+            .iter()
+            .map(|entry| entry.stream_ordering)
+            .collect::<Vec<_>>(),
+        [4]
+    );
+
+    let rebased = rebind_stream_cursor_to_head(&stream_index, &room, &pinned)
+        .unwrap()
+        .expect("the index has a head");
+    let advanced = page_stream_up_to(&stream_index, &room, Some(&rebased), true, 10, 4).unwrap();
+    assert_eq!(
+        advanced
+            .entries
+            .iter()
+            .map(|entry| entry.stream_ordering)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+
+    assert!(
+        rebind_stream_cursor_to_head(&stream_index, &[0x52; 16], &pinned).is_err(),
+        "rebinding must reject a cursor from another room"
+    );
+
+    drop(db);
+    std::fs::remove_dir_all(test_path).unwrap();
+}
+
+#[test]
 fn a_stale_dual_index_commit_does_not_publish_its_payload() {
     let test_path = test_dir("dual_stale_commit");
     let db = Database::open(test_path.clone()).unwrap();
