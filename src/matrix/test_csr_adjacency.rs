@@ -1616,6 +1616,28 @@ mod edge_log_recovery {
     }
 
     #[test]
+    fn an_unchanged_logged_event_does_not_pin_the_watermark() {
+        let root = test_root("edge-log-unchanged-watermark");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        for (id, prev) in [("$a", &[][..]), ("$a", &[][..]), ("$b", &["$a"][..])] {
+            adj.record_events_logged(&db, &log, &[event(id, prev)], AppendDurability::Deferred)
+                .unwrap();
+        }
+        assert_eq!(log.head(&db).unwrap(), 3);
+
+        CsrAdjacency::checkpoint_edge_log(&db, &log).unwrap();
+
+        assert_eq!(
+            log.pruned(&db).unwrap(),
+            3,
+            "the entry for the unchanged event must not block pruning"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recovery_replays_nothing_when_the_rows_survived() {
         let root = test_root("edge-log-idempotent");
         let db = Database::open(root.clone()).unwrap();

@@ -560,19 +560,20 @@ impl CsrAdjacency {
                         writer.append_rows_deferred_locked(self.scope(), &changed_rows)
                     })
                     .map_err(StorageError::Io)?;
-                if let Some(seq) = log_seq {
-                    // The watermark follows the rows in the same tail, so a
-                    // valid watermark means the rows before it are valid too.
-                    // It only advances from the entry just before this batch:
-                    // if an earlier batch's tail append failed, its entry is
-                    // still unapplied, and moving past it would hide it from
-                    // recovery. The watermark then stays put until
-                    // `recover_edge_log` replays the gap.
-                    let before =
-                        seq.saturating_sub(u64::try_from(events.len()).unwrap_or(u64::MAX));
-                    if read_watermark_locked(&store).map_err(StorageError::Io)? == before {
-                        write_watermark_locked(&store, db, seq).map_err(StorageError::Io)?;
-                    }
+            }
+            if let Some(seq) = log_seq {
+                // The watermark follows the rows in the same tail, so a
+                // valid watermark means the rows before it are valid too.
+                // It only advances from the entry just before this batch:
+                // if an earlier batch's tail append failed, its entry is
+                // still unapplied, and moving past it would hide it from
+                // recovery. The watermark then stays put until
+                // `recover_edge_log` replays the gap. An unchanged batch logs an
+                // entry without appending rows and must advance it too, or that
+                // entry would pin the watermark and block pruning.
+                let before = seq.saturating_sub(u64::try_from(events.len()).unwrap_or(u64::MAX));
+                if read_watermark_locked(&store).map_err(StorageError::Io)? == before {
+                    write_watermark_locked(&store, db, seq).map_err(StorageError::Io)?;
                 }
             }
             Ok(owners)
