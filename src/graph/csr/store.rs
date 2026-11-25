@@ -695,6 +695,13 @@ impl CsrStore {
                 }
             }
         }
+        // Judged before listing: the quiet margin must already have held when
+        // the listing began, not become true while it ran.
+        let quiet = stamp.as_ref().is_some_and(|stamp| {
+            SystemTime::now()
+                .duration_since(stamp.modified)
+                .is_ok_and(|age| age >= SEGMENT_CACHE_QUIET)
+        });
         let started = Instant::now();
         let listed = self.list_segments();
         SEGMENT_LISTINGS.fetch_add(1, Ordering::Relaxed);
@@ -711,9 +718,6 @@ impl CsrStore {
         // Stamp taken before the listing: a change during the listing makes
         // the stamp differ on the next read, never the other way round.
         if let Some(stamp) = stamp {
-            let quiet = SystemTime::now()
-                .duration_since(stamp.modified)
-                .is_ok_and(|age| age >= SEGMENT_CACHE_QUIET);
             SEGMENT_CACHE
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

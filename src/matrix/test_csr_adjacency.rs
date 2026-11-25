@@ -1252,6 +1252,40 @@ mod edge_log_recovery {
     }
 
     #[test]
+    fn the_watermark_never_passes_an_unapplied_entry() {
+        let root = test_root("edge-log-gap-watermark");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        // Entry 1 was logged but its rows never reached the tail, as after a
+        // failed append.
+        let lost = LoggedEvent {
+            scope: ROOM_B,
+            event_id: "$lost".to_owned(),
+            prev: Vec::new(),
+            auth: Vec::new(),
+            relation: None,
+        };
+        assert_eq!(log.append(&db, &[lost]).unwrap(), 1);
+        // A later successful batch must not advance the watermark over it.
+        CsrAdjacency::for_collection(&ROOM_A)
+            .record_events_logged(&db, &log, &[event("$a", &[])], AppendDurability::Deferred)
+            .unwrap();
+        assert_eq!(
+            CsrAdjacency::recover_edge_log(&db, &log).unwrap(),
+            2,
+            "recovery replays from before the gap"
+        );
+        assert_eq!(
+            CsrAdjacency::for_collection(&ROOM_B)
+                .prev_of(&db, "$lost")
+                .unwrap(),
+            Some(Vec::new()),
+            "the unapplied entry's rows were rebuilt"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn watermark_ahead_of_the_log_head_is_clamped() {
         use crate::database::tests::crash_image;
         use crate::journal::cut_segment_image_to_durable_mark;

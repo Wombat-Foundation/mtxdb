@@ -14,6 +14,8 @@
 //! rows they describe are durable in the CSR (see
 //! [`crate::edge_log::EdgeLog::prune_through`]).
 
+use std::sync::{Mutex, PoisonError};
+
 use crate::database::Database;
 use crate::layout::ShardType;
 use crate::short_id::GraphReader;
@@ -25,6 +27,8 @@ const ENTRY_VERSION: u8 = 1;
 const COUNTER_ID: NodeId = *b"MTXD-EDGELOG-CNT";
 const PRUNED_ID: NodeId = *b"MTXD-EDGELOG-PRN";
 const ENTRY_PREFIX: [u8; 8] = *b"EDGELOG1";
+/// Serialises [`EdgeLog::prune_through`] within the process.
+static PRUNE_LOCK: Mutex<()> = Mutex::new(());
 /// Entries removed per prune transaction, bounding one transaction's staging.
 const PRUNE_BATCH: u64 = 512;
 
@@ -307,6 +311,9 @@ impl EdgeLog {
     /// # Errors
     /// Returns an error if a transaction fails.
     pub fn prune_through(&self, db: &Database, through: u64) -> Result<(), StorageError> {
+        // The marker is advanced by a delta computed from what was read, so two
+        // overlapping prunes could both add the same range. One at a time.
+        let _serial = PRUNE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let mut done = self.pruned(db)?;
         while done < through {
             let first = done.saturating_add(1);

@@ -514,7 +514,18 @@ impl CsrAdjacency {
             let (keys, starts) = batch_keys(&prepared);
             let ids = self.events.get_or_create(db, &keys)?;
             let (owners, mut changed_rows) = merge_batch(&mut stored, &prepared, &starts, &ids)?;
-            self.add_child_rows(db, &mut changed_rows)?;
+            // Every logged `prev` edge feeds the reverse rows, not just the
+            // forward rows that changed: after a partial tail loss a forward
+            // row can survive while its reverse row is gone, and replay must
+            // restore it. Merging a child already listed changes nothing.
+            let mut prev_pairs: Vec<(u32, u32)> = Vec::new();
+            for (event, &start) in prepared.iter().zip(&starts) {
+                let first = start.saturating_add(1);
+                for offset in 0..event.prev.len() {
+                    prev_pairs.push((ids[start], ids[first.saturating_add(offset)]));
+                }
+            }
+            self.add_child_rows(db, &mut changed_rows, &prev_pairs)?;
             let appended = !changed_rows.is_empty();
             // Log the edges first, in a journaled transaction: if it fails
             // nothing has reached the tail, and if the rows are later lost the
@@ -554,7 +565,16 @@ impl CsrAdjacency {
                 if let Some(seq) = log_seq {
                     // The watermark follows the rows in the same tail, so a
                     // valid watermark means the rows before it are valid too.
-                    write_watermark_locked(&store, db, seq).map_err(StorageError::Io)?;
+                    // It only advances from the entry just before this batch:
+                    // if an earlier batch's tail append failed, its entry is
+                    // still unapplied, and moving past it would hide it from
+                    // recovery. The watermark then stays put until
+                    // `recover_edge_log` replays the gap.
+                    let before =
+                        seq.saturating_sub(u64::try_from(events.len()).unwrap_or(u64::MAX));
+                    if read_watermark_locked(&store).map_err(StorageError::Io)? == before {
+                        write_watermark_locked(&store, db, seq).map_err(StorageError::Io)?;
+                    }
                 }
             }
             Ok(owners)
@@ -574,7 +594,7 @@ impl CsrAdjacency {
         Ok(owners)
     }
 
-    /// Add the reverse rows for the `PREV` rows in `changed`: for each parent,
+    /// Add the reverse rows for the batch's `(child, parent)` `prev` pairs: for each parent,
     /// the stored children plus the batch's new ones. Runs under the store's
     /// write lock, so the read-merge-append is atomic.
     ///
@@ -585,6 +605,7 @@ impl CsrAdjacency {
         &self,
         db: &Database,
         changed: &mut Vec<RowRecord>,
+        prev_pairs: &[(u32, u32)],
     ) -> Result<(), StorageError> {
         let store = self.store(db);
         let mut added: std::collections::BTreeMap<u32, BTreeSet<Edge>> =
@@ -613,13 +634,11 @@ impl CsrAdjacency {
                 edges: vec![Edge { target: 0, kind: 0 }],
             });
         }
-        for row in changed.iter().filter(|row| row.family.id == PREV.id) {
-            for edge in &row.edges {
-                added.entry(edge.target).or_default().insert(Edge {
-                    target: row.owner,
-                    kind: 0,
-                });
-            }
+        for &(child, parent) in prev_pairs {
+            added.entry(parent).or_default().insert(Edge {
+                target: child,
+                kind: 0,
+            });
         }
         if added.is_empty() {
             return Ok(());
@@ -1506,7 +1525,19 @@ fn write_watermark_locked(store: &CsrStore, db: &Database, seq: u64) -> std::io:
 
 /// The last edge-log sequence number whose rows the CSR has (0 for none).
 fn read_watermark(store: &CsrStore) -> std::io::Result<u64> {
-    let rows = store.read_rows(WATERMARK_SCOPE, &[(WATERMARK, 0)])?;
+    Ok(watermark_from(
+        store.read_rows(WATERMARK_SCOPE, &[(WATERMARK, 0)])?,
+    ))
+}
+
+/// [`read_watermark`] for a caller holding the store's write lock.
+fn read_watermark_locked(store: &CsrStore) -> std::io::Result<u64> {
+    Ok(watermark_from(
+        store.read_rows_locked(WATERMARK_SCOPE, &[(WATERMARK, 0)])?,
+    ))
+}
+
+fn watermark_from(rows: Vec<Option<Vec<Edge>>>) -> u64 {
     let edges = rows.into_iter().next().flatten().unwrap_or_default();
     let half = |kind: u16| {
         edges
@@ -1514,7 +1545,7 @@ fn read_watermark(store: &CsrStore) -> std::io::Result<u64> {
             .find(|edge| edge.kind == kind)
             .map_or(0, |edge| u64::from(edge.target))
     };
-    Ok(half(0) << 32 | half(1))
+    (half(0) << 32) | half(1)
 }
 
 impl CsrAdjacency {
@@ -1545,6 +1576,10 @@ impl CsrAdjacency {
             return Ok(0);
         }
         if head == watermark {
+            // Nothing to replay, but the watermark and its rows may still be
+            // only in the page cache; do not report recovery done before they
+            // are durable.
+            store.sync_tail().map_err(StorageError::Io)?;
             return Ok(0);
         }
         let entries = log.read_range(db, watermark, head)?;
