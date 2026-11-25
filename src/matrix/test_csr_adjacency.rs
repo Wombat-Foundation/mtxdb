@@ -1406,6 +1406,60 @@ mod edge_log_recovery {
     }
 
     #[test]
+    fn watermark_repair_drops_relation_edges_with_rolled_back_kinds() {
+        use crate::database::tests::crash_image;
+        use crate::journal::cut_segment_image_to_durable_mark;
+
+        let root = test_root("edge-log-clamp-relation-kind");
+        let image = test_root("edge-log-clamp-relation-kind-image");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_events_logged(
+            &db,
+            &log,
+            &[event("$a", &[]), event("$b", &[])],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+        // Keep the event IDs and their log entries durable, but let a later
+        // relation-kind allocation and row reach the tail before its WAL group.
+        db.coordinator().sync().unwrap();
+        adj.record_events_logged(
+            &db,
+            &log,
+            &[EventRecord {
+                event_id: "$b",
+                prev: &[],
+                auth: &["$create"],
+                relation: Some(RelationRef {
+                    target: "$a",
+                    rel_type: "org.example.rolled-back-kind",
+                }),
+            }],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+        adj.sync_tail(&db).unwrap();
+
+        crash_image(&db, &root, &image);
+        cut_segment_image_to_durable_mark(&image.join("wal.bin")).unwrap();
+        drop(db);
+
+        let db = Database::open(image.clone()).unwrap();
+        assert_eq!(log.head(&db).unwrap(), 2);
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        assert_eq!(
+            adj.relation_of(&db, "$b", &AlwaysVisible).unwrap(),
+            None,
+            "the relation row must not retain a kind whose allocation rolled back"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
+    }
+
+    #[test]
     fn rows_lost_with_the_tail_are_rebuilt_from_the_log() {
         let root = test_root("edge-log-recover");
         let db = Database::open(root.clone()).unwrap();
