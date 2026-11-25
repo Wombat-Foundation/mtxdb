@@ -19,7 +19,11 @@ fn entry(room_id: [u8; 16], order: i64, seed: u8) -> TimelineEntry {
     TimelineEntry::new(room_id, order, i64::from(seed), node_id, event_ref)
 }
 
-fn span(min_entry: TimelineEntry, max_entry: TimelineEntry, entry_count: u64) -> SpanDescriptor {
+fn span(
+    min_entry: TimelineEntry,
+    max_entry: TimelineEntry,
+    entry_count: u64,
+) -> SpanDescriptor<TimelineEntry> {
     SpanDescriptor {
         min_entry,
         max_entry,
@@ -74,6 +78,83 @@ fn cursor_encoding_roundtrips() {
     let mut corrupt = bytes;
     corrupt[0] ^= 0xff;
     assert_eq!(TimelineCursor::decode(&corrupt), None);
+}
+
+#[test]
+fn ordered_index_writes_and_pages_through_height_four() {
+    let root = test_root("ordered_height_four_writes");
+    let db = Database::open(root.clone()).unwrap();
+    let engine = db.event_dag();
+    let index = OrderedIndex::<_, TinyKey>::open(engine.as_ref(), "tiny_height_four");
+
+    let empty_tx = db.begin_transaction();
+    index
+        .stage_append(&empty_tx, ShardType::EventDag, &[])
+        .unwrap();
+    empty_tx.commit().unwrap();
+    assert_eq!(ordered_height(&index, engine.as_ref()), 0);
+
+    index.build(&[TinyKey(1_000)]).unwrap();
+    assert_eq!(ordered_height(&index, engine.as_ref()), 1);
+
+    let stage_entries: Vec<_> = (1_001..1_017).map(TinyKey).collect();
+    let stage_tx = db.begin_transaction();
+    index
+        .stage_append(&stage_tx, ShardType::EventDag, &stage_entries)
+        .unwrap();
+    stage_tx.commit().unwrap();
+    assert_eq!(ordered_height(&index, engine.as_ref()), 2);
+
+    let level_three_entries: Vec<_> = (1_017..1_065).map(TinyKey).collect();
+    index.append_untransactional(&level_three_entries).unwrap();
+    assert_eq!(ordered_height(&index, engine.as_ref()), 3);
+
+    let level_four_entries: Vec<_> = (1_065..1_257).map(TinyKey).collect();
+    index.append_untransactional(&level_four_entries).unwrap();
+    assert_eq!(ordered_height(&index, engine.as_ref()), 4);
+
+    index.append_untransactional(&[TinyKey(1_257)]).unwrap();
+    let front_tx = db.begin_transaction();
+    index
+        .stage_append(&front_tx, ShardType::EventDag, &[TinyKey(999)])
+        .unwrap();
+    front_tx.commit().unwrap();
+    assert_eq!(ordered_height(&index, engine.as_ref()), 4);
+
+    let page = index.page(&(), None, true, 300).unwrap();
+    assert_eq!(page.entries.len(), 259);
+    assert_eq!(page.entries.first().copied(), Some(TinyKey(999)));
+    assert_eq!(page.entries.last().copied(), Some(TinyKey(1_257)));
+
+    drop(index);
+    drop(engine);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn ordered_height<S: StorageEngine + ?Sized, K: OrderedKey>(
+    index: &OrderedIndex<'_, S, K>,
+    engine: &S,
+) -> u8 {
+    let (root_id, _) = index.head().unwrap().unwrap();
+    let root_record = engine
+        .get(&index.collection_id(), &root_id)
+        .unwrap()
+        .unwrap();
+    decode_root::<K>(&root_record.bytes, index.domain())
+        .unwrap()
+        .height
+}
+
+#[test]
+fn ordered_cursor_rejects_another_key_domain() {
+    let engine = InMemoryStorage::new();
+    let first = OrderedIndex::<_, TinyKey>::open(&engine, "tiny_cursor_first");
+    let second = OrderedIndex::<_, TinyKey>::open(&engine, "tiny_cursor_second");
+    let root_id = first.build(&[TinyKey(4)]).unwrap();
+    let cursor = first.cursor(root_id, TinyKey(4));
+    let error = second.page(&(), Some(&cursor), true, 1).unwrap_err();
+    assert!(matches!(error, StorageError::Corrupt(_)));
 }
 
 #[test]
@@ -349,7 +430,10 @@ fn height_three_root_pages_through_two_directory_levels() {
     let root_id = content_id(&root_payload);
     index.write_record(&root_id, root_payload).unwrap();
     index
-        .write_record(&TIMELINE_HEAD_ID, encode_head(&root_id, 1, index.domain()))
+        .write_record(
+            &TIMELINE_HEAD_ID,
+            encode_head::<ScopedSeqKey>(&root_id, 1, index.domain()).unwrap(),
+        )
         .unwrap();
 
     assert_eq!(index.page(&room, None, true, 10).unwrap().entries, [entry]);
@@ -645,4 +729,80 @@ fn wire_encoding_is_byte_comparable_and_roundtrips() {
         DomainTag::new([0xD0; 16]),
     );
     assert_eq!(TimelineCursor::decode(&cursor.encode()), Some(cursor));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TinyKey(u64);
+
+impl OrderedKey for TinyKey {
+    type Prefix = ();
+
+    const WIRE_LEN: usize = 8;
+    const SCHEMA_TAG: [u8; 4] = *b"TINY";
+    const LEAF_CAP: usize = 4;
+    const DIR_FANOUT: usize = 4;
+
+    fn prefix(&self) {}
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.0.to_be_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        let value = u64::from_be_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| StorageError::Corrupt("tiny key length".to_owned()))?,
+        );
+        Ok(Self(value))
+    }
+}
+
+#[test]
+fn tiny_geometry_grows_and_pages_through_multiple_heights() {
+    let db_path = test_root("tiny_geometry");
+    let db = Database::open(db_path.clone()).unwrap();
+    let index = OrderedIndex::<_, TinyKey>::open(db.event_dag().as_ref(), "tiny_geometry");
+    let entries: Vec<TinyKey> = (1_000..2_100).map(TinyKey).collect();
+    index.build(&entries).unwrap();
+
+    let root_id = index.head().unwrap().unwrap().0;
+    let root_bytes = db
+        .event_dag()
+        .get(&index.collection_id(), &root_id)
+        .unwrap()
+        .unwrap();
+    let root = decode_root::<TinyKey>(&root_bytes.bytes, index.domain()).unwrap();
+    assert!(
+        root.height >= 4,
+        "tiny geometry should reach height 4+, got {}",
+        root.height
+    );
+
+    index
+        .append(&db, ShardType::EventDag, &[TinyKey(999)])
+        .unwrap();
+    let transaction = db.begin_transaction();
+    index
+        .stage_append(
+            &transaction,
+            ShardType::EventDag,
+            &[TinyKey(998), TinyKey(997)],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let first = index.page(&(), None, true, 3).unwrap();
+    assert_eq!(first.entries, [TinyKey(997), TinyKey(998), TinyKey(999)]);
+    let last = index.page(&(), None, false, 2).unwrap();
+    assert_eq!(last.entries, [TinyKey(2_099), TinyKey(2_098)]);
+
+    let wrong_domain = OrderedCursor::new(root_id, TinyKey(1_000), DomainTag::new([0xAB; 16]));
+    assert!(
+        index.page(&(), Some(&wrong_domain), true, 1).is_err(),
+        "a cursor from another domain must be rejected"
+    );
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(db_path);
 }
