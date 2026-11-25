@@ -3870,6 +3870,22 @@ impl JournalCoordinator {
         })
     }
 
+    /// Run the installed [`PreSyncHook`] before WAL durability work. Returns
+    /// whether a hook was installed.
+    ///
+    /// Callers must not hold the journal lock: the hook syncs derived stores
+    /// whose writers can be waiting on the journal while holding those stores'
+    /// locks.
+    fn run_pre_sync_hook(&self) -> io::Result<bool> {
+        let hook = self.pre_sync_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Fsync the captured handle with no journal lock held, recording the
     /// fsync time in `timings`.
     fn flush_captured_file(
@@ -3880,10 +3896,7 @@ impl JournalCoordinator {
         // The boundary is already captured and no journal lock is held, so the
         // hook's work covers everything published up to that boundary while
         // publishers carry on past it.
-        let pre_sync = self.pre_sync_hook.lock().clone();
-        if let Some(pre_sync) = pre_sync {
-            pre_sync()?;
-        }
+        self.run_pre_sync_hook()?;
         let fsync_started = std::time::Instant::now();
         #[cfg(test)]
         let _trace = crate::test_trace::span("wal.group_fsync", std::path::Path::new("wal"));
@@ -4914,9 +4927,18 @@ impl JournalCoordinator {
         // Wait out any in-flight fsync: the rewrite replaces the segment file,
         // and a sync must not flush a handle to the replaced inode.
         let _sync = self.sync_lock.lock();
+        // The rebuilt file fsyncs every retained group. Run the derived-store
+        // hook first, without the journal lock, and remember the boundary it
+        // covered. A group published after that boundary must not become
+        // durable through this rewrite.
+        let hooked_through = self.published_lsn();
+        let had_hook = self.run_pre_sync_hook()?;
         let mut journal = self.journal.lock();
         self.revoke_over_cap_leases(&journal);
         self.run_reclaim_hook();
+        if had_hook && journal.next_lsn.saturating_sub(1) > hooked_through {
+            return Ok(journal.skipped_reclaim());
+        }
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let reclaim = journal.reclaim_through(replay_limit)?;
         // The rewrite replaced the segment inode and moved its base LSN without
@@ -4935,9 +4957,14 @@ impl JournalCoordinator {
         blocked_by: Option<ShardType>,
     ) -> io::Result<Reclaim> {
         let _sync = self.sync_lock.lock();
+        let hooked_through = self.published_lsn();
+        let had_hook = self.run_pre_sync_hook()?;
         let mut journal = self.journal.lock();
         self.revoke_over_cap_leases(&journal);
         self.run_reclaim_hook();
+        if had_hook && journal.next_lsn.saturating_sub(1) > hooked_through {
+            return Ok(journal.skipped_reclaim());
+        }
         let replay_limit = self.replay_reclaim_limit(covered_lsn);
         let blocked_by = (replay_limit == covered_lsn)
             .then_some(blocked_by)
@@ -5533,6 +5560,18 @@ impl Journal {
     #[must_use]
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
+    }
+
+    /// A no-op reclaim result for a rewrite that must wait until a newer group
+    /// is durable and covered by the pre-sync hook.
+    fn skipped_reclaim(&self) -> Reclaim {
+        Reclaim {
+            retained_groups: u64::try_from(self.groups.len()).unwrap_or(u64::MAX),
+            retained_bytes: self
+                .file_len
+                .saturating_sub(u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX)),
+            ..Default::default()
+        }
     }
 
     /// Compact this segment, dropping committed groups the checkpoint has

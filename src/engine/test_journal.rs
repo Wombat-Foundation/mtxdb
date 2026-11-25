@@ -2838,6 +2838,61 @@ fn a_group_published_while_the_hook_runs_is_not_in_the_boundary() {
 }
 
 #[test]
+fn reclaim_runs_the_pre_sync_hook_before_making_retained_groups_durable() {
+    let coordinator = open_arc("reclaim_pre_sync");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    coordinator
+        .publish_group(&[put(1, 2, b"retained")])
+        .unwrap();
+    let runs = Arc::new(AtomicU64::new(0));
+    {
+        let runs = runs.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+    }
+
+    let reclaim = coordinator.reclaim_through(first.last_lsn).unwrap();
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the hook covers the retained suffix before its fsync"
+    );
+    assert!(reclaim.reclaimed_bytes > 0);
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
+fn reclaim_skips_a_group_published_after_the_hook_boundary() {
+    let coordinator = open_arc("reclaim_pre_sync_late");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    let late = Arc::new(AtomicU64::new(0));
+    {
+        let hooked = coordinator.clone();
+        let late = late.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            if late.load(Ordering::SeqCst) == 0 {
+                let receipt = hooked.publish_group(&[put(2, 2, b"late")]).unwrap();
+                late.store(receipt.last_lsn, Ordering::SeqCst);
+            }
+            Ok(())
+        })));
+    }
+    let reclaim = coordinator.reclaim_through(first.last_lsn).unwrap();
+
+    assert!(late.load(Ordering::SeqCst) > first.last_lsn);
+    assert_eq!(
+        reclaim.reclaimed_bytes, 0,
+        "a late group must not become durable through the rewrite"
+    );
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
 fn a_failing_pre_sync_hook_fails_the_sync_without_poisoning_the_journal() {
     let coordinator = open_arc("pre_sync_failure");
     let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
