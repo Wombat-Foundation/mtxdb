@@ -1320,6 +1320,11 @@ impl CsrAdjacency {
     /// Remove the room's adjacency and relation-kind dictionary in one commit:
     /// the kind ids live and die with the edges that use them.
     ///
+    /// Callers must serialize this with every other writer to the same scope.
+    /// The State deletion commits before the graph tombstone is appended, so a
+    /// concurrent `record_event` between those steps can be tombstoned without
+    /// being covered by the purge marker.
+    ///
     /// # Errors
     /// Returns an error if the delete cannot be staged or committed.
     pub fn purge(&self, db: &Database) -> Result<(), StorageError> {
@@ -1334,6 +1339,10 @@ impl CsrAdjacency {
     /// This is separate from [`Self::stage_purge`] because the graph store is
     /// outside the transaction layer. Call it after the transaction that drops
     /// the event-id maps commits.
+    ///
+    /// Callers must serialize this with every other writer to the same scope: a
+    /// write that lands between the State deletion and this call can be
+    /// tombstoned without being covered by the purge marker.
     ///
     /// # Errors
     /// Returns an error if the tombstone cannot be appended.
@@ -1634,6 +1643,30 @@ fn applied_purges(
     Ok(applied)
 }
 
+/// Raise the log past `floor` (the highest applied purge) when it is above
+/// `head`, and move the watermark with it. Entries up to `head` are pruned
+/// first, so nothing unapplied is lost, and the raised head is made durable
+/// before the watermark: a durable watermark above a rolled-back head would
+/// send the next recovery back through the rollback repair.
+fn raise_log_floor(
+    db: &Database,
+    store: &CsrStore,
+    log: &EdgeLog,
+    head: u64,
+    floor: u64,
+) -> Result<(), StorageError> {
+    if floor <= head {
+        return Ok(());
+    }
+    log.prune_through(db, head)?;
+    log.raise_head_to(db, floor)?;
+    db.coordinator().sync().map_err(StorageError::Io)?;
+    store
+        .with_write_lock(|| write_watermark_locked(store, db, floor))
+        .map_err(StorageError::Io)?;
+    store.sync_tail().map_err(StorageError::Io)
+}
+
 /// The highest log sequence number any scope records as an applied purge.
 fn max_applied_purge(store: &CsrStore) -> std::io::Result<u64> {
     let mut highest = 0_u64;
@@ -1720,7 +1753,7 @@ impl CsrAdjacency {
             // The repaired rows and the reset watermark are durable, so the
             // entries they cover are no longer needed.
             log.prune_through(db, head)?;
-            log.raise_head_to(db, purge_floor)?;
+            raise_log_floor(db, &store, log, head, purge_floor)?;
             return Ok(0);
         }
         if head == watermark {
@@ -1729,10 +1762,7 @@ impl CsrAdjacency {
             // are durable.
             store.sync_tail().map_err(StorageError::Io)?;
             repair_rows_after_rollback(db, &store, watermark)?;
-            if purge_floor > head {
-                log.prune_through(db, head)?;
-                log.raise_head_to(db, purge_floor)?;
-            }
+            raise_log_floor(db, &store, log, head, purge_floor)?;
             return Ok(0);
         }
         // Repair stale ids without advancing the watermark. If recovery crashes
@@ -1823,7 +1853,7 @@ impl CsrAdjacency {
         // The rows and the watermark are durable, so the log no longer needs
         // these entries.
         log.prune_through(db, head)?;
-        log.raise_head_to(db, purge_floor)?;
+        raise_log_floor(db, &store, log, head, purge_floor)?;
         Ok(replayed)
     }
 

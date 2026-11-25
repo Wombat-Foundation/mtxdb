@@ -522,6 +522,11 @@ impl RoomAuth {
     /// purge fails with [`RoomAuthError::StaleGeneration`] and no current
     /// generation.
     ///
+    /// Do not run `record_event` or `record_events` for the same room
+    /// concurrently with this: the graph tombstone is appended after the
+    /// transaction commits, and a write in between can be tombstoned without the
+    /// purge marker covering it.
+    ///
     /// # Errors
     /// Storage errors.
     pub fn purge(&self, db: &Database) -> Result<(), RoomAuthError> {

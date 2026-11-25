@@ -1594,13 +1594,23 @@ mod edge_log_recovery {
         adj.record_events_logged(&db, &log, &[event("$new", &[])], AppendDurability::Deferred)
             .unwrap();
         assert_eq!(log.head(&db).unwrap(), 4);
-        let db = crash_keeping_only_the_wal(&image, db);
+        // Copy the store as a crash would leave it, then check the live one.
+        let later = test_root("edge-log-purge-floor-later");
+        db.coordinator().sync().unwrap();
+        crash_image(&db, &image, &later);
+        // The watermark moved with the floor, so the new entry can be pruned.
+        CsrAdjacency::checkpoint_edge_log(&db, &log).unwrap();
+        assert_eq!(log.pruned(&db).unwrap(), 4);
+        drop(db);
+        let db = Database::open(later.clone()).unwrap();
+        let db = crash_keeping_only_the_wal(&later, db);
         CsrAdjacency::recover_edge_log(&db, &log).unwrap();
         assert_eq!(adj.prev_of(&db, "$new").unwrap(), Some(Vec::new()));
         assert_eq!(adj.prev_of(&db, "$a").unwrap(), None);
         drop(db);
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(image);
+        let _ = std::fs::remove_dir_all(later);
     }
 
     #[test]
