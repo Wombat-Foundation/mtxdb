@@ -808,3 +808,189 @@ fn tiny_geometry_grows_and_pages_through_multiple_heights() {
     drop(db);
     let _ = std::fs::remove_dir_all(db_path);
 }
+
+#[test]
+fn tiny_tree_removal_demotes_and_prefix_purge_keeps_old_cursors_valid() {
+    let db_path = test_root("tiny_remove_demote");
+    let db = Database::open(db_path.clone()).unwrap();
+    let index = OrderedIndex::<_, TinyKey>::open(db.event_dag().as_ref(), "tiny_remove_demote");
+    let entries: Vec<_> = (1_000..2_100).map(TinyKey).collect();
+    index.build(&entries).unwrap();
+    let old_page = index.page(&(), None, true, 1).unwrap();
+    let old_cursor = old_page.next_cursor.unwrap();
+    assert!(ordered_height(&index, db.event_dag().as_ref()) >= 4);
+
+    let removed_keys: Vec<_> = (1_000..2_098).map(TinyKey).collect();
+    let transaction = db.begin_transaction();
+    let (_root_after_remove, removed) = index
+        .stage_remove(&transaction, ShardType::EventDag, &removed_keys)
+        .unwrap();
+    assert_eq!(removed, 1_098);
+    transaction.commit().unwrap();
+
+    let remaining = index.page(&(), None, true, 10).unwrap();
+    assert_eq!(remaining.entries, [TinyKey(2_098), TinyKey(2_099)]);
+    let old_snapshot = index.page(&(), Some(&old_cursor), true, 2).unwrap();
+    assert_eq!(old_snapshot.entries, [TinyKey(1_001), TinyKey(1_002)]);
+
+    let transaction = db.begin_transaction();
+    let (_empty_root, removed) = index
+        .stage_purge_prefix(&transaction, ShardType::EventDag, ())
+        .unwrap();
+    assert_eq!(removed, 2);
+    transaction.commit().unwrap();
+    let count = index.head().unwrap().unwrap().1;
+    assert_eq!(count, 0);
+    assert_eq!(ordered_height(&index, db.event_dag().as_ref()), 0);
+    assert!(index.page(&(), None, true, 10).unwrap().entries.is_empty());
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[test]
+fn removal_collapses_height_and_keeps_a_canonical_empty_root() {
+    let engine = InMemoryStorage::new();
+    let index = OrderedIndex::<_, TinyKey>::open(&engine, "tiny_remove_height");
+    let entries: Vec<TinyKey> = (1..=300).map(TinyKey).collect();
+    index.build(&entries).unwrap();
+    assert_eq!(ordered_height(&index, &engine), 4);
+
+    let transaction = index.remove_untransactional(&(5..=300).map(TinyKey).collect::<Vec<_>>());
+    assert!(transaction.is_ok());
+    assert_eq!(ordered_height(&index, &engine), 1);
+    assert_eq!(index.head().unwrap().unwrap().1, 4);
+    assert_eq!(
+        index.page(&(), None, true, 10).unwrap().entries,
+        [TinyKey(1), TinyKey(2), TinyKey(3), TinyKey(4)]
+    );
+
+    index
+        .remove_untransactional(&[TinyKey(1), TinyKey(2), TinyKey(3), TinyKey(4)])
+        .unwrap();
+    assert_eq!(ordered_height(&index, &engine), 0);
+    assert_eq!(index.head().unwrap().unwrap().1, 0);
+    assert!(index.page(&(), None, true, 10).unwrap().entries.is_empty());
+}
+
+#[test]
+fn removing_absent_keys_leaves_the_root_unchanged() {
+    let engine = InMemoryStorage::new();
+    let index = OrderedIndex::<_, TinyKey>::open(&engine, "tiny_remove_gaps");
+    let root = index
+        .build(&[TinyKey(10), TinyKey(20), TinyKey(30)])
+        .unwrap();
+    let page = index.page(&(), None, true, 10).unwrap();
+
+    let unchanged = index
+        .remove_untransactional(&[TinyKey(15), TinyKey(25)])
+        .unwrap();
+    assert_eq!(unchanged.0, root);
+    assert_eq!(
+        index.page(&(), None, true, 10).unwrap().entries,
+        page.entries
+    );
+}
+
+#[test]
+fn a_cursor_pinned_before_removal_keeps_reading_its_snapshot() {
+    let engine = InMemoryStorage::new();
+    let index = OrderedIndex::<_, TinyKey>::open(&engine, "tiny_remove_cursor");
+    let entries: Vec<TinyKey> = (1..=100).map(TinyKey).collect();
+    index.build(&entries).unwrap();
+
+    let first = index.page(&(), None, true, 5).unwrap();
+    let pinned = first.next_cursor.expect("full page has a cursor");
+    index
+        .remove_untransactional(&(1..=50).map(TinyKey).collect::<Vec<_>>())
+        .unwrap();
+
+    let old = index.page(&(), Some(&pinned), true, 5).unwrap();
+    assert_eq!(
+        old.entries,
+        [TinyKey(6), TinyKey(7), TinyKey(8), TinyKey(9), TinyKey(10)]
+    );
+    let current = index.page(&(), None, true, 5).unwrap();
+    assert_eq!(
+        current.entries,
+        [
+            TinyKey(51),
+            TinyKey(52),
+            TinyKey(53),
+            TinyKey(54),
+            TinyKey(55)
+        ]
+    );
+}
+
+#[test]
+fn a_transactional_remove_and_mutate_publish_one_root() {
+    let root = test_root("transactional_remove_mutate");
+    let db = Database::open(root.clone()).unwrap();
+    let index = OrderedIndex::<_, TinyKey>::open(db.event_dag().as_ref(), "tiny_mutate");
+
+    let entries: Vec<TinyKey> = (1..=300).map(TinyKey).collect();
+    index.build(&entries).unwrap();
+
+    let remove_tx = db.begin_transaction();
+    let (removed_root, _removed) = index
+        .stage_remove(
+            &remove_tx,
+            ShardType::EventDag,
+            &(2..=300).map(TinyKey).collect::<Vec<_>>(),
+        )
+        .unwrap();
+    remove_tx.commit().unwrap();
+    assert_eq!(ordered_height(&index, db.event_dag().as_ref()), 1);
+    assert_eq!(index.head().unwrap().unwrap().0, removed_root);
+    assert_eq!(
+        index.page(&(), None, true, 10).unwrap().entries,
+        [TinyKey(1)]
+    );
+
+    let mutate_tx = db.begin_transaction();
+    index
+        .stage_mutate(
+            &mutate_tx,
+            ShardType::EventDag,
+            &[TinyKey(1)],
+            &[TinyKey(7), TinyKey(9)],
+        )
+        .unwrap();
+    mutate_tx.commit().unwrap();
+    assert_eq!(
+        index.page(&(), None, true, 10).unwrap().entries,
+        [TinyKey(7), TinyKey(9)]
+    );
+    assert_eq!(index.head().unwrap().unwrap().1, 2);
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn prefix_purge_drops_one_room_without_reading_its_subtrees() {
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "purge_rooms");
+    let room_a = [0xAA; 16];
+    let room_b = [0xBB; 16];
+    let mut entries = Vec::new();
+    for order in 1..=200 {
+        entries.push(entry(room_a, order, u8::try_from(order % 251).unwrap_or(0)));
+    }
+    for order in 1..=100 {
+        entries.push(entry(room_b, order, u8::try_from(order % 251).unwrap_or(1)));
+    }
+    index.build(&entries).unwrap();
+
+    index.purge_prefix_untransactional(room_a).unwrap();
+    assert!(collect(&index, &room_a, true, 17).is_empty());
+    assert_eq!(collect(&index, &room_b, true, 17).len(), 100);
+    assert_eq!(index.head().unwrap().unwrap().1, 100);
+    assert_eq!(ordered_height(&index, &engine), 1);
+
+    index.purge_prefix_untransactional(room_b).unwrap();
+    assert!(collect(&index, &room_b, true, 17).is_empty());
+    assert_eq!(index.head().unwrap().unwrap().1, 0);
+    assert_eq!(ordered_height(&index, &engine), 0);
+}

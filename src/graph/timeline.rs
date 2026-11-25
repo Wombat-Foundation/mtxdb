@@ -265,12 +265,27 @@ struct TimelineRoot<K: OrderedKey> {
 #[derive(Default)]
 struct StagedTree {
     records: Vec<StagedRecord>,
+    by_id: std::collections::HashMap<NodeId, usize>,
     inserted: u64,
+    removed: u64,
+}
+
+impl StagedTree {
+    fn push(&mut self, id: NodeId, record: StagedRecord) {
+        let index = self.records.len();
+        self.records.push(record);
+        self.by_id.insert(id, index);
+    }
 }
 
 enum StagedRecord {
     Leaf(NodeId, Vec<u8>),
     Directory(NodeId, Vec<u8>),
+}
+
+enum TreeMutation<K: OrderedKey> {
+    Remove(Vec<K>),
+    PurgePrefix(K::Prefix),
 }
 
 trait TimelineTreeIo<K: OrderedKey> {
@@ -545,6 +560,234 @@ fn append_spans<K: OrderedKey>(
         }
     }
     Ok(output)
+}
+
+fn write_leaf_span<K: OrderedKey>(
+    entries: &[K],
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<SpanDescriptor<K>, StorageError> {
+    let first = *entries
+        .first()
+        .ok_or_else(|| StorageError::Internal("cannot write an empty ordered leaf".to_owned()))?;
+    let last = *entries
+        .last()
+        .ok_or_else(|| StorageError::Internal("cannot write an empty ordered leaf".to_owned()))?;
+    let payload = encode_leaf::<K>(entries)?;
+    let id = content_id(&payload);
+    io.write_leaf(id, payload)?;
+    Ok(SpanDescriptor {
+        min_entry: first,
+        max_entry: last,
+        entry_count: u64::try_from(entries.len())
+            .map_err(|_| StorageError::Internal("ordered leaf count overflow".to_owned()))?,
+        child_id: id,
+    })
+}
+
+fn remove_spans<K: OrderedKey>(
+    spans: &[SpanDescriptor<K>],
+    level: u8,
+    to_remove: &[K],
+    io: &mut dyn TimelineTreeIo<K>,
+    removed: &mut u64,
+) -> Result<Vec<SpanDescriptor<K>>, StorageError> {
+    if spans.is_empty() || to_remove.is_empty() {
+        return Ok(spans.to_vec());
+    }
+    let mut assigned = vec![Vec::new(); spans.len()];
+    for entry in to_remove {
+        let index = spans.partition_point(|span| span.max_entry < *entry);
+        let Some(span) = spans.get(index) else {
+            continue;
+        };
+        if *entry < span.min_entry {
+            continue;
+        }
+        assigned
+            .get_mut(index)
+            .ok_or_else(|| StorageError::Internal("ordered remove route".to_owned()))?
+            .push(*entry);
+    }
+
+    let mut output = Vec::with_capacity(spans.len());
+    for (index, span) in spans.iter().enumerate() {
+        let incoming = assigned
+            .get(index)
+            .ok_or_else(|| StorageError::Internal("ordered remove assignment".to_owned()))?;
+        if incoming.is_empty() {
+            output.push(*span);
+            continue;
+        }
+        if level == 0 {
+            let existing = io.load_leaf(span)?;
+            validate_leaf_span(span, &existing)?;
+            let mut surviving = Vec::with_capacity(existing.len());
+            let (mut source, mut requested) = (0_usize, 0_usize);
+            let mut removed_here = 0_u64;
+            while source < existing.len() {
+                let entry = existing[source];
+                while incoming
+                    .get(requested)
+                    .is_some_and(|candidate| *candidate < entry)
+                {
+                    requested = requested.checked_add(1).ok_or_else(|| {
+                        StorageError::Internal("ordered remove offset overflow".to_owned())
+                    })?;
+                }
+                if incoming
+                    .get(requested)
+                    .is_some_and(|candidate| *candidate == entry)
+                {
+                    requested = requested.checked_add(1).ok_or_else(|| {
+                        StorageError::Internal("ordered remove offset overflow".to_owned())
+                    })?;
+                    removed_here = removed_here.checked_add(1).ok_or_else(|| {
+                        StorageError::Internal("ordered remove count overflow".to_owned())
+                    })?;
+                } else {
+                    surviving.push(entry);
+                }
+                source = source.checked_add(1).ok_or_else(|| {
+                    StorageError::Internal("ordered remove offset overflow".to_owned())
+                })?;
+            }
+            *removed = removed.checked_add(removed_here).ok_or_else(|| {
+                StorageError::Internal("ordered remove count overflow".to_owned())
+            })?;
+            if removed_here == 0 {
+                output.push(*span);
+            } else if !surviving.is_empty() {
+                output.push(write_leaf_span(&surviving, io)?);
+            }
+            continue;
+        }
+
+        let children = io.load_directory(span, level)?;
+        validate_span_children(span, &children)?;
+        let before = *removed;
+        let child_level = level
+            .checked_sub(1)
+            .ok_or_else(|| StorageError::Corrupt("ordered remove level underflow".to_owned()))?;
+        let changed = remove_spans(&children, child_level, incoming, io, removed)?;
+        if *removed == before {
+            output.push(*span);
+        } else if !changed.is_empty() {
+            output.extend(build_directory_blocks(
+                &changed,
+                level,
+                SplitMode::Interior,
+                |id, payload| io.write_directory(id, payload),
+            )?);
+        }
+    }
+    Ok(output)
+}
+
+fn purge_prefix_spans<K: OrderedKey>(
+    spans: &[SpanDescriptor<K>],
+    level: u8,
+    prefix: &K::Prefix,
+    io: &mut dyn TimelineTreeIo<K>,
+    removed: &mut u64,
+) -> Result<Vec<SpanDescriptor<K>>, StorageError> {
+    let mut output = Vec::with_capacity(spans.len());
+    for span in spans {
+        if span.max_entry.prefix() < *prefix || span.min_entry.prefix() > *prefix {
+            output.push(*span);
+            continue;
+        }
+        if span.min_entry.prefix() == *prefix && span.max_entry.prefix() == *prefix {
+            *removed = removed.checked_add(span.entry_count).ok_or_else(|| {
+                StorageError::Internal("ordered prefix purge count overflow".to_owned())
+            })?;
+            continue;
+        }
+        if level == 0 {
+            let existing = io.load_leaf(span)?;
+            validate_leaf_span(span, &existing)?;
+            let surviving: Vec<_> = existing
+                .iter()
+                .copied()
+                .filter(|entry| entry.prefix() != *prefix)
+                .collect();
+            let dropped = span
+                .entry_count
+                .checked_sub(u64::try_from(surviving.len()).map_err(|_| {
+                    StorageError::Internal("ordered prefix purge count overflow".to_owned())
+                })?)
+                .ok_or_else(|| StorageError::Corrupt("ordered leaf count underflow".to_owned()))?;
+            *removed = removed.checked_add(dropped).ok_or_else(|| {
+                StorageError::Internal("ordered prefix purge count overflow".to_owned())
+            })?;
+            if !surviving.is_empty() {
+                output.push(write_leaf_span(&surviving, io)?);
+            }
+            continue;
+        }
+
+        let children = io.load_directory(span, level)?;
+        validate_span_children(span, &children)?;
+        let before = *removed;
+        let child_level = level.checked_sub(1).ok_or_else(|| {
+            StorageError::Corrupt("ordered prefix purge level underflow".to_owned())
+        })?;
+        let changed = purge_prefix_spans(&children, child_level, prefix, io, removed)?;
+        if *removed == before {
+            output.push(*span);
+        } else if !changed.is_empty() {
+            output.extend(build_directory_blocks(
+                &changed,
+                level,
+                SplitMode::Interior,
+                |id, payload| io.write_directory(id, payload),
+            )?);
+        }
+    }
+    Ok(output)
+}
+
+fn demote_spans<K: OrderedKey>(
+    mut spans: Vec<SpanDescriptor<K>>,
+    mut height: u8,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<(u8, Vec<SpanDescriptor<K>>), StorageError> {
+    if spans.is_empty() {
+        return Ok((0, spans));
+    }
+    while height > 1 && spans.len() == 1 {
+        let child_level = height
+            .checked_sub(1)
+            .ok_or_else(|| StorageError::Corrupt("ordered root height underflow".to_owned()))?;
+        let children = io.load_directory(&spans[0], child_level)?;
+        validate_span_children(&spans[0], &children)?;
+        spans = children;
+        height = child_level;
+    }
+    Ok((height, spans))
+}
+
+fn span_entry_count<K: OrderedKey>(spans: &[SpanDescriptor<K>]) -> Result<u64, StorageError> {
+    spans.iter().try_fold(0_u64, |count, span| {
+        count
+            .checked_add(span.entry_count)
+            .ok_or_else(|| StorageError::Internal("ordered entry count overflow".to_owned()))
+    })
+}
+
+fn mutation_count<K: OrderedKey>(
+    old_count: u64,
+    removed: u64,
+    directories: &[SpanDescriptor<K>],
+) -> Result<u64, StorageError> {
+    let count = old_count
+        .checked_sub(removed)
+        .ok_or_else(|| StorageError::Corrupt("ordered remove count underflow".to_owned()))?;
+    if span_entry_count(directories)? != count {
+        return Err(StorageError::Corrupt(
+            "ordered mutation root count mismatch".to_owned(),
+        ));
+    }
+    Ok(count)
 }
 
 fn validate_leaf_span<K: OrderedKey>(
@@ -1228,6 +1471,237 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         Ok(root_id)
     }
 
+    /// Stage removal of the supplied keys and publish one replacement root.
+    /// Missing and duplicate keys are ignored.
+    ///
+    /// # Errors
+    /// Propagates transaction, storage, and record validation errors.
+    pub fn stage_remove(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        to_remove: &[K],
+    ) -> Result<(NodeId, u64), StorageError> {
+        let mut keys = to_remove.to_vec();
+        keys.sort_unstable();
+        keys.dedup();
+        self.stage_mutation(transaction, pool, TreeMutation::Remove(keys))
+    }
+
+    /// Stage removal of every key whose leading prefix equals `prefix`.
+    /// Entire covered subtrees are removed from their descriptors without
+    /// reading their directory or leaf records.
+    ///
+    /// # Errors
+    /// Propagates transaction, storage, and record validation errors.
+    pub fn stage_purge_prefix(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        prefix: K::Prefix,
+    ) -> Result<(NodeId, u64), StorageError> {
+        self.stage_mutation(transaction, pool, TreeMutation::PurgePrefix(prefix))
+    }
+
+    /// Remove keys through raw storage for single-writer maintenance.
+    ///
+    /// # Errors
+    /// Propagates storage errors or reports corrupt/missing referenced nodes.
+    pub fn remove_untransactional(&self, to_remove: &[K]) -> Result<(NodeId, u64), StorageError> {
+        let mut keys = to_remove.to_vec();
+        keys.sort_unstable();
+        keys.dedup();
+        self.mutate_untransactional(TreeMutation::Remove(keys))
+    }
+
+    /// Remove a complete leading-prefix range through raw storage.
+    ///
+    /// # Errors
+    /// Propagates storage errors or reports corrupt/missing referenced nodes.
+    pub fn purge_prefix_untransactional(
+        &self,
+        prefix: K::Prefix,
+    ) -> Result<(NodeId, u64), StorageError> {
+        self.mutate_untransactional(TreeMutation::PurgePrefix(prefix))
+    }
+
+    /// Stage a removal followed by an insertion in one transaction.
+    ///
+    /// Use this to repair or re-derive ordering keys: both passes publish a
+    /// single new root and head. The removal set is applied first.
+    ///
+    /// # Errors
+    /// Propagates the errors of [`Self::stage_remove`] and
+    /// [`Self::stage_append`].
+    pub fn stage_mutate(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        to_remove: &[K],
+        to_insert: &[K],
+    ) -> Result<NodeId, StorageError> {
+        self.stage_remove(transaction, pool, to_remove)?;
+        self.stage_append(transaction, pool, to_insert)
+    }
+
+    fn stage_mutation(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        mutation: TreeMutation<K>,
+    ) -> Result<(NodeId, u64), StorageError> {
+        validate_geometry::<K>()?;
+        let engine_identity = std::ptr::from_ref(self.engine).cast::<()>() as usize;
+        if engine_identity != transaction.pool_identity(pool) {
+            return Err(StorageError::Internal(
+                "ordered index and transaction use different storage pools".to_owned(),
+            ));
+        }
+        self.ensure_metadata()?;
+        let (head_records, collection_version) = transaction.get_with_collection_version(
+            pool,
+            &self.collection_id,
+            &[TIMELINE_HEAD_ID],
+        )?;
+        let head = head_records.first().ok_or_else(|| {
+            StorageError::Internal("ordered head read returned no slot".to_owned())
+        })?;
+        let (old_root_id, old_count, root) = if let Some(head) = head {
+            let (root_id, count) = decode_head::<K>(&head.bytes, self.domain)?;
+            let records = transaction.get(pool, &self.collection_id, &[root_id])?;
+            let root_record = records
+                .first()
+                .and_then(Option::as_ref)
+                .ok_or(StorageError::NotFound(root_id))?;
+            let root = decode_root::<K>(&root_record.bytes, self.domain)?;
+            if root.entry_count != count {
+                return Err(StorageError::Corrupt(
+                    "ordered head/root count mismatch".to_owned(),
+                ));
+            }
+            (Some(root_id), count, root)
+        } else {
+            (
+                None,
+                0,
+                TimelineRoot {
+                    domain: self.domain,
+                    height: 0,
+                    entry_count: 0,
+                    directories: Vec::new(),
+                },
+            )
+        };
+
+        let mut staged = StagedTree::default();
+        let mut removed = 0_u64;
+        let (height, directories) = {
+            let mut io = TransactionTimelineTreeIo {
+                index: self,
+                transaction,
+                pool,
+                staged: &mut staged,
+            };
+            let changed = match mutation {
+                TreeMutation::Remove(keys) => remove_spans(
+                    &root.directories,
+                    root.height.saturating_sub(1),
+                    &keys,
+                    &mut io,
+                    &mut removed,
+                )?,
+                TreeMutation::PurgePrefix(prefix) => purge_prefix_spans(
+                    &root.directories,
+                    root.height.saturating_sub(1),
+                    &prefix,
+                    &mut io,
+                    &mut removed,
+                )?,
+            };
+            demote_spans(changed, root.height, &mut io)?
+        };
+        staged.removed = removed;
+        if removed == 0 {
+            if let Some(root_id) = old_root_id {
+                return Ok((root_id, 0));
+            }
+        }
+        let count = mutation_count(old_count, removed, &directories)?;
+        transaction
+            .expect_collection_version(pool, self.collection_id, collection_version)
+            .map_err(StorageError::Io)?;
+        for record in staged.records {
+            match record {
+                StagedRecord::Leaf(id, payload) | StagedRecord::Directory(id, payload) => {
+                    self.stage_record(transaction, pool, &id, payload)?;
+                }
+            }
+        }
+        let root_payload = encode_root::<K>(&directories, count, height, self.domain)?;
+        let root_id = content_id(&root_payload);
+        self.stage_record(transaction, pool, &root_id, root_payload)?;
+        self.stage_record(
+            transaction,
+            pool,
+            &TIMELINE_HEAD_ID,
+            encode_head::<K>(&root_id, count, self.domain)?,
+        )?;
+        Ok((root_id, removed))
+    }
+
+    fn mutate_untransactional(
+        &self,
+        mutation: TreeMutation<K>,
+    ) -> Result<(NodeId, u64), StorageError> {
+        validate_geometry::<K>()?;
+        self.ensure_metadata()?;
+        let Some((old_root_id, old_count)) = self.head()? else {
+            let root_id = self.build(&[])?;
+            return Ok((root_id, 0));
+        };
+        let bytes = self
+            .engine
+            .get(&self.collection_id, &old_root_id)?
+            .ok_or(StorageError::NotFound(old_root_id))?;
+        let root = decode_root::<K>(&bytes.bytes, self.domain)?;
+        if root.entry_count != old_count {
+            return Err(StorageError::Corrupt(
+                "ordered head/root count mismatch".to_owned(),
+            ));
+        }
+        let mut removed = 0_u64;
+        let mut io = DirectTimelineTreeIo { index: self };
+        let changed = match mutation {
+            TreeMutation::Remove(keys) => remove_spans(
+                &root.directories,
+                root.height.saturating_sub(1),
+                &keys,
+                &mut io,
+                &mut removed,
+            )?,
+            TreeMutation::PurgePrefix(prefix) => purge_prefix_spans(
+                &root.directories,
+                root.height.saturating_sub(1),
+                &prefix,
+                &mut io,
+                &mut removed,
+            )?,
+        };
+        if removed == 0 {
+            return Ok((old_root_id, 0));
+        }
+        let (height, directories) = demote_spans(changed, root.height, &mut io)?;
+        let count = mutation_count(old_count, removed, &directories)?;
+        let root_payload = encode_root::<K>(&directories, count, height, self.domain)?;
+        let root_id = content_id(&root_payload);
+        self.write_record(&root_id, root_payload)?;
+        self.write_record(
+            &TIMELINE_HEAD_ID,
+            encode_head::<K>(&root_id, count, self.domain)?,
+        )?;
+        Ok((root_id, removed))
+    }
+
     /// Stage a record in this index's collection for publication on commit.
     ///
     /// # Errors
@@ -1529,6 +2003,17 @@ impl<S: StorageEngine + ?Sized, K: OrderedKey> TimelineTreeIo<K>
     for TransactionTimelineTreeIo<'_, '_, '_, '_, S, K>
 {
     fn load_leaf(&mut self, span: &SpanDescriptor<K>) -> Result<Vec<K>, StorageError> {
+        if let Some(index) = self.staged.by_id.get(&span.child_id).copied() {
+            let record = self.staged.records.get(index).ok_or_else(|| {
+                StorageError::Internal("staged ordered record index is invalid".to_owned())
+            })?;
+            return match record {
+                StagedRecord::Leaf(_, payload) => decode_leaf::<K>(payload),
+                StagedRecord::Directory(_, _) => Err(StorageError::Corrupt(
+                    "ordered leaf id names a directory".to_owned(),
+                )),
+            };
+        }
         let records =
             self.transaction
                 .get(self.pool, &self.index.collection_id, &[span.child_id])?;
@@ -1544,6 +2029,17 @@ impl<S: StorageEngine + ?Sized, K: OrderedKey> TimelineTreeIo<K>
         span: &SpanDescriptor<K>,
         level: u8,
     ) -> Result<Vec<SpanDescriptor<K>>, StorageError> {
+        if let Some(index) = self.staged.by_id.get(&span.child_id).copied() {
+            let record = self.staged.records.get(index).ok_or_else(|| {
+                StorageError::Internal("staged ordered record index is invalid".to_owned())
+            })?;
+            return match record {
+                StagedRecord::Directory(_, payload) => decode_directory::<K>(payload, level),
+                StagedRecord::Leaf(_, _) => Err(StorageError::Corrupt(
+                    "ordered directory id names a leaf".to_owned(),
+                )),
+            };
+        }
         let records =
             self.transaction
                 .get(self.pool, &self.index.collection_id, &[span.child_id])?;
@@ -1555,14 +2051,12 @@ impl<S: StorageEngine + ?Sized, K: OrderedKey> TimelineTreeIo<K>
     }
 
     fn write_leaf(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError> {
-        self.staged.records.push(StagedRecord::Leaf(id, payload));
+        self.staged.push(id, StagedRecord::Leaf(id, payload));
         Ok(())
     }
 
     fn write_directory(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError> {
-        self.staged
-            .records
-            .push(StagedRecord::Directory(id, payload));
+        self.staged.push(id, StagedRecord::Directory(id, payload));
         Ok(())
     }
 }
