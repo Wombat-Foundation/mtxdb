@@ -1418,7 +1418,20 @@ mod edge_log_recovery {
         adj.record_events_logged(
             &db,
             &log,
-            &[event("$a", &[]), event("$b", &[])],
+            &[
+                EventRecord {
+                    event_id: "$a",
+                    prev: &[],
+                    auth: &[],
+                    relation: None,
+                },
+                EventRecord {
+                    event_id: "$b",
+                    prev: &[],
+                    auth: &[],
+                    relation: None,
+                },
+            ],
             AppendDurability::Deferred,
         )
         .unwrap();
@@ -1431,7 +1444,7 @@ mod edge_log_recovery {
             &[EventRecord {
                 event_id: "$b",
                 prev: &[],
-                auth: &["$create"],
+                auth: &[],
                 relation: Some(RelationRef {
                     target: "$a",
                     rel_type: "org.example.rolled-back-kind",
@@ -1440,6 +1453,14 @@ mod edge_log_recovery {
             AppendDurability::Deferred,
         )
         .unwrap();
+        assert_eq!(
+            adj.relation_of(&db, "$b", &AlwaysVisible).unwrap(),
+            Some(Relation {
+                target: "$a".to_owned(),
+                rel_type: "org.example.rolled-back-kind".to_owned(),
+            }),
+            "the relation row exists before the simulated crash"
+        );
         adj.sync_tail(&db).unwrap();
 
         crash_image(&db, &root, &image);
