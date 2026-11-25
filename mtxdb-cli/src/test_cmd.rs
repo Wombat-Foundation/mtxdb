@@ -12150,6 +12150,62 @@ fn room_stats_scan_packs_missing_from_a_stale_collection_sidecar() {
 }
 
 #[test]
+fn room_stats_ignores_stale_body_after_latest_removal() {
+    let dir = unique_temp_dir();
+    let room = "!removed-join:test";
+    let collection = mtxdb::interop::room_event_collection_id(room.as_bytes());
+    let layout = DatabaseLayout::open(dir.clone()).unwrap();
+    let pool_dir = layout.pool_dir(ShardType::EventDag).unwrap();
+    let stale_body = r#"{"event_id":"$join","room_id":"!removed-join:test","type":"m.room.member","state_key":"@alice:test","origin_server_ts":2000,"content":{"membership":"join"}}"#;
+    let store = PackfileStorage::open(pool_dir.clone()).unwrap();
+    let id = [0x91; 16];
+    store
+        .put(
+            &collection,
+            &id,
+            &NodeData::from_slice(stale_body.as_bytes()),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let collection_hex = format_id(&collection);
+    let cli = Cli {
+        dirs: vec![dir.clone()],
+        shard_type: Some(ShardType::EventDag),
+        coalesce: false,
+        read_plan: mtxdb::ReadPlanPolicy::disabled(),
+        command: Commands::Remove {
+            collection: collection_hex.clone(),
+            ids: vec![format_id(&id)],
+            yes: true,
+        },
+    };
+    cmd_remove(&cli, &collection_hex, &[format_id(&id)], true).unwrap();
+
+    let stats = super::scan_room_event_stats(&pool_dir, &collection).unwrap();
+    assert_eq!(stats.records, 0);
+    assert!(stats.members.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn raw_scan_note_does_not_claim_truncation_at_the_limit() {
+    let at_limit = super::raw_scan_note(5, 5, true).unwrap();
+    assert!(at_limit.contains("stopped after 5"), "{at_limit}");
+    assert!(!at_limit.contains("showing first"), "{at_limit}");
+    assert_eq!(super::raw_scan_note(3, 5, true), None);
+    assert_eq!(super::raw_scan_note(3, usize::MAX, false), None);
+}
+
+#[test]
+fn sorted_scan_count_marks_only_actual_truncation() {
+    assert_eq!(super::sorted_scan_display(5, 5), (5, false));
+    assert_eq!(super::sorted_scan_display(6, 5), (5, true));
+    assert_eq!(super::sorted_scan_display(4, 5), (4, false));
+}
+
+#[test]
 fn committed_through_reports_reclaimed_history_for_a_reopened_segment() {
     // A fresh segment starts at base 1; nothing has been committed.
     assert_eq!(committed_through(0, 1), 0);
@@ -12476,6 +12532,48 @@ fn auth_check_reports_a_stored_auth_owner_without_an_event_body() {
     let report = cmd_auth_check(&cli, room, false, 0).unwrap();
     assert_eq!(report.with_edges, 3);
     assert_eq!(report.no_record, vec![edge_only]);
+    drop(db);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn auth_check_excludes_rows_above_the_reported_counter() {
+    let dir = unique_temp_dir();
+    let room = "!auth-counter-filter:test";
+    let collection = matrix_room_collection_id(room);
+    let db = Database::open(dir.clone()).unwrap();
+    let adjacency = mtxdb::csr_adjacency::CsrAdjacency::for_collection(&collection);
+    adjacency
+        .record_event(&db, "$allocated", &[], &[], None)
+        .unwrap();
+    let store = mtxdb::csr::store::CsrStore::open(db.layout(), ShardType::State);
+    let mut event_index = b"matrix-adjacency-c:".to_vec();
+    event_index.extend_from_slice(&collection);
+    let event_index = mtxdb::derive_collection_id(Some(mtxdb::MEMBER_NAMESPACE_INTL), &event_index);
+    let mut scope_name = b"matrix-csr:".to_vec();
+    scope_name.extend_from_slice(&event_index);
+    let scope = mtxdb::csr::store::ScopeId(mtxdb::derive_collection_id(
+        Some(mtxdb::MEMBER_NAMESPACE_INTL),
+        &scope_name,
+    ));
+    store
+        .writer(&db)
+        .unwrap()
+        .append_rows(
+            scope,
+            &[mtxdb::csr::store::RowRecord {
+                family: mtxdb::csr_adjacency::AUTH,
+                owner: 10_000,
+                edges: vec![mtxdb::csr::Edge { target: 1, kind: 0 }],
+            }],
+        )
+        .unwrap();
+
+    let (_, graph) = open_auth_test_graph(&dir);
+    let records = super::auth_check_records_from_csr(&adjacency, &graph).unwrap();
+    assert!(records.contains_key(&crate::auth_check::counter_node_id()));
+    assert!(!records.contains_key(&crate::auth_check::edge_node_id(10_000)));
+
     drop(db);
     std::fs::remove_dir_all(dir).unwrap();
 }

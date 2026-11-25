@@ -8302,16 +8302,13 @@ fn cmd_scan_collection_in_pool(
             }
         }
         out.flush()?;
-        if bounded && frames >= max_rows {
-            eprintln!("note: showing first {max_rows} matching records; use -l 0 to scan all");
-        } else {
-            eprint_scan_limit_note(frames, max_rows);
+        if let Some(note) = raw_scan_note(frames, max_rows, bounded) {
+            eprintln!("{note}");
         }
         return Ok(frames);
     }
     if context.mode.is_sorting() || context.reverse {
-        let displayed = frames.min(max_rows);
-        let truncated = frames > max_rows;
+        let (displayed, truncated) = sorted_scan_display(frames, max_rows);
         if context.show_section_header && !context.header_printed {
             if context.needs_section_spacing {
                 println!();
@@ -8358,6 +8355,29 @@ fn cmd_scan_collection_in_pool(
         print_scan_limit_note(frames, max_rows);
     }
     Ok(frames)
+}
+
+/// The note after a `--raw` scan. A bounded, unsorted scan stops as soon as it
+/// has `max_rows` matches, so reaching the limit does not show that more exist:
+/// say it stopped, not that rows were left out.
+fn raw_scan_note(frames: usize, max_rows: usize, bounded: bool) -> Option<String> {
+    if bounded && frames >= max_rows {
+        Some(format!(
+            "note: stopped after {max_rows} matching records; use -l 0 to scan all"
+        ))
+    } else if max_rows < frames {
+        Some(format!(
+            "note: only showing top {max_rows}; use `-l 0` to show all"
+        ))
+    } else {
+        None
+    }
+}
+
+/// The sorted branch sees the full match count, so an exact limit is not
+/// evidence that any rows were truncated.
+fn sorted_scan_display(frames: usize, max_rows: usize) -> (usize, bool) {
+    (frames.min(max_rows), frames > max_rows)
 }
 
 /// Print a collection's live records from its index.
@@ -8905,14 +8925,6 @@ fn scan_limit(limit: i64) -> usize {
 fn print_scan_limit_note(total: usize, limit: usize) {
     if limit < total {
         println!("note: only showing top {limit}; use `-l 0` to show all");
-    }
-}
-
-/// Same as [`print_scan_limit_note`] but to stderr -- for use after `--raw`
-/// output, where stdout must stay a clean byte stream (see `--raw`'s help).
-fn eprint_scan_limit_note(total: usize, limit: usize) {
-    if limit < total {
-        eprintln!("note: only showing top {limit}; use `-l 0` to show all");
     }
 }
 
