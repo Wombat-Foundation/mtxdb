@@ -1418,10 +1418,10 @@ mod edge_log_recovery {
         CsrAdjacency::checkpoint_edge_log(&db, &log).unwrap();
 
         assert_eq!(log.pruned(&db).unwrap(), log.head(&db).unwrap());
-        assert!(log
-            .read_range(&db, 0, log.head(&db).unwrap())
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            log.read_range(&db, 0, log.head(&db).unwrap()).unwrap(),
+            Vec::new()
+        );
         // The rows are durable now, so a restart replays nothing.
         let db = restart_keeping_everything(&root, db);
         assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
