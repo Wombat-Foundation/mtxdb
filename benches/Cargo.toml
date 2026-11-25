@@ -30,6 +30,7 @@ fjall = "2.11.2"
 libmdbx = "0.6"
 base64 = "0.22"
 mtxdb = { path = "..", features = ["reconcile", "test-util"] }
+rustix = { version = "1.1.6", features = ["fs"] }
 
 rusqlite = "0.32"
 
@@ -188,6 +189,13 @@ name = "timeline_index"
 path = "timeline_index.rs"
 harness = false
 
+# Multi-room shared-index cold-cache, fault, and mutation harness.
+[[bench]]
+name = "timeline_multi_room"
+path = "timeline_multi_room.rs"
+harness = false
+
+# Multi-room shared-index cold-cache, fault, and mutation harness.
 # End-to-end search-pack cost (index + query shapes) on a real-data corpus.
 [[bench]]
 name = "search_scan"
