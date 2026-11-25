@@ -456,6 +456,43 @@ impl CsrStore {
         Ok(())
     }
 
+    /// Replace one scope's rows with `rows`, while the caller holds this
+    /// directory's write lock. One tombstone hides every sealed and tail row,
+    /// then the surviving rows are appended after it.
+    pub(crate) fn rewrite_scope_locked(
+        &self,
+        scope: ScopeId,
+        rows: &[RowRecord],
+    ) -> io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.tail_path())?;
+        let valid = self.tail_valid()?;
+        let len = file.metadata()?.len();
+        if valid < len {
+            file.set_len(valid)?;
+        }
+        file.seek(SeekFrom::End(0))?;
+        let mut buffer = Vec::new();
+        write_frame(
+            &mut buffer,
+            &encode_row(scope, EdgeFamily::plain(0), 0, &[], true)?,
+        );
+        for row in rows {
+            let payload = encode_row(scope, row.family, row.owner, &row.edges, false)?;
+            write_frame(&mut buffer, &payload);
+        }
+        file.write_all(&buffer)?;
+        // The caller syncs once after rewriting every affected scope, but a
+        // repair can add many rows, so still bound the tail like any append.
+        self.maybe_seal()?;
+        Ok(())
+    }
+
     /// Every scope with rows in sealed segments or the verified tail.
     pub(crate) fn all_scopes(&self) -> io::Result<std::collections::BTreeSet<[u8; 16]>> {
         self.with_read_lock(|| {

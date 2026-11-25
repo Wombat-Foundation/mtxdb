@@ -1581,6 +1581,9 @@ impl CsrAdjacency {
             // still allocated, drop only the references to rolled-back ids,
             // and lower the watermark to the recovered log head.
             repair_rows_after_rollback(db, &store, head)?;
+            // The repaired rows and the reset watermark are durable, so the
+            // entries they cover are no longer needed.
+            log.prune_through(db, head)?;
             return Ok(0);
         }
         if head == watermark {
@@ -1671,6 +1674,88 @@ impl CsrAdjacency {
         store.sync_tail().map_err(StorageError::Io)?;
         log.prune_through(db, watermark)
     }
+}
+
+/// The CSR scope holding one event index's rows.
+fn csr_scope_for(events: &[u8; 16]) -> [u8; 16] {
+    let mut name = b"matrix-csr:".to_vec();
+    name.extend_from_slice(events);
+    derive_collection_id(Some(MEMBER_NAMESPACE_INTL), &name)
+}
+
+/// Drop CSR rows that name short ids the recovered short-id counters no longer
+/// allocate, then reset the watermark to `head`.
+///
+/// The pre-sync hook syncs adjacency tails before the WAL group covering them,
+/// so a crash can leave rows for events whose allocations rolled back. The
+/// allocations and their rows are all derived data: a row belongs to a
+/// recovered scope only while its owner and every target are below the scope's
+/// recovered next id. Anything above it names an event that no longer exists,
+/// and reusing that id for a new event must not inherit the orphan row.
+fn repair_rows_after_rollback(
+    db: &Database,
+    store: &CsrStore,
+    head: u64,
+) -> Result<(), StorageError> {
+    let scopes = store.all_scopes().map_err(StorageError::Io)?;
+    // A CSR scope is derived from its event collection, so enumerate the State
+    // pool's collections to recover each scope's committed short-id counter.
+    // A CSR scope with no matching collection lost every event it indexed.
+    let mut counters: HashMap<[u8; 16], (u32, u32)> = HashMap::new();
+    for collection in db.pool(ShardType::State).collection_ids() {
+        let adjacency = CsrAdjacency::for_collection(&collection);
+        let csr = adjacency.csr_collection();
+        if scopes.contains(&csr) {
+            let next_event = adjacency.events.counter(db)?;
+            let next_kind = adjacency.kinds.counter(db)?;
+            counters.insert(csr, (next_event, next_kind));
+        }
+    }
+    let mut repaired: Vec<(ScopeId, Vec<RowRecord>)> = Vec::new();
+    for scope in scopes {
+        let scope = ScopeId(scope);
+        if scope == WATERMARK_SCOPE {
+            continue;
+        }
+        let (next_event, next_kind) = counters.get(&scope.0).copied().unwrap_or((1, 1));
+        let data = store.read_scope(scope).map_err(StorageError::Io)?;
+        let mut changed = false;
+        let mut rows = Vec::with_capacity(data.rows.len());
+        for row in data.rows {
+            if row.owner >= next_event {
+                changed = true;
+                continue;
+            }
+            let before = row.edges.len();
+            let edges: Vec<Edge> = row
+                .edges
+                .into_iter()
+                .filter(|edge| {
+                    edge.target < next_event
+                        && (!row.family.typed
+                            || (edge.kind != 0 && u32::from(edge.kind) < next_kind))
+                })
+                .collect();
+            changed |= edges.len() != before;
+            rows.push(RowRecord {
+                family: row.family,
+                owner: row.owner,
+                edges,
+            });
+        }
+        if changed {
+            repaired.push((scope, rows));
+        }
+    }
+    store.with_write_lock(|| -> Result<(), StorageError> {
+        for (scope, rows) in &repaired {
+            store
+                .rewrite_scope_locked(*scope, rows)
+                .map_err(StorageError::Io)?;
+        }
+        write_watermark_locked(store, db, head).map_err(StorageError::Io)
+    })?;
+    store.sync_tail().map_err(StorageError::Io)
 }
 
 fn replay_edge_log_run(

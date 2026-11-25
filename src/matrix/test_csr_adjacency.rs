@@ -1333,7 +1333,7 @@ mod edge_log_recovery {
     }
 
     #[test]
-    fn watermark_ahead_of_the_log_head_purges_scopes_and_resets() {
+    fn watermark_ahead_of_the_log_head_keeps_only_surviving_allocations() {
         use crate::database::tests::crash_image;
         use crate::journal::cut_segment_image_to_durable_mark;
 
@@ -1341,29 +1341,51 @@ mod edge_log_recovery {
         let image = test_root("edge-log-clamp-image");
         let db = Database::open(root.clone()).unwrap();
         let log = EdgeLog::new();
-        let adj = CsrAdjacency::for_collection(&ROOM_A);
-        for (id, prev) in [("$a", &[][..]), ("$b", &["$a"][..]), ("$c", &["$b"][..])] {
-            adj.record_events_logged(&db, &log, &[event(id, prev)], AppendDurability::Deferred)
-                .unwrap();
-        }
-        // Keep the tail, watermark included, but make sure the WAL is the only
-        // thing a crash can lose. Cutting it to its durable mark drops the log.
-        adj.sync_tail(&db).unwrap();
+
+        // Room A's log entries and short-id allocations are durable before the
+        // tail is synced, so its rows must survive the repair.
+        let kept = CsrAdjacency::for_collection(&ROOM_A);
+        kept.record_events_logged(
+            &db,
+            &log,
+            &[event("$a", &[]), event("$b", &["$a"])],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+        db.coordinator().sync().unwrap();
+
+        // Room B's allocations are only in the WAL. Syncing the tail makes its
+        // rows and the watermark durable while the covering WAL group is not.
+        let lost = CsrAdjacency::for_collection(&ROOM_B);
+        lost.record_events_logged(
+            &db,
+            &log,
+            &[event("$lost", &[])],
+            AppendDurability::Deferred,
+        )
+        .unwrap();
+        lost.sync_tail(&db).unwrap();
+
         crash_image(&db, &root, &image);
         cut_segment_image_to_durable_mark(&image.join("wal.bin")).unwrap();
         drop(db);
 
         let db = Database::open(image.clone()).unwrap();
-        assert_eq!(log.head(&db).unwrap(), 0, "the WAL lost every entry");
+        assert_eq!(log.head(&db).unwrap(), 2, "only room A's entries survived");
+        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
         assert_eq!(
-            CsrAdjacency::recover_edge_log(&db, &log).unwrap(),
-            0,
-            "the repair tombstones the stale scopes and resets the watermark"
+            kept.prev_of(&db, "$b").unwrap(),
+            Some(vec!["$a".to_owned()]),
+            "rows covered by durable allocations are preserved"
+        );
+        assert_eq!(
+            lost.prev_of(&db, "$lost").unwrap(),
+            None,
+            "rows whose short-id allocation rolled back are dropped"
         );
 
         // The repaired store still accepts and recovers new logged appends.
-        let adj = CsrAdjacency::for_collection(&ROOM_B);
-        adj.record_events_logged(
+        lost.record_events_logged(
             &db,
             &log,
             &[event("$after", &[])],
