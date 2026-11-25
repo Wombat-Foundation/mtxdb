@@ -1616,6 +1616,35 @@ fn u64_at(edges: &[Edge], index: usize) -> u64 {
     (half(kind) << 32) | half(kind.saturating_add(1))
 }
 
+/// The last purge each scope in `entries` has applied.
+fn applied_purges(
+    store: &CsrStore,
+    entries: &[(u64, LoggedEvent)],
+) -> Result<HashMap<[u8; 16], (u64, u64)>, StorageError> {
+    let mut applied = HashMap::new();
+    for (_, event) in entries {
+        if applied.contains_key(&event.scope) {
+            continue;
+        }
+        let csr = CsrAdjacency::for_collection(&event.scope).scope();
+        if let Some(done) = read_purge_applied(store, csr).map_err(StorageError::Io)? {
+            applied.insert(event.scope, done);
+        }
+    }
+    Ok(applied)
+}
+
+/// The highest log sequence number any scope records as an applied purge.
+fn max_applied_purge(store: &CsrStore) -> std::io::Result<u64> {
+    let mut highest = 0_u64;
+    for scope in store.all_scopes()? {
+        if let Some((seq, _)) = read_purge_applied(store, ScopeId(scope))? {
+            highest = highest.max(seq);
+        }
+    }
+    Ok(highest)
+}
+
 /// Record, under the store's write lock, that the purge `(seq, token)` is
 /// applied to `scope`.
 fn write_purge_applied_locked(
@@ -1675,6 +1704,10 @@ impl CsrAdjacency {
         let store = CsrStore::open(db.layout(), ShardType::State);
         let watermark = read_watermark(&store).map_err(StorageError::Io)?;
         let head = log.head(db)?;
+        // A scope can record an applied purge past the recovered head: the log
+        // was rolled back beyond it. Numbers up to it must not be handed out
+        // again, or a later entry would look older than that purge.
+        let purge_floor = max_applied_purge(&store).map_err(StorageError::Io)?;
         if watermark > head {
             // The pre-sync hook makes CSR rows durable before the WAL group
             // that covers them, so a crash can leave rows for events whose
@@ -1683,10 +1716,11 @@ impl CsrAdjacency {
             // unrelated event. Keep every row whose owner and targets are
             // still allocated, drop only the references to rolled-back ids,
             // and lower the watermark to the recovered log head.
-            repair_rows_after_rollback(db, &store, head, head)?;
+            repair_rows_after_rollback(db, &store, head)?;
             // The repaired rows and the reset watermark are durable, so the
             // entries they cover are no longer needed.
             log.prune_through(db, head)?;
+            log.raise_head_to(db, purge_floor)?;
             return Ok(0);
         }
         if head == watermark {
@@ -1694,12 +1728,16 @@ impl CsrAdjacency {
             // only in the page cache; do not report recovery done before they
             // are durable.
             store.sync_tail().map_err(StorageError::Io)?;
-            repair_rows_after_rollback(db, &store, watermark, head)?;
+            repair_rows_after_rollback(db, &store, watermark)?;
+            if purge_floor > head {
+                log.prune_through(db, head)?;
+                log.raise_head_to(db, purge_floor)?;
+            }
             return Ok(0);
         }
         // Repair stale ids without advancing the watermark. If recovery crashes
         // before replay completes, the same entries must remain visible next time.
-        repair_rows_after_rollback(db, &store, watermark, head)?;
+        repair_rows_after_rollback(db, &store, watermark)?;
         let entries = log.read_range(db, watermark, head)?;
         // Entries at or below the prune point are legitimately gone; any other
         // gap means the log lost an entry and the rows it covered, so advancing
@@ -1720,16 +1758,7 @@ impl CsrAdjacency {
         // The last purge each scope has applied. A scope applied through a purge
         // whose log marker was since lost must not replay the entries before it,
         // and a purge already applied must not be replayed over later writes.
-        let mut applied: HashMap<[u8; 16], (u64, u64)> = HashMap::new();
-        for (_, event) in &entries {
-            if applied.contains_key(&event.scope) {
-                continue;
-            }
-            let csr = CsrAdjacency::for_collection(&event.scope).scope();
-            if let Some(done) = read_purge_applied(&store, csr).map_err(StorageError::Io)? {
-                applied.insert(event.scope, done);
-            }
-        }
+        let mut applied = applied_purges(&store, &entries)?;
         let mut replayed = 0_u32;
         let mut pending_scope = None;
         let mut pending = Vec::new();
@@ -1738,6 +1767,12 @@ impl CsrAdjacency {
                 if let Some(scope) = pending_scope.take() {
                     replayed = replayed.saturating_add(replay_edge_log_run(db, scope, &pending)?);
                     pending.clear();
+                }
+                if latest_purge.get(&event.scope) != Some(seq) {
+                    // A later tombstone subsumes this one. Reapplying an older
+                    // marker could erase unlogged rows written after the latest
+                    // purge, so only the latest boundary may clear the scope.
+                    continue;
                 }
                 // Sequence numbers are reused after a crash rolls the log back,
                 // so identity is the (sequence, token) pair. A boundary written
@@ -1788,6 +1823,7 @@ impl CsrAdjacency {
         // The rows and the watermark are durable, so the log no longer needs
         // these entries.
         log.prune_through(db, head)?;
+        log.raise_head_to(db, purge_floor)?;
         Ok(replayed)
     }
 
@@ -1831,7 +1867,6 @@ fn repair_rows_after_rollback(
     db: &Database,
     store: &CsrStore,
     watermark: u64,
-    head: u64,
 ) -> Result<(), StorageError> {
     let scopes = store.all_scopes().map_err(StorageError::Io)?;
     // A CSR scope is derived from its event collection, so enumerate the State
@@ -1880,18 +1915,14 @@ fn repair_rows_after_rollback(
             if row.family.id == PURGE_APPLIED.id {
                 // Its edges are log numbers, not short ids, so the filters
                 // below do not apply. Keep the row, so a rewrite does not lose
-                // the applied-purge state, unless it names a purge whose log
-                // entry rolled back: sequence numbers are reused, and a stale
-                // one could later be taken for a different purge.
-                if u64_at(&row.edges, 0) > head {
-                    changed = true;
-                } else {
-                    rows.push(RowRecord {
-                        family: row.family,
-                        owner: row.owner,
-                        edges: row.edges,
-                    });
-                }
+                // the applied-purge state. A sequence beyond the recovered
+                // head may be reused, but the token distinguishes a different
+                // purge that takes the same number.
+                rows.push(RowRecord {
+                    family: row.family,
+                    owner: row.owner,
+                    edges: row.edges,
+                });
                 continue;
             }
             if row.owner >= next {

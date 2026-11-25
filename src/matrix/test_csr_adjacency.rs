@@ -1200,6 +1200,23 @@ mod edge_log_recovery {
         Database::open(root.to_path_buf()).unwrap()
     }
 
+    fn scope_with_applied_purge(store: &CsrStore) -> ScopeId {
+        store
+            .all_scopes()
+            .unwrap()
+            .into_iter()
+            .map(ScopeId)
+            .find(|scope| {
+                store
+                    .read_scope(*scope)
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .any(|row| row.family.id == 41)
+            })
+            .expect("purge scope has an applied marker")
+    }
+
     #[test]
     fn rollback_repair_preserves_scopes_without_a_recovered_counter() {
         let root = test_root("edge-log-unknown-scope");
@@ -1356,6 +1373,315 @@ mod edge_log_recovery {
         assert_eq!(adj.prev_of(&db, "$after-purge").unwrap(), Some(Vec::new()));
         drop(db);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn applied_purge_preserves_later_unlogged_rows_across_a_log_gap() {
+        use crate::database::tests::crash_image;
+
+        let root = test_root("edge-log-purge-applied-gap");
+        let image = test_root("edge-log-purge-applied-gap-image");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_event(&db, "$before", &[], &[], None).unwrap();
+        assert_eq!(adj.prev_of(&db, "$before").unwrap(), Some(Vec::new()));
+
+        log.append(
+            &db,
+            &[LoggedEvent {
+                scope: ROOM_B,
+                event_id: "$unapplied".to_owned(),
+                prev: Vec::new(),
+                auth: Vec::new(),
+                relation: None,
+            }],
+        )
+        .unwrap();
+        adj.purge_graph(&db).unwrap();
+        adj.record_event(&db, "$after", &[], &[], None).unwrap();
+        adj.sync_tail(&db).unwrap();
+        db.coordinator().sync().unwrap();
+
+        crash_image(&db, &root, &image);
+        drop(db);
+        let db = Database::open(image.clone()).unwrap();
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        assert_eq!(adj.prev_of(&db, "$before").unwrap(), None);
+        assert_eq!(adj.prev_of(&db, "$after").unwrap(), Some(Vec::new()));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
+    }
+
+    #[test]
+    fn recovery_applies_a_purge_marker_when_its_tombstone_was_not_written() {
+        use crate::database::tests::crash_image;
+
+        let root = test_root("edge-log-purge-marker-only");
+        let image = test_root("edge-log-purge-marker-only-image");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_event(&db, "$before", &[], &[], None).unwrap();
+        adj.sync_tail(&db).unwrap();
+        db.coordinator().sync().unwrap();
+        log.append_scope_purge(&db, ROOM_A).unwrap();
+        db.coordinator().sync().unwrap();
+
+        crash_image(&db, &root, &image);
+        drop(db);
+        let db = Database::open(image.clone()).unwrap();
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        assert_eq!(adj.prev_of(&db, "$before").unwrap(), None);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
+    }
+
+    #[test]
+    fn recovery_applies_only_the_latest_purge_for_a_scope() {
+        use crate::database::tests::crash_image;
+
+        let root = test_root("edge-log-latest-purge");
+        let image = test_root("edge-log-latest-purge-image");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        log.append(
+            &db,
+            &[LoggedEvent {
+                scope: ROOM_B,
+                event_id: "$unapplied".to_owned(),
+                prev: Vec::new(),
+                auth: Vec::new(),
+                relation: None,
+            }],
+        )
+        .unwrap();
+        adj.record_event(&db, "$before", &[], &[], None).unwrap();
+        adj.purge_graph(&db).unwrap();
+        adj.record_event(&db, "$between", &[], &[], None).unwrap();
+        adj.purge_graph(&db).unwrap();
+        adj.record_event(&db, "$after", &[], &[], None).unwrap();
+        adj.sync_tail(&db).unwrap();
+        db.coordinator().sync().unwrap();
+
+        crash_image(&db, &root, &image);
+        drop(db);
+        let db = Database::open(image.clone()).unwrap();
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        assert_eq!(adj.prev_of(&db, "$before").unwrap(), None);
+        assert_eq!(adj.prev_of(&db, "$between").unwrap(), None);
+        assert_eq!(adj.prev_of(&db, "$after").unwrap(), Some(Vec::new()));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
+    }
+
+    #[test]
+    fn a_reused_purge_sequence_with_a_new_token_is_applied() {
+        use crate::database::tests::crash_image;
+        use crate::journal::cut_segment_image_to_durable_mark;
+
+        let root = test_root("edge-log-purge-token-reuse");
+        let image = test_root("edge-log-purge-token-reuse-image");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        let owner = adj.record_event(&db, "$old", &[], &[], None).unwrap();
+        log.append(
+            &db,
+            &[LoggedEvent {
+                scope: ROOM_B,
+                event_id: "$durable".to_owned(),
+                prev: Vec::new(),
+                auth: Vec::new(),
+                relation: None,
+            }],
+        )
+        .unwrap();
+        db.coordinator().sync().unwrap();
+        let before_purge = log.head(&db).unwrap();
+        assert_eq!(before_purge, 1);
+        adj.purge_graph(&db).unwrap();
+        let (first_seq, first_marker) = log
+            .read_range(&db, 0, log.head(&db).unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|(_, entry)| EdgeLog::is_scope_purge(entry))
+            .expect("purge marker was logged");
+        let first_token = EdgeLog::purge_token(&first_marker).unwrap();
+        assert_eq!(first_seq, 2);
+
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        let scope = scope_with_applied_purge(&store);
+        store
+            .writer(&db)
+            .unwrap()
+            .append_rows(
+                scope,
+                &[RowRecord {
+                    family: PREV,
+                    owner,
+                    edges: vec![crate::csr::Edge {
+                        target: owner,
+                        kind: 0,
+                    }],
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            adj.prev_of(&db, "$old").unwrap(),
+            Some(vec!["$old".to_owned()])
+        );
+
+        crash_image(&db, &root, &image);
+        cut_segment_image_to_durable_mark(&image.join("wal.bin")).unwrap();
+        drop(db);
+        let db = Database::open(image.clone()).unwrap();
+        assert_eq!(log.head(&db).unwrap(), 1);
+        let (new_seq, new_token) = log.append_scope_purge(&db, ROOM_A).unwrap();
+        assert_eq!(new_seq, first_seq);
+        assert_ne!(new_token, first_token);
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        assert_eq!(adj.prev_of(&db, "$old").unwrap(), None);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
+    }
+
+    #[test]
+    fn an_applied_purge_past_the_log_head_stays_a_floor_for_reused_numbers() {
+        use crate::database::tests::crash_image;
+        use crate::journal::cut_segment_image_to_durable_mark;
+
+        let root = test_root("edge-log-purge-floor");
+        let image = test_root("edge-log-purge-floor-image");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        // The gap keeps the watermark behind everything after it.
+        leave_a_gap(&db, &log);
+        adj.record_events_logged(&db, &log, &[event("$a", &[])], AppendDurability::Deferred)
+            .unwrap();
+        db.coordinator().sync().unwrap();
+        // The purge (log sequence 3) reaches the tail, but its WAL group does not.
+        adj.purge_graph(&db).unwrap();
+
+        crash_image(&db, &root, &image);
+        cut_segment_image_to_durable_mark(&image.join("wal.bin")).unwrap();
+        drop(db);
+        let db = Database::open(image.clone()).unwrap();
+        assert_eq!(log.head(&db).unwrap(), 2, "the purge entry was rolled back");
+
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        assert_eq!(
+            adj.prev_of(&db, "$a").unwrap(),
+            None,
+            "the purge applied at sequence 3 still hides the earlier entry"
+        );
+        assert_eq!(
+            log.head(&db).unwrap(),
+            3,
+            "numbers up to the applied purge are not handed out again"
+        );
+
+        // The next entry gets a number above the purge, so a later recovery
+        // cannot mistake it for one that precedes the purge.
+        adj.record_events_logged(&db, &log, &[event("$new", &[])], AppendDurability::Deferred)
+            .unwrap();
+        assert_eq!(log.head(&db).unwrap(), 4);
+        let db = crash_keeping_only_the_wal(&image, db);
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        assert_eq!(adj.prev_of(&db, "$new").unwrap(), Some(Vec::new()));
+        assert_eq!(adj.prev_of(&db, "$a").unwrap(), None);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
+    }
+
+    #[test]
+    fn a_scope_with_only_an_applied_purge_still_sets_the_floor() {
+        use crate::database::tests::crash_image;
+        use crate::journal::cut_segment_image_to_durable_mark;
+
+        let root = test_root("edge-log-purge-floor-marker-only");
+        let image = test_root("edge-log-purge-floor-marker-only-image");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        // No events and no log entries for this scope, only its purge.
+        CsrAdjacency::for_collection(&ROOM_B)
+            .purge_graph(&db)
+            .unwrap();
+
+        crash_image(&db, &root, &image);
+        cut_segment_image_to_durable_mark(&image.join("wal.bin")).unwrap();
+        drop(db);
+        let db = Database::open(image.clone()).unwrap();
+        assert_eq!(log.head(&db).unwrap(), 0);
+
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+
+        assert_eq!(log.head(&db).unwrap(), 1);
+        assert_eq!(log.pruned(&db).unwrap(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
+    }
+
+    #[test]
+    fn rollback_repair_keeps_a_purge_marker_for_an_unmapped_scope() {
+        use crate::database::tests::crash_image;
+
+        let root = test_root("edge-log-purge-marker-unmapped");
+        let image = test_root("edge-log-purge-marker-unmapped-image");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        log.append(
+            &db,
+            &[LoggedEvent {
+                scope: ROOM_A,
+                event_id: "$unapplied".to_owned(),
+                prev: Vec::new(),
+                auth: Vec::new(),
+                relation: None,
+            }],
+        )
+        .unwrap();
+        let adj = CsrAdjacency::for_collection(&ROOM_B);
+        adj.purge_graph(&db).unwrap();
+        log.append(
+            &db,
+            &[LoggedEvent {
+                scope: ROOM_B,
+                event_id: "$after".to_owned(),
+                prev: Vec::new(),
+                auth: Vec::new(),
+                relation: None,
+            }],
+        )
+        .unwrap();
+        db.coordinator().sync().unwrap();
+
+        crash_image(&db, &root, &image);
+        drop(db);
+        let db = Database::open(image.clone()).unwrap();
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        let scope = scope_with_applied_purge(&store);
+        assert!(store
+            .read_scope(scope)
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.family.id == 41));
+        assert_eq!(adj.prev_of(&db, "$after").unwrap(), Some(Vec::new()));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
     }
 
     #[test]

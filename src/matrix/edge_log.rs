@@ -377,6 +377,54 @@ impl EdgeLog {
         }
     }
 
+    /// Raise the head and the pruned marker together to `target`, once every
+    /// entry up to the current head has been pruned. Sequence numbers up to
+    /// `target` are then never handed out again.
+    ///
+    /// Recovery uses this when a CSR scope records an applied purge at a
+    /// sequence beyond the recovered head: the log was rolled back past that
+    /// purge, and a reused number at or below it would be taken for an entry
+    /// that precedes the purge. Does nothing if `target` is not above the head
+    /// or entries are still unpruned.
+    ///
+    /// # Errors
+    /// Returns an error if the transaction fails or a counter is corrupt.
+    pub fn raise_head_to(&self, db: &Database, target: u64) -> Result<(), StorageError> {
+        let _serial = PRUNE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let txn = db.begin_transaction();
+        let (records, versions) =
+            txn.get_with_record_versions(self.pool, &self.collection, &[COUNTER_ID, PRUNED_ID])?;
+        let read = |record: Option<&NodeData>| -> Result<u64, StorageError> {
+            let Some(record) = record else { return Ok(0) };
+            let raw: [u8; 8] = record
+                .bytes
+                .as_ref()
+                .try_into()
+                .map_err(|_| StorageError::Corrupt("edge log counter".to_owned()))?;
+            u64::try_from(i64::from_be_bytes(raw))
+                .map_err(|_| StorageError::Corrupt("edge log counter range".to_owned()))
+        };
+        let head = read(records[0].as_ref())?;
+        let pruned = read(records[1].as_ref())?;
+        if target <= head || pruned != head {
+            txn.abort()?;
+            return Ok(());
+        }
+        let delta = i64::try_from(target.saturating_sub(head))
+            .map_err(|_| StorageError::Corrupt("edge log raise range".to_owned()))?;
+        for (id, version) in [COUNTER_ID, PRUNED_ID].into_iter().zip(&versions) {
+            txn.expect_record_version(self.pool, self.collection, id, *version)
+                .map_err(StorageError::Io)?;
+        }
+        txn.increment_counters(
+            self.pool,
+            self.collection,
+            &[(COUNTER_ID, delta), (PRUNED_ID, delta)],
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Remove every entry with `seq <= through`, once the rows they describe
     /// are durable in the CSR. A persisted marker remembers how far pruning
     /// got, so a later call removes only what is new instead of re-checking the
