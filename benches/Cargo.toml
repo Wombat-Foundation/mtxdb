@@ -195,7 +195,6 @@ name = "timeline_multi_room"
 path = "timeline_multi_room.rs"
 harness = false
 
-# Multi-room shared-index cold-cache, fault, and mutation harness.
 # End-to-end search-pack cost (index + query shapes) on a real-data corpus.
 [[bench]]
 name = "search_scan"

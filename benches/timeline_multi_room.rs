@@ -43,9 +43,24 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 fn bench_root() -> PathBuf {
     std::env::var_os("MTXDB_BENCH_ROOT").map_or_else(
-        || std::env::temp_dir().join("mtxdb-timeline-multi-room"),
+        || {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../target/bench-scratch/timeline-multi-room")
+        },
         PathBuf::from,
     )
+}
+
+fn warn_if_tmpfs(root: &Path) {
+    let Ok(fs) = rustix::fs::statfs(root) else {
+        return;
+    };
+    if u64::try_from(fs.f_type).unwrap_or(u64::MAX) == 0x0102_1994 {
+        eprintln!(
+            "timeline_multi_room: {} is on tmpfs; fadvise and read_bytes cannot observe cold I/O",
+            root.display()
+        );
+    }
 }
 
 fn node_id(sequence: u64) -> NodeId {
@@ -356,6 +371,7 @@ fn maintain_journal(db: &Database) {
     let coordinator = db.coordinator();
     if coordinator.segment_len() > coordinator.reclaim_trigger_len() {
         let _ = db.event_dag().sync_all();
+        let _ = coordinator.reclaim_shared();
     }
 }
 
@@ -507,11 +523,15 @@ fn run_page_rows(
         ] {
             let mut pages: Vec<Duration> = Vec::new();
             let mut last_io = IoSnapshot::default();
+            let mut last_open_io = IoSnapshot::default();
             for _ in 0..samples {
                 db.event_dag().sync_all().expect("sync before eviction");
                 drop(db);
                 evict(root, EvictScope::All).expect("evict files before cold read");
+                let open_before = IoSnapshot::read();
                 db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
+                last_open_io = IoSnapshot::read().delta(open_before);
+                evict(root, EvictScope::All).expect("evict files after open");
                 let (topo_index, stream_index) =
                     open_event_timeline_indexes(db.event_dag().as_ref());
                 let before = IoSnapshot::read();
@@ -541,12 +561,15 @@ fn run_page_rows(
             let min_us = min(&pages).as_secs_f64() * 1e6;
             let median_us = median(&mut pages).as_secs_f64() * 1e6;
             println!(
-                "multi_room_page room={room_id} tier={} order={order} limit={limit} min_us={min_us:.1} median_us={median_us:.1} syscr={} disk_read_bytes={} majflt={} cgroup_pgmajfault={}",
+                "multi_room_page room={room_id} tier={} order={order} limit={limit} min_us={min_us:.1} median_us={median_us:.1} syscr={} disk_read_bytes={} open_read_bytes={} open_majflt={} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
                 tier_label(tier_rank),
                 last_io.syscr,
                 last_io.read_bytes,
+                last_open_io.read_bytes,
+                last_open_io.majflt,
                 last_io.majflt,
                 last_io.pgmajfault.unwrap_or(u64::MAX),
+                last_open_io.pgmajfault.unwrap_or(u64::MAX),
             );
             let (topo_index, stream_index) = open_event_timeline_indexes(db.event_dag().as_ref());
             let mut warm_pages = Vec::with_capacity(20);
@@ -616,12 +639,17 @@ fn run_fetch_rows(
             .collect();
         let mut elapsed_samples = Vec::with_capacity(samples);
         let mut last_io = IoSnapshot::default();
+        let mut last_open_io = IoSnapshot::default();
         let mut returned = 0usize;
         for _ in 0..samples {
             db.event_dag().sync_all().expect("sync before fetch");
             drop(db);
             evict(root, scope).expect("evict selected files before fetch");
+            let open_before = IoSnapshot::read();
             db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
+            let open_io = IoSnapshot::read().delta(open_before);
+            last_open_io = open_io;
+            evict(root, scope).expect("evict selected files after open");
             let before = IoSnapshot::read();
             let started = Instant::now();
             let payloads = db
@@ -648,15 +676,18 @@ fn run_fetch_rows(
                 .unwrap_or(0)
         };
         println!(
-            "multi_room_fetch evict={} count={} samples={} min_us={min_us:.1} median_us={median_us:.1} syscr={} rchar={} disk_read_bytes={} payload_bytes_returned={returned} read_amp_bp={amplification_bp} majflt={} cgroup_pgmajfault={}",
+            "multi_room_fetch evict={} count={} samples={} min_us={min_us:.1} median_us={median_us:.1} syscr={} rchar={} disk_read_bytes={} open_read_bytes={} open_majflt={} payload_bytes_returned={returned} read_amp_bp={amplification_bp} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
             scope.label(),
             ids.len(),
             samples,
             last_io.syscr,
             last_io.rchar,
             last_io.read_bytes,
+            last_open_io.read_bytes,
+            last_open_io.majflt,
             last_io.majflt,
             last_io.pgmajfault.unwrap_or(u64::MAX),
+            last_open_io.pgmajfault.unwrap_or(u64::MAX),
         );
     }
 
@@ -673,6 +704,7 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>) {
     let (topo_index, stream_index) = open_event_timeline_indexes(db.event_dag().as_ref());
     let mut promotion_times = Vec::new();
     let mut sequence = u64::from(u32::MAX);
+    let mut promotions = Vec::new();
     for _ in 0..20 {
         sequence = sequence.saturating_add(1);
         let node = node_id(sequence);
@@ -683,6 +715,21 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>) {
             node,
             event_ref(node),
         );
+        promotions.push((entry, node));
+    }
+    let seed = db.begin_transaction();
+    for (_, node) in &promotions {
+        seed.put(
+            ShardType::EventDag,
+            largest_room.collection,
+            *node,
+            &NodeData::new(payload(sequence, PAYLOAD_MIN)),
+        )
+        .expect("seed outlier payload");
+    }
+    seed.commit().expect("commit outlier payloads");
+    for (entry, _) in promotions {
+        let started = Instant::now();
         let transaction = db.begin_transaction();
         stage_promote_outlier_to_timeline(
             &transaction,
@@ -693,7 +740,6 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>) {
             &[entry],
         )
         .expect("stage promotion");
-        let started = Instant::now();
         transaction.commit().expect("commit promotion");
         promotion_times.push(started.elapsed());
     }
@@ -749,6 +795,8 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>) {
 fn main() {
     let root = bench_root();
     let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::create_dir_all(&root);
+    warn_if_tmpfs(&root);
     let events = env_usize("MTXDB_MULTI_EVENTS", 1_000_000);
     let room_count = env_usize("MTXDB_MULTI_ROOMS", 1_000);
     let batch = env_usize("MTXDB_MULTI_BATCH", 64).max(1);
@@ -788,6 +836,7 @@ fn main() {
         write_synthetic(&db, &mut rooms, &counts, batch);
     }
     db.event_dag().sync_all().expect("sync benchmark database");
+    let _ = db.coordinator().reclaim_shared();
     let write_ms = write_started.elapsed().as_secs_f64() * 1e3;
     println!(
         "multi_room_load events={total_events} rooms={} batch={batch} write_ms={write_ms:.1}",
