@@ -182,6 +182,12 @@ name = "pack_scan_profile"
 path = "pack_scan_profile.rs"
 harness = false
 
+# Timeline sidecar append, pagination, and selected-payload fetch costs.
+[[bench]]
+name = "timeline_index"
+path = "timeline_index.rs"
+harness = false
+
 # End-to-end search-pack cost (index + query shapes) on a real-data corpus.
 [[bench]]
 name = "search_scan"
