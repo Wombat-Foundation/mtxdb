@@ -52,6 +52,36 @@ fn payload(n: u64) -> Bytes {
     Bytes::from(bytes)
 }
 
+fn front_entry(offset: u64) -> TimelineEntry {
+    let offset_i64 = i64::try_from(offset).expect("front offset fits i64");
+    let position = -500_001_i64
+        .checked_sub(offset_i64)
+        .expect("front position fits i64");
+    let sequence = u64::MAX
+        .checked_sub(offset)
+        .expect("front node id sequence fits u64");
+    let id = node_id(sequence);
+    let mut reference = [0; 32];
+    reference[..16].copy_from_slice(&id);
+    reference[16..24].copy_from_slice(&offset.to_be_bytes());
+    TimelineEntry::new(ROOM, position, position, id, reference)
+}
+
+fn front_payload(offset: u64) -> Bytes {
+    let fill = u8::try_from(offset.checked_rem(251).expect("nonzero payload modulus"))
+        .expect("payload fill fits u8");
+    let mut bytes = vec![fill; PAYLOAD_BYTES];
+    bytes[..16].copy_from_slice(&ROOM);
+    let offset_i64 = i64::try_from(offset).expect("front offset fits i64");
+    let position = -500_001_i64
+        .checked_sub(offset_i64)
+        .expect("front position fits i64");
+    let ordering = position.to_be_bytes();
+    bytes[16..24].copy_from_slice(&ordering);
+    bytes[24..32].copy_from_slice(&ordering);
+    Bytes::from(bytes)
+}
+
 fn sample_ns(iterations: usize, mut operation: impl FnMut()) -> (u128, u128) {
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
@@ -297,17 +327,24 @@ fn run(n: usize, batch: usize) {
     let tail_payload_seed_us = tail_seed_start.elapsed().as_micros();
 
     let mut single_samples = Vec::with_capacity(SINGLE_TAIL_WRITES);
+    let mut single_first_ns = 0_u128;
     for offset in 0..SINGLE_TAIL_WRITES {
         let entry = entry(n as u64 + offset as u64);
         let start = Instant::now();
         reopened_index
             .append_untransactional(std::slice::from_ref(&entry))
             .expect("single-entry tail append");
-        single_samples.push(start.elapsed().as_nanos());
+        let elapsed = start.elapsed().as_nanos();
+        if offset == 0 {
+            single_first_ns = elapsed;
+        }
+        single_samples.push(elapsed);
     }
     single_samples.sort_unstable();
+    let single_max_ns = *single_samples.last().expect("tail single samples");
 
     let mut batch_samples = Vec::with_capacity(BATCHED_TAIL_WRITES);
+    let mut batch_first_ns = 0_u128;
     for batch_index in 0..BATCHED_TAIL_WRITES {
         let start_sequence =
             n as u64 + SINGLE_TAIL_WRITES as u64 + (batch_index * TAIL_BATCH_SIZE) as u64;
@@ -318,11 +355,16 @@ fn run(n: usize, batch: usize) {
         reopened_index
             .append_untransactional(&batch_entries)
             .expect("16-entry tail append");
-        batch_samples.push(start.elapsed().as_nanos());
+        let elapsed = start.elapsed().as_nanos();
+        if batch_index == 0 {
+            batch_first_ns = elapsed;
+        }
+        batch_samples.push(elapsed);
     }
     batch_samples.sort_unstable();
+    let batch_max_ns = *batch_samples.last().expect("tail batch samples");
     println!(
-        "timeline_tail_publish n={n} leaves_before~{} payload_seed_records={tail_total} payload_seed_us={tail_payload_seed_us} single_entries={} single_min_ns={} single_median_ns={} batch_entries={} batch_count={} batch_min_ns={} batch_median_ns={}",
+        "timeline_tail_publish n={n} leaves_before~{} payload_seed_records={tail_total} payload_seed_us={tail_payload_seed_us} single_entries={} single_first_ns={single_first_ns} single_min_ns={} single_median_ns={} single_max_ns={single_max_ns} batch_entries={} batch_count={} batch_first_ns={batch_first_ns} batch_min_ns={} batch_median_ns={} batch_max_ns={batch_max_ns}",
         n.div_ceil(TIMELINE_LEAF_CAP),
         SINGLE_TAIL_WRITES,
         single_samples[0],
@@ -332,7 +374,83 @@ fn run(n: usize, batch: usize) {
         batch_samples[0],
         batch_samples[batch_samples.len() / 2],
     );
-    reopened.sync_all().expect("sync tail publishes");
+
+    let front_records: Vec<_> = (0..tail_total)
+        .map(|offset| {
+            let offset = u64::try_from(offset).expect("front offset fits u64");
+            let sequence = u64::MAX
+                .checked_sub(offset)
+                .expect("front node id sequence fits u64");
+            (node_id(sequence), NodeData::new(front_payload(offset)))
+        })
+        .collect();
+    let front_seed_start = Instant::now();
+    reopened
+        .put_many(&EVENT_COLLECTION, &front_records)
+        .expect("seed front-backfill payloads");
+    let front_payload_seed_us = front_seed_start.elapsed().as_micros();
+
+    let mut front_single_samples = Vec::with_capacity(SINGLE_TAIL_WRITES);
+    let mut front_single_first_ns = 0_u128;
+    for offset in 0..SINGLE_TAIL_WRITES {
+        let offset = u64::try_from(offset).expect("front offset fits u64");
+        let entry = front_entry(offset);
+        let start = Instant::now();
+        reopened_index
+            .append_untransactional(std::slice::from_ref(&entry))
+            .expect("single-entry front append");
+        let elapsed = start.elapsed().as_nanos();
+        if offset == 0 {
+            front_single_first_ns = elapsed;
+        }
+        front_single_samples.push(elapsed);
+    }
+    front_single_samples.sort_unstable();
+    let front_single_max_ns = *front_single_samples.last().expect("front single samples");
+
+    let mut front_batch_samples = Vec::with_capacity(BATCHED_TAIL_WRITES);
+    let mut front_batch_first_ns = 0_u128;
+    for batch_index in 0..BATCHED_TAIL_WRITES {
+        let start_offset = SINGLE_TAIL_WRITES
+            .checked_add(
+                batch_index
+                    .checked_mul(TAIL_BATCH_SIZE)
+                    .expect("front batch offset fits usize"),
+            )
+            .expect("front batch offset fits usize");
+        let batch_entries: Vec<_> = (0..TAIL_BATCH_SIZE)
+            .map(|offset| {
+                let offset = start_offset
+                    .checked_add(offset)
+                    .and_then(|value| u64::try_from(value).ok())
+                    .expect("front batch entry offset fits u64");
+                front_entry(offset)
+            })
+            .collect();
+        let start = Instant::now();
+        reopened_index
+            .append_untransactional(&batch_entries)
+            .expect("16-entry front append");
+        let elapsed = start.elapsed().as_nanos();
+        if batch_index == 0 {
+            front_batch_first_ns = elapsed;
+        }
+        front_batch_samples.push(elapsed);
+    }
+    front_batch_samples.sort_unstable();
+    let front_batch_max_ns = *front_batch_samples.last().expect("front batch samples");
+    println!(
+        "timeline_front_publish n={n} leaves_before~{} payload_seed_records={tail_total} payload_seed_us={front_payload_seed_us} single_entries={} single_first_ns={front_single_first_ns} single_min_ns={} single_median_ns={} single_max_ns={front_single_max_ns} batch_entries={} batch_count={} batch_first_ns={front_batch_first_ns} batch_min_ns={} batch_median_ns={} batch_max_ns={front_batch_max_ns}",
+        n.div_ceil(TIMELINE_LEAF_CAP),
+        SINGLE_TAIL_WRITES,
+        front_single_samples[0],
+        front_single_samples[front_single_samples.len() / 2],
+        TAIL_BATCH_SIZE,
+        BATCHED_TAIL_WRITES,
+        front_batch_samples[0],
+        front_batch_samples[front_batch_samples.len() / 2],
+    );
+    reopened.sync_all().expect("sync timeline publishes");
     drop(reopened_index);
     drop(reopened);
     let _ = std::fs::remove_dir_all(dir);
