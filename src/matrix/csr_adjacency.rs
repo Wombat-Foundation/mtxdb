@@ -456,6 +456,11 @@ impl CsrAdjacency {
     /// watermark row naming the last log entry they cover, which is what makes
     /// recovery replay only what is missing.
     ///
+    /// If the tail append fails after the log entry is published, the entry is
+    /// left in the log rather than rolled back. A later recovery may therefore
+    /// add edges for an event whose recording failed. Logging first is what
+    /// makes recovery possible, so the entry is not removed.
+    ///
     /// # Errors
     /// As [`Self::record_event`], plus an error if this adjacency was not
     /// addressed by a room collection (see [`Self::for_collection`]), since the
