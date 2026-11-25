@@ -1964,14 +1964,6 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Age a directory's modification time so the segment cache trusts it.
-    fn age_dir(dir: &Path) {
-        let old = SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(60))
-            .unwrap();
-        File::open(dir).unwrap().set_modified(old).unwrap();
-    }
-
     #[test]
     fn a_quiet_store_directory_is_listed_once_and_a_seal_is_still_seen() {
         let layout = layout("segment-cache");
@@ -1980,10 +1972,17 @@ mod tests {
         store
             .with_write_lock(|| store.append_rows_locked(scope, &[row_for(1, 9)], false))
             .unwrap();
-        age_dir(store.dir());
         let family = row_for(1, 9).family;
         // The first read lists and caches; the rest must not list again.
         store.read_rows(scope, &[(family, 1)]).unwrap();
+        // Mark the just-listed entry as quiet to exercise cache reuse without
+        // sleeping for the production quiet interval.
+        SEGMENT_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(store.dir())
+            .unwrap()
+            .quiet = true;
         let before = listings(store.dir());
         for _ in 0..50 {
             assert!(store.read_rows(scope, &[(family, 1)]).unwrap()[0].is_some());
