@@ -9158,8 +9158,10 @@ fn a_room_import_populates_timeline_index() {
     assert_eq!(written.events, 6);
 
     let room_scope = room_scope_id(FIXTURE_ROOM.as_bytes());
-    let timeline_index =
-        EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1");
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
     assert_eq!(page.entries.len(), 6);
 
@@ -9366,9 +9368,12 @@ fn stale_auth_events_are_rejected_against_state_before() {
         3
     );
 
-    let page = EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1")
-        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
-        .unwrap();
+    let page = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+    .unwrap();
     let streams: Vec<i64> = page
         .entries
         .iter()
@@ -9451,9 +9456,12 @@ fn rejected_state_event_does_not_change_later_state() {
         4
     );
 
-    let page = EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1")
-        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
-        .unwrap();
+    let page = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+    .unwrap();
     let streams: Vec<i64> = page
         .entries
         .iter()
@@ -9546,9 +9554,12 @@ fn partial_base_state_is_left_unchecked() {
         5
     );
 
-    let page = EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1")
-        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
-        .unwrap();
+    let page = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+    .unwrap();
     let streams: Vec<i64> = page
         .entries
         .iter()
@@ -9756,8 +9767,10 @@ fn flag_index_timeline_count_matches_timeline_index() {
     assert_eq!(written.events, 5);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index =
-        EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1");
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
     let flags = RoomFlagIndex::new(room_id.as_bytes());
@@ -9811,8 +9824,10 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
     assert_eq!(written.events, 4);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index =
-        EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1");
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
     // The two non-outliers make it in; the soft-failed outlier stays out even
@@ -9883,8 +9898,10 @@ fn stream_and_arrival_order_survive_import() {
     assert_eq!(written.events, 5);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index =
-        EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1");
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
     // Live and backfilled positions are preserved exactly; the soft-failed
@@ -9991,9 +10008,12 @@ fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
         "--flag soft-failed selects the imported event"
     );
 
-    let page = EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1")
-        .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
-        .unwrap();
+    let page = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
+    .unwrap();
     let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
     assert_eq!(
         streams,
@@ -10159,8 +10179,10 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     assert_eq!(written.events, 6);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index =
-        EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1");
+    let timeline_index = EventTopoIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    );
     let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
 
     // Only the 4 timeline events should be present ($notimeline and $outlier excluded)

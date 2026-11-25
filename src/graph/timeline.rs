@@ -1280,12 +1280,24 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         forward: bool,
         limit: usize,
     ) -> Result<OrderedPage<K>, StorageError> {
+        self.page_with_snapshot(prefix, cursor, forward, limit)
+            .map(|(page, _snapshot_root)| page)
+    }
+
+    /// Read a page and return the exact root used for the read.
+    pub(crate) fn page_with_snapshot(
+        &self,
+        prefix: &K::Prefix,
+        cursor: Option<&OrderedCursor<K>>,
+        forward: bool,
+        limit: usize,
+    ) -> Result<(OrderedPage<K>, Option<NodeId>), StorageError> {
         let empty = OrderedPage {
             entries: Vec::new(),
             next_cursor: None,
         };
         if limit == 0 {
-            return Ok(empty);
+            return Ok((empty, None));
         }
         validate_geometry::<K>()?;
 
@@ -1309,7 +1321,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
             }
             None => match self.head()? {
                 Some((snapshot_root, _count)) => (snapshot_root, None),
-                None => return Ok(empty),
+                None => return Ok((empty, None)),
             },
         };
 
@@ -1319,7 +1331,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
             .ok_or(StorageError::NotFound(snapshot_root))?;
         let root = decode_root::<K>(&root_bytes.bytes, self.domain)?;
         if root.directories.is_empty() {
-            return Ok(empty);
+            return Ok((empty, Some(snapshot_root)));
         }
 
         let mut out: Vec<K> = Vec::with_capacity(limit);
@@ -1336,10 +1348,13 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         } else {
             None
         };
-        Ok(OrderedPage {
-            entries: out,
-            next_cursor,
-        })
+        Ok((
+            OrderedPage {
+                entries: out,
+                next_cursor,
+            },
+            Some(snapshot_root),
+        ))
     }
 
     fn forward_page(

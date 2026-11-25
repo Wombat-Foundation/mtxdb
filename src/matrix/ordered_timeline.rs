@@ -10,7 +10,8 @@ use crate::layout::ShardType;
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
 use crate::timeline::{OrderedCursor, OrderedIndex, OrderedKey, OrderedPage, ScopedSeqKey};
 
-const EVENT_TIMELINE_INDEX_NAME: &str = "event-timeline-v1";
+/// Stable logical name shared by both event-order key schemas.
+pub const EVENT_TIMELINE_INDEX_NAME: &str = "event-timeline-v1";
 const EVENT_KEY_WIRE_LEN: usize = 16 + 8 + 8 + 16 + 32;
 type DecodedEventKey = ([u8; 16], i64, i64, NodeId, [u8; 32]);
 const EVENT_TOPO_SCHEMA: [u8; 4] = *b"ETOP";
@@ -217,11 +218,14 @@ pub fn stage_event_timeline_batch<S: StorageEngine + ?Sized>(
     topo_index: &EventTopoIndex<'_, S>,
     stream_index: &EventStreamIndex<'_, S>,
     entries: &[EventTimelineEntry],
-) -> Result<(NodeId, NodeId), StorageError> {
+) -> Result<Option<(NodeId, NodeId)>, StorageError> {
     for (node_id, data) in payloads {
         transaction
             .put(pool, payload_collection, *node_id, data)
             .map_err(StorageError::Io)?;
+    }
+    if entries.is_empty() {
+        return Ok(None);
     }
     let topo_entries: Vec<_> = entries
         .iter()
@@ -235,7 +239,7 @@ pub fn stage_event_timeline_batch<S: StorageEngine + ?Sized>(
         .collect();
     let topo_root = topo_index.stage_append(transaction, pool, &topo_entries)?;
     let stream_root = stream_index.stage_append(transaction, pool, &stream_entries)?;
-    Ok((topo_root, stream_root))
+    Ok(Some((topo_root, stream_root)))
 }
 
 /// Read a stream-ordered page bounded by the contiguous visible watermark.
@@ -243,7 +247,8 @@ pub fn stage_event_timeline_batch<S: StorageEngine + ?Sized>(
 /// Reverse reads seek from a synthetic maximal key at the watermark. Forward
 /// reads stop at the first greater stream position and rebuild the resume
 /// cursor from the last retained entry so a later watermark advance cannot
-/// skip entries.
+/// skip entries. Returned cursors pin that read's root; callers resuming across
+/// requests must rebind the last key to the current root.
 ///
 /// # Errors
 /// Propagates ordered-index read errors, including cursor domain/prefix
@@ -262,6 +267,7 @@ pub fn page_stream_up_to<S: StorageEngine + ?Sized>(
         match cursor {
             Some(cursor)
                 if cursor.domain() == index.domain()
+                    && cursor.entry().room_scope == *room_scope
                     && cursor.entry().stream_ordering > persisted_up_to =>
             {
                 Some(index.cursor(
@@ -283,7 +289,8 @@ pub fn page_stream_up_to<S: StorageEngine + ?Sized>(
             },
         }
     };
-    let mut page = index.page(room_scope, bounded_cursor.as_ref(), forward, limit)?;
+    let (mut page, snapshot_root) =
+        index.page_with_snapshot(room_scope, bounded_cursor.as_ref(), forward, limit)?;
     if !forward {
         return Ok(page);
     }
@@ -296,13 +303,31 @@ pub fn page_stream_up_to<S: StorageEngine + ?Sized>(
         return Ok(page);
     }
     page.entries.truncate(visible_len);
-    page.next_cursor = match (page.entries.last().copied(), page.next_cursor.take()) {
-        (Some(last_visible), Some(source_cursor)) => {
-            Some(index.cursor(source_cursor.root_id(), last_visible)?)
-        }
+    page.next_cursor = match (page.entries.last().copied(), snapshot_root) {
+        (Some(last_visible), Some(root_id)) => Some(index.cursor(root_id, last_visible)?),
         _ => None,
     };
     Ok(page)
+}
+
+/// Re-anchor a stream cursor to the current index head for a new request.
+///
+/// # Errors
+/// Returns an error if the cursor belongs to another index domain or room.
+pub fn rebind_stream_cursor_to_head<S: StorageEngine + ?Sized>(
+    index: &EventStreamIndex<'_, S>,
+    room_scope: &[u8; 16],
+    cursor: &EventStreamCursor,
+) -> Result<Option<EventStreamCursor>, StorageError> {
+    if cursor.domain() != index.domain() || cursor.entry().room_scope != *room_scope {
+        return Err(StorageError::Corrupt(
+            "event stream cursor domain or room mismatch".to_owned(),
+        ));
+    }
+    index
+        .head()?
+        .map(|(root_id, _count)| index.cursor(root_id, cursor.entry()))
+        .transpose()
 }
 
 fn max_stream_key(room_scope: [u8; 16], persisted_up_to: i64) -> EventStreamKey {

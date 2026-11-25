@@ -997,8 +997,10 @@ impl RoomFlagIndex {
     }
 
     fn timeline_nodes(&self, db: &Database) -> Result<Vec<NodeId>, StorageError> {
-        let timeline_index =
-            EventTopoIndex::open(db.pool(ShardType::EventDag).as_ref(), "event-timeline-v1");
+        let timeline_index = EventTopoIndex::open(
+            db.pool(ShardType::EventDag).as_ref(),
+            crate::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        );
         let room_scope = room_scope_id(&self.room_id);
         let mut cursor = None;
         let mut timeline_nodes = Vec::new();

@@ -10,6 +10,9 @@ mod tests {
         room_event_collection_id, room_flag_collection_id, Verdict,
     };
     use crate::layout::ShardType;
+    use crate::ordered_timeline::{
+        open_event_timeline_indexes, stage_event_timeline_batch, EventTimelineEntry,
+    };
     use crate::room_flag::{
         flag_chunk_node_id, Flag, FlagChange, FlagQuery, RebuildInputs, RoomFlagIndex,
         CHUNK_CAPACITY, FLAG_META_ID,
@@ -400,25 +403,28 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        // 6. Append ev1 to TimelineIndex
-        let timeline_index = crate::timeline::TimelineIndex::open(
-            db.pool(ShardType::EventDag).as_ref(),
-            std::str::from_utf8(room_id).unwrap(),
-        );
+        // 6. Append ev1 to the shared topological and stream indexes.
+        let (topo_index, stream_index) =
+            open_event_timeline_indexes(db.pool(ShardType::EventDag).as_ref());
         let room_scope = crate::interop::room_scope_id(room_id);
-        timeline_index
-            .append(
-                &db,
-                ShardType::EventDag,
-                &[crate::timeline::TimelineEntry::new(
-                    room_scope,
-                    1,
-                    1,
-                    node1,
-                    crate::interop::event_id_ref(ev1),
-                )],
-            )
-            .unwrap();
+        let timeline_tx = db.begin_transaction();
+        stage_event_timeline_batch(
+            &timeline_tx,
+            ShardType::EventDag,
+            room_event_collection_id(room_id),
+            &[],
+            &topo_index,
+            &stream_index,
+            &[EventTimelineEntry::new(
+                room_scope,
+                1,
+                1,
+                node1,
+                crate::interop::event_id_ref(ev1),
+            )],
+        )
+        .unwrap();
+        timeline_tx.commit().unwrap();
 
         // Rebuild index
         let count = index.rebuild(&db).unwrap();

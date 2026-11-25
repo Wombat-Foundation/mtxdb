@@ -93,7 +93,7 @@ fn dual_index_batch_is_atomic_and_watermark_pages_resume_without_skips() {
     let topo_page = topo_index.page(&room, None, true, 10).unwrap();
     assert_eq!(topo_page.entries.len(), entries.len());
     assert_eq!(topo_page.entries[0].event_node_id, entries[0].event_node_id);
-    let visible = page_stream_up_to(&stream_index, &room, None, true, 3, 3).unwrap();
+    let visible = page_stream_up_to(&stream_index, &room, None, true, 10, 3).unwrap();
     assert_eq!(
         visible
             .entries
@@ -110,7 +110,7 @@ fn dual_index_batch_is_atomic_and_watermark_pages_resume_without_skips() {
     assert_eq!(advanced.entries.len(), 1);
     assert_eq!(advanced.entries[0].stream_ordering, 4);
 
-    let reverse = page_stream_up_to(&stream_index, &room, None, false, 3, 3).unwrap();
+    let reverse = page_stream_up_to(&stream_index, &room, None, false, 10, 3).unwrap();
     assert_eq!(
         reverse
             .entries
@@ -124,6 +124,46 @@ fn dual_index_batch_is_atomic_and_watermark_pages_resume_without_skips() {
         assert!(pool.get(&payload_collection, &payload.0).unwrap().is_some());
     }
 
+    let (root_id, _) = stream_index.head().unwrap().unwrap();
+    let cross_room_cursor = stream_index
+        .cursor(root_id, entries[2].stream_key())
+        .unwrap();
+    let other_room = [0x32; 16];
+    assert!(page_stream_up_to(
+        &stream_index,
+        &other_room,
+        Some(&cross_room_cursor),
+        false,
+        10,
+        3,
+    )
+    .is_err());
+
+    drop(db);
+    std::fs::remove_dir_all(test_path).unwrap();
+}
+
+#[test]
+fn empty_timeline_batch_does_not_stage_index_heads() {
+    let test_path = test_dir("empty_batch");
+    let db = Database::open(test_path.clone()).unwrap();
+    let pool = db.pool(ShardType::EventDag);
+    let (topo_index, stream_index) = open_event_timeline_indexes(pool.as_ref());
+    let transaction = db.begin_transaction();
+    let roots = stage_event_timeline_batch(
+        &transaction,
+        ShardType::EventDag,
+        [0xAC; 16],
+        &[],
+        &topo_index,
+        &stream_index,
+        &[],
+    )
+    .unwrap();
+    assert!(roots.is_none());
+    transaction.commit().unwrap();
+    assert!(topo_index.head().unwrap().is_none());
+    assert!(stream_index.head().unwrap().is_none());
     drop(db);
     std::fs::remove_dir_all(test_path).unwrap();
 }
