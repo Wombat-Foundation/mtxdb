@@ -4,12 +4,13 @@
 //! `cargo bench --manifest-path benches/Cargo.toml --bench timeline_multi_room`
 //!
 //! Defaults to a deterministic Zipfian synthetic corpus
-//! (`MTXDB_MULTI_EVENTS=100000`, `MTXDB_MULTI_ROOMS=100`). Set
+//! (`MTXDB_MULTI_EVENTS=1000000`, `MTXDB_MULTI_ROOMS=1000`). Set
 //! `MTXDB_TIMELINE_EXPORT` to a CSV length manifest with
-//! `room,topo,stream,payload_bytes` rows to drive the same reads with real
-//! event lengths. Every cold sample closes the handle, syncs, evicts the
-//! selected files through `vmtouch -e`, and reopens before timing.
-//! `MTXDB_TIMELINE_SAMPLES` controls cold repetitions.
+//! `room,topo,stream,payload_bytes` rows to drive size-shaped synthetic reads.
+//! Every cold sample syncs and closes the database, advises the kernel to
+//! evict selected files, then reopens before timing. The manifest mode does
+//! not read payloads from an existing database.
+//! `MTXDB_TIMELINE_SAMPLES` controls cold repetitions; warm pages use 20.
 //!
 //! Output rows separate index traversal (`multi_room_page`), locator plus body
 //! fetches (`multi_room_fetch`), and mutations (`multi_room_mutate`). I/O
@@ -20,7 +21,8 @@
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::pedantic
+    clippy::pedantic,
+    clippy::style
 )]
 
 use std::collections::HashMap;
@@ -34,6 +36,7 @@ use mtxdb::ordered_timeline::{
 };
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{interop, Database, ShardType};
+use rustix::fs::{fadvise, Advice};
 
 const PAYLOAD_MIN: usize = 256;
 const PAYLOAD_STEP: usize = 240;
@@ -289,41 +292,32 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn evict(dir: &Path, scope: EvictScope) -> bool {
-    let mut paths = Vec::new();
-    match scope {
-        EvictScope::All => paths.push(dir.to_path_buf()),
-        EvictScope::PacksOnly | EvictScope::IndexOnly => {
-            let mut files = Vec::new();
-            walk_files(dir, &mut files);
-            paths.extend(files.into_iter().filter(|path| {
-                let extension = path.extension().and_then(|value| value.to_str());
-                match scope {
-                    EvictScope::PacksOnly => extension == Some("pack"),
-                    EvictScope::IndexOnly => matches!(extension, Some("run" | "idx")),
-                    EvictScope::All => true,
-                }
-            }));
-        }
-    }
+fn evict(dir: &Path, scope: EvictScope) -> std::io::Result<()> {
+    let mut files = Vec::new();
+    walk_files(dir, &mut files);
+    let paths: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|path| {
+            let extension = path.extension().and_then(|value| value.to_str());
+            match scope {
+                EvictScope::All => true,
+                EvictScope::PacksOnly => extension == Some("pack"),
+                EvictScope::IndexOnly => matches!(extension, Some("run" | "idx")),
+            }
+        })
+        .collect();
     evict_paths(&paths)
 }
 
-fn evict_paths(paths: &[PathBuf]) -> bool {
-    if paths.is_empty() {
-        return true;
+fn evict_paths(paths: &[PathBuf]) -> std::io::Result<()> {
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let file = std::fs::File::open(path)?;
+        fadvise(&file, 0, None, Advice::DontNeed).map_err(std::io::Error::from)?;
     }
-    let mut ok = true;
-    for chunk in paths.chunks(256) {
-        ok &= std::process::Command::new("vmtouch")
-            .arg("-e")
-            .args(chunk)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-    }
-    ok
+    Ok(())
 }
 
 fn median(values: &mut [Duration]) -> Duration {
@@ -336,6 +330,13 @@ fn median(values: &mut [Duration]) -> Duration {
 
 fn min(values: &[Duration]) -> Duration {
     values.iter().copied().min().unwrap_or(Duration::ZERO)
+}
+
+fn maintain_journal(db: &Database) {
+    let coordinator = db.coordinator();
+    if coordinator.segment_len() > coordinator.reclaim_trigger_len() {
+        let _ = db.event_dag().sync_all();
+    }
 }
 
 fn write_synthetic(db: &Database, rooms: &mut [Room], counts: &[usize], batch: usize) {
@@ -397,6 +398,7 @@ fn write_synthetic(db: &Database, rooms: &mut [Room], counts: &[usize], batch: u
             )
             .expect("stage multi-room event batch");
             transaction.commit().expect("commit multi-room event batch");
+            maintain_journal(db);
         }
         if !progressed {
             break;
@@ -429,7 +431,7 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
                 continue;
             }
             let segment = &slice[..take];
-            let Some(room) = rooms.get(room_index) else {
+            let Some(selected_room) = rooms.get(room_index) else {
                 continue;
             };
             let mut entries = Vec::with_capacity(take);
@@ -438,7 +440,7 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
                 sequence = sequence.saturating_add(1);
                 let node = node_id(sequence);
                 entries.push(EventTimelineEntry::new(
-                    room.scope,
+                    selected_room.scope,
                     event.topo,
                     event.stream,
                     node,
@@ -450,7 +452,7 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
             stage_event_timeline_batch(
                 &transaction,
                 ShardType::EventDag,
-                room.collection,
+                selected_room.collection,
                 &payloads,
                 &topo_index,
                 &stream_index,
@@ -458,6 +460,7 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
             )
             .expect("stage manifest event batch");
             transaction.commit().expect("commit manifest event batch");
+            maintain_journal(db);
         }
     }
 }
@@ -465,8 +468,8 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
 fn main() {
     let root = bench_root();
     let _ = std::fs::remove_dir_all(&root);
-    let events = env_usize("MTXDB_MULTI_EVENTS", 100_000);
-    let room_count = env_usize("MTXDB_MULTI_ROOMS", 100);
+    let events = env_usize("MTXDB_MULTI_EVENTS", 1_000_000);
+    let room_count = env_usize("MTXDB_MULTI_ROOMS", 1_000);
     let batch = env_usize("MTXDB_MULTI_BATCH", 64).max(1);
     let samples = env_usize("MTXDB_TIMELINE_SAMPLES", 3).max(1);
 
@@ -533,10 +536,10 @@ fn main() {
     tiers.dedup();
 
     for (tier_rank, tier) in tiers.clone().into_iter().enumerate() {
-        let Some(room) = rooms.get(tier) else {
+        let Some(selected) = rooms.get(tier) else {
             continue;
         };
-        let room_id = String::from_utf8_lossy(&room.id).into_owned();
+        let room_id = String::from_utf8_lossy(&selected.id).into_owned();
         for (order, limit) in [
             ("topo", 50usize),
             ("topo", 128),
@@ -548,11 +551,8 @@ fn main() {
             for _ in 0..samples {
                 db.event_dag().sync_all().expect("sync before eviction");
                 drop(db);
+                evict(&root, EvictScope::All).expect("evict files before cold read");
                 db = Database::open(root.clone()).expect("reopen benchmark database");
-                let evicted = evict(&root, EvictScope::All);
-                if !evicted {
-                    eprintln!("timeline_multi_room: vmtouch -e unavailable; cold rows are warm");
-                }
                 let (topo_index, stream_index) =
                     open_event_timeline_indexes(db.event_dag().as_ref());
                 let before = IoSnapshot::read();
@@ -560,7 +560,7 @@ fn main() {
                     "topo" => {
                         let started = Instant::now();
                         let page = topo_index
-                            .page(&room.scope, None, true, limit)
+                            .page(&selected.scope, None, true, limit)
                             .expect("cold topological page");
                         (started.elapsed(), page.entries.len())
                     }
@@ -568,11 +568,11 @@ fn main() {
                         let started = Instant::now();
                         let page = page_stream_up_to(
                             &stream_index,
-                            &room.scope,
+                            &selected.scope,
                             None,
                             true,
                             limit,
-                            room.max_stream,
+                            selected.max_stream,
                         )
                         .expect("cold stream page");
                         (started.elapsed(), page.entries.len())
@@ -590,7 +590,41 @@ fn main() {
                 last_io.syscr,
                 last_io.read_bytes,
                 last_io.majflt,
-                last_io.pgmajfault.map_or(u64::MAX, |value| value),
+                last_io.pgmajfault.unwrap_or(u64::MAX),
+            );
+            let (topo_index, stream_index) =
+                open_event_timeline_indexes(db.event_dag().as_ref());
+            let mut warm_pages = Vec::with_capacity(20);
+            for _ in 0..20 {
+                let started = Instant::now();
+                let returned = if order == "topo" {
+                    topo_index
+                        .page(&selected.scope, None, true, limit)
+                        .expect("warm topological page")
+                        .entries
+                        .len()
+                } else {
+                    page_stream_up_to(
+                        &stream_index,
+                        &selected.scope,
+                        None,
+                        true,
+                        limit,
+                        selected.max_stream,
+                    )
+                    .expect("warm stream page")
+                    .entries
+                    .len()
+                };
+                std::hint::black_box(returned);
+                warm_pages.push(started.elapsed());
+            }
+            println!(
+                "multi_room_page_warm room={room_id} tier={} order={order} limit={limit} samples={} min_us={:.1} median_us={:.1}",
+                tier_label(tier_rank),
+                warm_pages.len(),
+                min(&warm_pages).as_secs_f64() * 1e6,
+                median(&mut warm_pages).as_secs_f64() * 1e6,
             );
         }
     }
@@ -603,27 +637,27 @@ fn main() {
         let Some(room_index) = tiers.first().copied() else {
             continue;
         };
-        let Some(room) = rooms.get(room_index) else {
+        let Some(selected) = rooms.get(room_index) else {
             continue;
         };
         db.event_dag().sync_all().expect("sync before fetch");
-        drop(db);
-        db = Database::open(root.clone()).expect("reopen benchmark database");
         let (topo_index, _stream_index) = open_event_timeline_indexes(db.event_dag().as_ref());
         let page = topo_index
-            .page(&room.scope, None, true, 128)
+            .page(&selected.scope, None, true, 128)
             .expect("warm index page");
         let ids: Vec<NodeId> = page
             .entries
             .iter()
             .map(|entry| entry.event_node_id)
             .collect();
-        let _ = evict(&root, scope);
+        drop(db);
+        evict(&root, scope).expect("evict selected files before fetch");
+        db = Database::open(root.clone()).expect("reopen benchmark database");
         let before = IoSnapshot::read();
         let started = Instant::now();
         let payloads = db
             .pool(ShardType::EventDag)
-            .get_many(&room.collection, &ids)
+            .get_many(&selected.collection, &ids)
             .expect("cold payload fetch");
         let elapsed = started.elapsed();
         let io = IoSnapshot::read().delta(before);
@@ -646,14 +680,14 @@ fn main() {
             io.rchar,
             io.read_bytes,
             io.majflt,
-            io.pgmajfault.map_or(u64::MAX, |value| value),
+            io.pgmajfault.unwrap_or(u64::MAX),
         );
     }
 
     let Some(largest) = tiers.first().copied() else {
         return;
     };
-    let Some(room) = rooms.get(largest) else {
+    let Some(largest_room) = rooms.get(largest) else {
         return;
     };
     let (topo_index, stream_index) = open_event_timeline_indexes(db.event_dag().as_ref());
@@ -663,7 +697,7 @@ fn main() {
         sequence = sequence.saturating_add(1);
         let node = node_id(sequence);
         let entry = EventTimelineEntry::new(
-            room.scope,
+            largest_room.scope,
             i64::try_from(sequence).unwrap_or(i64::MAX),
             i64::try_from(sequence).unwrap_or(i64::MAX),
             node,
@@ -673,7 +707,7 @@ fn main() {
         stage_event_timeline_batch(
             &transaction,
             ShardType::EventDag,
-            room.collection,
+            largest_room.collection,
             &[(node, NodeData::new(payload(sequence, PAYLOAD_MIN)))],
             &topo_index,
             &stream_index,
@@ -685,7 +719,7 @@ fn main() {
         promotion_times.push(started.elapsed());
     }
     let page = topo_index
-        .page(&room.scope, None, true, 128)
+        .page(&largest_room.scope, None, true, 128)
         .expect("mutation source page");
     let remove_entries: Vec<EventTimelineEntry> = page
         .entries
@@ -721,7 +755,7 @@ fn main() {
         ShardType::EventDag,
         &topo_index,
         &stream_index,
-        &room.scope,
+        &largest_room.scope,
     )
     .expect("stage room purge");
     transaction.commit().expect("commit room purge");
