@@ -194,10 +194,13 @@ jobs:
       matrix:
         include:
           - arch: ppc64le
+            platform: linux/ppc64le
             page_size: 4096
           - arch: armv7
+            platform: linux/arm/v7
             page_size: 4096
           - arch: riscv64
+            platform: linux/riscv64
             page_size: 4096
     steps:
       - uses: actions/checkout@v4
@@ -216,7 +219,14 @@ jobs:
           # walks away thinking the pinned rezzy commit does not exist
           # ("revspec ... not found"). A tmpfs has small inode numbers, so
           # keep Cargo's git/registry caches there instead of on the mount.
-          dockerRunArgs: --tmpfs /opt/cargo:size=2g
+          #
+          # The action builds a multi-arch image but runs it without
+          # `--platform`, so Docker warns that the image architecture does not
+          # match the amd64 host. Requesting the platform explicitly keeps the
+          # QEMU emulation (still required) but silences the warning.
+          dockerRunArgs: |
+            --platform=${{ matrix.platform }}
+            --tmpfs /opt/cargo:size=2g
           env: |
             RUSTUP_TOOLCHAIN: stable
             RUSTC_WRAPPER: ""
