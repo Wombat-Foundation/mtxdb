@@ -714,17 +714,30 @@ impl CsrStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error),
         };
-        // Take the entry out so no lock is held across disk reads.
-        let cached = TAIL_CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.dir);
-        let mut state = match cached {
-            Some(state) if state.valid <= len && state.generation == generation => state,
-            _ => TailState::default(),
-        };
+        // One shared entry per directory, locked for the read. A reader that
+        // arrives while another holds it waits for a short extension instead of
+        // finding no entry and re-decoding the whole tail from byte 0.
+        let entry = Arc::clone(
+            TAIL_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(self.dir.clone())
+                .or_default(),
+        );
+        let mut state = entry.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.valid > len || state.generation != generation {
+            *state = TailState::default();
+        }
         state.generation = generation;
         if state.valid < len {
+            #[cfg(test)]
+            if state.valid == 0 {
+                let mut counts = TAIL_FULL_DECODES
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let count = counts.entry(self.dir.clone()).or_default();
+                *count = count.saturating_add(1);
+            }
             let (frames, valid) = self.read_tail_from(state.valid)?;
             for frame in &frames {
                 state.apply(&frame.payload)?;
@@ -736,12 +749,7 @@ impl CsrStore {
         if self.segment_generation()? != generation {
             return Ok(None);
         }
-        let result = read(&state);
-        TAIL_CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(self.dir.clone(), state);
-        Ok(Some(result))
+        Ok(Some(read(&state)))
     }
 
     fn segment_generation(&self) -> io::Result<Option<u64>> {
@@ -947,7 +955,12 @@ impl TailState {
     }
 }
 
-static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, TailState>>> =
+/// Tests count reads that decoded a tail from byte 0.
+#[cfg(test)]
+static TAIL_FULL_DECODES: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static TAIL_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<TailState>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// One read/write lock per store directory, shared by every handle in the
@@ -1736,6 +1749,49 @@ mod tests {
         // The probe really does see the lock: a sync issued under it reports so.
         store.with_write_lock(|| store.sync_tail()).unwrap();
         assert!(test_last_sync_held_lock());
+        let _ = fs::remove_dir_all(layout.root());
+    }
+
+    #[test]
+    fn concurrent_readers_share_one_decoded_tail() {
+        let layout = layout("shared-tail");
+        let store = Arc::new(CsrStore::open(&layout, ShardType::State));
+        let scope = ScopeId([7; 16]);
+        let batch: Vec<_> = (2..=400).map(|owner| row_for(owner, 9)).collect();
+        store
+            .with_write_lock(|| store.append_rows_locked(scope, &batch, false))
+            .unwrap();
+        let family = row_for(1, 9).family;
+        // Warm the cache, then count decodes from byte 0 across racing readers.
+        store.read_rows(scope, &[(family, 2)]).unwrap();
+        let decodes = |dir: &Path| {
+            TAIL_FULL_DECODES
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(dir)
+                .copied()
+                .unwrap_or(0)
+        };
+        let before = decodes(store.dir());
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for owner in 2..300 {
+                        let rows = store.read_rows(scope, &[(family, owner)]).unwrap();
+                        assert!(rows[0].is_some());
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            decodes(store.dir()),
+            before,
+            "readers must extend one shared decoded tail, not re-decode it"
+        );
         let _ = fs::remove_dir_all(layout.root());
     }
 
