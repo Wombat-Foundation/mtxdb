@@ -980,39 +980,7 @@ impl TxnStage {
         collection_id: [u8; 16],
         entries: &[([u8; 16], Vec<u8>)],
     ) -> io::Result<()> {
-        let charge = entries
-            .iter()
-            .try_fold(0usize, |total, (_, payload)| {
-                total.checked_add(payload.len().saturating_add(64))
-            })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "transaction stage size overflow",
-                )
-            })?;
-        let mut data = self.data.lock();
-        if self.state.load(Ordering::Acquire) != Self::ACTIVE {
-            return Err(io::Error::other("transaction stage is not active"));
-        }
-        let total = data.bytes.checked_add(charge).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transaction stage size overflow",
-            )
-        })?;
-        if total > self.limit_bytes {
-            return Err(stage_too_large_with_limit(total, self.limit_bytes));
-        }
-        let pool_mutations = &mut data.pools[pool_index(pool)];
-        pool_mutations.extend(entries.iter().map(|(node_id, payload)| Mutation::Put {
-            collection_id,
-            node_id: *node_id,
-            payload: payload.clone(),
-        }));
-        data.applied[pool_index(pool)].extend(vec![false; entries.len()]);
-        data.bytes = total;
-        Ok(())
+        self.stage_puts_inner(pool, collection_id, None, entries)
     }
 
     /// Atomically add record-version preconditions and puts. Used by
@@ -1023,6 +991,16 @@ impl TxnStage {
         pool: ShardType,
         collection_id: [u8; 16],
         expectations: &[([u8; 16], u64)],
+        entries: &[([u8; 16], Vec<u8>)],
+    ) -> io::Result<()> {
+        self.stage_puts_inner(pool, collection_id, Some(expectations), entries)
+    }
+
+    fn stage_puts_inner(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        expectations: Option<&[([u8; 16], u64)]>,
         entries: &[([u8; 16], Vec<u8>)],
     ) -> io::Result<()> {
         let charge = entries
@@ -1050,17 +1028,19 @@ impl TxnStage {
             return Err(stage_too_large_with_limit(total, self.limit_bytes));
         }
         let index = pool_index(pool);
-        for (node_id, expected) in expectations {
-            if data
-                .record_expectation_keys
-                .insert((index, collection_id, *node_id))
-            {
-                data.record_expectations.push(RecordExpectation {
-                    pool,
-                    collection_id,
-                    node_id: *node_id,
-                    expected: *expected,
-                });
+        if let Some(expectations) = expectations {
+            for (node_id, expected) in expectations {
+                if data
+                    .record_expectation_keys
+                    .insert((index, collection_id, *node_id))
+                {
+                    data.record_expectations.push(RecordExpectation {
+                        pool,
+                        collection_id,
+                        node_id: *node_id,
+                        expected: *expected,
+                    });
+                }
             }
         }
         data.pools[index].extend(entries.iter().map(|(node_id, payload)| Mutation::Put {

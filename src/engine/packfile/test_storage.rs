@@ -13697,18 +13697,16 @@ fn versions_crash_child() {
     unreachable!("the child must exit at the versions crash point");
 }
 
-/// A crash between the versions fsync and the coverage claim leaves the
-/// checkpoint unreclaimed and `journal.lsn` unwritten. A paged reopen retires
-/// the checkpoint, so only `index.versions` can restore the version and
-/// coverage.
-#[test]
-#[ignore = "Paged + shared WAL is refused until a Paged sync can advance coverage"]
-fn versions_fsync_precedes_wal_reclaim_crash_safe() {
+fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
+    residency: crate::index::IndexResidency,
+    test_name: &str,
+    coverage_message: &str,
+) {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
     use std::process::Command;
 
-    let root = test_dir("versions_crash");
+    let root = test_dir(test_name);
     fs::create_dir_all(&root).unwrap();
     let output = Command::new(crate::io::test_binary_path())
         .args([
@@ -13743,7 +13741,7 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
         root.join("store"),
         48 * 1024,
         crate::packfile::ChecksumPolicy::Full,
-        crate::index::IndexResidency::Paged,
+        residency,
     )
     .unwrap();
     reopened
@@ -13759,11 +13757,25 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
     assert_eq!(
         reopened.durable_coverage(),
         coverage_before,
-        "coverage must come from index.versions when journal.lsn was never written"
+        "{coverage_message}"
     );
     drop(reopened);
     drop(coordinator);
     fs::remove_dir_all(&root).ok();
+}
+
+/// A crash between the versions fsync and the coverage claim leaves the
+/// checkpoint unreclaimed and `journal.lsn` unwritten. A paged reopen retires
+/// the checkpoint, so only `index.versions` can restore the version and
+/// coverage.
+#[test]
+#[ignore = "Paged + shared WAL is refused until a Paged sync can advance coverage"]
+fn versions_fsync_precedes_wal_reclaim_crash_safe() {
+    assert_versions_fsync_precedes_wal_reclaim_crash_safe(
+        crate::index::IndexResidency::Paged,
+        "versions_crash",
+        "coverage must come from index.versions when journal.lsn was never written",
+    );
 }
 
 /// The supported Resident counterpart of
@@ -13772,66 +13784,11 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
 /// reopen with the shared WAL.
 #[test]
 fn versions_fsync_precedes_wal_reclaim_crash_safe_resident() {
-    use crate::journal::{Journal, JournalCoordinator};
-    use crate::layout::ShardType;
-    use std::process::Command;
-
-    let root = test_dir("versions_crash_resident");
-    fs::create_dir_all(&root).unwrap();
-    let output = Command::new(crate::io::test_binary_path())
-        .args([
-            "--exact",
-            "packfile::storage::tests::versions_crash_child",
-            "--test-threads=1",
-        ])
-        .env("MTXDB_VERSIONS_CRASH_DIR", &root)
-        .env("MTXDB_CRASH_AT", "after-versions-fsync")
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(super::VERSIONS_CRASH_EXIT_CODE),
-        "child did not stop at the crash point\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let expected = fs::read_to_string(root.join("expected.txt")).unwrap();
-    let mut fields = expected.split_whitespace();
-    let version_before: u64 = fields.next().unwrap().parse().unwrap();
-    let coverage_before: u64 = fields.next().unwrap().parse().unwrap();
-    assert!(coverage_before >= version_before);
-
-    let wal = root.join("shared.wal");
-    let coordinator = Arc::new({
-        let (journal, scan) = Journal::open_shared(&wal).unwrap();
-        JournalCoordinator::new(journal, &scan)
-    });
-    let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
-        root.join("store"),
-        48 * 1024,
-        crate::packfile::ChecksumPolicy::Full,
+    assert_versions_fsync_precedes_wal_reclaim_crash_safe(
         crate::index::IndexResidency::Resident,
-    )
-    .unwrap();
-    reopened
-        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
-        .unwrap();
-    let (_, version_after) = reopened
-        .get_with_collection_version(&TEST_COLLECTION, &[distinct_id(255)])
-        .unwrap();
-    assert!(
-        version_after >= version_before,
-        "version went backwards after the crash: before={version_before}, after={version_after}"
+        "versions_crash_resident",
+        "coverage must survive a crash before journal.lsn was written",
     );
-    assert_eq!(
-        reopened.durable_coverage(),
-        coverage_before,
-        "coverage must survive a crash before journal.lsn was written"
-    );
-    drop(reopened);
-    drop(coordinator);
-    fs::remove_dir_all(&root).ok();
 }
 
 #[test]

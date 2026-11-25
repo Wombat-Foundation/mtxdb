@@ -303,9 +303,7 @@ impl CsrAdjacency {
 
     fn csr_collection(&self) -> [u8; 16] {
         let (_, events) = self.events.scope();
-        let mut name = b"matrix-csr:".to_vec();
-        name.extend_from_slice(&events);
-        derive_collection_id(Some(MEMBER_NAMESPACE_INTL), &name)
+        csr_scope_for(&events)
     }
 
     fn scope(&self) -> ScopeId {
@@ -1575,25 +1573,14 @@ impl CsrAdjacency {
         let watermark = read_watermark(&store).map_err(StorageError::Io)?;
         let head = log.head(db)?;
         if watermark > head {
-            // The tail outlived the WAL, which can also roll back short-ID
-            // allocations. Existing rows may now name different events if
-            // recording resumes. The CSR is a derived index over event bodies,
-            // so tombstone every scope in this store and lower the watermark to
-            // the recovered head. A scope can then be rebuilt from its events
-            // without ever serving rows that reference reassigned short ids.
-            let scopes: Vec<ScopeId> = store
-                .all_scopes()
-                .map_err(StorageError::Io)?
-                .into_iter()
-                .map(ScopeId)
-                .collect();
-            store.with_write_lock(|| -> Result<(), StorageError> {
-                store
-                    .purge_scopes_locked(&scopes)
-                    .map_err(StorageError::Io)?;
-                write_watermark_locked(&store, db, head).map_err(StorageError::Io)
-            })?;
-            store.sync_tail().map_err(StorageError::Io)?;
+            // The pre-sync hook makes CSR rows durable before the WAL group
+            // that covers them, so a crash can leave rows for events whose
+            // short-id allocations rolled back. Those ids can be handed out
+            // again, and their orphan rows would then be merged into an
+            // unrelated event. Keep every row whose owner and targets are
+            // still allocated, drop only the references to rolled-back ids,
+            // and lower the watermark to the recovered log head.
+            repair_rows_after_rollback(db, &store, head)?;
             return Ok(0);
         }
         if head == watermark {
