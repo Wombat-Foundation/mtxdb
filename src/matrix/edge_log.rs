@@ -11,7 +11,8 @@
 //! One log serves every scope. An entry carries its scope (the room's event
 //! collection id) and the event with its `prev`, `auth` and relation edges.
 //! Entries are numbered from 1 by a counter record, and are removed once the
-//! rows they describe are durable in the CSR (see [`EdgeLog::prune`]).
+//! rows they describe are durable in the CSR (see
+//! [`crate::edge_log::EdgeLog::prune_through`]).
 
 use crate::database::Database;
 use crate::layout::ShardType;
