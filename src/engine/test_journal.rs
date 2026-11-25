@@ -2776,6 +2776,121 @@ fn wait_until(mut condition: impl FnMut() -> bool, label: &str) {
 }
 
 #[test]
+fn pre_sync_hook_runs_after_the_boundary_is_captured_and_before_it_is_durable() {
+    let coordinator = open_arc("pre_sync_order");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    {
+        let hooked = coordinator.clone();
+        let seen = seen.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            // Not durable yet when the hook runs.
+            seen.lock().push(hooked.committed_lsn());
+            Ok(())
+        })));
+    }
+
+    coordinator.sync_through(first.last_lsn).unwrap();
+
+    assert_eq!(
+        *seen.lock(),
+        vec![0],
+        "the hook runs once, before the fsync"
+    );
+    assert_eq!(coordinator.committed_lsn(), first.last_lsn);
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
+fn a_group_published_while_the_hook_runs_is_not_in_the_boundary() {
+    let coordinator = open_arc("pre_sync_late_publish");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    let late = Arc::new(AtomicU64::new(0));
+    {
+        let hooked = coordinator.clone();
+        let late = late.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            // A writer publishes after the boundary was captured: its record
+            // must not become durable on the strength of this hook's work.
+            if late.load(Ordering::SeqCst) == 0 {
+                let receipt = hooked.publish_group(&[put(2, 2, b"late")]).unwrap();
+                late.store(receipt.last_lsn, Ordering::SeqCst);
+            }
+            Ok(())
+        })));
+    }
+
+    coordinator.sync_through(first.last_lsn).unwrap();
+
+    let late_lsn = late.load(Ordering::SeqCst);
+    assert!(late_lsn > first.last_lsn);
+    assert_eq!(
+        coordinator.committed_lsn(),
+        first.last_lsn,
+        "the late group is outside the captured boundary"
+    );
+    // The next sync covers it, running the hook again first.
+    coordinator.sync_through(late_lsn).unwrap();
+    assert_eq!(coordinator.committed_lsn(), late_lsn);
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
+fn a_failing_pre_sync_hook_fails_the_sync_without_poisoning_the_journal() {
+    let coordinator = open_arc("pre_sync_failure");
+    let first = coordinator.publish_group(&[put(1, 1, b"first")]).unwrap();
+    coordinator.set_pre_sync_hook(Some(Arc::new(|| {
+        Err(std::io::Error::other("adjacency flush failed"))
+    })));
+
+    assert!(coordinator.sync_through(first.last_lsn).is_err());
+    assert_eq!(coordinator.committed_lsn(), 0, "nothing became durable");
+
+    // The hook's failure is not a dropped-pages fsync failure: clearing it
+    // lets the same group commit.
+    coordinator.set_pre_sync_hook(None);
+    coordinator.sync_through(first.last_lsn).unwrap();
+    assert_eq!(coordinator.committed_lsn(), first.last_lsn);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
+fn the_background_committer_runs_the_pre_sync_hook_before_its_group_commit() {
+    let coordinator = open_arc("pre_sync_background");
+    let runs = Arc::new(AtomicU64::new(0));
+    {
+        let runs = runs.clone();
+        coordinator.set_pre_sync_hook(Some(Arc::new(move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+    }
+    coordinator
+        .start_background_committer(GroupCommitConfig {
+            interval: Duration::from_millis(20),
+            max_pending: u64::MAX,
+        })
+        .unwrap();
+
+    let lsn = coordinator
+        .publish_group(&[put(3, 3, b"timer")])
+        .map(|receipt| receipt.last_lsn)
+        .unwrap();
+    let token = coordinator.request_durable(lsn);
+    coordinator.wait_durable(token).unwrap();
+
+    assert!(
+        runs.load(Ordering::SeqCst) >= 1,
+        "a timer commit must run the hook before it fsyncs"
+    );
+    coordinator.stop_background_committer().unwrap();
+    coordinator.set_pre_sync_hook(None);
+    fs::remove_file(coordinator.path()).unwrap();
+}
+
+#[test]
 fn durability_stats_show_requests_sharing_few_fsyncs() {
     const WRITERS: u8 = 16;
     let coordinator = open_arc("dur_stats_shared");

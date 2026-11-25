@@ -1536,6 +1536,20 @@ impl Drop for SyncInFlightGuard<'_> {
 #[cfg(test)]
 type FsyncHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
+/// Work that must be durable before the WAL group covering a captured boundary
+/// is: run by every commit path (explicit sync, background committer, close)
+/// after the boundary is captured and before the fsync.
+///
+/// A derived structure that is written outside the WAL (the CSR adjacency
+/// tails) uses it to make its writes for the group durable first, so a crash
+/// can leave orphan derived rows but never a durable record whose derived rows
+/// are missing. Publishers take no lock the hook needs, so they keep appending
+/// while it runs; anything published after the capture is outside the group
+/// being made durable and is covered by the next one. An `Err` fails the sync
+/// without poisoning the journal: it says the hook's own work failed, not that
+/// the kernel dropped WAL pages.
+pub type PreSyncHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
 /// What a sync captured under the journal lock so it can flush without it.
 struct SyncCapture {
     /// Duplicate of the segment file handle current at capture time.
@@ -2407,6 +2421,9 @@ pub struct JournalCoordinator {
     /// An `Err` it returns is treated as the fsync failing.
     #[cfg(test)]
     fsync_hook: Mutex<Option<FsyncHook>>,
+    /// Work to make durable before each WAL group's fsync. See
+    /// [`PreSyncHook`].
+    pre_sync_hook: Mutex<Option<PreSyncHook>>,
     /// Guards [`Self::durable_cv`]. The condvar carries no state of its own;
     /// waiters re-check [`Self::committed_lsn`] and the committer's presence
     /// after every wake, so this only provides the required mutex pairing.
@@ -2607,6 +2624,7 @@ impl JournalCoordinator {
             sync_lock: Mutex::new(()),
             #[cfg(test)]
             fsync_hook: Mutex::new(None),
+            pre_sync_hook: Mutex::new(None),
             durable_lock: Mutex::new(()),
             durable_cv: Condvar::new(),
             background: Mutex::new(BackgroundState::Stopped),
@@ -3675,6 +3693,12 @@ impl JournalCoordinator {
         self.published_lsn.load(Ordering::Acquire)
     }
 
+    /// Install (or clear) the work to make durable before each WAL group's
+    /// fsync. See [`PreSyncHook`].
+    pub fn set_pre_sync_hook(&self, hook: Option<PreSyncHook>) {
+        *self.pre_sync_hook.lock() = hook;
+    }
+
     /// Capture the latest fully published mutation as this sync caller's
     /// acknowledgement boundary.
     #[must_use]
@@ -3853,6 +3877,13 @@ impl JournalCoordinator {
         capture: &SyncCapture,
         timings: &mut JournalSyncTimings,
     ) -> io::Result<()> {
+        // The boundary is already captured and no journal lock is held, so the
+        // hook's work covers everything published up to that boundary while
+        // publishers carry on past it.
+        let pre_sync = self.pre_sync_hook.lock().clone();
+        if let Some(pre_sync) = pre_sync {
+            pre_sync()?;
+        }
         let fsync_started = std::time::Instant::now();
         #[cfg(test)]
         let _trace = crate::test_trace::span("wal.group_fsync", std::path::Path::new("wal"));
