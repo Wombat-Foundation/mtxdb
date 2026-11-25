@@ -1152,7 +1152,7 @@ fn durable_record_events_syncs_once_outside_the_write_lock() {
 
 mod edge_log_recovery {
     use super::*;
-    use crate::edge_log::EdgeLog;
+    use crate::edge_log::{EdgeLog, LoggedEvent};
     use crate::layout::ShardType;
 
     const ROOM_A: [u8; 16] = [0xA1; 16];
@@ -1199,6 +1199,97 @@ mod edge_log_recovery {
         let db = crash_keeping_only_the_wal(&root, db);
         let err = CsrAdjacency::recover_edge_log(&db, &log).unwrap_err();
         assert!(err.to_string().contains("missing entries"), "{err}");
+    }
+
+    #[test]
+    fn a_lost_tail_watermark_can_still_skip_the_pruned_prefix() {
+        let root = test_root("edge-log-pruned-watermark");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        for (id, prev) in [("$a", &[][..]), ("$b", &["$a"][..])] {
+            adj.record_events_logged(&db, &log, &[event(id, prev)], AppendDurability::Deferred)
+                .unwrap();
+        }
+        adj.sync_tail(&db).unwrap();
+        CsrAdjacency::checkpoint_edge_log(&db, &log).unwrap();
+        assert_eq!(log.pruned(&db).unwrap(), 2);
+
+        for (id, prev) in [("$c", &["$b"][..]), ("$d", &["$c"][..])] {
+            adj.record_events_logged(&db, &log, &[event(id, prev)], AppendDurability::Deferred)
+                .unwrap();
+        }
+
+        // Lose the whole tail, watermark included; the WAL keeps the log and
+        // the prune marker. Entries 1-2 are legitimately gone, so recovery
+        // must look past the pruned prefix instead of reporting a gap.
+        let db = crash_keeping_only_the_wal(&root, db);
+        assert_eq!(log.head(&db).unwrap(), 4);
+        assert_eq!(log.pruned(&db).unwrap(), 2);
+        assert_eq!(
+            CsrAdjacency::recover_edge_log(&db, &log).unwrap(),
+            2,
+            "only the entries above the prune point are replayed"
+        );
+        assert_eq!(adj.prev_of(&db, "$d").unwrap(), Some(vec!["$c".to_owned()]));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watermark_ahead_of_the_log_head_is_clamped() {
+        use crate::database::tests::crash_image;
+        use crate::journal::cut_segment_image_to_durable_mark;
+
+        let root = test_root("edge-log-clamp");
+        let image = test_root("edge-log-clamp-image");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        for (id, prev) in [("$a", &[][..]), ("$b", &["$a"][..]), ("$c", &["$b"][..])] {
+            adj.record_events_logged(&db, &log, &[event(id, prev)], AppendDurability::Deferred)
+                .unwrap();
+        }
+        // Keep the tail, watermark included, but make sure the WAL is the only
+        // thing a crash can lose. Cutting it to its durable mark drops the log.
+        adj.sync_tail(&db).unwrap();
+        crash_image(&db, &root, &image);
+        cut_segment_image_to_durable_mark(&image.join("wal.bin")).unwrap();
+        drop(db);
+
+        let db = Database::open(image.clone()).unwrap();
+        assert_eq!(log.head(&db).unwrap(), 0, "the WAL lost every entry");
+        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
+
+        // Appends now reuse sequence 1. If the stale watermark stayed at 3,
+        // the next crash would treat these new entries as already applied.
+        let logged = LoggedEvent {
+            scope: ROOM_B,
+            event_id: "$after".to_owned(),
+            prev: Vec::new(),
+            auth: Vec::new(),
+            relation: None,
+        };
+        assert_eq!(log.append(&db, &[logged]).unwrap(), 1);
+        db.coordinator().sync().unwrap();
+        drop(db);
+
+        let db = Database::open(image.clone()).unwrap();
+        assert_eq!(
+            CsrAdjacency::recover_edge_log(&db, &log).unwrap(),
+            1,
+            "the reused sequence number must not be hidden by the old watermark"
+        );
+        assert_eq!(
+            CsrAdjacency::for_collection(&ROOM_B)
+                .prev_of(&db, "$after")
+                .unwrap(),
+            Some(Vec::new()),
+            "the entry's rows were replayed"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(image);
     }
 
     #[test]

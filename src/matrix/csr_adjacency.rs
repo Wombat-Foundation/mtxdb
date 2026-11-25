@@ -1500,7 +1500,18 @@ impl CsrAdjacency {
         let store = CsrStore::open(db.layout(), ShardType::State);
         let watermark = read_watermark(&store).map_err(StorageError::Io)?;
         let head = log.head(db)?;
-        if head <= watermark {
+        if watermark > head {
+            // The tail outlived the WAL. Its watermark names entries the log
+            // never kept, and new appends reuse those sequence numbers, so the
+            // stale watermark would make a later crash skip them. Lower it to
+            // the log head and make that durable before returning.
+            store
+                .with_write_lock(|| write_watermark_locked(&store, db, head))
+                .map_err(StorageError::Io)?;
+            store.sync_tail().map_err(StorageError::Io)?;
+            return Ok(0);
+        }
+        if head == watermark {
             return Ok(0);
         }
         let entries = log.read_range(db, watermark, head)?;
@@ -1578,6 +1589,9 @@ impl CsrAdjacency {
     pub fn checkpoint_edge_log(db: &Database, log: &EdgeLog) -> Result<(), StorageError> {
         let store = CsrStore::open(db.layout(), ShardType::State);
         let watermark = read_watermark(&store).map_err(StorageError::Io)?;
+        // A tail that outlived the WAL can name a watermark past the log head;
+        // pruning through it would hide every future entry up to that number.
+        let watermark = watermark.min(log.head(db)?);
         store.sync_tail().map_err(StorageError::Io)?;
         log.prune_through(db, watermark)
     }
