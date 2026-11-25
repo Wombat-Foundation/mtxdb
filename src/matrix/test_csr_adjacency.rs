@@ -1648,6 +1648,64 @@ mod edge_log_recovery {
     }
 
     #[test]
+    fn repair_drops_an_orphan_row_even_when_the_watermark_equals_the_head() {
+        let root = test_root("edge-log-equal-head-orphan");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_events_logged(&db, &log, &[event("$a", &[])], AppendDurability::Deferred)
+            .unwrap();
+        adj.sync_tail(&db).unwrap();
+
+        // A row for an owner the recovered counter never allocated, as left by
+        // an allocation that rolled back while the log entry survived.
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        let scope = store
+            .all_scopes()
+            .unwrap()
+            .into_iter()
+            .map(ScopeId)
+            .find(|scope| !store.read_scope(*scope).unwrap().rows.is_empty())
+            .expect("the room has rows");
+        let orphan_owner = 99;
+        store
+            .writer(&db)
+            .unwrap()
+            .append_rows(
+                scope,
+                &[RowRecord {
+                    family: PREV,
+                    owner: orphan_owner,
+                    edges: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let has_orphan = |store: &CsrStore| {
+            store
+                .read_scope(scope)
+                .unwrap()
+                .rows
+                .iter()
+                .any(|row| row.owner == orphan_owner)
+        };
+        assert!(has_orphan(&store));
+
+        let db = restart_keeping_everything(&root, db);
+        assert_eq!(
+            log.head(&db).unwrap(),
+            1,
+            "the watermark equals the head, so nothing replays"
+        );
+        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
+
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        assert!(!has_orphan(&store), "the orphan row must be repaired away");
+        assert_eq!(adj.prev_of(&db, "$a").unwrap(), Some(Vec::new()));
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rollback_repair_keeps_a_purge_marker_for_an_unmapped_scope() {
         use crate::database::tests::crash_image;
 
