@@ -268,6 +268,11 @@ pub trait StorageEngine: Send + Sync {
     /// Returns `StorageError::Io` on I/O failure.
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError>;
 
+    /// Mark a collection as an ordered-index collection, so storage that
+    /// separates index and body mappings can route its node reads
+    /// differently. Engines that do not distinguish mapping kinds ignore this.
+    fn mark_index_collection(&self, _collection_id: &[u8; 16]) {}
+
     /// Fetch multiple nodes by their structural hashes within a collection.
     /// Returns results in the same order as the input keys.
     ///

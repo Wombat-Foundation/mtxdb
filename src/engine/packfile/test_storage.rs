@@ -2431,6 +2431,74 @@ fn test_get_location_returns_the_winning_frame() {
 }
 
 #[test]
+fn test_get_slot_location_agrees_with_get_location_and_orders_appends() {
+    let dir = test_dir("get_slot_location_physical");
+    let store = PackfileStorage::open(dir).unwrap();
+    let mut written = Vec::new();
+    for tag in 0x70u8..0x74 {
+        let id = distinct_id(tag);
+        store
+            .put(
+                &TEST_COLLECTION,
+                &id,
+                &NodeData::new(bytes::Bytes::from(vec![tag; 32])),
+            )
+            .unwrap();
+        written.push(id);
+    }
+    store.sync().unwrap();
+
+    let shards: std::collections::HashMap<u16, std::sync::Arc<crate::shard::Shard>> =
+        store.shards.all_shards().into_iter().collect();
+    let verifies = store.shards.checksum_policy().verifies_reads();
+    let mut previous: Option<(u16, u64)> = None;
+    for id in &written {
+        let (slot, offset) = store
+            .get_slot_location(&TEST_COLLECTION, id)
+            .unwrap()
+            .expect("a just-written record is live");
+        let shard = shards.get(&slot).expect("the slot is an open shard");
+        let record = store.read_at(shard, offset, verifies).unwrap();
+        assert_eq!(record.hash, *id, "the slot location names this record");
+        assert_eq!(
+            store.get_location(&TEST_COLLECTION, id).unwrap(),
+            Some((shard.pack_id, offset)),
+            "slot and pack locations disagree"
+        );
+        if let Some(previous) = previous {
+            assert!(
+                (slot, offset) > previous,
+                "appends must be ordered by (slot, offset)"
+            );
+        }
+        previous = Some((slot, offset));
+    }
+
+    let physical = store
+        .collection_live_record_locations(&TEST_COLLECTION)
+        .unwrap()
+        .expect("a known collection has physical record locations");
+    assert_eq!(physical.len(), written.len());
+    for (id, slot, offset, frame_len) in physical {
+        assert!(written.contains(&id));
+        assert!(frame_len > 0);
+        assert_eq!(
+            store.get_slot_location(&TEST_COLLECTION, &id).unwrap(),
+            Some((slot, offset)),
+            "metadata scan and live index must agree on physical location"
+        );
+    }
+
+    assert_eq!(
+        store
+            .get_slot_location(&TEST_COLLECTION, &distinct_id(0x7f))
+            .unwrap(),
+        None,
+        "an unknown id resolves to no slot location"
+    );
+}
+
+#[test]
 fn test_get_location_retries_when_a_repack_retires_the_shard_mid_lookup() {
     let id = distinct_id(0x62);
     let (store, old_shard, fired, _guard) =
@@ -5050,6 +5118,7 @@ fn test_plan_read_extents_melds_gaps_and_splits_on_cap() {
             min_batch_candidates: 1,
             random_advice: false,
             point_random_mmap: false,
+            point_random_mmap_index: false,
         },
     );
     assert_eq!(
@@ -5085,6 +5154,7 @@ fn test_plan_read_extents_melds_gaps_and_splits_on_cap() {
             min_batch_candidates: 1,
             random_advice: false,
             point_random_mmap: false,
+            point_random_mmap_index: false,
         },
     );
     assert_eq!(
@@ -5118,6 +5188,7 @@ fn test_plan_read_extents_orders_by_slot() {
             min_batch_candidates: 1,
             random_advice: false,
             point_random_mmap: false,
+            point_random_mmap_index: false,
         },
     );
     let slots: Vec<u16> = extents.iter().map(|extent| extent.slot).collect();
@@ -5132,6 +5203,7 @@ fn test_read_plan_policy_wants_gates_on_batch_size_and_cap() {
         min_batch_candidates: 16,
         random_advice: false,
         point_random_mmap: false,
+        point_random_mmap_index: false,
     };
     assert!(!policy.wants(15));
     assert!(policy.wants(16));
@@ -5175,6 +5247,7 @@ fn test_get_many_prefetch_plan_counters() {
         min_batch_candidates: 1,
         random_advice: false,
         point_random_mmap: false,
+        point_random_mmap_index: false,
     });
 
     let ids: Vec<_> = entries.iter().map(|(id, _)| *id).collect();
@@ -14058,6 +14131,66 @@ fn ordered_point_mapping_survives_growth_unmap_and_repack() {
     for id in [first, second] {
         assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
     }
+}
+
+#[test]
+fn ordered_index_point_mapping_leaves_event_bodies_sequential() {
+    let dir = test_dir("ordered_index_point_mapping_scope");
+    let store = PackfileStorage::open(dir).unwrap();
+    let body_collection = [0x62; 16];
+    let body_id = distinct_id(213);
+    store
+        .put(
+            &body_collection,
+            &body_id,
+            &NodeData::new(bytes::Bytes::from_static(b"event body")),
+        )
+        .unwrap();
+
+    let scope = [0x63; 16];
+    let index = crate::timeline::OrderedIndex::<_, crate::timeline::ScopedSeqKey>::open(
+        &store,
+        "point_mapping_scope_test",
+    );
+    index
+        .build(&[crate::timeline::ScopedSeqKey::new(
+            scope,
+            1,
+            0,
+            distinct_id(214),
+            [0; 32],
+        )])
+        .unwrap();
+    store.sync_all().unwrap();
+    store
+        .generation(&index.collection_id())
+        .unwrap()
+        .cache
+        .clear();
+    store.generation(&body_collection).unwrap().cache.clear();
+    store.set_point_random_mmap_index(true);
+
+    assert_eq!(index.page(&scope, None, true, 4).unwrap().entries.len(), 1);
+    let shard = store.shards.all_shards().into_iter().next().unwrap().1;
+    assert!(
+        shard.mmap.read().is_none(),
+        "ordered-index reads should use the point mapping only"
+    );
+
+    assert!(store.get(&body_collection, &body_id).unwrap().is_some());
+    assert!(
+        shard.mmap.read().is_some(),
+        "body reads should retain the normal mapping in index-only mode"
+    );
+
+    let _ = store.unmap_shards();
+    store.generation(&body_collection).unwrap().cache.clear();
+    store.set_point_random_mmap(true);
+    assert!(store.get(&body_collection, &body_id).unwrap().is_some());
+    assert!(
+        shard.mmap.read().is_none(),
+        "the global point setting should still cover body reads"
+    );
 }
 
 #[test]

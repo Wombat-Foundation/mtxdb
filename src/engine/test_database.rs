@@ -17,17 +17,30 @@ fn test_root(name: &str) -> PathBuf {
 
 #[test]
 fn point_mapping_config_reaches_database_and_standalone_pools() {
-    for enabled in [false, true] {
-        let root = test_root(&format!("config-point-mapping-{enabled}"));
+    for (point_enabled, index_enabled) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let root = test_root(&format!(
+            "config-point-mapping-{point_enabled}-{index_enabled}"
+        ));
         let config = RuntimeConfig {
-            point_random_mmap: enabled,
+            point_random_mmap: point_enabled,
+            ordered_index_point_random_mmap: index_enabled,
             ..RuntimeConfig::default()
         };
         let database = Database::open_with_config(root.clone(), config).unwrap();
         for shard in ShardType::ALL {
             assert_eq!(
                 database.pool(shard).read_plan_policy().point_random_mmap,
-                enabled,
+                point_enabled,
+                "{shard:?}"
+            );
+            assert_eq!(
+                database
+                    .pool(shard)
+                    .read_plan_policy()
+                    .point_random_mmap_index,
+                index_enabled,
                 "{shard:?}"
             );
         }
@@ -35,10 +48,18 @@ fn point_mapping_config_reaches_database_and_standalone_pools() {
 
         let standalone = root.join("standalone");
         let writer = PackfileStorage::open_with_config(standalone.clone(), &config).unwrap();
-        assert_eq!(writer.read_plan_policy().point_random_mmap, enabled);
+        assert_eq!(writer.read_plan_policy().point_random_mmap, point_enabled);
+        assert_eq!(
+            writer.read_plan_policy().point_random_mmap_index,
+            index_enabled
+        );
         drop(writer);
         let reader = PackfileStorage::open_read_only_with_config(standalone, &config).unwrap();
-        assert_eq!(reader.read_plan_policy().point_random_mmap, enabled);
+        assert_eq!(reader.read_plan_policy().point_random_mmap, point_enabled);
+        assert_eq!(
+            reader.read_plan_policy().point_random_mmap_index,
+            index_enabled
+        );
         drop(reader);
         let _ = std::fs::remove_dir_all(root);
     }

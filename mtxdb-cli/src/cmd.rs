@@ -891,6 +891,7 @@ fn open_pool(dir: PathBuf) -> io::Result<PackfileStorage> {
             mtxdb::packfile::ChecksumPolicy::Full,
         )?;
         store.set_point_random_mmap(crate::runtime_config().point_random_mmap);
+        store.set_point_random_mmap_index(crate::runtime_config().ordered_index_point_random_mmap);
         Ok(store)
     } else {
         PackfileStorage::open_with_config(dir, crate::runtime_config())

@@ -233,11 +233,13 @@ fn read_plan_modes_keep_the_runtime_point_mapping_setting() {
         for enabled in [false, true] {
             let config = mtxdb::RuntimeConfig {
                 point_random_mmap: enabled,
+                ordered_index_point_random_mmap: enabled,
                 ..mtxdb::RuntimeConfig::default()
             };
             let mut plan = read_plan_from_mode(mode);
             apply_runtime_read_settings(&mut plan, &config);
             assert_eq!(plan.point_random_mmap, enabled, "{mode}");
+            assert_eq!(plan.point_random_mmap_index, enabled, "{mode}");
         }
     }
 }

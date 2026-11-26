@@ -52,6 +52,11 @@ pub struct RuntimeConfig {
     /// [`crate::packfile::storage::PackfileStorage::set_point_random_mmap`].
     /// Setting a read-plan policy afterwards replaces this value.
     pub point_random_mmap: bool,
+    /// Serve reads from registered ordered-index collections through a
+    /// separate random-advised mapping, leaving payload collections on the
+    /// normal mapping. Unset by default; controlled by
+    /// `MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP`.
+    pub ordered_index_point_random_mmap: bool,
     /// Segment length, in bytes, above which a sync forces a reclaiming
     /// checkpoint. `None` keeps the journal's built-in value. Must be in
     /// `1..=MAX_RECLAIM_TRIGGER_LEN` and below the live segment cap's
@@ -74,6 +79,7 @@ impl Default for RuntimeConfig {
             index_residency: None,
             stats_enabled: false,
             point_random_mmap: false,
+            ordered_index_point_random_mmap: false,
             reclaim_trigger_bytes: None,
             replay_lease_max_retained_bytes: None,
         }
@@ -163,6 +169,12 @@ impl RuntimeConfig {
             Some(value) => parse_bool("MTXDB_POINT_RANDOM_MMAP", &value)?,
         };
 
+        let ordered_index_point_random_mmap = match lookup("MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP")?
+        {
+            None => false,
+            Some(value) => parse_bool("MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP", &value)?,
+        };
+
         let reclaim_trigger_bytes = match lookup("MTXDB_RECLAIM_TRIGGER_BYTES")? {
             None => None,
             Some(value) => {
@@ -192,6 +204,7 @@ impl RuntimeConfig {
             index_residency,
             stats_enabled,
             point_random_mmap,
+            ordered_index_point_random_mmap,
             reclaim_trigger_bytes,
             replay_lease_max_retained_bytes,
         })
@@ -314,6 +327,7 @@ mod tests {
         assert_eq!(parsed.index_residency, None);
         assert!(!parsed.stats_enabled);
         assert!(!parsed.point_random_mmap);
+        assert!(!parsed.ordered_index_point_random_mmap);
     }
 
     #[test]
@@ -325,6 +339,7 @@ mod tests {
             ("MTXDB_INDEX_RESIDENCY", "Paged"),
             ("MTXDB_STATS", "yes"),
             ("MTXDB_POINT_RANDOM_MMAP", "on"),
+            ("MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP", "true"),
         ])
         .unwrap();
         assert_eq!(parsed.cache_capacity, 0);
@@ -333,6 +348,7 @@ mod tests {
         assert_eq!(parsed.index_residency, Some(IndexResidency::Paged));
         assert!(parsed.stats_enabled);
         assert!(parsed.point_random_mmap);
+        assert!(parsed.ordered_index_point_random_mmap);
     }
 
     #[test]
@@ -348,6 +364,7 @@ mod tests {
         assert!(config(&[("MTXDB_INDEX_RESIDENCY", "mmap")]).is_err());
         assert!(config(&[("MTXDB_STATS", "sometimes")]).is_err());
         assert!(config(&[("MTXDB_POINT_RANDOM_MMAP", "sometimes")]).is_err());
+        assert!(config(&[("MTXDB_ORDERED_INDEX_POINT_RANDOM_MMAP", "sometimes")]).is_err());
     }
 
     #[test]

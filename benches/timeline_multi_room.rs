@@ -770,7 +770,7 @@ fn write_synthetic(
                 let topo = stream
                     .saturating_add(i64::from(room.scope[0]).saturating_mul(1_000_000))
                     .saturating_sub(if sequence.is_multiple_of(20) { 7 } else { 0 });
-                entries.push(EventTimelineEntry::new(room.scope, topo, stream, node));
+                entries.push(EventTimelineEntry::new(room.scope, topo, 0, stream, node));
                 payloads.push((node, NodeData::new(payload(sequence, len))));
             }
             completed[room_index] = done.saturating_add(take);
@@ -831,6 +831,7 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
                 entries.push(EventTimelineEntry::new(
                     selected_room.scope,
                     event.topo,
+                    0,
                     event.stream,
                     node,
                 ));
@@ -859,7 +860,7 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
 /// selects the advised variant alone (default is the unadvised baseline).
 fn advice_modes() -> Vec<&'static str> {
     if std::env::var_os("MTXDB_PAGE_ADVICE_AB").is_some() {
-        let mut modes = vec!["default", "random", "point"];
+        let mut modes = vec!["default", "random", "point", "index"];
         if std::env::var_os("MTXDB_PAGE_AB_REVERSE").is_some() {
             modes.reverse();
         }
@@ -871,6 +872,14 @@ fn advice_modes() -> Vec<&'static str> {
     } else {
         vec!["default"]
     }
+}
+
+fn point_get_modes() -> Vec<&'static str> {
+    let mut modes = vec!["default", "point", "index"];
+    if std::env::var_os("MTXDB_PAGE_AB_REVERSE").is_some() {
+        modes.reverse();
+    }
+    modes
 }
 
 fn mapped_pack_vmas() -> usize {
@@ -933,6 +942,9 @@ fn run_page_rows_for_mode(
                 let _ = db.event_dag().unmap_shards();
                 if mode == "point" {
                     db.event_dag().set_point_random_mmap(true);
+                }
+                if mode == "index" {
+                    db.event_dag().set_point_random_mmap_index(true);
                 }
                 if mode == "random" {
                     let advised = db.event_dag().advise_random_shards();
@@ -1065,7 +1077,7 @@ fn run_sequential_get_rows(root: &Path, rooms: &[Room], samples: usize) {
         return;
     }
     let room_id = String::from_utf8_lossy(&selected.id).into_owned();
-    for mode in ["default", "point"] {
+    for mode in point_get_modes() {
         let mut times = Vec::with_capacity(samples);
         for sample in 0..samples {
             evict(root, EvictScope::All).expect("evict before sequential get");
@@ -1073,6 +1085,7 @@ fn run_sequential_get_rows(root: &Path, rooms: &[Room], samples: usize) {
             let db = open_benchmark_database(root.to_path_buf());
             let open_io = IoSnapshot::read().delta(open_before);
             db.event_dag().set_point_random_mmap(mode == "point");
+            db.event_dag().set_point_random_mmap_index(mode == "index");
             evict(root, EvictScope::All).expect("evict after sequential get open");
             let before = IoSnapshot::read();
             let started = Instant::now();
@@ -1099,6 +1112,213 @@ fn run_sequential_get_rows(root: &Path, rooms: &[Room], samples: usize) {
         }
         println!(
             "multi_room_seq_get_summary room={room_id} mode={mode} records={} samples={} min_us={:.1} median_us={:.1}",
+            ids.len(),
+            times.len(),
+            min(&times).as_secs_f64() * 1e6,
+            median(&mut times).as_secs_f64() * 1e6,
+        );
+    }
+}
+
+/// Disk-order variant of [`run_sequential_get_rows`].
+///
+/// Same records, same modes, but ordered by physical `(shard slot, offset)`
+/// instead of topological order. Sorting by location does not make records
+/// adjacent, so the layout line reports how many distinct slots were touched
+/// and how large the gaps between consecutive frames are.
+fn run_disk_order_get_rows(root: &Path, rooms: &[Room], samples: usize) {
+    const RECORDS: usize = 256;
+    let Some(selected) = rooms.first() else {
+        return;
+    };
+    let ids: Vec<NodeId> = {
+        let db = open_benchmark_database(root.to_path_buf());
+        let (topo_index, _) = open_event_timeline_indexes(db.event_dag().as_ref());
+        topo_index
+            .page(&selected.scope, None, true, RECORDS)
+            .expect("select disk-order get ids")
+            .entries
+            .iter()
+            .map(|entry| entry.event_node_id)
+            .collect()
+    };
+    if ids.is_empty() {
+        return;
+    }
+    let mut located: Vec<(u16, u64, NodeId)> = {
+        let db = open_benchmark_database(root.to_path_buf());
+        ids.iter()
+            .filter_map(|id| {
+                db.event_dag()
+                    .get_slot_location(&selected.collection, id)
+                    .expect("locate disk-order record")
+                    .map(|(slot, offset)| (slot, offset, *id))
+            })
+            .collect()
+    };
+    located.sort_unstable_by_key(|&(slot, offset, _)| (slot, offset));
+
+    let slots: std::collections::BTreeSet<u16> = located.iter().map(|(slot, ..)| *slot).collect();
+    let mut gaps = Vec::with_capacity(located.len().saturating_sub(1));
+    for pair in located.windows(2) {
+        let [(slot_a, offset_a, _), (slot_b, offset_b, _)] = pair else {
+            continue;
+        };
+        if slot_a == slot_b && offset_b > offset_a {
+            gaps.push(offset_b.saturating_sub(*offset_a));
+        }
+    }
+    let max_gap = gaps.iter().copied().max().unwrap_or(0);
+    let over_page = gaps.iter().filter(|&&gap| gap > 4096).count();
+    let span = located
+        .first()
+        .zip(located.last())
+        .map_or(0, |((_, start, _), (_, end, _))| end.saturating_sub(*start));
+    let room_id = String::from_utf8_lossy(&selected.id).into_owned();
+    println!(
+        "multi_room_seq_get_layout room={room_id} records={} located={} slots={} span_bytes={span} max_gap_bytes={max_gap} gaps_over_page={over_page} first={:?} last={:?}",
+        ids.len(),
+        located.len(),
+        slots.len(),
+        located.first().map(|(s, o, _)| (*s, *o)),
+        located.last().map(|(s, o, _)| (*s, *o)),
+    );
+    if located.is_empty() {
+        return;
+    }
+    let ordered: Vec<NodeId> = located.iter().map(|&(_, _, id)| id).collect();
+    for mode in point_get_modes() {
+        let mut times = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            evict(root, EvictScope::All).expect("evict before disk-order get");
+            let open_before = IoSnapshot::read();
+            let db = open_benchmark_database(root.to_path_buf());
+            let open_io = IoSnapshot::read().delta(open_before);
+            db.event_dag().set_point_random_mmap(mode == "point");
+            db.event_dag().set_point_random_mmap_index(mode == "index");
+            evict(root, EvictScope::All).expect("evict after disk-order get open");
+            let before = IoSnapshot::read();
+            let started = Instant::now();
+            for id in &ordered {
+                std::hint::black_box(
+                    db.event_dag()
+                        .get(&selected.collection, id)
+                        .expect("disk-order get"),
+                );
+            }
+            let elapsed = started.elapsed();
+            let io = IoSnapshot::read().delta(before);
+            times.push(elapsed);
+            println!(
+                "multi_room_seq_get_disk room={room_id} mode={mode} sample={} records={} us={:.1} disk_read_bytes={} open_read_bytes={} majflt={} pack_vmas={}",
+                sample.saturating_add(1),
+                ordered.len(),
+                elapsed.as_secs_f64() * 1e6,
+                io.read_bytes,
+                open_io.read_bytes,
+                io.majflt,
+                mapped_pack_vmas(),
+            );
+        }
+        println!(
+            "multi_room_seq_get_disk_summary room={room_id} mode={mode} records={} samples={} min_us={:.1} median_us={:.1}",
+            ordered.len(),
+            times.len(),
+            min(&times).as_secs_f64() * 1e6,
+            median(&mut times).as_secs_f64() * 1e6,
+        );
+    }
+}
+
+/// Measure single-record reads of a physically adjacent run of event frames.
+/// The selected run may span rooms because the event collection is shared.
+fn run_adjacent_get_rows(root: &Path, rooms: &[Room], samples: usize) {
+    const RECORDS: usize = 256;
+    let Some(selected) = rooms.first() else {
+        return;
+    };
+    let mut located = {
+        let db = open_benchmark_database(root.to_path_buf());
+        db.event_dag()
+            .collection_live_record_locations(&selected.collection)
+            .expect("scan event record locations")
+            .unwrap_or_default()
+    };
+    located.sort_unstable_by_key(|&(_, slot, offset, _)| (slot, offset));
+
+    let mut best_start = 0usize;
+    let mut best_len = 0usize;
+    let mut run_start = 0usize;
+    for index in 1..=located.len() {
+        // `index` starts at 1, so this never saturates.
+        let previous = index.saturating_sub(1);
+        let contiguous = index < located.len()
+            && located[previous].1 == located[index].1
+            && located[previous].2.saturating_add(located[previous].3) == located[index].2;
+        if !contiguous {
+            let run_len = index.saturating_sub(run_start);
+            if run_len > best_len {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            run_start = index;
+        }
+    }
+    let Some(run) = located.get(best_start..best_start.saturating_add(best_len.min(RECORDS)))
+    else {
+        return;
+    };
+    if run.len() < 2 {
+        println!("multi_room_seq_get_adjacent_skipped reason=no_adjacent_event_frames");
+        return;
+    }
+    let ids: Vec<NodeId> = run.iter().map(|&(id, ..)| id).collect();
+    let slot = run[0].1;
+    let first_offset = run[0].2;
+    let last_end = run
+        .last()
+        .map_or(first_offset, |record| record.2.saturating_add(record.3));
+    println!(
+        "multi_room_seq_get_adjacent_layout records={} shard_slot={slot} first_offset={first_offset} span_bytes={} frame_bytes={}",
+        ids.len(),
+        last_end.saturating_sub(first_offset),
+        run.iter().map(|record| record.3).sum::<u64>(),
+    );
+
+    let modes = point_get_modes();
+    let room_id = String::from_utf8_lossy(&selected.id).into_owned();
+    for mode in modes {
+        let mut times = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            evict(root, EvictScope::All).expect("evict before adjacent get");
+            let db = open_benchmark_database(root.to_path_buf());
+            db.event_dag().set_point_random_mmap(mode == "point");
+            db.event_dag().set_point_random_mmap_index(mode == "index");
+            evict(root, EvictScope::All).expect("evict after adjacent get open");
+            let before = IoSnapshot::read();
+            let started = Instant::now();
+            for id in &ids {
+                std::hint::black_box(
+                    db.event_dag()
+                        .get(&selected.collection, id)
+                        .expect("adjacent get"),
+                );
+            }
+            let elapsed = started.elapsed();
+            let io = IoSnapshot::read().delta(before);
+            times.push(elapsed);
+            println!(
+                "multi_room_seq_get_adjacent room={room_id} mode={mode} sample={} records={} us={:.1} disk_read_bytes={} majflt={} pack_vmas={}",
+                sample.saturating_add(1),
+                ids.len(),
+                elapsed.as_secs_f64() * 1e6,
+                io.read_bytes,
+                io.majflt,
+                mapped_pack_vmas(),
+            );
+        }
+        println!(
+            "multi_room_seq_get_adjacent_summary room={room_id} mode={mode} records={} samples={} min_us={:.1} median_us={:.1}",
             ids.len(),
             times.len(),
             min(&times).as_secs_f64() * 1e6,
@@ -1181,6 +1401,8 @@ fn run_paged_page_rows_for_mode(
                 let _ = store.unmap_shards();
                 if mode == "point" {
                     store.set_point_random_mmap(true);
+                } else if mode == "index" {
+                    store.set_point_random_mmap_index(true);
                 } else if mode == "random" {
                     std::hint::black_box(store.advise_random_shards());
                 }
@@ -1431,6 +1653,7 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min
         let entry = EventTimelineEntry::new(
             largest_room.scope,
             i64::try_from(sequence).unwrap_or(i64::MAX),
+            0,
             i64::try_from(sequence).unwrap_or(i64::MAX),
             node,
         );
@@ -1465,18 +1688,8 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min
     let page = topo_index
         .page(&largest_room.scope, None, true, 128)
         .expect("mutation source page");
-    let remove_entries: Vec<EventTimelineEntry> = page
-        .entries
-        .iter()
-        .map(|key| {
-            EventTimelineEntry::new(
-                key.room_scope,
-                key.topological_ordering,
-                key.stream_ordering,
-                key.event_node_id,
-            )
-        })
-        .collect();
+    let remove_entries: Vec<EventTimelineEntry> =
+        page.entries.iter().map(|key| key.entry()).collect();
     let transaction = db.begin_transaction();
     let started = Instant::now();
     let removed = stage_remove_event_timeline_batch(
@@ -1622,6 +1835,8 @@ fn main() {
     }
     if std::env::var_os("MTXDB_PAGE_ADVICE_AB").is_some() {
         run_sequential_get_rows(&root, &rooms, samples);
+        run_disk_order_get_rows(&root, &rooms, samples);
+        run_adjacent_get_rows(&root, &rooms, samples);
     }
     let mut db = open_benchmark_database(root.clone());
     db = run_page_rows(db, &root, &rooms, &tiers, samples);

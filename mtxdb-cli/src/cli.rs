@@ -1463,6 +1463,7 @@ fn sub_get() -> Command {
 /// runtime config set at open.
 fn apply_runtime_read_settings(plan: &mut ReadPlanPolicy, config: &mtxdb::RuntimeConfig) {
     plan.point_random_mmap = config.point_random_mmap;
+    plan.point_random_mmap_index = config.ordered_index_point_random_mmap;
 }
 
 /// Map the `--read-plan` CLI mode to a store policy.

@@ -37,6 +37,7 @@
 //! so resuming is exact and idempotent in both directions.
 
 use std::borrow::Cow;
+use std::ops::Bound;
 
 use bytes::Bytes;
 
@@ -1869,6 +1870,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         collection_id: [u8; 16],
         domain: DomainTag,
     ) -> Self {
+        engine.mark_index_collection(&collection_id);
         Self {
             engine,
             name: name.into(),
@@ -2601,7 +2603,30 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         forward: bool,
         limit: usize,
     ) -> Result<OrderedPage<K>, StorageError> {
-        self.page_with_snapshot(prefix, cursor, forward, limit)
+        self.page_range(prefix, cursor, forward, limit, Bound::Unbounded)
+    }
+
+    /// Read one page that stops at `end` in the direction of travel.
+    ///
+    /// Like [`Self::page`], but forward reads return only keys up to `end`
+    /// and reverse reads only keys down to it; `Included` keeps a key equal
+    /// to `end`, `Excluded` drops it. Reading stops at the bound without
+    /// loading leaves past it. `next_cursor` keeps the meaning it has in
+    /// [`Self::page`]: present exactly when the page filled `limit`, so a page
+    /// cut short by `end` has none.
+    ///
+    /// # Errors
+    /// Same as [`Self::page`]. An `end` with a different prefix is not an
+    /// error; it bounds the read as any other key would.
+    pub fn page_range(
+        &self,
+        prefix: &K::Prefix,
+        cursor: Option<&OrderedCursor<K>>,
+        forward: bool,
+        limit: usize,
+        end: Bound<K>,
+    ) -> Result<OrderedPage<K>, StorageError> {
+        self.page_with_snapshot(prefix, cursor, forward, limit, end)
             .map(|(page, _snapshot_root)| page)
     }
 
@@ -2612,6 +2637,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         cursor: Option<&OrderedCursor<K>>,
         forward: bool,
         limit: usize,
+        end: Bound<K>,
     ) -> Result<(OrderedPage<K>, Option<NodeId>), StorageError> {
         let empty = OrderedPage {
             entries: Vec::new(),
@@ -2656,9 +2682,11 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         let mut tree_out = Vec::with_capacity(limit);
         if !root.directories.is_empty() {
             if forward {
-                self.forward_page(&root.directories, level, prefix, key, limit, &mut tree_out)?;
+                let bounds = PageBounds { prefix, key, end };
+                self.forward_page(&root.directories, level, &bounds, limit, &mut tree_out)?;
             } else {
-                self.reverse_page(&root.directories, level, prefix, key, limit, &mut tree_out)?;
+                let bounds = PageBounds { prefix, key, end };
+                self.reverse_page(&root.directories, level, &bounds, limit, &mut tree_out)?;
             }
         }
         if let Some(snapshot) = &snapshot {
@@ -2666,7 +2694,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
                 .load_snapshot_delta(snapshot)?
                 .into_iter()
                 .filter(|entry| {
-                    if entry.prefix() != *prefix {
+                    if entry.prefix() != *prefix || !within_end(entry, &end, forward) {
                         return false;
                     }
                     match key {
@@ -2703,14 +2731,14 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         &self,
         spans: &[SpanDescriptor<K>],
         level: u8,
-        prefix: &K::Prefix,
-        key: Option<K>,
+        bounds: &PageBounds<'_, K>,
         limit: usize,
         out: &mut Vec<K>,
     ) -> Result<(), StorageError> {
+        let PageBounds { prefix, key, end } = *bounds;
         let start = forward_leaf_start(spans, key, prefix);
         for span in spans.iter().skip(start) {
-            if span.min_entry.prefix() > *prefix {
+            if span.min_entry.prefix() > *prefix || !within_end(&span.min_entry, &end, true) {
                 break;
             }
             if span.max_entry.prefix() < *prefix {
@@ -2728,6 +2756,9 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
                     if key.is_some_and(|k| *entry <= k) {
                         continue;
                     }
+                    if !within_end(entry, &end, true) {
+                        return Ok(());
+                    }
                     out.push(*entry);
                     if out.len() == limit {
                         return Ok(());
@@ -2735,7 +2766,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
                 }
             } else {
                 let children = self.load_directory(span.child_id, level)?;
-                self.forward_page(&children, level.saturating_sub(1), prefix, key, limit, out)?;
+                self.forward_page(&children, level.saturating_sub(1), bounds, limit, out)?;
                 if out.len() == limit {
                     return Ok(());
                 }
@@ -2748,11 +2779,11 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         &self,
         spans: &[SpanDescriptor<K>],
         level: u8,
-        prefix: &K::Prefix,
-        key: Option<K>,
+        bounds: &PageBounds<'_, K>,
         limit: usize,
         out: &mut Vec<K>,
     ) -> Result<(), StorageError> {
+        let PageBounds { prefix, key, end } = *bounds;
         let Some(start) = reverse_leaf_start(spans, key, prefix) else {
             return Ok(());
         };
@@ -2761,7 +2792,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
             if span.min_entry.prefix() > *prefix {
                 continue;
             }
-            if span.max_entry.prefix() < *prefix {
+            if span.max_entry.prefix() < *prefix || !within_end(&span.max_entry, &end, false) {
                 break;
             }
             if level == 0 {
@@ -2776,6 +2807,9 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
                     if key.is_some_and(|k| *entry >= k) {
                         continue;
                     }
+                    if !within_end(entry, &end, false) {
+                        return Ok(());
+                    }
                     out.push(*entry);
                     if out.len() == limit {
                         return Ok(());
@@ -2783,7 +2817,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
                 }
             } else {
                 let children = self.load_directory(span.child_id, level)?;
-                self.reverse_page(&children, level.saturating_sub(1), prefix, key, limit, out)?;
+                self.reverse_page(&children, level.saturating_sub(1), bounds, limit, out)?;
                 if out.len() == limit {
                     return Ok(());
                 }
@@ -2865,6 +2899,27 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
             .get(&self.collection_id, &id)?
             .ok_or(StorageError::NotFound(id))?;
         decode_directory::<K>(&bytes.bytes, expected_level)
+    }
+}
+
+/// The limits one page read walks within.
+#[derive(Clone, Copy)]
+struct PageBounds<'a, K: OrderedKey> {
+    prefix: &'a K::Prefix,
+    /// Exclusive start: the cursor key, if resuming.
+    key: Option<K>,
+    /// Far bound in the direction of travel.
+    end: Bound<K>,
+}
+
+/// Whether `entry` lies on the near side of `end` for the travel direction.
+fn within_end<K: Ord>(entry: &K, end: &Bound<K>, forward: bool) -> bool {
+    match (end, forward) {
+        (Bound::Unbounded, _) => true,
+        (Bound::Included(end), true) => entry <= end,
+        (Bound::Excluded(end), true) => entry < end,
+        (Bound::Included(end), false) => entry >= end,
+        (Bound::Excluded(end), false) => entry > end,
     }
 }
 

@@ -52,6 +52,9 @@ thread_local! {
 /// used to inline already-cached children in place of lazy hash pointers.
 pub type SwizzleFn = fn(&NodeData, &[NodeId], &[Option<Arc<NodeData>>]) -> NodeData;
 
+/// `(node id, shard slot, frame offset, frame length)` for a live record.
+pub type LiveRecordLocation = (NodeId, u16, u64, u64);
+
 /// Lowercase hex rendering of a 32-byte digest, for error messages.
 fn hex32(digest: &Digest32) -> String {
     use std::fmt::Write as _;
@@ -1568,6 +1571,11 @@ pub struct ReadPlanPolicy {
     /// Use a separate `MADV_RANDOM` mapping for single-record point reads.
     /// Sequential scans and multi-record reads keep the normal mapping.
     pub point_random_mmap: bool,
+    /// Use the separate `MADV_RANDOM` mapping for ordered-index node reads
+    /// only, leaving event bodies and other single-record reads on the normal
+    /// mapping. Index collections register themselves via
+    /// [`crate::storage::StorageEngine::mark_index_collection`].
+    pub point_random_mmap_index: bool,
 }
 
 impl Default for ReadPlanPolicy {
@@ -1591,6 +1599,7 @@ impl ReadPlanPolicy {
             min_batch_candidates: usize::MAX,
             random_advice: false,
             point_random_mmap: false,
+            point_random_mmap_index: false,
         }
     }
 
@@ -1606,6 +1615,7 @@ impl ReadPlanPolicy {
             min_batch_candidates: usize::MAX,
             random_advice: true,
             point_random_mmap: false,
+            point_random_mmap_index: false,
         }
     }
 
@@ -1624,6 +1634,7 @@ impl ReadPlanPolicy {
             min_batch_candidates: 16,
             random_advice: false,
             point_random_mmap: false,
+            point_random_mmap_index: false,
         }
     }
 
@@ -2259,6 +2270,9 @@ pub struct PackfileStorage {
     /// Read once per batch; settable at runtime via
     /// [`Self::set_read_plan_policy`].
     read_plan: parking_lot::RwLock<ReadPlanPolicy>,
+    /// Collections that hold ordered-index nodes; their reads may use the
+    /// index-specific point mapping instead of the body one.
+    index_collections: parking_lot::RwLock<std::collections::HashSet<[u8; 16]>>,
     /// Total number of `repack_collection_reachable` calls across all collections.
     repack_count: AtomicU64,
     /// Total records kept (rewritten into the new generation) across all repacks.
@@ -2792,6 +2806,7 @@ impl PackfileStorage {
         )?;
         store.set_stats_enabled(config.stats_enabled);
         store.set_point_random_mmap(config.point_random_mmap);
+        store.set_point_random_mmap_index(config.ordered_index_point_random_mmap);
         Ok(store)
     }
 
@@ -2825,6 +2840,7 @@ impl PackfileStorage {
         )?;
         store.set_stats_enabled(config.stats_enabled);
         store.set_point_random_mmap(config.point_random_mmap);
+        store.set_point_random_mmap_index(config.ordered_index_point_random_mmap);
         Ok(store)
     }
 
@@ -3724,6 +3740,7 @@ impl PackfileStorage {
             index_config,
             index_residency: residency,
             read_plan: RwLock::new(ReadPlanPolicy::default()),
+            index_collections: RwLock::new(std::collections::HashSet::new()),
             repack_count: AtomicU64::new(0),
             repack_kept_total: AtomicU64::new(0),
             repack_dropped_total: AtomicU64::new(0),
@@ -5093,6 +5110,41 @@ impl PackfileStorage {
             .transpose()
     }
 
+    /// Return live collection records with their physical frame locations.
+    ///
+    /// Each item is `(node_id, shard slot, frame offset, frame length)`. This
+    /// diagnostic helper scans pack metadata to recover node IDs alongside
+    /// the live locations. It is intended for offline measurement; callers
+    /// should avoid concurrent writes or repacks while using it.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Corrupt`] if a pack cannot be scanned and
+    /// [`StorageError::Io`] for underlying filesystem errors.
+    pub fn collection_live_record_locations(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Result<Option<Vec<LiveRecordLocation>>, StorageError> {
+        let Some(locations) = self.collection_live_locations(collection_id)? else {
+            return Ok(None);
+        };
+        let live: HashSet<(u16, u64)> = locations.into_iter().collect();
+        let mut records = Vec::with_capacity(live.len());
+        for (slot, shard) in self.shards.all_shards() {
+            let mut scanner =
+                packfile::scan_packfile_iter(&shard.path, false).map_err(StorageError::Io)?;
+            while let Some(entry) = scanner.next_with_removal() {
+                let entry = entry.map_err(StorageError::Io)?;
+                if entry.collection_id == *collection_id
+                    && !entry.removed
+                    && live.contains(&(slot, entry.offset))
+                {
+                    records.push((entry.hash, slot, entry.offset, entry.disk_bytes));
+                }
+            }
+        }
+        Ok(Some(records))
+    }
+
     /// `(collection_id, entry count, memory usage in bytes, index capacity)`
     /// for every known collection, sorted by collection ID, in a single pass
     /// over the collection map.
@@ -5151,6 +5203,20 @@ impl PackfileStorage {
     /// Sequential readers keep their normal mapping.
     pub fn set_point_random_mmap(&self, enabled: bool) {
         self.read_plan.write().point_random_mmap = enabled;
+    }
+
+    /// Use the separate mapping for ordered-index node reads only.
+    pub fn set_point_random_mmap_index(&self, enabled: bool) {
+        self.read_plan.write().point_random_mmap_index = enabled;
+    }
+
+    /// The point-mapping choice for a collection: ordered-index collections
+    /// use the index flag, everything else the body flag.
+    fn point_for(&self, collection_id: &[u8; 16]) -> bool {
+        let plan = self.read_plan.read();
+        plan.point_random_mmap
+            || (plan.point_random_mmap_index
+                && self.index_collections.read().contains(collection_id))
     }
 
     /// Whether this storage attempts zstd compression on written records.
@@ -8652,7 +8718,7 @@ impl PackfileStorage {
                 &candidates,
                 &pinned,
                 false,
-                self.read_plan.read().point_random_mmap,
+                self.point_for(collection_id),
             )?
             .and_then(|(_, lsn, _)| lsn))
     }
@@ -11862,6 +11928,54 @@ impl PackfileStorage {
         }
     }
 
+    /// The physical `(shard slot, byte offset)` of the durable frame `id`
+    /// resolves to, using the same candidate selection and pin/retry path as
+    /// [`StorageEngine::get`]. Returns `None` if `id` is not live.
+    ///
+    /// Unlike [`Self::get_location`] this reports the shard slot instead of
+    /// the pack id, so callers can order a set of records by physical
+    /// position. Pack ids are random; slots follow pack creation, and offsets
+    /// within a slot follow append order.
+    ///
+    /// This deliberately returns only a **durable pack location**, with the
+    /// same overlay caveat as [`Self::get_location`].
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if a candidate frame cannot be read, or
+    /// [`StorageError::Internal`] while a transaction overlay is active.
+    pub fn get_slot_location(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+    ) -> Result<Option<(u16, u64)>, StorageError> {
+        if self.overlay_reads_active() {
+            return Err(StorageError::Internal(
+                "get_slot_location does not resolve transaction-overlay reads".to_owned(),
+            ));
+        }
+        loop {
+            let gen_guard = self.generation(collection_id);
+            let Some(gen) = gen_guard.as_deref() else {
+                return Ok(None);
+            };
+            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
+            #[cfg(test)]
+            Self::run_test_before_pin();
+            let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
+            let still_current = match gen_guard.as_ref() {
+                Some(loaded) => {
+                    let current = self.generation(collection_id);
+                    Self::same_generation(current.as_ref(), loaded)
+                }
+                None => true,
+            };
+            if !still_current {
+                continue;
+            }
+            return self.resolve_slot_from_pinned(id, &candidates, &pinned);
+        }
+    }
+
     /// Resolve an `id` to its winning `(PackId, offset)` from already-pinned
     /// candidates, retaining the last read error rather than reporting a
     /// missing record. Mirrors [`Self::resolve_from_pinned`]'s candidate
@@ -11872,6 +11986,22 @@ impl PackfileStorage {
         candidates: &[(u16, u64)],
         pinned: &HashMap<u16, Arc<Shard>>,
     ) -> Result<Option<(PackId, u64)>, StorageError> {
+        let Some((slot, offset)) = self.resolve_slot_from_pinned(id, candidates, pinned)? else {
+            return Ok(None);
+        };
+        Ok(pinned.get(&slot).map(|shard| (shard.pack_id, offset)))
+    }
+
+    /// Resolve an `id` to its winning `(shard slot, offset)` from already
+    /// pinned candidates. Same candidate semantics as
+    /// [`Self::resolve_location_from_pinned`], but the slot is what orders
+    /// records physically: pack ids are random, while slots follow creation.
+    fn resolve_slot_from_pinned(
+        &self,
+        id: &NodeId,
+        candidates: &[(u16, u64)],
+        pinned: &HashMap<u16, Arc<Shard>>,
+    ) -> Result<Option<(u16, u64)>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for &(slot, offset) in candidates {
             let Some(shard) = pinned.get(&slot) else {
@@ -11884,7 +12014,7 @@ impl PackfileStorage {
             ) {
                 Ok(record) => {
                     if record.hash == *id {
-                        return Ok(Some((shard.pack_id, offset)));
+                        return Ok(Some((slot, offset)));
                     }
                 }
                 Err(error) => last_err = Some(error),
@@ -12193,7 +12323,11 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
-        self.get_internal(collection_id, id, self.read_plan.read().point_random_mmap)
+        self.get_internal(collection_id, id, self.point_for(collection_id))
+    }
+
+    fn mark_index_collection(&self, collection_id: &[u8; 16]) {
+        self.index_collections.write().insert(*collection_id);
     }
 
     #[allow(
@@ -12261,6 +12395,10 @@ impl StorageEngine for PackfileStorage {
             to_fetch.sort_unstable_by_key(|(_, candidates)| candidates[0]);
 
             let policy = self.read_plan_policy();
+            let point_one = ids.len() == 1
+                && (policy.point_random_mmap
+                    || (policy.point_random_mmap_index
+                        && self.index_collections.read().contains(collection_id)));
             let plan_wanted = policy.wants(usize::try_from(candidates_seen).unwrap_or(usize::MAX));
 
             // Suppress readahead for a scattered batch when asked. This is
@@ -12321,7 +12459,7 @@ impl StorageEngine for PackfileStorage {
                     candidates,
                     &pinned,
                     track,
-                    ids.len() == 1 && policy.point_random_mmap,
+                    ids.len() == 1 && point_one,
                 )?;
             }
 

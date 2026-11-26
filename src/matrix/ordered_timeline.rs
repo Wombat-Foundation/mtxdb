@@ -1,22 +1,27 @@
 //! Matrix event timeline adapters over the protocol-neutral ordered index.
 //!
 //! The two key types intentionally differ: topological paging orders by
-//! `(room, depth, stream, ...)`, while stream paging orders by
-//! `(room, stream, depth, ...)`. Their cursors are distinct Rust types and
-//! their collections are shared across rooms.
+//! `(room, depth, origin_server_ts, stream, ...)`, matching Synapse's
+//! `topological_ordering, origin_server_ts, stream_ordering` pagination order,
+//! while stream paging orders by `(room, stream, depth, origin_server_ts, ...)`.
+//! Their cursors are distinct Rust types and their collections are shared
+//! across rooms.
 
 use crate::database::DatabaseTransaction;
 use crate::layout::ShardType;
+use crate::packfile::storage::PackfileStorage;
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
-use crate::timeline::{OrderedCursor, OrderedIndex, OrderedKey, OrderedPage, ScopedSeqKey};
+use crate::template::CollectionMetadata;
+use crate::timeline::{OrderedCursor, OrderedIndex, OrderedKey, OrderedPage};
 
 /// Stable logical name shared by both event-order key schemas.
-pub const EVENT_TIMELINE_INDEX_NAME: &str = "event-timeline-v1";
-const EVENT_KEY_WIRE_LEN: usize = 16 + 8 + 8 + 16;
-type DecodedEventKey = ([u8; 16], i64, i64, NodeId);
+pub const EVENT_TIMELINE_INDEX_NAME: &str = "event-timeline-v2";
+const EVENT_KEY_WIRE_LEN: usize = 16 + 8 + 8 + 8 + 16;
+type DecodedEventKey = ([u8; 16], [i64; 3], NodeId);
 type TimelineMutationRoots = ((NodeId, u64), (NodeId, u64));
-const EVENT_TOPO_SCHEMA: [u8; 4] = *b"ETOP";
-const EVENT_STREAM_SCHEMA: [u8; 4] = *b"ESTR";
+const EVENT_TOPO_SCHEMA: [u8; 4] = *b"ETP2";
+const EVENT_STREAM_SCHEMA: [u8; 4] = *b"ESR2";
+const MIN_NODE_ID: NodeId = [0; 16];
 const MAX_NODE_ID: NodeId = [0xff; 16];
 
 /// Matrix event ordering and identity in domain terminology.
@@ -26,6 +31,9 @@ pub struct EventTimelineEntry {
     pub room_scope: [u8; 16],
     /// Matrix topological ordering, also called depth.
     pub topological_ordering: i64,
+    /// The event's `origin_server_ts`, or `0` when absent (Synapse's
+    /// `COALESCE(origin_server_ts, 0)`). Orders events of equal depth.
+    pub origin_server_ts: i64,
     /// Matrix stream ordering, signed to preserve backfill positions.
     pub stream_ordering: i64,
     /// Stored event node identifier.
@@ -38,12 +46,14 @@ impl EventTimelineEntry {
     pub const fn new(
         room_scope: [u8; 16],
         topological_ordering: i64,
+        origin_server_ts: i64,
         stream_ordering: i64,
         event_node_id: NodeId,
     ) -> Self {
         Self {
             room_scope,
             topological_ordering,
+            origin_server_ts,
             stream_ordering,
             event_node_id,
         }
@@ -55,6 +65,7 @@ impl EventTimelineEntry {
         EventTopoKey {
             room_scope: self.room_scope,
             topological_ordering: self.topological_ordering,
+            origin_server_ts: self.origin_server_ts,
             stream_ordering: self.stream_ordering,
             event_node_id: self.event_node_id,
         }
@@ -67,28 +78,74 @@ impl EventTimelineEntry {
             room_scope: self.room_scope,
             stream_ordering: self.stream_ordering,
             topological_ordering: self.topological_ordering,
+            origin_server_ts: self.origin_server_ts,
             event_node_id: self.event_node_id,
         }
     }
 }
 
-impl From<ScopedSeqKey> for EventTimelineEntry {
-    fn from(key: ScopedSeqKey) -> Self {
-        Self::new(key.scope, key.primary, key.secondary, key.id)
-    }
-}
-
-/// `(room, topological ordering, stream ordering, node id)` key.
+/// `(room, topological ordering, origin_server_ts, stream ordering, node id)` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventTopoKey {
     /// Leading room scope.
     pub room_scope: [u8; 16],
     /// Topological ordering.
     pub topological_ordering: i64,
+    /// `origin_server_ts`, `0` when absent.
+    pub origin_server_ts: i64,
     /// Stream ordering.
     pub stream_ordering: i64,
     /// Event record node id.
     pub event_node_id: NodeId,
+}
+
+impl EventTopoKey {
+    /// The timeline entry this key was projected from.
+    #[must_use]
+    pub const fn entry(self) -> EventTimelineEntry {
+        EventTimelineEntry::new(
+            self.room_scope,
+            self.topological_ordering,
+            self.origin_server_ts,
+            self.stream_ordering,
+            self.event_node_id,
+        )
+    }
+
+    /// The greatest key at a `(topological, origin_server_ts, stream)`
+    /// position. Every key at or before that position sorts at or below it.
+    #[must_use]
+    pub const fn position_max(
+        room_scope: [u8; 16],
+        topological_ordering: i64,
+        origin_server_ts: i64,
+        stream_ordering: i64,
+    ) -> Self {
+        Self {
+            room_scope,
+            topological_ordering,
+            origin_server_ts,
+            stream_ordering,
+            event_node_id: MAX_NODE_ID,
+        }
+    }
+
+    /// The least key at a `(topological, origin_server_ts, stream)` position.
+    #[must_use]
+    pub const fn position_min(
+        room_scope: [u8; 16],
+        topological_ordering: i64,
+        origin_server_ts: i64,
+        stream_ordering: i64,
+    ) -> Self {
+        Self {
+            room_scope,
+            topological_ordering,
+            origin_server_ts,
+            stream_ordering,
+            event_node_id: MIN_NODE_ID,
+        }
+    }
 }
 
 impl OrderedKey for EventTopoKey {
@@ -105,24 +162,29 @@ impl OrderedKey for EventTopoKey {
         encode_event_key(
             out,
             self.room_scope,
-            self.topological_ordering,
-            self.stream_ordering,
+            [
+                self.topological_ordering,
+                self.origin_server_ts,
+                self.stream_ordering,
+            ],
             self.event_node_id,
         );
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let (room_scope, primary, secondary, event_node_id) = decode_event_key(bytes)?;
+        let (room_scope, [topological_ordering, origin_server_ts, stream_ordering], event_node_id) =
+            decode_event_key(bytes)?;
         Ok(Self {
             room_scope,
-            topological_ordering: primary,
-            stream_ordering: secondary,
+            topological_ordering,
+            origin_server_ts,
+            stream_ordering,
             event_node_id,
         })
     }
 }
 
-/// `(room, stream ordering, topological ordering, node id)` key.
+/// `(room, stream ordering, topological ordering, origin_server_ts, node id)` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventStreamKey {
     /// Leading room scope.
@@ -131,8 +193,49 @@ pub struct EventStreamKey {
     pub stream_ordering: i64,
     /// Topological ordering.
     pub topological_ordering: i64,
+    /// `origin_server_ts`, `0` when absent. Carried so a stream page can
+    /// build topological tokens without fetching event bodies.
+    pub origin_server_ts: i64,
     /// Event record node id.
     pub event_node_id: NodeId,
+}
+
+impl EventStreamKey {
+    /// The timeline entry this key was projected from.
+    #[must_use]
+    pub const fn entry(self) -> EventTimelineEntry {
+        EventTimelineEntry::new(
+            self.room_scope,
+            self.topological_ordering,
+            self.origin_server_ts,
+            self.stream_ordering,
+            self.event_node_id,
+        )
+    }
+
+    /// The greatest key at a stream position.
+    #[must_use]
+    pub const fn position_max(room_scope: [u8; 16], stream_ordering: i64) -> Self {
+        Self {
+            room_scope,
+            stream_ordering,
+            topological_ordering: i64::MAX,
+            origin_server_ts: i64::MAX,
+            event_node_id: MAX_NODE_ID,
+        }
+    }
+
+    /// The least key at a stream position.
+    #[must_use]
+    pub const fn position_min(room_scope: [u8; 16], stream_ordering: i64) -> Self {
+        Self {
+            room_scope,
+            stream_ordering,
+            topological_ordering: i64::MIN,
+            origin_server_ts: i64::MIN,
+            event_node_id: MIN_NODE_ID,
+        }
+    }
 }
 
 impl OrderedKey for EventStreamKey {
@@ -149,19 +252,23 @@ impl OrderedKey for EventStreamKey {
         encode_event_key(
             out,
             self.room_scope,
-            self.stream_ordering,
-            self.topological_ordering,
+            [
+                self.stream_ordering,
+                self.topological_ordering,
+                self.origin_server_ts,
+            ],
             self.event_node_id,
         );
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let (room_scope, stream_ordering, topological_ordering, event_node_id) =
+        let (room_scope, [stream_ordering, topological_ordering, origin_server_ts], event_node_id) =
             decode_event_key(bytes)?;
         Ok(Self {
             room_scope,
             stream_ordering,
             topological_ordering,
+            origin_server_ts,
             event_node_id,
         })
     }
@@ -275,8 +382,13 @@ pub fn page_stream_up_to<S: StorageEngine + ?Sized>(
             },
         }
     };
-    let (mut page, snapshot_root) =
-        index.page_with_snapshot(room_scope, bounded_cursor.as_ref(), forward, limit)?;
+    let (mut page, snapshot_root) = index.page_with_snapshot(
+        room_scope,
+        bounded_cursor.as_ref(),
+        forward,
+        limit,
+        std::ops::Bound::Unbounded,
+    )?;
     if !forward {
         return Ok(page);
     }
@@ -434,25 +546,147 @@ pub fn page_with_rebind_fallback<S: StorageEngine + ?Sized, K: OrderedKey>(
     }
 }
 
-fn max_stream_key(room_scope: [u8; 16], persisted_up_to: i64) -> EventStreamKey {
-    EventStreamKey {
-        room_scope,
-        stream_ordering: persisted_up_to,
-        topological_ordering: i64::MAX,
-        event_node_id: MAX_NODE_ID,
+/// A [`StorageEngine`] view whose reads are read-committed.
+///
+/// An [`OrderedIndex`] reads a fixed-id head record that every append
+/// overwrites, then content-addressed tree records written after it. On a
+/// read-only worker handle, plain [`StorageEngine::get`] serves the in-memory
+/// index as of open, so it can return a stale head or miss newer records.
+/// Wrap such a handle in this view before opening the timeline indexes:
+/// `get` and `get_many` go through
+/// [`PackfileStorage::get_read_committed`], which applies the shared WAL's
+/// committed groups. On a writer handle that has no read journal, that
+/// degrades to an ordinary refreshed read, so the view is safe on either.
+/// Writes and the remaining methods delegate unchanged.
+#[derive(Clone, Copy)]
+pub struct ReadCommittedEngine<'a>(pub &'a PackfileStorage);
+
+/// Trait dispatch for the delegated methods: `PackfileStorage` has inherent
+/// methods with the same names and different signatures.
+type Engine = PackfileStorage;
+
+impl StorageEngine for ReadCommittedEngine<'_> {
+    fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
+        Ok(self
+            .0
+            .get_read_committed(collection_id, std::slice::from_ref(id))?
+            .into_iter()
+            .next()
+            .flatten())
     }
+
+    fn mark_index_collection(&self, collection_id: &[u8; 16]) {
+        <Engine as StorageEngine>::mark_index_collection(self.0, collection_id);
+    }
+
+    fn get_many(
+        &self,
+        collection_id: &[u8; 16],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<NodeData>>, StorageError> {
+        self.0.get_read_committed(collection_id, ids)
+    }
+
+    fn put(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        data: &NodeData,
+    ) -> Result<(), StorageError> {
+        <Engine as StorageEngine>::put(self.0, collection_id, id, data)
+    }
+
+    fn put_many(
+        &self,
+        collection_id: &[u8; 16],
+        entries: &[(NodeId, NodeData)],
+    ) -> Result<usize, StorageError> {
+        <Engine as StorageEngine>::put_many(self.0, collection_id, entries)
+    }
+
+    fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError> {
+        <Engine as StorageEngine>::remove(self.0, collection_id, id)
+    }
+
+    fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        <Engine as StorageEngine>::delete_collection(self.0, collection_id)
+    }
+
+    fn sync(&self) -> Result<(), StorageError> {
+        <Engine as StorageEngine>::sync(self.0)
+    }
+
+    fn refresh_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
+        <Engine as StorageEngine>::refresh_collection(self.0, collection_id)
+    }
+
+    fn collection_exists(&self, collection_id: &[u8; 16]) -> Result<bool, StorageError> {
+        <Engine as StorageEngine>::collection_exists(self.0, collection_id)
+    }
+
+    fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError> {
+        <Engine as StorageEngine>::collection_len(self.0, collection_id)
+    }
+
+    fn collection_record_ids(&self, collection_id: &[u8; 16]) -> Result<Vec<NodeId>, StorageError> {
+        <Engine as StorageEngine>::collection_record_ids(self.0, collection_id)
+    }
+
+    fn create_or_put_established(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
+        <Engine as StorageEngine>::create_or_put_established(
+            self.0,
+            collection_id,
+            metadata,
+            records,
+        )
+    }
+
+    fn put_many_established(
+        &self,
+        collection_id: &[u8; 16],
+        records: &[(NodeId, NodeData)],
+    ) -> Result<(), StorageError> {
+        <Engine as StorageEngine>::put_many_established(self.0, collection_id, records)
+    }
+
+    fn create_or_upsert_established_validated(
+        &self,
+        collection_id: &[u8; 16],
+        metadata: &CollectionMetadata,
+        node_id: &NodeId,
+        data: &NodeData,
+        validate: &mut dyn FnMut(Option<&NodeData>) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        <Engine as StorageEngine>::create_or_upsert_established_validated(
+            self.0,
+            collection_id,
+            metadata,
+            node_id,
+            data,
+            validate,
+        )
+    }
+}
+
+fn max_stream_key(room_scope: [u8; 16], persisted_up_to: i64) -> EventStreamKey {
+    EventStreamKey::position_max(room_scope, persisted_up_to)
 }
 
 fn encode_event_key(
     out: &mut Vec<u8>,
     room_scope: [u8; 16],
-    primary: i64,
-    secondary: i64,
+    positions: [i64; 3],
     event_node_id: NodeId,
 ) {
     out.extend_from_slice(&room_scope);
-    out.extend_from_slice(&encode_i64(primary));
-    out.extend_from_slice(&encode_i64(secondary));
+    for position in positions {
+        out.extend_from_slice(&encode_i64(position));
+    }
     out.extend_from_slice(&event_node_id);
 }
 
@@ -462,11 +696,14 @@ fn decode_event_key(bytes: &[u8]) -> Result<DecodedEventKey, StorageError> {
     }
     let mut room_scope = [0; 16];
     room_scope.copy_from_slice(&bytes[..16]);
-    let primary = decode_i64(&bytes[16..24])?;
-    let secondary = decode_i64(&bytes[24..32])?;
+    let positions = [
+        decode_i64(&bytes[16..24])?,
+        decode_i64(&bytes[24..32])?,
+        decode_i64(&bytes[32..40])?,
+    ];
     let mut event_node_id = [0; 16];
-    event_node_id.copy_from_slice(&bytes[32..48]);
-    Ok((room_scope, primary, secondary, event_node_id))
+    event_node_id.copy_from_slice(&bytes[40..56]);
+    Ok((room_scope, positions, event_node_id))
 }
 
 fn encode_i64(value: i64) -> [u8; 8] {

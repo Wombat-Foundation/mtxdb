@@ -1037,6 +1037,7 @@ impl Database {
             .with_append_policy(policy.append_policy);
             store.set_stats_enabled(config.stats_enabled);
             store.set_point_random_mmap(config.point_random_mmap);
+            store.set_point_random_mmap_index(config.ordered_index_point_random_mmap);
             // This process holds the exclusive WAL lock, so its in-memory
             // index is authoritative and a negative lookup is a true miss.
             // Left on, every miss after a sync (which moves the durable

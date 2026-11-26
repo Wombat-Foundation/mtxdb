@@ -442,6 +442,23 @@ pub(crate) fn timeline_orderings(
     }
 }
 
+/// The event's `origin_server_ts` as a timeline key position. Synapse orders
+/// same-depth events by `COALESCE(origin_server_ts, 0)`, so an absent or
+/// non-integer value is `0`.
+pub(crate) fn timeline_origin_server_ts(event: &RoomEvent) -> i64 {
+    event
+        .pdu
+        .get("origin_server_ts")
+        .and_then(|value| {
+            value.as_i64().or_else(|| {
+                value
+                    .as_u64()
+                    .map(|ts| i64::try_from(ts).unwrap_or(i64::MAX))
+            })
+        })
+        .unwrap_or(0)
+}
+
 /// The rejection the source recorded, or `None` when the export carried no
 /// verdict at all. An absent verdict is not a claim that the event was
 /// accepted, so disagreement reporting must skip it.
@@ -2441,6 +2458,7 @@ pub(crate) fn write_room_with_resolved_findings(
             batch_timeline_entries.push(mtxdb::ordered_timeline::EventTimelineEntry::new(
                 room_scope,
                 topological_ordering,
+                timeline_origin_server_ts(event),
                 stream_ordering,
                 record,
             ));
