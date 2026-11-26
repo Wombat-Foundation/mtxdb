@@ -482,6 +482,15 @@ fn min(values: &[Duration]) -> Duration {
     values.iter().copied().min().unwrap_or(Duration::ZERO)
 }
 
+fn open_benchmark_database(root: PathBuf) -> Database {
+    let config = if std::env::var_os("MTXDB_CACHE_CAPACITY").is_some() {
+        RuntimeConfig::from_env().expect("benchmark runtime config")
+    } else {
+        RuntimeConfig::default()
+    };
+    Database::open_with_config(root, config).expect("open benchmark database")
+}
+
 fn maintain_journal(db: &Database) {
     let coordinator = db.coordinator();
     if coordinator.segment_len() > coordinator.reclaim_trigger_len() {
@@ -529,7 +538,7 @@ fn reopen_benchmark_database(root: &Path, db: Database) -> Database {
     let before_frames = raw_pack_frame_count(root).expect("count raw pack frames before reopen");
     let open_before = IoSnapshot::read();
     drop(db);
-    let db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
+    let db = open_benchmark_database(root.to_path_buf());
     let open_io = IoSnapshot::read().delta(open_before);
     let after_files = directory_bytes(root);
     let after_frames = raw_pack_frame_count(root).expect("count raw pack frames after reopen");
@@ -758,7 +767,7 @@ fn run_page_rows(
                 drop(db);
                 evict(root, EvictScope::All).expect("evict files before cold read");
                 let open_before = IoSnapshot::read();
-                db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
+                db = open_benchmark_database(root.to_path_buf());
                 last_open_io = IoSnapshot::read().delta(open_before);
                 evict(root, EvictScope::All).expect("evict files after open");
                 let (topo_index, stream_index) =
@@ -973,7 +982,7 @@ fn run_fetch_rows(
             drop(db);
             evict(root, scope).expect("evict selected files before fetch");
             let open_before = IoSnapshot::read();
-            db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
+            db = open_benchmark_database(root.to_path_buf());
             let open_io = IoSnapshot::read().delta(open_before);
             last_open_io = open_io;
             evict(root, scope).expect("evict selected files after open");
@@ -1119,9 +1128,39 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min
     );
 }
 
+fn select_tiers(rooms: &[Room]) -> Vec<usize> {
+    let mut ranked: Vec<usize> = rooms
+        .iter()
+        .enumerate()
+        .filter(|(_, room)| room.max_stream > 0)
+        .map(|(index, _)| index)
+        .collect();
+    ranked.sort_unstable_by_key(|index| rooms.get(*index).map_or(0, |room| room.max_stream));
+    let mut tiers: Vec<usize> = Vec::new();
+    if let Some(index) = ranked.last() {
+        tiers.push(*index);
+    }
+    if ranked.len() > 2 {
+        if let Some(index) = ranked.get(ranked.len() / 2) {
+            if !tiers.contains(index) {
+                tiers.push(*index);
+            }
+        }
+    }
+    if let Some(index) = ranked.first() {
+        if !tiers.contains(index) {
+            tiers.push(*index);
+        }
+    }
+    tiers
+}
+
 fn main() {
     let root = bench_root();
-    let _ = std::fs::remove_dir_all(&root);
+    let open_only = std::env::var_os("MTXDB_MULTI_OPEN_ONLY").is_some();
+    if !open_only {
+        let _ = std::fs::remove_dir_all(&root);
+    }
     let _ = std::fs::create_dir_all(&root);
     warn_if_tmpfs(&root);
     let events = env_usize("MTXDB_MULTI_EVENTS", 1_000_000);
@@ -1160,7 +1199,17 @@ fn main() {
         (rooms, counts, None)
     };
     let total_events: usize = counts.iter().sum();
-    let db = Database::open(root.clone()).expect("open benchmark database");
+    if open_only {
+        let db = open_benchmark_database(root.clone());
+        println!(
+            "multi_room_open_only events={total_events} rooms={}",
+            rooms.len()
+        );
+        print_memory_diagnostics(&db, &root, &rooms);
+        print_extension_breakdown(&root, "open_only");
+        return;
+    }
+    let db = open_benchmark_database(root.clone());
 
     let write_started = Instant::now();
     if let Some(manifest_events) = manifest_events.as_deref() {
@@ -1178,35 +1227,13 @@ fn main() {
     print_memory_diagnostics(&db, &root, &rooms);
     print_extension_breakdown(&root, "load");
 
-    let mut ranked: Vec<usize> = rooms
-        .iter()
-        .enumerate()
-        .filter(|(_, room)| room.max_stream > 0)
-        .map(|(index, _)| index)
-        .collect();
-    ranked.sort_unstable_by_key(|index| rooms.get(*index).map_or(0, |room| room.max_stream));
-    let mut tiers: Vec<usize> = Vec::new();
-    if let Some(index) = ranked.last() {
-        tiers.push(*index);
-    }
-    if ranked.len() > 2 {
-        if let Some(index) = ranked.get(ranked.len() / 2) {
-            if !tiers.contains(index) {
-                tiers.push(*index);
-            }
-        }
-    }
-    if let Some(index) = ranked.first() {
-        if !tiers.contains(index) {
-            tiers.push(*index);
-        }
-    }
+    let tiers = select_tiers(&rooms);
 
     let db = reopen_benchmark_database(&root, db);
     print_memory_diagnostics(&db, &root, &rooms);
     drop(db);
     run_paged_page_rows(&root, &rooms, &tiers, samples);
-    let mut db = Database::open(root.clone()).expect("reopen benchmark database");
+    let mut db = open_benchmark_database(root.clone());
     db = run_page_rows(db, &root, &rooms, &tiers, samples);
     db = run_fetch_rows(db, &root, &rooms, tiers.first().copied(), samples);
     print_memory_diagnostics(&db, &root, &rooms);
