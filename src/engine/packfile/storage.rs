@@ -11456,18 +11456,13 @@ impl PackfileStorage {
         self.put_calls.fetch_add(1, Ordering::Relaxed);
         self.put_bytes
             .fetch_add(data.bytes.len() as u64, Ordering::Relaxed);
-        // New-collection puts must not interleave their record flush with a
-        // concurrent checkpoint's fingerprint→snapshot window (see
-        // `persist_index_checkpoint`). Existing collections are already gated
-        // by their `put_mutex`; a brand-new one isn't in that set yet, so we
-        // hold the publication lock shared for the whole put instead — the
-        // checkpoint holds it exclusive, excluding this put from the window.
+        // Keep a new collection's first put out of a concurrent checkpoint's
+        // fingerprint→snapshot window; existing collections hold `put_mutex`.
         let _create_guard = if self.generation(collection_id).is_none() {
             Some(self.collection_creation.read())
         } else {
             None
         };
-
         let (slot, offset, disk_bytes, published) =
             self.append_put_record(collection_id, id, data, metadata)?;
         if let Some(gen) = self.generation(collection_id) {
@@ -11492,7 +11487,6 @@ impl PackfileStorage {
                     } else {
                         self.record_disk_bytes(pack_id, collection_id, disk_bytes);
                     }
-
                     // Keep a live record resident under the shared byte
                     // budget, but never cache a removal marker: readers would
                     // otherwise decode an empty payload as the deleted value.
@@ -11507,69 +11501,8 @@ impl PackfileStorage {
                 }
             }
         }
-        let (index, cache) = {
-            let old_gen = self.generation(collection_id);
-            let generation = old_gen.as_ref().map_or(1, |g| g.generation);
-            let mut index = match &old_gen {
-                Some(g) => g.index.clone(),
-                // A brand-new collection's first insert: no count hint to
-                // size from (unlike `put_many`, which knows `entries.len()`),
-                // so start at a small fixed floor and let `grow()` size it
-                // up as real entries land. Previously this was a flat
-                // 4096-slot (32 KiB) floor per collection regardless of how
-                // many records it would ever hold -- workloads with many
-                // small/near-empty collections (e.g. per-room collections
-                // holding a handful of records each) paid that 32 KiB up
-                // front per collection, dwarfing the actual data by orders
-                // of magnitude.
-                //
-                // See `NEW_COLLECTION_INDEX_FLOOR` for why this isn't the
-                // index's own smaller hard floor.
-                None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
-            };
-            let inserted = self.insert_index(collection_id, &index, id, slot, offset, removed)?;
-            if let Ok((_bucket, _entry, is_new)) = inserted {
-                self.record_redo(
-                    collection_id,
-                    generation,
-                    id,
-                    RecordLocator {
-                        slot,
-                        offset,
-                        len: disk_bytes,
-                    },
-                    removed,
-                );
-                let pack_id = self.pack_id_for_slot(slot)?;
-                if is_new {
-                    self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
-                } else {
-                    self.record_disk_bytes(pack_id, collection_id, disk_bytes);
-                }
-            } else {
-                index = self.recover_index_after_failed_insert(
-                    collection_id,
-                    id,
-                    generation,
-                    RecordLocator {
-                        slot,
-                        offset,
-                        len: disk_bytes,
-                    },
-                    index,
-                    removed,
-                )?;
-            }
-            let cache = match &old_gen {
-                Some(g) => g.cache.clone(),
-                None => Arc::new(NodeCache::with_budget(
-                    self.cache_capacity,
-                    self.cache_budget.clone(),
-                )),
-            };
-
-            (index, cache)
-        };
+        let (index, cache) =
+            self.rebuild_put_index(collection_id, id, slot, offset, disk_bytes, removed)?;
 
         let cache_to_fill = Arc::clone(&cache);
         self.store_generation(collection_id, index, Some(cache), false)?;
@@ -11583,15 +11516,75 @@ impl PackfileStorage {
         Ok(())
     }
 
-    /// Keep cached reads aligned with the latest record version.
-    fn update_record_cache(
+    fn rebuild_put_index(
         &self,
-        generation: &RoomGeneration,
+        collection_id: &[u8; 16],
         id: &NodeId,
-        data: &NodeData,
+        slot: u16,
+        offset: u64,
+        disk_bytes: u64,
         removed: bool,
-    ) {
-        self.update_record_cache_for(&generation.cache, id, data, removed);
+    ) -> Result<(LossyIndex, Arc<NodeCache>), StorageError> {
+        let old_gen = self.generation(collection_id);
+        let generation = old_gen.as_ref().map_or(1, |g| g.generation);
+        let mut index = match &old_gen {
+            Some(g) => g.index.clone(),
+            // A brand-new collection's first insert: no count hint to
+            // size from (unlike `put_many`, which knows `entries.len()`),
+            // so start at a small fixed floor and let `grow()` size it
+            // up as real entries land. Previously this was a flat
+            // 4096-slot (32 KiB) floor per collection regardless of how
+            // many records it would ever hold -- workloads with many
+            // small/near-empty collections (e.g. per-room collections
+            // holding a handful of records each) paid that 32 KiB up
+            // front per collection, dwarfing the actual data by orders
+            // of magnitude.
+            //
+            // See `NEW_COLLECTION_INDEX_FLOOR` for why this isn't the
+            // index's own smaller hard floor.
+            None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
+        };
+        let inserted = self.insert_index(collection_id, &index, id, slot, offset, removed)?;
+        if let Ok((_bucket, _entry, is_new)) = inserted {
+            self.record_redo(
+                collection_id,
+                generation,
+                id,
+                RecordLocator {
+                    slot,
+                    offset,
+                    len: disk_bytes,
+                },
+                removed,
+            );
+            let pack_id = self.pack_id_for_slot(slot)?;
+            if is_new {
+                self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
+            } else {
+                self.record_disk_bytes(pack_id, collection_id, disk_bytes);
+            }
+        } else {
+            index = self.recover_index_after_failed_insert(
+                collection_id,
+                id,
+                generation,
+                RecordLocator {
+                    slot,
+                    offset,
+                    len: disk_bytes,
+                },
+                index,
+                removed,
+            )?;
+        }
+        let cache = match &old_gen {
+            Some(g) => g.cache.clone(),
+            None => Arc::new(NodeCache::with_budget(
+                self.cache_capacity,
+                self.cache_budget.clone(),
+            )),
+        };
+        Ok((index, cache))
     }
 
     fn update_record_cache_for(
