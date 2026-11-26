@@ -86,14 +86,16 @@ MTXDB_TEST_ENV := $(if $(findstring -Z,$(MTXDB_TEST_ARGS)),RUSTC_BOOTSTRAP=1)
 # The suite is fsync-bound (roughly 12.8k fsync/fdatasync calls per run), so
 # scratch on a disk-backed filesystem measures that device's sync latency, not
 # the code. Default it to tmpfs; set MTXDB_TEST_TMPDIR to a real path to run
-# the durability tests against actual storage.
-MTXDB_TEST_TMPDIR ?= /tmp
+# the durability tests against actual storage. An empty value falls back to
+# the caller's TMPDIR, then /tmp, so `MTXDB_TEST_TMPDIR=` stays usable.
+MTXDB_TEST_TMPDIR ?=
+MTXDB_TEST_BASE := $(or $(strip $(MTXDB_TEST_TMPDIR)),$(strip $(TMPDIR)),/tmp)
 
 .PHONY: test
 test: ##H Run library and workspace tests
 	@set -eu; \
-		mkdir -p "$(MTXDB_TEST_TMPDIR)"; \
-		scratch=$$(mktemp -d "$(MTXDB_TEST_TMPDIR)/mdb-test.XXXXXX"); \
+		mkdir -p "$(MTXDB_TEST_BASE)"; \
+		scratch=$$(mktemp -d "$(MTXDB_TEST_BASE)/mdb-test.XXXXXX"); \
 		cleanup() { status=$$?; if [ "$$status" -eq 0 ]; then rm -rf "$$scratch"; else echo "test scratch preserved at $$scratch" >&2; fi; exit "$$status"; }; \
 		trap cleanup EXIT; \
 		$(MTXDB_TEST_ENV) TMPDIR="$$scratch" $(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings $(MTXDB_TEST_ARGS_FLAG)
