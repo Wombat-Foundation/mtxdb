@@ -64,6 +64,8 @@ pub const TIMELINE_ROOT_MAGIC: [u8; 4] = *b"TMLR";
 pub const TIMELINE_DIRECTORY_MAGIC: [u8; 4] = *b"TMLD";
 /// Magic prefix of the head record (`b"TMLH"`).
 pub const TIMELINE_HEAD_MAGIC: [u8; 4] = *b"TMLH";
+/// Magic prefix of a buffered snapshot record (`b"TMLS"`).
+pub const TIMELINE_SNAPSHOT_MAGIC: [u8; 4] = *b"TMLS";
 /// Magic prefix of an opaque cursor (`b"TMLC"`).
 pub const TIMELINE_CURSOR_MAGIC: [u8; 4] = *b"TMLC";
 
@@ -79,6 +81,11 @@ const ENTRY_LEN: usize = 16 + 8 + 8 + 16 + 32;
 const LEAF_HEADER_LEN: usize = 7;
 const DIRECTORY_HEADER_LEN: usize = 8;
 const ROOT_HEADER_LEN: usize = 46;
+const SNAPSHOT_HEADER_LEN: usize = 60;
+const SNAPSHOT_TIER_LEN: usize = 18;
+/// Tier capacities for the buffered head tiers. The smallest buffer lives
+/// inline in the snapshot; the two carried tiers are ordinary leaves.
+const HEAD_TIER_CAPS: [usize; 2] = [24, 64];
 const ROOT_FIXED_LEN: usize = 57;
 const CURSOR_FIXED_LEN: usize = 49;
 const HEAD_LEN: usize = ROOT_FIXED_LEN;
@@ -86,6 +93,7 @@ const HEAD_LEN: usize = ROOT_FIXED_LEN;
 const CURSOR_LEN: usize = CURSOR_FIXED_LEN + ENTRY_LEN;
 const LEAF_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const ROOT_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
+const SNAPSHOT_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const DIRECTORY_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const HEAD_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const CURSOR_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
@@ -204,6 +212,9 @@ pub trait OrderedKey: Copy + Ord + Eq {
     const LEAF_CAP: usize = TIMELINE_LEAF_CAP;
     /// Maximum child descriptors in one directory record.
     const DIR_FANOUT: usize = TIMELINE_DIRECTORY_FANOUT;
+    /// Entries buffered inline in a head snapshot. Set to `0` to disable the
+    /// optional head tier for a key type.
+    const HEAD_INLINE_CAP: usize = 8;
 
     /// Return the leftmost prefix of this key's sort order.
     fn prefix(&self) -> Self::Prefix;
@@ -255,6 +266,42 @@ struct TimelineRoot<K: OrderedKey> {
     directories: Vec<DirectoryDescriptor<K>>,
 }
 
+/// One carried tier leaf in a buffered head snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeadTier {
+    tier: u8,
+    child_id: NodeId,
+    entry_count: u64,
+}
+
+/// A buffered, content-addressed head snapshot.
+///
+/// The snapshot names an immutable base root plus the not-yet-flushed delta:
+/// up to two carried leaf tiers and a small inline tier. Publishing a snapshot
+/// is a single small record write, so an append does not touch the copy-on-write
+/// tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TimelineSnapshot<K: OrderedKey> {
+    domain: DomainTag,
+    base_count: u64,
+    base_root_id: NodeId,
+    tiers: Vec<HeadTier>,
+    inline: Vec<K>,
+}
+
+impl<K: OrderedKey> TimelineSnapshot<K> {
+    fn delta_count(&self) -> Result<u64, StorageError> {
+        self.tiers.iter().try_fold(
+            u64::try_from(self.inline.len()).unwrap_or(u64::MAX),
+            |sum, tier| {
+                sum.checked_add(tier.entry_count).ok_or_else(|| {
+                    StorageError::Corrupt("timeline snapshot count overflow".to_owned())
+                })
+            },
+        )
+    }
+}
+
 /// Counts from an ordered-index mark-and-sweep pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OrderedGcStats {
@@ -268,7 +315,6 @@ pub struct OrderedGcStats {
 struct StagedTree {
     records: Vec<StagedRecord>,
     by_id: std::collections::HashMap<NodeId, usize>,
-    inserted: u64,
 }
 
 impl StagedTree {
@@ -341,6 +387,7 @@ enum TreeMutation<K: OrderedKey> {
 
 trait TimelineTreeIo<K: OrderedKey> {
     fn load_leaf(&mut self, span: &SpanDescriptor<K>) -> Result<Vec<K>, StorageError>;
+    fn load_leaf_id(&mut self, id: &NodeId) -> Result<Vec<K>, StorageError>;
     fn load_directory(
         &mut self,
         span: &SpanDescriptor<K>,
@@ -973,6 +1020,23 @@ fn mark_ordered_root<K: OrderedKey>(
         .first()
         .and_then(Option::as_ref)
         .ok_or(StorageError::NotFound(root_id))?;
+    if root_record.bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC) {
+        let snapshot = decode_snapshot::<K>(&root_record.bytes, domain)?;
+        for tier in &snapshot.tiers {
+            live.insert(tier.child_id);
+        }
+        if snapshot.base_count > 0 {
+            mark_ordered_root::<K>(
+                transaction,
+                pool,
+                collection_id,
+                domain,
+                snapshot.base_root_id,
+                live,
+            )?;
+        }
+        return Ok(());
+    }
     let root = decode_root::<K>(&root_record.bytes, domain)?;
     mark_ordered_spans::<K>(
         transaction,
@@ -1211,6 +1275,437 @@ fn content_id(payload: &[u8]) -> NodeId {
     let mut id = [0u8; 16];
     id.copy_from_slice(&digest[..16]);
     id
+}
+
+fn merge_sorted_unique<K: OrderedKey>(left: &[K], right: &[K]) -> Vec<K> {
+    let mut out = Vec::with_capacity(left.len().saturating_add(right.len()));
+    let (mut left_index, mut right_index) = (0_usize, 0_usize);
+    while left_index < left.len() || right_index < right.len() {
+        let take_left = right_index == right.len()
+            || (left_index < left.len() && left[left_index] <= right[right_index]);
+        let next = if take_left {
+            let value = left[left_index];
+            left_index = left_index.saturating_add(1);
+            value
+        } else {
+            let value = right[right_index];
+            right_index = right_index.saturating_add(1);
+            value
+        };
+        if out.last() != Some(&next) {
+            out.push(next);
+        }
+    }
+    out
+}
+
+fn load_snapshot_tiers<K: OrderedKey>(
+    snapshot: &TimelineSnapshot<K>,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<Vec<(u8, Vec<K>)>, StorageError> {
+    let mut tiers = Vec::with_capacity(snapshot.tiers.len());
+    for tier in &snapshot.tiers {
+        let entries = io.load_leaf_id(&tier.child_id)?;
+        if u64::try_from(entries.len()).ok() != Some(tier.entry_count) {
+            return Err(StorageError::Corrupt(
+                "timeline snapshot tier count mismatch".to_owned(),
+            ));
+        }
+        tiers.push((tier.tier, entries));
+    }
+    Ok(tiers)
+}
+
+/// All buffered keys in a snapshot, sorted and deduplicated.
+fn snapshot_delta<K: OrderedKey>(
+    snapshot: &TimelineSnapshot<K>,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<Vec<K>, StorageError> {
+    let mut delta = snapshot.inline.clone();
+    for (_, tier) in load_snapshot_tiers(snapshot, io)? {
+        delta = merge_sorted_unique(&delta, &tier);
+    }
+    Ok(delta)
+}
+
+fn main_contains<K: OrderedKey>(
+    spans: &[SpanDescriptor<K>],
+    level: u8,
+    key: &K,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<bool, StorageError> {
+    let position = spans.partition_point(|span| span.min_entry <= *key);
+    let Some(span) = position.checked_sub(1).and_then(|index| spans.get(index)) else {
+        return Ok(false);
+    };
+    if *key > span.max_entry {
+        return Ok(false);
+    }
+    if level == 0 {
+        let leaf = io.load_leaf(span)?;
+        return Ok(leaf.binary_search(key).is_ok());
+    }
+    let children = io.load_directory(span, level)?;
+    main_contains(&children, level.saturating_sub(1), key, io)
+}
+
+/// Drop keys already present in the main tree so a buffered retry stays a
+/// no-op instead of publishing a duplicate delta entry.
+fn drop_base_duplicates<K: OrderedKey>(
+    keys: &mut Vec<K>,
+    root: &TimelineRoot<K>,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<(), StorageError> {
+    if root.directories.is_empty() {
+        return Ok(());
+    }
+    let level = root.height.saturating_sub(1);
+    let mut kept = Vec::with_capacity(keys.len());
+    for key in keys.drain(..) {
+        if !main_contains(&root.directories, level, &key, io)? {
+            kept.push(key);
+        }
+    }
+    *keys = kept;
+    Ok(())
+}
+
+fn empty_root<K: OrderedKey>(domain: DomainTag) -> TimelineRoot<K> {
+    TimelineRoot {
+        domain,
+        height: 0,
+        entry_count: 0,
+        directories: Vec::new(),
+    }
+}
+
+struct AppendPlan {
+    /// New head record id, or `None` when the append changed nothing.
+    head_id: Option<NodeId>,
+    count: u64,
+    /// Snapshot or root records that are not tree leaves/directories.
+    records: Vec<(NodeId, Vec<u8>)>,
+}
+
+fn publish_clean_root<K: OrderedKey>(
+    base_root: &TimelineRoot<K>,
+    domain: DomainTag,
+    _io: &mut dyn TimelineTreeIo<K>,
+) -> Result<AppendPlan, StorageError> {
+    let count = base_root.entry_count;
+    let root_payload = encode_root::<K>(&base_root.directories, count, base_root.height, domain)?;
+    let root_id = content_id(&root_payload);
+    Ok(AppendPlan {
+        head_id: Some(root_id),
+        count,
+        records: vec![(root_id, root_payload)],
+    })
+}
+
+fn publish_flushed<K: OrderedKey>(
+    base_root: &TimelineRoot<K>,
+    delta: &[K],
+    domain: DomainTag,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<AppendPlan, StorageError> {
+    if delta.is_empty() {
+        if base_root.directories.is_empty() {
+            return publish_clean_root(base_root, domain, io);
+        }
+        return Ok(AppendPlan {
+            head_id: None,
+            count: base_root.entry_count,
+            records: Vec::new(),
+        });
+    }
+    let (start_height, mode) = root_split_mode(base_root, delta);
+    let mut inserted = 0_u64;
+    let spans = append_spans(
+        &base_root.directories,
+        base_root.height.saturating_sub(1),
+        delta,
+        io,
+        &mut inserted,
+    )?;
+    let (height, directories) = promote_spans(spans, start_height, mode, io)?;
+    let count = base_root
+        .entry_count
+        .checked_add(inserted)
+        .ok_or_else(|| StorageError::Internal("timeline entry count overflow".to_owned()))?;
+    let root_payload = encode_root::<K>(&directories, count, height, domain)?;
+    let root_id = content_id(&root_payload);
+    Ok(AppendPlan {
+        head_id: Some(root_id),
+        count,
+        records: vec![(root_id, root_payload)],
+    })
+}
+
+fn publish_snapshot<K: OrderedKey>(
+    snapshot: Option<&TimelineSnapshot<K>>,
+    base_count: u64,
+    base_root_id: NodeId,
+    inline: Vec<K>,
+    tiers: &[Option<Vec<K>>; 2],
+    domain: DomainTag,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<AppendPlan, StorageError> {
+    let existing = load_snapshot_tiers(
+        snapshot.unwrap_or(&TimelineSnapshot {
+            domain,
+            base_count: 0,
+            base_root_id: [0u8; 16],
+            tiers: Vec::new(),
+            inline: Vec::new(),
+        }),
+        io,
+    )?;
+    let mut descriptors = Vec::with_capacity(2);
+    let mut delta_count = u64::try_from(inline.len()).unwrap_or(u64::MAX);
+    for (tier_index, entries) in tiers.iter().enumerate() {
+        let Some(entries) = entries else {
+            continue;
+        };
+        if entries.is_empty() {
+            continue;
+        }
+        let tier = u8::try_from(tier_index)
+            .map_err(|_| StorageError::Internal("timeline snapshot tier".to_owned()))?;
+        let child_id = match existing
+            .iter()
+            .find(|(existing_tier, _)| *existing_tier == tier)
+        {
+            Some((_, existing_entries)) if existing_entries == entries => snapshot
+                .and_then(|snapshot| snapshot.tiers.iter().find(|item| item.tier == tier))
+                .map(|item| item.child_id)
+                .ok_or_else(|| StorageError::Internal("timeline snapshot tier id".to_owned()))?,
+            _ => {
+                let payload = encode_leaf::<K>(entries)?;
+                let id = content_id(&payload);
+                io.write_leaf(id, payload)?;
+                id
+            }
+        };
+        let entry_count = u64::try_from(entries.len())
+            .map_err(|_| StorageError::Internal("timeline snapshot tier count".to_owned()))?;
+        delta_count = delta_count
+            .checked_add(entry_count)
+            .ok_or_else(|| StorageError::Internal("timeline snapshot count".to_owned()))?;
+        descriptors.push(HeadTier {
+            tier,
+            child_id,
+            entry_count,
+        });
+    }
+    let snapshot = TimelineSnapshot {
+        domain,
+        base_count,
+        base_root_id: if base_count == 0 {
+            [0u8; 16]
+        } else {
+            base_root_id
+        },
+        tiers: descriptors,
+        inline,
+    };
+    if snapshot.delta_count()? != delta_count {
+        return Err(StorageError::Internal(
+            "timeline snapshot delta count".to_owned(),
+        ));
+    }
+    let payload = encode_snapshot::<K>(&snapshot, domain)?;
+    let id = content_id(&payload);
+    let count = base_count
+        .checked_add(delta_count)
+        .ok_or_else(|| StorageError::Internal("timeline snapshot count overflow".to_owned()))?;
+    Ok(AppendPlan {
+        head_id: Some(id),
+        count,
+        records: vec![(id, payload)],
+    })
+}
+
+fn plan_append<K: OrderedKey>(
+    snapshot: Option<&TimelineSnapshot<K>>,
+    base_root: &TimelineRoot<K>,
+    base_root_id: NodeId,
+    pending: &[K],
+    domain: DomainTag,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<AppendPlan, StorageError> {
+    let use_buffer = K::HEAD_INLINE_CAP > 0 && pending.len() < K::LEAF_CAP;
+    if !use_buffer {
+        let mut delta = pending.to_vec();
+        if let Some(snapshot) = snapshot {
+            delta = merge_sorted_unique(&snapshot_delta(snapshot, io)?, &delta);
+        }
+        return publish_flushed(base_root, &delta, domain, io);
+    }
+
+    let mut tiers: [Option<Vec<K>>; 2] = [None, None];
+    if let Some(snapshot) = snapshot {
+        for (tier, entries) in load_snapshot_tiers(snapshot, io)? {
+            let slot = tiers
+                .get_mut(usize::from(tier))
+                .ok_or_else(|| StorageError::Corrupt("timeline snapshot tier".to_owned()))?;
+            *slot = Some(entries);
+        }
+    }
+    let existing_delta = match snapshot {
+        Some(snapshot) => snapshot_delta(snapshot, io)?,
+        None => Vec::new(),
+    };
+    let mut fresh: Vec<K> = pending
+        .iter()
+        .filter(|key| existing_delta.binary_search(key).is_err())
+        .copied()
+        .collect();
+    drop_base_duplicates(&mut fresh, base_root, io)?;
+    if fresh.is_empty() {
+        if snapshot.is_none() && existing_delta.is_empty() {
+            return publish_clean_root(base_root, domain, io);
+        }
+        return Ok(AppendPlan {
+            head_id: None,
+            count: base_root.entry_count,
+            records: Vec::new(),
+        });
+    }
+    let inline = snapshot.map_or(&[][..], |snapshot| snapshot.inline.as_slice());
+    let mut carry = merge_sorted_unique(inline, &fresh);
+    if carry.len() <= K::HEAD_INLINE_CAP {
+        return publish_snapshot(
+            snapshot,
+            base_root.entry_count,
+            base_root_id,
+            carry,
+            &tiers,
+            domain,
+            io,
+        );
+    }
+    for (tier_index, cap) in HEAD_TIER_CAPS.iter().enumerate() {
+        if let Some(existing) = tiers[tier_index].take() {
+            carry = merge_sorted_unique(&carry, &existing);
+        }
+        if carry.len() <= *cap {
+            tiers[tier_index] = Some(carry);
+            return publish_snapshot(
+                snapshot,
+                base_root.entry_count,
+                base_root_id,
+                Vec::new(),
+                &tiers,
+                domain,
+                io,
+            );
+        }
+    }
+    publish_flushed(base_root, &carry, domain, io)
+}
+
+struct HeadSnapshotState<K: OrderedKey> {
+    snapshot: Option<TimelineSnapshot<K>>,
+    base_root: TimelineRoot<K>,
+    base_root_id: NodeId,
+}
+
+fn decode_head_state<K: OrderedKey>(
+    head_id: Option<NodeId>,
+    head_bytes: Option<&[u8]>,
+    expected_count: u64,
+    domain: DomainTag,
+    mut load: impl FnMut(&NodeId) -> Result<Bytes, StorageError>,
+) -> Result<HeadSnapshotState<K>, StorageError> {
+    let (Some(head_id), Some(bytes)) = (head_id, head_bytes) else {
+        if head_id.is_some() != head_bytes.is_some() {
+            return Err(StorageError::Internal(
+                "timeline head state is inconsistent".to_owned(),
+            ));
+        }
+        return Ok(HeadSnapshotState {
+            snapshot: None,
+            base_root: empty_root(domain),
+            base_root_id: [0u8; 16],
+        });
+    };
+    if bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC) {
+        let snapshot = decode_snapshot::<K>(bytes, domain)?;
+        let base_root = if snapshot.base_count == 0 {
+            empty_root(domain)
+        } else {
+            decode_root::<K>(&load(&snapshot.base_root_id)?, domain)?
+        };
+        if base_root.entry_count != snapshot.base_count {
+            return Err(StorageError::Corrupt(
+                "timeline snapshot/base count mismatch".to_owned(),
+            ));
+        }
+        let count = base_root
+            .entry_count
+            .checked_add(snapshot.delta_count()?)
+            .ok_or_else(|| StorageError::Corrupt("timeline snapshot count overflow".to_owned()))?;
+        if count != expected_count {
+            return Err(StorageError::Corrupt(
+                "timeline head/snapshot count mismatch".to_owned(),
+            ));
+        }
+        let base_root_id = snapshot.base_root_id;
+        Ok(HeadSnapshotState {
+            snapshot: Some(snapshot),
+            base_root,
+            base_root_id,
+        })
+    } else {
+        let base_root = decode_root::<K>(bytes, domain)?;
+        if base_root.entry_count != expected_count {
+            return Err(StorageError::Corrupt(
+                "timeline head/root count mismatch".to_owned(),
+            ));
+        }
+        Ok(HeadSnapshotState {
+            snapshot: None,
+            base_root_id: if base_root.entry_count == 0 {
+                [0u8; 16]
+            } else {
+                head_id
+            },
+            base_root,
+        })
+    }
+}
+
+fn fold_snapshot_delta<K: OrderedKey>(
+    snapshot: Option<&TimelineSnapshot<K>>,
+    base_root: &TimelineRoot<K>,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<TimelineRoot<K>, StorageError> {
+    let Some(snapshot) = snapshot else {
+        return Ok(base_root.clone());
+    };
+    let delta = snapshot_delta(snapshot, io)?;
+    if delta.is_empty() {
+        return Ok(base_root.clone());
+    }
+    let (start_height, mode) = root_split_mode(base_root, &delta);
+    let mut inserted = 0_u64;
+    let spans = append_spans(
+        &base_root.directories,
+        base_root.height.saturating_sub(1),
+        &delta,
+        io,
+        &mut inserted,
+    )?;
+    let (height, directories) = promote_spans(spans, start_height, mode, io)?;
+    Ok(TimelineRoot {
+        domain: base_root.domain,
+        height,
+        entry_count: base_root
+            .entry_count
+            .checked_add(inserted)
+            .ok_or_else(|| StorageError::Internal("timeline fold count overflow".to_owned()))?,
+        directories,
+    })
 }
 
 fn merge_and_stage_leaves<K: OrderedKey>(
@@ -1567,65 +2062,63 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         let head_record = head_records.first().ok_or_else(|| {
             StorageError::Internal("timeline head read returned no slot".to_owned())
         })?;
-        let (old_root_id, old_count, root) = if let Some(head) = head_record {
-            let (root_id, count) = decode_head::<K>(&head.bytes, self.domain)?;
-            let root_records = transaction.get(pool, &self.collection_id, &[root_id])?;
-            let root_record = root_records
+        let (old_head, head_bytes, head_count) = if let Some(head) = head_record {
+            let (head_id, count) = decode_head::<K>(&head.bytes, self.domain)?;
+            let records = transaction.get(pool, &self.collection_id, &[head_id])?;
+            let record = records
                 .first()
                 .and_then(Option::as_ref)
-                .ok_or(StorageError::NotFound(root_id))?;
-            let root = decode_root::<K>(&root_record.bytes, self.domain)?;
-            if root.entry_count != count {
-                return Err(StorageError::Corrupt(
-                    "timeline head/root count mismatch".to_owned(),
-                ));
-            }
-            (Some(root_id), count, root)
+                .ok_or(StorageError::NotFound(head_id))?;
+            (Some(head_id), Some(record.bytes.clone()), count)
         } else {
-            (
-                None,
-                0,
-                TimelineRoot {
-                    domain: self.domain,
-                    height: 0,
-                    entry_count: 0,
-                    directories: Vec::new(),
-                },
-            )
+            (None, None, 0)
         };
+        let state = decode_head_state::<K>(
+            old_head,
+            head_bytes.as_deref(),
+            head_count,
+            self.domain,
+            |id| {
+                let records = transaction.get(pool, &self.collection_id, &[*id])?;
+                let record = records
+                    .first()
+                    .and_then(Option::as_ref)
+                    .ok_or(StorageError::NotFound(*id))?;
+                Ok(record.bytes.clone())
+            },
+        )?;
         if new_entries.is_empty() {
-            if let Some(root_id) = old_root_id {
-                return Ok(root_id);
+            if let Some(head_id) = old_head {
+                return Ok(head_id);
             }
         }
 
         let mut pending = new_entries.to_vec();
         pending.sort_unstable();
         pending.dedup();
-        let mut inserted = 0_u64;
         let mut staged = StagedTree::default();
-        let (start_height, split_mode) = root_split_mode(&root, &pending);
-        let (next_height, next_directories) = {
+        let plan = {
             let mut io = TransactionTimelineTreeIo {
                 index: self,
                 transaction,
                 pool,
                 staged: &mut staged,
             };
-            let next_spans = append_spans(
-                &root.directories,
-                root.height.saturating_sub(1),
+            plan_append(
+                state.snapshot.as_ref(),
+                &state.base_root,
+                state.base_root_id,
                 &pending,
+                self.domain,
                 &mut io,
-                &mut inserted,
-            )?;
-            promote_spans(next_spans, start_height, split_mode, &mut io)?
+            )?
         };
-        staged.inserted = inserted;
-        if staged.inserted == 0 {
-            if let Some(root_id) = old_root_id {
-                return Ok(root_id);
-            }
+        let Some(next_head_id) = plan.head_id else {
+            return old_head
+                .ok_or_else(|| StorageError::Internal("timeline append made no head".to_owned()));
+        };
+        if old_head == Some(next_head_id) {
+            return Ok(next_head_id);
         }
 
         // The precondition is the collection's logical version rather than
@@ -1647,20 +2140,16 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
                 }
             }
         }
-
-        let count = old_count
-            .checked_add(staged.inserted)
-            .ok_or_else(|| StorageError::Internal("timeline entry count overflow".to_owned()))?;
-        let root_payload = encode_root::<K>(&next_directories, count, next_height, self.domain)?;
-        let root_id = content_id(&root_payload);
-        self.stage_record(transaction, pool, &root_id, root_payload)?;
+        for (id, payload) in plan.records {
+            self.stage_record(transaction, pool, &id, payload)?;
+        }
         self.stage_record(
             transaction,
             pool,
             &TIMELINE_HEAD_ID,
-            encode_head::<K>(&root_id, count, self.domain)?,
+            encode_head::<K>(&next_head_id, plan.count, self.domain)?,
         )?;
-        Ok(root_id)
+        Ok(next_head_id)
     }
 
     /// Unconditionally append through the raw storage engine. This utility is
@@ -1680,54 +2169,54 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
     pub fn append_untransactional(&self, new_entries: &[K]) -> Result<NodeId, StorageError> {
         validate_geometry::<K>()?;
         self.ensure_metadata()?;
-        let Some((old_root_id, old_count)) = self.head()? else {
+        let Some((head_id, old_count)) = self.head()? else {
             return self.build(new_entries);
         };
         if new_entries.is_empty() {
-            return Ok(old_root_id);
+            return Ok(head_id);
         }
-
-        let root_bytes = self
+        let head_bytes = self
             .engine
-            .get(&self.collection_id, &old_root_id)?
-            .ok_or(StorageError::NotFound(old_root_id))?;
-        let root = decode_root::<K>(&root_bytes.bytes, self.domain)?;
-        if root.entry_count != old_count {
-            return Err(StorageError::Corrupt(
-                "timeline head/root count mismatch".to_owned(),
-            ));
-        }
+            .get(&self.collection_id, &head_id)?
+            .ok_or(StorageError::NotFound(head_id))?;
+        let state = decode_head_state::<K>(
+            Some(head_id),
+            Some(&head_bytes.bytes),
+            old_count,
+            self.domain,
+            |id| {
+                let bytes = self
+                    .engine
+                    .get(&self.collection_id, id)?
+                    .ok_or(StorageError::NotFound(*id))?;
+                Ok(bytes.bytes)
+            },
+        )?;
         let mut pending = new_entries.to_vec();
         pending.sort_unstable();
         pending.dedup();
-        let (start_height, mode) = root_split_mode(&root, &pending);
-        let mut inserted = 0_u64;
-        let next_spans = {
-            let mut io = DirectTimelineTreeIo { index: self };
-            append_spans(
-                &root.directories,
-                root.height.saturating_sub(1),
-                &pending,
-                &mut io,
-                &mut inserted,
-            )?
-        };
-        if inserted == 0 {
-            return Ok(old_root_id);
-        }
         let mut io = DirectTimelineTreeIo { index: self };
-        let (height, directories) = promote_spans(next_spans, start_height, mode, &mut io)?;
-        let count = old_count
-            .checked_add(inserted)
-            .ok_or_else(|| StorageError::Internal("timeline entry count overflow".to_owned()))?;
-        let root_payload = encode_root::<K>(&directories, count, height, self.domain)?;
-        let root_id = content_id(&root_payload);
-        self.write_record(&root_id, root_payload)?;
-        self.write_record(
-            &TIMELINE_HEAD_ID,
-            encode_head::<K>(&root_id, count, self.domain)?,
+        let plan = plan_append(
+            state.snapshot.as_ref(),
+            &state.base_root,
+            state.base_root_id,
+            &pending,
+            self.domain,
+            &mut io,
         )?;
-        Ok(root_id)
+        let Some(next_head_id) = plan.head_id else {
+            return Ok(head_id);
+        };
+        for (id, payload) in plan.records {
+            self.write_record(&id, payload)?;
+        }
+        if next_head_id != head_id {
+            self.write_record(
+                &TIMELINE_HEAD_ID,
+                encode_head::<K>(&next_head_id, plan.count, self.domain)?,
+            )?;
+        }
+        Ok(next_head_id)
     }
 
     /// Stage removal of the supplied keys and publish one replacement root.
@@ -1820,6 +2309,12 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
             .filter(|id| !live.contains(id))
             .collect();
         let removed = unreachable.len();
+        if removed == 0 {
+            return Ok(OrderedGcStats {
+                retained: live.len(),
+                removed,
+            });
+        }
         transaction
             .remove_known_live_many(pool, self.collection_id, &unreachable, collection_version)
             .map_err(StorageError::Io)?;
@@ -1886,7 +2381,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         let engine_identity = std::ptr::from_ref(self.engine).cast::<()>() as usize;
         if engine_identity != transaction.pool_identity(pool) {
             return Err(StorageError::Internal(
-                "ordered index and transaction use different storage pools".to_owned(),
+                "timeline index and transaction use different storage pools".to_owned(),
             ));
         }
         self.ensure_metadata()?;
@@ -1898,53 +2393,60 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         let head = head_records.first().ok_or_else(|| {
             StorageError::Internal("ordered head read returned no slot".to_owned())
         })?;
-        let (old_root_id, old_count, root) = if let Some(head) = head {
-            let (root_id, count) = decode_head::<K>(&head.bytes, self.domain)?;
-            let records = transaction.get(pool, &self.collection_id, &[root_id])?;
-            let root_record = records
-                .first()
-                .and_then(Option::as_ref)
-                .ok_or(StorageError::NotFound(root_id))?;
-            let root = decode_root::<K>(&root_record.bytes, self.domain)?;
-            if root.entry_count != count {
-                return Err(StorageError::Corrupt(
-                    "ordered head/root count mismatch".to_owned(),
-                ));
-            }
-            (Some(root_id), count, root)
+        let (head_id, head_count) = if let Some(head) = head {
+            let (head_id, count) = decode_head::<K>(&head.bytes, self.domain)?;
+            (Some(head_id), count)
         } else {
-            (
-                None,
-                0,
-                TimelineRoot {
-                    domain: self.domain,
-                    height: 0,
-                    entry_count: 0,
-                    directories: Vec::new(),
-                },
-            )
+            (None, 0)
         };
+        let head_bytes = match head_id {
+            Some(head_id) => {
+                let records = transaction.get(pool, &self.collection_id, &[head_id])?;
+                let record = records
+                    .first()
+                    .and_then(Option::as_ref)
+                    .ok_or(StorageError::NotFound(head_id))?;
+                Some(record.bytes.clone())
+            }
+            None => None,
+        };
+        let state = decode_head_state::<K>(
+            head_id,
+            head_bytes.as_deref(),
+            head_count,
+            self.domain,
+            |id| {
+                let records = transaction.get(pool, &self.collection_id, &[*id])?;
+                let record = records
+                    .first()
+                    .and_then(Option::as_ref)
+                    .ok_or(StorageError::NotFound(*id))?;
+                Ok(record.bytes.clone())
+            },
+        )?;
 
         let mut staged = StagedTree::default();
-        let applied = {
+        let (height, directories, removed, inserted, count) = {
             let mut io = TransactionTimelineTreeIo {
                 index: self,
                 transaction,
                 pool,
                 staged: &mut staged,
             };
-            apply_staged_mutation(&root, old_count, mutation, self.domain, &mut io)?
+            let root = fold_snapshot_delta(state.snapshot.as_ref(), &state.base_root, &mut io)?;
+            let applied =
+                apply_staged_mutation(&root, root.entry_count, mutation, self.domain, &mut io)?;
+            (
+                applied.height,
+                applied.spans,
+                applied.removed,
+                applied.inserted,
+                applied.count,
+            )
         };
-        let AppliedMutation {
-            height,
-            spans: directories,
-            removed,
-            inserted,
-            count,
-        } = applied;
-        if removed == 0 && inserted == 0 {
-            if let Some(root_id) = old_root_id {
-                return Ok((root_id, 0));
+        if removed == 0 && inserted == 0 && state.snapshot.is_none() {
+            if let Some(head_id) = head_id {
+                return Ok((head_id, 0));
             }
         }
         if span_entry_count(&directories)? != count {
@@ -1981,22 +2483,30 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
     ) -> Result<(NodeId, u64), StorageError> {
         validate_geometry::<K>()?;
         self.ensure_metadata()?;
-        let Some((old_root_id, old_count)) = self.head()? else {
+        let Some((head_id, head_count)) = self.head()? else {
             let root_id = self.build(&[])?;
             return Ok((root_id, 0));
         };
-        let bytes = self
+        let head_bytes = self
             .engine
-            .get(&self.collection_id, &old_root_id)?
-            .ok_or(StorageError::NotFound(old_root_id))?;
-        let root = decode_root::<K>(&bytes.bytes, self.domain)?;
-        if root.entry_count != old_count {
-            return Err(StorageError::Corrupt(
-                "ordered head/root count mismatch".to_owned(),
-            ));
-        }
+            .get(&self.collection_id, &head_id)?
+            .ok_or(StorageError::NotFound(head_id))?;
+        let state = decode_head_state::<K>(
+            Some(head_id),
+            Some(&head_bytes.bytes),
+            head_count,
+            self.domain,
+            |id| {
+                let bytes = self
+                    .engine
+                    .get(&self.collection_id, id)?
+                    .ok_or(StorageError::NotFound(*id))?;
+                Ok(bytes.bytes)
+            },
+        )?;
         let mut removed = 0_u64;
         let mut io = DirectTimelineTreeIo { index: self };
+        let root = fold_snapshot_delta(state.snapshot.as_ref(), &state.base_root, &mut io)?;
         let changed = match mutation {
             TreeMutation::Remove(keys) => remove_spans(
                 &root.directories,
@@ -2018,11 +2528,11 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
                 ));
             }
         };
-        if removed == 0 {
-            return Ok((old_root_id, 0));
+        if removed == 0 && state.snapshot.is_none() {
+            return Ok((head_id, 0));
         }
         let (height, directories) = demote_spans(changed, root.height, &mut io)?;
-        let count = mutation_count(old_count, removed, &directories)?;
+        let count = mutation_count(root.entry_count, removed, &directories)?;
         let root_payload = encode_root::<K>(&directories, count, height, self.domain)?;
         let root_id = content_id(&root_payload);
         self.write_record(&root_id, root_payload)?;
@@ -2130,21 +2640,42 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
             },
         };
 
-        let root_bytes = self
-            .engine
-            .get(&self.collection_id, &snapshot_root)?
-            .ok_or(StorageError::NotFound(snapshot_root))?;
-        let root = decode_root::<K>(&root_bytes.bytes, self.domain)?;
-        if root.directories.is_empty() {
+        let (root, snapshot) = self.resolve_page_head(snapshot_root)?;
+        if root.directories.is_empty() && snapshot.is_none() {
             return Ok((empty, Some(snapshot_root)));
         }
 
         let mut out: Vec<K> = Vec::with_capacity(limit);
         let level = root.height.saturating_sub(1);
-        if forward {
-            self.forward_page(&root.directories, level, prefix, key, limit, &mut out)?;
+        let mut tree_out = Vec::with_capacity(limit);
+        if !root.directories.is_empty() {
+            if forward {
+                self.forward_page(&root.directories, level, prefix, key, limit, &mut tree_out)?;
+            } else {
+                self.reverse_page(&root.directories, level, prefix, key, limit, &mut tree_out)?;
+            }
+        }
+        if let Some(snapshot) = &snapshot {
+            let mut delta: Vec<K> = self
+                .load_snapshot_delta(snapshot)?
+                .into_iter()
+                .filter(|entry| {
+                    if entry.prefix() != *prefix {
+                        return false;
+                    }
+                    match key {
+                        Some(key) if forward => *entry > key,
+                        Some(key) => *entry < key,
+                        None => true,
+                    }
+                })
+                .collect();
+            if !forward {
+                delta.reverse();
+            }
+            merge_take(&tree_out, &delta, limit, forward, &mut out);
         } else {
-            self.reverse_page(&root.directories, level, prefix, key, limit, &mut out)?;
+            out = tree_out;
         }
         let next_cursor = if out.len() == limit {
             out.last()
@@ -2275,6 +2806,49 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         decode_leaf::<K>(&bytes.bytes)
     }
 
+    fn load_snapshot_delta(&self, snapshot: &TimelineSnapshot<K>) -> Result<Vec<K>, StorageError> {
+        let mut delta = snapshot.inline.clone();
+        for tier in &snapshot.tiers {
+            let entries = self.load_leaf(&tier.child_id)?;
+            if u64::try_from(entries.len()).ok() != Some(tier.entry_count) {
+                return Err(StorageError::Corrupt(
+                    "timeline snapshot tier count mismatch".to_owned(),
+                ));
+            }
+            delta = merge_sorted_unique(&delta, &entries);
+        }
+        Ok(delta)
+    }
+
+    fn resolve_page_head(
+        &self,
+        snapshot_root: NodeId,
+    ) -> Result<(TimelineRoot<K>, Option<TimelineSnapshot<K>>), StorageError> {
+        let head_bytes = self
+            .engine
+            .get(&self.collection_id, &snapshot_root)?
+            .ok_or(StorageError::NotFound(snapshot_root))?;
+        if !head_bytes.bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC) {
+            return Ok((decode_root::<K>(&head_bytes.bytes, self.domain)?, None));
+        }
+        let snapshot = decode_snapshot::<K>(&head_bytes.bytes, self.domain)?;
+        let root = if snapshot.base_count == 0 {
+            empty_root(self.domain)
+        } else {
+            let base_bytes = self
+                .engine
+                .get(&self.collection_id, &snapshot.base_root_id)?
+                .ok_or(StorageError::NotFound(snapshot.base_root_id))?;
+            decode_root::<K>(&base_bytes.bytes, self.domain)?
+        };
+        if root.entry_count != snapshot.base_count {
+            return Err(StorageError::Corrupt(
+                "timeline snapshot/base count mismatch".to_owned(),
+            ));
+        }
+        Ok((root, Some(snapshot)))
+    }
+
     fn load_directory(
         &self,
         id: NodeId,
@@ -2297,6 +2871,10 @@ impl<S: StorageEngine + ?Sized, K: OrderedKey> TimelineTreeIo<K>
 {
     fn load_leaf(&mut self, span: &SpanDescriptor<K>) -> Result<Vec<K>, StorageError> {
         self.index.load_leaf(&span.child_id)
+    }
+
+    fn load_leaf_id(&mut self, id: &NodeId) -> Result<Vec<K>, StorageError> {
+        self.index.load_leaf(id)
     }
 
     fn load_directory(
@@ -2333,6 +2911,28 @@ struct TransactionTimelineTreeIo<
 impl<S: StorageEngine + ?Sized, K: OrderedKey> TimelineTreeIo<K>
     for TransactionTimelineTreeIo<'_, '_, '_, '_, S, K>
 {
+    fn load_leaf_id(&mut self, id: &NodeId) -> Result<Vec<K>, StorageError> {
+        if let Some(index) = self.staged.by_id.get(id).copied() {
+            let record = self.staged.records.get(index).ok_or_else(|| {
+                StorageError::Internal("staged ordered record index is invalid".to_owned())
+            })?;
+            return match record {
+                StagedRecord::Leaf(_, payload) => decode_leaf::<K>(payload),
+                StagedRecord::Directory(_, _) => Err(StorageError::Corrupt(
+                    "ordered leaf id names a directory".to_owned(),
+                )),
+            };
+        }
+        let records = self
+            .transaction
+            .get(self.pool, &self.index.collection_id, &[*id])?;
+        let record = records
+            .first()
+            .and_then(Option::as_ref)
+            .ok_or(StorageError::NotFound(*id))?;
+        decode_leaf::<K>(&record.bytes)
+    }
+
     fn load_leaf(&mut self, span: &SpanDescriptor<K>) -> Result<Vec<K>, StorageError> {
         if let Some(index) = self.staged.by_id.get(&span.child_id).copied() {
             let record = self.staged.records.get(index).ok_or_else(|| {
@@ -2389,6 +2989,38 @@ impl<S: StorageEngine + ?Sized, K: OrderedKey> TimelineTreeIo<K>
     fn write_directory(&mut self, id: NodeId, payload: Vec<u8>) -> Result<(), StorageError> {
         self.staged.push(id, StagedRecord::Directory(id, payload));
         Ok(())
+    }
+}
+
+fn merge_take<K: OrderedKey>(
+    left: &[K],
+    right: &[K],
+    limit: usize,
+    forward: bool,
+    out: &mut Vec<K>,
+) {
+    let (mut left_index, mut right_index) = (0_usize, 0_usize);
+    while out.len() < limit && (left_index < left.len() || right_index < right.len()) {
+        let take_left = right_index == right.len()
+            || (left_index < left.len()
+                && if forward {
+                    left[left_index] <= right[right_index]
+                } else {
+                    left[left_index] >= right[right_index]
+                });
+        let value = if take_left {
+            let value = left[left_index];
+            left_index = left_index.saturating_add(1);
+            value
+        } else {
+            let value = right[right_index];
+            right_index = right_index.saturating_add(1);
+            value
+        };
+        if out.last() == Some(&value) {
+            continue;
+        }
+        out.push(value);
     }
 }
 
@@ -2840,6 +3472,255 @@ fn decode_root<K: OrderedKey>(
         directories,
     })
 }
+fn encode_snapshot<K: OrderedKey>(
+    snapshot: &TimelineSnapshot<K>,
+    domain: DomainTag,
+) -> Result<Vec<u8>, StorageError> {
+    validate_geometry::<K>()?;
+    if snapshot.domain != domain
+        || snapshot.tiers.len() > HEAD_TIER_CAPS.len()
+        || snapshot.inline.len() > K::HEAD_INLINE_CAP
+        || (snapshot.base_count == 0) != (snapshot.base_root_id == [0u8; 16])
+    {
+        return Err(StorageError::Internal(
+            "timeline snapshot shape is invalid".to_owned(),
+        ));
+    }
+    let mut seen = [false; 2];
+    for tier in &snapshot.tiers {
+        let cap = HEAD_TIER_CAPS
+            .get(usize::from(tier.tier))
+            .ok_or_else(|| StorageError::Internal("timeline snapshot tier".to_owned()))?;
+        let tier_seen = seen
+            .get_mut(usize::from(tier.tier))
+            .ok_or_else(|| StorageError::Internal("timeline snapshot tier".to_owned()))?;
+        let count = usize::try_from(tier.entry_count)
+            .map_err(|_| StorageError::Internal("timeline snapshot tier count".to_owned()))?;
+        if *tier_seen || count == 0 || count > *cap {
+            return Err(StorageError::Internal(
+                "timeline snapshot tier occupancy".to_owned(),
+            ));
+        }
+        *tier_seen = true;
+    }
+    if snapshot
+        .tiers
+        .windows(2)
+        .any(|pair| pair[0].tier >= pair[1].tier)
+        || snapshot
+            .tiers
+            .iter()
+            .any(|tier| usize::from(tier.tier) >= HEAD_TIER_CAPS.len())
+    {
+        return Err(StorageError::Internal(
+            "timeline snapshot tier order".to_owned(),
+        ));
+    }
+    if snapshot.inline.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(StorageError::Internal(
+            "timeline snapshot inline keys are not sorted".to_owned(),
+        ));
+    }
+    if snapshot.delta_count()? == 0 {
+        return Err(StorageError::Internal(
+            "timeline snapshot has an empty delta".to_owned(),
+        ));
+    }
+    let inline_count = u16::try_from(snapshot.inline.len())
+        .map_err(|_| StorageError::Internal("timeline snapshot inline count".to_owned()))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&TIMELINE_SNAPSHOT_MAGIC);
+    out.push(SNAPSHOT_FORMAT_VERSION);
+    out.extend_from_slice(domain.as_bytes());
+    out.extend_from_slice(&K::SCHEMA_TAG);
+    out.extend_from_slice(
+        &u32::try_from(K::LEAF_CAP)
+            .map_err(|_| StorageError::Internal("ordered leaf cap exceeds u32".to_owned()))?
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(
+        &u32::try_from(K::DIR_FANOUT)
+            .map_err(|_| StorageError::Internal("ordered fanout exceeds u32".to_owned()))?
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(&snapshot.base_count.to_be_bytes());
+    out.extend_from_slice(&snapshot.base_root_id);
+    out.push(
+        u8::try_from(snapshot.tiers.len())
+            .map_err(|_| StorageError::Internal("timeline snapshot tier count".to_owned()))?,
+    );
+    out.extend_from_slice(&inline_count.to_be_bytes());
+    for tier in &snapshot.tiers {
+        out.extend_from_slice(&tier.child_id);
+        out.extend_from_slice(
+            &u16::try_from(tier.entry_count)
+                .map_err(|_| StorageError::Internal("timeline snapshot tier count".to_owned()))?
+                .to_be_bytes(),
+        );
+    }
+    let mut previous = None;
+    for key in &snapshot.inline {
+        previous = Some(encode_front_coded_key(key, previous.as_deref(), &mut out)?);
+    }
+    Ok(out)
+}
+
+fn decode_snapshot_header<K: OrderedKey>(
+    bytes: &[u8],
+    expected_domain: DomainTag,
+) -> Result<(DomainTag, u64, NodeId, usize, usize), StorageError> {
+    validate_geometry::<K>()?;
+    if bytes.len() < SNAPSHOT_HEADER_LEN
+        || bytes[..4] != TIMELINE_SNAPSHOT_MAGIC
+        || bytes[4] != SNAPSHOT_FORMAT_VERSION
+    {
+        return Err(StorageError::Corrupt("timeline snapshot header".to_owned()));
+    }
+    let domain = DomainTag::new(
+        bytes[5..21]
+            .try_into()
+            .map_err(|_| StorageError::Corrupt("timeline snapshot domain".to_owned()))?,
+    );
+    if domain != expected_domain {
+        return Err(StorageError::Corrupt(
+            "timeline snapshot domain mismatch".to_owned(),
+        ));
+    }
+    let schema_tag: [u8; 4] = bytes[21..25]
+        .try_into()
+        .map_err(|_| StorageError::Corrupt("timeline snapshot schema".to_owned()))?;
+    let leaf_cap = u32::from_be_bytes(
+        bytes[25..29]
+            .try_into()
+            .map_err(|_| StorageError::Corrupt("timeline snapshot leaf cap".to_owned()))?,
+    );
+    let dir_fanout = u32::from_be_bytes(
+        bytes[29..33]
+            .try_into()
+            .map_err(|_| StorageError::Corrupt("timeline snapshot fanout".to_owned()))?,
+    );
+    if schema_tag != K::SCHEMA_TAG
+        || usize::try_from(leaf_cap).ok() != Some(K::LEAF_CAP)
+        || usize::try_from(dir_fanout).ok() != Some(K::DIR_FANOUT)
+    {
+        return Err(StorageError::Corrupt(
+            "timeline snapshot key geometry mismatch".to_owned(),
+        ));
+    }
+    let base_count = u64::from_be_bytes(
+        bytes[33..41]
+            .try_into()
+            .map_err(|_| StorageError::Corrupt("timeline snapshot base count".to_owned()))?,
+    );
+    let base_root_id: NodeId = bytes[41..57]
+        .try_into()
+        .map_err(|_| StorageError::Corrupt("timeline snapshot base root".to_owned()))?;
+    let tier_count = usize::from(bytes[57]);
+    let inline_count =
+        usize::from(u16::from_be_bytes(bytes[58..60].try_into().map_err(
+            |_| StorageError::Corrupt("timeline snapshot inline count".to_owned()),
+        )?));
+    if tier_count > HEAD_TIER_CAPS.len()
+        || inline_count > K::HEAD_INLINE_CAP
+        || (base_count == 0) != (base_root_id == [0u8; 16])
+    {
+        return Err(StorageError::Corrupt("timeline snapshot shape".to_owned()));
+    }
+    Ok((domain, base_count, base_root_id, tier_count, inline_count))
+}
+
+fn decode_snapshot_tiers(
+    bytes: &[u8],
+    offset: &mut usize,
+    tier_count: usize,
+) -> Result<Vec<HeadTier>, StorageError> {
+    let mut tiers = Vec::with_capacity(tier_count);
+    let mut seen = [false; 2];
+    for _ in 0..tier_count {
+        let end = offset
+            .checked_add(SNAPSHOT_TIER_LEN)
+            .ok_or_else(|| StorageError::Corrupt("timeline snapshot tier".to_owned()))?;
+        let tier_bytes = bytes
+            .get(*offset..end)
+            .ok_or_else(|| StorageError::Corrupt("timeline snapshot tier".to_owned()))?;
+        let child_id: NodeId = tier_bytes[..16]
+            .try_into()
+            .map_err(|_| StorageError::Corrupt("timeline snapshot tier id".to_owned()))?;
+        let entry_count =
+            u64::from(u16::from_be_bytes(tier_bytes[16..18].try_into().map_err(
+                |_| StorageError::Corrupt("timeline snapshot tier count".to_owned()),
+            )?));
+        let count = usize::try_from(entry_count)
+            .map_err(|_| StorageError::Corrupt("timeline snapshot tier count".to_owned()))?;
+        let tier_index = usize::from(count > HEAD_TIER_CAPS[0]);
+        let tier = u8::try_from(tier_index)
+            .map_err(|_| StorageError::Corrupt("timeline snapshot tier".to_owned()))?;
+        let cap = HEAD_TIER_CAPS[tier_index];
+        if count == 0 || count > cap || seen[tier_index] {
+            return Err(StorageError::Corrupt(
+                "timeline snapshot tier occupancy or order".to_owned(),
+            ));
+        }
+        seen[tier_index] = true;
+        *offset = end;
+        tiers.push(HeadTier {
+            tier,
+            child_id,
+            entry_count,
+        });
+    }
+    Ok(tiers)
+}
+
+fn decode_snapshot_inline<K: OrderedKey>(
+    bytes: &[u8],
+    offset: &mut usize,
+    inline_count: usize,
+) -> Result<Vec<K>, StorageError> {
+    let mut inline = Vec::with_capacity(inline_count);
+    let mut previous = None;
+    for _ in 0..inline_count {
+        let (key, wire) = decode_front_coded_key::<K>(bytes, offset, previous.as_deref())?;
+        if inline.last().is_some_and(|last| *last >= key) {
+            return Err(StorageError::Corrupt(
+                "timeline snapshot inline order".to_owned(),
+            ));
+        }
+        inline.push(key);
+        previous = Some(wire);
+    }
+    Ok(inline)
+}
+
+fn decode_snapshot<K: OrderedKey>(
+    bytes: &[u8],
+    expected_domain: DomainTag,
+) -> Result<TimelineSnapshot<K>, StorageError> {
+    let (domain, base_count, base_root_id, tier_count, inline_count) =
+        decode_snapshot_header::<K>(bytes, expected_domain)?;
+    let mut offset = SNAPSHOT_HEADER_LEN;
+    let tiers = decode_snapshot_tiers(bytes, &mut offset, tier_count)?;
+    let inline = decode_snapshot_inline::<K>(bytes, &mut offset, inline_count)?;
+    if offset != bytes.len() {
+        return Err(StorageError::Corrupt(
+            "timeline snapshot trailing bytes".to_owned(),
+        ));
+    }
+    let snapshot = TimelineSnapshot {
+        domain,
+        base_count,
+        base_root_id,
+        tiers,
+        inline,
+    };
+    if snapshot.delta_count()? == 0 {
+        return Err(StorageError::Corrupt(
+            "timeline snapshot has an empty delta".to_owned(),
+        ));
+    }
+    Ok(snapshot)
+}
+
 fn encode_head<K: OrderedKey>(
     root_id: &NodeId,
     count: u64,

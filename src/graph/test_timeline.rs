@@ -336,19 +336,19 @@ fn append_routes_gap_entries_to_the_room_or_nonfull_leaf() {
 #[test]
 fn interior_leaf_split_balances_mixed_room_entries() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "balanced_mixed_room_leaf");
+    let index = OrderedIndex::<_, NoHeadBufferKey>::open(&engine, "balanced_mixed_room_leaf");
     let initial: Vec<_> = (0_u8..64)
         .map(|seed| {
             let room = [seed % 10; 16];
             let order = i64::from(seed / 10).saturating_mul(10);
-            entry(room, order, seed)
+            NoHeadBufferKey(entry(room, order, seed))
         })
         .collect();
     index.build(&initial).unwrap();
 
     let middle_room = [5; 16];
     let inserted: Vec<_> = (0_u8..9)
-        .map(|offset| entry(middle_room, i64::from(offset + 1), 64 + offset))
+        .map(|offset| NoHeadBufferKey(entry(middle_room, i64::from(offset + 1), 64 + offset)))
         .collect();
     index.append_untransactional(&inserted).unwrap();
 
@@ -358,13 +358,165 @@ fn interior_leaf_split_balances_mixed_room_entries() {
         .get(&index.collection_id(), &root_id)
         .unwrap()
         .unwrap();
-    let root = decode_root::<ScopedSeqKey>(&root_bytes.bytes, index.domain()).unwrap();
+    let root = decode_root::<NoHeadBufferKey>(&root_bytes.bytes, index.domain()).unwrap();
     let leaf_counts: Vec<_> = root
         .directories
         .iter()
         .map(|leaf| leaf.entry_count)
         .collect();
     assert_eq!(leaf_counts, [37, 36]);
+}
+
+#[test]
+fn buffered_head_snapshot_carries_flushes_pages_and_pins_cursors() {
+    let root = test_root("buffered_head_snapshot");
+    let db = Database::open(root.clone()).unwrap();
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "buffered_head_snapshot");
+    let scope = [0x31; 16];
+    let mut entries = Vec::new();
+    let mut pinned_cursor = None;
+    let mut pinned_root = None;
+
+    for position in 1_u8..=100 {
+        let key = entry(scope, i64::from(position), position);
+        index.append(&db, ShardType::EventDag, &[key]).unwrap();
+        entries.push(key);
+
+        let (snapshot_id, count) = index.head().unwrap().unwrap();
+        assert_eq!(count, u64::from(position));
+        let snapshot = db
+            .event_dag()
+            .get(&index.collection_id(), &snapshot_id)
+            .unwrap()
+            .unwrap();
+        if position <= 8 {
+            let decoded = decode_snapshot::<ScopedSeqKey>(&snapshot.bytes, index.domain()).unwrap();
+            assert_eq!(decoded.inline.len(), usize::from(position));
+            assert_eq!(decoded.tiers.len(), 0);
+        }
+        if position == 9 {
+            let decoded = decode_snapshot::<ScopedSeqKey>(&snapshot.bytes, index.domain()).unwrap();
+            assert_eq!(decoded.inline.len(), 0);
+            assert_eq!(decoded.tiers.len(), 1);
+            assert_eq!(decoded.tiers[0].entry_count, 9);
+        }
+        if snapshot.bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC) {
+            let decoded = decode_snapshot::<ScopedSeqKey>(&snapshot.bytes, index.domain()).unwrap();
+            assert_eq!(
+                decoded
+                    .base_count
+                    .checked_add(decoded.delta_count().unwrap())
+                    .unwrap(),
+                count
+            );
+        } else {
+            assert!(snapshot.bytes.starts_with(&TIMELINE_ROOT_MAGIC));
+        }
+
+        if position == 5 {
+            let page = index.page(&scope, None, true, 2).unwrap();
+            pinned_cursor = page.next_cursor;
+            pinned_root = pinned_cursor.map(|cursor| cursor.root_id());
+        }
+    }
+
+    entries.sort_unstable();
+    assert_eq!(collect(&index, &scope, true, 7), entries);
+    let mut reversed = entries.clone();
+    reversed.reverse();
+    assert_eq!(collect(&index, &scope, false, 7), reversed);
+
+    let cursor = pinned_cursor.expect("the first snapshot page should have a cursor");
+    assert_eq!(
+        index.page(&scope, Some(&cursor), true, 10).unwrap().entries,
+        entries[..5]
+            .iter()
+            .copied()
+            .filter(|key| *key > cursor.entry())
+            .collect::<Vec<_>>()
+    );
+    let pinned_root = pinned_root.unwrap();
+    let tx = db.begin_transaction();
+    index
+        .stage_gc_unreachable_records(&tx, ShardType::EventDag, &[pinned_root])
+        .unwrap();
+    tx.commit().unwrap();
+    assert!(db
+        .event_dag()
+        .get(&index.collection_id(), &pinned_root)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        index
+            .page(&scope, Some(&cursor), true, 10)
+            .unwrap()
+            .entries
+            .len(),
+        3
+    );
+
+    let tx = db.begin_transaction();
+    index
+        .stage_gc_unreachable_records(&tx, ShardType::EventDag, &[])
+        .unwrap();
+    tx.commit().unwrap();
+    assert!(db
+        .event_dag()
+        .get(&index.collection_id(), &pinned_root)
+        .unwrap()
+        .is_none());
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn buffered_head_mutations_remove_inline_tier_and_room_entries() {
+    let root = test_root("buffered_head_mutations");
+    let db = Database::open(root.clone()).unwrap();
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "buffered_head_mutations");
+    let room_a = [0x41; 16];
+    let room_b = [0x42; 16];
+    let entries: Vec<_> = (0_u8..40)
+        .flat_map(|position| {
+            [
+                entry(room_a, i64::from(position), position),
+                entry(room_b, i64::from(position), position.wrapping_add(80)),
+            ]
+        })
+        .collect();
+    for key in &entries {
+        index.append(&db, ShardType::EventDag, &[*key]).unwrap();
+    }
+
+    let remove = [entries[0], entries[38], entries[76]];
+    let tx = db.begin_transaction();
+    let (_, removed) = index
+        .stage_remove(&tx, ShardType::EventDag, &remove)
+        .unwrap();
+    assert_eq!(removed, 3);
+    tx.commit().unwrap();
+    let retained: Vec<_> = entries
+        .iter()
+        .copied()
+        .filter(|key| !remove.contains(key))
+        .collect();
+    assert_eq!(collect(&index, &room_a, true, 100).len(), 37);
+
+    let tx = db.begin_transaction();
+    let (_, purged) = index
+        .stage_purge_prefix(&tx, ShardType::EventDag, room_a)
+        .unwrap();
+    assert_eq!(purged, 37);
+    tx.commit().unwrap();
+    assert_eq!(collect(&index, &room_a, true, 100), Vec::new());
+    assert_eq!(collect(&index, &room_b, true, 100).len(), 40);
+    assert_eq!(
+        index.head().unwrap().unwrap().1,
+        u64::try_from(retained.len() - 37).unwrap()
+    );
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -768,6 +920,29 @@ fn wire_encoding_is_byte_comparable_and_roundtrips() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TinyKey(u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct NoHeadBufferKey(ScopedSeqKey);
+
+impl OrderedKey for NoHeadBufferKey {
+    type Prefix = [u8; 16];
+
+    const WIRE_LEN: usize = ENTRY_LEN;
+    const SCHEMA_TAG: [u8; 4] = *b"NHBK";
+    const HEAD_INLINE_CAP: usize = 0;
+
+    fn prefix(&self) -> Self::Prefix {
+        self.0.scope
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        self.0.encode_into(out);
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        ScopedSeqKey::decode(bytes).map(Self)
+    }
+}
+
 impl OrderedKey for TinyKey {
     type Prefix = ();
 
@@ -775,6 +950,7 @@ impl OrderedKey for TinyKey {
     const SCHEMA_TAG: [u8; 4] = *b"TINY";
     const LEAF_CAP: usize = 4;
     const DIR_FANOUT: usize = 4;
+    const HEAD_INLINE_CAP: usize = 0;
 
     fn prefix(&self) {}
 
@@ -1112,4 +1288,195 @@ fn prefix_purge_drops_one_room_without_reading_its_subtrees() {
     assert_eq!(collect(&index, &room_b, true, 17).len(), 0);
     assert_eq!(index.head().unwrap().unwrap().1, 0);
     assert_eq!(ordered_height(&index, &engine), 0);
+}
+
+fn append_one<S: StorageEngine + ?Sized>(
+    db: &Database,
+    index: &OrderedIndex<'_, S, TimelineEntry>,
+    value: TimelineEntry,
+) {
+    let transaction = db.begin_transaction();
+    index
+        .stage_append(&transaction, ShardType::EventDag, &[value])
+        .unwrap();
+    transaction.commit().unwrap();
+}
+
+fn head_bytes<S: StorageEngine + ?Sized>(
+    db: &Database,
+    index: &OrderedIndex<'_, S, TimelineEntry>,
+) -> Vec<u8> {
+    let (head_id, _) = index.head().unwrap().unwrap();
+    db.event_dag()
+        .get(&index.collection_id(), &head_id)
+        .unwrap()
+        .unwrap()
+        .bytes
+        .to_vec()
+}
+
+#[test]
+fn head_snapshot_buffers_single_appends_and_pages_across_a_flush() {
+    let db_path = test_root("head_snapshot_flow");
+    let db = Database::open(db_path.clone()).unwrap();
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "head_snapshot_flow");
+    let room = [9u8; 16];
+
+    let empty = db.begin_transaction();
+    index
+        .stage_append(&empty, ShardType::EventDag, &[])
+        .unwrap();
+    empty.commit().unwrap();
+
+    let mut expected = Vec::new();
+    let mut saw_snapshot = false;
+    let mut saw_flush = false;
+    for value in 0..200_i64 {
+        let entry = entry(room, value, u8::try_from(value).unwrap());
+        append_one(&db, &index, entry);
+        expected.push(entry);
+        let bytes = head_bytes(&db, &index);
+        saw_snapshot |= bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC);
+        saw_flush |= bytes.starts_with(&TIMELINE_ROOT_MAGIC);
+    }
+    assert!(saw_snapshot, "single appends should buffer in TMLS");
+    assert!(saw_flush, "the buffer should flush to TMLR");
+
+    expected.sort_unstable();
+    expected.dedup();
+    assert_eq!(collect(&index, &room, true, 7), expected);
+    let mut reverse = collect(&index, &room, false, 7);
+    reverse.reverse();
+    assert_eq!(reverse, expected);
+    assert_eq!(
+        index.head().unwrap().unwrap().1,
+        u64::try_from(expected.len()).unwrap()
+    );
+}
+
+#[test]
+fn head_snapshot_cursor_survives_a_flush_and_pinned_gc() {
+    let db_path = test_root("head_snapshot_cursor");
+    let db = Database::open(db_path.clone()).unwrap();
+    let engine = db.event_dag();
+    let index = TimelineIndex::open(engine.as_ref(), "head_snapshot_cursor");
+    let room = [5u8; 16];
+
+    let mut expected = Vec::new();
+    for value in 0..6_i64 {
+        let entry = entry(room, value, u8::try_from(value).unwrap());
+        append_one(&db, &index, entry);
+        expected.push(entry);
+    }
+    expected.sort_unstable();
+    let first = index.page(&room, None, true, 2).unwrap();
+    let cursor = first.next_cursor.expect("full page has a cursor");
+    assert_eq!(first.entries, expected[..2]);
+    let pinned = cursor.root_id();
+
+    let bulk: Vec<_> = (100..180_i64)
+        .map(|value| entry(room, value, u8::try_from(value).unwrap()))
+        .collect();
+    let transaction = db.begin_transaction();
+    index
+        .stage_append(&transaction, ShardType::EventDag, &bulk)
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let rest = index.page(&room, Some(&cursor), true, 100).unwrap();
+    assert_eq!(rest.entries[0], expected[2]);
+
+    let gc = db.begin_transaction();
+    index
+        .stage_gc_unreachable_records(&gc, ShardType::EventDag, &[pinned])
+        .unwrap();
+    gc.commit().unwrap();
+    assert!(engine
+        .get(&index.collection_id(), &pinned)
+        .unwrap()
+        .is_some());
+    let still_there = index.page(&room, Some(&cursor), true, 100).unwrap();
+    assert_eq!(still_there.entries[0], expected[2]);
+
+    let gc = db.begin_transaction();
+    index
+        .stage_gc_unreachable_records(&gc, ShardType::EventDag, &[])
+        .unwrap();
+    gc.commit().unwrap();
+    assert!(engine
+        .get(&index.collection_id(), &pinned)
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        index.page(&room, Some(&cursor), true, 100),
+        Err(StorageError::NotFound(id)) if id == pinned
+    ));
+}
+
+#[test]
+fn buffered_head_snapshot_remove_and_purge_report_exact_counts() {
+    let db_path = test_root("head_snapshot_mutate");
+    let db = Database::open(db_path.clone()).unwrap();
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "head_snapshot_mutate");
+    let room = [3u8; 16];
+
+    let entries: Vec<_> = (0..5_i64)
+        .map(|value| entry(room, value, u8::try_from(value).unwrap()))
+        .collect();
+    for value in &entries {
+        append_one(&db, &index, *value);
+    }
+    assert!(head_bytes(&db, &index).starts_with(&TIMELINE_SNAPSHOT_MAGIC));
+
+    let transaction = db.begin_transaction();
+    let (_, removed) = index
+        .stage_remove(&transaction, ShardType::EventDag, &[entries[1], entries[3]])
+        .unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(removed, 2);
+    assert!(head_bytes(&db, &index).starts_with(&TIMELINE_ROOT_MAGIC));
+    assert_eq!(
+        collect(&index, &room, true, 10),
+        vec![entries[0], entries[2], entries[4]]
+    );
+
+    for value in 10..12_i64 {
+        append_one(
+            &db,
+            &index,
+            entry(room, value, u8::try_from(value).unwrap()),
+        );
+    }
+    let transaction = db.begin_transaction();
+    let (_, removed) = index
+        .stage_purge_prefix(&transaction, ShardType::EventDag, room)
+        .unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(removed, 5);
+    assert_eq!(index.head().unwrap().unwrap().1, 0);
+    assert_eq!(collect(&index, &room, true, 10).len(), 0);
+}
+
+#[test]
+fn duplicate_appends_across_head_and_base_do_not_publish() {
+    let db_path = test_root("head_snapshot_duplicates");
+    let db = Database::open(db_path.clone()).unwrap();
+    let index = TimelineIndex::open(db.event_dag().as_ref(), "head_snapshot_duplicates");
+    let room = [4u8; 16];
+
+    let base = entry(room, 1, 1);
+    index.build(&[base]).unwrap();
+    let built = head_bytes(&db, &index);
+    append_one(&db, &index, base);
+    assert_eq!(head_bytes(&db, &index), built);
+
+    let second = entry(room, 2, 2);
+    append_one(&db, &index, second);
+    let buffered = head_bytes(&db, &index);
+    assert!(buffered.starts_with(&TIMELINE_SNAPSHOT_MAGIC));
+    assert_eq!(index.head().unwrap().unwrap().1, 2);
+
+    append_one(&db, &index, second);
+    assert_eq!(head_bytes(&db, &index), buffered);
+    assert_eq!(index.head().unwrap().unwrap().1, 2);
 }
