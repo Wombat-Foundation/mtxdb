@@ -850,12 +850,41 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
     }
 }
 
+/// Mapping-advice variants for the cold-page readahead A/B.
+///
+/// `MTXDB_PAGE_ADVICE_AB=1` runs both; otherwise `MTXDB_PAGE_RANDOM_ADVICE=1`
+/// selects the advised variant alone (default is the unadvised baseline).
+fn advice_modes() -> Vec<&'static str> {
+    if std::env::var_os("MTXDB_PAGE_ADVICE_AB").is_some() {
+        vec!["default", "random"]
+    } else if std::env::var("MTXDB_PAGE_RANDOM_ADVICE").is_ok_and(|value| value != "0") {
+        vec!["random"]
+    } else {
+        vec!["default"]
+    }
+}
+
 fn run_page_rows(
     mut db: Database,
     root: &Path,
     rooms: &[Room],
     tiers: &[usize],
     samples: usize,
+) -> Database {
+    for mode in advice_modes() {
+        db = run_page_rows_for_mode(db, root, rooms, tiers, samples, mode);
+    }
+    db
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_page_rows_for_mode(
+    mut db: Database,
+    root: &Path,
+    rooms: &[Room],
+    tiers: &[usize],
+    samples: usize,
+    mode: &str,
 ) -> Database {
     for (tier_rank, tier) in tiers.iter().copied().enumerate() {
         let Some(selected) = rooms.get(tier) else {
@@ -877,6 +906,10 @@ fn run_page_rows(
                 let open_before = IoSnapshot::read();
                 db = open_benchmark_database(root.to_path_buf());
                 last_open_io = IoSnapshot::read().delta(open_before);
+                if mode == "random" {
+                    let advised = db.event_dag().advise_random_shards();
+                    std::hint::black_box(advised);
+                }
                 evict(root, EvictScope::All).expect("evict files after open");
                 let (topo_index, stream_index) =
                     open_event_timeline_indexes(db.event_dag().as_ref());
@@ -907,7 +940,7 @@ fn run_page_rows(
             let min_us = min(&pages).as_secs_f64() * 1e6;
             let median_us = median(&mut pages).as_secs_f64() * 1e6;
             println!(
-                "multi_room_page room={room_id} tier={} order={order} limit={limit} min_us={min_us:.1} median_us={median_us:.1} syscr={} disk_read_bytes={} open_read_bytes={} open_majflt={} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
+                "multi_room_page room={room_id} tier={} order={order} limit={limit} advice={mode} min_us={min_us:.1} median_us={median_us:.1} syscr={} disk_read_bytes={} open_read_bytes={} open_majflt={} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
                 tier_label(tier_rank),
                 last_io.syscr,
                 last_io.read_bytes,
@@ -944,7 +977,7 @@ fn run_page_rows(
                 warm_pages.push(started.elapsed());
             }
             println!(
-                "multi_room_page_warm room={room_id} tier={} order={order} limit={limit} samples={} min_us={:.1} median_us={:.1}",
+                "multi_room_page_warm room={room_id} tier={} order={order} limit={limit} advice={mode} samples={} min_us={:.1} median_us={:.1}",
                 tier_label(tier_rank),
                 warm_pages.len(),
                 min(&warm_pages).as_secs_f64() * 1e6,
@@ -953,7 +986,41 @@ fn run_page_rows(
         }
     }
 
-    db
+    drop(db);
+    run_mapping_control(root, mode);
+    open_benchmark_database(root.to_path_buf())
+}
+
+/// Sequential-mapping control for the readahead A/B: open a fresh mapping,
+/// drop the file cache, then walk every mapped shard page by page under the
+/// current advice. A regression here means `MADV_RANDOM` disabled fault-around
+/// and made sequential access slower.
+fn run_mapping_control(root: &Path, mode: &str) {
+    const CONTROL_RUNS: usize = 3;
+    let mut times = Vec::with_capacity(CONTROL_RUNS);
+    let mut last_io = IoSnapshot::default();
+    let mut pages = 0u64;
+    for _ in 0..CONTROL_RUNS {
+        evict(root, EvictScope::All).expect("evict before control open");
+        let db = open_benchmark_database(root.to_path_buf());
+        if mode == "random" {
+            std::hint::black_box(db.event_dag().advise_random_shards());
+        }
+        evict(root, EvictScope::All).expect("evict before mapping control");
+        let before = IoSnapshot::read();
+        let started = Instant::now();
+        pages = db.event_dag().touch_mapped_pages();
+        times.push(started.elapsed());
+        last_io = IoSnapshot::read().delta(before);
+    }
+    println!(
+        "multi_room_seq_mapping advice={mode} pages={pages} samples={} min_us={:.1} median_us={:.1} majflt={} disk_read_bytes={}",
+        times.len(),
+        min(&times).as_secs_f64() * 1e6,
+        median(&mut times).as_secs_f64() * 1e6,
+        last_io.majflt,
+        last_io.read_bytes,
+    );
 }
 
 /// Measure cold reads through the standalone paged-index reader. Unlike the
@@ -1367,6 +1434,7 @@ fn select_tiers(rooms: &[Room]) -> Vec<usize> {
 fn main() {
     let root = bench_root();
     let open_only = std::env::var_os("MTXDB_MULTI_OPEN_ONLY").is_some();
+    let page_only = std::env::var_os("MTXDB_MULTI_PAGE_ONLY").is_some();
     if !open_only {
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1442,10 +1510,15 @@ fn main() {
     let db = reopen_benchmark_database(&root, db);
     print_memory_diagnostics(&db, &root, &rooms);
     drop(db);
-    run_paged_page_rows(&root, &rooms, &tiers, samples);
-    run_paged_fetch_rows(&root, &rooms, tiers.first().copied(), samples);
+    if !page_only {
+        run_paged_page_rows(&root, &rooms, &tiers, samples);
+        run_paged_fetch_rows(&root, &rooms, tiers.first().copied(), samples);
+    }
     let mut db = open_benchmark_database(root.clone());
     db = run_page_rows(db, &root, &rooms, &tiers, samples);
+    if page_only {
+        return;
+    }
     db = run_fetch_rows(db, &root, &rooms, tiers.first().copied(), samples);
     print_memory_diagnostics(&db, &root, &rooms);
     print_extension_breakdown(&root, "after_reads");

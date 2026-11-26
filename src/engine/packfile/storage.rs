@@ -5224,6 +5224,67 @@ impl PackfileStorage {
             })
     }
 
+    /// Advise every mapped shard `MADV_RANDOM` and return how many mappings
+    /// were advised.
+    ///
+    /// Diagnostic hook for the cold-page readahead A/B. Single-record `get`
+    /// faults through these mappings without the advice that
+    /// [`ReadPlanPolicy::random_advice`] applies to a `get_many` batch, so a
+    /// benchmark can apply the same suppression to a page read and compare
+    /// the bytes it loads. The advice is persistent mapping state and is never
+    /// reset here; nothing calls this by default. Non-Unix builds advise
+    /// nothing and return zero.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn advise_random_shards(&self) -> u64 {
+        let mut advised = 0u64;
+        for (_, shard) in self.shards.all_shards() {
+            if let Ok(guard) = shard.mmap() {
+                if let Some(mapping) = guard.as_ref() {
+                    if mapping.advise(memmap2::Advice::Random).is_ok() {
+                        advised = advised.saturating_add(1);
+                    }
+                }
+            }
+        }
+        advised
+    }
+
+    /// Non-Unix builds have no `madvise`; readahead advice is a no-op.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub fn advise_random_shards(&self) -> u64 {
+        0
+    }
+
+    /// Touch one byte from every 4 KiB page of every mapped shard and return
+    /// the number of pages visited.
+    ///
+    /// Sequential-mapping control for the cold-page readahead A/B: run it
+    /// after [`Self::advise_random_shards`] to check whether suppression
+    /// slows access through the same mappings. Diagnostic only; the query
+    /// path never calls it.
+    #[must_use]
+    pub fn touch_mapped_pages(&self) -> u64 {
+        const PAGE_BYTES: usize = 4096;
+        let mut pages = 0u64;
+        let mut sink = 0u8;
+        for (_, shard) in self.shards.all_shards() {
+            if let Ok(guard) = shard.mmap() {
+                if let Some(mapping) = guard.as_ref() {
+                    for offset in (0..mapping.len()).step_by(PAGE_BYTES) {
+                        if let Some(byte) = mapping.get(offset) {
+                            sink ^= *byte;
+                            pages = pages.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        std::hint::black_box(sink);
+        pages
+    }
+
     fn put_mutex(&self, collection_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
         let mut locks = self.put_locks.lock();
         locks.entry(*collection_id).or_default().clone()
