@@ -14,7 +14,7 @@ pub use lru::LruCache;
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
 /// Default process-wide budget for decoded node bytes.
-pub const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Approximate resident bytes one decoded node occupies in a cache.
 ///
@@ -425,6 +425,11 @@ impl NodeCache {
     /// Returns `true` if the cache holds no entries.
     pub fn is_empty(&self) -> bool {
         self.state.read().map.is_empty()
+    }
+
+    /// Approximate resident bytes held by this cache's decoded nodes.
+    pub fn bytes(&self) -> usize {
+        self.state.read().bytes
     }
 
     /// Cache hit count.

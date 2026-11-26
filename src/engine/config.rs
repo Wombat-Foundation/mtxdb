@@ -18,7 +18,7 @@ use crate::packfile::storage::DEFAULT_CACHE_CAPACITY;
 ///
 /// The defaults preserve the library's historical behaviour except for the
 /// decoded-node cache byte budget, which is now bounded by default:
-/// - decoded-node cache: 100,000 entries per collection, 64 MiB across the
+/// - decoded-node cache: 100,000 entries per collection, 16 MiB across the
 ///   whole process;
 /// - transaction staging: the full 64 MiB engine ceiling;
 /// - index residency: whatever the constructor or pool policy selected

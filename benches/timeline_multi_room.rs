@@ -362,6 +362,17 @@ fn proc_status_kib(field: &str) -> Option<u64> {
     })
 }
 
+fn proc_smaps_kib(field: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    text.lines().find_map(|line| {
+        let (name, value) = line.rsplit_once(':')?;
+        if name.trim() != field {
+            return None;
+        }
+        value.split_whitespace().next()?.parse().ok()
+    })
+}
+
 fn file_kind(path: &Path) -> &'static str {
     let name = path
         .file_name()
@@ -618,13 +629,22 @@ fn print_memory_diagnostics(db: &Database, root: &Path, rooms: &[Room]) {
     let topo_records = count_records(&topo_index.collection_id());
     let stream_records = count_records(&stream_index.collection_id());
     let (pack_bytes, idx_bytes, run_bytes, wal_bytes, other_bytes) = directory_bytes(root);
+    let mut index_bytes = 0_u64;
+    let mut cache_bytes = 0_usize;
+    for shard in ShardType::ALL {
+        let pool = db.pool(shard);
+        index_bytes = index_bytes.saturating_add(pool.stats().index_bytes);
+        cache_bytes = cache_bytes.saturating_add(pool.resident_cache_stats().bytes);
+    }
     println!(
-        "multi_room_memory rss_kib={} anon_kib={} file_kib={} shmem_kib={} hwm_kib={} pack_bytes={pack_bytes} idx_bytes={idx_bytes} run_bytes={run_bytes} wal_bytes={wal_bytes} other_bytes={other_bytes} payload_records={payload_records} topo_records={topo_records} stream_records={stream_records}",
+        "multi_room_memory rss_kib={} anon_kib={} file_kib={} shmem_kib={} hwm_kib={} pss_anon_kib={} pss_file_kib={} index_bytes={index_bytes} cache_bytes={cache_bytes} pack_bytes={pack_bytes} idx_bytes={idx_bytes} run_bytes={run_bytes} wal_bytes={wal_bytes} other_bytes={other_bytes} payload_records={payload_records} topo_records={topo_records} stream_records={stream_records}",
         proc_status_kib("VmRSS:").unwrap_or(0),
         proc_status_kib("RssAnon:").unwrap_or(0),
         proc_status_kib("RssFile:").unwrap_or(0),
         proc_status_kib("RssShmem:").unwrap_or(0),
         proc_status_kib("VmHWM:").unwrap_or(0),
+        proc_smaps_kib("Pss_Anon").unwrap_or(0),
+        proc_smaps_kib("Pss_File").unwrap_or(0),
     );
 }
 

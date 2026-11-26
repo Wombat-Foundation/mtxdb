@@ -5189,6 +5189,7 @@ impl PackfileStorage {
             };
             stats.collections = stats.collections.saturating_add(1);
             stats.entries = stats.entries.saturating_add(generation.cache.len());
+            stats.bytes = stats.bytes.saturating_add(generation.cache.bytes());
             stats.hits = stats.hits.saturating_add(generation.cache.hits());
             stats.misses = stats.misses.saturating_add(generation.cache.misses());
         }
@@ -14398,6 +14399,8 @@ pub struct ResidentCacheStats {
     pub collections: usize,
     /// Number of decoded nodes currently held by those caches.
     pub entries: usize,
+    /// Approximate resident bytes held by those decoded nodes.
+    pub bytes: usize,
     /// Cumulative cache hits across those collections.
     pub hits: u64,
     /// Cumulative cache misses across those collections.
