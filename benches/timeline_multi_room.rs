@@ -1036,6 +1036,74 @@ fn run_mapping_control(db: &Database, root: &Path, mode: &str) {
     );
 }
 
+/// Sequential single-record reads through `get`: one room's event bodies in
+/// topological (append) order, cold, with the point mapping off and on.
+///
+/// `run_mapping_control` walks the shared mapping directly, so it cannot see
+/// what these reads cost: with the point mapping enabled every `get` faults
+/// through the random-advised view and loses fault-around.
+fn run_sequential_get_rows(root: &Path, rooms: &[Room], samples: usize) {
+    const RECORDS: usize = 256;
+    let Some(selected) = rooms.first() else {
+        return;
+    };
+    let ids: Vec<NodeId> = {
+        let db = open_benchmark_database(root.to_path_buf());
+        let (topo_index, _) = open_event_timeline_indexes(db.event_dag().as_ref());
+        topo_index
+            .page(&selected.scope, None, true, RECORDS)
+            .expect("select sequential get ids")
+            .entries
+            .iter()
+            .map(|entry| entry.event_node_id)
+            .collect()
+    };
+    if ids.is_empty() {
+        return;
+    }
+    let room_id = String::from_utf8_lossy(&selected.id).into_owned();
+    for mode in ["default", "point"] {
+        let mut times = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            evict(root, EvictScope::All).expect("evict before sequential get");
+            let open_before = IoSnapshot::read();
+            let db = open_benchmark_database(root.to_path_buf());
+            let open_io = IoSnapshot::read().delta(open_before);
+            db.event_dag().set_point_random_mmap(mode == "point");
+            evict(root, EvictScope::All).expect("evict after sequential get open");
+            let before = IoSnapshot::read();
+            let started = Instant::now();
+            for id in &ids {
+                std::hint::black_box(
+                    db.event_dag()
+                        .get(&selected.collection, id)
+                        .expect("sequential get"),
+                );
+            }
+            let elapsed = started.elapsed();
+            let io = IoSnapshot::read().delta(before);
+            times.push(elapsed);
+            println!(
+                "multi_room_seq_get room={room_id} mode={mode} sample={} records={} us={:.1} disk_read_bytes={} open_read_bytes={} majflt={} pack_vmas={}",
+                sample.saturating_add(1),
+                ids.len(),
+                elapsed.as_secs_f64() * 1e6,
+                io.read_bytes,
+                open_io.read_bytes,
+                io.majflt,
+                mapped_pack_vmas(),
+            );
+        }
+        println!(
+            "multi_room_seq_get_summary room={room_id} mode={mode} records={} samples={} min_us={:.1} median_us={:.1}",
+            ids.len(),
+            times.len(),
+            min(&times).as_secs_f64() * 1e6,
+            median(&mut times).as_secs_f64() * 1e6,
+        );
+    }
+}
+
 /// Measure cold reads through the standalone paged-index reader. Unlike the
 /// shared-WAL `Database`, this read-only pool can keep sealed-pack locators
 /// paged, so locator faults happen in the measured read rather than at open.
@@ -1548,6 +1616,9 @@ fn main() {
     run_paged_page_rows(&root, &rooms, &tiers, samples);
     if !page_only {
         run_paged_fetch_rows(&root, &rooms, tiers.first().copied(), samples);
+    }
+    if std::env::var_os("MTXDB_PAGE_ADVICE_AB").is_some() {
+        run_sequential_get_rows(&root, &rooms, samples);
     }
     let mut db = open_benchmark_database(root.clone());
     db = run_page_rows(db, &root, &rooms, &tiers, samples);
