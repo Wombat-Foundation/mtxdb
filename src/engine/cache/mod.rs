@@ -188,32 +188,41 @@ impl LruState {
         }
     }
 
+    /// Unlink the entry at `idx`, recycle its slot, and return its data and
+    /// charged cost. The caller returns the cost to the shared budget.
+    fn take(&mut self, idx: LinkIdx) -> (Option<Arc<NodeData>>, usize) {
+        let key = self.nodes[idx as usize].key;
+        self.map.remove(&key);
+        let data = self.nodes[idx as usize].data.take();
+        let cost = self.nodes[idx as usize].cost;
+        self.nodes[idx as usize].cost = 0;
+        self.bytes = self.bytes.saturating_sub(cost);
+
+        let prev = self.nodes[idx as usize].prev;
+        let next = self.nodes[idx as usize].next;
+        if prev == NIL {
+            self.head = next;
+        } else {
+            self.nodes[prev as usize].next = next;
+        }
+        if next == NIL {
+            self.tail = prev;
+        } else {
+            self.nodes[next as usize].prev = prev;
+        }
+        self.nodes[idx as usize].prev = NIL;
+        self.nodes[idx as usize].next = self.free_list;
+        self.free_list = idx;
+        (data, cost)
+    }
+
     /// Evict the least recently used entry and return its charged cost.
     fn evict_lru(&mut self) -> Option<usize> {
         let victim = self.tail;
         if victim == NIL {
             return None;
         }
-        let victim_prev = self.nodes[victim as usize].prev;
-        let victim_key = self.nodes[victim as usize].key;
-
-        if victim_prev != NIL {
-            self.nodes[victim_prev as usize].next = NIL;
-        }
-        self.tail = victim_prev;
-        if self.head == victim {
-            self.head = NIL;
-        }
-
-        self.map.remove(&victim_key);
-
-        let cost = self.nodes[victim as usize].cost;
-        self.bytes = self.bytes.saturating_sub(cost);
-        // Release the Arc and recycle the slot
-        self.nodes[victim as usize].data = None;
-        self.nodes[victim as usize].cost = 0;
-        self.nodes[victim as usize].next = self.free_list;
-        self.free_list = victim;
+        let (_, cost) = self.take(victim);
         Some(cost)
     }
 }
@@ -302,9 +311,10 @@ impl NodeCache {
     }
 
     /// Insert a node into the cache.
-    /// If the cache is full, evicts the least recently accessed entry. When a
-    /// shared budget is exhausted, the insertion is refused and the cache is
-    /// left unchanged.
+    ///
+    /// The least recently used entries are evicted from this cache to make
+    /// room. If the node still cannot fit it is not cached, and any previous
+    /// version under the same id is invalidated rather than left visible.
     ///
     /// # Panics
     /// Panics if the cache exceeds `u32::MAX` entries (impractical).
@@ -316,20 +326,12 @@ impl NodeCache {
         let cost = resident_bytes(&data);
         let mut state = self.state.write();
 
+        // A replacement must not leave the previous version visible if the
+        // new one cannot be admitted: drop it first, then treat the write as a
+        // fresh admission. A miss is correct; stale data is not.
         if let Some(&idx) = state.map.get(&id) {
-            let previous = state.nodes[idx as usize].cost;
-            if cost > previous {
-                if !self.reserve(cost.saturating_sub(previous)) {
-                    return;
-                }
-            } else {
-                self.release(previous.saturating_sub(cost));
-            }
-            state.bytes = state.bytes.saturating_sub(previous).saturating_add(cost);
-            state.nodes[idx as usize].data = Some(data);
-            state.nodes[idx as usize].cost = cost;
-            state.move_to_head(idx);
-            return;
+            let (_, previous) = state.take(idx);
+            self.release(previous);
         }
 
         // Draw from the shared budget, sacrificing this cache's own LRU
@@ -386,32 +388,10 @@ impl NodeCache {
     /// Remove a node from the cache.
     pub fn remove(&self, id: &NodeId) -> Option<Arc<NodeData>> {
         let mut state = self.state.write();
-        let idx = state.map.remove(id)?;
-        let cost = state.nodes[idx as usize].cost;
-        let data = state.nodes[idx as usize].data.take()?;
-
-        let prev = state.nodes[idx as usize].prev;
-        let next = state.nodes[idx as usize].next;
-        if prev != NIL {
-            state.nodes[prev as usize].next = next;
-        }
-        if next != NIL {
-            state.nodes[next as usize].prev = prev;
-        }
-        if state.head == idx {
-            state.head = next;
-        }
-        if state.tail == idx {
-            state.tail = prev;
-        }
-
-        state.bytes = state.bytes.saturating_sub(cost);
-        state.nodes[idx as usize].cost = 0;
-        state.nodes[idx as usize].next = state.free_list;
-        state.free_list = idx;
+        let idx = *state.map.get(id)?;
+        let (data, cost) = state.take(idx);
         self.release(cost);
-
-        Some(data)
+        data
     }
 
     /// Check which hashes are already resident in the cache.
@@ -622,6 +602,40 @@ mod tests {
         cache.insert([1; 16], data);
         assert_eq!(cache.len(), 0);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_rejected_larger_overwrite_invalidates_the_old_value() {
+        let old = test_node(32);
+        let larger = test_node(4096);
+        let old_cost = resident_bytes(&old);
+        let budget = Arc::new(CacheBudget::new(old_cost));
+        let cache = NodeCache::with_budget(8, Some(Arc::clone(&budget)));
+        let id = [1; 16];
+
+        cache.insert(id, old);
+        assert_eq!(cache.get(&id).map(|data| data.bytes.len()), Some(32));
+
+        // The replacement cannot fit, but the older cached value must not
+        // survive under an id that has already been overwritten.
+        cache.insert(id, larger);
+        assert!(cache.get(&id).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_replacement_that_fits_stores_the_new_value() {
+        let small = test_node(32);
+        let larger = test_node(96);
+        let budget = Arc::new(CacheBudget::new(resident_bytes(&larger).saturating_mul(2)));
+        let cache = NodeCache::with_budget(8, Some(Arc::clone(&budget)));
+
+        cache.insert([1; 16], small);
+        cache.insert([1; 16], Arc::clone(&larger));
+        assert_eq!(cache.get(&[1; 16]).map(|data| data.bytes.len()), Some(96));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(budget.used(), resident_bytes(&larger));
     }
 
     #[test]

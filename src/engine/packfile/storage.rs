@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use parking_lot::{MutexGuard, RwLock};
 
-use crate::cache::{NodeCache, PinnedNodes};
+use crate::cache::NodeCache;
 use crate::config::RuntimeConfig;
 use crate::csr::Csr;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
@@ -2204,7 +2204,6 @@ pub struct PackfileStorage {
     /// Collection indexes and their cross-table bookkeeping, replaced as one
     /// snapshot when a read-only worker reloads a checkpoint.
     index_tables: RwLock<IndexTables>,
-    pinned: PinnedNodes,
     base_dir: PathBuf,
     swizzle: Option<SwizzleFn>,
     put_locks: parking_lot::Mutex<HashMap<[u8; 16], Arc<parking_lot::Mutex<()>>>>,
@@ -3699,7 +3698,6 @@ impl PackfileStorage {
                 collection_shards: scan_out.collection_shards,
                 collection_disk_bytes: scan_out.collection_disk_bytes,
             }),
-            pinned: PinnedNodes::new(),
             base_dir,
             swizzle,
             put_locks: parking_lot::Mutex::new(HashMap::new()),
@@ -11342,19 +11340,11 @@ impl PackfileStorage {
 
         // Apply cache mutations only after all fallible generation publication
         // succeeds, so a failed batch does not leak partial state into the
-        // shared cache. Resolve and insert one entry at a time: retaining a
-        // prepared clone of the entire batch here would defeat the cache's
-        // size bound.
-        for (id, data) in entries {
-            let mut data_to_cache = data.clone();
-            for child in &mut data_to_cache.children {
-                if let NodeRef::Lazy(child_id) = child {
-                    if let Some(child_data) = self.pinned.get(child_id) {
-                        *child = NodeRef::Resolved(*child_id, child_data);
-                    }
-                }
-            }
-            cache.insert(*id, Arc::new(data_to_cache));
+        // shared cache. A batch is bulk/cold data: invalidate any previous
+        // version instead of admitting it, so an import or repack cannot
+        // displace the live reader working set.
+        for (id, _) in entries {
+            cache.remove(id);
         }
 
         // All fallible work is complete. Only now make the batch visible to
@@ -11497,7 +11487,12 @@ impl PackfileStorage {
                         self.record_disk_bytes(pack_id, collection_id, disk_bytes);
                     }
 
-                    self.update_record_cache(&gen, id, data, removed);
+                    // Writes do not populate the decoded cache: the record is
+                    // durable and indexed already, and admitting bulk imports
+                    // would evict the live reader working set. Invalidate any
+                    // stale version; reads can warm the cache through the
+                    // swizzled path.
+                    gen.cache.remove(id);
                     self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
                     self.note_published_materialized(published);
                     return Ok(());
@@ -11565,7 +11560,8 @@ impl PackfileStorage {
                 )),
             };
 
-            self.update_record_cache_for(&cache, id, data, removed);
+            // See the in-place path above: invalidate, never admit a write.
+            cache.remove(id);
 
             (index, cache)
         };
@@ -11574,39 +11570,6 @@ impl PackfileStorage {
         self.note_published_materialized(published);
 
         Ok(())
-    }
-
-    /// Keep cached reads aligned with the latest record version.
-    fn update_record_cache(
-        &self,
-        generation: &RoomGeneration,
-        id: &NodeId,
-        data: &NodeData,
-        removed: bool,
-    ) {
-        self.update_record_cache_for(&generation.cache, id, data, removed);
-    }
-
-    fn update_record_cache_for(
-        &self,
-        cache: &NodeCache,
-        id: &NodeId,
-        data: &NodeData,
-        removed: bool,
-    ) {
-        if removed {
-            cache.remove(id);
-            return;
-        }
-        let mut data_to_cache = data.clone();
-        for child in &mut data_to_cache.children {
-            if let NodeRef::Lazy(child_id) = child {
-                if let Some(child_data) = self.pinned.get(child_id) {
-                    *child = NodeRef::Resolved(*child_id, child_data);
-                }
-            }
-        }
-        cache.insert(*id, Arc::new(data_to_cache));
     }
 
     fn put_many_internal(
