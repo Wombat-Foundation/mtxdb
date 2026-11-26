@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::storage::{NodeData, NodeId};
+use crate::storage::{NodeData, NodeId, NodeRef};
 
 mod lru;
 
@@ -12,6 +12,109 @@ pub use lru::LruCache;
 
 /// Maximum number of entries in the node cache.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
+/// Default process-wide budget for decoded node bytes.
+pub const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Approximate resident bytes one decoded node occupies in a cache.
+///
+/// Counts the payload, the resolved-child vector's capacity, and the
+/// bookkeeping an entry adds (the LRU slot and its map key). Fixed-size
+/// `Bytes` handles whose payload lives elsewhere are not separate
+/// allocations, so this is a close upper estimate rather than an exact
+/// allocator measurement.
+fn resident_bytes(data: &NodeData) -> usize {
+    std::mem::size_of::<NodeData>()
+        .saturating_add(data.bytes.len())
+        .saturating_add(
+            data.children
+                .capacity()
+                .saturating_mul(std::mem::size_of::<NodeRef>()),
+        )
+        .saturating_add(std::mem::size_of::<LruNode>())
+        .saturating_add(std::mem::size_of::<NodeId>())
+}
+
+/// A byte budget shared by every decoded-node cache in one process.
+///
+/// Each collection still has its own LRU cache, but admission draws from this
+/// shared counter, so a database with many per-room collections cannot hold a
+/// full per-collection cache in each one. A cache that reaches the budget
+/// refuses new entries instead of evicting another collection's; reads then
+/// fall back to the pack.
+pub struct CacheBudget {
+    cap: usize,
+    used: AtomicUsize,
+}
+
+impl CacheBudget {
+    /// Create a budget that admits at most `cap` resident bytes.
+    #[must_use]
+    pub const fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    /// The configured byte cap.
+    #[must_use]
+    pub const fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Bytes currently admitted across every cache sharing this budget.
+    #[must_use]
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    /// Reserve `bytes` if the budget has room. Never exceeds `cap`.
+    fn try_reserve(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.cap {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Return `bytes` to the budget. Saturates rather than wrapping if a
+    /// caller ever over-releases.
+    fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
 
 /// Index into the intrusive linked list Vec.
 type LinkIdx = u32;
@@ -23,6 +126,8 @@ const NIL: LinkIdx = u32::MAX;
 struct LruNode {
     data: Option<Arc<NodeData>>,
     key: NodeId,
+    /// Approximate resident bytes charged to the budget for this entry.
+    cost: usize,
     prev: LinkIdx,
     next: LinkIdx,
 }
@@ -39,6 +144,8 @@ struct LruState {
     tail: LinkIdx,
     /// Head of the free list for recycled slots. NIL if empty.
     free_list: LinkIdx,
+    /// Sum of every resident entry's `cost`.
+    bytes: usize,
 }
 
 impl LruState {
@@ -49,6 +156,7 @@ impl LruState {
             head: NIL,
             tail: NIL,
             free_list: NIL,
+            bytes: 0,
         }
     }
 
@@ -80,10 +188,11 @@ impl LruState {
         }
     }
 
-    fn evict_lru(&mut self) {
+    /// Evict the least recently used entry and return its charged cost.
+    fn evict_lru(&mut self) -> Option<usize> {
         let victim = self.tail;
         if victim == NIL {
-            return;
+            return None;
         }
         let victim_prev = self.nodes[victim as usize].prev;
         let victim_key = self.nodes[victim as usize].key;
@@ -98,10 +207,14 @@ impl LruState {
 
         self.map.remove(&victim_key);
 
+        let cost = self.nodes[victim as usize].cost;
+        self.bytes = self.bytes.saturating_sub(cost);
         // Release the Arc and recycle the slot
         self.nodes[victim as usize].data = None;
+        self.nodes[victim as usize].cost = 0;
         self.nodes[victim as usize].next = self.free_list;
         self.free_list = victim;
+        Some(cost)
     }
 }
 
@@ -112,6 +225,8 @@ impl LruState {
 pub struct NodeCache {
     state: RwLock<LruState>,
     max_entries: usize,
+    /// Shared byte budget, or `None` for an entry-bounded cache.
+    budget: Option<Arc<CacheBudget>>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -120,6 +235,16 @@ impl NodeCache {
     /// Create a cache holding at most `max_entries` decoded nodes.
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
+        Self::with_budget(max_entries, None)
+    }
+
+    /// Create a cache that also draws admission from `budget`.
+    ///
+    /// `None` keeps the historical entry-only bound. `Some` makes every
+    /// insertion pay its approximate resident bytes, and refuses the
+    /// insertion when other caches have already consumed the budget.
+    #[must_use]
+    pub fn with_budget(max_entries: usize, budget: Option<Arc<CacheBudget>>) -> Self {
         Self {
             // Empty per-collection caches are the normal state immediately
             // after an mmap-backed open. Let their backing collections grow
@@ -129,8 +254,27 @@ impl NodeCache {
             // use for the first time.
             state: RwLock::new(LruState::empty()),
             max_entries,
+            budget,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+        }
+    }
+
+    /// The budget this cache draws from, if any.
+    #[must_use]
+    pub fn budget(&self) -> Option<&Arc<CacheBudget>> {
+        self.budget.as_ref()
+    }
+
+    fn reserve(&self, bytes: usize) -> bool {
+        self.budget
+            .as_ref()
+            .is_none_or(|budget| budget.try_reserve(bytes))
+    }
+
+    fn release(&self, bytes: usize) {
+        if let Some(budget) = &self.budget {
+            budget.release(bytes);
         }
     }
 
@@ -158,7 +302,9 @@ impl NodeCache {
     }
 
     /// Insert a node into the cache.
-    /// If the cache is full, evicts the least recently accessed entry.
+    /// If the cache is full, evicts the least recently accessed entry. When a
+    /// shared budget is exhausted, the insertion is refused and the cache is
+    /// left unchanged.
     ///
     /// # Panics
     /// Panics if the cache exceeds `u32::MAX` entries (impractical).
@@ -167,16 +313,40 @@ impl NodeCache {
             return;
         }
 
+        let cost = resident_bytes(&data);
         let mut state = self.state.write();
 
         if let Some(&idx) = state.map.get(&id) {
+            let previous = state.nodes[idx as usize].cost;
+            if cost > previous {
+                if !self.reserve(cost.saturating_sub(previous)) {
+                    return;
+                }
+            } else {
+                self.release(previous.saturating_sub(cost));
+            }
+            state.bytes = state.bytes.saturating_sub(previous).saturating_add(cost);
             state.nodes[idx as usize].data = Some(data);
+            state.nodes[idx as usize].cost = cost;
             state.move_to_head(idx);
             return;
         }
 
+        // Draw from the shared budget, sacrificing this cache's own LRU
+        // entries when the budget is full. A node that cannot fit even after
+        // this cache is empty is simply not cached; the caller keeps it.
+        while !self.reserve(cost) {
+            let Some(evicted) = state.evict_lru() else {
+                return;
+            };
+            self.release(evicted);
+        }
+
+        // The byte budget is not the entry-count limit: still make one slot.
         if state.map.len() >= self.max_entries {
-            state.evict_lru();
+            if let Some(evicted) = state.evict_lru() {
+                self.release(evicted);
+            }
         }
 
         let idx = if state.free_list == NIL {
@@ -185,6 +355,7 @@ impl NodeCache {
             state.nodes.push(LruNode {
                 data: None,
                 key: id,
+                cost: 0,
                 prev: NIL,
                 next: NIL,
             });
@@ -195,8 +366,10 @@ impl NodeCache {
             free_idx
         };
 
+        state.bytes = state.bytes.saturating_add(cost);
         state.nodes[idx as usize].data = Some(data);
         state.nodes[idx as usize].key = id;
+        state.nodes[idx as usize].cost = cost;
         state.nodes[idx as usize].prev = NIL;
         state.nodes[idx as usize].next = state.head;
         if state.head != NIL {
@@ -214,6 +387,7 @@ impl NodeCache {
     pub fn remove(&self, id: &NodeId) -> Option<Arc<NodeData>> {
         let mut state = self.state.write();
         let idx = state.map.remove(id)?;
+        let cost = state.nodes[idx as usize].cost;
         let data = state.nodes[idx as usize].data.take()?;
 
         let prev = state.nodes[idx as usize].prev;
@@ -231,8 +405,11 @@ impl NodeCache {
             state.tail = prev;
         }
 
+        state.bytes = state.bytes.saturating_sub(cost);
+        state.nodes[idx as usize].cost = 0;
         state.nodes[idx as usize].next = state.free_list;
         state.free_list = idx;
+        self.release(cost);
 
         Some(data)
     }
@@ -306,11 +483,23 @@ impl NodeCache {
     /// Clear all entries.
     pub fn clear(&self) {
         let mut state = self.state.write();
+        let bytes = state.bytes;
         state.map.clear();
         state.nodes.clear();
         state.head = NIL;
         state.tail = NIL;
         state.free_list = NIL;
+        state.bytes = 0;
+        self.release(bytes);
+    }
+}
+
+impl Drop for NodeCache {
+    fn drop(&mut self) {
+        // A deleted collection drops its cache without calling `clear`; return
+        // whatever it still holds so the shared budget does not leak.
+        let bytes = self.state.get_mut().bytes;
+        self.release(bytes);
     }
 }
 
@@ -379,6 +568,88 @@ impl Default for PinnedNodes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_node(payload_size: usize) -> Arc<NodeData> {
+        Arc::new(NodeData::new(bytes::Bytes::from(vec![7u8; payload_size])))
+    }
+
+    #[test]
+    fn shared_budget_bounds_total_admission_across_caches() {
+        let data = test_node(64);
+        let cost = resident_bytes(&data);
+        let budget = Arc::new(CacheBudget::new(cost.saturating_mul(2)));
+        let first = NodeCache::with_budget(4, Some(Arc::clone(&budget)));
+        let second = NodeCache::with_budget(4, Some(Arc::clone(&budget)));
+
+        first.insert([1; 16], Arc::clone(&data));
+        second.insert([2; 16], Arc::clone(&data));
+        assert_eq!(budget.used(), cost.saturating_mul(2));
+
+        // The budget is full, so the first cache gives up its own entry rather
+        // than growing past the shared cap.
+        first.insert([3; 16], Arc::clone(&data));
+        assert_eq!(budget.used(), cost.saturating_mul(2));
+        assert_eq!(first.len(), 1);
+        assert!(first.get(&[3; 16]).is_some());
+        assert!(second.get(&[2; 16]).is_some());
+    }
+
+    #[test]
+    fn removal_and_clear_release_shared_budget() {
+        let data = test_node(32);
+        let cost = resident_bytes(&data);
+        let budget = Arc::new(CacheBudget::new(cost.saturating_mul(3)));
+        let cache = NodeCache::with_budget(8, Some(Arc::clone(&budget)));
+
+        cache.insert([1; 16], Arc::clone(&data));
+        cache.insert([2; 16], Arc::clone(&data));
+        assert_eq!(budget.used(), cost.saturating_mul(2));
+
+        assert!(cache.remove(&[1; 16]).is_some());
+        assert_eq!(budget.used(), cost);
+
+        cache.clear();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_node_larger_than_the_budget_is_not_cached() {
+        let data = test_node(4096);
+        let cost = resident_bytes(&data);
+        let budget = Arc::new(CacheBudget::new(cost.saturating_sub(1)));
+        let cache = NodeCache::with_budget(8, Some(Arc::clone(&budget)));
+
+        cache.insert([1; 16], data);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn entry_limit_eviction_releases_budget() {
+        let data = test_node(16);
+        let cost = resident_bytes(&data);
+        let budget = Arc::new(CacheBudget::new(cost.saturating_mul(8)));
+        let cache = NodeCache::with_budget(1, Some(Arc::clone(&budget)));
+
+        cache.insert([1; 16], Arc::clone(&data));
+        cache.insert([2; 16], Arc::clone(&data));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(budget.used(), cost);
+    }
+
+    #[test]
+    fn dropping_a_cache_returns_its_budget() {
+        let data = test_node(24);
+        let cost = resident_bytes(&data);
+        let budget = Arc::new(CacheBudget::new(cost.saturating_mul(4)));
+        {
+            let cache = NodeCache::with_budget(8, Some(Arc::clone(&budget)));
+            cache.insert([1; 16], Arc::clone(&data));
+            cache.insert([2; 16], data);
+            assert_eq!(budget.used(), cost.saturating_mul(2));
+        }
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn hit_rate_scaling_boundary() {

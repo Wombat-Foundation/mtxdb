@@ -1216,6 +1216,7 @@ impl StreamingOpenScan {
         mut self,
         shards: &ShardPool,
         cache_capacity: usize,
+        cache_budget: Option<&Arc<crate::cache::CacheBudget>>,
     ) -> (RoomScanOutput, Vec<[u8; 16]>) {
         self.collection_order
             .retain(|collection_id| self.seen_collections.contains(collection_id));
@@ -1279,7 +1280,10 @@ impl StreamingOpenScan {
                     index,
                     sealed,
                     paged: self.residency == crate::index::IndexResidency::Paged,
-                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                    cache: Arc::new(NodeCache::with_budget(
+                        cache_capacity,
+                        cache_budget.cloned(),
+                    )),
                     generation: 1,
                 }),
             );
@@ -2238,6 +2242,8 @@ pub struct PackfileStorage {
     live_roots: RwLock<HashMap<[u8; 16], Vec<NodeId>>>,
     repack_threshold_entries: AtomicU64,
     cache_capacity: usize,
+    /// Shared process/database byte budget for decoded node payloads.
+    cache_budget: Option<Arc<crate::cache::CacheBudget>>,
     /// Per-instance index config: seed from the pool's `pool.meta`, floor
     /// and load factor from defaults (or future tuning).
     index_config: crate::index::IndexConfig,
@@ -2768,6 +2774,9 @@ impl PackfileStorage {
         let store = Self::open_with_options_and_residency(
             base_dir,
             config.cache_capacity,
+            config
+                .cache_bytes
+                .map(|bytes| Arc::new(crate::cache::CacheBudget::new(bytes))),
             None,
             true,
             None,
@@ -2797,6 +2806,9 @@ impl PackfileStorage {
         let store = Self::open_with_options_and_residency(
             base_dir,
             config.cache_capacity,
+            config
+                .cache_bytes
+                .map(|bytes| Arc::new(crate::cache::CacheBudget::new(bytes))),
             None,
             false,
             None,
@@ -3079,6 +3091,7 @@ impl PackfileStorage {
         Self::open_with_options_and_residency(
             base_dir,
             cache_capacity,
+            None,
             swizzle,
             writable,
             max_shard_bytes,
@@ -3106,6 +3119,7 @@ impl PackfileStorage {
             base_dir,
             DEFAULT_CACHE_CAPACITY,
             None,
+            None,
             true,
             None,
             true,
@@ -3130,6 +3144,7 @@ impl PackfileStorage {
             base_dir,
             DEFAULT_CACHE_CAPACITY,
             None,
+            None,
             true,
             Some(max_shard_bytes),
             true,
@@ -3142,6 +3157,7 @@ impl PackfileStorage {
     fn open_with_options_and_residency(
         base_dir: PathBuf,
         cache_capacity: usize,
+        cache_budget: Option<Arc<crate::cache::CacheBudget>>,
         swizzle: Option<SwizzleFn>,
         writable: bool,
         max_shard_bytes: Option<u64>,
@@ -3152,6 +3168,7 @@ impl PackfileStorage {
         Self::open_with_options_locked(
             base_dir,
             cache_capacity,
+            cache_budget,
             swizzle,
             writable,
             max_shard_bytes,
@@ -3167,6 +3184,7 @@ impl PackfileStorage {
     pub(crate) fn open_shared_member(
         base_dir: PathBuf,
         cache_capacity: usize,
+        cache_budget: Option<Arc<crate::cache::CacheBudget>>,
         max_shard_bytes: Option<u64>,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
@@ -3175,6 +3193,7 @@ impl PackfileStorage {
         Self::open_with_options_locked(
             base_dir,
             cache_capacity,
+            cache_budget,
             None,
             true,
             max_shard_bytes,
@@ -3190,6 +3209,7 @@ impl PackfileStorage {
     fn open_with_options_locked(
         base_dir: PathBuf,
         cache_capacity: usize,
+        cache_budget: Option<Arc<crate::cache::CacheBudget>>,
         swizzle: Option<SwizzleFn>,
         writable: bool,
         max_shard_bytes: Option<u64>,
@@ -3386,6 +3406,7 @@ impl PackfileStorage {
             Self::checkpoint_scan_out(
                 &base_dir,
                 cache_capacity,
+                cache_budget.as_ref(),
                 &shards,
                 &open_shards,
                 &deleted_collections,
@@ -3415,6 +3436,7 @@ impl PackfileStorage {
                 base_dir,
                 swizzle,
                 cache_capacity,
+                cache_budget,
                 residency,
                 delta_state,
                 checkpoint_covered,
@@ -3592,7 +3614,8 @@ impl PackfileStorage {
         // The frames themselves built the indexes; this final pass only turns
         // them into the shared generation and shard-accounting structures.
         let materialization_started = std::time::Instant::now();
-        let (scan_out, collection_order) = scan_state.finish(&shards, cache_capacity);
+        let (scan_out, collection_order) =
+            scan_state.finish(&shards, cache_capacity, cache_budget.as_ref());
         shards.set_sealed_runs(sealed_runs);
         timings.index_materialization = materialization_started.elapsed();
 
@@ -3604,6 +3627,7 @@ impl PackfileStorage {
             base_dir,
             swizzle,
             cache_capacity,
+            cache_budget,
             residency,
             // A full rescan re-cooks every index from scratch, so no delta log
             // can continue anything the checkpoint recorded; force the next
@@ -3644,6 +3668,7 @@ impl PackfileStorage {
         base_dir: PathBuf,
         swizzle: Option<SwizzleFn>,
         cache_capacity: usize,
+        cache_budget: Option<Arc<crate::cache::CacheBudget>>,
         residency: crate::index::IndexResidency,
         delta_state: DeltaLogState,
         read_covered: u64,
@@ -3687,6 +3712,7 @@ impl PackfileStorage {
             live_roots: RwLock::new(HashMap::new()),
             repack_threshold_entries: AtomicU64::new(DEFAULT_REPACK_THRESHOLD_ENTRIES),
             cache_capacity,
+            cache_budget,
             index_config,
             index_residency: residency,
             read_plan: RwLock::new(ReadPlanPolicy::default()),
@@ -4066,7 +4092,6 @@ impl PackfileStorage {
     /// one referencing packs that aren't live open shards) fall through to
     /// `BookkeepingSource::SlotScan` with empty maps: correctness never
     /// depends on the sidecar, it only accelerates.
-    #[allow(clippy::type_complexity)]
     fn gated_sidecar_bookkeeping(
         base_dir: &std::path::Path,
         local_fingerprint: u64,
@@ -4259,6 +4284,7 @@ impl PackfileStorage {
     fn checkpoint_scan_out(
         base_dir: &std::path::Path,
         cache_capacity: usize,
+        cache_budget: Option<&Arc<crate::cache::CacheBudget>>,
         shards: &ShardPool,
         open_shards: &[(u16, PackId, PathBuf, u64)],
         deleted_collections: &HashSet<[u8; 16]>,
@@ -4691,7 +4717,10 @@ impl PackfileStorage {
                     sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                     // Checkpoint loading is resident-only under strategy 1.
                     paged: false,
-                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                    cache: Arc::new(NodeCache::with_budget(
+                        cache_capacity,
+                        cache_budget.cloned(),
+                    )),
                     generation,
                 }),
             );
@@ -4739,7 +4768,10 @@ impl PackfileStorage {
                     sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                     // Checkpoint loading is resident-only under strategy 1.
                     paged: false,
-                    cache: Arc::new(NodeCache::new(cache_capacity)),
+                    cache: Arc::new(NodeCache::with_budget(
+                        cache_capacity,
+                        cache_budget.cloned(),
+                    )),
                     generation,
                 }),
             );
@@ -5140,7 +5172,12 @@ impl PackfileStorage {
     /// The collection-scoped node cache for `collection_id`, or a fresh empty one if the collection is unknown.
     pub fn collection_cache(&self, collection_id: &[u8; 16]) -> Arc<NodeCache> {
         self.generation(collection_id).map_or_else(
-            || Arc::new(NodeCache::new(self.cache_capacity)),
+            || {
+                Arc::new(NodeCache::with_budget(
+                    self.cache_capacity,
+                    self.cache_budget.clone(),
+                ))
+            },
             |g| g.cache.clone(),
         )
     }
@@ -7828,7 +7865,12 @@ impl PackfileStorage {
         cache: Option<Arc<NodeCache>>,
         bump_generation: bool,
     ) -> Result<(), StorageError> {
-        let cache = cache.unwrap_or_else(|| Arc::new(NodeCache::new(self.cache_capacity)));
+        let cache = cache.unwrap_or_else(|| {
+            Arc::new(NodeCache::with_budget(
+                self.cache_capacity,
+                self.cache_budget.clone(),
+            ))
+        });
         let is_new = self.collections_read().get(collection_id).is_none();
         let structural = bump_generation || is_new;
         if structural {
@@ -7861,7 +7903,10 @@ impl PackfileStorage {
                         index: LossyIndex::new(0),
                         sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                         paged: self.index_residency == crate::index::IndexResidency::Paged,
-                        cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                        cache: Arc::new(NodeCache::with_budget(
+                            self.cache_capacity,
+                            self.cache_budget.clone(),
+                        )),
                         generation: 1,
                     })
                 })
@@ -7885,7 +7930,10 @@ impl PackfileStorage {
                             index: LossyIndex::new(0),
                             sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
                             paged: self.index_residency == crate::index::IndexResidency::Paged,
-                            cache: Arc::new(NodeCache::new(self.cache_capacity)),
+                            cache: Arc::new(NodeCache::with_budget(
+                                self.cache_capacity,
+                                self.cache_budget.clone(),
+                            )),
                             generation: 1,
                         })
                     })
@@ -11511,7 +11559,10 @@ impl PackfileStorage {
             }
             let cache = match &old_gen {
                 Some(g) => g.cache.clone(),
-                None => Arc::new(NodeCache::new(self.cache_capacity)),
+                None => Arc::new(NodeCache::with_budget(
+                    self.cache_capacity,
+                    self.cache_budget.clone(),
+                )),
             };
 
             self.update_record_cache_for(&cache, id, data, removed);
@@ -11616,7 +11667,10 @@ impl PackfileStorage {
         let old_gen = self.generation(collection_id);
         let cache = match &old_gen {
             Some(g) => g.cache.clone(),
-            None => Arc::new(NodeCache::new(self.cache_capacity)),
+            None => Arc::new(NodeCache::with_budget(
+                self.cache_capacity,
+                self.cache_budget.clone(),
+            )),
         };
 
         let mut progress = self.prepare_put_many_progress(
@@ -14077,10 +14131,6 @@ impl PackfileStorage {
     /// reset semantics — `shards`/`cache`/`repack` reflect persisted state and
     /// are deliberately excluded from the reset.
     #[must_use]
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "a hit-rate is inherently an approximate floating-point presentation; counters retain their exact u64 values"
-    )]
     pub fn stats(&self) -> RuntimeStats {
         let (cache, index_bytes, collection_count, max_index_probe_len) =
             self.stats_collection_summary();

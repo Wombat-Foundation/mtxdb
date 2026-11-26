@@ -800,6 +800,7 @@ impl PackfileStorage {
             Self::checkpoint_scan_out(
                 &self.base_dir,
                 self.cache_capacity,
+                self.cache_budget.as_ref(),
                 &self.shards,
                 &open_shards,
                 &deleted_collections,

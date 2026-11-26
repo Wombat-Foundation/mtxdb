@@ -993,6 +993,9 @@ impl Database {
         }
         coordinator.configure_replay_lease_cap(config.replay_lease_max_retained_bytes);
 
+        let cache_budget = config
+            .cache_bytes
+            .map(|bytes| Arc::new(crate::cache::CacheBudget::new(bytes)));
         let mut pools = Vec::with_capacity(ShardType::ALL.len());
         for shard in ShardType::ALL {
             let dir = layout.pool_path(shard);
@@ -1000,6 +1003,7 @@ impl Database {
             let store = PackfileStorage::open_shared_member(
                 dir,
                 config.cache_capacity,
+                cache_budget.clone(),
                 policy.max_shard_bytes,
                 policy.compress,
                 policy.checksum_policy,

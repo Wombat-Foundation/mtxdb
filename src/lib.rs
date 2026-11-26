@@ -219,7 +219,7 @@ pub use auxiliary::{
     auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,
 };
 pub use bitmap_set::{BitmapSet, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
-pub use cache::{LruCache, NodeCache};
+pub use cache::{CacheBudget, LruCache, NodeCache};
 pub use config::{ConfigError, RuntimeConfig};
 pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,

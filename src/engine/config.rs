@@ -9,14 +9,17 @@
 
 use std::fmt;
 
+use crate::cache::DEFAULT_CACHE_BYTES;
 use crate::index::IndexResidency;
 use crate::journal::{MAX_RECLAIM_TRIGGER_LEN, MAX_TXN_STAGE_BYTES};
 use crate::packfile::storage::DEFAULT_CACHE_CAPACITY;
 
 /// Runtime knobs that are not part of a per-pool [`crate::PoolPolicy`].
 ///
-/// The defaults preserve the library's historical behaviour:
-/// - decoded-node cache: 100,000 entries per collection;
+/// The defaults preserve the library's historical behaviour except for the
+/// decoded-node cache byte budget, which is now bounded by default:
+/// - decoded-node cache: 100,000 entries per collection, 64 MiB across the
+///   whole process;
 /// - transaction staging: the full 64 MiB engine ceiling;
 /// - index residency: whatever the constructor or pool policy selected
 ///   (`Resident` in practice);
@@ -27,6 +30,14 @@ pub struct RuntimeConfig {
     /// Decoded-node cache entries, applied independently to each collection.
     /// `0` disables the cache.
     pub cache_capacity: usize,
+    /// Process-wide budget, in bytes, for decoded node payloads across every
+    /// collection and pool opened by one database.
+    ///
+    /// Each collection keeps its own LRU, but admission draws from this shared
+    /// counter, so per-room collections cannot each fill their own cache.
+    /// `None` removes the byte bound (collection entry counts still apply);
+    /// `Some(0)` disables caching entirely.
+    pub cache_bytes: Option<usize>,
     /// Maximum charged payload one transaction may stage. Must be in
     /// `1..=MAX_TXN_STAGE_BYTES`.
     pub txn_stage_limit_bytes: usize,
@@ -52,6 +63,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             cache_capacity: DEFAULT_CACHE_CAPACITY,
+            cache_bytes: Some(DEFAULT_CACHE_BYTES),
             txn_stage_limit_bytes: MAX_TXN_STAGE_BYTES,
             index_residency: None,
             stats_enabled: false,
@@ -93,6 +105,15 @@ impl RuntimeConfig {
                     "MTXDB_CACHE_CAPACITY must be a non-negative integer, got {value:?}"
                 ))
             })?,
+        };
+
+        let cache_bytes = match lookup("MTXDB_CACHE_BYTES")? {
+            None => Some(DEFAULT_CACHE_BYTES),
+            Some(value) => Some(value.trim().parse::<usize>().map_err(|_| {
+                ConfigError::new(format!(
+                    "MTXDB_CACHE_BYTES must be a non-negative integer, got {value:?}"
+                ))
+            })?),
         };
 
         let txn_stage_limit_bytes = match lookup("MTXDB_TXN_STAGE_LIMIT_BYTES")? {
@@ -154,6 +175,7 @@ impl RuntimeConfig {
 
         Ok(Self {
             cache_capacity,
+            cache_bytes,
             txn_stage_limit_bytes,
             index_residency,
             stats_enabled,
@@ -274,6 +296,7 @@ mod tests {
         let parsed = config(&[]).unwrap();
         assert_eq!(parsed, RuntimeConfig::default());
         assert_eq!(parsed.cache_capacity, DEFAULT_CACHE_CAPACITY);
+        assert_eq!(parsed.cache_bytes, Some(DEFAULT_CACHE_BYTES));
         assert_eq!(parsed.txn_stage_limit_bytes, MAX_TXN_STAGE_BYTES);
         assert_eq!(parsed.index_residency, None);
         assert!(!parsed.stats_enabled);
@@ -283,12 +306,14 @@ mod tests {
     fn parses_the_supported_values() {
         let parsed = config(&[
             ("MTXDB_CACHE_CAPACITY", "0"),
+            ("MTXDB_CACHE_BYTES", "0"),
             ("MTXDB_TXN_STAGE_LIMIT_BYTES", "1048576"),
             ("MTXDB_INDEX_RESIDENCY", "Paged"),
             ("MTXDB_STATS", "yes"),
         ])
         .unwrap();
         assert_eq!(parsed.cache_capacity, 0);
+        assert_eq!(parsed.cache_bytes, Some(0));
         assert_eq!(parsed.txn_stage_limit_bytes, 1 << 20);
         assert_eq!(parsed.index_residency, Some(IndexResidency::Paged));
         assert!(parsed.stats_enabled);
@@ -297,6 +322,7 @@ mod tests {
     #[test]
     fn rejects_invalid_values_instead_of_falling_back() {
         assert!(config(&[("MTXDB_CACHE_CAPACITY", "lots")]).is_err());
+        assert!(config(&[("MTXDB_CACHE_BYTES", "lots")]).is_err());
         assert!(config(&[("MTXDB_TXN_STAGE_LIMIT_BYTES", "0")]).is_err());
         assert!(config(&[(
             "MTXDB_TXN_STAGE_LIMIT_BYTES",
