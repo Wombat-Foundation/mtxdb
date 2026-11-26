@@ -97,7 +97,7 @@ verbose_file_reads = "warn"
 path = "src/lib.rs"
 
 [features]
-default = ["zstd", "bitmaps", "state-lattice"]
+default = ["zstd"]
 # Record-payload compression. On by default, so stores keep writing and reading
 # zstd frames; disable (with `default-features = false`) for builds that must
 # not carry zstd. A build without it always
@@ -119,19 +119,10 @@ test-util = []
 # alternate CAS or version paths.
 multi-reader = []
 
-# Domain-tagged bitmap sets and Matrix auth-closure APIs. This remains
-# switchable for minimal builds, while staying enabled by default for
-# compatibility with the public graph and Matrix APIs.
-bitmaps = ["dep:rezzy-recon"]
-
 # MSC4521 set reconciliation over the persisted event population (owner log,
 # sorted runs, resident kernel): element hashing, kernels and the `Population`
-# trait come from `rezzy-recon`. Off by default; carries that dependency.
-reconcile = ["dep:rezzy-recon"]
-
-# MSC4500 content-addressed state lattice checkpoint/chain codec. On by
-# default; the accumulator comes from `rezzy-recon`.
-state-lattice = ["dep:rezzy-recon"]
+# trait come from `rezzy-recon`. Off by default.
+reconcile = []
 
 [dependencies]
 arc-swap = "1"
@@ -148,7 +139,7 @@ parking_lot = { version = "0.12", features = ["arc_lock"] }
 # The content-addressed HAMT (`mtxdb::hamt`) and the Matrix state layer on top
 # of it (`mtxdb::state_hamt`).
 rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev" }
-rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1", optional = true }
+rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1" }
 sha2 = "0.11"
 zstd = { version = "0.14", default-features = false, optional = true }
 

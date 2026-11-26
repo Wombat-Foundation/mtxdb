@@ -56,14 +56,12 @@
 
 /// Transitive auth closures: pure in-memory computation plus the persisted
 /// generation layer, both under `bitmaps`.
-#[cfg(feature = "bitmaps")]
 #[path = "matrix/auth_closure.rs"]
 pub mod auth_closure;
 /// Named application-owned lookup indexes sharing the normal packfile engine.
 #[path = "graph/auxiliary.rs"]
 pub mod auxiliary;
 /// Domain-tagged `u32` bitmap sets with generic set algebra.
-#[cfg(feature = "bitmaps")]
 #[path = "graph/bitmap_set.rs"]
 pub mod bitmap_set;
 /// Verify-once decoded-node cache with O(1) LRU eviction, plus a pinned-node set.
@@ -87,6 +85,9 @@ pub mod dag;
 /// Root-level handle that opens every pool behind one shared WAL fence.
 #[path = "engine/database.rs"]
 pub mod database;
+/// Ordinal-universe tag shared by bitmap sets and ordered indexes.
+#[path = "graph/domain_tag.rs"]
+pub mod domain_tag;
 /// Journaled write-ahead log of event edges, replayed into the CSR after a crash.
 #[path = "matrix/edge_log.rs"]
 pub mod edge_log;
@@ -120,7 +121,6 @@ mod io;
 #[path = "engine/journal.rs"]
 pub mod journal;
 /// Content-addressed state lattice checkpoint/chain codec.
-#[cfg(feature = "state-lattice")]
 #[path = "matrix/lattice.rs"]
 pub mod lattice;
 /// Database-root layout and named independent packfile pools.
@@ -146,11 +146,9 @@ pub mod population;
 #[path = "engine/record_class.rs"]
 pub mod record_class;
 /// Public façade and error surface over a room's auth closures.
-#[cfg(feature = "bitmaps")]
 #[path = "matrix/room_auth.rs"]
 pub mod room_auth;
 /// Room-scoped flag and disposition bitmap index.
-#[cfg(feature = "bitmaps")]
 #[path = "matrix/room_flag.rs"]
 pub mod room_flag;
 /// Rebuildable full-text and field secondary indexes.
@@ -184,10 +182,8 @@ pub mod template;
 #[path = "graph/timeline.rs"]
 pub mod timeline;
 
-#[cfg(all(test, feature = "bitmaps"))]
 #[path = "matrix/test_auth_closure.rs"]
 mod test_auth_closure;
-#[cfg(all(test, feature = "bitmaps"))]
 #[path = "graph/test_bitmap_set.rs"]
 mod test_bitmap_set;
 #[cfg(test)]
@@ -206,10 +202,8 @@ mod test_logical_head;
 #[cfg(feature = "reconcile")]
 #[path = "graph/test_population.rs"]
 mod test_population;
-#[cfg(all(test, feature = "bitmaps"))]
 #[path = "matrix/test_room_auth.rs"]
 mod test_room_auth;
-#[cfg(all(test, feature = "bitmaps"))]
 #[path = "matrix/test_room_flag.rs"]
 mod test_room_flag;
 #[cfg(test)]
@@ -224,13 +218,13 @@ mod test_short_id;
 pub use auxiliary::{
     auxiliary_collection_id, auxiliary_key_digest, AuxiliaryIndex, AuxiliaryKeyDigest,
 };
-#[cfg(feature = "bitmaps")]
-pub use bitmap_set::{BitmapSet, DomainTag, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
+pub use bitmap_set::{BitmapSet, BITMAP_SET_FORMAT_VERSION, BITMAP_SET_MAGIC};
 pub use cache::{LruCache, NodeCache};
 pub use config::{ConfigError, RuntimeConfig};
 pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
 };
+pub use domain_tag::DomainTag;
 pub use index::LossyIndex;
 pub use interop::{
     commit_state_batches, decode_import_marker, decode_server_key, decode_state_root_handle_v1,
@@ -277,7 +271,6 @@ pub use record_class::{Durability, OrderingPolicy, RecordClass, Retention};
 pub use rezzy::hamt;
 #[cfg(feature = "reconcile")]
 pub use rezzy_recon as recon;
-#[cfg(feature = "bitmaps")]
 pub use room_flag::{
     flag_chunk_node_id, Flag, FlagChange, FlagQuery, RoomFlagIndex, CHUNK_CAPACITY, FLAG_META_ID,
     FLAG_META_MAGIC, FLAG_META_VERSION,

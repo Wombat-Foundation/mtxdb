@@ -1069,7 +1069,6 @@ impl CsrAdjacency {
     ///
     /// # Errors
     /// Returns an error on a read failure or a corrupt segment.
-    #[cfg(feature = "bitmaps")]
     pub(crate) fn family_rows(
         &self,
         db: &Database,

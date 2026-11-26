@@ -23,8 +23,8 @@
 //! are not stable.
 //!
 //! Layout (all content-addressed, immutable except the head):
-//! - **leaf** (`TMLF`): up to [`TIMELINE_LEAF_CAP`] sorted entries;
-//! - **directory** (`TMLD`): up to [`TIMELINE_DIRECTORY_FANOUT`] leaf
+//! - **leaf** (`TMLF`): up to [`crate::timeline::TIMELINE_LEAF_CAP`] sorted entries;
+//! - **directory** (`TMLD`): up to [`crate::timeline::TIMELINE_DIRECTORY_FANOUT`] leaf
 //!   descriptors with minimum, maximum, and entry count;
 //! - **root** (`TMLR`): an ordered directory manifest plus total entry count;
 //! - **head** (`TMLH`): a fixed-id record holding the current root id, the only
@@ -40,8 +40,8 @@ use std::borrow::Cow;
 
 use bytes::Bytes;
 
-use crate::bitmap_set::DomainTag;
 use crate::database::{Database, DatabaseTransaction};
+use crate::domain_tag::DomainTag;
 use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{
