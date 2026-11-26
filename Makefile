@@ -88,8 +88,11 @@ MTXDB_TEST_ENV := $(if $(findstring -Z,$(MTXDB_TEST_ARGS)),RUSTC_BOOTSTRAP=1)
 # the code. Default it to tmpfs; set MTXDB_TEST_TMPDIR to a real path to run
 # the durability tests against actual storage. An empty value falls back to
 # the caller's TMPDIR, then /tmp, so `MTXDB_TEST_TMPDIR=` stays usable.
-MTXDB_TEST_TMPDIR ?=
+ifeq ($(origin MTXDB_TEST_TMPDIR),undefined)
+MTXDB_TEST_BASE := /tmp
+else
 MTXDB_TEST_BASE := $(or $(strip $(MTXDB_TEST_TMPDIR)),$(strip $(TMPDIR)),/tmp)
+endif
 
 .PHONY: test
 test: ##H Run library and workspace tests
