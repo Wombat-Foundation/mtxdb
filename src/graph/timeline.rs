@@ -52,9 +52,9 @@ use crate::template::{
 /// Version byte for timeline records and cursors.
 pub const TIMELINE_FORMAT_VERSION: u8 = 0x01;
 /// Maximum entries per leaf record.
-pub const TIMELINE_LEAF_CAP: usize = 128;
+pub const TIMELINE_LEAF_CAP: usize = 64;
 /// Maximum leaf descriptors per directory record.
-pub const TIMELINE_DIRECTORY_FANOUT: usize = 256;
+pub const TIMELINE_DIRECTORY_FANOUT: usize = 16;
 
 /// Magic prefix of a leaf record (`b"TMLF"`).
 pub const TIMELINE_LEAF_MAGIC: [u8; 4] = *b"TMLF";
@@ -93,13 +93,6 @@ const CURSOR_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 /// Order-preserving big-endian encoding of a signed position: flipping the
 /// sign bit makes byte order equal numeric order, so the wire key is
 /// byte-comparable.
-fn span_descriptor_len<K: OrderedKey>() -> Result<usize, StorageError> {
-    K::WIRE_LEN
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(8 + 16))
-        .ok_or_else(|| StorageError::Internal("ordered span length overflow".to_owned()))
-}
-
 fn validate_geometry<K: OrderedKey>() -> Result<(), StorageError> {
     if K::WIRE_LEN == 0 || K::LEAF_CAP == 0 || K::DIR_FANOUT < 2 {
         return Err(StorageError::Internal(
@@ -542,9 +535,14 @@ fn append_spans<K: OrderedKey>(
             ));
         }
         let mut leaves = Vec::new();
-        merge_and_stage_leaves(&[], entries, &mut leaves, inserted, |id, payload| {
-            io.write_leaf(id, payload)
-        })?;
+        merge_and_stage_leaves(
+            &[],
+            entries,
+            SplitMode::Tail,
+            &mut leaves,
+            inserted,
+            |id, payload| io.write_leaf(id, payload),
+        )?;
         return Ok(leaves);
     }
 
@@ -572,17 +570,7 @@ fn append_spans<K: OrderedKey>(
                 .is_some_and(|entry| *entry > span.max_entry);
             let leaf_cap = u64::try_from(K::LEAF_CAP).unwrap_or(u64::MAX);
             if span.entry_count == leaf_cap && (all_before || all_after) {
-                let mut added = Vec::new();
-                merge_and_stage_leaves(&[], incoming, &mut added, inserted, |id, payload| {
-                    io.write_leaf(id, payload)
-                })?;
-                if all_before {
-                    output.extend(added);
-                    output.push(*span);
-                } else {
-                    output.push(*span);
-                    output.extend(added);
-                }
+                stage_outside_full_leaf(span, incoming, all_before, &mut output, inserted, io)?;
                 continue;
             }
             let existing = io.load_leaf(span)?;
@@ -594,9 +582,15 @@ fn append_spans<K: OrderedKey>(
                 output.push(*span);
                 continue;
             }
-            merge_and_stage_leaves(&existing, incoming, &mut output, inserted, |id, payload| {
-                io.write_leaf(id, payload)
-            })?;
+            let mode = split_mode(spans, index, span, incoming);
+            merge_and_stage_leaves(
+                &existing,
+                incoming,
+                mode,
+                &mut output,
+                inserted,
+                |id, payload| io.write_leaf(id, payload),
+            )?;
         } else {
             let children = io.load_directory(span, level)?;
             validate_span_children(span, &children)?;
@@ -618,6 +612,35 @@ fn append_spans<K: OrderedKey>(
         }
     }
     Ok(output)
+}
+
+/// Stage the new leaves an insertion adds entirely before or after `span`,
+/// leaving the full existing span untouched.
+fn stage_outside_full_leaf<K: OrderedKey>(
+    span: &SpanDescriptor<K>,
+    incoming: &[K],
+    all_before: bool,
+    output: &mut Vec<SpanDescriptor<K>>,
+    inserted: &mut u64,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<(), StorageError> {
+    let mut added = Vec::new();
+    let mode = if all_before {
+        SplitMode::Front
+    } else {
+        SplitMode::Tail
+    };
+    merge_and_stage_leaves(&[], incoming, mode, &mut added, inserted, |id, payload| {
+        io.write_leaf(id, payload)
+    })?;
+    if all_before {
+        output.extend(added);
+        output.push(*span);
+    } else {
+        output.push(*span);
+        output.extend(added);
+    }
+    Ok(())
 }
 
 fn write_leaf_span<K: OrderedKey>(
@@ -1193,6 +1216,7 @@ fn content_id(payload: &[u8]) -> NodeId {
 fn merge_and_stage_leaves<K: OrderedKey>(
     existing: &[K],
     incoming: &[K],
+    mode: SplitMode,
     manifest: &mut Vec<LeafDescriptor<K>>,
     inserted: &mut u64,
     mut stage_record: impl FnMut(NodeId, Vec<u8>) -> Result<(), StorageError>,
@@ -1226,7 +1250,37 @@ fn merge_and_stage_leaves<K: OrderedKey>(
         merged.push(entry);
     }
 
-    for chunk in merged.chunks(K::LEAF_CAP) {
+    let ranges = match mode {
+        SplitMode::Tail | SplitMode::Front => {
+            let remainder = merged.len().checked_rem(K::LEAF_CAP).ok_or_else(|| {
+                StorageError::Internal("ordered leaf capacity is zero".to_owned())
+            })?;
+            let first_size = match mode {
+                SplitMode::Tail => K::LEAF_CAP.min(merged.len()),
+                SplitMode::Front if remainder == 0 => K::LEAF_CAP,
+                SplitMode::Front => remainder,
+                SplitMode::Interior => unreachable!(),
+            };
+            let mut ranges = Vec::with_capacity(merged.len().div_ceil(K::LEAF_CAP));
+            let mut start = 0_usize;
+            while start < merged.len() {
+                let size = if start == 0 {
+                    first_size
+                } else {
+                    K::LEAF_CAP.min(merged.len().saturating_sub(start))
+                };
+                let end = start.checked_add(size).ok_or_else(|| {
+                    StorageError::Internal("ordered leaf range overflow".to_owned())
+                })?;
+                ranges.push(start..end);
+                start = end;
+            }
+            ranges
+        }
+        SplitMode::Interior => balanced_chunk_ranges(merged.len(), K::LEAF_CAP)?,
+    };
+    for range in ranges {
+        let chunk = &merged[range];
         let payload = encode_leaf::<K>(chunk)?;
         let id = content_id(&payload);
         let first = *chunk
@@ -2366,21 +2420,99 @@ fn reverse_leaf_start<K: OrderedKey>(
     }
 }
 
+/// Encode `key`'s raw wire bytes.
+fn wire_bytes<K: OrderedKey>(key: &K) -> Result<Vec<u8>, StorageError> {
+    let mut bytes = Vec::with_capacity(K::WIRE_LEN);
+    key.encode_into(&mut bytes);
+    if bytes.len() != K::WIRE_LEN {
+        return Err(StorageError::Corrupt(
+            "ordered key wire length mismatch".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Write one key front-coded against `previous`: a one-byte shared-prefix
+/// length followed by the remaining suffix. Returns the key's wire bytes.
+fn encode_front_coded_key<K: OrderedKey>(
+    key: &K,
+    previous: Option<&[u8]>,
+    out: &mut Vec<u8>,
+) -> Result<Vec<u8>, StorageError> {
+    let bytes = wire_bytes(key)?;
+    let shared = previous
+        .filter(|previous| previous.len() == K::WIRE_LEN)
+        .map_or(0, |previous| {
+            previous
+                .iter()
+                .zip(bytes.iter())
+                .take_while(|(left, right)| left == right)
+                .count()
+                .min(usize::from(u8::MAX))
+        });
+    out.push(u8::try_from(shared).unwrap_or(u8::MAX));
+    out.extend_from_slice(&bytes[shared..]);
+    Ok(bytes)
+}
+
+/// Read one front-coded key, reconstructing it from `previous`.
+fn decode_front_coded_key<K: OrderedKey>(
+    bytes: &[u8],
+    offset: &mut usize,
+    previous: Option<&[u8]>,
+) -> Result<(K, Vec<u8>), StorageError> {
+    let shared = usize::from(
+        *bytes
+            .get(*offset)
+            .ok_or_else(|| StorageError::Corrupt("ordered shared prefix".to_owned()))?,
+    );
+    *offset = offset
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Corrupt("ordered key offset".to_owned()))?;
+    let previous = match previous {
+        Some(previous) if previous.len() == K::WIRE_LEN => Some(previous),
+        _ => None,
+    };
+    if shared > K::WIRE_LEN || (shared > 0 && previous.is_none()) {
+        return Err(StorageError::Corrupt(
+            "ordered shared prefix out of range".to_owned(),
+        ));
+    }
+    let suffix_len = K::WIRE_LEN.saturating_sub(shared);
+    let end = offset
+        .checked_add(suffix_len)
+        .ok_or_else(|| StorageError::Corrupt("ordered key offset".to_owned()))?;
+    let suffix = bytes
+        .get(*offset..end)
+        .ok_or_else(|| StorageError::Corrupt("ordered key suffix".to_owned()))?;
+    let mut wire = vec![0u8; K::WIRE_LEN];
+    if shared > 0 {
+        let previous = previous
+            .ok_or_else(|| StorageError::Corrupt("ordered shared prefix has no base".to_owned()))?;
+        wire[..shared].copy_from_slice(&previous[..shared]);
+    }
+    wire[shared..].copy_from_slice(suffix);
+    *offset = end;
+    Ok((K::decode(&wire)?, wire))
+}
+
 fn encode_leaf<K: OrderedKey>(entries: &[K]) -> Result<Vec<u8>, StorageError> {
     validate_geometry::<K>()?;
     let count = u16::try_from(entries.len())
         .map_err(|_| StorageError::Internal("ordered leaf exceeds u16 entries".to_owned()))?;
     let capacity = entries
         .len()
-        .checked_mul(K::WIRE_LEN)
+        .checked_mul(K::WIRE_LEN.saturating_add(1))
         .and_then(|len| len.checked_add(LEAF_HEADER_LEN))
         .ok_or_else(|| StorageError::Internal("ordered leaf length overflow".to_owned()))?;
     let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&TIMELINE_LEAF_MAGIC);
     out.push(LEAF_FORMAT_VERSION);
     out.extend_from_slice(&count.to_be_bytes());
+    let mut previous = None;
     for entry in entries {
-        entry.encode_into(&mut out);
+        let encoded = encode_front_coded_key(entry, previous.as_deref(), &mut out)?;
+        previous = Some(encoded);
     }
     Ok(out)
 }
@@ -2393,24 +2525,25 @@ fn decode_leaf<K: OrderedKey>(bytes: &[u8]) -> Result<Vec<K>, StorageError> {
     {
         return Err(StorageError::Corrupt("timeline leaf header".to_owned()));
     }
-    let count = u16::from_be_bytes([bytes[5], bytes[6]]) as usize;
-    let expected = count
-        .checked_mul(K::WIRE_LEN)
-        .and_then(|body| body.checked_add(LEAF_HEADER_LEN))
-        .ok_or_else(|| StorageError::Corrupt("timeline leaf length".to_owned()))?;
-    if bytes.len() != expected {
-        return Err(StorageError::Corrupt("timeline leaf length".to_owned()));
+    let count = usize::from(u16::from_be_bytes([bytes[5], bytes[6]]));
+    if count == 0 || count > K::LEAF_CAP {
+        return Err(StorageError::Corrupt(
+            "timeline leaf occupancy out of range".to_owned(),
+        ));
     }
     let mut entries = Vec::with_capacity(count);
-    for index in 0..count {
-        let start = index
-            .checked_mul(K::WIRE_LEN)
-            .and_then(|offset| offset.checked_add(LEAF_HEADER_LEN))
-            .ok_or_else(|| StorageError::Corrupt("timeline leaf offset".to_owned()))?;
-        let end = start
-            .checked_add(K::WIRE_LEN)
-            .ok_or_else(|| StorageError::Corrupt("timeline leaf offset".to_owned()))?;
-        entries.push(K::decode(&bytes[start..end])?);
+    let mut offset = LEAF_HEADER_LEN;
+    let mut previous = None;
+    for _ in 0..count {
+        let (entry, encoded) =
+            decode_front_coded_key::<K>(bytes, &mut offset, previous.as_deref())?;
+        entries.push(entry);
+        previous = Some(encoded);
+    }
+    if offset != bytes.len() {
+        return Err(StorageError::Corrupt(
+            "timeline leaf trailing bytes".to_owned(),
+        ));
     }
     Ok(entries)
 }
@@ -2427,19 +2560,14 @@ fn encode_directory<K: OrderedKey>(
     }
     let span_count = u16::try_from(spans.len())
         .map_err(|_| StorageError::Internal("timeline directory exceeds u16 spans".to_owned()))?;
-    let descriptor_len = span_descriptor_len::<K>()?;
-    let capacity = spans
-        .len()
-        .checked_mul(descriptor_len)
-        .and_then(|len| len.checked_add(DIRECTORY_HEADER_LEN))
-        .ok_or_else(|| StorageError::Internal("ordered directory length overflow".to_owned()))?;
-    let mut out = Vec::with_capacity(capacity);
+    let mut out = Vec::new();
     out.extend_from_slice(&TIMELINE_DIRECTORY_MAGIC);
     out.push(DIRECTORY_FORMAT_VERSION);
     out.push(level);
     out.extend_from_slice(&span_count.to_be_bytes());
+    let mut previous_max = None;
     for span in spans {
-        encode_span(span, &mut out);
+        previous_max = Some(encode_span(span, previous_max.as_deref(), &mut out)?);
     }
     Ok(out)
 }
@@ -2462,73 +2590,84 @@ fn decode_directory<K: OrderedKey>(
         return Err(StorageError::Corrupt("timeline directory level".to_owned()));
     }
     let span_count = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
-    let descriptor_len = span_descriptor_len::<K>()?;
-    let expected = span_count
-        .checked_mul(descriptor_len)
-        .and_then(|body| body.checked_add(DIRECTORY_HEADER_LEN))
-        .ok_or_else(|| StorageError::Corrupt("timeline directory length".to_owned()))?;
-    if span_count == 0 || span_count > K::DIR_FANOUT || bytes.len() != expected {
+    if span_count == 0 || span_count > K::DIR_FANOUT {
         return Err(StorageError::Corrupt(
             "timeline directory length or occupancy".to_owned(),
         ));
     }
-    let body = bytes
-        .get(DIRECTORY_HEADER_LEN..)
-        .ok_or_else(|| StorageError::Corrupt("timeline directory body".to_owned()))?;
-    let mut chunks = body.chunks_exact(descriptor_len);
-    if !chunks.remainder().is_empty() {
-        return Err(StorageError::Corrupt(
-            "timeline directory trailing bytes".to_owned(),
-        ));
-    }
     let mut spans = Vec::with_capacity(span_count);
-    let mut previous_max = None;
-    for chunk in &mut chunks {
-        let span = decode_span(chunk)?;
+    let mut previous_max_encoded = None;
+    let mut previous_max_entry = None;
+    let mut offset = DIRECTORY_HEADER_LEN;
+    for _ in 0..span_count {
+        let (span, encoded_max) =
+            decode_span::<K>(bytes, &mut offset, previous_max_encoded.as_deref())?;
         if span.min_entry > span.max_entry
             || span.entry_count == 0
-            || previous_max.is_some_and(|previous| previous >= span.min_entry)
+            || previous_max_entry.is_some_and(|previous| previous >= span.min_entry)
         {
             return Err(StorageError::Corrupt(
                 "timeline directory span bounds or count".to_owned(),
             ));
         }
-        previous_max = Some(span.max_entry);
+        previous_max_entry = Some(span.max_entry);
+        previous_max_encoded = Some(encoded_max);
         spans.push(span);
+    }
+    if offset != bytes.len() {
+        return Err(StorageError::Corrupt(
+            "timeline directory trailing bytes".to_owned(),
+        ));
     }
     Ok(spans)
 }
 
-fn encode_span<K: OrderedKey>(span: &SpanDescriptor<K>, out: &mut Vec<u8>) {
-    span.min_entry.encode_into(out);
-    span.max_entry.encode_into(out);
+fn encode_span<K: OrderedKey>(
+    span: &SpanDescriptor<K>,
+    previous_max: Option<&[u8]>,
+    out: &mut Vec<u8>,
+) -> Result<Vec<u8>, StorageError> {
+    let encoded_min = encode_front_coded_key(&span.min_entry, previous_max, out)?;
+    let encoded_max = encode_front_coded_key(&span.max_entry, Some(&encoded_min), out)?;
     out.extend_from_slice(&span.entry_count.to_be_bytes());
     out.extend_from_slice(&span.child_id);
+    Ok(encoded_max)
 }
 
-fn decode_span<K: OrderedKey>(bytes: &[u8]) -> Result<SpanDescriptor<K>, StorageError> {
-    if bytes.len() != span_descriptor_len::<K>()? {
-        return Err(StorageError::Corrupt("timeline span length".to_owned()));
-    }
-    let (min_bytes, rest) = bytes
-        .split_at_checked(K::WIRE_LEN)
-        .ok_or_else(|| StorageError::Corrupt("timeline span min bound".to_owned()))?;
-    let (max_bytes, rest) = rest
-        .split_at_checked(K::WIRE_LEN)
-        .ok_or_else(|| StorageError::Corrupt("timeline span max bound".to_owned()))?;
-    let (count_bytes, child_bytes) = rest
-        .split_at_checked(8)
+fn decode_span<K: OrderedKey>(
+    bytes: &[u8],
+    offset: &mut usize,
+    previous_max: Option<&[u8]>,
+) -> Result<(SpanDescriptor<K>, Vec<u8>), StorageError> {
+    let (min_entry, encoded_min) = decode_front_coded_key::<K>(bytes, offset, previous_max)?;
+    let (max_entry, encoded_max) = decode_front_coded_key::<K>(bytes, offset, Some(&encoded_min))?;
+    let count_end = offset
+        .checked_add(8)
+        .ok_or_else(|| StorageError::Corrupt("timeline span count offset".to_owned()))?;
+    let count_bytes = bytes
+        .get(*offset..count_end)
         .ok_or_else(|| StorageError::Corrupt("timeline span count".to_owned()))?;
-    Ok(SpanDescriptor {
-        min_entry: K::decode(min_bytes)?,
-        max_entry: K::decode(max_bytes)?,
-        entry_count: u64::from_be_bytes(
-            <[u8; 8]>::try_from(count_bytes)
-                .map_err(|_| StorageError::Corrupt("timeline span count".to_owned()))?,
-        ),
-        child_id: <[u8; 16]>::try_from(child_bytes)
-            .map_err(|_| StorageError::Corrupt("timeline span child".to_owned()))?,
-    })
+    *offset = count_end;
+    let child_end = offset
+        .checked_add(16)
+        .ok_or_else(|| StorageError::Corrupt("timeline span child offset".to_owned()))?;
+    let child_bytes = bytes
+        .get(*offset..child_end)
+        .ok_or_else(|| StorageError::Corrupt("timeline span child".to_owned()))?;
+    *offset = child_end;
+    Ok((
+        SpanDescriptor {
+            min_entry,
+            max_entry,
+            entry_count: u64::from_be_bytes(
+                <[u8; 8]>::try_from(count_bytes)
+                    .map_err(|_| StorageError::Corrupt("timeline span count".to_owned()))?,
+            ),
+            child_id: <[u8; 16]>::try_from(child_bytes)
+                .map_err(|_| StorageError::Corrupt("timeline span child".to_owned()))?,
+        },
+        encoded_max,
+    ))
 }
 fn encode_root<K: OrderedKey>(
     directories: &[DirectoryDescriptor<K>],
@@ -2537,7 +2676,6 @@ fn encode_root<K: OrderedKey>(
     domain: DomainTag,
 ) -> Result<Vec<u8>, StorageError> {
     validate_geometry::<K>()?;
-    let descriptor_len = span_descriptor_len::<K>()?;
     let directory_count = u32::try_from(directories.len())
         .map_err(|_| StorageError::Internal("timeline root exceeds u32 directories".to_owned()))?;
     let counted = directories.iter().try_fold(0u64, |sum, directory| {
@@ -2549,12 +2687,12 @@ fn encode_root<K: OrderedKey>(
             "timeline root/directory count mismatch".to_owned(),
         ));
     }
-    let capacity = directories
-        .len()
-        .checked_mul(descriptor_len)
-        .and_then(|len| len.checked_add(ROOT_HEADER_LEN))
-        .ok_or_else(|| StorageError::Internal("ordered root length overflow".to_owned()))?;
-    let mut out = Vec::with_capacity(capacity);
+    if directories.len() > K::DIR_FANOUT {
+        return Err(StorageError::Internal(
+            "timeline root directory occupancy out of range".to_owned(),
+        ));
+    }
+    let mut out = Vec::new();
     out.extend_from_slice(&TIMELINE_ROOT_MAGIC);
     out.push(ROOT_FORMAT_VERSION);
     out.push(height);
@@ -2572,8 +2710,9 @@ fn encode_root<K: OrderedKey>(
     );
     out.extend_from_slice(&count.to_be_bytes());
     out.extend_from_slice(&directory_count.to_be_bytes());
+    let mut previous_max = None;
     for directory in directories {
-        encode_span(directory, &mut out);
+        previous_max = Some(encode_span(directory, previous_max.as_deref(), &mut out)?);
     }
     Ok(out)
 }
@@ -2629,6 +2768,11 @@ fn decode_root_header<K: OrderedKey>(
         bytes[42], bytes[43], bytes[44], bytes[45],
     ]))
     .map_err(|_| StorageError::Corrupt("ordered root directory count".to_owned()))?;
+    if directory_count > K::DIR_FANOUT {
+        return Err(StorageError::Corrupt(
+            "ordered root directory occupancy".to_owned(),
+        ));
+    }
     Ok((height, domain, entry_count, directory_count))
 }
 
@@ -2637,21 +2781,17 @@ fn decode_root_spans<K: OrderedKey>(
     descriptor_count: usize,
     expected_count: u64,
 ) -> Result<Vec<DirectoryDescriptor<K>>, StorageError> {
-    let descriptor_len = span_descriptor_len::<K>()?;
-    let mut chunks = body.chunks_exact(descriptor_len);
-    if !chunks.remainder().is_empty() || chunks.len() != descriptor_count {
-        return Err(StorageError::Corrupt(
-            "timeline root trailing bytes".to_owned(),
-        ));
-    }
     let mut directories: Vec<DirectoryDescriptor<K>> = Vec::with_capacity(descriptor_count);
-    let mut previous_max = None;
+    let mut previous_max_encoded = None;
+    let mut previous_max_entry = None;
     let mut counted = 0_u64;
-    for chunk in &mut chunks {
-        let descriptor = decode_span::<K>(chunk)?;
+    let mut offset = 0_usize;
+    for _ in 0..descriptor_count {
+        let (descriptor, encoded_max) =
+            decode_span::<K>(body, &mut offset, previous_max_encoded.as_deref())?;
         if descriptor.min_entry > descriptor.max_entry
             || descriptor.entry_count == 0
-            || previous_max.is_some_and(|previous| previous >= descriptor.min_entry)
+            || previous_max_entry.is_some_and(|previous| previous >= descriptor.min_entry)
         {
             return Err(StorageError::Corrupt(
                 "timeline root directory bounds or count".to_owned(),
@@ -2660,8 +2800,14 @@ fn decode_root_spans<K: OrderedKey>(
         counted = counted
             .checked_add(descriptor.entry_count)
             .ok_or_else(|| StorageError::Corrupt("timeline root count overflow".to_owned()))?;
-        previous_max = Some(descriptor.max_entry);
+        previous_max_entry = Some(descriptor.max_entry);
+        previous_max_encoded = Some(encoded_max);
         directories.push(descriptor);
+    }
+    if offset != body.len() {
+        return Err(StorageError::Corrupt(
+            "timeline root trailing bytes".to_owned(),
+        ));
     }
     if counted != expected_count || (expected_count == 0) != directories.is_empty() {
         return Err(StorageError::Corrupt(
@@ -2675,14 +2821,9 @@ fn decode_root<K: OrderedKey>(
     bytes: &[u8],
     expected_domain: DomainTag,
 ) -> Result<TimelineRoot<K>, StorageError> {
-    let descriptor_len = span_descriptor_len::<K>()?;
     let (height, domain, entry_count, directory_count) =
         decode_root_header::<K>(bytes, expected_domain)?;
-    let expected = directory_count
-        .checked_mul(descriptor_len)
-        .and_then(|body| body.checked_add(ROOT_HEADER_LEN))
-        .ok_or_else(|| StorageError::Corrupt("timeline root length".to_owned()))?;
-    if bytes.len() != expected {
+    if directory_count > bytes.len() {
         return Err(StorageError::Corrupt("timeline root length".to_owned()));
     }
     let body = bytes

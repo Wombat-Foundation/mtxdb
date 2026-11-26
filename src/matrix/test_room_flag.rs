@@ -415,13 +415,7 @@ mod tests {
             &[],
             &topo_index,
             &stream_index,
-            &[EventTimelineEntry::new(
-                room_scope,
-                1,
-                1,
-                node1,
-                crate::interop::event_id_ref(ev1),
-            )],
+            &[EventTimelineEntry::new(room_scope, 1, 1, node1)],
         )
         .unwrap();
         timeline_tx.commit().unwrap();

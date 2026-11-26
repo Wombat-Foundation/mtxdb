@@ -334,6 +334,40 @@ fn append_routes_gap_entries_to_the_room_or_nonfull_leaf() {
 }
 
 #[test]
+fn interior_leaf_split_balances_mixed_room_entries() {
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "balanced_mixed_room_leaf");
+    let initial: Vec<_> = (0_u8..64)
+        .map(|seed| {
+            let room = [seed % 10; 16];
+            let order = i64::from(seed / 10).saturating_mul(10);
+            entry(room, order, seed)
+        })
+        .collect();
+    index.build(&initial).unwrap();
+
+    let middle_room = [5; 16];
+    let inserted: Vec<_> = (0_u8..9)
+        .map(|offset| entry(middle_room, i64::from(offset + 1), 64 + offset))
+        .collect();
+    index.append_untransactional(&inserted).unwrap();
+
+    let (root_id, count) = index.head().unwrap().unwrap();
+    assert_eq!(count, 73);
+    let root_bytes = engine
+        .get(&index.collection_id(), &root_id)
+        .unwrap()
+        .unwrap();
+    let root = decode_root::<ScopedSeqKey>(&root_bytes.bytes, index.domain()).unwrap();
+    let leaf_counts: Vec<_> = root
+        .directories
+        .iter()
+        .map(|leaf| leaf.entry_count)
+        .collect();
+    assert_eq!(leaf_counts, [37, 36]);
+}
+
+#[test]
 fn backfill_into_next_room_routes_across_a_directory_gap() {
     let room_a = [10; 16];
     let room_b = [11; 16];

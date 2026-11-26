@@ -12,13 +12,12 @@ use crate::timeline::{OrderedCursor, OrderedIndex, OrderedKey, OrderedPage, Scop
 
 /// Stable logical name shared by both event-order key schemas.
 pub const EVENT_TIMELINE_INDEX_NAME: &str = "event-timeline-v1";
-const EVENT_KEY_WIRE_LEN: usize = 16 + 8 + 8 + 16 + 32;
-type DecodedEventKey = ([u8; 16], i64, i64, NodeId, [u8; 32]);
+const EVENT_KEY_WIRE_LEN: usize = 16 + 8 + 8 + 16;
+type DecodedEventKey = ([u8; 16], i64, i64, NodeId);
 type TimelineMutationRoots = ((NodeId, u64), (NodeId, u64));
 const EVENT_TOPO_SCHEMA: [u8; 4] = *b"ETOP";
 const EVENT_STREAM_SCHEMA: [u8; 4] = *b"ESTR";
 const MAX_NODE_ID: NodeId = [0xff; 16];
-const MAX_EVENT_TAG: [u8; 32] = [0xff; 32];
 
 /// Matrix event ordering and identity in domain terminology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +30,6 @@ pub struct EventTimelineEntry {
     pub stream_ordering: i64,
     /// Stored event node identifier.
     pub event_node_id: NodeId,
-    /// Stable logical event reference, unchanged by payload redaction.
-    pub event_ref: [u8; 32],
 }
 
 impl EventTimelineEntry {
@@ -43,14 +40,12 @@ impl EventTimelineEntry {
         topological_ordering: i64,
         stream_ordering: i64,
         event_node_id: NodeId,
-        event_ref: [u8; 32],
     ) -> Self {
         Self {
             room_scope,
             topological_ordering,
             stream_ordering,
             event_node_id,
-            event_ref,
         }
     }
 
@@ -62,7 +57,6 @@ impl EventTimelineEntry {
             topological_ordering: self.topological_ordering,
             stream_ordering: self.stream_ordering,
             event_node_id: self.event_node_id,
-            event_ref: self.event_ref,
         }
     }
 
@@ -74,18 +68,17 @@ impl EventTimelineEntry {
             stream_ordering: self.stream_ordering,
             topological_ordering: self.topological_ordering,
             event_node_id: self.event_node_id,
-            event_ref: self.event_ref,
         }
     }
 }
 
 impl From<ScopedSeqKey> for EventTimelineEntry {
     fn from(key: ScopedSeqKey) -> Self {
-        Self::new(key.scope, key.primary, key.secondary, key.id, key.tag)
+        Self::new(key.scope, key.primary, key.secondary, key.id)
     }
 }
 
-/// `(room, topological ordering, stream ordering, node id, event ref)` key.
+/// `(room, topological ordering, stream ordering, node id)` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventTopoKey {
     /// Leading room scope.
@@ -96,8 +89,6 @@ pub struct EventTopoKey {
     pub stream_ordering: i64,
     /// Event record node id.
     pub event_node_id: NodeId,
-    /// Stable event reference.
-    pub event_ref: [u8; 32],
 }
 
 impl OrderedKey for EventTopoKey {
@@ -117,23 +108,21 @@ impl OrderedKey for EventTopoKey {
             self.topological_ordering,
             self.stream_ordering,
             self.event_node_id,
-            self.event_ref,
         );
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let (room_scope, primary, secondary, event_node_id, event_ref) = decode_event_key(bytes)?;
+        let (room_scope, primary, secondary, event_node_id) = decode_event_key(bytes)?;
         Ok(Self {
             room_scope,
             topological_ordering: primary,
             stream_ordering: secondary,
             event_node_id,
-            event_ref,
         })
     }
 }
 
-/// `(room, stream ordering, topological ordering, node id, event ref)` key.
+/// `(room, stream ordering, topological ordering, node id)` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventStreamKey {
     /// Leading room scope.
@@ -144,8 +133,6 @@ pub struct EventStreamKey {
     pub topological_ordering: i64,
     /// Event record node id.
     pub event_node_id: NodeId,
-    /// Stable event reference.
-    pub event_ref: [u8; 32],
 }
 
 impl OrderedKey for EventStreamKey {
@@ -165,19 +152,17 @@ impl OrderedKey for EventStreamKey {
             self.stream_ordering,
             self.topological_ordering,
             self.event_node_id,
-            self.event_ref,
         );
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let (room_scope, stream_ordering, topological_ordering, event_node_id, event_ref) =
+        let (room_scope, stream_ordering, topological_ordering, event_node_id) =
             decode_event_key(bytes)?;
         Ok(Self {
             room_scope,
             stream_ordering,
             topological_ordering,
             event_node_id,
-            event_ref,
         })
     }
 }
@@ -455,7 +440,6 @@ fn max_stream_key(room_scope: [u8; 16], persisted_up_to: i64) -> EventStreamKey 
         stream_ordering: persisted_up_to,
         topological_ordering: i64::MAX,
         event_node_id: MAX_NODE_ID,
-        event_ref: MAX_EVENT_TAG,
     }
 }
 
@@ -465,13 +449,11 @@ fn encode_event_key(
     primary: i64,
     secondary: i64,
     event_node_id: NodeId,
-    event_ref: [u8; 32],
 ) {
     out.extend_from_slice(&room_scope);
     out.extend_from_slice(&encode_i64(primary));
     out.extend_from_slice(&encode_i64(secondary));
     out.extend_from_slice(&event_node_id);
-    out.extend_from_slice(&event_ref);
 }
 
 fn decode_event_key(bytes: &[u8]) -> Result<DecodedEventKey, StorageError> {
@@ -484,9 +466,7 @@ fn decode_event_key(bytes: &[u8]) -> Result<DecodedEventKey, StorageError> {
     let secondary = decode_i64(&bytes[24..32])?;
     let mut event_node_id = [0; 16];
     event_node_id.copy_from_slice(&bytes[32..48]);
-    let mut event_ref = [0; 32];
-    event_ref.copy_from_slice(&bytes[48..80]);
-    Ok((room_scope, primary, secondary, event_node_id, event_ref))
+    Ok((room_scope, primary, secondary, event_node_id))
 }
 
 fn encode_i64(value: i64) -> [u8; 8] {

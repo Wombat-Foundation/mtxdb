@@ -75,13 +75,6 @@ fn node_id(sequence: u64) -> NodeId {
     id
 }
 
-fn event_ref(node: NodeId) -> [u8; 32] {
-    let mut reference = [0u8; 32];
-    reference[..16].copy_from_slice(&node);
-    reference[16..].copy_from_slice(&node);
-    reference
-}
-
 fn payload(sequence: u64, len: usize) -> Bytes {
     const TEXT_SPAN: &[u8] = b"\"type\":\"m.room.message\",\"content\":{\"body\":\"hello world\"},";
     let mut bytes = vec![0u8; len];
@@ -754,13 +747,7 @@ fn write_synthetic(
                 let topo = stream
                     .saturating_add(i64::from(room.scope[0]).saturating_mul(1_000_000))
                     .saturating_sub(if sequence.is_multiple_of(20) { 7 } else { 0 });
-                entries.push(EventTimelineEntry::new(
-                    room.scope,
-                    topo,
-                    stream,
-                    node,
-                    event_ref(node),
-                ));
+                entries.push(EventTimelineEntry::new(room.scope, topo, stream, node));
                 payloads.push((node, NodeData::new(payload(sequence, len))));
             }
             completed[room_index] = done.saturating_add(take);
@@ -823,7 +810,6 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
                     event.topo,
                     event.stream,
                     node,
-                    event_ref(node),
                 ));
                 payloads.push((node, NodeData::new(payload(sequence, event.bytes))));
             }
@@ -1254,7 +1240,6 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min
             i64::try_from(sequence).unwrap_or(i64::MAX),
             i64::try_from(sequence).unwrap_or(i64::MAX),
             node,
-            event_ref(node),
         );
         promotions.push((entry, node));
     }
@@ -1296,7 +1281,6 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min
                 key.topological_ordering,
                 key.stream_ordering,
                 key.event_node_id,
-                key.event_ref,
             )
         })
         .collect();

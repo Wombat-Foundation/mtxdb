@@ -2438,13 +2438,11 @@ pub(crate) fn write_room_with_resolved_findings(
         if let Some((topological_ordering, stream_ordering)) =
             timeline_orderings(export, event, rejected)
         {
-            let event_ref = mtxdb::event_id_ref(event_id);
             batch_timeline_entries.push(mtxdb::ordered_timeline::EventTimelineEntry::new(
                 room_scope,
                 topological_ordering,
                 stream_ordering,
                 record,
-                event_ref,
             ));
         }
 

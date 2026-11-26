@@ -16,13 +16,13 @@ fn test_dir(name: &str) -> PathBuf {
 fn event(room: [u8; 16], depth: i64, stream: i64, id: u8) -> EventTimelineEntry {
     let mut node_id = [0; 16];
     node_id[15] = id;
-    let mut event_ref = [0; 32];
-    event_ref[31] = id;
-    EventTimelineEntry::new(room, depth, stream, node_id, event_ref)
+    EventTimelineEntry::new(room, depth, stream, node_id)
 }
 
 #[test]
 fn event_key_orders_match_their_memcomparable_encodings() {
+    assert_eq!(EventTopoKey::WIRE_LEN, 48);
+    assert_eq!(EventStreamKey::WIRE_LEN, 48);
     let entries = [
         event([1; 16], -4, 11, 1),
         event([1; 16], -4, -2, 2),
@@ -36,6 +36,7 @@ fn event_key_orders_match_their_memcomparable_encodings() {
         let mut topo_right_wire = Vec::new();
         topo_left.encode_into(&mut topo_left_wire);
         topo_right.encode_into(&mut topo_right_wire);
+        assert_eq!(EventTopoKey::decode(&topo_left_wire).unwrap(), topo_left);
         assert_eq!(
             topo_left.cmp(&topo_right),
             topo_left_wire.cmp(&topo_right_wire)
@@ -47,6 +48,10 @@ fn event_key_orders_match_their_memcomparable_encodings() {
         let mut stream_right_wire = Vec::new();
         stream_left.encode_into(&mut stream_left_wire);
         stream_right.encode_into(&mut stream_right_wire);
+        assert_eq!(
+            EventStreamKey::decode(&stream_left_wire).unwrap(),
+            stream_left
+        );
         assert_eq!(
             stream_left.cmp(&stream_right),
             stream_left_wire.cmp(&stream_right_wire)
@@ -72,7 +77,7 @@ fn dual_index_batch_is_atomic_and_watermark_pages_resume_without_skips() {
         .map(|entry| {
             (
                 entry.event_node_id,
-                NodeData::new(Bytes::from(vec![entry.event_ref[31]])),
+                NodeData::new(Bytes::from(vec![entry.event_node_id[15]])),
             )
         })
         .collect();
