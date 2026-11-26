@@ -1850,11 +1850,10 @@ fn test_cache_hit() {
 
     store.put(&TEST_COLLECTION, &id, &data).unwrap();
 
-    // Writes invalidate rather than admit; a read still hits whatever the
-    // swizzled path cached.
+    // Writes populate the decoded cache under the shared byte budget, so a
+    // repeated read is a hit.
     let gen = store.generation(&TEST_COLLECTION).unwrap();
-    assert_eq!(gen.cache.len(), 0);
-    gen.cache.insert(id, Arc::new(data));
+    assert_eq!(gen.cache.len(), 1);
 
     let _ = store.get(&TEST_COLLECTION, &id).unwrap();
     assert_eq!(gen.cache.hits(), 1);
@@ -4231,11 +4230,9 @@ fn test_swizzle_callback() {
 
     if let Some(gen) = store.generation(&TEST_COLLECTION) {
         gen.cache.clear();
-        // Writes no longer admit, so seed the children the swizzle lookup
-        // should find.
-        gen.cache.insert(child_a, Arc::new(data_a));
-        gen.cache.insert(child_b, Arc::new(data_b));
     }
+    store.put(&TEST_COLLECTION, &child_a, &data_a).unwrap();
+    store.put(&TEST_COLLECTION, &child_b, &data_b).unwrap();
 
     let extract = |_data: &NodeData| -> Vec<NodeId> { vec![child_a, child_b] };
 
@@ -5847,9 +5844,6 @@ fn test_delete_collection_preserves_other_collection_cache() {
     assert!(store.get(&collection_b, &id_b).unwrap().is_some());
 
     let gen_b_before = store.generation(&collection_b).unwrap();
-    // Writes invalidate rather than admit, so seed B's cache directly; the
-    // hit count below then proves deleting A left B's cache intact.
-    gen_b_before.cache.insert(id_b, Arc::new(data_b));
     let hits_b_before = gen_b_before.cache.hits();
 
     store.delete_collection(&collection_a).unwrap();
