@@ -404,6 +404,13 @@ pub trait StorageEngine: Send + Sync {
     /// Returns [`StorageError::Io`] on I/O failure.
     fn collection_len(&self, collection_id: &[u8; 16]) -> Result<Option<usize>, StorageError>;
 
+    /// Return live record IDs without materializing their payloads.
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot enumerate a consistent
+    /// collection snapshot.
+    fn collection_record_ids(&self, collection_id: &[u8; 16]) -> Result<Vec<NodeId>, StorageError>;
+
     /// Atomically establish a collection or append to it if already established.
     ///
     /// Under the collection's put-mutex:
@@ -919,6 +926,15 @@ impl StorageEngine for InMemoryStorage {
             .read()
             .get(collection_id)
             .map(std::collections::HashMap::len))
+    }
+
+    fn collection_record_ids(&self, collection_id: &[u8; 16]) -> Result<Vec<NodeId>, StorageError> {
+        Ok(self
+            .collections
+            .read()
+            .get(collection_id)
+            .map(|collection| collection.keys().copied().collect())
+            .unwrap_or_default())
     }
 
     fn create_or_put_established(

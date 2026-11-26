@@ -46,7 +46,7 @@ use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::{
     derive_collection_id, CollectionMetadata, FrameIdPolicy, PayloadPolicy, RecordIdentityRule,
-    MEMBER_NAMESPACE_ORDX,
+    COLLECTION_METADATA_RECORD_ID, MEMBER_NAMESPACE_ORDX,
 };
 
 /// Version byte for timeline records and cursors.
@@ -262,12 +262,20 @@ struct TimelineRoot<K: OrderedKey> {
     directories: Vec<DirectoryDescriptor<K>>,
 }
 
+/// Counts from an ordered-index mark-and-sweep pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrderedGcStats {
+    /// Live records retained after marking current and pinned roots.
+    pub retained: usize,
+    /// Unreachable records staged for removal.
+    pub removed: usize,
+}
+
 #[derive(Default)]
 struct StagedTree {
     records: Vec<StagedRecord>,
     by_id: std::collections::HashMap<NodeId, usize>,
     inserted: u64,
-    removed: u64,
 }
 
 impl StagedTree {
@@ -275,6 +283,55 @@ impl StagedTree {
         let index = self.records.len();
         self.records.push(record);
         self.by_id.insert(id, index);
+    }
+
+    fn retain_reachable<K: OrderedKey>(
+        &mut self,
+        spans: &[SpanDescriptor<K>],
+        level: u8,
+    ) -> Result<(), StorageError> {
+        fn mark<K: OrderedKey>(
+            spans: &[SpanDescriptor<K>],
+            level: u8,
+            records: &[StagedRecord],
+            by_id: &std::collections::HashMap<NodeId, usize>,
+            live: &mut std::collections::HashSet<NodeId>,
+        ) -> Result<(), StorageError> {
+            for span in spans {
+                live.insert(span.child_id);
+                if level == 0 {
+                    continue;
+                }
+                if let Some(index) = by_id.get(&span.child_id) {
+                    let Some(StagedRecord::Directory(_, bytes)) = records.get(*index) else {
+                        continue;
+                    };
+                    let children = decode_directory::<K>(bytes, level)?;
+                    let child_level = level.checked_sub(1).ok_or_else(|| {
+                        StorageError::Corrupt("ordered directory level underflow".to_owned())
+                    })?;
+                    mark(&children, child_level, records, by_id, live)?;
+                }
+            }
+            Ok(())
+        }
+
+        let mut live = std::collections::HashSet::new();
+        mark(spans, level, &self.records, &self.by_id, &mut live)?;
+        self.records.retain(|record| {
+            let id = match record {
+                StagedRecord::Leaf(id, _) | StagedRecord::Directory(id, _) => id,
+            };
+            live.contains(id)
+        });
+        self.by_id.clear();
+        for (index, record) in self.records.iter().enumerate() {
+            let id = match record {
+                StagedRecord::Leaf(id, _) | StagedRecord::Directory(id, _) => *id,
+            };
+            self.by_id.insert(id, index);
+        }
+        Ok(())
     }
 }
 
@@ -286,6 +343,7 @@ enum StagedRecord {
 enum TreeMutation<K: OrderedKey> {
     Remove(Vec<K>),
     PurgePrefix(K::Prefix),
+    Mutate { remove: Vec<K>, insert: Vec<K> },
 }
 
 trait TimelineTreeIo<K: OrderedKey> {
@@ -788,6 +846,153 @@ fn mutation_count<K: OrderedKey>(
         ));
     }
     Ok(count)
+}
+
+fn apply_staged_mutation<K: OrderedKey>(
+    root: &TimelineRoot<K>,
+    old_count: u64,
+    mutation: TreeMutation<K>,
+    domain: DomainTag,
+    io: &mut dyn TimelineTreeIo<K>,
+) -> Result<AppliedMutation<K>, StorageError> {
+    let mut removed = 0_u64;
+    let (height, spans, inserted, count) = match mutation {
+        TreeMutation::Remove(keys) => {
+            let changed = remove_spans(
+                &root.directories,
+                root.height.saturating_sub(1),
+                &keys,
+                io,
+                &mut removed,
+            )?;
+            let (height, spans) = demote_spans(changed, root.height, io)?;
+            let count = mutation_count(old_count, removed, &spans)?;
+            (height, spans, 0, count)
+        }
+        TreeMutation::PurgePrefix(prefix) => {
+            let changed = purge_prefix_spans(
+                &root.directories,
+                root.height.saturating_sub(1),
+                &prefix,
+                io,
+                &mut removed,
+            )?;
+            let (height, spans) = demote_spans(changed, root.height, io)?;
+            let count = mutation_count(old_count, removed, &spans)?;
+            (height, spans, 0, count)
+        }
+        TreeMutation::Mutate { remove, insert } => {
+            let changed = remove_spans(
+                &root.directories,
+                root.height.saturating_sub(1),
+                &remove,
+                io,
+                &mut removed,
+            )?;
+            let (base_height, base_spans) = demote_spans(changed, root.height, io)?;
+            let base_count = mutation_count(old_count, removed, &base_spans)?;
+            let base = TimelineRoot {
+                domain,
+                height: base_height,
+                entry_count: base_count,
+                directories: base_spans,
+            };
+            let mut inserted = 0_u64;
+            let (height, spans) = if insert.is_empty() {
+                (base_height, base.directories)
+            } else {
+                let (start_height, mode) = root_split_mode(&base, &insert);
+                let spans = append_spans(
+                    &base.directories,
+                    base.height.saturating_sub(1),
+                    &insert,
+                    io,
+                    &mut inserted,
+                )?;
+                promote_spans(spans, start_height, mode, io)?
+            };
+            let count = base_count
+                .checked_add(inserted)
+                .ok_or_else(|| StorageError::Internal("ordered entry count overflow".to_owned()))?;
+            (height, spans, inserted, count)
+        }
+    };
+    Ok(AppliedMutation {
+        height,
+        spans,
+        removed,
+        inserted,
+        count,
+    })
+}
+
+struct AppliedMutation<K: OrderedKey> {
+    height: u8,
+    spans: Vec<SpanDescriptor<K>>,
+    removed: u64,
+    inserted: u64,
+    count: u64,
+}
+
+fn mark_ordered_root<K: OrderedKey>(
+    transaction: &DatabaseTransaction<'_>,
+    pool: ShardType,
+    collection_id: &[u8; 16],
+    domain: DomainTag,
+    root_id: NodeId,
+    live: &mut std::collections::HashSet<NodeId>,
+) -> Result<(), StorageError> {
+    if !live.insert(root_id) {
+        return Ok(());
+    }
+    let records = transaction.get(pool, collection_id, &[root_id])?;
+    let root_record = records
+        .first()
+        .and_then(Option::as_ref)
+        .ok_or(StorageError::NotFound(root_id))?;
+    let root = decode_root::<K>(&root_record.bytes, domain)?;
+    mark_ordered_spans::<K>(
+        transaction,
+        pool,
+        collection_id,
+        &root.directories,
+        root.height.saturating_sub(1),
+        live,
+    )
+}
+
+fn mark_ordered_spans<K: OrderedKey>(
+    transaction: &DatabaseTransaction<'_>,
+    pool: ShardType,
+    collection_id: &[u8; 16],
+    spans: &[SpanDescriptor<K>],
+    level: u8,
+    live: &mut std::collections::HashSet<NodeId>,
+) -> Result<(), StorageError> {
+    for span in spans {
+        if !live.insert(span.child_id) || level == 0 {
+            continue;
+        }
+        let records = transaction.get(pool, collection_id, &[span.child_id])?;
+        let record = records
+            .first()
+            .and_then(Option::as_ref)
+            .ok_or(StorageError::NotFound(span.child_id))?;
+        let children = decode_directory::<K>(&record.bytes, level)?;
+        validate_span_children(span, &children)?;
+        let child_level = level
+            .checked_sub(1)
+            .ok_or_else(|| StorageError::Corrupt("ordered directory level underflow".to_owned()))?;
+        mark_ordered_spans::<K>(
+            transaction,
+            pool,
+            collection_id,
+            &children,
+            child_level,
+            live,
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_leaf_span<K: OrderedKey>(
@@ -1503,6 +1708,73 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         self.stage_mutation(transaction, pool, TreeMutation::PurgePrefix(prefix))
     }
 
+    /// Stage removal of unreachable `CoW` records, preserving the current head
+    /// and every explicitly pinned cursor root. Directory records are read to
+    /// mark descendants; leaf payloads are never loaded.
+    ///
+    /// The collection-version precondition makes the scan safe against a
+    /// concurrent append or mutation: if the collection changes after the
+    /// head/version snapshot, commit fails with a stale-read error.
+    ///
+    /// # Errors
+    /// Propagates storage, transaction, and record-validation errors.
+    pub fn stage_gc_unreachable_records(
+        &self,
+        transaction: &DatabaseTransaction<'_>,
+        pool: ShardType,
+        pinned_roots: &[NodeId],
+    ) -> Result<OrderedGcStats, StorageError> {
+        validate_geometry::<K>()?;
+        let engine_identity = std::ptr::from_ref(self.engine).cast::<()>() as usize;
+        if engine_identity != transaction.pool_identity(pool) {
+            return Err(StorageError::Internal(
+                "ordered index and transaction use different storage pools".to_owned(),
+            ));
+        }
+        let (head_records, collection_version) = transaction.get_with_collection_version(
+            pool,
+            &self.collection_id,
+            &[TIMELINE_HEAD_ID],
+        )?;
+        let head = head_records.first().ok_or_else(|| {
+            StorageError::Internal("ordered head read returned no slot".to_owned())
+        })?;
+        let mut live = std::collections::HashSet::new();
+        live.insert(COLLECTION_METADATA_RECORD_ID);
+        live.insert(TIMELINE_HEAD_ID);
+        let mut roots = pinned_roots.to_vec();
+        if let Some(head) = head {
+            let (root_id, _) = decode_head::<K>(&head.bytes, self.domain)?;
+            roots.push(root_id);
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        for root_id in roots {
+            mark_ordered_root::<K>(
+                transaction,
+                pool,
+                &self.collection_id,
+                self.domain,
+                root_id,
+                &mut live,
+            )?;
+        }
+
+        let stored_ids = self.engine.collection_record_ids(&self.collection_id)?;
+        let unreachable: Vec<NodeId> = stored_ids
+            .into_iter()
+            .filter(|id| !live.contains(id))
+            .collect();
+        let removed = unreachable.len();
+        transaction
+            .remove_known_live_many(pool, self.collection_id, &unreachable, collection_version)
+            .map_err(StorageError::Io)?;
+        Ok(OrderedGcStats {
+            retained: live.len(),
+            removed,
+        })
+    }
+
     /// Remove keys through raw storage for single-writer maintenance.
     ///
     /// # Errors
@@ -1540,8 +1812,14 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         to_remove: &[K],
         to_insert: &[K],
     ) -> Result<NodeId, StorageError> {
-        self.stage_remove(transaction, pool, to_remove)?;
-        self.stage_append(transaction, pool, to_insert)
+        let mut remove = to_remove.to_vec();
+        remove.sort_unstable();
+        remove.dedup();
+        let mut insert = to_insert.to_vec();
+        insert.sort_unstable();
+        insert.dedup();
+        self.stage_mutation(transaction, pool, TreeMutation::Mutate { remove, insert })
+            .map(|(root_id, _)| root_id)
     }
 
     fn stage_mutation(
@@ -1594,39 +1872,33 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         };
 
         let mut staged = StagedTree::default();
-        let mut removed = 0_u64;
-        let (height, directories) = {
+        let applied = {
             let mut io = TransactionTimelineTreeIo {
                 index: self,
                 transaction,
                 pool,
                 staged: &mut staged,
             };
-            let changed = match mutation {
-                TreeMutation::Remove(keys) => remove_spans(
-                    &root.directories,
-                    root.height.saturating_sub(1),
-                    &keys,
-                    &mut io,
-                    &mut removed,
-                )?,
-                TreeMutation::PurgePrefix(prefix) => purge_prefix_spans(
-                    &root.directories,
-                    root.height.saturating_sub(1),
-                    &prefix,
-                    &mut io,
-                    &mut removed,
-                )?,
-            };
-            demote_spans(changed, root.height, &mut io)?
+            apply_staged_mutation(&root, old_count, mutation, self.domain, &mut io)?
         };
-        staged.removed = removed;
-        if removed == 0 {
+        let AppliedMutation {
+            height,
+            spans: directories,
+            removed,
+            inserted,
+            count,
+        } = applied;
+        if removed == 0 && inserted == 0 {
             if let Some(root_id) = old_root_id {
                 return Ok((root_id, 0));
             }
         }
-        let count = mutation_count(old_count, removed, &directories)?;
+        if span_entry_count(&directories)? != count {
+            return Err(StorageError::Internal(
+                "ordered mutation count mismatch".to_owned(),
+            ));
+        }
+        staged.retain_reachable(&directories, height.saturating_sub(1))?;
         transaction
             .expect_collection_version(pool, self.collection_id, collection_version)
             .map_err(StorageError::Io)?;
@@ -1686,6 +1958,11 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
                 &mut io,
                 &mut removed,
             )?,
+            TreeMutation::Mutate { .. } => {
+                return Err(StorageError::Internal(
+                    "combined mutation requires a transaction".to_owned(),
+                ));
+            }
         };
         if removed == 0 {
             return Ok((old_root_id, 0));

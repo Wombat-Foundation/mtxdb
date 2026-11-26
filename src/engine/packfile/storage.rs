@@ -11773,6 +11773,41 @@ impl StorageEngine for PackfileStorage {
         self.try_collection_len(collection_id)
     }
 
+    fn collection_record_ids(&self, collection_id: &[u8; 16]) -> Result<Vec<NodeId>, StorageError> {
+        let put_lock = self.put_mutex(collection_id);
+        let put_guard = put_lock.lock();
+        let generation = self
+            .generation(collection_id)
+            .map(|guard| Arc::clone(&*guard));
+        let shards = self.shards.all_shards();
+        let scanners = Self::open_collection_scan_shards(&shards)?;
+        drop(put_guard);
+
+        let keys = Self::scan_collection_keys(scanners, collection_id)?;
+        let Some(generation) = generation else {
+            return Ok(Vec::new());
+        };
+        let mut live = Vec::with_capacity(keys.len());
+        for id in keys {
+            if generation.index.lookup_removed(&id) == Some(true) {
+                continue;
+            }
+            if generation.index.lookup_removed(&id) == Some(false) {
+                live.push(id);
+                continue;
+            }
+            if generation
+                .sealed
+                .lookup(collection_id, &id)
+                .map_err(|error| StorageError::Corrupt(error.to_string()))?
+                .is_some_and(|hit| !hit.removed())
+            {
+                live.push(id);
+            }
+        }
+        Ok(live)
+    }
+
     fn create_or_put_established(
         &self,
         collection_id: &[u8; 16],

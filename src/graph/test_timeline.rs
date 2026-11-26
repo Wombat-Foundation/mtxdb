@@ -968,6 +968,92 @@ fn a_transactional_remove_and_mutate_publish_one_root() {
 }
 
 #[test]
+fn ordered_gc_keeps_pinned_roots_and_sweeps_old_cow_nodes_without_leaf_reads() {
+    let root = test_root("ordered_gc_pinned_roots");
+    let db = Database::open(root.clone()).unwrap();
+    let index = OrderedIndex::<_, TinyKey>::open(db.event_dag().as_ref(), "tiny_gc");
+    index
+        .build(&(1..=1100).map(TinyKey).collect::<Vec<_>>())
+        .unwrap();
+    let (old_root, _) = index.head().unwrap().unwrap();
+    let old_page = index.page(&(), None, true, 12).unwrap();
+    let old_cursor = old_page.next_cursor.unwrap();
+
+    index.append_untransactional(&[TinyKey(1101)]).unwrap();
+    index.append_untransactional(&[TinyKey(1102)]).unwrap();
+    let tx = db.begin_transaction();
+    let stats = index
+        .stage_gc_unreachable_records(&tx, ShardType::EventDag, &[old_root])
+        .unwrap();
+    assert!(stats.removed > 0);
+    tx.commit().unwrap();
+    assert_eq!(
+        index
+            .page(&(), Some(&old_cursor), true, 12)
+            .unwrap()
+            .entries,
+        (13..=24).map(TinyKey).collect::<Vec<_>>()
+    );
+    assert_eq!(index.page(&(), None, true, 4).unwrap().entries.len(), 4);
+
+    let tx = db.begin_transaction();
+    let first = index
+        .stage_gc_unreachable_records(&tx, ShardType::EventDag, &[])
+        .unwrap();
+    tx.commit().unwrap();
+    assert!(first.removed > 0);
+
+    let tx = db.begin_transaction();
+    let second = index
+        .stage_gc_unreachable_records(&tx, ShardType::EventDag, &[])
+        .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(second.removed, 0);
+    assert_eq!(index.head().unwrap().unwrap().1, 1102);
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn staged_mutate_stages_only_one_final_cow_path() {
+    let root = test_root("staged_mutate_single_path");
+    let db = Database::open(root.clone()).unwrap();
+    let index = OrderedIndex::<_, TinyKey>::open(db.event_dag().as_ref(), "tiny_single_pass");
+    index
+        .build(&(1..=1100).map(TinyKey).collect::<Vec<_>>())
+        .unwrap();
+    let before = db
+        .event_dag()
+        .collection_len(&index.collection_id())
+        .unwrap()
+        .unwrap();
+
+    let tx = db.begin_transaction();
+    index
+        .stage_mutate(&tx, ShardType::EventDag, &[TinyKey(500)], &[TinyKey(1200)])
+        .unwrap();
+    tx.commit().unwrap();
+    let after = db
+        .event_dag()
+        .collection_len(&index.collection_id())
+        .unwrap()
+        .unwrap();
+    assert!(
+        after.saturating_sub(before) <= 12,
+        "record count: {before} -> {after}"
+    );
+    assert_eq!(index.head().unwrap().unwrap().1, 1100);
+    assert_eq!(
+        index.page(&(), None, true, 1100).unwrap().entries.len(),
+        1100
+    );
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn prefix_purge_drops_one_room_without_reading_its_subtrees() {
     let engine = InMemoryStorage::new();
     let index = TimelineIndex::open(&engine, "purge_rooms");

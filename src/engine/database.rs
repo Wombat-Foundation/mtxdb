@@ -411,6 +411,31 @@ impl DatabaseTransaction<'_> {
         self.remove_many_inner(pool, collection_id, node_ids, None)
     }
 
+    /// Stage removals for IDs obtained from a consistent metadata-only
+    /// collection scan, guarded by the collection version sampled with that
+    /// scan. Unlike [`Self::remove_many`], this does not fetch record payloads.
+    /// The caller must not have staged other mutations for these IDs.
+    ///
+    /// # Errors
+    /// Returns an error if the stage is inactive, its byte limit is exceeded,
+    /// or the collection version precondition cannot be staged.
+    pub(crate) fn remove_known_live_many(
+        &self,
+        pool: ShardType,
+        collection_id: [u8; 16],
+        node_ids: &[NodeId],
+        expected_collection_version: u64,
+    ) -> io::Result<()> {
+        let _lifecycle = self.lifecycle.lock();
+        if self.stage.state() != TxnStageState::Active {
+            return Err(io::Error::other("transaction stage is not active"));
+        }
+        self.stage
+            .stage_expectation(pool, collection_id, expected_collection_version)?;
+        self.stage
+            .stage_remove_records(pool, collection_id, node_ids)
+    }
+
     /// Stage removals with versions observed alongside a transaction-view
     /// read. Synthetic version zero for a staged put is replaced by a live
     /// version read here, as staged writes have no published version.
