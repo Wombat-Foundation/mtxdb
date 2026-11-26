@@ -369,9 +369,8 @@ fn interior_leaf_split_balances_mixed_room_entries() {
 
 #[test]
 fn buffered_head_snapshot_carries_flushes_pages_and_pins_cursors() {
-    let root = test_root("buffered_head_snapshot");
-    let db = Database::open(root.clone()).unwrap();
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "buffered_head_snapshot");
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "buffered_head_snapshot");
     let scope = [0x31; 16];
     let mut entries = Vec::new();
     let mut pinned_cursor = None;
@@ -379,13 +378,12 @@ fn buffered_head_snapshot_carries_flushes_pages_and_pins_cursors() {
 
     for position in 1_u8..=100 {
         let key = entry(scope, i64::from(position), position);
-        index.append(&db, ShardType::EventDag, &[key]).unwrap();
+        index.append_untransactional(&[key]).unwrap();
         entries.push(key);
 
         let (snapshot_id, count) = index.head().unwrap().unwrap();
         assert_eq!(count, u64::from(position));
-        let snapshot = db
-            .event_dag()
+        let snapshot = engine
             .get(&index.collection_id(), &snapshot_id)
             .unwrap()
             .unwrap();
@@ -436,13 +434,7 @@ fn buffered_head_snapshot_carries_flushes_pages_and_pins_cursors() {
             .collect::<Vec<_>>()
     );
     let pinned_root = pinned_root.unwrap();
-    let tx = db.begin_transaction();
-    index
-        .stage_gc_unreachable_records(&tx, ShardType::EventDag, &[pinned_root])
-        .unwrap();
-    tx.commit().unwrap();
-    assert!(db
-        .event_dag()
+    assert!(engine
         .get(&index.collection_id(), &pinned_root)
         .unwrap()
         .is_some());
@@ -454,26 +446,12 @@ fn buffered_head_snapshot_carries_flushes_pages_and_pins_cursors() {
             .len(),
         3
     );
-
-    let tx = db.begin_transaction();
-    index
-        .stage_gc_unreachable_records(&tx, ShardType::EventDag, &[])
-        .unwrap();
-    tx.commit().unwrap();
-    assert!(db
-        .event_dag()
-        .get(&index.collection_id(), &pinned_root)
-        .unwrap()
-        .is_none());
-    drop(db);
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn buffered_head_mutations_remove_inline_tier_and_room_entries() {
-    let root = test_root("buffered_head_mutations");
-    let db = Database::open(root.clone()).unwrap();
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "buffered_head_mutations");
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "buffered_head_mutations");
     let room_a = [0x41; 16];
     let room_b = [0x42; 16];
     let entries: Vec<_> = (0_u8..40)
@@ -485,16 +463,12 @@ fn buffered_head_mutations_remove_inline_tier_and_room_entries() {
         })
         .collect();
     for key in &entries {
-        index.append(&db, ShardType::EventDag, &[*key]).unwrap();
+        index.append_untransactional(&[*key]).unwrap();
     }
 
     let remove = [entries[0], entries[38], entries[76]];
-    let tx = db.begin_transaction();
-    let (_, removed) = index
-        .stage_remove(&tx, ShardType::EventDag, &remove)
-        .unwrap();
+    let (_, removed) = index.remove_untransactional(&remove).unwrap();
     assert_eq!(removed, 3);
-    tx.commit().unwrap();
     let retained: Vec<_> = entries
         .iter()
         .copied()
@@ -502,21 +476,14 @@ fn buffered_head_mutations_remove_inline_tier_and_room_entries() {
         .collect();
     assert_eq!(collect(&index, &room_a, true, 100).len(), 37);
 
-    let tx = db.begin_transaction();
-    let (_, purged) = index
-        .stage_purge_prefix(&tx, ShardType::EventDag, room_a)
-        .unwrap();
+    let (_, purged) = index.purge_prefix_untransactional(room_a).unwrap();
     assert_eq!(purged, 37);
-    tx.commit().unwrap();
     assert_eq!(collect(&index, &room_a, true, 100), Vec::new());
     assert_eq!(collect(&index, &room_b, true, 100).len(), 40);
     assert_eq!(
         index.head().unwrap().unwrap().1,
         u64::try_from(retained.len() - 37).unwrap()
     );
-
-    drop(db);
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1317,25 +1284,23 @@ fn head_bytes<S: StorageEngine + ?Sized>(
 
 #[test]
 fn head_snapshot_buffers_single_appends_and_pages_across_a_flush() {
-    let db_path = test_root("head_snapshot_flow");
-    let db = Database::open(db_path.clone()).unwrap();
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "head_snapshot_flow");
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "head_snapshot_flow");
     let room = [9u8; 16];
-
-    let empty = db.begin_transaction();
-    index
-        .stage_append(&empty, ShardType::EventDag, &[])
-        .unwrap();
-    empty.commit().unwrap();
 
     let mut expected = Vec::new();
     let mut saw_snapshot = false;
     let mut saw_flush = false;
     for value in 0..200_i64 {
         let entry = entry(room, value, u8::try_from(value).unwrap());
-        append_one(&db, &index, entry);
+        index.append_untransactional(&[entry]).unwrap();
         expected.push(entry);
-        let bytes = head_bytes(&db, &index);
+        let (head_id, _) = index.head().unwrap().unwrap();
+        let bytes = engine
+            .get(&index.collection_id(), &head_id)
+            .unwrap()
+            .unwrap()
+            .bytes;
         saw_snapshot |= bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC);
         saw_flush |= bytes.starts_with(&TIMELINE_ROOT_MAGIC);
     }

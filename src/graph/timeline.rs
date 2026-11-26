@@ -2169,8 +2169,14 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
     pub fn append_untransactional(&self, new_entries: &[K]) -> Result<NodeId, StorageError> {
         validate_geometry::<K>()?;
         self.ensure_metadata()?;
-        let Some((head_id, old_count)) = self.head()? else {
-            return self.build(new_entries);
+        let head = self.head()?;
+        let (head_id, old_count) = if let Some(head) = head {
+            head
+        } else {
+            // Publish an empty root first so the first small append takes the
+            // same buffered snapshot path as later ones.
+            let root_id = self.build(&[])?;
+            (root_id, 0)
         };
         if new_entries.is_empty() {
             return Ok(head_id);
