@@ -930,16 +930,14 @@ fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: us
             let mut elapsed_samples = Vec::with_capacity(samples);
             let mut last_io = IoSnapshot::default();
             let mut last_open_io = IoSnapshot::default();
-            let mut last_advised_bytes = 0u64;
+            let mut last_unmapped_bytes = 0u64;
             for _ in 0..samples {
                 evict(root, EvictScope::All).expect("evict before paged open");
                 let open_before = IoSnapshot::read();
                 let store = PackfileStorage::open_read_only_with_config(pool_path.clone(), &config)
                     .expect("open paged event DAG pool");
                 last_open_io = IoSnapshot::read().delta(open_before);
-                last_advised_bytes = store
-                    .evict_mapped_pages()
-                    .expect("evict mapped pages after paged open");
+                last_unmapped_bytes = store.unmap_shards();
                 evict(root, EvictScope::All).expect("evict files after paged open");
                 {
                     let (topo_index, stream_index) = open_event_timeline_indexes(&store);
@@ -972,7 +970,7 @@ fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: us
             let min_us = min(&elapsed_samples).as_secs_f64() * 1e6;
             let median_us = median(&mut elapsed_samples).as_secs_f64() * 1e6;
             println!(
-                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} samples={} min_us={min_us:.1} median_us={median_us:.1} advised_bytes={last_advised_bytes} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
+                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} samples={} min_us={min_us:.1} median_us={median_us:.1} unmapped_bytes={last_unmapped_bytes} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
                 tier_label(tier_rank),
                 elapsed_samples.len(),
                 last_open_io.read_bytes,
@@ -1036,16 +1034,14 @@ fn run_paged_fetch_rows(root: &Path, rooms: &[Room], tier: Option<usize>, sample
         let mut last_io = IoSnapshot::default();
         let mut last_open_io = IoSnapshot::default();
         let mut returned = 0usize;
-        let mut advised_bytes = 0u64;
+        let mut unmapped_bytes = 0u64;
         for _ in 0..samples {
             evict(root, scope).expect("evict before paged fetch open");
             let open_before = IoSnapshot::read();
             let store = PackfileStorage::open_read_only_with_config(pool_path.clone(), &config)
                 .expect("open paged event DAG pool for fetch");
             last_open_io = IoSnapshot::read().delta(open_before);
-            advised_bytes = store
-                .evict_mapped_pages()
-                .expect("evict mapped pages after paged fetch open");
+            unmapped_bytes = store.unmap_shards();
             evict(root, scope).expect("evict files after paged fetch open");
             let before = IoSnapshot::read();
             let started = Instant::now();
@@ -1072,7 +1068,7 @@ fn run_paged_fetch_rows(root: &Path, rooms: &[Room], tier: Option<usize>, sample
                 .unwrap_or(0)
         };
         println!(
-            "multi_room_fetch_paged evict={} count={} samples={} min_us={min_us:.1} median_us={median_us:.1} advised_bytes={advised_bytes} syscr={} rchar={} disk_read_bytes={} open_read_bytes={} open_majflt={} payload_bytes_returned={returned} read_amp_bp={amplification_bp} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
+            "multi_room_fetch_paged evict={} count={} samples={} min_us={min_us:.1} median_us={median_us:.1} unmapped_bytes={unmapped_bytes} syscr={} rchar={} disk_read_bytes={} open_read_bytes={} open_majflt={} payload_bytes_returned={returned} read_amp_bp={amplification_bp} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
             scope.label(),
             ids.len(),
             samples,

@@ -871,6 +871,17 @@ impl Shard {
         drop(guard);
         Ok(self.mmap.read())
     }
+
+    /// Drop this shard's cached mapping and return the mapping length.
+    ///
+    /// Previously returned zero-copy byte ranges may keep the mapping alive
+    /// until their `Arc` references are dropped. This only removes the shard's
+    /// own reference; it does not invalidate outstanding reads.
+    pub(crate) fn unmap(&self) -> u64 {
+        self.mmap.write().take().map_or(0, |mapping| {
+            u64::try_from(mapping.len()).unwrap_or(u64::MAX)
+        })
+    }
 }
 
 impl Drop for Shard {
