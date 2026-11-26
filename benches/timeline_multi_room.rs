@@ -8,6 +8,7 @@
 //! `MTXDB_TIMELINE_EXPORT` to a CSV length manifest with
 //! `room,topo,stream,payload_bytes` rows to drive size-shaped synthetic reads.
 //! `MTXDB_PAYLOAD_MIN` and `MTXDB_PAYLOAD_MAX` override synthetic payload bounds.
+//! `MTXDB_MAX_SHARD_BYTES` rotates the event pool's active pack so sealed sidecars exist.
 //! The load is synced and reclaimed once before read phases. Each resident
 //! cold sample closes the database, evicts selected files, then reopens before
 //! timing; the manifest mode does not read payloads from an existing database.
@@ -30,7 +31,7 @@ use mtxdb::ordered_timeline::{
 };
 use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb::{interop, Database, DatabaseLayout, RuntimeConfig, ShardType};
+use mtxdb::{interop, Database, DatabaseLayout, PoolPolicies, RuntimeConfig, ShardType};
 use rustix::fs::{fadvise, Advice};
 
 const PAYLOAD_MIN: usize = 256;
@@ -82,12 +83,37 @@ fn event_ref(node: NodeId) -> [u8; 32] {
 }
 
 fn payload(sequence: u64, len: usize) -> Bytes {
-    let fill = u8::try_from(sequence % 251).unwrap_or(0);
-    let mut bytes = vec![fill; len];
+    const TEXT_SPAN: &[u8] = b"\"type\":\"m.room.message\",\"content\":{\"body\":\"hello world\"},";
+    let mut bytes = vec![0u8; len];
+    for (chunk_index, chunk) in bytes.chunks_mut(64).enumerate() {
+        let random_len = chunk.len().min(16);
+        let mut state = sequence ^ u64::try_from(chunk_index).unwrap_or(u64::MAX);
+        for (offset, byte) in chunk.iter_mut().take(random_len).enumerate() {
+            if offset.is_multiple_of(8) {
+                state = splitmix64(state);
+            }
+            let shift = u32::try_from(offset % 8).unwrap_or(0).saturating_mul(8);
+            *byte = u8::try_from((state >> shift) & u64::from(u8::MAX)).unwrap_or(0);
+        }
+        for (offset, byte) in chunk.iter_mut().enumerate().skip(random_len) {
+            let text_offset = offset
+                .saturating_sub(random_len)
+                .checked_rem(TEXT_SPAN.len())
+                .unwrap_or(0);
+            *byte = TEXT_SPAN.get(text_offset).copied().unwrap_or_default();
+        }
+    }
     let header = node_id(sequence);
     let copy = header.len().min(bytes.len());
     bytes[..copy].copy_from_slice(&header[..copy]);
     Bytes::from(bytes)
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 struct Room {
@@ -488,7 +514,15 @@ fn open_benchmark_database(root: PathBuf) -> Database {
     } else {
         RuntimeConfig::default()
     };
-    Database::open_with_config(root, config).expect("open benchmark database")
+    let mut policies = PoolPolicies::default();
+    if let Some(bytes) = std::env::var("MTXDB_MAX_SHARD_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        policies.for_shard_mut(ShardType::EventDag).max_shard_bytes = Some(bytes);
+    }
+    Database::open_with_policies_and_config(root, policies, config)
+        .expect("open benchmark database")
 }
 
 fn maintain_journal(db: &Database) {
@@ -896,12 +930,17 @@ fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: us
             let mut elapsed_samples = Vec::with_capacity(samples);
             let mut last_io = IoSnapshot::default();
             let mut last_open_io = IoSnapshot::default();
+            let mut last_advised_bytes = 0u64;
             for _ in 0..samples {
                 evict(root, EvictScope::All).expect("evict before paged open");
                 let open_before = IoSnapshot::read();
                 let store = PackfileStorage::open_read_only_with_config(pool_path.clone(), &config)
                     .expect("open paged event DAG pool");
                 last_open_io = IoSnapshot::read().delta(open_before);
+                last_advised_bytes = store
+                    .evict_mapped_pages()
+                    .expect("evict mapped pages after paged open");
+                evict(root, EvictScope::All).expect("evict files after paged open");
                 {
                     let (topo_index, stream_index) = open_event_timeline_indexes(&store);
                     let before = IoSnapshot::read();
@@ -933,7 +972,7 @@ fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: us
             let min_us = min(&elapsed_samples).as_secs_f64() * 1e6;
             let median_us = median(&mut elapsed_samples).as_secs_f64() * 1e6;
             println!(
-                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} samples={} min_us={min_us:.1} median_us={median_us:.1} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
+                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} samples={} min_us={min_us:.1} median_us={median_us:.1} advised_bytes={last_advised_bytes} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
                 tier_label(tier_rank),
                 elapsed_samples.len(),
                 last_open_io.read_bytes,
@@ -944,6 +983,108 @@ fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: us
                 last_io.pgmajfault.unwrap_or(u64::MAX),
             );
         }
+    }
+}
+
+fn run_paged_fetch_rows(root: &Path, rooms: &[Room], tier: Option<usize>, samples: usize) {
+    let Some(selected) = tier.and_then(|index| rooms.get(index)) else {
+        return;
+    };
+    let wal_bytes = directory_bytes(root).3;
+    let extension_sizes = extension_bytes(root);
+    let has_sidecars = extension_sizes
+        .iter()
+        .any(|(extension, bytes)| matches!(extension.as_str(), "idx" | "run") && *bytes > 0);
+    if wal_bytes > EMPTY_SHARED_WAL_LEN || !has_sidecars {
+        println!(
+            "multi_room_fetch_paged_skipped reason={} wal_bytes={wal_bytes} has_sidecars={has_sidecars}",
+            if wal_bytes > EMPTY_SHARED_WAL_LEN {
+                "shared_wal_pending"
+            } else {
+                "no_sealed_index_sidecars"
+            }
+        );
+        return;
+    }
+    let db = open_benchmark_database(root.to_path_buf());
+    let (topo_index, _) = open_event_timeline_indexes(db.event_dag().as_ref());
+    let id_page = topo_index
+        .page(&selected.scope, None, true, 128)
+        .expect("select paged fetch ids");
+    let ids = id_page
+        .entries
+        .iter()
+        .map(|entry| entry.event_node_id)
+        .collect::<Vec<_>>();
+    drop(db);
+
+    let layout = DatabaseLayout::open_read_only(root.to_path_buf())
+        .expect("open benchmark layout read-only");
+    let pool_path = layout
+        .pool_dir_read_only(ShardType::EventDag)
+        .expect("find event DAG pool");
+    let config = RuntimeConfig {
+        index_residency: Some(IndexResidency::Paged),
+        ..RuntimeConfig::default()
+    };
+    for scope in [
+        EvictScope::All,
+        EvictScope::PacksOnly,
+        EvictScope::IndexOnly,
+    ] {
+        let mut timings = Vec::with_capacity(samples);
+        let mut last_io = IoSnapshot::default();
+        let mut last_open_io = IoSnapshot::default();
+        let mut returned = 0usize;
+        let mut advised_bytes = 0u64;
+        for _ in 0..samples {
+            evict(root, scope).expect("evict before paged fetch open");
+            let open_before = IoSnapshot::read();
+            let store = PackfileStorage::open_read_only_with_config(pool_path.clone(), &config)
+                .expect("open paged event DAG pool for fetch");
+            last_open_io = IoSnapshot::read().delta(open_before);
+            advised_bytes = store
+                .evict_mapped_pages()
+                .expect("evict mapped pages after paged fetch open");
+            evict(root, scope).expect("evict files after paged fetch open");
+            let before = IoSnapshot::read();
+            let started = Instant::now();
+            let payloads = store
+                .get_many(&selected.collection, &ids)
+                .expect("paged cold payload fetch");
+            timings.push(started.elapsed());
+            last_io = IoSnapshot::read().delta(before);
+            returned = payloads
+                .iter()
+                .flatten()
+                .map(|record| record.bytes.len())
+                .fold(0usize, usize::saturating_add);
+        }
+        let min_us = min(&timings).as_secs_f64() * 1e6;
+        let median_us = median(&mut timings).as_secs_f64() * 1e6;
+        let amplification_bp = if returned == 0 {
+            0
+        } else {
+            last_io
+                .read_bytes
+                .saturating_mul(10_000)
+                .checked_div(u64::try_from(returned).unwrap_or(u64::MAX).max(1))
+                .unwrap_or(0)
+        };
+        println!(
+            "multi_room_fetch_paged evict={} count={} samples={} min_us={min_us:.1} median_us={median_us:.1} advised_bytes={advised_bytes} syscr={} rchar={} disk_read_bytes={} open_read_bytes={} open_majflt={} payload_bytes_returned={returned} read_amp_bp={amplification_bp} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
+            scope.label(),
+            ids.len(),
+            samples,
+            last_io.syscr,
+            last_io.rchar,
+            last_io.read_bytes,
+            last_open_io.read_bytes,
+            last_open_io.majflt,
+            last_io.majflt,
+            last_io.pgmajfault.unwrap_or(u64::MAX),
+            last_open_io.pgmajfault.unwrap_or(u64::MAX),
+        );
     }
 }
 
@@ -1233,6 +1374,7 @@ fn main() {
     print_memory_diagnostics(&db, &root, &rooms);
     drop(db);
     run_paged_page_rows(&root, &rooms, &tiers, samples);
+    run_paged_fetch_rows(&root, &rooms, tiers.first().copied(), samples);
     let mut db = open_benchmark_database(root.clone());
     db = run_page_rows(db, &root, &rooms, &tiers, samples);
     db = run_fetch_rows(db, &root, &rooms, tiers.first().copied(), samples);
