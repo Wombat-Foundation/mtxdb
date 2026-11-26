@@ -1828,13 +1828,18 @@ impl ShardPool {
     /// contended pool lock.
     pub(crate) fn open_shared_member(
         base_dir: PathBuf,
+        max_shard_bytes: Option<u64>,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
     ) -> io::Result<Self> {
+        let max_shard_bytes = match max_shard_bytes {
+            None => MAX_SHARD_BYTES,
+            Some(value) => Self::validate_shard_size(value)?,
+        };
         Self::open_internal_locked(
             base_dir,
             true,
-            MAX_SHARD_BYTES,
+            max_shard_bytes,
             compress,
             checksum_policy,
             false,

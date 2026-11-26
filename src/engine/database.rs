@@ -45,6 +45,14 @@ pub struct PoolPolicy {
     /// root, HAMT nodes after their children); any other policy keeps id
     /// order. Logical ordering only: it never changes what is stored.
     pub ordering: crate::record_class::OrderingPolicy,
+    /// Rotation threshold, in bytes, for this pool's active pack.
+    ///
+    /// `None` uses [`crate::shard::MAX_SHARD_BYTES`], the hard ceiling imposed
+    /// by the 32-bit locator offset. A smaller threshold seals the active pack
+    /// sooner, which is what produces per-pack index sidecars and lets a reader
+    /// page locators instead of scanning one large pack. It changes only when
+    /// rotation happens, never what a record means.
+    pub max_shard_bytes: Option<u64>,
     /// When appended frames reach the pack file.
     ///
     /// The default [`crate::shard::AppendPolicy::Eager`] writes each frame as
@@ -68,6 +76,7 @@ impl Default for PoolPolicy {
             checksum_policy: crate::packfile::ChecksumPolicy::Full,
             index_residency: crate::index::IndexResidency::Resident,
             ordering: crate::record_class::OrderingPolicy::None,
+            max_shard_bytes: None,
             append_policy: crate::shard::AppendPolicy::Eager,
         }
     }
@@ -991,6 +1000,7 @@ impl Database {
             let store = PackfileStorage::open_shared_member(
                 dir,
                 config.cache_capacity,
+                policy.max_shard_bytes,
                 policy.compress,
                 policy.checksum_policy,
                 policy.index_residency,

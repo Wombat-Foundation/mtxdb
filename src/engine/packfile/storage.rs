@@ -3167,6 +3167,7 @@ impl PackfileStorage {
     pub(crate) fn open_shared_member(
         base_dir: PathBuf,
         cache_capacity: usize,
+        max_shard_bytes: Option<u64>,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
         residency: crate::index::IndexResidency,
@@ -3176,7 +3177,7 @@ impl PackfileStorage {
             cache_capacity,
             None,
             true,
-            None,
+            max_shard_bytes,
             compress,
             checksum_policy,
             residency,
@@ -3227,7 +3228,12 @@ impl PackfileStorage {
 
         let shard_open_started = std::time::Instant::now();
         let shards = if writable && !take_writer_lock {
-            ShardPool::open_shared_member(base_dir.clone(), compress, checksum_policy)?
+            ShardPool::open_shared_member(
+                base_dir.clone(),
+                max_shard_bytes,
+                compress,
+                checksum_policy,
+            )?
         } else if writable {
             match max_shard_bytes {
                 // Custom rotation thresholds are only used by benchmarks/
@@ -5166,6 +5172,41 @@ impl PackfileStorage {
             generation.cache.clear();
         }
         evicted
+    }
+
+    /// Advise the kernel to discard clean pages from every currently mapped
+    /// shard. This is intended for cold-cache diagnostics after opening a
+    /// read-only store, when `fadvise(DONTNEED)` alone may skip mapped pages.
+    ///
+    /// # Errors
+    /// Returns the first `madvise` error. Dirty pages are not discarded.
+    pub fn evict_mapped_pages(&self) -> Result<u64, StorageError> {
+        #[cfg(unix)]
+        {
+            let mut advised = 0u64;
+            for (_, shard) in self.shards.all_shards() {
+                let guard = shard.mmap().map_err(StorageError::Io)?;
+                if let Some(mapping) = guard.as_ref() {
+                    // SAFETY: `mapping` is live for the whole call, and
+                    // MADV_DONTNEED only discards clean resident pages; the
+                    // file-backed contents are unchanged and can be faulted
+                    // back in by any later access.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        mapping
+                            .unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
+                            .map_err(StorageError::Io)?;
+                    }
+                    advised =
+                        advised.saturating_add(u64::try_from(mapping.len()).unwrap_or(u64::MAX));
+                }
+            }
+            Ok(advised)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(0)
+        }
     }
 
     fn put_mutex(&self, collection_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
