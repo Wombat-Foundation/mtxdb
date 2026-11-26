@@ -16,6 +16,35 @@ fn test_root(name: &str) -> PathBuf {
 }
 
 #[test]
+fn point_mapping_config_reaches_database_and_standalone_pools() {
+    for enabled in [false, true] {
+        let root = test_root(&format!("config-point-mapping-{enabled}"));
+        let config = RuntimeConfig {
+            point_random_mmap: enabled,
+            ..RuntimeConfig::default()
+        };
+        let database = Database::open_with_config(root.clone(), config).unwrap();
+        for shard in ShardType::ALL {
+            assert_eq!(
+                database.pool(shard).read_plan_policy().point_random_mmap,
+                enabled,
+                "{shard:?}"
+            );
+        }
+        drop(database);
+
+        let standalone = root.join("standalone");
+        let writer = PackfileStorage::open_with_config(standalone.clone(), &config).unwrap();
+        assert_eq!(writer.read_plan_policy().point_random_mmap, enabled);
+        drop(writer);
+        let reader = PackfileStorage::open_read_only_with_config(standalone, &config).unwrap();
+        assert_eq!(reader.read_plan_policy().point_random_mmap, enabled);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
 fn paged_residency_is_rejected_before_the_root_is_created() {
     let root = test_root("config-paged-before-io");
     let config = RuntimeConfig {

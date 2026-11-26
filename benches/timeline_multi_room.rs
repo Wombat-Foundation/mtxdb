@@ -581,11 +581,14 @@ fn min(values: &[Duration]) -> Duration {
 }
 
 fn open_benchmark_database(root: PathBuf) -> Database {
-    let config = if std::env::var_os("MTXDB_CACHE_CAPACITY").is_some() {
+    let mut config = if std::env::var_os("MTXDB_CACHE_CAPACITY").is_some() {
         RuntimeConfig::from_env().expect("benchmark runtime config")
     } else {
         RuntimeConfig::default()
     };
+    // Each advice mode selects the point mapping itself; an ambient setting
+    // must not change the "default" rows.
+    config.point_random_mmap = false;
     let mut policies = PoolPolicies::default();
     if let Some(bytes) = std::env::var("MTXDB_MAX_SHARD_BYTES")
         .ok()

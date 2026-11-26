@@ -24,6 +24,7 @@ use crate::packfile::storage::DEFAULT_CACHE_CAPACITY;
 /// - index residency: whatever the constructor or pool policy selected
 ///   (`Resident` in practice);
 /// - read-path statistics: off;
+/// - point-read mapping: off;
 /// - WAL reclaim trigger: the journal's built-in quarter of the segment cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -46,6 +47,11 @@ pub struct RuntimeConfig {
     pub index_residency: Option<IndexResidency>,
     /// Enable the opt-in read-path counters and latency accounting.
     pub stats_enabled: bool,
+    /// Serve single-record reads from a separate random-advised mapping, in
+    /// every pool the config opens. See
+    /// [`crate::packfile::storage::PackfileStorage::set_point_random_mmap`].
+    /// Setting a read-plan policy afterwards replaces this value.
+    pub point_random_mmap: bool,
     /// Segment length, in bytes, above which a sync forces a reclaiming
     /// checkpoint. `None` keeps the journal's built-in value. Must be in
     /// `1..=MAX_RECLAIM_TRIGGER_LEN` and below the live segment cap's
@@ -67,6 +73,7 @@ impl Default for RuntimeConfig {
             txn_stage_limit_bytes: MAX_TXN_STAGE_BYTES,
             index_residency: None,
             stats_enabled: false,
+            point_random_mmap: false,
             reclaim_trigger_bytes: None,
             replay_lease_max_retained_bytes: None,
         }
@@ -151,6 +158,11 @@ impl RuntimeConfig {
             Some(value) => parse_bool("MTXDB_STATS", &value)?,
         };
 
+        let point_random_mmap = match lookup("MTXDB_POINT_RANDOM_MMAP")? {
+            None => false,
+            Some(value) => parse_bool("MTXDB_POINT_RANDOM_MMAP", &value)?,
+        };
+
         let reclaim_trigger_bytes = match lookup("MTXDB_RECLAIM_TRIGGER_BYTES")? {
             None => None,
             Some(value) => {
@@ -179,6 +191,7 @@ impl RuntimeConfig {
             txn_stage_limit_bytes,
             index_residency,
             stats_enabled,
+            point_random_mmap,
             reclaim_trigger_bytes,
             replay_lease_max_retained_bytes,
         })
@@ -300,6 +313,7 @@ mod tests {
         assert_eq!(parsed.txn_stage_limit_bytes, MAX_TXN_STAGE_BYTES);
         assert_eq!(parsed.index_residency, None);
         assert!(!parsed.stats_enabled);
+        assert!(!parsed.point_random_mmap);
     }
 
     #[test]
@@ -310,6 +324,7 @@ mod tests {
             ("MTXDB_TXN_STAGE_LIMIT_BYTES", "1048576"),
             ("MTXDB_INDEX_RESIDENCY", "Paged"),
             ("MTXDB_STATS", "yes"),
+            ("MTXDB_POINT_RANDOM_MMAP", "on"),
         ])
         .unwrap();
         assert_eq!(parsed.cache_capacity, 0);
@@ -317,6 +332,7 @@ mod tests {
         assert_eq!(parsed.txn_stage_limit_bytes, 1 << 20);
         assert_eq!(parsed.index_residency, Some(IndexResidency::Paged));
         assert!(parsed.stats_enabled);
+        assert!(parsed.point_random_mmap);
     }
 
     #[test]
@@ -331,6 +347,7 @@ mod tests {
         .is_err());
         assert!(config(&[("MTXDB_INDEX_RESIDENCY", "mmap")]).is_err());
         assert!(config(&[("MTXDB_STATS", "sometimes")]).is_err());
+        assert!(config(&[("MTXDB_POINT_RANDOM_MMAP", "sometimes")]).is_err());
     }
 
     #[test]

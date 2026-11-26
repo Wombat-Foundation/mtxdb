@@ -2791,6 +2791,7 @@ impl PackfileStorage {
             residency,
         )?;
         store.set_stats_enabled(config.stats_enabled);
+        store.set_point_random_mmap(config.point_random_mmap);
         Ok(store)
     }
 
@@ -2823,6 +2824,7 @@ impl PackfileStorage {
             residency,
         )?;
         store.set_stats_enabled(config.stats_enabled);
+        store.set_point_random_mmap(config.point_random_mmap);
         Ok(store)
     }
 

@@ -884,12 +884,14 @@ fn open_pool(dir: PathBuf) -> io::Result<PackfileStorage> {
     if let Some(compress) = compression_override()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?
     {
-        PackfileStorage::open_with_cache_and_policies(
+        let store = PackfileStorage::open_with_cache_and_policies(
             dir,
             crate::runtime_config().cache_capacity,
             compress,
             mtxdb::packfile::ChecksumPolicy::Full,
-        )
+        )?;
+        store.set_point_random_mmap(crate::runtime_config().point_random_mmap);
+        Ok(store)
     } else {
         PackfileStorage::open_with_config(dir, crate::runtime_config())
     }

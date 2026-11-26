@@ -227,6 +227,21 @@ fn test_read_plan_mode_maps_to_policy() {
     assert_ne!(read_plan_from_mode("prefetch"), ReadPlanPolicy::disabled());
 }
 
+#[test]
+fn read_plan_modes_keep_the_runtime_point_mapping_setting() {
+    for mode in ["plain", "prefetch"] {
+        for enabled in [false, true] {
+            let config = mtxdb::RuntimeConfig {
+                point_random_mmap: enabled,
+                ..mtxdb::RuntimeConfig::default()
+            };
+            let mut plan = read_plan_from_mode(mode);
+            apply_runtime_read_settings(&mut plan, &config);
+            assert_eq!(plan.point_random_mmap, enabled, "{mode}");
+        }
+    }
+}
+
 fn is_subcommand(name: &str) -> bool {
     build_cli().find_subcommand(name).is_some()
 }

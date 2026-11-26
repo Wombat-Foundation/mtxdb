@@ -1458,6 +1458,13 @@ fn sub_get() -> Command {
         )
 }
 
+/// Carry runtime read settings into the `--read-plan` policy. Commands apply
+/// that policy after opening a store, which would otherwise replace what the
+/// runtime config set at open.
+fn apply_runtime_read_settings(plan: &mut ReadPlanPolicy, config: &mtxdb::RuntimeConfig) {
+    plan.point_random_mmap = config.point_random_mmap;
+}
+
 /// Map the `--read-plan` CLI mode to a store policy.
 ///
 /// `clap`'s value parser restricts the argument to these modes, so the
@@ -1860,7 +1867,7 @@ fn parse_cli() -> Cli {
 // `Display` instead and let the profile/env decide nothing.
 /// Parse command-line arguments and execute the selected mtxdb command.
 pub fn run() -> std::process::ExitCode {
-    let cli = parse_cli();
+    let mut cli = parse_cli();
     if let Commands::Completions { shell } = &cli.command {
         #[cfg(feature = "completions")]
         {
@@ -1904,6 +1911,7 @@ pub fn run() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    apply_runtime_read_settings(&mut cli.read_plan, &runtime_config);
     let _ = RUNTIME_CONFIG.set(runtime_config);
 
     match cmd::run(&cli) {
