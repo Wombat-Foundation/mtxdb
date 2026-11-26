@@ -83,6 +83,15 @@ MTXDB_TEST_ARGS ?=
 MTXDB_TEST_ARGS_FLAG := $(if $(strip $(MTXDB_TEST_ARGS)),-- $(MTXDB_TEST_ARGS))
 MTXDB_TEST_ENV := $(if $(findstring -Z,$(MTXDB_TEST_ARGS)),RUSTC_BOOTSTRAP=1)
 
+# The suite is fsync-bound (roughly 12.8k fsync/fdatasync calls per run), so
+# scratch on a disk-backed filesystem measures that device's sync latency, not
+# the code. Default it to tmpfs; set MTXDB_TEST_TMPDIR to a real path to run
+# the durability tests against actual storage.
+MTXDB_TEST_TMPDIR ?= /tmp
+ifneq ($(strip $(MTXDB_TEST_TMPDIR)),)
+MTXDB_TEST_ENV := $(MTXDB_TEST_ENV) TMPDIR=$(MTXDB_TEST_TMPDIR)
+endif
+
 .PHONY: test
 test: ##H Run library and workspace tests
 	$(MTXDB_TEST_ENV) $(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings $(MTXDB_TEST_ARGS_FLAG)
