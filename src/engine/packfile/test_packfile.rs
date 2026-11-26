@@ -15,7 +15,8 @@ fn test_record(collection_id: [u8; 16], hash: [u8; 16], data: &[u8]) -> Record {
 fn test_dir(name: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("mdb_test_pf_{name}_{}_{id}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mdb_test_pf_{name}_{}_{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -1440,7 +1441,8 @@ fn test_write_header_rejects_zero_creation_sequence() {
 
 #[test]
 fn test_open_packfile_never_creates_or_initializes() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_open_no_create_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_open_no_create_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let missing = dir.join("missing.pack");

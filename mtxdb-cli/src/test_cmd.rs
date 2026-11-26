@@ -277,7 +277,7 @@ fn canonical_collection_display_aligns_roles_and_reserves_total_column() {
 fn unique_temp_dir() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     crate::sweep_stale_test_dirs();
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::test_scratch::root().join(format!(
         "mtxdb-cli-test-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)

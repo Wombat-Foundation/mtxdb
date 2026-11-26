@@ -62,7 +62,7 @@ fn checkpoint_round_trips_index_slots() {
         .zip(&indexes)
         .map(|((id, _, _), index)| (*id, index.serialize()))
         .collect();
-    let dir = std::env::temp_dir().join(format!("mtxdb_checkpoint_{}", std::process::id()));
+    let dir = crate::test_scratch::root().join(format!("mtxdb_checkpoint_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -134,7 +134,8 @@ fn checkpoint_round_trips_index_slots() {
 
 #[test]
 fn empty_checkpoint_round_trips() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_checkpoint_empty_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_checkpoint_empty_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -147,7 +148,8 @@ fn empty_checkpoint_round_trips() {
 
 #[test]
 fn corrupt_checkpoints_read_as_none() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_checkpoint_bad_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_checkpoint_bad_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -211,7 +213,8 @@ fn corrupt_checkpoints_read_as_none() {
 /// caller's full-rescan fallback instead of serving a garbled index.
 #[test]
 fn previous_version_checkpoint_is_rejected() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_prevver_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_ckpt_prevver_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -261,7 +264,7 @@ fn content_crc32_catches_value_preserving_slot_corruption() {
     // it names, without zeroing it) preserves that count and would have
     // silently passed. The CRC covers the exact bytes, so this same
     // corruption must now be rejected.
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::test_scratch::root().join(format!(
         "mtxdb_checkpoint_slot_corruption_{}",
         std::process::id()
     ));
@@ -315,7 +318,8 @@ fn content_crc32_catches_value_preserving_slot_corruption() {
 
 #[test]
 fn read_pack_fingerprint_missing_file() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_fp_missing_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_ckpt_fp_missing_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -328,7 +332,8 @@ fn read_pack_fingerprint_missing_file() {
 
 #[test]
 fn read_pack_fingerprint_truncated() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_fp_trunc_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_ckpt_fp_trunc_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -342,7 +347,8 @@ fn read_pack_fingerprint_truncated() {
 
 #[test]
 fn read_pack_fingerprint_invalid_magic() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_fp_badmagic_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_ckpt_fp_badmagic_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -358,7 +364,8 @@ fn read_pack_fingerprint_invalid_magic() {
 
 #[test]
 fn read_pack_fingerprint_valid_roundtrip() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_fp_valid_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_ckpt_fp_valid_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -389,7 +396,8 @@ fn read_pack_fingerprint_valid_roundtrip() {
 
 #[test]
 fn read_durable_fingerprint_no_checkpoint() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_durable_no_ckpt_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_durable_no_ckpt_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     assert!(
@@ -401,7 +409,8 @@ fn read_durable_fingerprint_no_checkpoint() {
 
 #[test]
 fn read_durable_fingerprint_checkpoint_only() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_durable_ckpt_only_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_durable_ckpt_only_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -436,7 +445,8 @@ fn read_durable_fingerprint_checkpoint_only() {
 
 #[test]
 fn read_pack_fingerprint_malformed_returns_err() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_malformed_ckpt_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_malformed_ckpt_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
@@ -454,7 +464,7 @@ fn read_pack_fingerprint_malformed_returns_err() {
 /// and is visible without reading the body.
 #[test]
 fn base_delta_seq_round_trips_through_the_header() {
-    let dir = std::env::temp_dir().join(format!("mtxdb-base-seq-{}", std::process::id()));
+    let dir = crate::test_scratch::root().join(format!("mtxdb-base-seq-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);
     let blobs = [([3u8; 16], index_with_entries(1, 20).serialize())];
@@ -483,7 +493,8 @@ fn base_delta_seq_round_trips_through_the_header() {
 
 #[test]
 fn checkpoint_round_trips_sorted_collection_versions() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_ckpt_versions_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_ckpt_versions_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_CHECKPOINT_FILE);

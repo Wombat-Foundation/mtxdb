@@ -5,6 +5,9 @@
 //! Cargo does not autodiscover `tests/unit/`, so `Cargo.toml` declares this
 //! target explicitly.
 
+#[path = "../../../src/test_scratch.rs"]
+mod test_scratch;
+
 mod meta_cli;
 mod raw_warning_cli;
 mod shard_type_cli;

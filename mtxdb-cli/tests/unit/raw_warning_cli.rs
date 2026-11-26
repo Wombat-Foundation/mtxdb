@@ -7,7 +7,7 @@ mod tests {
     /// A per-test temp root. Test thread names contain `::`, which is not
     /// valid in a Windows path, so colons become underscores.
     fn test_root(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::test_scratch::root().join(format!(
             "{prefix}-{}-{}",
             std::process::id(),
             std::thread::current()

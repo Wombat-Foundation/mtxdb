@@ -14,8 +14,8 @@ fn put(node: [u8; 16], payload: &[u8]) -> JournalMutation {
 }
 
 fn temp_wal(label: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("mtxdb_read_journal_{label}_{}", std::process::id()));
+    let dir = crate::test_scratch::root()
+        .join(format!("mtxdb_read_journal_{label}_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir.join("wal.bin")

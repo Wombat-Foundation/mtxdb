@@ -14,6 +14,9 @@
 // items to wrap in a `#[cfg(test)]` module.
 #![allow(clippy::tests_outside_test_module)]
 
+#[path = "../src/test_scratch.rs"]
+mod test_scratch;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -132,8 +135,8 @@ struct TempRoot(PathBuf);
 
 impl TempRoot {
     fn new(tag: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("mtxdb-shared-wal-{tag}-{}", std::process::id()));
+        let root = crate::test_scratch::root()
+            .join(format!("mtxdb-shared-wal-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         Self(root)
     }

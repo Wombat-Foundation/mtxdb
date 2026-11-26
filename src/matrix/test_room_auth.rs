@@ -16,7 +16,8 @@ const POOL: ShardType = ShardType::State;
 const ROOM: &str = "!facade:example.org";
 
 fn root(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("mtxdb-room-auth-{name}-{}", std::process::id()));
+    let path =
+        crate::test_scratch::root().join(format!("mtxdb-room-auth-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }

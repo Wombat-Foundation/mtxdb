@@ -3348,7 +3348,7 @@ mod auth_findings_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         crate::sweep_stale_test_dirs();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb-closure-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -3652,8 +3652,8 @@ mod auth_findings_tests {
     #[test]
     fn a_reclaim_shrinks_the_segment_and_clears_its_blockers() {
         crate::sweep_stale_test_dirs();
-        let dir =
-            std::env::temp_dir().join(format!("mtxdb-reclaim-outcome-test-{}", std::process::id()));
+        let dir = crate::test_scratch::root()
+            .join(format!("mtxdb-reclaim-outcome-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // The trigger has to sit above an empty segment's header, or the
         // segment could never come back under it.
@@ -3723,7 +3723,7 @@ mod auth_findings_tests {
     fn events_survive_a_reopen_after_a_reclaim() {
         for barrier in [false, true] {
             crate::sweep_stale_test_dirs();
-            let dir = std::env::temp_dir().join(format!(
+            let dir = crate::test_scratch::root().join(format!(
                 "mtxdb-reclaim-test-{}-{barrier}",
                 std::process::id()
             ));

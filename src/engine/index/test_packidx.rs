@@ -426,7 +426,8 @@ fn build_for_pack_round_trips_live_and_removed_records() {
     use crate::storage::{NodeData, StorageEngine as _};
     use crate::PackfileStorage;
 
-    let dir = std::env::temp_dir().join(format!("mtxdb-packidx-pack-{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb-packidx-pack-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let store = PackfileStorage::open(dir.clone()).unwrap();
     let collection = [0xAA; 16];
@@ -482,7 +483,7 @@ fn build_for_pack_round_trips_live_and_removed_records() {
 }
 
 fn test_path() -> PathBuf {
-    std::env::temp_dir().join(format!(
+    crate::test_scratch::root().join(format!(
         "mtxdb-packidx-test-{}-{}.idx",
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)

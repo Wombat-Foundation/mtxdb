@@ -718,7 +718,7 @@ mod tests {
     use crate::index::{IndexConfig, LossyIndex};
 
     fn temp_checkpoint(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::test_scratch::root().join(format!(
             "mtxdb-checkpoint-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

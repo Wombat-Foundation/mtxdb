@@ -5,7 +5,7 @@ use bytes::Bytes;
 use std::path::PathBuf;
 
 fn test_dir(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
+    let path = crate::test_scratch::root().join(format!(
         "mtxdb-ordered-event-timeline-{name}-{}",
         std::process::id()
     ));

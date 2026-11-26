@@ -1901,7 +1901,7 @@ mod tests {
         // each other's directory when they run in parallel.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_scratch::root().join(format!(
             "mtxdb-csr-store-{name}-{}-{unique}",
             std::process::id()
         ));

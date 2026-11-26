@@ -528,7 +528,8 @@ mod tests {
 
     #[test]
     fn append_numbers_entries_from_one_and_reads_them_back_in_order() {
-        let root = std::env::temp_dir().join(format!("mtxdb-edgelog-order-{}", std::process::id()));
+        let root =
+            crate::test_scratch::root().join(format!("mtxdb-edgelog-order-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let db = Database::open(root.clone()).unwrap();
         let log = EdgeLog::new();
@@ -559,7 +560,8 @@ mod tests {
 
     #[test]
     fn prune_removes_entries_but_the_head_never_goes_back() {
-        let root = std::env::temp_dir().join(format!("mtxdb-edgelog-prune-{}", std::process::id()));
+        let root =
+            crate::test_scratch::root().join(format!("mtxdb-edgelog-prune-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let db = Database::open(root.clone()).unwrap();
         let log = EdgeLog::new();

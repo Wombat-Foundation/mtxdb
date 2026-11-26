@@ -12,7 +12,7 @@ struct TestDir(PathBuf);
 
 impl TestDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::root().join(format!(
             "mtxdb-run-test-{}-{}",
             std::process::id(),
             DIR_COUNTER.fetch_add(1, Ordering::Relaxed)

@@ -174,7 +174,8 @@ fn compaction_drops_everything_before_a_collection_cut() {
 
 #[test]
 fn compact_delta_log_rewrites_in_place_and_preserves_the_claim() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_delta_compact_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_delta_compact_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_DELTA_FILE);
@@ -223,7 +224,7 @@ fn compact_delta_log_rewrites_in_place_and_preserves_the_claim() {
 
 #[test]
 fn compact_delta_log_skips_a_log_with_marginal_savings() {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::test_scratch::root().join(format!(
         "mtxdb_delta_compact_marginal_{}",
         std::process::id()
     ));
@@ -257,8 +258,8 @@ fn compact_delta_log_skips_a_log_with_marginal_savings() {
 
 #[test]
 fn compact_delta_log_reaps_a_crash_leftover_temp() {
-    let dir =
-        std::env::temp_dir().join(format!("mtxdb_delta_compact_stale_{}", std::process::id()));
+    let dir = crate::test_scratch::root()
+        .join(format!("mtxdb_delta_compact_stale_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_DELTA_FILE);
@@ -362,7 +363,8 @@ fn compact_operations_preserve_incremental_and_snapshot_replay_result() {
 
 #[test]
 fn v1_log_round_trips_operations() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_delta_v1_round_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_delta_v1_round_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_DELTA_FILE);
@@ -395,7 +397,8 @@ fn v1_log_round_trips_operations() {
 
 #[test]
 fn v1_torn_tail_keeps_the_committed_prefix() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_delta_v1_torn_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_delta_v1_torn_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_DELTA_FILE);
@@ -424,7 +427,8 @@ fn v1_torn_tail_keeps_the_committed_prefix() {
 
 #[test]
 fn v1_corrupt_batch_drops_that_batch_and_later() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_delta_v1_corrupt_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_delta_v1_corrupt_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_DELTA_FILE);
@@ -451,7 +455,8 @@ fn v1_corrupt_batch_drops_that_batch_and_later() {
 
 #[test]
 fn v1_reader_rejects_unsupported_and_empty_logs() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_delta_v1_reject_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_delta_v1_reject_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_DELTA_FILE);
@@ -606,7 +611,8 @@ fn v1_snapshot_rejects_blob_length_mismatch() {
 
 #[test]
 fn v1_append_batch_round_trips_through_the_reader() {
-    let dir = std::env::temp_dir().join(format!("mtxdb_delta_v1_append_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_delta_v1_append_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(INDEX_DELTA_FILE);
@@ -639,7 +645,8 @@ fn v1_append_batch_round_trips_through_the_reader() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 fn coverage_log_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mtxdb_delta_cov_{name}_{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb_delta_cov_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -1104,7 +1111,7 @@ fn a_torn_or_damaged_coverage_batch_claims_nothing() {
 }
 
 fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mtxdb_delta_{tag}_{}", std::process::id()));
+    let dir = crate::test_scratch::root().join(format!("mtxdb_delta_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

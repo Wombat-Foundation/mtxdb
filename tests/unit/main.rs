@@ -14,6 +14,9 @@
 //! `src/`; each carries `#![allow(clippy::tests_outside_test_module)]` since it
 //! is test code by construction rather than a `#[cfg(test)] mod tests`.
 
+#[path = "../../src/test_scratch.rs"]
+mod test_scratch;
+
 mod index_checkpoint;
 mod test_auth_graph;
 mod test_cache;

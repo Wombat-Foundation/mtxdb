@@ -108,7 +108,7 @@ fn phases(
 fn direct_reverse_timing() {
     for (fixture, prev_chain) in [("prev chain", true), ("no prev", false)] {
         for messages in [10_000_usize, 100_000] {
-            let root = std::env::temp_dir().join(format!(
+            let root = crate::test_scratch::root().join(format!(
                 "mtxdb-direct-reverse-timing-{}-{}-{messages}",
                 std::process::id(),
                 if prev_chain { "chain" } else { "star" }

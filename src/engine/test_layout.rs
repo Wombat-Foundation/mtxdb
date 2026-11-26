@@ -10,7 +10,10 @@ struct CleanupDir(PathBuf);
 impl CleanupDir {
     fn new(name: &str) -> Self {
         let id = CLEANUP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Self(std::env::temp_dir().join(format!("mtxdb-layout-{name}-{}-{id}", std::process::id())))
+        Self(
+            crate::test_scratch::root()
+                .join(format!("mtxdb-layout-{name}-{}-{id}", std::process::id())),
+        )
     }
 
     fn path(&self) -> &Path {
@@ -25,7 +28,8 @@ impl Drop for CleanupDir {
 }
 
 fn test_dir(name: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("mtxdb-layout-{name}-{}", std::process::id()));
+    let path =
+        crate::test_scratch::root().join(format!("mtxdb-layout-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&path);
     path
 }

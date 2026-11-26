@@ -88,13 +88,15 @@ MTXDB_TEST_ENV := $(if $(findstring -Z,$(MTXDB_TEST_ARGS)),RUSTC_BOOTSTRAP=1)
 # the code. Default it to tmpfs; set MTXDB_TEST_TMPDIR to a real path to run
 # the durability tests against actual storage.
 MTXDB_TEST_TMPDIR ?= /tmp
-ifneq ($(strip $(MTXDB_TEST_TMPDIR)),)
-MTXDB_TEST_ENV := $(MTXDB_TEST_ENV) TMPDIR=$(MTXDB_TEST_TMPDIR)
-endif
 
 .PHONY: test
 test: ##H Run library and workspace tests
-	$(MTXDB_TEST_ENV) $(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings $(MTXDB_TEST_ARGS_FLAG)
+	@set -eu; \
+		mkdir -p "$(MTXDB_TEST_TMPDIR)"; \
+		scratch=$$(mktemp -d "$(MTXDB_TEST_TMPDIR)/mdb-test.XXXXXX"); \
+		cleanup() { status=$$?; if [ "$$status" -eq 0 ]; then rm -rf "$$scratch"; else echo "test scratch preserved at $$scratch" >&2; fi; exit "$$status"; }; \
+		trap cleanup EXIT; \
+		$(MTXDB_TEST_ENV) TMPDIR="$$scratch" $(CARGO) test $(MTXDB_TEST_PROFILE_FLAG) --workspace --all-features --lib --tests --timings $(MTXDB_TEST_ARGS_FLAG)
 
 # Drop the Regions/Branches columns from the per-file terminal summary.
 LLVM_COV_FLAGS ?= -show-region-summary=false -show-branch-summary=false

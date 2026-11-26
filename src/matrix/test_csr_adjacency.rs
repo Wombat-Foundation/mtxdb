@@ -6,7 +6,8 @@ use std::path::PathBuf;
 const ROOM: &str = "!room:example.org";
 
 fn test_root(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("mtxdb-mtxadj-{name}-{}", std::process::id()));
+    let path =
+        crate::test_scratch::root().join(format!("mtxdb-mtxadj-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }

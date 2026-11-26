@@ -246,7 +246,7 @@ mod tests {
     use super::*;
 
     fn temp_segment(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb-publish-signal-{}-{}",
             std::process::id(),
             label

@@ -2,8 +2,8 @@ use super::*;
 
 #[test]
 fn state_batch_budget_respects_the_configured_stage_limit() {
-    let dir =
-        std::env::temp_dir().join(format!("mtxdb-interop-stage-limit-{}", std::process::id()));
+    let dir = crate::test_scratch::root()
+        .join(format!("mtxdb-interop-stage-limit-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let config = crate::RuntimeConfig {
         txn_stage_limit_bytes: 512,
@@ -300,7 +300,8 @@ fn outlier_flag_is_part_of_the_verdict_record() {
 
 #[test]
 fn state_batches_split_under_the_budget_and_read_back() {
-    let dir = std::env::temp_dir().join(format!("mtxdb-interop-state-{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb-interop-state-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let db = crate::Database::open(dir.clone()).unwrap();
     let room = b"!room:example.com";

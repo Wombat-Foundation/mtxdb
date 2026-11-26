@@ -6,7 +6,7 @@ mod tests {
 
     #[test]
     fn server_info_shard_type_selects_the_server_info_pool() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_scratch::root().join(format!(
             "mtxdb-shard-type-cli-{}-{}",
             std::process::id(),
             std::thread::current()

@@ -12,7 +12,8 @@ const COLLECTION: [u8; 16] = [0x4B; 16];
 const KEY: &[u8] = b"test-hamt-store";
 
 fn test_root(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("mtxdb-hamt-store-{name}-{}", std::process::id()));
+    let path =
+        crate::test_scratch::root().join(format!("mtxdb-hamt-store-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }

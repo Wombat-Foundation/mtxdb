@@ -22,8 +22,8 @@ fn would_block_server_key_update_retries_after_backoff() {
 }
 
 fn test_root(name: &str) -> PathBuf {
-    let path =
-        std::env::temp_dir().join(format!("mtxdb-server-keys-{name}-{}", std::process::id()));
+    let path = crate::test_scratch::root()
+        .join(format!("mtxdb-server-keys-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }

@@ -145,8 +145,8 @@ mod tests {
 
     #[test]
     fn reopen_from_checkpoint_serves_the_same_data() {
-        let dir =
-            std::env::temp_dir().join(format!("mtxdb_index_checkpoint_{}", std::process::id()));
+        let dir = crate::test_scratch::root()
+            .join(format!("mtxdb_index_checkpoint_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let store = make_store(&dir);
@@ -174,7 +174,7 @@ mod tests {
     fn open_and_sync_timings_are_recorded() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_open_timings_{}",
             std::process::id()
         ));
@@ -262,7 +262,7 @@ mod tests {
     fn shard_directory_bookkeeping_gate_and_fallback() {
         use mtxdb::packfile::storage::{BookkeepingSource, OpenPath};
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_sidecar_{}",
             std::process::id()
         ));
@@ -358,8 +358,8 @@ mod tests {
 
     #[test]
     fn corrupt_or_missing_checkpoint_falls_back_to_rescan() {
-        let dir =
-            std::env::temp_dir().join(format!("mtxdb_index_checkpoint_bad_{}", std::process::id()));
+        let dir = crate::test_scratch::root()
+            .join(format!("mtxdb_index_checkpoint_bad_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let store = make_store(&dir);
@@ -384,7 +384,7 @@ mod tests {
     fn unsupported_version_checkpoint_falls_back_to_rescan_and_rebuilds_current() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_bad_version_{}",
             std::process::id()
         ));
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn unsynced_append_invalidates_checkpoint_then_recovers() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_sync_{}",
             std::process::id()
         ));
@@ -503,7 +503,7 @@ mod tests {
     fn torn_delta_log_falls_back_to_rescan() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_torn_delta_{}",
             std::process::id()
         ));
@@ -576,7 +576,7 @@ mod tests {
     /// both halves independently at the last flushed boundary.
     #[test]
     fn buffered_crash_before_flush_leaves_pack_length_and_fingerprint_at_last_boundary() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_buffered_crash_{}",
             std::process::id()
         ));
@@ -647,8 +647,8 @@ mod tests {
 
     #[test]
     fn deleted_collections_are_not_resurrected_by_stale_checkpoint() {
-        let dir =
-            std::env::temp_dir().join(format!("mtxdb_index_checkpoint_del_{}", std::process::id()));
+        let dir = crate::test_scratch::root()
+            .join(format!("mtxdb_index_checkpoint_del_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let store = make_store(&dir);
@@ -690,7 +690,7 @@ mod tests {
     fn clean_sync_and_v1_replays_incremental_and_structural_changes() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_dirty_{}",
             std::process::id()
         ));
@@ -824,7 +824,7 @@ mod tests {
     fn each_dirty_sync_writes_the_sidecar_exactly_once() {
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_sidecar_once_{}",
             std::process::id()
         ));
@@ -916,7 +916,7 @@ mod tests {
         use mtxdb::index::delta;
         use mtxdb::packfile::storage::OpenPath;
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_delta_continue_{}",
             std::process::id()
         ));
@@ -998,7 +998,7 @@ mod tests {
     fn v1_collection_snapshots_and_tombstones_replay_across_reopen() {
         use mtxdb::index::delta::{read_delta_log, DeltaOperation};
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::root().join(format!(
             "mtxdb_index_checkpoint_v1_structural_{}",
             std::process::id()
         ));

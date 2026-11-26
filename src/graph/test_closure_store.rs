@@ -12,7 +12,8 @@ const POOL: ShardType = ShardType::ServerInfo;
 const SCOPE: [u8; 16] = [0xC1; 16];
 
 fn test_root(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("mtxdb-closure-{name}-{}", std::process::id()));
+    let path =
+        crate::test_scratch::root().join(format!("mtxdb-closure-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }

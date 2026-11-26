@@ -20,7 +20,7 @@ impl ReplayTestDir {
     fn new(label: &str) -> Self {
         loop {
             let id = REPLAY_TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let path = crate::test_scratch::root().join(format!(
                 "mtxdb_replay_{label}_{}_{}",
                 std::process::id(),
                 id
@@ -45,7 +45,7 @@ impl Drop for ReplayTestDir {
 }
 
 fn temp_path(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
+    crate::test_scratch::root().join(format!(
         "mtxdb_journal_{label}_{}_{}",
         std::process::id(),
         std::thread::current()

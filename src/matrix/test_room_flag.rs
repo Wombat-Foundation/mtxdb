@@ -35,7 +35,7 @@ mod tests {
     }
 
     fn test_root(name: &str) -> TestRoot {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::root().join(format!(
             "mtxdb-test-room-flag-{name}-{}",
             std::process::id()
         ));

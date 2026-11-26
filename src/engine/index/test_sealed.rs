@@ -317,7 +317,8 @@ fn sample_run(
 }
 
 fn scratch_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mtxdb-sealed-{name}-{}", std::process::id()));
+    let dir =
+        crate::test_scratch::root().join(format!("mtxdb-sealed-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

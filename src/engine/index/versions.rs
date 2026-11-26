@@ -232,7 +232,7 @@ mod tests {
     use super::*;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::test_scratch::root().join(format!(
             "mtxdb-versions-{label}-{}-{}",
             std::process::id(),
             TMP_COUNTER.fetch_add(1, Ordering::Relaxed)

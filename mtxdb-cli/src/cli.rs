@@ -9,6 +9,10 @@ mod state_hamt;
 mod state_policy;
 mod state_resolve;
 
+#[cfg(test)]
+#[path = "../../src/test_scratch.rs"]
+mod test_scratch;
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
