@@ -451,6 +451,10 @@ pub struct Shard {
     /// shard is refused rather than risk writing on top of, or scanning
     /// past, that corrupt physical tail.
     poisoned: AtomicBool,
+    /// Fail the next flush before its positioned write, exercising the
+    /// append rollback path without relying on filesystem-specific failures.
+    #[cfg(test)]
+    fail_next_flush: AtomicBool,
 }
 
 /// A byte range which keeps the mmap that backs it alive.  `Bytes::from_owner`
@@ -634,6 +638,8 @@ impl Shard {
             preallocated_len: AtomicU64::new(file_len),
             prealloc_disabled: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_flush: AtomicBool::new(false),
         }
     }
 
@@ -3031,6 +3037,10 @@ impl ShardPool {
             if pending_guard.is_empty() {
                 // Nothing buffered: nothing to commit or dirty.
                 return Ok(());
+            }
+            #[cfg(test)]
+            if shard.fail_next_flush.swap(false, Ordering::AcqRel) {
+                return Err(io::Error::other("injected test flush failure"));
             }
             let committed = shard.file_len.load(Ordering::Acquire);
             // Write directly from the still-buffered bytes rather than

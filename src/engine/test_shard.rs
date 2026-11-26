@@ -127,6 +127,53 @@ fn poisoned_shard_refuses_append_and_flush() {
 }
 
 #[test]
+fn failed_flush_rollback_retires_both_mappings_and_allows_later_io() {
+    let dir = test_dir("point_mapping_flush_rollback");
+    let pool = ShardPool::open(dir.clone()).unwrap();
+    let first = test_record(0x41, 0x01, b"committed before failure");
+    let (slot, first_offset) = pool.put_record(&first).unwrap();
+    let shard = pool.get_shard(slot).unwrap();
+
+    assert_eq!(
+        pool.read_at_mode(&shard, first_offset, true, true)
+            .unwrap()
+            .data,
+        first.data
+    );
+    assert!(shard.point_mmap.read().is_some());
+    assert!(shard.mmap().unwrap().is_some());
+
+    shard.fail_next_flush.store(true, Ordering::Release);
+    let failed = test_record(0x41, 0x02, b"must be rolled back");
+    let error = pool
+        .put_record(&failed)
+        .expect_err("injected flush failure must reach append rollback");
+    assert!(error.to_string().contains("injected test flush failure"));
+    assert!(shard.pending.lock().is_empty());
+    assert!(shard.point_mmap.read().is_none());
+    assert!(shard.mmap.read().is_none());
+
+    let later = test_record(0x41, 0x03, b"append after rollback");
+    let (later_slot, later_offset) = pool.put_record(&later).unwrap();
+    assert_eq!(later_slot, slot);
+    assert_eq!(
+        pool.read_at_mode(&shard, first_offset, true, true)
+            .unwrap()
+            .data,
+        first.data
+    );
+    assert_eq!(
+        pool.read_at_mode(&shard, later_offset, true, true)
+            .unwrap()
+            .data,
+        later.data
+    );
+
+    drop(pool);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn raw_reads_borrow_the_mmap_and_survive_a_remap() {
     let dir = test_dir("raw_read_mmap_owner");
     let pool = ShardPool::open(dir).unwrap();

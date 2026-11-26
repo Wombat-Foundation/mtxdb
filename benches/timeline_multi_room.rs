@@ -1020,25 +1020,19 @@ fn run_page_rows_for_mode(
 /// Walk the normal mapping on the same handle that just ran the page rows.
 /// This keeps the point mapping live while measuring sequential access.
 fn run_mapping_control(db: &Database, root: &Path, mode: &str) {
-    const CONTROL_RUNS: usize = 3;
-    let mut times = Vec::with_capacity(CONTROL_RUNS);
-    let mut last_io = IoSnapshot::default();
-    let mut pages = 0u64;
-    for _ in 0..CONTROL_RUNS {
-        evict(root, EvictScope::All).expect("evict before mapping control");
-        let before = IoSnapshot::read();
-        let started = Instant::now();
-        pages = db.event_dag().touch_mapped_pages();
-        times.push(started.elapsed());
-        last_io = IoSnapshot::read().delta(before);
-    }
+    // Keep this to one walk: advice is shared by the mapping, while repeated
+    // walks can become cache-resident even after fadvise(DONTNEED).
+    evict(root, EvictScope::All).expect("evict before mapping control");
+    let before = IoSnapshot::read();
+    let started = Instant::now();
+    let pages = db.event_dag().touch_mapped_pages();
+    let elapsed = started.elapsed();
+    let io = IoSnapshot::read().delta(before);
     println!(
-        "multi_room_seq_mapping advice={mode} pages={pages} samples={} min_us={:.1} median_us={:.1} majflt={} disk_read_bytes={}",
-        times.len(),
-        min(&times).as_secs_f64() * 1e6,
-        median(&mut times).as_secs_f64() * 1e6,
-        last_io.majflt,
-        last_io.read_bytes,
+        "multi_room_seq_mapping advice={mode} pages={pages} walk=first elapsed_us={:.1} majflt={} disk_read_bytes={}",
+        elapsed.as_secs_f64() * 1e6,
+        io.majflt,
+        io.read_bytes,
     );
 }
 
@@ -1106,7 +1100,6 @@ fn run_paged_page_rows_for_mode(
             let mut elapsed_samples = Vec::with_capacity(samples);
             let mut last_io = IoSnapshot::default();
             let mut last_open_io = IoSnapshot::default();
-            let mut last_unmapped_bytes = 0u64;
             let mut last_pack_vmas = 0usize;
             for _ in 0..samples {
                 evict(root, EvictScope::All).expect("evict before paged open");
@@ -1114,7 +1107,7 @@ fn run_paged_page_rows_for_mode(
                 let store = PackfileStorage::open_read_only_with_config(pool_path.clone(), &config)
                     .expect("open paged event DAG pool");
                 last_open_io = IoSnapshot::read().delta(open_before);
-                last_unmapped_bytes = store.unmap_shards();
+                let _ = store.unmap_shards();
                 if mode == "point" {
                     store.set_point_random_mmap(true);
                 } else if mode == "random" {
@@ -1153,7 +1146,7 @@ fn run_paged_page_rows_for_mode(
             let min_us = min(&elapsed_samples).as_secs_f64() * 1e6;
             let median_us = median(&mut elapsed_samples).as_secs_f64() * 1e6;
             println!(
-                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} advice={mode} samples={} min_us={min_us:.1} median_us={median_us:.1} unmapped_span_bytes={last_unmapped_bytes} pack_vmas={last_pack_vmas} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
+                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} advice={mode} samples={} min_us={min_us:.1} median_us={median_us:.1} pack_vmas={last_pack_vmas} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
                 tier_label(tier_rank),
                 elapsed_samples.len(),
                 last_open_io.read_bytes,
