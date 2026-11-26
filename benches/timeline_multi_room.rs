@@ -7,6 +7,7 @@
 //! (`MTXDB_MULTI_EVENTS=1000000`, `MTXDB_MULTI_ROOMS=1000`). Set
 //! `MTXDB_TIMELINE_EXPORT` to a CSV length manifest with
 //! `room,topo,stream,payload_bytes` rows to drive size-shaped synthetic reads.
+//! `MTXDB_PAYLOAD_MIN` and `MTXDB_PAYLOAD_MAX` override synthetic payload bounds.
 //! The load is synced and reclaimed once before read phases. Each resident
 //! cold sample closes the database, evicts selected files, then reopens before
 //! timing; the manifest mode does not read payloads from an existing database.
@@ -391,6 +392,19 @@ fn directory_bytes(root: &Path) -> (u64, u64, u64, u64, u64) {
     (pack, index, run, wal, other)
 }
 
+fn raw_pack_frame_count(root: &Path) -> std::io::Result<u64> {
+    let mut files = Vec::new();
+    walk_files(root, &mut files);
+    files
+        .into_iter()
+        .filter(|path| file_kind(path) == "pack")
+        .try_fold(0u64, |total, path| {
+            let count = mtxdb::packfile::scan_packfile_iter(&path, false)?
+                .try_fold(0u64, |count, frame| frame.map(|_| count.saturating_add(1)))?;
+            Ok(total.saturating_add(count))
+        })
+}
+
 fn extension_bytes(root: &Path) -> Vec<(String, u64)> {
     let mut files = Vec::new();
     walk_files(root, &mut files);
@@ -501,34 +515,97 @@ fn print_memory_diagnostics(db: &Database, root: &Path, rooms: &[Room]) {
     let stream_records = count_records(&stream_index.collection_id());
     let (pack_bytes, idx_bytes, run_bytes, wal_bytes, other_bytes) = directory_bytes(root);
     println!(
-        "multi_room_memory rss_kib={} hwm_kib={} pack_bytes={pack_bytes} idx_bytes={idx_bytes} run_bytes={run_bytes} wal_bytes={wal_bytes} other_bytes={other_bytes} payload_records={payload_records} topo_records={topo_records} stream_records={stream_records}",
+        "multi_room_memory rss_kib={} anon_kib={} file_kib={} shmem_kib={} hwm_kib={} pack_bytes={pack_bytes} idx_bytes={idx_bytes} run_bytes={run_bytes} wal_bytes={wal_bytes} other_bytes={other_bytes} payload_records={payload_records} topo_records={topo_records} stream_records={stream_records}",
         proc_status_kib("VmRSS:").unwrap_or(0),
+        proc_status_kib("RssAnon:").unwrap_or(0),
+        proc_status_kib("RssFile:").unwrap_or(0),
+        proc_status_kib("RssShmem:").unwrap_or(0),
         proc_status_kib("VmHWM:").unwrap_or(0),
     );
 }
 
-fn recover_benchmark_database(root: &Path, db: Database) -> Database {
-    let recovery_before = IoSnapshot::read();
+fn reopen_benchmark_database(root: &Path, db: Database) -> Database {
+    let before_files = directory_bytes(root);
+    let before_frames = raw_pack_frame_count(root).expect("count raw pack frames before reopen");
+    let open_before = IoSnapshot::read();
     drop(db);
-    let db = Database::open(root.to_path_buf()).expect("recover benchmark database");
-    let recovery_io = IoSnapshot::read().delta(recovery_before);
-    db.event_dag()
-        .sync_all()
-        .expect("sync recovered benchmark database");
-    let reclaim = db.coordinator().reclaim_shared();
+    let db = Database::open(root.to_path_buf()).expect("reopen benchmark database");
+    let open_io = IoSnapshot::read().delta(open_before);
+    let after_files = directory_bytes(root);
+    let after_frames = raw_pack_frame_count(root).expect("count raw pack frames after reopen");
     println!(
-        "multi_room_prepare recovery_read_bytes={} recovery_majflt={} recovery_cgroup_pgmajfault={} wal_bytes={} reclaim_call_ok={}",
-        recovery_io.read_bytes,
-        recovery_io.majflt,
-        recovery_io.pgmajfault.unwrap_or(u64::MAX),
-        directory_bytes(root).3,
-        reclaim.is_ok(),
+        "multi_room_reopen read_bytes={} majflt={} cgroup_pgmajfault={} pack_before={} pack_after={} frames_before={} frames_after={} wal_before={} wal_after={}",
+        open_io.read_bytes,
+        open_io.majflt,
+        open_io.pgmajfault.unwrap_or(u64::MAX),
+        before_files.0,
+        after_files.0,
+        before_frames,
+        after_frames,
+        before_files.3,
+        after_files.3,
     );
-    print_extension_breakdown(root, "prepared");
+    print_extension_breakdown(root, "after_reopen");
     db
 }
 
-fn write_synthetic(db: &Database, rooms: &mut [Room], counts: &[usize], batch: usize) {
+fn checkpoint_all_pools(db: &Database, root: &Path) -> (u64, u64) {
+    let before = raw_pack_frame_count(root).expect("count raw pack frames before checkpoint");
+    for pool in ShardType::ALL {
+        db.pool(pool)
+            .sync_all()
+            .expect("sync benchmark pool before checkpoint");
+    }
+    let coverage_before = ShardType::ALL
+        .into_iter()
+        .map(|pool| {
+            format!(
+                "{}:{}/{}",
+                pool.as_str(),
+                db.pool(pool).durable_coverage(),
+                db.coordinator().committed_lsn_for_pool(pool),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    for pool in ShardType::ALL {
+        db.pool(pool)
+            .force_index_checkpoint()
+            .expect("checkpoint benchmark pool before measurements");
+    }
+    let reclaim = db
+        .coordinator()
+        .reclaim_shared()
+        .expect("reclaim shared WAL after full checkpoint");
+    let after = raw_pack_frame_count(root).expect("count raw pack frames after checkpoint");
+    let coverage_after = ShardType::ALL
+        .into_iter()
+        .map(|pool| {
+            format!(
+                "{}:{}/{}",
+                pool.as_str(),
+                db.pool(pool).durable_coverage(),
+                db.coordinator().committed_lsn_for_pool(pool),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "multi_room_checkpoint coverage_before={coverage_before} coverage_after={coverage_after} blockers={:?} reclaimed={}",
+        db.coordinator().reclaim_blockers(),
+        reclaim.is_some(),
+    );
+    (before, after)
+}
+
+fn write_synthetic(
+    db: &Database,
+    rooms: &mut [Room],
+    counts: &[usize],
+    batch: usize,
+    payload_min: usize,
+    payload_max: usize,
+) {
     let mut sequence = 0u64;
     let mut completed = vec![0usize; rooms.len()];
     loop {
@@ -545,13 +622,13 @@ fn write_synthetic(db: &Database, rooms: &mut [Room], counts: &[usize], batch: u
             let mut payloads = Vec::with_capacity(take);
             for _ in 0..take {
                 sequence = sequence.saturating_add(1);
-                let len = PAYLOAD_MIN
+                let len = payload_min
                     .saturating_add(
                         usize::try_from(sequence % 16)
                             .unwrap_or(0)
                             .saturating_mul(PAYLOAD_STEP),
                     )
-                    .min(PAYLOAD_MAX);
+                    .min(payload_max);
                 let node = node_id(sequence);
                 let stream = if sequence.is_multiple_of(50) {
                     i64::try_from(sequence / 50)
@@ -944,7 +1021,7 @@ fn run_fetch_rows(
     db
 }
 
-fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>) {
+fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min: usize) {
     let Some(largest) = tier else {
         return;
     };
@@ -973,7 +1050,7 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>) {
             ShardType::EventDag,
             largest_room.collection,
             *node,
-            &NodeData::new(payload(sequence, PAYLOAD_MIN)),
+            &NodeData::new(payload(sequence, payload_min)),
         )
         .expect("seed outlier payload");
     }
@@ -1051,6 +1128,12 @@ fn main() {
     let room_count = env_usize("MTXDB_MULTI_ROOMS", 1_000);
     let batch = env_usize("MTXDB_MULTI_BATCH", 64).max(1);
     let samples = env_usize("MTXDB_TIMELINE_SAMPLES", 10).max(1);
+    let payload_min = env_usize("MTXDB_PAYLOAD_MIN", PAYLOAD_MIN);
+    let payload_max = env_usize("MTXDB_PAYLOAD_MAX", PAYLOAD_MAX);
+    if payload_min > payload_max {
+        eprintln!("timeline_multi_room: MTXDB_PAYLOAD_MIN exceeds MTXDB_PAYLOAD_MAX");
+        std::process::exit(2);
+    }
 
     let manifest = std::env::var_os("MTXDB_TIMELINE_EXPORT").map(PathBuf::from);
     let (mut rooms, counts, manifest_events) = if let Some(path) = manifest.as_deref() {
@@ -1083,18 +1166,14 @@ fn main() {
     if let Some(manifest_events) = manifest_events.as_deref() {
         write_manifest(&db, &rooms, manifest_events, batch);
     } else {
-        write_synthetic(&db, &mut rooms, &counts, batch);
+        write_synthetic(&db, &mut rooms, &counts, batch, payload_min, payload_max);
     }
-    db.event_dag().sync_all().expect("sync benchmark database");
-    let _ = db.coordinator().reclaim_shared();
-    db.event_dag()
-        .sync_all()
-        .expect("sync index sidecars before measurements");
-    let _ = db.coordinator().reclaim_shared();
+    let (frames_before_checkpoint, frames_after_checkpoint) = checkpoint_all_pools(&db, &root);
     let write_ms = write_started.elapsed().as_secs_f64() * 1e3;
     println!(
-        "multi_room_load events={total_events} rooms={} batch={batch} write_ms={write_ms:.1}",
-        rooms.len()
+        "multi_room_load events={total_events} rooms={} batch={batch} write_ms={write_ms:.1} payload_min={payload_min} payload_max={payload_max} raw_frames_before_checkpoint={frames_before_checkpoint} raw_frames_after_checkpoint={frames_after_checkpoint} wal_bytes={}",
+        rooms.len(),
+        directory_bytes(&root).3,
     );
     print_memory_diagnostics(&db, &root, &rooms);
     print_extension_breakdown(&root, "load");
@@ -1123,7 +1202,7 @@ fn main() {
         }
     }
 
-    let db = recover_benchmark_database(&root, db);
+    let db = reopen_benchmark_database(&root, db);
     print_memory_diagnostics(&db, &root, &rooms);
     drop(db);
     run_paged_page_rows(&root, &rooms, &tiers, samples);
@@ -1132,7 +1211,7 @@ fn main() {
     db = run_fetch_rows(db, &root, &rooms, tiers.first().copied(), samples);
     print_memory_diagnostics(&db, &root, &rooms);
     print_extension_breakdown(&root, "after_reads");
-    run_mutations(&db, &rooms, tiers.first().copied());
+    run_mutations(&db, &rooms, tiers.first().copied(), payload_min);
     print_extension_breakdown(&root, "after_mutations");
 }
 
