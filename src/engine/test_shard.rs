@@ -174,7 +174,7 @@ fn record_disk_len_rejects_truncated_frame_body() {
 
     let len = shard.file.metadata().unwrap().len();
     // Windows refuses to truncate a file while any view of it is mapped.
-    *shard.mmap.write() = None;
+    let _ = shard.unmap();
     shard.file.set_len(len - 1).unwrap();
 
     assert!(matches!(
@@ -186,7 +186,7 @@ fn record_disk_len_rejects_truncated_frame_body() {
 /// Overwrite bytes in a committed pack behind the mmap, so the next read sees
 /// them. Clearing the mapping first keeps the old snapshot from answering.
 fn corrupt_committed_bytes(shard: &Shard, offset: u64, bytes: &[u8]) {
-    *shard.mmap.write() = None;
+    let _ = shard.unmap();
     crate::io::write_all_at(&shard.file, bytes, offset).unwrap();
 }
 
@@ -268,7 +268,7 @@ fn read_at_committed_rejects_bad_prefixes_flags_and_truncation() {
 
     let len = shard.file.metadata().unwrap().len();
     // Windows refuses to truncate a file while any view of it is mapped.
-    *shard.mmap.write() = None;
+    let _ = shard.unmap();
     shard.file.set_len(len - 1).unwrap();
     let error = ShardPool::read_at_committed(&shard, offset, false)
         .expect_err("a frame whose tail is gone must be corrupt");

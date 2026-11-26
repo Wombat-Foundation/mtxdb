@@ -856,12 +856,32 @@ fn write_manifest(db: &Database, rooms: &[Room], events: &[SpecEvent], batch: us
 /// selects the advised variant alone (default is the unadvised baseline).
 fn advice_modes() -> Vec<&'static str> {
     if std::env::var_os("MTXDB_PAGE_ADVICE_AB").is_some() {
-        vec!["default", "random"]
+        let mut modes = vec!["default", "random", "point"];
+        if std::env::var_os("MTXDB_PAGE_AB_REVERSE").is_some() {
+            modes.reverse();
+        }
+        modes
+    } else if std::env::var_os("MTXDB_PAGE_POINT_MAPPING").is_some() {
+        vec!["point"]
     } else if std::env::var("MTXDB_PAGE_RANDOM_ADVICE").is_ok_and(|value| value != "0") {
         vec!["random"]
     } else {
         vec!["default"]
     }
+}
+
+fn mapped_pack_vmas() -> usize {
+    std::fs::read_to_string("/proc/self/maps").map_or(0, |maps| {
+        maps.lines()
+            .filter(|line| {
+                let mut fields = line.split_whitespace();
+                let path = fields.nth(5);
+                path.is_some_and(|path| {
+                    Path::new(path).extension().is_some_and(|ext| ext == "pack")
+                }) && fields.next().is_none()
+            })
+            .count()
+    })
 }
 
 fn run_page_rows(
@@ -900,12 +920,17 @@ fn run_page_rows_for_mode(
             let mut pages: Vec<Duration> = Vec::new();
             let mut last_io = IoSnapshot::default();
             let mut last_open_io = IoSnapshot::default();
+            let mut last_pack_vmas = 0usize;
             for _ in 0..samples {
                 drop(db);
                 evict(root, EvictScope::All).expect("evict files before cold read");
                 let open_before = IoSnapshot::read();
                 db = open_benchmark_database(root.to_path_buf());
                 last_open_io = IoSnapshot::read().delta(open_before);
+                let _ = db.event_dag().unmap_shards();
+                if mode == "point" {
+                    db.event_dag().set_point_random_mmap(true);
+                }
                 if mode == "random" {
                     let advised = db.event_dag().advise_random_shards();
                     std::hint::black_box(advised);
@@ -934,13 +959,14 @@ fn run_page_rows_for_mode(
                     (started.elapsed(), page.entries.len())
                 };
                 last_io = IoSnapshot::read().delta(before);
+                last_pack_vmas = mapped_pack_vmas();
                 std::hint::black_box(returned);
                 pages.push(elapsed);
             }
             let min_us = min(&pages).as_secs_f64() * 1e6;
             let median_us = median(&mut pages).as_secs_f64() * 1e6;
             println!(
-                "multi_room_page room={room_id} tier={} order={order} limit={limit} advice={mode} min_us={min_us:.1} median_us={median_us:.1} syscr={} disk_read_bytes={} open_read_bytes={} open_majflt={} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
+                "multi_room_page room={room_id} tier={} order={order} limit={limit} advice={mode} min_us={min_us:.1} median_us={median_us:.1} pack_vmas={last_pack_vmas} syscr={} disk_read_bytes={} open_read_bytes={} open_majflt={} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
                 tier_label(tier_rank),
                 last_io.syscr,
                 last_io.read_bytes,
@@ -986,26 +1012,19 @@ fn run_page_rows_for_mode(
         }
     }
 
+    run_mapping_control(&db, root, mode);
     drop(db);
-    run_mapping_control(root, mode);
     open_benchmark_database(root.to_path_buf())
 }
 
-/// Sequential-mapping control for the readahead A/B: open a fresh mapping,
-/// drop the file cache, then walk every mapped shard page by page under the
-/// current advice. A regression here means `MADV_RANDOM` disabled fault-around
-/// and made sequential access slower.
-fn run_mapping_control(root: &Path, mode: &str) {
+/// Walk the normal mapping on the same handle that just ran the page rows.
+/// This keeps the point mapping live while measuring sequential access.
+fn run_mapping_control(db: &Database, root: &Path, mode: &str) {
     const CONTROL_RUNS: usize = 3;
     let mut times = Vec::with_capacity(CONTROL_RUNS);
     let mut last_io = IoSnapshot::default();
     let mut pages = 0u64;
     for _ in 0..CONTROL_RUNS {
-        evict(root, EvictScope::All).expect("evict before control open");
-        let db = open_benchmark_database(root.to_path_buf());
-        if mode == "random" {
-            std::hint::black_box(db.event_dag().advise_random_shards());
-        }
         evict(root, EvictScope::All).expect("evict before mapping control");
         let before = IoSnapshot::read();
         let started = Instant::now();
@@ -1027,6 +1046,22 @@ fn run_mapping_control(root: &Path, mode: &str) {
 /// shared-WAL `Database`, this read-only pool can keep sealed-pack locators
 /// paged, so locator faults happen in the measured read rather than at open.
 fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: usize) {
+    for mode in advice_modes() {
+        run_paged_page_rows_for_mode(root, rooms, tiers, samples, mode);
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "cold samples and reporting share the same paged reader"
+)]
+fn run_paged_page_rows_for_mode(
+    root: &Path,
+    rooms: &[Room],
+    tiers: &[usize],
+    samples: usize,
+    mode: &str,
+) {
     let extension_sizes = extension_bytes(root);
     let idx_bytes = extension_sizes
         .iter()
@@ -1072,6 +1107,7 @@ fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: us
             let mut last_io = IoSnapshot::default();
             let mut last_open_io = IoSnapshot::default();
             let mut last_unmapped_bytes = 0u64;
+            let mut last_pack_vmas = 0usize;
             for _ in 0..samples {
                 evict(root, EvictScope::All).expect("evict before paged open");
                 let open_before = IoSnapshot::read();
@@ -1079,6 +1115,11 @@ fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: us
                     .expect("open paged event DAG pool");
                 last_open_io = IoSnapshot::read().delta(open_before);
                 last_unmapped_bytes = store.unmap_shards();
+                if mode == "point" {
+                    store.set_point_random_mmap(true);
+                } else if mode == "random" {
+                    std::hint::black_box(store.advise_random_shards());
+                }
                 evict(root, EvictScope::All).expect("evict files after paged open");
                 {
                     let (topo_index, stream_index) = open_event_timeline_indexes(&store);
@@ -1105,13 +1146,14 @@ fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: us
                     };
                     elapsed_samples.push(started.elapsed());
                     last_io = IoSnapshot::read().delta(before);
+                    last_pack_vmas = mapped_pack_vmas();
                     std::hint::black_box(returned);
                 }
             }
             let min_us = min(&elapsed_samples).as_secs_f64() * 1e6;
             let median_us = median(&mut elapsed_samples).as_secs_f64() * 1e6;
             println!(
-                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} samples={} min_us={min_us:.1} median_us={median_us:.1} unmapped_bytes={last_unmapped_bytes} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
+                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} advice={mode} samples={} min_us={min_us:.1} median_us={median_us:.1} unmapped_span_bytes={last_unmapped_bytes} pack_vmas={last_pack_vmas} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
                 tier_label(tier_rank),
                 elapsed_samples.len(),
                 last_open_io.read_bytes,
@@ -1510,8 +1552,8 @@ fn main() {
     let db = reopen_benchmark_database(&root, db);
     print_memory_diagnostics(&db, &root, &rooms);
     drop(db);
+    run_paged_page_rows(&root, &rooms, &tiers, samples);
     if !page_only {
-        run_paged_page_rows(&root, &rooms, &tiers, samples);
         run_paged_fetch_rows(&root, &rooms, tiers.first().copied(), samples);
     }
     let mut db = open_benchmark_database(root.clone());

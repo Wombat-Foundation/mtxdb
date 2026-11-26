@@ -1565,6 +1565,9 @@ pub struct ReadPlanPolicy {
     /// scan/compaction reads. Measurements are from one rotational HDD and one
     /// cheap SATA SSD; `NVMe` and other drives are untested.
     pub random_advice: bool,
+    /// Use a separate `MADV_RANDOM` mapping for single-record point reads.
+    /// Sequential scans and multi-record reads keep the normal mapping.
+    pub point_random_mmap: bool,
 }
 
 impl Default for ReadPlanPolicy {
@@ -1587,6 +1590,7 @@ impl ReadPlanPolicy {
             max_extent_bytes: 0,
             min_batch_candidates: usize::MAX,
             random_advice: false,
+            point_random_mmap: false,
         }
     }
 
@@ -1601,6 +1605,7 @@ impl ReadPlanPolicy {
             max_extent_bytes: 0,
             min_batch_candidates: usize::MAX,
             random_advice: true,
+            point_random_mmap: false,
         }
     }
 
@@ -1618,6 +1623,7 @@ impl ReadPlanPolicy {
             max_extent_bytes: 8 * 1024 * 1024,
             min_batch_candidates: 16,
             random_advice: false,
+            point_random_mmap: false,
         }
     }
 
@@ -5139,6 +5145,12 @@ impl PackfileStorage {
         *self.read_plan.read()
     }
 
+    /// Select a separate random-advised mapping for single-record reads.
+    /// Sequential readers keep their normal mapping.
+    pub fn set_point_random_mmap(&self, enabled: bool) {
+        self.read_plan.write().point_random_mmap = enabled;
+    }
+
     /// Whether this storage attempts zstd compression on written records.
     #[must_use]
     pub fn is_compression_enabled(&self) -> bool {
@@ -5212,8 +5224,10 @@ impl PackfileStorage {
         evicted
     }
 
-    /// Unmap every mapped shard so file-level cache eviction advice can target
-    /// pages that were previously pinned by this process's mappings.
+    /// Unmap both sequential and point mappings on every shard so file-level
+    /// cache eviction advice can target pages they previously pinned. Returns
+    /// the unmapped file span: each shard contributes the larger of its two
+    /// mapping lengths, so one file is not counted twice.
     #[must_use]
     pub fn unmap_shards(&self) -> u64 {
         self.shards
@@ -8527,8 +8541,19 @@ impl PackfileStorage {
         pinned: &HashMap<u16, Arc<Shard>>,
         track: bool,
     ) -> Result<Option<NodeData>, StorageError> {
+        self.resolve_from_pinned_mode(id, candidates, pinned, track, false)
+    }
+
+    fn resolve_from_pinned_mode(
+        &self,
+        id: &NodeId,
+        candidates: &[(u16, u64)],
+        pinned: &HashMap<u16, Arc<Shard>>,
+        track: bool,
+        point: bool,
+    ) -> Result<Option<NodeData>, StorageError> {
         Ok(self
-            .resolve_with_lsn_from_pinned(id, candidates, pinned, track)?
+            .resolve_with_lsn_from_pinned_mode(id, candidates, pinned, track, point)?
             .and_then(|(data, _, removed)| (!removed).then_some(data)))
     }
 
@@ -8536,12 +8561,13 @@ impl PackfileStorage {
     /// per-record write LSN. Only a record decoded from disk carries one; a
     /// caller using it to seed an optimistic token must consult the coordinator
     /// for records served from the in-memory cache.
-    fn resolve_with_lsn_from_pinned(
+    fn resolve_with_lsn_from_pinned_mode(
         &self,
         id: &NodeId,
         candidates: &[(u16, u64)],
         pinned: &HashMap<u16, Arc<Shard>>,
         track: bool,
+        point: bool,
     ) -> Result<Option<(NodeData, Option<u64>, bool)>, StorageError> {
         let mut last_err: Option<StorageError> = None;
         for &(slot, offset) in candidates {
@@ -8551,15 +8577,16 @@ impl PackfileStorage {
 
             if track {
                 self.candidate_reads.fetch_add(1, Ordering::Relaxed);
-                if let Ok(len) = Self::record_disk_len_at(shard.as_ref(), offset) {
+                if let Ok(len) = ShardPool::record_disk_len_at_mode(shard.as_ref(), offset, point) {
                     self.candidate_frame_bytes.fetch_add(len, Ordering::Relaxed);
                 }
             }
 
-            match self.read_at(
+            match self.shards.read_at_mode(
                 shard,
                 offset,
                 self.shards.checksum_policy().verifies_reads(),
+                point,
             ) {
                 Ok(record) => {
                     if record.hash != *id {
@@ -8618,7 +8645,13 @@ impl PackfileStorage {
         }
         let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
         Ok(self
-            .resolve_with_lsn_from_pinned(id, &candidates, &pinned, false)?
+            .resolve_with_lsn_from_pinned_mode(
+                id,
+                &candidates,
+                &pinned,
+                false,
+                self.read_plan.read().point_random_mmap,
+            )?
             .and_then(|(_, lsn, _)| lsn))
     }
 
@@ -11862,6 +11895,76 @@ impl PackfileStorage {
     }
 }
 
+impl PackfileStorage {
+    fn get_internal(
+        &self,
+        collection_id: &[u8; 16],
+        id: &NodeId,
+        point: bool,
+    ) -> Result<Option<NodeData>, StorageError> {
+        let track = self.stats_enabled.load(Ordering::Relaxed);
+        let _latency = if track {
+            OperationTimer::new(&self.operation_timings.get)
+        } else {
+            OperationTimer::disabled()
+        };
+        if self.overlay_reads_active() {
+            return Ok(self
+                .get_read_committed(collection_id, std::slice::from_ref(id))?
+                .into_iter()
+                .next()
+                .flatten());
+        }
+        // A concurrent repack can swap the generation and retire the shard ids
+        // its index pointed at. Pin the candidate shards and confirm the
+        // generation did not change between the index lookup and the pin
+        // (retirement only follows a swap); retry against the new generation if
+        // it did.
+        loop {
+            let gen_guard = self.generation(collection_id);
+            let Some(gen) = gen_guard.as_deref() else {
+                if track {
+                    self.get_calls.fetch_add(1, Ordering::Relaxed);
+                    self.get_misses.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(None);
+            };
+            if let Some(data) = gen.cache.get(id) {
+                if track {
+                    self.get_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(Some((*data).clone()));
+            }
+            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
+            #[cfg(test)]
+            Self::run_test_before_pin();
+            let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
+            let still_current = match gen_guard.as_ref() {
+                Some(loaded) => {
+                    let current = self.generation(collection_id);
+                    Self::same_generation(current.as_ref(), loaded)
+                }
+                None => true,
+            };
+            if !still_current {
+                continue;
+            }
+            if track {
+                self.index_candidates
+                    .fetch_add(candidates.len() as u64, Ordering::Relaxed);
+            }
+            let result = self.resolve_from_pinned_mode(id, &candidates, &pinned, track, point);
+            if track {
+                self.get_calls.fetch_add(1, Ordering::Relaxed);
+                if result.as_ref().is_ok_and(Option::is_none) {
+                    self.get_misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return result;
+        }
+    }
+}
+
 impl StorageEngine for PackfileStorage {
     fn collection_exists(&self, collection_id: &[u8; 16]) -> Result<bool, StorageError> {
         self.try_collection_exists(collection_id)
@@ -12088,68 +12191,13 @@ impl StorageEngine for PackfileStorage {
     }
 
     fn get(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<Option<NodeData>, StorageError> {
-        let track = self.stats_enabled.load(Ordering::Relaxed);
-        let _latency = if track {
-            OperationTimer::new(&self.operation_timings.get)
-        } else {
-            OperationTimer::disabled()
-        };
-        if self.overlay_reads_active() {
-            return Ok(self
-                .get_read_committed(collection_id, std::slice::from_ref(id))?
-                .into_iter()
-                .next()
-                .flatten());
-        }
-        // A concurrent repack can swap the generation and retire the shard ids
-        // its index pointed at. Pin the candidate shards and confirm the
-        // generation did not change between the index lookup and the pin
-        // (retirement only follows a swap); retry against the new generation if
-        // it did.
-        loop {
-            let gen_guard = self.generation(collection_id);
-            let Some(gen) = gen_guard.as_deref() else {
-                if track {
-                    self.get_calls.fetch_add(1, Ordering::Relaxed);
-                    self.get_misses.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(None);
-            };
-            if let Some(data) = gen.cache.get(id) {
-                if track {
-                    self.get_calls.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(Some((*data).clone()));
-            }
-            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
-            #[cfg(test)]
-            Self::run_test_before_pin();
-            let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
-            let still_current = match gen_guard.as_ref() {
-                Some(loaded) => {
-                    let current = self.generation(collection_id);
-                    Self::same_generation(current.as_ref(), loaded)
-                }
-                None => true,
-            };
-            if !still_current {
-                continue;
-            }
-            if track {
-                self.index_candidates
-                    .fetch_add(candidates.len() as u64, Ordering::Relaxed);
-            }
-            let result = self.resolve_from_pinned(id, &candidates, &pinned, track);
-            if track {
-                self.get_calls.fetch_add(1, Ordering::Relaxed);
-                if result.as_ref().is_ok_and(Option::is_none) {
-                    self.get_misses.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            return result;
-        }
+        self.get_internal(collection_id, id, self.read_plan.read().point_random_mmap)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "candidate pinning, read planning, and stats share one retry loop"
+    )]
     fn get_many(
         &self,
         collection_id: &[u8; 16],
@@ -12266,7 +12314,13 @@ impl StorageEngine for PackfileStorage {
             }
 
             for (i, candidates) in &to_fetch {
-                results[*i] = self.resolve_from_pinned(&ids[*i], candidates, &pinned, track)?;
+                results[*i] = self.resolve_from_pinned_mode(
+                    &ids[*i],
+                    candidates,
+                    &pinned,
+                    track,
+                    ids.len() == 1 && policy.point_random_mmap,
+                )?;
             }
 
             if track {

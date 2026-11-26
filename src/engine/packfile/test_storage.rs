@@ -5049,6 +5049,7 @@ fn test_plan_read_extents_melds_gaps_and_splits_on_cap() {
             max_extent_bytes: 10_000_000,
             min_batch_candidates: 1,
             random_advice: false,
+            point_random_mmap: false,
         },
     );
     assert_eq!(
@@ -5083,6 +5084,7 @@ fn test_plan_read_extents_melds_gaps_and_splits_on_cap() {
             max_extent_bytes: 200_000,
             min_batch_candidates: 1,
             random_advice: false,
+            point_random_mmap: false,
         },
     );
     assert_eq!(
@@ -5115,6 +5117,7 @@ fn test_plan_read_extents_orders_by_slot() {
             max_extent_bytes: 8 * 1024 * 1024,
             min_batch_candidates: 1,
             random_advice: false,
+            point_random_mmap: false,
         },
     );
     let slots: Vec<u16> = extents.iter().map(|extent| extent.slot).collect();
@@ -5128,6 +5131,7 @@ fn test_read_plan_policy_wants_gates_on_batch_size_and_cap() {
         max_extent_bytes: 8 * 1024 * 1024,
         min_batch_candidates: 16,
         random_advice: false,
+        point_random_mmap: false,
     };
     assert!(!policy.wants(15));
     assert!(policy.wants(16));
@@ -5170,6 +5174,7 @@ fn test_get_many_prefetch_plan_counters() {
         max_extent_bytes: 8 * 1024 * 1024,
         min_batch_candidates: 1,
         random_advice: false,
+        point_random_mmap: false,
     });
 
     let ids: Vec<_> = entries.iter().map(|(id, _)| *id).collect();
@@ -13978,6 +13983,141 @@ fn paged_repack_after_open_preserves_every_record() {
     }
     drop(reopened);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ordered_point_mapping_survives_growth_unmap_and_repack() {
+    let dir = test_dir("ordered_point_mapping_lifecycle");
+    let store = PackfileStorage::open(dir).unwrap();
+    let first = distinct_id(71);
+    let second = distinct_id(72);
+    store.set_point_random_mmap(true);
+
+    store
+        .put(
+            &TEST_COLLECTION,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    assert_eq!(
+        store
+            .get(&TEST_COLLECTION, &first)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"first"
+    );
+    let shard = store.shards.all_shards().into_iter().next().unwrap().1;
+    assert!(
+        shard.mmap.read().is_none(),
+        "point reads must not create the sequential mapping"
+    );
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    assert!(store
+        .get_read_committed(&TEST_COLLECTION, &[first])
+        .unwrap()[0]
+        .is_some());
+    assert!(
+        shard.mmap.read().is_none(),
+        "single-ID committed fallback must use the point mapping"
+    );
+
+    store
+        .put(
+            &TEST_COLLECTION,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    assert_eq!(
+        store
+            .get(&TEST_COLLECTION, &second)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"second"
+    );
+    assert!(
+        shard.mmap.read().is_none(),
+        "growth must not create the unused sequential mapping"
+    );
+
+    assert!(store.unmap_shards() > 0);
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    assert!(store.get(&TEST_COLLECTION, &first).unwrap().is_some());
+
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    for id in [first, second] {
+        assert!(store.get(&TEST_COLLECTION, &id).unwrap().is_some());
+    }
+}
+
+#[test]
+fn ordered_point_reads_survive_concurrent_growth_and_repack() {
+    let dir = test_dir("ordered_point_mapping_concurrent");
+    let store = PackfileStorage::open(dir).unwrap();
+    let fixed = distinct_id(91);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &fixed,
+            &NodeData::new(bytes::Bytes::from_static(b"fixed")),
+        )
+        .unwrap();
+    store.generation(&TEST_COLLECTION).unwrap().cache.clear();
+    store.set_point_random_mmap(true);
+    let latest = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            while latest.load(Ordering::Acquire) < 80 {
+                let value = store.get(&TEST_COLLECTION, &fixed).unwrap().unwrap();
+                assert_eq!(value.bytes.as_ref(), b"fixed");
+                let published = latest.load(Ordering::Acquire);
+                if published > 0 {
+                    let id = distinct_id(u8::try_from(published - 1).unwrap());
+                    assert_eq!(
+                        store
+                            .get(&TEST_COLLECTION, &id)
+                            .unwrap()
+                            .unwrap()
+                            .bytes
+                            .len(),
+                        128
+                    );
+                }
+                std::thread::yield_now();
+            }
+        });
+        let writer = scope.spawn(|| {
+            for number in 0..80u8 {
+                let id = distinct_id(number);
+                store
+                    .put(
+                        &TEST_COLLECTION,
+                        &id,
+                        &NodeData::new(bytes::Bytes::from(vec![number; 128])),
+                    )
+                    .unwrap();
+                latest.store(usize::from(number) + 1, Ordering::Release);
+                if number % 20 == 19 {
+                    store
+                        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+                        .unwrap();
+                }
+            }
+        });
+        reader.join().unwrap();
+        writer.join().unwrap();
+    });
 }
 
 #[test]
