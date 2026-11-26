@@ -431,6 +431,74 @@ fn raw_pack_frame_count(root: &Path) -> std::io::Result<u64> {
         })
 }
 
+fn collection_pack_bytes(root: &Path, collection_id: &[u8; 16]) -> std::io::Result<u64> {
+    let mut files = Vec::new();
+    walk_files(root, &mut files);
+    files
+        .into_iter()
+        .filter(|path| file_kind(path) == "pack")
+        .try_fold(0_u64, |total, path| {
+            let file_len = std::fs::metadata(&path)?.len();
+            let mut previous = None;
+            let mut collection_bytes = 0_u64;
+            for entry in mtxdb::packfile::scan_packfile_iter(&path, false)? {
+                let (entry_collection, _, offset) = entry?;
+                if let Some((previous_collection, previous_offset)) = previous {
+                    let frame_len = offset.saturating_sub(previous_offset);
+                    if previous_collection == *collection_id {
+                        collection_bytes = collection_bytes.saturating_add(frame_len);
+                    }
+                }
+                previous = Some((entry_collection, offset));
+            }
+            if let Some((previous_collection, previous_offset)) = previous {
+                if previous_collection == *collection_id {
+                    collection_bytes =
+                        collection_bytes.saturating_add(file_len.saturating_sub(previous_offset));
+                }
+            }
+            Ok(total.saturating_add(collection_bytes))
+        })
+}
+
+fn collection_payload_bytes(
+    store: &dyn StorageEngine,
+    collection_id: &[u8; 16],
+) -> Result<(usize, u64), Box<dyn std::error::Error>> {
+    let ids = store.collection_record_ids(collection_id)?;
+    let records = store.get_many_bytes(collection_id, &ids)?;
+    let bytes = records.into_iter().flatten().fold(0_u64, |total, payload| {
+        total.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX))
+    });
+    Ok((ids.len(), bytes))
+}
+
+fn print_ordered_write_metrics(db: &Database, root: &Path, events: usize, batch: usize) {
+    let (topo, stream) = open_event_timeline_indexes(db.event_dag().as_ref());
+    let topo_raw = collection_payload_bytes(db.event_dag().as_ref(), &topo.collection_id())
+        .expect("read raw topological index bytes");
+    let stream_raw = collection_payload_bytes(db.event_dag().as_ref(), &stream.collection_id())
+        .expect("read raw stream index bytes");
+    let topo_pack = collection_pack_bytes(root, &topo.collection_id())
+        .expect("scan topological index frame bytes");
+    let stream_pack = collection_pack_bytes(root, &stream.collection_id())
+        .expect("scan stream index frame bytes");
+    let raw_total = topo_raw.1.saturating_add(stream_raw.1);
+    let pack_total = topo_pack.saturating_add(stream_pack);
+    let divisor = u64::try_from(events.max(1)).unwrap_or(u64::MAX);
+    let raw_per_event = raw_total.checked_div(divisor).unwrap_or_default();
+    let packed_per_event = pack_total.checked_div(divisor).unwrap_or_default();
+    println!(
+        "multi_room_index_write batch={batch} events={events} topo_records={} topo_raw_bytes={} topo_pack_bytes={topo_pack} stream_records={} stream_raw_bytes={} stream_pack_bytes={stream_pack} combined_raw_bytes={raw_total} combined_pack_bytes={pack_total} raw_bytes_per_event={} packed_bytes_per_event={}",
+        topo_raw.0,
+        topo_raw.1,
+        stream_raw.0,
+        stream_raw.1,
+        raw_per_event,
+        packed_per_event,
+    );
+}
+
 fn extension_bytes(root: &Path) -> Vec<(String, u64)> {
     let mut files = Vec::new();
     walk_files(root, &mut files);
@@ -1363,6 +1431,7 @@ fn main() {
     );
     print_memory_diagnostics(&db, &root, &rooms);
     print_extension_breakdown(&root, "load");
+    print_ordered_write_metrics(&db, &root, total_events, batch);
 
     let tiers = select_tiers(&rooms);
 
