@@ -14604,7 +14604,17 @@ fn versions_crash_child() {
         let (journal, scan) = Journal::open_shared(&wal).unwrap();
         JournalCoordinator::new(journal, &scan)
     });
-    let store = PackfileStorage::open_with_max_shard_bytes(store_dir, 48 * 1024).unwrap();
+    let writer_residency = match std::env::var("MTXDB_VERSIONS_WRITER_RESIDENCY").as_deref() {
+        Ok("paged") => crate::index::IndexResidency::Paged,
+        _ => crate::index::IndexResidency::Resident,
+    };
+    let store = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        store_dir,
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        writer_residency,
+    )
+    .unwrap();
     store
         .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
         .unwrap();
@@ -14615,6 +14625,11 @@ fn versions_crash_child() {
         .unwrap();
     let coverage = coordinator.committed_lsn_for_pool(ShardType::State);
     std::fs::write(root.join("expected.txt"), format!("{version} {coverage}")).unwrap();
+    if let Ok(point) = std::env::var("MTXDB_VERSIONS_CRASH_POINT") {
+        // Arm the injected crash only after the WAL commit. This lets the
+        // Paged writer enter its first pack/version/coverage barrier.
+        std::env::set_var("MTXDB_CRASH_AT", point);
+    }
     // The crash point fires inside the checkpoint tail.
     store.force_index_checkpoint().unwrap();
     unreachable!("the child must exit at the versions crash point");
@@ -14624,6 +14639,8 @@ fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
     residency: crate::index::IndexResidency,
     test_name: &str,
     coverage_message: &str,
+    writer_residency: crate::index::IndexResidency,
+    crash_point: &str,
 ) {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -14638,7 +14655,15 @@ fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
             "--test-threads=1",
         ])
         .env("MTXDB_VERSIONS_CRASH_DIR", &root)
-        .env("MTXDB_CRASH_AT", "after-versions-fsync")
+        .env(
+            "MTXDB_VERSIONS_WRITER_RESIDENCY",
+            if writer_residency == crate::index::IndexResidency::Paged {
+                "paged"
+            } else {
+                "resident"
+            },
+        )
+        .env("MTXDB_VERSIONS_CRASH_POINT", crash_point)
         .output()
         .unwrap();
     assert_eq!(
@@ -14670,6 +14695,7 @@ fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
     reopened
         .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
         .unwrap();
+    reopened.replay_journal().unwrap();
     let (_, version_after) = reopened
         .get_with_collection_version(&TEST_COLLECTION, &[distinct_id(255)])
         .unwrap();
@@ -14677,11 +14703,22 @@ fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
         version_after >= version_before,
         "version went backwards after the crash: before={version_before}, after={version_after}"
     );
-    assert_eq!(
-        reopened.durable_coverage(),
-        coverage_before,
-        "{coverage_message}"
-    );
+    if crash_point == "after-paged-packs-fsync" {
+        assert!(
+            reopened.durable_coverage() < coverage_before,
+            "coverage must not advance before index.versions is durable"
+        );
+        assert!(
+            !Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
+            "the WAL must retain records not yet represented by index.versions"
+        );
+    } else {
+        assert_eq!(
+            reopened.durable_coverage(),
+            coverage_before,
+            "{coverage_message}"
+        );
+    }
     drop(reopened);
     drop(coordinator);
     fs::remove_dir_all(&root).ok();
@@ -14697,6 +14734,8 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
         crate::index::IndexResidency::Paged,
         "versions_crash",
         "coverage must come from index.versions when journal.lsn was never written",
+        crate::index::IndexResidency::Resident,
+        "after-versions-fsync",
     );
 }
 
@@ -14710,7 +14749,34 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe_resident() {
         crate::index::IndexResidency::Resident,
         "versions_crash_resident",
         "coverage must survive a crash before journal.lsn was written",
+        crate::index::IndexResidency::Resident,
+        "after-versions-fsync",
     );
+}
+
+/// Paged writers have no resident checkpoint: packs, then index.versions,
+/// then the shared-WAL coverage/reclaim are their durability handoff. Exercise
+/// each boundary with a Paged writer and recover in both supported modes.
+#[test]
+fn paged_writer_crashes_preserve_committed_versions_across_coverage_handoff() {
+    for (label, point) in [
+        ("packs", "after-paged-packs-fsync"),
+        ("versions", "after-paged-versions-fsync"),
+        ("reclaim", "after-paged-wal-reclaim"),
+    ] {
+        for (mode, residency) in [
+            ("resident", crate::index::IndexResidency::Resident),
+            ("paged", crate::index::IndexResidency::Paged),
+        ] {
+            assert_versions_fsync_precedes_wal_reclaim_crash_safe(
+                residency,
+                &format!("paged_writer_crash_{label}_{mode}"),
+                "every committed version and its coverage must survive the Paged writer crash",
+                crate::index::IndexResidency::Paged,
+                point,
+            );
+        }
+    }
 }
 
 #[test]

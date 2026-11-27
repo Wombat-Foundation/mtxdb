@@ -7178,6 +7178,7 @@ impl PackfileStorage {
             .unwrap_or(initial_covered)
             .max(initial_covered);
         self.shards.sync_all().map_err(StorageError::Io)?;
+        versions_crash_point("after-paged-packs-fsync");
         let versions = self.checkpoint_logical_versions(Some(covered));
         crate::index::versions::write_versions(
             &Self::index_versions_path(&self.base_dir),
@@ -7185,11 +7186,13 @@ impl PackfileStorage {
             covered,
         )
         .map_err(StorageError::Io)?;
+        versions_crash_point("after-paged-versions-fsync");
         self.durable_coverage.fetch_max(covered, Ordering::AcqRel);
 
         drop(guards);
         drop(create_guard);
         let _ = self.report_coverage_and_reclaim(covered);
+        versions_crash_point("after-paged-wal-reclaim");
         Ok(())
     }
 
