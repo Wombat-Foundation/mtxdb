@@ -1688,8 +1688,39 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min
     let page = topo_index
         .page(&largest_room.scope, None, true, 128)
         .expect("mutation source page");
-    let remove_entries: Vec<EventTimelineEntry> =
-        page.entries.iter().map(|key| key.entry()).collect();
+    // A topological key has no stream position, so collect them from the
+    // stream index before the timed removal.
+    let wanted: std::collections::HashSet<NodeId> =
+        page.entries.iter().map(|key| key.event_node_id).collect();
+    let mut streams = std::collections::HashMap::with_capacity(wanted.len());
+    let mut cursor = None;
+    while streams.len() < wanted.len() {
+        let stream_page = stream_index
+            .page(&largest_room.scope, cursor.as_ref(), true, 1024)
+            .expect("mutation stream page");
+        for key in &stream_page.entries {
+            if wanted.contains(&key.event_node_id) {
+                streams.insert(key.event_node_id, key.stream_ordering);
+            }
+        }
+        cursor = stream_page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let remove_entries: Vec<EventTimelineEntry> = page
+        .entries
+        .iter()
+        .map(|key| {
+            EventTimelineEntry::new(
+                key.room_scope,
+                key.topological_ordering,
+                key.origin_server_ts,
+                streams[&key.event_node_id],
+                key.event_node_id,
+            )
+        })
+        .collect();
     let transaction = db.begin_transaction();
     let started = Instant::now();
     let removed = stage_remove_event_timeline_batch(
