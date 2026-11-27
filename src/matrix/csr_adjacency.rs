@@ -1994,9 +1994,9 @@ fn repair_rows_after_rollback(
     let changed = store.with_write_lock(|| -> Result<bool, StorageError> {
         let watermark_changed =
             read_watermark_locked(store).map_err(StorageError::Io)? != watermark;
-        for (scope, rows) in &repaired {
+        if !repaired.is_empty() {
             store
-                .rewrite_scope_locked(*scope, rows)
+                .replace_scopes_locked(&repaired)
                 .map_err(StorageError::Io)?;
         }
         if watermark_changed {
