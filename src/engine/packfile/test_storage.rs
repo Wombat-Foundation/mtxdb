@@ -13929,6 +13929,34 @@ fn shared_reader_rejects_missing_or_corrupt_residency_record() {
 }
 
 #[test]
+fn refused_residency_change_does_not_overwrite_marker_before_lock() {
+    let dir = test_dir("refused_residency_change_keeps_marker");
+    let resident_writer = PackfileStorage::open_with_residency(
+        dir.clone(),
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Resident,
+    )
+    .unwrap();
+
+    let Err(error) = PackfileStorage::open_with_residency(
+        dir.clone(),
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    ) else {
+        panic!("a second writer must not acquire the held pool lock");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        read_index_residency_marker(&dir).unwrap(),
+        crate::index::IndexResidency::Resident,
+        "a writer refused by the pool lock must not change the persisted mode"
+    );
+
+    drop(resident_writer);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 #[cfg(feature = "multi-reader")]
 fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
     use crate::journal::{Journal, JournalCoordinator};

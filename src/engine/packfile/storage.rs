@@ -3526,12 +3526,6 @@ impl PackfileStorage {
         if writable && take_writer_lock {
             fs::create_dir_all(&base_dir)?;
         }
-        if writable {
-            // Persist the mode before a paged open retires a resident
-            // checkpoint or a writer can publish shared-WAL mutations.
-            persist_index_residency_marker(&base_dir, residency)?;
-        }
-
         let started = std::time::Instant::now();
         let mut timings = OpenTimings::default();
 
@@ -3564,6 +3558,13 @@ impl PackfileStorage {
         } else {
             ShardPool::open_read_only_with_policies(base_dir.clone(), checksum_policy)?
         };
+        if writable {
+            // The standalone shard open above holds the pool writer lock, and
+            // shared members are opened under Database's root lock. Publish
+            // the mode only after acquiring that lock, but before a paged open
+            // retires a resident checkpoint or the writer can publish WAL.
+            persist_index_residency_marker(&base_dir, residency)?;
+        }
         let shard_open_time = shard_open_started.elapsed();
         timings.shard_open = shard_open_time;
         let index_config = crate::index::IndexConfig {
