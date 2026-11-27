@@ -71,6 +71,14 @@ pub struct BucketUndo {
     pub was_empty: bool,
 }
 
+impl BucketUndo {
+    /// Whether the operation occupied a previously empty slot.
+    #[must_use]
+    pub const fn was_empty(&self) -> bool {
+        self.was_empty
+    }
+}
+
 #[derive(Debug)]
 struct Slot {
     tag_state: AtomicU64,
@@ -322,18 +330,17 @@ impl RawBucketTable {
         self.len() == 0
     }
 
-    /// Encode a deterministic, checksummed snapshot of the occupied locators.
-    /// The snapshot stores fingerprints rather than full keys; pack frames
-    /// remain authoritative and callers must verify candidates against them.
+    /// Copy every occupied locator in table order.
     #[must_use]
-    pub fn snapshot(&self) -> Vec<u8> {
+    pub fn entries(&self) -> Vec<BucketCandidate> {
         let mut entries = Vec::with_capacity(self.len());
         for (bucket_index, bucket) in self.buckets.iter().enumerate() {
-            for slot in &bucket.slots {
-                if let Some(candidate) = slot.snapshot(SlotLocation::Bucket {
+            for (slot_index, slot) in bucket.slots.iter().enumerate() {
+                let location = SlotLocation::Bucket {
                     bucket: u32::try_from(bucket_index).unwrap_or(u32::MAX),
-                    slot: 0,
-                }) {
+                    slot: u8::try_from(slot_index).unwrap_or(u8::MAX),
+                };
+                if let Some(candidate) = slot.snapshot(location) {
                     entries.push(candidate);
                 }
             }
@@ -346,7 +353,15 @@ impl RawBucketTable {
                 entries.push(candidate);
             }
         }
-        drop(overflow);
+        entries
+    }
+
+    /// Encode a deterministic, checksummed snapshot of the occupied locators.
+    /// The snapshot stores fingerprints rather than full keys; pack frames
+    /// remain authoritative and callers must verify candidates against them.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut entries = self.entries();
         entries.sort_unstable_by_key(|entry| {
             (
                 entry.fingerprint,
@@ -467,6 +482,24 @@ impl RawBucketTable {
             .iter()
             .filter(|slot| slot.tag_state.load(Ordering::Acquire) & SLOT_STATE_MASK != SLOT_EMPTY)
             .count()
+    }
+
+    /// Approximate private heap used by the base buckets and overflow slots.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        let overflow = self.overflow.lock();
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.buckets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Bucket>()),
+            )
+            .saturating_add(
+                overflow
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Arc<Slot>>()),
+            )
+            .saturating_add(overflow.len().saturating_mul(std::mem::size_of::<Slot>()))
     }
 
     /// Produce a seeded 62-bit fingerprint from the full key hash.
