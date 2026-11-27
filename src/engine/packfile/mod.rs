@@ -806,15 +806,9 @@ pub(crate) fn checked_frame_len(metadata_len: u32, data_len: u32) -> io::Result<
         })
 }
 
-/// Largest frame length a reader accepts: a frame lives wholly inside one
-/// shard, and shard offsets are bounded by `IndexEntry::MAX_OFFSET`, so a
-/// longer prefix can only be corruption. This is a sanity ceiling, not a
+/// Largest frame length a reader accepts. This is a sanity ceiling, not a
 /// record-size policy (that belongs to the collection template).
-pub(crate) const MAX_FRAME_LEN: u32 = {
-    // `IndexEntry::MAX_OFFSET` is `(1 << 32) - 2`; express the same
-    // invariant in the destination type instead of narrowing a u64.
-    u32::MAX - 1
-};
+pub(crate) const MAX_FRAME_LEN: u32 = u32::MAX - 1;
 
 /// Append exactly `n` bytes from `reader` to `buf`, allocating only as bytes
 /// actually arrive. A corrupt length prefix on a short stream therefore fails

@@ -28,6 +28,9 @@ impl Clone for BucketIndex {
 }
 
 impl BucketIndex {
+    /// Largest pack offset representable in a bucket locator.
+    pub const MAX_RECORD_OFFSET: u64 = (1_u64 << 48) - 1;
+
     /// Create an index with at least `min_entries` base slots.
     #[must_use]
     pub fn new(min_entries: usize) -> Self {

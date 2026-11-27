@@ -222,7 +222,6 @@ pub use database::{
     CommitPhaseStats, Database, DatabaseTransaction, PhaseTiming, PoolPolicies, PoolPolicy,
 };
 pub use domain_tag::DomainTag;
-pub use index::LossyIndex;
 pub use interop::{
     commit_state_batches, decode_import_marker, decode_server_key, decode_state_root_handle_v1,
     decode_verdict, encode_import_marker, encode_server_key, encode_state_root_handle_v1,

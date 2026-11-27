@@ -1,7 +1,7 @@
 #![allow(clippy::tests_outside_test_module)]
 
 use mtxdb::index::redo::*;
-use mtxdb::index::IndexEntry;
+use mtxdb::index::BucketIndex;
 use mtxdb::packfile::{PackId, PACK_ID_LEN};
 
 fn set(seq: u64) -> RedoRecord {
@@ -107,7 +107,7 @@ fn removed_set_flag_round_trips_in_v1_flags_byte() {
 
 #[test]
 fn an_offset_above_the_index_maximum_is_rejected_both_ways() {
-    let too_far = IndexEntry::MAX_OFFSET + 1;
+    let too_far = BucketIndex::MAX_RECORD_OFFSET + 1;
     let mut record = set(1);
     record.op = RedoOp::Set {
         full_hash: [1; 16],
@@ -128,7 +128,7 @@ fn an_offset_above_the_index_maximum_is_rejected_both_ways() {
     ok.op = RedoOp::Set {
         full_hash: [1; 16],
         pack_id: PackId([1; PACK_ID_LEN]),
-        offset: IndexEntry::MAX_OFFSET,
+        offset: BucketIndex::MAX_RECORD_OFFSET,
         record_len: 61,
         removed: false,
     };

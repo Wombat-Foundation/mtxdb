@@ -11,10 +11,12 @@ use parking_lot::{MutexGuard, RwLock};
 use crate::cache::{NodeCache, PinnedNodes};
 use crate::config::RuntimeConfig;
 use crate::csr::Csr;
+use crate::index::bucket::BucketCandidate;
+use crate::index::bucket::BucketUndo;
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
 use crate::index::redo::{RedoOp, RedoRecord};
-use crate::index::{EntryUndo, InsertError, LossyIndex};
+use crate::index::{BucketIndex, InsertError};
 use crate::journal::pool_tag;
 use crate::journal::{
     pool_from_tag, DurabilityToken, GroupCommitConfig, Journal, JournalCoordinator, JournalCursor,
@@ -986,6 +988,8 @@ struct RoomScanOutput {
     shard_collections: HashMap<PackId, HashMap<[u8; 16], u64>>,
     collection_shards: HashMap<[u8; 16], HashSet<PackId>>,
     collection_disk_bytes: HashMap<PackId, HashMap<[u8; 16], u64>>,
+    /// Header identity reads made while a full scan resolved bucket matches.
+    index_identity_reads: u64,
     /// A checkpoint-backed writable open found no valid shard→collection
     /// sidecar, so the next sync must write one even if no index is dirty.
     sidecar_missing: bool,
@@ -998,12 +1002,13 @@ struct RoomScanOutput {
 /// collection's current index and byte counters, but never stores a vector of
 /// every physical frame.
 struct StreamingOpenScan {
-    indexes: HashMap<[u8; 16], LossyIndex>,
+    indexes: HashMap<[u8; 16], BucketIndex>,
     collection_order: Vec<[u8; 16]>,
     known_collections: HashSet<[u8; 16]>,
     seen_collections: HashSet<[u8; 16]>,
     collection_home: HashMap<[u8; 16], u16>,
     collection_disk_bytes: HashMap<PackId, HashMap<[u8; 16], u64>>,
+    index_identity_reads: u64,
 }
 
 struct ScanInsertConfig<'a> {
@@ -1011,6 +1016,22 @@ struct ScanInsertConfig<'a> {
     generation_fences: &'a HashMap<[u8; 16], u32>,
     index_config: crate::index::IndexConfig,
 }
+
+#[derive(Clone, Copy)]
+struct ScanLocator {
+    collection_id: [u8; 16],
+    hash: [u8; 16],
+    offset: u64,
+    removed: bool,
+    slot: u16,
+}
+
+type PreparedCollectionScan = (
+    [u8; 16],
+    Option<Arc<RoomGeneration>>,
+    Vec<(u16, Arc<Shard>)>,
+    Vec<(u64, packfile::PackfileScanner)>,
+);
 
 impl StreamingOpenScan {
     fn new(collection_order: Vec<[u8; 16]>) -> Self {
@@ -1022,12 +1043,14 @@ impl StreamingOpenScan {
             seen_collections: HashSet::new(),
             collection_home: HashMap::new(),
             collection_disk_bytes: HashMap::new(),
+            index_identity_reads: 0,
         }
     }
 
     fn insert(
         &mut self,
         entry: packfile::ScanEntryWithRemoval,
+        shards: &ShardPool,
         slot: u16,
         pack_id: PackId,
         creation_seq: u32,
@@ -1057,33 +1080,43 @@ impl StreamingOpenScan {
             .or_default();
         *bytes = bytes.saturating_add(entry.disk_bytes);
         self.collection_home.insert(collection_id, slot);
-        self.insert_locator(
+        let locator = ScanLocator {
             collection_id,
-            &entry.hash,
-            entry.offset,
-            entry.removed,
+            hash: entry.hash,
+            offset: entry.offset,
+            removed: entry.removed,
             slot,
-            config.index_config,
-        )
+        };
+        self.insert_locator(locator, shards, config.index_config)
     }
 
     fn insert_locator(
         &mut self,
-        collection_id: [u8; 16],
-        hash: &[u8; 16],
-        offset: u64,
-        removed: bool,
-        slot: u16,
+        locator: ScanLocator,
+        shards: &ShardPool,
         index_config: crate::index::IndexConfig,
     ) -> Result<(), StorageError> {
+        let ScanLocator {
+            collection_id,
+            hash,
+            offset,
+            removed,
+            slot,
+        } = locator;
         let index = self
             .indexes
             .entry(collection_id)
-            .or_insert_with(|| LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, index_config));
-        check_index_offset(slot, hash, offset)?;
+            .or_insert_with(|| BucketIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, index_config));
+        check_index_offset(slot, &hash, offset)?;
+        let mut identity_reads = 0_u64;
         loop {
-            match index.insert_tracked_with_removed(hash, slot, offset, removed) {
-                Ok(_) => return Ok(()),
+            let inserted =
+                index.insert_with_identity(&hash, slot, offset, removed, |candidate| {
+                    identity_reads = identity_reads.saturating_add(1);
+                    bucket_candidate_identity(shards, &collection_id, candidate)
+                })?;
+            match inserted {
+                Ok(_) => break,
                 Err(InsertError::TableFull) => {
                     *index = index.grow().ok_or_else(|| {
                         StorageError::Corrupt(format!(
@@ -1091,13 +1124,10 @@ impl StreamingOpenScan {
                         ))
                     })?;
                 }
-                Err(error) => {
-                    return Err(StorageError::Corrupt(format!(
-                        "index insert failed for the record at offset {offset} in shard {slot}: {error}"
-                    )));
-                }
             }
         }
+        self.index_identity_reads = self.index_identity_reads.saturating_add(identity_reads);
+        Ok(())
     }
 
     fn finish(
@@ -1115,6 +1145,7 @@ impl StreamingOpenScan {
             .collect();
         let mut out = RoomScanOutput {
             collection_disk_bytes: self.collection_disk_bytes,
+            index_identity_reads: self.index_identity_reads,
             ..RoomScanOutput::default()
         };
         let index_config = crate::index::IndexConfig {
@@ -1124,7 +1155,7 @@ impl StreamingOpenScan {
         let collection_ids: Vec<[u8; 16]> = self.indexes.keys().copied().collect();
         for collection_id in collection_ids {
             let index = self.indexes.remove(&collection_id).unwrap_or_else(|| {
-                LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, index_config)
+                BucketIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, index_config)
             });
             if let Some(&home) = self.collection_home.get(&collection_id) {
                 shards.set_collection_home(&collection_id, home);
@@ -1200,12 +1231,9 @@ const SHARD_ROOMS_HEADER_LEN: usize = SHARD_ROOMS_CRC_OFFSET + 4;
 /// collection's stable insertion ordinal(8) + disk bytes(8).
 const SHARD_ROOMS_RECORD_LEN: usize = crate::packfile::PACK_ID_LEN + 16 + 8 + 8 + 8;
 
-/// The largest record offset `IndexEntry` can represent: its 32-bit offset
-/// field stores `offset + 1`, reserving the all-zeros encoding for the empty
-/// sentinel. Offsets beyond this can only come from externally
-/// created oversized packs — this engine's own writes rotate long before
-/// reaching it (`MAX_SHARD_BYTES` caps each shard's file size).
-const PACK_INDEX_OFFSET_LIMIT: u64 = crate::index::IndexEntry::MAX_OFFSET;
+/// The largest record offset representable in the bucket locator's 48-bit
+/// offset field. Pack rotation normally keeps offsets below this ceiling.
+const PACK_INDEX_OFFSET_LIMIT: u64 = BucketIndex::MAX_RECORD_OFFSET;
 
 /// Byte ceiling for the incremental index delta log. Once a session's
 /// accumulated frames exceed this, the next `sync()` stops appending and does
@@ -1497,37 +1525,30 @@ fn plan_read_extents(
     extents
 }
 
-/// Insert into a freshly built or grown index, failing the operation instead of
-/// publishing an index that silently lacks the record.
-fn insert_or_corrupt(
-    index: &LossyIndex,
-    hash: &[u8; 16],
-    slot: u16,
-    offset: u64,
-) -> Result<(), StorageError> {
-    insert_or_corrupt_with_removed(index, hash, slot, offset, false)
+/// Resolve a bucket candidate against its authoritative frame before allowing
+/// an insert to treat a fingerprint match as an overwrite.
+fn bucket_candidate_identity(
+    shards: &ShardPool,
+    collection_id: &[u8; 16],
+    candidate: &BucketCandidate,
+) -> Result<[u8; 16], StorageError> {
+    let shard = shards.get_shard(candidate.shard_slot).ok_or_else(|| {
+        StorageError::Corrupt(format!(
+            "index refers to missing shard {} while resolving a fingerprint candidate",
+            candidate.shard_slot
+        ))
+    })?;
+    let (found_collection, hash, _) = shards.record_identity_at(&shard, candidate.offset)?;
+    if found_collection != *collection_id {
+        return Err(StorageError::Corrupt(format!(
+            "index candidate at offset {} in shard {} belongs to another collection",
+            candidate.offset, candidate.shard_slot
+        )));
+    }
+    Ok(hash)
 }
 
-fn insert_or_corrupt_with_removed(
-    index: &LossyIndex,
-    hash: &[u8; 16],
-    slot: u16,
-    offset: u64,
-    removed: bool,
-) -> Result<(), StorageError> {
-    index
-        .insert_tracked_with_removed(hash, slot, offset, removed)
-        .map(|_| ())
-        .map_err(|error| {
-            StorageError::Corrupt(format!(
-                "index insert failed for the record at offset {offset} in shard {slot}: {error}"
-            ))
-        })
-}
-
-/// Reject a record whose in-shard offset the 32-bit `IndexEntry` field cannot
-/// represent, so the caller surfaces a `StorageError::Corrupt` instead of
-/// silently dropping the record (or panicking in `IndexEntry::new`).
+/// Reject a record whose in-shard offset exceeds the bucket locator width.
 fn check_index_offset(slot: u16, hash: &[u8; 16], offset: u64) -> Result<(), StorageError> {
     if offset > PACK_INDEX_OFFSET_LIMIT {
         return Err(StorageError::Corrupt(format!(
@@ -1685,7 +1706,7 @@ static SHARD_ROOMS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// never replay-applies frames for a pre-resize table onto a resized one.
 #[derive(Clone)]
 struct RoomGeneration {
-    index: LossyIndex,
+    index: BucketIndex,
     cache: Arc<NodeCache>,
     generation: u64,
 }
@@ -1759,7 +1780,7 @@ const PUT_MANY_JOURNAL_GROUP_LIMIT_BYTES: usize = 64 << 20;
 
 struct PutManyProgress {
     generation: u64,
-    owned_index: Option<LossyIndex>,
+    owned_index: Option<BucketIndex>,
     structural_change: bool,
     index_needs_rebuild: bool,
     /// Redo inputs for the entries inserted so far: `(id, slot, offset, record_len)`.
@@ -1767,7 +1788,7 @@ struct PutManyProgress {
     pending_shard_collections: Vec<(PackId, u64)>,
     pending_shard_collection_counts: Vec<PackId>,
     invalidate_delta: bool,
-    undo_log: Vec<EntryUndo>,
+    undo_log: Vec<BucketUndo>,
     /// Per-entry publications used when the batch is too large to publish as
     /// one WAL group (or when journaling is inactive).
     pending_materialized: Vec<Option<Published>>,
@@ -2040,7 +2061,7 @@ pub struct PackfileStorage {
     /// and how many. Maintained incrementally (a plain `put` just
     /// increments one counter; a full index rebuild/repack/initial scan
     /// replaces one collection's contribution wholesale via
-    /// `LossyIndex::slot_counts`) rather than ever re-derived by
+    /// `BucketIndex::slot_counts`) rather than ever re-derived by
     /// scanning a shard file, which is what made `collections_referencing_shard`
     /// and a `collections`-style listing expensive before this existed.
     /// Reverse index of `shard_collections`: which shards a given collection currently
@@ -2413,7 +2434,7 @@ struct RepackIncrementalState {
 const DEFAULT_REPACK_THRESHOLD_ENTRIES: u64 = 2048;
 pub(crate) const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 
-/// Minimum `LossyIndex` capacity for a brand-new collection's first
+/// Minimum `BucketIndex` capacity for a brand-new collection's first
 /// insert (`put` and `put_many`), in slots (8 bytes each).
 ///
 /// Not the index's own 16-slot hard floor: at the ~75% load factor
@@ -3086,6 +3107,7 @@ impl PackfileStorage {
                 packfile::try_recover_packfile_with::<StorageError, _>(&shard.path, |entry| {
                     scan_state.insert(
                         entry,
+                        &shards,
                         slot,
                         shard.pack_id,
                         shard.creation_seq,
@@ -3110,6 +3132,7 @@ impl PackfileStorage {
                         if scan_error.is_none() {
                             if let Err(error) = scan_state.insert(
                                 entry,
+                                &shards,
                                 slot,
                                 shard.pack_id,
                                 shard.creation_seq,
@@ -3207,6 +3230,7 @@ impl PackfileStorage {
         durable_coverage: u64,
         initial_durable_fp: u64,
     ) -> Self {
+        let initial_index_identity_reads = scan_out.index_identity_reads;
         let index_config = crate::index::IndexConfig {
             seed: shards.bucket_seed(),
             ..Default::default()
@@ -3340,7 +3364,7 @@ impl PackfileStorage {
             index_clone_time_ns: AtomicU64::new(0),
             index_grow_count: AtomicU64::new(0),
             index_rebuild_count: AtomicU64::new(0),
-            index_identity_reads: AtomicU64::new(0),
+            index_identity_reads: AtomicU64::new(initial_index_identity_reads),
             delta_invalidations: AtomicU64::new(0),
             sync_calls: AtomicU64::new(0),
             checkpoint_writes: AtomicU64::new(0),
@@ -3680,27 +3704,16 @@ impl PackfileStorage {
     /// hash.
     fn apply_redo_sets(
         collection_id: &[u8; 16],
-        index: LossyIndex,
+        index: BucketIndex,
         records: &[RedoRecord],
         pack_lookup: &HashMap<PackId, (u16, u64)>,
         mut identity_at: impl FnMut(u16, u64) -> Option<([u8; 16], [u8; 16])>,
-    ) -> Option<LossyIndex> {
-        let mut index = if index.is_mmap_backed() {
-            index.clone()
-        } else {
-            index
-        };
+    ) -> Option<BucketIndex> {
+        let mut index = index;
         let target =
-            LossyIndex::capacity_for_entries(index.len().saturating_add(records.len()), 0)?;
+            BucketIndex::capacity_for_entries(index.len().saturating_add(records.len()), 0)?;
         while usize::try_from(index.capacity()).ok()? < target {
-            index = index.grow().or_else(|| {
-                index
-                    .grow_by_recovering_hashes(|slot, offset, _tag| {
-                        identity_at(slot, offset).map(|(_, hash)| hash).ok_or(())
-                    })
-                    .ok()
-                    .flatten()
-            })?;
+            index = index.grow()?;
         }
         for record in records {
             let RedoOp::Set {
@@ -3715,32 +3728,19 @@ impl PackfileStorage {
             };
             let (slot, _) = *pack_lookup.get(&pack_id)?;
             loop {
-                match index.insert_undoable_with_removed(&full_hash, slot, offset, removed) {
-                    Ok(_) => break,
-                    Err(InsertError::TableFull) => {
-                        index = index.grow().or_else(|| {
-                            index
-                                .grow_by_recovering_hashes(|old_slot, old_offset, _tag| {
-                                    identity_at(old_slot, old_offset)
-                                        .map(|(_, hash)| hash)
-                                        .ok_or(())
-                                })
-                                .ok()
-                                .flatten()
-                        })?;
-                    }
-                    Err(InsertError::NeedsIdentity {
-                        bucket,
-                        slot: old_slot,
-                        offset: old_offset,
-                    }) => {
-                        let (found_collection, found_hash) = identity_at(old_slot, old_offset)?;
-                        if found_collection != *collection_id
-                            || !index.hydrate_slot_identity(bucket, &found_hash)
-                        {
-                            return None;
+                let inserted = index
+                    .insert_with_identity(&full_hash, slot, offset, removed, |candidate| {
+                        let (found_collection, found_hash) =
+                            identity_at(candidate.shard_slot, candidate.offset).ok_or(())?;
+                        if found_collection != *collection_id {
+                            return Err(());
                         }
-                    }
+                        Ok(found_hash)
+                    })
+                    .ok()?;
+                match inserted {
+                    Ok(_) => break,
+                    Err(InsertError::TableFull) => index = index.grow()?,
                 }
             }
         }
@@ -3957,7 +3957,7 @@ impl PackfileStorage {
                 )
             })
             .collect();
-        let mut snapshot_indexes: HashMap<[u8; 16], (u64, LossyIndex)> = HashMap::new();
+        let mut snapshot_indexes: HashMap<[u8; 16], (u64, BucketIndex)> = HashMap::new();
         let mut v1_tombstones = HashSet::new();
         // Logical redo: every pack this log may name, by its stable id, with its
         // current length. The log's tail fingerprint pins those lengths, so a
@@ -4014,17 +4014,11 @@ impl PackfileStorage {
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaGenerationMismatch);
                         return None;
                     }
-                    if let Some((_, index)) = snapshot_indexes.get(&frame.collection_id) {
-                        if index.replay_frames(std::slice::from_ref(&frame)).is_err() {
-                            timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
-                            return None;
-                        }
-                    } else {
-                        frames_by_collection
-                            .entry(frame.collection_id)
-                            .or_default()
-                            .push(frame);
-                    }
+                    // Physical-slot deltas name a legacy linear-probe position.
+                    // They cannot be replayed into the bucket table; the
+                    // caller falls back to the authoritative pack scan.
+                    timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
+                    return None;
                 }
                 DeltaOperation::CollectionSnapshot {
                     collection_id,
@@ -4035,24 +4029,11 @@ impl PackfileStorage {
                     if deleted_collections.contains(&collection_id) {
                         continue;
                     }
-                    let Some(capacity_bytes) = index_blob.get(..8) else {
-                        timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
-                        return None;
-                    };
-                    let capacity: usize = usize::try_from(u64::from_le_bytes(
-                        capacity_bytes.try_into().unwrap_or([0; 8]),
-                    ))
-                    .unwrap_or(usize::MAX);
-                    // Delta snapshots use the canonical slots-only v1 form.
-                    let slots_len = capacity
-                        .checked_mul(8)
-                        .and_then(|bytes| bytes.checked_add(8));
-                    if Some(index_blob.len()) != slots_len {
-                        timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
-                        return None;
-                    }
-                    let Ok(index) = LossyIndex::deserialize_with_config(&index_blob, index_config)
+                    let Ok(index) = BucketIndex::deserialize_with_config(&index_blob, index_config)
                     else {
+                        // Legacy linear-probe snapshots are not interpreted as
+                        // bucket tables. Their pack records remain the source
+                        // of truth, so reopen safely migrates them by scanning.
                         timings.checkpoint_reject = Some(CheckpointReject::DeltaApplyFailed);
                         return None;
                     };
@@ -4157,30 +4138,23 @@ impl PackfileStorage {
             // The checkpoint reader has already validated this range. Keep it
             // mmap-backed through the read-only fast path; the first writer
             // copy-on-writes it into the normal atomic slot array.
-            let (mut index, generation) = if let Some((generation, index)) =
-                snapshot_indexes.remove(&loaded.collection_id)
-            {
-                (index, generation)
-            } else {
-                let mmap_index = LossyIndex::from_mmap_slots_with_config(
-                    Arc::clone(&checkpoint.mmap),
-                    loaded.slots_offset,
-                    loaded.capacity,
-                    loaded.slot_count,
-                    index_config,
-                );
-                let index = if let Some(frames) = frames_by_collection.get(&loaded.collection_id) {
-                    let owned = mmap_index.clone();
-                    if owned.replay_frames(frames).is_err() {
+            let (mut index, generation) =
+                if let Some((generation, index)) = snapshot_indexes.remove(&loaded.collection_id) {
+                    (index, generation)
+                } else {
+                    let index = loaded
+                        .snapshot_len
+                        .checked_add(loaded.slots_offset)
+                        .and_then(|end| checkpoint.mmap.get(loaded.slots_offset..end))
+                        .and_then(|bytes| {
+                            BucketIndex::deserialize_with_config(bytes, index_config).ok()
+                        });
+                    let Some(index) = index else {
                         timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
                         return None;
-                    }
-                    owned
-                } else {
-                    mmap_index
+                    };
+                    (index, loaded.generation)
                 };
-                (index, loaded.generation)
-            };
             if !index.remap_slots(&slot_remap) {
                 timings.checkpoint_reject = Some(CheckpointReject::SlotRemapFailed);
                 return None;
@@ -5021,7 +4995,7 @@ impl PackfileStorage {
         // Open every scanner and capture every file-length boundary before
         // releasing any requested collection's put lock. The subsequent pack
         // walk uses retained handles, so repack may safely unlink old shards.
-        let mut prepared = Vec::with_capacity(collection_ids.len());
+        let mut prepared: Vec<PreparedCollectionScan> = Vec::with_capacity(collection_ids.len());
         for collection_id in &collection_ids {
             // Own the generation `Arc` so it stays pinned while the pack walk
             // runs after every collection put lock has been released.
@@ -5417,22 +5391,42 @@ impl PackfileStorage {
     fn build_index(
         offsets: &[([u8; 16], u16, u64, bool)],
         index_config: crate::index::IndexConfig,
-    ) -> Result<LossyIndex, StorageError> {
-        let index = LossyIndex::with_config(
+    ) -> Result<BucketIndex, StorageError> {
+        let index = BucketIndex::with_config(
             offsets
                 .len()
                 .saturating_mul(2)
                 .max(NEW_COLLECTION_INDEX_FLOOR),
             index_config,
         );
+        let identities: HashMap<(u16, u64), [u8; 16]> = offsets
+            .iter()
+            .map(|(hash, slot, offset, _)| ((*slot, *offset), *hash))
+            .collect();
         for (hash, slot, offset, removed) in offsets {
             check_index_offset(*slot, hash, *offset)?;
-            insert_or_corrupt_with_removed(&index, hash, *slot, *offset, *removed)?;
+            let inserted = index
+                .insert_with_identity(hash, *slot, *offset, *removed, |candidate| {
+                    identities
+                        .get(&(candidate.shard_slot, candidate.offset))
+                        .copied()
+                        .ok_or(())
+                })
+                .map_err(|()| {
+                    StorageError::Corrupt(format!(
+                        "index candidate at offset {offset} in shard {slot} is absent from the rebuild input"
+                    ))
+                })?;
+            if let Err(error) = inserted {
+                return Err(StorageError::Corrupt(format!(
+                    "index insert failed for the record at offset {offset} in shard {slot}: {error}"
+                )));
+            }
         }
         Ok(index)
     }
 
-    /// Convert a slot-keyed `slot_counts` from `LossyIndex` to a pack_id-keyed
+    /// Convert a slot-keyed `slot_counts` from `BucketIndex` to a pack_id-keyed
     /// `HashMap<PackId, u64>` for use with `replace_collection_shard_counts`.
     fn slot_counts_to_pack_id_counts(&self, counts: &HashMap<u16, u64>) -> HashMap<PackId, u64> {
         let shards = self.shards.all_shards();
@@ -5794,7 +5788,7 @@ impl PackfileStorage {
     }
 
     /// Replaces `collection_id`'s entire contribution to `shard_collections` with
-    /// `counts` (typically `LossyIndex::slot_counts()` converted to `pack_id` keys)
+    /// `counts` (typically `BucketIndex::slot_counts()` converted to `pack_id` keys)
     /// — clears it out of any shard it no longer occupies and installs the fresh
     /// per-shard counts. Used wherever a collection's index is replaced wholesale
     /// rather than incrementally appended to, since only then can its distribution
@@ -6121,7 +6115,7 @@ impl PackfileStorage {
         let pack_id = self.shards.get_shard(slot).map(|shard| shard.pack_id);
         let record_len = u32::try_from(record_len).unwrap_or(0);
         let representable =
-            pack_id.is_some() && record_len != 0 && offset <= crate::index::IndexEntry::MAX_OFFSET;
+            pack_id.is_some() && record_len != 0 && offset <= PACK_INDEX_OFFSET_LIMIT;
         let pack_id = pack_id.unwrap_or(PackId([0; crate::packfile::PACK_ID_LEN]));
         let mut state = self.delta_state.lock();
         let base_generation_matches =
@@ -6894,7 +6888,7 @@ impl PackfileStorage {
         (cap, budget, projected)
     }
 
-    fn serialize_snapshot_index(index: &LossyIndex) -> (usize, Vec<u8>) {
+    fn serialize_snapshot_index(index: &BucketIndex) -> (usize, Vec<u8>) {
         (index.serialized_len(), index.serialize())
     }
 
@@ -7296,10 +7290,10 @@ impl PackfileStorage {
             .map(|(collection_id, nodes)| {
                 let nodes = usize::try_from(nodes).ok()?;
                 // A live collection always starts at `NEW_COLLECTION_INDEX_FLOOR`
-                // (64), not `LossyIndex::new`'s own generic 16-slot floor — use
+                // (64), not `BucketIndex::new`'s own generic 16-slot floor — use
                 // the same starting point here or a small collection's
                 // capacity/memory estimate undershoots its real index.
-                let capacity = u32::try_from(LossyIndex::capacity_for_entries(
+                let capacity = u32::try_from(BucketIndex::capacity_for_entries(
                     nodes,
                     NEW_COLLECTION_INDEX_FLOOR,
                 )?)
@@ -7307,7 +7301,7 @@ impl PackfileStorage {
                 Some((
                     collection_id,
                     nodes,
-                    LossyIndex::memory_usage_for_entries(nodes, NEW_COLLECTION_INDEX_FLOOR)?,
+                    BucketIndex::memory_usage_for_entries(nodes, NEW_COLLECTION_INDEX_FLOOR)?,
                     capacity,
                 ))
             })
@@ -7481,7 +7475,7 @@ impl PackfileStorage {
     fn store_generation(
         &self,
         collection_id: &[u8; 16],
-        index: LossyIndex,
+        index: BucketIndex,
         cache: Option<Arc<NodeCache>>,
         bump_generation: bool,
     ) -> Result<(), StorageError> {
@@ -7518,7 +7512,7 @@ impl PackfileStorage {
                 .entry(*collection_id)
                 .or_insert_with(|| {
                     ArcSwap::from_pointee(RoomGeneration {
-                        index: LossyIndex::new(0),
+                        index: BucketIndex::new(0),
                         cache: Arc::new(NodeCache::with_budget(
                             self.cache_capacity,
                             self.cache_budget.clone(),
@@ -7543,7 +7537,7 @@ impl PackfileStorage {
                     .entry(*collection_id)
                     .or_insert_with(|| {
                         ArcSwap::from_pointee(RoomGeneration {
-                            index: LossyIndex::new(0),
+                            index: BucketIndex::new(0),
                             cache: Arc::new(NodeCache::with_budget(
                                 self.cache_capacity,
                                 self.cache_budget.clone(),
@@ -7598,7 +7592,7 @@ impl PackfileStorage {
         self.store_generation(collection_id, new_index, existing_cache, true)
     }
 
-    fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
+    fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<BucketIndex, StorageError> {
         // Full-fallback path: a batch that exhausted growth re-scans the
         // packfiles. Tracked so a heavy rebuild is visible in `stats()`.
         self.index_rebuild_count.fetch_add(1, Ordering::Relaxed);
@@ -7616,7 +7610,7 @@ impl PackfileStorage {
         // repeat. The pack scanner returns each shard's frames in offset order.
         let mut shards = self.shards.all_shards();
         shards.sort_by_key(|(_, shard)| shard.creation_seq);
-        let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
+        let mut index = BucketIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
         let generation_floor = self
             .collection_generation_fences
             .lock()
@@ -7640,132 +7634,79 @@ impl PackfileStorage {
                 if record.collection_id != *collection_id {
                     continue;
                 }
-                // `IndexEntry` can only represent offsets up to
-                // `PACK_INDEX_OFFSET_LIMIT`. Offsets an externally created
-                // oversized shard are rejected rather than silently skipped.
-                check_index_offset(slot, &record.hash, record.offset)?;
-                loop {
-                    match index.insert_tracked_with_removed(
-                        &record.hash,
-                        slot,
-                        record.offset,
-                        record.removed,
-                    ) {
-                        Ok(_) => break,
-                        Err(InsertError::TableFull) => {
-                            index = index.grow().ok_or_else(|| {
-                                StorageError::Corrupt(format!(
-                                    "index insert failed for the record at offset {} in shard {slot}: table cannot grow",
-                                    record.offset
-                                ))
-                            })?;
-                        }
-                        Err(error) => {
-                            return Err(StorageError::Corrupt(format!(
-                                "index insert failed for the record at offset {} in shard {slot}: {error}",
-                                record.offset
-                            )));
-                        }
-                    }
-                }
+                self.insert_rebuilt_record(collection_id, &mut index, slot, &record)?;
             }
         }
         Ok(index)
     }
 
-    /// Rehash a checkpoint-derived index without rescanning unrelated packs.
-    ///
-    /// A compact checkpoint keeps the packed `(shard, offset)` slots but not
-    /// the 64-bit home hashes needed by [`LossyIndex::grow`].  Each occupied
-    /// slot still names an authoritative frame whose fixed metadata prefix
-    /// contains the full hash, so recover those identities and rehash only
-    /// this collection's entries.  A missing shard, malformed frame, or a
-    /// frame from another collection fails closed to the caller's existing
-    /// whole-collection scan fallback.
-    fn grow_checkpoint_index(
+    fn insert_rebuilt_record(
         &self,
         collection_id: &[u8; 16],
-        index: &LossyIndex,
-    ) -> Result<Option<LossyIndex>, StorageError> {
-        index.grow_by_recovering_hashes(|slot, offset, slot_tag| {
-            let shard = self.shards.get_shard(slot).ok_or_else(|| {
-                StorageError::Corrupt(format!("checkpoint index refers to missing shard {slot}"))
-            })?;
-            let (found_collection, hash, _removed) =
-                self.shards.record_identity_at(&shard, offset)?;
-            if &found_collection != collection_id {
-                return Err(StorageError::Corrupt(format!(
-                    "checkpoint index offset {offset} in shard {slot} belongs to another collection"
-                )));
+        index: &mut BucketIndex,
+        slot: u16,
+        record: &packfile::ScanEntryWithRemoval,
+    ) -> Result<(), StorageError> {
+        check_index_offset(slot, &record.hash, record.offset)?;
+        loop {
+            match self.insert_index(
+                collection_id,
+                index,
+                &record.hash,
+                slot,
+                record.offset,
+                record.removed,
+            )? {
+                Ok(_) => return Ok(()),
+                Err(InsertError::TableFull) => {
+                    *index = index.grow().ok_or_else(|| {
+                        StorageError::Corrupt(format!(
+                            "index insert failed for the record at offset {} in shard {slot}: table cannot grow",
+                            record.offset
+                        ))
+                    })?;
+                }
             }
-            if index.tag_for_hash(&hash) != slot_tag {
-                return Err(StorageError::Corrupt(format!(
-                    "checkpoint index tag does not match frame at offset {offset} in shard {slot}"
-                )));
-            }
-            Ok(hash)
-        })
+        }
     }
 
     /// Insert with exact identity checks for checkpoint-derived slots.
     ///
-    /// A compact checkpoint retains a slot's tag and location but not the
-    /// remaining hash bits. On the rare same-tag probe, recover that frame's
-    /// metadata, hydrate the in-memory slot, and retry. Active indexes carry
-    /// their identities already, so their ordinary inserts take no I/O path.
+    /// A compact checkpoint retains the fingerprint and location, not the
+    /// full key. On a fingerprint match, verify the frame header before
+    /// treating it as an overwrite.
     fn insert_index(
         &self,
         collection_id: &[u8; 16],
-        index: &LossyIndex,
+        index: &BucketIndex,
         hash: &NodeId,
         slot: u16,
         offset: u64,
         removed: bool,
-    ) -> Result<Result<(u32, u64, bool), InsertError>, StorageError> {
+    ) -> Result<Result<bool, InsertError>, StorageError> {
         Ok(self
             .insert_index_undoable(collection_id, index, hash, slot, offset, removed)?
-            .map(|(bucket, slot, undo)| (bucket, slot, undo.was_empty())))
+            .map(|(_, was_new)| was_new))
     }
 
-    /// Like [`Self::insert_index`], but also returns the [`EntryUndo`]
+    /// Like [`Self::insert_index`], but also returns the [`BucketUndo`]
     /// needed to reverse this one write, for callers mutating a still-live
     /// (not cloned) index across a multi-record batch.
     fn insert_index_undoable(
         &self,
         collection_id: &[u8; 16],
-        index: &LossyIndex,
+        index: &BucketIndex,
         hash: &NodeId,
         slot: u16,
         offset: u64,
         removed: bool,
-    ) -> Result<Result<(u32, u64, EntryUndo), InsertError>, StorageError> {
-        loop {
-            match index.insert_undoable_with_removed(hash, slot, offset, removed) {
-                Ok(written) => return Ok(Ok(written)),
-                Err(InsertError::TableFull) => return Ok(Err(InsertError::TableFull)),
-                Err(InsertError::NeedsIdentity {
-                    bucket,
-                    slot,
-                    offset,
-                }) => {
-                    let shard = self.shards.get_shard(slot).ok_or_else(|| {
-                        StorageError::Corrupt(format!(
-                            "index refers to missing shard {slot} while resolving a tag collision"
-                        ))
-                    })?;
-                    let (found_collection, found_hash, _removed) =
-                        self.shards.record_identity_at(&shard, offset)?;
-                    self.index_identity_reads.fetch_add(1, Ordering::Relaxed);
-                    if &found_collection != collection_id
-                        || !index.hydrate_slot_identity(bucket, &found_hash)
-                    {
-                        return Err(StorageError::Corrupt(format!(
-                            "index tag candidate at offset {offset} in shard {slot} is inconsistent"
-                        )));
-                    }
-                }
-            }
-        }
+    ) -> Result<Result<(BucketUndo, bool), InsertError>, StorageError> {
+        let result = index.insert_with_identity(hash, slot, offset, removed, |candidate| {
+            let identity = bucket_candidate_identity(&self.shards, collection_id, candidate)?;
+            self.index_identity_reads.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, StorageError>(identity)
+        })?;
+        Ok(result)
     }
 
     /// Fetch a node and return it as a `NodeRef` with swizzled children.
@@ -9719,15 +9660,14 @@ impl PackfileStorage {
         };
         let insert_result =
             self.insert_index_undoable(collection_id, live, id, slot, offset, false)?;
-        let inserted = if let Ok((_bucket, _entry, undo)) = insert_result {
-            let was_empty = undo.was_empty();
+        let inserted = if let Ok((undo, was_new)) = insert_result {
             progress
                 .pending_deltas
                 .push((*id, slot, offset, record_len));
             if progress.owned_index.is_none() {
                 progress.undo_log.push(undo);
             }
-            was_empty
+            was_new
         } else {
             let grow_started = std::time::Instant::now();
             let grown = if let Some(grown) = live.grow() {
@@ -9736,9 +9676,7 @@ impl PackfileStorage {
                 // Match the single-put fallback: if recovering the
                 // checkpoint-backed hashes fails, rebuild this collection
                 // from pack records below instead of aborting a valid batch.
-                self.grow_checkpoint_index(collection_id, live)
-                    .ok()
-                    .flatten()
+                live.grow()
             };
             let Some(grown) = grown else {
                 progress.index_needs_rebuild = true;
@@ -9757,7 +9695,8 @@ impl PackfileStorage {
                 u64::try_from(grow_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            insert_or_corrupt(&grown, id, slot, offset)?;
+            self.insert_index(collection_id, &grown, id, slot, offset, false)?
+                .map_err(|error| StorageError::Corrupt(error.to_string()))?;
             progress.owned_index = Some(grown);
             true
         };
@@ -9894,9 +9833,8 @@ impl PackfileStorage {
     ) -> PutManyProgress {
         let started = std::time::Instant::now();
         let owned_index = match old_gen {
-            Some(generation) if !generation.index.is_mmap_backed() => None,
-            Some(generation) => Some(generation.index.clone()),
-            None => Some(LossyIndex::with_config(
+            Some(_) => None,
+            None => Some(BucketIndex::with_config(
                 entries_len
                     .saturating_mul(2)
                     .max(NEW_COLLECTION_INDEX_FLOOR),
@@ -10115,26 +10053,22 @@ impl PackfileStorage {
         id: &NodeId,
         generation: u64,
         locator: RecordLocator,
-        mut index: LossyIndex,
+        mut index: BucketIndex,
         removed: bool,
-    ) -> Result<LossyIndex, StorageError> {
+    ) -> Result<BucketIndex, StorageError> {
         let RecordLocator { slot, offset, len } = locator;
         // Growth changes table shape, not logical redo semantics. Log the
         // boundary write as usual; replay will grow the table itself.
         if let Some(grown) = index.grow() {
-            insert_or_corrupt_with_removed(&grown, id, slot, offset, removed)?;
-            index = grown;
-            self.record_redo(collection_id, generation, id, locator, removed);
-        } else if let Ok(Some(grown)) = self.grow_checkpoint_index(collection_id, &index) {
-            // Recovering checkpoint identities is bounded by this collection,
-            // unlike rebuilding it from all pack records.
-            insert_or_corrupt_with_removed(&grown, id, slot, offset, removed)?;
+            self.insert_index(collection_id, &grown, id, slot, offset, removed)?
+                .map_err(|error| StorageError::Corrupt(error.to_string()))?;
             index = grown;
             self.record_redo(collection_id, generation, id, locator, removed);
         } else {
             self.invalidate_delta_log(collection_id);
             index = self.rebuild_index(collection_id)?;
-            insert_or_corrupt_with_removed(&index, id, slot, offset, removed)?;
+            self.insert_index(collection_id, &index, id, slot, offset, removed)?
+                .map_err(|error| StorageError::Corrupt(error.to_string()))?;
         }
 
         // A rebuild re-derives shard distribution. The just-appended frame's
@@ -10170,39 +10104,37 @@ impl PackfileStorage {
         let (slot, offset, disk_bytes, published) =
             self.append_put_record(collection_id, id, data, metadata)?;
         if let Some(gen) = self.generation(collection_id) {
-            if !gen.index.is_mmap_backed() {
-                if let Ok((_bucket, _entry, inserted)) =
-                    self.insert_index(collection_id, &gen.index, id, slot, offset, removed)?
-                {
-                    self.record_redo(
-                        collection_id,
-                        gen.generation,
-                        id,
-                        RecordLocator {
-                            slot,
-                            offset,
-                            len: disk_bytes,
-                        },
-                        removed,
-                    );
-                    let pack_id = self.pack_id_for_slot(slot)?;
-                    if inserted {
-                        self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
-                    } else {
-                        self.record_disk_bytes(pack_id, collection_id, disk_bytes);
-                    }
-                    // Keep a live record resident under the shared byte
-                    // budget, but never cache a removal marker: readers would
-                    // otherwise decode an empty payload as the deleted value.
-                    if removed {
-                        gen.cache.remove(id);
-                    } else {
-                        self.update_record_cache_for(&gen.cache, id, data, removed);
-                    }
-                    self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-                    self.note_published_materialized(published);
-                    return Ok(());
+            if let Ok(inserted) =
+                self.insert_index(collection_id, &gen.index, id, slot, offset, removed)?
+            {
+                self.record_redo(
+                    collection_id,
+                    gen.generation,
+                    id,
+                    RecordLocator {
+                        slot,
+                        offset,
+                        len: disk_bytes,
+                    },
+                    removed,
+                );
+                let pack_id = self.pack_id_for_slot(slot)?;
+                if inserted {
+                    self.record_new_shard_collection(pack_id, collection_id, disk_bytes);
+                } else {
+                    self.record_disk_bytes(pack_id, collection_id, disk_bytes);
                 }
+                // Keep a live record resident under the shared byte budget,
+                // but never cache a removal marker: readers would otherwise
+                // decode an empty payload as the deleted value.
+                if removed {
+                    gen.cache.remove(id);
+                } else {
+                    self.update_record_cache_for(&gen.cache, id, data, removed);
+                }
+                self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
+                self.note_published_materialized(published);
+                return Ok(());
             }
         }
         let (index, cache) =
@@ -10228,7 +10160,7 @@ impl PackfileStorage {
         offset: u64,
         disk_bytes: u64,
         removed: bool,
-    ) -> Result<(LossyIndex, Arc<NodeCache>), StorageError> {
+    ) -> Result<(BucketIndex, Arc<NodeCache>), StorageError> {
         let old_gen = self.generation(collection_id);
         let generation = old_gen.as_ref().map_or(1, |g| g.generation);
         let mut index = match &old_gen {
@@ -10246,10 +10178,10 @@ impl PackfileStorage {
             //
             // See `NEW_COLLECTION_INDEX_FLOOR` for why this isn't the
             // index's own smaller hard floor.
-            None => LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
+            None => BucketIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config),
         };
         let inserted = self.insert_index(collection_id, &index, id, slot, offset, removed)?;
-        if let Ok((_bucket, _entry, is_new)) = inserted {
+        if let Ok(is_new) = inserted {
             self.record_redo(
                 collection_id,
                 generation,
@@ -10660,12 +10592,12 @@ impl StorageEngine for PackfileStorage {
         drop(put_guard);
 
         let keys = Self::scan_collection_keys(scanners, collection_id)?;
-        let Some(generation) = generation else {
+        if generation.is_none() {
             return Ok(Vec::new());
-        };
+        }
         let mut live = Vec::with_capacity(keys.len());
         for id in keys {
-            if generation.index.lookup_removed(&id) == Some(false) {
+            if self.durable_removed(collection_id, &id)? == Some(false) {
                 live.push(id);
             }
         }
@@ -11135,10 +11067,9 @@ impl PackfileStorage {
     /// Resolve whether `node_id` is explicitly removed in the durable
     /// collection, verifying the full 16-byte identity of every tag candidate.
     ///
-    /// `Ok(None)` means no candidate frame carries this identity. Unlike
-    /// [`LossyIndex::lookup_removed`], this is correct for a slots-only
-    /// checkpoint, whose index has no identity side tables and would report
-    /// every probe as unknown.
+    /// `Ok(None)` means no candidate frame carries this identity. Candidate
+    /// identity and the removal bit are both read from the authoritative frame
+    /// header, without reading or decompressing its payload.
     fn durable_removed(
         &self,
         collection_id: &[u8; 16],
@@ -11167,19 +11098,7 @@ impl PackfileStorage {
                 let (found_collection, found_hash, removed) =
                     self.shards.record_identity_at(shard, offset)?;
                 if &found_collection == collection_id && &found_hash == node_id {
-                    // `record_identity_at` validates the frame's structure but
-                    // not its checksum. Before trusting its removal bit, read
-                    // the exact version under the configured policy so a
-                    // corrupt frame cannot change a collection's length.
-                    if !self.shards.checksum_policy().verifies_reads() {
-                        return Ok(Some(removed));
-                    }
-                    let record = self.read_at(shard, offset, true)?;
-                    if record.collection_id == *collection_id && record.hash == *node_id {
-                        return Ok(Some(
-                            record.metadata.as_ref().is_some_and(|meta| meta.removed),
-                        ));
-                    }
+                    return Ok(Some(removed));
                 }
             }
             return Ok(None);
@@ -12976,7 +12895,7 @@ impl PackfileStorage {
 
         // Longest linear-probe chain observed across every live collection's
         // index, for operator visibility into collision-chain growth (see
-        // `LossyIndex::max_probe_len` — pure observability, no cap, no
+        // `BucketIndex::max_probe_len` — pure observability, no cap, no
         // effect on control flow).
         let max_index_probe_len = self
             .collections_read()
@@ -13341,7 +13260,7 @@ pub struct RuntimeStats {
     /// Longest linear-probe chain observed by any insert or lookup across
     /// every live collection's index, since each collection's index was
     /// constructed (never reset by `reset_stats`, matching `shards`/`cache`/
-    /// `index_bytes`/`repack` — see `LossyIndex::max_probe_len`). Pure
+    /// `index_bytes`/`repack` — see `BucketIndex::max_probe_len`). Pure
     /// observability: no probe-length cap exists or is implied by this
     /// value; it exists so an operator can notice collision-chain growth
     /// (e.g. under adversarial content against a misconfigured/unseeded

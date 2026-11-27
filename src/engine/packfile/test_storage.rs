@@ -1639,23 +1639,18 @@ fn checkpoint_index_growth_recovers_hashes_from_indexed_frames() {
     let checkpoint_index = reopened
         .generation(&TEST_COLLECTION)
         .expect("checkpoint collection exists");
-    assert!(checkpoint_index.index.is_mmap_backed());
-    let grown = reopened
-        .grow_checkpoint_index(&TEST_COLLECTION, &checkpoint_index.index)
-        .unwrap()
-        .expect("4K checkpoint index can grow");
+    assert!(!checkpoint_index.index.is_mmap_backed());
+    let grown = checkpoint_index.index.grow().expect("4K index can grow");
     assert_eq!(grown.len(), ENTRIES);
     for (id, _) in &entries {
         assert!(grown.lookup(id).is_some(), "recovered hash remains indexed");
     }
     drop(checkpoint_index);
 
-    // Exercise the actual put_many fallback too. `insert_index` fails
-    // closed once `len >= capacity * 3 / 4`, and the reopened generation
-    // is mmap-backed (so `LossyIndex::grow` — which needs the original
-    // homes — can't apply): crossing that threshold therefore always
-    // routes through `grow_checkpoint_index`, never a silent plain grow
-    // or a full pack rescan. Compute the threshold from the checkpoint's
+    // Exercise the actual put_many growth path too. `insert_index` fails
+    // closed once `len >= capacity * 3 / 4`; the decoded bucket snapshot
+    // retains the fingerprints and locators needed for an in-memory grow.
+    // Compute the threshold from the checkpoint's
     // actual on-disk capacity and add enough unique post-reopen entries
     // to be certain we cross it, instead of relying on one extra record
     // that may land comfortably under it.
@@ -3574,12 +3569,14 @@ fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
         .put(&collection, &batch_node(1), &NodeData::from_slice(b"one"))
         .unwrap();
     store.sync_all().unwrap();
-    store.delta_log_cap_override.store(512, Ordering::Relaxed);
+    // A self-describing one-entry bucket snapshot is much smaller than the
+    // former capacity-sized slot array. Keep the cap below that compact batch.
+    store.delta_log_cap_override.store(64, Ordering::Relaxed);
     store.invalidate_delta_log(&collection);
 
     let state = store.delta_state.lock().clone();
     let Err(error) = store.build_v1_pending_batch(&state, false) else {
-        panic!("the snapshot must not fit under a 512-byte cap");
+        panic!("the snapshot must not fit under a 64-byte cap");
     };
     let detail = PackfileStorage::delta_batch_too_large(&error).expect("a too-large batch");
     let blob_len = store
@@ -3589,7 +3586,7 @@ fn a_snapshot_that_cannot_fit_is_refused_before_it_is_serialized() {
         .unwrap();
     let expected = delta::v1_empty_batch_len() + delta::v1_snapshot_frame_len(blob_len).unwrap();
     assert_eq!(detail.batch_bytes, expected);
-    assert_eq!(detail.cap, 512);
+    assert_eq!(detail.cap, 64);
 
     // With the real cap the same pending snapshot builds.
     store.delta_log_cap_override.store(0, Ordering::Relaxed);
@@ -4493,7 +4490,8 @@ fn test_probe_reopen_first_append_sync_path() {
         );
         assert_eq!(
             after_put.put_many_clone_path_calls - before.put_many_clone_path_calls,
-            1
+            0,
+            "bucket-backed writes do not use the former whole-index clone path"
         );
         assert_eq!(after_put.index_grow_count - before.index_grow_count, 1);
         assert_eq!(
@@ -4648,12 +4646,6 @@ fn slots_only_reopen_resolves_removed_state_from_the_frame() {
     }
 
     let reopened = PackfileStorage::open(dir.clone()).unwrap();
-    let generation = reopened.generation(&collection).unwrap();
-    assert_eq!(
-        generation.index.lookup_removed(&id),
-        None,
-        "the slots-only index cannot prove identity before hydration"
-    );
     assert_eq!(
         reopened.durable_removed(&collection, &id).unwrap(),
         Some(true),
@@ -7505,7 +7497,7 @@ fn physical_only_collection_bytes_survive_reopen_without_live_shard_membership()
 #[test]
 fn test_collection_summaries_from_disk_capacity_matches_new_collection_floor() {
     // A one-node collection's live index starts at
-    // `NEW_COLLECTION_INDEX_FLOOR` (64), never `LossyIndex::new`'s own
+    // `NEW_COLLECTION_INDEX_FLOOR` (64), never `BucketIndex::new`'s own
     // generic 16-slot floor. The disk-only estimate (no packfiles
     // opened) must report the same capacity the live index actually
     // has, or a load-factor figure derived from it is wrong.
@@ -7632,7 +7624,7 @@ fn test_plan_collection_repack_matches_real_repack_without_mutating() {
             .unwrap();
     }
     // Duplicate a hash's payload under a fresh id to create something
-    // dedup would drop... actually LossyIndex already dedups by hash
+    // dedup would drop... actually BucketIndex already dedups by identity
     // on insert, so instead exercise the "no live roots: keep
     // everything" path, which is what --root-less usage always hits.
     let plan = store
@@ -8174,7 +8166,7 @@ fn ensure_collection_metadata_conflicting_writers_have_one_winner() {
 
 /// Checkpoint-backed hash recovery must handle frames that carry metadata
 /// (as `put_verified` writes do). `record_identity_at` previously rejected
-/// `FLAG_METADATA` frames, so `grow_checkpoint_index` failed closed to a
+/// `FLAG_METADATA` frames, so index growth failed closed to a
 /// full rescan instead of recovering their identity.
 #[test]
 fn checkpoint_growth_recovers_metadata_bearing_frames() {
@@ -8203,10 +8195,10 @@ fn checkpoint_growth_recovers_metadata_bearing_frames() {
     let checkpoint_index = reopened
         .generation(&collection)
         .expect("checkpoint collection exists");
-    assert!(checkpoint_index.index.is_mmap_backed());
-    let grown = reopened
-        .grow_checkpoint_index(&collection, &checkpoint_index.index)
-        .unwrap()
+    assert!(!checkpoint_index.index.is_mmap_backed());
+    let grown = checkpoint_index
+        .index
+        .grow()
         .expect("checkpoint index can grow");
     assert!(
         grown.lookup(&id).is_some(),
@@ -10012,7 +10004,7 @@ fn a_bad_redo_log_is_rejected_and_the_open_rescans() {
     };
     let out_of_extent = |record: &mut RedoRecord| {
         if let RedoOp::Set { offset, .. } = &mut record.op {
-            *offset = crate::index::IndexEntry::MAX_OFFSET;
+            *offset = BucketIndex::MAX_RECORD_OFFSET;
         }
     };
     let flat_sequence = |record: &mut RedoRecord| record.delta_seq = 0;
@@ -10334,25 +10326,38 @@ fn applying_redo_sets_is_idempotent_and_order_convergent() {
             base_generation: 1,
         });
     }
-    let fresh = || LossyIndex::with_config(16, config);
-    let once =
-        PackfileStorage::apply_redo_sets(&[1; 16], fresh(), &records, &pack_lookup, |_, _| None)
-            .unwrap();
-    let twice =
-        PackfileStorage::apply_redo_sets(&[1; 16], once.clone(), &records, &pack_lookup, |_, _| {
-            None
+    let fresh = || BucketIndex::with_config(16, config);
+    let identities: HashMap<(u16, u64), [u8; 16]> = records
+        .iter()
+        .filter_map(|record| match record.op {
+            RedoOp::Set {
+                full_hash, offset, ..
+            } => Some(((2, offset), full_hash)),
+            RedoOp::CollectionTombstone => None,
         })
-        .unwrap();
+        .collect();
+    let identity_at = |slot, offset| identities.get(&(slot, offset)).map(|hash| ([1; 16], *hash));
+    let once =
+        PackfileStorage::apply_redo_sets(&[1; 16], fresh(), &records, &pack_lookup, identity_at)
+            .unwrap();
+    let twice = PackfileStorage::apply_redo_sets(
+        &[1; 16],
+        once.clone(),
+        &records,
+        &pack_lookup,
+        identity_at,
+    )
+    .unwrap();
     let over_prefix = {
         let prefix = PackfileStorage::apply_redo_sets(
             &[1; 16],
             fresh(),
             &records[..350],
             &pack_lookup,
-            |_, _| None,
+            identity_at,
         )
         .unwrap();
-        PackfileStorage::apply_redo_sets(&[1; 16], prefix, &records, &pack_lookup, |_, _| None)
+        PackfileStorage::apply_redo_sets(&[1; 16], prefix, &records, &pack_lookup, identity_at)
             .unwrap()
     };
     assert_eq!(once.len(), 300, "300 distinct identities");
@@ -11937,15 +11942,20 @@ fn repacking_a_survivor_does_not_resurrect_a_deleted_collection_in_its_shard() {
 fn a_rebuild_insert_into_a_full_table_fails_instead_of_dropping_the_record() {
     // A table at its load threshold rejects new entries; the rebuild helpers
     // must surface that, not publish an index that silently lacks the record.
-    let index = LossyIndex::with_config(16, crate::index::IndexConfig::default());
+    let index = BucketIndex::with_config(16, crate::index::IndexConfig::default());
     let mut seq = 0u64;
     let rejected = loop {
         let mut hash = [0u8; 16];
         hash[..8].copy_from_slice(&seq.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
         hash[8..].copy_from_slice(&seq.to_be_bytes());
-        match insert_or_corrupt(&index, &hash, 0, 64 + seq) {
-            Ok(()) => seq += 1,
-            Err(error) => break error,
+        match index
+            .insert_with_identity(&hash, 0, 64 + seq, false, |_| Ok::<_, ()>([0; 16]))
+            .unwrap()
+        {
+            Ok(_) => seq += 1,
+            Err(error) => {
+                break StorageError::Corrupt(format!("index insert failed: {error}"));
+            }
         }
         assert!(
             seq < 1_000,
@@ -12875,9 +12885,9 @@ fn slots_only_reopen_counts_identity_reads_for_a_tag_collision() {
     let dir = test_dir("slots_only_identity_reads");
     let collection = [0x7Au8; 16];
 
-    // Equal bucket bytes (0..8) and equal tag bytes (8..12): the lossy index
-    // cannot tell these two apart without reading the frame header. Only the
-    // bytes it does not inspect (12..16, plus the tail it does) differ.
+    // Keep the first twelve bytes equal, as in the old lossy-index collision
+    // regression. BucketIndex fingerprints the full hash, so these remain
+    // separate keys without a frame identity read.
     let mut first = [0u8; 16];
     first[..8].copy_from_slice(&[0x11; 8]);
     first[8..12].copy_from_slice(&[0x22; 4]);
@@ -12926,8 +12936,8 @@ fn slots_only_reopen_counts_identity_reads_for_a_tag_collision() {
 
     assert_eq!(
         store.stats().index_identity_reads,
-        1,
-        "a same-tag probe against a slots-only index must hydrate from the frame"
+        0,
+        "different bucket fingerprints must not trigger an identity read"
     );
     assert_eq!(
         store

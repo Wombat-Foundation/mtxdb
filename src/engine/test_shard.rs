@@ -1547,16 +1547,12 @@ fn two_rooted_pools_open_in_one_process_without_self_blocking() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// Regression: `MAX_SHARD_BYTES` must stay within the offset field that
-/// `IndexEntry` stores as `offset + 1`, so the maximum valid offset must
-/// never reach the empty-slot sentinel boundary.
+/// Regression: `MAX_SHARD_BYTES` must stay within the bucket index's
+/// 48-bit offset field.
 #[test]
 fn max_shard_bytes_fits_index_slot() {
-    // The largest offset a shard can ever present must survive
-    // IndexEntry::new without panicking.
     let max_offset = MAX_SHARD_BYTES - 1;
-    let slot = crate::index::IndexEntry::new(0, 0, max_offset);
-    assert_eq!(slot.offset(), max_offset);
+    assert!(max_offset < crate::index::BucketIndex::MAX_RECORD_OFFSET);
 }
 
 /// Regression: `retire_slot` must not clear the active write shard's

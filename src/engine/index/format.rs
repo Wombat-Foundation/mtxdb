@@ -20,16 +20,9 @@ pub const PACK_TABLE_ENTRY_LEN: usize = 20;
 /// Bytes in one collection logical-version entry: collection id plus LSN.
 pub const COLLECTION_VERSION_ENTRY_LEN: usize = 24;
 
-/// One slot overwrite after a checkpoint.
-///
-/// `bucket` is the frame's landing bucket — the actual table position the
-/// slot was written at, after `insert_tracked` advanced past any occupied
-/// slots during linear probing — not the hash's home bucket. `replay_frames`
-/// writes directly to it, so a producer logging a frame at the home bucket
-/// instead would place the delta at the wrong slot. `slot` is the packed
-/// [`crate::index::IndexEntry`] representation stored there. `generation`
-/// prevents a delta for a pre-resize table being applied to a resized or
-/// repacked collection.
+/// Legacy physical-slot delta frame. The current bucket index cannot apply
+/// these table-position writes; storage rejects them and rebuilds by scanning
+/// the authoritative packs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaFrame {
     /// The collection whose index changed.
@@ -38,7 +31,7 @@ pub struct DeltaFrame {
     pub bucket: u32,
     /// The collection-index generation this frame applies to.
     pub generation: u64,
-    /// The packed `IndexEntry` value to store.
+    /// Opaque legacy slot value retained only for format decoding.
     pub slot: u64,
 }
 

@@ -249,14 +249,9 @@ const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
 /// and modular arithmetic.
 pub(crate) const MAX_SHARDS_U16: u16 = 4096;
 
-/// Maximum shard size before rotation: `2^32 - 2` bytes (~4 GiB), the
-/// largest value for which every offset a shard can ever produce still
-/// fits `IndexEntry`'s 32-bit offset field (which reserves its all-zero
-/// encoding as the empty-slot sentinel, capping the max representable
-/// offset at `2^32 - 2` — see `index::IndexEntry`). Do not round this up
-/// to a clean `4 * 1024 * 1024 * 1024`: that's one byte over the ceiling and
-/// lets a shard produce an offset `IndexEntry::new` panics on.
-pub const MAX_SHARD_BYTES: u64 = crate::index::IndexEntry::MAX_OFFSET;
+/// Maximum shard size representable by the bucket index's 48-bit offset.
+/// Normal rotation uses a much smaller configured threshold.
+pub const MAX_SHARD_BYTES: u64 = crate::index::BucketIndex::MAX_RECORD_OFFSET;
 
 /// Default in-memory threshold before a shard's buffered frames are written
 /// to disk as one positioned write. Keeps bulk writes from paying a
@@ -957,8 +952,7 @@ pub struct ShardPool {
     /// Per-pool rotation threshold, in bytes. Defaults to `MAX_SHARD_BYTES`
     /// but may be set lower (e.g. by a benchmark that wants many small
     /// packs to exercise repack/locality behavior) — never higher, since
-    /// `MAX_SHARD_BYTES` is a hard ceiling imposed by `IndexEntry`'s 32-bit
-    /// offset field.
+    /// `MAX_SHARD_BYTES` is the bucket index's 48-bit offset ceiling.
     max_shard_bytes: u64,
     /// Per-pool seed mixed into index bucket/tag derivation. Generated once
     /// at first pool creation, persisted in `pool.meta`, immutable after

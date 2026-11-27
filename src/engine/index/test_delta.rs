@@ -1150,32 +1150,6 @@ fn fingerprint_errors_render_their_context() {
 }
 
 #[test]
-fn replay_errors_render_their_context() {
-    let cases = [
-        (
-            DeltaReplayError::FrameOutOfBounds {
-                bucket: 9,
-                capacity: 4,
-            },
-            "delta frame bucket 9 exceeds index capacity 4",
-        ),
-        (
-            DeltaReplayError::RequiresOwnedIndex,
-            "delta replay requires an owned index",
-        ),
-        (
-            DeltaReplayError::EmptySlot { bucket: 3 },
-            "delta frame at bucket 3 carries the empty-slot sentinel",
-        ),
-    ];
-    for (error, text) in cases {
-        assert_eq!(error.to_string(), text);
-    }
-    let slot = DeltaReplayError::SlotOutOfRange { bucket: 1, slot: 7 }.to_string();
-    assert!(slot.contains("bucket 1") && slot.contains("slot 7"));
-}
-
-#[test]
 fn tail_fingerprint_reader_handles_each_log_shape() {
     let dir = scratch_dir("tailfp");
     let path = dir.join(INDEX_DELTA_FILE);

@@ -364,7 +364,7 @@ pub trait StorageEngine: Send + Sync {
     /// wrote after this one last loaded (or never loaded) the collection.
     ///
     /// Every implementation's in-memory index is private to the process
-    /// that built it (see `PackfileStorage`'s per-process `LossyIndex`) --
+    /// that built it (see `PackfileStorage`'s per-process `BucketIndex`) --
     /// there is no ambient cross-process invalidation, so a multi-worker
     /// deployment must call this explicitly on a suspected miss to pull in
     /// another worker's writes. Default no-op: engines with no on-disk

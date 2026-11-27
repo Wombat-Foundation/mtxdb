@@ -643,7 +643,7 @@ fn run_oneshot_open_benchmark(
         let store = PackfileStorage::open_read_only(dir.clone()).unwrap();
         let open_elapsed = started.elapsed();
 
-        // LossyIndex resident bytes (sum over all per-collection indices). This
+        // BucketIndex resident bytes (sum over all per-collection indices). This
         // is the number that becomes the checkpoint-file size in the persisted
         // index design; it is isolated from the mmap'd packfile page cache.
         let index_bytes: u64 = store

@@ -26,7 +26,7 @@
 
 use crate::packfile::PackId;
 
-use super::IndexEntry;
+use super::bucket_index::BucketIndex;
 
 /// Encoded length of one record.
 pub const REDO_RECORD_LEN: usize = 80;
@@ -135,7 +135,7 @@ impl RedoRecord {
     /// Encode the record.
     ///
     /// # Errors
-    /// A set whose offset exceeds [`IndexEntry::MAX_OFFSET`] or whose record
+    /// A set whose offset exceeds [`BucketIndex::MAX_RECORD_OFFSET`] or whose record
     /// length is zero cannot be represented.
     pub fn encode(&self) -> Result<[u8; REDO_RECORD_LEN], RedoError> {
         let mut buf = [0u8; REDO_RECORD_LEN];
@@ -148,7 +148,7 @@ impl RedoRecord {
                 record_len,
                 removed,
             } => {
-                if offset > IndexEntry::MAX_OFFSET {
+                if offset > BucketIndex::MAX_RECORD_OFFSET {
                     return Err(RedoError::OffsetTooLarge(offset));
                 }
                 if record_len == 0 {
@@ -191,7 +191,7 @@ impl RedoRecord {
         let record_len = u32::from_le_bytes(take(bytes, 60));
         let op = match op_byte {
             OP_SET => {
-                if offset > IndexEntry::MAX_OFFSET {
+                if offset > BucketIndex::MAX_RECORD_OFFSET {
                     return Err(RedoError::OffsetTooLarge(offset));
                 }
                 if record_len == 0 {

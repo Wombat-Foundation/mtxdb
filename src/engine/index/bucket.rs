@@ -414,6 +414,45 @@ fn parse_snapshot_entry(entry: &[u8]) -> Result<(u64, u16, u64, bool), BucketSna
     Ok((fingerprint, shard_slot, record_offset, removed))
 }
 
+fn validated_snapshot_layout(
+    bytes: &[u8],
+) -> Result<(usize, u64, usize, usize), BucketSnapshotError> {
+    let (bucket_count, seed, count) = parse_snapshot_header(bytes)?;
+    let checksum_offset = bytes
+        .len()
+        .checked_sub(4)
+        .ok_or(BucketSnapshotError::TooShort)?;
+    let expected_len = SNAPSHOT_HEADER_LEN
+        .checked_add(
+            count
+                .checked_mul(SNAPSHOT_ENTRY_LEN)
+                .ok_or(BucketSnapshotError::InvalidDimensions)?,
+        )
+        .and_then(|len| len.checked_add(4))
+        .ok_or(BucketSnapshotError::InvalidDimensions)?;
+    if bytes.len() != expected_len {
+        return Err(BucketSnapshotError::InvalidDimensions);
+    }
+    let expected_crc = u32::from_le_bytes(
+        bytes
+            .get(checksum_offset..)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or(BucketSnapshotError::TooShort)?,
+    );
+    if crc32fast::hash(&bytes[..checksum_offset]) != expected_crc {
+        return Err(BucketSnapshotError::ChecksumMismatch);
+    }
+    let bucket_count =
+        usize::try_from(bucket_count).map_err(|_| BucketSnapshotError::InvalidDimensions)?;
+    let max_entries = bucket_count
+        .checked_mul(SLOT_COUNT + MAX_OVERFLOW_PER_BUCKET)
+        .ok_or(BucketSnapshotError::InvalidDimensions)?;
+    if count > max_entries {
+        return Err(BucketSnapshotError::InvalidDimensions);
+    }
+    Ok((bucket_count, seed, count, checksum_offset))
+}
+
 impl RawBucketTable {
     /// Create a table with at least `min_entries` slots.
     #[must_use]
@@ -606,48 +645,12 @@ impl RawBucketTable {
     /// bad magic/version/checksum, has inconsistent dimensions, or contains an
     /// entry that cannot be installed.
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, BucketSnapshotError> {
-        let (bucket_count, seed, count) = parse_snapshot_header(bytes)?;
-        let expected_len = SNAPSHOT_HEADER_LEN
-            .checked_add(
-                count
-                    .checked_mul(SNAPSHOT_ENTRY_LEN)
-                    .ok_or(BucketSnapshotError::InvalidDimensions)?,
-            )
-            .and_then(|len| len.checked_add(4))
+        let (bucket_count, seed, count, _) = validated_snapshot_layout(bytes)?;
+        let minimum_entries = bucket_count
+            .checked_mul(SLOT_COUNT)
             .ok_or(BucketSnapshotError::InvalidDimensions)?;
-        if bytes.len() != expected_len {
-            return Err(BucketSnapshotError::InvalidDimensions);
-        }
-        let checksum_offset = bytes
-            .len()
-            .checked_sub(4)
-            .ok_or(BucketSnapshotError::TooShort)?;
-        let expected_crc = u32::from_le_bytes(
-            bytes
-                .get(checksum_offset..)
-                .and_then(|slice| slice.try_into().ok())
-                .ok_or(BucketSnapshotError::TooShort)?,
-        );
-        if crc32fast::hash(&bytes[..checksum_offset]) != expected_crc {
-            return Err(BucketSnapshotError::ChecksumMismatch);
-        }
-        let minimum_entries = usize::try_from(bucket_count)
-            .ok()
-            .and_then(|count| count.checked_mul(SLOT_COUNT))
-            .ok_or(BucketSnapshotError::InvalidDimensions)?;
-        let maximum_entries = minimum_entries
-            .checked_add(
-                usize::try_from(bucket_count)
-                    .ok()
-                    .and_then(|count| count.checked_mul(MAX_OVERFLOW_PER_BUCKET))
-                    .ok_or(BucketSnapshotError::InvalidDimensions)?,
-            )
-            .ok_or(BucketSnapshotError::InvalidDimensions)?;
-        if count > maximum_entries {
-            return Err(BucketSnapshotError::InvalidDimensions);
-        }
         let table = Self::new(minimum_entries, seed);
-        if table.buckets.len() != usize::try_from(bucket_count).unwrap_or(0) {
+        if table.buckets.len() != bucket_count {
             return Err(BucketSnapshotError::InvalidDimensions);
         }
         let mut offset = SNAPSHOT_HEADER_LEN;
@@ -669,6 +672,32 @@ impl RawBucketTable {
             }
         }
         Ok(table)
+    }
+
+    /// Validate a snapshot and return its `(bucket_count, entry_count)` without
+    /// allocating a bucket table. Checkpoint readers use this before the
+    /// owning index is materialized exactly once.
+    ///
+    /// # Errors
+    /// Returns [`BucketSnapshotError`] when the snapshot's dimensions, entries,
+    /// or checksum are invalid.
+    pub fn validate_snapshot(bytes: &[u8]) -> Result<(usize, usize), BucketSnapshotError> {
+        let (bucket_count, _, count, _) = validated_snapshot_layout(bytes)?;
+        let mut offset = SNAPSHOT_HEADER_LEN;
+        for _ in 0..count {
+            let end = offset
+                .checked_add(SNAPSHOT_ENTRY_LEN)
+                .ok_or(BucketSnapshotError::InvalidDimensions)?;
+            let entry = bytes
+                .get(offset..end)
+                .ok_or(BucketSnapshotError::InvalidEntry)?;
+            offset = end;
+            let (_, shard_slot, _, _) = parse_snapshot_entry(entry)?;
+            if usize::from(shard_slot) >= crate::shard::MAX_SHARDS {
+                return Err(BucketSnapshotError::InvalidEntry);
+            }
+        }
+        Ok((bucket_count, count))
     }
 
     /// Number of entries that could not fit in either candidate bucket.

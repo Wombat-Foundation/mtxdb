@@ -500,7 +500,7 @@ fn run_mtxdb(dir: &std::path::Path, nodes: usize) -> Run {
     drop(store_rw);
 
     // Resident index bytes, isolated from the mmap'd packfiles: sum of the
-    // per-collection LossyIndex slot arrays (the checkpoint-size input).
+    // per-collection BucketIndex tables (the checkpoint-size input).
     let (mem, mem_label) = {
         let store = mtxdb_open_read_only(dir);
         let bytes: u64 = store
@@ -1762,7 +1762,7 @@ fn main() {
     eprintln!();
     eprintln!("Interpretation (see DESIGN-open-and-index-persistence.md §1.2):");
     eprintln!("  cold checkpoint open measures a persisted-index reopen after page-cache");
-    eprintln!("  eviction; lookups are where the resident LossyIndex should beat B+tree walkers.");
+    eprintln!("  eviction; lookups are where the resident BucketIndex should beat B+tree walkers.");
 
     // Opt-in sustained-write phase: many small durable batches back-to-back,
     // long enough to surface flush/compaction-stall tails that the short

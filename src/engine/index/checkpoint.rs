@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
+use super::bucket::RawBucketTable;
 use super::format::{
     CheckpointHeader, CollectionDirEntry, CollectionVersionEntry, PackTableEntry,
     CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN, COLLECTION_VERSION_ENTRY_LEN,
@@ -45,14 +46,18 @@ use super::format::{
 use crate::packfile::PackId;
 
 /// Magic identifying the persisted-index checkpoint format.
-pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0001";
-/// Current v1 wire version (see [`CheckpointHeader::version`]).
+pub const CHECKPOINT_MAGIC: [u8; 8] = *b"MTXI0002";
+/// Current v2 wire version (see [`CheckpointHeader::version`]).
 ///
 /// This is a hard-cutover format; a mismatched version causes the checkpoint
 /// to be rebuilt rather than decoded through a different layout.
-pub const CHECKPOINT_VERSION: u32 = 1;
+pub const CHECKPOINT_VERSION: u32 = 2;
 /// File name of the persisted index checkpoint inside a store's base dir.
 pub const INDEX_CHECKPOINT_FILE: &str = "index.checkpoint";
+
+fn supported_checkpoint_header(header: &CheckpointHeader) -> bool {
+    header.magic == CHECKPOINT_MAGIC && header.version == CHECKPOINT_VERSION
+}
 
 /// Whether an opener verifies the checkpoint body's CRC32.
 ///
@@ -94,6 +99,8 @@ static CHECKPOINT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// A checkpoint read off disk, validated enough to trust for index rebuild.
 #[derive(Debug)]
 pub struct LoadedCheckpoint {
+    /// Wire-format version; only version 2 bucket snapshots are accepted.
+    pub version: u32,
     /// The pack-fingerprint the checkpoint was written against.
     pub fingerprint: u64,
     /// Journal LSN this checkpoint's index snapshot covers, captured atomically
@@ -104,8 +111,7 @@ pub struct LoadedCheckpoint {
     pub base_delta_seq: u64,
     /// One entry per collection, in the checkpoint's directory order.
     pub collections: Vec<LoadedCollection>,
-    /// Keeps the raw slot arrays alive for mmap-backed indexes built from
-    /// this checkpoint.
+    /// Keeps the raw snapshot bytes alive while collections are decoded.
     pub mmap: Arc<Mmap>,
     /// `(writer's local shard slot, pack_id)` for every pack live at
     /// checkpoint-write time. Every `slot` embedded in this checkpoint's
@@ -127,12 +133,14 @@ pub struct LoadedCollection {
     /// Checkpoint generation for this collection (reserved for a future
     /// delta-log; always 0 today).
     pub generation: u64,
-    /// Absolute byte offset of the raw `capacity * 8` slot array.
+    /// Absolute byte offset of the encoded bucket snapshot.
     pub slots_offset: usize,
     /// Allocated index capacity.
     pub capacity: u32,
     /// Number of non-empty slots, recorded at checkpoint write time.
     pub slot_count: u32,
+    /// Byte length of the encoded bucket snapshot.
+    pub snapshot_len: usize,
 }
 
 /// Deterministic FNV-1a hash of the `(pack_id, file_len)` set a checkpoint
@@ -154,56 +162,156 @@ pub fn pack_fingerprint(packs: &[(PackId, u64)]) -> u64 {
     hash
 }
 
-/// Decode the 8-byte capacity prefix of a `LossyIndex::serialize` blob.
-fn blob_capacity(blob: &[u8]) -> Option<u64> {
-    let head: [u8; 8] = blob.get(..8)?.try_into().ok()?;
-    Some(u64::from_le_bytes(head))
+struct CheckpointLayout {
+    collection_count: u32,
+    directory_bytes: u64,
+    slots_bytes: u64,
+    pack_table_count: u32,
+    pack_table_bytes: u64,
+    logical_version_count: u32,
+    logical_version_bytes: u64,
+    snapshot_counts: Vec<usize>,
 }
 
-/// Number of occupied (non-`0u64`) slots in a `LossyIndex::serialize` blob's
-/// slot section. The blob format is `[capacity_u64][slots × cap]`.
-fn blob_slot_count(blob: &[u8]) -> u32 {
-    let Some(capacity) = blob_capacity(blob) else {
-        return 0;
-    };
-    let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
-    let slots_end = 8_usize.saturating_add(cap.saturating_mul(8));
-    let slots = blob.get(8..slots_end).unwrap_or(&[]);
-    u32::try_from(
-        slots
-            .as_chunks::<8>()
-            .0
+fn checkpoint_layout(
+    covered_lsn: u64,
+    collections: &[([u8; 16], u64, &[u8])],
+    pack_table: &[(u16, PackId)],
+    logical_versions: &[([u8; 16], u64)],
+) -> io::Result<CheckpointLayout> {
+    if logical_versions
+        .windows(2)
+        .any(|pair| pair[0].0 >= pair[1].0)
+        || logical_versions
             .iter()
-            .filter(|slot| **slot != [0u8; 8])
-            .count(),
-    )
-    .unwrap_or(u32::MAX)
+            .any(|(_, version)| *version > covered_lsn)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "checkpoint logical versions must be sorted, unique, and covered by its LSN",
+        ));
+    }
+    let collection_count = u32::try_from(collections.len())
+        .map_err(|_| io::Error::other("too many collections for checkpoint u32"))?;
+    let directory_bytes = u64::try_from(collections.len())
+        .ok()
+        .and_then(|count| count.checked_mul(COLLECTION_DIR_ENTRY_LEN as u64))
+        .ok_or_else(|| io::Error::other("checkpoint directory size overflow"))?;
+    let mut slots_bytes = 0_u64;
+    let mut snapshot_counts = Vec::with_capacity(collections.len());
+    for (_, _, blob) in collections {
+        let (_, entry_count) = RawBucketTable::validate_snapshot(blob)
+            .map_err(|error| io::Error::other(format!("invalid bucket snapshot: {error}")))?;
+        let blob_len = u64::try_from(blob.len())
+            .map_err(|_| io::Error::other("bucket snapshot length exceeds u64"))?;
+        slots_bytes = slots_bytes
+            .checked_add(blob_len)
+            .ok_or_else(|| io::Error::other("checkpoint snapshot bytes overflow"))?;
+        if u32::try_from(blob.len()).is_err() {
+            return Err(io::Error::other(
+                "bucket snapshot exceeds directory length field",
+            ));
+        }
+        snapshot_counts.push(entry_count);
+    }
+    let pack_table_count = u32::try_from(pack_table.len())
+        .map_err(|_| io::Error::other("too many packs for checkpoint pack table u32"))?;
+    let pack_table_bytes = u64::try_from(pack_table.len())
+        .ok()
+        .and_then(|count| count.checked_mul(PACK_TABLE_ENTRY_LEN as u64))
+        .ok_or_else(|| io::Error::other("checkpoint pack table size overflow"))?;
+    let logical_version_count = u32::try_from(logical_versions.len())
+        .map_err(|_| io::Error::other("too many logical versions for checkpoint u32"))?;
+    let logical_version_bytes = u64::try_from(logical_versions.len())
+        .ok()
+        .and_then(|count| count.checked_mul(COLLECTION_VERSION_ENTRY_LEN as u64))
+        .ok_or_else(|| io::Error::other("checkpoint logical-version size overflow"))?;
+    Ok(CheckpointLayout {
+        collection_count,
+        directory_bytes,
+        slots_bytes,
+        pack_table_count,
+        pack_table_bytes,
+        logical_version_count,
+        logical_version_bytes,
+        snapshot_counts,
+    })
 }
 
-/// Write a complete checkpoint atomically: temp file, fsync, rename over the
-/// final path. `collections` holds each collection's `serialize` blob plus the
-/// index generation it was written at (recorded in its directory entry so a
-/// delta log's frames can be gated against the same generation on replay),
-/// the first collection listed becoming the first in the directory order.
+fn encode_checkpoint_body(
+    collections: &[([u8; 16], u64, &[u8])],
+    pack_table: &[(u16, PackId)],
+    logical_versions: &[([u8; 16], u64)],
+    layout: &CheckpointLayout,
+) -> io::Result<Vec<u8>> {
+    let directory_len = usize::try_from(layout.directory_bytes)
+        .map_err(|_| io::Error::other("checkpoint directory exceeds address space"))?;
+    let slots_len = usize::try_from(layout.slots_bytes)
+        .map_err(|_| io::Error::other("checkpoint snapshots exceed address space"))?;
+    let pack_len = usize::try_from(layout.pack_table_bytes)
+        .map_err(|_| io::Error::other("checkpoint pack table exceeds address space"))?;
+    let versions_len = usize::try_from(layout.logical_version_bytes)
+        .map_err(|_| io::Error::other("checkpoint logical versions exceed address space"))?;
+    let total_len = CHECKPOINT_HEADER_LEN
+        .checked_add(directory_len)
+        .and_then(|len| len.checked_add(slots_len))
+        .and_then(|len| len.checked_add(pack_len))
+        .and_then(|len| len.checked_add(versions_len))
+        .ok_or_else(|| io::Error::other("checkpoint length exceeds address space"))?;
+    let mut body = Vec::with_capacity(total_len);
+    body.resize(CHECKPOINT_HEADER_LEN, 0);
+    let mut body_offset = 0_u64;
+    for ((collection_id, generation, blob), entry_count) in
+        collections.iter().zip(&layout.snapshot_counts)
+    {
+        let entry = CollectionDirEntry {
+            collection_id: *collection_id,
+            generation: *generation,
+            slots_offset: body_offset,
+            homes_offset: 0,
+            tails_offset: 0,
+            capacity: u32::try_from(blob.len())
+                .map_err(|_| io::Error::other("bucket snapshot exceeds u32"))?,
+            slot_count: u32::try_from(*entry_count)
+                .map_err(|_| io::Error::other("bucket snapshot entry count exceeds u32"))?,
+        };
+        body.extend_from_slice(&entry.encode());
+        body_offset = body_offset
+            .checked_add(
+                u64::try_from(blob.len())
+                    .map_err(|_| io::Error::other("bucket snapshot length exceeds u64"))?,
+            )
+            .ok_or_else(|| io::Error::other("checkpoint body offset overflow"))?;
+    }
+    for (_, _, blob) in collections {
+        body.extend_from_slice(blob);
+    }
+    for &(slot, pack_id) in pack_table {
+        body.extend_from_slice(&PackTableEntry { slot, pack_id }.encode());
+    }
+    for &(collection_id, last_write_lsn) in logical_versions {
+        body.extend_from_slice(
+            &CollectionVersionEntry {
+                collection_id,
+                last_write_lsn,
+            }
+            .encode(),
+        );
+    }
+    Ok(body)
+}
+
+/// Write an MTXI0002 checkpoint atomically from validated bucket snapshots.
 ///
-/// # Contract
-/// The `fingerprint` and every `collections` blob must be *captured
-/// atomically*: derived from pack-file lengths and index slots that were both
-/// observed while every collection's writer lock was held. This function only
-/// makes that already-consistent (pack set, index snapshot) pair durable; it
-/// cannot reconcile the two if a concurrent `put` changed either side between
-/// capture and this call. The sole caller
-/// (`PackfileStorage::persist_index_checkpoint`) satisfies this by pinning the
-/// pack lengths and all collection generations under every `put_mutex` (and
-/// rotating the delta epoch there too) before handing them to this function.
+/// The snapshots and their pack fingerprint must describe the same captured
+/// storage state. Each collection's generation is stored in the directory for
+/// delta replay. The temporary file is synced before it replaces `path`.
+/// The caller must capture the fingerprint and snapshots while holding the
+/// collection writer locks so they describe the same storage state.
 ///
 /// # Errors
-/// Returns `io::Error` on any failure; the previous checkpoint (if any) is
-/// left intact in that case.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the checkpoint phases are one atomic construction; splitting them would scatter overflow-checked arithmetic that must stay in lockstep"
-)]
+/// Returns an I/O error if metadata is invalid, a bucket snapshot is malformed,
+/// or writing, syncing, or renaming the checkpoint fails.
 pub fn write_checkpoint(
     path: &Path,
     fingerprint: u64,
@@ -213,150 +321,26 @@ pub fn write_checkpoint(
     pack_table: &[(u16, PackId)],
     logical_versions: &[([u8; 16], u64)],
 ) -> std::io::Result<()> {
-    let pack_table_count = u32::try_from(pack_table.len())
-        .map_err(|_| std::io::Error::other("too many packs for checkpoint pack table u32"))?;
-    let pack_table_bytes = u64::try_from(pack_table.len())
-        .ok()
-        .and_then(|n| n.checked_mul(PACK_TABLE_ENTRY_LEN as u64))
-        .ok_or_else(|| std::io::Error::other("checkpoint pack table size overflow"))?;
-    let logical_version_count = u32::try_from(logical_versions.len())
-        .map_err(|_| std::io::Error::other("too many logical versions for checkpoint u32"))?;
-    let logical_version_bytes = u64::try_from(logical_versions.len())
-        .ok()
-        .and_then(|n| n.checked_mul(COLLECTION_VERSION_ENTRY_LEN as u64))
-        .ok_or_else(|| std::io::Error::other("checkpoint logical-version size overflow"))?;
-    if logical_versions
-        .windows(2)
-        .any(|pair| pair[0].0 >= pair[1].0)
-        || logical_versions
-            .iter()
-            .any(|(_, version)| *version > covered_lsn)
-    {
-        return Err(std::io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "checkpoint logical versions must be sorted, unique, and covered by its LSN",
-        ));
-    }
-
-    let count = u32::try_from(collections.len())
-        .map_err(|_| std::io::Error::other("too many collections for checkpoint u32"))?;
-    let directory_bytes = u64::try_from(collections.len())
-        .ok()
-        .and_then(|n| n.checked_mul(COLLECTION_DIR_ENTRY_LEN as u64))
-        .ok_or_else(|| std::io::Error::other("checkpoint directory size overflow"))?;
-
-    // Compute the slots section length from the serialize blobs.
-    let mut slots_bytes: u64 = 0;
-    for (_, _, blob) in collections {
-        let capacity = blob_capacity(blob)
-            .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
-        let cap8 = capacity
-            .checked_mul(8)
-            .ok_or_else(|| std::io::Error::other("collection capacity × 8 overflow"))?;
-        slots_bytes = slots_bytes
-            .checked_add(cap8)
-            .ok_or_else(|| std::io::Error::other("checkpoint slots size overflow"))?;
-        let expected_len = usize::try_from(cap8)
-            .ok()
-            .and_then(|len| len.checked_add(8))
-            .ok_or_else(|| std::io::Error::other("checkpoint slot blob size overflow"))?;
-        if blob.len() != expected_len {
-            return Err(std::io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "checkpoint collection blob must use the slots-only v1 format",
-            ));
-        }
-    }
-    let total_len = CHECKPOINT_HEADER_LEN
-        .saturating_add(usize::try_from(directory_bytes).unwrap_or(usize::MAX))
-        .saturating_add(usize::try_from(slots_bytes).unwrap_or(usize::MAX))
-        .saturating_add(usize::try_from(pack_table_bytes).unwrap_or(usize::MAX))
-        .saturating_add(usize::try_from(logical_version_bytes).unwrap_or(usize::MAX));
-    // Reserve the header first, then build the body directly into the final
-    // buffer. This avoids retaining a second checkpoint-sized body merely to
-    // calculate the CRC carried by the header.
-    let mut buf = Vec::with_capacity(total_len);
-    buf.resize(CHECKPOINT_HEADER_LEN, 0);
-
-    // Phase 1: build directory entries, tracking per-collection offsets.
-    //
-    // Each collection's slots follow the previous collection's slots.
-    let mut body_offset: u64 = 0;
-    let mut dir_entries = Vec::with_capacity(collections.len());
-    for (collection_id, generation, blob) in collections {
-        let capacity = blob_capacity(blob)
-            .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
-        let capacity32 = u32::try_from(capacity)
-            .map_err(|_| std::io::Error::other("index capacity exceeds u32"))?;
-        let cap8 = capacity
-            .checked_mul(8)
-            .ok_or_else(|| std::io::Error::other("collection capacity × 8 overflow"))?;
-        let slots_offset = body_offset;
-        dir_entries.push(CollectionDirEntry {
-            collection_id: *collection_id,
-            generation: *generation,
-            slots_offset,
-            homes_offset: 0,
-            tails_offset: 0,
-            capacity: capacity32,
-            slot_count: blob_slot_count(blob),
-        });
-        body_offset = body_offset
-            .checked_add(cap8)
-            .ok_or_else(|| std::io::Error::other("checkpoint body offset overflow"))?;
-    }
-
-    // Phase 2: write directory entries.
-    for entry in &dir_entries {
-        buf.extend_from_slice(&entry.encode());
-    }
-
-    // Phase 3: write each collection's slots.
-    for (_, _, blob) in collections {
-        let capacity = blob_capacity(blob)
-            .ok_or_else(|| std::io::Error::other("collection slot blob missing capacity"))?;
-        let cap = usize::try_from(capacity).unwrap_or(usize::MAX);
-        let slots_end = 8_usize.saturating_add(cap.saturating_mul(8));
-        if let Some(slots) = blob.get(8..slots_end) {
-            buf.extend_from_slice(slots);
-        }
-    }
-
-    // Phase 4: write the pack table (slot -> pack_id bindings), one fixed-
-    // width entry per currently-live pack. Appended after the slots body.
-    for &(slot, pack_id) in pack_table {
-        buf.extend_from_slice(&PackTableEntry { slot, pack_id }.encode());
-    }
-    // Phase 5: persist logical versions, sorted by collection id so the section
-    // is deterministic and can be validated without allocating a hash set.
-    for &(collection_id, last_write_lsn) in logical_versions {
-        buf.extend_from_slice(
-            &CollectionVersionEntry {
-                collection_id,
-                last_write_lsn,
-            }
-            .encode(),
-        );
-    }
-
+    let layout = checkpoint_layout(covered_lsn, collections, pack_table, logical_versions)?;
+    let mut buf = encode_checkpoint_body(collections, pack_table, logical_versions, &layout)?;
     let content_crc32 = crc32fast::hash(&buf[CHECKPOINT_HEADER_LEN..]);
 
     let header = CheckpointHeader {
         magic: CHECKPOINT_MAGIC,
         version: CHECKPOINT_VERSION,
-        collection_count: count,
-        directory_bytes,
-        slots_bytes,
+        collection_count: layout.collection_count,
+        directory_bytes: layout.directory_bytes,
+        slots_bytes: layout.slots_bytes,
         pack_fingerprint: fingerprint,
         content_crc32,
         homes_bytes: 0,
         tails_bytes: 0,
         covered_lsn,
-        pack_table_count,
-        pack_table_bytes,
+        pack_table_count: layout.pack_table_count,
+        pack_table_bytes: layout.pack_table_bytes,
         base_delta_seq,
-        logical_version_count,
-        logical_version_bytes,
+        logical_version_count: layout.logical_version_count,
+        logical_version_bytes: layout.logical_version_bytes,
     };
     buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
 
@@ -401,13 +385,141 @@ pub fn read_checkpoint(path: &Path) -> Option<LoadedCheckpoint> {
     read_checkpoint_with_policy(path, CheckpointChecksumPolicy::from_env())
 }
 
+struct CheckpointRegions {
+    collection_count: usize,
+    slot_base: usize,
+    slots_bytes: usize,
+    pack_table_base: usize,
+    logical_versions_base: usize,
+}
+
+fn checkpoint_regions(buf: &[u8], header: &CheckpointHeader) -> Option<CheckpointRegions> {
+    let collection_count = usize::try_from(header.collection_count).ok()?;
+    if header.directory_bytes
+        != u64::try_from(collection_count)
+            .ok()?
+            .checked_mul(COLLECTION_DIR_ENTRY_LEN as u64)?
+        || header.homes_bytes != 0
+        || header.tails_bytes != 0
+        || header.pack_table_count > u32::from(u16::MAX).saturating_add(1)
+        || header.pack_table_bytes
+            != u64::from(header.pack_table_count).checked_mul(PACK_TABLE_ENTRY_LEN as u64)?
+        || header.logical_version_bytes
+            != u64::from(header.logical_version_count)
+                .checked_mul(COLLECTION_VERSION_ENTRY_LEN as u64)?
+    {
+        return None;
+    }
+    let slot_base =
+        CHECKPOINT_HEADER_LEN.checked_add(usize::try_from(header.directory_bytes).ok()?)?;
+    let slots_bytes = usize::try_from(header.slots_bytes).ok()?;
+    let pack_table_base = slot_base.checked_add(slots_bytes)?;
+    let logical_versions_base =
+        pack_table_base.checked_add(usize::try_from(header.pack_table_bytes).ok()?)?;
+    let file_len =
+        logical_versions_base.checked_add(usize::try_from(header.logical_version_bytes).ok()?)?;
+    (buf.len() == file_len).then_some(CheckpointRegions {
+        collection_count,
+        slot_base,
+        slots_bytes,
+        pack_table_base,
+        logical_versions_base,
+    })
+}
+
+fn read_checkpoint_collections(
+    buf: &[u8],
+    count: usize,
+    slot_base: usize,
+    slots_bytes: usize,
+    pack_table_base: usize,
+) -> Option<Vec<LoadedCollection>> {
+    let mut collections = Vec::with_capacity(count);
+    let mut body_offset = 0_usize;
+    for index in 0..count {
+        let entry_offset =
+            CHECKPOINT_HEADER_LEN.checked_add(index.checked_mul(COLLECTION_DIR_ENTRY_LEN)?)?;
+        let entry_bytes: [u8; COLLECTION_DIR_ENTRY_LEN] = buf
+            .get(entry_offset..entry_offset.checked_add(COLLECTION_DIR_ENTRY_LEN)?)?
+            .try_into()
+            .ok()?;
+        let entry = CollectionDirEntry::decode(&entry_bytes)?;
+        if entry.homes_offset != 0
+            || entry.tails_offset != 0
+            || usize::try_from(entry.slots_offset).ok()? != body_offset
+        {
+            return None;
+        }
+        let region = slot_base.checked_add(body_offset)?;
+        let snapshot_len = usize::try_from(entry.capacity).ok()?;
+        let end = region.checked_add(snapshot_len)?;
+        let (bucket_count, entry_count) =
+            RawBucketTable::validate_snapshot(buf.get(region..end)?).ok()?;
+        if u32::try_from(entry_count).ok()? != entry.slot_count || end > pack_table_base {
+            return None;
+        }
+        let capacity = u32::try_from(bucket_count.checked_mul(4)?).ok()?;
+        body_offset = body_offset.checked_add(snapshot_len)?;
+        collections.push(LoadedCollection {
+            collection_id: entry.collection_id,
+            generation: entry.generation,
+            slots_offset: region,
+            capacity,
+            slot_count: entry.slot_count,
+            snapshot_len,
+        });
+    }
+    (body_offset == slots_bytes).then_some(collections)
+}
+
+fn read_checkpoint_pack_table(buf: &[u8], count: usize, base: usize) -> Option<Vec<(u16, PackId)>> {
+    let mut pack_table = Vec::with_capacity(count);
+    let mut seen_slots = HashSet::with_capacity(count);
+    let mut seen_pack_ids = HashSet::with_capacity(count);
+    for index in 0..count {
+        let start = base.checked_add(index.checked_mul(PACK_TABLE_ENTRY_LEN)?)?;
+        let bytes: [u8; PACK_TABLE_ENTRY_LEN] = buf
+            .get(start..start.checked_add(PACK_TABLE_ENTRY_LEN)?)?
+            .try_into()
+            .ok()?;
+        let entry = PackTableEntry::decode(&bytes)?;
+        if !seen_slots.insert(entry.slot) || !seen_pack_ids.insert(entry.pack_id) {
+            return None;
+        }
+        pack_table.push((entry.slot, entry.pack_id));
+    }
+    Some(pack_table)
+}
+
+fn read_checkpoint_logical_versions(
+    buf: &[u8],
+    count: usize,
+    base: usize,
+    covered_lsn: u64,
+) -> Option<Vec<([u8; 16], u64)>> {
+    let mut versions = Vec::with_capacity(count);
+    let mut previous_id = None;
+    for index in 0..count {
+        let start = base.checked_add(index.checked_mul(COLLECTION_VERSION_ENTRY_LEN)?)?;
+        let bytes: [u8; COLLECTION_VERSION_ENTRY_LEN] = buf
+            .get(start..start.checked_add(COLLECTION_VERSION_ENTRY_LEN)?)?
+            .try_into()
+            .ok()?;
+        let entry = CollectionVersionEntry::decode(&bytes)?;
+        if previous_id.is_some_and(|previous| previous >= entry.collection_id)
+            || entry.last_write_lsn > covered_lsn
+        {
+            return None;
+        }
+        previous_id = Some(entry.collection_id);
+        versions.push((entry.collection_id, entry.last_write_lsn));
+    }
+    Some(versions)
+}
+
 /// As [`read_checkpoint`], with an explicit integrity policy for callers that
 /// need deterministic configuration rather than the process environment.
 #[must_use]
-#[allow(
-    clippy::too_many_lines,
-    reason = "split across branches, too lazy to consolidate right now"
-)]
 pub fn read_checkpoint_with_policy(
     path: &Path,
     checksum_policy: CheckpointChecksumPolicy,
@@ -418,51 +530,10 @@ pub fn read_checkpoint_with_policy(
     let header_bytes: [u8; CHECKPOINT_HEADER_LEN] =
         buf.get(..CHECKPOINT_HEADER_LEN)?.try_into().ok()?;
     let header = CheckpointHeader::decode(&header_bytes)?;
-    if header.magic != CHECKPOINT_MAGIC || header.version != CHECKPOINT_VERSION {
+    if !supported_checkpoint_header(&header) {
         return None;
     }
-    let count = header.collection_count as usize;
-    if header.directory_bytes
-        != u64::try_from(count)
-            .ok()?
-            .checked_mul(COLLECTION_DIR_ENTRY_LEN as u64)?
-    {
-        return None;
-    }
-    let slot_base =
-        CHECKPOINT_HEADER_LEN.checked_add(usize::try_from(header.directory_bytes).ok()?)?;
-    // v1 checkpoints written before identity side tables were removed must not
-    // be loaded at all: the reader does not consume those tables, and their
-    // presence would only make the section offsets ambiguous.
-    if header.homes_bytes != 0 || header.tails_bytes != 0 {
-        return None;
-    }
-    let body_bytes = header.slots_bytes;
-    // Slots are unique u16 values, so a valid pack table cannot exceed 65,536
-    // entries; reject before `pack_table` and its dedupe sets reserve capacity
-    // from `pack_table_count`.
-    if header.pack_table_count > u32::from(u16::MAX).saturating_add(1) {
-        return None;
-    }
-    if header.pack_table_bytes
-        != u64::from(header.pack_table_count).checked_mul(PACK_TABLE_ENTRY_LEN as u64)?
-    {
-        return None;
-    }
-    if header.logical_version_bytes
-        != u64::from(header.logical_version_count)
-            .checked_mul(COLLECTION_VERSION_ENTRY_LEN as u64)?
-    {
-        return None;
-    }
-    let pack_table_base = slot_base.checked_add(usize::try_from(body_bytes).ok()?)?;
-    let logical_versions_base =
-        pack_table_base.checked_add(usize::try_from(header.pack_table_bytes).ok()?)?;
-    if buf.len()
-        != logical_versions_base.checked_add(usize::try_from(header.logical_version_bytes).ok()?)?
-    {
-        return None;
-    }
+    let regions = checkpoint_regions(buf, &header)?;
 
     // Verify the whole directory+slots body against the header's CRC in one
     // pass, in place of re-deriving each collection's occupancy by walking
@@ -478,113 +549,27 @@ pub fn read_checkpoint_with_policy(
         }
     }
 
-    let mut collections = Vec::with_capacity(count);
-    let mut body_offset = 0_usize;
-    for i in 0..count {
-        let entry_offset =
-            CHECKPOINT_HEADER_LEN.checked_add(i.checked_mul(COLLECTION_DIR_ENTRY_LEN)?)?;
-        let entry_bytes: [u8; COLLECTION_DIR_ENTRY_LEN] = buf
-            .get(entry_offset..entry_offset.saturating_add(COLLECTION_DIR_ENTRY_LEN))?
-            .try_into()
-            .ok()?;
-        let entry = CollectionDirEntry::decode(&entry_bytes)?;
-        if entry.homes_offset != 0 || entry.tails_offset != 0 {
-            return None;
-        }
-        if entry.capacity < 16 || !entry.capacity.is_power_of_two() {
-            return None;
-        }
-        // A corrupt or malicious directory entry could otherwise claim more
-        // occupied slots than the table has room for; a downstream consumer
-        // sizing an allocation off `slot_count` (e.g. a post-restart grow)
-        // would then trust a value with no upper bound instead of the
-        // checkpoint being rejected here. (An *understated* count — the
-        // failure mode the old occupancy walk additionally caught — is now
-        // caught by the CRC check above instead: any bit that makes
-        // `slot_count` disagree with the actual slots, or with what was
-        // written, changes the body's hash.)
-        if entry.slot_count > entry.capacity {
-            return None;
-        }
-        let slots_len = (entry.capacity as usize).checked_mul(8)?;
-        if usize::try_from(entry.slots_offset).ok()? != body_offset {
-            return None;
-        }
-        let region = slot_base.checked_add(body_offset)?;
-        let slots_end = region.checked_add(slots_len)?;
-        if slots_end > pack_table_base {
-            return None;
-        }
-        body_offset = body_offset.checked_add(slots_len)?;
-        let mut occupied = 0_u32;
-        for slot_bytes in buf
-            .get(region..region.checked_add(slots_len)?)?
-            .as_chunks::<8>()
-            .0
-        {
-            let raw = u64::from_le_bytes(*slot_bytes);
-            if !super::IndexEntry::valid_raw_slot(raw) {
-                return None;
-            }
-            if !super::IndexEntry(raw).is_empty() {
-                occupied = occupied.checked_add(1)?;
-            }
-        }
-        // The body CRC check above normally catches a `slot_count` that
-        // disagrees with the actual slots, but `WriteOnly` skips it. Count the
-        // slots we just walked so an understated value cannot become the
-        // index's `len` and let inserts pass the load-factor threshold.
-        if occupied != entry.slot_count {
-            return None;
-        }
-        collections.push(LoadedCollection {
-            collection_id: entry.collection_id,
-            generation: entry.generation,
-            slots_offset: region,
-            capacity: entry.capacity,
-            slot_count: entry.slot_count,
-        });
-    }
-    if body_offset != usize::try_from(body_bytes).ok()? {
-        return None;
-    }
-
-    let mut pack_table = Vec::with_capacity(header.pack_table_count as usize);
-    let mut seen_slots = HashSet::with_capacity(header.pack_table_count as usize);
-    let mut seen_pack_ids = HashSet::with_capacity(header.pack_table_count as usize);
-    for i in 0..header.pack_table_count as usize {
-        let entry_offset = pack_table_base.checked_add(i.checked_mul(PACK_TABLE_ENTRY_LEN)?)?;
-        let entry_bytes: [u8; PACK_TABLE_ENTRY_LEN] = buf
-            .get(entry_offset..entry_offset.saturating_add(PACK_TABLE_ENTRY_LEN))?
-            .try_into()
-            .ok()?;
-        let entry = PackTableEntry::decode(&entry_bytes)?;
-        if !seen_slots.insert(entry.slot) || !seen_pack_ids.insert(entry.pack_id) {
-            return None;
-        }
-        pack_table.push((entry.slot, entry.pack_id));
-    }
-
-    let mut logical_versions = Vec::with_capacity(header.logical_version_count as usize);
-    let mut previous_id = None;
-    for i in 0..header.logical_version_count as usize {
-        let entry_offset =
-            logical_versions_base.checked_add(i.checked_mul(COLLECTION_VERSION_ENTRY_LEN)?)?;
-        let entry_bytes: [u8; COLLECTION_VERSION_ENTRY_LEN] = buf
-            .get(entry_offset..entry_offset.saturating_add(COLLECTION_VERSION_ENTRY_LEN))?
-            .try_into()
-            .ok()?;
-        let entry = CollectionVersionEntry::decode(&entry_bytes)?;
-        if previous_id.is_some_and(|previous| previous >= entry.collection_id)
-            || entry.last_write_lsn > header.covered_lsn
-        {
-            return None;
-        }
-        previous_id = Some(entry.collection_id);
-        logical_versions.push((entry.collection_id, entry.last_write_lsn));
-    }
+    let collections = read_checkpoint_collections(
+        buf,
+        regions.collection_count,
+        regions.slot_base,
+        regions.slots_bytes,
+        regions.pack_table_base,
+    )?;
+    let pack_table = read_checkpoint_pack_table(
+        buf,
+        usize::try_from(header.pack_table_count).ok()?,
+        regions.pack_table_base,
+    )?;
+    let logical_versions = read_checkpoint_logical_versions(
+        buf,
+        usize::try_from(header.logical_version_count).ok()?,
+        regions.logical_versions_base,
+        header.covered_lsn,
+    )?;
 
     Some(LoadedCheckpoint {
+        version: header.version,
         fingerprint: header.pack_fingerprint,
         covered_lsn: header.covered_lsn,
         base_delta_seq: header.base_delta_seq,
@@ -647,7 +632,7 @@ pub fn read_checkpoint_summary(
         .map_err(|e| crate::index::delta::io_error(path, "read checkpoint header", e))?;
     let header = CheckpointHeader::decode(&buf)
         .ok_or_else(|| crate::index::delta::invalid(path, "checkpoint header decode failed"))?;
-    if header.magic != CHECKPOINT_MAGIC || header.version != CHECKPOINT_VERSION {
+    if !supported_checkpoint_header(&header) {
         return Err(crate::index::delta::invalid(
             path,
             "invalid checkpoint magic/version",
@@ -715,7 +700,7 @@ pub fn read_durable_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{IndexConfig, LossyIndex};
+    use crate::index::{BucketIndex, IndexConfig};
 
     fn temp_checkpoint(label: &str) -> PathBuf {
         crate::test_scratch::root().join(format!(
@@ -737,8 +722,8 @@ mod tests {
         bytes[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header_bytes);
     }
 
-    fn write_slots_only_checkpoint(path: &Path, pack_table: &[(u16, PackId)]) {
-        let index = LossyIndex::with_config(16, IndexConfig::default());
+    fn write_bucket_snapshot_checkpoint(path: &Path, pack_table: &[(u16, PackId)]) {
+        let index = BucketIndex::with_config(16, IndexConfig::default());
         let blob = index.serialize();
         write_checkpoint(
             path,
@@ -752,10 +737,46 @@ mod tests {
         .unwrap();
     }
 
+    fn write_legacy_v1_empty_checkpoint(path: &Path) {
+        let mut bytes = vec![0_u8; CHECKPOINT_HEADER_LEN];
+        bytes.extend_from_slice(
+            &CollectionDirEntry {
+                collection_id: [0xA1; 16],
+                generation: 3,
+                slots_offset: 0,
+                homes_offset: 0,
+                tails_offset: 0,
+                capacity: 16,
+                slot_count: 0,
+            }
+            .encode(),
+        );
+        bytes.resize(CHECKPOINT_HEADER_LEN + COLLECTION_DIR_ENTRY_LEN + 16 * 8, 0);
+        let header = CheckpointHeader {
+            magic: *b"MTXI0001",
+            version: 1,
+            collection_count: 1,
+            directory_bytes: COLLECTION_DIR_ENTRY_LEN as u64,
+            slots_bytes: 16 * 8,
+            pack_fingerprint: 0x1234,
+            content_crc32: crc32fast::hash(&bytes[CHECKPOINT_HEADER_LEN..]),
+            homes_bytes: 0,
+            tails_bytes: 0,
+            covered_lsn: 0,
+            pack_table_count: 0,
+            pack_table_bytes: 0,
+            base_delta_seq: 0,
+            logical_version_count: 0,
+            logical_version_bytes: 0,
+        };
+        bytes[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
+        fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn checkpoint_slot_range_cannot_extend_into_pack_table() {
         let path = temp_checkpoint("slot-bounds");
-        write_slots_only_checkpoint(&path, &[(0, PackId([0xB2; 16]))]);
+        write_bucket_snapshot_checkpoint(&path, &[(0, PackId([0xB2; 16]))]);
         let mut bytes = fs::read(&path).unwrap();
         let header =
             CheckpointHeader::decode(bytes[..CHECKPOINT_HEADER_LEN].try_into().unwrap()).unwrap();
@@ -775,8 +796,11 @@ mod tests {
     #[test]
     fn write_only_rejects_a_slot_count_that_understates_the_slots() {
         let path = temp_checkpoint("understated-slot-count");
-        let index = LossyIndex::with_config(16, IndexConfig::default());
-        index.insert(&[0xA5; 16], 0, 128).unwrap();
+        let index = BucketIndex::with_config(16, IndexConfig::default());
+        index
+            .insert_with_identity(&[0xA5; 16], 0, 128, false, |_| Ok::<_, ()>([0xA5; 16]))
+            .unwrap()
+            .unwrap();
         let blob = index.serialize();
         write_checkpoint(&path, 0x1234, 10, 0, &[([0xA1; 16], 0, &blob)], &[], &[]).unwrap();
 
@@ -806,7 +830,7 @@ mod tests {
             [(1, PackId([0xB1; 16])), (1, PackId([0xB2; 16]))],
             [(1, PackId([0xB1; 16])), (2, PackId([0xB1; 16]))],
         ] {
-            write_slots_only_checkpoint(&path, &packs);
+            write_bucket_snapshot_checkpoint(&path, &packs);
             assert!(
                 read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_none(),
                 "duplicate pack identity must be rejected even with a valid checksum: {packs:?}"
@@ -818,7 +842,7 @@ mod tests {
     #[test]
     fn checkpoint_rejects_unordered_or_uncovered_collection_versions() {
         let path = temp_checkpoint("invalid-version-table");
-        let index = LossyIndex::with_config(16, IndexConfig::default());
+        let index = BucketIndex::with_config(16, IndexConfig::default());
         let blob = index.serialize();
         for versions in [
             [([0xA1; 16], 7), ([0xA1; 16], 8)],
@@ -869,26 +893,27 @@ mod tests {
     }
 
     #[test]
-    fn failed_insert_on_checkpoint_mapping_does_not_allocate_identity_tables() {
-        let path = temp_checkpoint("mapped-insert");
-        write_slots_only_checkpoint(&path, &[]);
+    fn bucket_checkpoint_restores_a_valid_owned_index() {
+        let path = temp_checkpoint("bucket-snapshot");
+        write_bucket_snapshot_checkpoint(&path, &[]);
         let loaded = read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).unwrap();
         let collection = &loaded.collections[0];
-        let index = LossyIndex::from_mmap_slots_with_config(
-            Arc::clone(&loaded.mmap),
-            collection.slots_offset,
-            collection.capacity,
-            collection.slot_count,
-            IndexConfig::default(),
-        );
-        let before = index.resident_bytes();
+        assert_eq!(loaded.version, CHECKPOINT_VERSION);
+        let snapshot_end = collection.slots_offset + collection.snapshot_len;
+        let snapshot = loaded
+            .mmap
+            .get(collection.slots_offset..snapshot_end)
+            .unwrap();
+        let index = BucketIndex::deserialize_with_config(snapshot, IndexConfig::default()).unwrap();
+        assert!(index.is_empty());
+        let _ = fs::remove_file(path);
+    }
 
-        assert!(matches!(
-            index.insert_undoable(&[0xA5; 16], 0, 128),
-            Err(super::super::InsertError::TableFull)
-        ));
-        assert_eq!(index.resident_bytes(), before);
-        assert!(index.is_mmap_backed());
+    #[test]
+    fn v1_checkpoint_is_rejected_for_sequential_scan_fallback() {
+        let path = temp_checkpoint("legacy-v1");
+        write_legacy_v1_empty_checkpoint(&path);
+        assert!(read_checkpoint_with_policy(&path, CheckpointChecksumPolicy::Full).is_none());
         let _ = fs::remove_file(path);
     }
 }

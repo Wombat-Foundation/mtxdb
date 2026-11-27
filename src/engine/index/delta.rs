@@ -154,9 +154,8 @@ pub enum DeltaOperation {
         generation: u64,
         /// Stable position in `collection_order`.
         order_key: u64,
-        /// `LossyIndex::serialize()` bytes in the slots-only v1 format. The
-        /// payload is self-describing by length; semantic validation occurs
-        /// during replay, where the configured index policy is available.
+        /// `BucketIndex` snapshot bytes. The payload is self-describing by
+        /// length and validated using the pool's index configuration.
         index_blob: Vec<u8>,
     },
     /// Remove a collection from the replayed checkpoint state.
@@ -1600,73 +1599,6 @@ pub fn append_batch_with_durability_and_directory(
     }
     Ok(appended)
 }
-
-/// Errors that can arise while applying a replayed delta log to a
-/// checkpoint-backed index. Any of these means the log is structurally
-/// inconsistent with the checkpoint it claims to continue, and the whole log
-/// must be rejected (opener falls back to a rescan).
-#[derive(Debug, PartialEq, Eq)]
-pub enum DeltaReplayError {
-    /// A frame targets a bucket outside the checkpoint index's capacity.
-    FrameOutOfBounds {
-        /// The frame's target bucket.
-        bucket: u32,
-        /// The checkpoint index's capacity.
-        capacity: u32,
-    },
-    /// Replay requires an owned (materialized) slot array.
-    RequiresOwnedIndex,
-    /// A frame carried the empty-slot sentinel (`0`). A legitimate insert
-    /// never produces one — `record_delta` only ever logs a freshly built,
-    /// non-empty `IndexEntry` — so this can only be log corruption or a
-    /// structurally invalid frame. Storing it as-is would silently erase
-    /// whatever live entry currently occupies that bucket and truncate the
-    /// probe chain past it, stranding any entries beyond it.
-    EmptySlot {
-        /// The frame's target bucket.
-        bucket: u32,
-    },
-    /// A frame's packed entry named a slot at or above
-    /// [`crate::shard::MAX_SHARDS`], which no live shard can occupy. A
-    /// legitimate writer never produces one (`IndexEntry::new` rejects it), so
-    /// this can only be log corruption or a structurally invalid frame.
-    /// Accepting it would install an entry the shard scan cannot resolve.
-    SlotOutOfRange {
-        /// The frame's target bucket.
-        bucket: u32,
-        /// The decoded slot, at or above `MAX_SHARDS`.
-        slot: u16,
-    },
-}
-
-impl std::fmt::Display for DeltaReplayError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::FrameOutOfBounds { bucket, capacity } => {
-                write!(
-                    f,
-                    "delta frame bucket {bucket} exceeds index capacity {capacity}"
-                )
-            }
-            Self::RequiresOwnedIndex => write!(f, "delta replay requires an owned index"),
-            Self::EmptySlot { bucket } => {
-                write!(
-                    f,
-                    "delta frame at bucket {bucket} carries the empty-slot sentinel"
-                )
-            }
-            Self::SlotOutOfRange { bucket, slot } => {
-                write!(
-                    f,
-                    "delta frame at bucket {bucket} names shard slot {slot}, \
-                     which is not below MAX_SHARDS"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for DeltaReplayError {}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
