@@ -3168,7 +3168,11 @@ impl PackfileStorage {
     /// only frames tagged with `pool`, so a worker reading the state pool does
     /// not observe event-DAG or edges mutations that share the same
     /// segment. `wal_path` is the database root's shared `wal.bin`, not a
-    /// per-pool segment.
+    /// per-pool segment. This uses the default resident index configuration.
+    /// If the writer uses paged residency, use
+    /// [`Self::open_read_committed_shared_with_config`] with the matching
+    /// runtime configuration so coverage reloads rebuild the same locator
+    /// representation.
     ///
     /// # Errors
     /// Same as [`Self::open_read_committed`].
