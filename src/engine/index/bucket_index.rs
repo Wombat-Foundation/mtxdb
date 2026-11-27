@@ -304,7 +304,34 @@ impl BucketIndex {
     /// Returns [`BucketSnapshotError`] when the snapshot is malformed, corrupt,
     /// or contains more entries than the configured load threshold permits.
     pub fn deserialize(data: &[u8], config: IndexConfig) -> Result<Self, BucketSnapshotError> {
-        let table = RawBucketTable::from_snapshot(data)?;
+        Self::deserialize_with_checksum(data, config, true)
+    }
+
+    /// Decode a checkpoint snapshot after `read_checkpoint_with_policy` has
+    /// applied the enclosing checkpoint's checksum policy. The snapshot is
+    /// still structurally validated, but its CRC is covered by the checkpoint
+    /// body CRC and is not recomputed here.
+    ///
+    /// # Errors
+    /// Returns [`BucketSnapshotError`] when the snapshot is malformed or
+    /// contains more entries than the configured load threshold permits.
+    pub(crate) fn deserialize_validated_checkpoint_snapshot(
+        data: &[u8],
+        config: IndexConfig,
+    ) -> Result<Self, BucketSnapshotError> {
+        Self::deserialize_with_checksum(data, config, false)
+    }
+
+    fn deserialize_with_checksum(
+        data: &[u8],
+        config: IndexConfig,
+        verify_checksum: bool,
+    ) -> Result<Self, BucketSnapshotError> {
+        let table = if verify_checksum {
+            RawBucketTable::from_snapshot(data)?
+        } else {
+            RawBucketTable::from_validated_snapshot(data)?
+        };
         if table.len() > max_occupied(table.capacity(), config.load_factor_percent) {
             return Err(BucketSnapshotError::InvalidDimensions);
         }
@@ -435,6 +462,32 @@ mod tests {
         );
         index.rollback_slot(&insert);
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn validated_checkpoint_decode_skips_only_the_redundant_inner_crc() {
+        let config = IndexConfig {
+            seed: 0xCAFE,
+            floor: 16,
+            load_factor_percent: 75,
+        };
+        let index = BucketIndex::with_config(16, config);
+        let hash = [0x4D; 16];
+        index
+            .insert_with_identity(&hash, 7, 64, false, |_| Ok::<_, ()>(hash))
+            .unwrap()
+            .unwrap();
+
+        let mut snapshot = index.serialize();
+        // Snapshot header (32 bytes), then the first entry's offset field
+        // begins 16 bytes into its 24-byte entry. Keep the entry valid while
+        // making its inner CRC stale.
+        snapshot[48] ^= 1;
+        assert!(BucketIndex::deserialize(&snapshot, config).is_err());
+
+        let decoded =
+            BucketIndex::deserialize_validated_checkpoint_snapshot(&snapshot, config).unwrap();
+        assert_eq!(decoded.lookup(&hash), Some((7, 65)));
     }
 
     #[test]

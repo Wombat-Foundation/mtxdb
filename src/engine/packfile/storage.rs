@@ -3682,12 +3682,9 @@ impl PackfileStorage {
             else {
                 return None;
             };
-            let Some(shard) = pack_lookup
+            let shard = pack_lookup
                 .get(&pack_id)
-                .and_then(|(slot, _)| shards.get_shard(*slot))
-            else {
-                return None;
-            };
+                .and_then(|(slot, _)| shards.get_shard(*slot))?;
             identity_reads = identity_reads.saturating_add(1);
             if !matches!(
                 shards.record_identity_at(&shard, offset),
@@ -4128,8 +4125,10 @@ impl PackfileStorage {
         // Gating needs each collection's post-replay length (the checkpoint
         // occupancy plus whatever fresh-slot writes the replayed frames add),
         // so the sidecar check runs after materialization below.
-        let mut scan_out = RoomScanOutput::default();
-        scan_out.index_identity_reads = index_identity_reads;
+        let mut scan_out = RoomScanOutput {
+            index_identity_reads,
+            ..RoomScanOutput::default()
+        };
         let mut collection_order = Vec::with_capacity(checkpoint.collections.len());
         let mut current_len: HashMap<[u8; 16], u32> =
             HashMap::with_capacity(checkpoint.collections.len());
@@ -4145,23 +4144,25 @@ impl PackfileStorage {
             }
             // The checkpoint reader has validated this range. Decode the
             // bucket snapshot directly into its owned table exactly once.
-            let (mut index, generation) =
-                if let Some((generation, index)) = snapshot_indexes.remove(&loaded.collection_id) {
-                    (index, generation)
-                } else {
-                    let index = loaded
-                        .snapshot_len
-                        .checked_add(loaded.slots_offset)
-                        .and_then(|end| checkpoint.mmap.get(loaded.slots_offset..end))
-                        .and_then(|bytes| {
-                            BucketIndex::deserialize_with_config(bytes, index_config).ok()
-                        });
-                    let Some(index) = index else {
-                        timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
-                        return None;
-                    };
-                    (index, loaded.generation)
+            let (mut index, generation) = if let Some((generation, index)) =
+                snapshot_indexes.remove(&loaded.collection_id)
+            {
+                (index, generation)
+            } else {
+                let index = loaded
+                    .snapshot_len
+                    .checked_add(loaded.slots_offset)
+                    .and_then(|end| checkpoint.mmap.get(loaded.slots_offset..end))
+                    .and_then(|bytes| {
+                        BucketIndex::deserialize_validated_checkpoint_snapshot(bytes, index_config)
+                            .ok()
+                    });
+                let Some(index) = index else {
+                    timings.checkpoint_reject = Some(CheckpointReject::IndexUpdateFailed);
+                    return None;
                 };
+                (index, loaded.generation)
+            };
             if !index.remap_slots(&slot_remap) {
                 timings.checkpoint_reject = Some(CheckpointReject::SlotRemapFailed);
                 return None;
@@ -9680,14 +9681,7 @@ impl PackfileStorage {
             was_new
         } else {
             let grow_started = std::time::Instant::now();
-            let grown = if let Some(grown) = live.grow() {
-                Some(grown)
-            } else {
-                // Match the single-put fallback: if recovering the
-                // checkpoint-backed hashes fails, rebuild this collection
-                // from pack records below instead of aborting a valid batch.
-                live.grow()
-            };
+            let grown = live.grow();
             let Some(grown) = grown else {
                 progress.index_needs_rebuild = true;
                 progress.structural_change = true;
@@ -10607,7 +10601,7 @@ impl StorageEngine for PackfileStorage {
         }
         let mut live = Vec::with_capacity(keys.len());
         for id in keys {
-            if self.durable_removed(collection_id, &id)? == Some(false) {
+            if self.durable_removed_after_scan(collection_id, &id)? == Some(false) {
                 live.push(id);
             }
         }
@@ -11085,6 +11079,25 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         node_id: &[u8; 16],
     ) -> Result<Option<bool>, StorageError> {
+        self.durable_removed_with_scan_state(collection_id, node_id, false)
+    }
+
+    /// Resolve tombstone state after `scan_collection_keys` already walked the
+    /// relevant pack data. This path only needs the frame header identity.
+    fn durable_removed_after_scan(
+        &self,
+        collection_id: &[u8; 16],
+        node_id: &[u8; 16],
+    ) -> Result<Option<bool>, StorageError> {
+        self.durable_removed_with_scan_state(collection_id, node_id, true)
+    }
+
+    fn durable_removed_with_scan_state(
+        &self,
+        collection_id: &[u8; 16],
+        node_id: &[u8; 16],
+        already_scanned: bool,
+    ) -> Result<Option<bool>, StorageError> {
         loop {
             let generation = self.generation(collection_id);
             let Some(gen) = generation.as_ref() else {
@@ -11105,9 +11118,19 @@ impl PackfileStorage {
                 let Some(shard) = pinned.get(&slot) else {
                     continue;
                 };
-                let (found_collection, found_hash, removed) =
+                let (found_collection, found_hash, header_removed) =
                     self.shards.record_identity_at(shard, offset)?;
                 if &found_collection == collection_id && &found_hash == node_id {
+                    let removed =
+                        if already_scanned || !self.shards.checksum_policy().verifies_reads() {
+                            header_removed
+                        } else {
+                            self.shards
+                                .read_at(shard, offset, true)?
+                                .metadata
+                                .as_ref()
+                                .is_some_and(|metadata| metadata.removed)
+                        };
                     return Ok(Some(removed));
                 }
             }

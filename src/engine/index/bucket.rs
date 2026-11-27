@@ -416,6 +416,7 @@ fn parse_snapshot_entry(entry: &[u8]) -> Result<(u64, u16, u64, bool), BucketSna
 
 fn validated_snapshot_layout(
     bytes: &[u8],
+    verify_checksum: bool,
 ) -> Result<(usize, u64, usize, usize), BucketSnapshotError> {
     let (bucket_count, seed, count) = parse_snapshot_header(bytes)?;
     let checksum_offset = bytes
@@ -433,14 +434,16 @@ fn validated_snapshot_layout(
     if bytes.len() != expected_len {
         return Err(BucketSnapshotError::InvalidDimensions);
     }
-    let expected_crc = u32::from_le_bytes(
-        bytes
-            .get(checksum_offset..)
-            .and_then(|slice| slice.try_into().ok())
-            .ok_or(BucketSnapshotError::TooShort)?,
-    );
-    if crc32fast::hash(&bytes[..checksum_offset]) != expected_crc {
-        return Err(BucketSnapshotError::ChecksumMismatch);
+    if verify_checksum {
+        let expected_crc = u32::from_le_bytes(
+            bytes
+                .get(checksum_offset..)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or(BucketSnapshotError::TooShort)?,
+        );
+        if crc32fast::hash(&bytes[..checksum_offset]) != expected_crc {
+            return Err(BucketSnapshotError::ChecksumMismatch);
+        }
     }
     let bucket_count =
         usize::try_from(bucket_count).map_err(|_| BucketSnapshotError::InvalidDimensions)?;
@@ -645,7 +648,25 @@ impl RawBucketTable {
     /// bad magic/version/checksum, has inconsistent dimensions, or contains an
     /// entry that cannot be installed.
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, BucketSnapshotError> {
-        let (bucket_count, seed, count, _) = validated_snapshot_layout(bytes)?;
+        Self::from_snapshot_with_checksum(bytes, true)
+    }
+
+    /// Restore a snapshot after an enclosing format has applied its integrity
+    /// policy. Dimensions and entries are still validated; only the inner CRC
+    /// is skipped because a checkpoint's body CRC already covers these bytes.
+    ///
+    /// # Errors
+    /// Returns [`BucketSnapshotError`] when the snapshot is malformed or an
+    /// entry cannot be installed.
+    pub(crate) fn from_validated_snapshot(bytes: &[u8]) -> Result<Self, BucketSnapshotError> {
+        Self::from_snapshot_with_checksum(bytes, false)
+    }
+
+    fn from_snapshot_with_checksum(
+        bytes: &[u8],
+        verify_checksum: bool,
+    ) -> Result<Self, BucketSnapshotError> {
+        let (bucket_count, seed, count, _) = validated_snapshot_layout(bytes, verify_checksum)?;
         let minimum_entries = bucket_count
             .checked_mul(SLOT_COUNT)
             .ok_or(BucketSnapshotError::InvalidDimensions)?;
@@ -682,7 +703,23 @@ impl RawBucketTable {
     /// Returns [`BucketSnapshotError`] when the snapshot's dimensions, entries,
     /// or checksum are invalid.
     pub fn validate_snapshot(bytes: &[u8]) -> Result<(usize, usize), BucketSnapshotError> {
-        let (bucket_count, _, count, _) = validated_snapshot_layout(bytes)?;
+        Self::validate_snapshot_with_checksum(bytes, true)
+    }
+
+    /// Validate snapshot dimensions and entries, optionally checking its CRC.
+    ///
+    /// Checkpoint `WriteOnly` mode still validates every structural invariant
+    /// while intentionally trusting both the outer body CRC and this snapshot
+    /// CRC.
+    ///
+    /// # Errors
+    /// Returns [`BucketSnapshotError`] for malformed dimensions or entries, or
+    /// for a checksum mismatch when `verify_checksum` is true.
+    pub fn validate_snapshot_with_checksum(
+        bytes: &[u8],
+        verify_checksum: bool,
+    ) -> Result<(usize, usize), BucketSnapshotError> {
+        let (bucket_count, _, count, _) = validated_snapshot_layout(bytes, verify_checksum)?;
         let mut offset = SNAPSHOT_HEADER_LEN;
         for _ in 0..count {
             let end = offset

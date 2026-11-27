@@ -453,8 +453,11 @@ fn read_checkpoint_collections(
         let region = slot_base.checked_add(body_offset)?;
         let snapshot_len = usize::try_from(entry.capacity).ok()?;
         let end = region.checked_add(snapshot_len)?;
+        // `read_checkpoint_with_policy` has already checked the enclosing
+        // body CRC when policy is `Full`. Under `WriteOnly`, both CRCs are
+        // intentionally trusted, while snapshot structure is still checked.
         let (bucket_count, entry_count) =
-            RawBucketTable::validate_snapshot(buf.get(region..end)?).ok()?;
+            RawBucketTable::validate_snapshot_with_checksum(buf.get(region..end)?, false).ok()?;
         if u32::try_from(entry_count).ok()? != entry.slot_count || end > pack_table_base {
             return None;
         }

@@ -4544,6 +4544,41 @@ fn test_probe_reopen_first_append_sync_path() {
 }
 
 #[test]
+fn write_sync_write_sync_reopens_from_the_checkpoint() {
+    let dir = test_dir("two_sync_checkpoint_reopen");
+    let collection = [0x6D; 16];
+    let first = batch_node(0xA1);
+    let second = batch_node(0xA2);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(&collection, &first, &NodeData::from_slice(b"first"))
+        .unwrap();
+    store.sync_all().unwrap();
+    store
+        .put(&collection, &second, &NodeData::from_slice(b"second"))
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        reopened.open_timings().unwrap().path,
+        OpenPath::Checkpoint,
+        "the second sync must leave a checkpoint-usable index, not force a full scan"
+    );
+    assert_eq!(
+        reopened.get(&collection, &first).unwrap().unwrap().bytes,
+        bytes::Bytes::from_static(b"first")
+    );
+    assert_eq!(
+        reopened.get(&collection, &second).unwrap().unwrap().bytes,
+        bytes::Bytes::from_static(b"second")
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn test_rebuild_index_triggers_on_full_table() {
     let dir = test_dir("rebuild_index_full");
     let store = PackfileStorage::open(dir).unwrap();
@@ -4708,6 +4743,48 @@ fn durable_removed_retries_when_generation_swaps_before_pin() {
     drop(hook);
     drop(store);
     fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn durable_removed_keeps_full_checksum_verification() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = test_dir("durable_removed_full_checksum");
+    let collection = [0xAB; 16];
+    let id = distinct_id(0x73);
+    let store = PackfileStorage::open_with_policies(
+        dir.clone(),
+        true,
+        crate::packfile::ChecksumPolicy::Full,
+    )
+    .unwrap();
+    store
+        .put(&collection, &id, &NodeData::from_slice(b"checksum target"))
+        .unwrap();
+    store.sync_all().unwrap();
+    let (slot, offset) = store
+        .generation(&collection)
+        .unwrap()
+        .index
+        .lookup(&id)
+        .unwrap();
+    let shard = store.shards.get_shard(slot).unwrap();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&shard.path)
+        .unwrap();
+    let payload_byte = offset + 4 + u64::from(crate::packfile::FRAME_FIXED_LEN);
+    file.seek(SeekFrom::Start(payload_byte)).unwrap();
+    file.write_all(&[0xFF]).unwrap();
+    file.sync_all().unwrap();
+
+    let error = store.durable_removed(&collection, &id).unwrap_err();
+    assert!(
+        matches!(error, StorageError::Corrupt(_)),
+        "full checksum policy must reject corruption during collection metadata lookup: {error}"
+    );
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
