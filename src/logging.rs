@@ -1,8 +1,8 @@
 //! mtxdb's optional structured logging API.
 //!
-//! Enable the `logging` feature to use the level macros and [`init`]. Hosts
-//! can either call `init` to install mtxdb's compact stderr subscriber, or
-//! install their own tracing subscriber.
+//! Enable the `logging` feature to use the level macros and
+//! [`init`](crate::logging::init). Hosts can either call `init` to install
+//! mtxdb's compact stderr subscriber, or install their own tracing subscriber.
 
 pub use tracing::{debug, error, info, trace, warn};
 
