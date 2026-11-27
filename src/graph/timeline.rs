@@ -42,6 +42,7 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::database::{Database, DatabaseTransaction};
+use crate::define_ordered_key;
 use crate::domain_tag::DomainTag;
 use crate::layout::ShardType;
 use crate::storage::{DigestAlgorithm, NodeData, NodeId, StorageEngine, StorageError};
@@ -78,6 +79,7 @@ pub type KeyTag = [u8; 32];
 /// Compatibility alias for timeline callers that used event references.
 pub type EventRef = KeyTag;
 
+#[cfg(test)]
 const ENTRY_LEN: usize = 16 + 8 + 8 + 16 + 32;
 const LEAF_HEADER_LEN: usize = 7;
 const DIRECTORY_HEADER_LEN: usize = 8;
@@ -90,6 +92,7 @@ const HEAD_TIER_CAPS: [usize; 2] = [24, 64];
 const ROOT_FIXED_LEN: usize = 57;
 const CURSOR_FIXED_LEN: usize = 49;
 const HEAD_LEN: usize = ROOT_FIXED_LEN;
+#[cfg(test)]
 #[cfg(test)]
 const CURSOR_LEN: usize = CURSOR_FIXED_LEN + ENTRY_LEN;
 const LEAF_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
@@ -116,32 +119,31 @@ fn validate_geometry<K: OrderedKey>() -> Result<(), StorageError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn encode_position(value: i64) -> [u8; 8] {
     let mut bytes = value.to_be_bytes();
     bytes[0] ^= 0x80;
     bytes
 }
 
+#[cfg(test)]
 fn decode_position(mut bytes: [u8; 8]) -> i64 {
     bytes[0] ^= 0x80;
     i64::from_be_bytes(bytes)
 }
 
-/// One fixed-width ordered key: `(scope, primary, secondary, id, tag)`.
-///
-/// Field order is the sort order (`derive(Ord)` compares in declaration order).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ScopedSeqKey {
-    /// The leading scope component.
-    pub scope: [u8; 16],
-    /// Caller-supplied primary signed order component.
-    pub primary: i64,
-    /// Caller-supplied secondary signed order component.
-    pub secondary: i64,
-    /// The 128-bit record id; tie-break after the order components.
-    pub id: NodeId,
-    /// Caller-supplied 32-byte final disambiguator.
-    pub tag: KeyTag,
+define_ordered_key! {
+    /// One fixed-width ordered key: `(scope, primary, secondary, id, tag)`.
+    ///
+    /// Field order is the sort order (`derive(Ord)` compares in declaration
+    /// order).
+    pub struct ScopedSeqKey(*b"SQK1") {
+        prefix scope: [u8; 16],
+        primary: i64,
+        secondary: i64,
+        id: NodeId,
+        tag: KeyTag,
+    }
 }
 
 impl ScopedSeqKey {
@@ -163,38 +165,14 @@ impl ScopedSeqKey {
         }
     }
 
+    #[cfg(test)]
     fn encode_into(self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.scope);
-        out.extend_from_slice(&encode_position(self.primary));
-        out.extend_from_slice(&encode_position(self.secondary));
-        out.extend_from_slice(&self.id);
-        out.extend_from_slice(&self.tag);
+        <Self as OrderedKey>::encode_into(&self, out);
     }
 
+    #[cfg(test)]
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        if bytes.len() != ENTRY_LEN {
-            return Err(StorageError::Corrupt("timeline entry length".to_owned()));
-        }
-        let position = |range: std::ops::Range<usize>, what: &str| {
-            <[u8; 8]>::try_from(&bytes[range])
-                .map(decode_position)
-                .map_err(|_| StorageError::Corrupt(format!("timeline entry {what}")))
-        };
-        let mut scope = [0u8; 16];
-        scope.copy_from_slice(&bytes[..16]);
-        let primary = position(16..24, "primary ordering")?;
-        let secondary = position(24..32, "secondary ordering")?;
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&bytes[32..48]);
-        let mut tag = [0u8; 32];
-        tag.copy_from_slice(&bytes[48..ENTRY_LEN]);
-        Ok(Self {
-            scope,
-            primary,
-            secondary,
-            id,
-            tag,
-        })
+        <Self as OrderedKey>::decode(bytes)
     }
 }
 
@@ -227,25 +205,6 @@ pub trait OrderedKey: Copy + Ord + Eq {
     /// Returns [`StorageError::Corrupt`] if `bytes` is not exactly
     /// [`Self::WIRE_LEN`] bytes or does not decode into a valid key.
     fn decode(bytes: &[u8]) -> Result<Self, StorageError>;
-}
-
-impl OrderedKey for ScopedSeqKey {
-    type Prefix = [u8; 16];
-
-    const WIRE_LEN: usize = ENTRY_LEN;
-    const SCHEMA_TAG: [u8; 4] = *b"SQK1";
-
-    fn prefix(&self) -> Self::Prefix {
-        self.scope
-    }
-
-    fn encode_into(&self, out: &mut Vec<u8>) {
-        (*self).encode_into(out);
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        ScopedSeqKey::decode(bytes)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -184,6 +184,9 @@ pub mod template;
 /// Persisted, ordered timeline index with copy-on-write roots.
 #[path = "graph/timeline.rs"]
 pub mod timeline;
+/// Shared fixed-width key and compact-integer codecs.
+#[path = "engine/wire.rs"]
+pub mod wire;
 
 #[path = "matrix/test_auth_closure.rs"]
 mod test_auth_closure;
