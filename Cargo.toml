@@ -103,8 +103,8 @@ default = ["zstd"]
 # not carry zstd. A build without it always
 # writes raw frames and refuses to read compressed ones.
 zstd = ["dep:zstd", "dep:zstd-sys"]
-# Shared structured logging macros through Rezzy's `rezzy-log` convention.
-logging = ["rezzy/logging"]
+# mtxdb's tracing events and opt-in stderr subscriber.
+logging = ["dep:tracing", "dep:tracing-subscriber"]
 
 # Exposes `JournalCoordinator::set_segment_cap` so downstream tests can reach the
 # journal's hard limit without writing hundreds of MiB. Not for production use.
@@ -143,6 +143,8 @@ parking_lot = { version = "0.12", features = ["arc_lock"] }
 rezzy = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev" }
 rezzy-recon = { git = "https://gitlab.com/wombat-foundation/rezzy.git", branch = "dev", version = "0.6.0-rc.1" }
 sha2 = "0.11"
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"], optional = true }
 zstd = { version = "0.14", default-features = false, optional = true }
 
 # `zstd`/`zstd-safe` don't forward a "pkg-config"/"vendored" feature of their

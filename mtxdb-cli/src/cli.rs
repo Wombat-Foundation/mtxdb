@@ -1868,6 +1868,9 @@ fn parse_cli() -> Cli {
 // `Display` instead and let the profile/env decide nothing.
 /// Parse command-line arguments and execute the selected mtxdb command.
 pub fn run() -> std::process::ExitCode {
+    #[cfg(feature = "logging")]
+    let _ = mtxdb::logging::init();
+
     let mut cli = parse_cli();
     if let Commands::Completions { shell } = &cli.command {
         #[cfg(feature = "completions")]

@@ -13658,14 +13658,18 @@ fn paged_repack_does_not_resurrect_deleted_generation() {
         reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
         "the open-time fence should hide the deleted generation"
     );
-    rezzy::info!(
-        old_before_repack = ?reopened
-            .get(&TEST_COLLECTION, &old)
-            .unwrap()
-            .map(|data| data.bytes.clone()),
-        deleted_collections = ?fs::read(dir.join("deleted.collections")).ok(),
-        "checking delete/recreate state before repack"
-    );
+    #[cfg(feature = "logging")]
+    {
+        let _ = crate::logging::init();
+        crate::logging::info!(
+            old_before_repack = ?reopened
+                .get(&TEST_COLLECTION, &old)
+                .unwrap()
+                .map(|data| data.bytes.clone()),
+            deleted_collections = ?fs::read(dir.join("deleted.collections")).ok(),
+            "checking delete/recreate state before repack"
+        );
+    }
     // Both physical generations must be visible to the repack scan, or this
     // test would pass without exercising the fence at all.
     let pack_files = std::fs::read_dir(&dir)

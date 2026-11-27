@@ -126,6 +126,9 @@ pub mod lattice;
 /// Database-root layout and named independent packfile pools.
 #[path = "engine/layout.rs"]
 pub mod layout;
+/// mtxdb's optional tracing macros and stderr subscriber.
+#[cfg(feature = "logging")]
+pub mod logging;
 /// Stable logical-ID to current physical-record pointers.
 #[path = "graph/logical_head.rs"]
 pub mod logical_head;

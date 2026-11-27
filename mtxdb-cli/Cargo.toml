@@ -34,6 +34,7 @@ default = ["completions"]
 # Shell-completion script generation. On by default; disable with
 # `default-features = false` to drop `clap_complete` from a lean CLI build.
 completions = ["dep:clap_complete"]
+logging = ["mtxdb/logging"]
 
 [dependencies]
 anyhow = "1.0"
