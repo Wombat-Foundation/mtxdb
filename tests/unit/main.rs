@@ -23,7 +23,6 @@ mod test_cache;
 mod test_csr;
 mod test_dag;
 mod test_format;
-mod test_frontier;
 mod test_index_checkpoint;
 mod test_matrix_policy;
 mod test_packfile_layout;

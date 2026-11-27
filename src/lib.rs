@@ -93,9 +93,6 @@ pub mod domain_tag;
 pub mod edge_log;
 #[path = "matrix/export_schema.rs"]
 pub mod export_schema;
-/// Frontier tracking for nodes awaiting their dependencies before being writable.
-#[path = "graph/frontier.rs"]
-pub mod frontier;
 /// Persisted, content-addressed HAMTs in an mtxdb collection, generic over
 /// key and value types; nodes are verified on read and routed canonically.
 #[path = "graph/hamt_store.rs"]
@@ -154,9 +151,6 @@ pub mod room_auth;
 /// Room-scoped flag and disposition bitmap index.
 #[path = "matrix/room_flag.rs"]
 pub mod room_flag;
-/// Rebuildable full-text and field secondary indexes.
-#[path = "search.rs"]
-pub mod search;
 /// Federation signing keys: per-key records, the MSC4499 binding rules, and
 /// the verbatim Notary payload.
 #[path = "matrix/server_keys.rs"]
@@ -214,9 +208,6 @@ mod test_room_auth;
 mod test_room_flag;
 #[cfg(test)]
 mod test_scratch;
-#[cfg(test)]
-#[path = "test_search.rs"]
-mod test_search;
 #[cfg(test)]
 #[path = "graph/test_short_id.rs"]
 mod test_short_id;
@@ -281,7 +272,6 @@ pub use room_flag::{
     flag_chunk_node_id, Flag, FlagChange, FlagQuery, RoomFlagIndex, CHUNK_CAPACITY, FLAG_META_ID,
     FLAG_META_MAGIC, FLAG_META_VERSION,
 };
-pub use search::{SearchDocument, SearchIndexes, SearchQuery};
 pub use shard::{LockHolderInfo, ShardPool};
 pub use state_group::{
     decode_state_group_record, encode_state_group_record, state_group_collection_id,

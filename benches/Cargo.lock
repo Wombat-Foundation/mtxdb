@@ -637,7 +637,6 @@ dependencies = [
  "bytes",
  "crc32fast",
  "fs2",
- "memchr",
  "memmap2",
  "parking_lot",
  "rezzy",

@@ -195,12 +195,6 @@ name = "timeline_multi_room"
 path = "timeline_multi_room.rs"
 harness = false
 
-# End-to-end search-pack cost (index + query shapes) on a real-data corpus.
-[[bench]]
-name = "search_scan"
-path = "search_scan.rs"
-harness = false
-
 # Reopen strategies for a sealed pack: checkpoint, scan, sorted .idx, trusted seal.
 [[bench]]
 name = "index_artifacts"
