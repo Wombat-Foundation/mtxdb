@@ -14282,9 +14282,9 @@ fn resident_checkpoint_refreshes_a_stale_versions_file() {
     let store_dir = test_dir("versions_resident_refresh_store");
     let wal = wal_dir.join("shared.wal");
 
-    // Seed the stale versions file directly: Paged journaling is refused, but
-    // a versions file left by an older build (or a Paged store that never
-    // checkpointed) must still not cap a later Resident checkpoint.
+    // Seed the stale versions file directly. A versions file left by an older
+    // build (or a Paged store that never checkpointed) must not cap a later
+    // Resident checkpoint.
     fs::create_dir_all(&store_dir).unwrap();
     crate::index::versions::write_versions(
         &PackfileStorage::index_versions_path(&store_dir),
@@ -14396,8 +14396,8 @@ fn paged_coverage_is_capped_by_the_versions_file() {
     )
     .unwrap();
 
-    // Paged journaling is refused, so read the cap from the open state
-    // instead of attaching a coordinator.
+    // Paged journaling is supported, so read the capped coverage from the
+    // open state after the paged scan.
     let reopened = PackfileStorage::open_with_max_shard_bytes_and_residency(
         store_dir.clone(),
         48 * 1024,
@@ -14586,9 +14586,8 @@ fn a_failed_publication_does_not_advance_coverage_until_retry() {
     );
 }
 
-/// Child half of [`versions_fsync_precedes_wal_reclaim_crash_safe`]: write,
-/// commit the WAL, then force a checkpoint and die after the versions fsync but
-/// before `journal.lsn` and reclaim.
+/// Child half of the versions/coverage crash tests: write and commit the WAL,
+/// then force a checkpoint and die at the configured durability boundary.
 #[test]
 fn versions_crash_child() {
     use crate::journal::{Journal, JournalCoordinator};
@@ -14630,9 +14629,19 @@ fn versions_crash_child() {
         // Paged writer enter its first pack/version/coverage barrier.
         std::env::set_var("MTXDB_CRASH_AT", point);
     }
-    // The crash point fires inside the checkpoint tail.
+    // The selected crash point fires inside the checkpoint tail.
     store.force_index_checkpoint().unwrap();
     unreachable!("the child must exit at the versions crash point");
+}
+
+#[derive(Clone, Copy)]
+enum PagedCrashRecovery {
+    /// Packs may be durable, but without durable versions the WAL must remain
+    /// available to replay the committed write.
+    ReplayFromWal,
+    /// Durable versions or a completed reclaim must preserve the saved
+    /// coverage claim across reopen.
+    KeepSavedCoverage,
 }
 
 fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
@@ -14641,6 +14650,7 @@ fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
     coverage_message: &str,
     writer_residency: crate::index::IndexResidency,
     crash_point: &str,
+    expected_recovery: PagedCrashRecovery,
 ) {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -14703,21 +14713,24 @@ fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
         version_after >= version_before,
         "version went backwards after the crash: before={version_before}, after={version_after}"
     );
-    if crash_point == "after-paged-packs-fsync" {
-        assert!(
-            reopened.durable_coverage() < coverage_before,
-            "coverage must not advance before index.versions is durable"
-        );
-        assert!(
-            !Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
-            "the WAL must retain records not yet represented by index.versions"
-        );
-    } else {
-        assert_eq!(
-            reopened.durable_coverage(),
-            coverage_before,
-            "{coverage_message}"
-        );
+    match expected_recovery {
+        PagedCrashRecovery::ReplayFromWal => {
+            assert!(
+                reopened.durable_coverage() < coverage_before,
+                "coverage must not advance before index.versions is durable"
+            );
+            assert!(
+                !Journal::scan_read_only(&wal).unwrap().groups.is_empty(),
+                "the WAL must retain records not yet represented by index.versions"
+            );
+        }
+        PagedCrashRecovery::KeepSavedCoverage => {
+            assert_eq!(
+                reopened.durable_coverage(),
+                coverage_before,
+                "{coverage_message}"
+            );
+        }
     }
     drop(reopened);
     drop(coordinator);
@@ -14736,6 +14749,7 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe() {
         "coverage must come from index.versions when journal.lsn was never written",
         crate::index::IndexResidency::Resident,
         "after-versions-fsync",
+        PagedCrashRecovery::KeepSavedCoverage,
     );
 }
 
@@ -14751,6 +14765,7 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe_resident() {
         "coverage must survive a crash before journal.lsn was written",
         crate::index::IndexResidency::Resident,
         "after-versions-fsync",
+        PagedCrashRecovery::KeepSavedCoverage,
     );
 }
 
@@ -14759,10 +14774,22 @@ fn versions_fsync_precedes_wal_reclaim_crash_safe_resident() {
 /// each boundary with a Paged writer and recover in both supported modes.
 #[test]
 fn paged_writer_crashes_preserve_committed_versions_across_coverage_handoff() {
-    for (label, point) in [
-        ("packs", "after-paged-packs-fsync"),
-        ("versions", "after-paged-versions-fsync"),
-        ("reclaim", "after-paged-wal-reclaim"),
+    for (label, point, expected) in [
+        (
+            "packs",
+            "after-paged-packs-fsync",
+            PagedCrashRecovery::ReplayFromWal,
+        ),
+        (
+            "versions",
+            "after-paged-versions-fsync",
+            PagedCrashRecovery::KeepSavedCoverage,
+        ),
+        (
+            "reclaim",
+            "after-paged-wal-reclaim",
+            PagedCrashRecovery::KeepSavedCoverage,
+        ),
     ] {
         for (mode, residency) in [
             ("resident", crate::index::IndexResidency::Resident),
@@ -14774,6 +14801,7 @@ fn paged_writer_crashes_preserve_committed_versions_across_coverage_handoff() {
                 "every committed version and its coverage must survive the Paged writer crash",
                 crate::index::IndexResidency::Paged,
                 point,
+                expected,
             );
         }
     }
