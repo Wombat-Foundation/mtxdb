@@ -736,8 +736,8 @@ impl PackfileStorage {
             // detects a gap while scanning a changed-length file, but that
             // path is skipped for an equal-length rewrite. The publish signal
             // tells us when to inspect the small header; if its base advanced
-            // beyond this reader's durable coverage, rebuild the durable
-            // paged index before trusting the now-shorter journal history.
+            // beyond this reader's durable coverage, reload the durable index
+            // before trusting the now-shorter journal history.
             if overlay.observed_len != 0
                 && Journal::read_base_lsn_read_only(&overlay.path)?
                     > overlay.covered.saturating_add(1)
@@ -774,18 +774,6 @@ impl PackfileStorage {
     /// Coverage is captured before the checkpoint is read, so the new bound can
     /// never be newer than the index loaded below.
     pub(super) fn reload_index_from_checkpoint(&self) -> bool {
-        // Paged mode keeps no primary-index checkpoint. Rebuild its compact
-        // tail and sealed sidecar tables from durable packs instead.
-        if self.index_residency == crate::index::IndexResidency::Paged {
-            let Some(covered) = self.reload_paged_index_from_packs() else {
-                self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
-                return false;
-            };
-            self.read_covered_lsn.store(covered, Ordering::Release);
-            self.materialized_lsn.fetch_max(covered, Ordering::Release);
-            self.read_reloads.fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
         // A writer may have created new packs since this handle opened, and the
         // checkpoint it wrote names that new pack set. Rediscover before
         // building the fingerprint, or the reload can never match.
@@ -912,15 +900,9 @@ impl PackfileStorage {
             let Some(overlay) = guard.as_mut() else {
                 return Ok(guard);
             };
-            // A reader may open while one writer is active and outlive a
-            // restart that changes residency. Check before returning a result.
-            if overlay.pool.is_some() {
-                self.validate_shared_reader_reload_mode()?;
-            }
             if self.refresh_worker_overlay(overlay)? == ReadRefresh::Applied {
                 return Ok(guard);
             }
-            self.validate_shared_reader_reload_mode()?;
             if !self.reload_index_from_checkpoint() {
                 reload_failed = true;
                 drop(guard);
@@ -969,11 +951,6 @@ impl PackfileStorage {
         }
         let advanced = self.read_covered_lsn.load(Ordering::Acquire) > coverage_before_attempts;
         if reload_failed || advanced {
-            // If durable shared-WAL coverage advanced without a resident
-            // checkpoint, this is not a transient read race: the worker was
-            // opened resident against a paged writer. Surface the configuration
-            // mismatch instead of telling callers to retry indefinitely.
-            self.validate_shared_reader_reload_mode()?;
             Err(StorageError::WouldBlock(
                 "read-committed reload failed or checkpoint coverage advanced; retry the read"
                     .to_owned(),

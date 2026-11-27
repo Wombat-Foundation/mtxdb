@@ -29,92 +29,6 @@ use crate::storage::{
     StorageEngine, StorageError,
 };
 
-const INDEX_RESIDENCY_FILE: &str = "index.residency";
-const INDEX_RESIDENCY_MAGIC: &[u8; 8] = b"MTXRES1\0";
-const INDEX_RESIDENCY_RECORD_LEN: usize = 13;
-
-fn index_residency_marker_path(base_dir: &Path) -> std::io::Result<PathBuf> {
-    if let Some(root) = crate::layout::enclosing_root(base_dir)? {
-        let pool = base_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| {
-                crate::layout::ShardType::ALL
-                    .into_iter()
-                    .find(|shard| shard.as_str() == name)
-            });
-        if let Some(pool) = pool {
-            return Ok(root.join(format!("{INDEX_RESIDENCY_FILE}.{}", pool.as_str())));
-        }
-        Ok(base_dir.join(INDEX_RESIDENCY_FILE))
-    } else {
-        Ok(base_dir.join(INDEX_RESIDENCY_FILE))
-    }
-}
-
-fn read_index_residency_marker(base_dir: &Path) -> std::io::Result<crate::index::IndexResidency> {
-    let path = index_residency_marker_path(base_dir)?;
-    let bytes = fs::read(&path)?;
-    if bytes.len() != INDEX_RESIDENCY_RECORD_LEN || bytes.get(..8) != Some(INDEX_RESIDENCY_MAGIC) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{} is not a valid index-residency record", path.display()),
-        ));
-    }
-    let expected_crc = u32::from_le_bytes(
-        bytes[9..13]
-            .try_into()
-            .expect("record length was checked above"),
-    );
-    if crc32fast::hash(&bytes[..9]) != expected_crc {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{} has an invalid index-residency checksum", path.display()),
-        ));
-    }
-    match bytes[8] {
-        0 => Ok(crate::index::IndexResidency::Resident),
-        1 => Ok(crate::index::IndexResidency::Paged),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{} has an unknown index-residency value", path.display()),
-        )),
-    }
-}
-
-fn persist_index_residency_marker(
-    base_dir: &Path,
-    residency: crate::index::IndexResidency,
-) -> std::io::Result<()> {
-    let path = index_residency_marker_path(base_dir)?;
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} has no parent directory", path.display()),
-        )
-    })?;
-    fs::create_dir_all(parent)?;
-    match read_index_residency_marker(base_dir) {
-        Ok(existing) if existing == residency => return Ok(()),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let mut bytes = Vec::with_capacity(INDEX_RESIDENCY_RECORD_LEN);
-    bytes.extend_from_slice(INDEX_RESIDENCY_MAGIC);
-    bytes.push(match residency {
-        crate::index::IndexResidency::Resident => 0,
-        crate::index::IndexResidency::Paged => 1,
-    });
-    bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
-    let temp_path = path.with_file_name(format!("{INDEX_RESIDENCY_FILE}.tmp"));
-    let mut temp = fs::File::create(&temp_path)?;
-    std::io::Write::write_all(&mut temp, &bytes)?;
-    temp.sync_all()?;
-    fs::rename(&temp_path, &path)?;
-    crate::shard::sync_directory(parent)?;
-    Ok(())
-}
 use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 
 mod read_journal;
@@ -273,13 +187,7 @@ pub struct OpenTimings {
     pub packfile_open: std::time::Duration,
     /// Number of packfiles successfully opened.
     pub packfile_open_calls: u64,
-    /// Packfiles whose full-scan index build came from a sealed `.idx` sidecar.
-    pub pack_index_sidecars: u64,
-    /// Time spent opening and validating sealed sidecars during the full scan.
-    pub pack_index_open: std::time::Duration,
-    /// Time spent folding a sealed sidecar into the per-collection locators.
-    pub pack_index_build: std::time::Duration,
-    /// Time spent scanning unsealed pack frames during the full scan.
+    /// Time spent scanning pack frames during the full scan.
     pub tail_scan: std::time::Duration,
     /// Restoring pool metadata and persisted shard statistics.
     pub metadata_restore: std::time::Duration,
@@ -349,9 +257,6 @@ impl Default for OpenTimings {
             packfile_recovery_calls: 0,
             packfile_open: std::time::Duration::ZERO,
             packfile_open_calls: 0,
-            pack_index_sidecars: 0,
-            pack_index_open: std::time::Duration::ZERO,
-            pack_index_build: std::time::Duration::ZERO,
             tail_scan: std::time::Duration::ZERO,
             metadata_restore: std::time::Duration::ZERO,
             pool_meta_restore: std::time::Duration::ZERO,
@@ -1099,12 +1004,6 @@ struct StreamingOpenScan {
     seen_collections: HashSet<[u8; 16]>,
     collection_home: HashMap<[u8; 16], u16>,
     collection_disk_bytes: HashMap<PackId, HashMap<[u8; 16], u64>>,
-    /// Per-collection sealed-pack locators. In `Resident` mode the resident
-    /// index still holds the same entries, so this is a read fallback; in
-    /// `Paged` mode it is the only locator source for these packs.
-    sealed: HashMap<[u8; 16], crate::index::sealed::SealedLocators>,
-    /// Whether sealed packs are also copied into the resident index.
-    residency: crate::index::IndexResidency,
 }
 
 struct ScanInsertConfig<'a> {
@@ -1114,7 +1013,7 @@ struct ScanInsertConfig<'a> {
 }
 
 impl StreamingOpenScan {
-    fn new(collection_order: Vec<[u8; 16]>, residency: crate::index::IndexResidency) -> Self {
+    fn new(collection_order: Vec<[u8; 16]>) -> Self {
         let known_collections = collection_order.iter().copied().collect();
         Self {
             indexes: HashMap::new(),
@@ -1123,8 +1022,6 @@ impl StreamingOpenScan {
             seen_collections: HashSet::new(),
             collection_home: HashMap::new(),
             collection_disk_bytes: HashMap::new(),
-            sealed: HashMap::new(),
-            residency,
         }
     }
 
@@ -1203,124 +1100,6 @@ impl StreamingOpenScan {
         }
     }
 
-    /// Ingest a sealed pack's sorted locator sidecar instead of scanning its
-    /// raw frames. The sidecar's per-collection byte totals preserve the
-    /// physical accounting that a frame scan would have produced.
-    fn insert_sidecar(
-        &mut self,
-        sidecar: &Arc<crate::index::packidx::MappedPackIndex>,
-        slot: u16,
-        pack_id: PackId,
-        creation_seq: u64,
-        config: &ScanInsertConfig<'_>,
-    ) -> Result<(), StorageError> {
-        let mut error = None;
-        sidecar.for_each_collection(|collection_id, disk_bytes| {
-            if error.is_some() {
-                return;
-            }
-            self.seen_collections.insert(collection_id);
-            if self.known_collections.insert(collection_id) {
-                self.collection_order.push(collection_id);
-            }
-            if config.deleted_collections.contains(&collection_id) {
-                return;
-            }
-            if config
-                .generation_fences
-                .get(&collection_id)
-                .is_some_and(|floor| creation_seq < u64::from(*floor))
-            {
-                return;
-            }
-            let bytes = self
-                .collection_disk_bytes
-                .entry(pack_id)
-                .or_default()
-                .entry(collection_id)
-                .or_default();
-            *bytes = bytes.saturating_add(disk_bytes);
-            self.collection_home.insert(collection_id, slot);
-            let mapped: Arc<crate::index::packidx::MappedPackIndex> = Arc::clone(sidecar);
-            let sealed_index: Arc<dyn crate::index::sealed::SealedIndex> = mapped;
-            self.sealed.entry(collection_id).or_default().insert(
-                crate::index::sealed::SealedPack {
-                    slot,
-                    pack_id,
-                    creation_seq,
-                    index: sealed_index,
-                },
-            );
-            // `Paged` exists to keep these locators out of the hash table; the
-            // sidecar plus `SealedLocators` is authoritative for this pack.
-            // `Resident` keeps the historical redundant copy.
-            if self.residency == crate::index::IndexResidency::Resident {
-                sidecar.for_each_entry_in_collection(&collection_id, |hash, locator| {
-                    if error.is_some() {
-                        return;
-                    }
-                    let (offset, removed) = match locator {
-                        crate::index::packidx::PackIndexLocator::Frame(offset) => {
-                            (u64::from(offset), false)
-                        }
-                        crate::index::packidx::PackIndexLocator::Removed(offset) => {
-                            (u64::from(offset), true)
-                        }
-                    };
-                    if let Err(failure) = self.insert_locator(
-                        collection_id,
-                        &hash,
-                        offset,
-                        removed,
-                        slot,
-                        config.index_config,
-                    ) {
-                        error = Some(failure);
-                    }
-                });
-            }
-        });
-        error.map_or(Ok(()), Err)
-    }
-
-    /// Ingest a run in place of its covered packs' sidecars. Its pack stats
-    /// are those sidecars' directory values, so accounting, collection homes
-    /// and first-seen collection order match what ingesting each covered
-    /// sidecar oldest first would produce.
-    fn insert_run(
-        &mut self,
-        run: &Arc<crate::index::sealed::SealedRun>,
-        deleted_collections: &HashSet<[u8; 16]>,
-    ) {
-        let mut rows: Vec<crate::index::run::RunPackStats> = run.run().pack_stats().collect();
-        rows.sort_by_key(|row| (row.ordinal, row.collection_id));
-        for row in rows {
-            let Some(pack) = run.packs().get(usize::from(row.ordinal)).copied() else {
-                continue;
-            };
-            let collection_id = row.collection_id;
-            self.seen_collections.insert(collection_id);
-            if self.known_collections.insert(collection_id) {
-                self.collection_order.push(collection_id);
-            }
-            if deleted_collections.contains(&collection_id) {
-                continue;
-            }
-            let bytes = self
-                .collection_disk_bytes
-                .entry(pack.pack_id)
-                .or_default()
-                .entry(collection_id)
-                .or_default();
-            *bytes = bytes.saturating_add(row.disk_bytes);
-            self.collection_home.insert(collection_id, pack.slot);
-            self.sealed
-                .entry(collection_id)
-                .or_default()
-                .insert_run(Arc::clone(run));
-        }
-    }
-
     fn finish(
         mut self,
         shards: &ShardPool,
@@ -1342,34 +1121,15 @@ impl StreamingOpenScan {
             seed: shards.bucket_seed(),
             ..Default::default()
         };
-        // A paged collection may have sealed packs but no unsealed tail, so
-        // the collection set is the union of both maps, not just `indexes`.
-        let mut collection_ids: Vec<[u8; 16]> = self.indexes.keys().copied().collect();
-        collection_ids.extend(
-            self.sealed
-                .keys()
-                .filter(|id| !self.indexes.contains_key(*id))
-                .copied(),
-        );
+        let collection_ids: Vec<[u8; 16]> = self.indexes.keys().copied().collect();
         for collection_id in collection_ids {
             let index = self.indexes.remove(&collection_id).unwrap_or_else(|| {
                 LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, index_config)
             });
-            let sealed = Arc::new(self.sealed.remove(&collection_id).unwrap_or_default());
             if let Some(&home) = self.collection_home.get(&collection_id) {
                 shards.set_collection_home(&collection_id, home);
             }
-            let counts = if self.residency == crate::index::IndexResidency::Paged {
-                let sealed_slots = sealed.slot_ids_in_collection(&collection_id);
-                let mut counts = index.slot_counts_excluding_set(&sealed_slots);
-                for (slot, count) in sealed.slot_counts_in_collection(&collection_id) {
-                    let entry = counts.entry(slot).or_insert(0u64);
-                    *entry = entry.saturating_add(count);
-                }
-                counts
-            } else {
-                index.slot_counts()
-            };
+            let counts = index.slot_counts();
             for (slot, count) in counts {
                 let Some(&pack_id) = slot_to_pack_id.get(&slot) else {
                     continue;
@@ -1387,8 +1147,6 @@ impl StreamingOpenScan {
                 collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
-                    sealed,
-                    paged: self.residency == crate::index::IndexResidency::Paged,
                     cache: Arc::new(NodeCache::with_budget(
                         cache_capacity,
                         cache_budget.cloned(),
@@ -1399,76 +1157,6 @@ impl StreamingOpenScan {
         }
         (out, self.collection_order)
     }
-}
-
-/// Serve a run accepted at pool open. `by_pack` maps each current pack to its
-/// slot and path. Returns `None` if a covered pack has no current shard; its
-/// packs then use their sidecars.
-fn sealed_run_for(
-    pool_run: crate::index::run::PoolRun,
-    by_pack: &HashMap<PackId, (u16, PathBuf)>,
-) -> Option<Arc<crate::index::sealed::SealedRun>> {
-    let mut packs = Vec::with_capacity(pool_run.run.packs().len());
-    let mut fallback = Vec::with_capacity(pool_run.run.packs().len());
-    for identity in pool_run.run.packs() {
-        let (slot, path) = by_pack.get(&identity.pack_id)?;
-        let pack = crate::index::sealed::RunPack {
-            slot: *slot,
-            pack_id: identity.pack_id,
-            creation_seq: identity.creation_seq,
-        };
-        packs.push(pack);
-        fallback.push((path.clone(), pack, *identity));
-    }
-    let run_path = pool_run.path;
-    let load: crate::index::sealed::RunFallback = Box::new(move || {
-        eprintln!(
-            "mtxdb: run {} failed verification; serving its packs from sidecars",
-            run_path.display()
-        );
-        load_run_fallback(&fallback)
-    });
-    crate::index::sealed::SealedRun::new(Arc::new(pool_run.run), packs, load)
-        .ok()
-        .map(Arc::new)
-}
-
-/// The covered packs' sidecars for a run that failed a check, oldest first. A
-/// sidecar that is missing or fails verification is rebuilt in memory from
-/// its pack.
-fn load_run_fallback(
-    packs: &[(
-        PathBuf,
-        crate::index::sealed::RunPack,
-        crate::index::packidx::PackIndexIdentity,
-    )],
-) -> Result<Vec<crate::index::sealed::SealedPack>, String> {
-    packs
-        .iter()
-        .map(|(path, pack, identity)| {
-            let index: Arc<dyn crate::index::sealed::SealedIndex> =
-                match crate::index::packidx::open_for_pack(path) {
-                    Some(sidecar) if sidecar.identity() == *identity => Arc::new(sidecar),
-                    _ => {
-                        let built = crate::index::packidx::build_for_pack(path, true)
-                            .map_err(|error| format!("pack {}: {error}", path.display()))?;
-                        if built.identity() != *identity {
-                            return Err(format!(
-                                "pack {} changed since its run was built",
-                                path.display()
-                            ));
-                        }
-                        Arc::new(built)
-                    }
-                };
-            Ok(crate::index::sealed::SealedPack {
-                slot: pack.slot,
-                pack_id: pack.pack_id,
-                creation_seq: pack.creation_seq,
-                index,
-            })
-        })
-        .collect()
 }
 
 /// Per-pack, per-collection on-disk bytes as `physical_layout` reports them
@@ -1577,14 +1265,6 @@ const READ_RUN_GAP_BYTES: u64 = 128;
 /// avoids a per-candidate length-prefix probe, which would fault in the very
 /// cold page the plan exists to prefetch.
 const MAX_FRAME_DISK_LEN: u64 = 64 * 1024 + 8;
-
-/// Default tiered merge threshold `T`: more unmerged sealed packs than this
-/// become one run.
-const RUN_MERGE_UNMERGED_PACKS: u64 = 16;
-
-/// Default tiered merge fan-in `r`: the newest run is folded into the next
-/// older one while it holds at least `1 / r` of that run's entries.
-const RUN_MERGE_FAN_IN: u64 = 4;
 
 /// Tuning for `get_many`'s merged read plan.
 ///
@@ -2006,54 +1686,14 @@ static SHARD_ROOMS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 struct RoomGeneration {
     index: LossyIndex,
-    /// Locator indexes for sealed packs, newest last. Populated when opening
-    /// sidecar-backed sealed packs; it may be empty when a resident scan has
-    /// already incorporated their live locators. Read paths consult it after
-    /// the resident index.
-    sealed: Arc<crate::index::sealed::SealedLocators>,
-    /// Whether the resident table deliberately omits sealed packs, so a
-    /// sealed lookup is required even when a resident tag candidate exists.
-    paged: bool,
     cache: Arc<NodeCache>,
     generation: u64,
 }
 
 impl RoomGeneration {
-    /// Locators to try for one key: the resident index first, then a sealed
-    /// pack only when the resident index has no candidate at all.
-    ///
-    /// The resident index is authoritative while it holds every pack. In the
-    /// paged mode this is building toward, only unsealed packs are resident,
-    /// so a miss there is exactly when a sealed locator is needed. A resident
-    /// removal stays first and therefore shadows an older sealed frame.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Corrupt`] when a damaged run's covered packs
-    /// cannot be served from their sidecars either; never a false miss.
-    fn candidates(
-        &self,
-        collection_id: &[u8; 16],
-        id: &NodeId,
-    ) -> Result<Vec<(u16, u64)>, StorageError> {
-        let mut candidates: Vec<(u16, u64)> = self.index.lookup_all(id).collect();
-        // Resident entries are always newer than sealed packs (they live in
-        // the active pack, or in a pack sealed during this session). In paged
-        // mode the resident table is incomplete by design, so a resident tag
-        // candidate does not prove the key is absent from sealed packs: append
-        // the sealed version as the next authoritative candidate. Resolution
-        // stops at the first 16-byte hash match, so a resident removal still
-        // shadows an older sealed frame.
-        if !candidates.is_empty() && !self.paged {
-            return Ok(candidates);
-        }
-        if let Some(hit) = self
-            .sealed
-            .lookup(collection_id, id)
-            .map_err(|error| StorageError::Corrupt(error.to_string()))?
-        {
-            candidates.push((hit.slot, hit.offset()));
-        }
-        Ok(candidates)
+    /// Locators to try for one key, from the resident index.
+    fn candidates(&self, id: &NodeId) -> Vec<(u16, u64)> {
+        self.index.lookup_all(id).collect()
     }
 }
 
@@ -2374,8 +2014,6 @@ pub struct PackfileStorage {
     /// Per-instance index config: seed from the pool's `pool.meta`, floor
     /// and load factor from defaults (or future tuning).
     index_config: crate::index::IndexConfig,
-    /// Where sealed packs' locators are served from.
-    index_residency: crate::index::IndexResidency,
     /// Merged-read-plan tuning for `get_many` (see [`ReadPlanPolicy`]).
     /// Read once per batch; settable at runtime via
     /// [`Self::set_read_plan_policy`].
@@ -2579,21 +2217,6 @@ pub struct PackfileStorage {
     index_grow_count: AtomicU64,
     /// Fallback `rebuild_index` calls (full pack scan).
     index_rebuild_count: AtomicU64,
-    /// Whether the sealed packs changed since the run merge policy last
-    /// looked (a Paged writable store only). Set at open, when sidecars are
-    /// drained and when a run is installed or discarded.
-    run_merge_due: AtomicBool,
-    /// Serializes run installs and merge planning across the threads that
-    /// drain sealed packs, so one range is never built twice.
-    run_maintenance: parking_lot::Mutex<()>,
-    /// Tiered merge policy: merge more than this many unmerged sealed packs
-    /// into a run (`T`).
-    run_merge_unmerged_packs: AtomicU64,
-    /// Tiered merge policy: fold the newest run into the next older one while
-    /// it holds at least `1 / r` of that run's entries (`r`).
-    run_merge_fan_in: AtomicU64,
-    /// Runs installed by the merge policy over this store's lifetime.
-    run_merges_installed: AtomicU64,
     /// Frame-header reads that resolved a same-tag probe candidate whose
     /// identity the index did not hold (slots-only checkpoint indexes).
     index_identity_reads: AtomicU64,
@@ -2806,103 +2429,6 @@ pub(crate) const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 const NEW_COLLECTION_INDEX_FLOOR: usize = 64;
 
 impl PackfileStorage {
-    /// Rebuild a Paged reader's collection tables from durable packs after a
-    /// shared-WAL reclaim overtakes its current overlay. Paged mode has no
-    /// checkpoint image, so the only safe reload is the same sidecar/frame
-    /// walk used by a cold open.
-    pub(super) fn reload_paged_index_from_packs(&self) -> Option<u64> {
-        let covered = Self::read_journal_lsn(&self.base_dir);
-        if self.shards.discover_shards().is_err() {
-            return None;
-        }
-        let deleted = Self::load_deleted_collections(&self.base_dir);
-        let Ok(fences) = Self::load_collection_generation_fences(&self.base_dir) else {
-            return None;
-        };
-        let collection_order = persisted_collection_order(&self.base_dir).unwrap_or_default();
-        let index_config = crate::index::IndexConfig {
-            seed: self.shards.bucket_seed(),
-            ..Default::default()
-        };
-        let insert_config = ScanInsertConfig {
-            deleted_collections: &deleted,
-            generation_fences: &fences,
-            index_config,
-        };
-        let mut scan =
-            StreamingOpenScan::new(collection_order, crate::index::IndexResidency::Paged);
-        let mut shards = self.shards.all_shards();
-        shards.sort_by_key(|(_, shard)| shard.creation_seq);
-        for (slot, shard) in shards {
-            if !shard.is_current.load(Ordering::Acquire) {
-                continue;
-            }
-            let sidecar = if shard.sealed.load(Ordering::Acquire) {
-                shard
-                    .take_sealed_index()
-                    .or_else(|| crate::index::packidx::open_for_pack(&shard.path).map(Arc::new))
-            } else {
-                None
-            };
-            if let Some(sidecar) = sidecar {
-                if scan
-                    .insert_sidecar(
-                        &sidecar,
-                        slot,
-                        shard.pack_id,
-                        u64::from(shard.creation_seq),
-                        &insert_config,
-                    )
-                    .is_err()
-                {
-                    return None;
-                }
-                continue;
-            }
-            let mut scan_error = None;
-            let mut visit = |entry| {
-                if scan_error.is_none() {
-                    if let Err(error) = scan.insert(
-                        entry,
-                        slot,
-                        shard.pack_id,
-                        shard.creation_seq,
-                        &insert_config,
-                    ) {
-                        scan_error = Some(error);
-                    }
-                }
-            };
-            if packfile::scan_packfile_from_with_removal_visit(
-                &shard.path,
-                0,
-                self.shards.checksum_policy().verifies_reads(),
-                &mut visit,
-            )
-            .is_err()
-                || scan_error.is_some()
-            {
-                return None;
-            }
-        }
-        let (scan_out, collection_order) = scan.finish(
-            &self.shards,
-            self.cache_capacity,
-            self.cache_budget.as_ref(),
-        );
-        {
-            let mut tables = self.index_tables.write();
-            tables.collections = scan_out.collections;
-            tables.collection_order = collection_order;
-            tables.shard_collections = scan_out.shard_collections;
-            tables.collection_shards = scan_out.collection_shards;
-            tables.collection_disk_bytes = scan_out.collection_disk_bytes;
-        }
-        *self.deleted_collections.lock() = deleted;
-        *self.collection_generation_fences.lock() = fences;
-        Some(covered)
-    }
-
     fn refresh_lock(&self, collection_id: &[u8; 16]) -> Arc<parking_lot::Mutex<()>> {
         let mut locks = self.refresh_locks.lock();
         locks
@@ -2983,9 +2509,7 @@ impl PackfileStorage {
     /// Open a writable packfile storage with explicit runtime settings.
     ///
     /// Callers that want environment defaults pass
-    /// [`RuntimeConfig::from_env`] here. Explicit `open_with_cache*` /
-    /// `open_with_residency*` constructors keep their explicit arguments; this
-    /// constructor applies `config` as-is.
+    /// [`RuntimeConfig::from_env`] here.
     ///
     /// # Errors
     /// Returns `InvalidInput` for an invalid [`RuntimeConfig`], or the same
@@ -2995,10 +2519,7 @@ impl PackfileStorage {
         config: &RuntimeConfig,
     ) -> Result<Self, std::io::Error> {
         config.validate()?;
-        let residency = config
-            .index_residency
-            .unwrap_or(crate::index::IndexResidency::Resident);
-        let store = Self::open_with_options_and_residency(
+        let store = Self::open_with_options_locked(
             base_dir,
             config.cache_capacity,
             config
@@ -3009,7 +2530,7 @@ impl PackfileStorage {
             None,
             true,
             packfile::ChecksumPolicy::Full,
-            residency,
+            true,
         )?;
         store.set_stats_enabled(config.stats_enabled);
         store.set_point_random_mmap(config.point_random_mmap);
@@ -3029,10 +2550,7 @@ impl PackfileStorage {
         config: &RuntimeConfig,
     ) -> Result<Self, std::io::Error> {
         config.validate()?;
-        let residency = config
-            .index_residency
-            .unwrap_or(crate::index::IndexResidency::Resident);
-        let store = Self::open_with_options_and_residency(
+        let store = Self::open_with_options_locked(
             base_dir,
             config.cache_capacity,
             config
@@ -3043,7 +2561,7 @@ impl PackfileStorage {
             None,
             true,
             packfile::ChecksumPolicy::Full,
-            residency,
+            true,
         )?;
         store.set_stats_enabled(config.stats_enabled);
         store.set_point_random_mmap(config.point_random_mmap);
@@ -3255,16 +2773,10 @@ impl PackfileStorage {
     /// only frames tagged with `pool`, so a worker reading the state pool does
     /// not observe event-DAG or edges mutations that share the same
     /// segment. `wal_path` is the database root's shared `wal.bin`, not a
-    /// per-pool segment. This uses the default resident index configuration.
-    /// If the writer uses paged residency, use
-    /// [`Self::open_read_committed_shared_with_config`] with the matching
-    /// runtime configuration so coverage reloads rebuild the same locator
-    /// representation.
+    /// per-pool segment.
     ///
     /// # Errors
-    /// Returns [`StorageError`] if the store or journal cannot be opened, the
-    /// residency record is missing or invalid, or this reader's residency
-    /// differs from the writer's persisted residency.
+    /// Returns [`StorageError`] if the store or journal cannot be opened.
     #[cfg(feature = "multi-reader")]
     pub fn open_read_committed_shared(
         base_dir: PathBuf,
@@ -3272,23 +2784,16 @@ impl PackfileStorage {
         pool: crate::layout::ShardType,
     ) -> Result<Self, StorageError> {
         let store = Self::open_read_only(base_dir)?;
-        store.validate_shared_reader_reload_mode()?;
         store.enable_read_journal_shared(wal_path, pool)?;
         Ok(store)
     }
 
     /// Open a read-only worker on one pool of a shared WAL, using explicit
-    /// runtime settings such as paged index residency.
-    ///
-    /// Use this when the writer's index residency is not the default. In
-    /// particular, paged writers require paged readers so WAL coverage reloads
-    /// rebuild the same locator representation.
+    /// runtime settings.
     ///
     /// # Errors
     /// Returns [`StorageError`] if opening the read-only store fails, runtime
-    /// settings are invalid, the residency record is missing or invalid, this
-    /// reader's residency differs from the writer's, or shared-WAL recovery
-    /// fails.
+    /// settings are invalid, or shared-WAL recovery fails.
     #[cfg(feature = "multi-reader")]
     pub fn open_read_committed_shared_with_config(
         base_dir: PathBuf,
@@ -3297,32 +2802,8 @@ impl PackfileStorage {
         config: &RuntimeConfig,
     ) -> Result<Self, StorageError> {
         let store = Self::open_read_only_with_config(base_dir, config)?;
-        store.validate_shared_reader_reload_mode()?;
         store.enable_read_journal_shared(wal_path, pool)?;
         Ok(store)
-    }
-
-    /// Require this reader to match the durable mode published by the writer.
-    /// Otherwise reclaimed shared-WAL coverage may be impossible to reload
-    /// from this reader's index representation.
-    fn validate_shared_reader_reload_mode(&self) -> Result<(), StorageError> {
-        let writer_residency = read_index_residency_marker(&self.base_dir).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                StorageError::Unsupported(format!(
-                    "{} has no persisted index-residency record; reopen its writer with this mtxdb version before attaching shared-WAL readers",
-                    self.base_dir.display()
-                ))
-            } else {
-                StorageError::Corrupt(error.to_string())
-            }
-        })?;
-        if writer_residency != self.index_residency {
-            return Err(StorageError::Unsupported(format!(
-                "{} writer uses {:?} index residency but this reader uses {:?}; open the reader with open_read_committed_shared_with_config and matching index residency",
-                self.base_dir.display(), writer_residency, self.index_residency
-            )));
-        }
-        Ok(())
     }
 
     /// Open a packfile storage with a custom per-collection cache capacity.
@@ -3374,93 +2855,15 @@ impl PackfileStorage {
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
     ) -> Result<Self, std::io::Error> {
-        Self::open_with_options_and_residency(
-            base_dir,
-            cache_capacity,
-            None,
-            swizzle,
-            writable,
-            max_shard_bytes,
-            compress,
-            checksum_policy,
-            crate::index::IndexResidency::Resident,
-        )
-    }
-
-    /// Open a packfile storage choosing where sealed packs' locators live.
-    ///
-    /// `Paged` keeps only the unsealed tail in the resident index and serves
-    /// sealed packs from their sidecars, including under `ChecksumPolicy::Full`
-    /// (point reads still verify each frame's CRC). See
-    /// `docs/2026-11-02-paged-primary-index.md`.
-    ///
-    /// # Errors
-    /// Same as [`Self::open`].
-    pub fn open_with_residency(
-        base_dir: PathBuf,
-        checksum_policy: packfile::ChecksumPolicy,
-        residency: crate::index::IndexResidency,
-    ) -> Result<Self, std::io::Error> {
-        Self::open_with_options_and_residency(
-            base_dir,
-            DEFAULT_CACHE_CAPACITY,
-            None,
-            None,
-            true,
-            None,
-            true,
-            checksum_policy,
-            residency,
-        )
-    }
-
-    /// Open with a custom shard rotation threshold and index residency.
-    /// Intended for tests and benchmarks that need many sealed packs without
-    /// writing gigabytes.
-    ///
-    /// # Errors
-    /// Same as [`Self::open_with_max_shard_bytes`].
-    pub fn open_with_max_shard_bytes_and_residency(
-        base_dir: PathBuf,
-        max_shard_bytes: u64,
-        checksum_policy: packfile::ChecksumPolicy,
-        residency: crate::index::IndexResidency,
-    ) -> Result<Self, std::io::Error> {
-        Self::open_with_options_and_residency(
-            base_dir,
-            DEFAULT_CACHE_CAPACITY,
-            None,
-            None,
-            true,
-            Some(max_shard_bytes),
-            true,
-            checksum_policy,
-            residency,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn open_with_options_and_residency(
-        base_dir: PathBuf,
-        cache_capacity: usize,
-        cache_budget: Option<Arc<crate::cache::CacheBudget>>,
-        swizzle: Option<SwizzleFn>,
-        writable: bool,
-        max_shard_bytes: Option<u64>,
-        compress: bool,
-        checksum_policy: packfile::ChecksumPolicy,
-        residency: crate::index::IndexResidency,
-    ) -> Result<Self, std::io::Error> {
         Self::open_with_options_locked(
             base_dir,
             cache_capacity,
-            cache_budget,
+            None,
             swizzle,
             writable,
             max_shard_bytes,
             compress,
             checksum_policy,
-            residency,
             true,
         )
     }
@@ -3474,7 +2877,6 @@ impl PackfileStorage {
         max_shard_bytes: Option<u64>,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
-        residency: crate::index::IndexResidency,
     ) -> Result<Self, std::io::Error> {
         Self::open_with_options_locked(
             base_dir,
@@ -3485,7 +2887,6 @@ impl PackfileStorage {
             max_shard_bytes,
             compress,
             checksum_policy,
-            residency,
             false,
         )
     }
@@ -3501,28 +2902,10 @@ impl PackfileStorage {
         max_shard_bytes: Option<u64>,
         compress: bool,
         checksum_policy: packfile::ChecksumPolicy,
-        residency: crate::index::IndexResidency,
         take_writer_lock: bool,
     ) -> Result<Self, std::io::Error> {
-        // Standalone maintenance opens must not silently convert one member
-        // of an existing shared-WAL root. The Database path opens members
-        // under its root lock (`take_writer_lock == false`) and applies one
-        // residency policy to the whole root.
-        if writable && take_writer_lock && residency == crate::index::IndexResidency::Paged {
-            if let Some(root) = crate::layout::enclosing_root(&base_dir)? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "{} is inside database root {}; open the database root to change index residency",
-                        base_dir.display(),
-                        root.display()
-                    ),
-                ));
-            }
-        }
         // A standalone writer creates its directory here. Shared members
-        // create theirs when publishing the residency marker; readers never
-        // create anything.
+        // create theirs with their first pack; readers never create anything.
         if writable && take_writer_lock {
             fs::create_dir_all(&base_dir)?;
         }
@@ -3558,13 +2941,6 @@ impl PackfileStorage {
         } else {
             ShardPool::open_read_only_with_policies(base_dir.clone(), checksum_policy)?
         };
-        if writable {
-            // The standalone shard open above holds the pool writer lock, and
-            // shared members are opened under Database's root lock. Publish
-            // the mode only after acquiring that lock, but before a paged open
-            // retires a resident checkpoint or the writer can publish WAL.
-            persist_index_residency_marker(&base_dir, residency)?;
-        }
         let shard_open_time = shard_open_started.elapsed();
         timings.shard_open = shard_open_time;
         let index_config = crate::index::IndexConfig {
@@ -3610,40 +2986,12 @@ impl PackfileStorage {
         // pack on disk still matches the fingerprint it was written against.
         let deleted_collections = Self::load_deleted_collections(&base_dir);
         let collection_generation_fences = Self::load_collection_generation_fences(&base_dir)?;
-        // Paged mode persists no primary index: sealed packs are served from
-        // their sidecars and the resident table is rebuilt from the active
-        // pack. Delete any checkpoint and delta epoch left by an earlier
-        // resident session *before* this session's first write, so a later
-        // resident open cannot load an image that predates those writes (and
-        // cannot replay a delta this session never wrote).
-        // Every writable open that can delete a delta log (this paged branch,
-        // the pack-set and fingerprint gates, and the rescan below) must first
-        // make the log's version table durable elsewhere. Do it once, up front,
-        // so no deletion site can run ahead of it.
+        // Every writable open that can delete a delta log (the pack-set and
+        // fingerprint gates, and the rescan below) must first make the log's
+        // version table durable elsewhere. Do it once, up front, so no
+        // deletion site can run ahead of it.
         if writable {
             Self::promote_delta_versions(&base_dir)?;
-        }
-        let mut versions_valid = true;
-        if residency == crate::index::IndexResidency::Paged && writable {
-            // The checkpoint is not the primary index in paged mode, but it
-            // is the only durable copy of collection versions for WAL groups
-            // that were already reclaimed. Move those versions to their own
-            // file before retiring it; if that fails, leave the checkpoint in
-            // place rather than destroying the only copy. This open never
-            // loads it, and a later resident open is protected by the pack
-            // fingerprint gate after any write.
-            let checkpoint_path = Self::index_checkpoint_path(&base_dir);
-            versions_valid = Self::ensure_versions_file(&base_dir);
-            if versions_valid || !checkpoint_path.exists() {
-                let _ = fs::remove_file(&checkpoint_path);
-            }
-            // When the versions file could not be produced, the retained
-            // checkpoint (and the delta epoch that extends it) are the only
-            // copy of those versions. Leave both untouched so a refused or
-            // retried open does not destroy durable index state.
-            if versions_valid {
-                Self::sweep_orphan_delta_logs(&base_dir, None);
-            }
         }
         // Capture the journal coverage *before* loading the index, so the bound
         // can never be newer than the index this handle builds. A writer writes
@@ -3651,31 +2999,12 @@ impl PackfileStorage {
         // always yields a bound <= the coverage of the checkpoint/scan below.
         let durable_state = Self::durable_index_state(&base_dir);
         let read_covered = Self::journal_lsn_with(&base_dir, durable_state.covered_lsn);
-        // A writable paged open retires the checkpoint and relies on
-        // `index.versions` as the durable collection-version baseline. If that
-        // file is missing or unreadable while the WAL claims nonzero coverage,
-        // opening anyway would start from an empty baseline and let reclaim
-        // drop the groups that still carry those versions.
-        if residency == crate::index::IndexResidency::Paged
-            && writable
-            && !versions_valid
-            && read_covered > 0
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "{} is missing or unreadable, but durable WAL coverage is {read_covered}; refusing to open a writable paged store with an empty version baseline",
-                    Self::index_versions_path(&base_dir).display()
-                ),
-            ));
-        }
-        // A resident writable open restores collection versions from the
-        // versions file or a checkpoint's logical-version section. If neither
-        // exists while the WAL still claims coverage, opening would report
-        // version 0 for reclaimed groups, so a conditional commit expecting 0
-        // could pass against non-empty data. Fail closed instead.
-        if residency == crate::index::IndexResidency::Resident
-            && writable
+        // A writable open restores collection versions from the versions file
+        // or a checkpoint's logical-version section. If neither exists while
+        // the WAL still claims coverage, opening would report version 0 for
+        // reclaimed groups, so a conditional commit expecting 0 could pass
+        // against non-empty data. Fail closed instead.
+        if writable
             && read_covered > 0
             // With no pack data there is nothing whose version could be lost.
             && !open_shards.is_empty()
@@ -3687,36 +3016,25 @@ impl PackfileStorage {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "no readable version baseline ({} or a checkpoint) while durable WAL coverage is {read_covered}; refusing to open a writable resident store with an empty version baseline",
+                    "no readable version baseline ({} or a checkpoint) while durable WAL coverage is {read_covered}; refusing to open a writable store with an empty version baseline",
                     Self::index_versions_path(&base_dir).display()
                 ),
             ));
         }
         timings.metadata_load = metadata_started.elapsed();
-        let checkpoint = if residency == crate::index::IndexResidency::Resident {
-            Self::checkpoint_scan_out(
-                &base_dir,
-                cache_capacity,
-                cache_budget.as_ref(),
-                &shards,
-                &open_shards,
-                &deleted_collections,
-                writable,
-                ReloadMode::Strict,
-                index_config,
-                &mut timings,
-            )
-        } else {
-            None
-        };
+        let checkpoint = Self::checkpoint_scan_out(
+            &base_dir,
+            cache_capacity,
+            cache_budget.as_ref(),
+            &shards,
+            &open_shards,
+            &deleted_collections,
+            writable,
+            ReloadMode::Strict,
+            index_config,
+            &mut timings,
+        );
         if let Some((scan_out, collection_order, delta_state, checkpoint_covered)) = checkpoint {
-            // Pool open retains verified sidecars so a full-scan index build
-            // can reuse them. A checkpoint open skips that scan, so release
-            // any images it did not consume before returning the store.
-            for (_, shard) in shards.all_shards() {
-                let _ = shard.take_sealed_index();
-            }
-            drop(shards.take_open_runs());
             timings.path = OpenPath::Checkpoint;
             let assemble_started = std::time::Instant::now();
             let store = Self::assemble(
@@ -3729,7 +3047,6 @@ impl PackfileStorage {
                 swizzle,
                 cache_capacity,
                 cache_budget,
-                residency,
                 delta_state,
                 checkpoint_covered,
                 read_covered,
@@ -3753,101 +3070,13 @@ impl PackfileStorage {
         // checkpoint rotates a fresh one and sweeps the old epochs.
 
         let scan_started = std::time::Instant::now();
-        let mut scan_state = StreamingOpenScan::new(collection_order, residency);
-        // Runs replace their covered packs' sidecars in Paged mode only. A
-        // resident build still reads each covered pack through its sidecar or
-        // a frame scan below.
-        // A merged run may span a collection's generation fence. Until runs
-        // carry per-collection generation boundaries, use source pack sidecars
-        // when any fence exists so pre-delete packs can be skipped.
-        let pool_runs = if collection_generation_fences.is_empty() {
-            shards.take_open_runs()
-        } else {
-            drop(shards.take_open_runs());
-            Vec::new()
-        };
-        let mut sealed_runs: Vec<Arc<crate::index::sealed::SealedRun>> = Vec::new();
-        let mut run_of_pack: HashMap<PackId, usize> = HashMap::new();
-        if residency == crate::index::IndexResidency::Paged {
-            let by_pack: HashMap<PackId, (u16, PathBuf)> = shards
-                .all_shards()
-                .into_iter()
-                .map(|(slot, shard)| (shard.pack_id, (slot, shard.path.clone())))
-                .collect();
-            for pool_run in pool_runs {
-                if let Some(run) = sealed_run_for(pool_run, &by_pack) {
-                    for pack in run.packs() {
-                        run_of_pack.insert(pack.pack_id, sealed_runs.len());
-                    }
-                    sealed_runs.push(run);
-                }
-            }
-        }
-        let mut runs_ingested = vec![false; sealed_runs.len()];
+        let mut scan_state = StreamingOpenScan::new(collection_order);
         // The index must see physical versions in order so inserts naturally
         // replace older values and removal markers. The open_shards snapshot
         // remains slot ordered for fingerprinting; sort a separate list here.
         let mut scan_shards = shards.all_shards();
         scan_shards.sort_by_key(|(_, shard)| shard.creation_seq);
         for (slot, shard) in scan_shards {
-            if let Some(&run_index) = run_of_pack.get(&shard.pack_id) {
-                // Runs cover consecutive packs, so ingesting the whole run at
-                // its first pack keeps the scan in creation order.
-                if let (Some(ingested), Some(run)) =
-                    (runs_ingested.get_mut(run_index), sealed_runs.get(run_index))
-                {
-                    if !*ingested {
-                        scan_state.insert_run(run, &deleted_collections);
-                        *ingested = true;
-                    }
-                }
-                continue;
-            }
-            // In `Paged` mode a sidecar replaces the frame scan even under
-            // `Full` checksums: point reads still verify each resolved frame,
-            // and an explicit scrub remains the eager whole-store sweep. In
-            // `Resident` mode the historical gate is unchanged.
-            let use_sidecar = shard.sealed.load(Ordering::Acquire)
-                && (residency == crate::index::IndexResidency::Paged
-                    || !shards.checksum_policy().verifies_reads());
-            if use_sidecar {
-                // Pool open already verified this pack's sidecar to decide it
-                // was sealed; reuse that image instead of checksumming it
-                // again here.
-                let opened = if let Some(sidecar) = shard.take_sealed_index() {
-                    Some(sidecar)
-                } else {
-                    let sidecar_open_started = std::time::Instant::now();
-                    let opened = crate::index::packidx::open_for_pack(&shard.path);
-                    timings.pack_index_open = timings
-                        .pack_index_open
-                        .saturating_add(sidecar_open_started.elapsed());
-                    opened.map(Arc::new)
-                };
-                if let Some(sidecar) = opened {
-                    let sidecar_build_started = std::time::Instant::now();
-                    let inserted = scan_state.insert_sidecar(
-                        &sidecar,
-                        slot,
-                        shard.pack_id,
-                        u64::from(shard.creation_seq),
-                        &ScanInsertConfig {
-                            deleted_collections: &deleted_collections,
-                            generation_fences: &collection_generation_fences,
-                            index_config,
-                        },
-                    );
-                    timings.pack_index_build = timings
-                        .pack_index_build
-                        .saturating_add(sidecar_build_started.elapsed());
-                    inserted?;
-                    timings.pack_index_sidecars = timings.pack_index_sidecars.saturating_add(1);
-                    continue;
-                }
-            } else {
-                // Resident mode will not consult this image; release it.
-                let _ = shard.take_sealed_index();
-            }
             let tail_started = std::time::Instant::now();
             if writable {
                 // Recovery can safely truncate only a torn final frame. The
@@ -3916,10 +3145,6 @@ impl PackfileStorage {
             }
             timings.tail_scan = timings.tail_scan.saturating_add(tail_started.elapsed());
         }
-        // Also cover unusual scan paths that did not consume a verified image.
-        for (_, shard) in shards.all_shards() {
-            let _ = shard.take_sealed_index();
-        }
         timings.full_scan = scan_started.elapsed();
 
         // The frames themselves built the indexes; this final pass only turns
@@ -3927,7 +3152,6 @@ impl PackfileStorage {
         let materialization_started = std::time::Instant::now();
         let (scan_out, collection_order) =
             scan_state.finish(&shards, cache_capacity, cache_budget.as_ref());
-        shards.set_sealed_runs(sealed_runs);
         timings.index_materialization = materialization_started.elapsed();
 
         let store = Self::assemble(
@@ -3940,7 +3164,6 @@ impl PackfileStorage {
             swizzle,
             cache_capacity,
             cache_budget,
-            residency,
             // A full rescan re-cooks every index from scratch, so no delta log
             // can continue anything the checkpoint recorded; force the next
             // dirty sync into a full checkpoint rewrite that re-bases the log.
@@ -3955,9 +3178,6 @@ impl PackfileStorage {
         // import) would rescan every packfile on every open forever.
         if writable {
             store.index_checkpoint_dirty.store(true, Ordering::Relaxed);
-        }
-        if writable && residency == crate::index::IndexResidency::Paged {
-            store.maintain_runs();
         }
         timings.total = started.elapsed();
         *store.last_open_timings.lock() = Some(timings);
@@ -3982,7 +3202,6 @@ impl PackfileStorage {
         swizzle: Option<SwizzleFn>,
         cache_capacity: usize,
         cache_budget: Option<Arc<crate::cache::CacheBudget>>,
-        residency: crate::index::IndexResidency,
         delta_state: DeltaLogState,
         read_covered: u64,
         durable_coverage: u64,
@@ -4028,7 +3247,6 @@ impl PackfileStorage {
             cache_capacity,
             cache_budget,
             index_config,
-            index_residency: residency,
             read_plan: RwLock::new(ReadPlanPolicy::default()),
             index_collections: RwLock::new(std::collections::HashSet::new()),
             repack_count: AtomicU64::new(0),
@@ -4122,11 +3340,6 @@ impl PackfileStorage {
             index_clone_time_ns: AtomicU64::new(0),
             index_grow_count: AtomicU64::new(0),
             index_rebuild_count: AtomicU64::new(0),
-            run_merge_due: AtomicBool::new(true),
-            run_maintenance: parking_lot::Mutex::new(()),
-            run_merge_unmerged_packs: AtomicU64::new(RUN_MERGE_UNMERGED_PACKS),
-            run_merge_fan_in: AtomicU64::new(RUN_MERGE_FAN_IN),
-            run_merges_installed: AtomicU64::new(0),
             index_identity_reads: AtomicU64::new(0),
             delta_invalidations: AtomicU64::new(0),
             sync_calls: AtomicU64::new(0),
@@ -4151,31 +3364,6 @@ impl PackfileStorage {
         base_dir.join(crate::index::versions::INDEX_VERSIONS_FILE)
     }
 
-    /// Persist collection versions from a legacy checkpoint into their own
-    /// file before a writable paged open retires the checkpoint.
-    ///
-    /// Returns `true` when a valid versions file is present afterwards (or
-    /// when there is no checkpoint to migrate). Sealed packs carry no version
-    /// tag, so the checkpoint's `logical_versions` are the only durable copy
-    /// for frames whose WAL groups were reclaimed.
-    fn ensure_versions_file(base_dir: &std::path::Path) -> bool {
-        let versions_path = Self::index_versions_path(base_dir);
-        if crate::index::versions::read_versions(&versions_path).is_some() {
-            return true;
-        }
-        let Some(checkpoint) =
-            crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir))
-        else {
-            return false;
-        };
-        crate::index::versions::write_versions(
-            &versions_path,
-            &checkpoint.logical_versions,
-            checkpoint.covered_lsn,
-        )
-        .is_ok()
-    }
-
     /// Persist the collection-version table a delta log carries into
     /// `index.versions` before a writable open can delete that log.
     ///
@@ -4183,7 +3371,7 @@ impl PackfileStorage {
     /// own coverage, and the version table it carries is then the only durable
     /// copy of the versions for the reclaimed groups. The open path deletes
     /// delta logs in several places (a log that no longer matches the pack set,
-    /// a checkpoint rejected into a rescan, a paged conversion), and every one
+    /// a checkpoint rejected into a rescan), and every one
     /// of them runs before [`Self::enable_shared_journal`] checks that the
     /// baseline covers the reclaimed history. Deleting the log first leaves
     /// nothing for that check to find, and every retry fails the same way.
@@ -4311,8 +3499,7 @@ impl PackfileStorage {
     /// header is the only place that coverage is written down.
     fn durable_index_state(base_dir: &std::path::Path) -> DurableIndexState {
         // The versions file is the coverage record that survives checkpoint
-        // retirement: a writable paged open deletes the checkpoint but keeps
-        // this file, so a crash between its fsync and `journal.lsn` must still
+        // retirement, so a crash between its fsync and `journal.lsn` must still
         // recover the coverage it names.
         let versions_coverage =
             crate::index::versions::read_coverage(&Self::index_versions_path(base_dir))
@@ -5029,9 +4216,6 @@ impl PackfileStorage {
                 loaded.collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
-                    sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
-                    // Checkpoint loading is resident-only under strategy 1.
-                    paged: false,
                     cache: Arc::new(NodeCache::with_budget(
                         cache_capacity,
                         cache_budget.cloned(),
@@ -5080,9 +4264,6 @@ impl PackfileStorage {
                 collection_id,
                 ArcSwap::from_pointee(RoomGeneration {
                     index,
-                    sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
-                    // Checkpoint loading is resident-only under strategy 1.
-                    paged: false,
                     cache: Arc::new(NodeCache::with_budget(
                         cache_capacity,
                         cache_budget.cloned(),
@@ -5313,21 +4494,10 @@ impl PackfileStorage {
     ) -> Option<(usize, usize, usize, u32)> {
         self.collections_read().get(collection_id).map(|gen| {
             let g = gen.load();
-            let sealed_slots = g.sealed.slot_ids_in_collection(collection_id);
-            let resident_entries: u64 = g
-                .index
-                .slot_counts_excluding_set(&sealed_slots)
-                .values()
-                .copied()
-                .sum();
-            let entries =
-                resident_entries.saturating_add(g.sealed.entry_count_in_collection(collection_id));
             (
-                usize::try_from(entries).unwrap_or(usize::MAX),
+                g.index.len(),
                 g.index.resident_bytes(),
-                g.index
-                    .mapped_bytes()
-                    .saturating_add(usize::try_from(g.sealed.mapped_bytes()).unwrap_or(usize::MAX)),
+                g.index.mapped_bytes(),
                 g.index.capacity(),
             )
         })
@@ -5339,20 +4509,7 @@ impl PackfileStorage {
     pub fn collection_index_info(&self, collection_id: &[u8; 16]) -> Option<(usize, usize, u32)> {
         self.collections_read().get(collection_id).map(|gen| {
             let g = gen.load();
-            let sealed_slots = g.sealed.slot_ids_in_collection(collection_id);
-            let resident_entries: u64 = g
-                .index
-                .slot_counts_excluding_set(&sealed_slots)
-                .values()
-                .copied()
-                .sum();
-            let entries =
-                resident_entries.saturating_add(g.sealed.entry_count_in_collection(collection_id));
-            (
-                usize::try_from(entries).unwrap_or(usize::MAX),
-                g.index.memory_usage(),
-                g.index.capacity(),
-            )
+            (g.index.len(), g.index.memory_usage(), g.index.capacity())
         })
     }
 
@@ -5362,42 +4519,10 @@ impl PackfileStorage {
     /// never scans pack files. The order is the index's bucket order. Callers
     /// resolve the slot to a shard and read the frame at the offset. Returns
     /// `None` when the collection is unknown.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::Corrupt`] when a damaged run's covered packs
-    /// cannot be served from their sidecars either.
-    pub fn collection_live_locations(
-        &self,
-        collection_id: &[u8; 16],
-    ) -> Result<Option<Vec<(u16, u64)>>, StorageError> {
+    pub fn collection_live_locations(&self, collection_id: &[u8; 16]) -> Option<Vec<(u16, u64)>> {
         self.collections_read()
             .get(collection_id)
-            .map(|generation| {
-                let g = generation.load();
-                let mut locations: Vec<(u16, u64)> = g.index.live_entries().collect();
-                if !g.paged || g.sealed.is_empty() {
-                    return Ok(locations);
-                }
-                // The resident tail is newer than every sealed pack, so its keys
-                // win. Among sealed packs, iteration is newest-first; keep the
-                // first occurrence of each id and drop removal versions. A
-                // resident identity (live or removal) also shadows the sealed
-                // version, so only yield a sealed locator when the resident
-                // index has no identity for the key.
-                let mut seen: HashSet<[u8; 16]> =
-                    HashSet::with_capacity(g.sealed.len().saturating_mul(64));
-                g.sealed
-                    .for_each_in_collection(collection_id, |hit, id| {
-                        if hit.removed() {
-                            seen.insert(id);
-                        } else if seen.insert(id) && g.index.lookup_removed(&id).is_none() {
-                            locations.push((hit.slot, hit.offset()));
-                        }
-                    })
-                    .map_err(|error| StorageError::Corrupt(error.to_string()))?;
-                Ok(locations)
-            })
-            .transpose()
+            .map(|generation| generation.load().index.live_entries().collect())
     }
 
     /// Return live collection records with their physical frame locations.
@@ -5414,7 +4539,7 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
     ) -> Result<Option<Vec<LiveRecordLocation>>, StorageError> {
-        let Some(locations) = self.collection_live_locations(collection_id)? else {
+        let Some(locations) = self.collection_live_locations(collection_id) else {
             return Ok(None);
         };
         let live: HashSet<(u16, u64)> = locations.into_iter().collect();
@@ -5446,18 +4571,9 @@ impl PackfileStorage {
             .filter_map(|id| {
                 tables.collections.get(id).map(|gen| {
                     let g = gen.load();
-                    let sealed_slots = g.sealed.slot_ids_in_collection(id);
-                    let resident_entries: u64 = g
-                        .index
-                        .slot_counts_excluding_set(&sealed_slots)
-                        .values()
-                        .copied()
-                        .sum();
-                    let entries =
-                        resident_entries.saturating_add(g.sealed.entry_count_in_collection(id));
                     (
                         *id,
-                        usize::try_from(entries).unwrap_or(usize::MAX),
+                        g.index.len(),
                         g.index.memory_usage(),
                         g.index.capacity(),
                     )
@@ -5916,8 +5032,6 @@ impl PackfileStorage {
                 } else {
                     Arc::new(RoomGeneration {
                         index: generation.index.clone(),
-                        sealed: Arc::clone(&generation.sealed),
-                        paged: generation.paged,
                         cache: Arc::clone(&generation.cache),
                         generation: generation.generation,
                     })
@@ -5962,7 +5076,6 @@ impl PackfileStorage {
         let mut work = Vec::new();
         if let Some(generation) = generation {
             Self::append_collection_locator_work(
-                collection_id,
                 keys,
                 generation,
                 &HashMap::new(),
@@ -5970,7 +5083,7 @@ impl PackfileStorage {
                 shards,
                 &mut pinned,
                 &mut work,
-            )?;
+            );
         }
         Ok(CollectionScan {
             store: self,
@@ -6068,8 +5181,6 @@ impl PackfileStorage {
             } else {
                 Arc::new(RoomGeneration {
                     index: generation.index.clone(),
-                    sealed: Arc::clone(&generation.sealed),
-                    paged: generation.paged,
                     cache: Arc::clone(&generation.cache),
                     generation: generation.generation,
                 })
@@ -6097,7 +5208,6 @@ impl PackfileStorage {
         let mut work = Vec::new();
         if let Some(generation) = generation.as_deref() {
             Self::append_collection_locator_work(
-                collection_id,
                 keys,
                 generation,
                 overlay_puts,
@@ -6105,7 +5215,7 @@ impl PackfileStorage {
                 &shards,
                 &mut pinned,
                 &mut work,
-            )?;
+            );
         }
 
         // Durable keys shadowed by the overlay were skipped above, so each
@@ -6175,7 +5285,6 @@ impl PackfileStorage {
         reason = "one scan snapshot: collection, keys, generation, overlay, shards, and outputs"
     )]
     fn append_collection_locator_work(
-        collection_id: &[u8; 16],
         keys: Vec<NodeId>,
         generation: &RoomGeneration,
         overlay_puts: &HashMap<NodeId, NodeData>,
@@ -6183,13 +5292,13 @@ impl PackfileStorage {
         shards: &[(u16, Arc<Shard>)],
         pinned: &mut HashMap<u16, Arc<Shard>>,
         work: &mut Vec<ScanWork>,
-    ) -> Result<(), StorageError> {
+    ) {
         for id in keys {
             if overlay_puts.contains_key(&id) || overlay_removes.contains(&id) {
                 // An overlay mutation is newer than the durable one.
                 continue;
             }
-            let candidates = generation.candidates(collection_id, &id)?;
+            let candidates = generation.candidates(&id);
             if candidates.is_empty() {
                 continue;
             }
@@ -6200,7 +5309,6 @@ impl PackfileStorage {
             }
             work.push(ScanWork::Locators(id, candidates));
         }
-        Ok(())
     }
 
     /// Materialized scan of one collection, kept for tests that assert on
@@ -7001,12 +6109,6 @@ impl PackfileStorage {
         locator: RecordLocator,
         removed: bool,
     ) {
-        // No persisted index, so there is no delta batch to queue. Keeping
-        // `pending` empty also stops it growing without bound in a long paged
-        // session.
-        if self.index_residency == crate::index::IndexResidency::Paged {
-            return;
-        }
         let RecordLocator {
             slot,
             offset,
@@ -7127,72 +6229,6 @@ impl PackfileStorage {
         Vec::new()
     }
 
-    /// Refresh the collection-version baseline from a paged sync.
-    ///
-    /// Paged mode has no checkpoint to carry versions and does not advance
-    /// journal coverage, so the WAL normally keeps them. Writing the file
-    /// anyway keeps the durable baseline current without paying for an index
-    /// image, and covers a later WAL truncation outside this writer's control.
-    fn persist_versions_file(&self) {
-        let (Some(journal), Some(pool)) = (
-            self.journal(),
-            pool_from_tag(self.journal_pool.load(Ordering::Acquire)),
-        ) else {
-            return;
-        };
-        let through = journal.committed_lsn_for_pool(pool);
-        let versions = journal.collection_versions_through(pool, through);
-        // Paged mode does not advance coverage; record the coverage the store
-        // already durably has, never `through`, or this file would authorize a
-        // reclaim the packs have not been checkpointed for.
-        let _ = crate::index::versions::write_versions(
-            &Self::index_versions_path(&self.base_dir),
-            &versions,
-            self.durable_coverage(),
-        );
-    }
-
-    /// Persist a Paged pool's pack data and collection versions before making
-    /// a newer shared-WAL coverage claim. Paged has no index checkpoint, so
-    /// the versions file is its durable recovery baseline.
-    fn persist_paged_coverage(&self) -> Result<(), StorageError> {
-        let Some(initial_covered) = self.checkpoint_covered_lsn() else {
-            self.persist_versions_file();
-            return Ok(());
-        };
-
-        let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
-        collection_ids.sort_unstable();
-        let mut lock_arcs: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
-        let create_guard = self.collection_creation.write();
-        let ids_now: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
-        for id in ids_now.iter().filter(|id| !collection_ids.contains(id)) {
-            lock_arcs.push(self.put_mutex(id));
-        }
-        let guards: Vec<_> = lock_arcs.iter().map(|lock| lock.lock()).collect();
-
-        // Re-sample only after all collection publications are quiescent, then
-        // fsync every pack before writing the matching versions/coverage file.
-        let covered = self
-            .checkpoint_covered_lsn()
-            .unwrap_or(initial_covered)
-            .max(initial_covered);
-        self.shards.sync_all().map_err(StorageError::Io)?;
-        let versions = self.checkpoint_logical_versions(Some(covered));
-        crate::index::versions::write_versions(
-            &Self::index_versions_path(&self.base_dir),
-            &versions,
-            covered,
-        )
-        .map_err(StorageError::Io)?;
-        self.durable_coverage.fetch_max(covered, Ordering::AcqRel);
-
-        drop(guards);
-        drop(create_guard);
-        let _ = self.report_coverage_and_reclaim(covered);
-        Ok(())
-    }
-
     /// Persist the full per-collection index state to `index.checkpoint`, so
     /// the next open can load it instead of rescanning every packfile.
     ///
@@ -7248,14 +6284,6 @@ impl PackfileStorage {
     fn capture_checkpoint(&self) -> Result<Option<CapturedCheckpoint>, StorageError> {
         let started = std::time::Instant::now();
         let mut breakdown = CheckpointBreakdown::default();
-        // Strategy 1: a paged store never publishes a primary-index
-        // checkpoint. The resident table is only the active pack, so an image
-        // would either omit sealed records (unsafe for a resident open) or
-        // require materializing them (defeating the mode).
-        if self.index_residency == crate::index::IndexResidency::Paged {
-            self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
-            return Ok(None);
-        }
         if !self.index_checkpoint_dirty.load(Ordering::Relaxed) {
             return Ok(None);
         }
@@ -8085,11 +7113,6 @@ impl PackfileStorage {
     /// claim last, appended and fsynced. A crash before the batch is durable
     /// leaves no claim; a torn batch fails its CRC and claims nothing.
     fn append_index_delta_v1(&self, with_coverage: bool) -> Result<Option<u64>, StorageError> {
-        // Strategy 1: no persisted primary index means no delta epoch to
-        // continue. `record_redo` already skips queueing frames.
-        if self.index_residency == crate::index::IndexResidency::Paged {
-            return Ok(None);
-        }
         if with_coverage {
             // Make the bulk of the pack bytes durable before any lock is taken;
             // the fsync under the locks below then only covers what was written
@@ -8445,21 +7468,6 @@ impl PackfileStorage {
         })?;
         Ok(Some((record.hash, new_slot, new_offset, disk_bytes)))
     }
-    /// Swap in a generation with a freshly derived sealed set.
-    ///
-    /// Repack/refresh build a full index from current frames, so every sealed
-    /// pack they replace must be dropped: a locator pointing at a retired
-    /// pack could otherwise resurrect a dropped record on a resident miss.
-    fn swap_generation_with_sealed(
-        &self,
-        collection_id: &[u8; 16],
-        index: LossyIndex,
-        sealed: Arc<crate::index::sealed::SealedLocators>,
-    ) -> Result<(), StorageError> {
-        let cache = self.generation(collection_id).map(|g| g.cache.clone());
-        self.store_generation_with_sealed(collection_id, index, sealed, cache, true)
-    }
-
     /// Store a new generation for a collection, reusing the existing cache if present.
     ///
     /// If the collection is new (not yet in the `collections` map), it is added to
@@ -8474,22 +7482,6 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         index: LossyIndex,
-        cache: Option<Arc<NodeCache>>,
-        bump_generation: bool,
-    ) -> Result<(), StorageError> {
-        let sealed = self.generation(collection_id).map_or_else(
-            || Arc::new(crate::index::sealed::SealedLocators::new()),
-            |gen| Arc::clone(&gen.sealed),
-        );
-        self.store_generation_with_sealed(collection_id, index, sealed, cache, bump_generation)
-    }
-
-    /// As [`Self::store_generation`], with an explicit sealed-locator set.
-    fn store_generation_with_sealed(
-        &self,
-        collection_id: &[u8; 16],
-        index: LossyIndex,
-        sealed: Arc<crate::index::sealed::SealedLocators>,
         cache: Option<Arc<NodeCache>>,
         bump_generation: bool,
     ) -> Result<(), StorageError> {
@@ -8509,8 +7501,6 @@ impl PackfileStorage {
         });
         let new_gen = Arc::new(RoomGeneration {
             index,
-            sealed,
-            paged: self.index_residency == crate::index::IndexResidency::Paged,
             cache,
             generation,
         });
@@ -8529,8 +7519,6 @@ impl PackfileStorage {
                 .or_insert_with(|| {
                     ArcSwap::from_pointee(RoomGeneration {
                         index: LossyIndex::new(0),
-                        sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
-                        paged: self.index_residency == crate::index::IndexResidency::Paged,
                         cache: Arc::new(NodeCache::with_budget(
                             self.cache_capacity,
                             self.cache_budget.clone(),
@@ -8556,8 +7544,6 @@ impl PackfileStorage {
                     .or_insert_with(|| {
                         ArcSwap::from_pointee(RoomGeneration {
                             index: LossyIndex::new(0),
-                            sealed: Arc::new(crate::index::sealed::SealedLocators::new()),
-                            paged: self.index_residency == crate::index::IndexResidency::Paged,
                             cache: Arc::new(NodeCache::with_budget(
                                 self.cache_capacity,
                                 self.cache_budget.clone(),
@@ -8571,85 +7557,6 @@ impl PackfileStorage {
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
-    /// Evict packs whose sidecar was durably published since the last drain
-    /// from a paged store's resident index.
-    ///
-    /// The pack is marked `sealed` before its sidecar exists, so eviction is
-    /// driven by [`ShardPool::take_sealed_ready`] — the queue is populated only
-    /// after the sidecar's atomic rename. `wait` joins in-flight sidecar
-    /// builders first, for a synchronous barrier.
-    ///
-    /// Each affected collection is rebuilt from the unsealed packs and the
-    /// now-published sidecars, then its generation is swapped in atomically.
-    /// A concurrent lookup therefore sees either the old generation (record
-    /// still resident) or the new one (record served by the sidecar), never a
-    /// gap. A missing or invalid sidecar leaves the collection resident; that
-    /// costs memory, never correctness.
-    fn evict_newly_sealed(&self, wait: bool) {
-        if self.index_residency != crate::index::IndexResidency::Paged {
-            return;
-        }
-        if wait {
-            self.shards.wait_for_seals();
-        }
-        let notices = self.shards.take_sealed_ready();
-        if !notices.is_empty() {
-            self.evict_sealed_notices(notices);
-            self.run_merge_due.store(true, Ordering::Release);
-        }
-        self.maintain_runs();
-    }
-
-    /// Swap each collection with entries in newly announced sealed packs to a
-    /// generation that serves them from their sidecars.
-    fn evict_sealed_notices(&self, notices: Vec<(u16, PackId)>) {
-        let mut affected: HashMap<[u8; 16], Vec<(u16, PackId)>> = HashMap::new();
-        for (slot, pack_id) in notices {
-            let Some(shard) = self.shards.get_shard(slot) else {
-                continue;
-            };
-            if shard.pack_id != pack_id || !shard.is_current.load(Ordering::Acquire) {
-                continue;
-            }
-            let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) else {
-                // The announce edge means this should not happen; if it does,
-                // keep the entries resident and let a later rebuild scan them.
-                continue;
-            };
-            sidecar.for_each_collection(|collection_id, count| {
-                if count > 0 {
-                    affected
-                        .entry(collection_id)
-                        .or_default()
-                        .push((slot, pack_id));
-                }
-            });
-        }
-        let mut retry = Vec::new();
-        for (collection_id, pending) in affected {
-            if let Some(generation) = self.generation(&collection_id) {
-                if pending
-                    .iter()
-                    .all(|(_, pack_id)| generation.sealed.contains_pack(*pack_id))
-                {
-                    continue;
-                }
-            }
-            if let Err(error) = self.refresh_collection(&collection_id) {
-                eprintln!(
-                    "mtxdb: paged eviction could not refresh {}: {error}",
-                    hex16(&collection_id)
-                );
-                // Do not drop the publication edge on a transient failure:
-                // the entries stay resident, and a later drain retries.
-                retry.extend(pending);
-            }
-        }
-        if !retry.is_empty() {
-            self.shards.return_sealed_ready(retry);
-        }
-    }
-
     /// Forces a re-scan of a collection's shards from disk and atomically swaps in the new index.
     /// This is designed for multi-worker environments to pull in external appends on demand.
     ///
@@ -8687,189 +7594,8 @@ impl PackfileStorage {
         };
         self.shards.discover_shards()?;
         let existing_cache = self.generation(collection_id).map(|g| g.cache.clone());
-        if self.index_residency == crate::index::IndexResidency::Paged {
-            // A paged refresh must not pull sealed packs back into the
-            // resident table. Rebuild only the unsealed tail and re-derive
-            // the sealed locator set from the packs that are sealed now.
-            let (new_index, sealed) = self.rebuild_tail(collection_id)?;
-            let sealed_slots = sealed.slot_ids_in_collection(collection_id);
-            let mut counts = new_index.slot_counts_excluding_set(&sealed_slots);
-            for (slot, count) in sealed.slot_counts_in_collection(collection_id) {
-                let entry = counts.entry(slot).or_insert(0u64);
-                *entry = entry.saturating_add(count);
-            }
-            self.replace_collection_shard_counts(
-                collection_id,
-                &self.slot_counts_to_pack_id_counts(&counts),
-            );
-            return self.store_generation_with_sealed(
-                collection_id,
-                new_index,
-                Arc::new(sealed),
-                existing_cache,
-                true,
-            );
-        }
         let new_index = self.rebuild_index(collection_id)?;
-        // `rebuild_index` scans every pack, so the result is complete and
-        // supersedes any previously registered sealed locators. Keeping them
-        // would double-count and could answer from a retired pack.
-        self.store_generation_with_sealed(
-            collection_id,
-            new_index,
-            Arc::new(crate::index::sealed::SealedLocators::new()),
-            existing_cache,
-            true,
-        )
-    }
-
-    /// Rebuild only the unsealed tail for one collection, registering every
-    /// sealed pack that contains it as a sidecar-backed locator source.
-    ///
-    /// A sealed pack with no usable sidecar is scanned into the resident
-    /// index instead, so a missing sidecar costs memory, never correctness.
-    fn ingest_current_sealed_runs(
-        &self,
-        collection_id: &[u8; 16],
-        generation_floor: Option<u32>,
-        sealed: &mut crate::index::sealed::SealedLocators,
-    ) -> HashSet<PackId> {
-        // Reuse this session's runs for the packs they cover. A run with a
-        // pack that is no longer current stops serving; its remaining packs
-        // are read through their sidecars below. A recreated collection must
-        // ignore runs from its previous generation.
-        let runs = if generation_floor.is_some() {
-            Vec::new()
-        } else {
-            self.shards.sealed_runs()
-        };
-        let mut run_covered = HashSet::new();
-        for run in runs {
-            let current = run.packs().iter().all(|pack| {
-                self.shards.get_shard(pack.slot).is_some_and(|shard| {
-                    shard.pack_id == pack.pack_id && shard.is_current.load(Ordering::Acquire)
-                })
-            });
-            if !current {
-                self.shards.drop_sealed_run(&run);
-                continue;
-            }
-            run_covered.extend(run.packs().iter().map(|pack| pack.pack_id));
-            if run
-                .run()
-                .pack_stats_in_collection(collection_id)
-                .next()
-                .is_some()
-            {
-                sealed.insert_run(run);
-            }
-        }
-        run_covered
-    }
-
-    fn rebuild_tail(
-        &self,
-        collection_id: &[u8; 16],
-    ) -> Result<(LossyIndex, crate::index::sealed::SealedLocators), StorageError> {
-        self.index_rebuild_count.fetch_add(1, Ordering::Relaxed);
-        self.shards.flush_all()?;
-        let mut shards = self.shards.all_shards();
-        shards.sort_by_key(|(_, shard)| shard.creation_seq);
-        let mut index = LossyIndex::with_config(NEW_COLLECTION_INDEX_FLOOR, self.index_config);
-        let mut sealed = crate::index::sealed::SealedLocators::new();
-        let generation_floor = self
-            .collection_generation_fences
-            .lock()
-            .get(collection_id)
-            .copied();
-        let run_covered =
-            self.ingest_current_sealed_runs(collection_id, generation_floor, &mut sealed);
-        // Sidecars this session already opened and verified, from every
-        // collection's generation: a sealed pack is immutable, so reopening
-        // and re-verifying it on each refresh (about 0.5 ms a pack) only adds
-        // put latency at every pack rotation.
-        let loaded = self.loaded_sidecars();
-        for (slot, shard) in shards {
-            if !shard.is_current.load(Ordering::Acquire) || run_covered.contains(&shard.pack_id) {
-                continue;
-            }
-            if generation_floor.is_some_and(|floor| shard.creation_seq < floor) {
-                continue;
-            }
-            if shard.sealed.load(Ordering::Acquire) {
-                if let Some(pack) = loaded.get(&shard.pack_id).filter(|pack| pack.slot == slot) {
-                    if pack.index.collection_entry_count(collection_id).is_some() {
-                        sealed.insert(pack.clone());
-                    }
-                    continue;
-                }
-                // A Paged rebuild trusts the sidecar instead of the frame
-                // scan even under `Full` checksums: the sidecar itself is
-                // CRC-verified, and point reads still verify each resolved
-                // frame. An eager whole-pack CRC sweep remains available as an
-                // explicit scrub.
-                if let Some(sidecar) = crate::index::packidx::open_for_pack(&shard.path) {
-                    if sidecar.collection_entry_count(collection_id).is_some() {
-                        let sidecar: Arc<dyn crate::index::sealed::SealedIndex> = Arc::new(sidecar);
-                        sealed.insert(crate::index::sealed::SealedPack {
-                            slot,
-                            pack_id: shard.pack_id,
-                            creation_seq: u64::from(shard.creation_seq),
-                            index: sidecar,
-                        });
-                    }
-                    // A valid sidecar is authoritative for this collection,
-                    // including "not present"; no frame scan is needed.
-                    continue;
-                }
-            }
-            let mut scanner = shard.scan_data_path(|path| {
-                packfile::scan_packfile_iter(path, self.shards.checksum_policy().verifies_reads())
-            })?;
-            while let Some(record) = scanner.next_with_removal() {
-                let record = record?;
-                if record.collection_id != *collection_id {
-                    continue;
-                }
-                check_index_offset(slot, &record.hash, record.offset)?;
-                loop {
-                    match index.insert_tracked_with_removed(
-                        &record.hash,
-                        slot,
-                        record.offset,
-                        record.removed,
-                    ) {
-                        Ok(_) => break,
-                        Err(InsertError::TableFull) => {
-                            index = index.grow().ok_or_else(|| {
-                                StorageError::Corrupt(format!(
-                                    "index insert failed for the record at offset {} in shard {slot}: table cannot grow",
-                                    record.offset
-                                ))
-                            })?;
-                        }
-                        Err(error) => {
-                            return Err(StorageError::Corrupt(format!(
-                                "index insert failed for the record at offset {} in shard {slot}: {error}",
-                                record.offset
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        Ok((index, sealed))
-    }
-
-    /// Every sidecar loaded into a collection generation, by pack.
-    fn loaded_sidecars(&self) -> HashMap<PackId, crate::index::sealed::SealedPack> {
-        let mut loaded = HashMap::new();
-        for gen_swap in self.collections_read().values() {
-            for pack in gen_swap.load().sealed.packs() {
-                loaded.entry(pack.pack_id).or_insert_with(|| pack.clone());
-            }
-        }
-        loaded
+        self.store_generation(collection_id, new_index, existing_cache, true)
     }
 
     fn rebuild_index(&self, collection_id: &[u8; 16]) -> Result<LossyIndex, StorageError> {
@@ -8898,54 +7624,12 @@ impl PackfileStorage {
             .copied();
         for (slot, shard) in shards {
             // A retired shard has no live records; its pack may already be
-            // gone, leaving only a stale sidecar. Never let it contribute.
+            // gone. Never let it contribute.
             if !shard.is_current.load(Ordering::Acquire) {
                 continue;
             }
             if generation_floor.is_some_and(|floor| shard.creation_seq < floor) {
                 continue;
-            }
-            // A sealed pack's sidecar already holds every frame's newest
-            // version, including removals. Use it instead of walking the raw
-            // frames; a missing or stale sidecar falls back to the scanner.
-            if shard.sealed.load(Ordering::Acquire)
-                && !self.shards.checksum_policy().verifies_reads()
-            {
-                if let Some(sealed) = crate::index::packidx::open_for_pack(&shard.path) {
-                    let mut entries = Vec::new();
-                    sealed.for_each_entry_in_collection(collection_id, |hash, locator| {
-                        entries.push((hash, locator));
-                    });
-                    for (hash, locator) in entries {
-                        let (offset, removed) = match locator {
-                            crate::index::packidx::PackIndexLocator::Frame(offset) => {
-                                (u64::from(offset), false)
-                            }
-                            crate::index::packidx::PackIndexLocator::Removed(offset) => {
-                                (u64::from(offset), true)
-                            }
-                        };
-                        check_index_offset(slot, &hash, offset)?;
-                        loop {
-                            match index.insert_tracked_with_removed(&hash, slot, offset, removed) {
-                                Ok(_) => break,
-                                Err(InsertError::TableFull) => {
-                                    index = index.grow().ok_or_else(|| {
-                                    StorageError::Corrupt(format!(
-                                        "index insert failed for the record at offset {offset} in shard {slot}: table cannot grow"
-                                    ))
-                                })?;
-                                }
-                                Err(error) => {
-                                    return Err(StorageError::Corrupt(format!(
-                                    "index insert failed for the record at offset {offset} in shard {slot}: {error}"
-                                )));
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
             }
 
             let mut scanner = shard.scan_data_path(|path| {
@@ -9228,7 +7912,7 @@ impl PackfileStorage {
         let Some(generation) = gen_guard.as_deref() else {
             return Ok(None);
         };
-        let candidates: Vec<(u16, u64)> = generation.candidates(collection_id, id)?;
+        let candidates: Vec<(u16, u64)> = generation.candidates(id);
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -9332,7 +8016,6 @@ impl PackfileStorage {
     fn bfs_ancestors(
         &self,
         gen: &Arc<RoomGeneration>,
-        collection_id: &[u8; 16],
         frontier: &[[u8; 16]],
         stop_at: &[[u8; 16]],
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
@@ -9351,12 +8034,7 @@ impl PackfileStorage {
         // concurrent repack can still retire the shard ids that generation's
         // index points at; without pinning, a node resolved after the swap
         // would miss even though it is still live. See `pin_shards`.
-        let mut referenced = gen.index.referenced_slot_ids();
-        for slot in gen.sealed.slot_ids_in_collection(collection_id) {
-            if let Some(entry) = referenced.get_mut(usize::from(slot)) {
-                *entry = true;
-            }
-        }
+        let referenced = gen.index.referenced_slot_ids();
         let pinned = self.pin_shards(
             referenced
                 .into_iter()
@@ -9372,7 +8050,7 @@ impl PackfileStorage {
         }
 
         while let Some(hash) = queue.pop_front() {
-            let Some(data) = self.resolve_pinned(gen, collection_id, &pinned, &hash)? else {
+            let Some(data) = self.resolve_pinned(gen, &pinned, &hash)? else {
                 // Not actually present under this generation — nothing to
                 // expand from and nothing to yield.
                 continue;
@@ -9408,7 +8086,6 @@ impl PackfileStorage {
     fn resolve_pinned(
         &self,
         gen: &Arc<RoomGeneration>,
-        collection_id: &[u8; 16],
         pinned: &HashMap<u16, Arc<Shard>>,
         id: &NodeId,
     ) -> Result<Option<NodeData>, StorageError> {
@@ -9416,7 +8093,7 @@ impl PackfileStorage {
             return Ok(Some((*data).clone()));
         }
         let track = self.stats_enabled.load(Ordering::Relaxed);
-        let candidates = gen.candidates(collection_id, id)?;
+        let candidates = gen.candidates(id);
         if track {
             self.index_candidates
                 .fetch_add(candidates.len() as u64, Ordering::Relaxed);
@@ -10298,12 +8975,9 @@ impl PackfileStorage {
             &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
         );
         // The repack index is rebuilt from current frames and is therefore
-        // complete; drop sealed locators that may point at retired packs.
-        self.swap_generation_with_sealed(
-            collection_id,
-            index,
-            Arc::new(crate::index::sealed::SealedLocators::new()),
-        )?;
+        // complete.
+        let cache = self.generation(collection_id).map(|g| g.cache.clone());
+        self.store_generation(collection_id, index, cache, true)?;
         self.retire_empty_shards(collection_id);
 
         self.repack_count.fetch_add(1, Ordering::Relaxed);
@@ -10625,12 +9299,9 @@ impl PackfileStorage {
                 &self.slot_counts_to_pack_id_counts(&index.slot_counts()),
             );
             // The repack index is rebuilt from current frames and is therefore
-            // complete; drop sealed locators that may point at retired packs.
-            self.swap_generation_with_sealed(
-                collection_id,
-                index,
-                Arc::new(crate::index::sealed::SealedLocators::new()),
-            )?;
+            // complete.
+            let cache = self.generation(collection_id).map(|g| g.cache.clone());
+            self.store_generation(collection_id, index, cache, true)?;
             // The batch path does a full cold-start scan (scan_collection_record_maps),
             // so we have no incremental adjacency to carry forward. Pass an empty
             // map so the next single-collection repack starts with a fresh cache
@@ -10740,14 +9411,8 @@ impl PackfileStorage {
             });
         };
 
-        let ((live_hashes, adjacency), resolved) = self.bfs_ancestors(
-            &gen,
-            collection_id,
-            frontier,
-            stop_at,
-            &extract_edges,
-            limits,
-        )?;
+        let ((live_hashes, adjacency), resolved) =
+            self.bfs_ancestors(&gen, frontier, stop_at, &extract_edges, limits)?;
 
         let csr = Csr::build_from_edges(&live_hashes, &adjacency);
         let mut topo = csr.topo_order();
@@ -10825,12 +9490,6 @@ impl PackfileStorage {
 
     /// Every collection writer lock is held by the caller.
     fn retire_empty_shards_locked(&self) {
-        // Runs pin only the packs where a collection has entries, so a pack
-        // that no collection reads any more can retire even while it sits in
-        // a run. Such a run is replaced first, in every generation holding
-        // it, by its surviving packs' sidecars.
-        self.invalidate_runs_over_retiring_packs();
-
         // Do not retain the map guard while acquiring collection locks: another
         // operation may need the map lock while it holds a collection lock.
         let collections = self.collections_read();
@@ -10843,16 +9502,6 @@ impl PackfileStorage {
             for (i, &has_refs) in ids.iter().enumerate() {
                 referenced[i] |= has_refs;
             }
-            // In paged mode the resident table omits sealed packs, but their
-            // sidecars still hold live records. A sealed shard must not be
-            // retired just because only the sidecar references it. A run
-            // still held here (its invalidation failed) pins every pack it
-            // covers, since its fallback would read them.
-            for slot in gen.sealed.slot_ids() {
-                if let Some(entry) = referenced.get_mut(usize::from(slot)) {
-                    *entry = true;
-                }
-            }
         }
 
         // Retire any shard not in the union.
@@ -10861,7 +9510,6 @@ impl PackfileStorage {
                 self.shards.retire_slot(id);
             }
         }
-        self.shards.wait_for_seals();
         drop(collections);
         let mut tables = self.index_tables.write();
         let live_pack_ids: HashSet<PackId> = tables
@@ -10873,662 +9521,6 @@ impl PackfileStorage {
             .collection_disk_bytes
             .retain(|pack_id, _| live_pack_ids.contains(pack_id));
     }
-
-    /// Replace every run that covers a pack about to retire. Every collection
-    /// writer lock is held by the caller.
-    ///
-    /// A pack is about to retire when no collection reads it: no resident
-    /// entry, no unmerged sidecar, and no run stats row for a collection that
-    /// holds the run. A run covering such a pack would keep it pinned forever
-    /// (its fallback reads every covered pack), so it is dropped as a whole
-    /// and each holding generation gets the surviving covered packs back as
-    /// sidecars. If any survivor's sidecar cannot be loaded, the run stays and
-    /// keeps all its packs: locators are never dropped silently.
-    fn invalidate_runs_over_retiring_packs(&self) {
-        let mut referenced = [false; shard::MAX_SHARDS];
-        let mut holders: Vec<([u8; 16], Arc<RoomGeneration>)> = Vec::new();
-        let mut runs: Vec<Arc<crate::index::sealed::SealedRun>> = Vec::new();
-        {
-            let collections = self.collections_read();
-            for (collection_id, gen_swap) in collections.iter() {
-                let gen = gen_swap.load_full();
-                for (i, &has_refs) in gen.index.referenced_slot_ids().iter().enumerate() {
-                    referenced[i] |= has_refs;
-                }
-                for slot in gen.sealed.slot_ids_in_collection(collection_id) {
-                    if let Some(entry) = referenced.get_mut(usize::from(slot)) {
-                        *entry = true;
-                    }
-                }
-                if gen.sealed.runs().is_empty() {
-                    continue;
-                }
-                for run in gen.sealed.runs() {
-                    if !runs.iter().any(|known| Arc::ptr_eq(known, run)) {
-                        runs.push(Arc::clone(run));
-                    }
-                }
-                holders.push((*collection_id, gen));
-            }
-        }
-        let retiring = |slot: u16| !referenced.get(usize::from(slot)).copied().unwrap_or(true);
-        for run in runs {
-            if !run.packs().iter().any(|pack| retiring(pack.slot)) {
-                continue;
-            }
-            let mut survivors = Vec::new();
-            for (pack, identity) in run.packs().iter().zip(run.run().packs()) {
-                if retiring(pack.slot) {
-                    continue;
-                }
-                let Some(shard) = self
-                    .shards
-                    .get_shard(pack.slot)
-                    .filter(|shard| shard.pack_id == pack.pack_id)
-                else {
-                    survivors.clear();
-                    break;
-                };
-                survivors.push((shard.path.clone(), *pack, *identity));
-            }
-            let expected = run
-                .packs()
-                .iter()
-                .filter(|pack| !retiring(pack.slot))
-                .count();
-            let restored = if survivors.len() == expected {
-                load_run_fallback(&survivors)
-            } else {
-                Err("a surviving covered pack has no current shard".into())
-            };
-            let restored = match restored {
-                Ok(restored) => restored,
-                Err(error) => {
-                    eprintln!(
-                        "mtxdb: keeping a run over a retiring pack; its sidecars could not be restored: {error}"
-                    );
-                    continue;
-                }
-            };
-            let mut swapped_all = true;
-            for (collection_id, gen) in &mut holders {
-                if !gen.sealed.contains_run(&run) {
-                    continue;
-                }
-                let mut sealed = (*gen.sealed).clone();
-                sealed.remove_run(&run);
-                for pack in &restored {
-                    if pack.index.collection_entry_count(collection_id).is_some() {
-                        sealed.insert(pack.clone());
-                    }
-                }
-                if let Err(error) = self.store_generation_with_sealed(
-                    collection_id,
-                    gen.index.clone(),
-                    Arc::new(sealed),
-                    Some(Arc::clone(&gen.cache)),
-                    false,
-                ) {
-                    eprintln!(
-                        "mtxdb: could not swap out a run for {}: {error}",
-                        hex16(collection_id)
-                    );
-                    swapped_all = false;
-                    continue;
-                }
-                if let Some(updated) = self.generation(collection_id) {
-                    *gen = Arc::clone(&updated);
-                }
-            }
-            // A generation that still holds the run pins every covered pack
-            // in the retirement pass, so a failed swap only delays retirement.
-            // Keep the run in the pool until no generation holds it.
-            if swapped_all {
-                self.shards.drop_sealed_run(&run);
-            }
-        }
-    }
-
-    /// Install finished runs, then start the next merge the tiered policy
-    /// asks for. Paged writable stores only; a no-op while another thread is
-    /// already doing this.
-    fn maintain_runs(&self) {
-        if !self.shards.is_writable() {
-            return;
-        }
-        let Some(_maintenance) = self.run_maintenance.try_lock() else {
-            return;
-        };
-        // Read the flag before taking results: the worker queues its result
-        // before it clears the flag, so an idle worker has nothing in flight.
-        let active = self.shards.run_merge_active();
-        for pool_run in self.shards.take_completed_run_merges() {
-            // A discarded run waits for the next sealed pack: replanning now
-            // would rebuild the same range and fail the same check.
-            if self.install_run(pool_run) {
-                self.run_merge_due.store(true, Ordering::Release);
-            }
-        }
-        if active || !self.run_merge_due.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        let Some(plan) = self.plan_run_merge() else {
-            return;
-        };
-        let dir = self.shards.base_dir().to_path_buf();
-        match self
-            .shards
-            .start_run_merge_worker(move |stop| build_planned_run(&dir, &plan, stop))
-        {
-            Ok(true) => {}
-            // Another merge is still running; look again after it lands.
-            Ok(false) => self.run_merge_due.store(true, Ordering::Release),
-            Err(error) => eprintln!("mtxdb: could not start a run merge: {error}"),
-        }
-    }
-
-    /// Block until in-flight run merges have been built and installed, and
-    /// run the policy again until it has nothing more to merge. This is useful
-    /// for deterministic maintenance and measurement barriers; a normal sync
-    /// never waits for a merge.
-    pub fn settle_run_merges(&self) {
-        let _ = self.shards.wait_for_run_merge();
-        self.run_merge_due.store(true, Ordering::Release);
-        loop {
-            // Install what the last merge produced and start the next one; a
-            // pass that starts nothing leaves no worker to wait for.
-            self.maintain_runs();
-            if !self.shards.wait_for_run_merge() {
-                return;
-            }
-        }
-    }
-
-    /// The next merge the tiered policy asks for, or `None`.
-    ///
-    /// Sources are walked in the pool's `(creation_seq, pack_id)` order from
-    /// its oldest pack: each existing run, then each sealed pack not in a run,
-    /// up to the first pack that is unsealed. A run must cover consecutive
-    /// pool packs or open rejects it, so the walk never skips a pack. In
-    /// order of preference:
-    ///
-    /// 1. sealed packs that sit between two runs (left when a repack
-    ///    invalidated a run) become a run of their own;
-    /// 2. more than `T` sealed packs after the newest run become one run;
-    /// 3. the newest run is merged with the next older one while it holds at
-    ///    least `1 / r` of that run's entries.
-    fn plan_run_merge(&self) -> Option<RunMergePlan> {
-        let mut pool: Vec<(u16, Arc<Shard>)> = self
-            .shards
-            .all_shards()
-            .into_iter()
-            .filter(|(_, shard)| shard.is_current.load(Ordering::Acquire))
-            .collect();
-        pool.sort_by_key(|(_, shard)| (shard.creation_seq, shard.pack_id.0));
-        let runs = self.shards.sealed_runs();
-        let mut units: Vec<RunMergeInput> = Vec::new();
-        let mut index = 0;
-        while let Some((_, shard)) = pool.get(index) {
-            let covering = runs
-                .iter()
-                .find(|run| run.packs().iter().any(|pack| pack.pack_id == shard.pack_id));
-            if let Some(run) = covering {
-                let span = pool.get(index..index.saturating_add(run.packs().len()));
-                let consecutive = run.packs().first().map(|pack| pack.pack_id)
-                    == Some(shard.pack_id)
-                    && span.is_some_and(|span| {
-                        span.len() == run.packs().len()
-                            && span
-                                .iter()
-                                .zip(run.packs())
-                                .all(|((_, shard), pack)| shard.pack_id == pack.pack_id)
-                    });
-                if !consecutive || run.run().is_invalid() {
-                    break;
-                }
-                units.push(RunMergeInput::Run(Arc::clone(run)));
-                index = index.saturating_add(run.packs().len());
-                continue;
-            }
-            if !shard.sealed.load(Ordering::Acquire) {
-                break;
-            }
-            units.push(RunMergeInput::Sidecar {
-                path: shard.path.clone(),
-                pack_id: shard.pack_id,
-                creation_seq: u64::from(shard.creation_seq),
-            });
-            index = index.saturating_add(1);
-        }
-
-        let is_run = |unit: &RunMergeInput| matches!(unit, RunMergeInput::Run(_));
-        // 1. Sidecars older than some run.
-        if let Some(last_run) = units.iter().rposition(is_run) {
-            if let Some(start) = units.get(..last_run)?.iter().position(|unit| !is_run(unit)) {
-                let len = units.get(start..)?.iter().position(is_run).unwrap_or(0);
-                return Some(RunMergePlan::new(units, start, len));
-            }
-        }
-        // 2. The unmerged tail.
-        let tail_start = units
-            .iter()
-            .rposition(is_run)
-            .map_or(0, |at| at.saturating_add(1));
-        let tail_len = units.len().saturating_sub(tail_start);
-        let threshold = self.run_merge_unmerged_packs.load(Ordering::Relaxed);
-        if u64::try_from(tail_len).unwrap_or(u64::MAX) > threshold {
-            return Some(RunMergePlan::new(units, tail_start, tail_len));
-        }
-        // 3. Carry the newest run into the next older one.
-        let run_positions: Vec<usize> = units
-            .iter()
-            .enumerate()
-            .filter_map(|(at, unit)| is_run(unit).then_some(at))
-            .collect();
-        let [.., older, newer] = run_positions.as_slice() else {
-            return None;
-        };
-        let (RunMergeInput::Run(older_run), RunMergeInput::Run(newer_run)) =
-            (units.get(*older)?, units.get(*newer)?)
-        else {
-            return None;
-        };
-        let fan_in = self.run_merge_fan_in.load(Ordering::Relaxed).max(1);
-        let carries =
-            newer_run.run().entry_count().saturating_mul(fan_in) >= older_run.run().entry_count();
-        (carries && newer.checked_sub(*older) == Some(1))
-            .then(|| RunMergePlan::new(units, *older, 2))
-    }
-
-    /// Install a published run into every generation that serves its packs.
-    ///
-    /// Under every collection lock, the run's packs must all still be current
-    /// with the same identity, any existing run touching its range must lie
-    /// inside it, and each collection with entries in the range must serve
-    /// either all or none of its packs from the run's inputs. Each serving
-    /// generation then swaps those sidecars and input runs for the new run,
-    /// and the pool lists it in the same critical section, so a later
-    /// `rebuild_tail` reuses it. Any failed check discards the new file and
-    /// leaves every generation unchanged. The input run files are deleted
-    /// once every swap succeeded. Returns whether the run was installed.
-    fn install_run(&self, pool_run: crate::index::run::PoolRun) -> bool {
-        let path = pool_run.path.clone();
-        let discard = |reason: &str| {
-            eprintln!("mtxdb: discarding run {}: {reason}", path.display());
-            let _ = fs::remove_file(&path);
-        };
-        let by_pack: HashMap<PackId, (u16, PathBuf)> = self
-            .shards
-            .all_shards()
-            .into_iter()
-            .filter(|(_, shard)| shard.is_current.load(Ordering::Acquire))
-            .map(|(slot, shard)| (shard.pack_id, (slot, shard.path.clone())))
-            .collect();
-        let Some(new_run) = sealed_run_for(pool_run, &by_pack) else {
-            discard("a covered pack is no longer in the pool");
-            return false;
-        };
-        let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
-        collection_ids.extend(new_run.run().pack_stats().map(|row| row.collection_id));
-        collection_ids.sort_unstable();
-        collection_ids.dedup();
-        let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
-        let guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
-
-        let RunInstall {
-            pool_runs,
-            inputs,
-            swaps,
-        } = match self.prepare_run_install(&new_run) {
-            Ok(install) => install,
-            Err(reason) => {
-                drop(guards);
-                discard(&reason);
-                return false;
-            }
-        };
-        let is_input = |run: &Arc<crate::index::sealed::SealedRun>| {
-            inputs.iter().any(|input| Arc::ptr_eq(input, run))
-        };
-
-        let mut applied = Vec::with_capacity(swaps.len());
-        let mut install_error = None;
-        for (collection_id, gen, sealed) in swaps {
-            match self.store_generation_with_sealed(
-                &collection_id,
-                gen.index.clone(),
-                Arc::new(sealed),
-                Some(Arc::clone(&gen.cache)),
-                false,
-            ) {
-                Ok(()) => applied.push((collection_id, gen)),
-                Err(error) => {
-                    install_error = Some((collection_id, error));
-                    break;
-                }
-            }
-        }
-        if let Some((failed_collection, error)) = install_error {
-            eprintln!(
-                "mtxdb: could not install a run for {}: {error}; rolling back prior swaps",
-                hex16(&failed_collection)
-            );
-            let mut rollback_ok = true;
-            for (collection_id, gen) in applied.into_iter().rev() {
-                if let Err(error) = self.store_generation_with_sealed(
-                    &collection_id,
-                    gen.index.clone(),
-                    Arc::clone(&gen.sealed),
-                    Some(Arc::clone(&gen.cache)),
-                    false,
-                ) {
-                    eprintln!(
-                        "mtxdb: could not roll back run install for {}: {error}",
-                        hex16(&collection_id)
-                    );
-                    rollback_ok = false;
-                }
-            }
-            drop(guards);
-            if rollback_ok {
-                discard("a collection generation rejected the install");
-            }
-            // If a rollback itself fails, leave the fully-published file in
-            // place: any generation that still points at it must keep working.
-            return false;
-        }
-        let mut runs: Vec<_> = pool_runs.into_iter().filter(|run| !is_input(run)).collect();
-        runs.push(Arc::clone(&new_run));
-        runs.sort_by_key(|run| {
-            run.packs()
-                .first()
-                .map(|pack| (pack.creation_seq, pack.pack_id.0))
-        });
-        self.shards.replace_sealed_runs(runs);
-        drop(guards);
-        self.run_merges_installed.fetch_add(1, Ordering::Relaxed);
-        // Mapped readers keep working on Unix; where unlinking a mapped file
-        // fails, the next writable open rejects the contained run.
-        for input in &inputs {
-            let _ = fs::remove_file(input.run().path());
-        }
-        true
-    }
-
-    /// Whether `identities` is one contiguous window of the current sealed
-    /// pool in `(creation_seq, pack_id)` order.
-    fn run_covers_contiguous_sealed_pool(
-        &self,
-        identities: &[crate::index::packidx::PackIndexIdentity],
-    ) -> bool {
-        let mut current_pool: Vec<_> = self
-            .shards
-            .all_shards()
-            .into_iter()
-            .filter(|(_, shard)| {
-                shard.is_current.load(Ordering::Acquire) && shard.sealed.load(Ordering::Acquire)
-            })
-            .map(|(_, shard)| crate::index::packidx::PackIndexIdentity {
-                pack_id: shard.pack_id,
-                creation_seq: u64::from(shard.creation_seq),
-                pack_file_len: shard.file_len.load(Ordering::Acquire),
-            })
-            .collect();
-        current_pool.sort_by_key(|identity| (identity.creation_seq, identity.pack_id.0));
-        !identities.is_empty()
-            && current_pool
-                .windows(identities.len())
-                .any(|window| window == identities)
-    }
-
-    fn run_packs_match_current_identity(&self, run: &crate::index::sealed::SealedRun) -> bool {
-        run.packs()
-            .iter()
-            .zip(run.run().packs())
-            .all(|(pack, identity)| {
-                self.shards.get_shard(pack.slot).is_some_and(|shard| {
-                    shard.pack_id == pack.pack_id
-                        && shard.pack_id == identity.pack_id
-                        && u64::from(shard.creation_seq) == identity.creation_seq
-                        && shard.file_len.load(Ordering::Acquire) == identity.pack_file_len
-                        && shard.is_current.load(Ordering::Acquire)
-                        && shard.sealed.load(Ordering::Acquire)
-                })
-            })
-    }
-
-    /// Check, under every collection lock, that `new_run` can replace its
-    /// inputs, and build each serving generation's replacement sealed set.
-    /// See [`Self::install_run`].
-    fn prepare_run_install(
-        &self,
-        new_run: &Arc<crate::index::sealed::SealedRun>,
-    ) -> Result<RunInstall, String> {
-        let current = self.run_packs_match_current_identity(new_run);
-        let contiguous = self.run_covers_contiguous_sealed_pool(new_run.run().packs());
-        if !current || !contiguous {
-            return Err("a covered pack was retired or replaced".into());
-        }
-        let covered: HashSet<PackId> = new_run.packs().iter().map(|pack| pack.pack_id).collect();
-        let (pool_runs, inputs) = self.run_inputs_for_install(&covered)?;
-        let swaps = self.prepare_run_generation_swaps(new_run, &covered, &inputs)?;
-        Ok(RunInstall {
-            pool_runs,
-            inputs,
-            swaps,
-        })
-    }
-
-    fn run_inputs_for_install(&self, covered: &HashSet<PackId>) -> Result<RunInputSet, String> {
-        let pool_runs = self.shards.sealed_runs();
-        let mut inputs = Vec::new();
-        for run in &pool_runs {
-            let touches = run
-                .packs()
-                .iter()
-                .filter(|pack| covered.contains(&pack.pack_id))
-                .count();
-            match touches {
-                0 => {}
-                inside if inside == run.packs().len() => inputs.push(Arc::clone(run)),
-                _ => return Err("an existing run overlaps its range".into()),
-            }
-        }
-        Ok((pool_runs, inputs))
-    }
-
-    fn prepare_run_generation_swaps(
-        &self,
-        new_run: &Arc<crate::index::sealed::SealedRun>,
-        covered: &HashSet<PackId>,
-        inputs: &[Arc<crate::index::sealed::SealedRun>],
-    ) -> Result<Vec<RunGenerationSwap>, String> {
-        let is_input = |run: &Arc<crate::index::sealed::SealedRun>| {
-            inputs.iter().any(|input| Arc::ptr_eq(input, run))
-        };
-        let mut rows: HashMap<[u8; 16], Vec<PackId>> = HashMap::new();
-        for row in new_run.run().pack_stats() {
-            if let Some(pack) = new_run.packs().get(usize::from(row.ordinal)) {
-                rows.entry(row.collection_id)
-                    .or_default()
-                    .push(pack.pack_id);
-            }
-        }
-        let mut swaps = Vec::new();
-        for (collection_id, packs) in &rows {
-            let Some(gen) = self.generation(collection_id) else {
-                // Deleted, or never loaded: nothing serves these packs.
-                continue;
-            };
-            let held = packs
-                .iter()
-                .filter(|pack_id| gen.sealed.contains_pack(**pack_id))
-                .count();
-            let foreign_run = gen.sealed.runs().iter().any(|run| {
-                run.packs()
-                    .iter()
-                    .any(|pack| covered.contains(&pack.pack_id))
-                    && !is_input(run)
-            });
-            if held == 0 && !foreign_run {
-                // This generation serves none of the range from sealed
-                // sources (for example, a collection re-created after a
-                // delete). Leave its view unchanged.
-                continue;
-            }
-            if held != packs.len() || foreign_run {
-                return Err(format!(
-                    "collection {} does not serve the range from its inputs",
-                    hex16(collection_id)
-                ));
-            }
-            let mut sealed = (*gen.sealed).clone();
-            for input in inputs {
-                sealed.remove_run(input);
-            }
-            for pack_id in covered {
-                sealed.remove_pack(*pack_id);
-            }
-            sealed.insert_run(Arc::clone(new_run));
-            swaps.push((*collection_id, Arc::clone(&*gen), sealed));
-        }
-        Ok(swaps)
-    }
-}
-
-/// A validated run install: the pool's runs before it, the ones it
-/// replaces, and each serving generation with its replacement sealed set.
-struct RunInstall {
-    pool_runs: Vec<Arc<crate::index::sealed::SealedRun>>,
-    inputs: Vec<Arc<crate::index::sealed::SealedRun>>,
-    swaps: Vec<RunGenerationSwap>,
-}
-
-type RunInputSet = (
-    Vec<Arc<crate::index::sealed::SealedRun>>,
-    Vec<Arc<crate::index::sealed::SealedRun>>,
-);
-
-type RunGenerationSwap = (
-    [u8; 16],
-    Arc<RoomGeneration>,
-    crate::index::sealed::SealedLocators,
-);
-
-/// One source of a planned merge, in pool order.
-enum RunMergeInput {
-    /// A sealed pack served by its sidecar.
-    Sidecar {
-        path: PathBuf,
-        pack_id: PackId,
-        creation_seq: u64,
-    },
-    /// An existing run.
-    Run(Arc<crate::index::sealed::SealedRun>),
-}
-
-/// A merge chosen by [`PackfileStorage::plan_run_merge`].
-struct RunMergePlan {
-    inputs: Vec<RunMergeInput>,
-    /// The output starts at the pool's oldest pack, so no older source can
-    /// hold a key and removals can be dropped.
-    drop_removals: bool,
-}
-
-impl RunMergePlan {
-    fn new(mut units: Vec<RunMergeInput>, start: usize, len: usize) -> Self {
-        let inputs: Vec<RunMergeInput> = units
-            .drain(start..start.saturating_add(len).min(units.len()))
-            .collect();
-        Self {
-            inputs,
-            drop_removals: start == 0,
-        }
-    }
-}
-
-/// Build the run a plan describes: reopen and verify each input sidecar,
-/// merge, and publish the file (temp write, fsync, rename, directory fsync,
-/// all in [`crate::index::run::merge_to_path`]). Holds no storage lock. A
-/// missing or damaged input skips this merge; nothing is published.
-fn build_planned_run(
-    dir: &Path,
-    plan: &RunMergePlan,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-) -> std::io::Result<Option<crate::index::run::PoolRun>> {
-    use crate::index::run::{MergeOptions, MergeSource, RunIndex};
-
-    if stop.load(Ordering::Relaxed) {
-        return Ok(None);
-    }
-    let mut sidecars = Vec::with_capacity(plan.inputs.len());
-    let mut identities = Vec::with_capacity(plan.inputs.len());
-    for input in &plan.inputs {
-        match input {
-            RunMergeInput::Sidecar {
-                path,
-                pack_id,
-                creation_seq,
-                ..
-            } => {
-                let sidecar = crate::index::packidx::open_for_pack(path)
-                    .filter(|sidecar| {
-                        let identity = sidecar.identity();
-                        identity.pack_id == *pack_id && identity.creation_seq == *creation_seq
-                    })
-                    .ok_or_else(|| {
-                        std::io::Error::other(format!(
-                            "the sidecar for {} is missing or damaged",
-                            path.display()
-                        ))
-                    })?;
-                identities.push(sidecar.identity());
-                sidecars.push(Some(sidecar));
-            }
-            RunMergeInput::Run(run) => {
-                if run.run().is_invalid() {
-                    return Err(std::io::Error::other("an input run failed a block check"));
-                }
-                identities.extend(run.run().packs().iter().copied());
-                sidecars.push(None);
-            }
-        }
-    }
-    let sources: Vec<MergeSource<'_>> = plan
-        .inputs
-        .iter()
-        .zip(&sidecars)
-        .map(|(input, sidecar)| match (input, sidecar) {
-            (RunMergeInput::Run(run), _) => MergeSource::Run(run.run()),
-            (RunMergeInput::Sidecar { .. }, Some(sidecar)) => MergeSource::Sidecar(sidecar),
-            (RunMergeInput::Sidecar { .. }, None) => unreachable!("every sidecar input was opened"),
-        })
-        .collect();
-    let (Some(first), Some(last)) = (identities.first(), identities.last()) else {
-        return Ok(None);
-    };
-    let path = dir.join(crate::index::run::run_file_name(first, last));
-    let summary = match crate::index::run::merge_to_path(
-        &sources,
-        &MergeOptions {
-            drop_removals: plan.drop_removals,
-            stop: Some(stop),
-            ..MergeOptions::default()
-        },
-        &path,
-    ) {
-        Ok(summary) => summary,
-        Err(crate::index::run::RunError::Cancelled) => return Ok(None),
-        Err(error) => return Err(std::io::Error::other(error)),
-    };
-    if summary.is_none() {
-        return Ok(None);
-    }
-    let run = RunIndex::open(&path).map_err(std::io::Error::other)?;
-    if run.entry_count() > 0 && !run.has_pack_stats() {
-        return Err(std::io::Error::other("the merged run has no pack stats"));
-    }
-    Ok(Some(crate::index::run::PoolRun { path, run }))
 }
 
 impl PackfileStorage {
@@ -12461,7 +10453,7 @@ impl PackfileStorage {
             let Some(gen) = gen_guard.as_deref() else {
                 return Ok(None);
             };
-            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
+            let candidates: Vec<(u16, u64)> = gen.candidates(id);
             #[cfg(test)]
             Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
@@ -12509,7 +10501,7 @@ impl PackfileStorage {
             let Some(gen) = gen_guard.as_deref() else {
                 return Ok(None);
             };
-            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
+            let candidates: Vec<(u16, u64)> = gen.candidates(id);
             #[cfg(test)]
             Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
@@ -12618,7 +10610,7 @@ impl PackfileStorage {
                 }
                 return Ok(Some((*data).clone()));
             }
-            let candidates: Vec<(u16, u64)> = gen.candidates(collection_id, id)?;
+            let candidates: Vec<(u16, u64)> = gen.candidates(id);
             #[cfg(test)]
             Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
@@ -12673,19 +10665,7 @@ impl StorageEngine for PackfileStorage {
         };
         let mut live = Vec::with_capacity(keys.len());
         for id in keys {
-            if generation.index.lookup_removed(&id) == Some(true) {
-                continue;
-            }
             if generation.index.lookup_removed(&id) == Some(false) {
-                live.push(id);
-                continue;
-            }
-            if generation
-                .sealed
-                .lookup(collection_id, &id)
-                .map_err(|error| StorageError::Corrupt(error.to_string()))?
-                .is_some_and(|hit| !hit.removed())
-            {
                 live.push(id);
             }
         }
@@ -12917,7 +10897,7 @@ impl StorageEngine for PackfileStorage {
                         results[i] = Some((*data).clone());
                         continue;
                     }
-                    let candidates = g.candidates(collection_id, id)?;
+                    let candidates = g.candidates(id);
                     candidates_seen = candidates_seen.saturating_add(candidates.len() as u64);
                     if !candidates.is_empty() {
                         to_fetch.push((i, candidates));
@@ -13039,11 +11019,7 @@ impl StorageEngine for PackfileStorage {
         } else {
             OperationTimer::disabled()
         };
-        let result = self.put_internal(collection_id, id, data, None);
-        // A put that rotated a pack may have published its sidecar while this
-        // call ran. Drain without waiting; a later operation picks it up.
-        self.evict_newly_sealed(false);
-        result
+        self.put_internal(collection_id, id, data, None)
     }
 
     fn put_many(
@@ -13056,15 +11032,11 @@ impl StorageEngine for PackfileStorage {
         } else {
             OperationTimer::disabled()
         };
-        let result = self.put_many_internal(collection_id, entries, None);
-        self.evict_newly_sealed(false);
-        result
+        self.put_many_internal(collection_id, entries, None)
     }
 
     fn remove(&self, collection_id: &[u8; 16], id: &NodeId) -> Result<bool, StorageError> {
-        let result = self.remove_record(collection_id, id);
-        self.evict_newly_sealed(false);
-        result
+        self.remove_record(collection_id, id)
     }
 
     fn delete_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -13099,9 +11071,10 @@ impl StorageEngine for PackfileStorage {
         let started = std::time::Instant::now();
         let mut timings = SyncTimings::default();
         let pending_generation = self.mark_sync_pending_age(&mut timings);
-        let result = self
-            .sync_durability(true, &mut timings)
-            .and_then(|()| self.persist_index_checkpoint_or_delta(&mut timings));
+        let result = self.sync_durability(true, &mut timings);
+        if result.is_ok() {
+            self.persist_index_checkpoint_or_delta(&mut timings);
+        }
         timings.failed = result.is_err();
         self.finish_sync_pending_age(pending_generation);
         // Remediation runs after the journal barrier and is part of what the
@@ -13118,7 +11091,6 @@ impl StorageEngine for PackfileStorage {
             self.count_sync_persistence(&timings);
             // A sync is the barrier that makes eviction deterministic: wait
             // for sidecar builders, then swap each affected collection.
-            self.evict_newly_sealed(true);
         }
         *self.last_sync_timings.lock() = Some(timings);
         result
@@ -13177,7 +11149,7 @@ impl PackfileStorage {
             let Some(gen) = generation.as_ref() else {
                 return Ok(None);
             };
-            let candidates = gen.candidates(collection_id, node_id)?;
+            let candidates = gen.candidates(node_id);
             #[cfg(test)]
             Self::run_test_before_pin();
             let pinned = self.pin_shards(candidates.iter().map(|&(slot, _)| slot));
@@ -13214,44 +11186,14 @@ impl PackfileStorage {
         }
     }
 
-    /// Count a collection's durable live records, including sealed packs that
-    /// a paged resident index deliberately omits.
-    ///
-    /// Sealed entries are walked newest-first, keeping the first version of
-    /// each id, dropping removal versions, and skipping ids whose newest
-    /// version is already in the resident index (live or removed).
-    fn durable_live_count(
-        generation: &RoomGeneration,
-        collection_id: &[u8; 16],
-    ) -> Result<usize, StorageError> {
-        let resident = generation.index.live_count();
-        if !generation.paged || generation.sealed.is_empty() {
-            return Ok(resident);
-        }
-        let mut seen: HashSet<[u8; 16]> =
-            HashSet::with_capacity(generation.sealed.len().saturating_mul(64));
-        let mut sealed_live = 0usize;
-        generation
-            .sealed
-            .for_each_in_collection(collection_id, |hit, id| {
-                if !seen.insert(id) || hit.removed() {
-                    return;
-                }
-                // A resident version (live or removal) is newer and is
-                // already reflected in `resident`.
-                if generation.index.lookup_removed(&id).is_some() {
-                    return;
-                }
-                sealed_live = sealed_live.saturating_add(1);
-            })
-            .map_err(|error| StorageError::Corrupt(error.to_string()))?;
-        Ok(resident.saturating_add(sealed_live))
+    /// Count a collection's durable live records in the resident index.
+    fn durable_live_count(generation: &RoomGeneration) -> usize {
+        generation.index.live_count()
     }
 
     /// Return collection length at read-committed visibility.
     ///
-    /// Explicitly removed keys are excluded from the count, and sealed packs
-    /// that a paged resident index omits are included. Overlay puts and
+    /// Explicitly removed keys are excluded from the count. Overlay puts and
     /// removals are reflected before they reach the durable index. A committed
     /// collection delete hides the durable generation until replacement puts
     /// are applied.
@@ -13273,14 +11215,14 @@ impl PackfileStorage {
             let Some(generation) = self.generation(collection_id) else {
                 return Ok(None);
             };
-            return Self::durable_live_count(generation.as_ref(), collection_id).map(Some);
+            return Ok(Some(Self::durable_live_count(generation.as_ref())));
         };
         let puts = overlay.puts.get(collection_id);
         let deleted = overlay.delete_lsn.contains_key(collection_id);
         let generation = self.generation(collection_id);
-        let durable_len = generation.as_ref().map_or(Ok(0), |generation| {
-            Self::durable_live_count(generation.as_ref(), collection_id)
-        })?;
+        let durable_len = generation.as_ref().map_or(0, |generation| {
+            Self::durable_live_count(generation.as_ref())
+        });
 
         if deleted {
             return Ok(puts
@@ -13455,9 +11397,10 @@ impl PackfileStorage {
         let started = std::time::Instant::now();
         let mut timings = SyncTimings::default();
         let pending_generation = self.mark_sync_pending_age(&mut timings);
-        let result = self
-            .sync_durability(false, &mut timings)
-            .and_then(|()| self.persist_index_checkpoint_or_delta(&mut timings));
+        let result = self.sync_durability(false, &mut timings);
+        if result.is_ok() {
+            self.persist_index_checkpoint_or_delta(&mut timings);
+        }
         timings.failed = result.is_err();
         self.finish_sync_pending_age(pending_generation);
         if result.is_ok() {
@@ -13469,7 +11412,6 @@ impl PackfileStorage {
         self.record_sync_diagnostics(&timings);
         if result.is_ok() {
             self.count_sync_persistence(&timings);
-            self.evict_newly_sealed(true);
         }
         *self.last_sync_timings.lock() = Some(timings);
         result
@@ -13509,13 +11451,6 @@ impl PackfileStorage {
     /// # Errors
     /// Propagates any shard-fsync or checkpoint-write failure.
     pub fn force_index_checkpoint(&self) -> Result<(), StorageError> {
-        // No primary-index checkpoint exists to force in paged mode; still
-        // honour the caller's durability request by flushing packs and
-        // recording versions before shared-WAL reclaim.
-        if self.index_residency == crate::index::IndexResidency::Paged {
-            self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
-            return self.persist_paged_coverage();
-        }
         self.index_checkpoint_dirty.store(true, Ordering::Relaxed);
         self.shards.sync_dirty().map_err(StorageError::Io)?;
         let _persist_guard = self.index_persist_lock.lock();
@@ -13548,9 +11483,7 @@ impl PackfileStorage {
     /// # Errors
     /// Propagates any shard-fsync failure from the synchronous fallback.
     pub fn force_index_checkpoint_detached(&self) -> Result<(), StorageError> {
-        if self.index_residency == crate::index::IndexResidency::Paged
-            || !self.background_checkpoint.load(Ordering::Relaxed)
-        {
+        if !self.background_checkpoint.load(Ordering::Relaxed) {
             return self.force_index_checkpoint();
         }
         self.shards.sync_dirty().map_err(StorageError::Io)?;
@@ -13736,7 +11669,7 @@ impl PackfileStorage {
         // coordinator already seeded versions from the retained WAL, so
         // merging this pool-local table with `max` preserves whichever side is
         // newer. The checkpoint is also read for compatibility with a store
-        // written before the file existed (a writable paged open migrates it).
+        // written before the versions file existed.
         let snapshot =
             crate::index::versions::read_versions(&Self::index_versions_path(&self.base_dir));
         let checkpoint =
@@ -14586,29 +12519,10 @@ impl PackfileStorage {
     /// regenerated even on an otherwise clean barrier, because that is a rare
     /// recovery path rather than a steady-state write.
     #[allow(clippy::too_many_lines)]
-    fn persist_index_checkpoint_or_delta(
-        &self,
-        timings: &mut SyncTimings,
-    ) -> Result<(), StorageError> {
+    fn persist_index_checkpoint_or_delta(&self, timings: &mut SyncTimings) {
         let _persist_guard = self.index_persist_lock.lock();
         if !self.settle_checkpoint_worker() {
-            return Ok(());
-        }
-        // Paged stores persist no primary index. Their versions file is the
-        // recovery baseline, and must be durable before shared-WAL reclaim.
-        if self.index_residency == crate::index::IndexResidency::Paged {
-            self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
-            let coverage_started = std::time::Instant::now();
-            self.persist_paged_coverage()?;
-            timings.checkpoint = coverage_started.elapsed();
-            if self.shard_collections_dirty.load(Ordering::Relaxed)
-                || self.shard_collections_stale.load(Ordering::Relaxed)
-            {
-                let sidecar_started = std::time::Instant::now();
-                self.persist_shard_collections_best_effort();
-                timings.sidecar = sidecar_started.elapsed();
-            }
-            return Ok(());
+            return;
         }
         // A delta append does not advance the journal coverage, so on its own it
         // never lets the segment shrink and the journal would fill to its hard
@@ -14633,7 +12547,7 @@ impl PackfileStorage {
                 self.persist_shard_collections_best_effort();
                 timings.sidecar = sidecar_started.elapsed();
             }
-            return Ok(());
+            return;
         }
         // Only a full checkpoint rewrite re-pins the sidecar to the pack
         // fingerprint the checkpoint just became. Every other dirty path
@@ -14726,7 +12640,7 @@ impl PackfileStorage {
                 // budget still rewrites.
                 self.checkpoint_skips.fetch_add(1, Ordering::Relaxed);
                 self.shard_collections_stale.store(true, Ordering::Relaxed);
-                return Ok(());
+                return;
             }
             let checkpoint_started = std::time::Instant::now();
             self.persist_index_checkpoint_for_sync();
@@ -14767,7 +12681,6 @@ impl PackfileStorage {
             self.persist_shard_collections_best_effort();
             timings.sidecar = sidecar_started.elapsed();
         }
-        Ok(())
     }
 
     /// Fingerprint of the current on-disk pack set, computed from each

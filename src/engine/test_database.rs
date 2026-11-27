@@ -1,6 +1,5 @@
 use super::{Database, DatabaseTransaction, PoolPolicies, PoolPolicy, TransactionOverlayGuard};
 use crate::config::RuntimeConfig;
-use crate::index::IndexResidency;
 use crate::journal::Journal;
 use crate::layout::ShardType;
 use crate::packfile::storage::PackfileStorage;
@@ -63,72 +62,6 @@ fn point_mapping_config_reaches_database_and_standalone_pools() {
         drop(reader);
         let _ = std::fs::remove_dir_all(root);
     }
-}
-
-#[test]
-fn paged_residency_is_supported_with_the_shared_wal() {
-    let root = test_root("config-paged-before-io");
-    let config = RuntimeConfig {
-        index_residency: Some(IndexResidency::Paged),
-        ..RuntimeConfig::default()
-    };
-    let db = Database::open_with_config(root.clone(), config)
-        .expect("Paged residency must work with shared-WAL pools");
-    drop(db);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn a_paged_pool_policy_is_supported_with_the_shared_wal() {
-    let root = test_root("policy-paged-before-io");
-    let policy = PoolPolicy {
-        index_residency: IndexResidency::Paged,
-        ..PoolPolicy::default()
-    };
-    let db = Database::open_with_policies(root.clone(), PoolPolicies::uniform(policy))
-        .expect("Paged pool policies must work with shared-WAL pools");
-    drop(db);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn writable_paged_open_inside_a_database_root_is_rejected_and_keeps_the_checkpoint() {
-    let root = test_root("writable-paged-inside-root");
-    let db = Database::open(root.clone()).unwrap();
-    let collection = [0x42_u8; 16];
-    db.event_dag()
-        .put(
-            &collection,
-            &node(1),
-            &NodeData::new(bytes::Bytes::from_static(b"checkpoint me")),
-        )
-        .unwrap();
-    db.event_dag().sync_all().unwrap();
-    let pool = db.layout().pool_path(ShardType::EventDag);
-    drop(db);
-
-    let checkpoint = pool.join(crate::index::checkpoint::INDEX_CHECKPOINT_FILE);
-    assert!(
-        checkpoint.exists(),
-        "the fixture did not write a checkpoint"
-    );
-
-    let config = RuntimeConfig {
-        index_residency: Some(IndexResidency::Paged),
-        ..RuntimeConfig::default()
-    };
-    let Err(error) = PackfileStorage::open_with_config(pool.clone(), &config) else {
-        panic!("a writable paged pool inside a database root must be rejected")
-    };
-    assert!(
-        error.to_string().to_ascii_lowercase().contains("paged"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        checkpoint.exists(),
-        "rejecting the open must not retire the root's checkpoint"
-    );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

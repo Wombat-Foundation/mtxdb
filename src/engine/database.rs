@@ -36,9 +36,6 @@ pub struct PoolPolicy {
     pub compress: bool,
     /// How much CRC32 checksum verification this pool applies.
     pub checksum_policy: crate::packfile::ChecksumPolicy,
-    /// Whether sealed packs keep their locators in the resident index or are
-    /// served from their sidecars.
-    pub index_residency: crate::index::IndexResidency,
     /// Physical layout repack gives this pool's records. A topological
     /// policy writes each record after the records it depends on (events
     /// after their `prev_events`, state groups after their parents and HAMT
@@ -74,7 +71,6 @@ impl Default for PoolPolicy {
         Self {
             compress: true,
             checksum_policy: crate::packfile::ChecksumPolicy::Full,
-            index_residency: crate::index::IndexResidency::Resident,
             ordering: crate::record_class::OrderingPolicy::None,
             max_shard_bytes: None,
             append_policy: crate::shard::AppendPolicy::Eager,
@@ -962,28 +958,15 @@ impl Database {
 
     /// Open with explicit policies and runtime settings.
     ///
-    /// A `Some` index residency in `config` overrides every pool's policy,
-    /// including paged. A paged pool advances durable coverage from its
-    /// sidecar sync, so a read-only worker sharing that pool's WAL must open
-    /// with the same residency (see
-    /// `PackfileStorage::open_read_committed_shared_with_config`, available
-    /// with the `multi-reader` feature); the plain shared reader opens
-    /// resident and cannot reload a paged writer's reclaimed WAL.
-    ///
     /// # Errors
-    /// Returns an error for an invalid config, unsupported residency, if the
-    /// root lock is held, or if any pool cannot be opened or attached.
+    /// Returns an error for an invalid config, if the root lock is held, or
+    /// if any pool cannot be opened or attached.
     pub fn open_with_policies_and_config(
         root: PathBuf,
-        mut policies: PoolPolicies,
+        policies: PoolPolicies,
         config: RuntimeConfig,
     ) -> Result<Self, StorageError> {
         config.validate_for_database()?;
-        if let Some(residency) = config.index_residency {
-            for shard in ShardType::ALL {
-                policies.for_shard_mut(shard).index_residency = residency;
-            }
-        }
         Self::open_with_policies_and_config_unchecked(root, policies, config)
     }
 
@@ -1029,7 +1012,6 @@ impl Database {
                 policy.max_shard_bytes,
                 policy.compress,
                 policy.checksum_policy,
-                policy.index_residency,
             )?
             .with_append_policy(policy.append_policy);
             store.set_stats_enabled(config.stats_enabled);

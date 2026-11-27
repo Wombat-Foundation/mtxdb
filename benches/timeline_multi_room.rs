@@ -23,21 +23,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use mtxdb::index::IndexResidency;
 use mtxdb::ordered_timeline::{
     open_event_timeline_indexes, page_stream_up_to, stage_event_timeline_batch,
     stage_promote_outlier_to_timeline, stage_purge_room_timeline,
     stage_remove_event_timeline_batch, EventTimelineEntry,
 };
-use mtxdb::packfile::storage::PackfileStorage;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb::{interop, Database, DatabaseLayout, PoolPolicies, RuntimeConfig, ShardType};
+use mtxdb::{interop, Database, PoolPolicies, RuntimeConfig, ShardType};
 use rustix::fs::{fadvise, Advice};
 
 const PAYLOAD_MIN: usize = 256;
 const PAYLOAD_STEP: usize = 240;
 const PAYLOAD_MAX: usize = 4096;
-const EMPTY_SHARED_WAL_LEN: u64 = 12_288;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -1327,232 +1324,6 @@ fn run_adjacent_get_rows(root: &Path, rooms: &[Room], samples: usize) {
     }
 }
 
-/// Measure cold reads through the standalone paged-index reader. Unlike the
-/// shared-WAL `Database`, this read-only pool can keep sealed-pack locators
-/// paged, so locator faults happen in the measured read rather than at open.
-fn run_paged_page_rows(root: &Path, rooms: &[Room], tiers: &[usize], samples: usize) {
-    for mode in advice_modes() {
-        run_paged_page_rows_for_mode(root, rooms, tiers, samples, mode);
-    }
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "cold samples and reporting share the same paged reader"
-)]
-fn run_paged_page_rows_for_mode(
-    root: &Path,
-    rooms: &[Room],
-    tiers: &[usize],
-    samples: usize,
-    mode: &str,
-) {
-    let extension_sizes = extension_bytes(root);
-    let idx_bytes = extension_sizes
-        .iter()
-        .find_map(|(extension, bytes)| (extension == "idx").then_some(*bytes))
-        .unwrap_or(0);
-    let run_bytes = extension_sizes
-        .iter()
-        .find_map(|(extension, bytes)| (extension == "run").then_some(*bytes))
-        .unwrap_or(0);
-    let wal_bytes = directory_bytes(root).3;
-    if wal_bytes > EMPTY_SHARED_WAL_LEN {
-        println!("multi_room_page_paged_skipped reason=shared_wal_pending wal_bytes={wal_bytes}");
-        return;
-    }
-    if idx_bytes.saturating_add(run_bytes) == 0 {
-        println!(
-            "multi_room_page_paged_skipped reason=no_sealed_index_sidecars idx_bytes={idx_bytes} run_bytes={run_bytes}"
-        );
-        return;
-    }
-    let layout = DatabaseLayout::open_read_only(root.to_path_buf())
-        .expect("open benchmark layout read-only");
-    let pool_path = layout
-        .pool_dir_read_only(ShardType::EventDag)
-        .expect("find event DAG pool");
-    let config = RuntimeConfig {
-        index_residency: Some(IndexResidency::Paged),
-        ..RuntimeConfig::default()
-    };
-
-    for (tier_rank, tier) in tiers.iter().copied().enumerate() {
-        let Some(selected) = rooms.get(tier) else {
-            continue;
-        };
-        let room_id = String::from_utf8_lossy(&selected.id).into_owned();
-        for (order, limit) in [
-            ("topo", 50usize),
-            ("topo", 128),
-            ("stream_up_to", 50),
-            ("stream_up_to", 128),
-        ] {
-            let mut elapsed_samples = Vec::with_capacity(samples);
-            let mut last_io = IoSnapshot::default();
-            let mut last_open_io = IoSnapshot::default();
-            let mut last_pack_vmas = 0usize;
-            for _ in 0..samples {
-                evict(root, EvictScope::All).expect("evict before paged open");
-                let open_before = IoSnapshot::read();
-                let store = PackfileStorage::open_read_only_with_config(pool_path.clone(), &config)
-                    .expect("open paged event DAG pool");
-                last_open_io = IoSnapshot::read().delta(open_before);
-                let _ = store.unmap_shards();
-                if mode == "point" {
-                    store.set_point_random_mmap(true);
-                } else if mode == "index" {
-                    store.set_point_random_mmap_index(true);
-                } else if mode == "random" {
-                    std::hint::black_box(store.advise_random_shards());
-                }
-                evict(root, EvictScope::All).expect("evict files after paged open");
-                {
-                    let (topo_index, stream_index) = open_event_timeline_indexes(&store);
-                    let before = IoSnapshot::read();
-                    let started = Instant::now();
-                    let returned = if order == "topo" {
-                        topo_index
-                            .page(&selected.scope, None, true, limit)
-                            .expect("paged topological page")
-                            .entries
-                            .len()
-                    } else {
-                        page_stream_up_to(
-                            &stream_index,
-                            &selected.scope,
-                            None,
-                            true,
-                            limit,
-                            selected.max_stream,
-                        )
-                        .expect("paged stream page")
-                        .entries
-                        .len()
-                    };
-                    elapsed_samples.push(started.elapsed());
-                    last_io = IoSnapshot::read().delta(before);
-                    last_pack_vmas = mapped_pack_vmas();
-                    std::hint::black_box(returned);
-                }
-            }
-            let min_us = min(&elapsed_samples).as_secs_f64() * 1e6;
-            let median_us = median(&mut elapsed_samples).as_secs_f64() * 1e6;
-            println!(
-                "multi_room_page_paged room={room_id} tier={} order={order} limit={limit} advice={mode} samples={} min_us={min_us:.1} median_us={median_us:.1} pack_vmas={last_pack_vmas} open_read_bytes={} disk_read_bytes={} open_majflt={} majflt={} open_cgroup_pgmajfault={} cgroup_pgmajfault={}",
-                tier_label(tier_rank),
-                elapsed_samples.len(),
-                last_open_io.read_bytes,
-                last_io.read_bytes,
-                last_open_io.majflt,
-                last_io.majflt,
-                last_open_io.pgmajfault.unwrap_or(u64::MAX),
-                last_io.pgmajfault.unwrap_or(u64::MAX),
-            );
-        }
-    }
-}
-
-fn run_paged_fetch_rows(root: &Path, rooms: &[Room], tier: Option<usize>, samples: usize) {
-    let Some(selected) = tier.and_then(|index| rooms.get(index)) else {
-        return;
-    };
-    let wal_bytes = directory_bytes(root).3;
-    let extension_sizes = extension_bytes(root);
-    let has_sidecars = extension_sizes
-        .iter()
-        .any(|(extension, bytes)| matches!(extension.as_str(), "idx" | "run") && *bytes > 0);
-    if wal_bytes > EMPTY_SHARED_WAL_LEN || !has_sidecars {
-        println!(
-            "multi_room_fetch_paged_skipped reason={} wal_bytes={wal_bytes} has_sidecars={has_sidecars}",
-            if wal_bytes > EMPTY_SHARED_WAL_LEN {
-                "shared_wal_pending"
-            } else {
-                "no_sealed_index_sidecars"
-            }
-        );
-        return;
-    }
-    let db = open_benchmark_database(root.to_path_buf());
-    let (topo_index, _) = open_event_timeline_indexes(db.event_dag().as_ref());
-    let id_page = topo_index
-        .page(&selected.scope, None, true, 128)
-        .expect("select paged fetch ids");
-    let ids = id_page
-        .entries
-        .iter()
-        .map(|entry| entry.event_node_id)
-        .collect::<Vec<_>>();
-    drop(db);
-
-    let layout = DatabaseLayout::open_read_only(root.to_path_buf())
-        .expect("open benchmark layout read-only");
-    let pool_path = layout
-        .pool_dir_read_only(ShardType::EventDag)
-        .expect("find event DAG pool");
-    let config = RuntimeConfig {
-        index_residency: Some(IndexResidency::Paged),
-        ..RuntimeConfig::default()
-    };
-    for scope in [
-        EvictScope::All,
-        EvictScope::PacksOnly,
-        EvictScope::IndexOnly,
-    ] {
-        let mut timings = Vec::with_capacity(samples);
-        let mut last_io = IoSnapshot::default();
-        let mut last_open_io = IoSnapshot::default();
-        let mut returned = 0usize;
-        let mut unmapped_bytes = 0u64;
-        for _ in 0..samples {
-            evict(root, scope).expect("evict before paged fetch open");
-            let open_before = IoSnapshot::read();
-            let store = PackfileStorage::open_read_only_with_config(pool_path.clone(), &config)
-                .expect("open paged event DAG pool for fetch");
-            last_open_io = IoSnapshot::read().delta(open_before);
-            unmapped_bytes = store.unmap_shards();
-            evict(root, scope).expect("evict files after paged fetch open");
-            let before = IoSnapshot::read();
-            let started = Instant::now();
-            let payloads = store
-                .get_many(&selected.collection, &ids)
-                .expect("paged cold payload fetch");
-            timings.push(started.elapsed());
-            last_io = IoSnapshot::read().delta(before);
-            returned = payloads
-                .iter()
-                .flatten()
-                .map(|record| record.bytes.len())
-                .fold(0usize, usize::saturating_add);
-        }
-        let min_us = min(&timings).as_secs_f64() * 1e6;
-        let median_us = median(&mut timings).as_secs_f64() * 1e6;
-        let amplification_bp = if returned == 0 {
-            0
-        } else {
-            last_io
-                .read_bytes
-                .saturating_mul(10_000)
-                .checked_div(u64::try_from(returned).unwrap_or(u64::MAX).max(1))
-                .unwrap_or(0)
-        };
-        println!(
-            "multi_room_fetch_paged evict={} count={} samples={} min_us={min_us:.1} median_us={median_us:.1} unmapped_bytes={unmapped_bytes} syscr={} rchar={} disk_read_bytes={} open_read_bytes={} open_majflt={} payload_bytes_returned={returned} read_amp_bp={amplification_bp} majflt={} cgroup_pgmajfault={} open_cgroup_pgmajfault={}",
-            scope.label(),
-            ids.len(),
-            samples,
-            last_io.syscr,
-            last_io.rchar,
-            last_io.read_bytes,
-            last_open_io.read_bytes,
-            last_open_io.majflt,
-            last_io.majflt,
-            last_io.pgmajfault.unwrap_or(u64::MAX),
-            last_open_io.pgmajfault.unwrap_or(u64::MAX),
-        );
-    }
-}
-
 fn run_fetch_rows(
     mut db: Database,
     root: &Path,
@@ -1860,10 +1631,7 @@ fn main() {
     let db = reopen_benchmark_database(&root, db);
     print_memory_diagnostics(&db, &root, &rooms);
     drop(db);
-    run_paged_page_rows(&root, &rooms, &tiers, samples);
-    if !page_only {
-        run_paged_fetch_rows(&root, &rooms, tiers.first().copied(), samples);
-    }
+    if !page_only {}
     if std::env::var_os("MTXDB_PAGE_ADVICE_AB").is_some() {
         run_sequential_get_rows(&root, &rooms, samples);
         run_disk_order_get_rows(&root, &rooms, samples);

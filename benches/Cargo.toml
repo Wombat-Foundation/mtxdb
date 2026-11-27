@@ -164,14 +164,6 @@ harness = false
 name = "index_segments"
 path = "index_segments.rs"
 harness = false
-
-# Does a rotation wait for a pack-index build when builders fall behind?
-[[bench]]
-name = "seal_rotation"
-path = "seal_rotation.rs"
-harness = false
-
-# Append-path A/B: eager vs buffered pack writes, per-record vs batched WAL.
 [[bench]]
 name = "io_append"
 path = "io_append.rs"
@@ -195,13 +187,11 @@ name = "timeline_multi_room"
 path = "timeline_multi_room.rs"
 harness = false
 
-# Reopen strategies for a sealed pack: checkpoint, scan, sorted .idx, trusted seal.
+# End-to-end search-pack cost (index + query shapes) on a real-data corpus.
 [[bench]]
-name = "index_artifacts"
-path = "index_artifacts.rs"
+name = "search_scan"
+path = "search_scan.rs"
 harness = false
-
-# Does a large store find every record after one clean reopen?
 [[bench]]
 name = "big_reopen_repro"
 path = "big_reopen_repro.rs"

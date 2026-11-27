@@ -8426,7 +8426,7 @@ fn cmd_scan_collection_live_rows(
     );
     let collection_id = parse_scan_collection_selector(cli, selector)?;
     let store = open_store_read_only(cli)?;
-    let Some(locations) = store.collection_live_locations(&collection_id)? else {
+    let Some(locations) = store.collection_live_locations(&collection_id) else {
         bail!(
             "collection {} not found{}",
             format_id(&collection_id),

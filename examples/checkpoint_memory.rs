@@ -227,36 +227,12 @@ fn peak_rss_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (out, peak.load(Ordering::Relaxed))
 }
 
-/// Index residency selected for reopened handles. The initial build always
-/// runs resident so the store looks like a default-written database; set
-/// `MTXDB_MEASURE_RESIDENCY=paged` to measure the tail-only reopen.
-fn measure_residency() -> mtxdb::index::IndexResidency {
-    match std::env::var("MTXDB_MEASURE_RESIDENCY").as_deref() {
-        Ok("paged") => mtxdb::index::IndexResidency::Paged,
-        Ok("resident") | Err(std::env::VarError::NotPresent) => {
-            mtxdb::index::IndexResidency::Resident
-        }
-        Ok(other) => panic!("unknown MTXDB_MEASURE_RESIDENCY value: {other}"),
-        Err(error) => panic!("cannot read MTXDB_MEASURE_RESIDENCY: {error}"),
-    }
-}
-
-fn open_store(dir: PathBuf, residency: mtxdb::index::IndexResidency) -> PackfileStorage {
+/// Open a store, optionally with a small rotation threshold.
+fn open_store(dir: PathBuf) -> PackfileStorage {
     if let Some(max_shard_bytes) = max_shard_bytes() {
-        return PackfileStorage::open_with_max_shard_bytes_and_residency(
-            dir,
-            max_shard_bytes,
-            mtxdb::packfile::ChecksumPolicy::Full,
-            residency,
-        )
-        .unwrap();
+        return PackfileStorage::open_with_max_shard_bytes(dir, max_shard_bytes).unwrap();
     }
-    if residency == mtxdb::index::IndexResidency::Paged {
-        PackfileStorage::open_with_residency(dir, mtxdb::packfile::ChecksumPolicy::Full, residency)
-            .unwrap()
-    } else {
-        PackfileStorage::open(dir).unwrap()
-    }
+    PackfileStorage::open(dir).unwrap()
 }
 
 /// The initial build uses the default resident index. `MTXDB_MEASURE_MAX_SHARD_BYTES`
@@ -338,9 +314,8 @@ fn main() {
 
     // Reopen the slots-only checkpoint and measure write costs.
     drop(store);
-    let residency = measure_residency();
     let rss_before = rss_bytes();
-    let store = open_store(dir.clone(), residency);
+    let store = open_store(dir.clone());
     let (heap, mapped, logical, slots) = index_memory(&store);
     println!(
         "reopen (slots-only): heap {:.1} MiB ({:.2} B/rec), mapped {:.1} MiB ({:.2} B/slot), logical {:.2} B/rec, rss +{:.1} MiB (before {:.1})",
@@ -382,11 +357,11 @@ fn main() {
         }
     }
     let baseline = rss_bytes();
-    let (store, peak) = peak_rss_during(|| open_store(dir.clone(), residency));
+    let (store, peak) = peak_rss_during(|| open_store(dir.clone()));
     let (heap, _mapped, _logical, _slots) = index_memory(&store);
     if let Some(timing) = store.open_timings() {
         println!(
-            "open stages: total={:?}, shard_open={:?} (discovery={:?}, writer_lock={:?}, recovery={:?}, pack_open={:?}, metadata_restore={:?}), metadata_load={:?}, checkpoint_decode={:?}, fingerprint={:?}, index_materialization={:?}, full_scan={:?}, bookkeeping={:?}, assemble={:?}, sidecars={}",
+            "open stages: total={:?}, shard_open={:?} (discovery={:?}, writer_lock={:?}, recovery={:?}, pack_open={:?}, metadata_restore={:?}), metadata_load={:?}, checkpoint_decode={:?}, fingerprint={:?}, index_materialization={:?}, full_scan={:?}, bookkeeping={:?}, assemble={:?}",
             timing.total,
             timing.shard_open,
             timing.shard_discovery,
@@ -401,14 +376,9 @@ fn main() {
             timing.full_scan,
             timing.bookkeeping,
             timing.assemble,
-            timing.pack_index_sidecars,
         );
     }
-    let open_label = if residency == mtxdb::index::IndexResidency::Paged {
-        "paged open (sidecars, no checkpoint)"
-    } else {
-        "full-scan open"
-    };
+    let open_label = "full-scan open";
     println!(
         "{open_label}: peak rss {:.1} MiB (from {:.1} MiB, +{:.1}), final heap {:.1} MiB ({:.2} B/rec)",
         mib(peak),
@@ -465,7 +435,7 @@ fn run_cold_rewrite(dir: &Path, records: u64) {
     );
     drop(store);
 
-    let reopened = open_store(dir.to_path_buf(), measure_residency());
+    let reopened = open_store(dir.to_path_buf());
     let (heap, mapped, _logical, slots) = index_memory(&reopened);
     let evicted = if std::env::var("MTXDB_MEASURE_EVICT").as_deref() == Ok("1") {
         evict_dir(dir)
