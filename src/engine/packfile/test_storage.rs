@@ -13990,7 +13990,7 @@ fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
         )
         .unwrap();
     writer.sync().unwrap();
-    assert!(Journal::scan_read_only(&wal).unwrap().groups.is_empty());
+    assert_eq!(Journal::scan_read_only(&wal).unwrap().groups.len(), 0);
 
     assert_residency_mismatch(PackfileStorage::open_read_committed_shared(
         dir.clone(),
@@ -14018,7 +14018,7 @@ fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
         )
         .unwrap();
     writer.sync().unwrap();
-    assert!(Journal::scan_read_only(&wal).unwrap().groups.is_empty());
+    assert_eq!(Journal::scan_read_only(&wal).unwrap().groups.len(), 0);
 
     let values = reader
         .get_read_committed(&collection, &[first, second])
@@ -14107,7 +14107,7 @@ fn shared_reader_detects_writer_residency_change_before_reload() {
         )
         .unwrap();
     paged_writer.sync().unwrap();
-    assert!(Journal::scan_read_only(&wal).unwrap().groups.is_empty());
+    assert_eq!(Journal::scan_read_only(&wal).unwrap().groups.len(), 0);
 
     assert_residency_mismatch(reader.get_read_committed(&collection, &[first, second]));
 

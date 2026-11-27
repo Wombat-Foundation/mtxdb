@@ -6414,7 +6414,7 @@ impl PackfileStorage {
             )));
         }
         let mut fences = HashMap::with_capacity(count);
-        for entry in bytes[HEADER_LEN..crc_offset].chunks_exact(ENTRY_LEN) {
+        for entry in bytes[HEADER_LEN..crc_offset].as_chunks::<ENTRY_LEN>().0 {
             let collection_id: [u8; 16] = entry[..16].try_into().expect("fixed id width");
             let creation_seq = u32::from_le_bytes(entry[16..20].try_into().expect("fixed seq"));
             if creation_seq == 0 || fences.insert(collection_id, creation_seq).is_some() {
