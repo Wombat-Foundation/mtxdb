@@ -4856,6 +4856,54 @@ fn durable_removed_keeps_full_checksum_verification() {
 }
 
 #[test]
+fn durable_removed_checks_full_checksum_when_identity_header_mismatches() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = test_dir("durable_removed_corrupt_identity_header");
+    let collection = [0xAC; 16];
+    let id = distinct_id(0x74);
+    let store = PackfileStorage::open_with_policies(
+        dir.clone(),
+        true,
+        crate::packfile::ChecksumPolicy::Full,
+    )
+    .unwrap();
+    store
+        .put(
+            &collection,
+            &id,
+            &NodeData::from_slice(b"header checksum target"),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    let (slot, offset) = store
+        .generation(&collection)
+        .unwrap()
+        .index
+        .lookup(&id)
+        .unwrap();
+    let shard = store.shards.get_shard(slot).unwrap();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&shard.path)
+        .unwrap();
+    // Frame layout: 4-byte frame length, flags, 4-byte uncompressed length,
+    // then the 16-byte collection id covered by the frame CRC.
+    file.seek(SeekFrom::Start(offset.saturating_add(9)))
+        .unwrap();
+    file.write_all(&[collection[0] ^ 1]).unwrap();
+    file.sync_all().unwrap();
+
+    let error = store.durable_removed(&collection, &id).unwrap_err();
+    assert!(
+        matches!(error, StorageError::Corrupt(_)),
+        "full checksum policy must reject a corrupted live identity header: {error}"
+    );
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn collection_len_overlay_handles_slots_only_tombstone_put_and_remove() {
     let dir = test_dir("collection_len_slots_only_overlay_tombstone");
     let wal = dir.join("wal.bin");
