@@ -1832,6 +1832,98 @@ fn a_power_cut_image_never_loses_a_record_a_claim_covered() {
     let _ = std::fs::remove_dir_all(image);
 }
 
+/// A shared-WAL barrier syncs the journal globally, but a Paged pool only
+/// reports coverage after its own packs and versions file are durable. The
+/// first crash image therefore has to replay the other pool's WAL-only write;
+/// after both pools sync, the second image has to recover from their Paged
+/// baselines with the WAL reclaimed.
+#[test]
+fn paged_shared_wal_crash_images_preserve_each_pool_across_partial_barriers() {
+    let root = test_root("paged_shared_wal_cut_source");
+    let first_image = test_root("paged_shared_wal_cut_one_pool_synced");
+    let second_image = test_root("paged_shared_wal_cut_all_pools_synced");
+    let collection = [0x6f; 16];
+    let state_node = [0x31; 16];
+    let event_node = [0x42; 16];
+    let config = RuntimeConfig {
+        index_residency: Some(IndexResidency::Paged),
+        ..RuntimeConfig::default()
+    };
+    let db = Database::open_with_config(root.clone(), config).unwrap();
+    db.coordinator().set_reclaim_trigger_len(1);
+    db.state()
+        .put(
+            &collection,
+            &state_node,
+            &NodeData::from_slice(b"paged state"),
+        )
+        .unwrap();
+    db.event_dag()
+        .put(
+            &collection,
+            &event_node,
+            &NodeData::from_slice(b"paged event"),
+        )
+        .unwrap();
+
+    // This commits both writes to the shared WAL, but only State's Paged
+    // baseline is made durable, so the retained WAL must recover EventDag.
+    db.state().sync().unwrap();
+    crash_image(&db, &root, &first_image);
+    let recovered = Database::open_with_config(first_image.clone(), config).unwrap();
+    assert_eq!(
+        recovered
+            .state()
+            .get(&collection, &state_node)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"paged state"
+    );
+    assert_eq!(
+        recovered
+            .event_dag()
+            .get(&collection, &event_node)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"paged event",
+        "the other pool's durable WAL group must replay after its pack is cut"
+    );
+    drop(recovered);
+
+    // Once EventDag's own packs and versions are durable, both pools cover
+    // the shared group and the WAL can be reclaimed safely.
+    db.event_dag().sync().unwrap();
+    assert!(
+        Journal::scan_read_only(db.layout().shared_wal_path())
+            .unwrap()
+            .groups
+            .is_empty(),
+        "both Paged baselines should let the shared WAL reclaim the covered group"
+    );
+    crash_image(&db, &root, &second_image);
+    let recovered = Database::open_with_config(second_image.clone(), config).unwrap();
+    assert!(recovered
+        .state()
+        .get(&collection, &state_node)
+        .unwrap()
+        .is_some());
+    assert!(recovered
+        .event_dag()
+        .get(&collection, &event_node)
+        .unwrap()
+        .is_some());
+
+    drop(recovered);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(first_image);
+    let _ = std::fs::remove_dir_all(second_image);
+}
+
 /// The same lag, but the database can make the silent pool checkpoint. Once
 /// the segment reaches the emergency zone it does, reclaim succeeds, and no
 /// commit ever fails. The full-scale policy loop lives in
