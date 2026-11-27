@@ -3524,8 +3524,8 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
         return Ok(());
     }
     println!(
-        "{:<6} {:<12} {:<12} {:<34} event_id",
-        "idx", "depth", "stream", "node_id"
+        "{:<6} {:<12} {:<14} {:<34} event_id",
+        "idx", "depth", "origin_ts", "node_id"
     );
     println!("{}", "-".repeat(90));
     for (idx, entry) in page.entries.iter().enumerate() {
@@ -3539,10 +3539,10 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
             })
             .unwrap_or_else(|| "-".to_owned());
         println!(
-            "{:<6} {:<12} {:<12} {:<34} {}",
+            "{:<6} {:<12} {:<14} {:<34} {}",
             idx.saturating_add(1),
             entry.topological_ordering,
-            entry.stream_ordering,
+            entry.origin_server_ts,
             node_hex,
             event_id_str
         );

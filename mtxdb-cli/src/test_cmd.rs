@@ -9322,7 +9322,6 @@ fn forced_rejection_import_sets_flags_and_not_excludes_it() {
 
 #[test]
 fn stale_auth_events_are_rejected_against_state_before() {
-    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
     use mtxdb::room_scope_id;
     use mtxdb::ShardType;
@@ -9368,7 +9367,7 @@ fn stale_auth_events_are_rejected_against_state_before() {
         3
     );
 
-    let page = EventTopoIndex::open(
+    let page = mtxdb::ordered_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
         mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
@@ -9389,7 +9388,6 @@ fn stale_auth_events_are_rejected_against_state_before() {
 #[test]
 fn rejected_state_event_does_not_change_later_state() {
     use mtxdb::export_schema::RejectionCode;
-    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
     use mtxdb::room_scope_id;
     use mtxdb::ShardType;
@@ -9456,7 +9454,7 @@ fn rejected_state_event_does_not_change_later_state() {
         4
     );
 
-    let page = EventTopoIndex::open(
+    let page = mtxdb::ordered_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
         mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
@@ -9499,7 +9497,6 @@ fn rejected_state_event_does_not_change_later_state() {
 
 #[test]
 fn partial_base_state_is_left_unchecked() {
-    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
     use mtxdb::room_scope_id;
     use mtxdb::ShardType;
@@ -9554,7 +9551,7 @@ fn partial_base_state_is_left_unchecked() {
         5
     );
 
-    let page = EventTopoIndex::open(
+    let page = mtxdb::ordered_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
         mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
@@ -9782,7 +9779,6 @@ fn flag_index_timeline_count_matches_timeline_index() {
 #[test]
 fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
     use crate::interchange::parse_room;
-    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
     use mtxdb::room_scope_id;
     use mtxdb::ShardType;
@@ -9824,7 +9820,7 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
     assert_eq!(written.events, 4);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index = EventTopoIndex::open(
+    let timeline_index = mtxdb::ordered_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
         mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
     );
@@ -9906,8 +9902,18 @@ fn stream_and_arrival_order_survive_import() {
 
     // Live and backfilled positions are preserved exactly; the soft-failed
     // event has no timeline position and stays out.
-    let streams: Vec<i64> = page.entries.iter().map(|e| e.stream_ordering).collect();
-    assert_eq!(streams, vec![1, 2, 3, -5]);
+    let stream_page = mtxdb::ordered_timeline::EventStreamIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope, None, true, 100)
+    .unwrap();
+    let streams: Vec<i64> = stream_page
+        .entries
+        .iter()
+        .map(|e| e.stream_ordering)
+        .collect();
+    assert_eq!(streams, vec![-5, 1, 2, 3]);
     let depths: Vec<i64> = page
         .entries
         .iter()
@@ -9956,7 +9962,6 @@ fn stream_and_arrival_order_survive_import() {
 fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
     use crate::interchange::parse_room;
     use mtxdb::interop::*;
-    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
     use mtxdb::room_scope_id;
     use mtxdb::ShardType;
@@ -10008,7 +10013,7 @@ fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
         "--flag soft-failed selects the imported event"
     );
 
-    let page = EventTopoIndex::open(
+    let page = mtxdb::ordered_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
         mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
@@ -10191,19 +10196,33 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     // Verify ordering:
     // 1. $backfill (depth: 10, stream: -5)
     assert_eq!(page.entries[0].topological_ordering, 10);
-    assert_eq!(page.entries[0].stream_ordering, -5);
+    assert_eq!(page.entries[0].origin_server_ts, 1000);
 
     // 2. $join (depth: 10, stream: 0)
     assert_eq!(page.entries[1].topological_ordering, 10);
-    assert_eq!(page.entries[1].stream_ordering, 0);
+    assert_eq!(page.entries[1].origin_server_ts, 1500);
 
     // 3. $normal (depth: 10, stream: 100)
     assert_eq!(page.entries[2].topological_ordering, 10);
-    assert_eq!(page.entries[2].stream_ordering, 100);
+    assert_eq!(page.entries[2].origin_server_ts, 2000);
 
     // 4. $later (depth: 11, stream: 101)
     assert_eq!(page.entries[3].topological_ordering, 11);
-    assert_eq!(page.entries[3].stream_ordering, 101);
+    assert_eq!(page.entries[3].origin_server_ts, 3000);
+
+    // The stream index keeps the signed positions, in stream order.
+    let stream_page = mtxdb::ordered_timeline::EventStreamIndex::open(
+        db.pool(ShardType::EventDag).as_ref(),
+        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+    )
+    .page(&room_scope, None, true, 10)
+    .unwrap();
+    let streams: Vec<i64> = stream_page
+        .entries
+        .iter()
+        .map(|e| e.stream_ordering)
+        .collect();
+    assert_eq!(streams, vec![-5, 0, 100, 101]);
 
     // Verify re-import idempotence: re-importing the same export does not duplicate entries
     let (written_again, _) =
