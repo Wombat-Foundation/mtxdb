@@ -202,6 +202,69 @@ fn reverse_pages_are_forward_reversed() {
 }
 
 #[test]
+fn count_range_uses_subtree_counts_and_includes_buffered_entries() {
+    let engine = InMemoryStorage::new();
+    let index = TimelineIndex::open(&engine, "count_range");
+    let scope = [0x41; 16];
+    let other_scope = [0x42; 16];
+    let entries: Vec<_> = (0..1_200_i64)
+        .flat_map(|position| {
+            [
+                entry(scope, position, u8::try_from(position % 251).unwrap()),
+                entry(other_scope, position, u8::try_from(position % 251).unwrap()),
+            ]
+        })
+        .collect();
+    index.build(&entries).unwrap();
+    for position in 1_200..1_210_i64 {
+        index
+            .append_untransactional(&[entry(
+                scope,
+                position,
+                u8::try_from(position % 251).unwrap(),
+            )])
+            .unwrap();
+    }
+
+    assert_eq!(
+        index
+            .count_range(
+                &scope,
+                Bound::Included(entry(scope, 20, 20)),
+                Bound::Included(entry(scope, 80, 80)),
+            )
+            .unwrap(),
+        61
+    );
+    assert_eq!(
+        index
+            .count_range(&scope, Bound::Unbounded, Bound::Unbounded)
+            .unwrap(),
+        1_210
+    );
+    assert_eq!(
+        index
+            .count_range(
+                &other_scope,
+                Bound::Included(entry(other_scope, 20, 20)),
+                Bound::Excluded(entry(other_scope, 80, 80)),
+            )
+            .unwrap(),
+        60
+    );
+    assert_eq!(
+        index
+            .count_range(
+                &scope,
+                Bound::Included(entry(scope, 80, 80)),
+                Bound::Excluded(entry(scope, 20, 20)),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn cursor_pins_its_snapshot_across_a_rebuild() {
     let engine = InMemoryStorage::new();
     let index = TimelineIndex::open(&engine, "test");

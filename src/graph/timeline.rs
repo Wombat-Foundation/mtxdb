@@ -2584,6 +2584,102 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         }
     }
 
+    /// Count entries in `prefix` within the half-open/closed key bounds.
+    ///
+    /// Fully covered subtrees use their stored entry counts; only directory
+    /// paths crossing a bound and their boundary leaves are read. Buffered
+    /// head entries are counted from the snapshot delta. This reads the
+    /// current head, not a cursor-pinned snapshot.
+    ///
+    /// # Errors
+    /// [`StorageError::Corrupt`] if a referenced node or its counts do not
+    /// validate; [`StorageError::NotFound`] if a referenced record is missing.
+    pub fn count_range(
+        &self,
+        prefix: &K::Prefix,
+        start: Bound<K>,
+        end: Bound<K>,
+    ) -> Result<u64, StorageError> {
+        validate_geometry::<K>()?;
+        let Some((head_id, _)) = self.head()? else {
+            return Ok(0);
+        };
+        let (root, snapshot) = self.resolve_page_head(head_id)?;
+        let mut count = self.count_spans(
+            &root.directories,
+            root.height.saturating_sub(1),
+            prefix,
+            &start,
+            &end,
+        )?;
+        if let Some(snapshot) = snapshot {
+            for entry in self.load_snapshot_delta(&snapshot)? {
+                if entry.prefix() == *prefix && in_key_range(&entry, &start, &end) {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        StorageError::Corrupt("timeline range count overflow".to_owned())
+                    })?;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn count_spans(
+        &self,
+        spans: &[SpanDescriptor<K>],
+        level: u8,
+        prefix: &K::Prefix,
+        start: &Bound<K>,
+        end: &Bound<K>,
+    ) -> Result<u64, StorageError> {
+        let mut count = 0_u64;
+        for span in spans {
+            if span.max_entry.prefix() < *prefix
+                || span.min_entry.prefix() > *prefix
+                || before_start(&span.max_entry, start)
+                || after_end(&span.min_entry, end)
+            {
+                continue;
+            }
+            if span.min_entry.prefix() == *prefix
+                && span.max_entry.prefix() == *prefix
+                && !before_start(&span.min_entry, start)
+                && !after_end(&span.max_entry, end)
+            {
+                count = count.checked_add(span.entry_count).ok_or_else(|| {
+                    StorageError::Corrupt("timeline range count overflow".to_owned())
+                })?;
+                continue;
+            }
+            if level == 0 {
+                for entry in self.load_leaf(&span.child_id)? {
+                    if entry.prefix() == *prefix && in_key_range(&entry, start, end) {
+                        count = count.checked_add(1).ok_or_else(|| {
+                            StorageError::Corrupt("timeline range count overflow".to_owned())
+                        })?;
+                    }
+                }
+            } else {
+                let children = self.load_directory(span.child_id, level)?;
+                validate_span_children(span, &children)?;
+                count = count
+                    .checked_add(self.count_spans(
+                        &children,
+                        level.checked_sub(1).ok_or_else(|| {
+                            StorageError::Corrupt("timeline directory level underflow".to_owned())
+                        })?,
+                        prefix,
+                        start,
+                        end,
+                    )?)
+                    .ok_or_else(|| {
+                        StorageError::Corrupt("timeline range count overflow".to_owned())
+                    })?;
+            }
+        }
+        Ok(count)
+    }
+
     /// Read one page for a leading-key prefix in ascending or reverse order.
     ///
     /// Forward returns keys strictly greater than `cursor`; reverse strictly
@@ -2921,6 +3017,26 @@ fn within_end<K: Ord>(entry: &K, end: &Bound<K>, forward: bool) -> bool {
         (Bound::Included(end), false) => entry >= end,
         (Bound::Excluded(end), false) => entry > end,
     }
+}
+
+fn before_start<K: Ord>(entry: &K, start: &Bound<K>) -> bool {
+    match start {
+        Bound::Unbounded => false,
+        Bound::Included(start) => entry < start,
+        Bound::Excluded(start) => entry <= start,
+    }
+}
+
+fn after_end<K: Ord>(entry: &K, end: &Bound<K>) -> bool {
+    match end {
+        Bound::Unbounded => false,
+        Bound::Included(end) => entry > end,
+        Bound::Excluded(end) => entry >= end,
+    }
+}
+
+fn in_key_range<K: Ord>(entry: &K, start: &Bound<K>, end: &Bound<K>) -> bool {
+    !before_start(entry, start) && !after_end(entry, end)
 }
 
 struct DirectTimelineTreeIo<'index, 'engine, S: StorageEngine + ?Sized, K: OrderedKey> {
