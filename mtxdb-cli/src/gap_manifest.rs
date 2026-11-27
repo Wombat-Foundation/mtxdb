@@ -1426,7 +1426,10 @@ mod tests {
     #[test]
     fn an_empty_manifest_writes_no_record() {
         let encoded = encode(&GapManifest::default()).unwrap();
-        assert!(decode(&encoded).unwrap().is_empty());
+        assert!(
+            decode(&encoded).unwrap().is_empty(),
+            "value should be empty"
+        );
     }
 
     fn report(json: &str) -> OwnedValue {

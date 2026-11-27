@@ -75,7 +75,7 @@ fn an_empty_store_has_an_empty_population() {
     let root = test_root("empty");
     let db = Database::open(root.clone()).unwrap();
     let snapshot = index().population_snapshot(&db).unwrap();
-    assert!(snapshot.is_empty());
+    assert!(snapshot.is_empty(), "value should be empty");
     assert_eq!(snapshot.manifest_version(), 0);
     assert_eq!(snapshot.owner_seq_ceiling(), 1);
     drop(db);

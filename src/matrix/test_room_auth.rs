@@ -842,7 +842,7 @@ fn batch_helpers_and_short_ids_agree_with_single_event_recording() {
     );
 
     let (prev, auth) = room.referenced_event_ids_by_family(&db).unwrap();
-    assert!(prev.is_empty());
+    assert!(prev.is_empty(), "value should be empty");
     assert_eq!(auth.into_iter().collect::<Vec<_>>(), vec!["$a".to_owned()]);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);

@@ -97,7 +97,10 @@ fn physical_layout_ignores_unrelated_pack_files_but_rejects_bad_pool_packs() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("other-app.pack"), b"not an mdb pack").unwrap();
-    assert!(physical_layout(&dir).unwrap().packs.is_empty());
+    assert!(
+        physical_layout(&dir).unwrap().packs.is_empty(),
+        "value should be empty"
+    );
 
     std::fs::write(dir.join("pack_0000000000000000.pack"), b"not an mdb pack").unwrap();
     assert_eq!(

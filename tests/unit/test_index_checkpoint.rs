@@ -142,7 +142,7 @@ fn empty_checkpoint_round_trips() {
     write_checkpoint(&path, pack_fingerprint(&[]), 0, 0, &[], &[], &[]).unwrap();
     let loaded = read_checkpoint(&path).expect("empty checkpoint is still a valid file");
     assert_eq!(loaded.fingerprint, pack_fingerprint(&[]));
-    assert!(loaded.collections.is_empty());
+    assert!(loaded.collections.is_empty(), "value should be empty");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

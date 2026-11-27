@@ -143,7 +143,7 @@ fn test_slot_packing() {
     assert_eq!(entry.tag(), 0xCDEF);
     assert_eq!(entry.slot(), 42);
     assert_eq!(entry.offset(), 0x0FFF_FFF0);
-    assert!(!entry.is_empty());
+    assert!(!entry.is_empty(), "value should not be empty");
 }
 
 #[test]
@@ -163,7 +163,7 @@ fn new_accepts_the_highest_live_slot_and_rejects_the_next() {
 #[test]
 fn test_slot_empty() {
     let entry = IndexEntry::empty();
-    assert!(entry.is_empty());
+    assert!(entry.is_empty(), "value should be empty");
     assert_eq!(entry.tag(), 0);
 }
 
@@ -309,7 +309,7 @@ fn test_table_full_returns_error() {
 #[test]
 fn test_is_empty_and_memory_usage() {
     let index = LossyIndex::new(128);
-    assert!(index.is_empty());
+    assert!(index.is_empty(), "value should be empty");
     assert_eq!(
         index.memory_usage(),
         128 * LIVE_SLOT_BYTES + std::mem::size_of::<LossyIndex>()
@@ -317,7 +317,7 @@ fn test_is_empty_and_memory_usage() {
 
     let index = LossyIndex::new(128);
     index.insert(&test_hash(0x01), 0, 1).unwrap();
-    assert!(!index.is_empty());
+    assert!(!index.is_empty(), "value should not be empty");
 }
 
 #[test]

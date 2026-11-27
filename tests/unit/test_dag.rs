@@ -70,7 +70,7 @@ fn test_clear_is_o1() {
     assert_eq!(frontier.len(), 1000);
     frontier.clear();
     assert_eq!(frontier.len(), 0);
-    assert!(frontier.is_empty());
+    assert!(frontier.is_empty(), "value should be empty");
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn test_auth_edges_resident_and_disk() {
 #[test]
 fn test_active_collection_frontier_default() {
     let frontier = ActiveRoomFrontier::default();
-    assert!(frontier.is_empty());
+    assert!(frontier.is_empty(), "value should be empty");
     assert_eq!(frontier.len(), 0);
 }
 

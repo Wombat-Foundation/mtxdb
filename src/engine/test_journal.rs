@@ -4280,7 +4280,7 @@ fn inactive_stage_rejects_every_staging_call_without_changing_state() {
     stage
         .stage_remove_records(ShardType::State, [1; 16], &[])
         .unwrap();
-    assert!(stage.is_empty());
+    assert!(stage.is_empty(), "value should be empty");
 }
 
 #[test]

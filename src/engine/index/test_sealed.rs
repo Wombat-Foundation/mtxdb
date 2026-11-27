@@ -233,7 +233,7 @@ fn iteration_yields_newest_pack_first() {
 #[test]
 fn empty_set_has_no_packs() {
     let set = SealedLocators::new();
-    assert!(set.is_empty());
+    assert!(set.is_empty(), "value should be empty");
     assert_eq!(set.len(), 0);
     assert_eq!(set.mapped_bytes(), 0);
     assert!(set.lookup(&COLLECTION, &KEY).unwrap().is_none());

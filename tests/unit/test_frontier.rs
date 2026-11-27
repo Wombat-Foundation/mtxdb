@@ -8,7 +8,7 @@ fn test_frontier_batch() {
     let hashes = vec![[1u8; 16], [2u8; 16], [3u8; 16]];
     let batch = FrontierBatch::new(hashes.clone());
     assert_eq!(batch.len(), 3);
-    assert!(!batch.is_empty());
+    assert!(!batch.is_empty(), "value should not be empty");
     assert_eq!(batch.hashes, hashes);
 }
 
@@ -31,14 +31,14 @@ fn test_bfs_layer_dedup() {
 #[test]
 fn test_bfs_layer_hashes_and_is_empty() {
     let layer = BfsLayer::new();
-    assert!(layer.is_empty());
+    assert!(layer.is_empty(), "value should be empty");
     let empty: &[NodeId] = &[];
     assert_eq!(layer.hashes(), empty);
 
     let mut layer = BfsLayer::new();
     layer.push([1u8; 16], [0xFF; 16]);
     layer.push([2u8; 16], [0xFF; 16]);
-    assert!(!layer.is_empty());
+    assert!(!layer.is_empty(), "value should not be empty");
     assert_eq!(layer.hashes().len(), 2);
     assert_eq!(layer.hashes()[0], [1u8; 16]);
     assert_eq!(layer.hashes()[1], [2u8; 16]);
@@ -47,7 +47,7 @@ fn test_bfs_layer_hashes_and_is_empty() {
 #[test]
 fn test_bfs_layer_default() {
     let layer = BfsLayer::default();
-    assert!(layer.is_empty());
+    assert!(layer.is_empty(), "value should be empty");
     assert_eq!(layer.len(), 0);
 }
 

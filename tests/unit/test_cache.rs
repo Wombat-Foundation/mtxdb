@@ -158,12 +158,12 @@ fn test_pinned_nodes() {
 #[test]
 fn test_pinned_default_is_empty_clear() {
     let pinned = PinnedNodes::default();
-    assert!(pinned.is_empty());
+    assert!(pinned.is_empty(), "value should be empty");
     let id = [0x03u8; 16];
     pinned.pin(id, test_data("x"));
-    assert!(!pinned.is_empty());
+    assert!(!pinned.is_empty(), "value should not be empty");
     pinned.clear();
-    assert!(pinned.is_empty());
+    assert!(pinned.is_empty(), "value should be empty");
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn test_remove() {
     cache.insert(id, test_data("data"));
     assert!(cache.remove(&id).is_some());
     assert!(cache.get(&id).is_none());
-    assert!(cache.is_empty());
+    assert!(cache.is_empty(), "value should be empty");
 }
 
 #[test]
@@ -252,7 +252,7 @@ fn test_generic_lru_reentrant_clone_does_not_deadlock() {
     let cache = Arc::new(LruCache::new(4));
     cache.insert(1, Reenter(Arc::clone(&cache)));
     assert!(cache.get(&1).is_some());
-    assert!(!cache.is_empty());
+    assert!(!cache.is_empty(), "value should not be empty");
     cache.clear(); // break the Arc cycle
 }
 
@@ -300,7 +300,7 @@ fn test_generic_lru_clear() {
     cache.insert("b", 2);
     cache.clear();
 
-    assert!(cache.is_empty());
+    assert!(cache.is_empty(), "value should be empty");
     assert_eq!(cache.get(&"a"), None);
     assert_eq!(cache.get(&"b"), None);
 }
@@ -341,5 +341,5 @@ fn test_generic_lru_concurrent_access() {
         }
     });
 
-    assert!(cache.is_empty());
+    assert!(cache.is_empty(), "value should be empty");
 }

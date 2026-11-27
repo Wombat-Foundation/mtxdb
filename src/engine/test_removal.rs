@@ -106,7 +106,7 @@ fn a_metadata_less_removed_frame_round_trips_on_the_flag_alone() {
         .unwrap()
         .unwrap();
     assert!(decoded.metadata.is_some_and(|metadata| metadata.removed));
-    assert!(decoded.data.is_empty());
+    assert!(decoded.data.is_empty(), "value should be empty");
 }
 
 /// With a metadata block present the flag and the block both survive.

@@ -2322,7 +2322,7 @@ fn versioned_transaction_read_rejects_stale_commit_and_retries() {
         .scan_collection_at_snapshot(&collection)
         .unwrap();
     let scanned = scan.collect::<Result<Vec<_>, _>>().unwrap();
-    assert!(!scanned.is_empty());
+    assert!(!scanned.is_empty(), "value should not be empty");
     assert!(db
         .pool(pool)
         .recheck_collection_version(&collection, scan_version)

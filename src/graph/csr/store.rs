@@ -2439,7 +2439,10 @@ mod tests {
         store.seal().unwrap();
         assert_eq!(store.read_scope(a).unwrap().rows[0].edges[0].target, 2);
         assert_eq!(store.read_scope(b).unwrap().rows[0].edges[0].target, 3);
-        assert!(store.read_scope(ScopeId([3; 16])).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(ScopeId([3; 16])).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         let _ = fs::remove_dir_all(layout.root());
     }
 
@@ -2564,7 +2567,10 @@ mod tests {
         // A tombstone in the new tail hides the sealed rows, only for its scope.
         store.purge_scope(scope).unwrap();
         assert_eq!(point(1), None);
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         assert_eq!(store.read_scope(other).unwrap().rows.len(), 1);
         // Rows recorded after the purge are visible again.
         store.append_rows(scope, &[row(7, 1)]).unwrap();
@@ -2580,9 +2586,15 @@ mod tests {
         store.append_rows(scope, &[row(2, 1)]).unwrap();
         store.seal().unwrap();
         store.purge_scope(scope).unwrap();
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         store.seal().unwrap();
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         let _ = fs::remove_dir_all(layout.root());
     }
 
@@ -2626,7 +2638,10 @@ mod tests {
         store.purge_scope(scope).unwrap();
         assert_eq!(tail_len(), 0, "the purge seals the tail");
         assert_eq!(store.segments().unwrap().len(), 1);
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         let _ = fs::remove_dir_all(layout.root());
     }
 
@@ -2650,7 +2665,10 @@ mod tests {
             writer.append_rows(scope, &[row(2, 1)]).unwrap();
             assert_eq!(store.read_scope(scope).unwrap().rows.len(), 1);
             writer.purge_scope(scope).unwrap();
-            assert!(store.read_scope(scope).unwrap().rows.is_empty());
+            assert!(
+                store.read_scope(scope).unwrap().rows.is_empty(),
+                "value should be empty"
+            );
         }
         let _ = fs::remove_dir_all(owner_root);
         let _ = fs::remove_dir_all(other_root);
@@ -2786,7 +2804,10 @@ mod tests {
         }
         for thread in 0..THREADS {
             let purge_scope = ScopeId([u8::try_from(thread + 10).unwrap(); 16]);
-            assert!(store.read_scope(purge_scope).unwrap().rows.is_empty());
+            assert!(
+                store.read_scope(purge_scope).unwrap().rows.is_empty(),
+                "value should be empty"
+            );
         }
         let _ = fs::remove_dir_all(layout.root());
     }
@@ -2894,7 +2915,10 @@ mod tests {
         store.seal().unwrap();
         store.purge_scope(scope).unwrap();
         // Prime the cache with the purge, then seal it into a new segment.
-        assert!(store.read_scope(scope).unwrap().rows.is_empty());
+        assert!(
+            store.read_scope(scope).unwrap().rows.is_empty(),
+            "value should be empty"
+        );
         let old_len = fs::metadata(store.tail_path()).unwrap().len();
         store.seal().unwrap();
         // Simulate another process refilling the tail until it is at least as

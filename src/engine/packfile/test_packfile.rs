@@ -140,7 +140,7 @@ fn test_last_write_lsn_metadata_tag() {
         last_write_lsn: Some(0xDEAD_BEEF_0102_0304),
         ..FrameMetadata::default()
     };
-    assert!(!metadata.is_empty());
+    assert!(!metadata.is_empty(), "value should not be empty");
     let encoded = metadata.encode().unwrap();
     let (decoded, consumed) = FrameMetadata::decode(&encoded).unwrap();
     assert_eq!(consumed, encoded.len());

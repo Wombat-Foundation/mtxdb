@@ -2765,8 +2765,8 @@ fn waiting_set_families_clear_on_the_right_kind_of_arrival() {
         &no_timeline,
         &no_anywhere,
     );
-    assert!(waiting.prev.is_empty());
-    assert!(waiting.auth.is_empty());
+    assert!(waiting.prev.is_empty(), "value should be empty");
+    assert!(waiting.auth.is_empty(), "value should be empty");
 }
 
 /// A room that starts empty must still report its growing size, or the direct
@@ -3006,8 +3006,8 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
         let waiting = &cache.waiting[&collection_id];
         match index {
             0 => {
-                assert!(waiting.prev.is_empty());
-                assert!(waiting.auth.is_empty());
+                assert!(waiting.prev.is_empty(), "value should be empty");
+                assert!(waiting.auth.is_empty(), "value should be empty");
             }
             1 => {
                 assert!(waiting.prev.contains("$later-prev"));
@@ -3033,12 +3033,12 @@ fn run_scoped_waiting_set_matches_a_rebuild_after_every_file() {
             }
             3 => {
                 assert!(waiting.prev.contains("$later-auth"));
-                assert!(waiting.auth.is_empty());
+                assert!(waiting.auth.is_empty(), "value should be empty");
             }
             _ => {
                 assert!(waiting.prev.contains("$still-later"));
                 assert!(!waiting.prev.contains("$later-auth"));
-                assert!(waiting.auth.is_empty());
+                assert!(waiting.auth.is_empty(), "value should be empty");
             }
         }
     }
@@ -7018,7 +7018,7 @@ fn compute_state_groups_assigns_groups_per_event() {
 #[test]
 fn compute_state_groups_empty_input() {
     let groups = compute_state_groups_partial(&[], &[], "!r:x").groups;
-    assert!(groups.is_empty());
+    assert!(groups.is_empty(), "value should be empty");
 }
 
 #[test]
@@ -7148,7 +7148,7 @@ fn partial_state_groups_report_cycles() {
         r#"{"event_id":"$second","room_id":"!r:x","type":"m.room.message","prev_events":["$first"],"content":{}}"#,
     );
     let result = compute_state_groups_partial(&[first, second], &[], "!r:x");
-    assert!(result.groups.is_empty());
+    assert!(result.groups.is_empty(), "value should be empty");
     assert_eq!(result.unresolved.len(), 2);
 }
 
@@ -12221,7 +12221,7 @@ fn room_stats_ignores_stale_body_after_latest_removal() {
 
     let stats = super::scan_room_event_stats(&pool_dir, &collection).unwrap();
     assert_eq!(stats.records, 0);
-    assert!(stats.members.is_empty());
+    assert!(stats.members.is_empty(), "value should be empty");
     std::fs::remove_dir_all(dir).unwrap();
 }
 

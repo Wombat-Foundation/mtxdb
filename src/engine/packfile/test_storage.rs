@@ -13884,6 +13884,7 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
     fs::remove_dir_all(&store_dir).ok();
 }
 
+#[cfg(feature = "multi-reader")]
 fn assert_residency_mismatch<T>(result: Result<T, StorageError>) {
     let Err(error) = result else {
         panic!("a shared reader must reject mismatched writer residency");
@@ -14824,7 +14825,7 @@ fn paged_full_scan_uses_sidecars_under_full_checksums() {
     );
     {
         let generation = store.generation(&TEST_COLLECTION).expect("generation");
-        assert!(!generation.sealed.is_empty());
+        assert!(!generation.sealed.is_empty(), "value should not be empty");
         let sealed = usize::try_from(
             generation
                 .sealed
@@ -15778,7 +15779,10 @@ fn paged_repack_invalidates_a_run_over_retired_packs() {
         "the surviving covered packs answer through their sidecars"
     );
     drop(other);
-    assert!(store.shards.sealed_runs().is_empty());
+    assert!(
+        store.shards.sealed_runs().is_empty(),
+        "value should be empty"
+    );
     assert_store_matches(&store, &expected, "after repack");
     store.sync_all().unwrap();
     drop(store);
@@ -15942,7 +15946,10 @@ fn paged_run_crash_points_reopen_with_identical_answers() {
     fs::write(&temporary, b"partial run").unwrap();
     let store = paged_open(&dir);
     assert!(!temporary.exists(), "a writable open deletes a temp run");
-    assert!(store.shards.sealed_runs().is_empty());
+    assert!(
+        store.shards.sealed_runs().is_empty(),
+        "value should be empty"
+    );
     assert_store_matches(&store, &expected, "after a crash before rename");
 
     // After the rename (with or without the directory fsync), before the
@@ -16015,7 +16022,10 @@ fn paged_run_install_is_discarded_after_its_packs_retire() {
         .unwrap();
     store.install_run(built);
     assert!(!path.exists(), "a run over a retired pack is discarded");
-    assert!(store.shards.sealed_runs().is_empty());
+    assert!(
+        store.shards.sealed_runs().is_empty(),
+        "value should be empty"
+    );
     assert_eq!(store.run_merges_installed.load(Ordering::Relaxed), 0);
     for collection in [TEST_COLLECTION, OTHER_COLLECTION] {
         assert!(store

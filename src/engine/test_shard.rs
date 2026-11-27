@@ -149,7 +149,7 @@ fn failed_flush_rollback_retires_both_mappings_and_allows_later_io() {
         .put_record(&failed)
         .expect_err("injected flush failure must reach append rollback");
     assert!(error.to_string().contains("injected test flush failure"));
-    assert!(shard.pending.lock().is_empty());
+    assert!(shard.pending.lock().is_empty(), "value should be empty");
     assert!(shard.point_mmap.read().is_none());
     assert!(shard.mmap.read().is_none());
 
@@ -356,9 +356,9 @@ fn record_identity_at_rejects_a_damaged_removal_crc() {
 fn test_sync_dirty_noop_when_nothing_written() {
     let dir = test_dir("sync_dirty_noop");
     let pool = ShardPool::open(dir).unwrap();
-    assert!(pool.dirty.lock().is_empty());
+    assert!(pool.dirty.lock().is_empty(), "value should be empty");
     pool.sync_dirty().unwrap();
-    assert!(pool.dirty.lock().is_empty());
+    assert!(pool.dirty.lock().is_empty(), "value should be empty");
 }
 
 #[test]
@@ -2190,8 +2190,14 @@ fn seal_queue_skips_a_pack_retired_while_queued() {
     pool.wait_for_seals();
     let ready = pool.take_sealed_ready();
     assert_eq!(ready, vec![(packs[1].slot, packs[1].pack_id)]);
-    assert!(pool.seal_queue.state.lock().pending.is_empty());
-    assert!(pool.seal_queue.state.lock().outstanding.is_empty());
+    assert!(
+        pool.seal_queue.state.lock().pending.is_empty(),
+        "value should be empty"
+    );
+    assert!(
+        pool.seal_queue.state.lock().outstanding.is_empty(),
+        "value should be empty"
+    );
 }
 
 /// Dropping the pool drains submitted work and joins the workers.

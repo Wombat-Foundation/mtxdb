@@ -289,7 +289,7 @@ fn outlier_flag_is_part_of_the_verdict_record() {
     assert_eq!(bytes, [&[1, 0b1000, 4, 0, 0, 0][..], b"$e:x"].concat());
     assert_eq!(decode_verdict(&bytes).unwrap().1, outlier);
     let timeline = Verdict::default();
-    assert!(timeline.is_empty());
+    assert!(timeline.is_empty(), "value should be empty");
     assert!(
         !decode_verdict(&encode_verdict(b"$e:x", &timeline).unwrap())
             .unwrap()
