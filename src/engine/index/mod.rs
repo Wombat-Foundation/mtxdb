@@ -11,6 +11,8 @@ pub mod format;
 pub mod redo;
 pub mod versions;
 
+pub use bucket_index::BucketIndex;
+
 use crate::index::delta::DeltaReplayError;
 use crate::index::format::DeltaFrame;
 

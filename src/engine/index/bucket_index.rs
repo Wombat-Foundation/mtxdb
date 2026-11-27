@@ -4,6 +4,7 @@
 //! checked against the authoritative frame header at the storage boundary.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::bucket::{BucketCandidate, BucketSnapshotError, BucketUndo, RawBucketTable};
 use super::{IndexConfig, InsertError};
@@ -13,6 +14,7 @@ use super::{IndexConfig, InsertError};
 pub struct BucketIndex {
     table: RawBucketTable,
     config: IndexConfig,
+    max_candidates: AtomicU32,
 }
 
 impl Clone for BucketIndex {
@@ -22,6 +24,7 @@ impl Clone for BucketIndex {
         Self {
             table,
             config: self.config,
+            max_candidates: AtomicU32::new(self.max_candidates.load(Ordering::Relaxed)),
         }
     }
 }
@@ -40,6 +43,7 @@ impl BucketIndex {
         Self {
             table: RawBucketTable::new(min_entries, config.seed),
             config,
+            max_candidates: AtomicU32::new(0),
         }
     }
 
@@ -77,7 +81,7 @@ impl BucketIndex {
         mut identity_at: impl FnMut(&BucketCandidate) -> Result<[u8; 16], E>,
     ) -> Result<Result<(BucketUndo, bool), InsertError>, E> {
         let fingerprint = self.table.fingerprint(hash);
-        for candidate in self.table.candidates(fingerprint) {
+        for candidate in self.candidates_for_fingerprint(fingerprint) {
             if identity_at(&candidate)? == *hash {
                 return Ok(self
                     .table
@@ -106,7 +110,47 @@ impl BucketIndex {
     /// each candidate against the frame's full identity before returning it.
     #[must_use]
     pub fn candidates(&self, hash: &[u8; 16]) -> Vec<BucketCandidate> {
-        self.table.candidates(self.table.fingerprint(hash))
+        self.candidates_for_fingerprint(self.table.fingerprint(hash))
+    }
+
+    /// Iterate candidate `(shard, offset)` locators for a key.
+    pub fn lookup_all(&self, hash: &[u8; 16]) -> std::vec::IntoIter<(u16, u64)> {
+        self.candidates(hash)
+            .into_iter()
+            .map(|candidate| (candidate.shard_slot, candidate.offset))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    /// Return the first candidate locator for a key, if any.
+    #[must_use]
+    pub fn lookup(&self, hash: &[u8; 16]) -> Option<(u16, u64)> {
+        self.candidates(hash)
+            .into_iter()
+            .next()
+            .map(|candidate| (candidate.shard_slot, candidate.offset))
+    }
+
+    fn candidates_for_fingerprint(&self, fingerprint: u64) -> Vec<BucketCandidate> {
+        let candidates = self.table.candidates(fingerprint);
+        self.max_candidates.fetch_max(
+            u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+        candidates
+    }
+
+    /// Maximum candidate count seen in a fingerprint lookup.
+    #[must_use]
+    pub fn max_candidate_count(&self) -> u32 {
+        self.max_candidates.load(Ordering::Relaxed)
+    }
+
+    /// Compatibility metric for callers still using the former probe-chain
+    /// statistic. It now reports the maximum fingerprint candidate count.
+    #[must_use]
+    pub fn max_probe_len(&self) -> u32 {
+        self.max_candidate_count()
     }
 
     /// Grow the table and rehash its stored fingerprints without reading packs.
@@ -115,6 +159,7 @@ impl BucketIndex {
         Some(Self {
             table: self.table.grow()?,
             config: self.config,
+            max_candidates: AtomicU32::new(self.max_candidate_count()),
         })
     }
 
@@ -243,18 +288,71 @@ impl BucketIndex {
     /// # Errors
     /// Returns [`BucketSnapshotError`] when the snapshot is malformed, corrupt,
     /// or contains more entries than the configured load threshold permits.
+    pub fn deserialize_with_config(
+        data: &[u8],
+        config: IndexConfig,
+    ) -> Result<Self, BucketSnapshotError> {
+        Self::deserialize(data, config)
+    }
+
+    /// Decode a bucket snapshot using this pool's load-factor policy.
+    ///
+    /// # Errors
+    /// Returns [`BucketSnapshotError`] when the snapshot is malformed, corrupt,
+    /// or contains more entries than the configured load threshold permits.
     pub fn deserialize(data: &[u8], config: IndexConfig) -> Result<Self, BucketSnapshotError> {
         let table = RawBucketTable::from_snapshot(data)?;
         if table.len() > max_occupied(table.capacity(), config.load_factor_percent) {
             return Err(BucketSnapshotError::InvalidDimensions);
         }
-        Ok(Self { table, config })
+        Ok(Self {
+            table,
+            config,
+            max_candidates: AtomicU32::new(0),
+        })
+    }
+
+    /// The table is always resident; it is never backed by a checkpoint mmap.
+    #[must_use]
+    pub const fn is_mmap_backed(&self) -> bool {
+        false
+    }
+
+    /// Bytes mapped from checkpoint storage. Bucket snapshots are decoded to
+    /// owned cache-line buckets, so this is always zero.
+    #[must_use]
+    pub const fn mapped_bytes(&self) -> usize {
+        0
+    }
+
+    /// Estimated total memory for the standard capacity policy.
+    #[must_use]
+    pub fn memory_usage_for_entries(entries: usize, min_capacity: usize) -> Option<usize> {
+        Self::capacity_for_entries(entries, min_capacity)?
+            .checked_mul(16)?
+            .checked_add(std::mem::size_of::<Self>())
+    }
+
+    /// Table capacity after applying the standard two-times-entry allocation
+    /// policy and the caller's starting floor.
+    #[must_use]
+    pub fn capacity_for_entries(entries: usize, min_capacity: usize) -> Option<usize> {
+        entries
+            .saturating_mul(2)
+            .max(min_capacity.max(16))
+            .checked_next_power_of_two()
     }
 
     /// Bytes occupied by the owned bucket allocation and overflow slots.
     #[must_use]
     pub fn resident_bytes(&self) -> usize {
         self.table.resident_bytes()
+    }
+
+    /// Estimate index memory, including the table header and overflow slots.
+    #[must_use]
+    pub fn memory_usage(&self) -> usize {
+        self.resident_bytes()
     }
 }
 
