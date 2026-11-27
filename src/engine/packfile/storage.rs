@@ -3183,6 +3183,7 @@ impl PackfileStorage {
         pool: crate::layout::ShardType,
     ) -> Result<Self, StorageError> {
         let store = Self::open_read_only(base_dir)?;
+        store.validate_shared_reader_reload_mode()?;
         store.enable_read_journal_shared(wal_path, pool)?;
         Ok(store)
     }
@@ -3205,8 +3206,26 @@ impl PackfileStorage {
         config: &RuntimeConfig,
     ) -> Result<Self, StorageError> {
         let store = Self::open_read_only_with_config(base_dir, config)?;
+        store.validate_shared_reader_reload_mode()?;
         store.enable_read_journal_shared(wal_path, pool)?;
         Ok(store)
+    }
+
+    /// A resident reader can reload reclaimed shared-WAL coverage only from
+    /// a resident index checkpoint. Paged writers intentionally remove that
+    /// checkpoint and reload from packs instead, so fail during open rather
+    /// than returning a retry-shaped read error later.
+    fn validate_shared_reader_reload_mode(&self) -> Result<(), StorageError> {
+        if self.index_residency == crate::index::IndexResidency::Resident
+            && !Self::index_checkpoint_path(&self.base_dir).is_file()
+            && Self::read_journal_lsn(&self.base_dir) > 0
+        {
+            return Err(StorageError::Unsupported(format!(
+                "{} has reclaimed shared-WAL coverage but no resident index checkpoint; the writer may use paged residency. Open the reader with open_read_committed_shared_with_config and matching index residency",
+                self.base_dir.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Open a packfile storage with a custom per-collection cache capacity.

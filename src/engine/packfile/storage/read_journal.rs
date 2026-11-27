@@ -963,6 +963,11 @@ impl PackfileStorage {
         }
         let advanced = self.read_covered_lsn.load(Ordering::Acquire) > coverage_before_attempts;
         if reload_failed || advanced {
+            // If durable shared-WAL coverage advanced without a resident
+            // checkpoint, this is not a transient read race: the worker was
+            // opened resident against a paged writer. Surface the configuration
+            // mismatch instead of telling callers to retry indefinitely.
+            self.validate_shared_reader_reload_mode()?;
             Err(StorageError::WouldBlock(
                 "read-committed reload failed or checkpoint coverage advanced; retry the read"
                     .to_owned(),

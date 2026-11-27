@@ -13884,6 +13884,16 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
     fs::remove_dir_all(&store_dir).ok();
 }
 
+fn assert_residency_mismatch<T>(result: Result<T, StorageError>) {
+    let Err(error) = result else {
+        panic!("a resident reader must reject reclaimed paged-writer coverage");
+    };
+    assert!(
+        matches!(&error, StorageError::Unsupported(message) if message.contains("matching index residency")),
+        "mismatched shared reader should explain how to open with matching residency: {error:?}"
+    );
+}
+
 #[test]
 #[cfg(feature = "multi-reader")]
 fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
@@ -13917,9 +13927,19 @@ fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
             &NodeData::new(bytes::Bytes::from_static(b"first")),
         )
         .unwrap();
+    let early_resident_reader =
+        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State).unwrap();
     writer.sync().unwrap();
     assert!(Journal::scan_read_only(&wal).unwrap().groups.is_empty());
 
+    assert_residency_mismatch(early_resident_reader.get_read_committed(&collection, &[first]));
+    drop(early_resident_reader);
+
+    assert_residency_mismatch(PackfileStorage::open_read_committed_shared(
+        dir.clone(),
+        &wal,
+        ShardType::State,
+    ));
     let config = crate::RuntimeConfig {
         index_residency: Some(crate::index::IndexResidency::Paged),
         ..crate::RuntimeConfig::default()
