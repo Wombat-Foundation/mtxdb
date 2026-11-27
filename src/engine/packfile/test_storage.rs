@@ -14089,6 +14089,73 @@ fn shared_reader_detects_writer_residency_change_before_reload() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A writer restart that changes residency must be noticed even when this
+/// reader's next read needs no reload. Without the early check the overlay and
+/// the pinned index still answer the read, so the mismatch would go unreported
+/// until a later reclaim.
+#[test]
+#[cfg(feature = "multi-reader")]
+fn shared_reader_rejects_residency_change_without_a_reload() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("shared_reader_residency_change_no_reload");
+    let wal = dir.join("shared.wal");
+    let collection = [0x58u8; 16];
+    let first = distinct_id(5);
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+
+    let resident_writer = PackfileStorage::open(dir.clone()).unwrap();
+    resident_writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    resident_writer
+        .journal()
+        .unwrap()
+        .set_reclaim_trigger_len(1);
+    resident_writer
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    resident_writer.sync().unwrap();
+
+    let reader =
+        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State).unwrap();
+    assert_eq!(
+        reader.get_read_committed(&collection, &[first]).unwrap()[0]
+            .as_ref()
+            .map(|data| data.bytes.as_ref()),
+        Some(&b"first"[..])
+    );
+    drop(resident_writer);
+
+    // Opening the paged writer rewrites the residency record but leaves the
+    // WAL and this reader's covered LSN untouched, so the read below would be
+    // served from the pinned index and overlay without the early check.
+    let paged_writer = PackfileStorage::open_with_residency(
+        dir.clone(),
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    paged_writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+
+    assert_residency_mismatch(reader.get_read_committed(&collection, &[first]));
+
+    drop(reader);
+    drop(paged_writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A paged writer records its residency on disk, so a resident reader is
 /// rejected at open even while all writes are still buffered and no WAL
 /// coverage has been reclaimed. The checkpoint/coverage fallback alone cannot
