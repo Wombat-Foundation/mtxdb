@@ -12,8 +12,8 @@
 //! Their cursors are distinct Rust types, and their collections are shared
 //! across rooms.
 
-use crate::define_ordered_key;
 use crate::database::DatabaseTransaction;
+use crate::define_ordered_key;
 use crate::layout::ShardType;
 use crate::packfile::storage::PackfileStorage;
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};

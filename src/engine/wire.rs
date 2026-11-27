@@ -4,6 +4,8 @@
 //! probing, and I/O stay in their owning modules so a macro expansion never
 //! hides a state machine from the debugger or the borrow checker.
 
+#![allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation)]
+
 use crate::storage::StorageError;
 
 /// One fixed-width field whose big-endian encoding sorts like its value.
@@ -137,6 +139,7 @@ macro_rules! define_ordered_key {
                 )+
             }
 
+            #[allow(clippy::arithmetic_side_effects)]
             fn decode(bytes: &[u8]) -> Result<Self, $crate::storage::StorageError> {
                 if bytes.len() != Self::WIRE_LEN {
                     return Err($crate::storage::StorageError::Corrupt(
