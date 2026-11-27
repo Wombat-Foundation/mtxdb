@@ -26,7 +26,7 @@ use bytes::Bytes;
 use mtxdb::ordered_timeline::{
     open_event_timeline_indexes, page_stream_up_to, stage_event_timeline_batch,
     stage_promote_outlier_to_timeline, stage_purge_room_timeline,
-    stage_remove_event_timeline_batch, EventTimelineEntry,
+    stage_remove_event_timeline_batch, EventStreamIndex, EventTimelineEntry,
 };
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
 use mtxdb::{interop, Database, PoolPolicies, RuntimeConfig, ShardType};
@@ -1407,7 +1407,31 @@ fn run_fetch_rows(
     db
 }
 
-#[allow(clippy::too_many_lines)]
+/// Resolve each event's stream position from the stream index.
+fn collect_stream_positions<S: StorageEngine + ?Sized>(
+    stream_index: &EventStreamIndex<'_, S>,
+    scope: &[u8; 16],
+    wanted: &std::collections::HashSet<NodeId>,
+) -> HashMap<NodeId, i64> {
+    let mut streams = HashMap::with_capacity(wanted.len());
+    let mut cursor = None;
+    while streams.len() < wanted.len() {
+        let stream_page = stream_index
+            .page(scope, cursor.as_ref(), true, 1024)
+            .expect("mutation stream page");
+        for key in &stream_page.entries {
+            if wanted.contains(&key.event_node_id) {
+                streams.insert(key.event_node_id, key.stream_ordering);
+            }
+        }
+        cursor = stream_page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    streams
+}
+
 fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min: usize) {
     let Some(largest) = tier else {
         return;
@@ -1464,22 +1488,7 @@ fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min
     // stream index before the timed removal.
     let wanted: std::collections::HashSet<NodeId> =
         page.entries.iter().map(|key| key.event_node_id).collect();
-    let mut streams = std::collections::HashMap::with_capacity(wanted.len());
-    let mut cursor = None;
-    while streams.len() < wanted.len() {
-        let stream_page = stream_index
-            .page(&largest_room.scope, cursor.as_ref(), true, 1024)
-            .expect("mutation stream page");
-        for key in &stream_page.entries {
-            if wanted.contains(&key.event_node_id) {
-                streams.insert(key.event_node_id, key.stream_ordering);
-            }
-        }
-        cursor = stream_page.next_cursor;
-        if cursor.is_none() {
-            break;
-        }
-    }
+    let streams = collect_stream_positions(&stream_index, &largest_room.scope, &wanted);
     let remove_entries: Vec<EventTimelineEntry> = page
         .entries
         .iter()
