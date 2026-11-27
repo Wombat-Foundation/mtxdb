@@ -493,9 +493,20 @@ impl CsrStore {
     }
 
     /// Seal, replacing each listed scope's rows, while the caller holds this
-    /// directory's write lock. The new segment is published by rename, so a
-    /// crash leaves every listed scope old or every one new. The tail truncate
-    /// is not synced here: a caller replacing rows must sync the tail after.
+    /// directory's write lock. All listed scopes reach the directory together:
+    /// the new segment is published by one rename, so a crash before it leaves
+    /// every listed scope as it was.
+    ///
+    /// That is not the whole guarantee. Until the tail truncate below is
+    /// durable, a crash can bring the old tail back, and the tail is applied
+    /// after sealed segments. Its rows then override the new segment, so rows
+    /// the replacement deleted can reappear while rows that only lived in older
+    /// sealed segments stay replaced. The state is mixed, not old-or-new.
+    /// Callers must run open-time recovery before serving reads; it rebuilds
+    /// the affected scopes and converges.
+    ///
+    /// The tail truncate is not synced here: a caller replacing rows must sync
+    /// the tail after.
     pub(crate) fn replace_scopes_locked(
         &self,
         replacements: &[(ScopeId, Vec<RowRecord>)],
