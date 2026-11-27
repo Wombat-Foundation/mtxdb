@@ -1896,7 +1896,7 @@ fn repair_rows_after_rollback(
     db: &Database,
     store: &CsrStore,
     watermark: u64,
-) -> Result<(), StorageError> {
+) -> Result<bool, StorageError> {
     let scopes = store.all_scopes().map_err(StorageError::Io)?;
     // A CSR scope is derived from its event collection, so enumerate the State
     // pool's collections to recover each scope's committed short-id counter.
@@ -1991,15 +1991,23 @@ fn repair_rows_after_rollback(
             repaired.push((scope, rows));
         }
     }
-    store.with_write_lock(|| -> Result<(), StorageError> {
+    let changed = store.with_write_lock(|| -> Result<bool, StorageError> {
+        let watermark_changed =
+            read_watermark_locked(store).map_err(StorageError::Io)? != watermark;
         for (scope, rows) in &repaired {
             store
                 .rewrite_scope_locked(*scope, rows)
                 .map_err(StorageError::Io)?;
         }
-        write_watermark_locked(store, db, watermark).map_err(StorageError::Io)
+        if watermark_changed {
+            write_watermark_locked(store, db, watermark).map_err(StorageError::Io)?;
+        }
+        Ok(watermark_changed || !repaired.is_empty())
     })?;
-    store.sync_tail().map_err(StorageError::Io)
+    if changed {
+        store.sync_tail().map_err(StorageError::Io)?;
+    }
+    Ok(changed)
 }
 
 fn replay_edge_log_run(

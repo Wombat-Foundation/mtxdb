@@ -1244,6 +1244,33 @@ mod edge_log_recovery {
     }
 
     #[test]
+    fn clean_recovery_syncs_the_existing_tail_once() {
+        let root = test_root("edge-log-clean-recovery-sync-count");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        CsrAdjacency::for_collection(&ROOM_A)
+            .record_events_logged(
+                &db,
+                &log,
+                &[event("$clean-recovery", &[])],
+                AppendDurability::Durable,
+            )
+            .unwrap();
+        let db = restart_keeping_everything(&root, db);
+
+        let before = crate::csr::store::test_tail_syncs();
+        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
+        assert_eq!(
+            crate::csr::store::test_tail_syncs() - before,
+            1,
+            "clean recovery needs its initial durability barrier but no rewrite barrier"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_missing_entry_above_the_prune_point_is_corruption() {
         let root = test_root("edge-log-gap");
         let db = Database::open(root.clone()).unwrap();
@@ -1697,7 +1724,13 @@ mod edge_log_recovery {
             1,
             "the watermark equals the head, so nothing replays"
         );
+        let before = crate::csr::store::test_tail_syncs();
         assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
+        assert_eq!(
+            crate::csr::store::test_tail_syncs() - before,
+            2,
+            "a repair that changes rows must sync them after the initial barrier"
+        );
 
         let store = CsrStore::open(db.layout(), ShardType::State);
         assert!(!has_orphan(&store), "the orphan row must be repaired away");
