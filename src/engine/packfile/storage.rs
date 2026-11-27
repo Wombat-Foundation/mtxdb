@@ -1050,7 +1050,7 @@ impl StreamingOpenScan {
     fn insert(
         &mut self,
         entry: packfile::ScanEntryWithRemoval,
-        shards: &ShardPool,
+        pool: &ShardPool,
         slot: u16,
         pack_id: PackId,
         creation_seq: u32,
@@ -1087,13 +1087,13 @@ impl StreamingOpenScan {
             removed: entry.removed,
             slot,
         };
-        self.insert_locator(locator, shards, config.index_config)
+        self.insert_locator(locator, pool, config.index_config)
     }
 
     fn insert_locator(
         &mut self,
         locator: ScanLocator,
-        shards: &ShardPool,
+        pool: &ShardPool,
         index_config: crate::index::IndexConfig,
     ) -> Result<(), StorageError> {
         let ScanLocator {
@@ -1113,7 +1113,7 @@ impl StreamingOpenScan {
             let inserted =
                 index.insert_with_identity(&hash, slot, offset, removed, |candidate| {
                     identity_reads = identity_reads.saturating_add(1);
-                    bucket_candidate_identity(shards, &collection_id, candidate)
+                    bucket_candidate_identity(pool, &collection_id, candidate)
                 })?;
             match inserted {
                 Ok(_) => break,
@@ -1528,17 +1528,17 @@ fn plan_read_extents(
 /// Resolve a bucket candidate against its authoritative frame before allowing
 /// an insert to treat a fingerprint match as an overwrite.
 fn bucket_candidate_identity(
-    shards: &ShardPool,
+    pool: &ShardPool,
     collection_id: &[u8; 16],
     candidate: &BucketCandidate,
 ) -> Result<[u8; 16], StorageError> {
-    let shard = shards.get_shard(candidate.shard_slot).ok_or_else(|| {
+    let shard = pool.get_shard(candidate.shard_slot).ok_or_else(|| {
         StorageError::Corrupt(format!(
             "index refers to missing shard {} while resolving a fingerprint candidate",
             candidate.shard_slot
         ))
     })?;
-    let (found_collection, hash, _) = shards.record_identity_at(&shard, candidate.offset)?;
+    let (found_collection, hash, _) = pool.record_identity_at(&shard, candidate.offset)?;
     if found_collection != *collection_id {
         return Err(StorageError::Corrupt(format!(
             "index candidate at offset {} in shard {} belongs to another collection",
@@ -3670,8 +3670,9 @@ impl PackfileStorage {
         shards: &ShardPool,
         sets: &HashMap<[u8; 16], Vec<RedoRecord>>,
         pack_lookup: &HashMap<PackId, (u16, u64)>,
-    ) -> bool {
-        sets.values().flatten().all(|record| {
+    ) -> Option<u64> {
+        let mut identity_reads = 0_u64;
+        for record in sets.values().flatten() {
             let RedoOp::Set {
                 full_hash,
                 pack_id,
@@ -3679,20 +3680,24 @@ impl PackfileStorage {
                 ..
             } = record.op
             else {
-                return false;
+                return None;
             };
             let Some(shard) = pack_lookup
                 .get(&pack_id)
                 .and_then(|(slot, _)| shards.get_shard(*slot))
             else {
-                return false;
+                return None;
             };
-            matches!(
+            identity_reads = identity_reads.saturating_add(1);
+            if !matches!(
                 shards.record_identity_at(&shard, offset),
                 Ok((collection, hash, _removed))
                     if collection == record.collection_id && hash == full_hash
-            )
-        })
+            ) {
+                return None;
+            }
+        }
+        Some(identity_reads)
     }
 
     /// Apply logical redo sets, in `delta_seq` order, to a loaded index whose
@@ -4074,10 +4079,12 @@ impl PackfileStorage {
         // mismatch). Offsets ascend within a pack in log order, since each set
         // names a freshly appended record, so this is a sequential pass over
         // pages the pack recovery has just read.
-        if !Self::redo_locators_verified(shards, &redo_by_collection, &pack_lookup) {
+        let Some(mut index_identity_reads) =
+            Self::redo_locators_verified(shards, &redo_by_collection, &pack_lookup)
+        else {
             timings.checkpoint_reject = Some(CheckpointReject::RedoLocatorUnverified);
             return None;
-        }
+        };
 
         let slot_to_pack_id: HashMap<u16, PackId> = open_shards
             .iter()
@@ -4122,6 +4129,7 @@ impl PackfileStorage {
         // occupancy plus whatever fresh-slot writes the replayed frames add),
         // so the sidecar check runs after materialization below.
         let mut scan_out = RoomScanOutput::default();
+        scan_out.index_identity_reads = index_identity_reads;
         let mut collection_order = Vec::with_capacity(checkpoint.collections.len());
         let mut current_len: HashMap<[u8; 16], u32> =
             HashMap::with_capacity(checkpoint.collections.len());
@@ -4135,9 +4143,8 @@ impl PackfileStorage {
                 // logical-delete set is authoritative.
                 continue;
             }
-            // The checkpoint reader has already validated this range. Keep it
-            // mmap-backed through the read-only fast path; the first writer
-            // copy-on-writes it into the normal atomic slot array.
+            // The checkpoint reader has validated this range. Decode the
+            // bucket snapshot directly into its owned table exactly once.
             let (mut index, generation) =
                 if let Some((generation, index)) = snapshot_indexes.remove(&loaded.collection_id) {
                     (index, generation)
@@ -4167,6 +4174,7 @@ impl PackfileStorage {
                         &records,
                         &pack_lookup,
                         |slot, offset| {
+                            index_identity_reads = index_identity_reads.saturating_add(1);
                             let shard = shards.get_shard(slot)?;
                             let (collection, hash, _) =
                                 shards.record_identity_at(&shard, offset).ok()?;
@@ -4215,6 +4223,7 @@ impl PackfileStorage {
                         &records,
                         &pack_lookup,
                         |slot, offset| {
+                            index_identity_reads = index_identity_reads.saturating_add(1);
                             let shard = shards.get_shard(slot)?;
                             let (collection, hash, _) =
                                 shards.record_identity_at(&shard, offset).ok()?;
@@ -4364,6 +4373,7 @@ impl PackfileStorage {
         // The index holds the checkpoint plus the operations of the log that were
         // applied, so it covers whatever those describe as well.
         let covered_lsn = covered_lsn.max(log_coverage.unwrap_or(0));
+        scan_out.index_identity_reads = index_identity_reads;
         Some((scan_out, collection_order, delta_state, covered_lsn))
     }
 
