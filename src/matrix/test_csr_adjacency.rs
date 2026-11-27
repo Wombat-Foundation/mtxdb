@@ -1876,6 +1876,88 @@ mod edge_log_recovery {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A crash between publishing the replacement segment and truncating the
+    /// tail is not old-or-new: the restored tail re-adds the rows the repair
+    /// removed from the tail, while rows it removed from an older sealed
+    /// segment stay gone. Recovery must converge that mixed state.
+    #[test]
+    fn a_lost_tail_truncate_mixes_sealed_and_tail_rows() {
+        let root = test_root("edge-log-mixed-repair-window");
+        let db = Database::open(root.clone()).unwrap();
+        let log = EdgeLog::new();
+        let adj = CsrAdjacency::for_collection(&ROOM_A);
+        adj.record_events_logged(&db, &log, &[event("$a", &[])], AppendDurability::Durable)
+            .unwrap();
+        adj.sync_tail(&db).unwrap();
+
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        let scope = store
+            .all_scopes()
+            .unwrap()
+            .into_iter()
+            .map(ScopeId)
+            .find(|scope| !store.read_scope(*scope).unwrap().rows.is_empty())
+            .expect("the room has rows");
+        let expected = scope_links(&store, scope);
+
+        let orphan = |owner| RowRecord {
+            family: PREV,
+            owner,
+            edges: Vec::new(),
+        };
+        // One orphan is sealed into an older segment, the other stays in the
+        // tail. Both name ids the recovered counter never allocated.
+        store
+            .writer(&db)
+            .unwrap()
+            .append_rows(scope, &[orphan(99)])
+            .unwrap();
+        store.seal().unwrap();
+        store
+            .writer(&db)
+            .unwrap()
+            .append_rows(scope, &[orphan(98)])
+            .unwrap();
+        let tail = db.layout().graph_path(ShardType::State).join("tail.log");
+        let old_tail = std::fs::read(&tail).unwrap();
+        assert_eq!(
+            scope_links(&store, scope).len(),
+            expected.len() + 2,
+            "both orphans must be visible before the repair"
+        );
+
+        // The first recovery drops both orphans and publishes a new segment.
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        assert_eq!(scope_links(&store, scope), expected);
+
+        // Recreate the tail a crashed truncate would leave behind, then open
+        // without recovering: the tail rows are back, the sealed row is not.
+        drop(db);
+        std::fs::write(&tail, &old_tail).unwrap();
+        let db = Database::open(root.clone()).unwrap();
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        let mixed = scope_links(&store, scope);
+        assert!(
+            mixed
+                .iter()
+                .any(|(_, owner, edges)| *owner == 98 && edges.is_empty()),
+            "a row deleted from the tail must reappear"
+        );
+        assert!(
+            !mixed.iter().any(|(_, owner, _)| *owner == 99),
+            "a row deleted from the sealed segment must stay repaired"
+        );
+        assert_ne!(mixed, expected, "the window must be mixed, not old-or-new");
+
+        // Recovery runs the filter again and converges.
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        assert_eq!(scope_links(&store, scope), expected);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rollback_repair_keeps_a_purge_marker_for_an_unmapped_scope() {
         use crate::database::tests::crash_image;
