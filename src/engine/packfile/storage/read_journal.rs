@@ -915,6 +915,7 @@ impl PackfileStorage {
             if self.refresh_worker_overlay(overlay)? == ReadRefresh::Applied {
                 return Ok(guard);
             }
+            self.validate_shared_reader_reload_mode()?;
             if !self.reload_index_from_checkpoint() {
                 reload_failed = true;
                 drop(guard);

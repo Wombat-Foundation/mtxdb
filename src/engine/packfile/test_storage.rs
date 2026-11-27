@@ -13896,6 +13896,40 @@ fn assert_residency_mismatch<T>(result: Result<T, StorageError>) {
 
 #[test]
 #[cfg(feature = "multi-reader")]
+fn shared_reader_rejects_missing_or_corrupt_residency_record() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("shared_reader_missing_residency_record");
+    let wal = dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    drop(writer);
+    drop(coordinator);
+
+    let residency_path = dir.join("index.residency");
+    fs::remove_file(&residency_path).unwrap();
+    assert!(matches!(
+        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State),
+        Err(StorageError::Unsupported(message)) if message.contains("no persisted index-residency record")
+    ));
+
+    fs::write(&residency_path, b"invalid").unwrap();
+    assert!(matches!(
+        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State),
+        Err(StorageError::Corrupt(message)) if message.contains("not a valid index-residency record")
+    ));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
 fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -13927,13 +13961,8 @@ fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
             &NodeData::new(bytes::Bytes::from_static(b"first")),
         )
         .unwrap();
-    let early_resident_reader =
-        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State).unwrap();
     writer.sync().unwrap();
     assert!(Journal::scan_read_only(&wal).unwrap().groups.is_empty());
-
-    assert_residency_mismatch(early_resident_reader.get_read_committed(&collection, &[first]));
-    drop(early_resident_reader);
 
     assert_residency_mismatch(PackfileStorage::open_read_committed_shared(
         dir.clone(),
@@ -13985,6 +14014,77 @@ fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
 
     drop(reader);
     drop(writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn shared_reader_detects_writer_residency_change_before_reload() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("shared_reader_residency_change");
+    let wal = dir.join("shared.wal");
+    let collection = [0x58u8; 16];
+    let first = distinct_id(3);
+    let second = distinct_id(4);
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+
+    let resident_writer = PackfileStorage::open(dir.clone()).unwrap();
+    resident_writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    resident_writer
+        .journal()
+        .unwrap()
+        .set_reclaim_trigger_len(1);
+    resident_writer
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    resident_writer.sync().unwrap();
+
+    let reader =
+        PackfileStorage::open_read_committed_shared(dir.clone(), &wal, ShardType::State).unwrap();
+    assert_eq!(
+        reader.get_read_committed(&collection, &[first]).unwrap()[0]
+            .as_ref()
+            .map(|data| data.bytes.as_ref()),
+        Some(&b"first"[..])
+    );
+    drop(resident_writer);
+
+    let paged_writer = PackfileStorage::open_with_residency(
+        dir.clone(),
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    paged_writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    paged_writer.journal().unwrap().set_reclaim_trigger_len(1);
+    paged_writer
+        .put(
+            &collection,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+    paged_writer.sync().unwrap();
+    assert!(Journal::scan_read_only(&wal).unwrap().groups.is_empty());
+
+    assert_residency_mismatch(reader.get_read_committed(&collection, &[first, second]));
+
+    drop(reader);
+    drop(paged_writer);
     drop(coordinator);
     let _ = fs::remove_dir_all(&dir);
 }

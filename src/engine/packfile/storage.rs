@@ -28,6 +28,93 @@ use crate::storage::{
     validate_established_upsert_inputs, Digest32, DigestAlgorithm, NodeData, NodeId, NodeRef,
     StorageEngine, StorageError,
 };
+
+const INDEX_RESIDENCY_FILE: &str = "index.residency";
+const INDEX_RESIDENCY_MAGIC: &[u8; 8] = b"MTXRES1\0";
+const INDEX_RESIDENCY_RECORD_LEN: usize = 13;
+
+fn index_residency_marker_path(base_dir: &Path) -> std::io::Result<PathBuf> {
+    if let Some(root) = crate::layout::enclosing_root(base_dir)? {
+        let pool = base_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                crate::layout::ShardType::ALL
+                    .into_iter()
+                    .find(|shard| shard.as_str() == name)
+            });
+        if let Some(pool) = pool {
+            return Ok(root.join(format!("{INDEX_RESIDENCY_FILE}.{}", pool.as_str())));
+        }
+        Ok(base_dir.join(INDEX_RESIDENCY_FILE))
+    } else {
+        Ok(base_dir.join(INDEX_RESIDENCY_FILE))
+    }
+}
+
+fn read_index_residency_marker(base_dir: &Path) -> std::io::Result<crate::index::IndexResidency> {
+    let path = index_residency_marker_path(base_dir)?;
+    let bytes = fs::read(&path)?;
+    if bytes.len() != INDEX_RESIDENCY_RECORD_LEN || bytes.get(..8) != Some(INDEX_RESIDENCY_MAGIC) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a valid index-residency record", path.display()),
+        ));
+    }
+    let expected_crc = u32::from_le_bytes(
+        bytes[9..13]
+            .try_into()
+            .expect("record length was checked above"),
+    );
+    if crc32fast::hash(&bytes[..9]) != expected_crc {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} has an invalid index-residency checksum", path.display()),
+        ));
+    }
+    match bytes[8] {
+        0 => Ok(crate::index::IndexResidency::Resident),
+        1 => Ok(crate::index::IndexResidency::Paged),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} has an unknown index-residency value", path.display()),
+        )),
+    }
+}
+
+fn persist_index_residency_marker(
+    base_dir: &Path,
+    residency: crate::index::IndexResidency,
+) -> std::io::Result<()> {
+    let path = index_residency_marker_path(base_dir)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    match read_index_residency_marker(base_dir) {
+        Ok(existing) if existing == residency => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut bytes = Vec::with_capacity(INDEX_RESIDENCY_RECORD_LEN);
+    bytes.extend_from_slice(INDEX_RESIDENCY_MAGIC);
+    bytes.push(match residency {
+        crate::index::IndexResidency::Resident => 0,
+        crate::index::IndexResidency::Paged => 1,
+    });
+    bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+    let temp_path = path.with_file_name(format!("{INDEX_RESIDENCY_FILE}.tmp"));
+    let mut temp = fs::File::create(&temp_path)?;
+    std::io::Write::write_all(&mut temp, &bytes)?;
+    temp.sync_all()?;
+    fs::rename(&temp_path, &path)?;
+    crate::shard::sync_directory(parent)?;
+    Ok(())
+}
 use crate::template::{CollectionMetadata, COLLECTION_METADATA_RECORD_ID};
 
 mod read_journal;
@@ -3175,7 +3262,9 @@ impl PackfileStorage {
     /// representation.
     ///
     /// # Errors
-    /// Same as [`Self::open_read_committed`].
+    /// Returns [`StorageError`] if the store or journal cannot be opened, the
+    /// residency record is missing or invalid, or this reader's residency
+    /// differs from the writer's persisted residency.
     #[cfg(feature = "multi-reader")]
     pub fn open_read_committed_shared(
         base_dir: PathBuf,
@@ -3197,7 +3286,9 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns [`StorageError`] if opening the read-only store fails, runtime
-    /// settings are invalid, or shared-WAL recovery fails.
+    /// settings are invalid, the residency record is missing or invalid, this
+    /// reader's residency differs from the writer's, or shared-WAL recovery
+    /// fails.
     #[cfg(feature = "multi-reader")]
     pub fn open_read_committed_shared_with_config(
         base_dir: PathBuf,
@@ -3211,18 +3302,24 @@ impl PackfileStorage {
         Ok(store)
     }
 
-    /// A resident reader can reload reclaimed shared-WAL coverage only from
-    /// a resident index checkpoint. Paged writers intentionally remove that
-    /// checkpoint and reload from packs instead, so fail during open rather
-    /// than returning a retry-shaped read error later.
+    /// Require this reader to match the durable mode published by the writer.
+    /// Otherwise reclaimed shared-WAL coverage may be impossible to reload
+    /// from this reader's index representation.
     fn validate_shared_reader_reload_mode(&self) -> Result<(), StorageError> {
-        if self.index_residency == crate::index::IndexResidency::Resident
-            && !Self::index_checkpoint_path(&self.base_dir).is_file()
-            && Self::read_journal_lsn(&self.base_dir) > 0
-        {
+        let writer_residency = read_index_residency_marker(&self.base_dir).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StorageError::Unsupported(format!(
+                    "{} has no persisted index-residency record; reopen its writer with this mtxdb version before attaching shared-WAL readers",
+                    self.base_dir.display()
+                ))
+            } else {
+                StorageError::Corrupt(error.to_string())
+            }
+        })?;
+        if writer_residency != self.index_residency {
             return Err(StorageError::Unsupported(format!(
-                "{} has reclaimed shared-WAL coverage but no resident index checkpoint; the writer may use paged residency. Open the reader with open_read_committed_shared_with_config and matching index residency",
-                self.base_dir.display()
+                "{} writer uses {:?} index residency but this reader uses {:?}; open the reader with open_read_committed_shared_with_config and matching index residency",
+                self.base_dir.display(), writer_residency, self.index_residency
             )));
         }
         Ok(())
@@ -3423,11 +3520,16 @@ impl PackfileStorage {
                 ));
             }
         }
-        // Only a standalone writer creates its directory here. A member of a
-        // shared database creates it with its first pack, and a reader never
-        // creates anything.
+        // A standalone writer creates its directory here. Shared members
+        // create theirs when publishing the residency marker; readers never
+        // create anything.
         if writable && take_writer_lock {
             fs::create_dir_all(&base_dir)?;
+        }
+        if writable {
+            // Persist the mode before a paged open retires a resident
+            // checkpoint or a writer can publish shared-WAL mutations.
+            persist_index_residency_marker(&base_dir, residency)?;
         }
 
         let started = std::time::Instant::now();
