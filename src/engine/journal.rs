@@ -5007,6 +5007,25 @@ impl Journal {
         })
     }
 
+    /// Read only the segment header's base LSN without scanning journal groups.
+    /// A read-only worker uses this after a publish-signal change to detect a
+    /// reclaim that rewrote the segment without changing its length.
+    pub(crate) fn read_base_lsn_read_only(path: impl AsRef<Path>) -> io::Result<u64> {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let len = file.metadata()?.len();
+        if len < u64::try_from(FILE_HEADER_LEN).unwrap_or(u64::MAX) {
+            return Ok(0);
+        }
+        let mut header = vec![0; FILE_HEADER_LEN];
+        file.read_exact(&mut header)?;
+        let (_, base_lsn) = validate_file_header(&header)?;
+        Ok(base_lsn)
+    }
+
     /// Scan only the committed groups appended at or after `start`, a group
     /// boundary returned by an earlier scan's `valid_len`.
     ///

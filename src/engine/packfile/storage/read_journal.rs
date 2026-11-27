@@ -731,6 +731,19 @@ impl PackfileStorage {
             if overlay.last_epoch == Some(epoch) && overlay.last_revision == Some(revision) {
                 return Ok(ReadRefresh::Applied);
             }
+            // Reclaim can replace the segment while retaining exactly the
+            // same length (including an empty segment). The normal refresh
+            // detects a gap while scanning a changed-length file, but that
+            // path is skipped for an equal-length rewrite. The publish signal
+            // tells us when to inspect the small header; if its base advanced
+            // beyond this reader's durable coverage, rebuild the durable
+            // paged index before trusting the now-shorter journal history.
+            if overlay.observed_len != 0
+                && Journal::read_base_lsn_read_only(&overlay.path)?
+                    > overlay.covered.saturating_add(1)
+            {
+                return Ok(ReadRefresh::NeedsReload);
+            }
         }
         let before = overlay.scanned_bytes;
         let result = overlay.refresh(false);
@@ -761,12 +774,17 @@ impl PackfileStorage {
     /// Coverage is captured before the checkpoint is read, so the new bound can
     /// never be newer than the index loaded below.
     pub(super) fn reload_index_from_checkpoint(&self) -> bool {
-        // Paged mode keeps no primary-index checkpoint, and a resident
-        // checkpoint would re-materialize sealed locators. Fail closed here;
-        // the caller's durable-read path remains authoritative.
+        // Paged mode keeps no primary-index checkpoint. Rebuild its compact
+        // tail and sealed sidecar tables from durable packs instead.
         if self.index_residency == crate::index::IndexResidency::Paged {
-            self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
-            return false;
+            let Some(covered) = self.reload_paged_index_from_packs() else {
+                self.read_reload_failures.fetch_add(1, Ordering::Relaxed);
+                return false;
+            };
+            self.read_covered_lsn.store(covered, Ordering::Release);
+            self.materialized_lsn.fetch_max(covered, Ordering::Release);
+            self.read_reloads.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
         // A writer may have created new packs since this handle opened, and the
         // checkpoint it wrote names that new pack set. Rediscover before

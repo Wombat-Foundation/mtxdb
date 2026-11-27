@@ -252,6 +252,50 @@ fn count_range_uses_subtree_counts_and_includes_buffered_entries() {
             .unwrap(),
         60
     );
+    // Bounds can fall wholly inside the buffered head delta, or cross from
+    // the tree into that delta.
+    assert_eq!(
+        index
+            .count_range(
+                &scope,
+                Bound::Included(entry(scope, 1_202, 198)),
+                Bound::Included(entry(scope, 1_206, 202)),
+            )
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        index
+            .count_range(
+                &scope,
+                Bound::Included(entry(scope, 1_198, 194)),
+                Bound::Included(entry(scope, 1_203, 199)),
+            )
+            .unwrap(),
+        6
+    );
+
+    let removed = [
+        entry(scope, 30, 30),
+        entry(scope, 1_205, u8::try_from(1_205 % 251).unwrap()),
+    ];
+    assert_eq!(index.remove_untransactional(&removed).unwrap().1, 2);
+    assert_eq!(
+        index
+            .count_range(&scope, Bound::Unbounded, Bound::Unbounded)
+            .unwrap(),
+        1_208
+    );
+    assert_eq!(
+        index
+            .count_range(
+                &scope,
+                Bound::Included(removed[0]),
+                Bound::Included(removed[0]),
+            )
+            .unwrap(),
+        0
+    );
     assert_eq!(
         index
             .count_range(

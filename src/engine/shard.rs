@@ -3641,6 +3641,22 @@ impl ShardPool {
         self.rotate_locked()
     }
 
+    /// Start a new physical generation for a collection after it was deleted.
+    /// The returned creation sequence is a durable-scan fence: records in
+    /// older packs belong to the deleted generation and must not be restored
+    /// when the collection is rebuilt from packfiles.
+    pub(crate) fn start_collection_generation(&self, collection_id: &[u8; 16]) -> io::Result<u32> {
+        let _guard = self.rotation_lock.lock();
+        let previous = *self.active_write.lock();
+        self.rotate_locked()?;
+        let slot = *self.active_write.lock();
+        self.collection_home.write().insert(*collection_id, slot);
+        self.maybe_seal_pack(previous);
+        self.get_shard(slot)
+            .map(|shard| shard.creation_seq)
+            .ok_or_else(|| io::Error::other("new collection generation shard disappeared"))
+    }
+
     /// Stop future appends before indexing the old pack. The sidecar is
     /// disposable: an I/O or validation failure leaves recovery on the frame
     /// scanner, while the newly selected pack continues accepting writes.

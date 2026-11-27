@@ -230,20 +230,10 @@ impl RuntimeConfig {
 
     /// Validate the configuration for a shared-WAL [`crate::Database`].
     ///
-    /// Paged residency is rejected here, before the root lock or WAL is
-    /// opened. The journaling path cannot advance durable coverage from a
-    /// paged sync, so discovering that after modifying on-disk state is
-    /// needlessly destructive.
-    ///
     /// # Errors
-    /// Returns [`ConfigError`] for a bad staging limit or Paged residency.
+    /// Returns [`ConfigError`] for a bad staging limit.
     pub fn validate_for_database(&self) -> Result<(), ConfigError> {
         self.validate()?;
-        if self.index_residency == Some(IndexResidency::Paged) {
-            return Err(ConfigError::new(
-                "MTXDB_INDEX_RESIDENCY=paged cannot be used with Database/shared WAL; use `resident`",
-            ));
-        }
         Ok(())
     }
 }
@@ -408,8 +398,8 @@ mod tests {
     }
 
     #[test]
-    fn database_rejects_paged_before_opening() {
+    fn database_accepts_paged_configuration() {
         let parsed = config(&[("MTXDB_INDEX_RESIDENCY", "paged")]).unwrap();
-        assert!(parsed.validate_for_database().is_err());
+        assert!(parsed.validate_for_database().is_ok());
     }
 }

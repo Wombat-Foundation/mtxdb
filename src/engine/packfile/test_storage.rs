@@ -8217,49 +8217,62 @@ fn checkpoint_growth_recovers_metadata_bearing_frames() {
     fs::remove_dir_all(&dir).ok();
 }
 
-/// Two stores attached to one shared coordinator: a single pool's sync
-/// commits both pools' published mutations in one durability barrier, and
-/// a later reopen replays only each pool's own tagged frames.
 #[test]
-fn paged_residency_rejects_wal_journaling_until_coverage_can_advance() {
+fn paged_residency_supports_shared_wal_reopen() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
 
-    let dir = test_dir("paged_rejects_wal");
+    let dir = test_dir("paged_shared_wal_reopen");
+    let wal = dir.join("wal.bin");
+    let collection = [0x57; 16];
+    let id = distinct_id(7);
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
     let store = PackfileStorage::open_with_residency(
         dir.clone(),
         packfile::ChecksumPolicy::Full,
         crate::index::IndexResidency::Paged,
     )
     .unwrap();
-    let per_pool = store.enable_journal(dir.join("per-pool.wal")).unwrap_err();
-    assert!(matches!(
-        per_pool,
-        StorageError::Unsupported(message) if message.contains("journal coverage")
-    ));
-
-    let sequence = Arc::new(AtomicU64::new(1));
-    let sequenced = store
-        .enable_journal_with_sequence(dir.join("sequenced.wal"), sequence)
-        .unwrap_err();
-    assert!(matches!(
-        sequenced,
-        StorageError::Unsupported(message) if message.contains("journal coverage")
-    ));
-
-    let shared_root = test_dir("paged_rejects_shared_wal");
-    let (journal, scan) = Journal::open_shared(shared_root.join("wal.bin")).unwrap();
-    let coordinator = Arc::new(JournalCoordinator::new(journal, &scan));
-    let shared = store
-        .enable_shared_journal(coordinator, ShardType::EventDag)
-        .unwrap_err();
-    assert!(matches!(
-        shared,
-        StorageError::Unsupported(message) if message.contains("journal coverage")
-    ));
+    store
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
+        .unwrap();
+    store
+        .put(
+            &collection,
+            &id,
+            &NodeData::new(bytes::Bytes::from_static(b"paged shared WAL")),
+        )
+        .unwrap();
+    store.sync().unwrap();
     drop(store);
-    fs::remove_dir_all(dir).ok();
-    fs::remove_dir_all(shared_root).ok();
+    drop(coordinator);
+
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let reopened = PackfileStorage::open_with_residency(
+        dir.clone(),
+        packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    reopened
+        .enable_shared_journal(coordinator, ShardType::EventDag)
+        .unwrap();
+    assert_eq!(
+        reopened
+            .get(&collection, &id)
+            .unwrap()
+            .as_ref()
+            .map(|data| data.bytes.as_ref()),
+        Some(&b"paged shared WAL"[..])
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -13347,12 +13360,54 @@ fn paged_open(dir: &std::path::Path) -> PackfileStorage {
     .unwrap()
 }
 
-/// A collection version is durable in the checkpoint (or the WAL groups the
-/// checkpoint has not reclaimed), not in the sealed packs' frames. A paged
-/// open deletes the checkpoint, so a version that only lived there must not
-/// come back as zero after the WAL has been reclaimed.
 #[test]
-#[ignore = "Paged + shared WAL is refused until a Paged sync can advance coverage"]
+fn paged_delete_recreate_does_not_resurrect_old_records_after_reopen() {
+    let dir = test_dir("paged_delete_recreate_generation_fence");
+    let old = distinct_id(1);
+    let new = distinct_id(2);
+
+    let store = paged_open(&dir);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "reopening a recreated paged collection must not expose pre-delete records"
+    );
+    assert_eq!(
+        reopened
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A collection version is durable in `index.versions` before a paged pool
+/// reports coverage and lets the shared WAL reclaim its group.
+#[test]
 fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
     use crate::journal::{Journal, JournalCoordinator};
     use crate::layout::ShardType;
@@ -13375,8 +13430,8 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
         fill_incompressible(&store, &TEST_COLLECTION, 10_000, 120);
         coordinator.sync().unwrap();
         store.sync_all().unwrap();
-        // A full checkpoint is what advances coverage and lets the journal
-        // drop the groups; a delta append would leave them for replay.
+        // Paged sync persists the version baseline before reporting coverage,
+        // which lets the journal drop the groups without an index checkpoint.
         store.force_index_checkpoint().unwrap();
         assert_eq!(
             Journal::scan_read_only(&wal).unwrap().groups.len(),
@@ -13425,6 +13480,88 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
     drop(coordinator);
     fs::remove_dir_all(&wal_dir).ok();
     fs::remove_dir_all(&store_dir).ok();
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("paged_worker_reload_after_reclaim");
+    let wal = dir.join("shared.wal");
+    let collection = [0x57u8; 16];
+    let first = distinct_id(1);
+    let second = distinct_id(2);
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let writer = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    writer.journal().unwrap().set_reclaim_trigger_len(1);
+    writer
+        .put(
+            &collection,
+            &first,
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    writer.sync().unwrap();
+    assert!(Journal::scan_read_only(&wal).unwrap().groups.is_empty());
+
+    let config = crate::RuntimeConfig {
+        index_residency: Some(crate::index::IndexResidency::Paged),
+        ..crate::RuntimeConfig::default()
+    };
+    let reader = PackfileStorage::open_read_only_with_config(dir.clone(), &config).unwrap();
+    reader
+        .enable_read_journal_shared(&wal, ShardType::State)
+        .unwrap();
+    assert_eq!(reader.read_covered_lsn.load(Ordering::Acquire), 1);
+
+    writer
+        .put(
+            &collection,
+            &second,
+            &NodeData::new(bytes::Bytes::from_static(b"second")),
+        )
+        .unwrap();
+    writer.sync().unwrap();
+    assert!(Journal::scan_read_only(&wal).unwrap().groups.is_empty());
+
+    let values = reader
+        .get_read_committed(&collection, &[first, second])
+        .unwrap();
+    assert!(
+        reader.stats().read_reloads >= 1,
+        "paged worker should reload after reclaim; coverage={}, journal coverage={}",
+        reader.read_covered_lsn.load(Ordering::Acquire),
+        PackfileStorage::read_journal_lsn(&dir)
+    );
+    assert_eq!(
+        values[0].as_ref().map(|data| data.bytes.as_ref()),
+        Some(&b"first"[..])
+    );
+    assert_eq!(
+        values[1].as_ref().map(|data| data.bytes.as_ref()),
+        Some(&b"second"[..])
+    );
+    assert!(reader.stats().read_reloads >= 1);
+    assert!(reader.read_covered_lsn.load(Ordering::Acquire) >= 2);
+
+    drop(reader);
+    drop(writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// The coverage cap applies whenever a valid versions file exists, in either
@@ -13851,7 +13988,6 @@ fn assert_versions_fsync_precedes_wal_reclaim_crash_safe(
 /// the checkpoint, so only `index.versions` can restore the version and
 /// coverage.
 #[test]
-#[ignore = "Paged + shared WAL is refused until a Paged sync can advance coverage"]
 fn versions_fsync_precedes_wal_reclaim_crash_safe() {
     assert_versions_fsync_precedes_wal_reclaim_crash_safe(
         crate::index::IndexResidency::Paged,

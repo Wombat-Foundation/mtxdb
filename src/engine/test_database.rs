@@ -66,48 +66,29 @@ fn point_mapping_config_reaches_database_and_standalone_pools() {
 }
 
 #[test]
-fn paged_residency_is_rejected_before_the_root_is_created() {
+fn paged_residency_is_supported_with_the_shared_wal() {
     let root = test_root("config-paged-before-io");
     let config = RuntimeConfig {
         index_residency: Some(IndexResidency::Paged),
         ..RuntimeConfig::default()
     };
-    let Err(error) = Database::open_with_config(root.clone(), config) else {
-        panic!("paged residency must be rejected");
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("cannot be used with Database/shared WAL"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        !root.exists(),
-        "validation must run before the layout creates the root"
-    );
+    let db = Database::open_with_config(root.clone(), config)
+        .expect("Paged residency must work with shared-WAL pools");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn a_paged_pool_policy_is_rejected_before_the_root_is_created() {
+fn a_paged_pool_policy_is_supported_with_the_shared_wal() {
     let root = test_root("policy-paged-before-io");
     let policy = PoolPolicy {
         index_residency: IndexResidency::Paged,
         ..PoolPolicy::default()
     };
-    let Err(error) = Database::open_with_policies(root.clone(), PoolPolicies::uniform(policy))
-    else {
-        panic!("paged residency must be rejected");
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("cannot use shared WAL journaling"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        !root.exists(),
-        "validation must run before the layout creates the root"
-    );
+    let db = Database::open_with_policies(root.clone(), PoolPolicies::uniform(policy))
+        .expect("Paged pool policies must work with shared-WAL pools");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

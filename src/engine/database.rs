@@ -980,13 +980,6 @@ impl Database {
                 policies.for_shard_mut(shard).index_residency = residency;
             }
         }
-        for shard in ShardType::ALL {
-            if policies.for_shard(shard).index_residency == crate::index::IndexResidency::Paged {
-                return Err(StorageError::Unsupported(format!(
-                    "{shard:?} uses Paged index residency, which cannot use shared WAL journaling; use Resident residency"
-                )));
-            }
-        }
         Self::open_with_policies_and_config_unchecked(root, policies, config)
     }
 
