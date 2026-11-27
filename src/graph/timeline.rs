@@ -2601,6 +2601,9 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         end: Bound<K>,
     ) -> Result<u64, StorageError> {
         validate_geometry::<K>()?;
+        if empty_key_range(&start, &end) {
+            return Ok(0);
+        }
         let Some((head_id, _)) = self.head()? else {
             return Ok(0);
         };
@@ -3037,6 +3040,15 @@ fn after_end<K: Ord>(entry: &K, end: &Bound<K>) -> bool {
 
 fn in_key_range<K: Ord>(entry: &K, start: &Bound<K>, end: &Bound<K>) -> bool {
     !before_start(entry, start) && !after_end(entry, end)
+}
+
+fn empty_key_range<K: Ord>(start: &Bound<K>, end: &Bound<K>) -> bool {
+    match (start, end) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(start), Bound::Included(end)) => start > end,
+        (Bound::Included(start) | Bound::Excluded(start), Bound::Excluded(end))
+        | (Bound::Excluded(start), Bound::Included(end)) => start >= end,
+    }
 }
 
 struct DirectTimelineTreeIo<'index, 'engine, S: StorageEngine + ?Sized, K: OrderedKey> {
