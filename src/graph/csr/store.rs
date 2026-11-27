@@ -497,13 +497,19 @@ impl CsrStore {
     /// the new segment is published by one rename, so a crash before it leaves
     /// every listed scope as it was.
     ///
-    /// That is not the whole guarantee. Until the tail truncate below is
-    /// durable, a crash can bring the old tail back, and the tail is applied
-    /// after sealed segments. Its rows then override the new segment, so rows
-    /// the replacement deleted can reappear while rows that only lived in older
-    /// sealed segments stay replaced. The state is mixed, not old-or-new.
-    /// Callers must run open-time recovery before serving reads; it rebuilds
-    /// the affected scopes and converges.
+    /// That is not the whole guarantee. The tail truncate below is unsynced,
+    /// and the process can stop between the rename and the truncate. Either
+    /// way the old tail survives, and it is applied after sealed segments, so
+    /// its rows override the new segment: rows the replacement deleted can
+    /// reappear, while rows that only lived in older sealed segments stay
+    /// replaced. The state is mixed, not old-or-new.
+    ///
+    /// Recovery is therefore mandatory before the store serves reads or writes.
+    /// Writes matter as much as reads: a reused short id could inherit a
+    /// resurrected orphan row. Recovery re-filters the existing rows against
+    /// the recovered id limits rather than rebuilding them from the log, so
+    /// running it again converges. It is not automatic: a caller must invoke it
+    /// after opening a writable store.
     ///
     /// The tail truncate is not synced here: a caller replacing rows must sync
     /// the tail after.
