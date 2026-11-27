@@ -13416,6 +13416,122 @@ fn paged_delete_recreate_does_not_resurrect_old_records_after_reopen() {
 }
 
 #[test]
+fn paged_generation_fence_excludes_old_records_after_delete_marker_is_cleared() {
+    let dir = test_dir("paged_generation_fence_before_first_new_record");
+    let old = distinct_id(1);
+    let new = distinct_id(2);
+
+    let store = paged_open(&dir);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+
+    // Model a stop after publishing the durable generation fence but before
+    // clearing the deletion marker.
+    store
+        .prepare_recreated_collection(&TEST_COLLECTION)
+        .unwrap();
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "the delete marker must hide old records while the recreation is incomplete"
+    );
+    // Once the durable fence exists, clearing the marker cannot expose the old
+    // generation, even if the first new-generation append was lost.
+    reopened.clear_deleted_collection(&TEST_COLLECTION).unwrap();
+    drop(reopened);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "the generation fence must exclude old records after the marker is cleared"
+    );
+    reopened
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    reopened.sync_all().unwrap();
+    drop(reopened);
+
+    let final_open = paged_open(&dir);
+    assert!(final_open.get(&TEST_COLLECTION, &old).unwrap().is_none());
+    assert_eq!(
+        final_open
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+    drop(final_open);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_read_only_refresh_loads_new_generation_fence() {
+    let dir = test_dir("paged_read_only_refresh_generation_fence");
+    let old = distinct_id(8);
+    let new = distinct_id(9);
+    let config = crate::config::RuntimeConfig {
+        index_residency: Some(crate::index::IndexResidency::Paged),
+        ..crate::config::RuntimeConfig::default()
+    };
+
+    let writer = paged_open(&dir);
+    writer
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    writer.sync_all().unwrap();
+    let reader = PackfileStorage::open_read_only_with_config(dir.clone(), &config).unwrap();
+    assert!(reader.get(&TEST_COLLECTION, &old).unwrap().is_some());
+
+    writer.delete_collection(&TEST_COLLECTION).unwrap();
+    writer
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    writer.sync_all().unwrap();
+
+    reader.refresh_collection(&TEST_COLLECTION).unwrap();
+    assert!(
+        reader.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a read-only worker must load the writer's generation fence before refresh"
+    );
+    assert_eq!(
+        reader
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+
+    drop(reader);
+    drop(writer);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn resident_delete_recreate_fence_survives_resident_and_paged_reopen() {
     let dir = test_dir("resident_delete_recreate_generation_fence");
     let old = distinct_id(3);
@@ -13541,11 +13657,6 @@ fn paged_repack_does_not_resurrect_deleted_generation() {
     assert!(
         reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
         "the open-time fence should hide the deleted generation"
-    );
-    rezzy::info!(
-        old_before_repack = ?reopened.get(&TEST_COLLECTION, &old).unwrap().map(|data| data.bytes.clone()),
-        deleted_collections = ?fs::read(dir.join("deleted.collections")).ok(),
-        "checking delete/recreate state before repack"
     );
     // Both physical generations must be visible to the repack scan, or this
     // test would pass without exercising the fence at all.
