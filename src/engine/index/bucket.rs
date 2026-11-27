@@ -10,6 +10,7 @@
 //! storage layer, which can verify a candidate against its authoritative pack.
 
 use std::hint::spin_loop;
+use std::io::{self, Write};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,6 +29,31 @@ const OFFSET_MASK: u64 = (1 << 48) - 1;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"MTXRBK01";
 const SNAPSHOT_HEADER_LEN: usize = 32;
 const SNAPSHOT_ENTRY_LEN: usize = 24;
+
+fn write_snapshot_header(
+    header: &mut [u8; SNAPSHOT_HEADER_LEN],
+    bucket_count: usize,
+    seed: u64,
+    entry_count: usize,
+) {
+    header[..8].copy_from_slice(&SNAPSHOT_MAGIC);
+    header[8..12].copy_from_slice(&1_u32.to_le_bytes());
+    header[12..16].copy_from_slice(
+        &u32::try_from(bucket_count)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    header[16..24].copy_from_slice(&seed.to_le_bytes());
+    header[24..32].copy_from_slice(&u64::try_from(entry_count).unwrap_or(u64::MAX).to_le_bytes());
+}
+
+fn encode_snapshot_entry(encoded: &mut [u8; SNAPSHOT_ENTRY_LEN], entry: &BucketCandidate) {
+    encoded[..8].copy_from_slice(&entry.fingerprint.to_le_bytes());
+    encoded[8..10].copy_from_slice(&entry.shard_slot.to_le_bytes());
+    encoded[10] = u8::from(entry.removed);
+    encoded[11..16].fill(0);
+    encoded[16..24].copy_from_slice(&entry.offset.to_le_bytes());
+}
 
 /// One locator returned by a fingerprint lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -595,11 +621,8 @@ impl RawBucketTable {
         found
     }
 
-    /// Encode a deterministic, checksummed snapshot of the occupied locators.
-    /// The snapshot stores fingerprints rather than full keys; pack frames
-    /// remain authoritative and callers must verify candidates against them.
-    #[must_use]
-    pub fn snapshot(&self) -> Vec<u8> {
+    /// Occupied entries in the deterministic snapshot order.
+    fn sorted_entries(&self) -> Vec<BucketCandidate> {
         let mut entries = self.entries();
         entries.sort_unstable_by_key(|entry| {
             (
@@ -609,35 +632,97 @@ impl RawBucketTable {
                 entry.removed,
             )
         });
+        entries
+    }
 
-        let mut bytes = Vec::with_capacity(
-            SNAPSHOT_HEADER_LEN
-                .saturating_add(entries.len().saturating_mul(SNAPSHOT_ENTRY_LEN))
-                .saturating_add(4),
-        );
-        bytes.extend_from_slice(&SNAPSHOT_MAGIC);
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(
-            &u32::try_from(self.buckets.len())
-                .unwrap_or(u32::MAX)
-                .to_le_bytes(),
-        );
-        bytes.extend_from_slice(&self.seed.to_le_bytes());
-        bytes.extend_from_slice(
-            &u64::try_from(entries.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        for entry in entries {
-            bytes.extend_from_slice(&entry.fingerprint.to_le_bytes());
-            bytes.extend_from_slice(&entry.shard_slot.to_le_bytes());
-            bytes.push(u8::from(entry.removed));
-            bytes.extend_from_slice(&[0; 5]);
-            bytes.extend_from_slice(&entry.offset.to_le_bytes());
-        }
-        let checksum = crc32fast::hash(&bytes);
-        bytes.extend_from_slice(&checksum.to_le_bytes());
+    /// Encode a deterministic, checksummed snapshot of the occupied locators.
+    /// The snapshot stores fingerprints rather than full keys; pack frames
+    /// remain authoritative and callers must verify candidates against them.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        let entries = self.sorted_entries();
+        let mut bytes = Vec::with_capacity(self.snapshot_len());
+        // Writing into a `Vec` cannot fail, and live entries are always in
+        // range, so encoding a snapshot here is infallible.
+        let _ = self.write_snapshot_entries(&entries, &mut bytes);
         bytes
+    }
+
+    /// Stream the same bytes [`Self::snapshot`] returns into `writer`, without
+    /// building the encoded snapshot on the heap.
+    ///
+    /// `expected_entries` is the occupied-entry count the caller used to size
+    /// its directory entry; a mismatch means the table changed under the
+    /// capture, which must never happen while its writer lock is held.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidData`] if an occupied entry is out of
+    /// range or the count disagrees with `expected_entries`, or any error from
+    /// `writer`.
+    pub fn write_snapshot_to<W: Write + ?Sized>(
+        &self,
+        expected_entries: usize,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        let entries = self.sorted_entries();
+        if entries.len() != expected_entries {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bucket snapshot entry count changed during capture",
+            ));
+        }
+        for entry in &entries {
+            if entry.fingerprint > FINGERPRINT_MASK
+                || entry.offset > OFFSET_MASK
+                || usize::from(entry.shard_slot) >= crate::shard::MAX_SHARDS
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bucket snapshot entry is out of range",
+                ));
+            }
+        }
+        self.write_snapshot_entries(&entries, writer)
+    }
+
+    /// The single snapshot encoder shared by [`Self::snapshot`] and
+    /// [`Self::write_snapshot_to`].
+    fn write_snapshot_entries<W: Write + ?Sized>(
+        &self,
+        entries: &[BucketCandidate],
+        writer: &mut W,
+    ) -> io::Result<()> {
+        let mut header = [0_u8; SNAPSHOT_HEADER_LEN];
+        write_snapshot_header(&mut header, self.buckets.len(), self.seed, entries.len());
+        let mut crc = crc32fast::Hasher::new();
+        writer.write_all(&header)?;
+        crc.update(&header);
+        // Batch entries through a stack buffer so the writer and CRC see
+        // 4 KiB at a time instead of one 24-byte call per entry.
+        let mut chunk = [0_u8; 4096];
+        let mut used: usize = 0;
+        let mut encoded = [0_u8; SNAPSHOT_ENTRY_LEN];
+        for entry in entries {
+            let end = used
+                .checked_add(SNAPSHOT_ENTRY_LEN)
+                .expect("snapshot chunk offset is bounded by its capacity");
+            if end > chunk.len() {
+                writer.write_all(&chunk[..used])?;
+                crc.update(&chunk[..used]);
+                used = 0;
+            }
+            let end = used
+                .checked_add(SNAPSHOT_ENTRY_LEN)
+                .expect("snapshot chunk offset is bounded by its capacity");
+            encode_snapshot_entry(&mut encoded, entry);
+            chunk[used..end].copy_from_slice(&encoded);
+            used = end;
+        }
+        if used > 0 {
+            writer.write_all(&chunk[..used])?;
+            crc.update(&chunk[..used]);
+        }
+        writer.write_all(&crc.finalize().to_le_bytes())
     }
 
     /// Restore a table snapshot, rejecting malformed dimensions, entries, or
@@ -1376,6 +1461,12 @@ mod tests {
         table.insert_new(second, 9, 1 << 41, true).unwrap();
 
         let snapshot = table.snapshot();
+        let mut streamed = Vec::new();
+        table.write_snapshot_to(table.len(), &mut streamed).unwrap();
+        assert_eq!(
+            streamed, snapshot,
+            "streaming must preserve the snapshot bytes"
+        );
         let restored = RawBucketTable::from_snapshot(&snapshot).unwrap();
         assert_eq!(restored.len(), 2);
         assert_eq!(restored.fingerprint(&[0x11; 16]), first);

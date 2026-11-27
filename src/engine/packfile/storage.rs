@@ -13,6 +13,7 @@ use crate::config::RuntimeConfig;
 use crate::csr::Csr;
 use crate::index::bucket::BucketCandidate;
 use crate::index::bucket::BucketUndo;
+use crate::index::checkpoint::{CheckpointWrite, PreparedCheckpoint};
 use crate::index::delta::{self, DeltaOperation, DELTA_LOG_HEADER_LEN, INDEX_DELTA_FILE};
 use crate::index::format::DeltaFrame;
 use crate::index::redo::{RedoOp, RedoRecord};
@@ -2389,6 +2390,10 @@ pub struct PackfileStorage {
     /// Test-only: a hold and a failure the next checkpoint tail takes with it.
     #[cfg(test)]
     checkpoint_tail_hook: parking_lot::Mutex<Option<TailHook>>,
+    /// Test-only: fail the next checkpoint capture after its delta epoch
+    /// rotates, exercising the abandon-and-rewrite recovery path.
+    #[cfg(test)]
+    checkpoint_prepare_fail: AtomicBool,
     /// Successful checkpoint-bound index reloads triggered by the
     /// read-committed overlay, because a writer's reclaim outran the coverage
     /// this handle's index incorporated. A WAL-cell failure on the reload path
@@ -3306,6 +3311,8 @@ impl PackfileStorage {
             background_checkpoint: AtomicBool::new(false),
             #[cfg(test)]
             checkpoint_tail_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_prepare_fail: AtomicBool::new(false),
             read_reloads: AtomicU64::new(0),
             read_reload_failures: AtomicU64::new(0),
             read_refreshes: AtomicU64::new(0),
@@ -6301,6 +6308,12 @@ impl PackfileStorage {
             self.shards.sync_dirty()?;
         }
         breakdown.pre_sync = started.elapsed();
+        // Open the temp file before taking any collection lock: creating it
+        // touches the parent directory, which can contend with a concurrent
+        // directory sync or dirty-page throttle. Foreground puts must never
+        // wait on that while holding every collection's put_mutex.
+        let checkpoint_path = Self::index_checkpoint_path(&self.base_dir);
+        let prepared = PreparedCheckpoint::create(&checkpoint_path).map_err(StorageError::Io)?;
         let lock_started = std::time::Instant::now();
         // Epoch-handoff protocol: hold every collection's put_mutex only
         // across the snapshot + epoch rotation below (same sorted-lock
@@ -6429,11 +6442,15 @@ impl PackfileStorage {
         // reclaim floor both describe only frames this index holds.
         let wal_lsn = self.checkpoint_covered_lsn();
         let logical_versions = self.checkpoint_logical_versions(wal_lsn);
-        // The image is captured here, under the locks, as bytes: the tail never
-        // reads the live table. Pending frames were cleared by the rotation and
-        // no put is mid-flight, so clearing the flag now loses nothing; a put
-        // after the locks drop sets it again, and a failed tail sets it back.
-        let blobs = Self::serialize_snapshots(&snapshots);
+        let source = CheckpointBodySource {
+            fingerprint,
+            base_delta_seq,
+            covered_lsn: wal_lsn,
+            snapshots: &snapshots,
+            pack_table: &pack_table,
+            logical_versions: &logical_versions,
+        };
+        let prepared = self.write_checkpoint_body(prepared, &source)?;
         breakdown.serialize = serialize_started.elapsed();
         self.index_checkpoint_dirty.store(false, Ordering::Relaxed);
         drop(guards);
@@ -6454,10 +6471,8 @@ impl PackfileStorage {
             base_dir: self.base_dir.clone(),
             fingerprint,
             covered_lsn: wal_lsn,
-            base_delta_seq,
             logical_versions,
-            blobs,
-            pack_table,
+            prepared,
             journal: self.journal(),
             pool_tag: self.journal_pool.load(Ordering::Acquire),
             durable_coverage: Arc::clone(&self.durable_coverage),
@@ -6466,6 +6481,52 @@ impl PackfileStorage {
         };
         breakdown.total = started.elapsed();
         Ok(Some(CapturedCheckpoint { tail, breakdown }))
+    }
+
+    fn write_checkpoint_body(
+        &self,
+        prepared: PreparedCheckpoint,
+        source: &CheckpointBodySource<'_>,
+    ) -> Result<PreparedCheckpoint, StorageError> {
+        let result = (|| {
+            // Snapshot dimensions are O(1) from each resident index, so the
+            // directory can be sized before any snapshot byte is produced.
+            let mut metadata = Vec::with_capacity(source.snapshots.len());
+            for (collection_id, generation, room) in source.snapshots {
+                let snapshot_bytes = u32::try_from(room.index.serialized_len()).map_err(|_| {
+                    std::io::Error::other("bucket snapshot exceeds the checkpoint u32 length field")
+                })?;
+                let entry_count = u32::try_from(room.index.len()).map_err(|_| {
+                    std::io::Error::other("bucket snapshot entry count exceeds u32")
+                })?;
+                metadata.push((*collection_id, *generation, snapshot_bytes, entry_count));
+            }
+            let input = CheckpointWrite {
+                fingerprint: source.fingerprint,
+                // The fixed-width header uses zero for absent coverage, as the
+                // existing format does. Keep the Option in CheckpointTail for
+                // the post-install journal decision.
+                covered_lsn: source.covered_lsn.unwrap_or(0),
+                base_delta_seq: source.base_delta_seq,
+                collections: &metadata,
+                pack_table: source.pack_table,
+                logical_versions: source.logical_versions,
+            };
+            prepared.write_body(&input, |index, writer| {
+                #[cfg(test)]
+                if self.checkpoint_prepare_fail.swap(false, Ordering::Relaxed) {
+                    return Err(std::io::Error::other("injected checkpoint prepare failure"));
+                }
+                source.snapshots[index]
+                    .2
+                    .index
+                    .write_snapshot_to(metadata[index].3 as usize, writer)
+            })
+        })();
+        result.map_err(|error| {
+            self.abandon_checkpoint();
+            StorageError::Io(error)
+        })
     }
 
     /// Serialize snapshots and write their checkpoint, for the test mirrors of
@@ -6502,18 +6563,6 @@ impl PackfileStorage {
             logical_versions,
         )?;
         Ok(serialized)
-    }
-
-    /// Serialize every snapshot's index into an owned checkpoint blob.
-    fn serialize_snapshots(
-        snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
-    ) -> Vec<([u8; 16], u64, Vec<u8>)> {
-        snapshots
-            .iter()
-            .map(|(collection_id, generation, room)| {
-                (*collection_id, *generation, room.index.serialize())
-            })
-            .collect()
     }
 
     /// Fold a finished tail into the capture's breakdown and publish it.
@@ -6613,6 +6662,13 @@ impl PackfileStorage {
         let (release, gate) = std::sync::mpsc::channel();
         *self.checkpoint_tail_hook.lock() = Some(TailHook { gate, fail });
         release
+    }
+
+    /// Test-only: fail the next checkpoint capture after its delta epoch has
+    /// rotated, so the next sync must abandon and rewrite the image.
+    #[cfg(test)]
+    pub(crate) fn fail_next_checkpoint_prepare(&self) {
+        self.checkpoint_prepare_fail.store(true, Ordering::Relaxed);
     }
 
     /// Whether a checkpoint tail is running on its worker thread.
@@ -11133,6 +11189,14 @@ impl PackfileStorage {
                         };
                     return Ok(Some(removed));
                 }
+                // `record_identity_at` checks the frame CRC only for frames
+                // flagged removed, so a live header whose identity bytes rotted
+                // would look like an ordinary non-match. Verify the candidate
+                // under Full policy before skipping it; 62-bit fingerprints make
+                // this effectively never taken on healthy data.
+                if !already_scanned && self.shards.checksum_policy().verifies_reads() {
+                    let _ = self.shards.read_at(shard, offset, true)?;
+                }
             }
             return Ok(None);
         }
@@ -13426,10 +13490,8 @@ struct CheckpointTail {
     base_dir: PathBuf,
     fingerprint: u64,
     covered_lsn: Option<u64>,
-    base_delta_seq: u64,
     logical_versions: Vec<([u8; 16], u64)>,
-    blobs: Vec<([u8; 16], u64, Vec<u8>)>,
-    pack_table: Vec<(u16, PackId)>,
+    prepared: PreparedCheckpoint,
     journal: Option<Arc<JournalCoordinator>>,
     pool_tag: u8,
     durable_coverage: Arc<AtomicU64>,
@@ -13464,21 +13526,10 @@ impl CheckpointTail {
         fs::create_dir_all(&self.base_dir).map_err(StorageError::Io)?;
         let path = PackfileStorage::index_checkpoint_path(&self.base_dir);
         let write_started = std::time::Instant::now();
-        let blobs: Vec<([u8; 16], u64, &[u8])> = self
-            .blobs
-            .iter()
-            .map(|(collection_id, generation, blob)| (*collection_id, *generation, blob.as_slice()))
-            .collect();
-        crate::index::checkpoint::write_checkpoint(
-            &path,
-            self.fingerprint,
-            self.covered_lsn.unwrap_or(0),
-            self.base_delta_seq,
-            &blobs,
-            &self.pack_table,
-            &self.logical_versions,
-        )
-        .map_err(StorageError::Io)?;
+        // The body was streamed and checksummed under the capture locks. Only
+        // the disk barrier and the atomic install happen here, after every
+        // writer lock was released.
+        self.prepared.install().map_err(StorageError::Io)?;
         done.write = write_started.elapsed();
         done.checkpoint_bytes = fs::metadata(&path).map_or(0, |meta| meta.len());
         // Collection versions are not reconstructible from sealed packs: a
@@ -13539,6 +13590,15 @@ impl CheckpointTail {
 struct CapturedCheckpoint {
     tail: CheckpointTail,
     breakdown: CheckpointBreakdown,
+}
+
+struct CheckpointBodySource<'a> {
+    fingerprint: u64,
+    base_delta_seq: u64,
+    covered_lsn: Option<u64>,
+    snapshots: &'a [([u8; 16], u64, Arc<RoomGeneration>)],
+    pack_table: &'a [(u16, PackId)],
+    logical_versions: &'a [([u8; 16], u64)],
 }
 
 /// A tail running on its own thread, with the capture's phase timings.

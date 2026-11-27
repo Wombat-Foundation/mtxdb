@@ -4,6 +4,7 @@
 //! checked against the authoritative frame header at the storage boundary.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::bucket::{BucketCandidate, BucketSnapshotError, BucketUndo, RawBucketTable};
@@ -284,6 +285,18 @@ impl BucketIndex {
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
         self.table.snapshot()
+    }
+
+    /// Stream the bucket snapshot into `writer` without building it on the heap.
+    ///
+    /// # Errors
+    /// Returns any error from `writer`.
+    pub(crate) fn write_snapshot_to<W: io::Write + ?Sized>(
+        &self,
+        expected_entries: usize,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        self.table.write_snapshot_to(expected_entries, writer)
     }
 
     /// Decode a bucket snapshot using this pool's load-factor policy.

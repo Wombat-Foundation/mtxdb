@@ -13,6 +13,7 @@
 //! cold sample closes the database, evicts selected files, then reopens before
 //! timing; the manifest mode does not read payloads from an existing database.
 //! `MTXDB_TIMELINE_SAMPLES` controls cold repetitions; warm pages use 20.
+//! `MTXDB_MULTI_CHECKPOINT_ONLY=1` stops after checkpoint diagnostics.
 //!
 //! Output rows separate index traversal (`multi_room_page`), locator plus body
 //! fetches (`multi_room_fetch`), and mutations (`multi_room_mutate`). I/O
@@ -20,6 +21,8 @@
 //! `memory.stat`; they are process-wide deltas around each measurement.
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -359,6 +362,27 @@ fn proc_status_kib(field: &str) -> Option<u64> {
     })
 }
 
+fn peak_anon_during<T>(operation: impl FnOnce() -> T) -> (T, u64, u64) {
+    let before = proc_status_kib("RssAnon:").unwrap_or(0);
+    let peak = Arc::new(AtomicU64::new(before));
+    let running = Arc::new(AtomicBool::new(true));
+    let sampler_peak = Arc::clone(&peak);
+    let sampler_running = Arc::clone(&running);
+    let sampler = std::thread::spawn(move || {
+        while sampler_running.load(Ordering::Relaxed) {
+            let current = proc_status_kib("RssAnon:").unwrap_or(0);
+            sampler_peak.fetch_max(current, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let current = proc_status_kib("RssAnon:").unwrap_or(0);
+        sampler_peak.fetch_max(current, Ordering::Relaxed);
+    });
+    let result = operation();
+    running.store(false, Ordering::Relaxed);
+    sampler.join().expect("RssAnon sampler thread");
+    (result, before, peak.load(Ordering::Relaxed))
+}
+
 fn proc_smaps_kib(field: &str) -> Option<u64> {
     let text = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
     text.lines().find_map(|line| {
@@ -693,9 +717,29 @@ fn checkpoint_all_pools(db: &Database, root: &Path) -> (u64, u64) {
         .collect::<Vec<_>>()
         .join(",");
     for pool in ShardType::ALL {
-        db.pool(pool)
-            .force_index_checkpoint()
-            .expect("checkpoint benchmark pool before measurements");
+        let store = db.pool(pool);
+        let identity_before = store.stats().index_identity_reads;
+        let (result, anon_before, anon_peak) = peak_anon_during(|| store.force_index_checkpoint());
+        result.expect("checkpoint benchmark pool before measurements");
+        let identity_reads = store
+            .stats()
+            .index_identity_reads
+            .saturating_sub(identity_before);
+        if let Some(breakdown) = store.checkpoint_breakdown() {
+            println!(
+                "multi_room_checkpoint_detail pool={} anon_before_kib={anon_before} anon_peak_kib={anon_peak} anon_delta_peak_kib={} identity_reads={} lock_wait_ms={:.3} locked_sync_ms={:.3} snapshot_ms={:.3} serialize_ms={:.3} write_ms={:.3} total_ms={:.3} checkpoint_bytes={}",
+                pool.as_str(),
+                anon_peak.saturating_sub(anon_before),
+                identity_reads,
+                breakdown.lock_wait.as_secs_f64() * 1e3,
+                breakdown.locked_sync.as_secs_f64() * 1e3,
+                breakdown.snapshot.as_secs_f64() * 1e3,
+                breakdown.serialize.as_secs_f64() * 1e3,
+                breakdown.write.as_secs_f64() * 1e3,
+                breakdown.total.as_secs_f64() * 1e3,
+                breakdown.checkpoint_bytes,
+            );
+        }
     }
     let reclaim = db
         .coordinator()
@@ -1566,6 +1610,7 @@ fn main() {
     let root = bench_root();
     let open_only = std::env::var_os("MTXDB_MULTI_OPEN_ONLY").is_some();
     let page_only = std::env::var_os("MTXDB_MULTI_PAGE_ONLY").is_some();
+    let checkpoint_only = std::env::var_os("MTXDB_MULTI_CHECKPOINT_ONLY").is_some();
     if !open_only {
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1635,6 +1680,9 @@ fn main() {
     print_memory_diagnostics(&db, &root, &rooms);
     print_extension_breakdown(&root, "load");
     print_ordered_write_metrics(&db, &root, total_events, batch);
+    if checkpoint_only {
+        return;
+    }
 
     let tiers = select_tiers(&rooms);
 

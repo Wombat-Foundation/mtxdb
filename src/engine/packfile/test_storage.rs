@@ -4579,6 +4579,74 @@ fn write_sync_write_sync_reopens_from_the_checkpoint() {
 }
 
 #[test]
+fn failed_checkpoint_prepare_is_abandoned_and_the_next_sync_rewrites() {
+    let dir = test_dir("checkpoint_prepare_failure_recovers");
+    let collection = [0xB7; 16];
+    let first = batch_node(0x51);
+    let second = batch_node(0x52);
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(&collection, &first, &NodeData::from_slice(b"first"))
+        .unwrap();
+    store.sync_all().unwrap();
+
+    store.fail_next_checkpoint_prepare();
+    store
+        .put(&collection, &second, &NodeData::from_slice(b"second"))
+        .unwrap();
+    let error = store
+        .force_index_checkpoint()
+        .expect_err("the injected prepare failure must surface");
+    assert!(matches!(error, StorageError::Io(_)), "{error}");
+    assert_eq!(
+        store.delta_state.lock().base_fingerprint,
+        None,
+        "the failed image must be abandoned"
+    );
+    assert!(
+        fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("index.checkpoint.tmp.")),
+        "failed preparation must remove its temporary checkpoint"
+    );
+
+    // The failed prepare must not leave the session's delta epoch pointing at
+    // an image that was never written: the next sync reaches the rewrite path
+    // instead of appending to an orphaned log.
+    let third = batch_node(0x53);
+    store
+        .put(&collection, &third, &NodeData::from_slice(b"third"))
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert_eq!(
+        reopened.open_timings().unwrap().path,
+        OpenPath::Checkpoint,
+        "the recovery sync must install a usable checkpoint"
+    );
+    assert_eq!(
+        reopened.get(&collection, &first).unwrap().unwrap().bytes,
+        bytes::Bytes::from_static(b"first")
+    );
+    assert_eq!(
+        reopened.get(&collection, &second).unwrap().unwrap().bytes,
+        bytes::Bytes::from_static(b"second")
+    );
+    assert_eq!(
+        reopened.get(&collection, &third).unwrap().unwrap().bytes,
+        bytes::Bytes::from_static(b"third")
+    );
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn test_rebuild_index_triggers_on_full_table() {
     let dir = test_dir("rebuild_index_full");
     let store = PackfileStorage::open(dir).unwrap();
@@ -13970,15 +14038,28 @@ fn checkpoint_tail_sweeps_rejected_epochs_but_keeps_the_live_epoch() {
     let rejected_path = PackfileStorage::delta_path(&dir, rejected_fingerprint);
     fs::write(&rejected_path, b"rejected epoch").unwrap();
 
+    let checkpoint_path = PackfileStorage::index_checkpoint_path(&dir);
+    let prepared = PreparedCheckpoint::create(&checkpoint_path)
+        .unwrap()
+        .write_body(
+            &CheckpointWrite {
+                fingerprint: live_fingerprint,
+                covered_lsn: 0,
+                base_delta_seq: 0,
+                collections: &[],
+                pack_table: &[],
+                logical_versions: &[],
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
     let (release_tail, wait_for_tail) = std::sync::mpsc::channel();
     let tail = CheckpointTail {
         base_dir: dir.clone(),
         fingerprint: live_fingerprint,
         covered_lsn: None,
-        base_delta_seq: 0,
         logical_versions: Vec::new(),
-        blobs: Vec::new(),
-        pack_table: Vec::new(),
+        prepared,
         journal: None,
         pool_tag: 0,
         durable_coverage: Arc::new(AtomicU64::new(0)),

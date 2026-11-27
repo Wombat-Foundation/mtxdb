@@ -15,8 +15,8 @@
 //! ```text
 //!   [CheckpointHeader 104B]
 //!   [CollectionDirEntry * count, 56B each]
-//!   [collection 0 slots: capacity * 8B]
-//!   [collection 1 slots: capacity * 8B]
+//!   [collection 0: MTXI0002 bucket snapshot (32B header + 24B per entry + CRC)]
+//!   [collection 1: MTXI0002 bucket snapshot (32B header + 24B per entry + CRC)]
 //!   [PackTableEntry * pack_table_count, 20B each]
 //!   [CollectionVersionEntry * logical_version_count, 24B each]
 //!   ...
@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -162,7 +162,7 @@ pub fn pack_fingerprint(packs: &[(PackId, u64)]) -> u64 {
     hash
 }
 
-struct CheckpointLayout {
+struct CheckpointDimensions {
     collection_count: u32,
     directory_bytes: u64,
     slots_bytes: u64,
@@ -170,63 +170,251 @@ struct CheckpointLayout {
     pack_table_bytes: u64,
     logical_version_count: u32,
     logical_version_bytes: u64,
-    snapshot_counts: Vec<usize>,
+    directory: Vec<CollectionDirEntry>,
 }
 
-fn checkpoint_layout(
-    covered_lsn: u64,
-    collections: &[([u8; 16], u64, &[u8])],
-    pack_table: &[(u16, PackId)],
-    logical_versions: &[([u8; 16], u64)],
-) -> io::Result<CheckpointLayout> {
-    if logical_versions
+/// Metadata and sources for one streamed checkpoint.
+///
+/// `collections` carries `(collection id, generation, snapshot bytes, entry
+/// count)` per collection in directory order. The snapshot length is the exact
+/// number of bytes the corresponding slot writer must emit; it is known in
+/// O(1) from the index (`BucketIndex::serialized_len`), so the layout can be
+/// written before the snapshots are.
+pub(crate) struct CheckpointWrite<'a> {
+    pub(crate) fingerprint: u64,
+    pub(crate) covered_lsn: u64,
+    pub(crate) base_delta_seq: u64,
+    pub(crate) collections: &'a [([u8; 16], u64, u32, u32)],
+    pub(crate) pack_table: &'a [(u16, PackId)],
+    pub(crate) logical_versions: &'a [([u8; 16], u64)],
+}
+
+/// A checkpoint temp file that has been created and, once [`Self::write_body`]
+/// runs, streamed and checksummed, but is not yet durable or installed.
+///
+/// The temp file is opened before the caller takes its collection locks, and
+/// kept open across [`Self::install`] so the sync happens on the same handle
+/// that wrote the bytes. Dropping an uninstalled value removes the temp file.
+pub(crate) struct PreparedCheckpoint {
+    file: Option<fs::File>,
+    tmp_path: Option<PathBuf>,
+    final_path: PathBuf,
+}
+
+impl PreparedCheckpoint {
+    /// Create the parent directory and the temporary file for `path`.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the directory or file cannot be created.
+    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let unique = CHECKPOINT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = PathBuf::from(format!(
+            "{}.tmp.{}.{unique}",
+            path.display(),
+            std::process::id()
+        ));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        Ok(Self {
+            file: Some(file),
+            tmp_path: Some(tmp_path),
+            final_path: path.to_path_buf(),
+        })
+    }
+
+    /// Stream the header placeholder, body and footer into the temp file, then
+    /// seek back and write the finalized header.
+    ///
+    /// `write_slots` runs once per collection in directory order and must emit
+    /// exactly that collection's declared snapshot length.
+    ///
+    /// # Errors
+    /// Returns an I/O error for invalid metadata, a slot-writer failure, or a
+    /// temp-file write/seek failure.
+    pub(crate) fn write_body(
+        mut self,
+        input: &CheckpointWrite<'_>,
+        mut write_slots: impl FnMut(usize, &mut dyn io::Write) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let dimensions = checkpoint_dimensions(input)?;
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("checkpoint temp file already written"))?;
+        let mut writer = CheckpointBodyWriter {
+            inner: io::BufWriter::with_capacity(64 * 1024, file),
+            crc: crc32fast::Hasher::new(),
+        };
+        writer.inner.write_all(&[0; CHECKPOINT_HEADER_LEN])?;
+        write_checkpoint_sections(&mut writer, input, &dimensions, &mut write_slots)?;
+        writer.flush()?;
+        let content_crc32 = writer.crc.finalize();
+        let mut file = writer
+            .inner
+            .into_inner()
+            .map_err(io::IntoInnerError::into_error)?;
+        let header = CheckpointHeader {
+            magic: CHECKPOINT_MAGIC,
+            version: CHECKPOINT_VERSION,
+            collection_count: dimensions.collection_count,
+            directory_bytes: dimensions.directory_bytes,
+            slots_bytes: dimensions.slots_bytes,
+            pack_fingerprint: input.fingerprint,
+            content_crc32,
+            homes_bytes: 0,
+            tails_bytes: 0,
+            covered_lsn: input.covered_lsn,
+            pack_table_count: dimensions.pack_table_count,
+            pack_table_bytes: dimensions.pack_table_bytes,
+            base_delta_seq: input.base_delta_seq,
+            logical_version_count: dimensions.logical_version_count,
+            logical_version_bytes: dimensions.logical_version_bytes,
+        };
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header.encode())?;
+        file.flush()?;
+        self.file = Some(file);
+        Ok(self)
+    }
+
+    /// Flush the temp file to stable storage and atomically install it.
+    ///
+    /// # Errors
+    /// Returns an I/O error if syncing or renaming the prepared file fails. The
+    /// temp file is removed on failure; on success it is disarmed so `Drop`
+    /// does not unlink the installed checkpoint.
+    pub(crate) fn install(mut self) -> io::Result<()> {
+        let Some(file) = self.file.take() else {
+            return Err(io::Error::other("checkpoint temp file was not written"));
+        };
+        file.sync_data()?;
+        // Required before rename on Windows.
+        drop(file);
+        let tmp_path = self
+            .tmp_path
+            .as_ref()
+            .ok_or_else(|| io::Error::other("checkpoint temp path already consumed"))?;
+        fs::rename(tmp_path, &self.final_path)?;
+        self.tmp_path = None;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedCheckpoint {
+    fn drop(&mut self) {
+        if let Some(path) = self.tmp_path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct CheckpointBodyWriter<W> {
+    inner: W,
+    crc: crc32fast::Hasher,
+}
+
+impl<W: io::Write> io::Write for CheckpointBodyWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.crc.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct CheckpointCountWriter<'a, W> {
+    inner: &'a mut CheckpointBodyWriter<W>,
+    written: u64,
+}
+
+impl<W: io::Write> io::Write for CheckpointCountWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.written = self
+            .written
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn checkpoint_dimensions(input: &CheckpointWrite<'_>) -> io::Result<CheckpointDimensions> {
+    if input
+        .logical_versions
         .windows(2)
         .any(|pair| pair[0].0 >= pair[1].0)
-        || logical_versions
+        || input
+            .logical_versions
             .iter()
-            .any(|(_, version)| *version > covered_lsn)
+            .any(|(_, version)| *version > input.covered_lsn)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "checkpoint logical versions must be sorted, unique, and covered by its LSN",
         ));
     }
-    let collection_count = u32::try_from(collections.len())
+    let collection_count = u32::try_from(input.collections.len())
         .map_err(|_| io::Error::other("too many collections for checkpoint u32"))?;
-    let directory_bytes = u64::try_from(collections.len())
+    let directory_bytes = u64::try_from(input.collections.len())
         .ok()
         .and_then(|count| count.checked_mul(COLLECTION_DIR_ENTRY_LEN as u64))
         .ok_or_else(|| io::Error::other("checkpoint directory size overflow"))?;
     let mut slots_bytes = 0_u64;
-    let mut snapshot_counts = Vec::with_capacity(collections.len());
-    for (_, _, blob) in collections {
-        let (_, entry_count) = RawBucketTable::validate_snapshot(blob)
-            .map_err(|error| io::Error::other(format!("invalid bucket snapshot: {error}")))?;
-        let blob_len = u64::try_from(blob.len())
-            .map_err(|_| io::Error::other("bucket snapshot length exceeds u64"))?;
-        slots_bytes = slots_bytes
-            .checked_add(blob_len)
-            .ok_or_else(|| io::Error::other("checkpoint snapshot bytes overflow"))?;
-        if u32::try_from(blob.len()).is_err() {
-            return Err(io::Error::other(
-                "bucket snapshot exceeds directory length field",
+    let mut body_offset = 0_u64;
+    let mut directory = Vec::with_capacity(input.collections.len());
+    for (collection_id, generation, snapshot_bytes, entry_count) in input.collections {
+        if *snapshot_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint collection has an empty bucket snapshot",
             ));
         }
-        snapshot_counts.push(entry_count);
+        let bytes = u64::from(*snapshot_bytes);
+        directory.push(CollectionDirEntry {
+            collection_id: *collection_id,
+            generation: *generation,
+            slots_offset: body_offset,
+            homes_offset: 0,
+            tails_offset: 0,
+            // For MTXI0002 this directory field holds the snapshot's byte
+            // length; readers derive bucket count from the snapshot header.
+            capacity: *snapshot_bytes,
+            slot_count: *entry_count,
+        });
+        body_offset = body_offset
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("checkpoint body offset overflow"))?;
+        slots_bytes = slots_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("checkpoint slots size overflow"))?;
     }
-    let pack_table_count = u32::try_from(pack_table.len())
+    let pack_table_count = u32::try_from(input.pack_table.len())
         .map_err(|_| io::Error::other("too many packs for checkpoint pack table u32"))?;
-    let pack_table_bytes = u64::try_from(pack_table.len())
+    let pack_table_bytes = u64::try_from(input.pack_table.len())
         .ok()
         .and_then(|count| count.checked_mul(PACK_TABLE_ENTRY_LEN as u64))
         .ok_or_else(|| io::Error::other("checkpoint pack table size overflow"))?;
-    let logical_version_count = u32::try_from(logical_versions.len())
+    let logical_version_count = u32::try_from(input.logical_versions.len())
         .map_err(|_| io::Error::other("too many logical versions for checkpoint u32"))?;
-    let logical_version_bytes = u64::try_from(logical_versions.len())
+    let logical_version_bytes = u64::try_from(input.logical_versions.len())
         .ok()
         .and_then(|count| count.checked_mul(COLLECTION_VERSION_ENTRY_LEN as u64))
         .ok_or_else(|| io::Error::other("checkpoint logical-version size overflow"))?;
-    Ok(CheckpointLayout {
+    Ok(CheckpointDimensions {
         collection_count,
         directory_bytes,
         slots_bytes,
@@ -234,71 +422,45 @@ fn checkpoint_layout(
         pack_table_bytes,
         logical_version_count,
         logical_version_bytes,
-        snapshot_counts,
+        directory,
     })
 }
 
-fn encode_checkpoint_body(
-    collections: &[([u8; 16], u64, &[u8])],
-    pack_table: &[(u16, PackId)],
-    logical_versions: &[([u8; 16], u64)],
-    layout: &CheckpointLayout,
-) -> io::Result<Vec<u8>> {
-    let directory_len = usize::try_from(layout.directory_bytes)
-        .map_err(|_| io::Error::other("checkpoint directory exceeds address space"))?;
-    let slots_len = usize::try_from(layout.slots_bytes)
-        .map_err(|_| io::Error::other("checkpoint snapshots exceed address space"))?;
-    let pack_len = usize::try_from(layout.pack_table_bytes)
-        .map_err(|_| io::Error::other("checkpoint pack table exceeds address space"))?;
-    let versions_len = usize::try_from(layout.logical_version_bytes)
-        .map_err(|_| io::Error::other("checkpoint logical versions exceed address space"))?;
-    let total_len = CHECKPOINT_HEADER_LEN
-        .checked_add(directory_len)
-        .and_then(|len| len.checked_add(slots_len))
-        .and_then(|len| len.checked_add(pack_len))
-        .and_then(|len| len.checked_add(versions_len))
-        .ok_or_else(|| io::Error::other("checkpoint length exceeds address space"))?;
-    let mut body = Vec::with_capacity(total_len);
-    body.resize(CHECKPOINT_HEADER_LEN, 0);
-    let mut body_offset = 0_u64;
-    for ((collection_id, generation, blob), entry_count) in
-        collections.iter().zip(&layout.snapshot_counts)
-    {
-        let entry = CollectionDirEntry {
-            collection_id: *collection_id,
-            generation: *generation,
-            slots_offset: body_offset,
-            homes_offset: 0,
-            tails_offset: 0,
-            capacity: u32::try_from(blob.len())
-                .map_err(|_| io::Error::other("bucket snapshot exceeds u32"))?,
-            slot_count: u32::try_from(*entry_count)
-                .map_err(|_| io::Error::other("bucket snapshot entry count exceeds u32"))?,
+fn write_checkpoint_sections(
+    writer: &mut CheckpointBodyWriter<io::BufWriter<fs::File>>,
+    input: &CheckpointWrite<'_>,
+    dimensions: &CheckpointDimensions,
+    write_slots: &mut impl FnMut(usize, &mut dyn io::Write) -> io::Result<()>,
+) -> io::Result<()> {
+    for entry in &dimensions.directory {
+        writer.write_all(&entry.encode())?;
+    }
+    for (index, (_, _, snapshot_bytes, _)) in input.collections.iter().enumerate() {
+        let mut counted = CheckpointCountWriter {
+            inner: writer,
+            written: 0,
         };
-        body.extend_from_slice(&entry.encode());
-        body_offset = body_offset
-            .checked_add(
-                u64::try_from(blob.len())
-                    .map_err(|_| io::Error::other("bucket snapshot length exceeds u64"))?,
-            )
-            .ok_or_else(|| io::Error::other("checkpoint body offset overflow"))?;
+        write_slots(index, &mut counted)?;
+        if counted.written != u64::from(*snapshot_bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint slot writer emitted the wrong byte count",
+            ));
+        }
     }
-    for (_, _, blob) in collections {
-        body.extend_from_slice(blob);
+    for &(slot, pack_id) in input.pack_table {
+        writer.write_all(&PackTableEntry { slot, pack_id }.encode())?;
     }
-    for &(slot, pack_id) in pack_table {
-        body.extend_from_slice(&PackTableEntry { slot, pack_id }.encode());
-    }
-    for &(collection_id, last_write_lsn) in logical_versions {
-        body.extend_from_slice(
+    for &(collection_id, last_write_lsn) in input.logical_versions {
+        writer.write_all(
             &CollectionVersionEntry {
                 collection_id,
                 last_write_lsn,
             }
             .encode(),
-        );
+        )?;
     }
-    Ok(body)
+    Ok(())
 }
 
 /// Write an MTXI0002 checkpoint atomically from validated bucket snapshots.
@@ -321,60 +483,31 @@ pub fn write_checkpoint(
     pack_table: &[(u16, PackId)],
     logical_versions: &[([u8; 16], u64)],
 ) -> std::io::Result<()> {
-    let layout = checkpoint_layout(covered_lsn, collections, pack_table, logical_versions)?;
-    let mut buf = encode_checkpoint_body(collections, pack_table, logical_versions, &layout)?;
-    let content_crc32 = crc32fast::hash(&buf[CHECKPOINT_HEADER_LEN..]);
-
-    let header = CheckpointHeader {
-        magic: CHECKPOINT_MAGIC,
-        version: CHECKPOINT_VERSION,
-        collection_count: layout.collection_count,
-        directory_bytes: layout.directory_bytes,
-        slots_bytes: layout.slots_bytes,
-        pack_fingerprint: fingerprint,
-        content_crc32,
-        homes_bytes: 0,
-        tails_bytes: 0,
+    let metadata: Vec<([u8; 16], u64, u32, u32)> = collections
+        .iter()
+        .map(|(collection_id, generation, blob)| {
+            let (_, entry_count) = RawBucketTable::validate_snapshot(blob)
+                .map_err(|error| io::Error::other(format!("invalid bucket snapshot: {error}")))?;
+            let snapshot_bytes = u32::try_from(blob.len())
+                .map_err(|_| io::Error::other("bucket snapshot exceeds u32"))?;
+            let entry_count = u32::try_from(entry_count)
+                .map_err(|_| io::Error::other("bucket snapshot entry count exceeds u32"))?;
+            Ok((*collection_id, *generation, snapshot_bytes, entry_count))
+        })
+        .collect::<io::Result<_>>()?;
+    let input = CheckpointWrite {
+        fingerprint,
         covered_lsn,
-        pack_table_count: layout.pack_table_count,
-        pack_table_bytes: layout.pack_table_bytes,
         base_delta_seq,
-        logical_version_count: layout.logical_version_count,
-        logical_version_bytes: layout.logical_version_bytes,
+        collections: &metadata,
+        pack_table,
+        logical_versions,
     };
-    buf[..CHECKPOINT_HEADER_LEN].copy_from_slice(&header.encode());
-
-    let unique = CHECKPOINT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = PathBuf::from(format!(
-        "{}.tmp.{}.{unique}",
-        path.display(),
-        std::process::id()
-    ));
-    let write_result = (|| -> std::io::Result<()> {
-        let mut tmp = fs::File::create(&tmp_path)?;
-        tmp.write_all(&buf)?;
-        // `sync_data` (fdatasync), not `sync_all` (fsync): per POSIX,
-        // fdatasync durably flushes the file's data plus whatever metadata
-        // is needed to retrieve it (the extended length included) — that's
-        // the whole content/length guarantee this write needs. It skips
-        // metadata that's *not* needed to read the data back (mtime/ctime).
-        // That's a real distinction, not a claim that all inode metadata is
-        // irrelevant here generally (permissions/ownership can still matter
-        // operationally) — it just happens that none of the metadata this
-        // skips is read back through this temp name: it's renamed over
-        // `path` immediately below and never opened by this name again. The
-        // caller (`persist_index_checkpoint`) separately fsyncs the base
-        // directory after the rename, which is what makes the rename itself
-        // durable; if that directory fsync fails, reopen falls back to
-        // whichever checkpoint (old or new) is actually intact rather than
-        // trusting the rename — this change doesn't alter that fallback.
-        tmp.sync_data()
-    })();
-    if let Err(e) = write_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-    fs::rename(&tmp_path, path)
+    PreparedCheckpoint::create(path)?
+        .write_body(&input, |index, writer| {
+            writer.write_all(collections[index].2)
+        })?
+        .install()
 }
 
 /// Read and validate a checkpoint. Returns `None` for any problem — a
