@@ -103,6 +103,8 @@ default = ["zstd"]
 # not carry zstd. A build without it always
 # writes raw frames and refuses to read compressed ones.
 zstd = ["dep:zstd", "dep:zstd-sys"]
+# Shared structured logging macros through Rezzy's `rezzy-log` convention.
+logging = ["rezzy/logging"]
 
 # Exposes `JournalCoordinator::set_segment_cap` so downstream tests can reach the
 # journal's hard limit without writing hundreds of MiB. Not for production use.
