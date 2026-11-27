@@ -253,6 +253,107 @@ pub struct RawBucketTable {
     seed: u64,
 }
 
+/// Allocation-free iterator over occupied table slots.
+pub struct BucketEntries<'a> {
+    table: &'a RawBucketTable,
+    bucket_index: usize,
+    slot_index: usize,
+    overflow_index: usize,
+}
+
+impl Iterator for BucketEntries<'_> {
+    type Item = BucketCandidate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.bucket_index < self.table.buckets.len() {
+                let bucket = self.bucket_index;
+                let slot = self.slot_index;
+                self.slot_index = self.slot_index.saturating_add(1);
+                if self.slot_index == SLOT_COUNT {
+                    self.slot_index = 0;
+                    self.bucket_index = self.bucket_index.saturating_add(1);
+                }
+                let location = SlotLocation::Bucket {
+                    bucket: u32::try_from(bucket).ok()?,
+                    slot: u8::try_from(slot).ok()?,
+                };
+                if let Some(entry) = self.table.buckets[bucket].slots[slot].snapshot(location) {
+                    return Some(entry);
+                }
+                continue;
+            }
+            if self.table.overflow_len.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+            let entry = {
+                let overflow = self.table.overflow.lock();
+                let slot = overflow.get(self.overflow_index)?;
+                let location = SlotLocation::Overflow(u32::try_from(self.overflow_index).ok()?);
+                self.overflow_index = self.overflow_index.saturating_add(1);
+                slot.snapshot(location)
+            };
+            if entry.is_some() {
+                return entry;
+            }
+        }
+    }
+}
+
+/// Allocation-free iterator over a fingerprint's candidate slots.
+pub struct BucketCandidates<'a> {
+    table: &'a RawBucketTable,
+    fingerprint: u64,
+    choices: [usize; 2],
+    choice_count: usize,
+    choice_index: usize,
+    slot_index: usize,
+    overflow_index: usize,
+}
+
+impl Iterator for BucketCandidates<'_> {
+    type Item = BucketCandidate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.choice_index < self.choice_count {
+                let bucket = self.choices[self.choice_index];
+                let slot_index = self.slot_index;
+                self.slot_index = self.slot_index.saturating_add(1);
+                if self.slot_index == SLOT_COUNT {
+                    self.slot_index = 0;
+                    self.choice_index = self.choice_index.saturating_add(1);
+                }
+                let location = SlotLocation::Bucket {
+                    bucket: u32::try_from(bucket).ok()?,
+                    slot: u8::try_from(slot_index).ok()?,
+                };
+                if let Some(candidate) =
+                    self.table.buckets[bucket].slots[slot_index].snapshot(location)
+                {
+                    if candidate.fingerprint == self.fingerprint {
+                        return Some(candidate);
+                    }
+                }
+                continue;
+            }
+            if self.table.overflow_len.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+            let candidate = {
+                let overflow = self.table.overflow.lock();
+                let slot = overflow.get(self.overflow_index)?;
+                let location = SlotLocation::Overflow(u32::try_from(self.overflow_index).ok()?);
+                self.overflow_index = self.overflow_index.saturating_add(1);
+                slot.snapshot(location)
+            };
+            if candidate.is_some_and(|entry| entry.fingerprint == self.fingerprint) {
+                return candidate;
+            }
+        }
+    }
+}
+
 fn parse_snapshot_header(bytes: &[u8]) -> Result<(u32, u64, usize), BucketSnapshotError> {
     let header = bytes
         .get(..SNAPSHOT_HEADER_LEN)
@@ -409,43 +510,13 @@ impl RawBucketTable {
 
     /// Iterate occupied entries. The common case performs no heap allocation;
     /// the overflow handles are copied only when overflow entries exist.
-    pub fn iter_entries(&self) -> impl Iterator<Item = BucketCandidate> + '_ {
-        let overflow: Vec<_> = if self.overflow_len.load(Ordering::Acquire) == 0 {
-            Vec::new()
-        } else {
-            self.overflow.lock().iter().cloned().collect()
-        };
-        let mut bucket_index = 0_usize;
-        let mut slot_index = 0_usize;
-        let mut overflow_index = 0_usize;
-        std::iter::from_fn(move || loop {
-            if bucket_index < self.buckets.len() {
-                let current_bucket = bucket_index;
-                let current_slot = slot_index;
-                slot_index = slot_index.saturating_add(1);
-                if slot_index == SLOT_COUNT {
-                    slot_index = 0;
-                    bucket_index = bucket_index.saturating_add(1);
-                }
-                let location = SlotLocation::Bucket {
-                    bucket: u32::try_from(current_bucket).unwrap_or(u32::MAX),
-                    slot: u8::try_from(current_slot).unwrap_or(u8::MAX),
-                };
-                if let Some(entry) =
-                    self.buckets[current_bucket].slots[current_slot].snapshot(location)
-                {
-                    return Some(entry);
-                }
-                continue;
-            }
-            let slot = overflow.get(overflow_index)?;
-            let location =
-                SlotLocation::Overflow(u32::try_from(overflow_index).unwrap_or(u32::MAX));
-            overflow_index = overflow_index.saturating_add(1);
-            if let Some(entry) = slot.snapshot(location) {
-                return Some(entry);
-            }
-        })
+    pub fn iter_entries(&self) -> BucketEntries<'_> {
+        BucketEntries {
+            table: self,
+            bucket_index: 0,
+            slot_index: 0,
+            overflow_index: 0,
+        }
     }
 
     /// Copy the table in place, preserving every slot's location.
@@ -658,50 +729,17 @@ impl RawBucketTable {
 
     /// Iterate matches directly from the two candidate buckets. The ordinary
     /// path is allocation-free; overflow handles are copied only when needed.
-    pub fn candidate_iter(&self, fingerprint: u64) -> impl Iterator<Item = BucketCandidate> + '_ {
+    pub fn candidate_iter(&self, fingerprint: u64) -> BucketCandidates<'_> {
         let (first, second) = self.choices(fingerprint);
-        let bucket_count = if first == second { 1 } else { 2 };
-        let choices = [first, second];
-        let overflow: Vec<_> = if self.overflow_len.load(Ordering::Acquire) == 0 {
-            Vec::new()
-        } else {
-            self.overflow.lock().iter().cloned().collect()
-        };
-        let mut choice_index = 0_usize;
-        let mut slot_index = 0_usize;
-        let mut overflow_index = 0_usize;
-        std::iter::from_fn(move || loop {
-            if choice_index < bucket_count {
-                let bucket_index = choices[choice_index];
-                let current_slot = slot_index;
-                slot_index = slot_index.saturating_add(1);
-                if slot_index == SLOT_COUNT {
-                    slot_index = 0;
-                    choice_index = choice_index.saturating_add(1);
-                }
-                let location = SlotLocation::Bucket {
-                    bucket: u32::try_from(bucket_index).unwrap_or(u32::MAX),
-                    slot: u8::try_from(current_slot).unwrap_or(u8::MAX),
-                };
-                if let Some(candidate) =
-                    self.buckets[bucket_index].slots[current_slot].snapshot(location)
-                {
-                    if candidate.fingerprint == fingerprint {
-                        return Some(candidate);
-                    }
-                }
-                continue;
-            }
-            let slot = overflow.get(overflow_index)?;
-            let location =
-                SlotLocation::Overflow(u32::try_from(overflow_index).unwrap_or(u32::MAX));
-            overflow_index = overflow_index.saturating_add(1);
-            if let Some(candidate) = slot.snapshot(location) {
-                if candidate.fingerprint == fingerprint {
-                    return Some(candidate);
-                }
-            }
-        })
+        BucketCandidates {
+            table: self,
+            fingerprint,
+            choices: [first, second],
+            choice_count: if first == second { 1 } else { 2 },
+            choice_index: 0,
+            slot_index: 0,
+            overflow_index: 0,
+        }
     }
 
     /// Insert a new key candidate. Exact replacement is a separate operation
@@ -902,10 +940,12 @@ impl RawBucketTable {
     pub fn grow(&self) -> Option<Self> {
         let next_entries = self.capacity().checked_mul(2)?;
         let grown = Self::new(next_entries, self.seed);
-        for bucket in &self.buckets {
-            for slot in &bucket.slots {
-                if let Some(candidate) = slot.snapshot(SlotLocation::Bucket { bucket: 0, slot: 0 })
-                {
+        for (bucket_index, bucket) in self.buckets.iter().enumerate() {
+            for (slot_index, slot) in bucket.slots.iter().enumerate() {
+                if let Some(candidate) = slot.snapshot(SlotLocation::Bucket {
+                    bucket: u32::try_from(bucket_index).ok()?,
+                    slot: u8::try_from(slot_index).ok()?,
+                }) {
                     grown.insert_new(
                         candidate.fingerprint,
                         candidate.shard_slot,
@@ -1050,7 +1090,9 @@ fn mix64(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bucket, RawBucketTable, SlotLocation, SNAPSHOT_HEADER_LEN};
+    use super::{
+        mix64, Bucket, RawBucketTable, SlotLocation, FINGERPRINT_MASK, SNAPSHOT_HEADER_LEN,
+    };
 
     #[test]
     fn bucket_is_one_cache_line_of_four_slots() {
@@ -1184,6 +1226,51 @@ mod tests {
             .iter()
             .any(|entry| matches!(entry.location, SlotLocation::Overflow(_))));
         assert_eq!(table.snapshot_len(), table.snapshot().len());
+    }
+
+    #[test]
+    fn canonical_snapshot_order_restores_tables_at_overflow_limit() {
+        let table = RawBucketTable::new(256, 0x6A09_E667);
+        let mut inserted = 0_u64;
+        // Deterministic pseudo-random fingerprints create varied two-choice
+        // graphs; fill until the bounded live insertion policy is exhausted.
+        for value in 0_u64..10_000 {
+            let fingerprint = mix64(value.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & FINGERPRINT_MASK;
+            if table
+                .insert_new(fingerprint, 3, value, value % 7 == 0)
+                .is_none()
+            {
+                break;
+            }
+            inserted += 1;
+        }
+        assert!(usize::try_from(inserted).unwrap() >= table.capacity());
+        assert!(table.overflow_len() > 0);
+
+        let encoded = table.snapshot();
+        let restored = RawBucketTable::from_snapshot(&encoded)
+            .expect("canonical order may require extra snapshot overflow slots");
+        assert_eq!(restored.len(), table.len());
+        assert_eq!(restored.live_len(), table.live_len());
+        assert_eq!(restored.snapshot(), encoded);
+    }
+
+    #[test]
+    fn live_count_tracks_insert_replace_rollback_and_snapshot() {
+        let table = RawBucketTable::new(16, 9);
+        let live = table.insert_new(1, 2, 10, false).unwrap();
+        assert_eq!((table.len(), table.live_len()), (1, 1));
+        let location = live.location;
+        let removed = table.replace(location, 1, 2, 11, true).unwrap();
+        assert_eq!((table.len(), table.live_len()), (1, 0));
+        table.rollback(removed);
+        assert_eq!((table.len(), table.live_len()), (1, 1));
+        table.rollback(live);
+        assert_eq!((table.len(), table.live_len()), (0, 0));
+
+        table.insert_new(5, 2, 20, true).unwrap();
+        let restored = RawBucketTable::from_snapshot(&table.snapshot()).unwrap();
+        assert_eq!((restored.len(), restored.live_len()), (1, 0));
     }
 
     #[test]

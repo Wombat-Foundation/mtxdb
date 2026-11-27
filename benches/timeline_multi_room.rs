@@ -1407,6 +1407,7 @@ fn run_fetch_rows(
     db
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_mutations(db: &Database, rooms: &[Room], tier: Option<usize>, payload_min: usize) {
     let Some(largest) = tier else {
         return;
@@ -1631,7 +1632,6 @@ fn main() {
     let db = reopen_benchmark_database(&root, db);
     print_memory_diagnostics(&db, &root, &rooms);
     drop(db);
-    if !page_only {}
     if std::env::var_os("MTXDB_PAGE_ADVICE_AB").is_some() {
         run_sequential_get_rows(&root, &rooms, samples);
         run_disk_order_get_rows(&root, &rooms, samples);

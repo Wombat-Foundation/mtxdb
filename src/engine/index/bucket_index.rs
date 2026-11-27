@@ -338,6 +338,7 @@ impl BucketIndex {
         min_capacity: usize,
         config: IndexConfig,
     ) -> Option<usize> {
+        config.validate().ok()?;
         let percent = usize::from(config.load_factor_percent);
         if percent == 0 {
             return None;
@@ -463,5 +464,26 @@ mod tests {
             assert_eq!(candidate.offset, u64::try_from(offset).unwrap() << 40);
             assert_eq!(candidate.removed, offset == 2);
         }
+    }
+
+    #[test]
+    fn configured_capacity_respects_load_factor() {
+        let config = IndexConfig {
+            seed: 7,
+            floor: 16,
+            load_factor_percent: 25,
+        };
+        assert_eq!(
+            BucketIndex::capacity_for_entries_with_config(100, 16, config),
+            Some(512)
+        );
+        let invalid = IndexConfig {
+            load_factor_percent: 0,
+            ..config
+        };
+        assert_eq!(
+            BucketIndex::capacity_for_entries_with_config(100, 16, invalid),
+            None
+        );
     }
 }
