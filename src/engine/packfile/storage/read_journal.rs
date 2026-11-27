@@ -912,6 +912,11 @@ impl PackfileStorage {
             let Some(overlay) = guard.as_mut() else {
                 return Ok(guard);
             };
+            // A reader may open while one writer is active and outlive a
+            // restart that changes residency. Check before returning a result.
+            if overlay.pool.is_some() {
+                self.validate_shared_reader_reload_mode()?;
+            }
             if self.refresh_worker_overlay(overlay)? == ReadRefresh::Applied {
                 return Ok(guard);
             }

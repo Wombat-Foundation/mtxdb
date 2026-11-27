@@ -13886,7 +13886,7 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
 
 fn assert_residency_mismatch<T>(result: Result<T, StorageError>) {
     let Err(error) = result else {
-        panic!("a resident reader must reject reclaimed paged-writer coverage");
+        panic!("a shared reader must reject mismatched writer residency");
     };
     assert!(
         matches!(&error, StorageError::Unsupported(message) if message.contains("matching index residency")),
@@ -14085,6 +14085,90 @@ fn shared_reader_detects_writer_residency_change_before_reload() {
 
     drop(reader);
     drop(paged_writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A paged writer records its residency on disk, so a resident reader is
+/// rejected at open even while all writes are still buffered and no WAL
+/// coverage has been reclaimed. The checkpoint/coverage fallback alone cannot
+/// see this case.
+#[test]
+#[cfg(feature = "multi-reader")]
+fn resident_reader_rejects_a_paged_writer_before_reclaim() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("resident_reader_rejects_paged_writer");
+    let wal = dir.join("shared.wal");
+    let collection = [0x58u8; 16];
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let writer = PackfileStorage::open_with_max_shard_bytes_and_residency(
+        dir.clone(),
+        48 * 1024,
+        crate::packfile::ChecksumPolicy::Full,
+        crate::index::IndexResidency::Paged,
+    )
+    .unwrap();
+    writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+    writer
+        .put(
+            &collection,
+            &distinct_id(1),
+            &NodeData::new(bytes::Bytes::from_static(b"first")),
+        )
+        .unwrap();
+    assert_eq!(
+        PackfileStorage::read_journal_lsn(&dir),
+        0,
+        "the writer must have no durable coverage yet"
+    );
+
+    assert_residency_mismatch(PackfileStorage::open_read_committed_shared(
+        dir.clone(),
+        &wal,
+        ShardType::State,
+    ));
+
+    drop(writer);
+    drop(coordinator);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "multi-reader")]
+fn paged_reader_rejects_a_resident_writer() {
+    use crate::journal::{Journal, JournalCoordinator};
+    use crate::layout::ShardType;
+
+    let dir = test_dir("paged_reader_rejects_resident_writer");
+    let wal = dir.join("shared.wal");
+    let coordinator = Arc::new({
+        let (journal, scan) = Journal::open_shared(&wal).unwrap();
+        JournalCoordinator::new(journal, &scan)
+    });
+    let writer = PackfileStorage::open(dir.clone()).unwrap();
+    writer
+        .enable_shared_journal(Arc::clone(&coordinator), ShardType::State)
+        .unwrap();
+
+    let paged_config = crate::RuntimeConfig {
+        index_residency: Some(crate::index::IndexResidency::Paged),
+        ..crate::RuntimeConfig::default()
+    };
+    assert_residency_mismatch(PackfileStorage::open_read_committed_shared_with_config(
+        dir.clone(),
+        &wal,
+        ShardType::State,
+        &paged_config,
+    ));
+
+    drop(writer);
     drop(coordinator);
     let _ = fs::remove_dir_all(&dir);
 }
