@@ -3,12 +3,12 @@
 //! Collection logical versions are a journal concept, not a packfile one: a
 //! checkpoint records them, and the retained WAL can seed versions for groups
 //! it still holds. A reclaimed group has no frame-level version tag, so once
-//! the checkpoint that covered it is deleted — as a writable paged open does —
+//! the checkpoint that covered it is deleted — as a writable open does —
 //! the only durable copy of the version is gone.
 //!
 //! This file is that durable copy. It holds only `(collection_id, version)`
 //! pairs and the coverage LSN those versions are durable through: no index
-//! slots, no pack table. A paged reopen reads it in one sequential pass and
+//! slots, no pack table. A reopen reads it in one sequential pass and
 //! merges it into the journal's version tables with the same `max` rule as the
 //! checkpoint baseline. It is written before the WAL coverage claim that
 //! permits reclaim, so a reclaimed group's version always has a home, and the
