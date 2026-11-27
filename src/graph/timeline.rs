@@ -93,7 +93,6 @@ const ROOT_FIXED_LEN: usize = 57;
 const CURSOR_FIXED_LEN: usize = 49;
 const HEAD_LEN: usize = ROOT_FIXED_LEN;
 #[cfg(test)]
-#[cfg(test)]
 const CURSOR_LEN: usize = CURSOR_FIXED_LEN + ENTRY_LEN;
 const LEAF_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
 const ROOT_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;

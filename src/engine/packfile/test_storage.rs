@@ -13884,6 +13884,7 @@ fn paged_reopen_keeps_collection_version_after_wal_reclaim() {
     fs::remove_dir_all(&store_dir).ok();
 }
 
+#[cfg(feature = "multi-reader")]
 fn assert_residency_mismatch<T>(result: Result<T, StorageError>) {
     let Err(error) = result else {
         panic!("a shared reader must reject mismatched writer residency");

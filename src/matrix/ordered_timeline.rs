@@ -1,14 +1,14 @@
 //! Matrix event timeline adapters over the protocol-neutral ordered index.
 //!
 //! The two key types are deliberately minimal projections of
-//! [`EventTimelineEntry`]:
+//! [`EventTimelineEntry`](crate::ordered_timeline::EventTimelineEntry):
 //!
-//! - [`EventTopoKey`] orders by `(room, depth, origin_server_ts, node id)`.
-//! - [`EventStreamKey`] orders by `(room, stream ordering, node id)`.
+//! - [`EventTopoKey`](crate::ordered_timeline::EventTopoKey) orders by `(room, depth, origin_server_ts, node id)`.
+//! - [`EventStreamKey`](crate::ordered_timeline::EventStreamKey) orders by `(room, stream ordering, node id)`.
 //!
 //! A field that belongs only to the other projection is not duplicated in the
 //! key; the node id completes each total order. Callers that need both
-//! positions must keep the domain [`EventTimelineEntry`] or fetch the event.
+//! positions must keep the domain [`EventTimelineEntry`](crate::ordered_timeline::EventTimelineEntry) or fetch the event.
 //! Their cursors are distinct Rust types, and their collections are shared
 //! across rooms.
 
