@@ -19,10 +19,8 @@ pub struct BucketIndex {
 
 impl Clone for BucketIndex {
     fn clone(&self) -> Self {
-        let table = RawBucketTable::from_snapshot(&self.table.snapshot())
-            .expect("a table's own snapshot is valid");
         Self {
-            table,
+            table: self.table.clone_direct(),
             config: self.config,
             max_candidates: AtomicU32::new(self.max_candidates.load(Ordering::Relaxed)),
         }
@@ -108,36 +106,36 @@ impl BucketIndex {
 
     /// Candidates with this key's seeded fingerprint. Callers must verify
     /// each candidate against the frame's full identity before returning it.
-    #[must_use]
-    pub fn candidates(&self, hash: &[u8; 16]) -> Vec<BucketCandidate> {
+    pub fn candidates(&self, hash: &[u8; 16]) -> impl Iterator<Item = BucketCandidate> + '_ {
         self.candidates_for_fingerprint(self.table.fingerprint(hash))
     }
 
     /// Iterate candidate `(shard, offset)` locators for a key.
-    pub fn lookup_all(&self, hash: &[u8; 16]) -> std::vec::IntoIter<(u16, u64)> {
+    pub fn lookup_all(&self, hash: &[u8; 16]) -> impl Iterator<Item = (u16, u64)> + '_ {
         self.candidates(hash)
-            .into_iter()
             .map(|candidate| (candidate.shard_slot, candidate.offset))
-            .collect::<Vec<_>>()
-            .into_iter()
     }
 
     /// Return the first candidate locator for a key, if any.
     #[must_use]
     pub fn lookup(&self, hash: &[u8; 16]) -> Option<(u16, u64)> {
         self.candidates(hash)
-            .into_iter()
             .next()
             .map(|candidate| (candidate.shard_slot, candidate.offset))
     }
 
-    fn candidates_for_fingerprint(&self, fingerprint: u64) -> Vec<BucketCandidate> {
-        let candidates = self.table.candidates(fingerprint);
-        self.max_candidates.fetch_max(
-            u32::try_from(candidates.len()).unwrap_or(u32::MAX),
-            Ordering::Relaxed,
-        );
-        candidates
+    fn candidates_for_fingerprint(
+        &self,
+        fingerprint: u64,
+    ) -> impl Iterator<Item = BucketCandidate> + '_ {
+        let mut candidates = self.table.candidate_iter(fingerprint);
+        let mut seen = 0_u32;
+        std::iter::from_fn(move || {
+            candidates.next().inspect(|_| {
+                seen = seen.saturating_add(1);
+                self.max_candidates.fetch_max(seen, Ordering::Relaxed);
+            })
+        })
     }
 
     /// Maximum candidate count seen in a fingerprint lookup.
@@ -166,28 +164,19 @@ impl BucketIndex {
     /// Count live (non-removal) locators.
     #[must_use]
     pub fn live_count(&self) -> usize {
-        self.table
-            .entries()
-            .iter()
-            .filter(|entry| !entry.removed)
-            .count()
+        self.table.live_len()
     }
 
     /// Count removal locators.
     #[must_use]
     pub fn removed_count(&self) -> usize {
-        self.table
-            .entries()
-            .iter()
-            .filter(|entry| entry.removed)
-            .count()
+        self.table.len().saturating_sub(self.table.live_len())
     }
 
     /// Iterate live `(shard, offset)` locators.
-    pub fn live_entries(&self) -> impl Iterator<Item = (u16, u64)> {
+    pub fn live_entries(&self) -> impl Iterator<Item = (u16, u64)> + use<'_> {
         self.table
-            .entries()
-            .into_iter()
+            .iter_entries()
             .filter(|entry| !entry.removed)
             .map(|entry| (entry.shard_slot, entry.offset))
     }
@@ -205,12 +194,13 @@ impl BucketIndex {
         mut excluded: impl FnMut(u16) -> bool,
     ) -> HashMap<u16, u64> {
         let mut counts = HashMap::new();
-        for entry in self.table.entries() {
+        self.table.for_each_entry(|entry| {
             if !excluded(entry.shard_slot) {
                 let count = counts.entry(entry.shard_slot).or_insert(0_u64);
                 *count = count.saturating_add(1);
             }
-        }
+            true
+        });
         counts
     }
 
@@ -224,21 +214,19 @@ impl BucketIndex {
     #[must_use]
     pub fn referenced_slot_ids(&self) -> [bool; crate::shard::MAX_SHARDS] {
         let mut seen = [false; crate::shard::MAX_SHARDS];
-        for entry in self.table.entries() {
+        self.table.for_each_entry(|entry| {
             if let Some(slot) = seen.get_mut(usize::from(entry.shard_slot)) {
                 *slot = true;
             }
-        }
+            true
+        });
         seen
     }
 
     /// Whether any locator references `slot`.
     #[must_use]
     pub fn references_slot(&self, slot: u16) -> bool {
-        self.table
-            .entries()
-            .iter()
-            .any(|entry| entry.shard_slot == slot)
+        self.table.references_slot(slot)
     }
 
     /// Remap every locator's process-local shard slot.
@@ -251,11 +239,13 @@ impl BucketIndex {
         {
             return false;
         }
+        // Apply to a private copy so a failed `replace` cannot leave the live
+        // table half-remapped.
+        let table = self.table.clone_direct();
         for entry in entries {
             let slot = remap[&entry.shard_slot];
             if slot != entry.shard_slot
-                && self
-                    .table
+                && table
                     .replace(
                         entry.location,
                         entry.fingerprint,
@@ -268,13 +258,14 @@ impl BucketIndex {
                 return false;
             }
         }
+        self.table = table;
         true
     }
 
     /// Encoded v1 bucket snapshot length.
     #[must_use]
     pub fn serialized_len(&self) -> usize {
-        self.table.snapshot().len()
+        self.table.snapshot_len()
     }
 
     /// Encode the bucket snapshot.
@@ -337,8 +328,25 @@ impl BucketIndex {
     /// policy and the caller's starting floor.
     #[must_use]
     pub fn capacity_for_entries(entries: usize, min_capacity: usize) -> Option<usize> {
-        entries
-            .saturating_mul(2)
+        Self::capacity_for_entries_with_config(entries, min_capacity, IndexConfig::default())
+    }
+
+    /// Size a table for `entries` under the supplied maximum load factor.
+    #[must_use]
+    pub fn capacity_for_entries_with_config(
+        entries: usize,
+        min_capacity: usize,
+        config: IndexConfig,
+    ) -> Option<usize> {
+        let percent = usize::from(config.load_factor_percent);
+        if percent == 0 {
+            return None;
+        }
+        let numerator = entries
+            .checked_mul(100)?
+            .checked_add(percent.saturating_sub(1))?;
+        numerator
+            .checked_div(percent)?
             .max(min_capacity.max(16))
             .checked_next_power_of_two()
     }
@@ -391,7 +399,7 @@ mod tests {
         assert!(!was_new);
         assert!(!overwrite.was_empty());
         assert_eq!(index.len(), 1);
-        let candidates = index.candidates(&hash);
+        let candidates: Vec<_> = index.candidates(&hash).collect();
         let [candidate] = candidates.as_slice() else {
             panic!("same identity must retain one locator")
         };
@@ -401,7 +409,7 @@ mod tests {
         );
 
         index.rollback_slot(&overwrite);
-        let candidates = index.candidates(&hash);
+        let candidates: Vec<_> = index.candidates(&hash).collect();
         let [candidate] = candidates.as_slice() else {
             panic!("rollback must restore one locator")
         };
@@ -448,7 +456,7 @@ mod tests {
         assert_eq!(restored.len(), 3);
         let grown = restored.grow().unwrap();
         for (offset, hash) in hashes.iter().enumerate() {
-            let candidates = grown.candidates(hash);
+            let candidates: Vec<_> = grown.candidates(hash).collect();
             let [candidate] = candidates.as_slice() else {
                 panic!("snapshot and growth must retain one candidate per identity")
             };
