@@ -50,34 +50,6 @@ mod tests {
         paths.pop().expect("the live pack path was just validated")
     }
 
-    fn assert_delete_then_recreate_in_log(
-        operations: &[mtxdb::index::delta::DeltaOperation],
-        collection: [u8; 16],
-    ) {
-        use mtxdb::index::delta::DeltaOperation;
-        let tombstone = operations
-            .iter()
-            .position(|operation| {
-                matches!(
-                    operation,
-                    DeltaOperation::CollectionTombstone { collection_id, .. }
-                        if *collection_id == collection
-                )
-            })
-            .expect("delete tombstone is present");
-        let snapshot = operations
-            .iter()
-            .rposition(|operation| {
-                matches!(
-                    operation,
-                    DeltaOperation::CollectionSnapshot { collection_id, .. }
-                        if *collection_id == collection
-                )
-            })
-            .expect("recreation snapshot is present");
-        assert!(tombstone < snapshot);
-    }
-
     fn collection_id(seed: u8) -> [u8; 16] {
         let mut id = [0u8; 16];
         id[15] = seed;
@@ -1057,10 +1029,20 @@ mod tests {
             )
             .unwrap();
         reopened.sync_all().unwrap();
-        let path = current_delta_path(&dir).expect("recreation leaves v1 log");
-        let log = read_delta_log(&path).expect("delete and recreation log decodes");
-        assert_delete_then_recreate_in_log(&log.operations, deleted_collection);
+        // Recreating a deleted collection fences off its old generation, which
+        // ends the delta epoch. The reopen below checks what must survive.
         drop(reopened);
+
+        let checkpoint = mtxdb::index::checkpoint::read_checkpoint(
+            &dir.join(mtxdb::index::checkpoint::INDEX_CHECKPOINT_FILE),
+        )
+        .expect("generation-fenced recreation writes a checkpoint");
+        let recreated = checkpoint
+            .collections
+            .iter()
+            .find(|entry| entry.collection_id == deleted_collection)
+            .expect("checkpoint includes the recreated collection");
+        assert_eq!(recreated.slot_count, 1);
 
         let reopened = PackfileStorage::open(dir.clone()).unwrap();
         assert_eq!(

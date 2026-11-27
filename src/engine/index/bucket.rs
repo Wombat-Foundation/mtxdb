@@ -214,6 +214,80 @@ pub struct RawBucketTable {
     seed: u64,
 }
 
+fn parse_snapshot_header(bytes: &[u8]) -> Result<(u32, u64, usize), BucketSnapshotError> {
+    let header = bytes
+        .get(..SNAPSHOT_HEADER_LEN)
+        .ok_or(BucketSnapshotError::TooShort)?;
+    if header.get(..8) != Some(SNAPSHOT_MAGIC.as_slice()) {
+        return Err(BucketSnapshotError::BadMagic);
+    }
+    let version = u32::from_le_bytes(
+        header
+            .get(8..12)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or(BucketSnapshotError::TooShort)?,
+    );
+    if version != 1 {
+        return Err(BucketSnapshotError::UnsupportedVersion(version));
+    }
+    let bucket_count = u32::from_le_bytes(
+        header
+            .get(12..16)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or(BucketSnapshotError::TooShort)?,
+    );
+    if bucket_count == 0 || !bucket_count.is_power_of_two() {
+        return Err(BucketSnapshotError::InvalidDimensions);
+    }
+    let seed = u64::from_le_bytes(
+        header
+            .get(16..24)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or(BucketSnapshotError::TooShort)?,
+    );
+    let count = u64::from_le_bytes(
+        header
+            .get(24..32)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or(BucketSnapshotError::TooShort)?,
+    );
+    let count = usize::try_from(count).map_err(|_| BucketSnapshotError::InvalidDimensions)?;
+    Ok((bucket_count, seed, count))
+}
+
+fn parse_snapshot_entry(entry: &[u8]) -> Result<(u64, u16, u64, bool), BucketSnapshotError> {
+    let fingerprint = u64::from_le_bytes(
+        entry
+            .get(..8)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or(BucketSnapshotError::InvalidEntry)?,
+    );
+    let shard_slot = u16::from_le_bytes(
+        entry
+            .get(8..10)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or(BucketSnapshotError::InvalidEntry)?,
+    );
+    let removed = match entry.get(10) {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return Err(BucketSnapshotError::InvalidEntry),
+    };
+    if entry.get(11..16) != Some([0; 5].as_slice()) || fingerprint > FINGERPRINT_MASK {
+        return Err(BucketSnapshotError::InvalidEntry);
+    }
+    let record_offset = u64::from_le_bytes(
+        entry
+            .get(16..24)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or(BucketSnapshotError::InvalidEntry)?,
+    );
+    if record_offset > OFFSET_MASK {
+        return Err(BucketSnapshotError::InvalidEntry);
+    }
+    Ok((fingerprint, shard_slot, record_offset, removed))
+}
+
 impl RawBucketTable {
     /// Create a table with at least `min_entries` slots.
     #[must_use]
@@ -314,24 +388,13 @@ impl RawBucketTable {
 
     /// Restore a table snapshot, rejecting malformed dimensions, entries, or
     /// checksums before publishing any state.
+    ///
+    /// # Errors
+    /// Returns [`BucketSnapshotError`] when the snapshot is truncated, has a
+    /// bad magic/version/checksum, has inconsistent dimensions, or contains an
+    /// entry that cannot be installed.
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, BucketSnapshotError> {
-        if bytes.len() < SNAPSHOT_HEADER_LEN + 4 {
-            return Err(BucketSnapshotError::TooShort);
-        }
-        if bytes[..8] != SNAPSHOT_MAGIC {
-            return Err(BucketSnapshotError::BadMagic);
-        }
-        let version = u32::from_le_bytes(bytes[8..12].try_into().expect("checked header"));
-        if version != 1 {
-            return Err(BucketSnapshotError::UnsupportedVersion(version));
-        }
-        let bucket_count = u32::from_le_bytes(bytes[12..16].try_into().expect("checked header"));
-        if bucket_count < 1 || !bucket_count.is_power_of_two() {
-            return Err(BucketSnapshotError::InvalidDimensions);
-        }
-        let seed = u64::from_le_bytes(bytes[16..24].try_into().expect("checked header"));
-        let count = u64::from_le_bytes(bytes[24..32].try_into().expect("checked header"));
-        let count = usize::try_from(count).map_err(|_| BucketSnapshotError::InvalidDimensions)?;
+        let (bucket_count, seed, count) = parse_snapshot_header(bytes)?;
         let expected_len = SNAPSHOT_HEADER_LEN
             .checked_add(
                 count
@@ -343,11 +406,15 @@ impl RawBucketTable {
         if bytes.len() != expected_len {
             return Err(BucketSnapshotError::InvalidDimensions);
         }
-        let checksum_offset = bytes.len() - 4;
+        let checksum_offset = bytes
+            .len()
+            .checked_sub(4)
+            .ok_or(BucketSnapshotError::TooShort)?;
         let expected_crc = u32::from_le_bytes(
-            bytes[checksum_offset..]
-                .try_into()
-                .expect("four-byte checksum"),
+            bytes
+                .get(checksum_offset..)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or(BucketSnapshotError::TooShort)?,
         );
         if crc32fast::hash(&bytes[..checksum_offset]) != expected_crc {
             return Err(BucketSnapshotError::ChecksumMismatch);
@@ -368,26 +435,22 @@ impl RawBucketTable {
             return Err(BucketSnapshotError::InvalidDimensions);
         }
         let table = Self::new(minimum_entries, seed);
-        if table.buckets.len() != bucket_count as usize {
+        if table.buckets.len() != usize::try_from(bucket_count).unwrap_or(0) {
             return Err(BucketSnapshotError::InvalidDimensions);
         }
-        for index in 0..count {
-            let start = SNAPSHOT_HEADER_LEN + index * SNAPSHOT_ENTRY_LEN;
-            let fingerprint = u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
-            let shard_slot = u16::from_le_bytes(bytes[start + 8..start + 10].try_into().unwrap());
-            let removed = match bytes[start + 10] {
-                0 => false,
-                1 => true,
-                _ => return Err(BucketSnapshotError::InvalidEntry),
-            };
-            if bytes[start + 11..start + 16] != [0; 5] || fingerprint > FINGERPRINT_MASK {
-                return Err(BucketSnapshotError::InvalidEntry);
-            }
-            let offset = u64::from_le_bytes(bytes[start + 16..start + 24].try_into().unwrap());
+        let mut offset = SNAPSHOT_HEADER_LEN;
+        for _ in 0..count {
+            let end = offset
+                .checked_add(SNAPSHOT_ENTRY_LEN)
+                .ok_or(BucketSnapshotError::InvalidDimensions)?;
+            let entry = bytes
+                .get(offset..end)
+                .ok_or(BucketSnapshotError::InvalidEntry)?;
+            offset = end;
+            let (fingerprint, shard_slot, record_offset, removed) = parse_snapshot_entry(entry)?;
             if usize::from(shard_slot) >= crate::shard::MAX_SHARDS
-                || offset > OFFSET_MASK
                 || table
-                    .insert_new(fingerprint, shard_slot, offset, removed)
+                    .insert_new(fingerprint, shard_slot, record_offset, removed)
                     .is_none()
             {
                 return Err(BucketSnapshotError::InvalidEntry);
@@ -409,8 +472,12 @@ impl RawBucketTable {
     /// Produce a seeded 62-bit fingerprint from the full key hash.
     #[must_use]
     pub fn fingerprint(&self, hash: &[u8; 16]) -> u64 {
-        let left = u64::from_le_bytes(hash[..8].try_into().expect("fixed hash width"));
-        let right = u64::from_le_bytes(hash[8..].try_into().expect("fixed hash width"));
+        let mut left = [0_u8; 8];
+        left.copy_from_slice(&hash[..8]);
+        let mut right = [0_u8; 8];
+        right.copy_from_slice(&hash[8..]);
+        let left = u64::from_le_bytes(left);
+        let right = u64::from_le_bytes(right);
         mix64(left ^ mix64(right ^ self.seed) ^ self.seed.rotate_left(29)) & FINGERPRINT_MASK
     }
 
@@ -603,34 +670,24 @@ impl RawBucketTable {
             for slot in &bucket.slots {
                 if let Some(candidate) = slot.snapshot(SlotLocation::Bucket { bucket: 0, slot: 0 })
                 {
-                    if grown
-                        .insert_new(
-                            candidate.fingerprint,
-                            candidate.shard_slot,
-                            candidate.offset,
-                            candidate.removed,
-                        )
-                        .is_none()
-                    {
-                        return None;
-                    }
+                    grown.insert_new(
+                        candidate.fingerprint,
+                        candidate.shard_slot,
+                        candidate.offset,
+                        candidate.removed,
+                    )?;
                 }
             }
         }
         let overflow = self.overflow.lock();
         for slot in overflow.iter() {
             if let Some(candidate) = slot.snapshot(SlotLocation::Overflow(0)) {
-                if grown
-                    .insert_new(
-                        candidate.fingerprint,
-                        candidate.shard_slot,
-                        candidate.offset,
-                        candidate.removed,
-                    )
-                    .is_none()
-                {
-                    return None;
-                }
+                grown.insert_new(
+                    candidate.fingerprint,
+                    candidate.shard_slot,
+                    candidate.offset,
+                    candidate.removed,
+                )?;
             }
         }
         Some(grown)
@@ -645,7 +702,7 @@ impl RawBucketTable {
         .unwrap_or(0)
             & mask;
         if self.buckets.len() > 1 && second == first {
-            second = (second + 1) & mask;
+            second = second.wrapping_add(1) & mask;
         }
         (first, second)
     }
@@ -720,6 +777,17 @@ impl std::fmt::Display for BucketSnapshotError {
 }
 
 impl std::error::Error for BucketSnapshotError {}
+
+fn pack_locator(shard_slot: u16, offset: u64) -> Option<u64> {
+    (offset <= OFFSET_MASK).then_some((u64::from(shard_slot) << 48) | offset)
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
 
 #[cfg(test)]
 mod tests {
@@ -864,15 +932,4 @@ mod tests {
             Err(super::BucketSnapshotError::InvalidEntry)
         ));
     }
-}
-
-fn pack_locator(shard_slot: u16, offset: u64) -> Option<u64> {
-    (offset <= OFFSET_MASK).then_some((u64::from(shard_slot) << 48) | offset)
-}
-
-fn mix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
 }
