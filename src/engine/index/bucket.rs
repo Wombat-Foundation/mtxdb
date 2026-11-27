@@ -104,7 +104,7 @@ impl Slot {
                 spin_loop();
                 continue;
             }
-            let locator = self.locator.load(Ordering::Relaxed);
+            let locator = self.locator.load(Ordering::Acquire);
             if self.tag_state.load(Ordering::Acquire) == tag_state {
                 return Self {
                     tag_state: AtomicU64::new(tag_state),
@@ -125,7 +125,7 @@ impl Slot {
             if state == SLOT_EMPTY {
                 return None;
             }
-            let packed = self.locator.load(Ordering::Relaxed);
+            let packed = self.locator.load(Ordering::Acquire);
             if self.tag_state.load(Ordering::Acquire) != before {
                 continue;
             }
@@ -151,13 +151,13 @@ impl Slot {
             let locked = (old & !SLOT_STATE_MASK) | SLOT_LOCKED;
             if self
                 .tag_state
-                .compare_exchange_weak(old, locked, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange_weak(old, locked, Ordering::AcqRel, Ordering::Relaxed)
                 .is_err()
             {
                 continue;
             }
             let old_locator = self.locator.load(Ordering::Relaxed);
-            self.locator.store(packed, Ordering::Relaxed);
+            self.locator.store(packed, Ordering::Release);
             self.tag_state.store(next, Ordering::Release);
             return (old, old_locator);
         }
@@ -167,12 +167,12 @@ impl Slot {
         let locked = ((fingerprint & FINGERPRINT_MASK) << 2) | SLOT_LOCKED;
         if self
             .tag_state
-            .compare_exchange(SLOT_EMPTY, locked, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(SLOT_EMPTY, locked, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
             return None;
         }
-        self.locator.store(packed, Ordering::Relaxed);
+        self.locator.store(packed, Ordering::Release);
         self.tag_state.store(
             ((fingerprint & FINGERPRINT_MASK) << 2)
                 | if removed { SLOT_REMOVED } else { SLOT_LIVE },
@@ -191,12 +191,12 @@ impl Slot {
             let locked = (old & !SLOT_STATE_MASK) | SLOT_LOCKED;
             if self
                 .tag_state
-                .compare_exchange_weak(old, locked, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange_weak(old, locked, Ordering::AcqRel, Ordering::Relaxed)
                 .is_err()
             {
                 continue;
             }
-            self.locator.store(locator, Ordering::Relaxed);
+            self.locator.store(locator, Ordering::Release);
             self.tag_state.store(tag_state, Ordering::Release);
             return;
         }
@@ -258,7 +258,8 @@ pub struct BucketEntries<'a> {
     table: &'a RawBucketTable,
     bucket_index: usize,
     slot_index: usize,
-    overflow_index: usize,
+    overflow_entries: Option<std::vec::IntoIter<BucketCandidate>>,
+    overflow_scanned: bool,
 }
 
 impl Iterator for BucketEntries<'_> {
@@ -283,19 +284,11 @@ impl Iterator for BucketEntries<'_> {
                 }
                 continue;
             }
-            if self.table.overflow_len.load(Ordering::Acquire) == 0 {
-                return None;
+            if !self.overflow_scanned {
+                self.overflow_entries = Some(self.table.overflow_entries(None));
+                self.overflow_scanned = true;
             }
-            let entry = {
-                let overflow = self.table.overflow.lock();
-                let slot = overflow.get(self.overflow_index)?;
-                let location = SlotLocation::Overflow(u32::try_from(self.overflow_index).ok()?);
-                self.overflow_index = self.overflow_index.saturating_add(1);
-                slot.snapshot(location)
-            };
-            if entry.is_some() {
-                return entry;
-            }
+            return self.overflow_entries.as_mut()?.next();
         }
     }
 }
@@ -308,7 +301,8 @@ pub struct BucketCandidates<'a> {
     choice_count: usize,
     choice_index: usize,
     slot_index: usize,
-    overflow_index: usize,
+    overflow_entries: Option<std::vec::IntoIter<BucketCandidate>>,
+    overflow_scanned: bool,
 }
 
 impl Iterator for BucketCandidates<'_> {
@@ -337,19 +331,11 @@ impl Iterator for BucketCandidates<'_> {
                 }
                 continue;
             }
-            if self.table.overflow_len.load(Ordering::Acquire) == 0 {
-                return None;
+            if !self.overflow_scanned {
+                self.overflow_entries = Some(self.table.overflow_entries(Some(self.fingerprint)));
+                self.overflow_scanned = true;
             }
-            let candidate = {
-                let overflow = self.table.overflow.lock();
-                let slot = overflow.get(self.overflow_index)?;
-                let location = SlotLocation::Overflow(u32::try_from(self.overflow_index).ok()?);
-                self.overflow_index = self.overflow_index.saturating_add(1);
-                slot.snapshot(location)
-            };
-            if candidate.is_some_and(|entry| entry.fingerprint == self.fingerprint) {
-                return candidate;
-            }
+            return self.overflow_entries.as_mut()?.next();
         }
     }
 }
@@ -515,7 +501,8 @@ impl RawBucketTable {
             table: self,
             bucket_index: 0,
             slot_index: 0,
-            overflow_index: 0,
+            overflow_entries: None,
+            overflow_scanned: false,
         }
     }
 
@@ -738,8 +725,31 @@ impl RawBucketTable {
             choice_count: if first == second { 1 } else { 2 },
             choice_index: 0,
             slot_index: 0,
-            overflow_index: 0,
+            overflow_entries: None,
+            overflow_scanned: false,
         }
+    }
+
+    /// Snapshot overflow matches while holding the overflow mutex once.
+    /// Overflow is a rare slow path; readers then iterate without lock
+    /// thrashing and writers are blocked only for this one scan.
+    fn overflow_entries(&self, fingerprint: Option<u64>) -> std::vec::IntoIter<BucketCandidate> {
+        if self.overflow_len.load(Ordering::Acquire) == 0 {
+            return Vec::new().into_iter();
+        }
+        let overflow = self.overflow.lock();
+        overflow
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let location = SlotLocation::Overflow(u32::try_from(index).ok()?);
+                let candidate = slot.snapshot(location)?;
+                fingerprint
+                    .is_none_or(|expected| candidate.fingerprint == expected)
+                    .then_some(candidate)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// Insert a new key candidate. Exact replacement is a separate operation
@@ -946,7 +956,7 @@ impl RawBucketTable {
                     bucket: u32::try_from(bucket_index).ok()?,
                     slot: u8::try_from(slot_index).ok()?,
                 }) {
-                    grown.insert_new(
+                    grown.insert_snapshot_entry(
                         candidate.fingerprint,
                         candidate.shard_slot,
                         candidate.offset,
@@ -961,7 +971,7 @@ impl RawBucketTable {
                 if let Some(candidate) = slot.snapshot(SlotLocation::Overflow(
                     u32::try_from(index).unwrap_or(u32::MAX),
                 )) {
-                    grown.insert_new(
+                    grown.insert_snapshot_entry(
                         candidate.fingerprint,
                         candidate.shard_slot,
                         candidate.offset,
@@ -1226,6 +1236,24 @@ mod tests {
             .iter()
             .any(|entry| matches!(entry.location, SlotLocation::Overflow(_))));
         assert_eq!(table.snapshot_len(), table.snapshot().len());
+    }
+
+    #[test]
+    fn grow_preserves_snapshot_overflow_above_live_insertion_limit() {
+        let table = RawBucketTable::new(4, 0x19);
+        for offset in 0..12 {
+            table
+                .insert_snapshot_entry(42, 1, offset, false)
+                .expect("snapshot restore permits bounded-layout overflow");
+        }
+        assert!(table.overflow_len() > table.buckets.len());
+
+        let grown = table
+            .grow()
+            .expect("rehash must preserve every restored entry");
+        assert_eq!(grown.len(), table.len());
+        assert_eq!(grown.live_len(), table.live_len());
+        assert_eq!(grown.entries().len(), 12);
     }
 
     #[test]

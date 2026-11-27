@@ -232,13 +232,22 @@ impl BucketIndex {
     /// Remap every locator's process-local shard slot.
     #[must_use]
     pub fn remap_slots(&mut self, remap: &HashMap<u16, u16>) -> bool {
-        let entries = self.table.entries();
-        if entries
-            .iter()
-            .any(|entry| !remap.contains_key(&entry.shard_slot))
-        {
+        let mut all_mapped = true;
+        let mut needs_rewrite = false;
+        self.table.for_each_entry(|entry| {
+            match remap.get(&entry.shard_slot) {
+                Some(&new_slot) => needs_rewrite |= new_slot != entry.shard_slot,
+                None => all_mapped = false,
+            }
+            all_mapped
+        });
+        if !all_mapped {
             return false;
         }
+        if !needs_rewrite {
+            return true;
+        }
+        let entries = self.table.entries();
         // Apply to a private copy so a failed `replace` cannot leave the live
         // table half-remapped.
         let table = self.table.clone_direct();
@@ -328,7 +337,10 @@ impl BucketIndex {
     /// policy and the caller's starting floor.
     #[must_use]
     pub fn capacity_for_entries(entries: usize, min_capacity: usize) -> Option<usize> {
-        Self::capacity_for_entries_with_config(entries, min_capacity, IndexConfig::default())
+        entries
+            .saturating_mul(2)
+            .max(min_capacity.max(16))
+            .checked_next_power_of_two()
     }
 
     /// Size a table for `entries` under the supplied maximum load factor.
@@ -485,5 +497,37 @@ mod tests {
             BucketIndex::capacity_for_entries_with_config(100, 16, invalid),
             None
         );
+    }
+
+    #[test]
+    fn standard_capacity_keeps_two_times_entry_policy() {
+        assert_eq!(BucketIndex::capacity_for_entries(40, 64), Some(128));
+        assert_eq!(BucketIndex::capacity_for_entries(48, 64), Some(128));
+        assert_eq!(
+            BucketIndex::capacity_for_entries_with_config(48, 64, IndexConfig::default()),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn identity_remap_preserves_snapshot_and_missing_mapping_is_atomic() {
+        let index = BucketIndex::new(16);
+        let hashes = [[0x11; 16], [0x22; 16]];
+        for (slot, hash) in hashes.iter().enumerate() {
+            index
+                .insert_with_identity(hash, u16::try_from(slot).unwrap(), 10, false, |_| {
+                    Ok::<_, ()>(*hash)
+                })
+                .unwrap()
+                .unwrap();
+        }
+        let before = index.serialize();
+        let mut identity = index.clone();
+        assert!(identity.remap_slots(&std::collections::HashMap::from([(0, 0), (1, 1)])));
+        assert_eq!(identity.serialize(), before);
+
+        let mut incomplete = index.clone();
+        assert!(!incomplete.remap_slots(&std::collections::HashMap::from([(0, 9)])));
+        assert_eq!(incomplete.serialize(), before);
     }
 }
